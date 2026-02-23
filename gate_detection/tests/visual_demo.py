@@ -56,7 +56,7 @@ def make_features_panel(detections, image_width: int, image_height: int, panel_w
     return panel
 
 
-def run_synthetic_demo(preset: str = "red"):
+def run_synthetic_demo(preset=None):
     """Cycle through synthetic test scenarios and show detection in GUI."""
     scenarios = [
         ("Center gate", {"gate_center": (320, 240), "gate_size": 150}),
@@ -75,7 +75,7 @@ def run_synthetic_demo(preset: str = "red"):
         kwargs = dict(kwargs)
         if "gate_color_bgr" not in kwargs:
             colors = {"red": (0, 0, 255), "blue": (255, 0, 0), "orange": (0, 165, 255), "green": (0, 255, 0)}
-            kwargs["gate_color_bgr"] = colors.get(preset, (0, 0, 255))
+            kwargs["gate_color_bgr"] = colors.get(preset or "red", (0, 0, 255))
 
         image = create_synthetic_gate_image(**kwargs)
         detections = detector.detect(image)
@@ -119,7 +119,7 @@ def run_synthetic_demo(preset: str = "red"):
     cv2.destroyAllWindows()
 
 
-def run_image_demo(image_path: str, preset: str = "red"):
+def run_image_demo(image_path: str, preset=None):
     """Run detection on a single image and show GUI."""
     image = cv2.imread(image_path)
     if image is None:
@@ -154,15 +154,17 @@ def run_image_demo(image_path: str, preset: str = "red"):
 def main():
     parser = argparse.ArgumentParser(description="Visual GUI for gate detection")
     parser.add_argument("--image", type=str, help="Path to image file")
-    parser.add_argument("--preset", type=str, default="red", choices=["red", "blue", "orange", "green"],
-                        help="Gate color preset for detection")
+    parser.add_argument("--preset", type=str, default=None,
+                        choices=["none", "red", "blue", "orange", "green", "purple", "tii_purple", "tii_purple_wide"],
+                        help="Gate color preset (default: none = color-agnostic)")
     args = parser.parse_args()
 
+    preset = args.preset if args.preset != "none" else None
     if args.image:
-        run_image_demo(args.image, args.preset)
+        run_image_demo(args.image, preset)
     else:
         print("Synthetic demo: [N]ext scenario, [P]rev, [Q]uit")
-        run_synthetic_demo(args.preset)
+        run_synthetic_demo(preset)
 
 
 if __name__ == "__main__":

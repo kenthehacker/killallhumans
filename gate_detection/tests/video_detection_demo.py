@@ -79,9 +79,9 @@ def main():
     parser.add_argument(
         "--preset",
         type=str,
-        default="orange",
-        choices=["red", "blue", "orange", "green"],
-        help="Gate color preset (default orange for TII)",
+        default=None,
+        choices=["none", "red", "blue", "orange", "green", "purple", "tii_purple", "tii_purple_wide"],
+        help="Gate color preset. Default: none (color-agnostic). Pass a name to add that preset on top of the agnostic strategies.",
     )
     parser.add_argument(
         "--delay",
@@ -115,8 +115,9 @@ def main():
 
     if args.max_frames > 0:
         frame_paths = frame_paths[: args.max_frames]
-    print(f"Playing {len(frame_paths)} frames (preset={args.preset}). [SPACE] pause, [Q] quit, [S] step.")
-    detector = GateDetector(color_preset=args.preset)
+    preset = args.preset if args.preset != "none" else None
+    print(f"Playing {len(frame_paths)} frames (preset={preset}). [SPACE] pause, [Q] quit, [S] step.")
+    detector = GateDetector(color_preset=preset)
     paused = False
     idx = 0
 
