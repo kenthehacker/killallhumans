@@ -102,6 +102,8 @@ class GateDetector:
         camera_fov_horizontal: float = 90.0,  # degrees
         image_width: int = 640,
         image_height: int = 480,
+        max_aspect_ratio: float = 3.0,
+        max_aspect_ratio_partial: float = 4.5,
     ):
         """
         Initialize the gate detector.
@@ -113,12 +115,16 @@ class GateDetector:
             camera_fov_horizontal: Camera field of view in degrees
             image_width: Expected image width
             image_height: Expected image height
+            max_aspect_ratio: Max aspect ratio for a valid gate (full frame)
+            max_aspect_ratio_partial: Max aspect ratio when gate touches image edge (partial gate)
         """
         self.min_area = min_area
         self.max_area = max_area
         self.camera_fov = camera_fov_horizontal
         self.image_width = image_width
         self.image_height = image_height
+        self.max_aspect_ratio = max_aspect_ratio
+        self.max_aspect_ratio_partial = max_aspect_ratio_partial
         
         # Set HSV thresholds based on color preset
         self.hsv_lower, self.hsv_upper = self._get_color_thresholds(color_preset)
@@ -221,8 +227,16 @@ class GateDetector:
             return None
         aspect_ratio = max(rect_w, rect_h) / min(rect_w, rect_h)
 
-        # Gates are roughly square - filter extreme aspect ratios
-        if aspect_ratio > 3.0:
+        # Gates are roughly square; allow higher aspect ratio for partial gates at image edge
+        img_h, img_w = image_shape[:2]
+        margin = 3
+        touches_edge = (
+            x < margin or y < margin
+            or (x + w) > (img_w - margin)
+            or (y + h) > (img_h - margin)
+        )
+        max_ar = self.max_aspect_ratio_partial if touches_edge else self.max_aspect_ratio
+        if aspect_ratio > max_ar:
             return None
 
         rect_area = rect_w * rect_h
@@ -233,8 +247,6 @@ class GateDetector:
         center_x = x + w // 2
         center_y = y + h // 2
 
-        # Image dimensions for normalized position
-        img_h, img_w = image_shape[:2]
         norm_x = (2.0 * center_x / max(img_w, 1)) - 1.0
         norm_y = (2.0 * center_y / max(img_h, 1)) - 1.0
         mid_y = img_h / 2.0

@@ -17,6 +17,7 @@ pip3 install -r requirements.txt
 | HSV calibrator | `python3 src/color_calibrator.py --image path.png` | Tune HSV thresholds on image/video/camera |
 | Fetch real gate images | `python3 tests/scripts/fetch_gate_images_from_dataset.py --dataset /path/to/drone-racing-dataset` | Copy sample frames from [TII drone-racing-dataset](https://github.com/tii-racing/drone-racing-dataset) into `tests/example_gate_images/` |
 | Run on real images | `python3 tests/scripts/run_detection_on_examples.py [--preset orange] [--save]` | Run detector on all images in `tests/example_gate_images/` (batch) |
+| Video detection demo | `python3 tests/video_detection_demo.py --dataset /path/to/drone-racing-dataset [--flight flight-01a-ellipse] [--preset orange]` | Play TII dataset frames with gate detection overlay; [SPACE] pause, [Q] quit |
 
 **Testing on real images:** Put real drone gate frames in `tests/example_gate_images/` (see that folder’s [README](tests/example_gate_images/README.md)). You can sample images from the TII Racing dataset with the fetch script, then run `run_detection_on_examples.py` to verify detection on unlabeled real-life frames.
 
