@@ -29,7 +29,8 @@ from test_detection import create_synthetic_gate_image
 
 def make_features_panel(detections, image_width: int, image_height: int, panel_width: int = 380) -> np.ndarray:
     """Build a text panel image listing ML features for the first (or selected) detection."""
-    panel = np.full((520, panel_width, 3), 28, dtype=np.uint8)
+    panel_height = image_height  # match image height so hstack works
+    panel = np.full((panel_height, panel_width, 3), 28, dtype=np.uint8)
     if not detections:
         cv2.putText(panel, "No gates detected", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
         return panel
