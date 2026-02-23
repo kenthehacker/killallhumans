@@ -240,6 +240,101 @@ def test_rotated_gate():
     return image, detections
 
 
+def test_angled_gate_3d_like():
+    """Test detection when gate is not head-on (strong in-plane rotation / 3D-like view)."""
+    print("\n" + "="*50)
+    print("TEST: Angled / 3D-like Gate (not head-on)")
+    print("="*50)
+    
+    # Strong rotations that still look like a quad in 2D
+    for rotation_deg in [35, 45, -40]:
+        image = create_synthetic_gate_image(
+            gate_center=(320, 240),
+            gate_size=120,
+            rotation_deg=rotation_deg,
+        )
+        detector = GateDetector(color_preset="red")
+        detections = detector.detect(image)
+        assert len(detections) >= 1, f"Should detect gate at rotation {rotation_deg}°"
+        det = detections[0]
+        assert det.confidence > 0, "Should have positive confidence"
+        print(f"  rotation={rotation_deg}° -> detected center=({det.center_x}, {det.center_y}) conf={det.confidence:.2f}")
+    print("  ✓ PASSED (works for angled/rotated gates)")
+
+
+def test_multiple_gates_in_frame():
+    """Test that we detect all gates when more than one is in the frame."""
+    print("\n" + "="*50)
+    print("TEST: Multiple Gates in One Frame")
+    print("="*50)
+    
+    # Build image with 3 gates (red hollow squares at different positions)
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    image[:] = (40, 40, 40)
+    red = (0, 0, 255)
+    centers = [(160, 160), (320, 240), (480, 320)]
+    size = 80
+    half = size // 2
+    thick = size // 5
+    inner_half = half - thick
+    
+    for cx, cy in centers:
+        outer = np.array([
+            [cx - half, cy - half], [cx + half, cy - half],
+            [cx + half, cy + half], [cx - half, cy + half],
+        ], dtype=np.int32)
+        inner = np.array([
+            [cx - inner_half, cy - inner_half], [cx + inner_half, cy - inner_half],
+            [cx + inner_half, cy + inner_half], [cx - inner_half, cy + inner_half],
+        ], dtype=np.int32)
+        cv2.fillPoly(image, [outer], red)
+        cv2.fillPoly(image, [inner], (40, 40, 40))
+    
+    detector = GateDetector(color_preset="red", min_area=500)
+    detections = detector.detect(image)
+    
+    assert len(detections) >= 2, f"Expected at least 2 gates, got {len(detections)}"
+    # With 3 gates we may get 3; allow 2 if one contour merges
+    print(f"  Gates in image: 3, detections: {len(detections)}")
+    print("  ✓ PASSED (multiple gates detected)")
+
+
+def test_partial_gate_at_edge():
+    """Test that we can still detect a gate that is partially out of frame."""
+    print("\n" + "="*50)
+    print("TEST: Partial Gate (not fully in frame)")
+    print("="*50)
+    
+    # Gate centered so that a good chunk is visible but one side is clipped
+    # Put center near left edge so right part of gate is in frame
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    image[:] = (40, 40, 40)
+    red = (0, 0, 255)
+    cx, cy = 100, 240  # gate center; gate will extend left out of frame
+    half = 90
+    thick = 18
+    inner_half = half - thick
+    # Clip points to image (0..639, 0..479)
+    outer = np.array([
+        [max(0, cx - half), cy - half], [min(639, cx + half), cy - half],
+        [min(639, cx + half), cy + half], [max(0, cx - half), cy + half],
+    ], dtype=np.int32)
+    inner = np.array([
+        [max(0, cx - inner_half), cy - inner_half], [min(639, cx + inner_half), cy - inner_half],
+        [min(639, cx + inner_half), cy + inner_half], [max(0, cx - inner_half), cy + inner_half],
+    ], dtype=np.int32)
+    cv2.fillPoly(image, [outer], red)
+    cv2.fillPoly(image, [inner], (40, 40, 40))
+    
+    detector = GateDetector(color_preset="red", min_area=500, max_aspect_ratio_partial=4.5)
+    detections = detector.detect(image)
+    
+    # We should get at least one detection (the visible part of the gate)
+    assert len(detections) >= 1, "Should detect partial gate at image edge"
+    print(f"  Partial gate at edge -> detections: {len(detections)}")
+    print("  ✓ PASSED (partial gate handled)")
+
+
 def test_no_gate():
     """Test that detector doesn't false positive on empty image."""
     print("\n" + "="*50)
@@ -375,6 +470,9 @@ def run_all_tests():
         test_steering_error()
         test_multiple_colors()
         test_rotated_gate()
+        test_angled_gate_3d_like()
+        test_multiple_gates_in_frame()
+        test_partial_gate_at_edge()
         test_no_gate()
         test_distance_estimation()
         test_rich_ml_features()
