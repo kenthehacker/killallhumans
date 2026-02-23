@@ -1,0 +1,3 @@
+# Keeps this directory in git. Put real gate images here (see README.md).
+# Sample images from the TII dataset can be copied via:
+#   python3 tests/scripts/fetch_gate_images_from_dataset.py --dataset /path/to/drone-racing-dataset
