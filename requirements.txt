@@ -1,0 +1,8 @@
+# Shared project dependencies for local development and demos.
+-r gate_detection/requirements.txt
+
+# Simulation interactive viewer
+pyvista>=0.43.0
+
+# GUI backend for matplotlib fallback interactive viewer (Wayland/X11)
+PyQt6>=6.7.0
