@@ -11,7 +11,7 @@ Optional (for PyVista rendering path):
 From repo root, run:
 
 ```bash
-bash scripts/bootstrap_demo.sh --interactive --output-dir simulation/example_output
+bash scripts/bootstrap_demo.sh --interactive
 ```
 
 What this does:
@@ -23,7 +23,7 @@ What this does:
 If you only want snapshots:
 
 ```bash
-bash scripts/bootstrap_demo.sh --output-dir simulation/example_output
+bash scripts/bootstrap_demo.sh
 ```
 
 ## Manual Environment Setup
@@ -36,7 +36,7 @@ bash scripts/setup_venv.sh
 Then run the demo with the venv Python:
 
 ```bash
-bash scripts/run_demo.sh --interactive --output-dir simulation/example_output
+bash scripts/run_demo.sh --interactive
 ```
 
 ## Run Tests
@@ -55,14 +55,21 @@ Use this to produce a concrete example scene with gates + path and camera snapsh
 
 ```bash
 cd /home/john/grand_prix/killallhumans
-python3 -m simulation.demo --output-dir simulation/example_output
+python3 -m simulation.demo
 ```
 
 If your shell is not at repo root, this also works:
 
 ```bash
-python3 /home/john/grand_prix/killallhumans/simulation/demo.py --output-dir /home/john/grand_prix/killallhumans/simulation/example_output
+python3 /home/john/grand_prix/killallhumans/simulation/demo.py
 ```
+
+Scene config (YAML) used by default:
+- `simulation/configs/field_demo.yaml`
+- This file defines:
+  - gate geometry (`interior_width_m`, `interior_height_m`, `border_width_m`, `depth_m`)
+  - per-gate pose (`x`, `y`, `z`, `yaw`, `pitch`, `roll`)
+  - path control points
 
 Generated files:
 - `simulation/example_output/primary_camera_view.ppm`
@@ -76,7 +83,7 @@ To actually move around the field with a free-roam camera:
 
 ```bash
 cd /home/john/grand_prix/killallhumans
-python3 -m simulation.demo --interactive --output-dir simulation/example_output
+python3 -m simulation.demo --interactive
 ```
 
 Controls in window:

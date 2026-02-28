@@ -24,6 +24,7 @@ Build a simulation environment for autonomous drone-racing development that supp
 - `simulation/renderer.py`: scene viewer, free-roam control, snapshots
 - `simulation/adapters.py`: bridges to `flight_control`
 - `simulation/scenarios.py`: sample field/path builders
+- `simulation/configs/field_demo.yaml`: declarative scene config (gate geometry + poses + path)
 - `simulation/demo.py`: reproducible example field + snapshot generator
 - `simulation/tests/*`: coverage for each major subsystem
 

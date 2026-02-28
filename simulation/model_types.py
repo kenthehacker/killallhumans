@@ -26,17 +26,41 @@ class Pose3D:
 @dataclass(frozen=True)
 class GateConfig:
     gate_type: str = "square"
-    width_m: float = 1.0
-    height_m: float = 1.0
-    frame_thickness_m: float = 0.1
+    interior_width_m: float = 1.0
+    interior_height_m: float = 1.0
+    border_width_m: float = 0.15
+    depth_m: float = 0.08
     color: str = "red"
     label: str = ""
 
     def __post_init__(self) -> None:
-        if self.width_m <= 0 or self.height_m <= 0:
-            raise ValueError("Gate dimensions must be positive")
-        if self.frame_thickness_m <= 0:
-            raise ValueError("Gate frame thickness must be positive")
+        if self.interior_width_m <= 0 or self.interior_height_m <= 0:
+            raise ValueError("Gate interior dimensions must be positive")
+        if self.border_width_m <= 0:
+            raise ValueError("Gate border width must be positive")
+        if self.depth_m <= 0:
+            raise ValueError("Gate depth must be positive")
+
+    @property
+    def outer_width_m(self) -> float:
+        return self.interior_width_m + 2.0 * self.border_width_m
+
+    @property
+    def outer_height_m(self) -> float:
+        return self.interior_height_m + 2.0 * self.border_width_m
+
+    # Compatibility aliases for older callsites.
+    @property
+    def width_m(self) -> float:
+        return self.outer_width_m
+
+    @property
+    def height_m(self) -> float:
+        return self.outer_height_m
+
+    @property
+    def frame_thickness_m(self) -> float:
+        return self.depth_m
 
 
 @dataclass(frozen=True)

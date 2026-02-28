@@ -13,19 +13,20 @@ if __package__ in (None, ""):
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
     from simulation.renderer import render_scene
-    from simulation.scenarios import build_sample_field, build_sample_path
+    from simulation.scenarios import DEFAULT_SCENE_CONFIG, build_sample_field, build_sample_path
     from simulation.model_types import CameraPose, Pose3D
 else:
     from .renderer import render_scene
-    from .scenarios import build_sample_field, build_sample_path
+    from .scenarios import DEFAULT_SCENE_CONFIG, build_sample_field, build_sample_path
     from .model_types import CameraPose, Pose3D
 
 
 def run_demo(output_dir: Path, interactive: bool = False) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    field = build_sample_field()
-    path = build_sample_path()
+    config_path = DEFAULT_SCENE_CONFIG
+    field = build_sample_field(config_path=config_path)
+    path = build_sample_path(config_path=config_path)
     viewer = render_scene(field, path)
 
     if interactive:
@@ -54,13 +55,19 @@ def run_demo(output_dir: Path, interactive: bool = False) -> dict:
 
     summary = {
         "field_name": field.config.name,
+        "scene_config": str(config_path),
         "gate_count": len(field.gates),
         "gates": [
             {
                 "id": gate.gate_id,
                 "sequence_index": gate.sequence_index,
                 "position": [gate.pose.x, gate.pose.y, gate.pose.z],
+                "rotation_rpy": [gate.pose.roll, gate.pose.pitch, gate.pose.yaw],
                 "color": gate.config.color,
+                "interior_width_m": gate.config.interior_width_m,
+                "interior_height_m": gate.config.interior_height_m,
+                "border_width_m": gate.config.border_width_m,
+                "depth_m": gate.config.depth_m,
             }
             for gate in field.gates
         ],
@@ -97,6 +104,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate demo simulation field snapshots")
     parser.add_argument(
         "--output-dir",
+        nargs="?",
+        const=Path("simulation/example_output"),
         type=Path,
         default=Path("simulation/example_output"),
         help="Directory where demo outputs are written",

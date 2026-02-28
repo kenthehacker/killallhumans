@@ -46,13 +46,8 @@ class SimulationViewer:
 
         self._plotter.clear()
         for gate in self.field.gates:
-            cube = pv.Cube(
-                center=(gate.pose.x, gate.pose.y, gate.pose.z),
-                x_length=max(gate.config.width_m, 0.1),
-                y_length=max(gate.config.frame_thickness_m, 0.05),
-                z_length=max(gate.config.height_m, 0.1),
-            )
-            self._plotter.add_mesh(cube, color=gate.config.color, opacity=0.65)
+            for segment_mesh in _build_gate_frame_meshes(gate):
+                self._plotter.add_mesh(segment_mesh, color=gate.config.color, opacity=0.85)
 
         if self.path and self.path.points:
             path_lines = pv.lines_from_points(self.path.points, close=False)
@@ -164,6 +159,17 @@ class SimulationViewer:
         for gate in self.field.gates:
             ax.scatter(gate.pose.x, gate.pose.y, gate.pose.z, s=80, c=gate.config.color, marker="s")
             ax.text(gate.pose.x, gate.pose.y, gate.pose.z, gate.gate_id, fontsize=8)
+            ax.quiver(
+                gate.pose.x,
+                gate.pose.y,
+                gate.pose.z,
+                math.cos(gate.pose.yaw),
+                math.sin(gate.pose.yaw),
+                0.0,
+                length=1.2,
+                color=gate.config.color,
+                alpha=0.7,
+            )
 
         if self.path and self.path.points:
             xs = [p[0] for p in self.path.points]
@@ -352,3 +358,29 @@ def _is_noninteractive_mpl_backend(backend_name: str) -> bool:
     if name.startswith("module://") and ("inline" in name or "ipympl" in name):
         return True
     return False
+
+
+def _build_gate_frame_meshes(gate) -> list:
+    interior_w = max(gate.config.interior_width_m, 0.05)
+    interior_h = max(gate.config.interior_height_m, 0.05)
+    border = max(gate.config.border_width_m, 0.01)
+    depth = max(gate.config.depth_m, 0.02)
+
+    outer_w = interior_w + 2.0 * border
+    outer_h = interior_h + 2.0 * border
+
+    local_segments = [
+        pv.Cube(center=(0.0, 0.0, interior_h * 0.5 + border * 0.5), x_length=outer_w, y_length=depth, z_length=border),
+        pv.Cube(center=(0.0, 0.0, -interior_h * 0.5 - border * 0.5), x_length=outer_w, y_length=depth, z_length=border),
+        pv.Cube(center=(-interior_w * 0.5 - border * 0.5, 0.0, 0.0), x_length=border, y_length=depth, z_length=interior_h),
+        pv.Cube(center=(interior_w * 0.5 + border * 0.5, 0.0, 0.0), x_length=border, y_length=depth, z_length=interior_h),
+    ]
+
+    out = []
+    for segment in local_segments:
+        segment.rotate_x(math.degrees(gate.pose.roll), point=(0.0, 0.0, 0.0), inplace=True)
+        segment.rotate_y(math.degrees(gate.pose.pitch), point=(0.0, 0.0, 0.0), inplace=True)
+        segment.rotate_z(math.degrees(gate.pose.yaw), point=(0.0, 0.0, 0.0), inplace=True)
+        segment.translate((gate.pose.x, gate.pose.y, gate.pose.z), inplace=True)
+        out.append(segment)
+    return out

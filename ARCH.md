@@ -15,12 +15,18 @@ Defines strongly-typed dataclasses for:
 - Path model: `PathSpec`, `PathPolyline`
 - Shared pose/geometry: `Pose3D`
 
+`GateConfig` uses explicit geometric parameters:
+- `interior_width_m`, `interior_height_m` (opening)
+- `border_width_m` (frame border)
+- `depth_m` (small thickness through gate depth axis)
+
 ### 2. Scene Construction
 - `simulation/gates.py`: builds validated `Gate` objects.
 - `simulation/field.py`: assembles a field and provides:
   - gate lookup (`get_gate`)
   - nearest-gate query (`nearest_gate`)
   - coarse visibility prefilter (`visible_gate_prefilter`)
+- `simulation/scenarios.py`: loads scene definitions from YAML (`simulation/configs/field_demo.yaml` by default), including gate geometry and per-gate pose (x/y/z + yaw/pitch/roll).
 
 ### 3. Path Subsystem (`simulation/pathing.py`)
 - Input: spline control points (`PathSpec`)
@@ -40,6 +46,7 @@ Defines strongly-typed dataclasses for:
 - `SimulationViewer` coordinates field/path rendering and camera snapshots.
 - Free-roam camera state is represented by `FreeRoamCameraController` and can be toggled independently.
 - PyVista integration is optional; if unavailable, snapshot logic still works.
+- Gate rendering uses a true 3D frame model (top/bottom/left/right segments) derived from interior/border/depth config, with per-gate rotation applied.
 
 ### 6. Integration Edges (`simulation/adapters.py`)
 - Adapts detection-like objects to `flight_control` target states.
