@@ -179,6 +179,10 @@ class SimulationViewer:
 
         bmin = self.field.config.bounds_min
         bmax = self.field.config.bounds_max
+        # Ensure axes stay linear even if user/global matplotlib style sets log scales.
+        ax.set_xscale("linear")
+        ax.set_yscale("linear")
+        ax.set_zscale("linear")
         ax.set_xlim(bmin[0], bmax[0])
         ax.set_ylim(bmin[1], bmax[1])
         ax.set_zlim(bmin[2], bmax[2])
@@ -201,6 +205,8 @@ class SimulationViewer:
         )
 
         frame = get_camera_view(self.field, self.primary_camera, include_depth=False)
+        ax_cam.set_xscale("linear")
+        ax_cam.set_yscale("linear")
         image_artist = ax_cam.imshow(np.array(frame.rgb, dtype=np.uint8))
         ax_cam.set_title("Drone Camera View")
         ax_cam.axis("off")
@@ -221,29 +227,29 @@ class SimulationViewer:
             right_x = -math.sin(yaw)
             right_y = math.cos(yaw)
 
-            if key == "w":
+            if key == "e":
                 x += move_step * fwd_x
                 y += move_step * fwd_y
-            elif key == "s":
+            elif key == "d":
                 x -= move_step * fwd_x
                 y -= move_step * fwd_y
             elif key == "a":
                 x -= move_step * right_x
                 y -= move_step * right_y
-            elif key == "d":
+            elif key == "g":
                 x += move_step * right_x
                 y += move_step * right_y
-            elif key == "r":
+            elif key == "y":
                 z += z_step
-            elif key == "f":
+            elif key == "h":
                 z -= z_step
-            elif key == "j":
-                yaw += yaw_step
             elif key == "l":
-                yaw -= yaw_step
-            elif key == "i":
-                pitch = min(pitch + pitch_step, 1.2)
+                yaw += yaw_step
             elif key == "k":
+                yaw -= yaw_step
+            elif key == "u":
+                pitch = min(pitch + pitch_step, 1.2)
+            elif key == "j":
                 pitch = max(pitch - pitch_step, -1.2)
             elif key == "p":
                 print(
@@ -306,7 +312,7 @@ class SimulationViewer:
 
         fig.canvas.mpl_connect("key_press_event", _on_key)
         fig.suptitle(
-            "Free-roam controls: W/S forward-back, A/D strafe, R/F up-down, J/L yaw, I/K pitch, P print pose, Q quit",
+            "Free-roam controls: E/D forward-back, A/G strafe, Y/H up-down, L/K yaw, U/J pitch, P print pose, Q quit",
             fontsize=9,
         )
         self.set_free_roam(True)

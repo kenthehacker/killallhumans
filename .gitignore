@@ -1,1 +1,12 @@
 /external_data
+
+# Python virtual envs and bytecode caches
+.venv/
+__pycache__/
+*.py[cod]
+
+# Simulation/demo generated binary artifacts
+simulation/example_output/*.ppm
+simulation/example_output/*.png
+simulation/example_output/*.jpg
+simulation/example_output/*.jpeg

@@ -4,7 +4,7 @@ from .field import generate_field, get_gate, nearest_gate, visible_gate_prefilte
 from .gates import generate_gate
 from .pathing import build_path
 from .renderer import SimulationViewer, render_scene
-from .scenarios import build_sample_field, build_sample_path
+from .scenarios import build_field_from_yaml, build_path_from_yaml, build_sample_field, build_sample_path
 from .model_types import (
     CameraFrame,
     CameraPose,
@@ -33,6 +33,8 @@ __all__ = [
     "SimulationViewer",
     "VisibleGateAnnotation",
     "build_path",
+    "build_field_from_yaml",
+    "build_path_from_yaml",
     "build_sample_field",
     "build_sample_path",
     "gate_detection_to_target_state",

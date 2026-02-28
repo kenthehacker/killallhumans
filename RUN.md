@@ -2,31 +2,13 @@
 
 ## Prerequisites
 - Python 3.10+
-- From repo root: `/home/john/grand_prix/killallhumans`
+- From repo root: `killhumans`
 
 Optional (for PyVista rendering path):
 - `pyvista` and its rendering dependencies
 
+
 ## Quick Start (Brand New Machine)
-From repo root, run:
-
-```bash
-bash scripts/bootstrap_demo.sh --interactive
-```
-
-What this does:
-- Creates `.venv/` if missing
-- Installs dependencies from `requirements.txt`
-- Launches the demo in interactive free-roam mode
-- Includes `PyQt6` so matplotlib fallback can open an interactive window on Wayland/X11.
-
-If you only want snapshots:
-
-```bash
-bash scripts/bootstrap_demo.sh
-```
-
-## Manual Environment Setup
 Create a virtual environment and install all required packages:
 
 ```bash
@@ -37,6 +19,17 @@ Then run the demo with the venv Python:
 
 ```bash
 bash scripts/run_demo.sh --interactive
+```
+What this does:
+- Creates `.venv/` if missing
+- Installs dependencies from `requirements.txt`
+- Launches the demo in interactive free-roam mode
+- Includes `PyQt6` so matplotlib fallback can open an interactive window on Wayland/X11.
+
+If you only want snapshots:
+
+```bash
+bash scripts/bootstrap_demo.sh
 ```
 
 ## Run Tests
@@ -70,6 +63,7 @@ Scene config (YAML) used by default:
   - gate geometry (`interior_width_m`, `interior_height_m`, `border_width_m`, `depth_m`)
   - per-gate pose (`x`, `y`, `z`, `yaw`, `pitch`, `roll`)
   - path control points
+- It supports any number of gates; each gate can override `config.color`.
 
 Generated files:
 - `simulation/example_output/primary_camera_view.ppm`
@@ -88,13 +82,13 @@ python3 -m simulation.demo --interactive
 
 Controls in window:
 - Matplotlib fallback controls:
-  - `W` / `S`: forward / back
-  - `A` / `D`: strafe left / right
-  - `R` / `F`: up / down
-  - `J` / `L`: yaw left / right
-  - `I` / `K`: pitch up / down
-- `p`: print current camera pose to terminal
-- `q`: close viewer
+  - `E` / `D`: forward / back
+  - `A` / `G`: strafe left / right
+  - `Y` / `H`: up / down
+  - `L` / `K`: yaw left / right
+  - `U` / `J`: pitch up / down
+  - `p`: print current camera pose to terminal
+  - `q`: close viewer
 
 Requirements:
 - A graphical desktop session with either:
@@ -157,6 +151,8 @@ PY
 from simulation import (
     CameraPose,
     Pose3D,
+    build_field_from_yaml,
+    build_path_from_yaml,
     build_sample_field,
     build_sample_path,
     render_scene,
@@ -164,6 +160,9 @@ from simulation import (
 
 field = build_sample_field()
 path = build_sample_path()
+# Or explicit YAML loading:
+# field = build_field_from_yaml(Path("simulation/configs/field_demo.yaml"))
+# path = build_path_from_yaml(Path("simulation/configs/field_demo.yaml"))
 viewer = render_scene(field, path)
 
 viewer.set_free_roam(True)

@@ -18,12 +18,20 @@ DEFAULT_SCENE_CONFIG = Path(__file__).resolve().parent / "configs" / "field_demo
 
 
 def build_sample_field(config_path: Path | None = None) -> Field:
-    scene = _load_scene_config(config_path or DEFAULT_SCENE_CONFIG)
-    return _build_field_from_scene(scene)
+    return build_field_from_yaml(config_path or DEFAULT_SCENE_CONFIG)
 
 
 def build_sample_path(config_path: Path | None = None) -> PathPolyline:
-    scene = _load_scene_config(config_path or DEFAULT_SCENE_CONFIG)
+    return build_path_from_yaml(config_path or DEFAULT_SCENE_CONFIG)
+
+
+def build_field_from_yaml(config_path: Path) -> Field:
+    scene = _load_scene_config(config_path)
+    return _build_field_from_scene(scene)
+
+
+def build_path_from_yaml(config_path: Path) -> PathPolyline:
+    scene = _load_scene_config(config_path)
     path_data = scene.get("path", {})
     control_points = [tuple(point) for point in path_data.get("control_points", [])]
     if not control_points:
@@ -63,6 +71,8 @@ def _build_field_from_scene(scene: Dict[str, Any]) -> Field:
 
     gate_defaults = scene.get("gate_defaults", {})
     gates_data = scene.get("gates", [])
+    if not isinstance(gates_data, list):
+        raise ValueError("Scene config gates must be a list")
     gates = [_build_gate_from_data(gate_defaults, gate_data) for gate_data in gates_data]
     return generate_field(config, gates)
 
