@@ -426,6 +426,49 @@ def test_rich_ml_features():
     print("  ✓ PASSED")
 
 
+def test_color_agnostic_detection():
+    """Test that the detector finds gates WITHOUT a color preset (edge-first + clustering)."""
+    print("\n" + "="*50)
+    print("TEST: Color-Agnostic Detection (no preset)")
+    print("="*50)
+
+    # Cyan gate -- not in any preset
+    cyan_bgr = (255, 255, 0)
+    image = create_synthetic_gate_image(
+        gate_color_bgr=cyan_bgr,
+        gate_center=(320, 240),
+        gate_size=150,
+        background_color=(40, 40, 40),
+    )
+
+    detector = GateDetector()  # no color_preset
+    detections = detector.detect(image)
+
+    assert len(detections) >= 1, "Should detect cyan gate without any preset"
+    det = detections[0]
+    assert abs(det.center_x - 320) < 30, f"X center off by {abs(det.center_x - 320)}"
+    assert abs(det.center_y - 240) < 30, f"Y center off by {abs(det.center_y - 240)}"
+    print(f"  Cyan gate (no preset): center=({det.center_x}, {det.center_y}) conf={det.confidence:.2f} method={det.detection_method}")
+
+    # White gate on gray background -- extreme case
+    white_bgr = (255, 255, 255)
+    image2 = create_synthetic_gate_image(
+        gate_color_bgr=white_bgr,
+        gate_center=(320, 240),
+        gate_size=150,
+        background_color=(80, 80, 80),
+    )
+    detections2 = detector.detect(image2)
+    assert len(detections2) >= 1, "Should detect white gate without any preset"
+    print(f"  White gate (no preset): detections={len(detections2)} method={detections2[0].detection_method}")
+
+    # ML features should include detection_method
+    f = detections[0].to_ml_features(640, 480)
+    assert "detection_method" in f, "ML features should include detection_method"
+
+    print("  ✓ PASSED (color-agnostic detection works)")
+
+
 def demo_visualization():
     """Create a demo visualization."""
     print("\n" + "="*50)
@@ -476,6 +519,7 @@ def run_all_tests():
         test_no_gate()
         test_distance_estimation()
         test_rich_ml_features()
+        test_color_agnostic_detection()
         demo_visualization()
         
         print("\n" + "="*50)
