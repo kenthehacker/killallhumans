@@ -10,3 +10,8 @@ simulation/example_output/*.ppm
 simulation/example_output/*.png
 simulation/example_output/*.jpg
 simulation/example_output/*.jpeg
+
+
+gate_detection/training/dataset/images
+gate_detection/training/dataset/
+gate_detection/training/val_failures
