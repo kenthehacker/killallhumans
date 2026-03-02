@@ -1,9 +1,10 @@
 # Architecture
 
 ## Current System Layout
-- `flight_control/`: controller stack (`MPCPlanner`, PID, target adapters)
-- `gate_detection/`: classical CV gate detection and feature extraction
-- `simulation/`: synthetic field/gate/path/camera environment for integration and testing
+- `flight_control/`: controller stack (`MPCPlanner`, PID, `TRPYMixer`, target adapters)
+- `gate_detection/`: classical CV + YOLOv8-pose fused gate detection, Phase 1 detector
+- `simulation/`: lightweight synthetic field/gate/path/camera environment (no physics)
+- `sim_pybullet/`: PyBullet-based closed-loop simulation with real physics, gate sequencing, dual-camera rendering
 - `scripts/`: environment bootstrap and demo execution helpers
 
 ## Simulation Architecture
@@ -60,39 +61,93 @@ Defines strongly-typed dataclasses for:
 - Supports interactive free-roam mode (`--interactive`) using a live PyVista window.
 - Writes artifacts to `simulation/example_output/` for quick inspection.
 
-## Data Flow
-1. Build gates -> build field
+## PyBullet Simulation Architecture (`sim_pybullet/`)
+
+### Overview
+Closed-loop simulation with realistic rigid-body physics. Runs the full
+autonomy stack: camera → detection → sequencing → planning → control → physics.
+
+### Components
+- `sim_pybullet/drone.py` — `QuadrotorDrone`: box-body drone with attitude-level
+  inner-loop controller. Accepts normalized (throttle, roll, pitch, yaw). Provides
+  FPV and spectator camera images via `pybullet.getCameraImage()`.
+- `sim_pybullet/gate_models.py` — Creates gate frame segments as static PyBullet
+  bodies. Supports color changes for highlight/dim/reset (gate sequencing visuals).
+- `sim_pybullet/env.py` — `DroneRaceEnv`: manages the PyBullet physics client,
+  ground plane, gate placement, and drone spawning. Loads race configs from JSON.
+- `sim_pybullet/sequencer.py` — `GateSequencer`: tracks gate order, detects
+  pass-through events via signed-distance plane crossing, manages gate highlighting.
+- `sim_pybullet/runner.py` — `RaceRunner`: the main closed-loop. Ties physics
+  stepping, camera rendering, detection, flight control, and HUD display together.
+
+### Data Flow (Closed Loop)
+1. `pybullet.stepSimulation()` → advance physics
+2. Read drone state (position, velocity, orientation)
+3. Render FPV camera → RGB image
+4. Gate detection (real pipeline or sim metadata)
+5. Gate sequencing → target gate selection
+6. `FlightController.step_trpy()` → `TRPYCommand`
+7. `QuadrotorDrone.apply_command()` → forces/torques in PyBullet
+8. Render dual-camera HUD display
+9. Check gate pass-through → advance sequence
+10. Loop until all gates passed or timeout
+
+### Detection Modes
+- **Sim metadata** (default): uses known gate positions for fast iteration
+- **Real detection** (`--use-detection`): runs actual `gate_detection` pipeline on rendered frames
+- **Phase 1** (`--detector phase1`): optimized for highlighted gates in desaturated environment
+
+## Flight Control Architecture
+
+### Control Pipeline
+```
+TargetState → MPCPlanner → desired velocity/yaw
+                              ↓
+                         PID controllers (vx, vy, vz, yaw)
+                              ↓
+                         ControlCommand (ax, ay, az, yaw_rate)
+                              ↓
+                         TRPYMixer
+                              ↓
+                         TRPYCommand (throttle, roll, pitch, yaw)
+```
+
+### TRPYMixer (`flight_control/mixer.py`)
+Converts world-frame accelerations to competition-format controls:
+- `throttle` = thrust needed to achieve vertical accel (gravity-compensated)
+- `roll` = desired roll angle from lateral accel (body frame)
+- `pitch` = desired pitch angle from forward accel (body frame)
+- `yaw` = direct pass-through of yaw rate
+
+## Lightweight Simulation (`simulation/`)
+
+(Preserved unchanged — see previous sections above.)
+
+### 1–7: Same as before (domain types, scene construction, etc.)
+
+## Data Flow (Lightweight)
+1. Build gates → build field
 2. Build path from control points
 3. Render/snapshot scene at any camera pose
 4. Optionally bridge outputs into flight control target interfaces
 
-## Tradeoffs (Current)
-- 2.5D kinematic model chosen over rigid-body physics:
-  - Pro: fast iteration, deterministic behavior, low complexity
-  - Con: lower fidelity for dynamics/collision realism
-- Camera rendering is lightweight raster overlay, not photoreal:
-  - Pro: fast, testable, dependency-light
-  - Con: limited realism for CV stress-testing
-- PyVista is optional and not required for core tests:
-  - Pro: portability/CI friendliness
-  - Con: interactive UX depends on local graphics setup
-- Path representation is spline control points only (MVP):
-  - Pro: concise racing-line definition
-  - Con: no native support yet for constrained optimization paths
+## Gate Detection Architecture (`gate_detection/`)
 
-## Future Improvements
-1. Physics fidelity
-   - Add rigid-body dynamics, drag, thrust constraints, and collision checks.
-2. Rendering fidelity
-   - Add textured meshes, lighting models, and sensor-noise simulation.
-3. Camera outputs
-   - Add segmentation/depth as first-class products and NumPy-backed buffers.
-4. Planning integration
-   - Add direct interfaces for sequence-aware gate traversal and trajectory timing.
-5. Performance
-   - Vectorize projection/raster operations and add batched frame generation.
-6. Tooling
-   - Extend bootstrap scripts for OS-specific dependency checks and better diagnostics.
+### Detectors
+- `GateDetector` — color-agnostic classical pipeline (edge + clustering + HSV)
+- `FusedGateDetector` — classical + YOLOv8n-pose, IoU-matched fusion
+- `Phase1GateDetector` — saturation/brightness thresholding for VQ1
+
+### Training Pipeline
+- `training/extract_frames.py` — extracts TII dataset frames with YOLO-pose labels
+- `training/train.py` — trains YOLOv8n-pose on the extracted dataset
+- `training/validate.py` — validation metrics + problem frame analysis
+- `training/export.py` — exports to ONNX for deployment
+
+## Tradeoffs
+- Two simulation systems: lightweight (fast, testable) + PyBullet (realistic, heavy)
+- TRPY mixer is a linear approximation; works for moderate attitudes but degrades at extreme angles
+- Phase 1 detector is deliberately simple — will need retuning once we see the actual VQ1 environment
 
 ## Maintenance Rule
 Keep this file updated whenever:

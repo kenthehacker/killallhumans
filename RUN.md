@@ -2,7 +2,10 @@
 
 ## Prerequisites
 - Python 3.10+
-- From repo root: `killhumans`
+- From repo root: `killallhumans`
+
+Required for PyBullet simulation:
+- `pybullet` (`pip install pybullet`)
 
 Optional (for PyVista rendering path):
 - `pyvista` and its rendering dependencies
@@ -181,3 +184,50 @@ print(len(frame.visible_gates), frame.outside_field)
 ## Notes
 - The renderer works even without PyVista; if PyVista is available, scene objects are also constructed in a plotter.
 - The camera frame is currently represented as Python lists (RGB tuples + optional depth map) for portability in MVP.
+
+---
+
+## PyBullet Drone Racing Simulation
+
+### Install PyBullet
+```bash
+pip install pybullet
+```
+
+### Run the Race Simulation
+From the repo root:
+
+```bash
+# Default: sim-metadata detection (fast, uses known gate positions)
+python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json
+
+# With real gate detection pipeline
+python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --use-detection
+
+# With Phase 1 detector (highlighted gates)
+python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --use-detection --detector phase1
+
+# With fused detector (classical + YOLO)
+python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --use-detection --detector fused
+
+# Headless (no PyBullet GUI window, still shows OpenCV HUD)
+python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --no-gui
+```
+
+### Controls During Simulation
+- `Q` — quit
+- `R` — reset simulation
+
+### Simulation Display
+- **Left panel**: 1st-person FPV from drone camera (with detection overlay when `--use-detection`)
+- **Right panel**: 3rd-person spectator camera (chase view)
+- **HUD**: speed, altitude, target gate, gates passed, elapsed time, distance to gate
+
+### Race Configuration
+Race configs are JSON files in `sim_pybullet/configs/`. They define:
+- Field bounds
+- Gate positions, sizes, colors, and sequence order
+- Drone start position and heading
+- Physics timestep and gravity
+
+See `sim_pybullet/configs/race_01.json` for an example.

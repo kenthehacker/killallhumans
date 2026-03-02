@@ -6,3 +6,10 @@ pyvista>=0.43.0
 
 # GUI backend for matplotlib fallback interactive viewer (Wayland/X11)
 PyQt6>=6.7.0
+
+# PyBullet simulation (physics + rendering)
+pybullet>=3.2.0
+
+# Crazyflie CF2X physics + DSLPIDControl (install from GitHub, not on PyPI)
+# pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git
+gym-pybullet-drones @ git+https://github.com/utiasDSL/gym-pybullet-drones.git

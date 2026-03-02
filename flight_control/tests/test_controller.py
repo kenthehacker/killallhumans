@@ -14,13 +14,16 @@ class TestPIDController(unittest.TestCase):
 
 
 class TestMPCPlanner(unittest.TestCase):
-    def test_mpc_velocity_points_to_target(self) -> None:
+    def test_mpc_accel_points_to_target(self) -> None:
+        # MPC now returns (best_accel, yaw). With a target far ahead and a
+        # non-zero desired pass-through velocity, the planner must accelerate
+        # in the +x direction to reduce position AND velocity error.
         config = MPCConfig(dt=0.05, horizon_steps=10)
         planner = MPCPlanner(config)
         state = DroneState((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0)
-        target = TargetState((2.0, 0.0, 0.0))
-        desired_velocity, _ = planner.plan(state, target)
-        self.assertGreater(desired_velocity[0], 0.0)
+        target = TargetState((10.0, 0.0, 0.0), velocity=(3.0, 0.0, 0.0))
+        best_accel, _ = planner.plan(state, target)
+        self.assertGreater(best_accel[0], 0.0)
 
 
 class TestFlightController(unittest.TestCase):

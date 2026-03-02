@@ -15,3 +15,6 @@ simulation/example_output/*.jpeg
 gate_detection/training/dataset/images
 gate_detection/training/dataset/
 gate_detection/training/val_failures
+
+# Telemetry logs
+logs/

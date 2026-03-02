@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
-from typing import Protocol, Tuple
+from typing import Optional, Protocol, Tuple
 
 from .types import DroneState, TargetState
 
@@ -21,7 +23,7 @@ class CameraModel:
 def gate_detection_to_target(
     detection: GateDetectionLike,
     drone_state: DroneState,
-    camera: CameraModel | None = None,
+    camera: Optional[CameraModel] = None,
 ) -> TargetState:
     camera = camera or CameraModel()
     distance = max(detection.estimated_distance, camera.min_distance)
@@ -42,7 +44,10 @@ def gate_detection_to_target(
         world_z,
     )
 
-    return TargetState(position=target_position, yaw=drone_state.yaw)
+    dx = target_position[0] - drone_state.position[0]
+    dy = target_position[1] - drone_state.position[1]
+    target_yaw = math.atan2(dy, dx)
+    return TargetState(position=target_position, yaw=target_yaw)
 
 
 def _rotate_xy(yaw: float, forward: float, right: float) -> Tuple[float, float]:
