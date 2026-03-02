@@ -38,6 +38,10 @@ except ImportError:
 # DSLPIDControl has no built-in tilt limit; we enforce it here.
 _MAX_TILT_RAD = math.radians(35)
 
+# Tilt threshold above which we enter auto-recovery (hover) mode.
+# Spiraling or sharp-turn instability is caught here before it cascades.
+_TUMBLE_TILT_RAD = math.radians(50)
+
 
 @dataclass
 class GPDDroneConfig:
@@ -107,8 +111,15 @@ class GPDDrone:
         self._max_horiz_thrust = self._ctrl.GRAVITY * math.tan(_MAX_TILT_RAD)
 
         self.step_count: int = 0
+        # FPV camera matrix cache
         self._last_view_matrix: Optional[np.ndarray] = None
         self._last_proj_matrix: Optional[np.ndarray] = None
+        # Spectator camera matrix cache (updated on each get_spectator_image call)
+        self._spec_view_matrix: Optional[np.ndarray] = None
+        self._spec_proj_matrix: Optional[np.ndarray] = None
+        self._spec_resolution: Tuple[int, int] = (640, 480)
+        # True while the drone is in auto-recovery mode (tumble detected)
+        self.in_recovery: bool = False
 
     # ------------------------------------------------------------------
     # Public interface
@@ -135,7 +146,26 @@ class GPDDrone:
         sv = self._env._getDroneStateVector(0)
         cur_pos = sv[0:3]
         cur_quat = sv[3:7]
+        cur_rpy = sv[7:10]   # (roll, pitch, yaw)
         cur_vel = sv[10:13]
+
+        # --- Tumble detection: override caller's target during instability ---
+        # If tilt exceeds threshold, command "hover here" until stable again.
+        is_tumbling = (
+            abs(cur_rpy[0]) > _TUMBLE_TILT_RAD   # roll
+            or abs(cur_rpy[1]) > _TUMBLE_TILT_RAD  # pitch
+        )
+        if is_tumbling:
+            self.in_recovery = True
+        elif self.in_recovery and abs(cur_rpy[0]) < math.radians(15) and abs(cur_rpy[1]) < math.radians(15):
+            self.in_recovery = False  # stable enough to resume normal flight
+
+        if self.in_recovery:
+            # Hover at current XY; climb slightly if low to avoid ground.
+            recover_z = max(float(cur_pos[2]), 0.5)
+            target_pos = (float(cur_pos[0]), float(cur_pos[1]), recover_z)
+            target_vel = (0.0, 0.0, 0.0)
+            target_yaw = float(cur_rpy[2])   # keep current heading
 
         pos_e = np.array(target_pos, dtype=float) - cur_pos
         vel_e = np.array(target_vel, dtype=float) - cur_vel
@@ -249,8 +279,11 @@ class GPDDrone:
         )
         self._ctrl.reset()
         self.step_count = 0
+        self.in_recovery = False
         self._last_view_matrix = None
         self._last_proj_matrix = None
+        self._spec_view_matrix = None
+        self._spec_proj_matrix = None
 
     def close(self) -> None:
         self._env.close()
@@ -361,6 +394,11 @@ class GPDDrone:
             fov=70, aspect=w / h, nearVal=0.1, farVal=200.0,
             physicsClientId=self.CLIENT,
         )
+        # Cache for project_points_to_spectator()
+        self._spec_view_matrix = np.array(view_matrix).reshape(4, 4).T
+        self._spec_proj_matrix = np.array(proj_matrix).reshape(4, 4).T
+        self._spec_resolution = (w, h)
+
         _, _, rgba, _, _ = p.getCameraImage(
             width=w, height=h,
             viewMatrix=view_matrix,
@@ -370,3 +408,28 @@ class GPDDrone:
         )
         rgb = np.array(rgba, dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
         return rgb[:, :, ::-1].copy()
+
+    def project_points_to_spectator(self, world_points: np.ndarray) -> np.ndarray:
+        """
+        Project Nx3 world-space points into the most-recently-rendered spectator view.
+        Must be called after get_spectator_image() each frame.
+        Returns Nx3: (pixel_x, pixel_y, depth). depth ≤ 0 means behind camera.
+        """
+        if self._spec_view_matrix is None:
+            return np.full((len(world_points), 3), -1.0)
+        V = self._spec_view_matrix
+        P = self._spec_proj_matrix
+        w, h = self._spec_resolution
+        results = []
+        for pt in world_points:
+            p_hom = np.array([pt[0], pt[1], pt[2], 1.0])
+            cam = V @ p_hom
+            clip = P @ cam
+            if abs(clip[3]) < 1e-9:
+                results.append([-1.0, -1.0, -1.0])
+                continue
+            ndc = clip[:3] / clip[3]
+            px = (ndc[0] + 1.0) * 0.5 * w
+            py = (1.0 - ndc[1]) * 0.5 * h
+            results.append([px, py, float(-cam[2])])
+        return np.array(results)

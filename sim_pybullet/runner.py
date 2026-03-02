@@ -40,6 +40,113 @@ from .env import DroneRaceEnv, RaceConfig
 from .sequencer import GateSequencer
 
 
+class RacingLine:
+    """
+    Catmull-Rom spline through race waypoints: smooth curved racing path.
+
+    Passes through every waypoint with C1 continuity so the drone can
+    anticipate upcoming gate directions rather than making rigid-angle turns.
+    The caller gets a closest-point + lookahead query each control step, giving
+    a continuously updated target that blends smoothly from gate to gate.
+    """
+
+    def __init__(self, waypoints: List[np.ndarray], samples_per_seg: int = 60):
+        if len(waypoints) < 2:
+            raise ValueError("Need at least 2 waypoints")
+        self._wps = [np.array(w, dtype=float) for w in waypoints]
+        self._n = samples_per_seg
+        self._build()
+
+    @staticmethod
+    def _cr(p0: np.ndarray, p1: np.ndarray, p2: np.ndarray,
+            p3: np.ndarray, t: float) -> np.ndarray:
+        """Catmull-Rom interpolation at parameter t in [0, 1)."""
+        t2, t3 = t * t, t * t * t
+        return 0.5 * (
+            2.0 * p1
+            + (-p0 + p2) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+        )
+
+    def _build(self):
+        wps, n = self._wps, self._n
+        padded = [wps[0]] + wps + [wps[-1]]   # ghost endpoints for open spline
+
+        pts, seg_idxs = [], []
+        for seg in range(len(wps) - 1):
+            p0, p1, p2, p3 = padded[seg], padded[seg + 1], padded[seg + 2], padded[seg + 3]
+            for i in range(n):
+                pts.append(self._cr(p0, p1, p2, p3, i / n))
+                seg_idxs.append(seg)
+        pts.append(wps[-1])
+        seg_idxs.append(len(wps) - 2)
+
+        self._pts = np.array(pts, dtype=float)
+        self._seg_idxs = np.array(seg_idxs, dtype=int)
+
+        # Cumulative arc lengths
+        diffs = np.diff(self._pts, axis=0)
+        self._arcs = np.concatenate(
+            [[0.0], np.cumsum(np.linalg.norm(diffs, axis=1))]
+        )
+        self.total_length = float(self._arcs[-1])
+
+        # Normalized tangents (central differences)
+        T = np.empty_like(self._pts)
+        T[0] = self._pts[1] - self._pts[0]
+        T[-1] = self._pts[-1] - self._pts[-2]
+        T[1:-1] = self._pts[2:] - self._pts[:-2]
+        norms = np.linalg.norm(T, axis=1, keepdims=True)
+        self._tangents = T / np.where(norms < 1e-9, 1.0, norms)
+
+    @property
+    def points(self) -> np.ndarray:
+        return self._pts
+
+    @property
+    def seg_indices(self) -> np.ndarray:
+        return self._seg_idxs
+
+    def waypoint_arc(self, wp_idx: int) -> float:
+        """Arc length at input waypoint wp_idx (0=start, 1=first gate, …)."""
+        idx = min(wp_idx * self._n, len(self._arcs) - 1)
+        return float(self._arcs[idx])
+
+    def query(
+        self,
+        drone_pos: np.ndarray,
+        lookahead_m: float,
+        min_arc: float = 0.0,
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
+        """
+        Find closest spline point at/after min_arc, advance by lookahead_m.
+
+        Returns:
+            target_position  — 3D point on the spline (np.ndarray)
+            target_tangent   — unit direction at that point (np.ndarray)
+            lateral_error    — distance from drone to the closest spline point (float)
+        """
+        search_start = int(np.searchsorted(self._arcs, max(0.0, min_arc - 1.0)))
+        s_pts = self._pts[search_start:]
+        s_arcs = self._arcs[search_start:]
+        s_tan = self._tangents[search_start:]
+
+        if len(s_pts) == 0:
+            return self._pts[-1], self._tangents[-1], 0.0
+
+        dists = np.linalg.norm(s_pts - drone_pos, axis=1)
+        local = int(np.argmin(dists))
+        lat_err = float(dists[local])
+        base_arc = float(s_arcs[local])
+
+        target_arc = min(base_arc + lookahead_m, self.total_length)
+        la_idx = int(np.searchsorted(s_arcs, target_arc))
+        la_idx = min(la_idx, len(s_pts) - 1)
+
+        return s_pts[la_idx], s_tan[la_idx], lat_err
+
+
 class RaceRunner:
     """
     Main simulation loop: physics -> detect -> plan -> control -> render.
@@ -64,6 +171,13 @@ class RaceRunner:
         race_config = DroneRaceEnv.load_config(config_path)
         self.env = DroneRaceEnv(race_config=race_config, gui=gui)
         self.sequencer = GateSequencer(race_config.gates)
+
+        # Smooth Catmull-Rom racing line: start position + all gate centers.
+        # Pre-built once; used every control step for spline-following.
+        _rl_wps = [np.array(race_config.start_position)] + [
+            np.array([g.pose.x, g.pose.y, g.pose.z]) for g in race_config.gates
+        ]
+        self._racing_line = RacingLine(_rl_wps)
 
         # Dim all gates, then highlight only the current target
         for gate in race_config.gates:
@@ -237,42 +351,61 @@ class RaceRunner:
         return self._target_from_sim_metadata(drone_state)
 
     def _target_from_sim_metadata(self, drone_state: DroneState) -> TargetState:
-        """Compute target from known gate position with approach waypoint and pass-through velocity."""
+        """
+        Spline-following controller with lookahead and lateral-error speed boost.
+
+        Instead of targeting a rigid approach waypoint per gate, we follow a
+        smooth Catmull-Rom spline through all gates.  The 3m lookahead means the
+        drone always steers toward a point ahead of its spline position, creating
+        natural curves that anticipate the next gate's direction.
+
+        Speed boost: if the drone drifts off the racing line, cruise speed is
+        scaled up (up to +50%) so position correction is rapid.
+        """
         gate = self.sequencer.current_gate
         if gate is None:
             return TargetState(position=drone_state.position)
 
-        gate_pos = np.array([gate.pose.x, gate.pose.y, gate.pose.z])
         drone_pos = np.array(drone_state.position)
-        gate_normal = self.sequencer._gate_normal(gate.pose)
+        gate_pos = np.array([gate.pose.x, gate.pose.y, gate.pose.z])
+        dist_to_gate = float(np.linalg.norm(gate_pos - drone_pos))
 
-        CRUISE_SPEED = 2.0
-        APPROACH_OFFSET = 2.0
+        # Don't search spline points before the previously passed gate —
+        # prevents the closest-point search from latching onto a segment behind us.
+        min_arc = self._racing_line.waypoint_arc(self.sequencer.gates_passed)
 
-        dist_to_gate = np.linalg.norm(gate_pos - drone_pos)
+        # Lookahead: target a point 3m ahead on the spline from closest position.
+        # The spline tangent at that point is used as the velocity feedforward
+        # and yaw target — the drone naturally carves smooth corners.
+        LOOKAHEAD = 3.0
+        target_pt, tangent, lateral_err = self._racing_line.query(
+            drone_pos, LOOKAHEAD, min_arc=min_arc
+        )
+        target_yaw = float(math.atan2(float(tangent[1]), float(tangent[0])))
 
-        if dist_to_gate > APPROACH_OFFSET * 1.5:
-            target_pos = gate_pos - gate_normal * APPROACH_OFFSET
-            # Approach phase: velocity and yaw point toward the waypoint
-            to_target = target_pos - drone_pos
-            to_target_xy = np.array([to_target[0], to_target[1], 0.0])
-            dist_xy = np.linalg.norm(to_target_xy)
-            if dist_xy > 0.1:
-                approach_dir = to_target_xy / dist_xy
-                target_vel = tuple(approach_dir * CRUISE_SPEED)
-                target_yaw = math.atan2(float(approach_dir[1]), float(approach_dir[0]))
-            else:
-                target_vel = tuple(gate_normal * CRUISE_SPEED)
-                target_yaw = math.atan2(float(gate_normal[1]), float(gate_normal[0]))
+        # Base cruise speed, reduced when the spline tangent is far from current
+        # heading (sharp remaining curve).  Spline already smooths most turns
+        # so the reduction is mild compared to the old rigid-waypoint approach.
+        yaw_diff = abs(math.atan2(
+            math.sin(target_yaw - drone_state.yaw),
+            math.cos(target_yaw - drone_state.yaw),
+        ))
+        base_speed = 2.0 * max(0.6, 1.0 - 0.4 * min(yaw_diff / math.radians(90), 1.0))
+
+        # Throttle boost: lateral deviation from racing line → increase speed to
+        # snap back.  1m off = +25%; 2m off = +50% (capped).
+        speed = base_speed * (1.0 + min(lateral_err / 2.0, 0.5))
+
+        # Within 1.5m of the gate: lock position target to the exact gate center
+        # so the drone punches through cleanly rather than curving around it.
+        if dist_to_gate < 1.5:
+            target_pos = tuple(gate_pos)
         else:
-            target_pos = gate_pos
-            # Close to gate: align with gate normal for pass-through
-            target_vel = tuple(gate_normal * CRUISE_SPEED)
-            target_yaw = math.atan2(float(gate_normal[1]), float(gate_normal[0]))
+            target_pos = tuple(target_pt)
 
         return TargetState(
-            position=tuple(target_pos),
-            velocity=target_vel,
+            position=target_pos,
+            velocity=tuple(tangent * speed),
             yaw=target_yaw,
         )
 
@@ -313,12 +446,24 @@ class RaceRunner:
         else:
             self._draw_sim_bboxes(fpv)
 
-        # 3rd person (spectator)
+        # 3rd person (spectator) — must be rendered before calling project_points_to_spectator
         spectator = self.env.drone.get_spectator_image(
             distance=self._spec_dist,
             yaw_offset=self._spec_yaw,
             pitch_offset=self._spec_pitch,
         )
+
+        # Racing-line overlay: project gate waypoints into camera views as 2D lines.
+        # PyBullet addUserDebugLine only shows in the GUI window, not getCameraImage.
+        self._draw_racing_lines_2d(spectator, use_spectator=True)
+        self._draw_racing_lines_2d(fpv, use_spectator=False)
+
+        # Recovery indicator
+        if self.env.drone.in_recovery:
+            cv2.putText(spectator, "RECOVERY", (10, spectator.shape[0] // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.putText(spectator, "RECOVERY", (10, spectator.shape[0] // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 60, 255), 2, cv2.LINE_AA)
 
         # HUD overlay
         self._draw_hud(fpv, drone_state, sim_time, "FPV")
@@ -416,6 +561,15 @@ class RaceRunner:
             ])
         return np.array(world_corners)
 
+    @staticmethod
+    def _put_text(image: np.ndarray, text: str, pos, scale: float,
+                  color, thickness: int = 1):
+        """Render text with a black outline so it's readable on any background."""
+        cv2.putText(image, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(image, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                    scale, color, thickness, cv2.LINE_AA)
+
     def _draw_hud(
         self,
         image: np.ndarray,
@@ -431,39 +585,85 @@ class RaceRunner:
         gate_name = gate.gate_id if gate else "DONE"
 
         lines = [
-            f"{label}",
-            f"Speed: {speed:.1f} m/s  Alt: {alt:.1f}m",
-            f"Target: {gate_name}  [{self.sequencer.gates_passed}/{self.sequencer.total_gates}]",
-            f"Time: {sim_time:.1f}s",
+            (f"{label}", (0, 255, 255)),
+            (f"Speed: {speed:.1f} m/s  Alt: {alt:.1f}m", (0, 255, 255)),
+            (f"Target: {gate_name}  [{self.sequencer.gates_passed}/{self.sequencer.total_gates}]",
+             (0, 255, 0) if gate else (180, 180, 180)),
+            (f"Time: {sim_time:.1f}s", (0, 255, 255)),
         ]
 
         y = 20
-        for line in lines:
-            cv2.putText(
-                image, line, (10, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                (0, 255, 255), 1, cv2.LINE_AA,
-            )
+        for text, color in lines:
+            self._put_text(image, text, (10, y), 0.5, color)
             y += 22
 
         if gate:
             dx = gate.pose.x - state.position[0]
             dy = gate.pose.y - state.position[1]
             dist = math.sqrt(dx * dx + dy * dy)
-            cv2.putText(
-                image, f"Dist to gate: {dist:.1f}m",
-                (10, h - 15),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                (0, 200, 200), 1, cv2.LINE_AA,
-            )
+            self._put_text(image, f"Dist to gate: {dist:.1f}m",
+                           (10, h - 15), 0.45, (0, 220, 220))
 
         if label == "Spectator":
-            cv2.putText(
-                image, "WASD: orbit  +/-: zoom  Q: quit",
-                (10, h - 35),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                (150, 150, 150), 1, cv2.LINE_AA,
-            )
+            self._put_text(image, "WASD: orbit  +/-: zoom  Q: quit  R: reset",
+                           (10, h - 35), 0.35, (200, 200, 200))
+
+    def _draw_racing_lines_2d(self, image: np.ndarray, use_spectator: bool):
+        """
+        Draw the smooth Catmull-Rom racing spline as 2D projected lines on the image.
+
+        PyBullet addUserDebugLine only shows in the GUI window, not getCameraImage().
+        This method projects the dense spline points through the camera matrices
+        and draws them with cv2.line() — producing a smooth curved racing line.
+        """
+        all_gates = self.sequencer.all_gates
+        if not all_gates:
+            return
+
+        # Subsample the spline (every 4th point) to keep projection cost low
+        # while still producing a visually smooth curve.
+        STEP = 4
+        spline_pts = self._racing_line.points[::STEP]
+        seg_idxs = self._racing_line.seg_indices[::STEP]
+
+        if use_spectator:
+            projected = self.env.drone.project_points_to_spectator(spline_pts)
+        else:
+            projected = self.env.drone.project_points_to_fpv(spline_pts)
+
+        passed_ids = set(self.sequencer.passed_gate_ids)
+        current_id = self.sequencer.current_gate.gate_id if self.sequencer.current_gate else None
+        h, w = image.shape[:2]
+        margin = 500
+
+        for i in range(len(spline_pts) - 1):
+            pt1 = projected[i]
+            pt2 = projected[i + 1]
+            if pt1[2] <= 0 or pt2[2] <= 0:
+                continue
+
+            x1, y1 = int(pt1[0]), int(pt1[1])
+            x2, y2 = int(pt2[0]), int(pt2[1])
+
+            if (max(x1, x2) < -margin or min(x1, x2) > w + margin
+                    or max(y1, y2) < -margin or min(y1, y2) > h + margin):
+                continue
+
+            # Color by which gate this segment leads toward
+            seg = int(seg_idxs[i])
+            if seg < len(all_gates):
+                gate = all_gates[seg]
+                if gate.gate_id in passed_ids:
+                    color = (80, 80, 80)       # grey — passed
+                elif gate.gate_id == current_id:
+                    color = (0, 220, 255)      # yellow — current target
+                else:
+                    color = (255, 120, 30)     # blue-orange — upcoming
+            else:
+                color = (80, 80, 80)
+
+            cv2.line(image, (x1, y1), (x2, y2), (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.line(image, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
 
     def _log_frame(self, sim_time, step, state_dict, drone_state, target):
         gate = self.sequencer.current_gate
@@ -508,25 +708,38 @@ class RaceRunner:
             self._spec_dist = min(25.0, self._spec_dist + 1.0)
 
     def _draw_racing_lines(self):
-        """Draw blue lines through all gate centers as a static racing-line preview."""
+        """Draw the smooth racing spline in the PyBullet GUI window."""
         for lid in self._racing_line_ids:
             p.removeUserDebugItem(lid, physicsClientId=self.env.client)
         self._racing_line_ids.clear()
 
-        gates = self.sequencer.all_gates
-        if not gates:
+        all_gates = self.sequencer.all_gates
+        if not all_gates:
             return
 
         passed = set(self.sequencer.passed_gate_ids)
-        waypoints = [list(self.env.race_config.start_position)] + [
-            [g.pose.x, g.pose.y, g.pose.z] for g in gates
-        ]
+        current_id = self.sequencer.current_gate.gate_id if self.sequencer.current_gate else None
+        pts = self._racing_line.points
+        seg_idxs = self._racing_line.seg_indices
 
-        for i in range(len(waypoints) - 1):
-            gate_id = gates[i].gate_id if i < len(gates) else None
-            color = [0.4, 0.4, 0.4] if gate_id and gate_id in passed else [0.2, 0.6, 1.0]
+        # Subsample to ~150 debug line segments for GPU/CPU budget
+        step = max(1, len(pts) // 150)
+        for i in range(0, len(pts) - step, step):
+            seg = int(seg_idxs[min(i, len(seg_idxs) - 1)])
+            if seg < len(all_gates):
+                gate = all_gates[seg]
+                if gate.gate_id in passed:
+                    color = [0.4, 0.4, 0.4]
+                elif gate.gate_id == current_id:
+                    color = [1.0, 0.9, 0.0]
+                else:
+                    color = [0.2, 0.6, 1.0]
+            else:
+                color = [0.4, 0.4, 0.4]
+
+            j = min(i + step, len(pts) - 1)
             lid = p.addUserDebugLine(
-                waypoints[i], waypoints[i + 1],
+                pts[i].tolist(), pts[j].tolist(),
                 color, lineWidth=2.0,
                 physicsClientId=self.env.client,
             )
