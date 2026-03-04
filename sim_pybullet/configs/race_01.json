@@ -1,0 +1,35 @@
+{
+  "field": {
+    "name": "race-01",
+    "bounds_min": [-5.0, -15.0, 0.0],
+    "bounds_max": [60.0, 15.0, 15.0]
+  },
+  "gate_defaults": {
+    "gate_type": "square",
+    "interior_width_m": 1.2,
+    "interior_height_m": 1.2,
+    "border_width_m": 0.18,
+    "depth_m": 0.10,
+    "color": "red"
+  },
+  "gates": [
+    { "id": "gate-1", "sequence_index": 1, "pose": { "x": 8.0, "y": 0.0, "z": 1.5, "yaw": 0.0 }, "config": { "color": "red" } },
+    { "id": "gate-2", "sequence_index": 2, "pose": { "x": 18.0, "y": 4.0, "z": 2.2, "yaw": 0.38 }, "config": { "color": "blue" } },
+    { "id": "gate-3", "sequence_index": 3, "pose": { "x": 28.0, "y": -2.0, "z": 1.5, "yaw": -0.54 }, "config": { "color": "green" } },
+    { "id": "gate-4", "sequence_index": 4, "pose": { "x": 38.0, "y": 1.0, "z": 2.2, "yaw": 0.29 }, "config": { "color": "yellow" } },
+    { "id": "gate-5", "sequence_index": 5, "pose": { "x": 46.0, "y": -2.0, "z": 1.8, "yaw": -0.36 }, "config": { "color": "orange" } },
+    { "id": "gate-6", "sequence_index": 6, "pose": { "x": 54.0, "y": 0.0, "z": 2.5, "yaw": 0.0 }, "config": { "color": "purple" } },
+    { "id": "gate-7", "sequence_index": 7, "pose": { "x": 52.5, "y": 4.33, "z": 3.5, "yaw": 1.047 }, "config": { "color": "blue" } },
+    { "id": "gate-8", "sequence_index": 8, "pose": { "x": 49.0, "y": 4.33, "z": 4.5, "yaw": 2.094 }, "config": { "color": "green" } },
+    { "id": "gate-9", "sequence_index": 9, "pose": { "x": 47.0, "y": 0.0, "z": 5.5, "yaw": 3.142 }, "config": { "color": "yellow" } },
+    { "id": "gate-10", "sequence_index": 10, "pose": { "x": 49.0, "y": -4.33, "z": 6.5, "yaw": -2.094 }, "config": { "color": "orange" } },
+    { "id": "gate-11", "sequence_index": 11, "pose": { "x": 52.5, "y": -4.33, "z": 7.5, "yaw": -1.047 }, "config": { "color": "red" } },
+    { "id": "gate-12", "sequence_index": 12, "pose": { "x": 56.0, "y": 0.0, "z": 8.5, "yaw": 0.0 }, "config": { "color": "white" } }
+  ],
+  "start": {
+    "position": [0.0, 0.0, 1.5],
+    "yaw": 0.0
+  },
+  "timestep": 0.004166,
+  "gravity": -9.81
+}

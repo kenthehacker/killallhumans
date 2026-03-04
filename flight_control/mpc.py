@@ -8,14 +8,19 @@ class MPCPlanner:
         self.config = config
 
     def plan(self, state: DroneState, target: TargetState) -> Tuple[Tuple[float, float, float], float]:
+        """
+        Returns (best_acceleration, target_yaw).
+        The acceleration is the constant control input that minimizes cost
+        over the planning horizon — passed directly to the mixer.
+        """
         best_cost = float("inf")
-        best_velocity = state.velocity
+        best_accel = (0.0, 0.0, 0.0)
         best_yaw = target.yaw
 
         accel_choices = _accel_candidates(self.config.max_acceleration)
 
         for ax, ay, az in accel_choices:
-            cost, v_candidate = _simulate_cost(
+            cost = _simulate_cost(
                 state,
                 target,
                 self.config,
@@ -23,8 +28,8 @@ class MPCPlanner:
             )
             if cost < best_cost:
                 best_cost = cost
-                best_velocity = v_candidate
-        return best_velocity, best_yaw
+                best_accel = (ax, ay, az)
+        return best_accel, best_yaw
 
 
 def _accel_candidates(max_accel: Tuple[float, float, float]) -> Tuple[Tuple[float, float, float], ...]:
@@ -45,7 +50,7 @@ def _simulate_cost(
     target: TargetState,
     config: MPCConfig,
     accel: Tuple[float, float, float],
-) -> Tuple[float, Tuple[float, float, float]]:
+) -> float:
     pos_x, pos_y, pos_z = state.position
     vel_x, vel_y, vel_z = state.velocity
     target_px, target_py, target_pz = target.position
@@ -58,6 +63,7 @@ def _simulate_cost(
         vel_x = _clamp(vel_x + ax * config.dt, -max_vx, max_vx)
         vel_y = _clamp(vel_y + ay * config.dt, -max_vy, max_vy)
         vel_z = _clamp(vel_z + az * config.dt, -max_vz, max_vz)
+
         pos_x += vel_x * config.dt
         pos_y += vel_y * config.dt
         pos_z += vel_z * config.dt
@@ -94,7 +100,7 @@ def _simulate_cost(
         + config.terminal_velocity_weight * terminal_vel_error
     )
 
-    return cost, (vel_x, vel_y, vel_z)
+    return cost
 
 
 def _clamp(value: float, low: float, high: float) -> float:

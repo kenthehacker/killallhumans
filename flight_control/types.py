@@ -19,14 +19,14 @@ class TargetState:
 @dataclass
 class MPCConfig:
     dt: float = 0.05
-    horizon_steps: int = 15
+    horizon_steps: int = 25
     max_velocity: Tuple[float, float, float] = (6.0, 6.0, 3.0)
-    max_acceleration: Tuple[float, float, float] = (8.0, 8.0, 6.0)
+    max_acceleration: Tuple[float, float, float] = (5.0, 5.0, 3.0)
     position_weight: float = 1.0
-    velocity_weight: float = 0.3
+    velocity_weight: float = 0.8
     acceleration_weight: float = 0.05
     terminal_position_weight: float = 4.0
-    terminal_velocity_weight: float = 0.5
+    terminal_velocity_weight: float = 2.0
 
 
 @dataclass
@@ -41,8 +41,8 @@ class PIDConfig:
 @dataclass
 class ControllerConfig:
     mpc: MPCConfig = field(default_factory=MPCConfig)
-    velocity_pid: PIDConfig = field(default_factory=lambda: PIDConfig(1.8, 0.1, 0.25, 2.0, 8.0))
-    yaw_pid: PIDConfig = field(default_factory=lambda: PIDConfig(3.0, 0.05, 0.2, 1.5, 4.0))
+    vz_pid: PIDConfig = field(default_factory=lambda: PIDConfig(2.0, 0.1, 0.4, 2.0, 5.0))
+    yaw_pid: PIDConfig = field(default_factory=lambda: PIDConfig(3.0, 0.05, 0.4, 1.5, 4.0))
 
 
 @dataclass
