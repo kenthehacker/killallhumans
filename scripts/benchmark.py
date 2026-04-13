@@ -122,7 +122,7 @@ def run_unit_tests() -> Dict[str, Any]:
         ).optimize(wps, start_position=(0, 0, -2))
         assert traj.total_time > 0, "total_time must be positive"
         assert len(traj.points) > 10, f"too few points: {len(traj.points)}"
-        assert len(traj.segment_times) == 3, f"expected 3 segments, got {len(traj.segment_times)}"
+        assert len(traj.segment_times) == 4, f"expected 4 segments (3 gates + finish), got {len(traj.segment_times)}"
     tests.append(("trajectory_generation", _traj))
 
     # --- Racing line ---
@@ -296,7 +296,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # Use consistent physics parameters between tracker and kinematic model.
     # Generic drone (1kg, 20N max thrust, ~2g TWR) rather than Crazyflie.
     tracker = GeometricTracker(TrackerConfig(
-        kp_xy=4.0, kd_xy=3.0, kp_z=6.0, kd_z=4.0,
+        kp_xy=5.0, kd_xy=3.5, kp_z=6.0, kd_z=4.0,
         feedforward_accel=1.0,  # full feedforward (Leveling the Playing Field, 2025)
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
     ))

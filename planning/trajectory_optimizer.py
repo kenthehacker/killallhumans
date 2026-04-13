@@ -184,10 +184,40 @@ class TrajectoryOptimizer:
         if not gates:
             raise ValueError("No gates provided")
 
-        # Build waypoints: start + gates
+        # Build waypoints: start + gates + virtual finish past last gate
+        # Inspired by "On Your Own" (Romero 2025, arxiv:2510.13644):
+        # each gate gets entry/exit waypoints. For the final gate, we add
+        # a virtual waypoint ~2m past it along its normal to ensure the
+        # trajectory covers the full approach and passage through the gate.
         waypoints = [np.array(start_position)]
         for g in gates:
             waypoints.append(np.array(g.position))
+
+        # Add virtual finish waypoint past last gate
+        if len(gates) >= 1:
+            last_gate = gates[-1]
+            normal = np.array(last_gate.normal, dtype=float)
+            norm_mag = np.linalg.norm(normal)
+            if norm_mag > 0.1:
+                normal = normal / norm_mag
+            else:
+                # Fallback: direction from second-to-last to last waypoint
+                normal = waypoints[-1] - waypoints[-2]
+                n_mag = np.linalg.norm(normal)
+                if n_mag > 0.1:
+                    normal = normal / n_mag
+                else:
+                    normal = np.array([1.0, 0.0, 0.0])
+            finish_wp = waypoints[-1] + normal * 2.0
+            waypoints.append(finish_wp)
+            # Create a virtual gate for the finish waypoint
+            gates = list(gates) + [GateWaypoint(
+                position=tuple(finish_wp),
+                normal=tuple(normal),
+                width=last_gate.width,
+                height=last_gate.height,
+                yaw=last_gate.yaw,
+            )]
 
         # Compute initial time allocation (distance-based heuristic)
         segment_times = self._initial_time_allocation(waypoints)
