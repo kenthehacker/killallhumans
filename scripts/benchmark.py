@@ -122,7 +122,7 @@ def run_unit_tests() -> Dict[str, Any]:
         ).optimize(wps, start_position=(0, 0, -2))
         assert traj.total_time > 0, "total_time must be positive"
         assert len(traj.points) > 10, f"too few points: {len(traj.points)}"
-        assert len(traj.segment_times) == 4, f"expected 4 segments (3 gates + finish), got {len(traj.segment_times)}"
+        assert len(traj.segment_times) == 7, f"expected 7 segments (3 gates × 2 entry/exit + finish), got {len(traj.segment_times)}"
     tests.append(("trajectory_generation", _traj))
 
     # --- Racing line ---

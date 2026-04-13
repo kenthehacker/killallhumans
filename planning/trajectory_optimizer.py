@@ -184,14 +184,35 @@ class TrajectoryOptimizer:
         if not gates:
             raise ValueError("No gates provided")
 
-        # Build waypoints: start + gates + virtual finish past last gate
-        # Inspired by "On Your Own" (Romero 2025, arxiv:2510.13644):
-        # each gate gets entry/exit waypoints. For the final gate, we add
-        # a virtual waypoint ~2m past it along its normal to ensure the
-        # trajectory covers the full approach and passage through the gate.
+        # Build waypoints: start + (entry/exit per gate) + virtual finish
+        # Based on "On Your Own" (Romero 2025, arxiv:2510.13644):
+        # Each gate gets TWO waypoints at ±0.4m along its normal direction.
+        # This ensures the trajectory flies smoothly THROUGH each gate
+        # rather than making abrupt direction changes at gate centers.
+        # The entry/exit approach was deployed at IROS 2024 and Abu Dhabi
+        # F1 GP, where the autonomous drone outperformed a professional pilot.
+        ENTRY_EXIT_OFFSET = 0.4  # meters, per "On Your Own" paper
+
         waypoints = [np.array(start_position)]
         for g in gates:
-            waypoints.append(np.array(g.position))
+            pos = np.array(g.position, dtype=float)
+            normal = np.array(g.normal, dtype=float)
+            norm_mag = np.linalg.norm(normal)
+            if norm_mag > 0.1:
+                normal = normal / norm_mag
+            else:
+                # Fallback: direction from previous waypoint
+                normal = pos - waypoints[-1]
+                n_mag = np.linalg.norm(normal)
+                if n_mag > 0.1:
+                    normal = normal / n_mag
+                else:
+                    normal = np.array([1.0, 0.0, 0.0])
+
+            entry = pos - normal * ENTRY_EXIT_OFFSET
+            exit_wp = pos + normal * ENTRY_EXIT_OFFSET
+            waypoints.append(entry)
+            waypoints.append(exit_wp)
 
         # Add virtual finish waypoint past last gate
         if len(gates) >= 1:
@@ -331,7 +352,7 @@ class TrajectoryOptimizer:
                 speed_factor = 0.45
 
             avg_speed = self.constraints.max_velocity * speed_factor
-            t = max(dist / avg_speed, 0.3)  # minimum segment time
+            t = max(dist / avg_speed, 0.1)  # minimum segment time (lowered for short entry/exit segments)
             times.append(t)
         return times
 
@@ -411,7 +432,7 @@ class TrajectoryOptimizer:
 
         optimized_times = np.exp(result.x)
         # Enforce minimum segment time
-        optimized_times = np.maximum(optimized_times, 0.2)
+        optimized_times = np.maximum(optimized_times, 0.1)
         return optimized_times.tolist()
 
     def add_fov_constraints(
