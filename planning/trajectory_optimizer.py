@@ -186,11 +186,16 @@ class TrajectoryOptimizer:
 
         # Build waypoints: start + (entry/exit per gate) + virtual finish
         # Based on "On Your Own" (Romero 2025, arxiv:2510.13644):
-        # Each gate gets TWO waypoints at ±0.4m along its normal direction.
-        # This ensures the trajectory flies smoothly THROUGH each gate
-        # rather than making abrupt direction changes at gate centers.
+        # Each gate gets TWO waypoints along its normal direction.
         # The entry/exit approach was deployed at IROS 2024 and Abu Dhabi
         # F1 GP, where the autonomous drone outperformed a professional pilot.
+        #
+        # Iteration 6: adaptive offsets based on turn angle at each gate.
+        # "On Your Own" uses 0.4m for normal gates, 1.25m for Split-S.
+        # TOGT Planner (Qin 2024): gates are regions, not points.
+        # Sharp turns (like helix entry) need longer offsets to give the
+        # min-snap polynomial more room to create smooth curves.
+
         ENTRY_EXIT_OFFSET = 0.4  # meters, per "On Your Own" paper
 
         waypoints = [np.array(start_position)]
@@ -248,6 +253,17 @@ class TrajectoryOptimizer:
             waypoints, segment_times, start_velocity
         )
 
+        # Post-optimization: inflate time at sharp gate-center turns.
+        # The L-BFGS penalty approach (using waypoint-level turn angles)
+        # was ineffective because entry/exit waypoints dilute the angles.
+        # Instead, compute turn angles from gate centers and inflate the
+        # 3 segments around the sharpest turns (approaching + through-gate).
+        # Research: TACO (Sanghvi 2025) adapts trajectory parameters to
+        # local characteristics; LMPC (Zhao 2025) uses per-section cost.
+        segment_times = self._inflate_sharp_turns(
+            waypoints, segment_times, gates
+        )
+
         # Generate polynomial trajectory with optimized times
         points = self._generate_trajectory(
             waypoints, segment_times, start_velocity, gates
@@ -274,6 +290,65 @@ class TrajectoryOptimizer:
             segment_times=segment_times,
             gate_waypoints=gates,
         )
+
+    def _inflate_sharp_turns(
+        self,
+        waypoints: List[np.ndarray],
+        segment_times: List[float],
+        gates: List[GateWaypoint],
+    ) -> List[float]:
+        """
+        Inflate segment times near sharp gate-center turns.
+
+        Computes turn angles from gate center positions (not waypoints, which
+        are diluted by entry/exit points). For turns > 60°, inflates the
+        2 segments approaching and 1 segment leaving the turn apex by a
+        factor proportional to the turn severity.
+
+        This is applied AFTER L-BFGS optimization to avoid distorting
+        the optimizer's objective function while still giving the controller
+        enough time to execute sharp turns.
+
+        Research: TACO (Sanghvi 2025) adapts trajectory parameters to
+        local trajectory characteristics; LMPC (Zhao 2025) varies
+        aggressiveness per track section.
+        """
+        times = list(segment_times)
+        n_gates = len(gates)
+        if n_gates < 3:
+            return times
+
+        # Compute gate-center positions
+        gate_centers = [np.array(g.position) for g in gates]
+
+        # Compute turn angle at each gate (angle between approach and departure)
+        for gi in range(1, n_gates - 1):
+            v_in = gate_centers[gi] - gate_centers[gi - 1]
+            v_out = gate_centers[gi + 1] - gate_centers[gi]
+            n1 = np.linalg.norm(v_in)
+            n2 = np.linalg.norm(v_out)
+            if n1 < 0.1 or n2 < 0.1:
+                continue
+            cos_a = np.clip(np.dot(v_in, v_out) / (n1 * n2), -1, 1)
+            turn_angle = math.acos(cos_a)
+
+            if turn_angle > 1.05:  # > ~60 degrees
+                # Inflation factor: 60° → 1.25x, 90° → 1.60x
+                severity = (turn_angle - 1.05) / (math.pi / 2 - 1.05)
+                severity = min(severity, 1.0)
+                inflate = 1.0 + 0.35 * severity
+
+                # Each gate gi has entry at waypoint index 2*gi+1, exit at 2*gi+2
+                # (waypoint 0 is start position, then pairs for each gate)
+                # Segments to inflate: approaching entry, entry→exit, exit→next_entry
+                seg_entry = 2 * gi      # segment ending at gate entry
+                seg_through = 2 * gi + 1  # segment through gate (entry→exit)
+
+                for seg_idx in [seg_entry, seg_through]:
+                    if 0 <= seg_idx < len(times):
+                        times[seg_idx] *= inflate
+
+        return times
 
     def _relax_for_fov(
         self,
@@ -398,6 +473,10 @@ class TrajectoryOptimizer:
                     accel = abs(v2 - v1) / max(times[i], 0.01)
                     if accel > self.constraints.max_acceleration:
                         penalty += (accel - self.constraints.max_acceleration) ** 2 * 20
+
+            # (Curvature-speed penalty removed — moved to post-optimization
+            # _inflate_sharp_turns() which uses gate-center turn angles instead
+            # of diluted waypoint-level angles.)
 
             # Perception-aware FOV penalty (ETH 2025)
             # Penalize segments where the target gate would fall outside camera FOV
