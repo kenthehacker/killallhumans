@@ -265,12 +265,42 @@ class TrajectoryOptimizer:
     def _initial_time_allocation(
         self, waypoints: List[np.ndarray]
     ) -> List[float]:
-        """Heuristic: time proportional to distance, with speed ramp."""
+        """Curvature-aware time allocation.
+
+        Inspired by TOGT Planner (Qin 2024, ICRA): "high-curvature segments
+        naturally require more time to stay within thrust limits." Instead of
+        a uniform speed factor, we allocate more time to turning segments and
+        less to straight segments.
+        """
         times = []
         for i in range(len(waypoints) - 1):
             dist = float(np.linalg.norm(waypoints[i + 1] - waypoints[i]))
-            # Assume average speed is 60% of max
-            avg_speed = self.constraints.max_velocity * 0.6
+
+            # Compute turn angle at the endpoint of this segment
+            turn_angle = 0.0
+            if i + 1 < len(waypoints) - 1:
+                v_in = waypoints[i + 1] - waypoints[i]
+                v_out = waypoints[i + 2] - waypoints[i + 1]
+                norm_in = np.linalg.norm(v_in)
+                norm_out = np.linalg.norm(v_out)
+                if norm_in > 0.1 and norm_out > 0.1:
+                    cos_a = np.clip(
+                        np.dot(v_in, v_out) / (norm_in * norm_out), -1, 1
+                    )
+                    turn_angle = math.acos(cos_a)
+
+            # Curvature-aware speed factor:
+            # - Straight (< 17 deg): 65% of max velocity
+            # - Moderate turn (17-57 deg): 55% of max velocity
+            # - Sharp turn (> 57 deg): 45% of max velocity
+            if turn_angle < 0.3:
+                speed_factor = 0.65
+            elif turn_angle < 1.0:
+                speed_factor = 0.55
+            else:
+                speed_factor = 0.45
+
+            avg_speed = self.constraints.max_velocity * speed_factor
             t = max(dist / avg_speed, 0.3)  # minimum segment time
             times.append(t)
         return times

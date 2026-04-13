@@ -45,10 +45,10 @@ if str(_REPO) not in sys.path:
 # ---------------------------------------------------------------------------
 THRESHOLDS = {
     "unit_tests_pass_rate": 1.0,          # 100% unit tests must pass
-    "max_avg_tracking_error_m": 1.0,      # average cross-track error (tightened from 2.0)
-    "max_max_tracking_error_m": 4.0,      # worst-case cross-track error (tightened from 5.0)
-    "max_ekf_uncertainty_m": 1.0,         # EKF position uncertainty (tightened from 3.0)
-    "min_loop_hz": 100,                   # minimum control loop frequency (tightened from 20)
+    "max_avg_tracking_error_m": 0.5,      # aspirational target (tightened from 1.0)
+    "max_max_tracking_error_m": 2.0,      # aspirational target (tightened from 4.0)
+    "max_ekf_uncertainty_m": 0.5,         # aspirational target (tightened from 1.0)
+    "min_loop_hz": 100,                   # minimum control loop frequency
     "min_gate_pass_rate": 1.0,            # Phase 1: require full gate completion (was 0.8)
     "max_total_time_s": 30.0,             # must finish within 30s
     "no_crash": True,                     # must not crash
@@ -297,6 +297,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # Generic drone (1kg, 20N max thrust, ~2g TWR) rather than Crazyflie.
     tracker = GeometricTracker(TrackerConfig(
         kp_xy=4.0, kd_xy=3.0, kp_z=6.0, kd_z=4.0,
+        feedforward_accel=1.0,  # full feedforward (Leveling the Playing Field, 2025)
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
     ))
 

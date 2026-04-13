@@ -44,7 +44,9 @@ class TrackerConfig:
     kw: float = 2.5       # angular velocity damping
 
     # Feed-forward weight (0 = pure feedback, 1 = full feedforward)
-    feedforward_accel: float = 0.8
+    # Full feedforward recommended by "Leveling the Playing Field" (2025):
+    # feedforward is the most important single fix for geometric controllers.
+    feedforward_accel: float = 1.0
 
     # Physical limits
     max_tilt_rad: float = 0.7       # ~40 degrees
