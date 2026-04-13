@@ -1,15 +1,17 @@
 # Shared project dependencies for local development and demos.
 -r gate_detection/requirements.txt
 
-# Simulation interactive viewer
+# ── Competition Interface (MAVLink / MAVSDK) ──
+mavsdk>=2.0.0
+
+# ── Core Scientific Computing ──
+numpy>=1.20.0
+scipy>=1.10.0
+
+# ── Simulation (local dev only — not needed for competition) ──
 pyvista>=0.43.0
-
-# GUI backend for matplotlib fallback interactive viewer (Wayland/X11)
 PyQt6>=6.7.0
-
-# PyBullet simulation (physics + rendering)
 pybullet>=3.2.0
-
-# Crazyflie CF2X physics + DSLPIDControl (install from GitHub, not on PyPI)
+# Crazyflie CF2X physics + DSLPIDControl
 # pip install git+https://github.com/utiasDSL/gym-pybullet-drones.git
 gym-pybullet-drones @ git+https://github.com/utiasDSL/gym-pybullet-drones.git

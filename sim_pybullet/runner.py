@@ -214,6 +214,21 @@ class RaceRunner:
         self._racing_line_ids: list = []
         self._draw_racing_lines()
 
+        # Target altitude slew limiting state
+        self._prev_target_z: Optional[float] = None
+
+        # Telemetry tracking for enhanced logging
+        self._peak_roll: float = 0.0
+        self._peak_pitch: float = 0.0
+        self._recovery_count: int = 0
+        self._was_in_recovery: bool = False
+        self._last_target_source: str = ""
+        self._last_target_mode: str = ""
+        self._last_lookahead: float = 0.0
+        self._last_lateral_err: float = 0.0
+        self._last_speed_mult: float = 0.0
+        self._last_target_z_delta: float = 0.0
+
         # Telemetry logging
         log_dir = Path("logs")
         log_dir.mkdir(exist_ok=True)
@@ -229,6 +244,10 @@ class RaceRunner:
             "target_gate_id", "target_x", "target_y", "target_z",
             "dist_to_gate",
             "gates_passed", "total_gates",
+            "target_source", "target_mode",
+            "lookahead_dist", "lateral_error", "speed_multiplier",
+            "target_z_delta", "peak_roll", "peak_pitch",
+            "recovery_count",
         ])
 
     def _init_detector(self, detector_type: str):
@@ -302,8 +321,30 @@ class RaceRunner:
                 print(f"\nFlew too high: {drone_state.position[2]:.2f}m")
                 break
 
+            # Track peak roll/pitch and recovery events
+            roll_abs = abs(state_dict["roll"])
+            pitch_abs = abs(state_dict["pitch"])
+            self._peak_roll = max(self._peak_roll, roll_abs)
+            self._peak_pitch = max(self._peak_pitch, pitch_abs)
+            if self.env.drone.in_recovery and not self._was_in_recovery:
+                self._recovery_count += 1
+            self._was_in_recovery = self.env.drone.in_recovery
+
             # 3. Determine target
             target = self._get_target(drone_state)
+
+            # --- Step 7: Last-resort descent protection ---
+            # If altitude <1.0m and descending >2.0 m/s, override to climb.
+            alt = drone_state.position[2]
+            vz = drone_state.velocity[2]
+            if alt < 1.0 and vz < -2.0:
+                # Emergency: command climb to 1.5m at current XY
+                target = TargetState(
+                    position=(drone_state.position[0], drone_state.position[1], 1.5),
+                    velocity=(0.0, 0.0, 1.0),
+                    yaw=drone_state.yaw,
+                )
+
             self._update_target_line(drone_state.position, target.position)
 
             # 4. Log telemetry (before stepping so we log state that triggered the command)
@@ -352,15 +393,18 @@ class RaceRunner:
 
     def _target_from_sim_metadata(self, drone_state: DroneState) -> TargetState:
         """
-        Spline-following controller with lookahead and lateral-error speed boost.
+        Spline-following controller with adaptive lookahead, smooth gate blend,
+        geometry-aware speed, and altitude slew limiting.
 
-        Instead of targeting a rigid approach waypoint per gate, we follow a
-        smooth Catmull-Rom spline through all gates.  The 3m lookahead means the
-        drone always steers toward a point ahead of its spline position, creating
-        natural curves that anticipate the next gate's direction.
-
-        Speed boost: if the drone drifts off the racing line, cruise speed is
-        scaled up (up to +50%) so position correction is rapid.
+        Changes from original fixed-lookahead controller (see PLAN.md):
+          - Adaptive lookahead: min(3.0, dist_to_gate * 0.3) prevents jumping
+            past gates in tight helix sections.
+          - Smooth gate blend: linear interpolation over final 1.5m replaces the
+            hard switch to gate center that caused target discontinuities.
+          - Tight-section speed reduction: when next gate is <6m away, lateral-
+            error speed boost is disabled and base speed is reduced.
+          - Altitude slew limiting: target z rate clamped to ±2.0 m/s to prevent
+            abrupt altitude demands in the helix climb.
         """
         gate = self.sequencer.current_gate
         if gate is None:
@@ -374,34 +418,81 @@ class RaceRunner:
         # prevents the closest-point search from latching onto a segment behind us.
         min_arc = self._racing_line.waypoint_arc(self.sequencer.gates_passed)
 
-        # Lookahead: target a point 3m ahead on the spline from closest position.
-        # The spline tangent at that point is used as the velocity feedforward
-        # and yaw target — the drone naturally carves smooth corners.
-        LOOKAHEAD = 3.0
+        # --- Step 2: Adaptive lookahead ---
+        # In tight helix (3.6-4.9m spacing), fixed 3m = 62-83% of gate spacing,
+        # causing target to jump past the current gate. Scale with distance.
+        lookahead = min(3.0, dist_to_gate * 0.3)
+        lookahead = max(lookahead, 0.5)  # floor to prevent zero-lookahead stall
+
         target_pt, tangent, lateral_err = self._racing_line.query(
-            drone_pos, LOOKAHEAD, min_arc=min_arc
+            drone_pos, lookahead, min_arc=min_arc
         )
         target_yaw = float(math.atan2(float(tangent[1]), float(tangent[0])))
 
-        # Base cruise speed, reduced when the spline tangent is far from current
-        # heading (sharp remaining curve).  Spline already smooths most turns
-        # so the reduction is mild compared to the old rigid-waypoint approach.
+        # Base cruise speed, reduced for sharp yaw differences.
         yaw_diff = abs(math.atan2(
             math.sin(target_yaw - drone_state.yaw),
             math.cos(target_yaw - drone_state.yaw),
         ))
         base_speed = 2.0 * max(0.6, 1.0 - 0.4 * min(yaw_diff / math.radians(90), 1.0))
 
-        # Throttle boost: lateral deviation from racing line → increase speed to
-        # snap back.  1m off = +25%; 2m off = +50% (capped).
-        speed = base_speed * (1.0 + min(lateral_err / 2.0, 0.5))
+        # --- Step 5: Geometry-aware speed scheduling ---
+        # Compute distance to next gate after current for tight-section detection.
+        next_gate_dist = dist_to_gate  # fallback
+        all_gates = self.sequencer.all_gates
+        cur_idx = self.sequencer.gates_passed
+        if cur_idx + 1 < len(all_gates):
+            next_g = all_gates[cur_idx + 1]
+            next_pos = np.array([next_g.pose.x, next_g.pose.y, next_g.pose.z])
+            next_gate_dist = float(np.linalg.norm(next_pos - gate_pos))
 
-        # Within 1.5m of the gate: lock position target to the exact gate center
-        # so the drone punches through cleanly rather than curving around it.
-        if dist_to_gate < 1.5:
-            target_pos = tuple(gate_pos)
+        if next_gate_dist < 6.0:
+            # Tight section: no lateral-error speed boost, reduce base speed
+            speed = base_speed * 0.6
+            target_mode = "spline_tight"
+        else:
+            # Open section: lateral-error speed boost helps snap back to line
+            speed = base_speed * (1.0 + min(lateral_err / 2.0, 0.5))
+            target_mode = "spline"
+
+        # --- Step 3: Smooth gate blend (replaces hard 1.5m switch) ---
+        BLEND_RADIUS = 1.5
+        if dist_to_gate < BLEND_RADIUS:
+            # Linear blend: at 1.5m → 100% spline, at 0m → 100% gate center
+            alpha = dist_to_gate / BLEND_RADIUS  # 1.0 at edge, 0.0 at gate
+            target_pos_arr = alpha * target_pt + (1.0 - alpha) * gate_pos
+            target_pos = tuple(target_pos_arr)
+            target_mode = "blend_gate"
         else:
             target_pos = tuple(target_pt)
+
+        # --- Step 4: Target altitude slew limiting ---
+        MAX_Z_RATE = 2.0  # m/s
+        ctrl_freq = self.env.drone.config.ctrl_freq
+        dt = 1.0 / ctrl_freq
+        raw_target_z = target_pos[2]
+
+        if self._prev_target_z is not None:
+            max_dz = MAX_Z_RATE * dt
+            clamped_z = np.clip(
+                raw_target_z,
+                self._prev_target_z - max_dz,
+                self._prev_target_z + max_dz,
+            )
+            target_z_delta = abs(raw_target_z - self._prev_target_z)
+            target_pos = (target_pos[0], target_pos[1], float(clamped_z))
+        else:
+            target_z_delta = 0.0
+
+        self._prev_target_z = target_pos[2]
+
+        # Update telemetry tracking
+        self._last_target_source = "metadata"
+        self._last_target_mode = target_mode
+        self._last_lookahead = lookahead
+        self._last_lateral_err = lateral_err
+        self._last_speed_mult = speed / max(base_speed, 1e-6)
+        self._last_target_z_delta = target_z_delta
 
         return TargetState(
             position=target_pos,
@@ -417,14 +508,19 @@ class RaceRunner:
             fused_dets = self._fused_detector.detect(image)
             if fused_dets:
                 det = fused_dets[0].final
+                self._last_target_source = "detection"
+                self._last_target_mode = "detection"
                 return gate_detection_to_target(det, drone_state, self._camera_model)
         elif self._detector:
             detections = self._detector.detect(image)
             if detections:
                 det = detections[0]
+                self._last_target_source = "detection"
+                self._last_target_mode = "detection"
                 return gate_detection_to_target(det, drone_state, self._camera_model)
 
         # Fallback to sim metadata if detection found nothing
+        self._last_target_source = "metadata_fallback"
         return self._target_from_sim_metadata(drone_state)
 
     def _render_frame(
@@ -690,6 +786,15 @@ class RaceRunner:
             f"{dist:.4f}",
             self.sequencer.gates_passed,
             self.sequencer.total_gates,
+            self._last_target_source,
+            self._last_target_mode,
+            f"{self._last_lookahead:.3f}",
+            f"{self._last_lateral_err:.3f}",
+            f"{self._last_speed_mult:.3f}",
+            f"{self._last_target_z_delta:.4f}",
+            f"{self._peak_roll:.4f}",
+            f"{self._peak_pitch:.4f}",
+            self._recovery_count,
         ])
 
     def _handle_camera_keys(self, key: int):

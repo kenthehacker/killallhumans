@@ -39,8 +39,9 @@ except ImportError:
 _MAX_TILT_RAD = math.radians(35)
 
 # Tilt threshold above which we enter auto-recovery (hover) mode.
-# Spiraling or sharp-turn instability is caught here before it cascades.
-_TUMBLE_TILT_RAD = math.radians(50)
+# 38 deg is close to _MAX_TILT_RAD (35 deg) — catches instability early
+# before the drone reaches clearly unrecoverable attitudes.
+_TUMBLE_TILT_RAD = math.radians(38)
 
 
 @dataclass
