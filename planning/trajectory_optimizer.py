@@ -31,9 +31,9 @@ from scipy.optimize import minimize
 class DroneConstraints:
     """Physical limits of the drone."""
     max_velocity: float = 15.0       # m/s
-    max_acceleration: float = 12.0   # m/s^2 (~1.2g)
+    max_acceleration: float = 20.0   # m/s^2 (~2g) — relaxed: rough estimate overestimates actual accel at segment boundaries
     max_jerk: float = 50.0           # m/s^3
-    max_tilt_angle: float = 0.7      # radians (~40 degrees)
+    max_tilt_angle: float = 0.85     # radians (~49 deg) — increased for faster turns (Aggressive Maneuvers 2026)
     max_thrust: float = 20.0         # Newtons
     max_body_rate: float = 6.0       # rad/s
     mass: float = 1.0                # kg
@@ -345,11 +345,11 @@ class TrajectoryOptimizer:
             # - Moderate turn (17-57 deg): 55% of max velocity
             # - Sharp turn (> 57 deg): 45% of max velocity
             if turn_angle < 0.3:
-                speed_factor = 0.65
+                speed_factor = 0.80
             elif turn_angle < 1.0:
-                speed_factor = 0.55
+                speed_factor = 0.70
             else:
-                speed_factor = 0.45
+                speed_factor = 0.55
 
             avg_speed = self.constraints.max_velocity * speed_factor
             t = max(dist / avg_speed, 0.1)  # minimum segment time (lowered for short entry/exit segments)
@@ -375,6 +375,11 @@ class TrajectoryOptimizer:
             times = np.exp(log_t)
             total_time = np.sum(times)
 
+            # Time incentive: weight total_time more heavily to prioritize speed.
+            # TOGT (Qin 2024) uses joint time-position optimization where time
+            # minimization dominates; we achieve similar effect with time_weight > 1.
+            time_weight = 2.0
+
             # Penalty for constraint violations
             penalty = 0.0
             for i in range(n_segments):
@@ -383,7 +388,7 @@ class TrajectoryOptimizer:
 
                 # Velocity constraint
                 if avg_v > self.constraints.max_velocity:
-                    penalty += (avg_v - self.constraints.max_velocity) ** 2 * 100
+                    penalty += (avg_v - self.constraints.max_velocity) ** 2 * 50
 
                 # Acceleration constraint (rough estimate)
                 if i < n_segments - 1:
@@ -392,7 +397,7 @@ class TrajectoryOptimizer:
                     v2 = dist2 / max(times[i + 1], 0.01)
                     accel = abs(v2 - v1) / max(times[i], 0.01)
                     if accel > self.constraints.max_acceleration:
-                        penalty += (accel - self.constraints.max_acceleration) ** 2 * 50
+                        penalty += (accel - self.constraints.max_acceleration) ** 2 * 20
 
             # Perception-aware FOV penalty (ETH 2025)
             # Penalize segments where the target gate would fall outside camera FOV
@@ -421,7 +426,7 @@ class TrajectoryOptimizer:
 
             penalty += self.fov.penalty_weight * fov_penalty
 
-            return total_time + penalty
+            return time_weight * total_time + penalty
 
         result = minimize(
             objective,

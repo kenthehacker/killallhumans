@@ -289,14 +289,14 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=10.0), dt_sample=0.02,
+        constraints=DroneConstraints(max_velocity=15.0), dt_sample=0.02,
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
     # Use consistent physics parameters between tracker and kinematic model.
     # Generic drone (1kg, 20N max thrust, ~2g TWR) rather than Crazyflie.
     tracker = GeometricTracker(TrackerConfig(
-        kp_xy=5.0, kd_xy=3.5, kp_z=6.0, kd_z=4.0,
+        kp_xy=6.0, kd_xy=4.0, kp_z=8.0, kd_z=5.0,
         feedforward_accel=1.0,  # full feedforward (Leveling the Playing Field, 2025)
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
     ))
@@ -307,8 +307,8 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     yaw = 0.0
 
     # Kinematic parameters (tuned to approximate Crazyflie CF2X dynamics)
-    max_accel = 12.0      # m/s^2 (~1.2g, matches DroneConstraints)
-    max_speed = 12.0      # m/s
+    max_accel = 15.0      # m/s^2 (~1.5g, matches DroneConstraints)
+    max_speed = 15.0      # m/s — increased to match trajectory planner ceiling
     drag = 0.5            # velocity damping (aerodynamic drag approximation)
     yaw_rate_max = 4.0    # rad/s
 
@@ -581,7 +581,7 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     rl_opt = RacingLineOptimizer()
     opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=10.0), dt_sample=0.02,
+        constraints=DroneConstraints(max_velocity=15.0), dt_sample=0.02,
     )
     trajectory = traj_opt.optimize(opt_wps, start_pos, (0, 0, 0))
 

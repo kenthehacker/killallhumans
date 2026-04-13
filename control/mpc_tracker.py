@@ -49,7 +49,7 @@ class TrackerConfig:
     feedforward_accel: float = 1.0
 
     # Physical limits
-    max_tilt_rad: float = 0.7       # ~40 degrees
+    max_tilt_rad: float = 0.85      # ~49 deg — increased for faster turns (Aggressive Maneuvers 2026)
     max_thrust_normalized: float = 0.95
     min_thrust_normalized: float = 0.05
     max_body_rate: float = 6.0      # rad/s
