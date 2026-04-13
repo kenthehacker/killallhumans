@@ -298,20 +298,30 @@ class TrajectoryOptimizer:
         gates: List[GateWaypoint],
     ) -> List[float]:
         """
-        Inflate segment times near sharp gate-center turns.
+        Inflate segment times near turns that exceed controller capability.
 
-        Computes turn angles from gate center positions (not waypoints, which
-        are diluted by entry/exit points). For turns > 60°, inflates the
-        2 segments approaching and 1 segment leaving the turn apex by a
-        factor proportional to the turn severity.
+        Two complementary checks (applied AFTER L-BFGS optimization):
 
-        This is applied AFTER L-BFGS optimization to avoid distorting
-        the optimizer's objective function while still giving the controller
-        enough time to execute sharp turns.
+        1. **Angle-based** (>60°): Sharp turns get time inflation proportional
+           to turn severity. Handles helix entry (gate-7) and similar.
 
-        Research: TACO (Sanghvi 2025) adapts trajectory parameters to
-        local trajectory characteristics; LMPC (Zhao 2025) varies
-        aggressiveness per track section.
+        2. **Centripetal acceleration-based** (NEW, iter 7): Moderate turns
+           at high speed get inflation proportional to centripetal acceleration
+           excess. Handles S-turns (gate-3/4) where turn angles are below 60°
+           but long approaches allow high speed into the turn.
+
+        The centripetal check computes: a_c = v² × κ, where v is the
+        estimated approach speed from L-BFGS segment times and κ is the
+        path curvature estimated from gate-center turn angle / approach distance.
+
+        Research backing:
+        - TOPPQuad (Mao, IROS 2024): dynamic feasibility requires checking
+          centripetal acceleration against thrust constraints, not just angle
+        - Alternating Peak (de Vries, ECC 2024): peak constraint ratio per
+          segment determines required time inflation
+        - TACO (Sanghvi 2025): trajectory parameters should adapt to local
+          characteristics (speed + curvature, not curvature alone)
+        - Teissing (RA-L 2024): boundary velocity at turns is the key variable
         """
         times = list(segment_times)
         n_gates = len(gates)
@@ -320,6 +330,12 @@ class TrajectoryOptimizer:
 
         # Compute gate-center positions
         gate_centers = [np.array(g.position) for g in gates]
+
+        # Centripetal acceleration threshold: beyond this, the PD controller
+        # (kp_xy=6, kd_xy=4) cannot track the turn without significant
+        # overshoot. Derived from TOPPQuad's feasibility principle.
+        # Set low enough to catch S-turn gates (3/4) where a_c ≈ 3.6-4.7.
+        a_centripetal_threshold = 3.5  # m/s² — catches S-turn gates (a_c ≈ 3.6-4.8)
 
         # Compute turn angle at each gate (angle between approach and departure)
         for gi in range(1, n_gates - 1):
@@ -332,18 +348,53 @@ class TrajectoryOptimizer:
             cos_a = np.clip(np.dot(v_in, v_out) / (n1 * n2), -1, 1)
             turn_angle = math.acos(cos_a)
 
-            if turn_angle > 1.05:  # > ~60 degrees
+            # Each gate gi has entry at waypoint index 2*gi+1, exit at 2*gi+2
+            seg_entry = 2 * gi      # segment ending at gate entry
+            seg_through = 2 * gi + 1  # segment through gate (entry→exit)
+
+            inflate = 1.0
+
+            if turn_angle > 1.05:  # > ~60 degrees — original angle-based
                 # Inflation factor: 60° → 1.25x, 90° → 1.60x
                 severity = (turn_angle - 1.05) / (math.pi / 2 - 1.05)
                 severity = min(severity, 1.0)
                 inflate = 1.0 + 0.35 * severity
+            elif turn_angle > 0.3:  # > ~17° — check centripetal acceleration
+                # Estimate approach speed from L-BFGS segment times.
+                # The approach to gate gi uses segments leading to entry wp.
+                # seg_entry-1 is the segment from prev gate exit to this gate entry.
+                approach_seg = seg_entry - 1 if seg_entry > 0 else seg_entry
+                approach_dist = 0.0
+                approach_time = 0.0
+                for s in [approach_seg, seg_entry]:
+                    if 0 <= s < len(times):
+                        d = float(np.linalg.norm(
+                            waypoints[s + 1] - waypoints[s]))
+                        approach_dist += d
+                        approach_time += times[s]
+                if approach_time > 0.01:
+                    avg_speed = approach_dist / approach_time
+                else:
+                    avg_speed = 0.0
 
-                # Each gate gi has entry at waypoint index 2*gi+1, exit at 2*gi+2
-                # (waypoint 0 is start position, then pairs for each gate)
-                # Segments to inflate: approaching entry, entry→exit, exit→next_entry
-                seg_entry = 2 * gi      # segment ending at gate entry
-                seg_through = 2 * gi + 1  # segment through gate (entry→exit)
+                # Curvature estimate from gate-center geometry
+                # κ ≈ turn_angle / approach_distance (between gate centers)
+                approach_gate_dist = n1  # distance between gate centers
+                if approach_gate_dist > 0.5:
+                    curvature = turn_angle / approach_gate_dist
+                else:
+                    curvature = 0.0
 
+                # Centripetal acceleration: a_c = v² × κ
+                a_centripetal = avg_speed ** 2 * curvature
+
+                if a_centripetal > a_centripetal_threshold:
+                    # Inflate proportional to excess centripetal acceleration
+                    excess = (a_centripetal - a_centripetal_threshold) / a_centripetal_threshold
+                    severity = min(excess, 1.0)
+                    inflate = 1.0 + 0.25 * severity  # range: 1.0x to 1.25x
+
+            if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:
                     if 0 <= seg_idx < len(times):
                         times[seg_idx] *= inflate
