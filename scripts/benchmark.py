@@ -719,8 +719,8 @@ def main():
     parser.add_argument("--mode", choices=["unit", "synthetic", "sim", "full"], default="full")
     parser.add_argument("--config", type=str,
                         default=str(_REPO / "sim_pybullet" / "configs" / "race_01.json"))
-    parser.add_argument("--duration", type=float, default=15.0,
-                        help="Sim-time seconds (default 15)")
+    parser.add_argument("--duration", type=float, default=30.0,
+                        help="Sim-time seconds (default 30, matches max_total_time_s threshold)")
     parser.add_argument("--json-only", action="store_true",
                         help="Only output JSON to stdout, suppress stderr summary")
     parser.add_argument("--strict", action="store_true",
