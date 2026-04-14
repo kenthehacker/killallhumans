@@ -22,6 +22,15 @@ Research: AERO-MPPI (Chen 2026) — ensemble re-rollout under common cost;
 T-MPC (de Groot 2024) — parallel planners with fallback guarantee;
 BO Racing Line (Jain 2020) — sim oracle for trajectory selection;
 TACO (Sanghvi 2025) — trajectory-aware optimization reduces error 32%.
+
+Iteration 23: three-term normalized composite score replaces error-only
+selection. Adds race_time as a third objective with min-max normalization
+across candidates (COP, Bohm ICRA 2022). Weights: 0.5*avg_err +
+0.2*worst_gate + 0.3*race_time. Recovers race time regression from iter 22
+while preserving tracking accuracy.
+Research: COP (Bohm 2022) — Pareto-aware normalized multi-objective;
+CiMPCC (Li 2025) — curvature-integrated speed optimization;
+ILMPC (Zhao 2025) — adaptive cost, pure time → gate misses.
 """
 
 from __future__ import annotations
@@ -183,6 +192,14 @@ class RacingLineOptimizer:
 
         return optimized_gates
 
+    # Composite score weights for sim-based selection (iteration 23).
+    # Research: ILMPC (Zhao 2025) ablation shows pure time → gate misses;
+    # COP (Bohm, ICRA 2022) recommends normalized multi-objective scoring;
+    # CiMPCC (Li 2025) shows curvature-aware speed targets beat raw time.
+    _W_AVG_ERR = 0.5   # primary: average tracking error
+    _W_WORST = 0.2     # secondary: worst per-gate error
+    _W_TIME = 0.3      # tertiary: race time (COP/CiMPCC/ILMPC research-backed)
+
     def _select_by_sim(
         self,
         gates: List[GateWaypoint],
@@ -193,14 +210,19 @@ class RacingLineOptimizer:
         Select the best racing line candidate by kinematic sim evaluation.
 
         Builds a full trajectory for each L-BFGS result and runs a lightweight
-        kinematic tracking simulation to measure actual tracking error. Selects
-        by composite score: 0.7 * avg_error + 0.3 * worst_gate_error.
+        kinematic tracking simulation. Uses normalized three-term composite:
+        W_AVG * norm_avg_err + W_WORST * norm_worst_gate + W_TIME * norm_time.
+
+        Normalization (COP, Bohm ICRA 2022): each metric is min-max normalized
+        across the candidate pool to [0,1], preventing scale mismatch between
+        meters (tracking error) and seconds (race time).
 
         Falls back to L-BFGS objective selection if sim evaluation fails.
 
-        Research: AERO-MPPI (Chen 2026) — re-rollout under common cost;
-        T-MPC (de Groot 2024) — Theorem 2 fallback guarantee (zero-init
-        included as candidate, so sim-based selection can't regress);
+        Research: COP (Bohm 2022) — normalize by (nadir-utopia) range;
+        CiMPCC (Li 2025) — curvature-modulated speed targets;
+        ILMPC (Zhao 2025) — adaptive cost, pure time → gate miss;
+        T-MPC (de Groot 2024) — Theorem 2 fallback guarantee;
         BO Racing Line (Jain 2020) — sim oracle for trajectory selection.
         """
         from .trajectory_optimizer import (
@@ -212,10 +234,10 @@ class RacingLineOptimizer:
             dt_sample=0.02,  # coarser than benchmark for speed
         )
 
-        scores = []
+        # Pass 1: evaluate all candidates, collect raw metrics
+        raw_metrics: list = []  # (avg_err, worst_gate_err, race_time, idx)
         for idx, result in enumerate(all_results):
             try:
-                # Build gate waypoints from this candidate's offsets
                 positions = self._apply_offsets(gates, result.x)
                 candidate_gates = []
                 for i, gate in enumerate(gates):
@@ -227,24 +249,22 @@ class RacingLineOptimizer:
                         yaw=gate.yaw,
                     ))
 
-                # Build full trajectory
                 trajectory = traj_opt.optimize(
                     candidate_gates, start_position, (0, 0, 0)
                 )
 
-                # Run lightweight kinematic sim
                 avg_err, worst_gate_err, race_time = self._kinematic_eval(
                     trajectory, start_position, gates
                 )
 
-                # Composite score: prioritize avg error, penalize worst gate
-                score = 0.7 * avg_err + 0.3 * worst_gate_err
-                scores.append((score, race_time, idx))
+                raw_metrics.append((avg_err, worst_gate_err, race_time, idx))
             except Exception:
-                # If trajectory build or sim fails, assign worst score
-                scores.append((999.0, 999.0, idx))
+                raw_metrics.append((999.0, 999.0, 999.0, idx))
 
-        if not scores or all(s[0] >= 999.0 for s in scores):
+        # Filter out failed evaluations
+        valid = [(a, w, t, i) for a, w, t, i in raw_metrics if a < 999.0]
+
+        if not valid:
             # Fallback: L-BFGS objective selection (T-MPC Theorem 2)
             best_idx = 0
             best_fun = all_results[0].fun
@@ -254,9 +274,34 @@ class RacingLineOptimizer:
                     best_idx = i
             return best_idx
 
-        # Select by lowest composite score
-        scores.sort(key=lambda x: (x[0], x[1]))
-        return scores[0][2]
+        # Pass 2: min-max normalize each metric across candidates (COP)
+        avg_errs = [m[0] for m in valid]
+        worst_errs = [m[1] for m in valid]
+        times = [m[2] for m in valid]
+
+        def _normalize(vals: list) -> list:
+            lo, hi = min(vals), max(vals)
+            rng = hi - lo
+            if rng < 1e-9:
+                return [0.0] * len(vals)
+            return [(v - lo) / rng for v in vals]
+
+        norm_avg = _normalize(avg_errs)
+        norm_worst = _normalize(worst_errs)
+        norm_time = _normalize(times)
+
+        # Composite score with normalized metrics
+        scored = []
+        for j, (a, w, t, i) in enumerate(valid):
+            score = (
+                self._W_AVG_ERR * norm_avg[j]
+                + self._W_WORST * norm_worst[j]
+                + self._W_TIME * norm_time[j]
+            )
+            scored.append((score, i))
+
+        scored.sort()
+        return scored[0][1]
 
     @staticmethod
     def _kinematic_eval(
