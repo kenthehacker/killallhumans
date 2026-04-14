@@ -1,6 +1,6 @@
 {
-  "iteration": 23,
-  "timestamp": "2026-04-14T14:42:00Z",
+  "iteration": 24,
+  "timestamp": "2026-04-14T15:00:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -67,89 +67,90 @@
     "sampling_racing_line_ogretmen_2024",
     "cimpcc_lap_time_li_2025",
     "ilmpc_adaptive_cost_drone_2025",
-    "cop_pareto_planning_tzoumanikas_2022"
+    "cop_pareto_planning_tzoumanikas_2022",
+    "quaypoints_racing_2025",
+    "spatially_aware_cmaes_racing_2026"
   ],
-  "total_papers_analyzed": 63,
+  "total_papers_analyzed": 65,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.206,
-    "max_tracking_error_m": 0.682,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 8085,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.311,
-    "race_time_s": 14.15
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.223,
     "max_tracking_error_m": 0.678,
     "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7575,
+    "avg_loop_hz": 7787,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-3",
     "worst_gate_error_m": 0.374,
     "race_time_s": 13.99
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.211,
+    "max_tracking_error_m": 0.755,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7571,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-7",
+    "worst_gate_error_m": 0.327,
+    "race_time_s": 14.02
+  },
   "changes_committed": true,
-  "commit_hash": "7fdaad5",
+  "commit_hash": "a9ca9f8",
   "diagnostic": {
-    "root_cause": "The 10-candidate L-BFGS pool is bipartite: Basin A (fast, 13.99s, gate-3=0.374m) and Basin B (slow, 14.15s, gate-3=0.209m). ANY non-zero time weight selects Basin A. No intermediate candidates exist.",
+    "root_cause": "The helix section (gates 7-10) has a persistent error floor of 0.24-0.33m across all racing line variants. This is independent of the S-turn optimization and likely caused by the tight 3D helix geometry exceeding the PD controller's tracking bandwidth.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.108,
-      "avg_thrust": 0.799
+      "avg_pitch_rad": -0.111,
+      "avg_thrust": 0.795
     },
-    "trend": "oscillating",
+    "trend": "improving",
     "architectural_issues": [
-      "Bipartite candidate pool: 10 L-BFGS starts produce only 2 distinct basins with no intermediate racing lines",
-      "Gate-3 S-turn: fast racing line approach angle exceeds PD controller tracking capability",
-      "Gate-7 helix entry stuck at 0.308m for 6+ iterations — independent of all racing line changes",
-      "Scoring function weight-insensitive: W_TIME=0.10, 0.20, 0.30 all select same candidate"
+      "Helix error floor (0.24-0.33m at gates 7-10) persists across 8+ iterations of racing line changes",
+      "Linear interpolation in offset space may not reach true Pareto optimum if front is curved",
+      "Race time aspirational target (<14s) missed by 0.02s — interpolated line is 0.03s slower than Basin A"
     ],
     "critic_findings": [
-      "All aspirational targets met simultaneously for the first time (avg<0.25m AND time<14s)",
-      "Normalized scoring correctly identifies competition-optimal Pareto point",
-      "Gate-3 regression is back to iter 21 level — effectively undoes iter 22's tracking improvement",
-      "Further scoring refinement is futile — candidate generation is the bottleneck"
+      "Basin-bridging interpolation successfully broke the oscillation pattern (iters 20-23)",
+      "Gate-3 error reduced 43% — largest single-gate improvement since iteration 13",
+      "Worst gate shifted from gate-3 (0.374m) to gate-7 (0.327m) — healthier error distribution",
+      "Helix regression is modest (+0.019m at gate-7) and acceptable given the S-turn gains"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Bipartite candidate pool — no intermediate racing lines between fast (13.99s) and slow (14.15s) basins",
-      "proposed_approach": "Add interpolation-based candidates: blend Basin A and Basin B offsets at ratios 0.25/0.50/0.75 to create intermediate racing lines",
-      "expected_impact": "Find racing line with ~14.05s time AND ~0.21m avg error — Pareto-intermediate",
+      "description": "Helix section (gates 7-10) has persistent error floor 0.24-0.33m across all racing line variants",
+      "proposed_approach": "Helix-specific time inflation or curvature-adaptive speed limits for the helix segment. Per-section racing line with different smoothness weights for helix vs S-turn.",
+      "expected_impact": "Gate-7 error 0.33→0.25m, avg error 0.211→0.200m",
       "priority": 1,
-      "research_refs": ["bo_racing_line_heilmeier_2020", "cop_pareto_planning_tzoumanikas_2022"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Gate-7 helix entry stuck at 0.308m for 6+ iterations",
-      "proposed_approach": "Per-section racing line: different smoothness weights for helix vs S-turn, or helix-specific inflation tuning",
-      "expected_impact": "Gate-7 error 0.308→0.25m",
-      "priority": 2,
       "research_refs": ["cimpcc_curvature_velocity_li_2024", "mastering_diverse_tracks_2025"]
     },
     {
-      "area": "control",
-      "description": "Gate-3 S-turn tracking error 0.374m on fast racing line — PD controller can't track sharp approach",
-      "proposed_approach": "Increase feedforward aggressiveness for high-curvature segments, or add S-turn-specific trajectory smoothing",
-      "expected_impact": "Gate-3 error 0.374→0.30m on fast racing line",
+      "area": "trajectory_planning",
+      "description": "Finer interpolation refinement — 3-point interpolation found good candidate, but Pareto front may have better points",
+      "proposed_approach": "Add 5-7 interpolation points near the selected α, or locally optimize (L-BFGS) from the interpolated candidate",
+      "expected_impact": "Race time 14.02→13.99s while maintaining gate-3 accuracy",
+      "priority": 2,
+      "research_refs": ["quaypoints_racing_2025", "bo_racing_line_heilmeier_2020"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Race time 14.02s slightly over aspirational <14s target",
+      "proposed_approach": "More aggressive TOPP retiming on straight segments, or fine interpolation to recover 0.03s",
+      "expected_impact": "Race time 14.02→13.98s",
       "priority": 3,
-      "research_refs": ["taco_trajectory_aware_controller_2025", "aggressive_tracking_tal_2018"]
+      "research_refs": ["toppquad_speed_profile_mao_2024"]
     },
     {
       "area": "control",
-      "description": "MPCC controller upgrade — contouring error decomposition for all gates",
-      "proposed_approach": "Implement contouring/progress error decomposition for cross-track vs along-track control",
+      "description": "MPCC controller upgrade for contouring/progress error decomposition",
+      "proposed_approach": "Implement contouring error decomposition for cross-track vs along-track control",
       "expected_impact": "Tracking improvement across all gates",
       "priority": 4,
       "research_refs": ["mpcc_plus_plus_krinner_2024"]
@@ -158,7 +159,7 @@
       "area": "system_integration",
       "description": "PyBullet integration for realistic physics validation",
       "proposed_approach": "Port kinematic sim evaluation to PyBullet for competition-realistic feedback",
-      "expected_impact": "More realistic racing line selection, competition readiness",
+      "expected_impact": "Competition readiness",
       "priority": 5,
       "research_refs": []
     }
