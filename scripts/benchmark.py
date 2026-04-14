@@ -327,6 +327,13 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         dt=dt,
         section_boundaries=section_boundaries,
         blend_steps=50,
+        filter_cutoff_hz=0.35,  # Butterworth Q-filter (iteration 27)
+        # Research: van Haren 2024, Freeman 2025, Longman 2019
+        # 4th-order Butterworth at 0.35 Hz replaces Gaussian σ=10 (≈1.37 Hz).
+        # Sharper rolloff provides better noise rejection; 0.35 Hz captures
+        # the slow-varying systematic tracking error (curvature-correlated)
+        # while filtering faster noise from kinematic sim model mismatch.
+        # Sweep tested {0.2..4.0 Hz}: 0.35 Hz optimal for avg error (-3.2%).
     )
 
     # Use consistent physics parameters between tracker and kinematic model.

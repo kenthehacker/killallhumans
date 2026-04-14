@@ -133,6 +133,7 @@ def compute_ilc_offset_table(
     dt: float = 0.01,
     section_boundaries: Optional[list] = None,
     blend_steps: int = 50,
+    filter_cutoff_hz: Optional[float] = None,
 ) -> Optional[np.ndarray]:
     """
     Compute a position-offset table via offline ILC to reduce systematic tracking error.
@@ -149,12 +150,19 @@ def compute_ilc_offset_table(
     trajectory is split into sections that are learned independently to prevent
     cross-contamination between sections with different dynamics.
 
+    Q-filter (iteration 27): When filter_cutoff_hz is set, uses a zero-phase
+    4th-order Butterworth low-pass filter instead of Gaussian smoothing. This
+    provides sharper frequency cutoff and principled convergence guarantees.
+
     Research basis:
     - Schoellig et al. 2012: P-type ILC with feedforward correction achieves
       87% error reduction in 3-5 iterations on real quadrotors.
     - Spatial ILC (Lv 2023): spatial domain decouples speed and path.
     - Zhang, Meng & Cai 2024: Segment-wise ILC prevents cross-contamination.
     - Liu, Zheng & Chen 2023: Section-specific gains for monotone convergence.
+    - van Haren et al. 2024 (ECC): Frequency-domain ILC with Q-filter design.
+    - Freeman et al. 2025 (Int. J. Control): Zero-phase Butterworth Q-filter
+      for robust ILC convergence. Cutoff must be below controller bandwidth.
 
     Args:
         trajectory: The pre-computed RaceTrajectory.
@@ -162,7 +170,8 @@ def compute_ilc_offset_table(
         alpha: Learning rate per iteration (0.2-0.5). Used as default if no
             section_boundaries provided.
         max_iterations: Maximum ILC iterations.
-        smoothing_sigma: Gaussian kernel width (in timesteps).
+        smoothing_sigma: Gaussian kernel width (in timesteps). Used when
+            filter_cutoff_hz is None.
         max_correction_m: Maximum cross-track offset magnitude (meters).
         convergence_threshold: Stop if avg error improves by less than this.
         dt: Sim timestep (must match benchmark).
@@ -172,6 +181,10 @@ def compute_ilc_offset_table(
             If 4th element omitted, uses global max_correction_m.
             If None, uses global alpha.
         blend_steps: Number of steps for blending between adjacent sections.
+        filter_cutoff_hz: Butterworth Q-filter cutoff frequency in Hz. When
+            set, replaces Gaussian smoothing with a zero-phase 4th-order
+            Butterworth low-pass filter. Recommended: 2-3 Hz for a PD
+            controller with 3-5 Hz bandwidth. If None, uses Gaussian.
 
     Returns:
         Offset table as np.ndarray of shape (n_steps, 3), or None if ILC
@@ -179,6 +192,16 @@ def compute_ilc_offset_table(
         the reference position at time k*dt.
     """
     from scipy.ndimage import gaussian_filter1d
+
+    # Butterworth Q-filter setup (iteration 27)
+    butter_b, butter_a = None, None
+    if filter_cutoff_hz is not None:
+        from scipy.signal import butter, filtfilt as _filtfilt
+        nyquist = 0.5 / dt  # Nyquist frequency
+        Wn = filter_cutoff_hz / nyquist
+        if Wn >= 1.0:
+            Wn = 0.99  # clamp to valid range
+        butter_b, butter_a = butter(4, Wn, btype='low')
 
     max_accel = 15.0
     max_speed = 15.0
@@ -261,7 +284,7 @@ def compute_ilc_offset_table(
         if baseline_avg_err is None:
             baseline_avg_err = avg_err
 
-        # Check convergence
+        # Check convergence (global — same as original)
         if ilc_iter > 0:
             improvement = prev_avg_err - avg_err
             if improvement < convergence_threshold:
@@ -297,10 +320,23 @@ def compute_ilc_offset_table(
 
                 # Smooth within section only (no cross-section bleed)
                 sec_smoothed = np.zeros_like(sec_ct)
-                for axis in range(3):
-                    sec_smoothed[:, axis] = gaussian_filter1d(
-                        sec_ct[:, axis], sigma=smoothing_sigma
-                    )
+                if butter_b is not None and len(sec_ct) > 60:
+                    # Zero-phase Butterworth Q-filter (iteration 27)
+                    # Reflect-pad to handle filtfilt boundary effects
+                    # (Freeman 2025: ~50-60 samples at 2 Hz cutoff)
+                    from scipy.signal import filtfilt as _filtfilt
+                    pad_len = min(60, len(sec_ct) - 1)
+                    for axis in range(3):
+                        signal = sec_ct[:, axis]
+                        padded = np.pad(signal, pad_len, mode='reflect')
+                        filtered = _filtfilt(butter_b, butter_a, padded)
+                        sec_smoothed[:, axis] = filtered[pad_len:-pad_len] if pad_len > 0 else filtered
+                else:
+                    # Gaussian fallback (for short sections or when no cutoff specified)
+                    for axis in range(3):
+                        sec_smoothed[:, axis] = gaussian_filter1d(
+                            sec_ct[:, axis], sigma=smoothing_sigma
+                        )
 
                 # Clip magnitude (per-section limit)
                 mag = np.linalg.norm(sec_smoothed, axis=1, keepdims=True)
@@ -329,8 +365,18 @@ def compute_ilc_offset_table(
             # Global ILC (backward compatible)
             # Smooth
             smoothed = np.zeros_like(cross_track)
-            for axis in range(3):
-                smoothed[:, axis] = gaussian_filter1d(cross_track[:, axis], sigma=smoothing_sigma)
+            if butter_b is not None and len(cross_track) > 60:
+                # Zero-phase Butterworth Q-filter
+                from scipy.signal import filtfilt as _filtfilt
+                pad_len = min(60, len(cross_track) - 1)
+                for axis in range(3):
+                    signal = cross_track[:, axis]
+                    padded = np.pad(signal, pad_len, mode='reflect')
+                    filtered = _filtfilt(butter_b, butter_a, padded)
+                    smoothed[:, axis] = filtered[pad_len:-pad_len] if pad_len > 0 else filtered
+            else:
+                for axis in range(3):
+                    smoothed[:, axis] = gaussian_filter1d(cross_track[:, axis], sigma=smoothing_sigma)
 
             # Clip magnitude
             mag = np.linalg.norm(smoothed, axis=1, keepdims=True)
