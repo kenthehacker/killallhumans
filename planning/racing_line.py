@@ -31,6 +31,14 @@ while preserving tracking accuracy.
 Research: COP (Bohm 2022) — Pareto-aware normalized multi-objective;
 CiMPCC (Li 2025) — curvature-integrated speed optimization;
 ILMPC (Zhao 2025) — adaptive cost, pure time → gate misses.
+
+Iteration 24: basin-bridging interpolation generates intermediate racing
+line candidates between the two L-BFGS basins. Instead of only 2 distinct
+solutions, the pool now includes 3 convex-interpolated candidates at
+α ∈ {0.25, 0.50, 0.75}. This directly addresses the bipartite candidate
+pool diagnosed in iter 23.
+Research: QuayPoints (2025) — λ-interpolation between racing lines;
+Spatially-Aware CMA-ES (Wachter 2026) — population-based basin exploration.
 """
 
 from __future__ import annotations
@@ -260,6 +268,69 @@ class RacingLineOptimizer:
                 raw_metrics.append((avg_err, worst_gate_err, race_time, idx))
             except Exception:
                 raw_metrics.append((999.0, 999.0, 999.0, idx))
+
+        # --- Basin-bridging interpolation (iteration 24) ---
+        # Research: QuayPoints (2025) — λ_interp = α·λ_A + (1-α)·λ_B
+        # produces valid intermediate racing lines between known basins.
+        # Spatially-Aware CMA-ES (Wachter 2026) — population-based search
+        # explores across basins; interpolation is the lightweight equivalent.
+        valid_for_basins = [
+            (a, w, t, i) for a, w, t, i in raw_metrics if a < 999.0
+        ]
+        if len(valid_for_basins) >= 2:
+            # Identify basins by race_time extremes
+            times_list = [m[2] for m in valid_for_basins]
+            time_range = max(times_list) - min(times_list)
+            if time_range > 0.05:  # distinct basins exist (>50ms gap)
+                basin_a_entry = min(valid_for_basins, key=lambda m: m[2])
+                basin_b_entry = max(valid_for_basins, key=lambda m: m[2])
+                basin_a_idx = basin_a_entry[3]
+                basin_b_idx = basin_b_entry[3]
+                offsets_a = all_results[basin_a_idx].x
+                offsets_b = all_results[basin_b_idx].x
+
+                # Generate 3 interpolated candidates at α = 0.25, 0.50, 0.75
+                # α=1.0 is Basin A (fast), α=0.0 is Basin B (slow)
+                interp_alphas = [0.75, 0.50, 0.25]
+                for alpha in interp_alphas:
+                    offsets_interp = alpha * offsets_a + (1 - alpha) * offsets_b
+                    # Index must match between raw_metrics and all_results
+                    interp_idx = len(raw_metrics)
+                    try:
+                        positions = self._apply_offsets(gates, offsets_interp)
+                        candidate_gates = []
+                        for i, gate in enumerate(gates):
+                            candidate_gates.append(GateWaypoint(
+                                position=positions[i],
+                                normal=gate.normal,
+                                width=gate.width,
+                                height=gate.height,
+                                yaw=gate.yaw,
+                            ))
+
+                        trajectory = traj_opt.optimize(
+                            candidate_gates, start_position, (0, 0, 0)
+                        )
+
+                        avg_err, worst_gate_err, race_time = self._kinematic_eval(
+                            trajectory, start_position, gates
+                        )
+
+                        raw_metrics.append((avg_err, worst_gate_err, race_time, interp_idx))
+                        # Store the interpolated offsets for later use
+                        # Create a mock result object with the interpolated offsets
+                        class _InterpolatedResult:
+                            def __init__(self, x):
+                                self.x = x
+                                self.fun = 0.0
+                        all_results.append(_InterpolatedResult(offsets_interp))
+                    except Exception:
+                        raw_metrics.append((999.0, 999.0, 999.0, interp_idx))
+                        class _InterpolatedResult:
+                            def __init__(self, x):
+                                self.x = x
+                                self.fun = 999.0
+                        all_results.append(_InterpolatedResult(offsets_interp))
 
         # Filter out failed evaluations
         valid = [(a, w, t, i) for a, w, t, i in raw_metrics if a < 999.0]
