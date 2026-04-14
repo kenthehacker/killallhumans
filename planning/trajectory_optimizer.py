@@ -283,13 +283,12 @@ class TrajectoryOptimizer:
                 waypoints, segment_times, start_velocity, gates,
             )
 
-        # Post-optimization: try uniform time compression (iteration 14).
-        # Inspired by MFRL (Ryou, IJRR 2024): binary search over scalar
-        # time scale while preserving allocation ratios. TOPPQuad (Mao,
-        # IROS 2024) shows that fixed-geometry trajectories can often be
-        # traversed faster without changing the path shape.
-        segment_times = self._compress_times(
-            waypoints, segment_times, start_velocity
+        # Post-optimization: TOPP-RA-style speed retiming (iteration 15).
+        # Uses actual polynomial curvature + forward-backward propagation
+        # to find near-optimal speed profile. Replaces heuristic compression.
+        # Research: TOPPQuad (Mao 2024), FBGA (Piazza 2025), TOPP-RA (Pham 2017).
+        segment_times = self._topp_retime(
+            waypoints, segment_times, start_velocity, gates
         )
         points = self._generate_trajectory(
             waypoints, segment_times, start_velocity, gates,
@@ -428,69 +427,120 @@ class TrajectoryOptimizer:
 
         return times
 
-    def _compress_times(
+    def _topp_retime(
         self,
         waypoints: List[np.ndarray],
         segment_times: List[float],
         start_velocity: Tuple[float, float, float],
+        gates: List[GateWaypoint],
     ) -> List[float]:
         """
-        Post-optimization: selectively compress easy segments to recover speed.
+        TOPP-RA-style forward-backward speed retiming using waypoint geometry.
 
-        Inspired by TOPPQuad (Mao, IROS 2024) and MFRL (Ryou, IJRR 2024):
-        the key insight is that straight/low-curvature segments can be
-        traversed faster without violating dynamic constraints, while
-        turn segments are already near their limits.
+        Uses the timing-independent geometric curvature from waypoint positions
+        (not from polynomial derivatives, which depend on current timing).
+        Then runs TOPP-RA forward-backward propagation to find the fastest
+        feasible speed profile respecting centripetal and longitudinal
+        acceleration limits.
 
-        Rather than uniform compression (which fails because turn segments
-        are already at acceleration limits), this selectively compresses
-        only segments where the current average speed is well below the
-        maximum velocity. This is a lightweight approximation of the TOPP
-        concept: maximize speed on straights, preserve timing on turns.
+        Research basis:
+        - TOPPQuad (Mao, IROS 2024): fix geometry, optimize speed → 40-50% faster
+        - FBGA (Piazza, RA-L 2025): forward-backward matches OC within 0.36%
+        - TOPP-RA (Pham & Pham, 2017): reachability-based forward-backward
         """
         times = list(segment_times)
         n = len(times)
+        if n < 2:
+            return times
 
+        # Acceleration budgets:
+        # Centripetal: max tilt 0.85→ g*tan(0.85) ≈ 11.4, use 10.0 for margin
+        # Longitudinal: budget for speed changes between segments
+        a_centripetal = 10.0
+        a_longitudinal = 8.0
         max_v = self.constraints.max_velocity
-        max_a = self.constraints.max_acceleration
+        min_v = 2.0
+        max_compression = 0.65  # don't compress below 65% of original
+
+        # --- Step 1: Compute segment distances and geometric curvature ---
+        seg_dist = []  # straight-line distances
+        seg_curv = []  # geometric curvature at segment endpoint
 
         for i in range(n):
-            if i >= len(waypoints) - 1:
-                break
-            dist = float(np.linalg.norm(waypoints[i + 1] - waypoints[i]))
-            if dist < 0.01:
+            if i + 1 < len(waypoints):
+                d = float(np.linalg.norm(waypoints[i + 1] - waypoints[i]))
+            else:
+                d = 0.01
+            seg_dist.append(max(d, 0.01))
+
+            # Geometric curvature at waypoint i+1 (endpoint of segment i)
+            # κ ≈ 2 * sin(θ/2) / chord_length (Menger curvature from 3 points)
+            k = 0.0
+            if 0 < i + 1 < len(waypoints) - 1:
+                p0 = waypoints[i]
+                p1 = waypoints[i + 1]
+                p2 = waypoints[i + 2] if i + 2 < len(waypoints) else p1
+                v1 = p1 - p0
+                v2 = p2 - p1
+                n1 = float(np.linalg.norm(v1))
+                n2 = float(np.linalg.norm(v2))
+                if n1 > 0.01 and n2 > 0.01:
+                    # Cross product magnitude gives twice the triangle area
+                    cross_mag = float(np.linalg.norm(np.cross(v1, v2)))
+                    # Menger curvature: κ = 2*|cross| / (|v1| * |v2| * |v1+v2|)
+                    chord = float(np.linalg.norm(p2 - p0))
+                    if chord > 0.01:
+                        k = 2.0 * cross_mag / (n1 * n2 * chord)
+            seg_curv.append(k)
+
+        # --- Step 2: Speed limits from curvature ---
+        # Use the MAX curvature of the two endpoints of each segment
+        v_max_seg = []
+        for i in range(n):
+            k_start = seg_curv[i - 1] if i > 0 else 0.0
+            k_end = seg_curv[i]
+            k_max = max(k_start, k_end)
+            if k_max > 1e-4:
+                v_limit = math.sqrt(a_centripetal / k_max)
+                v_limit = min(v_limit, max_v)
+            else:
+                v_limit = max_v
+            v_max_seg.append(max(v_limit, min_v))
+
+        # --- Step 3: Forward-backward propagation ---
+        v_start = float(np.linalg.norm(np.array(start_velocity)))
+        v_start = max(v_start, min_v)
+
+        # Forward pass: v² = v0² + 2*a*s
+        v_fwd = [0.0] * n
+        v_fwd[0] = min(v_start, v_max_seg[0])
+        for i in range(1, n):
+            v_sq = v_fwd[i - 1] ** 2 + 2.0 * a_longitudinal * seg_dist[i - 1]
+            v_fwd[i] = min(v_max_seg[i], math.sqrt(max(v_sq, 0.0)), max_v)
+
+        # Backward pass: deceleration from end
+        v_bwd = [0.0] * n
+        v_bwd[n - 1] = min(v_max_seg[n - 1], max_v * 0.5)  # end slower
+        for i in range(n - 2, -1, -1):
+            v_sq = v_bwd[i + 1] ** 2 + 2.0 * a_longitudinal * seg_dist[i]
+            v_bwd[i] = min(v_max_seg[i], math.sqrt(max(v_sq, 0.0)))
+
+        # --- Step 4: Optimal speed = min(forward, backward) ---
+        v_opt = [max(min(v_fwd[i], v_bwd[i]), min_v) for i in range(n)]
+
+        # --- Step 5: Compute new segment times ---
+        new_times = list(times)
+        for i in range(n):
+            if seg_dist[i] < 0.01:
                 continue
-            avg_v = dist / max(times[i], 0.01)
+            new_time = seg_dist[i] / v_opt[i]
+            # Don't compress below max_compression of original
+            new_time = max(new_time, times[i] * max_compression)
+            # Only compress, never expand
+            new_time = min(new_time, times[i])
+            new_times[i] = max(new_time, 0.1)
 
-            # Only compress if current speed is below 75% of max velocity
-            # and the segment is long enough to benefit (>0.3s)
-            if avg_v < max_v * 0.75 and times[i] > 0.3:
-                # Target: increase speed toward 85% of max_velocity,
-                # but cap at 15% speedup to be conservative
-                target_v = min(max_v * 0.85, avg_v * 1.15)
-
-                # Check acceleration constraint at boundaries
-                feasible = True
-                if i > 0:
-                    prev_dist = float(np.linalg.norm(
-                        waypoints[i] - waypoints[i - 1]))
-                    prev_v = prev_dist / max(times[i - 1], 0.01)
-                    accel = abs(target_v - prev_v) / max(times[i - 1], 0.01)
-                    if accel > max_a * 0.90:
-                        feasible = False
-                if feasible and i + 1 < n and i + 2 < len(waypoints):
-                    next_dist = float(np.linalg.norm(
-                        waypoints[i + 2] - waypoints[i + 1]))
-                    next_v = next_dist / max(times[i + 1], 0.01)
-                    accel = abs(next_v - target_v) / max(times[i], 0.01)
-                    if accel > max_a * 0.90:
-                        feasible = False
-
-                if feasible:
-                    new_time = dist / target_v
-                    times[i] = max(new_time, 0.1)
-
-        return times
+        return new_times
 
     def _relax_for_fov(
         self,
