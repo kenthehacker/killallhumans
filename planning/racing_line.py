@@ -53,7 +53,17 @@ class RacingLineOptimizer:
 
     For each gate, finds the optimal pass-through point within the
     gate opening that minimizes total path length and curvature.
+
+    Uses multi-start L-BFGS-B (iteration 19) to escape local minima.
+    Research: T-MPC (de Groot, T-RO 2024) — parallel optimization from
+    diverse homotopy seeds with fallback guarantee (Theorem 2).
+    AERO-MPPI (Chen, ICRA 2026) — ensemble of M parallel optimizers
+    from structurally different initializations.
+    F1-Init (Shehadeh 2026) — initialization sensitivity causes
+    convergence to suboptimal local minima.
     """
+
+    N_STARTS = 10  # 1 zero + 1 late-apex + 8 random (deterministic seed)
 
     def __init__(self, config: RacingLineConfig = None):
         self.config = config or RacingLineConfig()
@@ -66,6 +76,10 @@ class RacingLineOptimizer:
         """
         Optimize gate pass-through points for minimum time.
 
+        Uses multi-start L-BFGS-B to explore multiple basins of attraction.
+        Includes zero-initialization as fallback (guaranteed no regression
+        per T-MPC Theorem 2, de Groot et al. T-RO 2024).
+
         Returns a new list of GateWaypoints with optimized positions
         (offset within gate openings for corner cutting).
         """
@@ -73,9 +87,8 @@ class RacingLineOptimizer:
             return list(gates)
 
         n = len(gates)
-        # Optimization variables: lateral offset for each gate [-1, 1]
-        # and vertical offset [-1, 1]
-        x0 = np.zeros(n * 2)  # (lateral, vertical) per gate
+        max_off = self.config.max_lateral_offset
+        bounds = [(-max_off, max_off)] * (n * 2)
 
         def objective(offsets: np.ndarray) -> float:
             points = self._apply_offsets(gates, offsets)
@@ -105,18 +118,38 @@ class RacingLineOptimizer:
                 + self.config.smoothness_weight * curvature
             )
 
-        # Bounds: offsets limited to gate opening
-        max_off = self.config.max_lateral_offset
-        bounds = [(-max_off, max_off)] * (n * 2)
+        # --- Multi-start initialization (iteration 19) ---
+        # Research: AERO-MPPI runs M=15 parallel instances from diverse seeds.
+        # T-MPC runs P=4 parallel MPCs from distinct homotopy classes.
+        # F1-Init shows initialization quality determines which basin L-BFGS finds.
+        candidates = []
 
-        result = minimize(
-            objective, x0,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": 100},
-        )
+        # Start 0: zero initialization (current baseline — fallback guarantee)
+        candidates.append(np.zeros(n * 2))
 
-        optimized_positions = self._apply_offsets(gates, result.x)
+        # Start 1: late-apex geometric prior for S-turns
+        # For each gate, compute turn direction and offset to cut inside.
+        # Research: F1-Init — geometric prior places optimizer in better basin.
+        candidates.append(self._late_apex_init(gates, start_position, n, max_off))
+
+        # Starts 2..N_STARTS-1: random initializations (deterministic seed)
+        rng = np.random.default_rng(42)
+        for _ in range(self.N_STARTS - 2):
+            candidates.append(rng.uniform(-max_off, max_off, n * 2))
+
+        # Run L-BFGS-B from each candidate, select best by objective value
+        best_result = None
+        for x0 in candidates:
+            result = minimize(
+                objective, x0,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={"maxiter": 300},  # raised from 100 (F1-Init: baseline needs 520 iters)
+            )
+            if best_result is None or result.fun < best_result.fun:
+                best_result = result
+
+        optimized_positions = self._apply_offsets(gates, best_result.x)
         optimized_gates = []
         for i, gate in enumerate(gates):
             optimized_gates.append(GateWaypoint(
@@ -128,6 +161,38 @@ class RacingLineOptimizer:
             ))
 
         return optimized_gates
+
+    def _late_apex_init(
+        self,
+        gates: List[GateWaypoint],
+        start_position: Tuple[float, float, float],
+        n: int,
+        max_off: float,
+    ) -> np.ndarray:
+        """
+        Compute a late-apex initialization for the racing line.
+
+        For each gate, determines the turn direction (left/right) and
+        sets the lateral offset to cut the inside of the turn.
+        Research: F1-Init (Shehadeh 2026) — expert-like initialization
+        places optimizer closer to the optimal basin.
+        """
+        x0 = np.zeros(n * 2)
+        centers = [np.array(start_position)]
+        for g in gates:
+            centers.append(np.array(g.position))
+
+        for i in range(n):
+            if i == 0 or i >= n - 1:
+                continue  # first and last gate: keep centered
+            v_in = centers[i + 1] - centers[i]
+            v_out = centers[i + 2] - centers[i + 1] if i + 2 < len(centers) else v_in
+            # Cross product Z-component determines turn direction (NED: -Z is up)
+            cross_z = v_in[0] * v_out[1] - v_in[1] * v_out[0]
+            if abs(cross_z) > 0.1:
+                # Cut inside the turn: positive cross_z = left turn → offset right
+                x0[i] = -np.sign(cross_z) * max_off * 0.5
+        return x0
 
     def _apply_offsets(
         self,
