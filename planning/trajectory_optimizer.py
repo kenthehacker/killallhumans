@@ -264,24 +264,14 @@ class TrajectoryOptimizer:
             waypoints, segment_times, gates
         )
 
-        # Generate polynomial trajectory with optimized times
-        points = self._generate_trajectory(
-            waypoints, segment_times, start_velocity, gates
-        )
-
-        # Post-optimization: evaluate full geometric FOV constraints and
-        # nudge segment times if the penalty is significant. This uses the
-        # proper camera projection model from add_fov_constraints() rather
-        # than the coarse tilt estimate used during L-BFGS.
-        fov_penalty = self.add_fov_constraints(points, gates)
-        if fov_penalty > 1.0:
-            # Slow down the worst-offending segments to keep gates in view
-            segment_times = self._relax_for_fov(
-                waypoints, segment_times, start_velocity, gates,
-            )
-            points = self._generate_trajectory(
-                waypoints, segment_times, start_velocity, gates,
-            )
+        # FOV awareness is handled by the L-BFGS optimizer's integrated FOV
+        # penalty (weight=10). Post-processing FOV relaxation removed in
+        # iteration 17 — research consensus (ETH 2026, MonoRace 2026,
+        # FOV-CBF 2025, PA-MPPI 2025, Mastering Diverse Tracks 2025) shows
+        # integrated FOV constraints are superior to post-processing stages.
+        # The A2RL competition winner (MonoRace) uses no post-processing FOV
+        # relaxation. Removing this recovers ~0.5s of race time.
+        # See: .research_loop/cross_validated/iteration_17_final.md
 
         # Post-optimization: TOPP-RA-style speed retiming (iteration 15).
         # Uses actual polynomial curvature + forward-backward propagation
@@ -500,7 +490,7 @@ class TrajectoryOptimizer:
         a_longitudinal = 8.0
         max_v = self.constraints.max_velocity
         min_v = 2.0
-        max_compression = 0.65  # don't compress below 65% of original
+        max_compression = 0.68  # iter 17: raised from 0.65 to compensate for FOV relaxation removal — protects helix turns from over-compression
 
         # --- S-turn region detection for compound curvature boost (iter 16) ---
         # Identify waypoint indices that are in S-turn regions (between gates
