@@ -421,13 +421,32 @@ class TrajectoryOptimizer:
                     severity = min(excess, 1.0)
                     inflate = 1.0 + 0.15 * severity  # range: 1.0x to 1.15x (reduced from 0.25, iter 9)
 
-            # --- S-turn compound inflation (iteration 16) ---
+            # --- S-turn first-gate detection (iteration 20) ---
+            # Detect when this gate is the FIRST of an S-turn pair (next gate
+            # has turn in opposite lateral direction). At S-turn entry, the
+            # drone must prepare for the upcoming lateral velocity reversal.
+            # Research: Mastering Diverse Tracks (Yu, RA-L 2025) — N→N+1 gate
+            # lookahead shapes trajectory through gate N considering gate N+1.
+            # VPMPCC (Li 2024) — early deceleration before S-turns.
+            is_s_turn_first = False
+            if gi + 1 < n_gates - 1 and turn_angle > 0.25:
+                if cross_z[gi] != 0 and cross_z[gi + 1] != 0:
+                    is_s_turn_first = (cross_z[gi] * cross_z[gi + 1] < 0)
+
+            # --- S-turn compound inflation (iteration 16, updated iter 20) ---
             # For the second gate of an S-turn pair, apply extra inflation.
             # The drone arrives with lateral velocity in the wrong direction
             # and must reverse it — requires more time than a single turn.
             # Research: CiMPCC compound curvature, VPMPCC sustained low speed.
             if is_s_turn:
-                s_turn_inflate = 1.10  # 10% compound inflation (tuned down from 15%, iter 16)
+                # Junction gates (both first AND second of S-turn pairs) get
+                # extra inflation — cascading S-turns with no straight recovery.
+                # Research: CiMPCC (Li 2024) — compound curvature doesn't drop
+                # between consecutive opposite turns.
+                if is_s_turn_first:
+                    s_turn_inflate = 1.13  # junction: 13% (boosted from 10%, iter 20)
+                else:
+                    s_turn_inflate = 1.10  # standard second-gate: 10% (iter 16)
                 inflate = max(inflate, s_turn_inflate)
 
                 # Also inflate the APPROACH segment (prev gate exit → this entry).
@@ -435,6 +454,24 @@ class TrajectoryOptimizer:
                 approach_seg = seg_entry - 1  # segment from prev gate exit to this entry
                 if 0 <= approach_seg < len(times):
                     times[approach_seg] *= 1.05  # 5% approach deceleration (tuned: 10%→7%→5%)
+
+            # --- S-turn first-gate departure inflation (iteration 20) ---
+            # For the first gate of an S-turn pair, inflate the EXIT/departure
+            # segments to give the controller time to settle before reversing
+            # lateral velocity toward the next gate.
+            # Research: VPMPCC (Li 2024) — approach segments to second turn need
+            # slowing. Imitation Learning (Zhou 2024) — opposite-direction
+            # transition phases need deceleration management.
+            if is_s_turn_first and not is_s_turn:
+                # Pure first-gate (not junction) — inflate departure only
+                depart_seg = seg_through + 1  # segment from gate exit to next entry
+                if 0 <= depart_seg < len(times):
+                    times[depart_seg] *= 1.06  # 6% departure inflation
+            elif is_s_turn_first and is_s_turn:
+                # Junction gate — already boosted to 1.13 above; also inflate departure
+                depart_seg = seg_through + 1
+                if 0 <= depart_seg < len(times):
+                    times[depart_seg] *= 1.04  # 4% departure inflation (less than pure first)
 
             # Bidirectional proximity-based inflation for closely-spaced gates (iter 13, updated iter 18).
             # Helix gates are 3.6-5.7m apart; short polynomial segments create
@@ -517,10 +554,20 @@ class TrajectoryOptimizer:
             for gi in range(2, n_gates - 1):
                 if gi - 1 in cross_z and gi in cross_z:
                     if cross_z[gi - 1] * cross_z[gi] < 0:
-                        # S-turn: mark segments around this gate
+                        # S-turn second gate: mark segments around this gate
                         # Gate gi waypoints: entry=2*gi+1, exit=2*gi+2
                         # Segments: approach (2*gi-1 to 2*gi+1), through (2*gi+1)
                         for s in range(max(0, 2 * gi - 1), min(n, 2 * gi + 3)):
+                            s_turn_segments.add(s)
+            # --- S-turn first-gate region detection (iteration 20) ---
+            # Also mark segments around first-gate S-turns so compound curvature
+            # boost applies to departure segments too.
+            # Research: VPMPCC (Li 2024) — approach to second turn needs slowing.
+            for gi in range(1, n_gates - 2):
+                if gi in cross_z and gi + 1 in cross_z:
+                    if cross_z[gi] * cross_z[gi + 1] < 0:
+                        # S-turn first gate: mark departure segments
+                        for s in range(max(0, 2 * gi + 1), min(n, 2 * gi + 4)):
                             s_turn_segments.add(s)
 
         # --- Step 1: Compute segment distances and geometric curvature ---
