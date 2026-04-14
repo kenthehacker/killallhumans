@@ -293,21 +293,40 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
-    # --- Offline ILC position-offset table (iteration 25) ---
-    # Computes a cross-track position offset via P-type ILC to reduce systematic
-    # tracking error, especially in the helix section (gates 7-10).
-    # The offset is applied to the controller's position reference at runtime,
-    # preserving the original trajectory's polynomial derivatives for feedforward.
-    # Research: Schoellig et al. 2012, Spatial ILC (Lv 2023), ILMPC (Zhao 2025).
+    # --- Offline per-section ILC position-offset table (iteration 26) ---
+    # Per-section ILC prevents cross-contamination between S-turn and helix sections.
+    # Each section gets its own learning rate and independent offset accumulation.
+    # Blended at boundaries to avoid discontinuities.
+    # Research: Zhang 2024 (segment-wise ILC), Liu 2023 (time-varying gains),
+    # Schoellig 2012, Spatial ILC (Lv 2023), ILMPC (Zhao 2025).
     from planning.trajectory_optimizer import compute_ilc_offset_table
+    # Section boundary: midpoint between gate-6 (~6.8s) and gate-7 (~8.0s)
+    # = ~7.4s → step 740 at dt=0.01
+    n_total_steps = int(trajectory.total_time / dt) + 50
+    section_boundary_step = int(7.4 / dt)  # ~740
+    # --- Offline per-section ILC position-offset table (iteration 26) ---
+    # Per-section ILC with section-specific correction limits allows the helix section
+    # to accumulate larger offsets (0.35m) where errors are highest, while keeping
+    # S-turn corrections conservative (0.15m) to avoid max-error regression.
+    # Research: Zhang 2024 (segment-wise ILC), Liu 2023 (time-varying gains),
+    # Schoellig 2012, Spatial ILC (Lv 2023), ILMPC (Zhao 2025).
+    from planning.trajectory_optimizer import compute_ilc_offset_table
+    n_total_steps = int(trajectory.total_time / dt) + 50
+    section_boundary_step = int(7.4 / dt)  # ~740: midpoint between gate-6 and gate-7
+    section_boundaries = [
+        (0, section_boundary_step, 0.4, 0.15),             # S-turn: gates 1-6, conservative
+        (section_boundary_step, n_total_steps, 0.4, 0.35),  # Helix: gates 7-12, higher limit
+    ]
     ilc_offsets = compute_ilc_offset_table(
         trajectory, tuple(start_pos),
-        alpha=0.4,             # conservative learning rate
-        max_iterations=5,      # convergence typically in 3-5 (Schoellig 2012)
-        smoothing_sigma=10.0,  # Gaussian kernel width (timesteps at dt=0.01)
-        max_correction_m=0.15, # safety limit on cross-track shift
-        convergence_threshold=0.002,  # stop when <2mm improvement
-        dt=dt,                 # must match benchmark sim timestep
+        alpha=0.4,
+        max_iterations=5,
+        smoothing_sigma=10.0,
+        max_correction_m=0.15,
+        convergence_threshold=0.002,
+        dt=dt,
+        section_boundaries=section_boundaries,
+        blend_steps=50,
     )
 
     # Use consistent physics parameters between tracker and kinematic model.
