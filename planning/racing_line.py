@@ -13,6 +13,15 @@ Key insights from the research:
     on a longer timescale than human pilots, cutting corners aggressively.
   - Corner cutting: when two consecutive gates require a turn, fly through
     the inside edge of the first gate to reduce path curvature.
+
+Iteration 22: sim-based racing line selection replaces proxy-objective
+selection. Instead of selecting the best L-BFGS candidate by
+(path_length + curvature²), we build a full trajectory for each candidate
+and run a lightweight kinematic sim to evaluate actual tracking error.
+Research: AERO-MPPI (Chen 2026) — ensemble re-rollout under common cost;
+T-MPC (de Groot 2024) — parallel planners with fallback guarantee;
+BO Racing Line (Jain 2020) — sim oracle for trajectory selection;
+TACO (Sanghvi 2025) — trajectory-aware optimization reduces error 32%.
 """
 
 from __future__ import annotations
@@ -137,8 +146,10 @@ class RacingLineOptimizer:
         for _ in range(self.N_STARTS - 2):
             candidates.append(rng.uniform(-max_off, max_off, n * 2))
 
-        # Run L-BFGS-B from each candidate, select best by objective value
-        best_result = None
+        # Run L-BFGS-B from each candidate, collect ALL results (iter 22)
+        # Research: AERO-MPPI collects all M=15 optimizer outputs before selection.
+        # T-MPC collects P parallel solutions + non-guided fallback.
+        all_results = []
         for x0 in candidates:
             result = minimize(
                 objective, x0,
@@ -146,8 +157,18 @@ class RacingLineOptimizer:
                 bounds=bounds,
                 options={"maxiter": 300},  # raised from 100 (F1-Init: baseline needs 520 iters)
             )
-            if best_result is None or result.fun < best_result.fun:
-                best_result = result
+            all_results.append(result)
+
+        # --- Sim-based selection (iteration 22) ---
+        # Instead of selecting by L-BFGS objective (proxy), build a full
+        # trajectory for each candidate and evaluate via kinematic sim.
+        # Research: AERO-MPPI re-rolls all candidates under common cost.
+        # BO Racing Line (Jain 2020) uses sim oracle, not geometric proxy.
+        # TACO (Sanghvi 2025) adapts trajectory to controller capability.
+        best_idx = self._select_by_sim(
+            gates, all_results, start_position
+        )
+        best_result = all_results[best_idx]
 
         optimized_positions = self._apply_offsets(gates, best_result.x)
         optimized_gates = []
@@ -161,6 +182,179 @@ class RacingLineOptimizer:
             ))
 
         return optimized_gates
+
+    def _select_by_sim(
+        self,
+        gates: List[GateWaypoint],
+        all_results: list,
+        start_position: Tuple[float, float, float],
+    ) -> int:
+        """
+        Select the best racing line candidate by kinematic sim evaluation.
+
+        Builds a full trajectory for each L-BFGS result and runs a lightweight
+        kinematic tracking simulation to measure actual tracking error. Selects
+        by composite score: 0.7 * avg_error + 0.3 * worst_gate_error.
+
+        Falls back to L-BFGS objective selection if sim evaluation fails.
+
+        Research: AERO-MPPI (Chen 2026) — re-rollout under common cost;
+        T-MPC (de Groot 2024) — Theorem 2 fallback guarantee (zero-init
+        included as candidate, so sim-based selection can't regress);
+        BO Racing Line (Jain 2020) — sim oracle for trajectory selection.
+        """
+        from .trajectory_optimizer import (
+            DroneConstraints, TrajectoryOptimizer, TrajectoryPoint,
+        )
+
+        traj_opt = TrajectoryOptimizer(
+            constraints=DroneConstraints(max_velocity=15.0),
+            dt_sample=0.02,  # coarser than benchmark for speed
+        )
+
+        scores = []
+        for idx, result in enumerate(all_results):
+            try:
+                # Build gate waypoints from this candidate's offsets
+                positions = self._apply_offsets(gates, result.x)
+                candidate_gates = []
+                for i, gate in enumerate(gates):
+                    candidate_gates.append(GateWaypoint(
+                        position=positions[i],
+                        normal=gate.normal,
+                        width=gate.width,
+                        height=gate.height,
+                        yaw=gate.yaw,
+                    ))
+
+                # Build full trajectory
+                trajectory = traj_opt.optimize(
+                    candidate_gates, start_position, (0, 0, 0)
+                )
+
+                # Run lightweight kinematic sim
+                avg_err, worst_gate_err, race_time = self._kinematic_eval(
+                    trajectory, start_position, gates
+                )
+
+                # Composite score: prioritize avg error, penalize worst gate
+                score = 0.7 * avg_err + 0.3 * worst_gate_err
+                scores.append((score, race_time, idx))
+            except Exception:
+                # If trajectory build or sim fails, assign worst score
+                scores.append((999.0, 999.0, idx))
+
+        if not scores or all(s[0] >= 999.0 for s in scores):
+            # Fallback: L-BFGS objective selection (T-MPC Theorem 2)
+            best_idx = 0
+            best_fun = all_results[0].fun
+            for i, r in enumerate(all_results):
+                if r.fun < best_fun:
+                    best_fun = r.fun
+                    best_idx = i
+            return best_idx
+
+        # Select by lowest composite score
+        scores.sort(key=lambda x: (x[0], x[1]))
+        return scores[0][2]
+
+    @staticmethod
+    def _kinematic_eval(
+        trajectory,
+        start_position: Tuple[float, float, float],
+        gates: List[GateWaypoint],
+    ) -> Tuple[float, float, float]:
+        """
+        Lightweight kinematic sim to evaluate trajectory tracking quality.
+
+        Replicates the benchmark kinematic sim physics with coarser dt=0.02
+        for faster evaluation. Returns (avg_error, worst_gate_error, race_time).
+
+        Physics: PD controller + drag + acceleration clamp.
+        Same gains as benchmark: kp_xy=6, kd_xy=4, kp_z=8, kd_z=5, ff=0.4.
+        """
+        dt = 0.02
+        max_accel = 15.0
+        max_speed = 15.0
+        drag = 0.5
+        kp_xy, kd_xy = 6.0, 4.0
+        kp_z, kd_z = 8.0, 5.0
+        ff_accel = 0.4
+
+        pos = np.array(start_position, dtype=float)
+        vel = np.zeros(3)
+
+        tracking_errors = []
+        per_gate_errors: dict = {}
+        n_steps = int(trajectory.total_time / dt) + 50  # small overrun buffer
+        race_time = trajectory.total_time
+
+        # Pre-compute gate centers for gate assignment
+        gate_centers = [np.array(g.position) for g in gates]
+        n_gates = len(gate_centers)
+
+        for step in range(n_steps):
+            sim_time = step * dt
+            if sim_time > trajectory.total_time + 1.0:
+                break
+
+            # Get reference
+            ref = trajectory.sample(sim_time)
+            target_pos = np.array(ref.position)
+            target_vel = np.array(ref.velocity)
+            ref_acc = np.array(ref.acceleration)
+
+            # PD controller with feedforward (matches benchmark GeometricTracker)
+            pos_err = target_pos - pos
+            vel_err = target_vel - vel
+
+            accel_des = np.zeros(3)
+            # XY
+            accel_des[0] = kp_xy * pos_err[0] + kd_xy * vel_err[0]
+            accel_des[1] = kp_xy * pos_err[1] + kd_xy * vel_err[1]
+            # Z
+            accel_des[2] = kp_z * pos_err[2] + kd_z * vel_err[2]
+            # Feedforward
+            accel_des += ff_accel * ref_acc
+
+            # Drag
+            accel = accel_des - drag * vel
+
+            # Clamp
+            accel_mag = np.linalg.norm(accel)
+            if accel_mag > max_accel:
+                accel = accel / accel_mag * max_accel
+
+            # Integrate
+            vel = vel + accel * dt
+            speed = np.linalg.norm(vel)
+            if speed > max_speed:
+                vel = vel / speed * max_speed
+            pos = pos + vel * dt
+
+            # Tracking error (closest point on trajectory)
+            closest = trajectory.find_closest(tuple(pos))
+            err = math.sqrt(sum(
+                (a - b) ** 2 for a, b in zip(pos, closest.position)
+            ))
+            tracking_errors.append(err)
+
+            # Assign error to nearest gate (for worst-gate computation)
+            if n_gates > 0:
+                dists_to_gates = [
+                    float(np.linalg.norm(pos - gc)) for gc in gate_centers
+                ]
+                nearest_gate_idx = int(np.argmin(dists_to_gates))
+                gate_id = f"gate-{nearest_gate_idx + 1}"
+                per_gate_errors.setdefault(gate_id, []).append(err)
+
+        avg_err = float(np.mean(tracking_errors)) if tracking_errors else 999.0
+        worst_gate_err = 0.0
+        for gate_id, errs in per_gate_errors.items():
+            gate_avg = float(np.mean(errs))
+            worst_gate_err = max(worst_gate_err, gate_avg)
+
+        return avg_err, worst_gate_err, race_time
 
     def _late_apex_init(
         self,
