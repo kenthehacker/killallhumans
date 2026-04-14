@@ -1,6 +1,6 @@
 {
-  "iteration": 6,
-  "timestamp": "2026-04-13T16:41:00Z",
+  "iteration": 7,
+  "timestamp": "2026-04-13T17:30:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -19,22 +19,13 @@
     "alternating_peak_optimization_2024",
     "time_optimal_waypoint_foehn_2021",
     "taco_sanghvi_2025",
-    "lmpc_adaptive_cost_zhao_2025"
+    "lmpc_adaptive_cost_zhao_2025",
+    "toppquad_mao_2024",
+    "aggressiveness_aware_control_2026",
+    "alternating_peak_foehn_2024"
   ],
-  "total_papers_analyzed": 15,
+  "total_papers_analyzed": 18,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.398,
-    "max_tracking_error_m": 1.310,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7397,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.932,
-    "race_time_s": 14.73
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.336,
     "max_tracking_error_m": 0.990,
@@ -46,72 +37,85 @@
     "worst_gate_error_m": 0.661,
     "race_time_s": 15.28
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.285,
+    "max_tracking_error_m": 0.759,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7722,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.509,
+    "race_time_s": 16.74
+  },
   "changes_committed": true,
-  "commit_hash": "bc42b9b",
+  "commit_hash": "050205f",
   "diagnostic": {
-    "root_cause": "Gate-7 helix entry tracking error (0.932m) was caused by the L-BFGS optimizer not allocating enough time to segments around sharp gate-center turns. Entry/exit waypoints diluted turn angles so L-BFGS-internal curvature penalties were ineffective. Post-optimization time inflation using gate-center turn angles (not waypoint angles) solved the dilution problem.",
+    "root_cause": "Gate-3/gate-4 S-turn tracking errors (0.661m/0.598m) were caused by insufficient time allocation at moderate turns (48°/38°) with long approach distances (11.7m/10.5m). The PD controller (kp_xy=6, kd_xy=4) cannot redirect the drone fast enough when centripetal acceleration a_c = v²κ exceeds ~3.5 m/s². Turn angle alone was insufficient — the centripetal acceleration metric captures the combined effect of speed AND curvature.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.112,
-      "avg_thrust": 0.784,
+      "avg_pitch_rad": -0.106,
+      "avg_thrust": 0.739,
       "controller_saturation_gates": [3, 4, 7]
     },
     "trend": "improving",
     "architectural_issues": [
-      "Gates 3-4 (S-turn) are now the worst at 0.661m/0.598m — turn angles (48°/38°) are below the 60° inflation threshold but the long approach distances (11.7m/10.5m) allow high speed into moderate turns",
-      "Controller still saturates at 0.85 rad tilt at gates 3, 4, 7",
-      "Race time increased 3.7% (14.73→15.28s) due to time inflation at sharp turns — partially recoverable by tuning time_weight",
-      "The L-BFGS optimizer objective is reaching its limits — further improvements require either better trajectory representation or stronger controller"
+      "Kinematic sim bypasses tilt limit — uses raw last_desired_acceleration (unclamped by tilt), only caps at max_accel=15.0. The 0.85 rad tilt saturation is cosmetic and does NOT affect sim dynamics. Raising max_tilt_rad has ZERO effect on benchmarks.",
+      "Speed-accuracy Pareto frontier intensifying: iter 5 (14.73s/0.398m) → iter 6 (15.28s/0.336m) → iter 7 (16.74s/0.285m). Race time regressed 14% since iter 5 while accuracy improved 28%.",
+      "Gate-4 S-turn cumulative effect (alternating turn directions across gates 2-3-4) not captured by per-gate curvature estimates — gate-4 remains at 0.509m",
+      "PD controller bandwidth (kp_xy=6, kd_xy=4) is the fundamental tracking limit — further trajectory inflation has diminishing returns"
     ],
     "critic_findings": [
-      "Avg tracking error 0.336m is well within 0.5m threshold — 0.164m headroom",
-      "Max tracking error dropped below 1.0m for first time (0.990m) — significant safety improvement",
-      "Gate-3/gate-4 S-turn errors are unchanged from iter 5 — inflation doesn't help because turn angles are below threshold",
-      "Race time regression is modest (+3.7%) but moves away from 14s aspirational target"
+      "Avg tracking error 0.285m with 0.215m headroom to 0.5m threshold",
+      "Max tracking error 0.759m — well below 2.0m threshold and below 1.0m for first time",
+      "Centripetal acceleration (v²κ) correctly identifies gates where speed + moderate curvature exceeds controller capability — validated by TOPPQuad and Alternating Peak papers",
+      "Race time 16.74s has regressed 10% from iter 6 (15.28s) and 14% from iter 5 (14.73s) — recovery is next priority",
+      "Downstream gates 9-12 improved significantly (up to -0.107m at gate-11) from slower overall trajectory"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Reduce gate-3/gate-4 S-turn tracking error (0.661m/0.598m) — now the worst gates",
-      "proposed_approach": "Lower inflation threshold to ~45° to catch moderate turns, or use speed-proportional inflation (penalize high speed + moderate turn, not just sharp turn alone). Alternative: increase max_tilt_rad to 1.0 rad to give controller more authority.",
-      "expected_impact": "Gate-3 error 0.661→0.45m, gate-4 0.598→0.40m, avg error 0.336→0.30m",
+      "description": "Recover race time toward 14s target (currently 16.74s, was 14.73s at iter 5)",
+      "proposed_approach": "Increase time_weight from 2.0 to 2.5 in L-BFGS. Inflation still compensates at turns but optimizer pushes harder for speed on straight segments. Also consider reducing kinematic sim drag from 0.5 to 0.3.",
+      "expected_impact": "Race time 16.74→15.5s, avg error may increase slightly",
       "priority": 1,
-      "research_refs": ["taco_sanghvi_2025", "lmpc_adaptive_cost_zhao_2025"]
+      "research_refs": ["togt_planner_qin_2024", "realtime_mintime_teissing_2024"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Recover race time toward 14s target (currently 15.28s, was 14.73s)",
-      "proposed_approach": "Increase time_weight from 2.0 to 2.2-2.5 to make L-BFGS push harder for speed. May partially offset time inflation.",
-      "expected_impact": "Race time 15.28→14.5s",
+      "description": "S-turn cumulative effect — gate-4 still at 0.509m",
+      "proposed_approach": "Detect consecutive turns in opposite directions and boost inflation for the second turn. Or add angular velocity reset term.",
+      "expected_impact": "Gate-4 0.509→0.40m",
       "priority": 2,
-      "research_refs": ["togt_planner_qin_2024"]
-    },
-    {
-      "area": "system_integration",
-      "description": "Install gym-pybullet-drones for realistic physics validation",
-      "proposed_approach": "pip install gym-pybullet-drones, enable PyBullet benchmark path",
-      "expected_impact": "More realistic benchmarking; may reveal new issues with drag, motor dynamics",
-      "priority": 3,
-      "research_refs": []
+      "research_refs": ["taco_sanghvi_2025"]
     },
     {
       "area": "control",
-      "description": "Increase controller authority — raise max_tilt_rad or add integral term",
-      "proposed_approach": "max_tilt_rad from 0.85 to 1.0 rad (57°) gives controller more range for aggressive turns. Risk: may cause instability at extreme angles.",
-      "expected_impact": "Reduce controller saturation at sharp turns, lower tracking error at gates 3, 4, 7",
-      "priority": 4,
+      "description": "Controller gains optimization — PD gains kp_xy=6, kd_xy=4 limit tracking bandwidth",
+      "proposed_approach": "Bayesian optimization of kp_xy, kd_xy, kp_z, kd_z against benchmark reward. Per Leveling the Playing Field paper.",
+      "expected_impact": "Avg error -10% without race time cost",
+      "priority": 3,
       "research_refs": ["leveling_playing_field_2025"]
     },
     {
+      "area": "system_integration",
+      "description": "PyBullet physics validation — kinematic sim doesn't model tilt limits, motor dynamics, or aerodynamics",
+      "proposed_approach": "Install gym-pybullet-drones, enable PyBullet benchmark",
+      "expected_impact": "More realistic benchmarking",
+      "priority": 4,
+      "research_refs": []
+    },
+    {
       "area": "perception_estimation",
-      "description": "Port perception modules from race_pipeline.py into sim_pybullet runner",
-      "proposed_approach": "Integrate GateTracker/GatePnP/EKF into runner for perception filtering",
-      "expected_impact": "Eliminate raw detection target jumps in PyBullet sim",
+      "description": "Perception pipeline integration — runner still uses raw detections, bypasses EKF/GateTracker/PnP",
+      "proposed_approach": "Integrate estimation modules into sim runner",
+      "expected_impact": "Eliminate target jumps in PyBullet sim",
       "priority": 5,
       "research_refs": []
     }
