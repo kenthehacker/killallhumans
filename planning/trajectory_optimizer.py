@@ -411,22 +411,38 @@ class TrajectoryOptimizer:
         gates: List[GateWaypoint],
     ) -> List[float]:
         """
-        Iteratively relax segment times to reduce FOV violations.
+        Targeted relaxation of segment times to reduce FOV violations.
 
-        Increases time for segments with high curvature (which causes
-        aggressive tilt and FOV loss) until the geometric FOV penalty
-        drops below threshold or max iterations are reached.
+        Research basis (iteration 10):
+        - ETH 2026 (arXiv:2603.04305): proper FOV soft constraints add only
+          +8.1% to trajectory time. Our previous implementation added +29%.
+        - KAIST 2025 (arXiv:2512.20475): heading-based FOV control adds +0%
+          race time. Position trajectory doesn't need slowing for FOV.
+        - Consensus: post-hoc inflation should be minimal; the L-BFGS
+          optimizer's FOV penalty (weight=10) already provides baseline
+          awareness.
+
+        Changes from original (iteration 10):
+        - Reduced iterations: 5 → 3
+        - Reduced multiplier: 1.10 → 1.07 per segment
+        - Raised break threshold: 0.5 → 100.0 (ETH shows penalties in
+          hundreds are normal for near-optimal trajectories)
+        - Added 25% cap on total time inflation from this step
+        - Keep turn threshold at 0.5 rad (~30°) to cover helix segments
         """
         times = list(segment_times)
-        for _iteration in range(5):
+        pre_relax_total = sum(times)
+        max_total = pre_relax_total * 1.25  # cap: at most +25% from FOV
+
+        for _iteration in range(3):
             points = self._generate_trajectory(
                 waypoints, times, start_velocity, gates
             )
             penalty = self.add_fov_constraints(points, gates)
-            if penalty < 0.5:
+            if penalty < 100.0:
                 break
 
-            # Identify high-curvature segments and increase their time
+            # Inflate segments with turns > 30° (same threshold as original)
             for i in range(len(times) - 1):
                 v_in = waypoints[i + 1] - waypoints[i]
                 v_out = waypoints[i + 2] - waypoints[i + 1] if i + 2 < len(waypoints) else v_in
@@ -438,7 +454,14 @@ class TrajectoryOptimizer:
                     )
                     turn = math.acos(cos_a)
                     if turn > 0.5:  # > ~30 degrees
-                        times[i] *= 1.1  # slow down by 10%
+                        times[i] *= 1.07  # 7% increase (down from 10%)
+
+            # Enforce cap on total time inflation
+            current_total = sum(times)
+            if current_total > max_total:
+                scale = max_total / current_total
+                times = [t * scale for t in times]
+
         return times
 
     def _initial_time_allocation(
