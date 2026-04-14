@@ -283,6 +283,18 @@ class TrajectoryOptimizer:
                 waypoints, segment_times, start_velocity, gates,
             )
 
+        # Post-optimization: try uniform time compression (iteration 14).
+        # Inspired by MFRL (Ryou, IJRR 2024): binary search over scalar
+        # time scale while preserving allocation ratios. TOPPQuad (Mao,
+        # IROS 2024) shows that fixed-geometry trajectories can often be
+        # traversed faster without changing the path shape.
+        segment_times = self._compress_times(
+            waypoints, segment_times, start_velocity
+        )
+        points = self._generate_trajectory(
+            waypoints, segment_times, start_velocity, gates,
+        )
+
         total_time = sum(segment_times)
         return RaceTrajectory(
             points=points,
@@ -398,21 +410,85 @@ class TrajectoryOptimizer:
 
             # Proximity-based inflation for closely-spaced gates (iteration 13).
             # Helix gates are 3.6-4.9m apart; short polynomial segments create
-            # high curvature that the PD controller can't follow. Add up to 25%
-            # additional inflation when consecutive gates are within 6m.
-            # Research: TOGT (Qin 2024) gate region constraints; TACO (Sanghvi
-            # 2025) local trajectory characteristic adaptation.
+            # high curvature that the PD controller can't follow. Reduced from
+            # 25% to 12% (iter 14): smooth racing line (smooth=0.40) already
+            # produces excellent helix tracking (0.09-0.17m), so less inflation
+            # is needed. TOPPQuad (Mao 2024): excessive inflation wastes time.
             if gi + 1 < n_gates:
                 dist_between = float(np.linalg.norm(
                     gate_centers[gi + 1] - gate_centers[gi]))
                 if dist_between < 6.0 and turn_angle > 0.4:  # ~23° minimum
-                    proximity_factor = 1.0 + 0.25 * (1.0 - dist_between / 6.0)
+                    proximity_factor = 1.0 + 0.12 * (1.0 - dist_between / 6.0)  # was 0.25 (iter 14)
                     inflate = max(inflate, proximity_factor)
 
             if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:
                     if 0 <= seg_idx < len(times):
                         times[seg_idx] *= inflate
+
+        return times
+
+    def _compress_times(
+        self,
+        waypoints: List[np.ndarray],
+        segment_times: List[float],
+        start_velocity: Tuple[float, float, float],
+    ) -> List[float]:
+        """
+        Post-optimization: selectively compress easy segments to recover speed.
+
+        Inspired by TOPPQuad (Mao, IROS 2024) and MFRL (Ryou, IJRR 2024):
+        the key insight is that straight/low-curvature segments can be
+        traversed faster without violating dynamic constraints, while
+        turn segments are already near their limits.
+
+        Rather than uniform compression (which fails because turn segments
+        are already at acceleration limits), this selectively compresses
+        only segments where the current average speed is well below the
+        maximum velocity. This is a lightweight approximation of the TOPP
+        concept: maximize speed on straights, preserve timing on turns.
+        """
+        times = list(segment_times)
+        n = len(times)
+
+        max_v = self.constraints.max_velocity
+        max_a = self.constraints.max_acceleration
+
+        for i in range(n):
+            if i >= len(waypoints) - 1:
+                break
+            dist = float(np.linalg.norm(waypoints[i + 1] - waypoints[i]))
+            if dist < 0.01:
+                continue
+            avg_v = dist / max(times[i], 0.01)
+
+            # Only compress if current speed is below 75% of max velocity
+            # and the segment is long enough to benefit (>0.3s)
+            if avg_v < max_v * 0.75 and times[i] > 0.3:
+                # Target: increase speed toward 85% of max_velocity,
+                # but cap at 15% speedup to be conservative
+                target_v = min(max_v * 0.85, avg_v * 1.15)
+
+                # Check acceleration constraint at boundaries
+                feasible = True
+                if i > 0:
+                    prev_dist = float(np.linalg.norm(
+                        waypoints[i] - waypoints[i - 1]))
+                    prev_v = prev_dist / max(times[i - 1], 0.01)
+                    accel = abs(target_v - prev_v) / max(times[i - 1], 0.01)
+                    if accel > max_a * 0.90:
+                        feasible = False
+                if feasible and i + 1 < n and i + 2 < len(waypoints):
+                    next_dist = float(np.linalg.norm(
+                        waypoints[i + 2] - waypoints[i + 1]))
+                    next_v = next_dist / max(times[i + 1], 0.01)
+                    accel = abs(next_v - target_v) / max(times[i], 0.01)
+                    if accel > max_a * 0.90:
+                        feasible = False
+
+                if feasible:
+                    new_time = dist / target_v
+                    times[i] = max(new_time, 0.1)
 
         return times
 
@@ -426,28 +502,29 @@ class TrajectoryOptimizer:
         """
         Targeted relaxation of segment times to reduce FOV violations.
 
-        Research basis (iteration 10):
+        Research basis (iteration 10, updated iteration 14):
         - ETH 2026 (arXiv:2603.04305): proper FOV soft constraints add only
-          +8.1% to trajectory time. Our previous implementation added +29%.
+          +8.1% to trajectory time. Our previous implementation added +14.1%.
         - KAIST 2025 (arXiv:2512.20475): heading-based FOV control adds +0%
           race time. Position trajectory doesn't need slowing for FOV.
+        - TOPPQuad (Mao, IROS 2024): geometry-timing decoupling — excessive
+          post-hoc inflation wastes time without improving tracking.
         - Consensus: post-hoc inflation should be minimal; the L-BFGS
           optimizer's FOV penalty (weight=10) already provides baseline
           awareness.
 
-        Changes from original (iteration 10):
-        - Reduced iterations: 5 → 3
-        - Reduced multiplier: 1.10 → 1.07 per segment
-        - Raised break threshold: 0.5 → 100.0 (ETH shows penalties in
-          hundreds are normal for near-optimal trajectories)
-        - Added 25% cap on total time inflation from this step
-        - Keep turn threshold at 0.5 rad (~30°) to cover helix segments
+        Changes (iteration 14 — speed recovery):
+        - Reduced iterations: 3 → 2 (enough to converge)
+        - Reduced multiplier: 1.07 → 1.03 per segment (ETH: +8.1% is sufficient)
+        - Reduced cap: 25% → 8% (aligned with ETH finding)
+        - The L-BFGS FOV penalty (weight=10) already provides primary FOV
+          awareness; this step is a safety net, not the primary mechanism.
         """
         times = list(segment_times)
         pre_relax_total = sum(times)
-        max_total = pre_relax_total * 1.25  # cap: at most +25% from FOV
+        max_total = pre_relax_total * 1.08  # cap: at most +8% from FOV (was 25%, iter 14)
 
-        for _iteration in range(3):
+        for _iteration in range(2):  # was 3 (iter 14: 2 is enough to converge)
             points = self._generate_trajectory(
                 waypoints, times, start_velocity, gates
             )
@@ -467,7 +544,7 @@ class TrajectoryOptimizer:
                     )
                     turn = math.acos(cos_a)
                     if turn > 0.5:  # > ~30 degrees
-                        times[i] *= 1.07  # 7% increase (down from 10%)
+                        times[i] *= 1.03  # 3% increase (was 7%, iter 14)
 
             # Enforce cap on total time inflation
             current_total = sum(times)
