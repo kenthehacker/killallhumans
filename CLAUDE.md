@@ -51,16 +51,17 @@ Edit the relevant module, then re-run the benchmark to verify improvement.
 ### 5. Repeat
 Continue the loop until `overall_passed: true` and metrics improve.
 
-## Quality Targets (current thresholds)
-| Metric | Threshold | Aspirational |
+## Quality Targets (current thresholds — tightened to aspirational in iteration 2)
+| Metric | Threshold | Next Target |
 |--------|-----------|-------------|
 | Unit test pass rate | 100% | 100% |
-| Avg tracking error | < 2.0m | < 0.5m |
-| Max tracking error | < 5.0m | < 2.0m |
-| EKF uncertainty | < 3.0m | < 0.5m |
-| Gate pass rate | > 50% | 100% |
-| Loop frequency | > 20 Hz | > 100 Hz |
+| Avg tracking error | < 0.5m | < 0.25m |
+| Max tracking error | < 2.0m | < 1.0m |
+| EKF uncertainty | < 0.5m | < 0.1m |
+| Gate pass rate | 100% | 100% |
+| Loop frequency | > 100 Hz | > 100 Hz |
 | No crash | required | required |
+| Race time | < 30s | < 14s |
 
 When all thresholds are met, tighten them toward aspirational targets.
 
