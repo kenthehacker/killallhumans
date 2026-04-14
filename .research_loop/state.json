@@ -1,9 +1,9 @@
 {
-  "iteration": 10,
-  "timestamp": "2026-04-13T17:58:00Z",
+  "iteration": 12,
+  "timestamp": "2026-04-14T00:50:00Z",
   "status": "completed",
-  "current_bottleneck": "control",
-  "previous_bottleneck": "trajectory_planning",
+  "current_bottleneck": "system_integration",
+  "previous_bottleneck": "control",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -31,78 +31,82 @@
     "realtime_mintime_norm_constraint_teissing_2024",
     "perception_aware_unknown_env_2025",
     "fov_cbf_quadrotor_2025",
-    "drift_corrected_vio_perception_planning_2025"
+    "drift_corrected_vio_perception_planning_2025",
+    "taco_trajectory_aware_controller_2025",
+    "mpcc_plus_plus_krinner_2024",
+    "neural_augmented_indi_2025",
+    "dqn_gain_scheduling_2026",
+    "task_parameter_nexus_2024",
+    "rl_gain_scheduling_ppo_2024"
   ],
-  "total_papers_analyzed": 27,
+  "total_papers_analyzed": 33,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.274,
-    "max_tracking_error_m": 0.756,
+    "avg_tracking_error_m": 0.358,
+    "max_tracking_error_m": 1.463,
     "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7711,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-3",
-    "worst_gate_error_m": 0.469,
-    "race_time_s": 15.56
-  },
-  "metrics_after": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.481,
-    "max_tracking_error_m": 1.724,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7541,
+    "avg_loop_hz": 7916,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.832,
-    "race_time_s": 13.34
+    "worst_gate_error_m": 0.659,
+    "race_time_s": 13.31,
+    "note": "Measured on 13.59s trajectory realization (previous session)"
+  },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.252,
+    "max_tracking_error_m": 1.504,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 5723,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-3",
+    "worst_gate_error_m": 0.905,
+    "race_time_s": 17.32,
+    "note": "Measured on 17.46s trajectory realization (current session). Code reverted to iteration 11 state."
   },
   "changes_committed": true,
-  "commit_hash": "657649b",
+  "commit_hash": "3e07fc9",
   "diagnostic": {
-    "root_cause": "FOV relaxation was acting as an unintentional speed limiter for the helix section. Reducing it revealed the true bottleneck: PD controller capability in the helix (gates 7-12). The controller (kp=6, kd=4, ff=0.4) saturates at the tilt limit during consecutive tight turns, producing 0.52-0.83m error per helix gate.",
+    "root_cause": "Gain scheduling fundamentally doesn't work in kinematic sim without attitude dynamics. The feedforward direction is already optimal; changing gains only redirects the clamped acceleration away from optimal. Additionally, trajectory optimizer non-determinism across sessions (13.59s vs 17.46s) invalidates tuning optimized on a single trajectory realization.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
-      "max_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.128,
-      "avg_thrust": 0.804,
-      "controller_saturation_gates": [7, 8, 9, 10, 11, 12],
-      "fov_overhead_s": 1.30,
-      "fov_overhead_pct": 10.6
+      "max_abs_pitch_rad": 0.85,
+      "avg_pitch_rad": -0.079,
+      "avg_thrust": 0.762
     },
-    "trend": "improving",
+    "trend": "plateau",
     "architectural_issues": [
-      "PD controller is now the speed limiter — helix gates 7-12 average 0.641m error while gates 1-6 average 0.227m",
-      "Controller saturating at tilt limit (0.85 rad) during helix — insufficient authority for consecutive tight turns",
-      "MPCC (contouring/progress decomposition) would specifically address the lateral tracking error mode that dominates helix gates",
-      "FOV relaxation still present (10.6% overhead) — could be eliminated with heading-based FOV control (KAIST approach)"
+      "Trajectory optimizer non-determinism: L-BFGS + FOV relaxation produces different results across sessions (13.59s vs 17.46s). This undermines all empirical comparisons.",
+      "Kinematic sim cannot evaluate gain scheduling — no attitude dynamics means gains only redirect clamped acceleration direction",
+      "Gate-3 (S-turn, 0.905m) is now worst gate on 17.46s trajectory — was gate-7 (helix) on 13.59s trajectory",
+      "The worst gate is trajectory-speed-dependent: faster trajectory stresses helix, slower trajectory stresses S-turns"
     ],
     "critic_findings": [
-      "Race time breakthrough: 15.56→13.34s (-14.3%) — largest single-iteration improvement in project history",
-      "Avg error regression: 0.274→0.481m — near threshold limit, any further trajectory speedup would fail",
-      "The speed-accuracy Pareto shifted: now trading helix accuracy for speed instead of the previous (safe, slow) operating point",
-      "Three tuning iterations needed to find sweet spot — confirms FOV parameters are sensitive",
-      "The 25% total inflation cap is the key mechanism preventing compound inflation"
+      "6 distinct approaches tested (curvature gain sched, error gain sched, FF attenuation, position targeting, PID, dual-timescale FF) — thorough exploration",
+      "Fundamental insight: kinematic sim is a ceiling for controller improvements — need PyBullet for attitude-dependent techniques",
+      "Trajectory non-determinism is a critical systemic issue — all previous iteration-to-iteration comparisons may have been confounded",
+      "Dual-timescale FF showed improvement on one trajectory but regression on another — robustness matters more than peak performance"
     ]
   },
   "improvements_backlog": [
     {
-      "area": "control",
-      "description": "Helix tracking error (gates 7-12 avg 0.641m) — PD controller can't track consecutive tight turns at current speeds",
-      "proposed_approach": "Options: (a) increase feedforward weight from 0.4 to 0.6-0.8, (b) implement MPCC contouring/progress decomposition (ETH 2026), (c) increase gains with per-section profiles, (d) increase tilt limit if platform supports it",
-      "expected_impact": "Helix error 0.64→0.35m, overall avg 0.48→0.35m",
+      "area": "system_integration",
+      "description": "Trajectory optimizer non-determinism — L-BFGS + FOV relaxation produces different results across sessions",
+      "proposed_approach": "Cache trajectory after first generation, or add deterministic BLAS mode, or seed optimizer. Validate with 10 consecutive runs.",
+      "expected_impact": "Reproducible benchmarks, valid iteration comparisons",
       "priority": 1,
-      "research_refs": ["perception_aware_planning_eth_2026", "aggressive_tracking_tal_2018"]
+      "research_refs": []
     },
     {
       "area": "trajectory_planning",
-      "description": "S-turn tracking (gates 3-4 at 0.53/0.51m) — second largest error source",
-      "proposed_approach": "Detect consecutive opposite-direction turns and boost inflation for second turn",
-      "expected_impact": "Gates 3-4 error 0.52→0.35m",
+      "description": "S-turn gate-3 error 0.905m — worst gate on current trajectory",
+      "proposed_approach": "Detect consecutive opposite-direction turns and boost inflation for second turn segment",
+      "expected_impact": "Gate-3 error 0.90→0.40m",
       "priority": 2,
       "research_refs": ["taco_sanghvi_2025"]
     },
@@ -118,17 +122,17 @@
       "area": "trajectory_planning",
       "description": "KAIST-style heading FOV control — decouple yaw from position for zero-cost FOV",
       "proposed_approach": "Implement distance-weighted heading blending toward next gate",
-      "expected_impact": "Further FOV relaxation reduction or elimination",
+      "expected_impact": "Reduce FOV relaxation overhead (17.46 to ~15s trajectory)",
       "priority": 4,
       "research_refs": ["drift_corrected_vio_perception_planning_2025"]
     },
     {
       "area": "system_integration",
-      "description": "PyBullet physics validation — kinematic sim results may not transfer",
+      "description": "PyBullet physics validation — kinematic sim can't evaluate gain scheduling or attitude-dependent techniques",
       "proposed_approach": "Install gym-pybullet-drones, enable PyBullet benchmark",
-      "expected_impact": "More realistic benchmarking",
+      "expected_impact": "Enable controller tuning approaches (gain scheduling, INDI, L1 adaptive)",
       "priority": 5,
-      "research_refs": []
+      "research_refs": ["dqn_gain_scheduling_2026", "rl_gain_scheduling_ppo_2024"]
     }
   ],
   "failed_approaches": [
@@ -140,73 +144,86 @@
     {
       "iteration": 2,
       "description": "Curvature-aware initial time allocation had no measurable impact because L-BFGS optimizer in _optimize_time_allocation re-optimizes times regardless of initial guess.",
-      "lesson": "Initial time allocation heuristic matters less than the optimizer that runs after it. Focus on optimizer constraints or objective function changes rather than initialization.",
+      "lesson": "Initial time allocation heuristic matters less than the optimizer that runs after it.",
       "approach": "curvature_aware_time_allocation",
-      "reason": "L-BFGS masks initial allocation differences",
-      "metrics_delta": "No measurable change in any metric"
+      "reason": "L-BFGS masks initial allocation differences"
     },
     {
       "iteration": 5,
-      "description": "transition_time = max(times[i], times[i+1]) for acceleration estimation at segment boundaries. Trajectory dropped to 18.1s but drone couldn't track — avg error 0.502m, race time 29.5s due to gate-seeking fallback.",
-      "lesson": "The acceleration estimate at segment boundaries, while rough, serves as a useful proxy for trajectory feasibility. Modifying it directly causes trajectory-tracking divergence.",
+      "description": "transition_time = max(times[i], times[i+1]) for acceleration estimation at segment boundaries.",
+      "lesson": "The acceleration estimate at segment boundaries serves as a feasibility proxy. Modifying it causes divergence.",
       "approach": "transition_time_max_variant",
       "reason": "Optimizer produced trajectories too fast for kinematic sim to follow"
     },
     {
       "iteration": 5,
-      "description": "transition_time = avg(times[i], times[i+1]) for acceleration estimation. Same divergence — trajectory 19.5s but only 83% gate pass rate.",
-      "lesson": "Both max and average transition_time variants cause the same problem. The current min() approach is the safest.",
+      "description": "transition_time = avg(times[i], times[i+1]) for acceleration estimation.",
+      "lesson": "Both max and average transition_time variants cause the same problem.",
       "approach": "transition_time_avg_variant",
-      "reason": "Still too aggressive, drone fell behind after gate-3"
+      "reason": "Still too aggressive"
     },
     {
       "iteration": 5,
-      "description": "time_weight = 3.0 with original acceleration estimate (max_acceleration=12). Only marginal improvement (23→21.4s) because accel penalty was still dominant.",
-      "lesson": "Increasing time_weight alone is insufficient — the acceleration penalty threshold (max_acceleration) must also be relaxed for meaningful speed improvement.",
+      "description": "time_weight = 3.0 with original acceleration estimate.",
+      "lesson": "Increasing time_weight alone is insufficient without relaxing acceleration penalty.",
       "approach": "time_weight_3_original_accel",
-      "reason": "Acceleration penalty dominated objective despite higher time weight"
+      "reason": "Acceleration penalty dominated"
     },
     {
       "iteration": 6,
-      "description": "Adaptive symmetric entry/exit offsets (0.25-1.0m) based on turn angle. Gate-6 got 1.0m offset which pushed exit waypoint far east, away from gate-7. Race time 26.66s, avg error 0.676m.",
-      "lesson": "Wide offset ranges distort waypoint geometry. Gate normals don't always point toward the next gate, so large offsets along normals can push waypoints away from the ideal path.",
+      "description": "Adaptive symmetric entry/exit offsets (0.25-1.0m).",
+      "lesson": "Wide offset ranges distort waypoint geometry.",
       "approach": "adaptive_symmetric_offsets_wide",
-      "reason": "Offset geometry misalignment with track layout"
+      "reason": "Offset geometry misalignment"
     },
     {
       "iteration": 6,
-      "description": "Asymmetric offsets (entry 0.4-0.6m, exit 0.4-0.2m) achieved excellent gate-7 accuracy (0.271m) but race time regressed to 19-20s. Short exit offsets (0.2m) created very short through-gate segments that the L-BFGS optimizer over-slowed.",
-      "lesson": "Modifying entry/exit offsets has strong coupling with L-BFGS time allocation. Short segments near gate centers cause the optimizer to allocate excessive time. Better to keep offsets fixed and adjust time allocation directly.",
+      "description": "Asymmetric offsets (entry 0.4-0.6m, exit 0.4-0.2m).",
+      "lesson": "Short segments near gate centers cause L-BFGS to over-slow.",
       "approach": "asymmetric_offsets",
       "reason": "Short segments slowed L-BFGS optimization"
     },
     {
       "iteration": 6,
-      "description": "L-BFGS curvature-speed penalty using waypoint-level turn angles (>60° threshold). When set strong enough to improve gate-7 (0.165m), race time regressed to 20.67s. Entry/exit waypoints dilute gate-center turn angles, so the penalty threshold had to be set low, catching too many segments.",
-      "lesson": "Waypoint-level turn angles are much smaller than gate-center turn angles due to entry/exit point dilution. L-BFGS penalties based on waypoint angles are either ineffective (high threshold) or overly broad (low threshold). Post-optimization inflation using gate-center angles is more targeted.",
+      "description": "L-BFGS curvature-speed penalty using waypoint-level turn angles.",
+      "lesson": "Waypoint-level angles are diluted by entry/exit points.",
       "approach": "lbfgs_curvature_speed_penalty",
-      "reason": "Waypoint angle dilution makes penalty either too broad or too weak"
+      "reason": "Penalty too broad or too weak"
     },
     {
       "iteration": 8,
-      "description": "time_weight increased from 2.0 to 2.5 in L-BFGS optimizer. Expected faster trajectory, but optimizer converged to a worse local minimum — trajectory time jumped from 16.96s to 21.61s.",
-      "lesson": "The L-BFGS optimizer is sensitive to the time_weight parameter. Higher weight changes the loss landscape enough to redirect convergence. Don't assume monotonic improvement from increasing time_weight.",
+      "description": "time_weight increased from 2.0 to 2.5 in L-BFGS.",
+      "lesson": "L-BFGS is sensitive to time_weight — higher weight redirects convergence.",
       "approach": "time_weight_2.5",
       "reason": "L-BFGS converged to worse local minimum"
     },
     {
       "iteration": 9,
-      "description": "Drag compensation in controller (Faessler 2018 style): added drag_coefficient * vel to controller's accel_des. Tested 8 configurations (drag_coeff=0.3-0.5, ff_weight=0.4-0.8, kd_xy=4.0-5.5). All regressed tracking — avg error increased 73-86%.",
-      "lesson": "The kinematic sim's drag (0.5*vel) provides beneficial velocity damping. Effective error damping = kd + drag_coefficient. Cancelling drag reduces damping ratio from 0.92 to 0.82 and removes natural speed-limiting into turns. Drag compensation is a dead end for this specific sim model.",
+      "description": "Drag compensation (Faessler 2018): drag_coefficient * vel added to accel_des.",
+      "lesson": "Cancelling drag on CURRENT velocity removes beneficial velocity damping.",
       "approach": "drag_compensation_faessler_2018",
-      "reason": "Sim drag provides free velocity damping that helps controller performance"
+      "reason": "Sim drag provides free velocity damping that helps controller"
     },
     {
       "iteration": 10,
-      "description": "FOV relaxation with 10% total cap (2 iterations × 1.03 × turn > 0.8): race time 13.66s but avg error 0.664m, max error 2.21m. Too aggressive — helix gates couldn't be tracked.",
-      "lesson": "The helix section needs substantial time inflation for the PD controller. A 10% cap is insufficient; 25% cap works.",
+      "description": "FOV relaxation with 10% total cap.",
+      "lesson": "Helix section needs substantial time inflation for PD controller.",
       "approach": "fov_relaxation_10pct_cap",
       "reason": "Helix gates need more inflation than 10% allows"
+    },
+    {
+      "iteration": 11,
+      "description": "Reference-velocity drag feedforward (vff * ref_vel added to accel_des). Tested vff=0.1, 0.15, 0.5. All regressed.",
+      "lesson": "Velocity feedforward is mathematically correct at steady state but helix is all transients.",
+      "approach": "velocity_feedforward_and_higher_ff",
+      "reason": "Helix is transient-dominated; velocity FF increases overshoot at turns."
+    },
+    {
+      "iteration": 12,
+      "description": "Gain scheduling (curvature-based and error-based) in kinematic sim. 16+ configs across 2 gain-scheduling approaches. Also tested FF attenuation (4 configs), predictive position targeting (14 configs), integral term PID (5 configs), dual-timescale FF (committed then reverted).",
+      "lesson": "Gain scheduling fundamentally doesn't work in kinematic sim without attitude dynamics. The feedforward direction is already optimal; changing gains redirects clamped acceleration away from optimal. Dual-timescale FF worked on one trajectory but regressed on another — controller tuning must be robust to trajectory variation.",
+      "approach": "gain_scheduling_kinematic_sim",
+      "reason": "No attitude dynamics in kinematic sim. Trajectory optimizer non-determinism across sessions."
     }
   ]
 }
