@@ -436,18 +436,26 @@ class TrajectoryOptimizer:
                 if 0 <= approach_seg < len(times):
                     times[approach_seg] *= 1.05  # 5% approach deceleration (tuned: 10%→7%→5%)
 
-            # Proximity-based inflation for closely-spaced gates (iteration 13).
-            # Helix gates are 3.6-4.9m apart; short polynomial segments create
-            # high curvature that the PD controller can't follow. Reduced from
-            # 25% to 12% (iter 14): smooth racing line (smooth=0.40) already
-            # produces excellent helix tracking (0.09-0.17m), so less inflation
-            # is needed. TOPPQuad (Mao 2024): excessive inflation wastes time.
-            if gi + 1 < n_gates:
-                dist_between = float(np.linalg.norm(
-                    gate_centers[gi + 1] - gate_centers[gi]))
-                if dist_between < 6.0 and turn_angle > 0.4:  # ~23° minimum
-                    proximity_factor = 1.0 + 0.12 * (1.0 - dist_between / 6.0)  # was 0.25 (iter 14)
-                    inflate = max(inflate, proximity_factor)
+            # Bidirectional proximity-based inflation for closely-spaced gates (iter 13, updated iter 18).
+            # Helix gates are 3.6-5.7m apart; short polynomial segments create
+            # high curvature that the PD controller can't follow.
+            # Iter 18: Changed from forward-only to BIDIRECTIONAL — uses min
+            # distance to prev OR next gate. Gate 11 (49.9° turn) was getting
+            # only 0.7% inflation because dist to next gate (5.66m) is large,
+            # despite dist to prev gate (3.64m) being small. This caused helix
+            # regression when FOV relaxation was removed in iter 17.
+            # Also increased multiplier 0.12→0.18 to compensate for lost FOV inflation.
+            # Research: CiMPCC (Li 2024) — compound curvature for sequential turns
+            # requires considering ALL neighbors. Quad-LCD (Srikanthan 2025) —
+            # per-segment feasibility depends on approach context.
+            dist_next = float(np.linalg.norm(
+                gate_centers[gi + 1] - gate_centers[gi])) if gi + 1 < n_gates else 999.0
+            dist_prev = float(np.linalg.norm(
+                gate_centers[gi] - gate_centers[gi - 1])) if gi > 0 else 999.0
+            dist_closest = min(dist_next, dist_prev)
+            if dist_closest < 6.0 and turn_angle > 0.4:  # ~23° minimum
+                proximity_factor = 1.0 + 0.22 * (1.0 - dist_closest / 6.0)  # was 0.12, forward-only (iter 14)
+                inflate = max(inflate, proximity_factor)
 
             if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:
