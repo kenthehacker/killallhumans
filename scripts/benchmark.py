@@ -297,7 +297,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # Generic drone (1kg, 20N max thrust, ~2g TWR) rather than Crazyflie.
     tracker = GeometricTracker(TrackerConfig(
         kp_xy=6.0, kd_xy=4.0, kp_z=8.0, kd_z=5.0,
-        feedforward_accel=0.4,  # optimal from sweep (0.3/0.4/0.5/0.7/1.0), drag mismatch limits full ff
+        feedforward_accel=0.4,  # optimal with drag providing velocity damping
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
     ))
 

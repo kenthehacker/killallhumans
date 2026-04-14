@@ -332,10 +332,11 @@ class TrajectoryOptimizer:
         gate_centers = [np.array(g.position) for g in gates]
 
         # Centripetal acceleration threshold: beyond this, the PD controller
-        # (kp_xy=6, kd_xy=4) cannot track the turn without significant
-        # overshoot. Derived from TOPPQuad's feasibility principle.
-        # Set low enough to catch S-turn gates (3/4) where a_c ≈ 3.6-4.7.
-        a_centripetal_threshold = 3.5  # m/s² — catches S-turn gates (a_c ≈ 3.6-4.8)
+        # with feedforward cannot track the turn without significant overshoot.
+        # With feedforward active (iter 8, ff=0.4), the controller handles
+        # turns better, so threshold raised from 3.5→4.5 (iter 9).
+        # Research: TOPPQuad feasibility, Teissing RA-L 2024 norm constraints.
+        a_centripetal_threshold = 4.5  # m/s² — raised from 3.5, feedforward handles moderate turns
 
         # Compute turn angle at each gate (angle between approach and departure)
         for gi in range(1, n_gates - 1):
@@ -354,11 +355,12 @@ class TrajectoryOptimizer:
 
             inflate = 1.0
 
-            if turn_angle > 1.05:  # > ~60 degrees — original angle-based
-                # Inflation factor: 60° → 1.25x, 90° → 1.60x
+            if turn_angle > 1.05:  # > ~60 degrees — angle-based
+                # Inflation factor: reduced from 0.35→0.25 (iter 9) since
+                # feedforward (iter 8) anticipates turns. 60°→1.25x, 90°→1.50x.
                 severity = (turn_angle - 1.05) / (math.pi / 2 - 1.05)
                 severity = min(severity, 1.0)
-                inflate = 1.0 + 0.35 * severity
+                inflate = 1.0 + 0.25 * severity
             elif turn_angle > 0.3:  # > ~17° — check centripetal acceleration
                 # Estimate approach speed from L-BFGS segment times.
                 # The approach to gate gi uses segments leading to entry wp.
@@ -392,7 +394,7 @@ class TrajectoryOptimizer:
                     # Inflate proportional to excess centripetal acceleration
                     excess = (a_centripetal - a_centripetal_threshold) / a_centripetal_threshold
                     severity = min(excess, 1.0)
-                    inflate = 1.0 + 0.25 * severity  # range: 1.0x to 1.25x
+                    inflate = 1.0 + 0.15 * severity  # range: 1.0x to 1.15x (reduced from 0.25, iter 9)
 
             if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:

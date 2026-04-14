@@ -46,10 +46,15 @@ class TrackerConfig:
     # Feed-forward weight (0 = pure feedback, 1 = full feedforward)
     # "Leveling the Playing Field" (2025): feedforward is the most important
     # single fix for geometric controllers. Scaled to 0.4 because the kinematic
-    # sim's drag (0.5) creates a model mismatch — full feedforward (1.0) causes
-    # overshoot at high-speed segments where drag force is significant and
-    # unmodeled by the controller. Sweep: 0.3→0.4→0.5→0.7→1.0, 0.4 optimal.
+    # sim's drag (0.5) provides beneficial velocity damping that helps turn
+    # tracking. Drag compensation was tested (iter 9) but regresses because
+    # drag provides "free" speed-limiting into turns. See failed_approaches.
     feedforward_accel: float = 0.4
+
+    # Drag compensation coefficient (Faessler et al., IEEE RA-L 2018).
+    # Set to 0.0 — drag compensation regresses tracking because the sim's
+    # drag provides beneficial velocity damping. See iteration 9 analysis.
+    drag_coefficient: float = 0.0
 
     # Physical limits
     max_tilt_rad: float = 0.85      # ~49 deg — increased for faster turns (Aggressive Maneuvers 2026)
@@ -111,11 +116,11 @@ class GeometricTracker:
         ep = ref_pos - pos
         ev = ref_vel - vel
 
-        # Desired acceleration (PD + feedforward)
+        # Desired acceleration (PD + feedforward + optional drag compensation)
         accel_des = np.array([
-            c.kp_xy * ep[0] + c.kd_xy * ev[0] + c.feedforward_accel * ref_acc[0],
-            c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1],
-            c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2],
+            c.kp_xy * ep[0] + c.kd_xy * ev[0] + c.feedforward_accel * ref_acc[0] + c.drag_coefficient * vel[0],
+            c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1] + c.drag_coefficient * vel[1],
+            c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2] + c.drag_coefficient * vel[2],
         ])
 
         # In NED: gravity is (0, 0, g) pointing down
