@@ -1,6 +1,6 @@
 {
-  "iteration": 25,
-  "timestamp": "2026-04-14T15:24:00Z",
+  "iteration": 26,
+  "timestamp": "2026-04-14T16:05:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -71,22 +71,13 @@
     "quaypoints_racing_2025",
     "spatially_aware_cmaes_racing_2026",
     "schoellig_optbased_ilc_2012",
-    "qpgp_ilc_2026"
+    "qpgp_ilc_2026",
+    "freq_domain_ilc_vanharen_2024",
+    "segmentwise_ilc_zhang_2024",
+    "monotonic_ilc_timevarying_gain_liu_2023"
   ],
-  "total_papers_analyzed": 67,
+  "total_papers_analyzed": 70,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.211,
-    "max_tracking_error_m": 0.755,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7571,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.327,
-    "race_time_s": 14.02
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.199,
     "max_tracking_error_m": 0.697,
@@ -98,64 +89,85 @@
     "worst_gate_error_m": 0.293,
     "race_time_s": 14.00
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.187,
+    "max_tracking_error_m": 0.697,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 6453,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.293,
+    "race_time_s": 14.01
+  },
   "changes_committed": true,
-  "commit_hash": "a6f0c12",
+  "commit_hash": "1f15d6e",
   "diagnostic": {
-    "root_cause": "The helix section error floor was caused by the PD controller's systematic cross-track lag on tight 3D geometry. ILC position-offset table pre-compensates this lag by shifting the controller's position reference in the direction of expected error. The offset preserves original polynomial derivatives for feedforward quality.",
+    "root_cause": "The PD controller's systematic cross-track lag varies by trajectory section. The helix section requires larger ILC corrections (0.35m vs 0.15m) due to tighter 3D geometry, but the global correction limit was capping all sections equally, leaving helix under-corrected.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.106,
-      "avg_thrust": 0.794
+      "avg_pitch_rad": -0.107,
+      "avg_thrust": 0.788
     },
     "trend": "improving",
     "architectural_issues": [
-      "Gate-4 regressed 22% due to global ILC offset trading S-turn accuracy for helix accuracy",
-      "P50 tracking error increased 4.9% while avg/max/p95 improved — ILC primarily helps worst-case sections",
-      "Loop Hz decreased 22% due to ILC computation overhead (one-time cost, not real-time)"
+      "Gate-4 (0.293m) is the new worst gate — S-turn correction limit (0.15m) may be too conservative",
+      "Gate-8 mildly regressed (+6.7%) despite being in the helix section — possible offset discontinuity",
+      "Global convergence check can terminate S-turn learning early when helix converges fast",
+      "Roll/pitch at saturation (0.85 rad) during high-error sections indicates PD controller physical limits"
     ],
     "critic_findings": [
-      "Helix error floor (8-iteration plateau) finally broken: gate-7 0.327→0.263m (-19.6%)",
-      "All aspirational targets met simultaneously for the first time",
-      "Position-offset table architecture is fundamentally different from prior approaches — first closed-loop trajectory-controller optimization",
-      "Two failed ILC attempts (full error + FD derivatives) were critical learning steps"
+      "Per-section max_correction is the key insight — per-section alpha and smoothing are irrelevant at σ=10",
+      "Optimal helix max_correction is 0.35m — beyond that (0.50m) overcorrection degrades accuracy",
+      "9 configurations tested systematically: avg error monotonically decreased with helix max_correction up to 0.35m",
+      "S-turn max_correction increase helps avg but increases max error (0.697→0.747m at 0.20m)"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Per-section ILC offset to eliminate gate-4 regression while maintaining helix gains",
-      "proposed_approach": "Segment trajectory into S-turn and helix sections, apply ILC independently per section with section-specific parameters",
-      "expected_impact": "Gate-4 error 0.293→0.240m (restore), avg error 0.199→0.190m",
+      "description": "Gate-4 correction: increase S-turn max_correction or split into 3+ sections for finer control",
+      "proposed_approach": "Split S-turn into pre-gate-4 and post-gate-4 sections with different max_correction limits, or increase S-turn limit to 0.18m with cumulative offset cap",
+      "expected_impact": "Gate-4 0.293→0.260m, avg error 0.187→0.183m",
       "priority": 1,
-      "research_refs": ["spatial_ilc_virtual_tube_2023", "schoellig_optbased_ilc_2012"]
+      "research_refs": ["segmentwise_ilc_zhang_2024"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Finer interpolation refinement — 5-7 points near selected α for better Pareto candidate",
-      "proposed_approach": "Add interpolation points near the selected α, or locally optimize (L-BFGS) from the interpolated candidate",
-      "expected_impact": "Race time 14.00→13.97s while maintaining accuracy",
+      "description": "Replace Gaussian smoothing with zero-phase Butterworth Q-filter for principled frequency-domain convergence",
+      "proposed_approach": "scipy.signal.filtfilt with Butterworth low-pass at fc≈2-3Hz replaces gaussian_filter1d",
+      "expected_impact": "Cleaner corrections, potentially higher alpha, avg error 2-5% improvement",
       "priority": 2,
-      "research_refs": ["quaypoints_racing_2025", "bo_racing_line_heilmeier_2020"]
+      "research_refs": ["freq_domain_ilc_vanharen_2024"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Per-section convergence checks to decouple iteration counts across sections",
+      "proposed_approach": "Track per-section avg error independently; only update sections that haven't converged",
+      "expected_impact": "S-turn gets more iterations, 1-3% improvement",
+      "priority": 3,
+      "research_refs": ["monotonic_ilc_timevarying_gain_liu_2023"]
     },
     {
       "area": "control",
-      "description": "MPCC controller upgrade for contouring/progress error decomposition",
+      "description": "MPCC controller for contouring/progress error decomposition",
       "proposed_approach": "Implement contouring error decomposition for cross-track vs along-track control",
       "expected_impact": "Tracking improvement across all gates, orthogonal to ILC",
-      "priority": 3,
+      "priority": 4,
       "research_refs": ["mpcc_plus_plus_krinner_2024"]
     },
     {
-      "area": "system_integration",
-      "description": "PyBullet integration for realistic physics validation",
-      "proposed_approach": "Port kinematic sim evaluation to PyBullet for competition-realistic feedback",
-      "expected_impact": "Competition readiness",
-      "priority": 4,
-      "research_refs": []
+      "area": "trajectory_planning",
+      "description": "Finer interpolation refinement for racing line Pareto selection",
+      "proposed_approach": "5-7 interpolation points near selected α for better Pareto candidate",
+      "expected_impact": "Race time 14.01→13.97s",
+      "priority": 5,
+      "research_refs": ["quaypoints_racing_2025", "bo_racing_line_heilmeier_2020"]
     }
   ],
   "failed_approaches": [
@@ -317,6 +329,20 @@
       "lesson": "FD-computed velocity/acceleration from shifted positions introduces noise that corrupts feedforward control (ff_accel=0.4). Don't modify trajectory; apply offset at controller level only.",
       "approach": "crosstrack_ilc_fd_derivatives",
       "reason": "Finite-difference noise corrupts feedforward signal"
+    },
+    {
+      "iteration": 26,
+      "description": "Per-section ILC with higher alphas (0.5/0.6). Race time 14→27s due to offset saturation.",
+      "lesson": "Higher alpha causes cumulative offset to saturate at 0.375-0.45m (vs 0.30m baseline), pushing drone too far off course. Keep alpha ≤0.4.",
+      "approach": "per_section_ilc_higher_alpha",
+      "reason": "Cumulative offset saturation at higher alpha causes catastrophic race time regression"
+    },
+    {
+      "iteration": 26,
+      "description": "Blending at per-section ILC boundaries (linear weight ramp over 50 steps).",
+      "lesson": "The blending ramp creates a near-zero offset gap at the boundary. With σ=10 smoothing kernel, no blending is needed — hard concatenation works fine.",
+      "approach": "per_section_ilc_boundary_blending",
+      "reason": "Near-zero gap from weight ramp caused worse results than hard boundary"
     }
   ]
 }
