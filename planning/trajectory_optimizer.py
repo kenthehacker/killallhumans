@@ -333,6 +333,10 @@ class TrajectoryOptimizer:
         - TACO (Sanghvi 2025): trajectory parameters should adapt to local
           characteristics (speed + curvature, not curvature alone)
         - Teissing (RA-L 2024): boundary velocity at turns is the key variable
+        - CiMPCC (Li, ITSC 2024): compound curvature for S-turns — curvature
+          doesn't drop between consecutive opposite-direction turns
+        - VPMPCC (Li, 2024): early deceleration before S-turns; approach
+          segments to the second turn need slowing
         """
         times = list(segment_times)
         n_gates = len(gates)
@@ -348,6 +352,16 @@ class TrajectoryOptimizer:
         # turns better, so threshold raised from 3.5→4.5 (iter 9).
         # Research: TOPPQuad feasibility, Teissing RA-L 2024 norm constraints.
         a_centripetal_threshold = 4.5  # m/s² — raised from 3.5, feedforward handles moderate turns
+
+        # --- Pre-compute turn cross-products for S-turn detection (iter 16) ---
+        # An S-turn is two consecutive turns with opposite lateral direction.
+        # Detection: cross product Z-component changes sign between consecutive gates.
+        # Research: CiMPCC (Li, ITSC 2024) — smoothed compound curvature for chicanes.
+        cross_z = [0.0] * n_gates  # Z-component of cross(v_in, v_out) at each gate
+        for gi in range(1, n_gates - 1):
+            v_in = gate_centers[gi] - gate_centers[gi - 1]
+            v_out = gate_centers[gi + 1] - gate_centers[gi]
+            cross_z[gi] = float(np.cross(v_in, v_out)[2])  # yaw-plane direction
 
         # Compute turn angle at each gate (angle between approach and departure)
         for gi in range(1, n_gates - 1):
@@ -365,6 +379,16 @@ class TrajectoryOptimizer:
             seg_through = 2 * gi + 1  # segment through gate (entry→exit)
 
             inflate = 1.0
+
+            # --- S-turn detection (iteration 16) ---
+            # An S-turn occurs when this gate and the previous gate have turns
+            # in opposite directions (cross product sign change).
+            # Research: CiMPCC compound curvature, VPMPCC early deceleration.
+            is_s_turn = False
+            if gi >= 2 and turn_angle > 0.25:
+                # Check if previous gate also had a turn in the opposite direction
+                if cross_z[gi - 1] != 0 and cross_z[gi] != 0:
+                    is_s_turn = (cross_z[gi - 1] * cross_z[gi] < 0)
 
             if turn_angle > 1.05:  # > ~60 degrees — angle-based
                 # Inflation factor: reduced from 0.35→0.25 (iter 9) since
@@ -407,6 +431,21 @@ class TrajectoryOptimizer:
                     severity = min(excess, 1.0)
                     inflate = 1.0 + 0.15 * severity  # range: 1.0x to 1.15x (reduced from 0.25, iter 9)
 
+            # --- S-turn compound inflation (iteration 16) ---
+            # For the second gate of an S-turn pair, apply extra inflation.
+            # The drone arrives with lateral velocity in the wrong direction
+            # and must reverse it — requires more time than a single turn.
+            # Research: CiMPCC compound curvature, VPMPCC sustained low speed.
+            if is_s_turn:
+                s_turn_inflate = 1.10  # 10% compound inflation (tuned down from 15%, iter 16)
+                inflate = max(inflate, s_turn_inflate)
+
+                # Also inflate the APPROACH segment (prev gate exit → this entry).
+                # Research: VPMPCC shows early deceleration is critical for S-turns.
+                approach_seg = seg_entry - 1  # segment from prev gate exit to this entry
+                if 0 <= approach_seg < len(times):
+                    times[approach_seg] *= 1.05  # 5% approach deceleration (tuned: 10%→7%→5%)
+
             # Proximity-based inflation for closely-spaced gates (iteration 13).
             # Helix gates are 3.6-4.9m apart; short polynomial segments create
             # high curvature that the PD controller can't follow. Reduced from
@@ -447,6 +486,7 @@ class TrajectoryOptimizer:
         - TOPPQuad (Mao, IROS 2024): fix geometry, optimize speed → 40-50% faster
         - FBGA (Piazza, RA-L 2025): forward-backward matches OC within 0.36%
         - TOPP-RA (Pham & Pham, 2017): reachability-based forward-backward
+        - CiMPCC (Li, ITSC 2024): compound curvature boost for S-turn regions
         """
         times = list(segment_times)
         n = len(times)
@@ -461,6 +501,29 @@ class TrajectoryOptimizer:
         max_v = self.constraints.max_velocity
         min_v = 2.0
         max_compression = 0.65  # don't compress below 65% of original
+
+        # --- S-turn region detection for compound curvature boost (iter 16) ---
+        # Identify waypoint indices that are in S-turn regions (between gates
+        # with consecutive opposite-direction turns). Boost curvature at these
+        # waypoints to prevent TOPP from speeding through S-turns.
+        # Research: CiMPCC (Li, ITSC 2024) — compound curvature for chicanes.
+        s_turn_segments = set()  # segment indices in S-turn regions
+        n_gates = len(gates)
+        if n_gates >= 3:
+            gate_centers = [np.array(g.position) for g in gates]
+            cross_z = {}
+            for gi in range(1, n_gates - 1):
+                v_in = gate_centers[gi] - gate_centers[gi - 1]
+                v_out = gate_centers[gi + 1] - gate_centers[gi]
+                cross_z[gi] = float(np.cross(v_in, v_out)[2])
+            for gi in range(2, n_gates - 1):
+                if gi - 1 in cross_z and gi in cross_z:
+                    if cross_z[gi - 1] * cross_z[gi] < 0:
+                        # S-turn: mark segments around this gate
+                        # Gate gi waypoints: entry=2*gi+1, exit=2*gi+2
+                        # Segments: approach (2*gi-1 to 2*gi+1), through (2*gi+1)
+                        for s in range(max(0, 2 * gi - 1), min(n, 2 * gi + 3)):
+                            s_turn_segments.add(s)
 
         # --- Step 1: Compute segment distances and geometric curvature ---
         seg_dist = []  # straight-line distances
@@ -491,6 +554,14 @@ class TrajectoryOptimizer:
                     chord = float(np.linalg.norm(p2 - p0))
                     if chord > 0.01:
                         k = 2.0 * cross_mag / (n1 * n2 * chord)
+
+            # Compound curvature boost for S-turn regions (iter 16).
+            # In S-turn segments, the effective curvature is higher than the
+            # point Menger curvature because the drone must reverse its lateral
+            # velocity, requiring more centripetal margin.
+            if i in s_turn_segments and k > 1e-4:
+                k *= 1.2  # 20% compound curvature boost (tuned from 30%)
+
             seg_curv.append(k)
 
         # --- Step 2: Speed limits from curvature ---
