@@ -297,7 +297,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # Generic drone (1kg, 20N max thrust, ~2g TWR) rather than Crazyflie.
     tracker = GeometricTracker(TrackerConfig(
         kp_xy=6.0, kd_xy=4.0, kp_z=8.0, kd_z=5.0,
-        feedforward_accel=1.0,  # full feedforward (Leveling the Playing Field, 2025)
+        feedforward_accel=0.4,  # optimal from sweep (0.3/0.4/0.5/0.7/1.0), drag mismatch limits full ff
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
     ))
 
@@ -373,14 +373,19 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
                     target_yaw = float(math.atan2(d[1], d[0]))
 
         # --- Controller: use real GeometricTracker (Phase 1 requirement) ---
+        # Pass trajectory acceleration and jerk for feedforward control.
+        # "Leveling the Playing Field" (Kunapuli 2025): feedforward is the
+        # most important single fix for geometric controllers.
+        # Gate-seeking fallback uses zero acceleration (no trajectory data).
+        use_fallback = sim_time > trajectory.total_time and not seq.is_complete
         ref_point = TrajectoryPoint(
             time=sim_time,
             position=tuple(target_pos),
             velocity=tuple(target_vel),
-            acceleration=(0, 0, 0),
-            jerk=(0, 0, 0),
+            acceleration=(0, 0, 0) if use_fallback else ref.acceleration,
+            jerk=(0, 0, 0) if use_fallback else ref.jerk,
             yaw=target_yaw,
-            yaw_rate=0.0,
+            yaw_rate=0.0 if use_fallback else ref.yaw_rate,
         )
         cmd = tracker.track(tuple(pos), tuple(vel), yaw, ref_point)
 

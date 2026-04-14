@@ -44,9 +44,12 @@ class TrackerConfig:
     kw: float = 2.5       # angular velocity damping
 
     # Feed-forward weight (0 = pure feedback, 1 = full feedforward)
-    # Full feedforward recommended by "Leveling the Playing Field" (2025):
-    # feedforward is the most important single fix for geometric controllers.
-    feedforward_accel: float = 1.0
+    # "Leveling the Playing Field" (2025): feedforward is the most important
+    # single fix for geometric controllers. Scaled to 0.4 because the kinematic
+    # sim's drag (0.5) creates a model mismatch — full feedforward (1.0) causes
+    # overshoot at high-speed segments where drag force is significant and
+    # unmodeled by the controller. Sweep: 0.3→0.4→0.5→0.7→1.0, 0.4 optimal.
+    feedforward_accel: float = 0.4
 
     # Physical limits
     max_tilt_rad: float = 0.85      # ~49 deg — increased for faster turns (Aggressive Maneuvers 2026)
