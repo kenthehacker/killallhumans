@@ -444,7 +444,7 @@ class TrajectoryOptimizer:
                 # Research: CiMPCC (Li 2024) — compound curvature doesn't drop
                 # between consecutive opposite turns.
                 if is_s_turn_first:
-                    s_turn_inflate = 1.13  # junction: 13% (boosted from 10%, iter 20)
+                    s_turn_inflate = 1.12  # junction: 12% (iter 21: reduced from 13% for speed recovery)
                 else:
                     s_turn_inflate = 1.10  # standard second-gate: 10% (iter 16)
                 inflate = max(inflate, s_turn_inflate)
@@ -453,7 +453,7 @@ class TrajectoryOptimizer:
                 # Research: VPMPCC shows early deceleration is critical for S-turns.
                 approach_seg = seg_entry - 1  # segment from prev gate exit to this entry
                 if 0 <= approach_seg < len(times):
-                    times[approach_seg] *= 1.05  # 5% approach deceleration (tuned: 10%→7%→5%)
+                    times[approach_seg] *= 1.03  # 3% approach deceleration (iter 21: reduced from 5%→3% for speed recovery)
 
             # --- S-turn first-gate departure inflation (iteration 20) ---
             # For the first gate of an S-turn pair, inflate the EXIT/departure
@@ -466,12 +466,12 @@ class TrajectoryOptimizer:
                 # Pure first-gate (not junction) — inflate departure only
                 depart_seg = seg_through + 1  # segment from gate exit to next entry
                 if 0 <= depart_seg < len(times):
-                    times[depart_seg] *= 1.06  # 6% departure inflation
+                    times[depart_seg] *= 1.04  # 4% departure inflation (iter 21: reduced from 6%)
             elif is_s_turn_first and is_s_turn:
                 # Junction gate — already boosted to 1.13 above; also inflate departure
                 depart_seg = seg_through + 1
                 if 0 <= depart_seg < len(times):
-                    times[depart_seg] *= 1.04  # 4% departure inflation (less than pure first)
+                    times[depart_seg] *= 1.02  # 2% departure inflation (iter 21: reduced from 4%)
 
             # Bidirectional proximity-based inflation for closely-spaced gates (iter 13, updated iter 18).
             # Helix gates are 3.6-5.7m apart; short polynomial segments create
@@ -535,7 +535,13 @@ class TrajectoryOptimizer:
         a_longitudinal = 8.0
         max_v = self.constraints.max_velocity
         min_v = 2.0
-        max_compression = 0.68  # iter 17: raised from 0.65 to compensate for FOV relaxation removal — protects helix turns from over-compression
+        # Compression floor: per-segment, not uniform (iter 21).
+        # S-turn and high-curvature segments keep 0.68 (iter 17 protection).
+        # Low-curvature/straight segments use 0.60 to recover race time.
+        # Research: FBGA (Piazza 2025) — forward-backward naturally compresses
+        # easy segments more. STORM (Zhang 2025) — per-segment LP for times.
+        max_compression_protected = 0.68  # S-turn, helix, high-curvature
+        max_compression_easy = 0.63  # straights, shallow curves
 
         # --- S-turn region detection for compound curvature boost (iter 16) ---
         # Identify waypoint indices that are in S-turn regions (between gates
@@ -609,6 +615,23 @@ class TrajectoryOptimizer:
 
             seg_curv.append(k)
 
+        # --- Step 1b: Per-segment compression floor (iteration 21) ---
+        # S-turn regions and high-curvature segments keep the protective 0.68 floor.
+        # Straight/easy segments use 0.60 to allow more speed recovery.
+        # Research: FBGA (Piazza 2025), STORM (Zhang 2025) — per-segment timing.
+        curvature_threshold = 0.3  # rad/m — segments above this are "turns"
+        seg_floor = []
+        for i in range(n):
+            if i in s_turn_segments:
+                seg_floor.append(max_compression_protected)
+            elif seg_curv[i] > curvature_threshold:
+                seg_floor.append(max_compression_protected)
+            elif i > 0 and seg_curv[i - 1] > curvature_threshold:
+                # Segment leading into a turn also gets protection
+                seg_floor.append(max_compression_protected)
+            else:
+                seg_floor.append(max_compression_easy)
+
         # --- Step 2: Speed limits from curvature ---
         # Use the MAX curvature of the two endpoints of each segment
         v_max_seg = []
@@ -636,7 +659,7 @@ class TrajectoryOptimizer:
 
         # Backward pass: deceleration from end
         v_bwd = [0.0] * n
-        v_bwd[n - 1] = min(v_max_seg[n - 1], max_v * 0.5)  # end slower
+        v_bwd[n - 1] = min(v_max_seg[n - 1], max_v * 0.65)  # end speed (iter 21: raised from 0.5→0.65, no need to slow at finish)
         for i in range(n - 2, -1, -1):
             v_sq = v_bwd[i + 1] ** 2 + 2.0 * a_longitudinal * seg_dist[i]
             v_bwd[i] = min(v_max_seg[i], math.sqrt(max(v_sq, 0.0)))
@@ -650,8 +673,8 @@ class TrajectoryOptimizer:
             if seg_dist[i] < 0.01:
                 continue
             new_time = seg_dist[i] / v_opt[i]
-            # Don't compress below max_compression of original
-            new_time = max(new_time, times[i] * max_compression)
+            # Don't compress below per-segment floor (iter 21: selective)
+            new_time = max(new_time, times[i] * seg_floor[i])
             # Only compress, never expand
             new_time = min(new_time, times[i])
             new_times[i] = max(new_time, 0.1)
