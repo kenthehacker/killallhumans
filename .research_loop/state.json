@@ -1,9 +1,9 @@
 {
-  "iteration": 19,
-  "timestamp": "2026-04-14T12:45:00Z",
+  "iteration": 20,
+  "timestamp": "2026-04-14T13:00:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
-  "previous_bottleneck": "system_integration",
+  "previous_bottleneck": "trajectory_planning",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -56,22 +56,13 @@
     "spatial_ilc_virtual_tube_2023",
     "aero_mppi_ensemble_2025",
     "f1_data_driven_init_shehadeh_2026",
-    "topology_driven_parallel_degroot_2024"
+    "topology_driven_parallel_degroot_2024",
+    "learning_agile_gate_traversal_sun_2025",
+    "imitation_learning_timeopt_waypoints_2024",
+    "rl_safe_timeopt_cluttered_2025"
   ],
-  "total_papers_analyzed": 52,
+  "total_papers_analyzed": 55,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.234,
-    "max_tracking_error_m": 0.696,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7510,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-4",
-    "worst_gate_error_m": 0.413,
-    "race_time_s": 13.91
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.230,
     "max_tracking_error_m": 0.683,
@@ -83,57 +74,69 @@
     "worst_gate_error_m": 0.463,
     "race_time_s": 13.88
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.218,
+    "max_tracking_error_m": 0.679,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7390,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-3",
+    "worst_gate_error_m": 0.345,
+    "race_time_s": 14.10
+  },
   "changes_committed": true,
-  "commit_hash": "f49e1e5",
+  "commit_hash": "c858575",
   "diagnostic": {
-    "root_cause": "L-BFGS was stuck in a local minimum favoring gate-3 at gate-4's expense. Multi-start found a basin 24.9% better for gate-4 but 40.7% worse for gate-3 — S-turn coupling means optimizing one worsens the other. Net: all aggregates improved.",
+    "root_cause": "Gate-3 was at the junction of two cascading S-turn pairs (2→3 and 3→4) but only received inflation as the second gate of pair (2,3). Adding first-gate detection, junction boost (1.13), and departure inflation (1.06/1.04) gave the controller time to prepare for lateral velocity reversal.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.107,
-      "avg_thrust": 0.803
+      "avg_pitch_rad": -0.108,
+      "avg_thrust": 0.797
     },
     "trend": "improving",
     "architectural_issues": [
-      "S-turn coupling: gate-3 and gate-4 errors are anti-correlated — optimizing one worsens the other",
-      "L-BFGS objective (path_length + curvature²) doesn't minimize tracking error — selection cost mismatch",
-      "Racing line and segment timing are optimized sequentially, not jointly",
-      "Kinematic sim trajectory planning approaching limits — controller changes (MPCC) or PyBullet needed for step change"
+      "Race time regressed 0.22s due to S-turn inflation — need selective compression in low-error regions",
+      "L-BFGS objective (path_length + curvature²) still doesn't minimize tracking error — sim-based selection gap",
+      "S-turn inflation system now comprehensive but complex — 5 interacting mechanisms",
+      "Kinematic sim approaching limits — MPCC controller or PyBullet needed for step change"
     ],
     "critic_findings": [
-      "Multi-start found a new basin as predicted — zero-init was suboptimal for 18 iterations",
-      "Late-apex geometric initialization was NOT the winner — random seed was",
-      "P95 increased (+0.012m) despite avg decreasing — gate-3 tail behavior diverged from mean",
-      "First iteration to improve race time, avg error, and max error simultaneously"
+      "Junction gate concept (first + second S-turn) was the key missing abstraction for 20 iterations",
+      "Gate-4 improved despite departure inflation — counter-intuitive but validated",
+      "P95 improved 16.2% while avg improved only 5.2% — tail behavior dominated by gate-3 peak",
+      "Zero helix regression — changes perfectly isolated to S-turn region"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Gate-3 S-turn inflation — first S-turn bend now worst gate at 0.463m",
-      "proposed_approach": "Add approach-side inflation for first gate of S-turn pairs (currently only second gate gets compound inflation)",
-      "expected_impact": "Gate-3 error 0.463→0.35m, avg error improvement",
+      "description": "Race time recovery — 14.10s exceeds aspirational <14s target",
+      "proposed_approach": "Selective segment compression in low-error regions (gate-1, gate-5, gate-6 straights)",
+      "expected_impact": "Race time 14.10→13.95s without tracking regression",
       "priority": 1,
-      "research_refs": ["cimpcc_curvature_velocity_li_2024", "vpmpcc_data_driven_racing_li_2024"]
+      "research_refs": ["toppquad_speed_profile_mao_2024", "fbga_velocity_profile_piazza_2025"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Gate-7 helix entry — now worst gate at 0.308m",
+      "proposed_approach": "Investigate helix entry specialized handling beyond current angle + proximity inflation",
+      "expected_impact": "Gate-7 error 0.308→0.25m",
+      "priority": 2,
+      "research_refs": ["cimpcc_curvature_velocity_li_2024"]
     },
     {
       "area": "system_integration",
       "description": "Sim-based multi-start selection — use kinematic sim tracking error instead of L-BFGS objective",
       "proposed_approach": "Run each of 10 candidate racing lines through kinematic sim, select by avg tracking error",
-      "expected_impact": "Find racing line the controller can actually follow best — may resolve gate-3/4 trade-off",
-      "priority": 2,
-      "research_refs": ["aero_mppi_ensemble_2025", "topology_driven_parallel_degroot_2024"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Joint racing line + timing optimization — co-optimize offsets and segment times",
-      "proposed_approach": "Single L-BFGS pass optimizing both lateral offsets and time allocation together",
-      "expected_impact": "Better global trade-off between speed and trackability",
+      "expected_impact": "Find racing line the controller can actually follow best",
       "priority": 3,
-      "research_refs": ["f1_data_driven_init_shehadeh_2026", "taco_trajectory_aware_controller_2025"]
+      "research_refs": ["aero_mppi_ensemble_2025", "topology_driven_parallel_degroot_2024"]
     },
     {
       "area": "control",
@@ -145,11 +148,11 @@
     },
     {
       "area": "trajectory_planning",
-      "description": "Learned per-segment feasibility predictor — replace heuristic inflation",
-      "proposed_approach": "Train MLP on (segment polynomials, approach velocity) to tracking error",
-      "expected_impact": "Better inflation accuracy than hand-tuned rules",
+      "description": "Joint racing line + timing optimization — co-optimize offsets and segment times",
+      "proposed_approach": "Single L-BFGS pass optimizing both lateral offsets and time allocation together",
+      "expected_impact": "Better global trade-off between speed and trackability",
       "priority": 5,
-      "research_refs": ["quad_lcd_srikanthan_2025", "spatial_ilc_virtual_tube_2023"]
+      "research_refs": ["f1_data_driven_init_shehadeh_2026", "taco_trajectory_aware_controller_2025"]
     }
   ],
   "failed_approaches": [
