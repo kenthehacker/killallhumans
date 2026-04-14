@@ -396,6 +396,19 @@ class TrajectoryOptimizer:
                     severity = min(excess, 1.0)
                     inflate = 1.0 + 0.15 * severity  # range: 1.0x to 1.15x (reduced from 0.25, iter 9)
 
+            # Proximity-based inflation for closely-spaced gates (iteration 13).
+            # Helix gates are 3.6-4.9m apart; short polynomial segments create
+            # high curvature that the PD controller can't follow. Add up to 25%
+            # additional inflation when consecutive gates are within 6m.
+            # Research: TOGT (Qin 2024) gate region constraints; TACO (Sanghvi
+            # 2025) local trajectory characteristic adaptation.
+            if gi + 1 < n_gates:
+                dist_between = float(np.linalg.norm(
+                    gate_centers[gi + 1] - gate_centers[gi]))
+                if dist_between < 6.0 and turn_angle > 0.4:  # ~23° minimum
+                    proximity_factor = 1.0 + 0.25 * (1.0 - dist_between / 6.0)
+                    inflate = max(inflate, proximity_factor)
+
             if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:
                     if 0 <= seg_idx < len(times):

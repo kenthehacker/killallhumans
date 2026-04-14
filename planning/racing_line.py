@@ -30,10 +30,20 @@ from .trajectory_optimizer import GateWaypoint
 @dataclass
 class RacingLineConfig:
     """Configuration for racing line optimization."""
-    max_lateral_offset: float = 0.4    # max offset from gate center (fraction of half-width)
+    max_lateral_offset: float = 0.6    # max offset from gate center (fraction of half-width)
+                                       # Increased from 0.4 (iter 13): optimizer was maxing out
+                                       # at 0.339m, constraining corner-cutting.
+                                       # TOGT (Qin 2024): gates are regions, not points.
+                                       # 0.6 * 0.6m half-width = 0.36m offset, leaves 0.24m margin.
     corner_cut_aggressiveness: float = 0.7  # 0=center, 1=max corner cut
     speed_weight: float = 1.0          # importance of minimizing time
-    smoothness_weight: float = 0.3     # importance of path smoothness
+    smoothness_weight: float = 0.40    # importance of path smoothness
+                                       # Increased from 0.3 (iter 13): with offset=0.6, smooth≥0.35
+                                       # steers the racing line L-BFGS into a qualitatively
+                                       # smoother local minimum. smooth=0.40 is the sweet spot:
+                                       # helix tracking drops 73% (gate-7: 0.659→0.180m) while
+                                       # S-turn (gate-3) stays acceptable (0.402→0.422m).
+                                       # ILMPC (Zhao 2025): trajectory quality > controller tuning.
     lookahead_gates: int = 3           # gates to consider for corner cutting
 
 
