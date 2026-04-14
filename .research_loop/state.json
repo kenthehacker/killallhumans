@@ -1,6 +1,6 @@
 {
-  "iteration": 21,
-  "timestamp": "2026-04-14T14:00:00Z",
+  "iteration": 22,
+  "timestamp": "2026-04-14T14:24:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -61,22 +61,13 @@
     "imitation_learning_timeopt_waypoints_2024",
     "rl_safe_timeopt_cluttered_2025",
     "storm_spatiotemporal_optimization_2025",
-    "sequence_modeling_lstm_topp_mao_2025"
+    "sequence_modeling_lstm_topp_mao_2025",
+    "bo_racing_line_heilmeier_2020",
+    "multiobjective_pid_quadrotor_2025",
+    "sampling_racing_line_ogretmen_2024"
   ],
-  "total_papers_analyzed": 57,
+  "total_papers_analyzed": 60,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.218,
-    "max_tracking_error_m": 0.679,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7652,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-3",
-    "worst_gate_error_m": 0.345,
-    "race_time_s": 14.10
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.223,
     "max_tracking_error_m": 0.678,
@@ -88,73 +79,85 @@
     "worst_gate_error_m": 0.374,
     "race_time_s": 13.99
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.206,
+    "max_tracking_error_m": 0.682,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 8085,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-7",
+    "worst_gate_error_m": 0.311,
+    "race_time_s": 14.15
+  },
   "changes_committed": true,
-  "commit_hash": "7305169",
+  "commit_hash": "6fb6eea",
   "diagnostic": {
-    "root_cause": "Race time 14.10s caused by comprehensive S-turn inflation (junction, departure, approach) over-conservatively slowing the S-turn region. Six coordinated micro-optimizations recovered 0.11s: selective compression floor (0.63 for easy segments), end speed increase, and modest inflation parameter reductions.",
+    "root_cause": "L-BFGS proxy objective (path_length + curvature²) systematically selected racing lines that are geometrically efficient but dynamically poor for the PD controller at the S-turn. Sim-based evaluation found a 44% better racing line from the existing 10-candidate pool.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.108,
-      "avg_thrust": 0.799
+      "avg_pitch_rad": -0.110,
+      "avg_thrust": 0.796
     },
     "trend": "improving",
     "architectural_issues": [
-      "Kinematic sim approaching limits for parameter tuning — diminishing returns",
-      "L-BFGS proxy objective (path_length + curvature²) doesn't correlate with tracking error for racing line selection",
-      "Gate-7 helix entry stuck at 0.308m for 5+ iterations",
-      "Gate-2 sensitive to approach compression — not classified as S-turn but needs protection"
+      "Sim-based selection composite score has no speed term — selects smoother but slower racing lines",
+      "Gate-7 helix entry stuck at ~0.31m for 6+ iterations — isolated from racing line changes",
+      "Race time regressed 13.99→14.15s, misses aspirational <14s target by 0.15s",
+      "Kinematic sim evaluator uses coarser dt=0.02 — minor model mismatch with benchmark dt=0.01"
     ],
     "critic_findings": [
-      "Compression floor alone was insufficient (0.01s) — inflation parameters were the real binding constraint",
-      "Six coordinated changes required — no single change crossed 14s threshold",
-      "Helix gates (7-11) perfectly isolated from all changes — zero impact",
-      "Both aspirational targets now met simultaneously for first time"
+      "Gate-3 improved 44% — validates proxy-vs-actual hypothesis dramatically",
+      "Selected racing line was from existing 10-candidate pool — just filtered out by wrong criterion",
+      "Gate-2/gate-3 trade-off: smoother gate-3 approach requires different gate-2 entry angle",
+      "Helix gates completely unaffected — S-turn and helix are independently optimized regions"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Gate-3 S-turn tracking at 0.374m — regressed from 0.345m in iter 20",
-      "proposed_approach": "Sim-based racing line selection: evaluate candidate racing lines by kinematic sim tracking error instead of L-BFGS proxy objective",
-      "expected_impact": "Gate-3 error recovery to ~0.34m without speed regression",
+      "description": "Race time regressed 13.99→14.15s — sim-based composite score has no speed term",
+      "proposed_approach": "Add time penalty to composite: score = 0.6*avg_err + 0.2*worst_gate + 0.2*race_time_normalized",
+      "expected_impact": "Recover to ~14.0s while keeping most tracking improvement",
       "priority": 1,
-      "research_refs": ["aero_mppi_ensemble_2025", "topology_driven_parallel_degroot_2024"]
+      "research_refs": ["bo_racing_line_heilmeier_2020"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Gate-7 helix entry stuck at 0.308m for 5+ iterations",
-      "proposed_approach": "Investigate specialized helix-entry handling or curvature-aware racing line through helix",
-      "expected_impact": "Gate-7 error 0.308→0.25m",
+      "description": "Gate-7 helix entry stuck at 0.311m for 6+ iterations — isolated from racing line changes",
+      "proposed_approach": "Per-section racing line: different smoothness weights for helix vs S-turn, or helix-specific inflation tuning",
+      "expected_impact": "Gate-7 error 0.311→0.25m",
       "priority": 2,
       "research_refs": ["cimpcc_curvature_velocity_li_2024", "mastering_diverse_tracks_2025"]
     },
     {
-      "area": "system_integration",
-      "description": "Sim-based multi-start racing line selection",
-      "proposed_approach": "Run each of 10 candidate racing lines through kinematic sim, select by avg tracking error",
-      "expected_impact": "Find racing line the controller can actually follow best",
+      "area": "trajectory_planning",
+      "description": "Gate-2 approach at 0.246m — mild regression from 0.234m due to new racing line",
+      "proposed_approach": "Add gate-2 weighting in sim-based composite score, or investigate racing line entry angle",
+      "expected_impact": "Gate-2 error recovery to ~0.23m",
       "priority": 3,
-      "research_refs": ["aero_mppi_ensemble_2025", "topology_driven_parallel_degroot_2024"]
+      "research_refs": ["taco_trajectory_aware_controller_2025"]
     },
     {
       "area": "control",
-      "description": "MPCC controller upgrade — contouring error decomposition",
-      "proposed_approach": "Implement contouring/progress error for cross-track vs along-track control",
-      "expected_impact": "Major tracking accuracy improvement (ETH 2026: 0.07m avg at 9.8 m/s)",
+      "description": "MPCC controller upgrade — contouring error decomposition for all gates",
+      "proposed_approach": "Implement contouring/progress error decomposition for cross-track vs along-track control",
+      "expected_impact": "Tracking improvement across all gates (ETH: 0.07m avg at 9.8 m/s)",
       "priority": 4,
-      "research_refs": ["mpcc_plus_plus_krinner_2024", "ilmpc_improved_drone_racing_2025"]
+      "research_refs": ["mpcc_plus_plus_krinner_2024"]
     },
     {
-      "area": "trajectory_planning",
-      "description": "Gate-2 approach optimization — sensitive to compression (0.212→0.234m)",
-      "proposed_approach": "Classify gate-2 approach as moderately-protected segment or improve racing line entry angle",
-      "expected_impact": "Gate-2 error recovery to ~0.215m",
+      "area": "system_integration",
+      "description": "PyBullet integration for realistic physics validation",
+      "proposed_approach": "Port kinematic sim evaluation to PyBullet for competition-realistic feedback",
+      "expected_impact": "More realistic racing line selection, competition readiness",
       "priority": 5,
-      "research_refs": ["taco_trajectory_aware_controller_2025"]
+      "research_refs": []
     }
   ],
   "failed_approaches": [
