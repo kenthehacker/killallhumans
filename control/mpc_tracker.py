@@ -56,6 +56,14 @@ class TrackerConfig:
     # drag provides beneficial velocity damping. See iteration 9 analysis.
     drag_coefficient: float = 0.0
 
+    # Reference-velocity drag feedforward (iteration 11).
+    # Adds vff * ref_vel to accel_des to cancel drag-induced steady-state error.
+    # Unlike drag_coefficient (which uses CURRENT vel and kills damping),
+    # this uses REFERENCE vel, preserving drag's velocity-error damping
+    # while eliminating drag-induced forcing. See iteration 11 synthesis.
+    # Backed by: Tal & Karaman 2018, L1Quad 2025, DATT 2023.
+    velocity_feedforward: float = 0.0
+
     # Physical limits
     max_tilt_rad: float = 0.85      # ~49 deg — increased for faster turns (Aggressive Maneuvers 2026)
     max_thrust_normalized: float = 0.95
@@ -117,10 +125,12 @@ class GeometricTracker:
         ev = ref_vel - vel
 
         # Desired acceleration (PD + feedforward + optional drag compensation)
+        # velocity_feedforward: adds vff * ref_vel to cancel drag-induced
+        # steady-state error while preserving drag's velocity-error damping.
         accel_des = np.array([
-            c.kp_xy * ep[0] + c.kd_xy * ev[0] + c.feedforward_accel * ref_acc[0] + c.drag_coefficient * vel[0],
-            c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1] + c.drag_coefficient * vel[1],
-            c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2] + c.drag_coefficient * vel[2],
+            c.kp_xy * ep[0] + c.kd_xy * ev[0] + c.feedforward_accel * ref_acc[0] + c.drag_coefficient * vel[0] + c.velocity_feedforward * ref_vel[0],
+            c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1] + c.drag_coefficient * vel[1] + c.velocity_feedforward * ref_vel[1],
+            c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2] + c.drag_coefficient * vel[2] + c.velocity_feedforward * ref_vel[2],
         ])
 
         # In NED: gravity is (0, 0, g) pointing down
