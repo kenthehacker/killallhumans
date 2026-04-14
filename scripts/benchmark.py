@@ -302,17 +302,11 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
     ))
 
-    # Dual-timescale feedforward (TACO, Sanghvi 2025; Tal & Karaman 2018).
-    # Splits feedforward between current-time and lookahead acceleration.
-    # Current-time FF provides "where the trajectory IS now" directional info,
-    # Lookahead FF provides "where it's going" anticipation for turns.
-    # This dual-timescale approach improves directionality during S-turns and
-    # helix sections where the acceleration direction changes rapidly.
-    # Discovered via systematic sweep: ff_curr=0.10 + ff_ahead=0.25 at 70ms
-    # outperforms single-time ff=0.40 at 50ms by 16% avg error reduction.
-    ff_lookahead_s = 0.07  # 70ms lookahead for predictive FF
-    ff_curr_weight = 0.10  # feedforward weight for current-time acceleration
-    ff_ahead_weight = 0.25  # feedforward weight for lookahead acceleration
+    # Predictive feedforward lookahead (Tal & Karaman 2018 style).
+    # Use acceleration from slightly ahead in the trajectory to
+    # anticipate upcoming turns. This is the time-domain equivalent
+    # of jerk feedforward via differential flatness.
+    ff_lookahead_s = 0.05  # 50ms lookahead for predictive FF
 
     # --- Synthetic drone state ---
     pos = start_pos.copy()
@@ -386,29 +380,20 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
                     target_yaw = float(math.atan2(d[1], d[0]))
 
         # --- Controller: use real GeometricTracker (Phase 1 requirement) ---
-        # Dual-timescale feedforward: split between current and lookahead.
+        # Pass trajectory acceleration and jerk for feedforward control.
         # "Leveling the Playing Field" (Kunapuli 2025): feedforward is the
         # most important single fix for geometric controllers.
         # Gate-seeking fallback uses zero acceleration (no trajectory data).
         use_fallback = sim_time > trajectory.total_time and not seq.is_complete
-        # Dual-timescale feedforward (TACO, Sanghvi 2025; Tal & Karaman 2018).
-        # Current-time acceleration provides local trajectory direction;
-        # lookahead acceleration anticipates upcoming turns.
+        # Predictive feedforward: use acceleration from slightly ahead
+        # to anticipate turns (Tal & Karaman 2018 jerk-FF principle)
         if not use_fallback and ff_lookahead_s > 0:
             ref_ahead = trajectory.sample(sim_time + ff_lookahead_s)
-            # Blend current and lookahead acceleration for feedforward
-            ff_acc = tuple(
-                ff_curr_weight * ref.acceleration[i] + ff_ahead_weight * ref_ahead.acceleration[i]
-                for i in range(3)
-            )
+            ff_acc = ref_ahead.acceleration
             ff_jerk = ref_ahead.jerk
         else:
-            ff_acc = (0, 0, 0)
-            ff_jerk = (0, 0, 0)
-
-        # Build reference point with blended feedforward acceleration.
-        # Set feedforward_accel=1.0 since ff_acc already has correct weights.
-        tracker.config.feedforward_accel = 1.0 if not use_fallback else 0.0
+            ff_acc = (0, 0, 0) if use_fallback else ref.acceleration
+            ff_jerk = (0, 0, 0) if use_fallback else ref.jerk
         ref_point = TrajectoryPoint(
             time=sim_time,
             position=tuple(target_pos),
