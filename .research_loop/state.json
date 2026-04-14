@@ -1,9 +1,9 @@
 {
-  "iteration": 12,
-  "timestamp": "2026-04-14T00:50:00Z",
+  "iteration": 15,
+  "timestamp": "2026-04-14T11:00:00Z",
   "status": "completed",
-  "current_bottleneck": "system_integration",
-  "previous_bottleneck": "control",
+  "current_bottleneck": "trajectory_planning",
+  "previous_bottleneck": "trajectory_planning",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -37,102 +37,107 @@
     "neural_augmented_indi_2025",
     "dqn_gain_scheduling_2026",
     "task_parameter_nexus_2024",
-    "rl_gain_scheduling_ppo_2024"
+    "rl_gain_scheduling_ppo_2024",
+    "arola_modular_architecture_2026",
+    "ilmpc_drone_racing_2025",
+    "mppi_reference_free_racing_2025",
+    "toppquad_speed_profile_mao_2024",
+    "sequence_modeling_toppquad_2025",
+    "multifidelity_rl_replanning_2024",
+    "fbga_velocity_profile_piazza_2025",
+    "cpc_foehn_2021"
   ],
-  "total_papers_analyzed": 33,
+  "total_papers_analyzed": 41,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.358,
-    "max_tracking_error_m": 1.463,
+    "avg_tracking_error_m": 0.254,
+    "max_tracking_error_m": 0.746,
     "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7916,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.659,
-    "race_time_s": 13.31,
-    "note": "Measured on 13.59s trajectory realization (previous session)"
-  },
-  "metrics_after": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.252,
-    "max_tracking_error_m": 1.504,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 5723,
+    "avg_loop_hz": 6976,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-3",
-    "worst_gate_error_m": 0.905,
-    "race_time_s": 17.32,
-    "note": "Measured on 17.46s trajectory realization (current session). Code reverted to iteration 11 state."
+    "worst_gate_error_m": 0.439,
+    "race_time_s": 14.62
+  },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.251,
+    "max_tracking_error_m": 0.679,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7745,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.465,
+    "race_time_s": 13.50
   },
   "changes_committed": true,
-  "commit_hash": "3e07fc9",
+  "commit_hash": "15436e6",
   "diagnostic": {
-    "root_cause": "Gain scheduling fundamentally doesn't work in kinematic sim without attitude dynamics. The feedforward direction is already optimal; changing gains only redirects the clamped acceleration away from optimal. Additionally, trajectory optimizer non-determinism across sessions (13.59s vs 17.46s) invalidates tuning optimized on a single trajectory realization.",
+    "root_cause": "Heuristic _compress_times left significant speed on the table — only checked per-segment average speeds against max_velocity without accounting for geometric curvature or acceleration transitions. TOPP-RA forward-backward propagation with waypoint Menger curvature found ~2.3s of compression (15.94→13.68s) vs the heuristic's ~1.15s.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.079,
-      "avg_thrust": 0.762
+      "avg_pitch_rad": -0.101,
+      "avg_thrust": 0.822
     },
-    "trend": "plateau",
+    "trend": "improving",
     "architectural_issues": [
-      "Trajectory optimizer non-determinism: L-BFGS + FOV relaxation produces different results across sessions (13.59s vs 17.46s). This undermines all empirical comparisons.",
-      "Kinematic sim cannot evaluate gain scheduling — no attitude dynamics means gains only redirect clamped acceleration direction",
-      "Gate-3 (S-turn, 0.905m) is now worst gate on 17.46s trajectory — was gate-7 (helix) on 13.59s trajectory",
-      "The worst gate is trajectory-speed-dependent: faster trajectory stresses helix, slower trajectory stresses S-turns"
+      "Four-stage post-optimization pipeline (L-BFGS → inflate → FOV → TOPP) partially undoes its own work — consolidate to three stages",
+      "S-turn (gates 3-4) is the clear bottleneck at 0.452/0.465m — geometry problem, not speed",
+      "Gate-4 worsened because TOPP retimer speeds up approach to S-turn; turn inflation calibrated for old (slower) approach speed",
+      "FOV relaxation can be removed — L-BFGS FOV penalty (weight=10) provides sufficient awareness"
     ],
     "critic_findings": [
-      "6 distinct approaches tested (curvature gain sched, error gain sched, FF attenuation, position targeting, PID, dual-timescale FF) — thorough exploration",
-      "Fundamental insight: kinematic sim is a ceiling for controller improvements — need PyBullet for attitude-dependent techniques",
-      "Trajectory non-determinism is a critical systemic issue — all previous iteration-to-iteration comparisons may have been confounded",
-      "Dual-timescale FF showed improvement on one trajectory but regression on another — robustness matters more than peak performance"
+      "TOPP retimer speeds up straights effectively (gates 1-2, 9-12 improved) but S-turn gates 3-4 regressed",
+      "Avg thrust decreased 0.837→0.822 despite faster trajectory — more efficient speed profile with less accel/decel cycling",
+      "Polynomial curvature is timing-dependent and MUST NOT be used for speed profiling — use waypoint Menger curvature"
     ]
   },
   "improvements_backlog": [
     {
-      "area": "system_integration",
-      "description": "Trajectory optimizer non-determinism — L-BFGS + FOV relaxation produces different results across sessions",
-      "proposed_approach": "Cache trajectory after first generation, or add deterministic BLAS mode, or seed optimizer. Validate with 10 consecutive runs.",
-      "expected_impact": "Reproducible benchmarks, valid iteration comparisons",
+      "area": "trajectory_planning",
+      "description": "S-turn gate-3/4 treatment — gate-4 now worst at 0.465m, approach speed increased by TOPP retimer",
+      "proposed_approach": "Detect consecutive opposite-direction turns (S-turn) and add extra time inflation for the second turn. Re-calibrate _inflate_sharp_turns for faster approach speeds.",
+      "expected_impact": "Gate-4 error 0.465→0.35m, avg error 0.251→0.23m",
       "priority": 1,
+      "research_refs": ["taco_sanghvi_2025", "alternating_peak_foehn_2024"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Consolidate post-optimization pipeline — merge inflate + TOPP into single curvature-aware retimer, remove FOV relaxation",
+      "proposed_approach": "Remove _relax_for_fov entirely. Merge _inflate_sharp_turns logic into _topp_retime with curvature-dependent minimum times.",
+      "expected_impact": "Cleaner architecture, small speed gain, more coherent pipeline",
+      "priority": 2,
+      "research_refs": ["perception_aware_planning_eth_2026", "toppquad_speed_profile_mao_2024"]
+    },
+    {
+      "area": "system_integration",
+      "description": "Tighten aspirational thresholds — race time now meets <14s, new target <13s",
+      "proposed_approach": "Update thresholds: race_time < 13s, avg_error < 0.25m, max_error < 0.5m",
+      "expected_impact": "Drive continued improvement toward competition-level performance",
+      "priority": 3,
       "research_refs": []
     },
     {
-      "area": "trajectory_planning",
-      "description": "S-turn gate-3 error 0.905m — worst gate on current trajectory",
-      "proposed_approach": "Detect consecutive opposite-direction turns and boost inflation for second turn segment",
-      "expected_impact": "Gate-3 error 0.90→0.40m",
-      "priority": 2,
-      "research_refs": ["taco_sanghvi_2025"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Norm-based acceleration constraints — sphere vs box gives >20% faster trajectories",
-      "proposed_approach": "Replace per-axis velocity/acceleration checks in L-BFGS with norm-based",
-      "expected_impact": "10-20% faster base trajectory",
-      "priority": 3,
-      "research_refs": ["realtime_mintime_norm_constraint_teissing_2024"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "KAIST-style heading FOV control — decouple yaw from position for zero-cost FOV",
-      "proposed_approach": "Implement distance-weighted heading blending toward next gate",
-      "expected_impact": "Reduce FOV relaxation overhead (17.46 to ~15s trajectory)",
-      "priority": 4,
-      "research_refs": ["drift_corrected_vio_perception_planning_2025"]
-    },
-    {
       "area": "system_integration",
-      "description": "PyBullet physics validation — kinematic sim can't evaluate gain scheduling or attitude-dependent techniques",
-      "proposed_approach": "Install gym-pybullet-drones, enable PyBullet benchmark",
-      "expected_impact": "Enable controller tuning approaches (gain scheduling, INDI, L1 adaptive)",
+      "description": "Multi-start racing line optimization — escape L-BFGS local minima",
+      "proposed_approach": "Run L-BFGS from 5-10 random initializations, score by TOPP-computed race time",
+      "expected_impact": "Find better racing line basins, potential 0.5-1s improvement",
+      "priority": 4,
+      "research_refs": ["sequence_modeling_toppquad_2025"]
+    },
+    {
+      "area": "control",
+      "description": "Controller adaptation for faster trajectory — avg thrust decreased (margin exists)",
+      "proposed_approach": "Increase feedforward gain on straight segments where thrust margin is available",
+      "expected_impact": "Avg error 0.251→0.23m",
       "priority": 5,
-      "research_refs": ["dqn_gain_scheduling_2026", "rl_gain_scheduling_ppo_2024"]
+      "research_refs": ["taco_sanghvi_2025"]
     }
   ],
   "failed_approaches": [
@@ -224,6 +229,34 @@
       "lesson": "Gain scheduling fundamentally doesn't work in kinematic sim without attitude dynamics. The feedforward direction is already optimal; changing gains redirects clamped acceleration away from optimal. Dual-timescale FF worked on one trajectory but regressed on another — controller tuning must be robust to trajectory variation.",
       "approach": "gain_scheduling_kinematic_sim",
       "reason": "No attitude dynamics in kinematic sim. Trajectory optimizer non-determinism across sessions."
+    },
+    {
+      "iteration": 13,
+      "description": "Racing line offset=0.6 with smoothness_weight=0.3 (fast basin). Produces 12.78s trajectory but gate-7 error 0.971m — worse than baseline.",
+      "lesson": "The racing line L-BFGS has two distinct local minima: fast (12.78s, high tracking error) and smooth (17.4s, low tracking error). The fast basin produces a trajectory too aggressive for the kinematic sim PD controller.",
+      "approach": "fast_racing_line_basin",
+      "reason": "Fast trajectory creates untrackable curvature in helix"
+    },
+    {
+      "iteration": 14,
+      "description": "Uniform time compression (3-15% compression of all segments). Even 3% was infeasible because some turn segments are already at acceleration limits.",
+      "lesson": "Compression must be segment-selective — only speed up segments with velocity headroom. Turn segments are already at their dynamic limits.",
+      "approach": "uniform_time_compression",
+      "reason": "Turn segments at acceleration limits prevent any uniform speedup"
+    },
+    {
+      "iteration": 15,
+      "description": "Polynomial curvature (κ = |v × a| / |v|³) for TOPP speed profiling. Curvature was artificially low because polynomial coefficients are timing-dependent — slow trajectory 'straightens out'.",
+      "lesson": "Polynomial curvature is timing-dependent and does NOT reflect geometric path curvature. Use waypoint Menger curvature for timing-independent speed profiling.",
+      "approach": "polynomial_curvature_topp",
+      "reason": "Polynomial curvature at slow timing gives near-zero values, producing no compression"
+    },
+    {
+      "iteration": 15,
+      "description": "Curvature-dependent compression floors (0.65 straights / 0.80 turns) for TOPP retimer.",
+      "lesson": "Curvature-dependent floors are too conservative — TOPP speed limits already handle curvature-aware slowdown. Uniform floor is better.",
+      "approach": "curvature_dependent_compression_floors",
+      "reason": "Produced only 14.30s vs 13.50s with uniform 0.65 floor"
     }
   ]
 }
