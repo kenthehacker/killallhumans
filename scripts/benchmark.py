@@ -293,6 +293,23 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
+    # --- Offline ILC position-offset table (iteration 25) ---
+    # Computes a cross-track position offset via P-type ILC to reduce systematic
+    # tracking error, especially in the helix section (gates 7-10).
+    # The offset is applied to the controller's position reference at runtime,
+    # preserving the original trajectory's polynomial derivatives for feedforward.
+    # Research: Schoellig et al. 2012, Spatial ILC (Lv 2023), ILMPC (Zhao 2025).
+    from planning.trajectory_optimizer import compute_ilc_offset_table
+    ilc_offsets = compute_ilc_offset_table(
+        trajectory, tuple(start_pos),
+        alpha=0.4,             # conservative learning rate
+        max_iterations=5,      # convergence typically in 3-5 (Schoellig 2012)
+        smoothing_sigma=10.0,  # Gaussian kernel width (timesteps at dt=0.01)
+        max_correction_m=0.15, # safety limit on cross-track shift
+        convergence_threshold=0.002,  # stop when <2mm improvement
+        dt=dt,                 # must match benchmark sim timestep
+    )
+
     # Use consistent physics parameters between tracker and kinematic model.
     # Generic drone (1kg, 20N max thrust, ~2g TWR) rather than Crazyflie.
     tracker = GeometricTracker(TrackerConfig(
@@ -364,6 +381,9 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         # Get reference
         ref = trajectory.sample(sim_time)
         target_pos = np.array(ref.position)
+        # Apply ILC position offset (cross-track correction for systematic error)
+        if ilc_offsets is not None and step < len(ilc_offsets):
+            target_pos = target_pos + ilc_offsets[step]
         target_vel = np.array(ref.velocity)
         target_yaw = ref.yaw
 

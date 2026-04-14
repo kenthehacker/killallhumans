@@ -122,6 +122,163 @@ class RaceTrajectory:
         return self.points[idx]
 
 
+def compute_ilc_offset_table(
+    trajectory: RaceTrajectory,
+    start_position: Tuple[float, float, float],
+    alpha: float = 0.4,
+    max_iterations: int = 5,
+    smoothing_sigma: float = 10.0,
+    max_correction_m: float = 0.15,
+    convergence_threshold: float = 0.002,
+    dt: float = 0.01,
+) -> Optional[np.ndarray]:
+    """
+    Compute a position-offset table via offline ILC to reduce systematic tracking error.
+
+    Instead of modifying the trajectory (which corrupts feedforward derivatives),
+    this computes a time-indexed position offset that is added to the controller's
+    reference position at runtime. The original trajectory's velocity, acceleration,
+    and jerk remain untouched, preserving the smooth polynomial feedforward.
+
+    The offset is purely cross-track (perpendicular to the trajectory tangent),
+    so it adjusts the path without changing the timing.
+
+    Research basis:
+    - Schoellig et al. 2012: P-type ILC with feedforward correction achieves
+      87% error reduction in 3-5 iterations on real quadrotors.
+    - Spatial ILC (Lv 2023): spatial domain decouples speed and path.
+
+    Args:
+        trajectory: The pre-computed RaceTrajectory.
+        start_position: Drone starting position.
+        alpha: Learning rate per iteration (0.2-0.5).
+        max_iterations: Maximum ILC iterations.
+        smoothing_sigma: Gaussian kernel width (in timesteps).
+        max_correction_m: Maximum cross-track offset magnitude (meters).
+        convergence_threshold: Stop if avg error improves by less than this.
+        dt: Sim timestep (must match benchmark).
+
+    Returns:
+        Offset table as np.ndarray of shape (n_steps, 3), or None if ILC
+        doesn't improve tracking. The offset at step k should be ADDED to
+        the reference position at time k*dt.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    max_accel = 15.0
+    max_speed = 15.0
+    drag = 0.5
+    kp_xy, kd_xy = 6.0, 4.0
+    kp_z, kd_z = 8.0, 5.0
+    ff_accel = 0.4
+    ff_lookahead_s = 0.05
+
+    n_steps = int(trajectory.total_time / dt) + 50
+    cumulative_offset = np.zeros((n_steps, 3))
+    baseline_avg_err = None
+
+    for ilc_iter in range(max_iterations):
+        # --- Run kinematic sim with current offset ---
+        pos = np.array(start_position, dtype=float)
+        vel = np.zeros(3)
+
+        ref_positions = np.zeros((n_steps, 3))
+        ref_velocities = np.zeros((n_steps, 3))
+        actual_positions = np.zeros((n_steps, 3))
+        actual_steps = 0
+
+        for step in range(n_steps):
+            sim_time = step * dt
+            if sim_time > trajectory.total_time:
+                break
+
+            ref = trajectory.sample(sim_time)
+            target_pos = np.array(ref.position) + cumulative_offset[step]
+            target_vel = np.array(ref.velocity)  # preserve original velocity
+            ref_acc = np.array(ref.acceleration)
+
+            if ff_lookahead_s > 0 and sim_time + ff_lookahead_s <= trajectory.total_time:
+                ref_ahead = trajectory.sample(sim_time + ff_lookahead_s)
+                ff_acc_vec = np.array(ref_ahead.acceleration)
+            else:
+                ff_acc_vec = ref_acc
+
+            ref_positions[step] = target_pos
+            ref_velocities[step] = np.array(ref.velocity)  # original, not offset
+            actual_positions[step] = pos.copy()
+            actual_steps = step + 1
+
+            # PD controller with feedforward (matches benchmark exactly)
+            pos_err = target_pos - pos
+            vel_err = target_vel - vel
+            accel_des = np.zeros(3)
+            accel_des[0] = kp_xy * pos_err[0] + kd_xy * vel_err[0]
+            accel_des[1] = kp_xy * pos_err[1] + kd_xy * vel_err[1]
+            accel_des[2] = kp_z * pos_err[2] + kd_z * vel_err[2]
+            accel_des += ff_accel * ff_acc_vec
+
+            accel = accel_des - drag * vel
+            accel_mag = np.linalg.norm(accel)
+            if accel_mag > max_accel:
+                accel = accel / accel_mag * max_accel
+            vel = vel + accel * dt
+            speed = np.linalg.norm(vel)
+            if speed > max_speed:
+                vel = vel / speed * max_speed
+            pos = pos + vel * dt
+
+        # Compute error relative to ORIGINAL trajectory (not offset reference)
+        orig_positions = np.zeros((actual_steps, 3))
+        for step in range(actual_steps):
+            ref = trajectory.sample(step * dt)
+            orig_positions[step] = np.array(ref.position)
+
+        errors = orig_positions - actual_positions[:actual_steps]
+        error_magnitudes = np.linalg.norm(errors, axis=1)
+        avg_err = float(np.mean(error_magnitudes))
+
+        if baseline_avg_err is None:
+            baseline_avg_err = avg_err
+
+        # Check convergence
+        if ilc_iter > 0:
+            improvement = prev_avg_err - avg_err
+            if improvement < convergence_threshold:
+                break
+        prev_avg_err = avg_err
+
+        # --- Compute cross-track correction ---
+        cross_track = np.zeros((actual_steps, 3))
+        for k in range(actual_steps):
+            tangent = ref_velocities[k]
+            tn = np.linalg.norm(tangent)
+            if tn > 0.1:
+                tu = tangent / tn
+                along = np.dot(errors[k], tu) * tu
+                cross_track[k] = errors[k] - along
+            else:
+                cross_track[k] = errors[k]
+
+        # Smooth
+        smoothed = np.zeros_like(cross_track)
+        for axis in range(3):
+            smoothed[:, axis] = gaussian_filter1d(cross_track[:, axis], sigma=smoothing_sigma)
+
+        # Clip magnitude
+        mag = np.linalg.norm(smoothed, axis=1, keepdims=True)
+        too_big = mag > max_correction_m
+        smoothed = np.where(too_big, smoothed * max_correction_m / np.maximum(mag, 1e-9), smoothed)
+
+        # Accumulate offset
+        cumulative_offset[:actual_steps] += alpha * smoothed
+
+    # Return offset table only if it improved things
+    final_err = prev_avg_err
+    if final_err >= baseline_avg_err:
+        return None  # ILC didn't help
+    return cumulative_offset
+
+
 @dataclass
 class FOVConfig:
     """
