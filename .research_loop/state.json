@@ -1,6 +1,6 @@
 {
-  "iteration": 16,
-  "timestamp": "2026-04-14T11:00:00Z",
+  "iteration": 17,
+  "timestamp": "2026-04-14T12:12:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -47,22 +47,13 @@
     "fbga_velocity_profile_piazza_2025",
     "cpc_foehn_2021",
     "cimpcc_curvature_velocity_li_2024",
-    "vpmpcc_data_driven_racing_li_2024"
+    "vpmpcc_data_driven_racing_li_2024",
+    "monorace_champion_level_2026",
+    "pa_mppi_perception_aware_2025",
+    "mastering_diverse_tracks_2025"
   ],
-  "total_papers_analyzed": 43,
+  "total_papers_analyzed": 46,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.251,
-    "max_tracking_error_m": 0.679,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7745,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-4",
-    "worst_gate_error_m": 0.465,
-    "race_time_s": 13.50
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.232,
     "max_tracking_error_m": 0.667,
@@ -74,71 +65,84 @@
     "worst_gate_error_m": 0.419,
     "race_time_s": 13.95
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.248,
+    "max_tracking_error_m": 0.803,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7720,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.413,
+    "race_time_s": 13.62
+  },
   "changes_committed": true,
-  "commit_hash": "10f5419",
+  "commit_hash": "f15087f",
   "diagnostic": {
-    "root_cause": "S-turn gates 3-4 treated independently by _inflate_sharp_turns — missed compound effect of consecutive opposite-direction turns requiring lateral velocity reversal. TOPP retimer exacerbated by speeding approach to S-turn.",
+    "root_cause": "FOV relaxation was doing double duty: (1) FOV awareness and (2) beneficial helix turn inflation. Removing it exposed helix to TOPP over-compression. max_compression 0.65→0.68 partially compensated but helix gates 7-12 still regressed 0.025-0.052m each.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.099,
-      "avg_thrust": 0.816
+      "avg_pitch_rad": -0.101,
+      "avg_thrust": 0.827
     },
     "trend": "improving",
     "architectural_issues": [
-      "FOV relaxation stage adds ~0.5s and should be removed — L-BFGS FOV penalty is sufficient",
-      "Gate-4 still worst at 0.419m — geometry problem: S-turn second half inherently harder",
-      "Four-stage post-optimization pipeline is getting complex — consolidation needed"
+      "Helix needs dedicated turn inflation — currently only gets generic treatment via curvature-based TOPP speed limits",
+      "max_compression in TOPP is the binding constraint on helix speed, not curvature-based limits",
+      "Gate-4 still worst at 0.413m — S-turn geometry inherently challenging",
+      "Avg error 0.248m is barely below 0.25m aspirational — next iteration should recover accuracy"
     ],
     "critic_findings": [
-      "S-turn compound inflation effectively targets gates 3-4-5 without affecting other gates",
-      "Approach inflation has diminishing returns — 5% vs 10% gives same accuracy",
-      "All aspirational targets now met simultaneously for the first time"
+      "FOV relaxation removal successfully simplified pipeline from 4→3 stages",
+      "Trajectory generation 27% faster (47ms vs 64ms) due to removed intermediate generation",
+      "a_centripetal parameter has no effect when max_compression is binding — indicates TOPP floor is too dominant"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Remove FOV relaxation stage — _relax_for_fov adds ~0.5s, L-BFGS penalty is sufficient",
-      "proposed_approach": "Remove _relax_for_fov call from generate(). Rely on L-BFGS FOV penalty (weight=10) alone.",
-      "expected_impact": "Race time 13.95→13.5s, avg error unchanged",
+      "description": "Helix accuracy recovery — gates 7-12 regressed 0.025-0.052m each from FOV relaxation removal",
+      "proposed_approach": "Add helix-specific inflation in _inflate_sharp_turns for moderate-angle turns (20-40°). Currently only >60° turns get angle-based inflation.",
+      "expected_impact": "Helix gates recover to iter 16 levels, avg error 0.248→0.235m",
       "priority": 1,
-      "research_refs": ["perception_aware_planning_eth_2026", "toppquad_speed_profile_mao_2024"]
+      "research_refs": ["taco_trajectory_aware_controller_2025", "cimpcc_curvature_velocity_li_2024"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Gate-4 residual S-turn tracking — still worst gate at 0.419m",
-      "proposed_approach": "Adjust racing line lateral offset at gate-4 to reduce effective curvature, or increase gate-4 specific inflation",
-      "expected_impact": "Gate-4 error 0.419→0.35m, avg error 0.232→0.22m",
+      "description": "Gate-4 still worst at 0.413m — S-turn second half",
+      "proposed_approach": "Increase gate-4 specific inflation or adjust racing line lateral offset",
+      "expected_impact": "Gate-4 error 0.413→0.35m",
       "priority": 2,
       "research_refs": ["taco_trajectory_aware_controller_2025"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Yaw optimization for FOV — heading-based approach adds +0% race time",
+      "proposed_approach": "Optimize yaw profile to keep gates visible instead of slowing trajectory",
+      "expected_impact": "Better FOV awareness with zero time cost",
+      "priority": 3,
+      "research_refs": ["drift_corrected_vio_2025", "monorace_champion_level_2026"]
     },
     {
       "area": "system_integration",
       "description": "Multi-start racing line optimization — escape L-BFGS local minima",
       "proposed_approach": "Run L-BFGS from 5-10 random initializations, score by TOPP-computed race time",
       "expected_impact": "Find better racing line basins, potential 0.5-1s improvement",
-      "priority": 3,
+      "priority": 4,
       "research_refs": ["sequence_modeling_toppquad_2025"]
     },
     {
-      "area": "system_integration",
-      "description": "Tighten aspirational thresholds — all current targets met",
-      "proposed_approach": "Update thresholds: race_time < 13s, avg_error < 0.20m, max_error < 0.5m",
-      "expected_impact": "Drive continued improvement toward competition-level performance",
-      "priority": 4,
-      "research_refs": []
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Pipeline consolidation — merge inflate + TOPP into single curvature-aware retimer",
-      "proposed_approach": "Single curvature-aware stage that both inflates sharp turns and compresses straights",
-      "expected_impact": "Cleaner architecture, easier parameter tuning",
+      "area": "control",
+      "description": "MPCC controller upgrade — ETH 2026 achieves 0.07m avg error at 9.8 m/s",
+      "proposed_approach": "Implement contouring/progress error decomposition in tracker",
+      "expected_impact": "Major tracking accuracy improvement, but significant architectural change",
       "priority": 5,
-      "research_refs": ["toppquad_speed_profile_mao_2024", "fbga_velocity_profile_piazza_2025"]
+      "research_refs": ["perception_aware_planning_eth_2026", "mpcc_plus_plus_krinner_2024"]
     }
   ],
   "failed_approaches": [
@@ -258,6 +262,13 @@
       "lesson": "Curvature-dependent floors are too conservative — TOPP speed limits already handle curvature-aware slowdown. Uniform floor is better.",
       "approach": "curvature_dependent_compression_floors",
       "reason": "Produced only 14.30s vs 13.50s with uniform 0.65 floor"
+    },
+    {
+      "iteration": 17,
+      "description": "a_centripetal reduction (10.0→9.0) in TOPP retimer to limit turn speeds after FOV relaxation removal.",
+      "lesson": "max_compression floor (0.65) is the binding constraint on helix speed, not the curvature-based speed limits. Reducing a_centripetal has zero effect when max_compression dominates.",
+      "approach": "a_centripetal_reduction_topp",
+      "reason": "max_compression floor is binding constraint, not curvature speed limits"
     }
   ]
 }
