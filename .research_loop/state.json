@@ -1,6 +1,6 @@
 {
-  "iteration": 22,
-  "timestamp": "2026-04-14T14:24:00Z",
+  "iteration": 23,
+  "timestamp": "2026-04-14T14:42:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -64,22 +64,13 @@
     "sequence_modeling_lstm_topp_mao_2025",
     "bo_racing_line_heilmeier_2020",
     "multiobjective_pid_quadrotor_2025",
-    "sampling_racing_line_ogretmen_2024"
+    "sampling_racing_line_ogretmen_2024",
+    "cimpcc_lap_time_li_2025",
+    "ilmpc_adaptive_cost_drone_2025",
+    "cop_pareto_planning_tzoumanikas_2022"
   ],
-  "total_papers_analyzed": 60,
+  "total_papers_analyzed": 63,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.223,
-    "max_tracking_error_m": 0.678,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7797,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-3",
-    "worst_gate_error_m": 0.374,
-    "race_time_s": 13.99
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.206,
     "max_tracking_error_m": 0.682,
@@ -91,63 +82,75 @@
     "worst_gate_error_m": 0.311,
     "race_time_s": 14.15
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.223,
+    "max_tracking_error_m": 0.678,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7575,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-3",
+    "worst_gate_error_m": 0.374,
+    "race_time_s": 13.99
+  },
   "changes_committed": true,
-  "commit_hash": "6fb6eea",
+  "commit_hash": "7fdaad5",
   "diagnostic": {
-    "root_cause": "L-BFGS proxy objective (path_length + curvature²) systematically selected racing lines that are geometrically efficient but dynamically poor for the PD controller at the S-turn. Sim-based evaluation found a 44% better racing line from the existing 10-candidate pool.",
+    "root_cause": "The 10-candidate L-BFGS pool is bipartite: Basin A (fast, 13.99s, gate-3=0.374m) and Basin B (slow, 14.15s, gate-3=0.209m). ANY non-zero time weight selects Basin A. No intermediate candidates exist.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.110,
-      "avg_thrust": 0.796
+      "avg_pitch_rad": -0.108,
+      "avg_thrust": 0.799
     },
-    "trend": "improving",
+    "trend": "oscillating",
     "architectural_issues": [
-      "Sim-based selection composite score has no speed term — selects smoother but slower racing lines",
-      "Gate-7 helix entry stuck at ~0.31m for 6+ iterations — isolated from racing line changes",
-      "Race time regressed 13.99→14.15s, misses aspirational <14s target by 0.15s",
-      "Kinematic sim evaluator uses coarser dt=0.02 — minor model mismatch with benchmark dt=0.01"
+      "Bipartite candidate pool: 10 L-BFGS starts produce only 2 distinct basins with no intermediate racing lines",
+      "Gate-3 S-turn: fast racing line approach angle exceeds PD controller tracking capability",
+      "Gate-7 helix entry stuck at 0.308m for 6+ iterations — independent of all racing line changes",
+      "Scoring function weight-insensitive: W_TIME=0.10, 0.20, 0.30 all select same candidate"
     ],
     "critic_findings": [
-      "Gate-3 improved 44% — validates proxy-vs-actual hypothesis dramatically",
-      "Selected racing line was from existing 10-candidate pool — just filtered out by wrong criterion",
-      "Gate-2/gate-3 trade-off: smoother gate-3 approach requires different gate-2 entry angle",
-      "Helix gates completely unaffected — S-turn and helix are independently optimized regions"
+      "All aspirational targets met simultaneously for the first time (avg<0.25m AND time<14s)",
+      "Normalized scoring correctly identifies competition-optimal Pareto point",
+      "Gate-3 regression is back to iter 21 level — effectively undoes iter 22's tracking improvement",
+      "Further scoring refinement is futile — candidate generation is the bottleneck"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Race time regressed 13.99→14.15s — sim-based composite score has no speed term",
-      "proposed_approach": "Add time penalty to composite: score = 0.6*avg_err + 0.2*worst_gate + 0.2*race_time_normalized",
-      "expected_impact": "Recover to ~14.0s while keeping most tracking improvement",
+      "description": "Bipartite candidate pool — no intermediate racing lines between fast (13.99s) and slow (14.15s) basins",
+      "proposed_approach": "Add interpolation-based candidates: blend Basin A and Basin B offsets at ratios 0.25/0.50/0.75 to create intermediate racing lines",
+      "expected_impact": "Find racing line with ~14.05s time AND ~0.21m avg error — Pareto-intermediate",
       "priority": 1,
-      "research_refs": ["bo_racing_line_heilmeier_2020"]
+      "research_refs": ["bo_racing_line_heilmeier_2020", "cop_pareto_planning_tzoumanikas_2022"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Gate-7 helix entry stuck at 0.311m for 6+ iterations — isolated from racing line changes",
+      "description": "Gate-7 helix entry stuck at 0.308m for 6+ iterations",
       "proposed_approach": "Per-section racing line: different smoothness weights for helix vs S-turn, or helix-specific inflation tuning",
-      "expected_impact": "Gate-7 error 0.311→0.25m",
+      "expected_impact": "Gate-7 error 0.308→0.25m",
       "priority": 2,
       "research_refs": ["cimpcc_curvature_velocity_li_2024", "mastering_diverse_tracks_2025"]
     },
     {
-      "area": "trajectory_planning",
-      "description": "Gate-2 approach at 0.246m — mild regression from 0.234m due to new racing line",
-      "proposed_approach": "Add gate-2 weighting in sim-based composite score, or investigate racing line entry angle",
-      "expected_impact": "Gate-2 error recovery to ~0.23m",
+      "area": "control",
+      "description": "Gate-3 S-turn tracking error 0.374m on fast racing line — PD controller can't track sharp approach",
+      "proposed_approach": "Increase feedforward aggressiveness for high-curvature segments, or add S-turn-specific trajectory smoothing",
+      "expected_impact": "Gate-3 error 0.374→0.30m on fast racing line",
       "priority": 3,
-      "research_refs": ["taco_trajectory_aware_controller_2025"]
+      "research_refs": ["taco_trajectory_aware_controller_2025", "aggressive_tracking_tal_2018"]
     },
     {
       "area": "control",
       "description": "MPCC controller upgrade — contouring error decomposition for all gates",
       "proposed_approach": "Implement contouring/progress error decomposition for cross-track vs along-track control",
-      "expected_impact": "Tracking improvement across all gates (ETH: 0.07m avg at 9.8 m/s)",
+      "expected_impact": "Tracking improvement across all gates",
       "priority": 4,
       "research_refs": ["mpcc_plus_plus_krinner_2024"]
     },
@@ -288,7 +291,7 @@
     {
       "iteration": 21,
       "description": "Compression floor alone (0.68→0.60 for easy segments) only saved 0.01s race time.",
-      "lesson": "Compression floor is NOT the primary binding constraint for race time — S-turn inflation parameters consume more of the time budget. Inflation tuning is a bigger lever than compression floor.",
+      "lesson": "Compression floor is NOT the primary binding constraint for race time — S-turn inflation parameters consume more of the time budget.",
       "approach": "compression_floor_only",
       "reason": "L-BFGS already produces near-optimal times for straight segments; floor rarely binds"
     },
@@ -298,6 +301,13 @@
       "lesson": "Gate-2 has moderate curvature that isn't classified as S-turn or high-curvature, but its approach speed is sensitive to compression.",
       "approach": "aggressive_easy_compression_0.50",
       "reason": "Gate-2 approach speed too high, 24% tracking regression"
+    },
+    {
+      "iteration": 23,
+      "description": "Composite score weight tuning (tested 0.5/0.2/0.3, 0.55/0.25/0.2, 0.6/0.3/0.1) — all produce identical selection due to bipartite candidate pool.",
+      "lesson": "When candidates are bipartite, weight tuning is futile. The bottleneck shifts from scoring to candidate generation.",
+      "approach": "composite_weight_sensitivity_scan",
+      "reason": "Bipartite pool: all non-zero time weights select Basin A (fast)"
     }
   ]
 }
