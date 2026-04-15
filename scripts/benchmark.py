@@ -314,7 +314,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007):
         # Pre-inflection uses 0.0 to recover gate-2; helix uses 0.7 for max benefit.
         (0, inflection_start, 0.4, 0.15, 0.35, 0.0),                # Pre-inflection: no vel correction
-        (inflection_start, inflection_end, 0.4, 0.15, 0.40, 0.4),   # Gate-3 inflection: moderate vel
+        (inflection_start, inflection_end, 0.45, 0.15, 0.40, 0.4),  # iter 45: alpha 0.4→0.45 for gate-3 improvement (Schoellig 2012)
         (inflection_end, helix_start, 0.4, 0.15, 0.35, 0.5),        # Post-inflection: standard vel
         (helix_start, n_total_steps, 0.4, 0.45, 0.35, 0.7),         # Helix: aggressive vel, increased correction cap
     ]
