@@ -1,6 +1,6 @@
 {
-  "iteration": 34,
-  "timestamp": "2026-04-15T09:30:00Z",
+  "iteration": 35,
+  "timestamp": "2026-04-15T10:08:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -99,97 +99,100 @@
     "sampling_online_racingline_ogretmen_2024",
     "cdbo_racing_cully_2018",
     "gradient_free_multidomain_zheng_2022",
-    "data_driven_aggressive_racing_vpmpcc_2024"
+    "data_driven_aggressive_racing_vpmpcc_2024",
+    "ilmpc_lmpc_improved_2025",
+    "spatially_aware_controller_feedback_2026",
+    "ngtc_robust_agile_2025"
   ],
-  "total_papers_analyzed": 95,
+  "total_papers_analyzed": 98,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.19953,
-    "max_tracking_error_m": 0.6868,
+    "avg_tracking_error_m": 0.1853,
+    "max_tracking_error_m": 0.7422,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 6701,
+    "avg_loop_hz": 7513,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-4",
-    "worst_gate_error_m": 0.4226,
-    "race_time_s": 13.81,
-    "note": "Corrected baseline after fixing unit test cache corruption bug from iter 33"
+    "worst_gate": "gate-7",
+    "worst_gate_error_m": 0.2840,
+    "race_time_s": 13.79,
+    "note": "Corrected baseline after reverting iter 34 bad offset"
   },
   "metrics_after": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.18723,
-    "max_tracking_error_m": 0.6958,
+    "avg_tracking_error_m": 0.1709,
+    "max_tracking_error_m": 0.7422,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 6707,
+    "avg_loop_hz": 7785,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-4",
-    "worst_gate_error_m": 0.3434,
-    "race_time_s": 13.89,
+    "worst_gate": "gate-3",
+    "worst_gate_error_m": 0.2473,
+    "race_time_s": 14.09,
     "deterministic": true
   },
   "changes_committed": true,
-  "commit_hash": "d4a4f28",
+  "commit_hash": "d80f408",
   "diagnostic": {
-    "root_cause": "Gate-8 at max lateral offset (-0.6) created excessive trajectory curvature in the helix, cascading upstream to gate-4 (0.423m). Moving gate-8 to -0.2 smooths the helix entry, reducing gate-4 error by 18.7%. Also discovered unit test cache corruption bug from iter 33 that produced false baseline numbers.",
+    "root_cause": "TOPP compression floor (0.65) was the binding constraint for helix entry/exit segments. For 10+ iterations, inflation/curvature changes had no effect because TOPP floor clamped helix segment times to 65% of inflated values. Raising floor to 0.76 allows the PD controller more time for sharp helix turns.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.108,
-      "avg_thrust": 0.797
+      "avg_pitch_rad": -0.107,
+      "avg_thrust": 0.794
     },
     "trend": "improving",
     "architectural_issues": [
       "PD controller saturating at 0.85 rad — needs geometric SE(3) or MPCC controller",
-      "Basin switching constrains offset search space (~30% of values safe)",
-      "Gate-4 helix entry transition has trajectory-shape-driven error at 0.343m",
-      "Kinematic sim lacks attitude dynamics — may not reflect real performance"
+      "Max tracking error 0.742m unchanged — at controller limit, not trajectory limit",
+      "Gate-3 S-turn (0.247m) is now worst gate — S-turn TOPP floor may also be binding",
+      "ILC convergence criterion is global — stops helix learning when pre-helix converges"
     ],
     "critic_findings": [
-      "Single offset change is minimal and well-tested via sweep",
-      "Cache isolation fix is a genuine bugfix preventing future non-determinism",
-      "Basin switching discovery adds knowledge for future offset tuning",
-      "Corrected baseline reveals gate-4, not gate-7, as true worst gate"
+      "Single parameter change (helix floor) is clean and well-validated (8-point sweep)",
+      "Monotonic improvement confirms genuine binding constraint, not noise",
+      "Non-helix gates unaffected — zero regression risk",
+      "Iter 34 regression discovery prevents future bad baselines"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Gate-4 helix entry transition (0.343m) — worst gate after offset optimization",
-      "proposed_approach": "Targeted inflation increase or ILC bandwidth adjustment for straight-to-helix transition section",
-      "expected_impact": "gate-4 0.343→0.280m, avg tracking error improvement",
+      "description": "Gate-3 S-turn (0.247m) — now the worst gate after helix floor improvement",
+      "proposed_approach": "Check if S-turn TOPP floor is binding; analogous diagnostic to helix floor discovery",
+      "expected_impact": "gate-3 0.247→0.210m, avg error improvement",
       "priority": 1,
-      "research_refs": ["cimpcc_curvature_velocity_li_2024", "segmentwise_ilc_zhang_2024"]
+      "research_refs": ["cimpcc_curvature_velocity_li_2024", "vpmpcc_data_driven_racing_li_2024"]
     },
     {
       "area": "control",
       "description": "MPCC or SE(3) geometric controller to replace PD (saturating at 0.85 rad)",
       "proposed_approach": "Implement contouring error decomposition (MPCC) or SE(3) geometric tracking",
-      "expected_impact": "5-15% tracking improvement across all gates",
+      "expected_impact": "5-15% tracking improvement across all gates, reduce max error",
       "priority": 2,
-      "research_refs": ["mpcc_plus_plus_krinner_2024", "monorace_champion_level_2026"]
+      "research_refs": ["mpcc_plus_plus_krinner_2024", "ngtc_robust_agile_2025"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Automated basin-aware offset search with basin switching detection",
-      "proposed_approach": "CdBO with race_time threshold to detect and reject basin-switched evaluations",
-      "expected_impact": "Find better offsets for gates 6-9 within safe offset space",
+      "description": "Helix floor + controller co-optimization — recover race time after controller upgrade",
+      "proposed_approach": "Lower helix floor back toward 0.65-0.70 once better controller is in place",
+      "expected_impact": "Recover 0.1-0.3s race time",
       "priority": 3,
-      "research_refs": ["cdbo_racing_cully_2018", "gradient_free_multidomain_zheng_2022"]
+      "research_refs": ["spatially_aware_controller_feedback_2026"]
     },
     {
       "area": "trajectory_planning",
-      "description": "TOPP compression tuning with verified determinism",
-      "proposed_approach": "Reduce TOPP compression floors now that racing line is truly frozen",
-      "expected_impact": "0.1-0.2s race time improvement",
+      "description": "ILC per-section convergence criterion — global convergence stops helix learning early",
+      "proposed_approach": "Replace global convergence check with per-section convergence",
+      "expected_impact": "1-2% avg error improvement",
       "priority": 4,
-      "research_refs": ["toppquad_speed_profile_mao_2024", "fbga_velocity_profile_piazza_2025"]
+      "research_refs": ["segmentwise_ilc_zhang_2024"]
     },
     {
       "area": "system_integration",
-      "description": "Port to PyBullet sim for realistic physics validation",
-      "proposed_approach": "Validate kinematic sim results against full physics sim",
-      "expected_impact": "Better correlation with competition performance",
+      "description": "Automated regression detection in benchmark pipeline",
+      "proposed_approach": "Compare benchmark results against previous committed results; flag >5% regressions",
+      "expected_impact": "Prevent hidden regressions like iter 34",
       "priority": 5,
       "research_refs": []
     }
@@ -451,6 +454,34 @@
       "lesson": "Vertical offset changes have stronger coupling to trajectory shape than expected. Only lateral offsets at specific values are safe.",
       "approach": "gate8_vertical_offset_change",
       "reason": "Basin switching — race time exploded to 27.31s"
+    },
+    {
+      "iteration": 34,
+      "description": "Gate-8 lateral offset -0.6→-0.2 caused massive hidden regression (0.185→0.600m avg error).",
+      "lesson": "ALWAYS validate with full benchmark, not simplified sim. The iter 34 simplified sim showed improvement but full benchmark showed 3x regression.",
+      "approach": "gate8_lateral_offset_minus02",
+      "reason": "Full benchmark shows 0.600m avg error; iter 34 report was based on simplified sim validation"
+    },
+    {
+      "iteration": 35,
+      "description": "More ILC iterations (5→8). Avg error 0.185→0.703m, race time 27s.",
+      "lesson": "ILC offsets accumulate over iterations (5×0.4×0.35=0.70m). Larger offsets destabilize the PD controller. The controller can't track reference+0.97m offset.",
+      "approach": "more_ilc_iterations_8",
+      "reason": "Cumulative ILC offsets too large for PD controller"
+    },
+    {
+      "iteration": 35,
+      "description": "Curvature-proportional helix inflation (10-15% based on turn angle). No effect.",
+      "lesson": "TOPP floor overrides inflation — when the floor is binding, inflation changes have zero effect on final segment times.",
+      "approach": "curvature_proportional_helix_inflation",
+      "reason": "TOPP floor is binding constraint, not inflation"
+    },
+    {
+      "iteration": 35,
+      "description": "TOPP helix curvature boost 1.15→1.25. No effect.",
+      "lesson": "When TOPP floor is binding, curvature boost has zero effect. The speed limit is already above the floor.",
+      "approach": "helix_curvature_boost_125",
+      "reason": "TOPP floor is binding constraint, not speed limit"
     }
   ]
 }
