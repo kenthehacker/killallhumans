@@ -889,6 +889,7 @@ class TrajectoryOptimizer:
         # Research: FBGA (Piazza 2025) — forward-backward naturally compresses
         # easy segments more. STORM (Zhang 2025) — per-segment LP for times.
         max_compression_protected = 0.65  # S-turn, helix, high-curvature (iter 30: reduced from 0.66 — round 2; FBGA Piazza 2025)
+        max_compression_helix = 0.76  # Helix-specific higher floor (iter 35: gate-7 at 0.284m, TOPP floor was binding constraint; swept 0.68-0.80, 0.76 is Pareto-optimal)
         max_compression_easy = 0.59  # straights, shallow curves (iter 30: reduced from 0.60 — round 2; ILC compensates)
 
         # --- S-turn region detection for compound curvature boost (iter 16) ---
@@ -1011,8 +1012,15 @@ class TrajectoryOptimizer:
             if i in s_turn_segments:
                 seg_floor.append(max_compression_protected)
             elif i in helix_segments:
-                # Helix segments also get protected floor (iteration 31)
-                seg_floor.append(max_compression_protected)
+                # Helix segments get higher floor than S-turns (iteration 35).
+                # TOPP floor is the binding constraint for helix entry/exit
+                # segments (ratio=0.65 = floor). Raising the floor retains more
+                # of the inflated time, giving the PD controller more time to
+                # navigate sharp helix turns (especially gate-7 at 68.5°).
+                # Research: Spatially-Aware (arXiv 2602.15642) — spatially-varying
+                # acceleration limits; ILMPC (arXiv 2508.01103) — adaptive cost
+                # dynamically weights time-optimal vs tracking quality.
+                seg_floor.append(max_compression_helix)
             elif seg_curv[i] > curvature_threshold:
                 seg_floor.append(max_compression_protected)
             elif i > 0 and seg_curv[i - 1] > curvature_threshold:
