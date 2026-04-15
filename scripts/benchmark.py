@@ -314,8 +314,8 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007):
         # Pre-inflection uses 0.0 to recover gate-2; helix uses 0.7 for max benefit.
         (0, inflection_start, 0.30, 0.15, 0.35, 0.0),               # iter 47: alpha 0.4→0.30 to prevent gate-2 over-correction at 7 ILC iters
-        (inflection_start, inflection_end, 0.50, 0.15, 0.40, 0.4),  # iter 46: alpha 0.45→0.50 for gate-3/4 (Longman 2023 convergence accel)
-        (inflection_end, helix_start, 0.4, 0.15, 0.35, 0.5),        # Post-inflection: standard vel
+        (inflection_start, inflection_end, 0.46, 0.15, 0.40, 0.4),  # iter 48: alpha 0.50→0.46 — rebalanced for 8 ILC iters, reduces gate-5 spatial coupling
+        (inflection_end, helix_start, 0.50, 0.15, 0.35, 0.5),       # iter 48: alpha 0.4→0.50 for deeper post-inflection convergence
         (helix_start, n_total_steps, 0.45, 0.50, 0.35, 0.7),        # iter 47: helix alpha 0.4→0.45 for gate-7 with 7 ILC iters
     ]
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
@@ -325,10 +325,10 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     ilc_result = compute_ilc_offset_table(
         trajectory, tuple(start_pos),
         alpha=0.4,
-        max_iterations=7,              # iter 47: 5→7 for better ILC convergence
+        max_iterations=8,              # iter 48: 7→8 for deeper ILC convergence (Longman 2023)
         smoothing_sigma=10.0,
         max_correction_m=0.15,
-        convergence_threshold=0.002,
+        convergence_threshold=0.0005,         # iter 48: 0.002→0.0005 to allow deeper ILC convergence
         dt=dt,
         section_boundaries=section_boundaries,
         blend_steps=50,
