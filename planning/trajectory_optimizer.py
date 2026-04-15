@@ -755,11 +755,13 @@ class TrajectoryOptimizer:
                     is_s_turn = (cross_z[gi - 1] * cross_z[gi] < 0)
 
             if turn_angle > 1.05:  # > ~60 degrees — angle-based
-                # Inflation factor: reduced from 0.35→0.25 (iter 9) since
-                # feedforward (iter 8) anticipates turns. 60°→1.25x, 90°→1.50x.
+                # Inflation factor: reduced 0.25→0.12 (iter 44) — speed recovery.
+                # With 0.112m headroom to 0.25m threshold, halve protection to
+                # trade accuracy for speed. ILC compensates for systematic error.
+                # Research: CPC (Foehn 2021), TACO (Sanghvi 2025), MonoRace (2026).
                 severity = (turn_angle - 1.05) / (math.pi / 2 - 1.05)
                 severity = min(severity, 1.0)
-                inflate = 1.0 + 0.25 * severity
+                inflate = 1.0 + 0.12 * severity
             elif turn_angle > 0.3:  # > ~17° — check centripetal acceleration
                 # Estimate approach speed from L-BFGS segment times.
                 # The approach to gate gi uses segments leading to entry wp.
@@ -793,7 +795,7 @@ class TrajectoryOptimizer:
                     # Inflate proportional to excess centripetal acceleration
                     excess = (a_centripetal - a_centripetal_threshold) / a_centripetal_threshold
                     severity = min(excess, 1.0)
-                    inflate = 1.0 + 0.15 * severity  # range: 1.0x to 1.15x (reduced from 0.25, iter 9)
+                    inflate = 1.0 + 0.08 * severity  # range: 1.0x to 1.08x (iter 44: 0.15→0.08, speed recovery)
 
             # --- S-turn first-gate detection (iteration 20) ---
             # Detect when this gate is the FIRST of an S-turn pair (next gate
@@ -818,16 +820,16 @@ class TrajectoryOptimizer:
                 # Research: CiMPCC (Li 2024) — compound curvature doesn't drop
                 # between consecutive opposite turns.
                 if is_s_turn_first:
-                    s_turn_inflate = 1.09  # junction: 9% (iter 30: reduced from 10% — round 2; ILMPC 2508.01103)
+                    s_turn_inflate = 1.04  # junction: 4% (iter 44: 9%→4%, speed recovery; CPC Foehn 2021)
                 else:
-                    s_turn_inflate = 1.07  # standard second-gate: 7% (iter 30: reduced from 8% — round 2)
+                    s_turn_inflate = 1.03  # standard second-gate: 3% (iter 44: 7%→3%, speed recovery)
                 inflate = max(inflate, s_turn_inflate)
 
                 # Also inflate the APPROACH segment (prev gate exit → this entry).
                 # Research: VPMPCC shows early deceleration is critical for S-turns.
                 approach_seg = seg_entry - 1  # segment from prev gate exit to this entry
                 if 0 <= approach_seg < len(times):
-                    times[approach_seg] *= 1.01  # 1% approach deceleration (iter 30: reduced from 2% — round 2)
+                    times[approach_seg] *= 1.005  # 0.5% approach deceleration (iter 44: 1%→0.5%, speed recovery)
 
             # --- S-turn first-gate departure inflation (iteration 20) ---
             # For the first gate of an S-turn pair, inflate the EXIT/departure
@@ -840,12 +842,12 @@ class TrajectoryOptimizer:
                 # Pure first-gate (not junction) — inflate departure only
                 depart_seg = seg_through + 1  # segment from gate exit to next entry
                 if 0 <= depart_seg < len(times):
-                    times[depart_seg] *= 1.02  # 2% departure inflation (iter 30: reduced from 3% — round 2)
+                    times[depart_seg] *= 1.01  # 1% departure inflation (iter 44: 2%→1%, speed recovery)
             elif is_s_turn_first and is_s_turn:
                 # Junction gate — already boosted above; also inflate departure
                 depart_seg = seg_through + 1
                 if 0 <= depart_seg < len(times):
-                    times[depart_seg] *= 1.005  # 0.5% departure inflation (iter 30: reduced from 1% — round 2)
+                    times[depart_seg] *= 1.002  # 0.2% departure inflation (iter 44: 0.5%→0.2%, speed recovery)
 
             # Bidirectional proximity-based inflation for closely-spaced gates (iter 13, updated iter 18).
             # Helix gates are 3.6-5.7m apart; short polynomial segments create
@@ -865,7 +867,7 @@ class TrajectoryOptimizer:
                 gate_centers[gi] - gate_centers[gi - 1])) if gi > 0 else 999.0
             dist_closest = min(dist_next, dist_prev)
             if dist_closest < 6.0 and turn_angle > 0.4:  # ~23° minimum
-                proximity_factor = 1.0 + 0.22 * (1.0 - dist_closest / 6.0)  # was 0.12, forward-only (iter 14)
+                proximity_factor = 1.0 + 0.12 * (1.0 - dist_closest / 6.0)  # iter 44: 0.22→0.12, speed recovery
                 inflate = max(inflate, proximity_factor)
 
             # --- Helix compound inflation (iteration 31) ---
@@ -876,7 +878,7 @@ class TrajectoryOptimizer:
             # Research: CiMPCC (Li 2024) — compound curvature for sequential
             # same-direction turns; Online VP (Ogretmen 2025) — apex velocity limits.
             if gi in helix_entry_gates:
-                helix_entry_inflate = 1.12  # 12% for helix entry (was only 8.7% from proximity)
+                helix_entry_inflate = 1.06  # 6% for helix entry (iter 44: 12%→6%, speed recovery)
                 inflate = max(inflate, helix_entry_inflate)
             elif gi in helix_gates and gi not in helix_entry_gates:
                 # Helix interior gates also need compound inflation.
@@ -884,7 +886,7 @@ class TrajectoryOptimizer:
                 # gate) but only got 8.7% from proximity. The compound nature
                 # of sustained same-direction turns means each gate needs more
                 # margin than its point curvature suggests.
-                helix_interior_inflate = 1.10  # 10% minimum for helix interior
+                helix_interior_inflate = 1.05  # 5% minimum for helix interior (iter 44: 10%→5%, speed recovery)
                 inflate = max(inflate, helix_interior_inflate)
 
             if inflate > 1.001:
