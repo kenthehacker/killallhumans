@@ -34,8 +34,11 @@ from planning.trajectory_optimizer import TrajectoryPoint
 class TrackerConfig:
     """Gains and limits for the trajectory tracker."""
     # Position gains (proportional + derivative)
-    kp_xy: float = 6.0
-    kd_xy: float = 4.0
+    # Tuned via systematic sweep in iteration 38 (40+ configs).
+    # Research: NGTC (Pries 2025) uses kp=25, kd=11 (mass-normalized).
+    # Damping ratio: ζ=(kd+drag)/(2√kp) = (5.5+0.5)/(2√7) ≈ 1.13.
+    kp_xy: float = 7.0
+    kd_xy: float = 5.5
     kp_z: float = 8.0
     kd_z: float = 5.0
 
@@ -44,12 +47,13 @@ class TrackerConfig:
     kw: float = 2.5       # angular velocity damping
 
     # Feed-forward weight (0 = pure feedback, 1 = full feedforward)
-    # "Leveling the Playing Field" (2025): feedforward is the most important
-    # single fix for geometric controllers. Scaled to 0.4 because the kinematic
-    # sim's drag (0.5) provides beneficial velocity damping that helps turn
-    # tracking. Drag compensation was tested (iter 9) but regresses because
-    # drag provides "free" speed-limiting into turns. See failed_approaches.
-    feedforward_accel: float = 0.4
+    # "Leveling the Playing Field" (Kunapuli 2025): feedforward is the most
+    # important single fix. Literature uses ff=1.0 but our kinematic sim
+    # with drag=0.5 causes basin switching at ff>0.52. Sweep found ff=0.50
+    # optimal: balances feedforward anticipation vs. stability margin.
+    # Higher ff (0.6-1.0) triggers catastrophic trajectory tracking failure
+    # in the kinematic sim (race time 14s→27s). See iteration 38 analysis.
+    feedforward_accel: float = 0.50
 
     # Drag compensation coefficient (Faessler et al., IEEE RA-L 2018).
     # Set to 0.0 — drag compensation regresses tracking because the sim's
