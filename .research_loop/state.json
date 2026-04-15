@@ -1,6 +1,6 @@
 {
-  "iteration": 26,
-  "timestamp": "2026-04-14T16:05:00Z",
+  "iteration": 28,
+  "timestamp": "2026-04-14T17:15:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -74,100 +74,108 @@
     "qpgp_ilc_2026",
     "freq_domain_ilc_vanharen_2024",
     "segmentwise_ilc_zhang_2024",
-    "monotonic_ilc_timevarying_gain_liu_2023"
+    "monotonic_ilc_timevarying_gain_liu_2023",
+    "filtfilt_cliff_filters_longman_2019",
+    "nn_augmented_ilc_butterworth_2025",
+    "lmpc_drone_racing_adaptive_cost_2025",
+    "qpgp_predictive_ilc_2026",
+    "robust_ilc_mimo_butterworth_2025",
+    "timevarying_qfilter_bristow_2007",
+    "segment_based_ailc_zhang_2026",
+    "dual_ilc_mimo_ewering_2025"
   ],
-  "total_papers_analyzed": 70,
+  "total_papers_analyzed": 78,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.199,
-    "max_tracking_error_m": 0.697,
+    "avg_tracking_error_m": 0.17865,
+    "max_tracking_error_m": 0.7017,
     "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 5899,
+    "avg_loop_hz": 7218,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-4",
-    "worst_gate_error_m": 0.293,
-    "race_time_s": 14.00
+    "worst_gate": "gate-3",
+    "worst_gate_error_m": 0.292,
+    "race_time_s": 14.03
   },
   "metrics_after": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.187,
-    "max_tracking_error_m": 0.697,
+    "avg_tracking_error_m": 0.17458,
+    "max_tracking_error_m": 0.7045,
     "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 6453,
+    "avg_loop_hz": 6914,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-4",
-    "worst_gate_error_m": 0.293,
-    "race_time_s": 14.01
+    "worst_gate": "gate-7",
+    "worst_gate_error_m": 0.276,
+    "race_time_s": 14.03
   },
   "changes_committed": true,
-  "commit_hash": "1f15d6e",
+  "commit_hash": "3055e9d",
   "diagnostic": {
-    "root_cause": "The PD controller's systematic cross-track lag varies by trajectory section. The helix section requires larger ILC corrections (0.35m vs 0.15m) due to tighter 3D geometry, but the global correction limit was capping all sections equally, leaving helix under-corrected.",
+    "root_cause": "Gate-7 (helix entry, 0.276m) is the persistent worst gate. ILC filter changes do not affect it because the error is from the helix trajectory itself requiring more centripetal acceleration than the PD controller can provide at saturation (0.85 rad roll/pitch). Speed profiling or racing line adjustment needed.",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.107,
-      "avg_thrust": 0.788
+      "avg_pitch_rad": -0.111,
+      "avg_thrust": 0.795
     },
-    "trend": "improving",
+    "trend": "diminishing_returns",
     "architectural_issues": [
-      "Gate-4 (0.293m) is the new worst gate — S-turn correction limit (0.15m) may be too conservative",
-      "Gate-8 mildly regressed (+6.7%) despite being in the helix section — possible offset discontinuity",
-      "Global convergence check can terminate S-turn learning early when helix converges fast",
-      "Roll/pitch at saturation (0.85 rad) during high-error sections indicates PD controller physical limits"
+      "Gate-7 (0.276m) is persistent across ILC iterations — not an ILC filter problem",
+      "Roll/pitch at saturation (0.85 rad) during helix — PD controller physically limited",
+      "ILC improvements diminishing: -5.7%, -5.8%, -3.2%, -2.3% over 4 iterations",
+      "Race time stuck at 14.03s — need racing line or speed profile changes to improve"
     ],
     "critic_findings": [
-      "Per-section max_correction is the key insight — per-section alpha and smoothing are irrelevant at σ=10",
-      "Optimal helix max_correction is 0.35m — beyond that (0.50m) overcorrection degrades accuracy",
-      "9 configurations tested systematically: avg error monotonically decreased with helix max_correction up to 0.35m",
-      "S-turn max_correction increase helps avg but increases max error (0.697→0.747m at 0.20m)"
+      "Gate-3 improvement flat across 0.40-0.60 Hz — structure matters more than exact cutoff",
+      "Extended boundaries (>5s inflection) cause catastrophic regression",
+      "Boundary sensitivity: wide (2.0-4.4s) > tight (2.0-3.8s) by 3%",
+      "0.40 Hz optimal, not 0.75 Hz as initially predicted — matched-bandwidth principle confirmed"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Gate-4 correction: increase S-turn max_correction or split into 3+ sections for finer control",
-      "proposed_approach": "Split S-turn into pre-gate-4 and post-gate-4 sections with different max_correction limits, or increase S-turn limit to 0.18m with cumulative offset cap",
-      "expected_impact": "Gate-4 0.293→0.260m, avg error 0.187→0.183m",
+      "description": "Gate-7 helix entry optimization — persistent worst gate at 0.276m",
+      "proposed_approach": "Speed profiling adjustment near helix entry (gates 6-7 transition), or racing line helix radius tightening",
+      "expected_impact": "Gate-7 0.276→0.240m, avg error 0.175→0.172m",
       "priority": 1,
-      "research_refs": ["segmentwise_ilc_zhang_2024"]
+      "research_refs": ["toppquad_speed_profile_mao_2024", "fbga_velocity_profile_piazza_2025"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Replace Gaussian smoothing with zero-phase Butterworth Q-filter for principled frequency-domain convergence",
-      "proposed_approach": "scipy.signal.filtfilt with Butterworth low-pass at fc≈2-3Hz replaces gaussian_filter1d",
-      "expected_impact": "Cleaner corrections, potentially higher alpha, avg error 2-5% improvement",
+      "description": "Racing line fine-tuning for faster race time",
+      "proposed_approach": "5-7 interpolation points near current α for marginal race time improvement",
+      "expected_impact": "Race time 14.03→13.95s, trade <0.005m avg error",
       "priority": 2,
-      "research_refs": ["freq_domain_ilc_vanharen_2024"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Per-section convergence checks to decouple iteration counts across sections",
-      "proposed_approach": "Track per-section avg error independently; only update sections that haven't converged",
-      "expected_impact": "S-turn gets more iterations, 1-3% improvement",
-      "priority": 3,
-      "research_refs": ["monotonic_ilc_timevarying_gain_liu_2023"]
+      "research_refs": ["quaypoints_racing_2025", "bo_racing_line_heilmeier_2020"]
     },
     {
       "area": "control",
-      "description": "MPCC controller for contouring/progress error decomposition",
+      "description": "MPCC controller for contouring/progress decomposition",
       "proposed_approach": "Implement contouring error decomposition for cross-track vs along-track control",
-      "expected_impact": "Tracking improvement across all gates, orthogonal to ILC",
-      "priority": 4,
+      "expected_impact": "Tracking improvement across all gates, especially helix",
+      "priority": 3,
       "research_refs": ["mpcc_plus_plus_krinner_2024"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Finer interpolation refinement for racing line Pareto selection",
-      "proposed_approach": "5-7 interpolation points near selected α for better Pareto candidate",
-      "expected_impact": "Race time 14.01→13.97s",
+      "description": "STFT-based adaptive bandwidth per ILC iteration",
+      "proposed_approach": "Update bandwidth profile each iteration from residual STFT (Bristow 2007 adaptive variant)",
+      "expected_impact": "Marginal: ~1% avg error reduction",
+      "priority": 4,
+      "research_refs": ["timevarying_qfilter_bristow_2007"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "GP-predictive ILC momentum term for faster convergence",
+      "proposed_approach": "Add e_hat = omega * e_i (omega≈0.8) to ILC update",
+      "expected_impact": "Converge in 3 iterations instead of 5",
       "priority": 5,
-      "research_refs": ["quaypoints_racing_2025", "bo_racing_line_heilmeier_2020"]
+      "research_refs": ["qpgp_predictive_ilc_2026"]
     }
   ],
   "failed_approaches": [
@@ -343,6 +351,34 @@
       "lesson": "The blending ramp creates a near-zero offset gap at the boundary. With σ=10 smoothing kernel, no blending is needed — hard concatenation works fine.",
       "approach": "per_section_ilc_boundary_blending",
       "reason": "Near-zero gap from weight ramp caused worse results than hard boundary"
+    },
+    {
+      "iteration": 27,
+      "description": "Per-section convergence tracking (each section converges independently, stopping updates when improvement < 0.002m).",
+      "lesson": "S-turn section converges after only 1 iteration (improvement 0.0007m < 0.002m threshold), dramatically reducing total S-turn corrections. Even with min_iterations=3, avg error still regressed 1-2.7% vs global convergence.",
+      "approach": "per_section_convergence_tracking",
+      "reason": "S-turn converges too quickly, stopping learning prematurely"
+    },
+    {
+      "iteration": 27,
+      "description": "Butterworth Q-filter at cutoffs > 1.5 Hz. Tested 1.5, 2.0, 2.5, 3.0, 4.0 Hz. All regressed avg error.",
+      "lesson": "The optimal ILC correction bandwidth matches the spatial frequency of systematic error (~0.35 Hz), not the controller bandwidth (3-5 Hz). Higher cutoffs pass kinematic sim model mismatch noise.",
+      "approach": "butterworth_high_cutoff",
+      "reason": "Avg error regressed 0.3-3.5% at cutoffs > 1.5 Hz"
+    },
+    {
+      "iteration": 28,
+      "description": "Extended inflection boundaries (1.5-5.0s) for per-section bandwidth.",
+      "lesson": "Section boundaries that cut across gate approach zones cause catastrophic regression (avg error 0.70m). Boundaries must align with natural track segments.",
+      "approach": "extended_inflection_boundaries",
+      "reason": "Crossing gate-1/gate-2 boundary corrupted corrections"
+    },
+    {
+      "iteration": 28,
+      "description": "Inflection cutoff > 0.60 Hz provides negligible gate-3 improvement over 0.40 Hz but significantly increases gate-4 regression.",
+      "lesson": "Gate-3 improvement is flat across 0.40-0.60 Hz. The per-section structure matters more than the exact cutoff. Use the lowest cutoff that captures the inflection error content.",
+      "approach": "high_inflection_cutoff",
+      "reason": "Gate-3 at 0.222m regardless of cutoff; higher cutoffs worsen gate-4"
     }
   ]
 }
