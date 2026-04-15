@@ -4607,3 +4607,174 @@
   },
   "overall_passed": true
 }
+{
+  "timestamp": "2026-04-14T23:47:30",
+  "mode": "full",
+  "thresholds": {
+    "unit_tests_pass_rate": 1.0,
+    "max_avg_tracking_error_m": 0.5,
+    "max_max_tracking_error_m": 2.0,
+    "max_ekf_uncertainty_m": 0.5,
+    "min_loop_hz": 100,
+    "min_gate_pass_rate": 1.0,
+    "max_total_time_s": 30.0,
+    "no_crash": true
+  },
+  "unit_tests": {
+    "tests": [
+      {
+        "name": "quaternion_roundtrip",
+        "passed": true,
+        "time_ms": 0.01999997766688466
+      },
+      {
+        "name": "ekf_convergence",
+        "passed": true,
+        "time_ms": 6.270833022426814
+      },
+      {
+        "name": "trajectory_generation",
+        "passed": true,
+        "time_ms": 44.828582962509245
+      },
+      {
+        "name": "racing_line",
+        "passed": true,
+        "time_ms": 150.66562499850988
+      },
+      {
+        "name": "speed_profiler",
+        "passed": true,
+        "time_ms": 0.062417006120085716
+      },
+      {
+        "name": "geometric_tracker",
+        "passed": true,
+        "time_ms": 0.05558301927521825
+      },
+      {
+        "name": "gate_sequencer",
+        "passed": true,
+        "time_ms": 0.042041006963700056
+      },
+      {
+        "name": "gate_tracker",
+        "passed": true,
+        "time_ms": 0.7462500361725688
+      },
+      {
+        "name": "state_predictor",
+        "passed": true,
+        "time_ms": 0.010167015716433525
+      }
+    ],
+    "passed": 9,
+    "failed": 0,
+    "total": 9,
+    "pass_rate": 1.0,
+    "total_time_ms": 202.70149904536083
+  },
+  "synthetic_sim": {
+    "available": true,
+    "skipped": false,
+    "sim_type": "synthetic_kinematic",
+    "trajectory_time_s": 13.974231438437927,
+    "trajectory_points": 686,
+    "sim_time_s": 13.790000000000001,
+    "wall_time_s": 0.17624330520629883,
+    "dt": 0.01,
+    "termination_reason": "race_complete",
+    "crashed": false,
+    "gates_passed": 12,
+    "total_gates": 12,
+    "gate_pass_rate": 1.0,
+    "complete": true,
+    "gate_pass_times": [
+      {
+        "gate_id": "gate-1",
+        "time_s": 1.01
+      },
+      {
+        "gate_id": "gate-2",
+        "time_s": 1.8800000000000001
+      },
+      {
+        "gate_id": "gate-3",
+        "time_s": 2.91
+      },
+      {
+        "gate_id": "gate-4",
+        "time_s": 4.26
+      },
+      {
+        "gate_id": "gate-5",
+        "time_s": 5.42
+      },
+      {
+        "gate_id": "gate-6",
+        "time_s": 6.58
+      },
+      {
+        "gate_id": "gate-7",
+        "time_s": 7.79
+      },
+      {
+        "gate_id": "gate-8",
+        "time_s": 8.64
+      },
+      {
+        "gate_id": "gate-9",
+        "time_s": 10.18
+      },
+      {
+        "gate_id": "gate-10",
+        "time_s": 11.290000000000001
+      },
+      {
+        "gate_id": "gate-11",
+        "time_s": 12.43
+      },
+      {
+        "gate_id": "gate-12",
+        "time_s": 13.780000000000001
+      }
+    ],
+    "avg_tracking_error_m": 0.18528416163226688,
+    "max_tracking_error_m": 0.7421972528653045,
+    "p50_tracking_error_m": 0.1774700630103575,
+    "p95_tracking_error_m": 0.38232903542378827,
+    "ekf_uncertainty_m": 0.01189688672221057,
+    "avg_loop_hz": 7827.291605110815,
+    "total_steps": 1378,
+    "per_gate_avg_error": {
+      "gate-1": 0.11084556795476799,
+      "gate-2": 0.17907145528626753,
+      "gate-3": 0.2473127768541052,
+      "gate-4": 0.20153446551589244,
+      "gate-5": 0.18010957799330865,
+      "gate-6": 0.16194595383061228,
+      "gate-7": 0.28396584364176325,
+      "gate-8": 0.2348907613370623,
+      "gate-9": 0.17968528829742655,
+      "gate-10": 0.154817530496711,
+      "gate-11": 0.16265803022498385,
+      "gate-12": 0.13676494578402487
+    },
+    "controller_trace_summary": {
+      "samples": 1378,
+      "avg_roll_rad": 0.05198700091503163,
+      "avg_pitch_rad": -0.11037675088567779,
+      "avg_thrust": 0.7974124537529284,
+      "max_abs_roll_rad": 0.85,
+      "max_abs_pitch_rad": 0.85
+    },
+    "threshold_failures": [],
+    "sim_passed": true
+  },
+  "simulation": {
+    "available": false,
+    "skipped": true,
+    "skip_reason": "Cannot create sim: gym-pybullet-drones is required.\npip install git+https://github.com/utiasDSL/gym-pybullet-drones.git"
+  },
+  "overall_passed": true
+}

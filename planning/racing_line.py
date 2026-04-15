@@ -39,11 +39,26 @@ solutions, the pool now includes 3 convex-interpolated candidates at
 pool diagnosed in iter 23.
 Research: QuayPoints (2025) — λ-interpolation between racing lines;
 Spatially-Aware CMA-ES (Wachter 2026) — population-based basin exploration.
+
+Iteration 33: racing line offset caching for determinism. The multi-start
+L-BFGS + _select_by_sim() pipeline has near-equal-energy basins at current
+parameters, causing non-deterministic racing line selection across runs.
+This blocks all further parameter tuning (diagnosed in iters 29-32).
+Solution: cache the winning offsets to a JSON file. On subsequent runs,
+load cached offsets instead of re-optimizing. Cache is keyed by a hash of
+gate positions + config, so it auto-invalidates on track/config changes.
+Research: On Your Own (Romero 2025) — pre-computed reference trajectories;
+QuayPoints (2025) — offline racing line computation;
+BO Racing Line (Heilmeier 2020) — sim oracle with cached results;
+F1-Init (Shehadeh 2026) — initialization sensitivity in multi-modal landscapes.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -51,6 +66,10 @@ import numpy as np
 from scipy.optimize import minimize
 
 from .trajectory_optimizer import GateWaypoint
+
+# Cache file location — alongside this module
+_CACHE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CACHE_FILE = os.path.join(_CACHE_DIR, "racing_line_cache.json")
 
 
 @dataclass
@@ -71,6 +90,7 @@ class RacingLineConfig:
                                        # S-turn (gate-3) stays acceptable (0.402→0.422m).
                                        # ILMPC (Zhao 2025): trajectory quality > controller tuning.
     lookahead_gates: int = 3           # gates to consider for corner cutting
+    use_cache: bool = True             # use cached racing line offsets for determinism (iter 33)
 
 
 class RacingLineOptimizer:
@@ -94,6 +114,80 @@ class RacingLineOptimizer:
     def __init__(self, config: RacingLineConfig = None):
         self.config = config or RacingLineConfig()
 
+    @staticmethod
+    def _compute_cache_key(
+        gates: List[GateWaypoint],
+        start_position: Tuple[float, float, float],
+        config: RacingLineConfig,
+    ) -> str:
+        """Compute a hash-based cache key from inputs.
+
+        Includes gate positions, normals, yaw, and config parameters.
+        Rounded to 6 decimal places for floating-point stability.
+        """
+        key_data = {
+            "start": [round(x, 6) for x in start_position],
+            "gates": [
+                {
+                    "pos": [round(x, 6) for x in g.position],
+                    "normal": [round(x, 6) for x in g.normal],
+                    "yaw": round(g.yaw, 6),
+                    "width": round(g.width, 6),
+                    "height": round(g.height, 6),
+                }
+                for g in gates
+            ],
+            "config": {
+                "max_lateral_offset": config.max_lateral_offset,
+                "smoothness_weight": config.smoothness_weight,
+                "speed_weight": config.speed_weight,
+                "corner_cut_aggressiveness": config.corner_cut_aggressiveness,
+            },
+        }
+        key_str = json.dumps(key_data, sort_keys=True)
+        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _load_cache(cache_key: str) -> Optional[np.ndarray]:
+        """Load cached offsets if cache file exists and key matches."""
+        try:
+            if not os.path.exists(_CACHE_FILE):
+                return None
+            with open(_CACHE_FILE, "r") as f:
+                data = json.load(f)
+            if data.get("cache_key") != cache_key:
+                return None
+            if data.get("version") != 1:
+                return None
+            return np.array(data["offsets"], dtype=np.float64)
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return None
+
+    @staticmethod
+    def _save_cache(
+        cache_key: str,
+        offsets: np.ndarray,
+        metrics: Optional[dict] = None,
+        n_candidates: int = 0,
+        selected_idx: int = 0,
+    ) -> None:
+        """Save winning offsets to cache file."""
+        from datetime import datetime, timezone
+        data = {
+            "version": 1,
+            "cache_key": cache_key,
+            "offsets": offsets.tolist(),
+            "metrics": metrics or {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "n_candidates_evaluated": n_candidates,
+            "selected_candidate_idx": selected_idx,
+        }
+        try:
+            with open(_CACHE_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass  # cache write failure is non-fatal
+
     def optimize(
         self,
         gates: List[GateWaypoint],
@@ -102,15 +196,33 @@ class RacingLineOptimizer:
         """
         Optimize gate pass-through points for minimum time.
 
-        Uses multi-start L-BFGS-B to explore multiple basins of attraction.
-        Includes zero-initialization as fallback (guaranteed no regression
-        per T-MPC Theorem 2, de Groot et al. T-RO 2024).
+        Iteration 33: checks cache first. If cached offsets exist for this
+        gate configuration, uses them directly (deterministic, fast).
+        Otherwise runs full multi-start L-BFGS + sim-based selection and
+        caches the result for future runs.
 
         Returns a new list of GateWaypoints with optimized positions
         (offset within gate openings for corner cutting).
         """
         if len(gates) < 2:
             return list(gates)
+
+        # --- Cache check (iteration 33) ---
+        cache_key = self._compute_cache_key(gates, start_position, self.config)
+        if self.config.use_cache:
+            cached_offsets = self._load_cache(cache_key)
+            if cached_offsets is not None:
+                optimized_positions = self._apply_offsets(gates, cached_offsets)
+                optimized_gates = []
+                for i, gate in enumerate(gates):
+                    optimized_gates.append(GateWaypoint(
+                        position=optimized_positions[i],
+                        normal=gate.normal,
+                        width=gate.width,
+                        height=gate.height,
+                        yaw=gate.yaw,
+                    ))
+                return optimized_gates
 
         n = len(gates)
         max_off = self.config.max_lateral_offset
@@ -186,6 +298,15 @@ class RacingLineOptimizer:
             gates, all_results, start_position
         )
         best_result = all_results[best_idx]
+
+        # --- Save to cache (iteration 33) ---
+        if self.config.use_cache:
+            self._save_cache(
+                cache_key,
+                best_result.x,
+                n_candidates=len(all_results),
+                selected_idx=best_idx,
+            )
 
         optimized_positions = self._apply_offsets(gates, best_result.x)
         optimized_gates = []
