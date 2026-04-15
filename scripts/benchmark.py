@@ -316,7 +316,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         (0, inflection_start, 0.4, 0.15, 0.35, 0.0),                # Pre-inflection: no vel correction
         (inflection_start, inflection_end, 0.4, 0.15, 0.40, 0.4),   # Gate-3 inflection: moderate vel
         (inflection_end, helix_start, 0.4, 0.15, 0.35, 0.5),        # Post-inflection: standard vel
-        (helix_start, n_total_steps, 0.4, 0.35, 0.35, 0.7),         # Helix: aggressive vel
+        (helix_start, n_total_steps, 0.4, 0.45, 0.35, 0.7),         # Helix: aggressive vel, increased correction cap
     ]
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
     # tuple. Velocity offsets are the smooth time derivative of position offsets,
