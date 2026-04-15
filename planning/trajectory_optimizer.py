@@ -154,6 +154,12 @@ def compute_ilc_offset_table(
     4th-order Butterworth low-pass filter instead of Gaussian smoothing. This
     provides sharper frequency cutoff and principled convergence guarantees.
 
+    Per-section bandwidth (iteration 28): Each section can specify its own
+    filter cutoff via a 5th element in section_boundaries. This implements
+    the time-varying Q-filter design from Bristow & Alleyne (ACC 2007):
+    higher bandwidth at S-turn inflections where error has high-frequency
+    content, lower bandwidth at smooth sections for noise rejection.
+
     Research basis:
     - Schoellig et al. 2012: P-type ILC with feedforward correction achieves
       87% error reduction in 3-5 iterations on real quadrotors.
@@ -177,8 +183,11 @@ def compute_ilc_offset_table(
         dt: Sim timestep (must match benchmark).
         section_boundaries: List of tuples defining independent ILC sections.
             Format: (start_step, end_step, section_alpha) or
-            (start_step, end_step, section_alpha, section_max_correction_m).
+            (start_step, end_step, section_alpha, section_max_correction_m) or
+            (start_step, end_step, section_alpha, section_max_correction_m, section_cutoff_hz).
             If 4th element omitted, uses global max_correction_m.
+            If 5th element present, uses a section-specific Butterworth cutoff
+            (Bristow & Alleyne 2007: time-varying Q-filter bandwidth).
             If None, uses global alpha.
         blend_steps: Number of steps for blending between adjacent sections.
         filter_cutoff_hz: Butterworth Q-filter cutoff frequency in Hz. When
@@ -320,7 +329,19 @@ def compute_ilc_offset_table(
 
                 # Smooth within section only (no cross-section bleed)
                 sec_smoothed = np.zeros_like(sec_ct)
-                if butter_b is not None and len(sec_ct) > 60:
+
+                # Per-section Butterworth cutoff (iteration 28, Bristow & Alleyne 2007)
+                # If section has a 5th element, use section-specific filter.
+                sec_butter_b, sec_butter_a = butter_b, butter_a  # default: global
+                if len(sec_def) > 4 and sec_def[4] is not None:
+                    from scipy.signal import butter as _butter
+                    sec_cutoff = sec_def[4]
+                    sec_Wn = sec_cutoff / (0.5 / dt)  # normalize by Nyquist
+                    if sec_Wn >= 1.0:
+                        sec_Wn = 0.99
+                    sec_butter_b, sec_butter_a = _butter(4, sec_Wn, btype='low')
+
+                if sec_butter_b is not None and len(sec_ct) > 60:
                     # Zero-phase Butterworth Q-filter (iteration 27)
                     # Reflect-pad to handle filtfilt boundary effects
                     # (Freeman 2025: ~50-60 samples at 2 Hz cutoff)
@@ -329,7 +350,7 @@ def compute_ilc_offset_table(
                     for axis in range(3):
                         signal = sec_ct[:, axis]
                         padded = np.pad(signal, pad_len, mode='reflect')
-                        filtered = _filtfilt(butter_b, butter_a, padded)
+                        filtered = _filtfilt(sec_butter_b, sec_butter_a, padded)
                         sec_smoothed[:, axis] = filtered[pad_len:-pad_len] if pad_len > 0 else filtered
                 else:
                     # Gaussian fallback (for short sections or when no cutoff specified)

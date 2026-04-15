@@ -293,29 +293,27 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
-    # --- Offline per-section ILC position-offset table (iteration 26) ---
-    # Per-section ILC prevents cross-contamination between S-turn and helix sections.
-    # Each section gets its own learning rate and independent offset accumulation.
-    # Blended at boundaries to avoid discontinuities.
-    # Research: Zhang 2024 (segment-wise ILC), Liu 2023 (time-varying gains),
-    # Schoellig 2012, Spatial ILC (Lv 2023), ILMPC (Zhao 2025).
-    from planning.trajectory_optimizer import compute_ilc_offset_table
-    # Section boundary: midpoint between gate-6 (~6.8s) and gate-7 (~8.0s)
-    # = ~7.4s → step 740 at dt=0.01
-    n_total_steps = int(trajectory.total_time / dt) + 50
-    section_boundary_step = int(7.4 / dt)  # ~740
-    # --- Offline per-section ILC position-offset table (iteration 26) ---
-    # Per-section ILC with section-specific correction limits allows the helix section
-    # to accumulate larger offsets (0.35m) where errors are highest, while keeping
-    # S-turn corrections conservative (0.15m) to avoid max-error regression.
-    # Research: Zhang 2024 (segment-wise ILC), Liu 2023 (time-varying gains),
-    # Schoellig 2012, Spatial ILC (Lv 2023), ILMPC (Zhao 2025).
+    # --- Offline per-section ILC with per-section Q-filter bandwidth (iteration 28) ---
+    # Time-varying Q-filter (Bristow & Alleyne 2007, ACC): different Butterworth
+    # cutoffs per track section. Higher bandwidth at S-turn inflection (gate-3)
+    # where error has high-frequency content from centripetal reversal. Lower
+    # bandwidth at smooth sections for noise rejection.
+    # Research: Bristow & Alleyne 2007/2008, Zhang 2024 (segment-wise ILC),
+    # Freeman 2025, van Haren 2024, Longman 2019.
     from planning.trajectory_optimizer import compute_ilc_offset_table
     n_total_steps = int(trajectory.total_time / dt) + 50
-    section_boundary_step = int(7.4 / dt)  # ~740: midpoint between gate-6 and gate-7
+    # Section boundaries (iteration 28): 3 sections with per-section bandwidth
+    # Gate-3 at ~2.94s. Inflection region: 2.0s-4.4s (steps 200-440).
+    # Helix boundary: midpoint gate-6/gate-7 (~7.4s, step 740).
+    inflection_start = int(2.0 / dt)   # step 200
+    inflection_end = int(4.4 / dt)     # step 440
+    helix_start = int(7.4 / dt)        # step 740
     section_boundaries = [
-        (0, section_boundary_step, 0.4, 0.15),             # S-turn: gates 1-6, conservative
-        (section_boundary_step, n_total_steps, 0.4, 0.35),  # Helix: gates 7-12, higher limit
+        # (start, end, alpha, max_correction_m, filter_cutoff_hz)
+        (0, inflection_start, 0.4, 0.15, 0.35),                # Pre-inflection: 0.35 Hz
+        (inflection_start, inflection_end, 0.4, 0.15, 0.40),   # Gate-3 inflection: 0.40 Hz (Bristow & Alleyne 2007)
+        (inflection_end, helix_start, 0.4, 0.15, 0.35),        # Post-inflection: 0.35 Hz
+        (helix_start, n_total_steps, 0.4, 0.35, 0.35),         # Helix: 0.35 Hz
     ]
     ilc_offsets = compute_ilc_offset_table(
         trajectory, tuple(start_pos),
@@ -327,13 +325,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         dt=dt,
         section_boundaries=section_boundaries,
         blend_steps=50,
-        filter_cutoff_hz=0.35,  # Butterworth Q-filter (iteration 27)
-        # Research: van Haren 2024, Freeman 2025, Longman 2019
-        # 4th-order Butterworth at 0.35 Hz replaces Gaussian σ=10 (≈1.37 Hz).
-        # Sharper rolloff provides better noise rejection; 0.35 Hz captures
-        # the slow-varying systematic tracking error (curvature-correlated)
-        # while filtering faster noise from kinematic sim model mismatch.
-        # Sweep tested {0.2..4.0 Hz}: 0.35 Hz optimal for avg error (-3.2%).
+        filter_cutoff_hz=0.35,  # Global fallback (used by sections without 5th element)
     )
 
     # Use consistent physics parameters between tracker and kinematic model.
