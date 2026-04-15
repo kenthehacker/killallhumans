@@ -888,7 +888,8 @@ class TrajectoryOptimizer:
         # Low-curvature/straight segments use 0.60 to recover race time.
         # Research: FBGA (Piazza 2025) — forward-backward naturally compresses
         # easy segments more. STORM (Zhang 2025) — per-segment LP for times.
-        max_compression_protected = 0.65  # S-turn, helix, high-curvature (iter 30: reduced from 0.66 — round 2; FBGA Piazza 2025)
+        max_compression_sturn = 0.67  # S-turn floor (iter 37: split from protected, swept 0.65-0.73; 0.67 gives -1.1% avg error with +0.04s time; joint helix compensation unfavorable — GripMap Werner 2025, CiMPCC Li 2024)
+        max_compression_protected = 0.65  # high-curvature, pre-turn (iter 30: reduced from 0.66 — round 2; FBGA Piazza 2025)
         max_compression_helix = 0.72  # Helix floor (iter 36: Pareto rebalance from 0.76 — swept 0.70-0.74, 0.72 recovers race time 14.09→13.98s while keeping avg err 0.176m; iter 35 set 0.76 for accuracy-optimal but overshot 14s target)
         max_compression_easy = 0.59  # straights, shallow curves (iter 30: reduced from 0.60 — round 2; ILC compensates)
 
@@ -1010,7 +1011,7 @@ class TrajectoryOptimizer:
         seg_floor = []
         for i in range(n):
             if i in s_turn_segments:
-                seg_floor.append(max_compression_protected)
+                seg_floor.append(max_compression_sturn)
             elif i in helix_segments:
                 # Helix segments get higher floor than S-turns (iteration 35).
                 # TOPP floor is the binding constraint for helix entry/exit
