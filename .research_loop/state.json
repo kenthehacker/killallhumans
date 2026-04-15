@@ -1,6 +1,6 @@
 {
-  "iteration": 33,
-  "timestamp": "2026-04-14T23:43:00Z",
+  "iteration": 34,
+  "timestamp": "2026-04-15T09:30:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -96,86 +96,91 @@
     "pmpc_gate_aware_racing_2024",
     "rethinking_reference_mppi_2025",
     "f1_datadriven_init_efficient_2026",
-    "sampling_online_racingline_ogretmen_2024"
+    "sampling_online_racingline_ogretmen_2024",
+    "cdbo_racing_cully_2018",
+    "gradient_free_multidomain_zheng_2022",
+    "data_driven_aggressive_racing_vpmpcc_2024"
   ],
-  "total_papers_analyzed": 92,
+  "total_papers_analyzed": 95,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.18528,
-    "max_tracking_error_m": 0.7422,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7593,
+    "avg_tracking_error_m": 0.19953,
+    "max_tracking_error_m": 0.6868,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 6701,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.284,
-    "race_time_s": 13.79
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.4226,
+    "race_time_s": 13.81,
+    "note": "Corrected baseline after fixing unit test cache corruption bug from iter 33"
   },
   "metrics_after": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.18528,
-    "max_tracking_error_m": 0.7422,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 5378,
+    "avg_tracking_error_m": 0.18723,
+    "max_tracking_error_m": 0.6958,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 6707,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.284,
-    "race_time_s": 13.79,
-    "deterministic": true,
-    "note": "No metric changes. Determinism achieved via racing line offset caching."
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.3434,
+    "race_time_s": 13.89,
+    "deterministic": true
   },
   "changes_committed": true,
-  "commit_hash": "b477cf9",
+  "commit_hash": "d4a4f28",
   "diagnostic": {
-    "root_cause": "Racing line _select_by_sim() had near-equal-energy basins causing non-deterministic results across runs. Fixed by caching winning offsets to JSON. Remaining bottleneck is helix gates (7-8) with trajectory-shape-driven error, and PD controller saturating at 0.85 rad.",
+    "root_cause": "Gate-8 at max lateral offset (-0.6) created excessive trajectory curvature in the helix, cascading upstream to gate-4 (0.423m). Moving gate-8 to -0.2 smooths the helix entry, reducing gate-4 error by 18.7%. Also discovered unit test cache corruption bug from iter 33 that produced false baseline numbers.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.110,
+      "avg_pitch_rad": -0.108,
       "avg_thrust": 0.797
     },
     "trend": "improving",
     "architectural_issues": [
       "PD controller saturating at 0.85 rad — needs geometric SE(3) or MPCC controller",
-      "Helix gates (7-8) have trajectory-shape-driven error resistant to inflation",
+      "Basin switching constrains offset search space (~30% of values safe)",
+      "Gate-4 helix entry transition has trajectory-shape-driven error at 0.343m",
       "Kinematic sim lacks attitude dynamics — may not reflect real performance"
     ],
     "critic_findings": [
-      "Cache implementation is clean with auto-invalidation",
-      "Cache bypass (use_cache=False) available for forced re-optimization",
-      "Manual cache editing now possible for controlled offset experiments"
+      "Single offset change is minimal and well-tested via sweep",
+      "Cache isolation fix is a genuine bugfix preventing future non-determinism",
+      "Basin switching discovery adds knowledge for future offset tuning",
+      "Corrected baseline reveals gate-4, not gate-7, as true worst gate"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Manual racing line offset tuning for helix gates (gate-7: 0.284m, gate-8: 0.235m)",
-      "proposed_approach": "Edit racing_line_cache.json directly to test different offsets for helix gates. Cache mechanism ensures deterministic evaluation of each change.",
-      "expected_impact": "gate-7 0.284→0.250m, gate-8 0.235→0.210m",
+      "description": "Gate-4 helix entry transition (0.343m) — worst gate after offset optimization",
+      "proposed_approach": "Targeted inflation increase or ILC bandwidth adjustment for straight-to-helix transition section",
+      "expected_impact": "gate-4 0.343→0.280m, avg tracking error improvement",
       "priority": 1,
-      "research_refs": ["togt_planner_qin_2024"]
+      "research_refs": ["cimpcc_curvature_velocity_li_2024", "segmentwise_ilc_zhang_2024"]
     },
     {
       "area": "control",
       "description": "MPCC or SE(3) geometric controller to replace PD (saturating at 0.85 rad)",
-      "proposed_approach": "Implement contouring error decomposition (MPCC) or SE(3) geometric tracking. Orthogonal to trajectory changes.",
+      "proposed_approach": "Implement contouring error decomposition (MPCC) or SE(3) geometric tracking",
       "expected_impact": "5-15% tracking improvement across all gates",
       "priority": 2,
-      "research_refs": ["mpcc_plus_plus_krinner_2024", "nrhdg_drone_racing_path_2025"]
+      "research_refs": ["mpcc_plus_plus_krinner_2024", "monorace_champion_level_2026"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Gate-3 S-turn approach deceleration (0.247m)",
-      "proposed_approach": "Targeted inflation or ILC adjustment for S-turn approach section",
-      "expected_impact": "gate-3 0.247→0.220m",
+      "description": "Automated basin-aware offset search with basin switching detection",
+      "proposed_approach": "CdBO with race_time threshold to detect and reject basin-switched evaluations",
+      "expected_impact": "Find better offsets for gates 6-9 within safe offset space",
       "priority": 3,
-      "research_refs": ["cimpcc_curvature_velocity_li_2024", "segmentwise_ilc_zhang_2024"]
+      "research_refs": ["cdbo_racing_cully_2018", "gradient_free_multidomain_zheng_2022"]
     },
     {
       "area": "trajectory_planning",
-      "description": "TOPP compression with verified determinism",
-      "proposed_approach": "Safely reduce TOPP compression floors now that racing line is frozen",
+      "description": "TOPP compression tuning with verified determinism",
+      "proposed_approach": "Reduce TOPP compression floors now that racing line is truly frozen",
       "expected_impact": "0.1-0.2s race time improvement",
       "priority": 4,
       "research_refs": ["toppquad_speed_profile_mao_2024", "fbga_velocity_profile_piazza_2025"]
@@ -432,6 +437,20 @@
       "lesson": "Near-equal-energy basins produce non-deterministic outcomes. Verify from clean state.",
       "approach": "inflation_reduction_round3_non_reproducible",
       "reason": "Non-deterministic basin selection"
+    },
+    {
+      "iteration": 34,
+      "description": "Gate-7 lateral offset change (0.555→0.6) triggers basin switching in full pipeline.",
+      "lesson": "Even small gate-7 offset changes cause trajectory optimizer basin switching. Gate-7 is at a basin boundary.",
+      "approach": "gate7_lateral_offset_change",
+      "reason": "Basin switching — race time exploded to 27.22s"
+    },
+    {
+      "iteration": 34,
+      "description": "Gate-8 vertical offset change (-0.067→0.333) triggers basin switching in full pipeline.",
+      "lesson": "Vertical offset changes have stronger coupling to trajectory shape than expected. Only lateral offsets at specific values are safe.",
+      "approach": "gate8_vertical_offset_change",
+      "reason": "Basin switching — race time exploded to 27.31s"
     }
   ]
 }

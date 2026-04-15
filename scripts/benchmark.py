@@ -131,7 +131,8 @@ def run_unit_tests() -> Dict[str, Any]:
             GateWaypoint(position=(5, 0, -2), normal=(1, 0, 0), yaw=0),
             GateWaypoint(position=(10, 5, -2), normal=(0, 1, 0), yaw=math.pi / 2),
         ]
-        out = RacingLineOptimizer().optimize(wps, (0, 0, -2))
+        from planning.racing_line import RacingLineConfig
+        out = RacingLineOptimizer(RacingLineConfig(use_cache=False)).optimize(wps, (0, 0, -2))
         assert len(out) == 2
     tests.append(("racing_line", _rl))
 
