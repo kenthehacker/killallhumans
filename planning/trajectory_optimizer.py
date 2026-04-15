@@ -644,6 +644,44 @@ class TrajectoryOptimizer:
             v_out = gate_centers[gi + 1] - gate_centers[gi]
             cross_z[gi] = float(np.cross(v_in, v_out)[2])  # yaw-plane direction
 
+        # --- Helix detection (iteration 31) ---
+        # A helix is 3+ consecutive same-direction turns with short inter-gate
+        # distances. Unlike S-turns (opposite-direction), helix gates were NOT
+        # getting compound curvature treatment despite sustained high curvature.
+        # Gate-7 (helix entry) had only 8.7% inflation vs 25% for gate-6 (94° turn).
+        # Research: CiMPCC (Li, ITSC 2024) — compound curvature for sequential
+        # same-direction turns; TOPPQuad (Mao 2024) — sustained curvature needs
+        # compound feasibility check; FBGA (Piazza 2025) — apex speed limits.
+        # Online Velocity Profile (Ogretmen 2025) — apex-based velocity limits.
+        helix_gates = set()  # gate indices confirmed in helix
+        helix_entry_gates = set()  # first gate of each helix section
+        if n_gates >= 4:
+            # Find consecutive same-direction turn sequences
+            run_start = None
+            run_gates = []
+            for gi in range(2, n_gates - 1):
+                prev_same = (cross_z[gi - 1] * cross_z[gi] > 0) if (cross_z[gi - 1] != 0 and cross_z[gi] != 0) else False
+                dist_to_prev = float(np.linalg.norm(gate_centers[gi] - gate_centers[gi - 1]))
+                if prev_same and dist_to_prev < 7.0:
+                    if run_start is None:
+                        run_start = gi - 1
+                        run_gates = [gi - 1, gi]
+                    else:
+                        run_gates.append(gi)
+                else:
+                    # End of run — check if it's a helix (3+ gates)
+                    if len(run_gates) >= 3:
+                        for g in run_gates:
+                            helix_gates.add(g)
+                        helix_entry_gates.add(run_gates[0])
+                    run_start = None
+                    run_gates = []
+            # Check final run
+            if len(run_gates) >= 3:
+                for g in run_gates:
+                    helix_gates.add(g)
+                helix_entry_gates.add(run_gates[0])
+
         # Compute turn angle at each gate (angle between approach and departure)
         for gi in range(1, n_gates - 1):
             v_in = gate_centers[gi] - gate_centers[gi - 1]
@@ -785,6 +823,25 @@ class TrajectoryOptimizer:
                 proximity_factor = 1.0 + 0.22 * (1.0 - dist_closest / 6.0)  # was 0.12, forward-only (iter 14)
                 inflate = max(inflate, proximity_factor)
 
+            # --- Helix compound inflation (iteration 31) ---
+            # Helix entry gates need extra inflation because the drone transitions
+            # from a different track section (straight/S-turn) into sustained
+            # high-curvature turns. The existing proximity-based inflation (8.7%
+            # for gate-7) is insufficient — gate-7 was 0.284m for 10+ iterations.
+            # Research: CiMPCC (Li 2024) — compound curvature for sequential
+            # same-direction turns; Online VP (Ogretmen 2025) — apex velocity limits.
+            if gi in helix_entry_gates:
+                helix_entry_inflate = 1.12  # 12% for helix entry (was only 8.7% from proximity)
+                inflate = max(inflate, helix_entry_inflate)
+            elif gi in helix_gates and gi not in helix_entry_gates:
+                # Helix interior gates also need compound inflation.
+                # Gate-7 (helix 2nd gate) has curvature 0.269 (highest of any
+                # gate) but only got 8.7% from proximity. The compound nature
+                # of sustained same-direction turns means each gate needs more
+                # margin than its point curvature suggests.
+                helix_interior_inflate = 1.10  # 10% minimum for helix interior
+                inflate = max(inflate, helix_interior_inflate)
+
             if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:
                     if 0 <= seg_idx < len(times):
@@ -867,6 +924,34 @@ class TrajectoryOptimizer:
                         for s in range(max(0, 2 * gi + 1), min(n, 2 * gi + 4)):
                             s_turn_segments.add(s)
 
+        # --- Helix segment detection for TOPP curvature boost (iteration 31) ---
+        # Helix sections (3+ consecutive same-direction turns, short distances)
+        # need compound curvature treatment analogous to S-turns. Without this,
+        # gate-7 (helix entry, 0.284m error) was undertreated for 10+ iterations.
+        # Research: CiMPCC (Li 2024) — compound curvature for same-direction
+        # sequential turns; TOPPQuad (Mao 2024) — sustained curvature feasibility.
+        helix_segments = set()
+        if n_gates >= 4:
+            helix_run_gates = []
+            for gi in range(2, n_gates - 1):
+                prev_same = (cross_z.get(gi - 1, 0) * cross_z.get(gi, 0) > 0) if (cross_z.get(gi - 1, 0) != 0 and cross_z.get(gi, 0) != 0) else False
+                dist_g = float(np.linalg.norm(gate_centers[gi] - gate_centers[gi - 1]))
+                if prev_same and dist_g < 7.0:
+                    if not helix_run_gates:
+                        helix_run_gates = [gi - 1, gi]
+                    else:
+                        helix_run_gates.append(gi)
+                else:
+                    if len(helix_run_gates) >= 3:
+                        for g in helix_run_gates:
+                            for s in range(max(0, 2 * g - 1), min(n, 2 * g + 3)):
+                                helix_segments.add(s)
+                    helix_run_gates = []
+            if len(helix_run_gates) >= 3:
+                for g in helix_run_gates:
+                    for s in range(max(0, 2 * g - 1), min(n, 2 * g + 3)):
+                        helix_segments.add(s)
+
         # --- Step 1: Compute segment distances and geometric curvature ---
         seg_dist = []  # straight-line distances
         seg_curv = []  # geometric curvature at segment endpoint
@@ -904,6 +989,16 @@ class TrajectoryOptimizer:
             if i in s_turn_segments and k > 1e-4:
                 k *= 1.2  # 20% compound curvature boost (tuned from 30%)
 
+            # Compound curvature boost for helix regions (iteration 31).
+            # Helix segments have sustained high curvature without recovery
+            # straights. The TOPP retimer underestimates difficulty because
+            # Menger curvature at individual waypoints doesn't capture the
+            # compound effect of consecutive same-direction turns.
+            # Research: CiMPCC (Li 2024) — compound curvature for sequential
+            # turns; TOPPQuad (Mao 2024) — sustained feasibility check.
+            if i in helix_segments and k > 1e-4 and i not in s_turn_segments:
+                k *= 1.15  # 15% compound curvature boost for helix
+
             seg_curv.append(k)
 
         # --- Step 1b: Per-segment compression floor (iteration 21) ---
@@ -914,6 +1009,9 @@ class TrajectoryOptimizer:
         seg_floor = []
         for i in range(n):
             if i in s_turn_segments:
+                seg_floor.append(max_compression_protected)
+            elif i in helix_segments:
+                # Helix segments also get protected floor (iteration 31)
                 seg_floor.append(max_compression_protected)
             elif seg_curv[i] > curvature_threshold:
                 seg_floor.append(max_compression_protected)
