@@ -303,8 +303,8 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # Freeman 2025, van Haren 2024, Longman 2019.
     from planning.trajectory_optimizer import compute_ilc_offset_table
     n_total_steps = int(trajectory.total_time / dt) + 50
-    # Section boundaries (iteration 28): 3 sections with per-section bandwidth
-    # Gate-3 at ~2.94s. Inflection region: 2.0s-4.4s (steps 200-440).
+    # Section boundaries (iteration 28): 4 sections with per-section bandwidth
+    # Gate-3 at ~2.93s. Inflection region: 2.0s-4.4s (steps 200-440).
     # Helix boundary: midpoint gate-6/gate-7 (~7.4s, step 740).
     inflection_start = int(2.0 / dt)   # step 200
     inflection_end = int(4.4 / dt)     # step 440
@@ -314,9 +314,9 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007):
         # Pre-inflection uses 0.0 to recover gate-2; helix uses 0.7 for max benefit.
         (0, inflection_start, 0.4, 0.15, 0.35, 0.0),                # Pre-inflection: no vel correction
-        (inflection_start, inflection_end, 0.45, 0.15, 0.40, 0.4),  # iter 45: alpha 0.4→0.45 for gate-3 improvement (Schoellig 2012)
+        (inflection_start, inflection_end, 0.50, 0.15, 0.40, 0.4),  # iter 46: alpha 0.45→0.50 for gate-3/4 (Longman 2023 convergence accel)
         (inflection_end, helix_start, 0.4, 0.15, 0.35, 0.5),        # Post-inflection: standard vel
-        (helix_start, n_total_steps, 0.4, 0.45, 0.35, 0.7),         # Helix: aggressive vel, increased correction cap
+        (helix_start, n_total_steps, 0.4, 0.50, 0.35, 0.7),         # iter 46: helix max_corr 0.45→0.50m for gate-7
     ]
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
     # tuple. Velocity offsets are the smooth time derivative of position offsets,
