@@ -1,6 +1,6 @@
 {
-  "iteration": 29,
-  "timestamp": "2026-04-14T17:34:00Z",
+  "iteration": 30,
+  "timestamp": "2026-04-14T17:58:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -85,98 +85,103 @@
     "dual_ilc_mimo_ewering_2025",
     "spiral_self_play_racing_2025",
     "robust_constrained_ilc_2022",
-    "strategizing_speed_lmpg_2026"
+    "strategizing_speed_lmpg_2026",
+    "track_centric_ilc_racing_2026",
+    "iteraoptiracing_unified_2025",
+    "timeopt_safety_constraints_2024"
   ],
-  "total_papers_analyzed": 81,
+  "total_papers_analyzed": 84,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.17458,
-    "max_tracking_error_m": 0.7045,
-    "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 6914,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.276,
-    "race_time_s": 14.03
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.18477,
     "max_tracking_error_m": 0.7248,
     "ekf_uncertainty_m": 0.012,
-    "avg_loop_hz": 7704,
+    "avg_loop_hz": 7851,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-7",
     "worst_gate_error_m": 0.282,
     "race_time_s": 13.80
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.19087,
+    "max_tracking_error_m": 0.7422,
+    "ekf_uncertainty_m": 0.012,
+    "avg_loop_hz": 7792,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-7",
+    "worst_gate_error_m": 0.284,
+    "race_time_s": 13.68
+  },
   "changes_committed": true,
-  "commit_hash": "cd3f4f8",
+  "commit_hash": "85a081a",
   "diagnostic": {
-    "root_cause": "Race time stuck at 14.03s because post-optimization inflation factors (S-turn 10-12%, TOPP floors 0.63-0.68) were calibrated before ILC existed. ILC now compensates for those errors independently, making inflation overly conservative. Reducing by 1-3% per factor recovered 0.23s race time.",
+    "root_cause": "Inflation reduction approaching hard limit. Racing line optimizer basin boundary causes catastrophic regression at 2% TOPP floor change. Only 1% per parameter per iteration is safe. Diminishing returns: 0.23s (iter 29) → 0.12s (iter 30) → ~0.08s (projected iter 31).",
     "telemetry_signals": {
       "target_jumps_gt_1m": null,
       "detection_frame_pct": null,
       "recovery_count": null,
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.110,
-      "avg_thrust": 0.798
+      "avg_pitch_rad": -0.111,
+      "avg_thrust": 0.800
     },
-    "trend": "new_area",
+    "trend": "diminishing_returns",
     "architectural_issues": [
-      "Racing line _select_by_sim uses full trajectory optimizer — parameter changes ripple into racing line selection, causing basin switching at >3% reduction per parameter",
-      "Gate-7 (0.282m) persistent worst gate, unaffected by inflation reduction",
+      "Racing line _select_by_sim basin switching at 2% TOPP floor change — hard limit at current absolute values",
+      "Gate-7 (0.284m) persistent worst gate for 10+ iterations, unaffected by inflation",
+      "End speed factor (0.65) doesn't bind — curvature limits dominate at track end",
       "Roll/pitch still saturating at 0.85 rad — PD controller at physical limits"
     ],
     "critic_findings": [
-      "Aggressive combined inflation+TOPP reductions (>3%) cause catastrophic racing line basin switching (26.82s)",
-      "Gate-8 (+19%) and gate-5 (+16%) are the most sensitive to inflation reduction",
-      "Gate-10 improved (-3%) despite overall accuracy regression — faster dynamics help at this specific gate"
+      "2% TOPP floor change alone triggers basin switching — sharper cliff than iter 29 suggested",
+      "Gate-4 (+8.4%) and gate-5 (+7.6%) continue as most sensitive gates to inflation",
+      "Gate-10 improved again (-4.5%) — pattern: faster trajectory helps this specific gate",
+      "frozen_inflation decoupling doesn't solve basin switching — the trajectory itself is untrackable"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Further inflation reduction round 2 — another 1-2% per parameter",
-      "proposed_approach": "Reduce S-turn inflate 1.08/1.10→1.06/1.08, TOPP floors 0.66/0.60→0.64/0.58",
-      "expected_impact": "Race time 13.80→13.6s, avg error 0.185→0.195m",
+      "description": "Gate-7 helix entry optimization — persistent worst gate at 0.284m for 10+ iterations",
+      "proposed_approach": "Helix-specific speed profiling, racing line tightening near gates 6-7, or dedicated helix inflation tuning",
+      "expected_impact": "Gate-7 0.284→0.250m, possible race time improvement from better helix tracking",
       "priority": 1,
-      "research_refs": ["ilmpc_improved_drone_racing_2025", "spatial_ilc_virtual_tube_2023"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Gate-7 helix entry optimization — persistent worst gate at 0.282m",
-      "proposed_approach": "Helix-specific speed profiling or racing line tightening near gates 6-7",
-      "expected_impact": "Gate-7 0.282→0.250m",
-      "priority": 2,
       "research_refs": ["toppquad_speed_profile_mao_2024", "fbga_velocity_profile_piazza_2025"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Racing line re-optimization — current line optimized with higher inflation",
-      "proposed_approach": "Increase N_STARTS or add targeted initializations near current optimum",
-      "expected_impact": "Potentially 0.1-0.2s race time from better racing line basin",
+      "description": "Further inflation reduction round 3 — 1% per parameter (diminishing returns)",
+      "proposed_approach": "S-turn 1.09/1.07→1.08/1.06, TOPP 0.65/0.59→0.64/0.58",
+      "expected_impact": "Race time 13.68→~13.60s, avg error 0.191→~0.198m",
+      "priority": 2,
+      "research_refs": ["ilmpc_improved_drone_racing_2025"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Racing line re-optimization with current parameters",
+      "proposed_approach": "Increase N_STARTS or add targeted initializations near current optimum with lower inflation",
+      "expected_impact": "0.05-0.15s race time from better racing line basin",
       "priority": 3,
-      "research_refs": ["f1_data_driven_init_shehadeh_2026", "aero_mppi_ensemble_2025"]
+      "research_refs": ["f1_data_driven_init_shehadeh_2026", "spatially_aware_cmaes_racing_2026"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "Decouple _select_by_sim from trajectory optimizer — architectural fix",
+      "proposed_approach": "Use simplified kinematic evaluation without inflation/TOPP in racing line selection",
+      "expected_impact": "Unlock larger parameter changes without basin switching",
+      "priority": 4,
+      "research_refs": ["track_centric_ilc_racing_2026", "taco_sanghvi_2025"]
     },
     {
       "area": "control",
       "description": "MPCC controller for contouring/progress decomposition",
       "proposed_approach": "Implement contouring error decomposition for cross-track vs along-track control",
       "expected_impact": "Tracking improvement across all gates, especially helix",
-      "priority": 4,
-      "research_refs": ["mpcc_plus_plus_krinner_2024"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "End speed optimization (currently 65% of max_v)",
-      "proposed_approach": "Increase end speed from 0.65 to 0.75 in TOPP backward pass",
-      "expected_impact": "0.05-0.1s race time reduction at finish",
       "priority": 5,
-      "research_refs": []
+      "research_refs": ["mpcc_plus_plus_krinner_2024"]
     }
   ],
   "failed_approaches": [
@@ -387,6 +392,27 @@
       "lesson": "Racing line _select_by_sim uses full trajectory optimizer internally. Parameter changes >3% per factor cause racing line basin switching, selecting an untrackable trajectory. Must limit changes to 1-3% per parameter.",
       "approach": "aggressive_combined_inflation_topp_reduction",
       "reason": "Racing line basin switching from cascading optimizer parameter changes"
+    },
+    {
+      "iteration": 30,
+      "description": "2% per-parameter inflation reduction (TOPP 0.64/0.58, S-turn 1.08/1.06). Race time exploded to 26.81s.",
+      "lesson": "At current absolute parameter values, even 2% TOPP floor change triggers basin switching. The boundary is sharper than iter 29 suggested — iter 29's success with 1-3% was because some parameters were further from the cliff. Now all parameters are near the cliff edge.",
+      "approach": "2pct_inflation_reduction_round2",
+      "reason": "Basin switching at 2% TOPP floor — absolute values near cliff edge"
+    },
+    {
+      "iteration": 30,
+      "description": "End speed increase 0.65→0.70 had zero effect on race time.",
+      "lesson": "Curvature-based speed limits at track end are well below max_v*0.70, so the backward pass terminal condition doesn't bind. Would need very high values (0.85+) to have any effect, which is likely unsafe.",
+      "approach": "end_speed_increase_0.70",
+      "reason": "End speed factor doesn't bind — curvature limits dominate"
+    },
+    {
+      "iteration": 30,
+      "description": "frozen_inflation decoupling (fixed parameters for racing line eval, live parameters for trajectory). Still caused 26.81s race time.",
+      "lesson": "The basin switching issue isn't just racing line selection — the trajectory ITSELF is untrackable at 2% more aggressive parameters. The controller/ILC can't track a trajectory that's 2% faster at current absolute values.",
+      "approach": "frozen_inflation_decoupling",
+      "reason": "Trajectory untrackable even with correct racing line selected"
     }
   ]
 }
