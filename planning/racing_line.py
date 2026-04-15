@@ -508,15 +508,16 @@ class RacingLineOptimizer:
         for faster evaluation. Returns (avg_error, worst_gate_error, race_time).
 
         Physics: PD controller + drag + acceleration clamp.
-        Same gains as benchmark: kp_xy=6, kd_xy=4, kp_z=8, kd_z=5, ff=0.4.
+        Gains synced with benchmark (iter 40): kp_xy=7, kd_xy=5.5, ff=0.50.
+        Note: gains updated but selection unchanged (same basin wins).
         """
         dt = 0.02
         max_accel = 15.0
         max_speed = 15.0
         drag = 0.5
-        kp_xy, kd_xy = 6.0, 4.0
+        kp_xy, kd_xy = 7.0, 5.5
         kp_z, kd_z = 8.0, 5.0
-        ff_accel = 0.4
+        ff_accel = 0.50
 
         pos = np.array(start_position, dtype=float)
         vel = np.zeros(3)
