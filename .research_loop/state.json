@@ -1,6 +1,6 @@
 {
-  "iteration": 41,
-  "timestamp": "2026-04-15T14:35:00Z",
+  "iteration": 42,
+  "timestamp": "2026-04-15T14:47:00Z",
   "status": "completed",
   "current_bottleneck": "system_integration",
   "previous_bottleneck": "system_integration",
@@ -124,19 +124,6 @@
   "total_papers_analyzed": 115,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1501,
-    "max_tracking_error_m": 0.7269,
-    "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7670,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-2",
-    "worst_gate_error_m": 0.2137,
-    "race_time_s": 14.07,
-    "deterministic": true
-  },
-  "metrics_after": {
-    "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.1401,
     "max_tracking_error_m": 0.7011,
     "ekf_uncertainty_m": 0.0119,
@@ -148,10 +135,23 @@
     "race_time_s": 14.08,
     "deterministic": true
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1384,
+    "max_tracking_error_m": 0.7269,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7674,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-2",
+    "worst_gate_error_m": 0.2137,
+    "race_time_s": 14.08,
+    "deterministic": true
+  },
   "changes_committed": true,
-  "commit_hash": "4386900",
+  "commit_hash": "2d72cd6",
   "diagnostic": {
-    "root_cause": "ILC position-velocity mismatch: position offsets shifted the target but velocity remained from original trajectory, creating systematic conflict between PD velocity error term and ILC position correction.",
+    "root_cause": "Uniform 0.5x velocity correction scaling caused gate-2 regression because velocity corrections in the pre-inflection section amplify the ILC gain mismatch (kp=6 vs kp=7). Per-section scaling (0.0 pre-inflection, 0.4 inflection, 0.5 post-inflection, 0.7 helix) eliminates the regression while preserving helix gains.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
@@ -160,43 +160,43 @@
     },
     "trend": "improving",
     "architectural_issues": [
-      "Gate-2 sensitivity to velocity correction: +13.4% regression at 0.5x scaling due to ILC gain mismatch amplification in pre-inflection section",
-      "ILC inner sim gain mismatch (kp=6 vs kp=7) now has different effects with velocity corrections — re-examine whether sync would work",
-      "Uniform velocity scaling across all sections suboptimal — per-section scaling would eliminate gate-2 regression",
       "Acceleration feedforward still from original trajectory — second derivative correction not yet applied",
-      "No PyBullet validation of 41 iterations of kinematic sim improvements"
+      "ILC inner sim gain mismatch (kp=6 vs kp=7) still present — re-examine with per-section velocity corrections",
+      "Max error 0.727m unchanged from iter 40 (pre-inflection section has 0.0 vel scaling)",
+      "No PyBullet validation of 42 iterations of kinematic sim improvements",
+      "Section boundary tuple now has 6 elements — consider refactoring to named config"
     ],
     "critic_findings": []
   },
   "improvements_backlog": [
     {
       "area": "system_integration",
-      "description": "Per-section velocity correction scaling to recover gate-2",
-      "proposed_approach": "Use 0.0-0.3x velocity scaling for pre-inflection section (0-200 steps), 0.5-0.7x for post-inflection and helix. This preserves the helix gains while eliminating gate-2 regression.",
-      "expected_impact": "Gate-2 recovery from 0.242 to ~0.215 while maintaining avg error ~0.140m",
-      "priority": 1,
-      "research_refs": ["segment_based_ailc_zhang_2026", "timevarying_qfilter_bristow_2007"]
-    },
-    {
-      "area": "system_integration",
       "description": "Acceleration correction from ILC offsets (second derivative)",
-      "proposed_approach": "Compute second time derivative of ILC position offset, add to feedforward acceleration. This makes the full reference (pos, vel, accel) consistent with the corrected path.",
-      "expected_impact": "Further 3-5% avg error reduction; requires careful noise management",
-      "priority": 2,
+      "proposed_approach": "Compute second time derivative of ILC position offset, add to feedforward acceleration with per-section scaling. This completes the full reference consistency (pos+vel+accel).",
+      "expected_impact": "3-5% avg error reduction; requires careful noise management via Butterworth filtering of second derivative",
+      "priority": 1,
       "research_refs": ["schoellig_optbased_ilc_2012", "track_centric_ilc_racing_2026"]
     },
     {
       "area": "system_integration",
-      "description": "ILC gain re-synchronization with velocity corrections",
-      "proposed_approach": "Synchronize ILC inner sim gains to match benchmark (kp=7, kd=5.5, ff=0.50) AND use velocity corrections. Previous sync attempt (iter 39) failed without vel corrections — may succeed with them.",
-      "expected_impact": "Could improve convergence if mismatch was masking residual errors; HIGH RISK",
-      "priority": 3,
+      "description": "ILC gain re-synchronization with per-section velocity corrections",
+      "proposed_approach": "Re-attempt ILC inner sim gain sync (kp=7, kd=5.5, ff=0.50) now with per-section velocity corrections. The per-section scaling may change the dynamics enough for sync to work.",
+      "expected_impact": "Could improve convergence or cause regression; HIGH RISK",
+      "priority": 2,
       "research_refs": ["ilc_mismatch_compensation_wu_2024"]
     },
     {
       "area": "system_integration",
+      "description": "Pre-inflection velocity correction with minimal scaling (0.1-0.2) to reduce max error",
+      "proposed_approach": "Try small pre-inflection velocity scaling to reduce max error from 0.727m without regressing gate-2",
+      "expected_impact": "Max error reduction 0.727→~0.710m; gate-2 may regress slightly",
+      "priority": 3,
+      "research_refs": ["timevarying_qfilter_bristow_2007"]
+    },
+    {
+      "area": "system_integration",
       "description": "PyBullet full-physics validation",
-      "proposed_approach": "Run benchmark with PyBullet sim to validate 41 iterations of kinematic sim tuning",
+      "proposed_approach": "Run benchmark with PyBullet sim to validate 42 iterations of kinematic sim tuning",
       "expected_impact": "Discover real-world viability; max_tilt_rad matters in full physics",
       "priority": 4,
       "research_refs": ["ngtc_tilt_analysis_supplement_2025", "lol_nmpc_lowlevel_dynamics_gupta_2025"]
@@ -571,6 +571,13 @@
       "lesson": "Full velocity scaling amplifies the ILC gain mismatch at gate-2. Partial scaling (0.5x) is optimal.",
       "approach": "full_velocity_correction_scaling",
       "reason": "Gate-2 regression exceeds 20% threshold at 1.0x scaling"
+    },
+    {
+      "iteration": 42,
+      "description": "Pre-inflection velocity scaling > 0.0 (tried 0.1). Gate-2 regresses to 0.219m.",
+      "lesson": "Any velocity correction in the pre-inflection section (0-200 steps) causes gate-2 regression. Must be 0.0.",
+      "approach": "pre_inflection_velocity_scaling_nonzero",
+      "reason": "Gate-2 regression from even 0.1x scaling in pre-inflection"
     }
   ]
 }
