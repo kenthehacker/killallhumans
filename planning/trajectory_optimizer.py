@@ -196,9 +196,19 @@ def compute_ilc_offset_table(
             controller with 3-5 Hz bandwidth. If None, uses Gaussian.
 
     Returns:
-        Offset table as np.ndarray of shape (n_steps, 3), or None if ILC
-        doesn't improve tracking. The offset at step k should be ADDED to
-        the reference position at time k*dt.
+        Tuple of (pos_offsets, vel_offsets) as np.ndarrays of shape
+        (n_steps, 3), or None if ILC doesn't improve tracking. The
+        position offset should be ADDED to the reference position, and the
+        velocity offset should be ADDED to the reference velocity.
+
+        Velocity-corrected ILC (iteration 41): The velocity offset is the
+        smooth time derivative of the position offset, ensuring consistency
+        between corrected position and velocity references. This eliminates
+        the mismatch where the controller was told to be at a shifted
+        position but move at the original velocity.
+        Research: Schoellig 2012 (ILC corrects feedforward inputs),
+        Kunapuli 2025 (feedforward is the most important single fix),
+        Nam 2026 (co-optimized position+velocity profiles).
     """
     from scipy.ndimage import gaussian_filter1d
 
@@ -230,7 +240,18 @@ def compute_ilc_offset_table(
     else:
         section_offsets = None
 
+    # Velocity offset: smooth derivative of position offset (iteration 41).
+    # Applied in both ILC inner sim and benchmark for consistency.
+    cumulative_vel_offset = np.zeros((n_steps, 3))
+
     for ilc_iter in range(max_iterations):
+        # Compute velocity offset from position offset (smooth derivative).
+        # np.gradient uses central differences (interior) and one-sided (boundaries).
+        # Since cumulative_offset is Butterworth-filtered, its derivative is smooth.
+        # Research: Schoellig 2012 — ILC should correct feedforward inputs.
+        if ilc_iter > 0:
+            cumulative_vel_offset = np.gradient(cumulative_offset, dt, axis=0)
+
         # --- Run kinematic sim with current offset ---
         pos = np.array(start_position, dtype=float)
         vel = np.zeros(3)
@@ -247,7 +268,10 @@ def compute_ilc_offset_table(
 
             ref = trajectory.sample(sim_time)
             target_pos = np.array(ref.position) + cumulative_offset[step]
-            target_vel = np.array(ref.velocity)  # preserve original velocity
+            # Velocity-corrected ILC (iteration 41): apply scaled velocity offset
+            # to make velocity reference consistent with position offset.
+            # Scale < 1.0 trades full consistency for stability at gate-2.
+            target_vel = np.array(ref.velocity) + 0.5 * cumulative_vel_offset[step]
             ref_acc = np.array(ref.acceleration)
 
             if ff_lookahead_s > 0 and sim_time + ff_lookahead_s <= trajectory.total_time:
@@ -406,11 +430,14 @@ def compute_ilc_offset_table(
 
             cumulative_offset[:actual_steps] += alpha * smoothed
 
-    # Return offset table only if it improved things
+    # Compute final velocity offset from converged position offset (iteration 41)
+    cumulative_vel_offset = np.gradient(cumulative_offset, dt, axis=0)
+
+    # Return offset tables only if ILC improved things
     final_err = prev_avg_err
     if final_err >= baseline_avg_err:
         return None  # ILC didn't help
-    return cumulative_offset
+    return (cumulative_offset, cumulative_vel_offset)
 
 
 @dataclass

@@ -316,7 +316,11 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         (inflection_end, helix_start, 0.4, 0.15, 0.35),        # Post-inflection: 0.35 Hz
         (helix_start, n_total_steps, 0.4, 0.35, 0.35),         # Helix: 0.35 Hz
     ]
-    ilc_offsets = compute_ilc_offset_table(
+    # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
+    # tuple. Velocity offsets are the smooth time derivative of position offsets,
+    # ensuring the controller's velocity reference is consistent with the shifted
+    # position reference. Research: Schoellig 2012, Kunapuli 2025, Nam 2026.
+    ilc_result = compute_ilc_offset_table(
         trajectory, tuple(start_pos),
         alpha=0.4,
         max_iterations=5,
@@ -328,6 +332,10 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         blend_steps=50,
         filter_cutoff_hz=0.35,  # Global fallback (used by sections without 5th element)
     )
+    if ilc_result is not None:
+        ilc_offsets, ilc_vel_offsets = ilc_result
+    else:
+        ilc_offsets, ilc_vel_offsets = None, None
 
     # Gains tuned via systematic sweep (iteration 38).
     # Research: "Leveling the Playing Field" (Kunapuli 2025) — feedforward is
@@ -407,6 +415,10 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         if ilc_offsets is not None and step < len(ilc_offsets):
             target_pos = target_pos + ilc_offsets[step]
         target_vel = np.array(ref.velocity)
+        # Apply ILC velocity offset (iteration 41: consistent position+velocity)
+        # Scale 0.5 trades full consistency for stability at gate-2.
+        if ilc_vel_offsets is not None and step < len(ilc_vel_offsets):
+            target_vel = target_vel + 0.5 * ilc_vel_offsets[step]
         target_yaw = ref.yaw
 
         # Gate-seeking fallback after trajectory ends
