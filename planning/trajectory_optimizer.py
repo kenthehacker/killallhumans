@@ -735,16 +735,16 @@ class TrajectoryOptimizer:
                 # Research: CiMPCC (Li 2024) — compound curvature doesn't drop
                 # between consecutive opposite turns.
                 if is_s_turn_first:
-                    s_turn_inflate = 1.10  # junction: 10% (iter 29: reduced from 12% — ILC compensates; Spatial ILC Lv 2023)
+                    s_turn_inflate = 1.09  # junction: 9% (iter 30: reduced from 10% — round 2; ILMPC 2508.01103)
                 else:
-                    s_turn_inflate = 1.08  # standard second-gate: 8% (iter 29: reduced from 10% — ILC compensates)
+                    s_turn_inflate = 1.07  # standard second-gate: 7% (iter 30: reduced from 8% — round 2)
                 inflate = max(inflate, s_turn_inflate)
 
                 # Also inflate the APPROACH segment (prev gate exit → this entry).
                 # Research: VPMPCC shows early deceleration is critical for S-turns.
                 approach_seg = seg_entry - 1  # segment from prev gate exit to this entry
                 if 0 <= approach_seg < len(times):
-                    times[approach_seg] *= 1.02  # 2% approach deceleration (iter 29: reduced from 3% — ILC handles approach errors)
+                    times[approach_seg] *= 1.01  # 1% approach deceleration (iter 30: reduced from 2% — round 2)
 
             # --- S-turn first-gate departure inflation (iteration 20) ---
             # For the first gate of an S-turn pair, inflate the EXIT/departure
@@ -757,12 +757,12 @@ class TrajectoryOptimizer:
                 # Pure first-gate (not junction) — inflate departure only
                 depart_seg = seg_through + 1  # segment from gate exit to next entry
                 if 0 <= depart_seg < len(times):
-                    times[depart_seg] *= 1.03  # 3% departure inflation (iter 29: reduced from 4% — ILC compensates)
+                    times[depart_seg] *= 1.02  # 2% departure inflation (iter 30: reduced from 3% — round 2)
             elif is_s_turn_first and is_s_turn:
-                # Junction gate — already boosted to 1.13 above; also inflate departure
+                # Junction gate — already boosted above; also inflate departure
                 depart_seg = seg_through + 1
                 if 0 <= depart_seg < len(times):
-                    times[depart_seg] *= 1.01  # 1% departure inflation (iter 29: reduced from 2% — ILC compensates)
+                    times[depart_seg] *= 1.005  # 0.5% departure inflation (iter 30: reduced from 1% — round 2)
 
             # Bidirectional proximity-based inflation for closely-spaced gates (iter 13, updated iter 18).
             # Helix gates are 3.6-5.7m apart; short polynomial segments create
@@ -831,8 +831,8 @@ class TrajectoryOptimizer:
         # Low-curvature/straight segments use 0.60 to recover race time.
         # Research: FBGA (Piazza 2025) — forward-backward naturally compresses
         # easy segments more. STORM (Zhang 2025) — per-segment LP for times.
-        max_compression_protected = 0.66  # S-turn, helix, high-curvature (iter 29: reduced from 0.68 — ILC compensates)
-        max_compression_easy = 0.60  # straights, shallow curves (iter 29: reduced from 0.63 — ILC compensates)
+        max_compression_protected = 0.65  # S-turn, helix, high-curvature (iter 30: reduced from 0.66 — round 2; FBGA Piazza 2025)
+        max_compression_easy = 0.59  # straights, shallow curves (iter 30: reduced from 0.60 — round 2; ILC compensates)
 
         # --- S-turn region detection for compound curvature boost (iter 16) ---
         # Identify waypoint indices that are in S-turn regions (between gates
