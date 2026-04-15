@@ -244,6 +244,19 @@ def compute_ilc_offset_table(
     # Applied in both ILC inner sim and benchmark for consistency.
     cumulative_vel_offset = np.zeros((n_steps, 3))
 
+    # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007).
+    # Different sections need different velocity scaling: pre-inflection (gate-2
+    # sensitive) uses 0.0, helix uses higher scaling for maximum benefit.
+    # 6th element of section_boundaries tuple = velocity correction scale.
+    vel_scale = np.full(n_steps, 0.5)  # default
+    if section_boundaries is not None:
+        for sec_def in section_boundaries:
+            sec_start, sec_end = sec_def[0], sec_def[1]
+            sec_vel_scale = sec_def[5] if len(sec_def) > 5 else 0.5
+            s = min(sec_start, n_steps)
+            e = min(sec_end, n_steps)
+            vel_scale[s:e] = sec_vel_scale
+
     for ilc_iter in range(max_iterations):
         # Compute velocity offset from position offset (smooth derivative).
         # np.gradient uses central differences (interior) and one-sided (boundaries).
@@ -268,10 +281,11 @@ def compute_ilc_offset_table(
 
             ref = trajectory.sample(sim_time)
             target_pos = np.array(ref.position) + cumulative_offset[step]
-            # Velocity-corrected ILC (iteration 41): apply scaled velocity offset
-            # to make velocity reference consistent with position offset.
-            # Scale < 1.0 trades full consistency for stability at gate-2.
-            target_vel = np.array(ref.velocity) + 0.5 * cumulative_vel_offset[step]
+            # Velocity-corrected ILC (iteration 41): apply per-section scaled velocity
+            # offset for consistency. Per-section scaling (iteration 42, Bristow &
+            # Alleyne 2007): different sections use different scaling to balance
+            # gate-2 stability vs helix improvement.
+            target_vel = np.array(ref.velocity) + vel_scale[step] * cumulative_vel_offset[step]
             ref_acc = np.array(ref.acceleration)
 
             if ff_lookahead_s > 0 and sim_time + ff_lookahead_s <= trajectory.total_time:
@@ -430,8 +444,12 @@ def compute_ilc_offset_table(
 
             cumulative_offset[:actual_steps] += alpha * smoothed
 
-    # Compute final velocity offset from converged position offset (iteration 41)
+    # Compute final velocity offset from converged position offset (iteration 41).
+    # Pre-bake per-section velocity scaling (iteration 42) so the caller can
+    # apply the offsets directly without knowing about sections.
     cumulative_vel_offset = np.gradient(cumulative_offset, dt, axis=0)
+    # Apply per-section scaling to the returned velocity offsets
+    cumulative_vel_offset *= vel_scale[:, np.newaxis]
 
     # Return offset tables only if ILC improved things
     final_err = prev_avg_err

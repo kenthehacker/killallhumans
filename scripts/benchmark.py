@@ -310,11 +310,13 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     inflection_end = int(4.4 / dt)     # step 440
     helix_start = int(7.4 / dt)        # step 740
     section_boundaries = [
-        # (start, end, alpha, max_correction_m, filter_cutoff_hz)
-        (0, inflection_start, 0.4, 0.15, 0.35),                # Pre-inflection: 0.35 Hz
-        (inflection_start, inflection_end, 0.4, 0.15, 0.40),   # Gate-3 inflection: 0.40 Hz (Bristow & Alleyne 2007)
-        (inflection_end, helix_start, 0.4, 0.15, 0.35),        # Post-inflection: 0.35 Hz
-        (helix_start, n_total_steps, 0.4, 0.35, 0.35),         # Helix: 0.35 Hz
+        # (start, end, alpha, max_correction_m, filter_cutoff_hz, vel_scale)
+        # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007):
+        # Pre-inflection uses 0.0 to recover gate-2; helix uses 0.7 for max benefit.
+        (0, inflection_start, 0.4, 0.15, 0.35, 0.0),                # Pre-inflection: no vel correction
+        (inflection_start, inflection_end, 0.4, 0.15, 0.40, 0.4),   # Gate-3 inflection: moderate vel
+        (inflection_end, helix_start, 0.4, 0.15, 0.35, 0.5),        # Post-inflection: standard vel
+        (helix_start, n_total_steps, 0.4, 0.35, 0.35, 0.7),         # Helix: aggressive vel
     ]
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
     # tuple. Velocity offsets are the smooth time derivative of position offsets,
@@ -415,10 +417,10 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         if ilc_offsets is not None and step < len(ilc_offsets):
             target_pos = target_pos + ilc_offsets[step]
         target_vel = np.array(ref.velocity)
-        # Apply ILC velocity offset (iteration 41: consistent position+velocity)
-        # Scale 0.5 trades full consistency for stability at gate-2.
+        # Apply ILC velocity offset (iteration 41+42: per-section scaled, pre-baked).
+        # Velocity offsets already include per-section scaling from compute_ilc_offset_table.
         if ilc_vel_offsets is not None and step < len(ilc_vel_offsets):
-            target_vel = target_vel + 0.5 * ilc_vel_offsets[step]
+            target_vel = target_vel + ilc_vel_offsets[step]
         target_yaw = ref.yaw
 
         # Gate-seeking fallback after trajectory ends
