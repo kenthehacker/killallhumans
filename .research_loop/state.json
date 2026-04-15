@@ -1,9 +1,9 @@
 {
-  "iteration": 45,
-  "timestamp": "2026-04-15T15:46:00Z",
+  "iteration": 46,
+  "timestamp": "2026-04-15T16:05:00Z",
   "status": "completed",
-  "current_bottleneck": "system_integration",
-  "previous_bottleneck": "trajectory_planning",
+  "current_bottleneck": "trajectory_planning",
+  "previous_bottleneck": "system_integration",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -128,28 +128,18 @@
     "curriculum_rl_quadrotor_racing_2026",
     "stochastic_uav_tradeoff_2024",
     "difflab_twophase_racing_2025",
-    "dynamics_invariant_scaleaware_drl_2025"
+    "dynamics_invariant_scaleaware_drl_2025",
+    "speedup_ilc_convergence_longman_2023",
+    "ilc_fast_nonlinear_oscillatory_brooks_2024",
+    "constrained_ilc_alternating_projection_2024"
   ],
-  "total_papers_analyzed": 124,
+  "total_papers_analyzed": 127,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1591,
-    "max_tracking_error_m": 0.6988,
-    "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7879,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-3",
-    "worst_gate_error_m": 0.2257,
-    "race_time_s": 13.51,
-    "deterministic": true
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.1863,
     "max_tracking_error_m": 0.7463,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7751,
+    "avg_loop_hz": 7720,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-4",
@@ -157,57 +147,69 @@
     "race_time_s": 13.31,
     "deterministic": true
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1856,
+    "max_tracking_error_m": 0.7461,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7686,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-4",
+    "worst_gate_error_m": 0.2870,
+    "race_time_s": 13.31,
+    "deterministic": true
+  },
   "changes_committed": true,
-  "commit_hash": null,
+  "commit_hash": "db1045c",
   "diagnostic": {
-    "root_cause": "L-BFGS time_weight increase from 2.0 to 2.3 pushes optimizer to find shorter segment times, reducing trajectory time 13.69→13.47s. ILC partially compensates but gate-4 and gate-7 (S-turn exit and helix entry) exceed 0.25m per-gate threshold due to faster approach speeds.",
+    "root_cause": "Gate-4 error (0.287m) is driven by L-BFGS time_weight=2.3 compressing gate-4 approach segments. ILC alpha increase partially compensates, but inflection section max_correction_m=0.15m is a binding constraint. Increasing max_correction transfers error to gate-5 through spatial coupling.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
       "avg_pitch_rad": -0.093,
-      "avg_thrust": 0.870
+      "avg_thrust": 0.871
     },
-    "trend": "improving",
+    "trend": "diminishing_returns",
     "architectural_issues": [
-      "Gate-4 at 0.302m — exceeded aspirational 0.25m threshold. L-BFGS compresses gate-4 approach segments the most.",
-      "Gate-7 at 0.252m — barely over aspirational threshold. Helix entry is consistently the hardest tracking point.",
-      "Gate-8 at 0.240m — close to threshold. Helix interior tracking degrades with faster trajectory.",
-      "L-BFGS landscape is highly non-convex — time_weight=2.2 finds worse minimum than 2.3. Unreliable for further tuning.",
-      "TOPP acceleration budget changes catastrophically destabilize ILC — ILC is tightly coupled to trajectory shape.",
-      "Actuator saturation (roll/pitch at 0.85 rad cap) approaches physical limit — average thrust at 0.870."
+      "Gate-4 at 0.287m — still exceeds aspirational 0.25m threshold. ILC alpha increase was the last productive ILC lever.",
+      "Gate-7 at 0.252m — barely over aspirational threshold. Helix cap increase (0.45→0.50m) had negligible effect.",
+      "ILC max_correction spatial coupling: any inflection cap increase >0.15m transfers error to gate-5 (+10-32%). Fundamental limitation of per-section ILC.",
+      "Section splitting introduces edge effects. Butterworth filter needs >100 samples per section for stable zero-phase filtering.",
+      "Actuator saturation (roll/pitch at 0.85 rad cap) — further speed requires either higher tilt cap or physics-based MPC controller."
     ],
     "critic_findings": []
   },
   "improvements_backlog": [
     {
-      "area": "system_integration",
-      "description": "Gate-4 and gate-7 ILC improvement to recover tracking quality",
-      "proposed_approach": "Extend inflection section to cover gate-4 (inflection_end 440→460). Increase helix section max_correction 0.45→0.50m. Re-tune vel_scale for new trajectory speeds.",
-      "expected_impact": "Gate-4 error 0.302→0.25m, gate-7 error 0.252→0.22m",
+      "area": "trajectory_planning",
+      "description": "L-BFGS multi-start optimization to find better local minima",
+      "proposed_approach": "Run L-BFGS from 3-5 random perturbations of initial times. Select trajectory with best sim score. Or use graduated time_weight: optimize at 2.0, then warm-restart at 2.3 from previous solution.",
+      "expected_impact": "Could find trajectory with lower gate-4 error while maintaining 13.31s race time. Potential sub-13s.",
       "priority": 1,
-      "research_refs": ["schoellig_optbased_ilc_2012", "track_centric_ilc_racing_2026"]
+      "research_refs": ["togt_planner_qin_2024", "f1_datadriven_init_efficient_2026"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Further targeted inflation reduction at gates with headroom",
-      "proposed_approach": "Reduce helix entry 1.06→1.03, helix interior 1.05→1.03. Target segments serving gates 1, 9, 10, 11 which have >0.1m headroom.",
+      "description": "Targeted inflation reduction at gates with headroom (1, 9, 10, 11)",
+      "proposed_approach": "Reduce helix interior inflation 1.05→1.03 for segments serving gates with >0.1m headroom.",
       "expected_impact": "Race time reduction 0.05-0.10s",
       "priority": 2,
       "research_refs": ["monorace_champion_level_2026", "cpc_foehn_2021"]
     },
     {
-      "area": "trajectory_planning",
-      "description": "L-BFGS multi-start optimization to avoid bad minima",
-      "proposed_approach": "Run L-BFGS from 3-5 random perturbations of initial times. Select trajectory with best sim score. Graduated time_weight: start 2.0→optimize→restart at 2.5 from previous solution.",
-      "expected_impact": "Could unlock time_weight=2.5+ safely, potentially 13.0s race time",
+      "area": "system_integration",
+      "description": "Competition robustness testing — noise, dropout, timing jitter",
+      "proposed_approach": "Add Gaussian noise to state estimates. Test with varying gate positions. Verify controller stability margins.",
+      "expected_impact": "Competition readiness — ensure the system works under real-world conditions",
       "priority": 3,
-      "research_refs": ["togt_planner_qin_2024", "f1_datadriven_init_efficient_2026"]
+      "research_refs": ["on_your_own_romero_2025"]
     },
     {
       "area": "system_integration",
-      "description": "Re-tune velocity correction scaling for time_weight=2.3 trajectory",
-      "proposed_approach": "Velocity profile changed with new time_weight. Current vel_scale (0.0/0.4/0.5/0.7) was tuned for old profile. Try 0.0/0.3/0.4/0.6 or 0.0/0.5/0.6/0.8.",
-      "expected_impact": "Reduce per-gate errors by 5-10%",
+      "description": "Post-inflection vel_scale re-tuning for gate-5 protection",
+      "proposed_approach": "Sweep vel_scale from 0.3 to 0.5 for the post-inflection section to reduce gate-5 sensitivity.",
+      "expected_impact": "Gate-5 error reduction 5-10%, enabling higher inflection max_correction",
       "priority": 4,
       "research_refs": ["spatial_ilc_virtual_tube_2023"]
     }
@@ -592,7 +594,7 @@
     {
       "iteration": 43,
       "description": "ILC acceleration feedforward correction (d²Δp/dt²). Tested 6 configs: per-section scaling, execution-time only, post-tracker, ff_ratio compensation. All regressed 0.1-1.2%.",
-      "lesson": "ILC position offsets already compensate for acceleration mismatch through cross-track corrections. Adding acceleration feedforward is redundant and introduces noise. The 'beneficial mismatch' between ILC inner sim (kp=6) and benchmark (kp=7) makes the ILC offsets implicitly optimal for the mismatched system. Any change to feedforward invalidates the calibration.",
+      "lesson": "ILC position offsets already compensate for acceleration mismatch through cross-track corrections. Adding acceleration feedforward is redundant and introduces noise.",
       "approach": "ilc_acceleration_feedforward_correction",
       "reason": "Redundant with ILC cross-track corrections; noise from 2nd derivative; invalidates ILC calibration"
     },
@@ -606,30 +608,58 @@
     {
       "iteration": 45,
       "description": "TOPP acceleration budget increase (a_centripetal 10→11, a_longitudinal 8→9.5). Race time exploded to 26.8-26.9s.",
-      "lesson": "TOPP acceleration budget changes catastrophically destabilize ILC. The TOPP speed profile change alters trajectory timing enough to make ILC offsets completely invalid. Even reverting floors doesn't help — the acceleration budgets alone cause the failure.",
+      "lesson": "TOPP acceleration budget changes catastrophically destabilize ILC.",
       "approach": "topp_acceleration_budget_increase",
       "reason": "Catastrophic ILC destabilization — trajectory timing mismatch"
     },
     {
       "iteration": 45,
       "description": "TOPP floor reduction alone (helix 0.72→0.70, easy 0.59→0.57, protected 0.65→0.63). Only 0.05s race time improvement.",
-      "lesson": "TOPP compression floors are NOT the primary binding constraint for race time. Confirms iter 21 finding. L-BFGS base times and inflation define trajectory speed, not TOPP floors.",
+      "lesson": "TOPP compression floors are NOT the primary binding constraint for race time.",
       "approach": "topp_floor_reduction_only_iter45",
       "reason": "Marginal gain — floor rarely binds"
     },
     {
       "iteration": 45,
       "description": "Centripetal inflation threshold increase (4.5→6.0). Zero effect.",
-      "lesson": "After iter 44's inflation halving, no turns in the current track have centripetal acceleration between 4.5-6.0 m/s². The centripetal inflation was already negligible.",
+      "lesson": "After iter 44's inflation halving, no turns in the current track have centripetal acceleration between 4.5-6.0 m/s².",
       "approach": "centripetal_threshold_increase_6.0",
       "reason": "Zero turns in affected range"
     },
     {
       "iteration": 45,
-      "description": "L-BFGS time_weight=2.2. Found WORSE local minimum than 2.3 — gate-3 at 0.390m, gate-4 at 0.498m.",
-      "lesson": "L-BFGS landscape is highly non-convex. time_weight=2.2 finds a bad minimum while 2.3 finds a good one. Non-monotonic behavior makes time_weight tuning unreliable.",
+      "description": "L-BFGS time_weight=2.2. Found WORSE local minimum than 2.3.",
+      "lesson": "L-BFGS landscape is highly non-convex. Non-monotonic behavior makes time_weight tuning unreliable.",
       "approach": "time_weight_2.2",
       "reason": "Bad L-BFGS local minimum"
+    },
+    {
+      "iteration": 46,
+      "description": "Inflection max_correction_m increase 0.15→0.20m. Gate-5 regressed 21.6%.",
+      "lesson": "Any inflection section max_correction >0.15m transfers error to gate-5 through spatial coupling. The correction magnitude creates larger position offsets that affect drone approach to gate-5.",
+      "approach": "inflection_max_corr_0.20",
+      "reason": "Gate-5 regression from spatial coupling"
+    },
+    {
+      "iteration": 46,
+      "description": "Inflection_end extension 440→460. Gate-5 regressed 32.4% (combined with max_corr 0.20m).",
+      "lesson": "Boundary shift changes which filter processes steps 440-460, causing ripple effects to gate-5.",
+      "approach": "inflection_end_460_extension",
+      "reason": "Cross-section contamination"
+    },
+    {
+      "iteration": 46,
+      "description": "5-section split (gate-3 + gate-4 subsections). Gate-4 unchanged, gate-5 regressed 35.8%.",
+      "lesson": "Short sections (<100 steps) don't have enough samples for stable Butterworth zero-phase filtering. Edge effects dominate.",
+      "approach": "5_section_split_gate4_subsection",
+      "reason": "Edge effects from short section, insufficient filter samples"
+    },
+    {
+      "iteration": 46,
+      "description": "Alpha 0.50 + max_corr 0.18m combined. Gate-5 regressed 21.1%.",
+      "lesson": "The max_corr increase is the primary driver of gate-5 regression, not the alpha increase. Alpha alone (0.50) keeps gate-5 at +5.5%.",
+      "approach": "alpha_050_maxcorr_018_combined",
+      "reason": "Max_corr component drives gate-5 regression"
     }
   ]
 }
