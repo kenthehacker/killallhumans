@@ -1,8 +1,8 @@
 {
-  "iteration": 38,
-  "timestamp": "2026-04-15T11:22:00Z",
+  "iteration": 39,
+  "timestamp": "2026-04-15T13:37:00Z",
   "status": "completed",
-  "current_bottleneck": "control",
+  "current_bottleneck": "system_integration",
   "previous_bottleneck": "control",
   "papers_analyzed": [
     "togt_planner_qin_2024",
@@ -111,28 +111,17 @@
     "spline_mincurv_xue_2024",
     "almost_global_tracking_s2_2024",
     "rl_pid_gain_prediction_2025",
-    "linear_nonlinear_mpc_quadrotor_2024"
+    "linear_nonlinear_mpc_quadrotor_2024",
+    "newton_raphson_flow_tracking_2024",
+    "indi_differential_flatness_tal_2018"
   ],
-  "total_papers_analyzed": 107,
+  "total_papers_analyzed": 109,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1741,
-    "max_tracking_error_m": 0.7159,
-    "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7847,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.2474,
-    "race_time_s": 14.02,
-    "deterministic": true
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.1507,
     "max_tracking_error_m": 0.7421,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7921,
+    "avg_loop_hz": 7316,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-2",
@@ -140,72 +129,85 @@
     "race_time_s": 14.01,
     "deterministic": true
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1501,
+    "max_tracking_error_m": 0.7269,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7084,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-2",
+    "worst_gate_error_m": 0.2137,
+    "race_time_s": 14.07,
+    "deterministic": true
+  },
   "changes_committed": true,
-  "commit_hash": "2a7f540",
+  "commit_hash": "b29722e",
   "diagnostic": {
-    "root_cause": "PD gains (kp=6, kd=4) and feedforward weight (0.4) were 2-4x below literature values. Systematic sweep of 40+ configs found ff=0.50, kp=7, kd=5.5 optimal — constrained by kinematic sim's drag model which causes basin switching at ff>0.52.",
+    "root_cause": "ILC-controller coupling is the dominant architectural constraint. The ILC inner sim uses stale gains (kp=6,kd=4,ff=0.4) but corrections happen to work well with the benchmark's new gains (kp=7,kd=5.5,ff=0.50). Synchronizing them regresses +15.1%. Only trajectory-level changes (TOPP floors) are safe because ILC adapts to whatever trajectory is given.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.097,
-      "avg_thrust": 0.836
+      "avg_pitch_rad": -0.096,
+      "avg_thrust": 0.837
     },
-    "trend": "new_area",
+    "trend": "diminishing_returns",
     "architectural_issues": [
-      "Controller parameter space has dangerously narrow stability window (ff=0.50±0.02)",
-      "Gate-2 regressed 22% — straight→turn transition handling with higher feedforward",
-      "Max tracking error +3.7% — p95 tracking error +3.5%",
-      "Kinematic sim drag model prevents ff=1.0 (literature standard)",
-      "Kinematic sim only — no PyBullet validation of gains"
+      "ILC-controller gain mismatch creates coupling trap — prevents independent controller optimization",
+      "ILC convergence code has latent bug when max_iterations <= 1",
+      "Controller saturating at max_tilt=0.85 rad on both axes",
+      "Kinematic sim drag model prevents ff>0.52 (literature standard is ff=1.0)",
+      "No PyBullet validation of accumulated 39-iteration gains"
     ],
     "critic_findings": [
-      "40+ config sweep is the most thorough controller tuning in the project's history",
-      "Sharp basin boundaries (ff=0.50→0.52 causes 14→27s) are a sim artifact, not physical",
-      "Gate-6 -44.6% improvement is remarkable — helix entry was heavily limited by PD damping",
-      "Gate-2 regression (+22%) should be investigated before claiming full convergence",
-      "Race time unchanged (14.01s) confirms this is a pure tracking improvement, not speed change"
+      "ILC coupling discovery is the most important finding — changes optimization strategy",
+      "TOPP S-turn floor 0.70 is near the safe boundary (0.66 triggers basin switching)",
+      "Gate-2 improvement (-2.1%) is real but small; gate-2 remains worst gate at 0.214m",
+      "Gates 3-5 regressed 1-3% — S-turn slowing has trade-offs",
+      "Race time +0.06s is acceptable but the aspirational <14s target is now further away"
     ]
   },
   "improvements_backlog": [
     {
-      "area": "control",
-      "description": "Gate-2 regression (+22%) — straight→turn transition overshoot from higher feedforward",
-      "proposed_approach": "Per-section ILC alpha tuning for gate-2 approach, or reduce lookahead_s for first 3 seconds of trajectory",
-      "expected_impact": "Fix gate-2 regression while preserving gate-3-8 gains",
+      "area": "system_integration",
+      "description": "Fix ILC-controller coupling: re-tune ILC section parameters with synchronized gains",
+      "proposed_approach": "Synchronized gains + grid search over (alpha, max_correction, cutoff, iterations) to find new optimal ILC config. Key: must change ALL ILC params simultaneously, not just gains.",
+      "expected_impact": "Unlock controller tuning space for future iterations; potentially 5-10% improvement",
       "priority": 1,
-      "research_refs": ["taco_trajectory_aware_controller_2025"]
-    },
-    {
-      "area": "control",
-      "description": "Velocity feedforward (vff=drag) may now work with ff=0.50 and better PD gains",
-      "proposed_approach": "Re-test vff=0.3-0.5 with current gains (previously failed at ff=0.4, kp=6)",
-      "expected_impact": "5-10% further avg error reduction from drag compensation",
-      "priority": 2,
-      "research_refs": ["flatness_rotor_drag_faessler_2018", "leveling_playing_field_2025"]
+      "research_refs": ["segment_based_ailc_zhang_2026", "dual_ilc_mimo_ewering_2025"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Re-optimize TOPP floors for new controller regime",
-      "proposed_approach": "The controller change shifts the trackability curve. Old floors (helix=0.72, S-turn=0.67) may no longer be optimal.",
-      "expected_impact": "2-5% further improvement from TOPP re-tuning",
+      "description": "Re-optimize racing line with new controller dynamics",
+      "proposed_approach": "Clear racing line cache, re-run optimization. New controller may track tighter racing lines, changing basin selection.",
+      "expected_impact": "Potentially different (better) racing line basin; 2-5% improvement possible",
+      "priority": 2,
+      "research_refs": ["spatially_aware_cmaes_racing_2026"]
+    },
+    {
+      "area": "system_integration",
+      "description": "PyBullet full-physics validation of all gains",
+      "proposed_approach": "Run benchmark with PyBullet sim to validate kinematic sim gains transfer",
+      "expected_impact": "Validate or invalidate all tuning from iters 1-39",
       "priority": 3,
       "research_refs": []
     },
     {
-      "area": "system_integration",
-      "description": "PyBullet full-physics validation of new gains",
-      "proposed_approach": "Run same trajectory in PyBullet sim, compare tracking with kinematic sim",
-      "expected_impact": "Validate kinematic gains transfer to real physics",
+      "area": "control",
+      "description": "Spatially-varying feedforward weight",
+      "proposed_approach": "Lower ff near gate-2 transition (t=1.5-2.0s), higher elsewhere. Requires code change to make ff time-varying.",
+      "expected_impact": "Targeted gate-2 improvement without affecting other gates",
       "priority": 4,
-      "research_refs": []
+      "research_refs": ["taco_sanghvi_2025", "spatially_aware_controller_feedback_2026"]
     },
     {
-      "area": "control",
-      "description": "Basin-aware parameter search: explore ff-lookahead coupling",
-      "proposed_approach": "Test ff=0.55 with lookahead_s=0.04 or ff=0.48 with lookahead_s=0.06",
-      "expected_impact": "Potentially unlock higher ff by reducing lookahead",
+      "area": "trajectory_planning",
+      "description": "Fix ILC convergence bug (max_iterations <= 1 crashes)",
+      "proposed_approach": "Add prev_avg_err initialization before loop in compute_ilc_offset_table()",
+      "expected_impact": "Code quality — enables testing ILC iteration count",
       "priority": 5,
-      "research_refs": ["aggressive_tracking_tal_2018"]
+      "research_refs": []
     }
   ],
   "failed_approaches": [
@@ -514,6 +516,41 @@
       "lesson": "Must maintain damping ratio ζ≥0.8. kp increase requires proportional kd increase. At kp=12 kd=4: ζ=0.65 (underdamped, gate-3 explodes to 1.0m).",
       "approach": "high_kp_without_kd_increase",
       "reason": "Underdamped oscillation at S-turn due to low damping ratio"
+    },
+    {
+      "iteration": 39,
+      "description": "ILC gain synchronization (match ILC inner sim to benchmark: kp=7,kd=5.5,ff=0.50). Avg error regressed +15.1%.",
+      "lesson": "ILC corrections are calibrated for the OLD controller dynamics. Synchronizing gains disrupts the converged correction pattern. The 'mismatch' is actually beneficial — the ILC finds different (better) corrections when computed with weaker gains.",
+      "approach": "ilc_gain_synchronization",
+      "reason": "ILC corrections optimized for old dynamics; new dynamics produce worse convergence"
+    },
+    {
+      "iteration": 39,
+      "description": "Lookahead reduction (0.05→0.00-0.04s) in both ILC and benchmark. Zero effect.",
+      "lesson": "Min-snap polynomial trajectory acceleration changes so smoothly that 0-50ms lookahead gives identical values. Lookahead timing has zero effect on this trajectory class.",
+      "approach": "lookahead_reduction_all_values",
+      "reason": "Trajectory acceleration too smooth for lookahead timing to matter"
+    },
+    {
+      "iteration": 39,
+      "description": "Velocity feedforward (vff=0.1-0.5) in benchmark only. All values give identical results (+9.1% regression).",
+      "lesson": "ILC coupling masks all controller-side changes. The ILC corrections dominate; any controller perturbation not reflected in ILC causes regression.",
+      "approach": "velocity_feedforward_benchmark_only",
+      "reason": "ILC-controller coupling masks controller changes"
+    },
+    {
+      "iteration": 39,
+      "description": "ILC section boundary/parameter changes (inflection_start, max_correction, alpha splits). All caused 27.5s race time.",
+      "lesson": "ILC section parameter changes cause the ILC to produce different offsets that destabilize tracking. The current ILC configuration is a fragile equilibrium.",
+      "approach": "ilc_section_parameter_changes",
+      "reason": "Different ILC offsets destabilize tracking; 27.5s race time"
+    },
+    {
+      "iteration": 39,
+      "description": "S-turn TOPP floor decrease 0.67→0.66 (faster). Basin switching — 27.49s race time.",
+      "lesson": "S-turn floor can only be raised (slower), not lowered. 0.66 triggers basin switching.",
+      "approach": "sturn_floor_decrease_0.66",
+      "reason": "Basin switching — floor decrease direction is unsafe"
     }
   ]
 }
