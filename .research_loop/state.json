@@ -1,6 +1,6 @@
 {
-  "iteration": 35,
-  "timestamp": "2026-04-15T10:08:00Z",
+  "iteration": 36,
+  "timestamp": "2026-04-15T10:28:00Z",
   "status": "completed",
   "current_bottleneck": "trajectory_planning",
   "previous_bottleneck": "trajectory_planning",
@@ -102,28 +102,18 @@
     "data_driven_aggressive_racing_vpmpcc_2024",
     "ilmpc_lmpc_improved_2025",
     "spatially_aware_controller_feedback_2026",
-    "ngtc_robust_agile_2025"
+    "ngtc_robust_agile_2025",
+    "jerk_constrained_topp_2024",
+    "primitive_planner_topp_ra_2025",
+    "cimpcc_lap_time_reduction_li_2025"
   ],
-  "total_papers_analyzed": 98,
+  "total_papers_analyzed": 101,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1853,
-    "max_tracking_error_m": 0.7422,
-    "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7513,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-7",
-    "worst_gate_error_m": 0.2840,
-    "race_time_s": 13.79,
-    "note": "Corrected baseline after reverting iter 34 bad offset"
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.1709,
     "max_tracking_error_m": 0.7422,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7785,
+    "avg_loop_hz": 7617,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-3",
@@ -131,70 +121,83 @@
     "race_time_s": 14.09,
     "deterministic": true
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1760,
+    "max_tracking_error_m": 0.7422,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7676,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-3",
+    "worst_gate_error_m": 0.2473,
+    "race_time_s": 13.98,
+    "deterministic": true
+  },
   "changes_committed": true,
-  "commit_hash": "d80f408",
+  "commit_hash": "40e7ee3",
   "diagnostic": {
-    "root_cause": "TOPP compression floor (0.65) was the binding constraint for helix entry/exit segments. For 10+ iterations, inflation/curvature changes had no effect because TOPP floor clamped helix segment times to 65% of inflated values. Raising floor to 0.76 allows the PD controller more time for sharp helix turns.",
+    "root_cause": "Iter 35 set helix TOPP floor to accuracy-optimal 0.76 but overshot 14s race time target. The Pareto frontier is linear: each 0.01 floor change moves race time by ~0.02s and avg error by ~0.0013m. Lowering to 0.72 recovers 0.11s while trading 0.005m accuracy.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
-      "avg_pitch_rad": -0.107,
-      "avg_thrust": 0.794
+      "avg_pitch_rad": -0.108,
+      "avg_thrust": 0.795
     },
     "trend": "improving",
     "architectural_issues": [
-      "PD controller saturating at 0.85 rad — needs geometric SE(3) or MPCC controller",
-      "Max tracking error 0.742m unchanged — at controller limit, not trajectory limit",
-      "Gate-3 S-turn (0.247m) is now worst gate — S-turn TOPP floor may also be binding",
-      "ILC convergence criterion is global — stops helix learning when pre-helix converges"
+      "PD controller saturating at 0.85 rad limits all gates",
+      "Max tracking error 0.742m unchanged — at controller limit",
+      "Gate-3 S-turn (0.247m) is worst gate — S-turn TOPP floor (0.65) is binding",
+      "Helix floor well-characterized — diminishing returns on further tuning"
     ],
     "critic_findings": [
-      "Single parameter change (helix floor) is clean and well-validated (8-point sweep)",
-      "Monotonic improvement confirms genuine binding constraint, not noise",
-      "Non-helix gates unaffected — zero regression risk",
-      "Iter 34 regression discovery prevents future bad baselines"
+      "Single parameter with 5-point sweep is clean and well-validated",
+      "Non-helix gate complete independence confirmed (zero change across sweep)",
+      "Linear Pareto trade-off makes future adjustments predictable",
+      "Selection of 0.72 is optimal: 0.73 misses 14s, 0.71 wastes accuracy"
     ]
   },
   "improvements_backlog": [
     {
       "area": "trajectory_planning",
-      "description": "Gate-3 S-turn (0.247m) — now the worst gate after helix floor improvement",
-      "proposed_approach": "Check if S-turn TOPP floor is binding; analogous diagnostic to helix floor discovery",
-      "expected_impact": "gate-3 0.247→0.210m, avg error improvement",
+      "description": "Gate-3 S-turn floor analysis — worst gate at 0.247m, S-turn TOPP floor (0.65) is binding",
+      "proposed_approach": "Sweep S-turn floor 0.65-0.72; may need to lower helix floor further to compensate time. Joint S-turn/helix sweep for time-neutral accuracy improvement.",
+      "expected_impact": "gate-3 0.247→0.220m, avg error improvement",
       "priority": 1,
-      "research_refs": ["cimpcc_curvature_velocity_li_2024", "vpmpcc_data_driven_racing_li_2024"]
+      "research_refs": ["cimpcc_curvature_velocity_li_2024", "jerk_constrained_topp_2024"]
     },
     {
       "area": "control",
       "description": "MPCC or SE(3) geometric controller to replace PD (saturating at 0.85 rad)",
       "proposed_approach": "Implement contouring error decomposition (MPCC) or SE(3) geometric tracking",
-      "expected_impact": "5-15% tracking improvement across all gates, reduce max error",
+      "expected_impact": "5-15% tracking improvement, unlock faster trajectories",
       "priority": 2,
       "research_refs": ["mpcc_plus_plus_krinner_2024", "ngtc_robust_agile_2025"]
     },
     {
       "area": "trajectory_planning",
-      "description": "Helix floor + controller co-optimization — recover race time after controller upgrade",
-      "proposed_approach": "Lower helix floor back toward 0.65-0.70 once better controller is in place",
-      "expected_impact": "Recover 0.1-0.3s race time",
+      "description": "Joint S-turn + helix floor co-optimization for time-neutral accuracy improvement",
+      "proposed_approach": "2D sweep: S-turn floor [0.65-0.72] × helix floor [0.68-0.74] selecting for min avg error at race_time ≤ 13.98s",
+      "expected_impact": "avg error 0.176→0.170m at same race time",
       "priority": 3,
       "research_refs": ["spatially_aware_controller_feedback_2026"]
     },
     {
       "area": "trajectory_planning",
-      "description": "ILC per-section convergence criterion — global convergence stops helix learning early",
-      "proposed_approach": "Replace global convergence check with per-section convergence",
-      "expected_impact": "1-2% avg error improvement",
+      "description": "Proper TOPP-RA with LP-based reachability (replaces manual floor tuning)",
+      "proposed_approach": "Implement Seidel's LP per path point, forward-backward reachability analysis",
+      "expected_impact": "Eliminates floor tuning; automatically optimal speed profile",
       "priority": 4,
-      "research_refs": ["segmentwise_ilc_zhang_2024"]
+      "research_refs": ["primitive_planner_topp_ra_2025", "toppquad_mao_2024"]
     },
     {
-      "area": "system_integration",
-      "description": "Automated regression detection in benchmark pipeline",
-      "proposed_approach": "Compare benchmark results against previous committed results; flag >5% regressions",
-      "expected_impact": "Prevent hidden regressions like iter 34",
+      "area": "trajectory_planning",
+      "description": "Jerk constraints in TOPP retimer for smoother S-turn transitions",
+      "proposed_approach": "Enforce max_jerk at segment boundaries in forward-backward pass",
+      "expected_impact": "1-3% S-turn error improvement",
       "priority": 5,
-      "research_refs": []
+      "research_refs": ["jerk_constrained_topp_2024"]
     }
   ],
   "failed_approaches": [
