@@ -889,7 +889,7 @@ class TrajectoryOptimizer:
         # Research: FBGA (Piazza 2025) — forward-backward naturally compresses
         # easy segments more. STORM (Zhang 2025) — per-segment LP for times.
         max_compression_protected = 0.65  # S-turn, helix, high-curvature (iter 30: reduced from 0.66 — round 2; FBGA Piazza 2025)
-        max_compression_helix = 0.76  # Helix-specific higher floor (iter 35: gate-7 at 0.284m, TOPP floor was binding constraint; swept 0.68-0.80, 0.76 is Pareto-optimal)
+        max_compression_helix = 0.72  # Helix floor (iter 36: Pareto rebalance from 0.76 — swept 0.70-0.74, 0.72 recovers race time 14.09→13.98s while keeping avg err 0.176m; iter 35 set 0.76 for accuracy-optimal but overshot 14s target)
         max_compression_easy = 0.59  # straights, shallow curves (iter 30: reduced from 0.60 — round 2; ILC compensates)
 
         # --- S-turn region detection for compound curvature boost (iter 16) ---
