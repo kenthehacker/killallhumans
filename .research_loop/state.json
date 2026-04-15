@@ -1,9 +1,9 @@
 {
-  "iteration": 39,
-  "timestamp": "2026-04-15T13:37:00Z",
+  "iteration": 40,
+  "timestamp": "2026-04-15T14:30:00Z",
   "status": "completed",
   "current_bottleneck": "system_integration",
-  "previous_bottleneck": "control",
+  "previous_bottleneck": "system_integration",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -113,20 +113,23 @@
     "rl_pid_gain_prediction_2025",
     "linear_nonlinear_mpc_quadrotor_2024",
     "newton_raphson_flow_tracking_2024",
-    "indi_differential_flatness_tal_2018"
+    "indi_differential_flatness_tal_2018",
+    "ngtc_tilt_analysis_supplement_2025",
+    "ilc_mismatch_compensation_wu_2024",
+    "lol_nmpc_lowlevel_dynamics_gupta_2025"
   ],
-  "total_papers_analyzed": 109,
+  "total_papers_analyzed": 112,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1507,
-    "max_tracking_error_m": 0.7421,
+    "avg_tracking_error_m": 0.1501,
+    "max_tracking_error_m": 0.7269,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7316,
+    "avg_loop_hz": 7084,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-2",
-    "worst_gate_error_m": 0.2183,
-    "race_time_s": 14.01,
+    "worst_gate_error_m": 0.2137,
+    "race_time_s": 14.07,
     "deterministic": true
   },
   "metrics_after": {
@@ -143,71 +146,63 @@
     "deterministic": true
   },
   "changes_committed": true,
-  "commit_hash": "b29722e",
+  "commit_hash": "0d03e64",
   "diagnostic": {
-    "root_cause": "ILC-controller coupling is the dominant architectural constraint. The ILC inner sim uses stale gains (kp=6,kd=4,ff=0.4) but corrections happen to work well with the benchmark's new gains (kp=7,kd=5.5,ff=0.50). Synchronizing them regresses +15.1%. Only trajectory-level changes (TOPP floors) are safe because ILC adapts to whatever trajectory is given.",
+    "root_cause": "System at local optimum. All parameter spaces exhausted within kinematic sim constraints: trajectory locked by basin switching, controller locked by ILC coupling, ILC locked in fragile equilibrium, speed profiling at Pareto frontier.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
       "avg_pitch_rad": -0.096,
       "avg_thrust": 0.837
     },
-    "trend": "diminishing_returns",
+    "trend": "plateau",
     "architectural_issues": [
+      "max_tilt_rad is COSMETIC in kinematic sim — last_desired_acceleration returns pre-clip values (line 200 mpc_tracker.py)",
       "ILC-controller gain mismatch creates coupling trap — prevents independent controller optimization",
-      "ILC convergence code has latent bug when max_iterations <= 1",
-      "Controller saturating at max_tilt=0.85 rad on both axes",
+      "Compound curvature boosts at Pareto frontier — can trade time for error but not improve both",
+      "Racing line eval gains don't affect basin selection — cache key excludes gains, and re-optimization selects same basin",
       "Kinematic sim drag model prevents ff>0.52 (literature standard is ff=1.0)",
-      "No PyBullet validation of accumulated 39-iteration gains"
+      "No PyBullet validation of accumulated 40-iteration gains"
     ],
-    "critic_findings": [
-      "ILC coupling discovery is the most important finding — changes optimization strategy",
-      "TOPP S-turn floor 0.70 is near the safe boundary (0.66 triggers basin switching)",
-      "Gate-2 improvement (-2.1%) is real but small; gate-2 remains worst gate at 0.214m",
-      "Gates 3-5 regressed 1-3% — S-turn slowing has trade-offs",
-      "Race time +0.06s is acceptable but the aspirational <14s target is now further away"
+    "iteration_40_findings": [
+      "max_tilt_rad sweep: zero effect (cosmetic parameter in kinematic sim)",
+      "Racing line eval gains sync: zero metric impact (same basin wins)",
+      "Compound curvature boost sweep: Pareto trade-off only (1.35/1.25 gives -2.1% avg error, +0.06s time)",
+      "Research consensus: 3 papers confirm unmodeled tilt saturation degrades DFBC 10x, but finding is irrelevant in kinematic sim"
     ]
   },
   "improvements_backlog": [
     {
       "area": "system_integration",
-      "description": "Fix ILC-controller coupling: re-tune ILC section parameters with synchronized gains",
-      "proposed_approach": "Synchronized gains + grid search over (alpha, max_correction, cutoff, iterations) to find new optimal ILC config. Key: must change ALL ILC params simultaneously, not just gains.",
-      "expected_impact": "Unlock controller tuning space for future iterations; potentially 5-10% improvement",
+      "description": "Full ILC re-derivation with tabula rasa approach",
+      "proposed_approach": "Start from zero offsets with current controller (kp=7,kd=5.5,ff=0.50). Full grid search over (alpha, max_correction, cutoff, iterations, section boundaries). Don't sync gains — find new ILC params that work with the existing gain mismatch as a feature.",
+      "expected_impact": "Break out of local optimum; potentially 5-15% improvement",
       "priority": 1,
-      "research_refs": ["segment_based_ailc_zhang_2026", "dual_ilc_mimo_ewering_2025"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Re-optimize racing line with new controller dynamics",
-      "proposed_approach": "Clear racing line cache, re-run optimization. New controller may track tighter racing lines, changing basin selection.",
-      "expected_impact": "Potentially different (better) racing line basin; 2-5% improvement possible",
-      "priority": 2,
-      "research_refs": ["spatially_aware_cmaes_racing_2026"]
+      "research_refs": ["segment_based_ailc_zhang_2026", "dual_ilc_mimo_ewering_2025", "ilc_mismatch_compensation_wu_2024"]
     },
     {
       "area": "system_integration",
-      "description": "PyBullet full-physics validation of all gains",
-      "proposed_approach": "Run benchmark with PyBullet sim to validate kinematic sim gains transfer",
-      "expected_impact": "Validate or invalidate all tuning from iters 1-39",
+      "description": "PyBullet full-physics validation — max_tilt_rad matters there",
+      "proposed_approach": "Run benchmark with PyBullet sim. max_tilt_rad is cosmetic in kinematic sim but affects real attitude dynamics. The 3 papers (NGTC, LoL-NMPC, ILC Mismatch) all predict improvement in full physics.",
+      "expected_impact": "Validate kinematic sim tuning AND test tilt constraint hypothesis",
+      "priority": 2,
+      "research_refs": ["ngtc_tilt_analysis_supplement_2025", "lol_nmpc_lowlevel_dynamics_gupta_2025"]
+    },
+    {
+      "area": "control",
+      "description": "MPCC path-following controller (replaces PD+ILC)",
+      "proposed_approach": "Replace the PD+feedforward+ILC architecture with a Model Predictive Contouring Controller that directly optimizes path-following. Eliminates ILC coupling entirely.",
+      "expected_impact": "Architectural breakthrough — removes the coupling trap",
       "priority": 3,
-      "research_refs": []
+      "research_refs": ["mpcc_plus_plus_krinner_2024", "cimpcc_curvature_velocity_li_2024"]
     },
     {
       "area": "control",
       "description": "Spatially-varying feedforward weight",
-      "proposed_approach": "Lower ff near gate-2 transition (t=1.5-2.0s), higher elsewhere. Requires code change to make ff time-varying.",
+      "proposed_approach": "Lower ff near gate-2 transition (t=1.5-2.0s), higher elsewhere. Must co-adapt ILC to avoid coupling.",
       "expected_impact": "Targeted gate-2 improvement without affecting other gates",
       "priority": 4,
       "research_refs": ["taco_sanghvi_2025", "spatially_aware_controller_feedback_2026"]
-    },
-    {
-      "area": "trajectory_planning",
-      "description": "Fix ILC convergence bug (max_iterations <= 1 crashes)",
-      "proposed_approach": "Add prev_avg_err initialization before loop in compute_ilc_offset_table()",
-      "expected_impact": "Code quality — enables testing ILC iteration count",
-      "priority": 5,
-      "research_refs": []
     }
   ],
   "failed_approaches": [
@@ -551,6 +546,20 @@
       "lesson": "S-turn floor can only be raised (slower), not lowered. 0.66 triggers basin switching.",
       "approach": "sturn_floor_decrease_0.66",
       "reason": "Basin switching — floor decrease direction is unsafe"
+    },
+    {
+      "iteration": 40,
+      "description": "max_tilt_rad sweep (0.85→1.05). All values produced identical metrics.",
+      "lesson": "max_tilt_rad is COSMETIC in kinematic sim. last_desired_acceleration (line 200 mpc_tracker.py) stores pre-clip acceleration. Tilt clipping only affects roll/pitch angles, which kinematic sim doesn't use for dynamics.",
+      "approach": "max_tilt_rad_sweep_kinematic_sim",
+      "reason": "Tilt clipping is cosmetic — doesn't affect kinematic sim dynamics"
+    },
+    {
+      "iteration": 40,
+      "description": "Compound curvature boost sweep (s_turn 1.0-1.35, helix 1.0-1.25). Pareto trade-off only.",
+      "lesson": "Higher boosts slow turns → lower avg error but higher race time. Best: 1.35/1.25 gives -2.1% avg error but +0.06s time. Cannot improve both simultaneously — at Pareto frontier.",
+      "approach": "compound_curvature_boost_pareto",
+      "reason": "Pareto trade-off between race time and tracking error — no Pareto improvement"
     }
   ]
 }
