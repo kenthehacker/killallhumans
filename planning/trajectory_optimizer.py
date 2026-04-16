@@ -134,6 +134,7 @@ def compute_ilc_offset_table(
     section_boundaries: Optional[list] = None,
     blend_steps: int = 50,
     filter_cutoff_hz: Optional[float] = None,
+    momentum_gamma: float = 0.0,
 ) -> Optional[np.ndarray]:
     """
     Compute a position-offset table via offline ILC to reduce systematic tracking error.
@@ -237,8 +238,12 @@ def compute_ilc_offset_table(
     # Per-section ILC: maintain independent offsets per section
     if section_boundaries is not None:
         section_offsets = [np.zeros((n_steps, 3)) for _ in section_boundaries]
+        # Heavy-ball momentum ILC (Wang 2023, arXiv:2312.14326):
+        # Store previous iteration's offsets for momentum term.
+        prev_section_offsets = [np.zeros((n_steps, 3)) for _ in section_boundaries]
     else:
         section_offsets = None
+        prev_section_offsets = None
 
     # Velocity offset: smooth derivative of position offset (iteration 41).
     # Applied in both ILC inner sim and benchmark for consistency.
@@ -406,9 +411,27 @@ def compute_ilc_offset_table(
                     sec_smoothed,
                 )
 
+                # Heavy-ball momentum ILC (Wang 2023, Polyak 1964):
+                # u_{k+1} = u_k + alpha * Q * e_k + gamma * (u_k - u_{k-1})
+                # Momentum helps escape shallow convergence plateaus.
+                # Per-section gamma via 7th element of section_boundaries tuple.
+                sec_gamma = sec_def[6] if len(sec_def) > 6 else momentum_gamma
+                if sec_gamma > 0 and ilc_iter > 0:
+                    momentum = (
+                        section_offsets[sec_idx][sec_start_c:sec_end_c]
+                        - prev_section_offsets[sec_idx][sec_start_c:sec_end_c]
+                    )
+                else:
+                    momentum = 0.0
+
+                # Store current offset before update (for next iteration's momentum)
+                prev_section_offsets[sec_idx][sec_start_c:sec_end_c] = (
+                    section_offsets[sec_idx][sec_start_c:sec_end_c].copy()
+                )
+
                 # Accumulate this section's offset independently
                 section_offsets[sec_idx][sec_start_c:sec_end_c] += (
-                    sec_alpha * sec_smoothed
+                    sec_alpha * sec_smoothed + sec_gamma * momentum
                 )
 
             # Combine section offsets into cumulative_offset (simple concatenation)

@@ -333,6 +333,7 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         section_boundaries=section_boundaries,
         blend_steps=50,
         filter_cutoff_hz=0.35,  # Global fallback (used by sections without 5th element)
+        momentum_gamma=0.2,    # iter 49: heavy-ball momentum ILC (Wang 2023, Polyak 1964)
     )
     if ilc_result is not None:
         ilc_offsets, ilc_vel_offsets = ilc_result
