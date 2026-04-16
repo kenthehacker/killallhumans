@@ -1,9 +1,9 @@
 {
-  "iteration": 49,
-  "timestamp": "2026-04-15T17:17:00Z",
+  "iteration": 50,
+  "timestamp": "2026-04-15T17:31:00Z",
   "status": "completed",
-  "current_bottleneck": "system_integration",
-  "previous_bottleneck": "trajectory_planning",
+  "current_bottleneck": "control",
+  "previous_bottleneck": "system_integration",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -140,19 +140,22 @@
     "qpgp_pilc_convergence_accel_2026",
     "nesterov_accelerated_ilc_wang_2023",
     "ilc_speedup_model_based_longman_2023",
-    "cdbo_coordinate_descent_racing_2018"
+    "cdbo_coordinate_descent_racing_2018",
+    "robust_drone_testing_pipeline_2025",
+    "simpleflight_sim2real_2024",
+    "reality_gap_robotics_uzh_2025"
   ],
-  "total_papers_analyzed": 136,
+  "total_papers_analyzed": 139,
   "metrics_before": {
     "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1632,
-    "max_tracking_error_m": 0.7394,
+    "avg_tracking_error_m": 0.1616,
+    "max_tracking_error_m": 0.7419,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7527,
+    "avg_loop_hz": 7665,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-5",
-    "worst_gate_error_m": 0.2517,
+    "worst_gate_error_m": 0.2643,
     "race_time_s": 13.31,
     "deterministic": true
   },
@@ -161,7 +164,7 @@
     "avg_tracking_error_m": 0.1616,
     "max_tracking_error_m": 0.7419,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7720,
+    "avg_loop_hz": 7881,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-5",
@@ -170,9 +173,9 @@
     "deterministic": true
   },
   "changes_committed": true,
-  "commit_hash": "3f174e8",
+  "commit_hash": "e207875",
   "diagnostic": {
-    "root_cause": "ILC is at deep convergence plateau after 8 iterations with per-section alpha rebalancing. Momentum redistributes error between gates (improving section-end gates, regressing section-start gates) rather than uniformly reducing it. Attitude saturation (0.85 rad) is the hard floor for tracking error in kinematic sim PD controller.",
+    "root_cause": "System at performance ceiling of kinematic sim + PD controller architecture. Attitude saturation (0.85 rad) is the hard floor. ILC at deep convergence plateau. Further improvement requires MPC/MPCC controller upgrade or real hardware deployment.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
@@ -181,36 +184,44 @@
     },
     "trend": "diminishing_returns",
     "architectural_issues": [
-      "Gate-5 at 0.264m — worst gate, at Pareto frontier with inflection/post-inflection coupling",
-      "Attitude saturation (0.85 rad) — fundamental kinematic sim PD controller limit",
-      "ILC section boundaries cause error discontinuities — momentum amplifies this at gate-5 and gate-8/9",
-      "ILC convergence essentially complete — further tuning yields <1% improvements",
-      "Racing line offsets locked to avoid basin switching — cannot re-optimize without architectural change"
+      "PD controller saturates at 0.85 rad — fundamental limit, requires MPC/MPCC",
+      "ILC at deep convergence plateau after 8 iterations + momentum",
+      "Basin switching risk prevents racing line re-optimization",
+      "Kinematic sim lacks motor latency, rotor dynamics, aerodynamic effects",
+      "Perception pipeline untested at racing speeds"
     ],
     "critic_findings": []
   },
   "improvements_backlog": [
     {
-      "area": "system_integration",
-      "description": "Competition robustness verification — noise, dropout, timing jitter, gate position perturbation",
-      "proposed_approach": "Add Gaussian noise to state estimates (σ=0.01-0.1m), test with perturbed gate positions (±0.05m), verify graceful degradation under realistic competition conditions.",
-      "expected_impact": "Competition readiness, identify failure modes before VQ1",
-      "priority": 1,
-      "research_refs": ["monorace_competition_robustness_2026", "on_your_own_romero_2025"]
-    },
-    {
       "area": "control",
       "description": "MPC/MPCC controller upgrade to break through attitude saturation limit",
       "proposed_approach": "Implement simplified MPCC from Krinner 2024. Would better utilize dynamics constraints and avoid the 0.85 rad hard ceiling.",
-      "expected_impact": "Could break through tracking error floor. Major architectural change.",
-      "priority": 2,
+      "expected_impact": "10-20% tracking improvement by utilizing full control authority",
+      "priority": 1,
       "research_refs": ["mpcc_plus_plus_krinner_2024", "cimpcc_lap_time_li_2025"]
     },
     {
+      "area": "system_integration",
+      "description": "Real hardware deployment with system identification",
+      "proposed_approach": "SysID (hover test, step response, chirp test, battery profiling per UZH RPG 2025) + HIL testing with PX4",
+      "expected_impact": "Identify real-world bottlenecks invisible in simulation",
+      "priority": 1,
+      "research_refs": ["reality_gap_robotics_uzh_2025", "simpleflight_sim2real_2024", "robust_drone_testing_pipeline_2025"]
+    },
+    {
+      "area": "perception_estimation",
+      "description": "Perception pipeline stress test at racing speeds",
+      "proposed_approach": "Test gate detection + PnP with motion blur, detection dropout, partial occlusion",
+      "expected_impact": "Identify perception failure modes before competition",
+      "priority": 2,
+      "research_refs": ["monorace_competition_robustness_2026", "on_your_own_romero_2025"]
+    },
+    {
       "area": "trajectory_planning",
-      "description": "ILC section boundary smoothing to reduce gate-5/gate-8 regression",
-      "proposed_approach": "Add blending region (10-20 steps) where alpha/gamma interpolate between adjacent sections.",
-      "expected_impact": "1-3% improvement by reducing boundary artifacts",
+      "description": "ILC section boundary smoothing",
+      "proposed_approach": "Add blending region (10-20 steps) where alpha/gamma interpolate between adjacent sections",
+      "expected_impact": "1-3% improvement by reducing boundary artifacts at gate-5/gate-8",
       "priority": 3,
       "research_refs": ["spatial_ilc_virtual_tube_2023", "segmentwise_ilc_zhang_2024"]
     }
