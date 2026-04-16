@@ -1,9 +1,9 @@
 {
-  "iteration": 48,
-  "timestamp": "2026-04-15T16:55:00Z",
+  "iteration": 49,
+  "timestamp": "2026-04-15T17:17:00Z",
   "status": "completed",
-  "current_bottleneck": "trajectory_planning",
-  "previous_bottleneck": "system_integration",
+  "current_bottleneck": "system_integration",
+  "previous_bottleneck": "trajectory_planning",
   "papers_analyzed": [
     "togt_planner_qin_2024",
     "leveling_playing_field_2025",
@@ -137,28 +137,18 @@
     "aero_mppi_ensemble_trajectory_2025",
     "tuning_parameter_ilc_fastest_convergence_2026",
     "monorace_competition_robustness_2026",
-    "qpgp_pilc_convergence_accel_2026"
+    "qpgp_pilc_convergence_accel_2026",
+    "nesterov_accelerated_ilc_wang_2023",
+    "ilc_speedup_model_based_longman_2023",
+    "cdbo_coordinate_descent_racing_2018"
   ],
-  "total_papers_analyzed": 133,
+  "total_papers_analyzed": 136,
   "metrics_before": {
-    "gate_pass_rate": 1.0,
-    "avg_tracking_error_m": 0.1733,
-    "max_tracking_error_m": 0.7261,
-    "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7508,
-    "crashed": false,
-    "unit_test_pass_rate": 1.0,
-    "worst_gate": "gate-5",
-    "worst_gate_error_m": 0.2639,
-    "race_time_s": 13.31,
-    "deterministic": true
-  },
-  "metrics_after": {
     "gate_pass_rate": 1.0,
     "avg_tracking_error_m": 0.1632,
     "max_tracking_error_m": 0.7394,
     "ekf_uncertainty_m": 0.0119,
-    "avg_loop_hz": 7632,
+    "avg_loop_hz": 7527,
     "crashed": false,
     "unit_test_pass_rate": 1.0,
     "worst_gate": "gate-5",
@@ -166,50 +156,63 @@
     "race_time_s": 13.31,
     "deterministic": true
   },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1616,
+    "max_tracking_error_m": 0.7419,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7720,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-5",
+    "worst_gate_error_m": 0.2643,
+    "race_time_s": 13.31,
+    "deterministic": true
+  },
   "changes_committed": true,
-  "commit_hash": "731ab41",
+  "commit_hash": "3f174e8",
   "diagnostic": {
-    "root_cause": "ILC convergence threshold (0.002) was preventing the 8th iteration from running. Post-inflection section was heavily under-converged at alpha=0.40. Inflection alpha=0.50 was causing excessive spatial coupling to gate-5.",
+    "root_cause": "ILC is at deep convergence plateau after 8 iterations with per-section alpha rebalancing. Momentum redistributes error between gates (improving section-end gates, regressing section-start gates) rather than uniformly reducing it. Attitude saturation (0.85 rad) is the hard floor for tracking error in kinematic sim PD controller.",
     "telemetry_signals": {
       "max_roll_rad": 0.85,
       "max_abs_pitch_rad": 0.85,
       "avg_pitch_rad": -0.093,
       "avg_thrust": 0.872
     },
-    "trend": "improving",
+    "trend": "diminishing_returns",
     "architectural_issues": [
-      "Gate-5 at 0.252m — still the worst gate, driven by inflection-to-postinflection spatial coupling at Pareto frontier",
-      "Gate-4 at 0.236m — inflection alpha reduction limits further improvement here",
-      "Max tracking error 0.739m — slightly worse than baseline (0.726m), possibly from deeper ILC corrections at transient points",
-      "Actuator saturation (roll/pitch at 0.85 rad cap) — fundamental limit of kinematic sim PD controller",
-      "ILC convergence now essentially complete at 8 iterations — further ILC tuning has diminishing returns"
+      "Gate-5 at 0.264m — worst gate, at Pareto frontier with inflection/post-inflection coupling",
+      "Attitude saturation (0.85 rad) — fundamental kinematic sim PD controller limit",
+      "ILC section boundaries cause error discontinuities — momentum amplifies this at gate-5 and gate-8/9",
+      "ILC convergence essentially complete — further tuning yields <1% improvements",
+      "Racing line offsets locked to avoid basin switching — cannot re-optimize without architectural change"
     ],
     "critic_findings": []
   },
   "improvements_backlog": [
     {
-      "area": "trajectory_planning",
-      "description": "Racing line lateral offset re-optimization for current 8-iteration ILC state",
-      "proposed_approach": "Re-sweep lateral offsets at gates 4, 5, 7 with current ILC config. Offsets were tuned in iterations 20-25 for 5-iteration ILC.",
-      "expected_impact": "3-8% avg error reduction if offsets are suboptimal for current ILC convergence state",
-      "priority": 1,
-      "research_refs": ["togt_planner_qin_2024", "bo_racing_line_heilmeier_2020"]
-    },
-    {
       "area": "system_integration",
-      "description": "Competition robustness verification — noise, dropout, timing jitter",
-      "proposed_approach": "Add Gaussian noise to state estimates. Test with varying gate positions. Verify graceful degradation.",
+      "description": "Competition robustness verification — noise, dropout, timing jitter, gate position perturbation",
+      "proposed_approach": "Add Gaussian noise to state estimates (σ=0.01-0.1m), test with perturbed gate positions (±0.05m), verify graceful degradation under realistic competition conditions.",
       "expected_impact": "Competition readiness, identify failure modes before VQ1",
-      "priority": 2,
+      "priority": 1,
       "research_refs": ["monorace_competition_robustness_2026", "on_your_own_romero_2025"]
     },
     {
       "area": "control",
-      "description": "Velocity feedforward re-evaluation with 8-iteration ILC",
-      "proposed_approach": "Test velocity_feedforward=0.1-0.3 with current config. Previous tests at 5 ILC iterations showed +9.1% regression.",
-      "expected_impact": "Possible 2-3% improvement at high-speed gates if ILC compensates differently at 8 iterations",
+      "description": "MPC/MPCC controller upgrade to break through attitude saturation limit",
+      "proposed_approach": "Implement simplified MPCC from Krinner 2024. Would better utilize dynamics constraints and avoid the 0.85 rad hard ceiling.",
+      "expected_impact": "Could break through tracking error floor. Major architectural change.",
+      "priority": 2,
+      "research_refs": ["mpcc_plus_plus_krinner_2024", "cimpcc_lap_time_li_2025"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "ILC section boundary smoothing to reduce gate-5/gate-8 regression",
+      "proposed_approach": "Add blending region (10-20 steps) where alpha/gamma interpolate between adjacent sections.",
+      "expected_impact": "1-3% improvement by reducing boundary artifacts",
       "priority": 3,
-      "research_refs": ["leveling_playing_field_2025"]
+      "research_refs": ["spatial_ilc_virtual_tube_2023", "segmentwise_ilc_zhang_2024"]
     }
   ],
   "failed_approaches": [
@@ -672,6 +675,27 @@
       "lesson": "Too-high alpha in one section causes faster convergence there, triggering global convergence threshold early, preventing other sections from converging.",
       "approach": "post_inflection_alpha_053_convergence_pattern",
       "reason": "Faster section convergence triggers early global stop"
+    },
+    {
+      "iteration": 49,
+      "description": "Per-section momentum (helix γ=0.4, s-turn γ=0.2, others γ=0.0). Avg error +5.1%.",
+      "lesson": "Per-section momentum creates worse cross-section coupling than uniform momentum through sim dynamics.",
+      "approach": "per_section_momentum_gamma",
+      "reason": "Heterogeneous momentum amplifies cross-section coupling"
+    },
+    {
+      "iteration": 49,
+      "description": "ILC max_iterations=9 + γ=0.2. Identical to 8 iterations.",
+      "lesson": "Momentum doesn't change convergence dynamics enough to enable a productive 9th iteration. Threshold still binds.",
+      "approach": "9_iters_with_momentum",
+      "reason": "Convergence threshold still binds at 0.0005"
+    },
+    {
+      "iteration": 49,
+      "description": "Post-inflection alpha=0.48 + momentum γ=0.2. Gate-5 WORSE (0.267m).",
+      "lesson": "Reducing alpha does not compensate for momentum's over-correction. The interaction is non-linear.",
+      "approach": "reduced_alpha_plus_momentum",
+      "reason": "Gate-5 regression worse than pure gamma=0.2"
     }
   ]
 }
