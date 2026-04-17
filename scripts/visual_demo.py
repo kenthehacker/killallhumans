@@ -20,6 +20,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
+import datetime
 import math
 import sys
 import time
@@ -216,10 +218,12 @@ class VisualDemo:
     """Runs the full new pipeline against PyBullet with live dual-view viz."""
 
     def __init__(self, config_path: str, max_time=120.0, sim_speed=1.0,
-                 gui=False, use_ekf=True, use_geometric=False):
+                 gui=False, use_ekf=True, use_geometric=False,
+                 no_render=False):
         self.max_time = max_time
         self.sim_speed = sim_speed
         self.use_ekf = use_ekf
+        self.no_render = no_render
 
         # ── Sim environment ──
         race_config = DroneRaceEnv.load_config(config_path)
@@ -299,6 +303,27 @@ class VisualDemo:
         self._render_interval = max(1, round(ctrl_freq / 30))
         self._steps_per_loop = max(1, int(sim_speed))
 
+        # ── CSV telemetry logging ──
+        logs_dir = _REPO / "logs"
+        logs_dir.mkdir(exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._csv_path = logs_dir / f"visual_demo_{ts}.csv"
+        self._csv_file = open(self._csv_path, "w", newline="")
+        self._csv_writer = csv.writer(self._csv_file)
+        self._csv_columns = [
+            "sim_time", "step_count",
+            "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z",
+            "roll", "pitch", "yaw",
+            "ref_pos_x", "ref_pos_y", "ref_pos_z",
+            "ref_vel_x", "ref_vel_y", "ref_vel_z",
+            "target_pos_x", "target_pos_y", "target_pos_z",
+            "target_vel_x", "target_vel_y", "target_vel_z",
+            "tracking_error_m", "current_gate_id", "gates_passed",
+            "target_source", "loop_dt_ms",
+        ]
+        self._csv_writer.writerow(self._csv_columns)
+        self._csv_flush_counter = 0
+
     # ──────────────────────────────────────────────────────────────
     # Main loop
     # ──────────────────────────────────────────────────────────────
@@ -369,6 +394,7 @@ class VisualDemo:
             target_pos = ref.position
             target_vel = ref.velocity
             target_yaw = ref.yaw
+            target_source = "trajectory"
 
             # Past the trajectory end? Navigate directly to next gate.
             if sim_time > self.trajectory.total_time and not self.sequencer.is_complete:
@@ -382,6 +408,7 @@ class VisualDemo:
                         target_pos = tuple(gpos)
                         target_vel = tuple(direction / dist * min(dist * 2, 5.0))
                         target_yaw = float(math.atan2(direction[1], direction[0]))
+                        target_source = "gate_fallback"
 
             if self.sequencer.should_slow_down():
                 target_vel = tuple(v * 0.3 for v in target_vel)
@@ -394,8 +421,27 @@ class VisualDemo:
             loop_dt = time.perf_counter() - loop_t0
             self._loop_times.append(loop_dt)
 
+            # 8b. CSV telemetry row
+            cur_gate = self.sequencer.current_gate
+            cur_gate_id = cur_gate.gate_id if cur_gate else "none"
+            self._csv_writer.writerow([
+                f"{sim_time:.4f}", self.env.step_count,
+                f"{pos[0]:.4f}", f"{pos[1]:.4f}", f"{pos[2]:.4f}",
+                f"{vel[0]:.4f}", f"{vel[1]:.4f}", f"{vel[2]:.4f}",
+                f"{rpy[0]:.4f}", f"{rpy[1]:.4f}", f"{rpy[2]:.4f}",
+                f"{ref.position[0]:.4f}", f"{ref.position[1]:.4f}", f"{ref.position[2]:.4f}",
+                f"{ref.velocity[0]:.4f}", f"{ref.velocity[1]:.4f}", f"{ref.velocity[2]:.4f}",
+                f"{target_pos[0]:.4f}", f"{target_pos[1]:.4f}", f"{target_pos[2]:.4f}",
+                f"{target_vel[0]:.4f}", f"{target_vel[1]:.4f}", f"{target_vel[2]:.4f}",
+                f"{trk_err:.4f}", cur_gate_id, self.sequencer.gates_passed,
+                target_source, f"{loop_dt * 1000:.2f}",
+            ])
+            self._csv_flush_counter += 1
+            if self._csv_flush_counter % 240 == 0:
+                self._csv_file.flush()
+
             # 9. Render
-            if self.env.step_count % self._render_interval == 0:
+            if not self.no_render and self.env.step_count % self._render_interval == 0:
                 self._render(sd, sim_time, ref, ekf_pos, ekf_unc, trk_err)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
@@ -404,7 +450,13 @@ class VisualDemo:
                 if key == ord("r"):
                     self._reset()
 
-        cv2.destroyAllWindows()
+        # Close CSV telemetry
+        self._csv_file.flush()
+        self._csv_file.close()
+        print(f"Telemetry CSV: {self._csv_path}")
+
+        if not self.no_render:
+            cv2.destroyAllWindows()
         self.env.close()
 
         avg_trk = (sum(self._tracking_errors) / len(self._tracking_errors)
@@ -418,6 +470,7 @@ class VisualDemo:
             "complete": self.sequencer.is_complete,
             "avg_tracking_error": avg_trk,
             "avg_loop_hz": avg_hz,
+            "csv_path": str(self._csv_path),
         }
 
     # ──────────────────────────────────────────────────────────────
@@ -571,6 +624,8 @@ def main():
                         help="Disable EKF (raw sim state)")
     parser.add_argument("--geometric", action="store_true",
                         help="Use GeometricTracker instead of SimplePositionTracker")
+    parser.add_argument("--no-render", action="store_true",
+                        help="Disable visualization (headless mode)")
     args = parser.parse_args()
 
     demo = VisualDemo(
@@ -580,6 +635,7 @@ def main():
         gui=args.pybullet_gui,
         use_ekf=not args.no_ekf,
         use_geometric=args.geometric,
+        no_render=args.no_render,
     )
     results = demo.run()
 
