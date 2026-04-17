@@ -384,17 +384,27 @@ class VisualDemo:
                 print(f"\nCrash! Alt={pos[2]:.2f}m")
                 break
 
-            # 5. Trajectory reference
-            ref = self.trajectory.sample(sim_time)
+            # 5. Trajectory reference (closest-point + lookahead)
             closest = self.trajectory.find_closest(pos)
             trk_err = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, closest.position)))
             self._tracking_errors.append(trk_err)
 
+            lookahead_time = min(closest.time + 0.3, self.trajectory.total_time)
+            ref = self.trajectory.sample(lookahead_time)
+
             # 6. Compute target for GPDDrone.step()
             target_pos = ref.position
-            target_vel = ref.velocity
             target_yaw = ref.yaw
             target_source = "trajectory"
+
+            # Clamp commanded velocity to Crazyflie-trackable speed
+            MAX_CMD_SPEED = 5.0
+            ref_speed = math.sqrt(sum(v * v for v in ref.velocity))
+            if ref_speed > MAX_CMD_SPEED:
+                scale = MAX_CMD_SPEED / ref_speed
+                target_vel = tuple(v * scale for v in ref.velocity)
+            else:
+                target_vel = ref.velocity
 
             # Past the trajectory end? Navigate directly to next gate.
             if sim_time > self.trajectory.total_time and not self.sequencer.is_complete:
