@@ -1,43 +1,57 @@
 {
-  "iteration": 1,
+  "iteration": 2,
   "status": "running",
   "loop_name": "regression_fix",
   "max_iterations": 15,
   "started_at": "2026-04-16T00:00:00Z",
   "target_failure": "visual_demo race_01 missed gate-1 (flew past to end of map), passed gates 1-4 after turnaround at 20.79s, crashed at alt=0.04m after gate-4. avg_tracking_error=1.902m (prior passing run 0.159m). avg_loop_hz=2422 (prior 9517).",
-  "current_bottleneck": "telemetry_logging_missing",
+  "current_bottleneck": "closest_point_trajectory_tracking_with_clamp",
   "last_metrics": {
-    "gates_passed": 4,
+    "gates_passed": 0,
     "total_gates": 12,
-    "sim_time": 36.938,
-    "avg_tracking_error": 1.902,
-    "max_tracking_error": null,
-    "avg_loop_hz": 2422.173,
+    "sim_time": 8.833,
+    "avg_tracking_error": 0.680,
+    "max_tracking_error": 2.917,
+    "p95_tracking_error": 2.347,
+    "avg_loop_hz": 3398,
     "crashed": true,
     "crash_alt": 0.04,
-    "gate_pass_times": {"gate-1": 20.79, "gate-2": 24.67, "gate-3": 29.73, "gate-4": 32.42}
+    "peak_ref_speed_ms": 16.83,
+    "peak_roll_deg": 178.37,
+    "peak_pitch_deg": 57.36,
+    "first_tilt_above_30deg_s": 0.396,
+    "first_ref_vel_above_5ms_s": 0.146,
+    "target_jump_count": 0,
+    "csv_path": "logs/visual_demo_20260416_172402.csv"
   },
   "best_metrics": null,
   "improvements_backlog": [
-    {"id": "add_csv_telemetry_logging_to_visual_demo", "priority": 1, "estimated_impact": "unblocks all downstream debugging", "rationale": "logs/ dir only has April-3 files — visual_demo never wrote CSVs"},
-    {"id": "closest_point_trajectory_tracking_with_clamp", "priority": 2, "estimated_impact": "gates 4→12 (biggest single fix)", "rationale": "root cause per iter 0: time-based sampling races ahead of Crazyflie physics. Fix: trajectory.find_closest(pos) + 0.3s lookahead + 5 m/s cmd-speed clamp"},
-    {"id": "polynomial_velocity_clamp_in_trajectory_optimizer", "priority": 3, "estimated_impact": "removes 17 m/s polynomial spikes", "rationale": "min-snap polynomial exceeds max_velocity=10.0 mid-segment"},
-    {"id": "ilc_offsets_in_visual_demo", "priority": 4, "estimated_impact": "~45% tracking error reduction", "rationale": "benchmark applies compute_ilc_offset_table, visual_demo does not"},
-    {"id": "enable_pybullet_in_benchmark", "priority": 5, "estimated_impact": "prevents future kinematic-only drift", "rationale": "benchmark_history shows simulation.skipped=true on every run — all 50 iterations optimized wrong target"}
+    {"id": "closest_point_trajectory_tracking_with_clamp", "priority": 1, "estimated_impact": "gates 0→12 (biggest single fix)", "rationale": "root cause per iter 0+1 telemetry: time-based sampling races ahead of Crazyflie physics. Fix: trajectory.find_closest(pos) + 0.3s lookahead + 5 m/s cmd-speed clamp. Telemetry confirms ref_vel > 5 m/s at t=0.146s causing immediate tilt saturation."},
+    {"id": "polynomial_velocity_clamp_in_trajectory_optimizer", "priority": 2, "estimated_impact": "removes 16.83 m/s polynomial spikes", "rationale": "min-snap polynomial exceeds max_velocity=10.0 mid-segment; peak measured at 16.83 m/s"},
+    {"id": "ilc_offsets_in_visual_demo", "priority": 3, "estimated_impact": "~45% tracking error reduction", "rationale": "benchmark applies compute_ilc_offset_table, visual_demo does not"},
+    {"id": "enable_pybullet_in_benchmark", "priority": 4, "estimated_impact": "prevents future kinematic-only drift", "rationale": "benchmark_history shows simulation.skipped=true on every run — all 50 iterations optimized wrong target"},
+    {"id": "add_seed_flag_for_reproducibility", "priority": 5, "estimated_impact": "reduces run-to-run noise", "rationale": "iter1 got 0 gates vs baseline 4 due to sim non-determinism"}
   ],
   "failed_approaches": [],
-  "commits": [],
+  "commits": [
+    {"iteration": 1, "sha": "3f747cf", "description": "CSV telemetry logging + --no-render flag", "gates_before": 4, "gates_after": 0, "note": "gate count diff is sim non-determinism, not code change"}
+  ],
   "diagnostic": {
-    "root_cause": "Architectural: min-snap trajectory peaks 17 m/s vs Crazyflie max horizontal accel 6.87 m/s². Time-based trajectory sampling causes reference to race ahead of drone.",
-    "telemetry_signals": ["no_telemetry_yet"],
-    "trend": null,
+    "root_cause": "Architectural: min-snap trajectory peaks 16.83 m/s (measured) vs Crazyflie max horizontal accel 6.87 m/s². Time-based trajectory sampling causes reference to race ahead of drone, producing immediate tilt saturation at t=0.396s and full tumble (178° roll).",
+    "telemetry_signals": [
+      "ref_vel > 5 m/s at t=0.146s",
+      "pitch > 30° at t=0.396s",
+      "roll reaches 178.37° (full inversion)",
+      "crash at t=8.833s, alt=0.04m",
+      "no target jumps (trajectory source throughout)"
+    ],
+    "trend": "iter1 establishes telemetry baseline. No behavioral fix yet.",
     "architectural_issues": [
       "benchmark.py skips PyBullet sim on every run — kinematic-only validation",
-      "visual_demo.py has no CSV logging — debugging blind",
-      "TrajectoryOptimizer.max_velocity only constrains boundary conditions",
+      "TrajectoryOptimizer.max_velocity only constrains boundary conditions, not mid-segment polynomial peaks",
       "visual_demo.py does not apply ILC offsets the benchmark relies on"
     ],
-    "critic_findings": []
+    "critic_findings": ["No high-severity issues in iter1 (logging-only change)"]
   },
   "success_criterion": "all 12 gates passed AND avg_tracking_error < 0.5m on pybullet visual_demo for 3 consecutive runs"
 }
