@@ -1543,6 +1543,19 @@ class TrajectoryOptimizer:
                     accelerations[j, axis] = _poly_deriv_eval(coeffs, t, 2)
                     jerks[j, axis] = _poly_deriv_eval(coeffs, t, 3)
 
+            # Clamp polynomial velocity magnitudes to max_velocity.
+            # Mid-segment polynomial velocities can exceed boundary conditions;
+            # this post-hoc clamp ensures ref_speed <= max_velocity everywhere.
+            # Scale acceleration and jerk by the same ratio to preserve direction.
+            max_vel = self.constraints.max_velocity
+            for j in range(n_samples):
+                speed = float(np.linalg.norm(velocities[j]))
+                if speed > max_vel:
+                    scale = max_vel / speed
+                    velocities[j] *= scale
+                    accelerations[j] *= scale
+                    jerks[j] *= scale
+
             # Compute yaw: point toward next gate
             gate_yaw = gates[i].yaw if i < len(gates) else 0.0
 
