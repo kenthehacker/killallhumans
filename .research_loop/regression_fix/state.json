@@ -1,57 +1,73 @@
 {
-  "iteration": 2,
+  "iteration": 3,
   "status": "running",
   "loop_name": "regression_fix",
   "max_iterations": 15,
   "started_at": "2026-04-16T00:00:00Z",
   "target_failure": "visual_demo race_01 missed gate-1 (flew past to end of map), passed gates 1-4 after turnaround at 20.79s, crashed at alt=0.04m after gate-4. avg_tracking_error=1.902m (prior passing run 0.159m). avg_loop_hz=2422 (prior 9517).",
-  "current_bottleneck": "closest_point_trajectory_tracking_with_clamp",
+  "current_bottleneck": "polynomial_velocity_clamp_in_trajectory_optimizer",
   "last_metrics": {
-    "gates_passed": 0,
+    "gates_passed": 4,
     "total_gates": 12,
-    "sim_time": 8.833,
-    "avg_tracking_error": 0.680,
-    "max_tracking_error": 2.917,
-    "p95_tracking_error": 2.347,
-    "avg_loop_hz": 3398,
+    "sim_time": 35.167,
+    "avg_tracking_error": 1.467,
+    "max_tracking_error": 4.602,
+    "p95_tracking_error": 3.524,
+    "avg_loop_hz": 3557,
     "crashed": true,
-    "crash_alt": 0.04,
-    "peak_ref_speed_ms": 16.83,
-    "peak_roll_deg": 178.37,
-    "peak_pitch_deg": 57.36,
-    "first_tilt_above_30deg_s": 0.396,
-    "first_ref_vel_above_5ms_s": 0.146,
-    "target_jump_count": 0,
-    "csv_path": "logs/visual_demo_20260416_172402.csv"
+    "crash_alt": 0.062,
+    "peak_ref_speed_ms": 16.84,
+    "peak_target_speed_ms": 5.00,
+    "peak_roll_deg": 174.79,
+    "peak_pitch_deg": 83.03,
+    "first_tilt_above_30deg_s": 0.271,
+    "first_ref_vel_above_5ms_s": 0.0,
+    "first_target_vel_above_5ms_s": null,
+    "target_jump_count": 9,
+    "target_source_trajectory_pct": 41,
+    "target_source_fallback_pct": 59,
+    "csv_path": "logs/visual_demo_20260416_173313.csv"
   },
-  "best_metrics": null,
+  "best_metrics": {
+    "gates_passed": 4,
+    "total_gates": 12,
+    "sim_time": 35.167,
+    "avg_tracking_error": 1.467,
+    "iteration": 2
+  },
   "improvements_backlog": [
-    {"id": "closest_point_trajectory_tracking_with_clamp", "priority": 1, "estimated_impact": "gates 0→12 (biggest single fix)", "rationale": "root cause per iter 0+1 telemetry: time-based sampling races ahead of Crazyflie physics. Fix: trajectory.find_closest(pos) + 0.3s lookahead + 5 m/s cmd-speed clamp. Telemetry confirms ref_vel > 5 m/s at t=0.146s causing immediate tilt saturation."},
-    {"id": "polynomial_velocity_clamp_in_trajectory_optimizer", "priority": 2, "estimated_impact": "removes 16.83 m/s polynomial spikes", "rationale": "min-snap polynomial exceeds max_velocity=10.0 mid-segment; peak measured at 16.83 m/s"},
+    {"id": "polynomial_velocity_clamp_in_trajectory_optimizer", "priority": 1, "estimated_impact": "gates 4→12 (trajectory covers all gates at Crazyflie-trackable speed)", "rationale": "Min-snap polynomial peaks 16.84 m/s but Crazyflie max ~5 m/s. Clamping polynomial velocities to 5 m/s would extend trajectory time from 14.3s to ~28s+, allowing drone to follow full trajectory through all 12 gates without needing fallback mode. Eliminates the 34m target jump at the trajectory→fallback transition."},
+    {"id": "smooth_fallback_transition", "priority": 2, "estimated_impact": "reduce target_jump from 34m to <2m", "rationale": "When sim_time > trajectory.total_time, the target jumps 34m from trajectory end (x=52) to gate-2 (x=18). A ramp/blend over 2-3s would prevent the violent maneuvering that eventually causes the crash."},
     {"id": "ilc_offsets_in_visual_demo", "priority": 3, "estimated_impact": "~45% tracking error reduction", "rationale": "benchmark applies compute_ilc_offset_table, visual_demo does not"},
     {"id": "enable_pybullet_in_benchmark", "priority": 4, "estimated_impact": "prevents future kinematic-only drift", "rationale": "benchmark_history shows simulation.skipped=true on every run — all 50 iterations optimized wrong target"},
-    {"id": "add_seed_flag_for_reproducibility", "priority": 5, "estimated_impact": "reduces run-to-run noise", "rationale": "iter1 got 0 gates vs baseline 4 due to sim non-determinism"}
+    {"id": "adaptive_lookahead", "priority": 5, "estimated_impact": "better trajectory following at varying speeds", "rationale": "0.3s fixed lookahead is conservative for slow segments and may overshoot on fast. Proportional to local curvature/speed would be better."},
+    {"id": "fallback_velocity_deceleration_profile", "priority": 6, "estimated_impact": "reduce tumble risk during gate approach", "rationale": "gate_fallback uses min(dist*2, 5.0) which commands high speed until very close. A gentler decel profile would prevent overshoot and tumble."}
   ],
-  "failed_approaches": [],
+  "failed_approaches": [
+    {"id": "position_based_fallback_condition", "iteration": 2, "description": "Changed fallback trigger from sim_time > total_time to closest.time >= total_time - 0.05. Drone stayed in trajectory mode indefinitely because speed clamp means it never reaches trajectory end. Gates dropped from 4→1. Reverted."}
+  ],
   "commits": [
-    {"iteration": 1, "sha": "3f747cf", "description": "CSV telemetry logging + --no-render flag", "gates_before": 4, "gates_after": 0, "note": "gate count diff is sim non-determinism, not code change"}
+    {"iteration": 1, "sha": "3f747cf", "description": "CSV telemetry logging + --no-render flag", "gates_before": 4, "gates_after": 0, "note": "gate count diff is sim non-determinism, not code change"},
+    {"iteration": 2, "sha": "0819bc8", "description": "closest-point tracking + 5 m/s velocity clamp", "gates_before": 0, "gates_after": 4, "note": "gate-1 at 1.83s (was unreachable). Survives 35.2s (vs 8.8s). Crashes during fallback at t=35.2s."}
   ],
   "diagnostic": {
-    "root_cause": "Architectural: min-snap trajectory peaks 16.83 m/s (measured) vs Crazyflie max horizontal accel 6.87 m/s². Time-based trajectory sampling causes reference to race ahead of drone, producing immediate tilt saturation at t=0.396s and full tumble (178° roll).",
+    "root_cause": "Architectural: min-snap trajectory peaks 16.84 m/s (measured) vs Crazyflie max horizontal accel 6.87 m/s². Closest-point tracking + 5 m/s clamp addresses the command-speed issue, but the trajectory is planned for 14.3s at 10 m/s. With 5 m/s clamp, drone only covers ~40% of trajectory before sim_time exceeds total_time, triggering a 34m target jump to fallback.",
     "telemetry_signals": [
-      "ref_vel > 5 m/s at t=0.146s",
-      "pitch > 30° at t=0.396s",
-      "roll reaches 178.37° (full inversion)",
-      "crash at t=8.833s, alt=0.04m",
-      "no target jumps (trajectory source throughout)"
+      "target_vel clamped to ≤5.0 m/s (CONFIRMED WORKING)",
+      "gate-1 passed at t=1.83s via trajectory tracking",
+      "gates 2-4 passed via gate_fallback at t=19-27s",
+      "34m target jump at t=14.27s (trajectory→fallback transition)",
+      "tumble starts at t=34.8s with roll=-159° during fallback to gate-5",
+      "crash at t=35.2s, alt=0.06m"
     ],
-    "trend": "iter1 establishes telemetry baseline. No behavioral fix yet.",
+    "trend": "iter1→iter2: gates 0→4, survival 8.8→35.2s. Velocity clamp eliminates initial tumble. Remaining issue: trajectory→fallback transition and fallback-mode stability.",
     "architectural_issues": [
-      "benchmark.py skips PyBullet sim on every run — kinematic-only validation",
-      "TrajectoryOptimizer.max_velocity only constrains boundary conditions, not mid-segment polynomial peaks",
-      "visual_demo.py does not apply ILC offsets the benchmark relies on"
+      "trajectory planned at 10 m/s but clamped to 5 m/s → trajectory covers only 40% of planned distance before timeout",
+      "fallback target jumps 34m at transition",
+      "no ILC offsets in visual_demo (benchmark has them)",
+      "benchmark.py still skips PyBullet sim"
     ],
-    "critic_findings": ["No high-severity issues in iter1 (logging-only change)"]
+    "critic_findings": ["No high-severity issues in iter2 reviews (manual). Codex MCP tools were unavailable."]
   },
   "success_criterion": "all 12 gates passed AND avg_tracking_error < 0.5m on pybullet visual_demo for 3 consecutive runs"
 }
