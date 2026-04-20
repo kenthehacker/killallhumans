@@ -264,14 +264,21 @@ class VisualDemo:
         rl_opt = RacingLineOptimizer()
         opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
 
-        profiler = SpeedProfiler(max_speed=10.0)
+        # Iteration 4 (race_01 regression fix): plan trajectory at 5 m/s to match
+        # the MAX_CMD_SPEED command clamp. Previously trajectory was planned at
+        # 10 m/s but command velocity was clamped to 5 m/s, causing the drone to
+        # lag the reference by 1-3m in the lateral axis and miss gates 2 and 3.
+        # Matching plan-speed to track-speed lets the drone actually follow the
+        # racing line through each gate center.
+        PLAN_MAX_SPEED = 5.0
+        profiler = SpeedProfiler(max_speed=PLAN_MAX_SPEED)
         self.wp_positions = [start_pos] + [g.position for g in opt_wps]
         self.speeds = profiler.profile(self.wp_positions)
         print(f"  Speed profile: min={min(self.speeds):.1f} max={max(self.speeds):.1f} m/s")
 
         print("Computing time-optimal trajectory...")
         traj_opt = TrajectoryOptimizer(
-            constraints=DroneConstraints(max_velocity=10.0),
+            constraints=DroneConstraints(max_velocity=PLAN_MAX_SPEED),
             dt_sample=0.02,
         )
         self.trajectory = traj_opt.optimize(opt_wps, start_pos, (0, 0, 0))
@@ -320,6 +327,11 @@ class VisualDemo:
             "target_vel_x", "target_vel_y", "target_vel_z",
             "tracking_error_m", "current_gate_id", "gates_passed",
             "target_source", "loop_dt_ms",
+            # Iter 4: gate-centering telemetry — distance to currently-targeted
+            # gate center (3D), and signed distance along gate normal (plane
+            # crossing = sign change). Lets us post-hoc measure how close the
+            # drone passes to gate center on each crossing.
+            "dist_to_current_gate_m", "signed_dist_to_gate_plane_m",
         ]
         self._csv_writer.writerow(self._csv_columns)
         self._csv_flush_counter = 0
@@ -365,11 +377,19 @@ class VisualDemo:
                 if nxt:
                     self.env.highlight_gate(nxt.gate_id)
 
+            # Iter 4: snapshot the pre-update target gate so the telemetry row
+            # written this frame reports the distance to the gate we are trying
+            # to cross, NOT the next one after sequencer.update advances the
+            # index (codex red-team catch from iter 4 review).
+            pre_update_target_gate = self.sequencer.current_gate
             new_passed = self.sequencer.update(pos)
             if new_passed:
+                # Report miss distance from gate center at pass time
+                gp = np.array(new_passed.position)
+                miss = float(np.linalg.norm(np.array(pos) - gp))
                 print(f"  PASSED {new_passed.gate_id} "
                       f"[{self.sequencer.gates_passed}/{self.sequencer.total_gates}] "
-                      f"t={sim_time:.2f}s")
+                      f"t={sim_time:.2f}s miss={miss:.2f}m")
 
             # 4. Termination checks
             if self.sequencer.is_complete:
@@ -432,8 +452,24 @@ class VisualDemo:
             self._loop_times.append(loop_dt)
 
             # 8b. CSV telemetry row
+            # Use the pre-update target gate for telemetry so pass-frame rows
+            # describe the crossing gate (not its successor). cur_gate_id still
+            # reports the post-update target so downstream dashboards keep the
+            # "which gate are we chasing now" semantic.
             cur_gate = self.sequencer.current_gate
             cur_gate_id = cur_gate.gate_id if cur_gate else "none"
+            tel_gate = pre_update_target_gate if pre_update_target_gate is not None else cur_gate
+            if tel_gate is not None:
+                gate_pos = np.array(tel_gate.position)
+                delta = np.array(pos) - gate_pos
+                dist_to_gate = float(np.linalg.norm(delta))
+                cy, sy = math.cos(tel_gate.yaw), math.sin(tel_gate.yaw)
+                cp, sp = math.cos(tel_gate.pitch), math.sin(tel_gate.pitch)
+                normal = np.array([cy * cp, sy * cp, sp])
+                signed_dist = float(np.dot(delta, normal))
+            else:
+                dist_to_gate = float("nan")
+                signed_dist = float("nan")
             self._csv_writer.writerow([
                 f"{sim_time:.4f}", self.env.step_count,
                 f"{pos[0]:.4f}", f"{pos[1]:.4f}", f"{pos[2]:.4f}",
@@ -445,6 +481,7 @@ class VisualDemo:
                 f"{target_vel[0]:.4f}", f"{target_vel[1]:.4f}", f"{target_vel[2]:.4f}",
                 f"{trk_err:.4f}", cur_gate_id, self.sequencer.gates_passed,
                 target_source, f"{loop_dt * 1000:.2f}",
+                f"{dist_to_gate:.4f}", f"{signed_dist:.4f}",
             ])
             self._csv_flush_counter += 1
             if self._csv_flush_counter % 240 == 0:

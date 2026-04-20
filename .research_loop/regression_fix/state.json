@@ -1,79 +1,78 @@
 {
-  "iteration": 4,
+  "iteration": 5,
   "status": "pending",
   "loop_name": "regression_fix",
   "max_iterations": 15,
   "started_at": "2026-04-16T00:00:00Z",
   "target_failure": "visual_demo race_01 missed gate-1 (flew past to end of map), passed gates 1-4 after turnaround at 20.79s, crashed at alt=0.04m after gate-4. avg_tracking_error=1.902m (prior passing run 0.159m). avg_loop_hz=2422 (prior 9517).",
-  "current_bottleneck": "smooth_fallback_transition",
+  "current_bottleneck": "helix_entry_tumble",
   "last_metrics": {
-    "gates_passed": 4,
+    "gates_passed": 6,
     "total_gates": 12,
-    "sim_time": 30.854,
-    "avg_tracking_error": 1.818,
-    "max_tracking_error": 4.682,
-    "p95_tracking_error": 3.806,
-    "avg_loop_hz": 3374,
+    "sim_time": 11.812,
+    "avg_tracking_error": 1.025,
+    "max_tracking_error": null,
+    "p95_tracking_error": null,
+    "avg_loop_hz": 3280,
     "crashed": true,
-    "crash_alt": 0.050,
-    "peak_ref_speed_ms": 10.00,
-    "peak_target_speed_ms": 5.00,
-    "peak_roll_deg": 179.78,
-    "peak_pitch_deg": 86.77,
-    "first_tilt_above_30deg_s": 0.271,
-    "first_ref_vel_above_5ms_s": 0.0,
-    "first_target_vel_above_5ms_s": 0.146,
-    "target_jump_count": 7,
-    "target_source_trajectory_pct": 46,
-    "target_source_fallback_pct": 54,
-    "csv_path": "logs/visual_demo_20260416_175631.csv"
+    "crash_alt": 0.040,
+    "crash_phase": "helix_entry_gate-7",
+    "peak_pitch_rad": 1.31,
+    "peak_roll_rad": 2.18,
+    "all_gates_passed_via": "trajectory",
+    "gate_miss_distances_m": {
+      "gate-1": 0.36,
+      "gate-2": 0.55,
+      "gate-3": 0.55,
+      "gate-4": 0.52,
+      "gate-5": 0.65,
+      "gate-6": 0.32
+    },
+    "csv_path": "logs/visual_demo_20260419_235213.csv"
   },
   "best_metrics": {
-    "gates_passed": 4,
+    "gates_passed": 6,
     "total_gates": 12,
-    "sim_time": 35.167,
-    "avg_tracking_error": 1.467,
-    "iteration": 2
+    "sim_time": 11.812,
+    "avg_tracking_error": 1.025,
+    "iteration": 4
   },
   "improvements_backlog": [
-    {"id": "smooth_fallback_transition", "priority": 1, "estimated_impact": "reduce target_jump from 34m to <2m, prevent crash", "rationale": "When sim_time > trajectory.total_time (14.3s), target jumps 34m from trajectory end (x=52) to gate-2 (x=18). A blend/ramp over 2-3s would prevent violent maneuvering. Now that polynomial velocities are clamped, this is the highest-impact remaining issue."},
-    {"id": "racing_line_gate_accuracy", "priority": 2, "estimated_impact": "gates 4→12 (progressive tracking unlocks all gates)", "rationale": "Iter 3 proved progressive tracking enables full-course navigation, but gate-2 is missed by 1.29m (needs <0.6m). Improving racing line to thread ALL gates within detection range would allow progressive tracking + extended fallback to complete the entire course."},
-    {"id": "ilc_offsets_in_visual_demo", "priority": 3, "estimated_impact": "~45% tracking error reduction", "rationale": "benchmark applies compute_ilc_offset_table, visual_demo does not"},
-    {"id": "enable_pybullet_in_benchmark", "priority": 4, "estimated_impact": "prevents future kinematic-only drift", "rationale": "benchmark_history shows simulation.skipped=true on every run — all 50 iterations optimized wrong target"},
-    {"id": "adaptive_lookahead", "priority": 5, "estimated_impact": "better trajectory following at varying speeds", "rationale": "0.3s fixed lookahead is conservative for slow segments and may overshoot on fast. Proportional to local curvature/speed would be better."},
-    {"id": "fallback_velocity_deceleration_profile", "priority": 6, "estimated_impact": "reduce tumble risk during gate approach", "rationale": "gate_fallback uses min(dist*2, 5.0) which commands high speed until very close. A gentler decel profile would prevent overshoot and tumble."},
-    {"id": "helix_altitude_stability", "priority": 7, "estimated_impact": "survive full helix section", "rationale": "Iter 3 progressive tracking showed drone crashing at t=25s in helix (alt 6.7→0.0m). Helix requires stable high-altitude flight with tight turns. May need reduced speed in helix or stronger altitude hold gains."}
+    {"id": "helix_entry_stabilization", "priority": 1, "estimated_impact": "gates 6→12 (unlock helix 7-12)", "rationale": "Drone tumbles on gate-6→gate-7 transition (54,0,2.5) → (52.5,4.3,3.5) — requires simultaneous -1.5m x, +4.3m y, +1m z within one trajectory segment. Peak pitch reaches 75° at t=11s. Need slower helix approach or better trajectory smoothing at this transition."},
+    {"id": "helix_trajectory_speed_profile", "priority": 2, "estimated_impact": "complete helix without tumble", "rationale": "Helix gates (7-12) are 3.6-5.7m apart with sharp turns + altitude gain. At 5 m/s some segments may need further reduction. Consider per-segment speed cap informed by curvature."},
+    {"id": "racing_line_cache_speed_key", "priority": 3, "estimated_impact": "prevents speed-mismatched cache consumption", "rationale": "Codex iter 4 review: racing_line_cache.json key ignores max_velocity. benchmark.py/smoke_test.py use 10-15 m/s, visual_demo now 5. If cache regenerated by benchmark, visual_demo would consume stale offsets. Add speed to cache key or invalidate on mismatch."},
+    {"id": "racing_line_select_by_sim_max_velocity", "priority": 4, "estimated_impact": "robustness under cache miss", "rationale": "Codex iter 4 review: _select_by_sim uses hardcoded DroneConstraints(max_velocity=15.0). On cache miss for a new track, line selection would assume 15 m/s. Parameterize to match downstream plan speed."},
+    {"id": "smooth_fallback_transition", "priority": 5, "estimated_impact": "eliminates 34m target jumps if fallback triggers", "rationale": "Fallback no longer triggers in iter 4 (trajectory now 19.9s covers all 12 gates), but if drone survives past trajectory end we still have the jump issue. Lower priority now."},
+    {"id": "ilc_offsets_in_visual_demo", "priority": 6, "estimated_impact": "~45% tracking error reduction", "rationale": "benchmark applies compute_ilc_offset_table, visual_demo does not"},
+    {"id": "enable_pybullet_in_benchmark", "priority": 7, "estimated_impact": "prevents future kinematic-only drift", "rationale": "benchmark_history shows simulation.skipped=true on every run"},
+    {"id": "adaptive_lookahead", "priority": 8, "estimated_impact": "better trajectory following at varying speeds", "rationale": "0.3s fixed lookahead"},
+    {"id": "fallback_velocity_deceleration_profile", "priority": 9, "estimated_impact": "reduce tumble risk during gate approach", "rationale": "gate_fallback uses min(dist*2, 5.0)"}
   ],
   "failed_approaches": [
     {"id": "position_based_fallback_condition", "iteration": 2, "description": "Changed fallback trigger from sim_time > total_time to closest.time >= total_time - 0.05. Drone stayed in trajectory mode indefinitely because speed clamp means it never reaches trajectory end. Gates dropped from 4→1. Reverted."},
-    {"id": "progressive_tracking_plus_3x_fallback", "iteration": 3, "description": "Progressive closest-point tracking [-20,+150] window + 3x total_time fallback extension. Drone followed entire trajectory (100% trajectory mode, peak_ref_speed 10.00 m/s) but sequential gate sequencer only detected gate-1 (gate-2 at 1.29m > 0.6m threshold). Crashed at t=25.2s in helix (alt 6.7→0.0m). Gates 4→1. Reverted visual_demo changes; kept polynomial velocity clamp in trajectory_optimizer.py."}
+    {"id": "progressive_tracking_plus_3x_fallback", "iteration": 3, "description": "Progressive closest-point tracking [-20,+150] window + 3x total_time fallback extension. Drone followed entire trajectory but sequencer only detected gate-1 (gate-2 at 1.29m > 0.6m threshold). Reverted visual_demo; kept polynomial velocity clamp in trajectory_optimizer.py."}
   ],
   "commits": [
-    {"iteration": 1, "sha": "3f747cf", "description": "CSV telemetry logging + --no-render flag", "gates_before": 4, "gates_after": 0, "note": "gate count diff is sim non-determinism, not code change"},
-    {"iteration": 2, "sha": "0819bc8", "description": "closest-point tracking + 5 m/s velocity clamp", "gates_before": 0, "gates_after": 4, "note": "gate-1 at 1.83s (was unreachable). Survives 35.2s (vs 8.8s). Crashes during fallback at t=35.2s."},
-    {"iteration": 3, "sha": "pending", "description": "polynomial velocity clamp in trajectory_optimizer.py (peak_ref_speed 16.84→10.00 m/s)", "gates_before": 4, "gates_after": 4, "note": "Correctness fix only — gates unchanged because fallback still dominates. Progressive tracking + 3x fallback attempted and reverted (gate regression 4→1)."}
+    {"iteration": 1, "sha": "3f747cf", "description": "CSV telemetry logging + --no-render flag", "gates_before": 4, "gates_after": 0, "note": "gate count diff is sim non-determinism"},
+    {"iteration": 2, "sha": "0819bc8", "description": "closest-point tracking + 5 m/s velocity clamp", "gates_before": 0, "gates_after": 4},
+    {"iteration": 3, "sha": "3a58e02", "description": "polynomial velocity clamp in trajectory_optimizer.py (peak_ref_speed 16.84→10.00 m/s)", "gates_before": 4, "gates_after": 4},
+    {"iteration": 4, "sha": "pending", "description": "match trajectory speed to cmd clamp (10→5 m/s) + gate-centering telemetry", "gates_before": 4, "gates_after": 6, "note": "All 6 via trajectory (no fallback). Miss distances 0.32-0.65m. avg_err 2.932→1.025m. Codex red-team P2 fix: pre-update gate snapshot for correct per-pass telemetry. Codex P1 (cache key speed-agnostic) noted in backlog — not a regression since race_01 cache hits."}
   ],
   "diagnostic": {
-    "root_cause": "Architectural: trajectory planned for 14.3s at 10 m/s, clamped to 5 m/s at command level. Drone traverses ~46% of trajectory before fallback triggers at t=14.3s. Fallback provides 54% of flight via direct-to-gate navigation with 34m target jumps. Polynomial velocity clamp (iter 3) fixed the reference speed issue but doesn't change the fundamental trajectory/fallback split.",
-    "telemetry_signals": [
-      "peak_ref_speed clamped to 10.00 m/s (was 16.84 m/s) — FIXED in iter 3",
-      "target_vel clamped to ≤5.0 m/s (CONFIRMED WORKING since iter 2)",
-      "gate-1 passed at t=1.85s via trajectory tracking",
-      "gates 2-4 passed via gate_fallback at t=19-27s",
-      "7 target jumps >2m (reduced from 9 in iter 2)",
-      "46% trajectory / 54% fallback mode split",
-      "tumble and crash at t~30s during fallback navigation"
+    "root_cause_iter4": "Trajectory planned at 10 m/s but cmd clamped to 5 m/s → drone lagged trajectory by 1-3m laterally → missed gates 2 and 3 by 1.45m and 3.49m. Fix: plan trajectory at 5 m/s (PLAN_MAX_SPEED). Trajectory now 19.9s (vs 14.3s) and covers the full course. Drone follows tight enough to pass gates 1-6 all at miss <0.66m.",
+    "new_root_cause": "Helix entry tumble: gate-6 (54,0,2.5) → gate-7 (52.5,4.3,3.5) requires simultaneous -1.5m x-reversal, +4.3m y-swing, +1.0m z-climb. The trajectory's min-snap polynomial can handle the path in space but the Crazyflie controller can't execute the body-rate demand, leading to pitch 75°/roll 125° tumble and altitude collapse.",
+    "telemetry_signals_iter4": [
+      "Trajectory 14.3s → 19.9s (5 m/s plan)",
+      "gates 1-6 all passed via trajectory mode",
+      "miss distances 0.32-0.65m (all within gate detection threshold 0.6m for pass_through_margin=1.0; some at edge)",
+      "crash at t=11.8s during gate-7 approach",
+      "pitch peaks 75° (1.31 rad), roll peaks 125° (2.18 rad)",
+      "avg_tracking_error 2.932 → 1.025 (65% reduction)"
     ],
-    "trend": "iter1→iter2: gates 0→4, survival 8.8→35.2s. iter2→iter3: gates 4→4, peak_ref_speed 16.84→10.00 m/s (correctness fix). Progressive tracking proved full-course navigation is possible but blocked by gate detection accuracy.",
-    "architectural_issues": [
-      "trajectory planned at 10 m/s but clamped to 5 m/s → trajectory covers only ~46% before timeout",
-      "fallback target jumps 34m at transition (7 jumps total)",
-      "racing line misses gate-2 by 1.29m (needs <0.6m for sequential detection)",
-      "helix section causes crash at high altitude (6.7→0.0m at t~25s)",
-      "no ILC offsets in visual_demo (benchmark has them)",
-      "benchmark.py still skips PyBullet sim"
-    ],
-    "critic_findings": ["Polynomial velocity clamp approved by both red-team and critic reviews. No high-severity issues."]
+    "critic_findings_iter4": [
+      "[P1] Racing line cache key ignores speed — cross-script risk (backlog)",
+      "[P2] Gate-centering telemetry snapshot fix applied (verified)"
+    ]
   },
   "success_criterion": "all 12 gates passed AND avg_tracking_error < 0.5m on pybullet visual_demo for 3 consecutive runs"
 }
