@@ -121,6 +121,7 @@ class GateSequencer:
         self,
         position: Tuple[float, float, float],
         gate_detected: bool = True,
+        detection_active: bool = True,
     ) -> Optional[GateSpec]:
         """
         Check if the drone has passed through the current gate.
@@ -128,6 +129,17 @@ class GateSequencer:
         Args:
             position: current drone position (NED)
             gate_detected: whether the current gate is being detected
+                this tick. Only meaningful when ``detection_active`` is
+                True; ignored otherwise.
+            detection_active: whether perception is actually running
+                this tick (camera frame available AND detector enabled).
+                When False, the dropout counter is reset rather than
+                incremented — a tick with no camera feed is not the
+                same thing as a tick where the detector looked and saw
+                nothing. Without this distinction, a competition run
+                that has no vision stream yet (mavlink_bridge returns
+                None for camera frames) would latch ``should_slow_down``
+                permanently after ~0.3 s of nominal flight.
 
         Returns:
             The gate that was just passed, or None
@@ -138,8 +150,14 @@ class GateSequencer:
         pos = np.array(position)
         passed_gate = None
 
-        # Track detection dropout
-        if gate_detected:
+        # Track detection dropout: only accrue the counter when the
+        # perception stack is actually running and failed to see the
+        # current gate. "No camera feed" must not trigger recovery-grade
+        # slowdown (the existing behaviour was a permanent 0.5×/0.7×
+        # scale latch once detection_dropout_frames ticks elapsed).
+        if not detection_active:
+            self._frames_without_detection = 0
+        elif gate_detected:
             self._frames_without_detection = 0
         else:
             self._frames_without_detection += 1

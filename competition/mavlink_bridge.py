@@ -99,10 +99,17 @@ class MAVLinkBridge(CompetitionInterface):
 
         self._connected = True
 
-        # Start telemetry subscriptions
+        # Start telemetry subscriptions.
+        # ``position_velocity_ned`` provides world-frame NED pose/vel
+        # directly; ``odometry`` is kept only as the source of body-frame
+        # angular velocity (which is the correct frame for that field).
+        # The earlier design tried to reuse ``odometry.position_body`` /
+        # ``velocity_body`` as NED, but MAVSDK explicitly documents those
+        # as body frame — feeding them into a world-frame estimator makes
+        # the EKF track a rotating coordinate frame.
         self._subscription_tasks = [
-            asyncio.create_task(self._subscribe_position_velocity()),
-            asyncio.create_task(self._subscribe_attitude()),
+            asyncio.create_task(self._subscribe_position_velocity_ned()),
+            asyncio.create_task(self._subscribe_odometry_attitude()),
             asyncio.create_task(self._subscribe_imu()),
         ]
 
@@ -201,37 +208,68 @@ class MAVLinkBridge(CompetitionInterface):
 
     # ── Telemetry subscriptions ──────────────────────────────────
 
-    async def _subscribe_position_velocity(self) -> None:
-        """Subscribe to position/velocity via ODOMETRY."""
-        async for odom in self._system.telemetry.odometry():
-            pos = odom.position_body
-            vel = odom.velocity_body
-            q = odom.q
+    async def _subscribe_position_velocity_ned(self) -> None:
+        """Subscribe to world-frame NED position and velocity."""
+        async for pv in self._system.telemetry.position_velocity_ned():
+            pos = pv.position
+            vel = pv.velocity
             ts = int(time.time() * 1e6)
 
-            self._latest_telem = TelemetryState(
-                timestamp_us=ts,
-                position_ned=(pos.x_m, pos.y_m, pos.z_m),
-                velocity_ned=(vel.x_m_s, vel.y_m_s, vel.z_m_s),
-                orientation=Quaternion(w=q.w, x=q.x, y=q.y, z=q.z),
-                angular_velocity=(
-                    odom.angular_velocity_body.roll_rad_s,
-                    odom.angular_velocity_body.pitch_rad_s,
-                    odom.angular_velocity_body.yaw_rad_s,
-                ),
-                imu=self._latest_imu,
-            )
-
-    async def _subscribe_attitude(self) -> None:
-        """Subscribe to attitude quaternion."""
-        async for attitude in self._system.telemetry.attitude_quaternion():
-            # Attitude updates are merged into the main telemetry state
-            # by the position/velocity subscription. This is a backup
-            # in case odometry doesn't include attitude.
-            if self._latest_telem is not None:
-                self._latest_telem.orientation = Quaternion(
-                    w=attitude.w, x=attitude.x, y=attitude.y, z=attitude.z
+            if self._latest_telem is None:
+                self._latest_telem = TelemetryState(
+                    timestamp_us=ts,
+                    position_ned=(pos.north_m, pos.east_m, pos.down_m),
+                    velocity_ned=(vel.north_m_s, vel.east_m_s, vel.down_m_s),
+                    orientation=Quaternion(w=1.0, x=0.0, y=0.0, z=0.0),
+                    angular_velocity=(0.0, 0.0, 0.0),
+                    imu=self._latest_imu,
                 )
+            else:
+                self._latest_telem.timestamp_us = ts
+                self._latest_telem.position_ned = (
+                    pos.north_m, pos.east_m, pos.down_m,
+                )
+                self._latest_telem.velocity_ned = (
+                    vel.north_m_s, vel.east_m_s, vel.down_m_s,
+                )
+                self._latest_telem.imu = self._latest_imu
+
+    async def _subscribe_odometry_attitude(self) -> None:
+        """Subscribe to ODOMETRY for attitude quaternion + body-frame rates.
+
+        ODOMETRY's quaternion (``q``) is world→body rotation (fine to
+        publish) and ``angular_velocity_body`` is already body-frame,
+        which is what ``TelemetryState.angular_velocity`` semantically
+        carries. We intentionally do NOT use ``position_body`` /
+        ``velocity_body`` here — those are body-frame and would corrupt
+        the world-frame NED fields populated in the stream above.
+        """
+        async for odom in self._system.telemetry.odometry():
+            q = odom.q
+            if self._latest_telem is None:
+                # position_velocity_ned() hasn't ticked yet; stage the
+                # orientation + rates to be picked up on the next tick.
+                self._latest_telem = TelemetryState(
+                    timestamp_us=int(time.time() * 1e6),
+                    position_ned=(0.0, 0.0, 0.0),
+                    velocity_ned=(0.0, 0.0, 0.0),
+                    orientation=Quaternion(w=q.w, x=q.x, y=q.y, z=q.z),
+                    angular_velocity=(
+                        odom.angular_velocity_body.roll_rad_s,
+                        odom.angular_velocity_body.pitch_rad_s,
+                        odom.angular_velocity_body.yaw_rad_s,
+                    ),
+                    imu=self._latest_imu,
+                )
+                continue
+            self._latest_telem.orientation = Quaternion(
+                w=q.w, x=q.x, y=q.y, z=q.z,
+            )
+            self._latest_telem.angular_velocity = (
+                odom.angular_velocity_body.roll_rad_s,
+                odom.angular_velocity_body.pitch_rad_s,
+                odom.angular_velocity_body.yaw_rad_s,
+            )
 
     async def _subscribe_imu(self) -> None:
         """Subscribe to high-rate IMU data."""

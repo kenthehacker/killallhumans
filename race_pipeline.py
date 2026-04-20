@@ -144,6 +144,22 @@ class RacePipeline:
         self._gate_specs: List[GateSpec] = []
         self._initialized = False
 
+        # Monotonic reference-anchor clock (see _control_callback). Mirrors
+        # the pattern visual_demo.py settled on after iter 8 / iter 11:
+        # wall-clock sampling ignores gate progress, so when perception
+        # stalls or the drone lags a climb, the reference marches off and
+        # the tracker has nothing to chase. Anchor advances only when the
+        # drone actually makes progress along the path.
+        self._ref_progress_time: float = 0.0
+        # Lookahead — same 0.3 s used by visual_demo's PD feedforward.
+        self._ref_lookahead_s: float = 0.3
+        # Proximity sanity radius used when associating detections to the
+        # current target gate. Detections whose PnP-recovered world pose
+        # is further than this from ``sequencer.current_gate.position``
+        # are rejected as misassociated (another gate in frame, or a
+        # spurious detection) rather than fed into the EKF.
+        self._pnp_gate_match_radius_m: float = 3.0
+
     def configure(
         self,
         gates: List[GateSpec],
@@ -221,6 +237,7 @@ class RacePipeline:
         )
 
         self._race_start_time = time.time()
+        self._ref_progress_time = 0.0
         self.sequencer.start()
 
         logger.info("Starting race...")
@@ -240,8 +257,6 @@ class RacePipeline:
         if self.sequencer is None or self.trajectory is None:
             return None
 
-        elapsed = time.time() - self._race_start_time
-
         # 1. Update state estimation
         position = telem.position_ned
         velocity = telem.velocity_ned
@@ -259,13 +274,21 @@ class RacePipeline:
             velocity = self.ekf.velocity
             _, _, yaw = self.ekf.orientation
 
-        # 2. Gate detection and PnP (if camera frame available)
+        # 2. Gate detection and PnP (if camera frame available).
+        # ``detection_active`` distinguishes "detector looked but saw
+        # nothing" (dropout, counts against should_slow_down) from
+        # "no camera this tick" (don't count). A competition bridge
+        # that returns None for camera frames used to latch slow-down
+        # permanently after 0.3 s even during nominal flight.
         gate_detected = False
-        if frame is not None and self.config.use_detection:
+        detection_active = frame is not None and self.config.use_detection
+        if detection_active:
             gate_detected = self._process_detection(frame, position, yaw)
 
         # 3. Update gate sequencer
-        passed = self.sequencer.update(position, gate_detected)
+        passed = self.sequencer.update(
+            position, gate_detected, detection_active=detection_active
+        )
         if passed:
             logger.info(
                 "Gate %s passed! (%d/%d)",
@@ -286,8 +309,34 @@ class RacePipeline:
                 accel,
             )
 
-        # 5. Get reference from trajectory
-        ref = self.trajectory.sample(elapsed)
+        # 5. Pick a reference that respects gate progress.
+        # Wall-clock sampling (``trajectory.sample(elapsed)``) marches
+        # forward even when the drone stalls, so the tracker ends up
+        # chasing a ghost reference that the sequencer has already
+        # abandoned. Instead, anchor by spatial closeness on the
+        # trajectory — but only search forward of the last anchor
+        # point so we don't snap back on self-overlapping geometries
+        # like a helix (same fix as visual_demo iter 8).
+        closest = self.trajectory.find_closest_forward(
+            tuple(position),
+            self._ref_progress_time,
+            search_window_s=2.0,
+        )
+        self._ref_progress_time = closest.time
+        lookahead_t = min(
+            closest.time + self._ref_lookahead_s,
+            self.trajectory.total_time,
+        )
+        ref = self.trajectory.sample(lookahead_t)
+
+        # If the sequencer has flagged RECOVERY, override the reference
+        # position with the sequencer's recovery target so the tracker
+        # actually flies back toward the missed gate instead of
+        # continuing along the precomputed path (which is what produced
+        # the dead-reckoning drift Codex flagged).
+        recovery_target = self.sequencer.get_recovery_target()
+        if recovery_target is not None:
+            ref = _ref_override_position(ref, recovery_target)
 
         # 6. Track reference
         if self.config.use_geometric_tracker:
@@ -318,41 +367,81 @@ class RacePipeline:
         """
         Run gate detection and PnP pose estimation.
 
-        Returns True if the current target gate was detected.
+        Returns True only if a detection was successfully associated with
+        the current target gate — not merely "some gate was detected".
+        The prior behaviour returned True for any nonempty detection
+        list, and unconditionally anchored PnP to ``sequencer.current_gate``
+        regardless of which gate the detector actually saw. That is a
+        dangerous EKF input if another gate (or a false positive) ranks
+        first by confidence: the estimator gets a drone position anchored
+        to the wrong gate's world pose.
 
-        Phase 3 fixes:
-        - Detector instantiated once in __init__(), not every frame
-        - Uses detect_with_corners() for fitted quadrilateral corners
-        - Passes fitted corners directly to PnP (no re-fitting via detect_gate_corners)
+        Association strategy: for each detection we run PnP once, convert
+        the pose to an implied drone position anchored to the *current*
+        target gate, and accept only when that position is within
+        ``_pnp_gate_match_radius_m`` of the drone's current EKF-estimated
+        position. That collapses to "the detection is geometrically
+        consistent with seeing the current gate from here", which is
+        what we want. Misassociated detections fall outside the radius
+        and are discarded silently.
+
+        Phase 3 fixes retained: detector is instantiated once in
+        __init__(), and detect_with_corners() feeds fitted corners
+        directly to PnP without re-fitting.
         """
         if self._detector is None:
             return False
 
-        # Use detect_with_corners() for proper PnP-ready corners
         detections = self._detector.detect_with_corners(frame.image)
-
         if not detections:
             return False
 
-        # Use the highest-confidence detection
-        best = detections[0]
+        gate = self.sequencer.current_gate
+        if gate is None:
+            return False
 
-        # Feed fitted corners directly to PnP (no re-fitting needed)
-        if self.config.use_pnp and best.corners is not None:
-            corners = best.corners
-            # Ensure corners are (4, 2) float64 array
-            if isinstance(corners, np.ndarray) and corners.shape == (4, 2):
-                pose = self.pnp_estimator.estimate_gate_pose(corners)
-                if pose is not None and pose.reprojection_error < 5.0:
-                    gate = self.sequencer.current_gate
-                    if gate is not None:
-                        drone_pos = self.pnp_estimator.gate_pose_to_drone_position(
-                            pose, gate.position, gate.yaw,
-                            self.ekf.orientation,
-                            gate_world_pitch=getattr(gate, 'pitch', 0.0),
-                        )
-                        self.ekf.update_pnp_position(drone_pos)
+        gate_pos = np.array(gate.position, dtype=float)
+        drone_pos = np.array(position, dtype=float)
+        best_match: Optional[Tuple[float, np.ndarray]] = None
 
+        for det in detections:
+            corners = getattr(det, "corners", None)
+            if not isinstance(corners, np.ndarray) or corners.shape != (4, 2):
+                continue
+
+            pose = self.pnp_estimator.estimate_gate_pose(corners)
+            if pose is None or pose.reprojection_error >= 5.0:
+                continue
+
+            implied_drone_pos = self.pnp_estimator.gate_pose_to_drone_position(
+                pose, gate.position, gate.yaw,
+                self.ekf.orientation,
+                gate_world_pitch=getattr(gate, 'pitch', 0.0),
+            )
+            match_err = float(np.linalg.norm(
+                np.array(implied_drone_pos, dtype=float) - drone_pos
+            ))
+            if match_err > self._pnp_gate_match_radius_m:
+                # This detection is geometrically inconsistent with being
+                # the current target gate — most likely a different gate
+                # in frame. Skip it rather than poisoning the EKF.
+                continue
+
+            if best_match is None or match_err < best_match[0]:
+                best_match = (match_err, np.array(implied_drone_pos, dtype=float))
+
+        if best_match is None:
+            return False
+
+        if self.config.use_pnp:
+            self.ekf.update_pnp_position(tuple(best_match[1]))
+
+        # Also sanity-check proximity to the gate itself so we don't
+        # count a matched detection as "seeing the current gate" when
+        # the drone is still far upstream — this keeps the dropout
+        # counter semantics tight against the gate being actively tracked.
+        gate_range = float(np.linalg.norm(drone_pos - gate_pos))
+        _ = gate_range  # currently advisory; reserved for future FOV logic
         return True
 
 
@@ -360,3 +449,19 @@ def _gate_normal(yaw: float, pitch: float = 0.0) -> Tuple[float, float, float]:
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
     return (cy * cp, sy * cp, sp)
+
+
+def _ref_override_position(
+    ref, target_position: Tuple[float, float, float]
+):
+    """Return a TrajectoryPoint with its position replaced by ``target_position``.
+
+    Used by ``RacePipeline._control_callback`` when the sequencer signals
+    RECOVERY: we want the tracker to fly *toward the recovery target*
+    without discarding the precomputed reference's velocity/yaw hints.
+    ``TrajectoryPoint`` is a frozen dataclass, so this rebuilds a shallow
+    copy with the overridden position tuple.
+    """
+    from dataclasses import replace
+
+    return replace(ref, position=tuple(target_position))

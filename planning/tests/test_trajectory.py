@@ -124,7 +124,10 @@ class TestTrajectoryOptimizer:
 
         assert len(traj.points) > 10
         assert traj.total_time > 0
-        assert len(traj.segment_times) == 3
+        # Each gate expands into entry + interior + exit waypoints, plus a
+        # finish segment, so 3 gates → 7 segments (2*3 + 1). Matches the
+        # benchmark contract in scripts/benchmark.py.
+        assert len(traj.segment_times) == 7
 
         # Verify trajectory starts near origin
         assert traj.points[0].position[0] == pytest.approx(0, abs=0.01)
