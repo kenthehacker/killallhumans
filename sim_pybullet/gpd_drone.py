@@ -136,6 +136,7 @@ class GPDDrone:
         target_pos: Tuple[float, float, float],
         target_vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         target_yaw: float = 0.0,
+        target_acc: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         """
         Compute tilt-safe motor RPMs and advance physics by one control timestep.
@@ -143,6 +144,15 @@ class GPDDrone:
         Position + velocity errors → target thrust vector (horizontal component
         clamped to ≤35 degrees of tilt) → target Euler angles → RPMs via
         DSLPIDControl attitude controller → CtrlAviary physics step.
+
+        ``target_acc`` is an optional acceleration feedforward (m/s², world
+        frame). When supplied, the required inertial force (``m·a_ref``) is
+        added directly to the target thrust — so the PD loop only has to
+        correct tracking errors rather than drive the entire reference
+        acceleration. On curved trajectories this removes the
+        ``ε = m·a_centripetal / kp`` steady-state cross-track error that
+        the pure PD controller otherwise accumulates (Mellinger & Kumar
+        2011 §IV; Tal & Karaman 2018 §III).
         """
         sv = self._env._getDroneStateVector(0)
         cur_pos = sv[0:3]
@@ -174,10 +184,17 @@ class GPDDrone:
         # --- Target thrust vector (Newtons, world frame) ---
         # Same PD structure as DSLPIDControl._dslPIDPositionControl but with
         # horizontal component clamped to prevent extreme tilt angles.
+        # ``GRAVITY`` here is already ``mass * g`` in Newtons (0.2646 N for
+        # the CF2X), so the drone mass is ``GRAVITY / g``. We use that to
+        # convert the acceleration-feedforward term (m/s²) into Newtons
+        # before adding it to the thrust command.
+        mass_kg = self._ctrl.GRAVITY / 9.81
+        ff_acc = np.array(target_acc, dtype=float)
         target_thrust = (
             self._ctrl.P_COEFF_FOR * pos_e
             + self._ctrl.D_COEFF_FOR * vel_e
             + np.array([0.0, 0.0, self._ctrl.GRAVITY])
+            + mass_kg * ff_acc
         )
 
         # Clip horizontal thrust so tilt stays within _MAX_TILT_RAD.

@@ -1,18 +1,18 @@
 {
-  "iteration": 8,
+  "iteration": 9,
   "status": "pending",
   "loop_name": "regression_fix",
   "max_iterations": 15,
   "started_at": "2026-04-16T00:00:00Z",
   "target_failure": "PRD 2_prd.md: primary off-angle-gate issue SOLVED. Remaining: avg_tracking_error < 0.5m (at 0.665m).",
   "primary_prd_objective": "RESOLVED — all 12 gates passed 3 consecutive deterministic runs, WITHOUT false-positive proximity credits. Gate-10 (the off-angle gate) passes at miss=0.48m, genuinely inside the 0.6m half-opening.",
-  "remaining_objective": "avg_tracking_error < 0.5m (iter 8 honest: 0.665m, iter 7 false-metric: 0.985m)",
+  "remaining_objective": "avg_tracking_error < 0.5m (iter 8 honest: 0.665m, iter 9 confirmed ceiling)",
   "last_metrics": {
     "gates_passed": 12,
     "total_gates": 12,
     "sim_time": 63.417,
     "avg_tracking_error": 0.665,
-    "avg_loop_hz": 3700,
+    "avg_loop_hz": 3373,
     "crashed": false,
     "complete": true,
     "determinism_runs": 3,
@@ -26,7 +26,16 @@
       "gate-5": 0.70, "gate-6": 0.56, "gate-7": 0.49, "gate-8": 0.77,
       "gate-9": 0.77, "gate-10": 0.48, "gate-11": 0.57, "gate-12": 1.17
     },
-    "notes": "Gate-12 miss=1.17m is late-credit-via-proximity after drone already crossed the opening; plane-crossing-only run gives miss=0.07m (confirmed deterministic)."
+    "csv_tracking_profile": {
+      "t_0_5_s": 0.423,
+      "t_5_10_s": 0.658,
+      "t_10_15_s": 0.791,
+      "t_15_20_s": 0.836,
+      "t_20_45_s": 0.66,
+      "t_45_50_s": 1.705,
+      "gate_fallback_t_50_63_s": 9.2
+    },
+    "notes": "Gate-12 miss=1.17m is late-credit-via-proximity after drone already crossed the opening. Trajectory-tracking phase spans t=0-47.6s (2283 frames); t=10-47.6s is drone-stalled/limping (target_source still 'trajectory') contributing 0.6-1.7m frames; t=50-63s is gate_fallback excluded from metric."
   },
   "best_metrics": {
     "gates_passed": 12,
@@ -36,39 +45,46 @@
     "iteration": 8,
     "commit": "ced3aa5 (with 333e099 + e836570)"
   },
-  "commits_iter8": [
-    {"sha": "333e099", "description": "sequencer proximity-respects-opening (false-positive fix)", "gates_after": 9, "avg_err": "8+ (metric broken post-fallback)"},
-    {"sha": "e836570", "description": "find_closest_forward + monotonic anchor + hybrid fallback", "gates_after": 12, "avg_err": 2.58, "note": "gates 7-10 miss 0.48-0.77m (honest through-opening)"},
-    {"sha": "ced3aa5", "description": "tracking_error metric: gate on target_source (not _ref_progress_time)", "gates_after": 12, "avg_err": 0.665}
+  "commits_iter9": [
+    {"sha": "(pending)", "description": "gpd_drone.py: expose target_acc parameter — infrastructure for future PyBullet-native FF/ILC. No behavioral change at default (0,0,0).", "gates_after": 12, "avg_err": 0.665}
   ],
-  "iter8_things_tried_and_regressed": [
-    {"id": "helix_interior_inflate_1.08", "result": "crash at t=21s (6/12)", "note": "Under new monotonic tracker, slower reference changes polynomial shape into one controller cannot follow."},
-    {"id": "helix_interior_inflate_1.12", "result": "crash at t=27s (6/12)"},
-    {"id": "plan_max_speed_3.5", "result": "crash at gate-6→7 transition (6/12)"},
-    {"id": "plan_max_speed_3.8", "result": "crash at t=12s (6/12)"},
-    {"id": "max_lateral_offset_0.75", "result": "crash at t=23s (4/12)", "note": "wider racing line corner-cut exceeds controller capability."},
-    {"id": "lookahead_0.5s", "result": "crash at t=56s (5/12)"},
-    {"id": "lookahead_0.2s", "result": "crash at gate-7 entry (6/12)"},
-    {"id": "lookahead_0.25s", "result": "crash at t=24s (6/12)"},
-    {"id": "ilc_offsets_max_correction_0.15", "result": "crash at gate-7 entry (6/12)", "note": "ILC tuned vs kinematic sim (kp=6, kd=4, max_accel=15); PyBullet CF2X cross-track bias differs. Sign does not transfer."},
-    {"id": "ilc_offsets_max_correction_0.10", "result": "crash at t=11.8s (6/12)"},
-    {"id": "ilc_offsets_max_correction_0.05", "result": "ILC did not converge, fallback to no correction", "note": "Result = baseline 12/12 + 0.665m."}
+  "iter9_things_tried_and_regressed": [
+    {"id": "centripetal_3d_K_0.05", "result": "6/12, crash at t=14.7s gate-6 entry", "note": "Full 3D offset too aggressive; vertical component tangles altitude loop."},
+    {"id": "centripetal_3d_K_0.02", "result": "8/12, crash at t=18.2s post gate-8", "note": "Drone actually tracks helix (gate-7 at t=13s vs baseline t=51s) but oversteers gate-10."},
+    {"id": "centripetal_3d_K_0.01", "result": "6/12, crash at t=11.7s gate-6 entry", "note": "Non-monotonic — smaller K destabilizes differently (offset is large enough to push, too small to enter correctly)."},
+    {"id": "centripetal_horiz_K_0.02_MAX_0.15", "result": "9/12, crash t=27s post gate-9 (gate-10 entry)", "note": "Drone passes gates 7/8/9 at clean miss 0.62/0.53/0.67 but crashes at the off-angle gate-10 transition."},
+    {"id": "centripetal_horiz_K_0.015", "result": "6/12, crash at t=11.9s helix entry", "note": "Similar to K=0.01 — instability zone between the working K=0.02 and safe K=0."},
+    {"id": "centripetal_horiz_K_0.02_gated_<6_gates", "result": "7/12, crash t=18.6s post gate-7", "note": "Applying offset ONLY to gates 0-5 still speeds drone into helix → crashes at gate-8."},
+    {"id": "centripetal_horiz_K_0.02_gated_<7_gates", "result": "8/12, crash t=22.9s", "note": "Offset off immediately after gate-7 pass leaves drone without momentum for helix."},
+    {"id": "centripetal_horiz_K_0.02_gated_<8_gates", "result": "11/12, crash t=26.96s before gate-12", "note": "Best sub-12 result. Gates 9/10/11 at 0.62/0.59/0.78 miss (vs baseline 0.77/0.48/0.57). But metric is 0.714m (INFLATED — offset shifts target_pos away from ref, so |drone-ref| measures offset not tracking quality)."},
+    {"id": "centripetal_horiz_K_0.02_gated_<9_gates", "result": "9/12, crash t=27s gate-10 entry", "note": "Offset through gate-9 pass destabilizes gate-10 approach."},
+    {"id": "accel_ff_gain_1.0_clamp_20", "result": "6/12 crash t=18.7s", "note": "Added target_acc → gpd_drone.py adds m·a to target_thrust. Full gain at min-snap polynomial boundaries produces attitude-command spikes controller can't track."},
+    {"id": "accel_ff_gain_0.5_clamp_5", "result": "6/12 crash t=11.9s helix entry, 0.526m tracking in first 11s", "note": "Tracking error DROPPED pre-helix but helix destabilized. Attitude-tilt-clamp saturation at segment boundaries."},
+    {"id": "accel_ff_gain_0.3_clamp_3", "result": "6/12 crash t=11.9s helix entry, 0.586m", "note": "Same helix-entry failure mode."},
+    {"id": "accel_ff_gain_0.2_clamp_1.5", "result": "6/12 crash t=13.8s helix entry, 0.947m", "note": "Even minimal gain breaks helix entry."},
+    {"id": "accel_ff_z_only_gain_0.5", "result": "6/12 crash t=13.9s helix entry, 0.851m", "note": "Vertical-only FF still destabilizes altitude loop during helix climb."},
+    {"id": "max_compression_helix_0.72_to_0.85", "result": "6/12 crash t=17.1s", "note": "Slowing helix changes min-snap polynomial shape → new trajectory is not the one the PD controller is tuned for."},
+    {"id": "P_COEFF_FOR_xy_0.4_to_0.6", "result": "7/12 crash t=16.3s, pre-helix gates at 0.51/0.47m miss", "note": "Tighter P gain dramatically improves gates 1-5 tracking (0.72→0.51 on gate-3, 0.68→0.47 on gate-4). Crashes at gate-8 because drone now catches up to helix and oversteers off-angle gate-10 entry."},
+    {"id": "P_COEFF_FOR_xy_0.4_to_0.5", "result": "7/12 crash, similar pre-helix improvement", "note": "Same failure mode — drone matches helix speed and crashes at off-angle gate."},
+    {"id": "P_COEFF_FOR_xy_0.4_to_0.45", "result": "7/12 crash t=13.6s, pre-helix gates at 0.54/0.48/0.61/0.60/0.81/0.63m", "note": "Minimal gain tweak still destabilizes — gate-5 miss 0.81m indicates oscillation onset."}
   ],
-  "lessons_learned_iter8": [
-    "The ``find_closest()`` global-argmin pattern is a textbook tracking bug on self-looping trajectories (helix, figure-8). Codex confirmed same pattern exists in scripts/benchmark.py:431 — should be ported there too.",
-    "After the monotonic-forward tracker fix, the parameter regime that previously tolerated helix_interior_inflate=1.08 no longer does. The tracker change alters which trajectory shapes are feasible; tuning from the false-positive era does not transfer.",
-    "ILC offsets from benchmark.py's kinematic sim do not transfer to PyBullet CF2X. The cross-track bias direction is apparently different. Porting ILC requires running it inside a PyBullet sim (much slower offline calibration).",
-    "``max_correction_m`` in compute_ilc_offset_table is a per-iteration clamp but the final cumulative offset can exceed it (observed: max_correction_m=0.15 → final max offset 0.225m).",
-    "``avg_tracking_error`` metric must gate on the ACTUAL target_source (trajectory vs gate_fallback), not on ``_ref_progress_time < total_time`` — otherwise the long helix-stall wall-clock time where drone is navigating via fallback but anchor hasn't reached total_time inflates the metric 4x."
+  "lessons_learned_iter9": [
+    "Baseline 12/12 + 0.665m is a FRAGILE EQUILIBRIUM. The 0.665m tracking error includes 36+ seconds of stall/limbo frames (t=10-47.6s) where target_source=='trajectory' but drone is stuck near gate-6 area waiting for the sim_time>2×total_time fallback trigger. Clean-tracking phase (t=0-10s) measures 0.4-0.7m — already near the 0.5m target on a per-frame basis.",
+    "ANY tracking improvement (centripetal offset, acceleration FF, tighter P gain, slower helix) fails gate-10 because the primary-PRD resolution depends on the drone stalling first. Stall → fallback → slow direct navigation → gate-10 passes at miss=0.48m. If drone tracks helix at design speed, it arrives at gate-10 too fast for the 82° off-normal pivot.",
+    "Acceleration feedforward via target_thrust += m·a_ref CANNOT be turned up without destabilizing the DSLPIDControl tilt-clamped thrust vector. At min-snap polynomial segment boundaries, a_ref has near-discontinuous spikes → attitude command spikes → attitude controller saturates → altitude loss → crash. Needs either a smoothed a_ref (low-pass filter) or a segment-aware FF gain schedule.",
+    "Tighter position gain kp_xy (0.4→0.6) dramatically improves pre-helix tracking (gate-3 miss 0.72→0.51, gate-4 miss 0.68→0.47) but the improvement is uniform across the race — which is exactly what overshoots the fragile helix-entry equilibrium.",
+    "The 'tracking error' metric as defined (|drone_pos - closest.position| where closest is on the ORIGINAL trajectory) actively penalizes approaches that shift target_pos away from ref. Centripetal position offset via target_pos += K·a_perp would need a correspondingly shifted metric to measure tracking quality — otherwise the metric measures the offset magnitude, not the tracking quality.",
+    "The 0.665m→<0.5m gap is genuinely STRUCTURAL. It requires ONE of: (a) joint fix of gate-10 structural issue (TOGT or Mellinger tangent constraints on min-snap) AND removing the stall, OR (b) metric refinement to separate 'clean trajectory tracking' phases from 'stalled/limbo' phases, OR (c) a smoothed acceleration-FF + per-segment gain schedule (not tractable in a single iteration)."
   ],
   "improvements_backlog_remaining": [
-    {"id": "apply_find_closest_forward_to_benchmark", "priority": 1, "rationale": "Codex cross-validation: same find_closest pattern in scripts/benchmark.py has the same bug."},
-    {"id": "pybullet_ilc_offline_calibration", "priority": 2, "rationale": "Run the ILC loop inside PyBullet (not kinematic sim) so the offsets match actual CF2X cross-track bias. Offline tool; resulting table cached to disk."},
-    {"id": "togt_in_gate_traversal_point", "priority": 3, "source": "Qin 2024 arXiv:2309.06837", "rationale": "Pre-optimize each gate's in-gate traversal point (2 free vars per gate, inside opening) to minimize turn angle. Directly addresses the off-normal helix gates."},
-    {"id": "mellinger_tangent_constraints", "priority": 4, "source": "Mellinger & Kumar 2011", "rationale": "Constrain polynomial velocity direction at helix waypoints to the racing tangent, preserving min-snap smoothness while forcing proper normal crossing."},
-    {"id": "per_segment_speed_profile_helix_only", "priority": 5, "rationale": "Tested global PLAN_MAX_SPEED reductions — all crashed. A helix-only speed reduction (not touching the gate-6→gate-7 transition) might work. Would need per-segment profile override."},
-    {"id": "reduce_closest_search_window_s_param", "priority": 6, "rationale": "Codex flagged 2s search window may alias if drone jumps >2s forward. Not observed but adding a monotonicity-only fallback (no window limit) would eliminate the theoretical edge case."},
-    {"id": "config_driven_parameter_move", "priority": 7, "rationale": "random_thoughts_answers.md: move course-specific magic numbers (helix_*_inflate, max_compression_helix, PLAN_MAX_SPEED, max_lateral_offset, proximity_pass_distance, smoothness_weight) into per-race JSON. Currently all live in code, tuned only for race_01."}
+    {"id": "togt_in_gate_traversal_point", "priority": 1, "source": "Qin 2024 arXiv:2309.06837", "rationale": "Pre-optimize each gate's in-gate traversal point (2 free vars per gate, inside opening) to minimize turn angle. Directly addresses the off-normal gate-10 that forces the baseline stall. Would let the drone track the helix at design speed AND enter gate-10 correctly. Prerequisite for any tracking improvement."},
+    {"id": "mellinger_tangent_constraints", "priority": 2, "source": "Mellinger & Kumar 2011", "rationale": "Constrain polynomial velocity direction at helix waypoints to the racing tangent, preserving min-snap smoothness while forcing proper normal crossing. Simpler code change than TOGT."},
+    {"id": "pybullet_ilc_offline_calibration", "priority": 3, "rationale": "Run ILC inside PyBullet (not the kinematic benchmark) so the offsets match actual CF2X cross-track bias. Use the new gpd_drone.target_acc hook (iter 9 infra) to apply cached ILC offsets at runtime."},
+    {"id": "segment_aware_accel_ff", "priority": 4, "rationale": "Apply target_acc FF with a gain schedule that ramps to 0 at each waypoint ± 0.1s (where min-snap has polynomial-boundary accel spikes), full gain in the middle of segments. Requires waypoint-time injection into the control loop."},
+    {"id": "smoothed_accel_ff_butterworth", "priority": 5, "rationale": "Apply a 2nd-order Butterworth low-pass to ref.acceleration (cutoff 2 Hz) to smooth min-snap boundary discontinuities before passing as target_acc. Simpler than segment-aware but less precise."},
+    {"id": "apply_find_closest_forward_to_benchmark", "priority": 6, "rationale": "Codex cross-validation: same find_closest pattern in scripts/benchmark.py has the same bug."},
+    {"id": "reduce_closest_search_window_s_param", "priority": 7, "rationale": "Codex flagged 2s search window may alias if drone jumps >2s forward. Not observed but adding a monotonicity-only fallback (no window limit) would eliminate the theoretical edge case."},
+    {"id": "config_driven_parameter_move", "priority": 8, "rationale": "random_thoughts_answers.md: move course-specific magic numbers into per-race JSON. Currently all live in code, tuned only for race_01."}
   ],
   "failed_approaches_all_iters": [
     {"id": "position_based_fallback_condition", "iteration": 2},
@@ -79,8 +95,15 @@
     {"id": "lookahead_0.0_closest_point_tracking", "iteration": 7},
     {"id": "helix_interior_inflate_1.08", "iteration": "7 and 8 (different regimes)"},
     {"id": "tangent_aligned_entry_exit", "iteration": 7, "note": "codex P0 rejected"},
-    {"id": "ilc_direct_port_from_benchmark", "iteration": 8, "note": "kinematic-vs-PyBullet mismatch"}
+    {"id": "ilc_direct_port_from_benchmark", "iteration": 8, "note": "kinematic-vs-PyBullet mismatch"},
+    {"id": "centripetal_position_offset_all_variants", "iteration": 9, "note": "9 K-sweep + gating variants; best 11/12 with inflated metric."},
+    {"id": "acceleration_feedforward_naive", "iteration": 9, "note": "All gains destabilize DSLPIDControl tilt-clamp at min-snap boundaries."},
+    {"id": "raise_max_compression_helix", "iteration": 9, "note": "0.72→0.85 changes polynomial shape; drone can't track the new trajectory."},
+    {"id": "raise_P_COEFF_FOR_xy", "iteration": 9, "note": "0.4→0.45/0.5/0.6 tightens pre-helix tracking but breaks helix-entry equilibrium."}
+  ],
+  "iter9_infrastructure_added": [
+    {"file": "sim_pybullet/gpd_drone.py", "change": "GPDDrone.step() now accepts optional target_acc parameter (default (0,0,0), backward compatible). When non-zero, adds m·target_acc to the target thrust vector — the standard Mellinger/Tal-Karaman acceleration feedforward. Unused at iter 9 but available for future iterations pursuing the backlog items (PyBullet-native ILC, segment-aware FF, smoothed accel-FF).", "behavioral_change": false}
   ],
   "success_criterion": "all 12 gates passed AND avg_tracking_error < 0.5m on pybullet visual_demo for 3 consecutive runs",
-  "current_gap_to_success": "avg_tracking_error 0.665m vs target 0.5m (0.165m over); all other criteria met."
+  "current_gap_to_success": "avg_tracking_error 0.665m vs target 0.5m (0.165m over); all other criteria met. Gap is structural, not tunable — see lessons_learned_iter9."
 }
