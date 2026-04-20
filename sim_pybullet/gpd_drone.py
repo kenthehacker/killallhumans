@@ -111,6 +111,12 @@ class GPDDrone:
         # GRAVITY here = mass * g = 0.265 N.
         self._max_horiz_thrust = self._ctrl.GRAVITY * math.tan(_MAX_TILT_RAD)
 
+        # Drone mass (kg). DSLPIDControl exposes only the mass*g term
+        # as ``self._ctrl.GRAVITY``; divide by g to recover the scalar.
+        # Cached here so feedforward callers (``step(target_acc=...)``) don't
+        # have to repeat the divide every control tick.
+        self.mass_kg: float = self._ctrl.GRAVITY / 9.81
+
         self.step_count: int = 0
         # FPV camera matrix cache
         self._last_view_matrix: Optional[np.ndarray] = None
@@ -184,17 +190,15 @@ class GPDDrone:
         # --- Target thrust vector (Newtons, world frame) ---
         # Same PD structure as DSLPIDControl._dslPIDPositionControl but with
         # horizontal component clamped to prevent extreme tilt angles.
-        # ``GRAVITY`` here is already ``mass * g`` in Newtons (0.2646 N for
-        # the CF2X), so the drone mass is ``GRAVITY / g``. We use that to
-        # convert the acceleration-feedforward term (m/s²) into Newtons
-        # before adding it to the thrust command.
-        mass_kg = self._ctrl.GRAVITY / 9.81
+        # The acceleration-feedforward term (``target_acc`` in m/s²) is
+        # converted to Newtons via ``mass_kg`` (cached in __init__) before
+        # it joins the thrust command.
         ff_acc = np.array(target_acc, dtype=float)
         target_thrust = (
             self._ctrl.P_COEFF_FOR * pos_e
             + self._ctrl.D_COEFF_FOR * vel_e
             + np.array([0.0, 0.0, self._ctrl.GRAVITY])
-            + mass_kg * ff_acc
+            + self.mass_kg * ff_acc
         )
 
         # Clip horizontal thrust so tilt stays within _MAX_TILT_RAD.

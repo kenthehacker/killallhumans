@@ -542,6 +542,46 @@ class FOVConfig:
     margin_fraction: float = 0.8    # use 80% of FOV as safe zone
 
 
+@dataclass
+class PlannerConfig:
+    """
+    Course-specific planner knobs that used to be hand-tuned literals.
+
+    Iter 10 (Phase A L1 of ``research_topics_2.md``): these values were
+    scattered across ``TrajectoryOptimizer`` as magic numbers with trailing
+    "# iter N: was X, tuned to Y" comments. Moving them onto one dataclass
+    makes the knob surface visible, lets a second race override them from
+    its own JSON without a code fork, and prepares the way for auto-tuning
+    (Phase C). Defaults preserve the exact iter-9 values so the baseline
+    12/12 × 0.665 m reproducer is bit-identical with and without an
+    explicit ``PlannerConfig`` argument.
+    """
+
+    # --- Entry/exit waypoint stand-off around every gate ---
+    # "On Your Own" (Romero 2025) uses 0.4 m for normal gates; the auxiliary
+    # waypoints force the min-snap polynomial to cross normally. Tightening
+    # this produces narrower lateral margin but steeper acceleration at the
+    # segment boundaries — destabilized helix entry in iter 9.
+    entry_exit_offset_m: float = 0.4
+
+    # --- TOPP-RA per-segment compression floors ---
+    # Lower = more aggressive retime (shorter segment time → higher speed),
+    # higher = more conservative. Per-regime because TOPP-RA naturally
+    # compresses easy segments more than turns (FBGA, Piazza 2025).
+    max_compression_sturn: float = 0.70        # S-turn floor (iter 39: basin switch at 0.66)
+    max_compression_protected: float = 0.65    # high-curvature, pre-turn (FBGA 2025)
+    max_compression_helix: float = 0.72        # Helix floor (iter 36 Pareto rebalance)
+    max_compression_easy: float = 0.59         # straights, shallow curves
+
+    # --- Helix-entry / interior inflation above proximity baseline ---
+    # Extra time-inflation for helix regions on top of the angle-based
+    # inflation in ``_inflate_sharp_turns``. Iter 8 found any value above
+    # 1.06 tumbles at helix entry because the slower reference changes the
+    # polynomial shape and the drone commits to a curve it cannot follow.
+    helix_entry_inflate: float = 1.06
+    helix_interior_inflate: float = 1.06
+
+
 class TrajectoryOptimizer:
     """
     Generates time-optimal trajectories through a sequence of gates.
@@ -564,10 +604,12 @@ class TrajectoryOptimizer:
         constraints: DroneConstraints = None,
         dt_sample: float = 0.01,
         fov_config: FOVConfig = None,
+        planner_config: Optional["PlannerConfig"] = None,
     ):
         self.constraints = constraints or DroneConstraints()
         self.dt_sample = dt_sample
         self.fov = fov_config or FOVConfig()
+        self.planner_config = planner_config or PlannerConfig()
 
     def optimize(
         self,
@@ -600,8 +642,10 @@ class TrajectoryOptimizer:
         # TOGT Planner (Qin 2024): gates are regions, not points.
         # Sharp turns (like helix entry) need longer offsets to give the
         # min-snap polynomial more room to create smooth curves.
+        # Iter 10: surfaced onto ``PlannerConfig.entry_exit_offset_m``;
+        # default preserves 0.4 m.
 
-        ENTRY_EXIT_OFFSET = 0.4  # meters, per "On Your Own" paper
+        ENTRY_EXIT_OFFSET = self.planner_config.entry_exit_offset_m
 
         waypoints = [np.array(start_position)]
         for g in gates:
@@ -947,16 +991,17 @@ class TrajectoryOptimizer:
             # Research: CiMPCC (Li 2024) — compound curvature for sequential
             # same-direction turns; Online VP (Ogretmen 2025) — apex velocity limits.
             if gi in helix_entry_gates:
-                helix_entry_inflate = 1.06  # 6% for helix entry (iter 44: 12%→6%, speed recovery)
-                inflate = max(inflate, helix_entry_inflate)
+                # iter 44: 12%→6% for speed recovery; iter 10 moved to config.
+                inflate = max(inflate, self.planner_config.helix_entry_inflate)
             elif gi in helix_gates and gi not in helix_entry_gates:
                 # Helix interior gates also need compound inflation.
                 # Gate-7 (helix 2nd gate) has curvature 0.269 (highest of any
                 # gate) but only got 8.7% from proximity. The compound nature
                 # of sustained same-direction turns means each gate needs more
-                # margin than its point curvature suggests.
-                helix_interior_inflate = 1.06  # 6% minimum for helix interior (iter 7 race_01-fix: 5%→6%). Iter 8 found that with the new monotonic-forward tracker, any increase above 6% (tested 1.08, 1.12) causes the drone to tumble at helix entry — the slower reference changes the polynomial shape such that the drone commits to a curve it cannot follow. 6% remains the feasibility ceiling for this controller.
-                inflate = max(inflate, helix_interior_inflate)
+                # margin than its point curvature suggests. 1.06 is the
+                # feasibility ceiling under the monotonic-forward tracker
+                # (iter 8 found 1.08/1.12 tumble at helix entry).
+                inflate = max(inflate, self.planner_config.helix_interior_inflate)
 
             if inflate > 1.001:
                 for seg_idx in [seg_entry, seg_through]:
@@ -1000,14 +1045,17 @@ class TrajectoryOptimizer:
         max_v = self.constraints.max_velocity
         min_v = 2.0
         # Compression floor: per-segment, not uniform (iter 21).
-        # S-turn and high-curvature segments keep 0.68 (iter 17 protection).
-        # Low-curvature/straight segments use 0.60 to recover race time.
+        # S-turn and high-curvature segments keep a higher floor (iter 17
+        # protection). Low-curvature/straight segments compress harder to
+        # recover race time.
+        # Iter 10: surfaced onto ``PlannerConfig``; defaults preserve the
+        # iter-9 tune (S-turn 0.70, protected 0.65, helix 0.72, easy 0.59).
         # Research: FBGA (Piazza 2025) — forward-backward naturally compresses
         # easy segments more. STORM (Zhang 2025) — per-segment LP for times.
-        max_compression_sturn = 0.70  # S-turn floor — DO NOT REDUCE (iter 39: basin switching at 0.66; iter 37 set 0.67→0.70)
-        max_compression_protected = 0.65  # high-curvature, pre-turn (iter 30: reduced from 0.66 — round 2; FBGA Piazza 2025)
-        max_compression_helix = 0.72  # Helix floor (iter 36: Pareto rebalance from 0.76 — swept 0.70-0.74, 0.72 recovers race time 14.09→13.98s while keeping avg err 0.176m; iter 35 set 0.76 for accuracy-optimal but overshot 14s target)
-        max_compression_easy = 0.59  # straights, shallow curves (iter 30: reduced from 0.60 — round 2; ILC compensates)
+        max_compression_sturn = self.planner_config.max_compression_sturn
+        max_compression_protected = self.planner_config.max_compression_protected
+        max_compression_helix = self.planner_config.max_compression_helix
+        max_compression_easy = self.planner_config.max_compression_easy
 
         # --- S-turn region detection for compound curvature boost (iter 16) ---
         # Identify waypoint indices that are in S-turn regions (between gates

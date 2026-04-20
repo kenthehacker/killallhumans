@@ -60,6 +60,43 @@ from gate_sequencing.sequencer import (
 # Helpers
 # ──────────────────────────────────────────────────────────────────
 
+
+class TrackingErrorAccumulator:
+    """Single source of truth for per-frame tracking-error samples.
+
+    Prior to iter 10 the demo kept two parallel containers: a 200-sample
+    ``deque`` for a potential HUD rolling window and a separate ``list`` for
+    the end-of-run average. They were appended and cleared in lock-step, and
+    a bug in iter 8 had let them diverge — leading to the "average over the
+    worst-tracking tail" misreport. This helper owns both views behind one
+    API so they can't drift apart again.
+
+    ``average`` is always computed over the full trajectory-tracking window
+    (not the rolling 200-sample buffer), which is the metric compared to the
+    <0.5 m PRD target.
+    """
+
+    def __init__(self, recent_window: int = 200) -> None:
+        self._all: List[float] = []
+        self._recent: deque = deque(maxlen=recent_window)
+
+    def append(self, value: float) -> None:
+        self._all.append(float(value))
+        self._recent.append(float(value))
+
+    def clear(self) -> None:
+        self._all.clear()
+        self._recent.clear()
+
+    def average(self) -> float:
+        return sum(self._all) / len(self._all) if self._all else 0.0
+
+    def recent(self) -> "deque":
+        return self._recent
+
+    def __len__(self) -> int:
+        return len(self._all)
+
 def gates_to_specs(gates: List[Gate]) -> List[GateSpec]:
     return [
         GateSpec(
@@ -322,14 +359,13 @@ class VisualDemo:
 
         # Timing / metrics
         self._loop_times: deque = deque(maxlen=120)
-        # HUD rolling window (recent samples for display).
-        self._tracking_errors: deque = deque(maxlen=200)
-        # Full trajectory-tracking error accumulator (for end-of-run avg).
-        # Kept separate from the HUD deque so the reported average covers
-        # the entire trajectory-tracking window, not just the last 200
-        # frames (which for the helix race are all from the worst-tracking
-        # tail and misrepresent the run).
-        self._trajectory_tracking_errors: list = []
+        # Tracking-error accumulator: owns both the full trajectory-tracking
+        # list (for the end-of-run average that is compared to the <0.5 m
+        # PRD) and a 200-sample rolling window (reserved for HUD smoothing).
+        # Iter 10: consolidated from two parallel containers into a single
+        # helper (``TrackingErrorAccumulator``) so the two views can't drift
+        # apart as they did in iter 8.
+        self._tracking = TrackingErrorAccumulator(recent_window=200)
 
         # Monotonic reference-time tracker (iter 8 race_01 fix): the previous
         # ``find_closest(pos)`` returns the global argmin which on a helix
@@ -513,8 +549,7 @@ class VisualDemo:
             # the drone is tens of metres away navigating to remaining
             # gates, which would inflate the metric to meaningless values.
             if target_source == "trajectory":
-                self._tracking_errors.append(trk_err)
-                self._trajectory_tracking_errors.append(trk_err)
+                self._tracking.append(trk_err)
 
             # 7. Step physics
             for _ in range(self._steps_per_loop):
@@ -579,11 +614,11 @@ class VisualDemo:
             cv2.destroyAllWindows()
         self.env.close()
 
-        # Use the full trajectory-tracking accumulator, not the HUD deque
-        # (which is capped to 200 most-recent samples).
-        avg_trk = (sum(self._trajectory_tracking_errors)
-                    / len(self._trajectory_tracking_errors)
-                    if self._trajectory_tracking_errors else 0)
+        # Full trajectory-tracking average (the metric compared to the
+        # <0.5 m PRD target). See ``TrackingErrorAccumulator`` — it keeps
+        # the full-window view separate from the rolling HUD view so they
+        # can't diverge.
+        avg_trk = self._tracking.average()
         avg_hz = (1.0 / (sum(self._loop_times) / len(self._loop_times))
                   if self._loop_times else 0)
         return {
@@ -717,8 +752,7 @@ class VisualDemo:
         if hasattr(self.tracker, "reset"):
             self.tracker.reset()
         self._loop_times.clear()
-        self._tracking_errors.clear()
-        self._trajectory_tracking_errors.clear()
+        self._tracking.clear()
         self._ref_progress_time = 0.0
         self.topdown.drone_trail.clear()
         self.topdown.ekf_trail.clear()

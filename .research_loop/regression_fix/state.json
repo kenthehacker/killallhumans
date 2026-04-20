@@ -1,5 +1,5 @@
 {
-  "iteration": 9,
+  "iteration": 10,
   "status": "pending",
   "loop_name": "regression_fix",
   "max_iterations": 15,
@@ -46,7 +46,26 @@
     "commit": "ced3aa5 (with 333e099 + e836570)"
   },
   "commits_iter9": [
-    {"sha": "(pending)", "description": "gpd_drone.py: expose target_acc parameter — infrastructure for future PyBullet-native FF/ILC. No behavioral change at default (0,0,0).", "gates_after": 12, "avg_err": 0.665}
+    {"sha": "0a1cb96", "description": "gpd_drone.py: expose target_acc parameter — infrastructure for future PyBullet-native FF/ILC. No behavioral change at default (0,0,0).", "gates_after": 12, "avg_err": 0.665}
+  ],
+  "iter10_focus": "Ralph-loop task: implement research_topics_2.md 'without regression'. Followed the doc's Phase A (L1 config-driven) recommendation + the two non-magic-number cleanups the doc explicitly called out — all pure refactors verifiable by baseline reproducibility.",
+  "commits_iter10": [
+    {"sha": "da03d53", "description": "Phase A L1 (research_topics_2.md): 3 pure refactors in service of no-regression progress. (1) gpd_drone.py — cache drone mass in __init__ so step() no longer recomputes GRAVITY/9.81 each tick (exposes self.mass_kg attribute called out in the research doc). (2) scripts/visual_demo.py — consolidate the 200-sample deque + _trajectory_tracking_errors list into a single TrackingErrorAccumulator helper so the two views can no longer diverge (was the source of the iter-8 HUD/reporting-average mismatch). (3) planning/trajectory_optimizer.py — introduce PlannerConfig dataclass and wire ENTRY_EXIT_OFFSET + the 4 max_compression floors + the 2 helix-inflate knobs through it. Defaults preserve iter-9 values bit-identically. Unlocks per-race override without a code fork (the research_topics_2.md Phase A ask).", "gates_after": 12, "avg_err": 0.665, "determinism_runs": 3, "baseline_preserved": true}
+  ],
+  "iter10_things_tried_and_regressed": [],
+  "iter10_refactors_shipped": [
+    {"file": "sim_pybullet/gpd_drone.py", "change": "GPDDrone.mass_kg attribute (cached in __init__). step() uses self.mass_kg rather than recomputing GRAVITY/9.81. Eliminates the iter-9 'hack' comment."},
+    {"file": "scripts/visual_demo.py", "change": "TrackingErrorAccumulator helper. Single API (append/average/clear/recent); owns both the full-trajectory list (for the PRD <0.5 m avg) and a 200-sample rolling window (reserved for HUD smoothing). Callers at line 515 and 580 now go through one object."},
+    {"file": "planning/trajectory_optimizer.py", "change": "PlannerConfig dataclass (entry_exit_offset_m, max_compression_{sturn,protected,helix,easy}, helix_{entry,interior}_inflate). TrajectoryOptimizer takes an optional planner_config; defaults match the iter-9 hardcoded values exactly. Replaces 7 magic literals with config-driven values without changing any of them."}
+  ],
+  "lessons_learned_iter10": [
+    "Research doc's Phase A ask is *structural*, not a tuning change. Moving ENTRY_EXIT_OFFSET onto PlannerConfig doesn't move the drone's trajectory one micron; it just lets a second race override it without editing trajectory_optimizer.py. That's the whole win — the doc called it 'no algorithm risk' and iter-10 confirms: 3 deterministic runs reproduced 12/12 × 63.417 s × 0.665 m exactly.",
+    "The 'deque + list' pair in visual_demo.py was dead on the deque side — nothing read it — but the research doc flagged it anyway because the *shape* of that pair is the bug pattern: two parallel containers owned by the same updater. The consolidation into TrackingErrorAccumulator makes the divergence literally impossible to reintroduce."
+  ],
+  "iter10_infrastructure_added": [
+    {"file": "sim_pybullet/gpd_drone.py", "change": "GPDDrone.mass_kg attribute exposed. Used internally by target_acc feedforward; available to future callers (PyBullet ILC, centripetal FF) without re-deriving from GRAVITY.", "behavioral_change": false},
+    {"file": "scripts/visual_demo.py", "change": "TrackingErrorAccumulator class owns both full-trajectory and rolling-window views. Single source of truth for tracking-error samples.", "behavioral_change": false},
+    {"file": "planning/trajectory_optimizer.py", "change": "PlannerConfig dataclass + optional planner_config argument on TrajectoryOptimizer.__init__. 7 previously-hardcoded values (ENTRY_EXIT_OFFSET, 4 compression floors, 2 helix inflates) are now config-driven with iter-9 defaults preserved. Prerequisite for research_topics_2.md Phase B (first-principles derivation) and Phase C (Bayesian auto-tuning).", "behavioral_change": false}
   ],
   "iter9_things_tried_and_regressed": [
     {"id": "centripetal_3d_K_0.05", "result": "6/12, crash at t=14.7s gate-6 entry", "note": "Full 3D offset too aggressive; vertical component tangles altitude loop."},
