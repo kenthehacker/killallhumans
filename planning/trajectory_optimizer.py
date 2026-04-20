@@ -632,6 +632,18 @@ class PlannerConfig:
     accel_ff_cutoff_hz: float = 2.0
     accel_ff_clamp_ms2: float = 5.0
 
+    # --- Research_topics_2.md C3: PyBullet-native ILC ---
+    # When ``ilc_table_path`` is a valid JSON file, the optimizer loads it
+    # via ``planning.ilc_runtime.ILCTable`` and overwrites each
+    # ``TrajectoryPoint.ff_acceleration`` with the interpolated table
+    # value at that point's time. This supersedes the Butterworth path
+    # above — the ILC calibration is expected to have already run its own
+    # Q-filter (Bristow & Alleyne 2007) before emitting the table.
+    # Default empty string → no table → no-op, baseline preserved.
+    # The offline calibrator (the other half of C3) lands in a future
+    # iteration; until then this hook lets hand-authored tables be tested.
+    ilc_table_path: str = ""
+
 
 class TrajectoryOptimizer:
     """
@@ -790,6 +802,14 @@ class TrajectoryOptimizer:
         if self.planner_config.accel_ff_gain > 0.0:
             self._populate_ff_acceleration(points)
 
+        # Research_topics_2.md C3: if an ILC table JSON is configured,
+        # load it and overwrite each point's ff_acceleration with the
+        # table-interpolated value. Empty path (default) → no-op.
+        if self.planner_config.ilc_table_path:
+            self._populate_ff_acceleration_from_ilc(
+                points, self.planner_config.ilc_table_path
+            )
+
         total_time = sum(segment_times)
         return RaceTrajectory(
             points=points,
@@ -855,6 +875,22 @@ class TrajectoryOptimizer:
                 float(smoothed[i, 1]),
                 float(smoothed[i, 2]),
             )
+
+    def _populate_ff_acceleration_from_ilc(
+        self, points: List[TrajectoryPoint], path: str
+    ) -> None:
+        """Overwrite ``ff_acceleration`` on each point from an ILC JSON table.
+
+        The JSON schema and interpolation live in ``ilc_runtime.py``.
+        Silently no-ops on empty path (belt-and-suspenders; the caller
+        already gates on non-empty).
+        """
+        from .ilc_runtime import try_load_ilc_table
+        table = try_load_ilc_table(path)
+        if table is None:
+            return
+        for pt in points:
+            pt.ff_acceleration = table.get_ff_acceleration(pt.time)
 
     def _inflate_sharp_turns(
         self,
