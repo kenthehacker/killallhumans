@@ -32,7 +32,7 @@
   },
   "timestep": 0.004166,
   "gravity": -9.81,
-  "_planner_notes": "iter 10 Phase A L1: these knobs were hardcoded in planning/trajectory_optimizer.py through iter 9. Values reproduce the iter-9 baseline (12/12 gates, 0.665 m avg tracking error) bit-identically. Future races may override any subset; unspecified keys fall back to the dataclass default.",
+  "_planner_notes": "iter 10 Phase A L1: these knobs were hardcoded in planning/trajectory_optimizer.py and scripts/visual_demo.py through iter 9. Values reproduce the iter-9 baseline (12/12 gates, 0.665 m avg tracking error) bit-identically. Future races may override any subset; unspecified keys fall back to the dataclass default.",
   "planner": {
     "entry_exit_offset_m": 0.4,
     "max_compression_sturn": 0.70,
@@ -40,7 +40,11 @@
     "max_compression_helix": 0.72,
     "max_compression_easy": 0.59,
     "helix_entry_inflate": 1.06,
-    "helix_interior_inflate": 1.06
+    "helix_interior_inflate": 1.06,
+    "plan_max_speed_mps": 4.0,
+    "cmd_max_speed_mps": 4.0,
+    "lookahead_s": 0.3,
+    "search_window_s": 2.0
   },
   "racing_line": {
     "max_lateral_offset": 0.6,
@@ -49,5 +53,8 @@
     "smoothness_weight": 0.40,
     "lookahead_gates": 3,
     "use_cache": true
+  },
+  "sequencer": {
+    "proximity_pass_distance": 1.2
   }
 }

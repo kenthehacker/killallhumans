@@ -581,6 +581,28 @@ class PlannerConfig:
     helix_entry_inflate: float = 1.06
     helix_interior_inflate: float = 1.06
 
+    # --- Speed envelope for trajectory planning and runtime clamp ---
+    # ``plan_max_speed_mps`` feeds ``SpeedProfiler`` and
+    # ``DroneConstraints.max_velocity``; ``cmd_max_speed_mps`` is the
+    # runtime clamp on ``target_vel`` handed to the drone. They must be
+    # equal (or the drone lags the reference): the iter-4/5 regression
+    # fixes drove both to 4.0 m/s for CF2X.
+    plan_max_speed_mps: float = 4.0
+    cmd_max_speed_mps: float = 4.0
+
+    # --- Tracker look-ahead (seconds) ---
+    # ``lookahead_s`` is added to the closest-point time before sampling
+    # the reference. Gives the PD controller a feed-forward target
+    # slightly ahead of the drone, compensating for controller latency.
+    lookahead_s: float = 0.3
+
+    # --- Monotonic-forward reference search window ---
+    # Upper bound on how far ahead ``find_closest_forward`` may search
+    # relative to the last anchor. Derived from control rate × drone
+    # max-forward-progress per tick in Phase B (not yet done); the 2.0 s
+    # default is the iter-8 value that resolved the helix self-overlap.
+    search_window_s: float = 2.0
+
 
 class TrajectoryOptimizer:
     """

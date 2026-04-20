@@ -312,7 +312,14 @@ class VisualDemo:
         # remains as an upper bound on the 3D distance but the lateral
         # opening check is the binding constraint — a drone at dist=1.1m
         # outside the opening box will not be credited with a pass.
-        seq_cfg = SequencerConfig(proximity_pass_distance=1.2)
+        #
+        # Iter 10 (Phase A L1): proximity_pass_distance now sourced from
+        # race_01.json's ``sequencer`` section; default 1.2 m preserves
+        # the iter-9 behavior exactly.
+        seq_cfg = _dataclass_from_overrides(
+            SequencerConfig,
+            {"proximity_pass_distance": 1.2, **race_config.sequencer_overrides},
+        )
         self.sequencer = NewGateSequencer(gate_specs, config=seq_cfg)
         self.sequencer.start()
 
@@ -355,7 +362,10 @@ class VisualDemo:
         # change + altitude climb. Peak pitch 75°, roll 125°, altitude
         # collapses. 4 m/s gives 25% more time per transition for the
         # Crazyflie body-rate controller to track without saturating tilt.
-        PLAN_MAX_SPEED = 4.0
+        #
+        # Iter 10 (Phase A L1): sourced from ``planner.plan_max_speed_mps``
+        # in race_01.json; default 4.0 m/s preserves iter-9 behavior.
+        PLAN_MAX_SPEED = planner_cfg.plan_max_speed_mps
         profiler = SpeedProfiler(max_speed=PLAN_MAX_SPEED)
         self.wp_positions = [start_pos] + [g.position for g in opt_wps]
         self.speeds = profiler.profile(self.wp_positions)
@@ -368,6 +378,11 @@ class VisualDemo:
             planner_config=planner_cfg,
         )
         self.trajectory = traj_opt.optimize(opt_wps, start_pos, (0, 0, 0))
+
+        # Stash per-tick knobs for the main loop (iter 10 Phase A L1).
+        self._cmd_max_speed = planner_cfg.cmd_max_speed_mps
+        self._lookahead_s = planner_cfg.lookahead_s
+        self._search_window_s = planner_cfg.search_window_s
         print(f"  Trajectory: {self.trajectory.total_time:.1f}s, "
               f"{len(self.trajectory.points)} points")
 
@@ -512,7 +527,8 @@ class VisualDemo:
             # the drone to orbit rather than advance. The forward-only
             # search guarantees the reference time only moves forward.
             closest = self.trajectory.find_closest_forward(
-                pos, self._ref_progress_time, search_window_s=2.0
+                pos, self._ref_progress_time,
+                search_window_s=self._search_window_s,
             )
             # Anchor advances with the natural closest-point progress. The
             # monotonic guarantee comes from ``find_closest_forward``'s
@@ -525,7 +541,9 @@ class VisualDemo:
             self._ref_progress_time = closest.time
             trk_err = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, closest.position)))
 
-            lookahead_time = min(closest.time + 0.3, self.trajectory.total_time)
+            lookahead_time = min(
+                closest.time + self._lookahead_s, self.trajectory.total_time
+            )
             ref = self.trajectory.sample(lookahead_time)
 
             # 6. Compute target for GPDDrone.step()
@@ -536,7 +554,9 @@ class VisualDemo:
             # Clamp commanded velocity to Crazyflie-trackable speed.
             # Iteration 5: lowered to 4.0 to match PLAN_MAX_SPEED so the
             # drone does not overshoot the trajectory reference at any point.
-            MAX_CMD_SPEED = 4.0
+            # Iter 10 Phase A L1: sourced from ``planner.cmd_max_speed_mps``
+            # in race_01.json; default 4.0 m/s preserves iter-9 behavior.
+            MAX_CMD_SPEED = self._cmd_max_speed
             ref_speed = math.sqrt(sum(v * v for v in ref.velocity))
             if ref_speed > MAX_CMD_SPEED:
                 scale = MAX_CMD_SPEED / ref_speed
