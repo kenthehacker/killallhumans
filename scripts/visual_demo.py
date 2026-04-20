@@ -457,18 +457,6 @@ class VisualDemo:
             # drone's tracking capability.
             self._ref_progress_time = closest.time
             trk_err = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, closest.position)))
-            # Only accumulate tracking error while the drone is actually
-            # following the planned trajectory (not during the post-traj
-            # gate_fallback direct-nav phase, which would pin the metric
-            # to meaningless "distance from trajectory-end-point" values
-            # while the drone navigates tens of meters away to remaining
-            # gates).
-            trajectory_active = (
-                self._ref_progress_time < self.trajectory.total_time - 1e-3
-            )
-            if trajectory_active:
-                self._tracking_errors.append(trk_err)
-                self._trajectory_tracking_errors.append(trk_err)
 
             lookahead_time = min(closest.time + 0.3, self.trajectory.total_time)
             ref = self.trajectory.sample(lookahead_time)
@@ -518,6 +506,15 @@ class VisualDemo:
 
             if self.sequencer.should_slow_down():
                 target_vel = tuple(v * 0.3 for v in target_vel)
+
+            # Accumulate tracking error only while the drone is actually
+            # following the planned trajectory. The gate_fallback phase
+            # pins ``closest.position`` to the trajectory-end point while
+            # the drone is tens of metres away navigating to remaining
+            # gates, which would inflate the metric to meaningless values.
+            if target_source == "trajectory":
+                self._tracking_errors.append(trk_err)
+                self._trajectory_tracking_errors.append(trk_err)
 
             # 7. Step physics
             for _ in range(self._steps_per_loop):
