@@ -245,14 +245,17 @@ class VisualDemo:
 
         # New gate sequencer.
         # Iteration 6: enable proximity_pass_distance so a gate counts as
-        # passed when the drone gets within 1.2 m of its centre and has moved
-        # to or beyond the gate plane. Min-snap trajectories through the helix
-        # (gates 7-12) skim within 1-1.8 m of each gate centre but overshoot
-        # the plane-crossing lateral threshold (0.6 m), so at trajectory speed
-        # the sequencer loses track even though the drone physically flies
-        # through the helix volume. Proximity pass-through lets the drone
-        # register those gates streaming by instead of triggering the direct-
-        # nav fallback pingpong that crashed iter 5 at gate-11.
+        # passed when the drone gets within 1.2 m of its centre and has
+        # moved to or beyond the gate plane.
+        #
+        # Iteration 8 (race_01 fix — false-positive audit): the sequencer
+        # now requires the drone's projection onto the gate plane to fall
+        # inside the rectangular opening (half_w=0.6m, half_h=0.6m for
+        # race_01 gates) before crediting a proximity-based pass. A close
+        # skim-by of an unlit frame edge no longer counts. The 1.2m value
+        # remains as an upper bound on the 3D distance but the lateral
+        # opening check is the binding constraint — a drone at dist=1.1m
+        # outside the opening box will not be credited with a pass.
         seq_cfg = SequencerConfig(proximity_pass_distance=1.2)
         self.sequencer = NewGateSequencer(gate_specs, config=seq_cfg)
         self.sequencer.start()

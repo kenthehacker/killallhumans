@@ -294,6 +294,80 @@ class TestCompletion:
         assert seq.current_gate is None
 
 
+# ── Proximity pass-through must respect the gate opening ───────────────
+
+
+class TestProximityRespectsOpening:
+    """A proximity-based pass-through must only count passes inside the lit
+    gate opening. If the drone flies close to the gate centre but outside
+    the rectangular opening, it must NOT be credited — otherwise the drone
+    can skim past unlit parts of the gate frame and still score.
+    """
+
+    def test_skim_outside_opening_does_not_count(self):
+        """Drone flies within proximity distance but outside the opening
+        box on the far side of the gate plane. Must not count."""
+        # 1.2m-wide gate at origin, facing +X.
+        gates = [_make_gate("G1", (0, 0, 0), yaw=0.0, idx=0,
+                             interior_width=1.2, interior_height=1.2)]
+        cfg = SequencerConfig(proximity_pass_distance=1.2)
+        seq = GateSequencer(gates, config=cfg)
+        seq.start()
+
+        # Previous frame: in front of the gate plane, 0.9m laterally right
+        # (outside the half-width of 0.6m), 0.8m ahead on +X.
+        seq.update((-0.8, 0.9, 0))
+        # Current frame: past the gate plane, still 0.9m laterally right.
+        # Distance to centre: sqrt(0.8^2 + 0.9^2) = 1.20m ≈ proximity limit.
+        # Plane sign did NOT change in a way that crosses the opening box
+        # (lateral_right = 0.9m > half_w=0.6m), so this is a skim-by.
+        result = seq.update((0.8, 0.9, 0))
+        # Old (buggy) behaviour: would return the gate because distance
+        # < proximity_pass_distance and d_curr > -0.5.
+        # New behaviour: must return None because drone is outside the
+        # opening box.
+        assert result is None, (
+            "Drone skimmed outside the gate opening but was credited "
+            "with a pass-through — proximity fallback is not respecting "
+            "the lit gate opening."
+        )
+
+    def test_close_through_opening_still_counts(self):
+        """Drone passes through the gate opening at reasonable distance from
+        centre — this is still a legitimate pass and should count even when
+        the plane-crossing sample straddles the plane by only a hair."""
+        gates = [_make_gate("G1", (0, 0, 0), yaw=0.0, idx=0,
+                             interior_width=1.2, interior_height=1.2)]
+        cfg = SequencerConfig(proximity_pass_distance=1.2)
+        seq = GateSequencer(gates, config=cfg)
+        seq.start()
+
+        # Drone passes through the opening near its edge but inside it:
+        # lateral offset 0.4m (< half_w=0.6m).
+        seq.update((-0.5, 0.4, 0))
+        result = seq.update((0.5, 0.4, 0))
+        assert result is not None
+        assert result.gate_id == "G1"
+
+    def test_proximity_behind_plane_inside_opening_counts(self):
+        """Drone is inside the gate opening and within proximity distance but
+        the plane sign didn't change (sampling gap). Proximity fallback
+        should still credit the pass because the drone is in the lit
+        frame."""
+        gates = [_make_gate("G1", (0, 0, 0), yaw=0.0, idx=0,
+                             interior_width=1.2, interior_height=1.2)]
+        cfg = SequencerConfig(proximity_pass_distance=1.2)
+        seq = GateSequencer(gates, config=cfg)
+        seq.start()
+
+        # Previous frame: in front of plane, 0.3m laterally (inside opening).
+        seq.update((-0.3, 0.3, 0))
+        # Current frame: just past plane (within 0.5m), still inside opening.
+        result = seq.update((0.1, 0.3, 0))
+        assert result is not None
+        assert result.gate_id == "G1"
+
+
 # ── Reset ────────────────────────────────────────────────────────────────
 
 

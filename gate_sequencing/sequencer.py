@@ -149,18 +149,25 @@ class GateSequencer:
             gate = self._gates[self._current_idx]
             plane_crossed = self._check_pass_through(self._prev_position, pos, gate)
 
-            # Proximity-based pass: if configured and drone is very close to gate center
+            # Proximity-based pass: only credits a pass when the drone is
+            # inside the lit gate opening. A "lit" gate is the currently
+            # targeted gate; if the drone flies close to it but outside the
+            # rectangular opening, this must NOT count (prior behaviour
+            # credited skim-bys at dist ≤ proximity_pass_distance regardless
+            # of lateral offset, producing false-positive passes).
             proximity_passed = False
             if not plane_crossed and self.config.proximity_pass_distance > 0:
                 dist = float(np.linalg.norm(pos - np.array(gate.position)))
                 if dist < self.config.proximity_pass_distance:
-                    # Verify the drone has moved past the gate plane
+                    gate_pos = np.array(gate.position)
                     normal = self._gate_normal(gate)
-                    d_curr = float(np.dot(pos - np.array(gate.position), normal))
-                    d_prev = float(np.dot(self._prev_position - np.array(gate.position), normal))
-                    # Accept if we're behind/on the plane or just crossed it
-                    if d_curr > -0.5:  # within 0.5m behind the plane
-                        proximity_passed = True
+                    d_curr = float(np.dot(pos - gate_pos, normal))
+                    if d_curr > -0.5:  # near or past the plane
+                        # Require drone to be inside the gate opening laterally,
+                        # i.e. its projection onto the gate plane falls within
+                        # (half_w × pass_through_margin, half_h × pass_through_margin).
+                        if self._point_in_gate_opening(pos, gate):
+                            proximity_passed = True
 
             if plane_crossed or proximity_passed:
                 passed_gate = gate
