@@ -47,9 +47,10 @@ from estimation.ekf import DroneEKF, EKFConfig
 from estimation.gate_pnp import CameraIntrinsics, GateGeometry, GatePnPEstimator
 from estimation.state_predictor import StatePredictor, LatencyConfig
 from planning.trajectory_optimizer import (
-    DroneConstraints, GateWaypoint, RaceTrajectory, TrajectoryOptimizer, TrajectoryPoint,
+    DroneConstraints, GateWaypoint, PlannerConfig, RaceTrajectory,
+    TrajectoryOptimizer, TrajectoryPoint,
 )
-from planning.racing_line import RacingLineOptimizer, SpeedProfiler
+from planning.racing_line import RacingLineConfig, RacingLineOptimizer, SpeedProfiler
 from control.mpc_tracker import SimplePositionTracker, GeometricTracker, TrackerConfig
 from gate_sequencing.sequencer import (
     GateSequencer as NewGateSequencer, GateSpec, RaceState, SequencerConfig,
@@ -59,6 +60,24 @@ from gate_sequencing.sequencer import (
 # ──────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────
+
+
+def _dataclass_from_overrides(cls, overrides: dict):
+    """Construct a dataclass instance, applying only keys it declares.
+
+    Iter 10 Phase A L1: race configs can carry a ``planner`` /
+    ``racing_line`` section with a subset of knobs. Unknown keys are
+    ignored (forward-compat: a newer config file on an older binary
+    shouldn't explode). Unspecified keys fall back to the dataclass's
+    own defaults, so baseline behavior is preserved when the section
+    is absent.
+    """
+    import dataclasses
+    if not overrides:
+        return cls()
+    valid_fields = {f.name for f in dataclasses.fields(cls)}
+    filtered = {k: v for k, v in overrides.items() if k in valid_fields}
+    return cls(**filtered)
 
 
 class TrackingErrorAccumulator:
@@ -310,8 +329,19 @@ class VisualDemo:
         self.state_predictor = StatePredictor(LatencyConfig())
 
         # ── Trajectory planning ──
+        # Iter 10 (Phase A L1): read optional per-race overrides for
+        # both the racing-line optimizer and the trajectory optimizer.
+        # When race_01.json has no such section the dataclasses fall
+        # back to their hardcoded defaults and behaviour is identical.
+        racing_line_cfg = _dataclass_from_overrides(
+            RacingLineConfig, race_config.racing_line_overrides
+        )
+        planner_cfg = _dataclass_from_overrides(
+            PlannerConfig, race_config.planner_overrides
+        )
+
         print("Optimizing racing line...")
-        rl_opt = RacingLineOptimizer()
+        rl_opt = RacingLineOptimizer(config=racing_line_cfg)
         opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
 
         # Iteration 4 (race_01 regression fix): plan trajectory at <=5 m/s to
@@ -335,6 +365,7 @@ class VisualDemo:
         traj_opt = TrajectoryOptimizer(
             constraints=DroneConstraints(max_velocity=PLAN_MAX_SPEED),
             dt_sample=0.02,
+            planner_config=planner_cfg,
         )
         self.trajectory = traj_opt.optimize(opt_wps, start_pos, (0, 0, 0))
         print(f"  Trajectory: {self.trajectory.total_time:.1f}s, "

@@ -27,9 +27,22 @@ class RaceConfig:
     timestep: float = 1.0 / 240.0
     gravity: float = -9.81
 
+    # Iter 10 (Phase A L1): per-race optional overrides for the planner and
+    # racing-line knobs that previously lived as magic literals in Python.
+    # Empty dict (default) → planners use their baked-in defaults exactly,
+    # so existing configs without a ``planner``/``racing_line`` section are
+    # byte-identical to pre-iter-10 behavior. Populated dicts are merged
+    # onto the corresponding dataclass defaults at planner construction.
+    planner_overrides: Dict[str, float] = None
+    racing_line_overrides: Dict[str, float] = None
+
     def __post_init__(self):
         if self.gates is None:
             self.gates = []
+        if self.planner_overrides is None:
+            self.planner_overrides = {}
+        if self.racing_line_overrides is None:
+            self.racing_line_overrides = {}
 
 
 class DroneRaceEnv:
@@ -167,6 +180,13 @@ class DroneRaceEnv:
         start_pos = tuple(start_data.get("position", [0.0, 0.0, 1.5]))
         start_yaw = start_data.get("yaw", 0.0)
 
+        # Iter 10 (Phase A L1): optional top-level ``planner`` and
+        # ``racing_line`` sections carry per-race overrides of knobs that
+        # used to be hardcoded in the planners. Unknown keys are ignored
+        # so the loader is forward-compatible with future additions.
+        planner_data = data.get("planner", {})
+        racing_line_data = data.get("racing_line", {})
+
         return RaceConfig(
             field_bounds_min=bounds_min,
             field_bounds_max=bounds_max,
@@ -175,4 +195,6 @@ class DroneRaceEnv:
             start_yaw=start_yaw,
             timestep=data.get("timestep", 1.0 / 240.0),
             gravity=data.get("gravity", -9.81),
+            planner_overrides=dict(planner_data),
+            racing_line_overrides=dict(racing_line_data),
         )
