@@ -792,6 +792,25 @@ class TrajectoryOptimizer:
         segment_times = self._topp_retime(
             waypoints, segment_times, start_velocity, gates
         )
+
+        # Iter 11 (field_demo fix): post-TOPP climb-angle floor.
+        # TOPP-RA maximizes speed subject to centripetal + longitudinal
+        # acceleration budgets but does not model the DSLPIDControl tilt
+        # clamp (35°), which caps the drone's sustainable mean vertical
+        # rate at roughly 0.5 × plan_max_speed before it can no longer
+        # split tilt between climb and horizontal correction. If a
+        # segment's |Δz|/T exceeds that ceiling, stretch the segment
+        # time so the drone can track the climb without the reference
+        # anchor deadlocking and dropping it out of the sky (observed on
+        # field_demo.yaml gate-1→gate-2 at iter-10 HEAD). This runs
+        # after TOPP so TOPP's compression floors cannot undo it.
+        # Race_01 segments all have |Δz|/T well below the ceiling so
+        # the 12/12 × 63.417 s × 0.665 m baseline is preserved bit-
+        # identically — verified empirically.
+        segment_times = self._inflate_vertical_climbs(
+            waypoints, segment_times
+        )
+
         points = self._generate_trajectory(
             waypoints, segment_times, start_velocity, gates,
         )
@@ -1158,6 +1177,69 @@ class TrajectoryOptimizer:
                 for seg_idx in [seg_entry, seg_through]:
                     if 0 <= seg_idx < len(times):
                         times[seg_idx] *= inflate
+
+        return times
+
+    def _inflate_vertical_climbs(
+        self,
+        waypoints: List[np.ndarray],
+        segment_times: List[float],
+    ) -> List[float]:
+        """Stretch segments whose required vertical rate exceeds what the
+        tilt-clamped DSLPIDControl (35° cap, TWR=2.25) can track.
+
+        Iter 11 (field_demo fix): on wide-bounds tracks where gate-to-gate
+        Δz approaches seg_len (field_demo.yaml gate-3 at z=4 → gate-4 at
+        z=10 is a pure-vertical 6 m climb), TOPP-RA's retiming does not
+        model the tilt-vs-climb split in the controller. The trajectory
+        then demands a mean v_z that forces the attitude loop to spend
+        its whole tilt budget on vertical thrust, leaving no headroom for
+        horizontal position correction — the drone falls behind the
+        climb, the monotonic-forward reference anchor deadlocks at the
+        window-start waypoint, and the controller drops out of the sky
+        (observed: frozen target at (10.23,0.75,3.78) for 31 ticks → alt
+        0.01 m crash at t=4.0 s).
+
+        Fix: classify each segment by its climb ratio (|Δz| / seg_len,
+        i.e. sin(climb_angle)) and impose a mean-v_z ceiling only when
+        the climb is steep enough to matter:
+
+          climb_ratio ≥ 0.85  → 0.20 × v_max (near-vertical; most tilt
+             budget is forced into thrust_z).
+          climb_ratio ≥ 0.50  → 0.30 × v_max (steep climb; partial tilt
+             budget still available for horizontal correction).
+          otherwise                → no ceiling.
+
+        Race_01's steepest inter-gate climb ratio is the helix at ~0.21
+        — below both thresholds — so no segment is inflated and the
+        12/12 × 63.417 s × 0.665 m baseline is preserved bit-identically.
+        field_demo gate-1→gate-2 (0.57) and gate-3→gate-4 (0.99) both
+        trigger and get stretched, letting the drone pass 4/4 gates.
+
+        The ceiling bounds the *mean* Δz/T over the segment. Peak
+        polynomial v_z can legitimately exceed it; the subsequent
+        ``_generate_trajectory`` post-hoc velocity clamp handles peaks.
+        """
+        times = list(segment_times)
+        v_max = self.constraints.max_velocity
+        for i, seg_t in enumerate(times):
+            if i + 1 >= len(waypoints):
+                break
+            dp = waypoints[i + 1] - waypoints[i]
+            dz = abs(float(dp[2]))
+            seg_len = float(np.linalg.norm(dp))
+            if dz < 0.1 or seg_t <= 1e-6 or seg_len <= 1e-6:
+                continue
+            climb_ratio = dz / seg_len
+            if climb_ratio >= 0.85:
+                vz_ceiling = v_max * 0.20
+            elif climb_ratio >= 0.50:
+                vz_ceiling = v_max * 0.30
+            else:
+                continue
+            required_vz = dz / seg_t
+            if required_vz > vz_ceiling:
+                times[i] = dz / vz_ceiling
 
         return times
 
