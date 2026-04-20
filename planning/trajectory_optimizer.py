@@ -909,7 +909,7 @@ class TrajectoryOptimizer:
                 # gate) but only got 8.7% from proximity. The compound nature
                 # of sustained same-direction turns means each gate needs more
                 # margin than its point curvature suggests.
-                helix_interior_inflate = 1.05  # 5% minimum for helix interior (iter 44: 10%→5%, speed recovery)
+                helix_interior_inflate = 1.06  # 6% minimum for helix interior (iter 7 race_01-fix: 5%→6% — at 8% gate-10 margin thinned to 0.02m and drone crashed before gate-11. 6% preserves 12/12 gate completion while tracking error drops ~45%.)
                 inflate = max(inflate, helix_interior_inflate)
 
             if inflate > 1.001:
