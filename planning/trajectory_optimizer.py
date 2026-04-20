@@ -121,6 +121,52 @@ class RaceTrajectory:
         idx = int(np.argmin(dists_sq))
         return self.points[idx]
 
+    def find_closest_forward(
+        self,
+        position: Tuple[float, float, float],
+        min_time: float,
+        search_window_s: float = 2.0,
+    ) -> TrajectoryPoint:
+        """Find the closest trajectory point at time >= min_time.
+
+        On self-looping geometries (helix, figure-8, etc.) the global-argmin
+        version above can snap between different revolutions as the drone
+        moves — the tracker loses a coherent forward reference and the
+        drone can end up circling. This forward-only variant bounds the
+        search to ``[min_time, min_time + search_window_s]`` so the
+        reference progresses monotonically in time.
+
+        If ``min_time`` is beyond the trajectory end, returns the last
+        point. If ``search_window_s`` truncates past the end, the search
+        window is clipped to the available range.
+        """
+        if not hasattr(self, '_positions_array'):
+            self._positions_array = np.array(
+                [pt.position for pt in self.points], dtype=np.float64
+            )
+        if not hasattr(self, '_times_array'):
+            self._times_array = np.array(
+                [pt.time for pt in self.points], dtype=np.float64
+            )
+
+        if min_time >= self.total_time:
+            return self.points[-1]
+
+        lo_t = max(0.0, min_time)
+        hi_t = min(self.total_time, min_time + search_window_s)
+
+        # searchsorted returns left-insertion index for lo_t, right for hi_t.
+        lo_idx = int(np.searchsorted(self._times_array, lo_t, side="left"))
+        hi_idx = int(np.searchsorted(self._times_array, hi_t, side="right"))
+        if hi_idx <= lo_idx:
+            return self.points[min(lo_idx, len(self.points) - 1)]
+
+        pos = np.array(position, dtype=np.float64)
+        diffs = self._positions_array[lo_idx:hi_idx] - pos
+        dists_sq = np.einsum('ij,ij->i', diffs, diffs)
+        local_idx = int(np.argmin(dists_sq))
+        return self.points[lo_idx + local_idx]
+
 
 def compute_ilc_offset_table(
     trajectory: RaceTrajectory,

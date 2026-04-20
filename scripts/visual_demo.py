@@ -322,7 +322,22 @@ class VisualDemo:
 
         # Timing / metrics
         self._loop_times: deque = deque(maxlen=120)
+        # HUD rolling window (recent samples for display).
         self._tracking_errors: deque = deque(maxlen=200)
+        # Full trajectory-tracking error accumulator (for end-of-run avg).
+        # Kept separate from the HUD deque so the reported average covers
+        # the entire trajectory-tracking window, not just the last 200
+        # frames (which for the helix race are all from the worst-tracking
+        # tail and misrepresent the run).
+        self._trajectory_tracking_errors: list = []
+
+        # Monotonic reference-time tracker (iter 8 race_01 fix): the previous
+        # ``find_closest(pos)`` returns the global argmin which on a helix
+        # trajectory can snap across revolutions as the drone moves, causing
+        # the reference to oscillate and the drone to lose its forward path.
+        # ``_ref_progress_time`` stores the last closest-point time so the
+        # next lookup is bounded to a forward window and cannot jump back.
+        self._ref_progress_time: float = 0.0
 
         ctrl_freq = self.env.drone.config.ctrl_freq
         self._render_interval = max(1, round(ctrl_freq / 30))
@@ -422,10 +437,38 @@ class VisualDemo:
                 print(f"\nCrash! Alt={pos[2]:.2f}m")
                 break
 
-            # 5. Trajectory reference (closest-point + lookahead)
-            closest = self.trajectory.find_closest(pos)
+            # 5. Trajectory reference (monotonic-forward closest + lookahead)
+            # Iter 8 race_01 fix: ``find_closest`` is replaced with
+            # ``find_closest_forward`` anchored at ``_ref_progress_time``.
+            # On the helix (gates 7-12) the trajectory self-overlaps, so
+            # global argmin could snap backward/across revolutions causing
+            # the drone to orbit rather than advance. The forward-only
+            # search guarantees the reference time only moves forward.
+            closest = self.trajectory.find_closest_forward(
+                pos, self._ref_progress_time, search_window_s=2.0
+            )
+            # Anchor advances with the natural closest-point progress. The
+            # monotonic guarantee comes from ``find_closest_forward``'s
+            # ``min_time=self._ref_progress_time`` bound — the returned
+            # point's time is always ≥ the previous anchor, so the anchor
+            # only moves forward. We do NOT force a minimum advance: if
+            # the drone momentarily stalls at an aggressive turn, the
+            # reference should wait with it rather than outrunning the
+            # drone's tracking capability.
+            self._ref_progress_time = closest.time
             trk_err = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, closest.position)))
-            self._tracking_errors.append(trk_err)
+            # Only accumulate tracking error while the drone is actually
+            # following the planned trajectory (not during the post-traj
+            # gate_fallback direct-nav phase, which would pin the metric
+            # to meaningless "distance from trajectory-end-point" values
+            # while the drone navigates tens of meters away to remaining
+            # gates).
+            trajectory_active = (
+                self._ref_progress_time < self.trajectory.total_time - 1e-3
+            )
+            if trajectory_active:
+                self._tracking_errors.append(trk_err)
+                self._trajectory_tracking_errors.append(trk_err)
 
             lookahead_time = min(closest.time + 0.3, self.trajectory.total_time)
             ref = self.trajectory.sample(lookahead_time)
@@ -447,7 +490,20 @@ class VisualDemo:
                 target_vel = ref.velocity
 
             # Past the trajectory end? Navigate directly to next gate.
-            if sim_time > self.trajectory.total_time and not self.sequencer.is_complete:
+            # Hybrid gating (iter 8 race_01 fix): enter fallback if EITHER
+            # (a) the drone has consumed all trajectory reference
+            # (_ref_progress_time ≥ total_time), OR
+            # (b) wall-clock is well past total_time and drone is stalled.
+            # Condition (a) is cleaner (codex cross-validation recommendation)
+            # but (a) alone deadlocks if the drone can't advance the monotonic
+            # anchor — so (b) serves as a watchdog. Threshold at 2× total_time
+            # gives the drone ample time to track the reference before direct
+            # intercept takes over.
+            traj_exhausted = (
+                self._ref_progress_time >= self.trajectory.total_time - 1e-3
+                or sim_time > self.trajectory.total_time * 2.0
+            )
+            if traj_exhausted and not self.sequencer.is_complete:
                 gate = self.sequencer.current_gate
                 if gate:
                     gpos = np.array(gate.position)
@@ -526,8 +582,11 @@ class VisualDemo:
             cv2.destroyAllWindows()
         self.env.close()
 
-        avg_trk = (sum(self._tracking_errors) / len(self._tracking_errors)
-                    if self._tracking_errors else 0)
+        # Use the full trajectory-tracking accumulator, not the HUD deque
+        # (which is capped to 200 most-recent samples).
+        avg_trk = (sum(self._trajectory_tracking_errors)
+                    / len(self._trajectory_tracking_errors)
+                    if self._trajectory_tracking_errors else 0)
         avg_hz = (1.0 / (sum(self._loop_times) / len(self._loop_times))
                   if self._loop_times else 0)
         return {
@@ -662,6 +721,8 @@ class VisualDemo:
             self.tracker.reset()
         self._loop_times.clear()
         self._tracking_errors.clear()
+        self._trajectory_tracking_errors.clear()
+        self._ref_progress_time = 0.0
         self.topdown.drone_trail.clear()
         self.topdown.ekf_trail.clear()
         for g in self.race_config.gates:
