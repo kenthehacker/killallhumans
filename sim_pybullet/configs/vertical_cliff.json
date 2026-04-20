@@ -1,0 +1,25 @@
+{
+  "field": {
+    "name": "vertical-cliff",
+    "bounds_min": [-5.0, -8.0, 0.0],
+    "bounds_max": [30.0, 8.0, 12.0]
+  },
+  "gate_defaults": {
+    "gate_type": "square",
+    "interior_width_m": 1.2,
+    "interior_height_m": 1.2,
+    "border_width_m": 0.18,
+    "depth_m": 0.10,
+    "color": "red"
+  },
+  "gates": [
+    { "id": "gate-1", "sequence_index": 1, "pose": { "x": 6.0,  "y":  0.0, "z": 1.5,  "yaw": 0.0 } },
+    { "id": "gate-2", "sequence_index": 2, "pose": { "x": 13.0, "y":  2.5, "z": 8.5,  "yaw": 0.15 }, "config": { "color": "blue"   } },
+    { "id": "gate-3", "sequence_index": 3, "pose": { "x": 20.0, "y": -2.5, "z": 2.0,  "yaw": -0.2 }, "config": { "color": "green"  } },
+    { "id": "gate-4", "sequence_index": 4, "pose": { "x": 25.0, "y":  0.0, "z": 10.5, "yaw": 0.0  }, "config": { "color": "yellow" } }
+  ],
+  "start": { "position": [0.0, 0.0, 1.5], "yaw": 0.0 },
+  "timestep": 0.004166,
+  "gravity": -9.81,
+  "_notes": "Extreme vertical swings: 1.5m -> 8.5m -> 2.0m -> 10.5m altitude across 25m horizontal. Tests the iter-11 climb-inflation policy — any raw trajectory here would demand more vertical accel than the tilt-clamped DSLPIDControl can track. Uses default planner knobs only. Iter-12 baseline: 4/4 gates in 18.5s at 0.897m avg tracking error. Proves the iter-11 climb-ratio inflation generalizes to steeper (1.5→10.5m) vertical swings than field_demo (4m→10m) without any per-race tuning."
+}
