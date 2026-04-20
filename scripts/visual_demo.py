@@ -264,13 +264,18 @@ class VisualDemo:
         rl_opt = RacingLineOptimizer()
         opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
 
-        # Iteration 4 (race_01 regression fix): plan trajectory at 5 m/s to match
-        # the MAX_CMD_SPEED command clamp. Previously trajectory was planned at
-        # 10 m/s but command velocity was clamped to 5 m/s, causing the drone to
-        # lag the reference by 1-3m in the lateral axis and miss gates 2 and 3.
-        # Matching plan-speed to track-speed lets the drone actually follow the
-        # racing line through each gate center.
-        PLAN_MAX_SPEED = 5.0
+        # Iteration 4 (race_01 regression fix): plan trajectory at <=5 m/s to
+        # match the MAX_CMD_SPEED command clamp. Previously trajectory was
+        # planned at 10 m/s but command velocity was clamped to 5 m/s, causing
+        # the drone to lag the reference by 1-3m laterally and miss gates 2/3.
+        #
+        # Iteration 5: further reduced to 4 m/s. At 5 m/s the drone completes
+        # gates 1-6 on the horizontal slalom but tumbles at gate-6→gate-7
+        # (helix entry) because the trajectory commands a sharp direction
+        # change + altitude climb. Peak pitch 75°, roll 125°, altitude
+        # collapses. 4 m/s gives 25% more time per transition for the
+        # Crazyflie body-rate controller to track without saturating tilt.
+        PLAN_MAX_SPEED = 4.0
         profiler = SpeedProfiler(max_speed=PLAN_MAX_SPEED)
         self.wp_positions = [start_pos] + [g.position for g in opt_wps]
         self.speeds = profiler.profile(self.wp_positions)
@@ -417,8 +422,10 @@ class VisualDemo:
             target_yaw = ref.yaw
             target_source = "trajectory"
 
-            # Clamp commanded velocity to Crazyflie-trackable speed
-            MAX_CMD_SPEED = 5.0
+            # Clamp commanded velocity to Crazyflie-trackable speed.
+            # Iteration 5: lowered to 4.0 to match PLAN_MAX_SPEED so the
+            # drone does not overshoot the trajectory reference at any point.
+            MAX_CMD_SPEED = 4.0
             ref_speed = math.sqrt(sum(v * v for v in ref.velocity))
             if ref_speed > MAX_CMD_SPEED:
                 scale = MAX_CMD_SPEED / ref_speed
