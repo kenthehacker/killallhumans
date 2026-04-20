@@ -603,8 +603,20 @@ class VisualDemo:
                 self._tracking.append(trk_err)
 
             # 7. Step physics
+            # Iter 10 opt-in: when PlannerConfig.accel_ff_gain > 0 the
+            # trajectory carries a smoothed ff_acceleration on each point;
+            # we hand that to GPDDrone.step as target_acc so the controller
+            # converts it to thrust via m·a_ff. At gain = 0 (default) the
+            # field is (0,0,0) and step() is behaviorally identical to the
+            # pre-iter-10 signature — baseline preserved.
+            target_acc = (
+                ref.ff_acceleration if target_source == "trajectory"
+                else (0.0, 0.0, 0.0)
+            )
             for _ in range(self._steps_per_loop):
-                self.env.drone.step(target_pos, target_vel, target_yaw)
+                self.env.drone.step(
+                    target_pos, target_vel, target_yaw, target_acc=target_acc
+                )
 
             # 8. Timing
             loop_dt = time.perf_counter() - loop_t0

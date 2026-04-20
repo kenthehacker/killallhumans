@@ -60,6 +60,16 @@ class TrajectoryPoint:
     jerk: Tuple[float, float, float]
     yaw: float
     yaw_rate: float
+    # Iter 10: optional feedforward acceleration (m/s², world frame) for
+    # ``GPDDrone.step(target_acc=...)``. Defaults to zero so callers that
+    # construct points with the first 7 positional fields behave exactly
+    # as before. Populated by ``TrajectoryOptimizer`` when
+    # ``PlannerConfig.accel_ff_gain > 0`` — a Butterworth-smoothed copy
+    # of ``acceleration``, scaled by the gain and clamped. Iter 9 found
+    # that feeding raw polynomial acceleration as FF destabilizes the
+    # tilt-clamped attitude loop at segment boundaries; the zero-phase
+    # low-pass (Bristow & Alleyne 2007 §4) removes the boundary spikes.
+    ff_acceleration: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -102,6 +112,9 @@ class RaceTrajectory:
             jerk=_lerp3(p0.jerk, p1.jerk, alpha),
             yaw=_lerp_angle(p0.yaw, p1.yaw, alpha),
             yaw_rate=p0.yaw_rate + alpha * (p1.yaw_rate - p0.yaw_rate),
+            ff_acceleration=_lerp3(
+                p0.ff_acceleration, p1.ff_acceleration, alpha
+            ),
         )
 
     def find_closest(self, position: Tuple[float, float, float]) -> TrajectoryPoint:
@@ -603,6 +616,22 @@ class PlannerConfig:
     # default is the iter-8 value that resolved the helix self-overlap.
     search_window_s: float = 2.0
 
+    # --- Smoothed acceleration feedforward (iter-9 backlog item #5) ---
+    # When ``accel_ff_gain > 0`` the optimizer runs a zero-phase 2nd-order
+    # Butterworth low-pass over each axis of the generated acceleration
+    # trace, scales it by ``accel_ff_gain``, clamps per-axis magnitudes to
+    # ``accel_ff_clamp_ms2``, and stores the result on each
+    # ``TrajectoryPoint.ff_acceleration``. Runtime callers pass that field
+    # as ``target_acc`` to ``GPDDrone.step`` — the Mellinger/Tal-Karaman
+    # feedforward term. Iter 9 found raw polynomial acceleration
+    # destabilizes the tilt-clamped attitude loop at segment boundaries;
+    # the low-pass (Bristow & Alleyne 2007) removes the boundary spikes.
+    # Default gain = 0.0 → ff_acceleration stays at zero → no behavioral
+    # change (the 12/12 × 0.665 m iter-9 baseline is preserved).
+    accel_ff_gain: float = 0.0
+    accel_ff_cutoff_hz: float = 2.0
+    accel_ff_clamp_ms2: float = 5.0
+
 
 class TrajectoryOptimizer:
     """
@@ -755,6 +784,12 @@ class TrajectoryOptimizer:
             waypoints, segment_times, start_velocity, gates,
         )
 
+        # Iter 10 (Phase A L1 opt-in): populate ff_acceleration on each
+        # point if the feedforward gain is non-zero. Default gain = 0.0
+        # leaves the field at its initialized (0,0,0) — no-op at runtime.
+        if self.planner_config.accel_ff_gain > 0.0:
+            self._populate_ff_acceleration(points)
+
         total_time = sum(segment_times)
         return RaceTrajectory(
             points=points,
@@ -762,6 +797,64 @@ class TrajectoryOptimizer:
             segment_times=segment_times,
             gate_waypoints=gates,
         )
+
+    def _populate_ff_acceleration(self, points: List[TrajectoryPoint]) -> None:
+        """Fill in ``ff_acceleration`` on each point from a low-passed copy.
+
+        Zero-phase 2nd-order Butterworth on each axis of the acceleration
+        trace → ×gain → per-axis clamp → write back to the points. The
+        zero-phase (``filtfilt``) variant is used so the smoothed signal
+        has no group delay relative to the unsmoothed acceleration, which
+        keeps the FF term temporally aligned with the polynomial segment
+        it was sampled from.
+
+        Research: Bristow & Alleyne 2007 §4 (Q-filter design for ILC);
+        Tal & Karaman 2018 §III (acceleration-FF Mellinger formulation).
+        """
+        if len(points) < 10:
+            return  # Too few samples to filter usefully.
+
+        from scipy.signal import butter, filtfilt  # lazy import
+
+        times = np.array([pt.time for pt in points], dtype=float)
+        # Average control dt over the trajectory (points are generated at
+        # roughly self.dt_sample, but segment boundaries vary slightly).
+        dt = float(np.mean(np.diff(times))) if len(times) >= 2 else self.dt_sample
+        if dt <= 0:
+            return
+        fs = 1.0 / dt  # effective sample rate (Hz)
+        nyq = 0.5 * fs
+        cutoff = self.planner_config.accel_ff_cutoff_hz
+        if cutoff >= nyq:
+            # Cutoff too high relative to sample rate — filter degenerates.
+            # Fall back to raw acceleration scaled by gain.
+            b, a = None, None
+        else:
+            b, a = butter(2, cutoff / nyq, btype="low")
+
+        accels = np.array(
+            [pt.acceleration for pt in points], dtype=float
+        )  # shape (N, 3)
+
+        if b is not None:
+            smoothed = np.empty_like(accels)
+            for axis in range(3):
+                smoothed[:, axis] = filtfilt(b, a, accels[:, axis])
+        else:
+            smoothed = accels.copy()
+
+        gain = self.planner_config.accel_ff_gain
+        clamp = self.planner_config.accel_ff_clamp_ms2
+        smoothed *= gain
+        # Per-axis magnitude clamp (matches iter-9 experimental rig).
+        np.clip(smoothed, -clamp, clamp, out=smoothed)
+
+        for i, pt in enumerate(points):
+            pt.ff_acceleration = (
+                float(smoothed[i, 0]),
+                float(smoothed[i, 1]),
+                float(smoothed[i, 2]),
+            )
 
     def _inflate_sharp_turns(
         self,
