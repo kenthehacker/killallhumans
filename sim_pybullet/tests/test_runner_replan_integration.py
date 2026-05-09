@@ -30,7 +30,10 @@ _install_fake_pybullet()
 from flight_control.types import DroneState, TargetState  # noqa: E402
 from simulation.model_types import Gate, GateConfig, Pose3D  # noqa: E402
 from sim_pybullet.runner import RaceRunner, RacingLine  # noqa: E402
-from sim_pybullet.sequencer import GateSequencer  # noqa: E402
+from sim_pybullet._gate_to_spec import to_spec as _gate_to_spec  # noqa: E402
+from gate_sequencing.sequencer import (  # noqa: E402
+    GateSequencer, SequencerConfig,
+)
 from planning.dynamic_replanner import DynamicReplanner, ReplanConfig  # noqa: E402
 
 
@@ -51,12 +54,16 @@ def _make_runner_stub(gates: List[Gate], contact_returns: List[Optional[str]]):
     """Construct a RaceRunner with just the surface needed for _maybe_replan
     + the gate-contact polling block in the main loop."""
     runner = RaceRunner.__new__(RaceRunner)
-    # Use the same default margin (1.5) the runner uses in production —
-    # tests rely on mark_collision (physics-driven) rather than geometric
-    # detection for crash setup, so the margin doesn't matter for these
-    # cases. Keeping it at the production default ensures the test
-    # exercises the same code path as the live runner.
-    runner.sequencer = GateSequencer(gates)
+    # Mirrors RaceRunner.__init__: platform-agnostic GateSequencer fed
+    # GateSpec adapters with the production sim_pybullet pass margin
+    # (1.5) plus decoupled crash_margin (1.0) so geometric crash
+    # detection is non-empty. Tests here exercise the same code path
+    # as the live runner.
+    runner.sequencer = GateSequencer(
+        [_gate_to_spec(g) for g in gates],
+        config=SequencerConfig(pass_through_margin=1.5, crash_margin=1.0),
+    )
+    runner.sequencer.start()
     runner._racing_line = RacingLine(
         [
             __import__("numpy").array([0, 0, 1.5]),
@@ -70,6 +77,7 @@ def _make_runner_stub(gates: List[Gate], contact_returns: List[Optional[str]]):
     runner._last_contact_gate_id = None
     runner._last_lateral_err = 0.0
     runner._prev_target_z = None
+    runner._replan_gates_baseline = 0
     runner._draw_racing_lines = lambda: None  # no-op for tests
 
     # Replace env with a mock that returns scripted gate_contact() values.
@@ -114,16 +122,19 @@ class TestContactToMarkCollision:
         assert runner.sequencer.crashed_gate_ids == ["G1"]
         assert runner.crashed_into_gate == "G1"
 
-    def test_gate_contact_marks_each_distinct_hit(self):
-        """Two distinct contacts (broken by a clean tick) should mark twice."""
+    def test_gate_contact_marks_distinct_gates(self):
+        """The runner's `_last_contact_gate_id` dedupe + the sequencer's
+        P1-5 idempotency together: each distinct gate id contacted
+        registers exactly one crash entry. Same-gate re-hits collapse
+        (P1-5); a different gate is a new event."""
         gates = [_gate("G1", 5, 0), _gate("G2", 10, 1)]
         runner = _make_runner_stub(
             gates,
-            contact_returns=["G1", None, "G1", None],
+            contact_returns=["G1", None, "G2", None],
         )
         for _ in range(4):
             _simulate_tick(runner, (4.5, 0.5, 1.5))
-        assert runner.sequencer.crashed_gate_ids == ["G1", "G1"]
+        assert runner.sequencer.crashed_gate_ids == ["G1", "G2"]
 
     def test_unknown_gate_id_silently_ignored(self):
         gates = [_gate("G1", 5, 0)]
@@ -190,9 +201,13 @@ class TestReplanIntegration:
         assert abs(first_pt[2] - 1.5) < 0.5
 
     def test_replan_count_persists_across_multiple_triggers(self):
+        # Distinct gate-id contacts each fire their own trigger. Set-of-ID
+        # detection (P1-3) suppresses repeat crashes on the same gate, so
+        # this test uses a different gate for the second crash. Repeat-
+        # same-gate escalation is owned by P1-11 (skip-after-N-failures).
         gates = [_gate("G1", 5, 0), _gate("G2", 10, 1), _gate("G3", 15, 2)]
         runner = _make_runner_stub(
-            gates, contact_returns=["G1", None, "G1", None],
+            gates, contact_returns=["G1", None, "G2", None],
         )
         drone_state = DroneState(
             position=(4.5, 0.5, 1.5), velocity=(0, 0, 0), yaw=0.0,
@@ -207,4 +222,125 @@ class TestReplanIntegration:
 
         _simulate_tick(runner, drone_state.position)
         runner._maybe_replan(sim_time=3.0, drone_state=drone_state)
-        assert runner._replan_count == 2  # second contact (broken by None tick)
+        assert runner._replan_count == 2  # G2 is a fresh trigger
+
+
+# ── P0-1: replan baseline snapshot + local-index targeting ────────────────
+
+
+class TestReplanTargeting:
+    """The replanned line starts fresh; min_arc indexing must reset per replan."""
+
+    def test_replan_baseline_snapshot_tracks_gates_passed(self):
+        # Drone has passed G1 already; now crashes G2.
+        gates = [_gate("G1", 5, 0), _gate("G2", 10, 1), _gate("G3", 15, 2)]
+        runner = _make_runner_stub(gates, contact_returns=["G2"])
+        runner.sequencer._passed.append("G1")
+        runner.sequencer._current_idx = 1
+
+        assert runner._replan_gates_baseline == 0  # initial
+
+        drone_state = DroneState(
+            position=(9.5, 0.5, 1.5), velocity=(0, 0, 0), yaw=0.0,
+        )
+        _simulate_tick(runner, drone_state.position)
+        runner._maybe_replan(sim_time=1.0, drone_state=drone_state)
+
+        assert runner._replan_gates_baseline == 1  # G1 was already passed
+
+    def test_replan_targets_next_gate_not_final(self):
+        """Spec test: replanned line waypoint 1 must be G1 (next un-passed)."""
+        gates = [_gate("G1", 5, 0), _gate("G2", 10, 1), _gate("G3", 15, 2)]
+        runner = _make_runner_stub(gates, contact_returns=["G1"])
+        state = DroneState(position=(4.5, 0.5, 1.5), velocity=(0, 0, 0), yaw=0.0)
+        _simulate_tick(runner, state.position)
+        runner._maybe_replan(sim_time=1.0, drone_state=state)
+        # Replanned line points[60] sits at the seg-1 endpoint = G1 (~x=5),
+        # not jumped past to G3 (x=15).
+        assert tuple(runner._racing_line.points[60])[0] < 7.0
+
+    def test_reset_restores_initial_racing_line(self):
+        """P0-2: after a replan rebuilds the line mid-flight, _reset() must
+        restore the line from the original start_position so 'r' brings the
+        drone back to a clean state, not chasing a stale post-replan stub."""
+        gates = [_gate("G1", 5, 0), _gate("G2", 10, 1)]
+        runner = _make_runner_stub(gates, contact_returns=["G1"])
+        runner.env.race_config = types.SimpleNamespace(
+            start_position=(0.0, 0.0, 1.5),
+            gates=gates,
+        )
+        runner.env.reset = MagicMock()
+
+        # Force a mid-race replan so the racing line is overwritten.
+        state = DroneState(position=(4.5, 0.5, 1.5), velocity=(0, 0, 0), yaw=0.0)
+        _simulate_tick(runner, state.position)
+        runner._maybe_replan(sim_time=1.0, drone_state=state)
+        # Sanity: replanned line starts at drone, not at origin.
+        assert abs(runner._racing_line.points[0][0] - 4.5) < 0.5
+
+        # Press 'r' equivalent.
+        runner._reset()
+
+        first_pt = runner._racing_line.points[0]
+        assert abs(first_pt[0] - 0.0) < 0.01
+        assert abs(first_pt[1] - 0.0) < 0.01
+        assert abs(first_pt[2] - 1.5) < 0.01
+        # Slew + lateral + contact + baseline state must also be cleared.
+        assert runner._prev_target_z is None
+        assert runner._last_lateral_err == 0.0
+        assert runner._last_contact_gate_id is None
+        assert runner._replan_gates_baseline == 0
+
+    def test_replan_seeds_prev_target_z_to_drone_altitude(self):
+        """P1-9: post-replan, the slew limiter must stay armed. Nulling
+        _prev_target_z disables it for one tick — the worst time, since
+        the next-gate altitude can be 2m+ off the drone's current z."""
+        gates = [_gate("G1", 5, 0), _gate("G2", 10, 1)]
+        runner = _make_runner_stub(gates, contact_returns=["G1"])
+        # Simulate a meaningful drone altitude pre-replan.
+        runner._prev_target_z = 1.0  # tracking from prior tick
+        drone_state = DroneState(
+            position=(4.5, 0.5, 1.5), velocity=(0, 0, 0), yaw=0.0,
+        )
+        _simulate_tick(runner, drone_state.position)
+        runner._maybe_replan(sim_time=1.0, drone_state=drone_state)
+
+        # Slew limiter must be ARMED (not None) and seeded to the drone's
+        # current z, not stale from before the replan.
+        assert runner._prev_target_z is not None, (
+            "P1-9: _prev_target_z nulled — slew limiter disabled post-replan"
+        )
+        assert abs(runner._prev_target_z - 1.5) < 1e-6, (
+            f"P1-9: _prev_target_z={runner._prev_target_z}, expected 1.5 "
+            f"(drone z at replan time)"
+        )
+
+    def test_post_replan_min_arc_uses_local_index(self):
+        """Pre-fix: gates_passed=2 → waypoint_arc(2) on rebuilt 4-wp line clamps
+        near G5, controller jumps past G3 and G4 to the final gate. With the
+        fix, local_idx = gates_passed - baseline = 0 → search from drone."""
+        gates = [
+            _gate("G1", 5, 0), _gate("G2", 10, 1), _gate("G3", 15, 2),
+            _gate("G4", 20, 3), _gate("G5", 25, 4),
+        ]
+        runner = _make_runner_stub(gates, contact_returns=["G3"])
+        runner.env.drone.config.ctrl_freq = 240
+        # Pretend drone already passed G1 + G2.
+        runner.sequencer._passed.extend(["G1", "G2"])
+        runner.sequencer._current_idx = 2
+
+        drone_state = DroneState(
+            position=(14.5, 0.5, 1.5), velocity=(0, 0, 0), yaw=0.0,
+        )
+        _simulate_tick(runner, drone_state.position)
+        runner._maybe_replan(sim_time=1.0, drone_state=drone_state)
+
+        # New line: [drone(14.5), G3(15), G4(20), G5(25)] — 3 segments.
+        target = runner._target_from_sim_metadata(drone_state)
+        # Drone is at x=14.5. With the fix (local_idx=0, min_arc=0), the
+        # spline search starts at drone and lookahead lands near G3 (x≈15).
+        # Without the fix, min_arc = waypoint_arc(2) on a 3-seg line clamps
+        # past G3, so the target jumps somewhere into seg 1/2 (x>17).
+        assert target.position[0] < 16.0, (
+            f"target x={target.position[0]:.2f} jumped past G3 — local_idx fix missing"
+        )

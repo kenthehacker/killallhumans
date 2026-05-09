@@ -94,9 +94,23 @@ class DynamicReplanner:
         self._last_replan_time: float = -math.inf
         self._consecutive_high_lateral: int = 0
         self._replan_count: int = 0
-        self._last_seen_crashes: int = 0
-        self._last_seen_misses: int = 0
+        # Set-of-IDs detection (P1-3): track which crash/miss IDs the
+        # sequencer has reported so far. The list length is tracked
+        # alongside so that a sequencer.reset() (which empties the lists)
+        # is detected as a length-shrink and resynced — set-difference
+        # alone would miss this when the post-reset crash happens to
+        # repeat a previously-seen ID.
+        self._seen_crash_ids: set = set()
+        self._seen_miss_ids: set = set()
+        self._n_crashes_seen: int = 0
+        self._n_misses_seen: int = 0
         self._last_trigger: Optional[ReplanTrigger] = None
+        # Edge-trigger latches for level signals. The sequencer's RECOVERY
+        # state and the sustained-lateral-error condition each persist for
+        # the duration of the perturbation; without these we'd report the
+        # trigger field True every tick. See P1-1.
+        self._was_off_track: bool = False
+        self._was_sustained: bool = False
 
     @property
     def replan_count(self) -> int:
@@ -110,9 +124,13 @@ class DynamicReplanner:
         self._last_replan_time = -math.inf
         self._consecutive_high_lateral = 0
         self._replan_count = 0
-        self._last_seen_crashes = 0
-        self._last_seen_misses = 0
+        self._seen_crash_ids = set()
+        self._seen_miss_ids = set()
+        self._n_crashes_seen = 0
+        self._n_misses_seen = 0
         self._last_trigger = None
+        self._was_off_track = False
+        self._was_sustained = False
 
     def evaluate(
         self,
@@ -127,23 +145,42 @@ class DynamicReplanner:
         cooldown. This split is deliberate: callers may want to log
         triggers even when not acting on them.
         """
-        n_crashes = len(sequencer.crashed_gate_ids)
-        n_misses = len(sequencer.missed_gate_ids)
+        # Set-of-IDs crash/miss detection. A length-shrink on the
+        # sequencer's authoritative list signals a reset; resync our
+        # baseline so a post-reset event with a previously-seen ID still
+        # registers as new.
+        crashed_list = sequencer.crashed_gate_ids
+        missed_list = sequencer.missed_gate_ids
+        if len(crashed_list) < self._n_crashes_seen:
+            self._seen_crash_ids = set()
+        if len(missed_list) < self._n_misses_seen:
+            self._seen_miss_ids = set()
+        self._n_crashes_seen = len(crashed_list)
+        self._n_misses_seen = len(missed_list)
+
+        crashed_set = set(crashed_list)
+        missed_set = set(missed_list)
+        new_crashes = crashed_set - self._seen_crash_ids
+        new_misses = missed_set - self._seen_miss_ids
+
+        gate_collision = bool(new_crashes)
+        missed_gate = bool(new_misses)
         crashed_gate = (
-            sequencer.crashed_gate_ids[-1]
-            if n_crashes > self._last_seen_crashes
-            else None
+            crashed_list[-1] if gate_collision else None
         )
 
-        gate_collision = n_crashes > self._last_seen_crashes
-        missed_gate = n_misses > self._last_seen_misses
+        self._seen_crash_ids = crashed_set
+        self._seen_miss_ids = missed_set
 
-        # Sustained lateral error counter
-        if lateral_error > self.config.lateral_error_threshold_m:
-            self._consecutive_high_lateral += 1
-        else:
-            self._consecutive_high_lateral = 0
-        sustained = (
+        # Sustained lateral error counter. Skip the update entirely when
+        # lateral_error is non-finite — a NaN tick must neither increment
+        # (false fire eventually) nor reset (silent disable).
+        if math.isfinite(lateral_error):
+            if lateral_error > self.config.lateral_error_threshold_m:
+                self._consecutive_high_lateral += 1
+            else:
+                self._consecutive_high_lateral = 0
+        level_sustained = (
             self._consecutive_high_lateral >= self.config.sustained_frames
         )
 
@@ -151,10 +188,17 @@ class DynamicReplanner:
         # one place. RaceState lives in the sequencer module; we compare
         # by string to avoid a hard import.
         state_name = getattr(sequencer.state, "name", str(sequencer.state))
-        off_track = state_name == "RECOVERY"
+        level_off_track = state_name == "RECOVERY"
 
-        self._last_seen_crashes = n_crashes
-        self._last_seen_misses = n_misses
+        # Edge-trigger: the level signals stay True for the duration of the
+        # perturbation, so report them only on the rising edge. Latches
+        # self-update from level each tick — mark_replanned deliberately
+        # leaves them alone so a still-True condition stays suppressed past
+        # the cooldown window.
+        off_track = level_off_track and not self._was_off_track
+        sustained = level_sustained and not self._was_sustained
+        self._was_off_track = level_off_track
+        self._was_sustained = level_sustained
 
         trigger = ReplanTrigger(
             gate_collision=gate_collision,
@@ -167,6 +211,10 @@ class DynamicReplanner:
 
     def should_replan(self, trigger: ReplanTrigger, sim_time: float) -> bool:
         if not trigger.triggered:
+            return False
+        # NaN/inf would slip through the cooldown check (NaN comparisons
+        # are False per IEEE-754; inf - finite = inf > cooldown). Reject.
+        if not math.isfinite(sim_time):
             return False
         if sim_time - self._last_replan_time < self.config.cooldown_seconds:
             return False
@@ -197,6 +245,11 @@ class DynamicReplanner:
         return wps
 
     def mark_replanned(self, sim_time: float, trigger: ReplanTrigger) -> None:
+        # Refuse non-finite writes — a single NaN tick would otherwise
+        # poison _last_replan_time and disable cooldown for the rest of
+        # the race.
+        if not math.isfinite(sim_time):
+            return
         self._last_replan_time = sim_time
         self._replan_count += 1
         self._last_trigger = trigger

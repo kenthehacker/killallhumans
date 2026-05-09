@@ -46,6 +46,7 @@ from estimation.gate_pnp import (
 )
 from estimation.state_predictor import LatencyConfig, StatePredictor
 from gate_sequencing.sequencer import GateSequencer, GateSpec, RaceState
+from planning.dynamic_replanner import DynamicReplanner, ReplanConfig
 from planning.racing_line import RacingLineOptimizer, SpeedProfiler
 from planning.trajectory_optimizer import (
     DroneConstraints,
@@ -140,6 +141,14 @@ class RacePipeline:
         # State
         self.sequencer: Optional[GateSequencer] = None
         self.trajectory: Optional[RaceTrajectory] = None
+        # Dynamic replanner — wires the same crash/iff-highlighted/
+        # off-track surface used by the sim runner into the real-flight
+        # path so a hardware run can rebuild the trajectory mid-race
+        # instead of dead-reckoning along the original (P1-14).
+        self.replanner: Optional[DynamicReplanner] = None
+        self._replan_count: int = 0
+        self._last_replan_reasons: List[str] = []
+        self._last_lateral_err: float = 0.0
         self._race_start_time: float = 0.0
         self._gate_specs: List[GateSpec] = []
         self._initialized = False
@@ -173,8 +182,22 @@ class RacePipeline:
         """
         self._gate_specs = gates
         self.sequencer = GateSequencer(gates)
+        self.replanner = DynamicReplanner(ReplanConfig())
+        self._replan_count = 0
+        self._last_replan_reasons = []
+        self._last_lateral_err = 0.0
 
-        # Convert gate specs to waypoints for trajectory planning
+        self._build_trajectory_from(start_position, start_velocity, gates)
+
+    def _build_trajectory_from(
+        self,
+        start_position: Tuple[float, float, float],
+        start_velocity: Tuple[float, float, float],
+        remaining_gates: List[GateSpec],
+    ) -> None:
+        """Build (or rebuild) self.trajectory through ``remaining_gates``
+        starting from the drone's current state. Shared by configure()
+        (initial build) and _maybe_replan() (mid-race rebuild)."""
         gate_waypoints = [
             GateWaypoint(
                 position=g.position,
@@ -183,28 +206,33 @@ class RacePipeline:
                 height=g.interior_height,
                 yaw=g.yaw,
             )
-            for g in gates
+            for g in remaining_gates
         ]
 
-        # Optimize racing line
-        logger.info("Optimizing racing line through %d gates...", len(gates))
+        logger.info(
+            "Optimizing racing line through %d gates...", len(remaining_gates),
+        )
         line_optimizer = RacingLineOptimizer()
-        optimized_waypoints = line_optimizer.optimize(gate_waypoints, start_position)
+        optimized_waypoints = line_optimizer.optimize(
+            gate_waypoints, start_position,
+        )
 
-        # Compute speed profile
         profiler = SpeedProfiler(max_speed=self.config.max_speed)
-        waypoint_positions = [start_position] + [g.position for g in optimized_waypoints]
+        waypoint_positions = [start_position] + [
+            g.position for g in optimized_waypoints
+        ]
         speeds = profiler.profile(waypoint_positions)
-        logger.info("Speed profile: min=%.1f max=%.1f m/s", min(speeds), max(speeds))
+        logger.info(
+            "Speed profile: min=%.1f max=%.1f m/s", min(speeds), max(speeds),
+        )
 
-        # Generate time-optimal trajectory
         logger.info("Computing time-optimal trajectory...")
         traj_optimizer = TrajectoryOptimizer(
             constraints=DroneConstraints(max_velocity=self.config.max_speed),
             dt_sample=self.config.trajectory_dt,
         )
         self.trajectory = traj_optimizer.optimize(
-            optimized_waypoints, start_position, start_velocity
+            optimized_waypoints, start_position, start_velocity,
         )
         logger.info(
             "Trajectory: %.1fs total, %d points",
@@ -299,6 +327,13 @@ class RacePipeline:
             logger.info("All gates passed! Race complete.")
             return AttitudeCommand(0, 0, yaw, 0.4)  # hover
 
+        # 3a. Dynamic replan: mirrors sim_pybullet/runner._maybe_replan.
+        #     A crash/miss/off-track surface event rebuilds the
+        #     trajectory from the drone's current state. The cooldown
+        #     guard inside DynamicReplanner prevents replan storms.
+        sim_time = time.monotonic() - self._race_start_time
+        self._maybe_replan(sim_time, position, velocity)
+
         # 4. State prediction (latency compensation)
         if self.config.use_state_predictor:
             accel = telem.imu.accel if telem.imu else None
@@ -323,6 +358,11 @@ class RacePipeline:
             search_window_s=2.0,
         )
         self._ref_progress_time = closest.time
+        # Distance from drone to closest point on the trajectory feeds the
+        # replanner's sustained_lateral_error trigger on the next tick.
+        self._last_lateral_err = float(
+            np.linalg.norm(np.array(position) - np.array(closest.position))
+        )
         lookahead_t = min(
             closest.time + self._ref_lookahead_s,
             self.trajectory.total_time,
@@ -357,6 +397,47 @@ class RacePipeline:
             )
 
         return cmd
+
+    def _maybe_replan(
+        self,
+        sim_time: float,
+        position: Tuple[float, float, float],
+        velocity: Tuple[float, float, float],
+    ) -> None:
+        """Evaluate the replanner; rebuild the trajectory on a positive
+        trigger. Mirrors sim_pybullet/runner._maybe_replan."""
+        if self.replanner is None or self.sequencer is None:
+            return
+        trig = self.replanner.evaluate(
+            sim_time=sim_time,
+            sequencer=self.sequencer,
+            lateral_error=self._last_lateral_err,
+        )
+        if not self.replanner.should_replan(trig, sim_time):
+            return
+        # Remaining gates from the sequencer's vantage point. The current
+        # gate (highlighted target) is the first remaining; passed gates
+        # are skipped.
+        remaining = self._gate_specs[self.sequencer.gates_passed:]
+        if not remaining:
+            return
+        try:
+            self._build_trajectory_from(position, velocity, remaining)
+        except Exception:
+            # Keep the old trajectory on failure — a partially built one
+            # would be worse than the one we already have.
+            logger.exception("Replanned trajectory rebuild failed; keeping prior.")
+            return
+        # Reset reference anchor so the closest-forward search starts at
+        # the new trajectory's beginning.
+        self._ref_progress_time = 0.0
+        self.replanner.mark_replanned(sim_time, trig)
+        self._replan_count += 1
+        self._last_replan_reasons = trig.reasons
+        logger.info(
+            "REPLAN #%d at t=%.2fs reasons=%s",
+            self._replan_count, sim_time, trig.reasons,
+        )
 
     def _process_detection(
         self,

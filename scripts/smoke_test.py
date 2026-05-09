@@ -184,7 +184,11 @@ def run_pybullet_test(config_path: str, duration: float) -> Tuple[dict, bool]:
     """Run the full pipeline against PyBullet headless. Returns (metrics, ok)."""
     try:
         from sim_pybullet.env import DroneRaceEnv
-        from sim_pybullet.sequencer import GateSequencer as SimSequencer
+        from sim_pybullet._gate_to_spec import to_spec as _to_spec
+        from gate_sequencing.sequencer import (
+            GateSequencer as SimSequencer,
+            SequencerConfig,
+        )
     except ImportError as e:
         print(f"  [SKIP] PyBullet not available: {e}")
         return {}, True  # skip = still ok
@@ -203,7 +207,11 @@ def run_pybullet_test(config_path: str, duration: float) -> Tuple[dict, bool]:
         return {}, True
 
     # Sim sequencer
-    sim_seq = SimSequencer(race_config.gates)
+    sim_seq = SimSequencer(
+        [_to_spec(g) for g in race_config.gates],
+        config=SequencerConfig(pass_through_margin=1.5, crash_margin=1.0),
+    )
+    sim_seq.start()
 
     # New pipeline
     start_pos = race_config.start_position
