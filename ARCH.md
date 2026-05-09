@@ -75,10 +75,23 @@ autonomy stack: camera → detection → sequencing → planning → control →
   bodies. Supports color changes for highlight/dim/reset (gate sequencing visuals).
 - `sim_pybullet/env.py` — `DroneRaceEnv`: manages the PyBullet physics client,
   ground plane, gate placement, and drone spawning. Loads race configs from JSON.
-- `sim_pybullet/sequencer.py` — `GateSequencer`: tracks gate order, detects
-  pass-through events via signed-distance plane crossing, manages gate highlighting.
+  Exposes `gate_contact()` returning the `gate_id` of any current PyBullet contact
+  manifold against a gate body (or `None`).
+- `sim_pybullet/_gate_to_spec.py` — adapter `to_spec(Gate) -> GateSpec`. The
+  sim_pybullet sequencer was collapsed (P2-1, 2026-05-09) into the platform-
+  agnostic `gate_sequencing.GateSequencer`; this adapter projects sim Gates
+  through.
 - `sim_pybullet/runner.py` — `RaceRunner`: the main closed-loop. Ties physics
   stepping, camera rendering, detection, flight control, and HUD display together.
+  Exposes `crashed_into_gate` (most recent crash gate_id, or `None`) — backed by
+  the sequencer's crash log so it survives a single-tick contact and can be
+  inspected after the run ends.
+- `planning/dynamic_replanner.py` — `DynamicReplanner`: stateful policy that
+  decides *when* to rebuild the racing line (gate collision, missed gate,
+  off-track recovery, sustained lateral error) and constructs the new waypoint
+  list from the drone's current state. Cooldown prevents replan storms; level
+  signals are edge-triggered so the trigger field reads True once per
+  perturbation.
 
 ### Data Flow (Closed Loop)
 1. `pybullet.stepSimulation()` → advance physics
@@ -86,11 +99,17 @@ autonomy stack: camera → detection → sequencing → planning → control →
 3. Render FPV camera → RGB image
 4. Gate detection (real pipeline or sim metadata)
 5. Gate sequencing → target gate selection
-6. `FlightController.step_trpy()` → `TRPYCommand`
-7. `QuadrotorDrone.apply_command()` → forces/torques in PyBullet
-8. Render dual-camera HUD display
-9. Check gate pass-through → advance sequence
-10. Loop until all gates passed or timeout
+   5a. Poll `env.gate_contact()` — first tick of a new contact calls
+       `sequencer.mark_collision(gate_id)`. The runner's
+       `_last_contact_gate_id` dedupes the persistent PyBullet manifold.
+6. Compute lateral_error against the racing line, then run
+   `replanner.evaluate(...)` and rebuild `_racing_line` from the drone's
+   current position on a positive trigger (`_maybe_replan`).
+7. `FlightController.step_trpy()` → `TRPYCommand`
+8. `QuadrotorDrone.apply_command()` → forces/torques in PyBullet
+9. Render dual-camera HUD display
+10. Check gate pass-through → advance sequence
+11. Loop until all gates passed or timeout
 
 ### Detection Modes
 - **Sim metadata** (default): uses known gate positions for fast iteration
@@ -135,8 +154,9 @@ Converts world-frame accelerations to competition-format controls:
 
 ### Detectors
 - `GateDetector` — color-agnostic classical pipeline (edge + clustering + HSV)
-- `FusedGateDetector` — classical + YOLOv8n-pose, IoU-matched fusion
 - `Phase1GateDetector` — saturation/brightness thresholding for VQ1
+- (`FusedGateDetector` was removed — module never landed; the `--detector fused`
+  branch was deleted 2026-05-09 with P0-4.)
 
 ### Training Pipeline
 - `training/extract_frames.py` — extracts TII dataset frames with YOLO-pose labels
@@ -148,6 +168,15 @@ Converts world-frame accelerations to competition-format controls:
 - Two simulation systems: lightweight (fast, testable) + PyBullet (realistic, heavy)
 - TRPY mixer is a linear approximation; works for moderate attitudes but degrades at extreme angles
 - Phase 1 detector is deliberately simple — will need retuning once we see the actual VQ1 environment
+- The attitude-control path is single-loop PD (no cascaded angle→rate PID inner
+  loop). Acceptable around hover and low-speed manoeuvres; structurally unstable
+  beyond hover (P0-5, deferred). Until the cascaded loop ships, target attitudes
+  must stay clamped.
+- Production `pass_through_margin = 1.5` keeps imprecise-flight tolerance for
+  pass classification, but the geometric crash zone collapses under it. The
+  authoritative crash signal in production is `mark_collision` (PyBullet's
+  contact manifold). `crash_margin = 1.0` (separate from `pass_through_margin`)
+  keeps the geometric crash zone non-empty for tests and debug.
 
 ## Maintenance Rule
 Keep this file updated whenever:
