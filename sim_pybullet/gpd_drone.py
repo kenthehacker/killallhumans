@@ -39,8 +39,9 @@ except ImportError:
 _MAX_TILT_RAD = math.radians(35)
 
 # Tilt threshold above which we enter auto-recovery (hover) mode.
-# Spiraling or sharp-turn instability is caught here before it cascades.
-_TUMBLE_TILT_RAD = math.radians(50)
+# 38 deg is close to _MAX_TILT_RAD (35 deg) — catches instability early
+# before the drone reaches clearly unrecoverable attitudes.
+_TUMBLE_TILT_RAD = math.radians(38)
 
 
 @dataclass
@@ -110,6 +111,12 @@ class GPDDrone:
         # GRAVITY here = mass * g = 0.265 N.
         self._max_horiz_thrust = self._ctrl.GRAVITY * math.tan(_MAX_TILT_RAD)
 
+        # Drone mass (kg). DSLPIDControl exposes only the mass*g term
+        # as ``self._ctrl.GRAVITY``; divide by g to recover the scalar.
+        # Cached here so feedforward callers (``step(target_acc=...)``) don't
+        # have to repeat the divide every control tick.
+        self.mass_kg: float = self._ctrl.GRAVITY / 9.81
+
         self.step_count: int = 0
         # FPV camera matrix cache
         self._last_view_matrix: Optional[np.ndarray] = None
@@ -130,11 +137,17 @@ class GPDDrone:
         """PyBullet physics client ID — add gate bodies here after construction."""
         return self._env.CLIENT
 
+    @property
+    def body_id(self) -> int:
+        """PyBullet body ID of the drone — used for contact-point queries."""
+        return self._env.DRONE_IDS[0]
+
     def step(
         self,
         target_pos: Tuple[float, float, float],
         target_vel: Tuple[float, float, float] = (0.0, 0.0, 0.0),
         target_yaw: float = 0.0,
+        target_acc: Tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
         """
         Compute tilt-safe motor RPMs and advance physics by one control timestep.
@@ -142,6 +155,15 @@ class GPDDrone:
         Position + velocity errors → target thrust vector (horizontal component
         clamped to ≤35 degrees of tilt) → target Euler angles → RPMs via
         DSLPIDControl attitude controller → CtrlAviary physics step.
+
+        ``target_acc`` is an optional acceleration feedforward (m/s², world
+        frame). When supplied, the required inertial force (``m·a_ref``) is
+        added directly to the target thrust — so the PD loop only has to
+        correct tracking errors rather than drive the entire reference
+        acceleration. On curved trajectories this removes the
+        ``ε = m·a_centripetal / kp`` steady-state cross-track error that
+        the pure PD controller otherwise accumulates (Mellinger & Kumar
+        2011 §IV; Tal & Karaman 2018 §III).
         """
         sv = self._env._getDroneStateVector(0)
         cur_pos = sv[0:3]
@@ -173,10 +195,15 @@ class GPDDrone:
         # --- Target thrust vector (Newtons, world frame) ---
         # Same PD structure as DSLPIDControl._dslPIDPositionControl but with
         # horizontal component clamped to prevent extreme tilt angles.
+        # The acceleration-feedforward term (``target_acc`` in m/s²) is
+        # converted to Newtons via ``mass_kg`` (cached in __init__) before
+        # it joins the thrust command.
+        ff_acc = np.array(target_acc, dtype=float)
         target_thrust = (
             self._ctrl.P_COEFF_FOR * pos_e
             + self._ctrl.D_COEFF_FOR * vel_e
             + np.array([0.0, 0.0, self._ctrl.GRAVITY])
+            + self.mass_kg * ff_acc
         )
 
         # Clip horizontal thrust so tilt stays within _MAX_TILT_RAD.

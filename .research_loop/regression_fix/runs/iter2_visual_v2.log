@@ -1,0 +1,45 @@
+pybullet build time: Oct 21 2025 16:30:45
+/opt/homebrew/Caskroom/miniconda/base/envs/drone/lib/python3.12/site-packages/gym_pybullet_drones/envs/BaseAviary.py:7: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+/opt/homebrew/Caskroom/miniconda/base/envs/drone/lib/python3.12/site-packages/gymnasium/spaces/box.py:236: UserWarning: [33mWARN: Box low's precision lowered by casting to float32, current low.dtype=float64[0m
+  gym.logger.warn(
+/opt/homebrew/Caskroom/miniconda/base/envs/drone/lib/python3.12/site-packages/gymnasium/spaces/box.py:306: UserWarning: [33mWARN: Box high's precision lowered by casting to float32, current high.dtype=float64[0m
+  gym.logger.warn(
+
+ERROR conda.cli.main_run:execute(127): `conda run python3 scripts/visual_demo.py --config sim_pybullet/configs/race_01.json --max-time 90 --no-render` failed. (See above for error)
+[INFO] BaseAviary.__init__() loaded parameters from the drone's .urdf:
+[INFO] m 0.027000, L 0.039700,
+[INFO] ixx 0.000014, iyy 0.000014, izz 0.000022,
+[INFO] kf 3.160000e-10, km 7.940000e-12,
+[INFO] t2w 2.250000, max_speed_kmh 30.000000,
+[INFO] gnd_eff_coeff 11.368590, prop_radius 0.023135,
+[INFO] drag_xy_coeff 0.000001, drag_z_coeff 0.000001,
+[INFO] dw_coeff_1 2267.180000, dw_coeff_2 0.160000, dw_coeff_3 -0.110000
+Optimizing racing line...
+  Speed profile: min=2.0 max=10.0 m/s
+Computing time-optimal trajectory...
+  Trajectory: 14.3s, 702 points
+
+=======================================================
+  AI Grand Prix — Visual Pipeline Demo
+  Gates: 12  Max time: 90.0s  Sim speed: 1.0x
+  EKF: ON  Controller: SimplePositionTracker
+  Press Q to quit, R to reset
+=======================================================
+
+  PASSED gate-1 [1/12] t=1.83s
+
+Crash! Alt=0.03m
+Telemetry CSV: /Users/kenichi.matsuo/Personal/killallhumans/logs/visual_demo_20260416_173209.csv
+
+=======================================================
+Results:
+  gates_passed: 1
+  total_gates: 12
+  sim_time: 37.417
+  complete: False
+  avg_tracking_error: 1.112
+  avg_loop_hz: 3523.548
+  csv_path: /Users/kenichi.matsuo/Personal/killallhumans/logs/visual_demo_20260416_173209.csv
+=======================================================
+

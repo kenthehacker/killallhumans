@@ -1,0 +1,712 @@
+{
+  "iteration": 50,
+  "timestamp": "2026-04-15T17:31:00Z",
+  "status": "completed",
+  "current_bottleneck": "control",
+  "previous_bottleneck": "system_integration",
+  "papers_analyzed": [
+    "togt_planner_qin_2024",
+    "leveling_playing_field_2025",
+    "perception_aware_planning_eth_2026",
+    "fast_minsnap_burke_2020",
+    "gate_aware_online_planning_2024",
+    "drift_corrected_vio_2025",
+    "time_optimal_long_range_2024",
+    "on_your_own_romero_2025",
+    "euclidean_noneuclidean_racing_fork_2024",
+    "aggressive_maneuvers_sensorimotor_2026",
+    "realtime_mintime_teissing_2024",
+    "alternating_peak_optimization_2024",
+    "time_optimal_waypoint_foehn_2021",
+    "taco_sanghvi_2025",
+    "lmpc_adaptive_cost_zhao_2025",
+    "toppquad_mao_2024",
+    "aggressiveness_aware_control_2026",
+    "alternating_peak_foehn_2024",
+    "aggressive_tracking_tal_2018",
+    "datt_adaptive_tracking_2023",
+    "flatness_rotor_drag_faessler_2018",
+    "drag_aware_planning_zhang_2024",
+    "l1quad_adaptive_geometric_wu_2025",
+    "realtime_mintime_norm_constraint_teissing_2024",
+    "perception_aware_unknown_env_2025",
+    "fov_cbf_quadrotor_2025",
+    "drift_corrected_vio_perception_planning_2025",
+    "taco_trajectory_aware_controller_2025",
+    "mpcc_plus_plus_krinner_2024",
+    "neural_augmented_indi_2025",
+    "dqn_gain_scheduling_2026",
+    "task_parameter_nexus_2024",
+    "rl_gain_scheduling_ppo_2024",
+    "arola_modular_architecture_2026",
+    "ilmpc_drone_racing_2025",
+    "mppi_reference_free_racing_2025",
+    "toppquad_speed_profile_mao_2024",
+    "sequence_modeling_toppquad_2025",
+    "multifidelity_rl_replanning_2024",
+    "fbga_velocity_profile_piazza_2025",
+    "cpc_foehn_2021",
+    "cimpcc_curvature_velocity_li_2024",
+    "vpmpcc_data_driven_racing_li_2024",
+    "monorace_champion_level_2026",
+    "pa_mppi_perception_aware_2025",
+    "mastering_diverse_tracks_2025",
+    "quad_lcd_srikanthan_2025",
+    "ilmpc_improved_drone_racing_2025",
+    "spatial_ilc_virtual_tube_2023",
+    "aero_mppi_ensemble_2025",
+    "f1_data_driven_init_shehadeh_2026",
+    "topology_driven_parallel_degroot_2024",
+    "learning_agile_gate_traversal_sun_2025",
+    "imitation_learning_timeopt_waypoints_2024",
+    "rl_safe_timeopt_cluttered_2025",
+    "storm_spatiotemporal_optimization_2025",
+    "sequence_modeling_lstm_topp_mao_2025",
+    "bo_racing_line_heilmeier_2020",
+    "multiobjective_pid_quadrotor_2025",
+    "sampling_racing_line_ogretmen_2024",
+    "cimpcc_lap_time_li_2025",
+    "ilmpc_adaptive_cost_drone_2025",
+    "cop_pareto_planning_tzoumanikas_2022",
+    "quaypoints_racing_2025",
+    "spatially_aware_cmaes_racing_2026",
+    "schoellig_optbased_ilc_2012",
+    "qpgp_ilc_2026",
+    "freq_domain_ilc_vanharen_2024",
+    "segmentwise_ilc_zhang_2024",
+    "monotonic_ilc_timevarying_gain_liu_2023",
+    "filtfilt_cliff_filters_longman_2019",
+    "nn_augmented_ilc_butterworth_2025",
+    "lmpc_drone_racing_adaptive_cost_2025",
+    "qpgp_predictive_ilc_2026",
+    "robust_ilc_mimo_butterworth_2025",
+    "timevarying_qfilter_bristow_2007",
+    "segment_based_ailc_zhang_2026",
+    "dual_ilc_mimo_ewering_2025",
+    "spiral_self_play_racing_2025",
+    "robust_constrained_ilc_2022",
+    "strategizing_speed_lmpg_2026",
+    "track_centric_ilc_racing_2026",
+    "iteraoptiracing_unified_2025",
+    "timeopt_safety_constraints_2024",
+    "online_velocity_profile_apex_ogretmen_2025",
+    "nrhdg_drone_racing_path_2025",
+    "realtime_mintime_agile_uav_2024",
+    "mollification_curvature_bounds_2025",
+    "pmpc_gate_aware_racing_2024",
+    "rethinking_reference_mppi_2025",
+    "f1_datadriven_init_efficient_2026",
+    "sampling_online_racingline_ogretmen_2024",
+    "cdbo_racing_cully_2018",
+    "gradient_free_multidomain_zheng_2022",
+    "data_driven_aggressive_racing_vpmpcc_2024",
+    "ilmpc_lmpc_improved_2025",
+    "spatially_aware_controller_feedback_2026",
+    "ngtc_robust_agile_2025",
+    "jerk_constrained_topp_2024",
+    "primitive_planner_topp_ra_2025",
+    "cimpcc_lap_time_reduction_li_2025",
+    "gripmap_spatially_resolved_constraints_2025",
+    "energy_limited_minlap_eshof_2026",
+    "spline_mincurv_xue_2024",
+    "almost_global_tracking_s2_2024",
+    "rl_pid_gain_prediction_2025",
+    "linear_nonlinear_mpc_quadrotor_2024",
+    "newton_raphson_flow_tracking_2024",
+    "indi_differential_flatness_tal_2018",
+    "ngtc_tilt_analysis_supplement_2025",
+    "ilc_mismatch_compensation_wu_2024",
+    "lol_nmpc_lowlevel_dynamics_gupta_2025",
+    "ilmpc_improved_racing_chen_2025",
+    "ilc_mismatch_vibration_wang_2024",
+    "qpgp_predictive_ilc_2026_v2",
+    "robust_agile_flight_stability_2025",
+    "control_friendly_trajectories_2026",
+    "ilc_dob_mismatch_dynamics_2024",
+    "raptor_foundation_policy_2025",
+    "online_vp_generation_racing_2025",
+    "curriculum_rl_quadrotor_racing_2026",
+    "stochastic_uav_tradeoff_2024",
+    "difflab_twophase_racing_2025",
+    "dynamics_invariant_scaleaware_drl_2025",
+    "speedup_ilc_convergence_longman_2023",
+    "ilc_fast_nonlinear_oscillatory_brooks_2024",
+    "constrained_ilc_alternating_projection_2024",
+    "curobo_multistart_lbfgs_2024",
+    "miso_multistart_optimization_2024",
+    "aero_mppi_ensemble_trajectory_2025",
+    "tuning_parameter_ilc_fastest_convergence_2026",
+    "monorace_competition_robustness_2026",
+    "qpgp_pilc_convergence_accel_2026",
+    "nesterov_accelerated_ilc_wang_2023",
+    "ilc_speedup_model_based_longman_2023",
+    "cdbo_coordinate_descent_racing_2018",
+    "robust_drone_testing_pipeline_2025",
+    "simpleflight_sim2real_2024",
+    "reality_gap_robotics_uzh_2025"
+  ],
+  "total_papers_analyzed": 139,
+  "metrics_before": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1616,
+    "max_tracking_error_m": 0.7419,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7665,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-5",
+    "worst_gate_error_m": 0.2643,
+    "race_time_s": 13.31,
+    "deterministic": true
+  },
+  "metrics_after": {
+    "gate_pass_rate": 1.0,
+    "avg_tracking_error_m": 0.1616,
+    "max_tracking_error_m": 0.7419,
+    "ekf_uncertainty_m": 0.0119,
+    "avg_loop_hz": 7881,
+    "crashed": false,
+    "unit_test_pass_rate": 1.0,
+    "worst_gate": "gate-5",
+    "worst_gate_error_m": 0.2643,
+    "race_time_s": 13.31,
+    "deterministic": true
+  },
+  "changes_committed": true,
+  "commit_hash": "e207875",
+  "diagnostic": {
+    "root_cause": "System at performance ceiling of kinematic sim + PD controller architecture. Attitude saturation (0.85 rad) is the hard floor. ILC at deep convergence plateau. Further improvement requires MPC/MPCC controller upgrade or real hardware deployment.",
+    "telemetry_signals": {
+      "max_roll_rad": 0.85,
+      "max_abs_pitch_rad": 0.85,
+      "avg_pitch_rad": -0.093,
+      "avg_thrust": 0.872
+    },
+    "trend": "diminishing_returns",
+    "architectural_issues": [
+      "PD controller saturates at 0.85 rad — fundamental limit, requires MPC/MPCC",
+      "ILC at deep convergence plateau after 8 iterations + momentum",
+      "Basin switching risk prevents racing line re-optimization",
+      "Kinematic sim lacks motor latency, rotor dynamics, aerodynamic effects",
+      "Perception pipeline untested at racing speeds"
+    ],
+    "critic_findings": []
+  },
+  "improvements_backlog": [
+    {
+      "area": "control",
+      "description": "MPC/MPCC controller upgrade to break through attitude saturation limit",
+      "proposed_approach": "Implement simplified MPCC from Krinner 2024. Would better utilize dynamics constraints and avoid the 0.85 rad hard ceiling.",
+      "expected_impact": "10-20% tracking improvement by utilizing full control authority",
+      "priority": 1,
+      "research_refs": ["mpcc_plus_plus_krinner_2024", "cimpcc_lap_time_li_2025"]
+    },
+    {
+      "area": "system_integration",
+      "description": "Real hardware deployment with system identification",
+      "proposed_approach": "SysID (hover test, step response, chirp test, battery profiling per UZH RPG 2025) + HIL testing with PX4",
+      "expected_impact": "Identify real-world bottlenecks invisible in simulation",
+      "priority": 1,
+      "research_refs": ["reality_gap_robotics_uzh_2025", "simpleflight_sim2real_2024", "robust_drone_testing_pipeline_2025"]
+    },
+    {
+      "area": "perception_estimation",
+      "description": "Perception pipeline stress test at racing speeds",
+      "proposed_approach": "Test gate detection + PnP with motion blur, detection dropout, partial occlusion",
+      "expected_impact": "Identify perception failure modes before competition",
+      "priority": 2,
+      "research_refs": ["monorace_competition_robustness_2026", "on_your_own_romero_2025"]
+    },
+    {
+      "area": "trajectory_planning",
+      "description": "ILC section boundary smoothing",
+      "proposed_approach": "Add blending region (10-20 steps) where alpha/gamma interpolate between adjacent sections",
+      "expected_impact": "1-3% improvement by reducing boundary artifacts at gate-5/gate-8",
+      "priority": 3,
+      "research_refs": ["spatial_ilc_virtual_tube_2023", "segmentwise_ilc_zhang_2024"]
+    }
+  ],
+  "failed_approaches": [
+    {
+      "iteration": 1,
+      "description": "Increased max_velocity from 10.0 to 12.0 AND initial time allocation from 0.6 to 0.7 simultaneously. Trajectory became too aggressive for kinematic sim PD controller.",
+      "lesson": "Match trajectory aggressiveness to controller capability. Change one parameter at a time."
+    },
+    {
+      "iteration": 2,
+      "description": "Curvature-aware initial time allocation had no measurable impact because L-BFGS optimizer re-optimizes times regardless of initial guess.",
+      "lesson": "Initial time allocation heuristic matters less than the optimizer that runs after it.",
+      "approach": "curvature_aware_time_allocation",
+      "reason": "L-BFGS masks initial allocation differences"
+    },
+    {
+      "iteration": 5,
+      "description": "transition_time = max(times[i], times[i+1]) for acceleration estimation at segment boundaries.",
+      "lesson": "The acceleration estimate at segment boundaries serves as a feasibility proxy. Modifying it causes divergence.",
+      "approach": "transition_time_max_variant",
+      "reason": "Optimizer produced trajectories too fast for kinematic sim to follow"
+    },
+    {
+      "iteration": 5,
+      "description": "transition_time = avg(times[i], times[i+1]) for acceleration estimation.",
+      "lesson": "Both max and average transition_time variants cause the same problem.",
+      "approach": "transition_time_avg_variant",
+      "reason": "Still too aggressive"
+    },
+    {
+      "iteration": 5,
+      "description": "time_weight = 3.0 with original acceleration estimate.",
+      "lesson": "Increasing time_weight alone is insufficient without relaxing acceleration penalty.",
+      "approach": "time_weight_3_original_accel",
+      "reason": "Acceleration penalty dominated"
+    },
+    {
+      "iteration": 6,
+      "description": "Adaptive symmetric entry/exit offsets (0.25-1.0m).",
+      "lesson": "Wide offset ranges distort waypoint geometry.",
+      "approach": "adaptive_symmetric_offsets_wide",
+      "reason": "Offset geometry misalignment"
+    },
+    {
+      "iteration": 6,
+      "description": "Asymmetric offsets (entry 0.4-0.6m, exit 0.4-0.2m).",
+      "lesson": "Short segments near gate centers cause L-BFGS to over-slow.",
+      "approach": "asymmetric_offsets",
+      "reason": "Short segments slowed L-BFGS optimization"
+    },
+    {
+      "iteration": 6,
+      "description": "L-BFGS curvature-speed penalty using waypoint-level turn angles.",
+      "lesson": "Waypoint-level angles are diluted by entry/exit points.",
+      "approach": "lbfgs_curvature_speed_penalty",
+      "reason": "Penalty too broad or too weak"
+    },
+    {
+      "iteration": 8,
+      "description": "time_weight increased from 2.0 to 2.5 in L-BFGS.",
+      "lesson": "L-BFGS is sensitive to time_weight — higher weight redirects convergence.",
+      "approach": "time_weight_2.5",
+      "reason": "L-BFGS converged to worse local minimum"
+    },
+    {
+      "iteration": 9,
+      "description": "Drag compensation (Faessler 2018): drag_coefficient * vel added to accel_des.",
+      "lesson": "Cancelling drag on CURRENT velocity removes beneficial velocity damping.",
+      "approach": "drag_compensation_faessler_2018",
+      "reason": "Sim drag provides free velocity damping that helps controller"
+    },
+    {
+      "iteration": 10,
+      "description": "FOV relaxation with 10% total cap.",
+      "lesson": "Helix section needs substantial time inflation for PD controller.",
+      "approach": "fov_relaxation_10pct_cap",
+      "reason": "Helix gates need more inflation than 10% allows"
+    },
+    {
+      "iteration": 11,
+      "description": "Reference-velocity drag feedforward. Tested vff=0.1, 0.15, 0.5. All regressed.",
+      "lesson": "Velocity feedforward is mathematically correct at steady state but helix is all transients.",
+      "approach": "velocity_feedforward_and_higher_ff",
+      "reason": "Helix is transient-dominated; velocity FF increases overshoot at turns."
+    },
+    {
+      "iteration": 12,
+      "description": "Gain scheduling (curvature-based and error-based) in kinematic sim. 16+ configs tested.",
+      "lesson": "Gain scheduling fundamentally doesn't work in kinematic sim without attitude dynamics.",
+      "approach": "gain_scheduling_kinematic_sim",
+      "reason": "No attitude dynamics in kinematic sim. Trajectory optimizer non-determinism."
+    },
+    {
+      "iteration": 13,
+      "description": "Racing line offset=0.6 with smoothness_weight=0.3 (fast basin).",
+      "lesson": "The racing line L-BFGS has two distinct local minima: fast (high tracking error) and smooth (low error).",
+      "approach": "fast_racing_line_basin",
+      "reason": "Fast trajectory creates untrackable curvature in helix"
+    },
+    {
+      "iteration": 14,
+      "description": "Uniform time compression (3-15% compression of all segments).",
+      "lesson": "Compression must be segment-selective — turn segments are at their dynamic limits.",
+      "approach": "uniform_time_compression",
+      "reason": "Turn segments at acceleration limits prevent any uniform speedup"
+    },
+    {
+      "iteration": 15,
+      "description": "Polynomial curvature for TOPP speed profiling.",
+      "lesson": "Polynomial curvature is timing-dependent. Use waypoint Menger curvature instead.",
+      "approach": "polynomial_curvature_topp",
+      "reason": "Polynomial curvature at slow timing gives near-zero values"
+    },
+    {
+      "iteration": 15,
+      "description": "Curvature-dependent compression floors (0.65 straights / 0.80 turns) for TOPP retimer.",
+      "lesson": "Curvature-dependent floors are too conservative. Uniform floor is better.",
+      "approach": "curvature_dependent_compression_floors",
+      "reason": "Produced only 14.30s vs 13.50s with uniform 0.65 floor"
+    },
+    {
+      "iteration": 17,
+      "description": "a_centripetal reduction (10.0 to 9.0) in TOPP retimer.",
+      "lesson": "max_compression floor is the binding constraint, not curvature-based speed limits.",
+      "approach": "a_centripetal_reduction_topp",
+      "reason": "max_compression floor is binding constraint"
+    },
+    {
+      "iteration": 21,
+      "description": "Compression floor alone (0.68→0.60 for easy segments) only saved 0.01s race time.",
+      "lesson": "Compression floor is NOT the primary binding constraint for race time.",
+      "approach": "compression_floor_only",
+      "reason": "L-BFGS already produces near-optimal times for straight segments; floor rarely binds"
+    },
+    {
+      "iteration": 21,
+      "description": "max_compression_easy=0.50 caused gate-2 to regress 24% (exceed 20% threshold).",
+      "lesson": "Gate-2 has moderate curvature that isn't classified as S-turn or high-curvature, but its approach speed is sensitive to compression.",
+      "approach": "aggressive_easy_compression_0.50",
+      "reason": "Gate-2 approach speed too high, 24% tracking regression"
+    },
+    {
+      "iteration": 23,
+      "description": "Composite score weight tuning (tested 0.5/0.2/0.3, 0.55/0.25/0.2, 0.6/0.3/0.1) — all produce identical selection due to bipartite candidate pool.",
+      "lesson": "When candidates are bipartite, weight tuning is futile.",
+      "approach": "composite_weight_sensitivity_scan",
+      "reason": "Bipartite pool: all non-zero time weights select Basin A (fast)"
+    },
+    {
+      "iteration": 25,
+      "description": "Full-error ILC (modify trajectory positions + recompute FD derivatives). Race time 14.02→29.32s.",
+      "lesson": "Along-track error component shifts entire trajectory forward. Only correct cross-track error.",
+      "approach": "full_error_ilc_trajectory_modification",
+      "reason": "Along-track correction changes timing relationship between position and velocity"
+    },
+    {
+      "iteration": 25,
+      "description": "Cross-track ILC with finite-difference recomputed derivatives. Avg error +9%, gate-2 +48%.",
+      "lesson": "FD-computed velocity/acceleration from shifted positions introduces noise that corrupts feedforward control.",
+      "approach": "crosstrack_ilc_fd_derivatives",
+      "reason": "Finite-difference noise corrupts feedforward signal"
+    },
+    {
+      "iteration": 26,
+      "description": "Per-section ILC with higher alphas (0.5/0.6). Race time 14→27s due to offset saturation.",
+      "lesson": "Higher alpha causes cumulative offset to saturate at 0.375-0.45m. Keep alpha ≤0.4.",
+      "approach": "per_section_ilc_higher_alpha",
+      "reason": "Cumulative offset saturation at higher alpha"
+    },
+    {
+      "iteration": 26,
+      "description": "Blending at per-section ILC boundaries (linear weight ramp over 50 steps).",
+      "lesson": "Near-zero offset gap from weight ramp. Hard concatenation works fine with sigma=10 smoothing.",
+      "approach": "per_section_ilc_boundary_blending",
+      "reason": "Near-zero gap from weight ramp caused worse results than hard boundary"
+    },
+    {
+      "iteration": 27,
+      "description": "Per-section convergence tracking (each section converges independently).",
+      "lesson": "S-turn section converges after only 1 iteration, reducing corrections.",
+      "approach": "per_section_convergence_tracking",
+      "reason": "S-turn converges too quickly, stopping learning prematurely"
+    },
+    {
+      "iteration": 27,
+      "description": "Butterworth Q-filter at cutoffs > 1.5 Hz. All regressed avg error.",
+      "lesson": "Optimal ILC bandwidth matches spatial frequency of systematic error (~0.35 Hz).",
+      "approach": "butterworth_high_cutoff",
+      "reason": "Avg error regressed 0.3-3.5% at cutoffs > 1.5 Hz"
+    },
+    {
+      "iteration": 28,
+      "description": "Extended inflection boundaries (1.5-5.0s) for per-section bandwidth.",
+      "lesson": "Section boundaries that cut across gate approach zones cause regression.",
+      "approach": "extended_inflection_boundaries",
+      "reason": "Crossing gate-1/gate-2 boundary corrupted corrections"
+    },
+    {
+      "iteration": 28,
+      "description": "Inflection cutoff > 0.60 Hz provides negligible gate-3 improvement.",
+      "lesson": "Per-section structure matters more than exact cutoff.",
+      "approach": "high_inflection_cutoff",
+      "reason": "Gate-3 at 0.222m regardless of cutoff; higher cutoffs worsen gate-4"
+    },
+    {
+      "iteration": 29,
+      "description": "Aggressive combined inflation+TOPP reductions. Race time exploded to 26.82s.",
+      "lesson": "Parameter changes >3% per factor cause racing line basin switching.",
+      "approach": "aggressive_combined_inflation_topp_reduction",
+      "reason": "Racing line basin switching"
+    },
+    {
+      "iteration": 30,
+      "description": "2% per-parameter inflation reduction. Race time exploded to 26.81s.",
+      "lesson": "Even 2% TOPP floor change triggers basin switching at current values.",
+      "approach": "2pct_inflation_reduction_round2",
+      "reason": "Basin switching at 2% TOPP floor"
+    },
+    {
+      "iteration": 30,
+      "description": "End speed increase 0.65→0.70 had zero effect.",
+      "lesson": "Curvature-based speed limits dominate end speed factor.",
+      "approach": "end_speed_increase_0.70",
+      "reason": "End speed factor doesn't bind"
+    },
+    {
+      "iteration": 30,
+      "description": "frozen_inflation decoupling. Still caused 26.81s race time.",
+      "lesson": "The trajectory ITSELF is untrackable at 2% more aggressive parameters.",
+      "approach": "frozen_inflation_decoupling",
+      "reason": "Trajectory untrackable even with correct racing line"
+    },
+    {
+      "iteration": 32,
+      "description": "Adaptive gate offsets (4 variants). ALL caused racing line basin switching.",
+      "lesson": "ENTRY_EXIT_OFFSET is globally coupled through _select_by_sim(). Even +0.02m triggers basin switching.",
+      "approach": "adaptive_gate_offsets_all_variants",
+      "reason": "Racing line _select_by_sim() exquisitely sensitive to geometry changes"
+    },
+    {
+      "iteration": 32,
+      "description": "Inflation reduction round 3 (6 params at ~1% each). Non-reproducible.",
+      "lesson": "Near-equal-energy basins produce non-deterministic outcomes. Verify from clean state.",
+      "approach": "inflation_reduction_round3_non_reproducible",
+      "reason": "Non-deterministic basin selection"
+    },
+    {
+      "iteration": 34,
+      "description": "Gate-7 lateral offset change (0.555→0.6) triggers basin switching in full pipeline.",
+      "lesson": "Even small gate-7 offset changes cause trajectory optimizer basin switching. Gate-7 is at a basin boundary.",
+      "approach": "gate7_lateral_offset_change",
+      "reason": "Basin switching — race time exploded to 27.22s"
+    },
+    {
+      "iteration": 34,
+      "description": "Gate-8 vertical offset change (-0.067→0.333) triggers basin switching in full pipeline.",
+      "lesson": "Vertical offset changes have stronger coupling to trajectory shape than expected. Only lateral offsets at specific values are safe.",
+      "approach": "gate8_vertical_offset_change",
+      "reason": "Basin switching — race time exploded to 27.31s"
+    },
+    {
+      "iteration": 34,
+      "description": "Gate-8 lateral offset -0.6→-0.2 caused massive hidden regression (0.185→0.600m avg error).",
+      "lesson": "ALWAYS validate with full benchmark, not simplified sim.",
+      "approach": "gate8_lateral_offset_minus02",
+      "reason": "Full benchmark shows 0.600m avg error"
+    },
+    {
+      "iteration": 35,
+      "description": "More ILC iterations (5→8). Avg error 0.185→0.703m, race time 27s.",
+      "lesson": "ILC offsets accumulate over iterations. Larger offsets destabilize the PD controller. NOTE: This was at old ILC config (pre-section alpha rebalancing). With per-section alpha rebalancing (iter 47-48), 8 iterations works well.",
+      "approach": "more_ilc_iterations_8",
+      "reason": "Cumulative ILC offsets too large for PD controller"
+    },
+    {
+      "iteration": 35,
+      "description": "Curvature-proportional helix inflation (10-15% based on turn angle). No effect.",
+      "lesson": "TOPP floor overrides inflation.",
+      "approach": "curvature_proportional_helix_inflation",
+      "reason": "TOPP floor is binding constraint, not inflation"
+    },
+    {
+      "iteration": 35,
+      "description": "TOPP helix curvature boost 1.15→1.25. No effect.",
+      "lesson": "When TOPP floor is binding, curvature boost has zero effect.",
+      "approach": "helix_curvature_boost_125",
+      "reason": "TOPP floor is binding constraint, not speed limit"
+    },
+    {
+      "iteration": 37,
+      "description": "Joint S-turn/helix floor optimization. All 10 joint combinations tested.",
+      "lesson": "Asymmetric curvature sensitivity makes joint optimization unfavorable.",
+      "approach": "joint_sturn_helix_floor_optimization",
+      "reason": "Asymmetric curvature sensitivity"
+    },
+    {
+      "iteration": 38,
+      "description": "Full feedforward (ff>=0.52) causes catastrophic tracking failure in kinematic sim.",
+      "lesson": "Kinematic sim drag model creates narrow stability window for feedforward: ff=0.48-0.50 only.",
+      "approach": "full_feedforward_kinematic_sim",
+      "reason": "Drag model feedback loop"
+    },
+    {
+      "iteration": 38,
+      "description": "Higher kp (8-12) without proportional kd increase causes gate-3 S-turn oscillation.",
+      "lesson": "Must maintain damping ratio >= 0.8.",
+      "approach": "high_kp_without_kd_increase",
+      "reason": "Underdamped oscillation at S-turn"
+    },
+    {
+      "iteration": 39,
+      "description": "ILC gain synchronization (match ILC inner sim to benchmark: kp=7,kd=5.5,ff=0.50). Avg error regressed +15.1%.",
+      "lesson": "ILC corrections calibrated for OLD dynamics. The 'mismatch' is beneficial.",
+      "approach": "ilc_gain_synchronization",
+      "reason": "ILC corrections optimized for old dynamics"
+    },
+    {
+      "iteration": 39,
+      "description": "Lookahead reduction (0.05→0.00-0.04s). Zero effect.",
+      "lesson": "Min-snap polynomial acceleration changes so smoothly that 0-50ms lookahead gives identical values.",
+      "approach": "lookahead_reduction_all_values",
+      "reason": "Trajectory acceleration too smooth for lookahead to matter"
+    },
+    {
+      "iteration": 39,
+      "description": "Velocity feedforward (vff=0.1-0.5) in benchmark only. All give +9.1% regression.",
+      "lesson": "ILC coupling masks all controller-side changes.",
+      "approach": "velocity_feedforward_benchmark_only",
+      "reason": "ILC-controller coupling masks controller changes"
+    },
+    {
+      "iteration": 39,
+      "description": "ILC section boundary/parameter changes. All caused 27.5s race time.",
+      "lesson": "ILC configuration is a fragile equilibrium.",
+      "approach": "ilc_section_parameter_changes",
+      "reason": "Different ILC offsets destabilize tracking"
+    },
+    {
+      "iteration": 39,
+      "description": "S-turn TOPP floor decrease 0.67→0.66. Basin switching.",
+      "lesson": "S-turn floor can only be raised (slower), not lowered.",
+      "approach": "sturn_floor_decrease_0.66",
+      "reason": "Basin switching"
+    },
+    {
+      "iteration": 40,
+      "description": "max_tilt_rad sweep (0.85→1.05). All identical metrics.",
+      "lesson": "max_tilt_rad is COSMETIC in kinematic sim.",
+      "approach": "max_tilt_rad_sweep_kinematic_sim",
+      "reason": "Tilt clipping is cosmetic"
+    },
+    {
+      "iteration": 40,
+      "description": "Compound curvature boost sweep. Pareto trade-off only.",
+      "lesson": "Higher boosts slow turns → lower avg error but higher race time. At Pareto frontier.",
+      "approach": "compound_curvature_boost_pareto",
+      "reason": "Pareto trade-off"
+    },
+    {
+      "iteration": 41,
+      "description": "Execution-time-only velocity correction (no change to ILC inner sim). Avg error +4.8%.",
+      "lesson": "ILC corrections are calibrated for position-only execution. Adding velocity corrections only at runtime creates a NEW mismatch since ILC learned without them.",
+      "approach": "execution_time_only_velocity_correction",
+      "reason": "ILC learned corrections assuming no velocity correction; runtime-only addition creates mismatch"
+    },
+    {
+      "iteration": 41,
+      "description": "Full (1.0x) velocity correction scaling. Gate-2 regressed 26.8%.",
+      "lesson": "Full velocity scaling amplifies the ILC gain mismatch at gate-2. Partial scaling (0.5x) is optimal.",
+      "approach": "full_velocity_correction_scaling",
+      "reason": "Gate-2 regression exceeds 20% threshold at 1.0x scaling"
+    },
+    {
+      "iteration": 42,
+      "description": "Pre-inflection velocity scaling > 0.0 (tried 0.1). Gate-2 regresses to 0.219m.",
+      "lesson": "Any velocity correction in the pre-inflection section (0-200 steps) causes gate-2 regression. Must be 0.0.",
+      "approach": "pre_inflection_velocity_scaling_nonzero",
+      "reason": "Gate-2 regression from even 0.1x scaling in pre-inflection"
+    },
+    {
+      "iteration": 43,
+      "description": "ILC acceleration feedforward correction (d²Δp/dt²). Tested 6 configs.",
+      "lesson": "ILC position offsets already compensate for acceleration mismatch through cross-track corrections.",
+      "approach": "ilc_acceleration_feedforward_correction",
+      "reason": "Redundant with ILC cross-track corrections"
+    },
+    {
+      "iteration": 43,
+      "description": "Non-helix correction cap increases (inflection 0.15→0.20, post-inflection 0.15→0.20). Both regressed gate-5.",
+      "lesson": "Inflection/post-inflection sections have optimal correction cap at 0.15m.",
+      "approach": "non_helix_correction_cap_increase",
+      "reason": "Gate-5 regression"
+    },
+    {
+      "iteration": 45,
+      "description": "TOPP acceleration budget increase. Race time exploded to 26.8-26.9s.",
+      "lesson": "TOPP acceleration budget changes catastrophically destabilize ILC.",
+      "approach": "topp_acceleration_budget_increase",
+      "reason": "Catastrophic ILC destabilization"
+    },
+    {
+      "iteration": 45,
+      "description": "TOPP floor reduction alone. Only 0.05s race time improvement.",
+      "lesson": "TOPP compression floors are NOT the primary binding constraint.",
+      "approach": "topp_floor_reduction_only_iter45",
+      "reason": "Marginal gain"
+    },
+    {
+      "iteration": 45,
+      "description": "L-BFGS time_weight=2.2. Found WORSE local minimum.",
+      "lesson": "L-BFGS landscape is highly non-convex. Non-monotonic behavior.",
+      "approach": "time_weight_2.2",
+      "reason": "Bad L-BFGS local minimum"
+    },
+    {
+      "iteration": 46,
+      "description": "Inflection max_correction_m increase 0.15→0.20m. Gate-5 regressed 21.6%.",
+      "lesson": "Any inflection section max_correction >0.15m transfers error to gate-5.",
+      "approach": "inflection_max_corr_0.20",
+      "reason": "Gate-5 regression from spatial coupling"
+    },
+    {
+      "iteration": 46,
+      "description": "5-section split. Gate-5 regressed 35.8%.",
+      "lesson": "Short sections (<100 steps) don't have enough samples for stable filtering.",
+      "approach": "5_section_split_gate4_subsection",
+      "reason": "Edge effects from short section"
+    },
+    {
+      "iteration": 47,
+      "description": "L-BFGS multi-start (3 variants: cost-based, sim-based, diverse seeds). All zero improvement.",
+      "lesson": "Current L-BFGS basin IS the best trackable one. L-BFGS objective doesn't model controller dynamics.",
+      "approach": "lbfgs_multistart_all_variants",
+      "reason": "Single dominant trackable basin"
+    },
+    {
+      "iteration": 47,
+      "description": "Post-inflection vel_scale reduction (0.5→0.35/0.45). Avg error +4.8-5.4%.",
+      "lesson": "Vel_scale below 0.5 in post-inflection causes downstream regression.",
+      "approach": "post_inflection_vel_scale_reduction",
+      "reason": "Downstream gate regression"
+    },
+    {
+      "iteration": 47,
+      "description": "Inflection max_correction 0.15→0.20 + extended region. Gate-5 +32.2%.",
+      "lesson": "Spatial coupling confirmed again.",
+      "approach": "inflection_maxcorr_020_extended_480",
+      "reason": "Gate-5 regression (same as iter 46)"
+    },
+    {
+      "iteration": 48,
+      "description": "ILC max_iterations=8 without convergence threshold reduction. Identical to 7 iterations.",
+      "lesson": "Convergence threshold (0.002) was the binding constraint, not iteration count. Must lower threshold when adding iterations.",
+      "approach": "ilc_8_iters_without_threshold_reduction",
+      "reason": "Convergence threshold stopped ILC before 8th iteration ran"
+    },
+    {
+      "iteration": 48,
+      "description": "Post-inflection alpha=0.53. Changed convergence pattern — early stopping prevented pre-inflection/inflection improvements.",
+      "lesson": "Too-high alpha in one section causes faster convergence there, triggering global convergence threshold early, preventing other sections from converging.",
+      "approach": "post_inflection_alpha_053_convergence_pattern",
+      "reason": "Faster section convergence triggers early global stop"
+    },
+    {
+      "iteration": 49,
+      "description": "Per-section momentum (helix γ=0.4, s-turn γ=0.2, others γ=0.0). Avg error +5.1%.",
+      "lesson": "Per-section momentum creates worse cross-section coupling than uniform momentum through sim dynamics.",
+      "approach": "per_section_momentum_gamma",
+      "reason": "Heterogeneous momentum amplifies cross-section coupling"
+    },
+    {
+      "iteration": 49,
+      "description": "ILC max_iterations=9 + γ=0.2. Identical to 8 iterations.",
+      "lesson": "Momentum doesn't change convergence dynamics enough to enable a productive 9th iteration. Threshold still binds.",
+      "approach": "9_iters_with_momentum",
+      "reason": "Convergence threshold still binds at 0.0005"
+    },
+    {
+      "iteration": 49,
+      "description": "Post-inflection alpha=0.48 + momentum γ=0.2. Gate-5 WORSE (0.267m).",
+      "lesson": "Reducing alpha does not compensate for momentum's over-correction. The interaction is non-linear.",
+      "approach": "reduced_alpha_plus_momentum",
+      "reason": "Gate-5 regression worse than pure gamma=0.2"
+    }
+  ]
+}

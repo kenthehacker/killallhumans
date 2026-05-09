@@ -1,0 +1,20 @@
+{
+  "total_rows": 425,
+  "gates_passed": 0,
+  "total_sim_time": 8.8333,
+  "avg_tracking_error": 0.6796,
+  "max_tracking_error": 2.9167,
+  "p95_tracking_error": 2.3466,
+  "target_jump_count": 0,
+  "peak_roll_deg": 178.37,
+  "peak_pitch_deg": 57.36,
+  "loop_dt_p50_ms": 0.29,
+  "loop_dt_p95_ms": 0.31,
+  "alt_min": 0.0711,
+  "alt_max": 3.3564,
+  "peak_ref_speed_ms": 16.83,
+  "first_ref_vel_above_5ms": 0.1458,
+  "first_tilt_above_30deg": 0.3958,
+  "crashed": false,
+  "csv_path": "logs/visual_demo_20260416_172402.csv"
+}

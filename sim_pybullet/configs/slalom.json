@@ -1,0 +1,29 @@
+{
+  "field": {
+    "name": "slalom",
+    "bounds_min": [-5.0, -6.0, 0.0],
+    "bounds_max": [40.0, 6.0, 5.0]
+  },
+  "gate_defaults": {
+    "gate_type": "square",
+    "interior_width_m": 1.2,
+    "interior_height_m": 1.2,
+    "border_width_m": 0.18,
+    "depth_m": 0.10,
+    "color": "red"
+  },
+  "gates": [
+    { "id": "gate-1", "sequence_index": 1, "pose": { "x": 5.0,  "y":  2.0, "z": 2.0, "yaw":  0.45 } },
+    { "id": "gate-2", "sequence_index": 2, "pose": { "x": 9.0,  "y": -2.0, "z": 2.0, "yaw": -0.45 }, "config": { "color": "blue"   } },
+    { "id": "gate-3", "sequence_index": 3, "pose": { "x": 13.0, "y":  2.0, "z": 2.0, "yaw":  0.45 }, "config": { "color": "green"  } },
+    { "id": "gate-4", "sequence_index": 4, "pose": { "x": 17.0, "y": -2.0, "z": 2.0, "yaw": -0.45 }, "config": { "color": "yellow" } },
+    { "id": "gate-5", "sequence_index": 5, "pose": { "x": 21.0, "y":  2.0, "z": 2.0, "yaw":  0.45 }, "config": { "color": "orange" } },
+    { "id": "gate-6", "sequence_index": 6, "pose": { "x": 25.0, "y": -2.0, "z": 2.0, "yaw": -0.45 }, "config": { "color": "purple" } },
+    { "id": "gate-7", "sequence_index": 7, "pose": { "x": 29.0, "y":  2.0, "z": 2.0, "yaw":  0.45 }, "config": { "color": "red"    } },
+    { "id": "gate-8", "sequence_index": 8, "pose": { "x": 33.0, "y":  0.0, "z": 2.0, "yaw":  0.0  }, "config": { "color": "white"  } }
+  ],
+  "start": { "position": [0.0, 0.0, 1.5], "yaw": 0.0 },
+  "timestep": 0.004166,
+  "gravity": -9.81,
+  "_notes": "Tight constant-altitude slalom. 8 gates alternating y=+-2 every 4m with yaw=+-0.45 rad. Stresses the racing-line optimizer's corner-cutting and the geometric tracker's lateral-G handling. Uses default planner knobs only. Iter-12 baseline: 1/8 gates, crashes after gate-1 — planner's tilt-clamped attitude loop can't track the 45-deg lateral-G demand at default 4 m/s plan speed on such tight gate cadence. Open regression target for a *lateral* climb-analog inflation (currently iter-11 only inflates vertical climbs)."
+}
