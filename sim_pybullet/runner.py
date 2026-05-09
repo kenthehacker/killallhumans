@@ -37,7 +37,8 @@ from flight_control.types import DroneState, TargetState
 from flight_control.adapter import gate_detection_to_target, CameraModel
 
 from .env import DroneRaceEnv, RaceConfig
-from .sequencer import GateSequencer
+from ._gate_to_spec import to_spec as _gate_to_spec
+from gate_sequencing.sequencer import GateSequencer, SequencerConfig
 from planning.dynamic_replanner import DynamicReplanner, ReplanConfig
 
 
@@ -171,21 +172,39 @@ class RaceRunner:
 
         race_config = DroneRaceEnv.load_config(config_path)
         self.env = DroneRaceEnv(race_config=race_config, gui=gui)
-        self.sequencer = GateSequencer(race_config.gates)
+        # Platform-agnostic GateSequencer drives both sim and real-flight
+        # paths after P2-1. The lenient pass_through_margin=1.5 preserves
+        # the original sim_pybullet imprecise-flight tolerance for clean
+        # passes; crash_margin=1.0 keeps the geometric crash zone non-empty
+        # under that lenient pass margin (P1-6).
+        self.sequencer = GateSequencer(
+            [_gate_to_spec(g) for g in race_config.gates],
+            config=SequencerConfig(
+                pass_through_margin=1.5,
+                crash_margin=1.0,
+            ),
+        )
+        # gate_sequencing.GateSequencer requires an explicit start() to
+        # leave RaceState.WAITING. Tests that bypass __init__ should
+        # likewise call start() on the sequencer before update().
+        self.sequencer.start()
 
         # Smooth Catmull-Rom racing line: start position + all gate centers.
-        # Rebuilt by `_replan_racing_line()` whenever the dynamic replanner
-        # fires (gate collision, missed gate, sustained off-track).
-        _rl_wps = [np.array(race_config.start_position)] + [
-            np.array([g.pose.x, g.pose.y, g.pose.z]) for g in race_config.gates
-        ]
-        self._racing_line = RacingLine(_rl_wps)
+        # Rebuilt by `_maybe_replan` whenever the dynamic replanner fires
+        # (gate collision, missed gate, sustained off-track) and restored
+        # by `_reset` so a mid-flight replan doesn't survive an 'r' press.
+        self._build_initial_racing_line()
 
         # Dynamic replanner — owns when-to-replan policy + new waypoint list.
         self._replanner = DynamicReplanner(ReplanConfig())
         self._replan_count = 0
         self._last_replan_reasons: List[str] = []
         self._last_contact_gate_id: Optional[str] = None
+        # Snapshot of `sequencer.gates_passed` at the moment the racing line
+        # was last rebuilt. Used by `_target_from_sim_metadata` to translate
+        # cumulative gates_passed into a local waypoint index on the
+        # replanned spline.
+        self._replan_gates_baseline: int = 0
 
         # Dim all gates, then highlight only the current target
         for gate in race_config.gates:
@@ -195,7 +214,6 @@ class RaceRunner:
             self.env.highlight_gate(first.gate_id)
 
         self._detector = None
-        self._fused_detector = None
         if use_detection:
             self._init_detector(detector_type)
 
@@ -244,6 +262,10 @@ class RaceRunner:
         self._log_path = log_dir / f"race_{ts}.csv"
         self._log_file = open(self._log_path, "w", newline="")
         self._csv_writer = csv.writer(self._log_file)
+        # Schema version row 0 — bump on additive vs structural changes so
+        # parsers can branch. Comment-prefixed (#) rows are skipped by
+        # most CSV consumers (pandas with `comment='#'`, etc.).
+        self._csv_writer.writerow(["#schema_version", "2"])
         self._csv_writer.writerow([
             "sim_time", "step",
             "pos_x", "pos_y", "pos_z",
@@ -256,6 +278,10 @@ class RaceRunner:
             "lookahead_dist", "lateral_error", "speed_multiplier",
             "target_z_delta", "peak_roll", "peak_pitch",
             "recovery_count",
+            # Replanner / crash surface (P1-12). `replan_reasons` is
+            # pipe-delimited so commas don't fight CSV; non-empty only on
+            # the tick the replanner actually fires.
+            "replan_count", "replan_reasons", "crashed_into_gate",
         ])
 
     def _init_detector(self, detector_type: str):
@@ -265,13 +291,6 @@ class RaceRunner:
         if detector_type == "phase1":
             from phase1_detector import Phase1GateDetector
             self._detector = Phase1GateDetector()
-        elif detector_type == "fused":
-            from fused_gate_detector import FusedGateDetector
-            model_path = str(
-                Path(__file__).resolve().parent.parent
-                / "gate_detection" / "models" / "best.pt"
-            )
-            self._fused_detector = FusedGateDetector(model_path=model_path)
         else:
             from gate_detector import GateDetector
             self._detector = GateDetector()
@@ -356,6 +375,20 @@ class RaceRunner:
                 self._recovery_count += 1
             self._was_in_recovery = self.env.drone.in_recovery
 
+            # 2a. Compute lateral_error once per tick BEFORE the replanner
+            #     consumes it (P1-13). Previously _target_from_sim_metadata
+            #     wrote it after _maybe_replan, so the replanner saw a
+            #     one-tick-stale value (or the init 0.0 on tick 1, and the
+            #     last detection-mode value otherwise). Closest-spline-pt
+            #     distance is independent of lookahead.
+            local_idx = self.sequencer.gates_passed - self._replan_gates_baseline
+            min_arc = self._racing_line.waypoint_arc(max(local_idx, 0))
+            _, _, self._last_lateral_err = self._racing_line.query(
+                np.array(drone_state.position),
+                lookahead_m=0.0,
+                min_arc=min_arc,
+            )
+
             # 2b. Dynamic-replan check. The replanner uses the sequencer's
             #     crash/miss/state surface plus the current lateral error
             #     to decide whether to rebuild the racing line. Cooldown
@@ -419,7 +452,7 @@ class RaceRunner:
         if gate is None:
             return TargetState(position=drone_state.position)
 
-        if self.use_detection and (self._detector or self._fused_detector):
+        if self.use_detection and self._detector:
             return self._target_from_detection(drone_state)
 
         return self._target_from_sim_metadata(drone_state)
@@ -444,12 +477,17 @@ class RaceRunner:
             return TargetState(position=drone_state.position)
 
         drone_pos = np.array(drone_state.position)
-        gate_pos = np.array([gate.pose.x, gate.pose.y, gate.pose.z])
+        gate_pos = np.array(gate.position)
         dist_to_gate = float(np.linalg.norm(gate_pos - drone_pos))
 
         # Don't search spline points before the previously passed gate —
-        # prevents the closest-point search from latching onto a segment behind us.
-        min_arc = self._racing_line.waypoint_arc(self.sequencer.gates_passed)
+        # prevents the closest-point search from latching onto a segment
+        # behind us. After a replan, the rebuilt line's waypoint indexing
+        # restarts at the drone's then-current position; translate the
+        # cumulative `gates_passed` into a local index by subtracting the
+        # baseline snapshotted at replan time.
+        local_idx = self.sequencer.gates_passed - self._replan_gates_baseline
+        min_arc = self._racing_line.waypoint_arc(max(local_idx, 0))
 
         # --- Step 2: Adaptive lookahead ---
         # In tight helix (3.6-4.9m spacing), fixed 3m = 62-83% of gate spacing,
@@ -476,7 +514,7 @@ class RaceRunner:
         cur_idx = self.sequencer.gates_passed
         if cur_idx + 1 < len(all_gates):
             next_g = all_gates[cur_idx + 1]
-            next_pos = np.array([next_g.pose.x, next_g.pose.y, next_g.pose.z])
+            next_pos = np.array(next_g.position)
             next_gate_dist = float(np.linalg.norm(next_pos - gate_pos))
 
         if next_gate_dist < 6.0:
@@ -519,11 +557,13 @@ class RaceRunner:
 
         self._prev_target_z = target_pos[2]
 
-        # Update telemetry tracking
+        # Update telemetry tracking. self._last_lateral_err is now hoisted
+        # in run() (P1-13) — don't overwrite it from this method's local
+        # query, which is computed for speed-scheduling, not for the
+        # replanner.
         self._last_target_source = "metadata"
         self._last_target_mode = target_mode
         self._last_lookahead = lookahead
-        self._last_lateral_err = lateral_err
         self._last_speed_mult = speed / max(base_speed, 1e-6)
         self._last_target_z_delta = target_z_delta
 
@@ -537,14 +577,7 @@ class RaceRunner:
         """Run gate detection on the camera image and convert to target."""
         image = self.env.drone.get_camera_image()
 
-        if self._fused_detector:
-            fused_dets = self._fused_detector.detect(image)
-            if fused_dets:
-                det = fused_dets[0].final
-                self._last_target_source = "detection"
-                self._last_target_mode = "detection"
-                return gate_detection_to_target(det, drone_state, self._camera_model)
-        elif self._detector:
+        if self._detector:
             detections = self._detector.detect(image)
             if detections:
                 det = detections[0]
@@ -569,9 +602,6 @@ class RaceRunner:
         if self.use_detection and self._detector:
             detections = self._detector.detect(fpv)
             fpv = self._detector.get_debug_visualization(fpv, detections)
-        elif self.use_detection and self._fused_detector:
-            fused_dets = self._fused_detector.detect(fpv)
-            fpv = self._fused_detector.get_debug_visualization(fpv, fused_dets)
         else:
             self._draw_sim_bboxes(fpv)
 
@@ -611,8 +641,14 @@ class RaceRunner:
         cv2.imshow("Drone Race Simulation", combined)
 
     def _draw_sim_bboxes(self, fpv: np.ndarray):
-        """Draw bounding boxes on FPV using known gate positions (sim metadata)."""
-        for gate in self.sequencer.all_gates:
+        """Draw bounding boxes on FPV using known gate positions (sim metadata).
+
+        Iterates the env's sim-Gate list (with rich pose+config) rather
+        than the sequencer's GateSpec adapters — the bbox geometry needs
+        the sim Gate's `.config.interior_*` and `.pose.roll/pitch/yaw`
+        rotation matrix that GateSpec doesn't carry verbatim.
+        """
+        for gate in self.env.race_config.gates:
             corners_3d = self._gate_opening_corners(gate)
             projected = self.env.drone.project_points_to_fpv(corners_3d)
 
@@ -727,8 +763,8 @@ class RaceRunner:
             y += 22
 
         if gate:
-            dx = gate.pose.x - state.position[0]
-            dy = gate.pose.y - state.position[1]
+            dx = gate.position[0] - state.position[0]
+            dy = gate.position[1] - state.position[1]
             dist = math.sqrt(dx * dx + dy * dy)
             self._put_text(image, f"Dist to gate: {dist:.1f}m",
                            (10, h - 15), 0.45, (0, 220, 220))
@@ -828,7 +864,13 @@ class RaceRunner:
             f"{self._peak_roll:.4f}",
             f"{self._peak_pitch:.4f}",
             self._recovery_count,
+            self._replan_count,
+            "|".join(self._last_replan_reasons),
+            self.crashed_into_gate or "",
         ])
+        # Reasons appear only on the firing tick — clear the latch so the
+        # next non-firing tick logs an empty reason field (P1-12).
+        self._last_replan_reasons = []
 
     def _handle_camera_keys(self, key: int):
         """Adjust spectator camera orbit based on keyboard input."""
@@ -921,10 +963,15 @@ class RaceRunner:
         if len(wps) < 2:
             return
         self._racing_line = RacingLine([np.array(w) for w in wps])
-        # The replanned line resets our spline-arc bookkeeping — anything
-        # that was tracking the old arc (target altitude slew, lateral
-        # error sustained counter) needs the same reset.
-        self._prev_target_z = None
+        # The replanned line resets our spline-arc bookkeeping. Snapshot
+        # the cumulative gates-passed count so subsequent ticks can
+        # convert it back to a local index on the rebuilt spline. Seed
+        # the altitude slew limiter to the drone's current z (P1-9): the
+        # next gate's altitude may sit 2 m+ above/below, and disabling
+        # the slew limiter for a single tick post-replan is the worst
+        # possible time to drop it.
+        self._replan_gates_baseline = self.sequencer.gates_passed
+        self._prev_target_z = float(drone_state.position[2])
         self._replanner.mark_replanned(sim_time, trig)
         self._replan_count += 1
         self._last_replan_reasons = trig.reasons
@@ -953,7 +1000,16 @@ class RaceRunner:
         self._replan_count = 0
         self._last_replan_reasons = []
         self._last_contact_gate_id = None
+        self._replan_gates_baseline = 0
         self._target_line_id = -1
+        # Restore the original racing line — _maybe_replan may have
+        # replaced it mid-flight; pressing 'r' must wipe that stub.
+        self._build_initial_racing_line()
+        # Per-tick controller state that's tied to the (now stale) line:
+        # altitude slew + lateral-error tracking re-initialise on the
+        # next tick.
+        self._prev_target_z = None
+        self._last_lateral_err = 0.0
         for gate in self.env.race_config.gates:
             self.env.dim_gate(gate.gate_id)
         first = self.sequencer.current_gate
@@ -961,6 +1017,19 @@ class RaceRunner:
             self.env.highlight_gate(first.gate_id)
         self._draw_racing_lines()
         print("Simulation reset")
+
+    def _build_initial_racing_line(self) -> None:
+        """Construct the Catmull-Rom racing line through start + gate centres.
+
+        Pulled out of __init__ so _reset can restore the original after a
+        mid-race replan has rewritten self._racing_line from the drone's
+        in-flight position.
+        """
+        rc = self.env.race_config
+        wps = [np.array(rc.start_position)] + [
+            np.array([g.pose.x, g.pose.y, g.pose.z]) for g in rc.gates
+        ]
+        self._racing_line = RacingLine(wps)
 
 
 def main():
@@ -980,7 +1049,7 @@ def main():
         "--detector",
         type=str,
         default="classical",
-        choices=["classical", "fused", "phase1"],
+        choices=["classical", "phase1"],
         help="Which detector to use (only applies with --use-detection)",
     )
     parser.add_argument(

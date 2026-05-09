@@ -101,17 +101,22 @@ class TRPYMixer:
 
         # Throttle: total thrust needed to achieve desired vertical accel
         # thrust / mass = (g + az_world) / cos(roll) / cos(pitch)
-        cos_correction = max(
-            math.cos(current_roll) * math.cos(current_pitch),
-            0.3,  # prevent division explosion at extreme angles
-        )
-        thrust_needed = (
-            self.config.drone_mass_kg
-            * (self.config.gravity + az_world)
-            / cos_correction
-        )
-        throttle = thrust_needed / self.config.max_thrust_n
-        throttle = _clamp(throttle, 0.0, 1.0)
+        # Inverted-attitude guard: when cos_tilt drops below the safe
+        # boundary the drone is past horizontal, and any positive thrust
+        # accelerates *toward* the ground. Idle the motors so the
+        # attitude-recovery loop can flip back over.
+        cos_tilt = math.cos(current_roll) * math.cos(current_pitch)
+        if cos_tilt < 0.1:
+            throttle = 0.05
+        else:
+            thrust_needed = (
+                self.config.drone_mass_kg
+                * (self.config.gravity + az_world)
+                / cos_tilt
+            )
+            throttle = _clamp(
+                thrust_needed / self.config.max_thrust_n, 0.05, 1.0,
+            )
 
         # Normalize to [-1, 1] range
         roll_norm = desired_roll / self.config.max_roll_angle

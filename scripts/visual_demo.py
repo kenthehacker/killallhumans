@@ -39,7 +39,10 @@ if str(_REPO) not in sys.path:
 
 # --- PyBullet sim ---
 from sim_pybullet.env import DroneRaceEnv, RaceConfig
-from sim_pybullet.sequencer import GateSequencer as SimSequencer
+from sim_pybullet._gate_to_spec import to_spec as _gate_to_spec
+from gate_sequencing.sequencer import (
+    GateSequencer as SimSequencer, SequencerConfig,
+)
 from simulation.model_types import Gate
 
 # --- New pipeline modules ---
@@ -286,8 +289,15 @@ class VisualDemo:
         self.env = DroneRaceEnv(race_config=race_config, gui=gui)
         self.race_config = race_config
 
-        # Sim sequencer (for gate highlight management)
-        self.sim_seq = SimSequencer(race_config.gates)
+        # Sim sequencer (for gate highlight management). Platform-
+        # agnostic GateSequencer post-P2-1 — feed adapted GateSpecs.
+        self.sim_seq = SimSequencer(
+            [_gate_to_spec(g) for g in race_config.gates],
+            config=SequencerConfig(
+                pass_through_margin=1.5, crash_margin=1.0,
+            ),
+        )
+        self.sim_seq.start()
         for g in race_config.gates:
             self.env.dim_gate(g.gate_id)
         f = self.sim_seq.current_gate

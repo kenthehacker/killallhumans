@@ -531,6 +531,120 @@ class TestCrashIntoGate:
         assert seq.current_gate.gate_id == "G1"  # still target
         assert seq.gates_passed == 0
 
+    # ── P1-4: same-tick mark_collision wins over geometric pass ────────
+
+    def test_mark_collision_wins_over_same_tick_pass(self):
+        """If a physics layer reports a collision and the same-tick geometry
+        ALSO classifies the crossing as a pass (lenient pass_through_margin),
+        the crash mark must win — `_last_event=='crash'` and the gate is NOT
+        added to `passed_gate_ids`."""
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        # Lenient pass margin (sim_pybullet's production default).
+        seq = GateSequencer(
+            gates, config=SequencerConfig(pass_through_margin=1.5),
+        )
+        seq.start()
+        # Step 1: drone before the gate plane.
+        seq.update((4.5, 0, 0))
+        # Step 2: physics says the drone hit the frame, then geometry runs.
+        # The drone is at (5.5, 0, 0) — clean centre crossing, would normally
+        # classify as pass under margin=1.5. Crash mark must override.
+        seq.mark_collision("G1", position=(5.0, 0.7, 0))
+        result = seq.update((5.5, 0, 0))
+        assert seq.last_event == "crash", (
+            f"crash mark overwritten; last_event={seq.last_event!r}"
+        )
+        assert "G1" not in seq.passed_gate_ids
+        assert seq.gates_passed == 0
+        assert result is None
+
+    # ── P1-5: state-gated + idempotent mark_collision ──────────────────
+
+    def test_mark_collision_pre_start_is_silent_noop(self):
+        """A pre-race spawn-overlap should not register a phantom crash."""
+        seq = GateSequencer(_make_course())
+        # NO seq.start() — state is WAITING.
+        seq.mark_collision("G1", position=(5.0, 0.7, 0))
+        assert seq.crashed_gate_ids == []
+        assert seq.last_event is None
+
+    def test_mark_collision_after_completion_is_noop(self):
+        """A post-race fly-through must not corrupt the crash log."""
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0)]
+        seq = GateSequencer(gates)
+        seq.start()
+        seq.update((4, 0, 0))
+        seq.update((6, 0, 0))  # passes G1 → state COMPLETED
+        assert seq.is_complete
+
+        seq.mark_collision("G1", position=(5.0, 0.7, 0))
+        assert seq.crashed_gate_ids == []  # noop; pass status preserved
+        assert seq.last_event == "pass"
+
+    def test_mark_collision_idempotent_dedupes_repeat_calls(self):
+        """Repeat mark_collision calls on the same gate (e.g. PyBullet
+        contact manifold persists) must NOT append duplicate entries."""
+        seq = GateSequencer(_make_course())
+        seq.start()
+        seq.mark_collision("G1", position=(5.0, 0.7, 0))
+        seq.mark_collision("G1", position=(5.0, 0.7, 0))
+        seq.mark_collision("G1", position=(5.0, 0.7, 0))
+        assert seq.crashed_gate_ids == ["G1"]
+
+    # ── P1-6: decoupled crash_margin ───────────────────────────────────
+
+    def test_lenient_pass_margin_still_detects_geometric_crashes(self):
+        """With production pass_through_margin=1.5 and crash_margin=1.0,
+        a frame hit at lateral 0.7 (inside outer 0.75, outside bare 0.6)
+        must still classify as a crash — not as a pass."""
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        seq = GateSequencer(
+            gates,
+            config=SequencerConfig(
+                pass_through_margin=1.5,  # production sim_pybullet default
+                crash_margin=1.0,         # bare opening for crash classification
+            ),
+        )
+        seq.start()
+        seq.update((4.5, 0.7, 0))
+        result = seq.update((5.5, 0.7, 0))
+        assert seq.crashed_gate_ids == ["G1"], (
+            "frame hit not classified as crash under lenient pass margin"
+        )
+        assert seq.last_event == "crash"
+        assert result is None
+
+    # ── P1-7: per-fly-by dedupe of crashes/misses ──────────────────────
+
+    def test_oscillating_against_frame_records_one_crash(self):
+        """Multiple plane re-crossings on the same gate during one fly-by
+        (drone wedged in the frame) record ONE crash entry."""
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        seq = GateSequencer(gates)
+        seq.start()
+        # Cross gate plane back and forth at lateral 0.7m (in crash zone).
+        seq.update((4.5, 0.7, 0))
+        seq.update((5.5, 0.7, 0))   # crash 1
+        seq.update((4.5, 0.7, 0))   # cross back — should NOT dupe-append
+        seq.update((5.5, 0.7, 0))   # cross again — should NOT dupe-append
+        assert seq.crashed_gate_ids == ["G1"]
+
+    def test_oscillating_outside_frame_records_one_miss(self):
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0)]
+        seq = GateSequencer(gates)
+        seq.start()
+        seq.update((4.5, 5.0, 0))
+        seq.update((5.5, 5.0, 0))  # miss 1
+        seq.update((4.5, 5.0, 0))
+        seq.update((5.5, 5.0, 0))  # repeat — dedupe
+        assert seq.missed_gate_ids == ["G1"]
+
     def test_reset_clears_crashes_and_misses(self):
         gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
                             interior_width=1.2, interior_height=1.2,

@@ -61,6 +61,11 @@ class RaceState(Enum):
 class SequencerConfig:
     """Sequencer tuning parameters."""
     pass_through_margin: float = 1.0     # gate opening multiplier for pass-through detection
+    # Crash classification uses the bare opening (multiplied by `crash_margin`)
+    # rather than the lenient pass-through tolerance. With production
+    # pass_through_margin=1.5 and a 0.15 m frame border, the geometric
+    # crash zone is empty unless this is set to ~1.0 (P1-6).
+    crash_margin: float = 1.0
     proximity_pass_distance: float = 0.0 # if >0, also pass gate when within this distance
     off_track_distance: float = 5.0      # meters from expected path before triggering recovery
     max_approach_angle: float = 1.2      # radians — max angle for valid gate approach
@@ -100,6 +105,11 @@ class GateSequencer:
         # The most recent terminal event for the current target gate.
         # Cleared when the target advances. One of: 'pass' | 'crash' | 'miss' | None.
         self._last_event: Optional[str] = None
+        # Set by mark_collision; consumed and cleared by update(). When set
+        # to the current gate's id, the same-tick pass classification is
+        # short-circuited so the authoritative physics-driven crash mark
+        # wins over a lenient geometric pass (P1-4).
+        self._collision_marked_this_tick: Optional[str] = None
 
     @property
     def current_gate(self) -> Optional[GateSpec]:
@@ -190,58 +200,84 @@ class GateSequencer:
         # Check pass-through (plane crossing or proximity)
         if self._prev_position is not None and not self.is_complete:
             gate = self._gates[self._current_idx]
-            plane_crossed = self._check_pass_through(self._prev_position, pos, gate)
 
-            # Proximity-based pass: only credits a pass when the drone is
-            # inside the lit gate opening. A "lit" gate is the currently
-            # targeted gate; if the drone flies close to it but outside the
-            # rectangular opening, this must NOT count (prior behaviour
-            # credited skim-bys at dist ≤ proximity_pass_distance regardless
-            # of lateral offset, producing false-positive passes).
-            proximity_passed = False
-            if not plane_crossed and self.config.proximity_pass_distance > 0:
-                dist = float(np.linalg.norm(pos - np.array(gate.position)))
-                if dist < self.config.proximity_pass_distance:
-                    gate_pos = np.array(gate.position)
-                    normal = self._gate_normal(gate)
-                    d_curr = float(np.dot(pos - gate_pos, normal))
-                    if d_curr > -0.5:  # near or past the plane
-                        # Require drone to be inside the gate opening laterally,
-                        # i.e. its projection onto the gate plane falls within
-                        # (half_w × pass_through_margin, half_h × pass_through_margin).
-                        if self._point_in_gate_opening(pos, gate):
-                            proximity_passed = True
+            # P1-4: a same-tick mark_collision on the current gate
+            # overrides the geometric pass classification — the physics
+            # contact is authoritative. Skip pass/crash/miss; the crash
+            # mark already set _last_event="crash".
+            collision_pre_marked = (
+                self._collision_marked_this_tick == gate.gate_id
+            )
+            if not collision_pre_marked:
+                plane_crossed = self._check_pass_through(
+                    self._prev_position, pos, gate,
+                )
 
-            if plane_crossed or proximity_passed:
-                passed_gate = gate
-                self._passed.append(gate.gate_id)
-                self._current_idx += 1
-                self._state = RaceState.RACING
-                self._recovery_target = None
-                self._last_event = "pass"
+                # Proximity-based pass: only credits a pass when the drone is
+                # inside the lit gate opening. A "lit" gate is the currently
+                # targeted gate; if the drone flies close to it but outside the
+                # rectangular opening, this must NOT count (prior behaviour
+                # credited skim-bys at dist ≤ proximity_pass_distance regardless
+                # of lateral offset, producing false-positive passes).
+                proximity_passed = False
+                if not plane_crossed and self.config.proximity_pass_distance > 0:
+                    dist = float(np.linalg.norm(pos - np.array(gate.position)))
+                    if dist < self.config.proximity_pass_distance:
+                        gate_pos = np.array(gate.position)
+                        normal = self._gate_normal(gate)
+                        d_curr = float(np.dot(pos - gate_pos, normal))
+                        if d_curr > -0.5:  # near or past the plane
+                            # Require drone to be inside the gate opening
+                            # laterally — the projection onto the gate plane
+                            # must fall inside (half × pass_through_margin).
+                            if self._point_in_gate_opening(pos, gate):
+                                proximity_passed = True
 
-                if self.is_complete:
-                    self._state = RaceState.COMPLETED
-            else:
-                # Pass-through *iff highlighted*: if the geometry shows the
-                # drone crossed the highlighted gate's plane but missed the
-                # opening, classify the event so upstream can react. We do
-                # not advance the target — the gate stays highlighted until
-                # the drone either passes it or skips ahead deliberately.
+                # P1-6: classify a frame hit as crash BEFORE crediting a
+                # lenient pass. With pass_through_margin=1.5 the pass test
+                # would otherwise eat every crossing inside the outer
+                # frame; gate the pass branch on the bare-opening check.
+                crash_classified = False
                 if self._plane_was_crossed(self._prev_position, pos, gate):
                     crossing = self._compute_crossing(
-                        self._prev_position, pos, gate
+                        self._prev_position, pos, gate,
                     )
                     if crossing is not None:
-                        if self._point_in_outer_frame(crossing, gate) \
-                                and not self._point_in_gate_opening(crossing, gate):
-                            self._crashes.append(
-                                (gate.gate_id, tuple(float(c) for c in crossing))
+                        in_outer = self._point_in_outer_frame(crossing, gate)
+                        in_crash_zone_opening = (
+                            self._point_in_opening_with_margin(
+                                crossing, gate, self.config.crash_margin,
                             )
-                            self._last_event = "crash"
-                        else:
-                            self._misses.append(gate.gate_id)
-                            self._last_event = "miss"
+                        )
+                        if in_outer and not in_crash_zone_opening:
+                            # Hit the frame between bare opening and outer.
+                            # P1-7: dedupe — only one entry per fly-by.
+                            if self._last_event != "crash":
+                                self._crashes.append(
+                                    (gate.gate_id,
+                                     tuple(float(c) for c in crossing))
+                                )
+                                self._last_event = "crash"
+                            crash_classified = True
+
+                if (plane_crossed or proximity_passed) and not crash_classified:
+                    passed_gate = gate
+                    self._passed.append(gate.gate_id)
+                    self._current_idx += 1
+                    self._state = RaceState.RACING
+                    self._recovery_target = None
+                    self._last_event = "pass"
+
+                    if self.is_complete:
+                        self._state = RaceState.COMPLETED
+                elif (
+                    not crash_classified
+                    and self._plane_was_crossed(self._prev_position, pos, gate)
+                ):
+                    # Plane crossed completely outside the frame → miss.
+                    if self._last_event != "miss":
+                        self._misses.append(gate.gate_id)
+                        self._last_event = "miss"
 
         # Check if off-track
         if not self.is_complete and self._state == RaceState.RACING:
@@ -252,6 +288,9 @@ class GateSequencer:
                 self._recovery_target = gate.position
 
         self._prev_position = pos
+        # Same-tick crash latch consumed; clear so the next tick starts
+        # fresh.
+        self._collision_marked_this_tick = None
         return passed_gate
 
     def get_recovery_target(self) -> Optional[Tuple[float, float, float]]:
@@ -300,6 +339,24 @@ class GateSequencer:
         gate = next((g for g in self._gates if g.gate_id == gate_id), None)
         if gate is None:
             raise ValueError(f"Unknown gate_id: {gate_id!r}")
+        # P1-5 state gate: pre-race spawn-overlap and post-race fly-throughs
+        # must NOT register as race crashes.
+        if self._state in (
+            RaceState.WAITING, RaceState.COMPLETED, RaceState.TIMED_OUT,
+        ):
+            return
+        # P1-5 idempotency: PyBullet's contact manifold persists across
+        # ticks; collapse repeat calls on the same gate to a single entry.
+        # Still flag _collision_marked_this_tick so P1-4 short-circuit
+        # fires even when the append is suppressed.
+        already_marked = (
+            self._last_event == "crash"
+            and self._crashes
+            and self._crashes[-1][0] == gate_id
+        )
+        if already_marked:
+            self._collision_marked_this_tick = gate_id
+            return
         if position is not None:
             pt = tuple(float(c) for c in position)
         elif self._prev_position is not None:
@@ -308,6 +365,7 @@ class GateSequencer:
             pt = tuple(float(c) for c in gate.position)
         self._crashes.append((gate_id, pt))
         self._last_event = "crash"
+        self._collision_marked_this_tick = gate_id
 
     def should_slow_down(self) -> bool:
         """Whether the drone should reduce speed (detection dropout, recovery)."""
@@ -384,7 +442,17 @@ class GateSequencer:
     def _point_in_gate_opening(
         self, point: np.ndarray, gate: GateSpec
     ) -> bool:
-        """Check if a point falls within the gate opening."""
+        """Check if a point falls within the lenient pass-through opening."""
+        return self._point_in_opening_with_margin(
+            point, gate, self.config.pass_through_margin,
+        )
+
+    def _point_in_opening_with_margin(
+        self, point: np.ndarray, gate: GateSpec, margin: float,
+    ) -> bool:
+        """Generalised opening check with an explicit margin. Pass detection
+        uses pass_through_margin (lenient); crash detection uses
+        crash_margin (strict, default 1.0 = bare opening)."""
         gate_pos = np.array(gate.position)
         relative = point - gate_pos
 
@@ -396,7 +464,6 @@ class GateSequencer:
 
         half_w = gate.interior_width / 2.0
         half_h = gate.interior_height / 2.0
-        margin = self.config.pass_through_margin
 
         return (
             abs(local_right) < half_w * margin
@@ -449,3 +516,4 @@ class GateSequencer:
         self._crashes.clear()
         self._misses.clear()
         self._last_event = None
+        self._collision_marked_this_tick = None

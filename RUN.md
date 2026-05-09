@@ -212,9 +212,6 @@ python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --use-
 # With Phase 1 detector (highlighted gates)
 python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --use-detection --detector phase1
 
-# With fused detector (classical + YOLO)
-python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --use-detection --detector fused
-
 # Headless (no PyBullet GUI window, still shows OpenCV HUD)
 python3 -m sim_pybullet.runner --config sim_pybullet/configs/race_01.json --no-gui
 ```
