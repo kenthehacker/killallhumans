@@ -112,6 +112,28 @@ class DroneRaceEnv:
             reset_gate_color(self.client, self.gate_bodies[gate_id], gate)
 
     # ------------------------------------------------------------------
+    # Collision queries
+    # ------------------------------------------------------------------
+
+    def gate_contact(self) -> Optional[str]:
+        """Return the gate_id the drone is currently touching, else None.
+
+        Walks every gate-segment body and asks PyBullet for contact points
+        against the drone. Cheap (~O(n_gates)) and deterministic — bullet
+        already maintains the contact manifold from the last step.
+        """
+        import pybullet as p
+        drone_id = self.drone.body_id
+        for gate_id, body_ids in self.gate_bodies.items():
+            for bid in body_ids:
+                contacts = p.getContactPoints(
+                    bodyA=drone_id, bodyB=bid, physicsClientId=self.client
+                )
+                if contacts:
+                    return gate_id
+        return None
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 

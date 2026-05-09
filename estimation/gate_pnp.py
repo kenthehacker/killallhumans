@@ -186,6 +186,7 @@ class GatePnPEstimator:
         gate_world_yaw: float,
         drone_orientation: Tuple[float, float, float],
         gate_world_pitch: float = 0.0,
+        gate_world_roll: float = 0.0,
     ) -> Tuple[float, float, float]:
         """
         Compute drone world position from gate PnP result.
@@ -199,6 +200,7 @@ class GatePnPEstimator:
             gate_world_yaw: gate facing direction (radians)
             drone_orientation: (roll, pitch, yaw) of drone
             gate_world_pitch: gate pitch angle (radians, default 0)
+            gate_world_roll: gate roll angle (radians, default 0)
 
         Returns:
             Estimated drone position in world frame (NED)
@@ -211,22 +213,11 @@ class GatePnPEstimator:
         # Camera position in gate frame
         camera_in_gate = -R_gc.T @ t_gc
 
-        # Gate frame to world frame: R = Rz(yaw) @ Ry(pitch)
-        # Phase 4 fix: use full gate orientation, not yaw-only.
-        cy, sy = math.cos(gate_world_yaw), math.sin(gate_world_yaw)
-        cp, sp = math.cos(gate_world_pitch), math.sin(gate_world_pitch)
-
-        R_yaw = np.array([
-            [cy, -sy, 0],
-            [sy, cy, 0],
-            [0, 0, 1],
-        ])
-        R_pitch = np.array([
-            [cp, 0, sp],
-            [0, 1, 0],
-            [-sp, 0, cp],
-        ])
-        R_gate_world = R_yaw @ R_pitch
+        R_gate_world = _gate_frame_to_world(
+            gate_world_yaw,
+            gate_world_pitch,
+            gate_world_roll,
+        )
 
         # Camera position in world frame
         gate_pos = np.array(gate_world_position)
@@ -296,3 +287,33 @@ def _order_corners(pts: np.ndarray) -> np.ndarray:
     bl = pts[np.argmax(d)]    # largest diff = bottom-left
 
     return np.array([tl, tr, br, bl], dtype=np.float64)
+
+
+def _gate_frame_to_world(
+    yaw: float, pitch: float = 0.0, roll: float = 0.0
+) -> np.ndarray:
+    """
+    Rotation matrix whose columns map gate-local axes into NED world axes.
+
+    GateGeometry defines local +Z as the gate normal, local +X as the
+    horizontal right direction, and local +Y as the downward opening axis.
+    That differs from a conventional yaw/pitch/roll body frame, so build the
+    basis explicitly.
+    """
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+
+    normal = np.array([cy * cp, sy * cp, sp], dtype=np.float64)
+    right0 = np.array([-sy, cy, 0.0], dtype=np.float64)
+    down0 = np.cross(normal, right0)
+    down_norm = np.linalg.norm(down0)
+    if down_norm > 1e-12:
+        down0 = down0 / down_norm
+    else:
+        down0 = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    cr, sr = math.cos(roll), math.sin(roll)
+    right = right0 * cr + down0 * sr
+    down = -right0 * sr + down0 * cr
+
+    return np.column_stack((right, down, normal))

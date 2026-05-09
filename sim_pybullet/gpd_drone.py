@@ -137,6 +137,11 @@ class GPDDrone:
         """PyBullet physics client ID — add gate bodies here after construction."""
         return self._env.CLIENT
 
+    @property
+    def body_id(self) -> int:
+        """PyBullet body ID of the drone — used for contact-point queries."""
+        return self._env.DRONE_IDS[0]
+
     def step(
         self,
         target_pos: Tuple[float, float, float],

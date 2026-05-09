@@ -368,6 +368,290 @@ class TestProximityRespectsOpening:
         assert result.gate_id == "G1"
 
 
+# ── Gate orientation basis ───────────────────────────────────────────────
+
+
+class TestGateOrientationBasis:
+    def test_pitched_gate_basis_is_orthonormal(self):
+        gate = _make_gate(
+            "G1",
+            (0, 0, 0),
+            yaw=math.radians(25.0),
+            idx=0,
+            pitch=math.radians(30.0),
+            roll=math.radians(15.0),
+        )
+
+        normal = GateSequencer._gate_normal(gate)
+        right = GateSequencer._gate_right(gate)
+        up = GateSequencer._gate_up(gate)
+
+        assert np.linalg.norm(normal) == pytest.approx(1.0, abs=1e-9)
+        assert np.linalg.norm(right) == pytest.approx(1.0, abs=1e-9)
+        assert np.linalg.norm(up) == pytest.approx(1.0, abs=1e-9)
+        assert float(np.dot(normal, right)) == pytest.approx(0.0, abs=1e-9)
+        assert float(np.dot(normal, up)) == pytest.approx(0.0, abs=1e-9)
+        assert float(np.dot(right, up)) == pytest.approx(0.0, abs=1e-9)
+
+    def test_pitched_gate_pass_through_uses_tilted_opening(self):
+        gate = _make_gate(
+            "G1",
+            (0, 0, 0),
+            yaw=0.0,
+            idx=0,
+            pitch=math.radians(30.0),
+            interior_width=1.2,
+            interior_height=1.2,
+        )
+        seq = GateSequencer([gate], config=SequencerConfig(pass_through_margin=1.0))
+        seq.start()
+
+        normal = GateSequencer._gate_normal(gate)
+        up = GateSequencer._gate_up(gate)
+        center = np.array(gate.position, dtype=float)
+
+        seq.update(tuple(center - normal + up * 0.7))
+        result = seq.update(tuple(center + normal + up * 0.7))
+
+        assert result is None
+
+
+# ── Crash-into-gate detection ────────────────────────────────────────────
+
+
+class TestCrashIntoGate:
+    """A 'crash' is a plane crossing inside the outer frame bounds but
+    outside the interior opening (drone hit the frame). A 'miss' is a
+    plane crossing completely outside the outer frame bounds (drone flew
+    around the gate). Both are classified on the highlighted gate only."""
+
+    def test_strut_hit_records_crash_not_pass(self):
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        seq = GateSequencer(gates)
+        seq.start()
+        # Drone flies into the right strut: lateral offset 0.7m
+        # (interior half = 0.6m, outer half = 0.75m → inside frame, outside opening)
+        seq.update((4.5, 0.7, 0))
+        passed = seq.update((5.5, 0.7, 0))
+        assert passed is None
+        assert seq.gates_passed == 0
+        assert seq.crashed_gate_ids == ["G1"]
+        assert seq.last_event == "crash"
+        # Crash position must be reported (used by the dynamic replanner).
+        gid, crash_pt = seq.last_crash
+        assert gid == "G1"
+        assert abs(crash_pt[0] - 5.0) < 1e-6  # crossing happened on the gate plane
+        assert abs(crash_pt[1] - 0.7) < 1e-6
+
+    def test_top_bar_hit_records_crash(self):
+        """Vertical hit on the top bar — same crash classification, vertical axis."""
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        seq = GateSequencer(gates)
+        seq.start()
+        # 0.7m above centre → inside outer frame (half_outer = 0.75m), outside opening (half = 0.6m).
+        seq.update((4.5, 0, 0.7))
+        passed = seq.update((5.5, 0, 0.7))
+        assert passed is None
+        assert seq.crashed_gate_ids == ["G1"]
+        assert seq.last_event == "crash"
+
+    def test_complete_miss_classified_as_miss_not_crash(self):
+        """Plane crossed completely outside the frame — miss, not crash."""
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        seq = GateSequencer(gates)
+        seq.start()
+        # Lateral 5m from centre — well outside outer frame.
+        seq.update((4.5, 5.0, 0))
+        seq.update((5.5, 5.0, 0))
+        assert seq.gates_passed == 0
+        assert seq.crashed_gate_ids == []
+        assert seq.missed_gate_ids == ["G1"]
+        assert seq.last_event == "miss"
+
+    def test_clean_pass_does_not_record_crash_or_miss(self):
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0)]
+        seq = GateSequencer(gates)
+        seq.start()
+        seq.update((4, 0, 0))
+        passed = seq.update((6, 0, 0))
+        assert passed is not None
+        assert seq.crashed_gate_ids == []
+        assert seq.missed_gate_ids == []
+        assert seq.last_event == "pass"
+
+    def test_mark_collision_records_crash_authoritatively(self):
+        """External collision sources (e.g. PyBullet contact) bypass geometry."""
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+        # Drone flying nominally — no geometric crash detected
+        seq.update((1, 0, 0))
+        seq.update((2, 0, 0))
+        assert seq.crashed_gate_ids == []
+        # Physics layer reports a contact with G1
+        seq.mark_collision("G1", position=(2.0, 0.0, 0.0))
+        assert seq.crashed_gate_ids == ["G1"]
+        assert seq.last_event == "crash"
+        gid, pt = seq.last_crash
+        assert gid == "G1"
+        assert pt == (2.0, 0.0, 0.0)
+
+    def test_mark_collision_unknown_gate_raises(self):
+        seq = GateSequencer(_make_course())
+        seq.start()
+        with pytest.raises(ValueError):
+            seq.mark_collision("does-not-exist")
+
+    def test_mark_collision_uses_last_known_position_by_default(self):
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+        seq.update((1.5, 0.2, 0.3))
+        seq.mark_collision("G1")
+        gid, pt = seq.last_crash
+        assert gid == "G1"
+        # Falls back to the last-known drone position
+        assert pt == (1.5, 0.2, 0.3)
+
+    def test_crash_does_not_advance_target(self):
+        """A crash on the highlighted gate must not advance the target.
+        The drone keeps trying to pass the same gate (or the upstream
+        replanner clears the situation)."""
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+        seq.update((4.5, 0.7, 0))
+        seq.update((5.5, 0.7, 0))
+        assert seq.current_gate.gate_id == "G1"  # still target
+        assert seq.gates_passed == 0
+
+    def test_reset_clears_crashes_and_misses(self):
+        gates = [_make_gate("G1", (5, 0, 0), yaw=0.0, idx=0,
+                            interior_width=1.2, interior_height=1.2,
+                            border_width=0.15)]
+        seq = GateSequencer(gates)
+        seq.start()
+        seq.update((4.5, 0.7, 0))
+        seq.update((5.5, 0.7, 0))
+        assert seq.crashed_gate_ids == ["G1"]
+        seq.reset()
+        assert seq.crashed_gate_ids == []
+        assert seq.missed_gate_ids == []
+        assert seq.last_event is None
+
+
+# ── Pass-through if and only if highlighted ──────────────────────────────
+
+
+class TestPassIfAndOnlyIfHighlighted:
+    """A pass-through must be reported if AND only if the gate the drone
+    crossed was the highlighted (current target) gate at the time of
+    crossing. Crossing a non-highlighted gate must NEVER be credited —
+    even if the drone goes through it geometrically."""
+
+    def test_crossing_highlighted_gate_credits_the_pass(self):
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+        # G1 is highlighted at the start
+        assert seq.current_gate.gate_id == "G1"
+        seq.update((4, 0, 0))
+        result = seq.update((6, 0, 0))
+        assert result is not None
+        assert result.gate_id == "G1"
+        assert seq.gates_passed == 1
+        assert "G1" in seq.passed_gate_ids
+
+    def test_crossing_non_highlighted_gate_does_not_credit(self):
+        """Drone flies cleanly through G2 while G1 is highlighted. No credit."""
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+        assert seq.current_gate.gate_id == "G1"  # highlighted
+
+        # Two straight crossings of G2's plane (x=10), inside its opening.
+        seq.update((9, 0, 0))
+        result = seq.update((11, 0, 0))
+        assert result is None
+        assert seq.gates_passed == 0
+        assert "G2" not in seq.passed_gate_ids
+        # Sequencer must NOT have advanced — G1 is still the highlighted target.
+        assert seq.current_gate.gate_id == "G1"
+
+    def test_late_crossing_of_previously_highlighted_gate_does_not_credit(self):
+        """After G1 is passed, G2 is highlighted. Re-crossing G1's plane must
+        not register — G1 is no longer highlighted."""
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+        # Pass G1 cleanly
+        seq.update((4, 0, 0))
+        seq.update((6, 0, 0))
+        assert seq.gates_passed == 1
+        assert seq.current_gate.gate_id == "G2"
+
+        # Fly back through G1 (no longer highlighted)
+        # We need to clear prev_position bias by walking around it. Two
+        # passes both on the upstream side first, then crossing back.
+        seq.update((6, 5, 0))
+        seq.update((4, 5, 0))   # parallel — no crossing
+        result = seq.update((4, 0, 0))   # now back at G1's near side
+        # Either the back-cross of G1 is detected as nothing (current is G2),
+        # or as nothing on G2 either. Either way, gates_passed stays at 1.
+        assert result is None
+        assert seq.gates_passed == 1
+        assert seq.current_gate.gate_id == "G2"  # G2 is still highlighted
+
+    def test_passing_iff_in_a_4_gate_course(self):
+        """Each pass-through must correspond exactly to the highlighted
+        gate at the time of the crossing. Build a 4-gate course and walk
+        the drone through them in order, asserting credit aligns with the
+        highlighted ID at each step."""
+        gates = [
+            _make_gate("G1", (5, 0, 0), yaw=0.0, idx=0),
+            _make_gate("G2", (10, 0, 0), yaw=0.0, idx=1),
+            _make_gate("G3", (15, 0, 0), yaw=0.0, idx=2),
+            _make_gate("G4", (20, 0, 0), yaw=0.0, idx=3),
+        ]
+        seq = GateSequencer(gates)
+        seq.start()
+
+        sequence_observed = []
+        for x in range(0, 22):
+            highlighted_before = seq.current_gate.gate_id if seq.current_gate else None
+            r = seq.update((float(x), 0, 0))
+            if r is not None:
+                # Pass must match what was highlighted *before* the update.
+                assert r.gate_id == highlighted_before
+                sequence_observed.append(r.gate_id)
+
+        assert sequence_observed == ["G1", "G2", "G3", "G4"]
+        assert seq.gates_passed == 4
+
+    def test_skip_then_correct_path(self):
+        """Drone strays past a later gate while G1 is highlighted — not
+        credited. Only the highlighted gate (G1) earns a pass."""
+        gates = _make_course()
+        seq = GateSequencer(gates)
+        seq.start()
+
+        # Stray pass of G3 (highlighted=G1). Crossing G3's plane in its
+        # opening MUST NOT credit because G3 isn't highlighted.
+        seq.update((14, 0, 0))
+        r = seq.update((16, 0, 0))
+        assert r is None
+        assert seq.gates_passed == 0
+        assert seq.current_gate.gate_id == "G1"
+        # Importantly G3 is NOT in passed_gate_ids even though we crossed it.
+        assert "G3" not in seq.passed_gate_ids
+
+
 # ── Reset ────────────────────────────────────────────────────────────────
 
 

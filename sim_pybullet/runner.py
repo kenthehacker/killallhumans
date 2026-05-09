@@ -38,6 +38,7 @@ from flight_control.adapter import gate_detection_to_target, CameraModel
 
 from .env import DroneRaceEnv, RaceConfig
 from .sequencer import GateSequencer
+from planning.dynamic_replanner import DynamicReplanner, ReplanConfig
 
 
 class RacingLine:
@@ -173,11 +174,18 @@ class RaceRunner:
         self.sequencer = GateSequencer(race_config.gates)
 
         # Smooth Catmull-Rom racing line: start position + all gate centers.
-        # Pre-built once; used every control step for spline-following.
+        # Rebuilt by `_replan_racing_line()` whenever the dynamic replanner
+        # fires (gate collision, missed gate, sustained off-track).
         _rl_wps = [np.array(race_config.start_position)] + [
             np.array([g.pose.x, g.pose.y, g.pose.z]) for g in race_config.gates
         ]
         self._racing_line = RacingLine(_rl_wps)
+
+        # Dynamic replanner — owns when-to-replan policy + new waypoint list.
+        self._replanner = DynamicReplanner(ReplanConfig())
+        self._replan_count = 0
+        self._last_replan_reasons: List[str] = []
+        self._last_contact_gate_id: Optional[str] = None
 
         # Dim all gates, then highlight only the current target
         for gate in race_config.gates:
@@ -291,7 +299,25 @@ class RaceRunner:
                 yaw=state_dict["yaw"],
             )
 
-            # 2. Check gate pass-through
+            # 2. Physics-reported gate collision → authoritative crash mark.
+            #    PyBullet's contact manifold persists across ticks, so a
+            #    single hit reports contact for many frames. Dedupe by
+            #    only marking the *first* tick of a sustained contact
+            #    against the same gate.
+            contact_gate_id = self.env.gate_contact()
+            known_ids = {g.gate_id for g in self.sequencer.all_gates}
+            if (contact_gate_id is not None
+                    and contact_gate_id in known_ids
+                    and contact_gate_id != self._last_contact_gate_id):
+                self.sequencer.mark_collision(
+                    contact_gate_id, position=drone_state.position,
+                )
+                print(
+                    f"  HIT gate {contact_gate_id} at t={sim_time:.2f}s"
+                )
+            self._last_contact_gate_id = contact_gate_id
+
+            # 3. Check gate pass-through
             passed = self.sequencer.update(drone_state.position)
             if passed:
                 print(f"  PASSED gate {passed.gate_id} at t={sim_time:.2f}s")
@@ -329,6 +355,13 @@ class RaceRunner:
             if self.env.drone.in_recovery and not self._was_in_recovery:
                 self._recovery_count += 1
             self._was_in_recovery = self.env.drone.in_recovery
+
+            # 2b. Dynamic-replan check. The replanner uses the sequencer's
+            #     crash/miss/state surface plus the current lateral error
+            #     to decide whether to rebuild the racing line. Cooldown
+            #     is enforced internally — a single perturbation can't
+            #     cause a storm of replans.
+            self._maybe_replan(sim_time, drone_state)
 
             # 3. Determine target
             target = self._get_target(drone_state)
@@ -872,10 +905,54 @@ class RaceRunner:
                 physicsClientId=self.env.client,
             )
 
+    def _maybe_replan(self, sim_time: float, drone_state: DroneState) -> None:
+        """Evaluate the dynamic replanner and rebuild the racing line if it fires."""
+        trig = self._replanner.evaluate(
+            sim_time=sim_time,
+            sequencer=self.sequencer,
+            lateral_error=self._last_lateral_err,
+        )
+        if not self._replanner.should_replan(trig, sim_time):
+            return
+        wps = self._replanner.waypoints_for_replan(
+            drone_position=drone_state.position,
+            sequencer=self.sequencer,
+        )
+        if len(wps) < 2:
+            return
+        self._racing_line = RacingLine([np.array(w) for w in wps])
+        # The replanned line resets our spline-arc bookkeeping — anything
+        # that was tracking the old arc (target altitude slew, lateral
+        # error sustained counter) needs the same reset.
+        self._prev_target_z = None
+        self._replanner.mark_replanned(sim_time, trig)
+        self._replan_count += 1
+        self._last_replan_reasons = trig.reasons
+        self._draw_racing_lines()
+        print(
+            f"  REPLAN #{self._replan_count} at t={sim_time:.2f}s "
+            f"reasons={trig.reasons}"
+        )
+
+    @property
+    def crashed_into_gate(self) -> Optional[str]:
+        """The gate_id of the most recent crash, or None.
+
+        Mirrors `env.gate_contact()` semantics from the test side, but
+        backed by the sequencer's crash log so it survives a single-tick
+        contact and can be inspected after the run ends.
+        """
+        last = self.sequencer.last_crash
+        return last[0] if last else None
+
     def _reset(self):
         """Reset the simulation."""
         self.env.reset()
         self.sequencer.reset()
+        self._replanner.reset()
+        self._replan_count = 0
+        self._last_replan_reasons = []
+        self._last_contact_gate_id = None
         self._target_line_id = -1
         for gate in self.env.race_config.gates:
             self.env.dim_gate(gate.gate_id)

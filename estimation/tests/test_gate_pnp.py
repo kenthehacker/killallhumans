@@ -221,8 +221,37 @@ class TestGatePoseToDronePosition:
         # Camera is at -5m along gate normal from gate position
         # With gate yaw=0, normal is along x, so drone at (10 - 5, 0, 0) = (5, 0, 0)
         # But gate frame Z maps to world X when yaw=0
-        assert isinstance(drone_pos, tuple)
-        assert len(drone_pos) == 3
+        assert drone_pos == pytest.approx((5.0, 0.0, 0.0), abs=1e-6)
+
+    def test_inverse_transform_with_yaw_and_pitch(self):
+        """Gate-local camera offset should rotate into the NED gate normal."""
+        estimator = GatePnPEstimator()
+        distance = 4.0
+        pose = GatePose(
+            position=(0.0, 0.0, distance),
+            rotation=np.eye(3),
+            distance=distance,
+            reprojection_error=0.1,
+        )
+        gate_world_pos = np.array((10.0, -2.0, 3.0), dtype=float)
+        gate_yaw = math.radians(45.0)
+        gate_pitch = math.radians(30.0)
+
+        drone_pos = estimator.gate_pose_to_drone_position(
+            pose,
+            tuple(gate_world_pos),
+            gate_yaw,
+            (0.0, 0.0, 0.0),
+            gate_world_pitch=gate_pitch,
+        )
+
+        normal = np.array([
+            math.cos(gate_yaw) * math.cos(gate_pitch),
+            math.sin(gate_yaw) * math.cos(gate_pitch),
+            math.sin(gate_pitch),
+        ])
+        expected = gate_world_pos - normal * distance
+        assert drone_pos == pytest.approx(tuple(expected), abs=1e-6)
 
     def test_output_is_3d_tuple(self):
         estimator = GatePnPEstimator()

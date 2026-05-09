@@ -244,7 +244,7 @@ class TestSpeedProfiler:
 
 class TestRacingLineOptimizer:
     def test_single_gate_unchanged(self):
-        opt = RacingLineOptimizer()
+        opt = RacingLineOptimizer(config=RacingLineConfig(use_cache=False))
         gates = [GateWaypoint(position=(5, 0, 0), normal=(1, 0, 0))]
         result = opt.optimize(gates)
         assert len(result) == 1
@@ -254,6 +254,7 @@ class TestRacingLineOptimizer:
         opt = RacingLineOptimizer(config=RacingLineConfig(
             max_lateral_offset=0.4,
             corner_cut_aggressiveness=0.7,
+            use_cache=False,
         ))
         # L-shaped course: forces corner cutting
         gates = [
@@ -282,7 +283,7 @@ class TestRacingLineOptimizer:
         assert opt_length <= center_length + 0.01
 
     def test_optimized_gates_preserve_count(self):
-        opt = RacingLineOptimizer()
+        opt = RacingLineOptimizer(config=RacingLineConfig(use_cache=False))
         gates = [
             GateWaypoint(position=(5, 0, 0), normal=(1, 0, 0)),
             GateWaypoint(position=(10, 5, 0), normal=(0, 1, 0)),
@@ -293,7 +294,10 @@ class TestRacingLineOptimizer:
 
     def test_optimized_gates_stay_near_originals(self):
         """Optimized positions shouldn't stray far from gate centers."""
-        opt = RacingLineOptimizer(config=RacingLineConfig(max_lateral_offset=0.4))
+        opt = RacingLineOptimizer(config=RacingLineConfig(
+            max_lateral_offset=0.4,
+            use_cache=False,
+        ))
         gates = [
             GateWaypoint(position=(5, 0, 0), normal=(1, 0, 0), width=1.5),
             GateWaypoint(position=(10, 5, 0), normal=(0, 1, 0), width=1.5),

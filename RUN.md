@@ -36,6 +36,11 @@ bash scripts/bootstrap_demo.sh
 ```
 
 ## Run Tests
+### Full Python test suite
+```bash
+bash -lc 'source .venv/bin/activate && python -m pytest -q'
+```
+
 ### Simulation package tests
 ```bash
 bash -lc 'source .venv/bin/activate && python -m unittest discover -s simulation/tests -v'

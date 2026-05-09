@@ -516,7 +516,19 @@ class VisualDemo:
                       f"Gates: {self.sequencer.gates_passed}/{self.sequencer.total_gates}")
                 break
             if pos[2] < 0.05:
-                print(f"\nCrash! Alt={pos[2]:.2f}m")
+                print(f"\nCrash (ground)! Alt={pos[2]:.2f}m  "
+                      f"Gates: {self.sequencer.gates_passed}/{self.sequencer.total_gates}")
+                break
+
+            # Gate-contact crash: any contact point against a frame strut
+            # counts as a crash. Pass-throughs are detected first via the
+            # sequencer above (line 488-507), so a contact remaining here
+            # means the drone struck the gate frame rather than passing
+            # through the opening.
+            hit_gate = self.env.gate_contact()
+            if hit_gate is not None:
+                print(f"\nCrash (gate-strut)! Hit {hit_gate}  "
+                      f"Gates: {self.sequencer.gates_passed}/{self.sequencer.total_gates}")
                 break
 
             # 5. Trajectory reference (monotonic-forward closest + lookahead)
@@ -574,9 +586,17 @@ class VisualDemo:
             # anchor — so (b) serves as a watchdog. Threshold at 2× total_time
             # gives the drone ample time to track the reference before direct
             # intercept takes over.
+            # Lag-based fallback (always-armed): if the drone is far from
+            # its closest trajectory point, abandon the plan and steer at
+            # the current gate. Catches mid-race disturbances (gate-frame
+            # bump, big crosswind) that the progress clock alone can't
+            # recover from — the closest point keeps moving forward but
+            # the drone never converges back to the line.
+            FALLBACK_LAG_M = 1.5
             traj_exhausted = (
                 self._ref_progress_time >= self.trajectory.total_time - 1e-3
                 or sim_time > self.trajectory.total_time * 2.0
+                or trk_err > FALLBACK_LAG_M
             )
             if traj_exhausted and not self.sequencer.is_complete:
                 gate = self.sequencer.current_gate

@@ -8,6 +8,9 @@ mavsdk>=2.0.0
 numpy>=1.20.0
 scipy>=1.10.0
 
+# ── Test runner ──
+pytest>=8.0.0
+
 # ── Simulation (local dev only — not needed for competition) ──
 pyvista>=0.43.0
 PyQt6>=6.7.0

@@ -9,6 +9,8 @@ Adds recovery behaviors missing from the original:
   - Missed gate handling (reattempt or skip)
   - Attitude excursion recovery
   - Detection dropout handling
+  - Geometric crash-into-gate detection
+  - External collision marking (e.g., PyBullet contact manifold)
 """
 
 from __future__ import annotations
@@ -31,7 +33,19 @@ class GateSpec:
     roll: float = 0.0
     interior_width: float = 1.2            # meters
     interior_height: float = 1.2           # meters
+    border_width: float = 0.15             # meters — frame thickness around the opening.
+                                           # Used by geometric crash detection: a plane
+                                           # crossing inside (interior + 2*border) but
+                                           # outside the interior opening = hit the frame.
     sequence_index: int = 0
+
+    @property
+    def outer_width(self) -> float:
+        return self.interior_width + 2.0 * self.border_width
+
+    @property
+    def outer_height(self) -> float:
+        return self.interior_height + 2.0 * self.border_width
 
 
 class RaceState(Enum):
@@ -75,6 +89,17 @@ class GateSequencer:
         self._state = RaceState.WAITING
         self._frames_without_detection = 0
         self._recovery_target: Optional[Tuple[float, float, float]] = None
+        # Crash + miss tracking. A crash is a plane crossing inside the outer
+        # frame but outside the interior opening, OR an externally reported
+        # collision via mark_collision(). A miss is a plane crossing outside
+        # both the opening and the outer frame (drone flew completely around
+        # the highlighted gate). Both are race-relevant signals for the
+        # replanner upstream.
+        self._crashes: List[Tuple[str, Tuple[float, float, float]]] = []
+        self._misses: List[str] = []
+        # The most recent terminal event for the current target gate.
+        # Cleared when the target advances. One of: 'pass' | 'crash' | 'miss' | None.
+        self._last_event: Optional[str] = None
 
     @property
     def current_gate(self) -> Optional[GateSpec]:
@@ -193,9 +218,30 @@ class GateSequencer:
                 self._current_idx += 1
                 self._state = RaceState.RACING
                 self._recovery_target = None
+                self._last_event = "pass"
 
                 if self.is_complete:
                     self._state = RaceState.COMPLETED
+            else:
+                # Pass-through *iff highlighted*: if the geometry shows the
+                # drone crossed the highlighted gate's plane but missed the
+                # opening, classify the event so upstream can react. We do
+                # not advance the target — the gate stays highlighted until
+                # the drone either passes it or skips ahead deliberately.
+                if self._plane_was_crossed(self._prev_position, pos, gate):
+                    crossing = self._compute_crossing(
+                        self._prev_position, pos, gate
+                    )
+                    if crossing is not None:
+                        if self._point_in_outer_frame(crossing, gate) \
+                                and not self._point_in_gate_opening(crossing, gate):
+                            self._crashes.append(
+                                (gate.gate_id, tuple(float(c) for c in crossing))
+                            )
+                            self._last_event = "crash"
+                        else:
+                            self._misses.append(gate.gate_id)
+                            self._last_event = "miss"
 
         # Check if off-track
         if not self.is_complete and self._state == RaceState.RACING:
@@ -214,6 +260,55 @@ class GateSequencer:
             return self._recovery_target
         return None
 
+    @property
+    def crashed_gate_ids(self) -> List[str]:
+        """All gate IDs the drone has hit so far (frame collisions)."""
+        return [gid for gid, _ in self._crashes]
+
+    @property
+    def last_crash(self) -> Optional[Tuple[str, Tuple[float, float, float]]]:
+        """(gate_id, crossing_point) of the most recent crash, or None."""
+        return self._crashes[-1] if self._crashes else None
+
+    @property
+    def missed_gate_ids(self) -> List[str]:
+        """Gate IDs whose plane was crossed completely outside the frame."""
+        return list(self._misses)
+
+    @property
+    def last_event(self) -> Optional[str]:
+        """One of 'pass' | 'crash' | 'miss' | None — for the current target."""
+        return self._last_event
+
+    @property
+    def passed_gate_ids(self) -> List[str]:
+        """Gate IDs the drone has passed through, in order."""
+        return list(self._passed)
+
+    def mark_collision(
+        self,
+        gate_id: str,
+        position: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Record an externally observed collision (e.g. PyBullet contact).
+
+        Use this when a physics layer reports the drone touched a gate body —
+        it bypasses the geometric heuristic and is authoritative. Position
+        defaults to the last known drone position; if none is available we
+        fall back to the gate centre.
+        """
+        gate = next((g for g in self._gates if g.gate_id == gate_id), None)
+        if gate is None:
+            raise ValueError(f"Unknown gate_id: {gate_id!r}")
+        if position is not None:
+            pt = tuple(float(c) for c in position)
+        elif self._prev_position is not None:
+            pt = tuple(float(c) for c in self._prev_position)
+        else:
+            pt = tuple(float(c) for c in gate.position)
+        self._crashes.append((gate_id, pt))
+        self._last_event = "crash"
+
     def should_slow_down(self) -> bool:
         """Whether the drone should reduce speed (detection dropout, recovery)."""
         return (
@@ -228,24 +323,63 @@ class GateSequencer:
         gate: GateSpec,
     ) -> bool:
         """Detect gate pass-through via plane crossing."""
+        crossing = self._compute_crossing(prev_pos, curr_pos, gate)
+        if crossing is None:
+            return False
+        return self._point_in_gate_opening(crossing, gate)
+
+    def _plane_was_crossed(
+        self,
+        prev_pos: np.ndarray,
+        curr_pos: np.ndarray,
+        gate: GateSpec,
+    ) -> bool:
         gate_pos = np.array(gate.position)
         normal = self._gate_normal(gate)
-
         d_prev = float(np.dot(prev_pos - gate_pos, normal))
         d_curr = float(np.dot(curr_pos - gate_pos, normal))
+        return d_prev * d_curr <= 0 and abs(d_curr - d_prev) >= 1e-9
 
-        # Must cross the plane (signs differ)
+    def _compute_crossing(
+        self,
+        prev_pos: np.ndarray,
+        curr_pos: np.ndarray,
+        gate: GateSpec,
+    ) -> Optional[np.ndarray]:
+        gate_pos = np.array(gate.position)
+        normal = self._gate_normal(gate)
+        d_prev = float(np.dot(prev_pos - gate_pos, normal))
+        d_curr = float(np.dot(curr_pos - gate_pos, normal))
         if d_prev * d_curr > 0:
-            return False
-
-        # Find crossing point
+            return None
         denom = d_curr - d_prev
         if abs(denom) < 1e-9:
-            return False
+            return None
         t = -d_prev / denom
-        crossing = prev_pos + t * (curr_pos - prev_pos)
+        return prev_pos + t * (curr_pos - prev_pos)
 
-        return self._point_in_gate_opening(crossing, gate)
+    def _point_in_outer_frame(
+        self, point: np.ndarray, gate: GateSpec
+    ) -> bool:
+        """True iff `point` is inside the gate's outer frame bounds.
+
+        The outer frame is `(interior + 2*border)` × `(interior + 2*border)`
+        in the gate's local right/up plane. Combined with the opening check,
+        a point inside the outer frame but outside the opening = hit the
+        actual gate frame (crash).
+        """
+        gate_pos = np.array(gate.position)
+        relative = point - gate_pos
+        right = self._gate_right(gate)
+        up = self._gate_up(gate)
+        local_right = float(np.dot(relative, right))
+        local_up = float(np.dot(relative, up))
+        half_outer_w = gate.outer_width / 2.0
+        half_outer_h = gate.outer_height / 2.0
+        return (
+            abs(local_right) < half_outer_w
+            and abs(local_up) < half_outer_h
+        )
 
     def _point_in_gate_opening(
         self, point: np.ndarray, gate: GateSpec
@@ -278,18 +412,32 @@ class GateSequencer:
     @staticmethod
     def _gate_right(gate: GateSpec) -> np.ndarray:
         cy, sy = math.cos(gate.yaw), math.sin(gate.yaw)
-        return np.array([-sy, cy, 0.0])
+        cp, sp = math.cos(gate.pitch), math.sin(gate.pitch)
+        cr, sr = math.cos(gate.roll), math.sin(gate.roll)
+
+        normal = np.array([cy * cp, sy * cp, sp])
+        right0 = np.array([-sy, cy, 0.0])
+        down0 = np.cross(normal, right0)
+        down_norm = np.linalg.norm(down0)
+        if down_norm > 1e-12:
+            down0 = down0 / down_norm
+
+        return right0 * cr + down0 * sr
 
     @staticmethod
     def _gate_up(gate: GateSpec) -> np.ndarray:
         cy, sy = math.cos(gate.yaw), math.sin(gate.yaw)
         cp, sp = math.cos(gate.pitch), math.sin(gate.pitch)
         cr, sr = math.cos(gate.roll), math.sin(gate.roll)
-        return np.array([
-            sy * sr + cy * sp * cr,
-            -cy * sr + sy * sp * cr,
-            cp * cr,
-        ])
+
+        normal = np.array([cy * cp, sy * cp, sp])
+        right0 = np.array([-sy, cy, 0.0])
+        down0 = np.cross(normal, right0)
+        down_norm = np.linalg.norm(down0)
+        if down_norm > 1e-12:
+            down0 = down0 / down_norm
+
+        return -right0 * sr + down0 * cr
 
     def reset(self) -> None:
         self._current_idx = 0
@@ -298,3 +446,6 @@ class GateSequencer:
         self._state = RaceState.WAITING
         self._frames_without_detection = 0
         self._recovery_target = None
+        self._crashes.clear()
+        self._misses.clear()
+        self._last_event = None

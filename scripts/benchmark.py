@@ -25,6 +25,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import sys
@@ -53,6 +54,15 @@ THRESHOLDS = {
     "max_total_time_s": 30.0,             # must finish within 30s
     "no_crash": True,                     # must not crash
 }
+
+
+def _dataclass_from_overrides(cls, overrides: dict):
+    """Construct dataclass config from known override keys only."""
+    if not overrides:
+        return cls()
+    valid_fields = {f.name for f in dataclasses.fields(cls)}
+    filtered = {k: v for k, v in overrides.items() if k in valid_fields}
+    return cls(**filtered)
 
 
 # ---------------------------------------------------------------------------
@@ -592,8 +602,6 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
 
     try:
         from sim_pybullet.env import DroneRaceEnv
-        from sim_pybullet.sequencer import GateSequencer as SimSequencer
-        from simulation.model_types import Gate
     except ImportError as e:
         result["skipped"] = True
         result["skip_reason"] = f"PyBullet not available: {e}"
@@ -617,11 +625,14 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
 
     # Pipeline setup
     from estimation.ekf import DroneEKF, EKFConfig
-    from estimation.state_predictor import StatePredictor
-    from gate_sequencing.sequencer import GateSequencer, GateSpec
-    from planning.trajectory_optimizer import DroneConstraints, GateWaypoint, TrajectoryOptimizer
-    from planning.racing_line import RacingLineOptimizer, SpeedProfiler
-    from control.mpc_tracker import SimplePositionTracker, TrackerConfig
+    from gate_sequencing.sequencer import GateSequencer, GateSpec, SequencerConfig
+    from planning.trajectory_optimizer import (
+        DroneConstraints,
+        GateWaypoint,
+        PlannerConfig,
+        TrajectoryOptimizer,
+    )
+    from planning.racing_line import RacingLineConfig, RacingLineOptimizer
 
     start_pos = race_config.start_position
 
@@ -654,17 +665,30 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     gate_specs = _to_specs(race_config.gates)
     gate_waypoints = _to_waypoints(race_config.gates)
 
-    seq = GateSequencer(gate_specs)
+    seq_cfg = _dataclass_from_overrides(
+        SequencerConfig,
+        {"proximity_pass_distance": 1.2, **race_config.sequencer_overrides},
+    )
+    seq = GateSequencer(gate_specs, config=seq_cfg)
     seq.start()
 
     ekf = DroneEKF(EKFConfig())
     ekf.initialize(start_pos, (0, 0, 0), timestamp_s=0.0)
 
     # Trajectory
-    rl_opt = RacingLineOptimizer()
+    racing_line_cfg = _dataclass_from_overrides(
+        RacingLineConfig, race_config.racing_line_overrides
+    )
+    planner_cfg = _dataclass_from_overrides(
+        PlannerConfig, race_config.planner_overrides
+    )
+
+    rl_opt = RacingLineOptimizer(config=racing_line_cfg)
     opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=15.0), dt_sample=0.02,
+        constraints=DroneConstraints(max_velocity=planner_cfg.plan_max_speed_mps),
+        dt_sample=0.02,
+        planner_config=planner_cfg,
     )
     trajectory = traj_opt.optimize(opt_wps, start_pos, (0, 0, 0))
 
@@ -679,6 +703,12 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     wall_start = time.time()
     crashed = False
     termination_reason = "time_limit"
+
+    # Progress clock: advances only when drone is close to its current
+    # reference. Replaces wall-clock sampling so a stalled / bumped drone
+    # doesn't have its plan fly away from it.
+    progress_t = 0.0
+    progress_max_lag_m = 1.5  # hold reference if drone is more than this far away
 
     while True:
         t0 = time.perf_counter()
@@ -706,27 +736,46 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
 
         if pos[2] < 0.05:
             crashed = True
-            termination_reason = "crash"
+            termination_reason = "crash_ground"
             break
 
-        # Trajectory tracking
-        ref = trajectory.sample(sim_time)
+        # Gate-contact crash detection: any contact point against an
+        # un-passed gate counts as a crash. Passing through the gate
+        # opening triggers the sequencer first (handled above), so a
+        # contact remaining here means we've hit a frame strut.
+        hit_gate = env.gate_contact()
+        if hit_gate is not None:
+            crashed = True
+            termination_reason = f"crash_gate:{hit_gate}"
+            break
+
+        # Progress-clock advance: only if drone is keeping up with the
+        # reference. If we're lagging, hold the reference and let the
+        # tracker pull us back to it.
+        ref_now = trajectory.sample(progress_t)
+        lag = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, ref_now.position)))
+        if lag < progress_max_lag_m and progress_t < trajectory.total_time:
+            dt_sim = env.race_config.timestep
+            progress_t = min(progress_t + dt_sim, trajectory.total_time)
+
+        # Trajectory tracking (sampled by progress clock, not wall clock)
+        ref = trajectory.sample(progress_t)
         target_pos = ref.position
         target_vel = ref.velocity
         target_yaw = ref.yaw
 
-        # Gate-seeking fallback
-        if sim_time > trajectory.total_time and not seq.is_complete:
-            gate = seq.current_gate
-            if gate:
-                gp = np.array(gate.position)
-                dp = np.array(pos)
-                d = gp - dp
-                dist = float(np.linalg.norm(d))
-                if dist > 0.1:
-                    target_pos = tuple(gp)
-                    target_vel = tuple(d / dist * min(dist * 2, 5.0))
-                    target_yaw = float(math.atan2(d[1], d[0]))
+        # Gate-seeking fallback (always-armed): if we've drifted off the
+        # plan AND there's still an un-passed gate, seek straight at it.
+        gate = seq.current_gate
+        if gate is not None and lag >= progress_max_lag_m:
+            gp = np.array(gate.position)
+            dp = np.array(pos)
+            d = gp - dp
+            dist = float(np.linalg.norm(d))
+            if dist > 0.1:
+                target_pos = tuple(gp)
+                target_vel = tuple(d / dist * min(dist * 2, 5.0))
+                target_yaw = float(math.atan2(d[1], d[0]))
 
         env.drone.step(target_pos, target_vel, target_yaw)
 
@@ -775,7 +824,7 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     # Threshold checks
     failures = []
     if crashed:
-        failures.append("drone crashed")
+        failures.append(f"drone crashed ({termination_reason})")
     if avg_err > THRESHOLDS["max_avg_tracking_error_m"]:
         failures.append(f"avg_tracking_error {avg_err:.2f}m > {THRESHOLDS['max_avg_tracking_error_m']}m")
     if max_err > THRESHOLDS["max_max_tracking_error_m"]:
@@ -842,10 +891,10 @@ def main():
     if args.mode in ("sim", "full"):
         sim = run_sim_benchmark(args.config, args.duration)
         report["simulation"] = sim
-        if sim.get("skipped", False) and args.strict:
+        if sim.get("skipped", False) and (args.strict or args.mode == "sim"):
             overall_pass = False
             sim.setdefault("threshold_failures", []).append(
-                "PyBullet skipped with --strict mode"
+                "PyBullet skipped"
             )
         elif not sim.get("skipped", False) and not sim.get("sim_passed", False):
             overall_pass = False

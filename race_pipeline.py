@@ -417,6 +417,7 @@ class RacePipeline:
                 pose, gate.position, gate.yaw,
                 self.ekf.orientation,
                 gate_world_pitch=getattr(gate, 'pitch', 0.0),
+                gate_world_roll=getattr(gate, 'roll', 0.0),
             )
             match_err = float(np.linalg.norm(
                 np.array(implied_drone_pos, dtype=float) - drone_pos
