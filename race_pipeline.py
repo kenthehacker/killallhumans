@@ -121,11 +121,22 @@ class RacePipeline:
         self.config = config or PipelineConfig()
 
         # Modules
+        # Iter-002 (B5, composer-25-4 F4): thread PipelineConfig's
+        # camera_pitch_offset_rad into the CameraIntrinsics built by
+        # from_fov. Previously the offset was stored on PipelineConfig
+        # but the constructed intrinsics dropped it, leaving
+        # CameraIntrinsics.pitch_offset_rad at its module default. The
+        # offset is irrelevant for position-only PnP with coincident
+        # camera/body origins (spec VADR-TS-002 §3.8), but it matters
+        # for any future code that derives orientation from a gate
+        # detection — wire it through now so the bug class can't
+        # silently regress.
         self.camera = CameraIntrinsics.from_fov(
             self.config.camera_fov_h,
             self.config.image_width,
             self.config.image_height,
         )
+        self.camera.pitch_offset_rad = self.config.camera_pitch_offset_rad
         self.gate_geometry = GateGeometry(
             self.config.gate_width, self.config.gate_height
         )

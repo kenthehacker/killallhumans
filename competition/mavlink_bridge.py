@@ -47,6 +47,8 @@ from .adapter import (
     Quaternion,
     TelemetryState,
 )
+from .aigp_geometry import AIGP_CAM_UDP_PORT
+from .vision_udp import VisionUdpListener
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,7 @@ class MAVLinkBridge(CompetitionInterface):
         await bridge.disconnect()
     """
 
-    def __init__(self):
+    def __init__(self, vision_port: int = AIGP_CAM_UDP_PORT):
         if not MAVSDK_AVAILABLE:
             raise RuntimeError(
                 "mavsdk package not installed. Install with: pip install mavsdk"
@@ -86,6 +88,13 @@ class MAVLinkBridge(CompetitionInterface):
         self._latest_imu: Optional[IMUData] = None
         self._subscription_tasks: list[asyncio.Task] = []
 
+        # Iter-002 B4 (consensus BLOCKER): vision stream listener. VADR-TS-002
+        # §4.6 — JPEG chunks over UDP :5600, separate from the MAVLink2 line.
+        # Lifecycle is tied to connect()/disconnect(): the listener binds
+        # the socket after MAVSDK is connected (to avoid eating packets
+        # before the autonomy is ready), and stops on disconnect.
+        self._vision_listener: VisionUdpListener = VisionUdpListener(port=vision_port)
+
     async def connect(self, address: str = "udp://:14540") -> None:
         logger.info("Connecting to simulator at %s", address)
         await self._system.connect(system_address=address)
@@ -98,6 +107,18 @@ class MAVLinkBridge(CompetitionInterface):
                 break
 
         self._connected = True
+
+        # Iter-002 B4: open the vision UDP socket *after* MAVSDK is up so
+        # we don't accumulate packets the autonomy can't yet consume.
+        try:
+            await self._vision_listener.start()
+            logger.info("Vision UDP listening on :%d", self._vision_listener.port)
+        except OSError as e:
+            logger.warning(
+                "Could not open vision UDP socket on :%d (%s) — "
+                "get_camera_frame() will return None.",
+                self._vision_listener.port, e,
+            )
 
         # Start telemetry subscriptions.
         # ``position_velocity_ned`` provides world-frame NED pose/vel
@@ -117,6 +138,11 @@ class MAVLinkBridge(CompetitionInterface):
         for task in self._subscription_tasks:
             task.cancel()
         self._subscription_tasks.clear()
+        # Iter-002 B4: tear down the vision listener to free the UDP port.
+        try:
+            await self._vision_listener.stop()
+        except Exception:
+            logger.exception("Vision UDP listener stop failed")
         self._connected = False
         logger.info("Disconnected")
 
@@ -161,10 +187,15 @@ class MAVLinkBridge(CompetitionInterface):
         return self._latest_telem
 
     async def get_camera_frame(self) -> Optional[CameraFrame]:
-        # Vision stream spec not yet released by competition
-        # This will be implemented when the vision stream specification
-        # is provided. For now, return None.
-        return None
+        """Return the latest decoded camera frame, or None if none available.
+
+        Iter-002 B4: vision UDP receiver runs in the background via the
+        asyncio DatagramProtocol set up in `connect()`. This call peeks
+        the most recent reassembled frame and decodes it on-demand —
+        decode cost is paid by the control-loop poll, not by every
+        incoming chunk.
+        """
+        return self._vision_listener.latest_frame()
 
     async def send_attitude(self, cmd: AttitudeCommand) -> None:
         if not self._offboard_active:

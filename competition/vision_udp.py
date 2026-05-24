@@ -306,3 +306,105 @@ def decode_jpeg_to_camera_frame(
         height=h,
         timestamp_us=frame.sim_time_ns // 1000,
     )
+
+
+# ---------------------------------------------------------------------------
+# Async UDP listener — wires the reassembler into an asyncio event loop
+# (iter-002 B4: MAVLinkBridge integration).
+# ---------------------------------------------------------------------------
+
+class _VisionDatagramProtocol:
+    """asyncio.DatagramProtocol that feeds raw bytes into a VisionUdpReceiver.
+
+    Defined as a duck-typed protocol (not subclassing DatagramProtocol) so
+    the module imports cleanly without asyncio at module-load time;
+    asyncio is only paid by the live listener path.
+    """
+
+    def __init__(self, receiver: VisionUdpReceiver):
+        self.receiver = receiver
+        self.errors = 0
+
+    def connection_made(self, transport) -> None:   # noqa: D401
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        try:
+            self.receiver.feed_packet(data)
+        except ValueError:
+            # Malformed packet — count it and keep listening. Real-world
+            # AIGP traffic is JPEG over UDP; one bad packet shouldn't
+            # poison the stream.
+            self.errors += 1
+
+    def error_received(self, exc) -> None:
+        self.errors += 1
+
+    def connection_lost(self, exc) -> None:
+        # Transport closed — caller handles cleanup via stop().
+        pass
+
+
+class VisionUdpListener:
+    """Asyncio wrapper that opens a UDP socket on `port` and feeds every
+    received datagram into a `VisionUdpReceiver`.
+
+    Lifecycle: ``await listener.start()`` to bind the socket and begin
+    receiving; ``await listener.stop()`` to close it. ``latest_frame()``
+    returns the most recent successfully-decoded `CameraFrame`, or None.
+
+    The listener doesn't decode JPEG on each packet — decoding happens
+    on demand inside `latest_frame()` so a control loop polling at 100 Hz
+    pays the decode cost only when it actually wants the freshest image,
+    while the receiver continues reassembling at network speed.
+    """
+
+    def __init__(
+        self,
+        port: int = AIGP_CAM_UDP_PORT,
+        receiver: Optional[VisionUdpReceiver] = None,
+        bind_host: str = "0.0.0.0",
+    ):
+        self.port: int = int(port)
+        self.bind_host: str = bind_host
+        self.receiver: VisionUdpReceiver = (
+            receiver if receiver is not None else VisionUdpReceiver(port=port)
+        )
+        self._transport = None  # asyncio.DatagramTransport (set by start)
+        self._protocol: Optional[_VisionDatagramProtocol] = None
+
+    async def start(self) -> None:
+        """Open the UDP socket and begin receiving."""
+        import asyncio  # local — keeps module importable without asyncio
+        loop = asyncio.get_event_loop()
+        self._transport, self._protocol = await loop.create_datagram_endpoint(
+            lambda: _VisionDatagramProtocol(self.receiver),
+            local_addr=(self.bind_host, self.port),
+        )
+
+    async def stop(self) -> None:
+        """Close the UDP socket. Idempotent."""
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
+            self._protocol = None
+
+    @property
+    def is_listening(self) -> bool:
+        return self._transport is not None
+
+    @property
+    def malformed_packet_count(self) -> int:
+        return self._protocol.errors if self._protocol else 0
+
+    def latest_frame(self):
+        """Decode and return the most recent CameraFrame, or None.
+
+        Decoding is on-demand (per call), not on every datagram, so the
+        control loop's 100 Hz polling rate pays one decode at most per
+        tick — and only if it actually pops a frame.
+        """
+        rf = self.receiver.pop_latest_frame()
+        if rf is None:
+            return None
+        return decode_jpeg_to_camera_frame(rf)

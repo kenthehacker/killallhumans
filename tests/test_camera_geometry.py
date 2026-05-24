@@ -119,3 +119,27 @@ def test_aigp_intrinsics_hfov_matches_spec_90deg():
     assert derived_hfov == pytest.approx(90.0, abs=0.05)
     # The genuine VFoV is much smaller — assert we surface it correctly.
     assert AIGP_CAM_VFOV_DEG == pytest.approx(58.715, abs=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Iter-001 review B5 / composer-25-4 F4: PipelineConfig pitch offset must
+# flow into the CameraIntrinsics built by RacePipeline.
+# ---------------------------------------------------------------------------
+
+def test_race_pipeline_threads_pitch_offset_into_intrinsics():
+    """Pre-fix: PipelineConfig.camera_pitch_offset_rad was a stored
+    value but the CameraIntrinsics returned by from_fov ignored it,
+    so the configured tilt never reached perception code."""
+    from race_pipeline import RacePipeline, PipelineConfig
+    from competition.aigp_geometry import AIGP_CAM_PITCH_OFFSET_RAD
+    # The pipeline needs a CompetitionInterface stub; minimal mock.
+    class _StubInterface:
+        pass
+    cfg = PipelineConfig(camera_pitch_offset_rad=math.radians(15.0))
+    pipe = RacePipeline(_StubInterface(), config=cfg)
+    assert pipe.camera.pitch_offset_rad == pytest.approx(math.radians(15.0))
+
+    # And the default uses the AIGP 20° tilt.
+    default = RacePipeline(_StubInterface(), config=PipelineConfig())
+    assert default.camera.pitch_offset_rad == pytest.approx(AIGP_CAM_PITCH_OFFSET_RAD)
+    assert default.camera.pitch_offset_rad == pytest.approx(math.radians(20.0))
