@@ -130,10 +130,17 @@ def derive_section_boundaries(
     point_runs.append((start_pt, len(classes), cur_class))
 
     # Convert point indices to step indices via point.time / dt.
+    # Iter-001 review Opus F6: use round-to-nearest instead of floor.
+    # With floor (the previous behaviour), point times that quantise to
+    # the same step index produced zero-length runs that got silently
+    # dropped at the `if e_step <= s_step: continue` filter below. With
+    # rounding the boundary lands on the closest step, preserving the
+    # partition's coverage when trajectory sample spacing is finer than
+    # the simulation step.
     def _pt_to_step(i: int) -> int:
         if i >= len(points):
             return n_total_steps
-        return int(points[i].time / dt)
+        return int(round(points[i].time / dt))
 
     step_runs: List[Tuple[int, int, str]] = []
     for (s_pt, e_pt, cls) in point_runs:

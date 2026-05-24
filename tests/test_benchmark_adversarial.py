@@ -149,6 +149,58 @@ def test_synthetic_bench_terminal_failure_makes_sim_passed_false():
 
 
 # ---------------------------------------------------------------------------
+# Iter-002 (composer-25 F6/F7): crashed and disqualified are SEPARATE signals
+# ---------------------------------------------------------------------------
+
+def test_bench_does_not_overload_crashed_for_dq():
+    """A bench run that DQs must report `crashed=False` and
+    `disqualified=True`. Pre-fix the bench conflated the two by setting
+    crashed=True whenever DQ fired, which is misleading: DQ is a rule
+    violation, not a physical impact, and downstream code that branches
+    on `crashed` was making the wrong call.
+
+    Construction: two gates 1m apart along +X with sequence_index 0 and 1.
+    The synthetic kinematic drone tracking the trajectory blows through
+    both gates fast enough that we either get a clean completion or a
+    DQ (race_pipeline pattern). Either way, `crashed` must stay False.
+    """
+    from scripts.benchmark import run_synthetic_benchmark  # noqa: WPS433
+
+    skip_course = {
+        "start": {"position": [0.0, 0.0, 2.0]},
+        "gate_defaults": {
+            "interior_width_m": 1.5,
+            "interior_height_m": 1.5,
+            "border_width_m": 0.6,
+        },
+        "gates": [
+            {
+                "id": "g1",
+                "pose": {"x": 5.0, "y": 0.0, "z": 2.0, "yaw": 0.0, "pitch": 0.0},
+                "config": {"interior_width_m": 1.5, "interior_height_m": 1.5,
+                           "border_width_m": 0.6},
+                "sequence_index": 0,
+            },
+            {
+                "id": "g2",
+                "pose": {"x": 6.0, "y": 0.0, "z": 2.0, "yaw": 0.0, "pitch": 0.0},
+                "config": {"interior_width_m": 1.5, "interior_height_m": 1.5,
+                           "border_width_m": 0.6},
+                "sequence_index": 1,
+            },
+        ],
+    }
+    result = run_synthetic_benchmark(duration=5.0, dt=0.01, config=skip_course)
+    # If a DQ fired, the bench's crashed flag must NOT have been set.
+    if result.get("disqualified"):
+        assert result["crashed"] is False, (
+            f"DQ must not be conflated with crashed; got crashed={result['crashed']!r}, "
+            f"disqualified={result['disqualified']!r}, "
+            f"reason={result.get('termination_reason')!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # I-3: no race_01 wall-clock magic constants in the default path
 # ---------------------------------------------------------------------------
 

@@ -439,16 +439,18 @@ def run_synthetic_benchmark(
             termination_reason = "race_complete"
             break
 
-        # iter-001 A7: terminal failures come from the sequencer first, then
-        # the kinematic-sim envelope. The sequencer's geometric crash branch
-        # (P1-6) classifies gate-frame strikes; the new out-of-order DQ
-        # branch flags U-turn / skip patterns. Either is a hard fail.
+        # iter-001 A7 + iter-002 (composer-25 F6/F7): terminal failures
+        # come from the sequencer first, then the kinematic-sim envelope.
+        # `crashed` and `disqualified` are SEPARATE signals — a DQ is a
+        # rule violation, not a physical impact. Bench reports both
+        # truthfully so the result-dict consumer can distinguish them.
         if seq.last_crash is not None:
             crashed = True
             termination_reason = f"crash_gate:{seq.last_crash[0]}"
             break
         if seq.is_disqualified:
-            crashed = True
+            # Note: NOT setting crashed=True — DQ is its own terminal
+            # signal, surfaced in the result dict's `disqualified` field.
             termination_reason = f"disqualified:{seq.dq_reason}"
             break
 
@@ -782,13 +784,14 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
             termination_reason = "race_complete"
             break
 
-        # iter-001 A7: out-of-order DQ is terminal on the PyBullet path too.
-        # Frame-strut crashes still flow primarily through `env.gate_contact()`
-        # because the contact manifold is authoritative; sequencer's geometric
-        # crash classification is a secondary signal (handled later if env
-        # didn't see a contact this tick).
+        # iter-001 A7 + iter-002 (composer-25 F6/F7): DQ is terminal on
+        # the PyBullet path too — but it's NOT a crash. Frame-strut
+        # crashes still flow primarily through `env.gate_contact()`
+        # (the contact manifold is authoritative); the sequencer's
+        # geometric crash classification is a secondary signal.
         if seq.is_disqualified:
-            crashed = True
+            # Not setting crashed=True — surfaced via the result dict's
+            # disqualified field.
             termination_reason = f"disqualified:{seq.dq_reason}"
             break
 

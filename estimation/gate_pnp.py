@@ -106,9 +106,14 @@ class CameraIntrinsics:
 
 @dataclass
 class GateGeometry:
-    """Physical gate dimensions for PnP."""
-    interior_width_m: float = 1.2
-    interior_height_m: float = 1.2
+    """Physical gate dimensions for PnP.
+
+    Iter-002 (5/7 reviews MINOR): defaults updated to AIGP VQ1 spec
+    (1.5 m inner opening per VADR-TS-002 §3.7). Legacy tracks supply
+    explicit smaller dimensions via constructor args.
+    """
+    interior_width_m: float = AIGP_GATE_INTERIOR_M
+    interior_height_m: float = AIGP_GATE_INTERIOR_M
 
     @property
     def object_points(self) -> np.ndarray:
