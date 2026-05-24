@@ -55,7 +55,11 @@ class CameraIntrinsics:
     fy: float = AIGP_CAM_FY                  # 320 px
     cx: float = AIGP_CAM_CX                  # 320 px
     cy: float = AIGP_CAM_CY                  # 180 px
-    fov_h_deg: float = AIGP_CAM_VFOV_DEG     # 90° (AIGP camera has square pixels → HFoV == VFoV)
+    fov_h_deg: float = 90.0                  # Horizontal FoV; matches AIGP intrinsics
+                                             # (2·atan(320/320) = 90°). The spec's
+                                             # literal "VFoV=90°" is inconsistent with
+                                             # fx=fy=320 — see aigp_geometry.py for the
+                                             # full derivation. We trust the intrinsics.
     image_width: int = AIGP_CAM_WIDTH_PX     # 640
     image_height: int = AIGP_CAM_HEIGHT_PX   # 360
     # Camera tilt about body-Y axis. Positive = nose-up. AIGP camera is

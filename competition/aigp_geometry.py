@@ -41,8 +41,21 @@ AIGP_CAM_FX: float = 320.0
 AIGP_CAM_FY: float = 320.0
 AIGP_CAM_CX: float = 320.0
 AIGP_CAM_CY: float = 180.0
-AIGP_CAM_VFOV_DEG: float = 90.0
-AIGP_CAM_VFOV_RAD: float = math.radians(90.0)
+
+# Spec ambiguity (iter-001 review composer-25-4 F8): VADR-TS-002 §3.8
+# literally states "VFoV = 90°" but with fx = fy = 320 and image
+# dimensions 640 × 360, the actual field of view derived from the
+# intrinsics is:
+#   HFoV = 2 · atan(W/2 / fx) = 2 · atan(320/320) = 90.0°
+#   VFoV = 2 · atan(H/2 / fy) = 2 · atan(180/320) ≈ 58.71°
+# These two derived values are internally consistent. The spec's literal
+# "VFoV = 90°" claim is inconsistent with fx=fy=320 — most likely a typo
+# where "H" was meant. Trust the intrinsics over the textual claim; the
+# spec PDF text takes second priority to the pinhole geometry.
+AIGP_CAM_HFOV_DEG: float = 90.0
+AIGP_CAM_VFOV_DEG: float = math.degrees(2.0 * math.atan(180.0 / 320.0))    # 58.715°
+AIGP_CAM_HFOV_RAD: float = math.radians(AIGP_CAM_HFOV_DEG)
+AIGP_CAM_VFOV_RAD: float = 2.0 * math.atan(180.0 / 320.0)
 # Camera is tilted 20° UPWARD from body frame (positive pitch = nose-up).
 # A feature at the horizon therefore projects BELOW image centre by
 # ~fy·tan(20°) ≈ 116 px.

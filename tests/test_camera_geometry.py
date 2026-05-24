@@ -99,3 +99,23 @@ def test_camera_intrinsics_legacy_constructor_still_works():
     assert cam.image_height == 480
     # fx from horizontal FoV: fx = w / (2·tan(fov/2)) = 640 / (2·tan(45°)) = 320.
     assert cam.fx == pytest.approx(320.0, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Iter-001 review composer-25-4 F8: AIGP FoV / intrinsics consistency
+# ---------------------------------------------------------------------------
+
+def test_aigp_intrinsics_hfov_matches_spec_90deg():
+    """fx = 320, image width = 640 → HFoV = 2·atan(320/320) = 90°.
+    The spec's "VFoV = 90°" claim is inconsistent; trust the intrinsics
+    (which give H = 90° and V ≈ 58.7°)."""
+    from competition.aigp_geometry import (
+        AIGP_CAM_FX, AIGP_CAM_HFOV_DEG, AIGP_CAM_VFOV_DEG, AIGP_CAM_WIDTH_PX,
+    )
+    derived_hfov = math.degrees(
+        2.0 * math.atan((AIGP_CAM_WIDTH_PX / 2) / AIGP_CAM_FX)
+    )
+    assert derived_hfov == pytest.approx(AIGP_CAM_HFOV_DEG, abs=0.05)
+    assert derived_hfov == pytest.approx(90.0, abs=0.05)
+    # The genuine VFoV is much smaller — assert we surface it correctly.
+    assert AIGP_CAM_VFOV_DEG == pytest.approx(58.715, abs=0.05)

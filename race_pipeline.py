@@ -35,6 +35,7 @@ from competition.adapter import (
     CompetitionInterface,
     TelemetryState,
 )
+from competition.aigp_geometry import AIGP_VQ1_MAX_RUN_DURATION_S
 from competition.session import RaceSession
 from control.mpc_tracker import GeometricTracker, SimplePositionTracker, TrackerConfig
 from estimation.ekf import DroneEKF, EKFConfig
@@ -276,6 +277,7 @@ class RacePipeline:
             self.sequencer is not None and (
                 self.sequencer.is_complete
                 or self.sequencer.is_disqualified
+                or self.sequencer.is_timed_out
                 or self.sequencer.last_crash is not None
             )
         )
@@ -354,6 +356,23 @@ class RacePipeline:
             gate_id, _xyz = self.sequencer.last_crash
             logger.error("Race terminated: gate-frame crash on %s", gate_id)
             return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+        # Iter-002 (5/7 reviews): enforce VQ1 8-minute cap. Sequencer's
+        # TIMED_OUT state is set by RaceSession or the bench based on
+        # elapsed sim time; here we just abort the loop cleanly.
+        if self.sequencer.is_timed_out:
+            logger.error(
+                "Race terminated: timeout — %s",
+                self.sequencer.timeout_reason or "max_run_duration_exceeded",
+            )
+            return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+
+        # Wall-time check against the AIGP VQ1 8-minute cap. Trip the
+        # sequencer once; the next tick takes the early-return above.
+        elapsed = time.monotonic() - self._race_start_time
+        if elapsed > AIGP_VQ1_MAX_RUN_DURATION_S and not self.sequencer.is_timed_out:
+            self.sequencer.mark_timed_out(
+                f"vq1_max_run_duration_exceeded:{elapsed:.1f}s"
+            )
 
         # 3a. Dynamic replan: mirrors sim_pybullet/runner._maybe_replan.
         #     A crash/miss/off-track surface event rebuilds the

@@ -135,6 +135,10 @@ class GateSequencer:
         # Reason set when the sequencer DQs the run. None unless
         # `self._state == RaceState.DISQUALIFIED`. Format: "out_of_order:<gate_id>".
         self._dq_reason: Optional[str] = None
+        # Iter-002 (5/7 reviews MAJOR): RaceState.TIMED_OUT was dead code
+        # before — defined but never assigned. Now bench/pipeline call
+        # `mark_timed_out(reason)` when the 8-minute VQ1 cap is exceeded.
+        self._timeout_reason: Optional[str] = None
 
     @property
     def current_gate(self) -> Optional[GateSpec]:
@@ -166,6 +170,32 @@ class GateSequencer:
     def dq_reason(self) -> Optional[str]:
         """Human-readable reason for the DQ, or None."""
         return self._dq_reason
+
+    @property
+    def is_timed_out(self) -> bool:
+        """True if the run exceeded the VQ1 8-minute cap or any caller-imposed limit."""
+        return self._state == RaceState.TIMED_OUT
+
+    @property
+    def timeout_reason(self) -> Optional[str]:
+        """Human-readable reason for the timeout, or None."""
+        return self._timeout_reason
+
+    def mark_timed_out(self, reason: str = "max_run_duration_exceeded") -> None:
+        """Transition to RaceState.TIMED_OUT. Idempotent — repeated calls
+        are silently ignored. Pre-race / completed / DQ'd state takes
+        precedence (terminal events don't get retroactively re-terminated).
+        """
+        if self._state in (
+            RaceState.WAITING,
+            RaceState.COMPLETED,
+            RaceState.DISQUALIFIED,
+            RaceState.TIMED_OUT,
+        ):
+            return
+        self._state = RaceState.TIMED_OUT
+        self._timeout_reason = reason
+        self._last_event = "timeout"
 
     @property
     def gates_passed(self) -> int:
@@ -665,3 +695,4 @@ class GateSequencer:
         self._last_event = None
         self._collision_marked_this_tick = None
         self._dq_reason = None
+        self._timeout_reason = None

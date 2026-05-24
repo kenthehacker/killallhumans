@@ -371,3 +371,62 @@ def test_far_grazing_with_lenient_margin_still_benign():
         # If the crash branch did fire somehow, it should be on g1 (current),
         # not g2.
         assert seq.last_crash[0] == "g1"
+
+
+# ---------------------------------------------------------------------------
+# Iter-002 (5/7 reviews MAJOR): RaceState.TIMED_OUT now wired up
+# ---------------------------------------------------------------------------
+
+def test_mark_timed_out_transitions_state():
+    gates = _make_line(3)
+    seq = GateSequencer(gates)
+    seq.start()
+    seq.update((4.0, 0.0, -2.0))
+    assert not seq.is_timed_out
+    seq.mark_timed_out("vq1_8min_cap")
+    assert seq.is_timed_out
+    assert seq.state == RaceState.TIMED_OUT
+    assert seq.timeout_reason == "vq1_8min_cap"
+
+
+def test_timed_out_run_short_circuits_subsequent_updates():
+    gates = _make_line(3)
+    seq = GateSequencer(gates)
+    seq.start()
+    seq.update((4.5, 0.0, -2.0))
+    seq.mark_timed_out("test")
+    # Subsequent updates must NOT credit gates or fire any events.
+    result = seq.update((5.5, 0.0, -2.0))
+    assert result is None
+    assert seq.gates_passed == 0
+    assert seq.is_timed_out
+
+
+def test_mark_timed_out_is_idempotent():
+    seq = GateSequencer(_make_line(3))
+    seq.start()
+    seq.mark_timed_out("first")
+    seq.mark_timed_out("second")
+    # First call wins; second is a no-op.
+    assert seq.timeout_reason == "first"
+
+
+def test_mark_timed_out_does_not_overwrite_dq_or_completion():
+    seq = GateSequencer(_make_line(3), _ordered_cfg())
+    seq.start()
+    # Trigger DQ first.
+    seq.update((14.5, 0.0, -2.0))
+    seq.update((15.5, 0.0, -2.0))
+    assert seq.is_disqualified
+    seq.mark_timed_out("late_timeout")
+    # DQ takes precedence over a subsequent timeout call.
+    assert seq.is_disqualified
+    assert not seq.is_timed_out
+
+
+def test_mark_timed_out_pre_race_is_silent_noop():
+    seq = GateSequencer(_make_line(3))
+    # Don't call start() — still in WAITING.
+    seq.mark_timed_out("too_early")
+    assert seq.state == RaceState.WAITING
+    assert not seq.is_timed_out
