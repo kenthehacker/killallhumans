@@ -150,3 +150,54 @@ def test_json_roundtrip(tmp_path: Path):
     assert reloaded.drag_per_mass == pytest.approx(cal.drag_per_mass)
     assert reloaded.mass_kg == pytest.approx(cal.mass_kg)
     assert reloaded.max_thrust_n == pytest.approx(cal.max_thrust_n)
+
+
+# ---------------------------------------------------------------------------
+# Iter-003 (4/7 reviews MINOR): JSON schema validation
+# ---------------------------------------------------------------------------
+
+def test_read_calibration_json_rejects_missing_required_key(tmp_path: Path):
+    import json as _json
+    path = tmp_path / "bad.json"
+    path.write_text(_json.dumps({"drag_per_mass_1_per_s": 0.4}))  # missing k_t
+    with pytest.raises(ValueError, match="missing"):
+        DroneCalibrator.read_calibration_json(path)
+
+
+def test_read_calibration_json_rejects_negative_thrust(tmp_path: Path):
+    import json as _json
+    path = tmp_path / "neg.json"
+    path.write_text(_json.dumps({
+        "thrust_per_mass_1_per_s2": -22.0,  # impossible
+        "drag_per_mass_1_per_s": 0.4,
+        "n_samples": 200,
+        "rmse_mps2": 0.05,
+    }))
+    with pytest.raises(ValueError, match="non-positive thrust"):
+        DroneCalibrator.read_calibration_json(path)
+
+
+def test_read_calibration_json_rejects_nan(tmp_path: Path):
+    import json as _json
+    path = tmp_path / "nan.json"
+    # JSON doesn't have NaN per RFC8259, but Python's json module accepts it
+    # when serialising; we test by writing the literal text.
+    path.write_text(
+        '{"thrust_per_mass_1_per_s2": NaN, "drag_per_mass_1_per_s": 0.4, '
+        '"n_samples": 200, "rmse_mps2": 0.05}'
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        DroneCalibrator.read_calibration_json(path)
+
+
+def test_read_calibration_json_rejects_zero_samples(tmp_path: Path):
+    import json as _json
+    path = tmp_path / "zero.json"
+    path.write_text(_json.dumps({
+        "thrust_per_mass_1_per_s2": 22.0,
+        "drag_per_mass_1_per_s": 0.4,
+        "n_samples": 0,
+        "rmse_mps2": 0.05,
+    }))
+    with pytest.raises(ValueError, match="n_samples"):
+        DroneCalibrator.read_calibration_json(path)

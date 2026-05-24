@@ -259,6 +259,11 @@ class GateSequencer:
 
         pos = np.array(position)
         passed_gate = None
+        # iter-003 (gpt-55-2 F2): tick-local flag for "did the current-gate
+        # classification block record a fresh crash this tick?" — used to
+        # gate the future-gate DQ scan so a physical crash always wins
+        # over an out-of-order rule violation in the same segment.
+        crash_recorded_this_tick = False
 
         # Track detection dropout: only accrue the counter when the
         # perception stack is actually running and failed to see the
@@ -326,13 +331,24 @@ class GateSequencer:
                         )
                         if in_outer and not in_crash_zone_opening:
                             # Hit the frame between bare opening and outer.
-                            # P1-7: dedupe — only one entry per fly-by.
-                            if self._last_event != "crash":
+                            # P1-7: dedup ONLY within the SAME gate's fly-by.
+                            # iter-003 (composer-25-5 F15 / gpt-55-1 F3):
+                            # the previous `_last_event != "crash"` check
+                            # dropped a second crash on a DIFFERENT gate
+                            # in the same tick (multi-strut segments).
+                            # Dedup must key on gate_id, not on last_event.
+                            already_in_this_flyby = (
+                                self._crashes
+                                and self._crashes[-1][0] == gate.gate_id
+                                and self._last_event == "crash"
+                            )
+                            if not already_in_this_flyby:
                                 self._crashes.append(
                                     (gate.gate_id,
                                      tuple(float(c) for c in crossing))
                                 )
                                 self._last_event = "crash"
+                                crash_recorded_this_tick = True
                             crash_classified = True
 
                 if (plane_crossed or proximity_passed) and not crash_classified:
@@ -410,11 +426,20 @@ class GateSequencer:
         # `crash` (handled above for the current target via the P1-6
         # branch); we only DQ on opening-inside crossings.
         # ---------------------------------------------------------------
+        # iter-003: future-gate scan combines two independent concerns —
+        # opening crossing → out-of-order DQ (only when enforce_in_order),
+        # and strut hit → crash (always, physical impact). Splitting them
+        # so a caller that opts out of in-order enforcement still gets
+        # honest crash detection.
+        # gpt-55-2 F2: physical crash takes priority over DQ. A tick that
+        # already classified a crash this tick must not ALSO DQ — that
+        # would obscure the actual cause of termination.
         if (
-            self.config.enforce_in_order
-            and self._state != RaceState.DISQUALIFIED
+            self._state != RaceState.DISQUALIFIED
             and self._prev_position is not None
             and not self.is_complete
+            and not crash_recorded_this_tick
+            and self._collision_marked_this_tick is None
         ):
             for future_gate in self._gates[self._current_idx + 1:]:
                 if not self._plane_was_crossed(self._prev_position, pos, future_gate):
@@ -426,29 +451,35 @@ class GateSequencer:
                     continue
                 # Iter-001 review Opus F14: use the STRICT crash_margin
                 # opening (default 1.0 = bare opening) for the DQ check,
-                # NOT the lenient pass_through_margin (default 1.0 here
-                # but 1.5 in the synthetic bench). Otherwise a track with
-                # lenient pass-through and tight outer frame creates a
-                # false-DQ region where lenient_opening > outer_frame.
+                # NOT the lenient pass_through_margin.
                 in_strict_opening = self._point_in_opening_with_margin(
                     crossing, future_gate, self.config.crash_margin,
                 )
                 in_outer = self._point_in_outer_frame(crossing, future_gate)
                 if in_strict_opening:
-                    self._state = RaceState.DISQUALIFIED
-                    self._dq_reason = f"out_of_order:{future_gate.gate_id}"
-                    self._last_event = "dq"
-                    break
-                # Iter-001 review Opus F3: future-gate strut hits (inside
-                # outer frame but outside strict opening) are physical
-                # collisions and must be terminal crashes, not silently
-                # ignored. Symmetrises the geometry classification with
-                # the current-gate P1-6 branch above.
+                    # Out-of-order rule violation — only terminal under
+                    # strict-ordering mode. With enforce_in_order=False
+                    # the caller has explicitly opted out (legacy tests,
+                    # debug runs).
+                    if self.config.enforce_in_order:
+                        self._state = RaceState.DISQUALIFIED
+                        self._dq_reason = f"out_of_order:{future_gate.gate_id}"
+                        self._last_event = "dq"
+                        break
+                    # else: silently ignore the out-of-order opening pass.
+                    continue
+                # Iter-001 review Opus F3 + iter-003: future-gate strut
+                # hits are PHYSICAL crashes, recorded regardless of
+                # enforce_in_order. Dedup keyed on gate_id (not on
+                # _last_event alone), so two struts on two different
+                # gates in successive ticks both record.
                 if in_outer:
-                    if self._last_event != "crash" or (
+                    already_in_this_flyby = (
                         self._crashes
-                        and self._crashes[-1][0] != future_gate.gate_id
-                    ):
+                        and self._crashes[-1][0] == future_gate.gate_id
+                        and self._last_event == "crash"
+                    )
+                    if not already_in_this_flyby:
                         self._crashes.append(
                             (future_gate.gate_id,
                              tuple(float(c) for c in crossing))

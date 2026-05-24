@@ -173,15 +173,62 @@ class DroneCalibrator:
     def read_calibration_json(
         path: Union[str, Path],
     ) -> CalibrationResult:
-        """Reverse of write_calibration_json."""
+        """Reverse of write_calibration_json with basic schema validation.
+
+        iter-003 (4/7 reviews MINOR): the previous version accepted any
+        JSON object with the right keys, including physically impossible
+        values (negative thrust, NaN). Now: required keys must be present,
+        all numeric fields must be finite, and thrust_per_mass must be
+        positive (drag may legitimately be ~0 for a frictionless model).
+        """
+        import math as _math
+
+        required = (
+            "thrust_per_mass_1_per_s2", "drag_per_mass_1_per_s",
+            "n_samples", "rmse_mps2",
+        )
         with open(path) as f:
             d = json.load(f)
+        for k in required:
+            if k not in d:
+                raise ValueError(f"calibration JSON missing required key {k!r}")
+
+        k_t = float(d["thrust_per_mass_1_per_s2"])
+        k_d = float(d["drag_per_mass_1_per_s"])
+        rmse = float(d["rmse_mps2"])
+        n = int(d["n_samples"])
+        if not (_math.isfinite(k_t) and _math.isfinite(k_d) and _math.isfinite(rmse)):
+            raise ValueError(
+                f"calibration JSON contains non-finite numerics: "
+                f"k_t={k_t!r}, k_d={k_d!r}, rmse={rmse!r}"
+            )
+        if k_t <= 0.0:
+            raise ValueError(
+                f"calibration JSON has non-positive thrust_per_mass "
+                f"({k_t!r}) — physical thrust must be upward-positive"
+            )
+        if n < 1:
+            raise ValueError(f"calibration JSON has n_samples<1 ({n!r})")
+
+        mass = d.get("mass_kg")
+        max_thrust = d.get("max_thrust_n")
+        drag = d.get("drag_coefficient")
+        for label, val in (("mass_kg", mass),
+                          ("max_thrust_n", max_thrust),
+                          ("drag_coefficient", drag)):
+            if val is not None and not _math.isfinite(float(val)):
+                raise ValueError(f"calibration JSON has non-finite {label}: {val!r}")
+        if mass is not None and float(mass) <= 0.0:
+            raise ValueError(f"calibration JSON has non-positive mass_kg: {mass!r}")
+        if max_thrust is not None and float(max_thrust) <= 0.0:
+            raise ValueError(f"calibration JSON has non-positive max_thrust_n: {max_thrust!r}")
+
         return CalibrationResult(
-            thrust_per_mass=float(d["thrust_per_mass_1_per_s2"]),
-            drag_per_mass=float(d["drag_per_mass_1_per_s"]),
-            n_samples=int(d["n_samples"]),
-            rmse=float(d["rmse_mps2"]),
-            mass_kg=d.get("mass_kg"),
-            max_thrust_n=d.get("max_thrust_n"),
-            drag_coefficient=d.get("drag_coefficient"),
+            thrust_per_mass=k_t,
+            drag_per_mass=k_d,
+            n_samples=n,
+            rmse=rmse,
+            mass_kg=float(mass) if mass is not None else None,
+            max_thrust_n=float(max_thrust) if max_thrust is not None else None,
+            drag_coefficient=float(drag) if drag is not None else None,
         )

@@ -430,3 +430,62 @@ def test_mark_timed_out_pre_race_is_silent_noop():
     seq.mark_timed_out("too_early")
     assert seq.state == RaceState.WAITING
     assert not seq.is_timed_out
+
+
+# ---------------------------------------------------------------------------
+# Iter-003 (composer-25-5 F15 / gpt-55-1 F3): multi-strut crash dedup
+# ---------------------------------------------------------------------------
+
+def test_consecutive_strut_crashes_on_different_gates_both_recorded():
+    """Pre-fix: the dedup gate `_last_event != "crash"` dropped a fresh
+    crash on a DIFFERENT gate if a prior tick already recorded one.
+    Post-fix: dedup is keyed on gate_id, so two distinct strut hits
+    record two distinct crash entries.
+    """
+    gates = _make_line(3)
+    # Disable in-order DQ so the test focuses on crash dedup, not DQ.
+    seq = GateSequencer(gates, SequencerConfig(enforce_in_order=False))
+    seq.start()
+    # Tick 1: hit g1's strut (y=1.0 — outside opening 0.75, inside outer 1.35).
+    seq.update((4.5, 1.0, -2.0))
+    seq.update((5.5, 1.0, -2.0))
+    assert len(seq._crashes) == 1
+    assert seq._crashes[0][0] == "g1"
+    # Tick 2: hit g2's strut (still inside its outer frame).
+    # G2 is at x=10. y=1.0 should still produce a strut hit.
+    seq.update((9.5, 1.0, -2.0))
+    seq.update((10.5, 1.0, -2.0))
+    # Both crashes must be recorded; dedup should not have dropped the
+    # second one just because the first set _last_event="crash".
+    assert len(seq._crashes) == 2, (
+        f"expected 2 crashes (one per gate), got {len(seq._crashes)}: {seq._crashes}"
+    )
+    assert seq._crashes[1][0] == "g2"
+
+
+# ---------------------------------------------------------------------------
+# Iter-003 (gpt-55-2 F2): crash wins over DQ in the same tick
+# ---------------------------------------------------------------------------
+
+def test_crash_on_current_gate_skips_future_gate_dq_scan():
+    """If the same tick has a crash on the CURRENT gate AND a future-gate
+    opening crossing, the crash wins. Pre-fix the DQ scan still ran and
+    set DISQUALIFIED, conflating two distinct terminal signals.
+    """
+    # Build a scenario where the same prev->pos segment hits g1's strut
+    # AND crosses g3's opening. g1 at (5, 0, -2), g3 at (15, 0, -2),
+    # both AIGP geometry. Drone goes from (4, 1, -2) to (15.5, 1, -2):
+    # - crosses g1 at (5, 1, -2): outside opening 0.75, inside outer 1.35 -> CRASH
+    # - crosses g3 at (15, 1, -2): outside opening 0.75, inside outer 1.35 -> would be future-gate crash
+    # The current-gate CRASH should fire and skip the DQ scan.
+    gates = _make_line(3)
+    seq = GateSequencer(gates, _ordered_cfg())
+    seq.start()
+    seq.update((4.0, 1.0, -2.0))
+    seq.update((15.5, 1.0, -2.0))
+    assert seq.last_crash is not None, "expected a crash on g1 (current)"
+    assert seq.last_crash[0] == "g1"
+    # And we must NOT have DQ'd — crash wins.
+    assert not seq.is_disqualified, (
+        f"crash should suppress DQ; dq_reason={seq.dq_reason!r}"
+    )
