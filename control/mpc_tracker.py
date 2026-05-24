@@ -79,6 +79,16 @@ class TrackerConfig:
     gravity: float = 9.81
     max_thrust_n: float = 20.0
 
+    # iter-001 A15: learned tracker residual (lightweight ML).
+    # Off-by-default — only enable on a track where a trained model has
+    # been validated to beat baseline on the holdout set. The MLP is
+    # bypassed entirely when use_residual=False, so default-config
+    # callers get byte-identical behaviour to the pre-A15 tracker.
+    use_residual: bool = False
+    residual_weights_path: Optional[str] = None      # .npz path (see control/learned_residual.py)
+    residual_clamp_rad: float = 0.05                 # hard clamp on roll/pitch deltas (~2.9°)
+    residual_thrust_clamp: float = 0.05              # hard clamp on thrust delta (~5% of full scale)
+
 
 class GeometricTracker:
     """
@@ -97,6 +107,21 @@ class GeometricTracker:
 
     def __init__(self, config: TrackerConfig = None):
         self.config = config or TrackerConfig()
+        # iter-001 A15: optional learned residual. Loaded lazily so the
+        # import / npz-load cost is only paid when the feature is on.
+        self._residual = None
+        if self.config.use_residual:
+            from control.learned_residual import TrackerResidualMLP
+            if self.config.residual_weights_path:
+                self._residual = TrackerResidualMLP.from_npz(
+                    self.config.residual_weights_path
+                )
+            else:
+                # Safety baseline: zero-init weights produce zero residual,
+                # so enabling the feature without a trained model is still
+                # byte-identical to baseline (modulo float math from the
+                # extra branch — see test_residual_off_is_baseline).
+                self._residual = TrackerResidualMLP.zero_init()
 
     def track(
         self,
@@ -189,6 +214,35 @@ class GeometricTracker:
         # Clamp to limits
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
         desired_pitch = np.clip(desired_pitch, -c.max_tilt_rad, c.max_tilt_rad)
+
+        # iter-001 A15: learned residual on (roll, pitch, thrust). Hard-
+        # clamped at the consumer so a corrupted weights file or out-of-
+        # distribution input cannot push commands beyond the safety
+        # envelope. Re-applies max_tilt_rad / thrust limits after the
+        # residual is added — clamp composition: residual-clamp first,
+        # then physical clamp. Off-switch: `use_residual=False`.
+        if self._residual is not None:
+            from control.learned_residual import build_input_features
+            x = build_input_features(
+                pos_err=ep, vel_err=ev, ref_accel=ref_acc,
+                thrust_normalized=thrust_normalized,
+            )
+            r = self._residual.forward(x)
+            d_roll = float(np.clip(r[0], -c.residual_clamp_rad, c.residual_clamp_rad))
+            d_pitch = float(np.clip(r[1], -c.residual_clamp_rad, c.residual_clamp_rad))
+            d_thrust = float(
+                np.clip(r[2], -c.residual_thrust_clamp, c.residual_thrust_clamp)
+            )
+            desired_roll = float(np.clip(
+                desired_roll + d_roll, -c.max_tilt_rad, c.max_tilt_rad,
+            ))
+            desired_pitch = float(np.clip(
+                desired_pitch + d_pitch, -c.max_tilt_rad, c.max_tilt_rad,
+            ))
+            thrust_normalized = float(np.clip(
+                thrust_normalized + d_thrust,
+                c.min_thrust_normalized, c.max_thrust_normalized,
+            ))
 
         cmd = AttitudeCommand(
             roll_rad=float(desired_roll),
