@@ -522,8 +522,21 @@ class TestCrashIntoGate:
     def test_crash_does_not_advance_target(self):
         """A crash on the highlighted gate must not advance the target.
         The drone keeps trying to pass the same gate (or the upstream
-        replanner clears the situation)."""
-        gates = _make_course()
+        replanner clears the situation).
+
+        Test uses explicit 1.2 m / 0.15 m geometry — y=0.7 is in the
+        [0.6, 0.75] strut annulus under that geometry. With AIGP defaults
+        (1.5 m opening, 0.6 m border) the same y would be a clean pass,
+        which is fine for the AIGP-default path but isn't what THIS test
+        is checking.
+        """
+        gates = [
+            _make_gate(
+                f"G{i+1}", (5.0 * (i + 1), 0.0, 0.0), yaw=0.0, idx=i,
+                interior_width=1.2, interior_height=1.2, border_width=0.15,
+            )
+            for i in range(3)
+        ]
         seq = GateSequencer(gates)
         seq.start()
         seq.update((4.5, 0.7, 0))

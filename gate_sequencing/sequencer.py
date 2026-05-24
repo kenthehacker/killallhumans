@@ -22,21 +22,35 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
+# Defaults track VADR-TS-002 §3.7. Track configs (e.g. race_01.json)
+# may override via explicit constructor args.
+from competition.aigp_geometry import (
+    AIGP_GATE_BORDER_M,
+    AIGP_GATE_DEPTH_M,
+    AIGP_GATE_INTERIOR_M,
+)
+
 
 @dataclass
 class GateSpec:
-    """Platform-agnostic gate definition."""
+    """Platform-agnostic gate definition.
+
+    Defaults match VADR-TS-002 §3.7 (AIGP Virtual Qualifier 1):
+        interior 1.5 m × 1.5 m, border 0.6 m, depth 0.26 m → outer 2.7 m.
+    Legacy tracks supply explicit smaller dimensions via constructor args.
+    """
     gate_id: str
-    position: Tuple[float, float, float]  # center (NED)
+    position: Tuple[float, float, float]   # center (NED)
     yaw: float = 0.0                       # facing direction (radians)
     pitch: float = 0.0
     roll: float = 0.0
-    interior_width: float = 1.2            # meters
-    interior_height: float = 1.2           # meters
-    border_width: float = 0.15             # meters — frame thickness around the opening.
-                                           # Used by geometric crash detection: a plane
-                                           # crossing inside (interior + 2*border) but
-                                           # outside the interior opening = hit the frame.
+    interior_width: float = AIGP_GATE_INTERIOR_M    # 1.5 m
+    interior_height: float = AIGP_GATE_INTERIOR_M   # 1.5 m
+    border_width: float = AIGP_GATE_BORDER_M        # 0.6 m frame thickness.
+                                                    # Crash zone = plane crossing inside
+                                                    # (interior + 2·border) but outside
+                                                    # the bare interior opening (P1-6).
+    depth: float = AIGP_GATE_DEPTH_M                # 0.26 m through-gate depth.
     sequence_index: int = 0
 
     @property
@@ -50,11 +64,12 @@ class GateSpec:
 
 class RaceState(Enum):
     """Current state of the race."""
-    WAITING = auto()      # before start
-    RACING = auto()       # normal racing
-    RECOVERY = auto()     # recovering from off-track / missed gate
-    COMPLETED = auto()    # all gates passed
-    TIMED_OUT = auto()    # exceeded time limit
+    WAITING = auto()       # before start
+    RACING = auto()        # normal racing
+    RECOVERY = auto()      # recovering from off-track / missed gate
+    COMPLETED = auto()     # all gates passed
+    TIMED_OUT = auto()     # exceeded time limit
+    DISQUALIFIED = auto()  # terminal failure — out-of-order pass, etc.
 
 
 @dataclass
@@ -71,6 +86,13 @@ class SequencerConfig:
     max_approach_angle: float = 1.2      # radians — max angle for valid gate approach
     detection_dropout_frames: int = 30   # frames without detection before slowing down
     recovery_speed_factor: float = 0.3   # speed reduction during recovery
+    # When True, any plane crossing of an unpassed-non-current gate's *opening*
+    # is a terminal DQ ("out-of-order"). Crossings outside the opening (e.g.
+    # far above or beside a future gate) are benign. Frame-strut hits of any
+    # gate continue to be classified as `crash`, not DQ. Default True so the
+    # competition-relevant strict-order rule is the out-of-the-box behaviour;
+    # legacy tests / debug runs can opt out via SequencerConfig(enforce_in_order=False).
+    enforce_in_order: bool = True
 
 
 class GateSequencer:
@@ -110,6 +132,9 @@ class GateSequencer:
         # short-circuited so the authoritative physics-driven crash mark
         # wins over a lenient geometric pass (P1-4).
         self._collision_marked_this_tick: Optional[str] = None
+        # Reason set when the sequencer DQs the run. None unless
+        # `self._state == RaceState.DISQUALIFIED`. Format: "out_of_order:<gate_id>".
+        self._dq_reason: Optional[str] = None
 
     @property
     def current_gate(self) -> Optional[GateSpec]:
@@ -125,7 +150,22 @@ class GateSequencer:
 
     @property
     def is_complete(self) -> bool:
+        # A DQ run is never "complete" — `is_complete` means the drone
+        # actually finished the course. Downstream consumers check
+        # `is_disqualified` separately for terminal-but-failed runs.
+        if self._state == RaceState.DISQUALIFIED:
+            return False
         return self._current_idx >= len(self._gates)
+
+    @property
+    def is_disqualified(self) -> bool:
+        """True if the run was terminated for a rule violation (e.g. out-of-order pass)."""
+        return self._state == RaceState.DISQUALIFIED
+
+    @property
+    def dq_reason(self) -> Optional[str]:
+        """Human-readable reason for the DQ, or None."""
+        return self._dq_reason
 
     @property
     def gates_passed(self) -> int:
@@ -179,7 +219,12 @@ class GateSequencer:
         Returns:
             The gate that was just passed, or None
         """
-        if self._state in (RaceState.COMPLETED, RaceState.TIMED_OUT, RaceState.WAITING):
+        if self._state in (
+            RaceState.COMPLETED,
+            RaceState.TIMED_OUT,
+            RaceState.WAITING,
+            RaceState.DISQUALIFIED,
+        ):
             return None
 
         pos = np.array(position)
@@ -279,7 +324,37 @@ class GateSequencer:
                         self._misses.append(gate.gate_id)
                         self._last_event = "miss"
 
-        # Check if off-track
+        # ---------------------------------------------------------------
+        # Out-of-order DQ: any unpassed-non-current gate whose *opening*
+        # was crossed this tick is a terminal rule violation. This catches
+        # the U-turn false-complete pattern from `.loop/specs/2_known_issues.md`
+        # (I-1): drone skips gate N, passes gates N+1..K, U-turns back
+        # through gate N, then the original "skip" tick is the smoking gun.
+        # Frame-strut hits of any gate continue to be classified as
+        # `crash` (handled above for the current target via the P1-6
+        # branch); we only DQ on opening-inside crossings.
+        # ---------------------------------------------------------------
+        if (
+            self.config.enforce_in_order
+            and self._state != RaceState.DISQUALIFIED
+            and self._prev_position is not None
+            and not self.is_complete
+        ):
+            for future_gate in self._gates[self._current_idx + 1:]:
+                if not self._plane_was_crossed(self._prev_position, pos, future_gate):
+                    continue
+                crossing = self._compute_crossing(
+                    self._prev_position, pos, future_gate,
+                )
+                if crossing is None:
+                    continue
+                if self._point_in_gate_opening(crossing, future_gate):
+                    self._state = RaceState.DISQUALIFIED
+                    self._dq_reason = f"out_of_order:{future_gate.gate_id}"
+                    self._last_event = "dq"
+                    break
+
+        # Check if off-track (suppressed once DQ'd or completed)
         if not self.is_complete and self._state == RaceState.RACING:
             gate = self._gates[self._current_idx]
             dist_to_gate = float(np.linalg.norm(pos - np.array(gate.position)))
@@ -517,3 +592,4 @@ class GateSequencer:
         self._misses.clear()
         self._last_event = None
         self._collision_marked_this_tick = None
+        self._dq_reason = None

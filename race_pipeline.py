@@ -60,18 +60,26 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the racing pipeline."""
+    """Configuration for the racing pipeline.
+
+    Defaults match the AIGP VQ1 spec (VADR-TS-002): 640×360 forward
+    camera tilted 20° up, 1.5 m gate openings. Legacy tracks override
+    via explicit args at construction time.
+    """
     # Control rate
     target_hz: float = 100.0
 
-    # Camera
+    # Camera (AIGP VQ1 — VADR-TS-002 §3.8 + §4.6)
     camera_fov_h: float = 90.0
     image_width: int = 640
-    image_height: int = 480
+    image_height: int = 360
+    # Body→camera tilt in radians, positive = nose-up. AIGP camera is
+    # tilted 20° upward; legacy / debug paths can override to 0.
+    camera_pitch_offset_rad: float = math.radians(20.0)
 
-    # Gate geometry
-    gate_width: float = 1.2
-    gate_height: float = 1.2
+    # Gate geometry (AIGP VQ1 — VADR-TS-002 §3.7)
+    gate_width: float = 1.5
+    gate_height: float = 1.5
 
     # Detection
     use_detection: bool = True

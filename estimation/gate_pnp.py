@@ -20,6 +20,19 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+# Defaults track VADR-TS-002 §3.8 — single source of truth.
+from competition.aigp_geometry import (
+    AIGP_CAM_CX,
+    AIGP_CAM_CY,
+    AIGP_CAM_FX,
+    AIGP_CAM_FY,
+    AIGP_CAM_HEIGHT_PX,
+    AIGP_CAM_PITCH_OFFSET_RAD,
+    AIGP_CAM_VFOV_DEG,
+    AIGP_CAM_WIDTH_PX,
+    AIGP_GATE_INTERIOR_M,
+)
+
 
 @dataclass
 class GatePose:
@@ -32,20 +45,39 @@ class GatePose:
 
 @dataclass
 class CameraIntrinsics:
-    """Camera calibration parameters."""
-    fx: float = 462.0    # focal length x (pixels)
-    fy: float = 462.0    # focal length y (pixels)
-    cx: float = 320.0    # principal point x (pixels)
-    cy: float = 240.0    # principal point y (pixels)
-    fov_h_deg: float = 90.0
-    image_width: int = 640
-    image_height: int = 480
+    """Camera calibration parameters.
+
+    Defaults match VADR-TS-002 §3.8 (AIGP VQ1): 640×360 pinhole,
+    fx=fy=320, cx=320, cy=180, tilted 20° UPWARD from body frame.
+    Legacy 640×480 calibrations supply explicit args (or use `from_fov`).
+    """
+    fx: float = AIGP_CAM_FX                  # 320 px
+    fy: float = AIGP_CAM_FY                  # 320 px
+    cx: float = AIGP_CAM_CX                  # 320 px
+    cy: float = AIGP_CAM_CY                  # 180 px
+    fov_h_deg: float = AIGP_CAM_VFOV_DEG     # 90° (AIGP camera has square pixels → HFoV == VFoV)
+    image_width: int = AIGP_CAM_WIDTH_PX     # 640
+    image_height: int = AIGP_CAM_HEIGHT_PX   # 360
+    # Camera tilt about body-Y axis. Positive = nose-up. AIGP camera is
+    # tilted 20° upward, so a feature on the world horizon projects
+    # BELOW cy by `fy·tan(pitch_offset_rad) ≈ 116 px`. PnP must apply
+    # `R_pitch(pitch_offset_rad)` when converting camera-frame pose to
+    # body-frame drone position.
+    pitch_offset_rad: float = AIGP_CAM_PITCH_OFFSET_RAD
 
     @staticmethod
     def from_fov(
         fov_h_deg: float, width: int, height: int
     ) -> "CameraIntrinsics":
-        """Compute intrinsics from horizontal FOV and image dimensions."""
+        """Compute intrinsics from horizontal FOV and image dimensions.
+
+        Preserves the legacy 640×480 path: callers that pass explicit
+        width/height get principal point at (w/2, h/2) — NOT the AIGP
+        default of (320, 180) — because `from_fov` is the "build for a
+        custom camera" entry point. Pitch offset stays at the AIGP
+        default; legacy callers that need a non-tilted camera should
+        construct directly and override `pitch_offset_rad=0.0`.
+        """
         fx = width / (2 * math.tan(math.radians(fov_h_deg / 2)))
         fy = fx  # assume square pixels
         return CameraIntrinsics(
