@@ -150,7 +150,13 @@ class GatePnPEstimator:
         camera: CameraIntrinsics = None,
         gate: GateGeometry = None,
     ):
-        self.camera = camera or CameraIntrinsics.from_fov(90.0, 640, 480)
+        # Iter-002 review M3 (5/7 MAJOR): when camera is None, fall back to
+        # AIGP defaults (640x360, fx=fy=320, +20deg tilt) instead of the
+        # legacy 640x480 / fov-derived intrinsics. The default CameraIntrinsics
+        # constructor already encodes the spec'd values; using from_fov here
+        # would silently revert anyone who instantiated GatePnPEstimator
+        # without an explicit camera argument back to legacy geometry.
+        self.camera = camera or CameraIntrinsics()
         self.gate = gate or GateGeometry()
         self._last_pose: Optional[GatePose] = None
 

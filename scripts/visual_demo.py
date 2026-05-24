@@ -337,8 +337,17 @@ class VisualDemo:
         self.ekf = DroneEKF(EKFConfig())
         self.ekf.initialize(start_pos, (0, 0, 0), timestamp_s=0.0)
 
-        # PnP estimator
-        cam = CameraIntrinsics.from_fov(self.env.drone.config.camera_fov, 640, 480)
+        # PnP estimator — iter-002 review M3: use AIGP camera resolution by
+        # default. The legacy literal 640x480 silently overrode the AIGP
+        # intrinsics; if a specific demo needs the legacy resolution, pass
+        # explicit args.
+        from competition.aigp_geometry import (
+            AIGP_CAM_HEIGHT_PX, AIGP_CAM_WIDTH_PX,
+        )
+        cam = CameraIntrinsics.from_fov(
+            self.env.drone.config.camera_fov,
+            AIGP_CAM_WIDTH_PX, AIGP_CAM_HEIGHT_PX,
+        )
         g0 = race_config.gates[0].config
         self.pnp = GatePnPEstimator(cam, GateGeometry(g0.interior_width_m, g0.interior_height_m))
 

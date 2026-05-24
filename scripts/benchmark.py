@@ -255,6 +255,7 @@ def run_synthetic_benchmark(
     # Deterministic seed for reproducible benchmark results (SimpleFlight 2024,
     # Testing Pipeline 2025: fixed seeds are a competition deployment best practice).
     np.random.seed(42)
+    from competition.aigp_geometry import AIGP_VQ1_MAX_RUN_DURATION_S
     from estimation.ekf import DroneEKF, EKFConfig
     from gate_sequencing.sequencer import GateSequencer, GateSpec, SequencerConfig
     from planning.trajectory_optimizer import DroneConstraints, GateWaypoint, TrajectoryOptimizer, TrajectoryPoint
@@ -314,8 +315,14 @@ def run_synthetic_benchmark(
     start_pos = np.array(start_data.get("position", [0.0, 0.0, 1.5]), dtype=float)
 
     # --- Pipeline setup ---
+    # Iter-002 review M7 (4/7 reviews MAJOR): align pass_through_margin
+    # with the platform default (1.0). The previous synthetic bench used
+    # 1.5, which produced different DQ behaviour from the PyBullet bench
+    # for the same trajectory — platform honesty drift. The crash-margin
+    # opening still uses the strict bare-opening test, so this only
+    # tightens what counts as a credited pass.
     seq = GateSequencer(gate_specs, SequencerConfig(
-        pass_through_margin=1.5,
+        pass_through_margin=1.0,
         proximity_pass_distance=1.0,  # pass if within 1.0m of gate center
     ))
     seq.start()
@@ -437,6 +444,17 @@ def run_synthetic_benchmark(
 
         if seq.is_complete:
             termination_reason = "race_complete"
+            break
+
+        # iter-002 review M6 (5/7 reviews MAJOR): enforce the VQ1 8-minute
+        # cap on bench paths too. Without this, the bench could run a
+        # trajectory that exceeds 480 s without surfacing a timeout — the
+        # competition rule would silently be violated.
+        if sim_time > AIGP_VQ1_MAX_RUN_DURATION_S:
+            seq.mark_timed_out(
+                f"vq1_max_run_duration_exceeded:{sim_time:.1f}s"
+            )
+            termination_reason = f"timed_out:{seq.timeout_reason}"
             break
 
         # iter-001 A7 + iter-002 (composer-25 F6/F7): terminal failures
