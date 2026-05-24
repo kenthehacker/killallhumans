@@ -293,7 +293,14 @@ class RacePipeline:
             )
         )
 
-        self._race_start_time = time.time()
+        # Iter-002 review B1 (5/7 BLOCKER): use time.monotonic() for elapsed-
+        # time measurement. The previous code initialised this via time.time()
+        # (seconds since epoch ~1.78e9) but compared it against time.monotonic()
+        # (seconds since boot ~1.5e5) in the 8-minute timeout check; the
+        # subtraction produced a huge negative number that never exceeded
+        # the cap, leaving the AIGP VQ1 8-minute rule unenforced. Both
+        # ends of the elapsed calc now use the same monotonic clock.
+        self._race_start_time = time.monotonic()
         self._ref_progress_time = 0.0
         self.sequencer.start()
 

@@ -118,6 +118,26 @@ class DroneCalibrator:
                 "thrust input producing UPWARD (negative-z) acceleration"
             )
 
+        # Iter-002 review M4 (6/7 reviews MAJOR): a sign-flipped feeder
+        # absorbs the missing intercept into k_t (large positive value)
+        # without tripping the positivity guard. RMSE/|y| catches it —
+        # a fit that aligns with the physics has RMSE small compared to
+        # the typical |g − a_z|. A wrong-physics fit has RMSE ~ g/√3
+        # (residual range −g to +g with uniform u), giving ratio ~0.18
+        # vs ~0.005 for the right physics. Threshold 0.10 picks up gross
+        # misfits with comfortable margin on real telemetry noise (which
+        # rarely exceeds 0.5 m/s² RMSE on accel readings, well under 0.10
+        # of typical |y| ≈ 10 m/s²).
+        y_scale = float(np.mean(np.abs(y))) or 1e-3
+        if rmse / y_scale > 0.10:
+            raise ValueError(
+                f"calibration fit is gross (rmse={rmse:.3f} m/s², "
+                f"mean|y|={y_scale:.3f} m/s²) — likely a sign / convention "
+                "mismatch in the sample feeder. Check that thrust_normalized "
+                "is in [0,1], velocity_z_world is NED (+z down), and "
+                "accel_z_world is the IMU's z-axis reading in the same NED frame."
+            )
+
         result = CalibrationResult(
             thrust_per_mass=k_t,
             drag_per_mass=k_d,

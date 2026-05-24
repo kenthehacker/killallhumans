@@ -372,9 +372,23 @@ class VisionUdpListener:
         )
         self._transport = None  # asyncio.DatagramTransport (set by start)
         self._protocol: Optional[_VisionDatagramProtocol] = None
+        # Iter-002 review M2 (7/7 reviews MAJOR): cache the last decoded
+        # CameraFrame so a 100Hz poll doesn't re-decode the same JPEG 30
+        # times per source-frame. Decode only fires on frame_id transition.
+        self._last_decoded_frame_id: int = -1
+        self._last_decoded_camera_frame = None
 
     async def start(self) -> None:
-        """Open the UDP socket and begin receiving."""
+        """Open the UDP socket and begin receiving.
+
+        Iter-002 review M1 (6/7 reviews MAJOR): idempotent. A second
+        start() with a transport already bound is a no-op; the prior
+        version silently overwrote `self._transport`, leaking the first
+        socket's bound port and protocol object. Real exposure: any
+        reconnect path in MAVLinkBridge would leak.
+        """
+        if self._transport is not None:
+            return
         import asyncio  # local — keeps module importable without asyncio
         loop = asyncio.get_event_loop()
         self._transport, self._protocol = await loop.create_datagram_endpoint(
@@ -400,11 +414,18 @@ class VisionUdpListener:
     def latest_frame(self):
         """Decode and return the most recent CameraFrame, or None.
 
-        Decoding is on-demand (per call), not on every datagram, so the
-        control loop's 100 Hz polling rate pays one decode at most per
-        tick — and only if it actually pops a frame.
+        Iter-002 review M2: decode-and-cache by frame_id. A poll that
+        sees the same frame_id as the previous poll returns the cached
+        CameraFrame instead of re-decoding the JPEG. Cache invalidates
+        on frame_id change; cv2.imdecode is paid at most once per
+        source-frame.
         """
         rf = self.receiver.pop_latest_frame()
         if rf is None:
             return None
-        return decode_jpeg_to_camera_frame(rf)
+        if rf.frame_id == self._last_decoded_frame_id:
+            return self._last_decoded_camera_frame
+        cf = decode_jpeg_to_camera_frame(rf)
+        self._last_decoded_frame_id = rf.frame_id
+        self._last_decoded_camera_frame = cf
+        return cf

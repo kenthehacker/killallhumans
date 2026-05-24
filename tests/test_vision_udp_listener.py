@@ -165,3 +165,66 @@ def test_listener_lifecycle_idempotent_stop(event_loop):
         assert not listener.is_listening
 
     event_loop.run_until_complete(_runner())
+
+
+def test_listener_start_is_idempotent(event_loop):
+    """Iter-002 review M1 (6/7 reviews MAJOR): calling start() twice
+    must NOT leak the first UDP transport. Pre-fix the second start()
+    overwrote self._transport, leaving the original socket bound but
+    unreferenced.
+    """
+    port = _free_port()
+    listener = VisionUdpListener(port=port, bind_host="127.0.0.1")
+    asyncio.set_event_loop(event_loop)
+
+    async def _runner():
+        await listener.start()
+        first_transport = listener._transport
+        assert first_transport is not None
+        # Second start() must be a no-op — same transport, same protocol.
+        await listener.start()
+        assert listener._transport is first_transport
+        await listener.stop()
+
+    event_loop.run_until_complete(_runner())
+
+
+def test_listener_latest_frame_caches_by_frame_id():
+    """Iter-002 review M2 (7/7 reviews MAJOR): a 100Hz poll on the same
+    source-frame must NOT re-decode the JPEG. Cache invalidation happens
+    on frame_id transition.
+
+    Uses cv2.imencode to build a real, decodable JPEG so the cache
+    actually contains a CameraFrame (not None from a failed decode).
+    """
+    import cv2
+    import numpy as np
+    from competition.vision_udp import ReassembledFrame
+
+    port = _free_port()
+    listener = VisionUdpListener(port=port, bind_host="127.0.0.1")
+
+    # Build a real 640×360 JPEG.
+    img = np.zeros((360, 640, 3), dtype=np.uint8)
+    img[100:200, 100:200] = 255  # add some content so it's not a flat zero
+    ok, buf = cv2.imencode(".jpg", img)
+    assert ok, "cv2 must produce a valid JPEG"
+    real_jpeg = buf.tobytes()
+
+    listener.receiver._latest_frame = ReassembledFrame(
+        frame_id=42, jpeg_bytes=real_jpeg, sim_time_ns=10 ** 9,
+    )
+    # Two polls on the same frame_id must yield the same CameraFrame object
+    # (cache hit, not re-decode).
+    cf1 = listener.latest_frame()
+    cf2 = listener.latest_frame()
+    assert cf1 is not None, "first decode must succeed"
+    assert cf1 is cf2, "second latest_frame() must hit the decode cache"
+
+    # New frame_id invalidates the cache.
+    listener.receiver._latest_frame = ReassembledFrame(
+        frame_id=43, jpeg_bytes=real_jpeg, sim_time_ns=2 * 10 ** 9,
+    )
+    cf3 = listener.latest_frame()
+    assert cf3 is not None
+    assert cf3 is not cf1, "new frame_id must trigger a fresh decode"

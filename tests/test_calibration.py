@@ -60,6 +60,30 @@ def test_recovers_seeded_ratios_within_10_percent():
     assert abs(cal.drag_per_mass - k_d_true) / k_d_true < 0.10
 
 
+def test_sign_flipped_synth_now_rejected_via_rmse_guard():
+    """Iter-002 review M4: a sign-flipped feeder used to escape the
+    positivity guard with a large positive k_t (bias absorbed). Now the
+    RMSE/|y| ratio catches the gross misfit.
+    """
+    k_t_true, k_d_true = 22.0, 0.40
+    rng = np.random.default_rng(7)
+    u = rng.uniform(0.3, 0.9, size=200)
+    v = rng.uniform(-3.0, 3.0, size=200)
+    # Sign-flipped physics (matches the OLD buggy synth formula).
+    a = -k_t_true * u - k_d_true * v - 9.81
+    samples = [
+        CalibrationSample(
+            thrust_normalized=float(u_i),
+            velocity_z_world=float(v_i),
+            accel_z_world=float(a_i),
+        )
+        for u_i, v_i, a_i in zip(u, v, a)
+    ]
+    # Should raise (either positivity guard or the new RMSE guard).
+    with pytest.raises(ValueError):
+        DroneCalibrator().identify_thrust_drag_ratios(samples)
+
+
 def test_hover_only_samples_recover_g_over_u():
     """At a steady hover, thrust must balance gravity: k_t·u = g, so k_t = g/u.
 
