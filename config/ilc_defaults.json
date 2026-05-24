@@ -1,0 +1,39 @@
+{
+  "_about": "ILC hyperparameters for the synthetic + PyBullet benchmark. Track-specific overrides go in the track's own config JSON under `ilc_global_overrides` and `ilc_section_overrides`. NEVER hard-code values that vary per-course in scripts/benchmark.py — they belong here or in the track config.",
+  "_source": "Iter 001 A9 — synthesis at .loop/synthesis/iter_001.md",
+
+  "global": {
+    "alpha": 0.40,
+    "max_iterations": 5,
+    "smoothing_sigma": 10.0,
+    "max_correction_m": 0.15,
+    "convergence_threshold": 0.002,
+    "filter_cutoff_hz": 0.35,
+    "momentum_gamma": 0.0,
+    "blend_steps": 50
+  },
+
+  "sections": {
+    "low": {
+      "_about": "Smooth / low-curvature segments. Conservative — small alpha, tight max_corr, low cutoff (more smoothing), zero velocity scaling.",
+      "alpha": 0.30,
+      "max_correction_m": 0.15,
+      "filter_cutoff_hz": 0.35,
+      "vel_scale": 0.0
+    },
+    "high": {
+      "_about": "High-curvature segments (e.g. helix climbs, S-turn inflections). Aggressive — larger alpha, wider max_corr, mid velocity scaling.",
+      "alpha": 0.45,
+      "max_correction_m": 0.30,
+      "filter_cutoff_hz": 0.35,
+      "vel_scale": 0.5
+    }
+  },
+
+  "partition": {
+    "_about": "How derive_section_boundaries splits a trajectory into low/high-class sections.",
+    "curvature_quantile_threshold": 0.6,
+    "n_sections_max": 4,
+    "min_section_steps": 50
+  }
+}

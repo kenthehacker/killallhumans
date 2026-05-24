@@ -276,6 +276,12 @@ def run_synthetic_benchmark(
     default_w = gate_defaults.get("interior_width_m", 1.2)
     default_h = gate_defaults.get("interior_height_m", 1.2)
 
+    # Per-track border_width may differ from the AIGP default (0.6 m); race_01
+    # uses 0.18 m, etc. The bench used to drop this and let GateSpec's default
+    # win, which silently changed the geometric crash zone whenever the
+    # default shifted. Propagate it explicitly.
+    default_border = gate_defaults.get("border_width_m")
+
     gate_specs = []
     gate_waypoints = []
     for gd in data.get("gates", []):
@@ -286,12 +292,17 @@ def run_synthetic_benchmark(
         pitch = pose.get("pitch", 0)
         w = gc.get("interior_width_m", default_w)
         h = gc.get("interior_height_m", default_h)
+        # Per-gate border override > course-level default > GateSpec default.
+        per_gate_border = gc.get("border_width_m", default_border)
 
-        gate_specs.append(GateSpec(
+        gs_kwargs = dict(
             gate_id=gd["id"], position=(x, y, z), yaw=yaw, pitch=pitch,
             interior_width=w, interior_height=h,
             sequence_index=gd.get("sequence_index", 0),
-        ))
+        )
+        if per_gate_border is not None:
+            gs_kwargs["border_width"] = per_gate_border
+        gate_specs.append(GateSpec(**gs_kwargs))
         cy, sy = math.cos(yaw), math.sin(yaw)
         cp, sp = math.cos(pitch), math.sin(pitch)
         gate_waypoints.append(GateWaypoint(
@@ -320,46 +331,47 @@ def run_synthetic_benchmark(
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
-    # --- Offline per-section ILC with per-section Q-filter bandwidth (iteration 28) ---
-    # Time-varying Q-filter (Bristow & Alleyne 2007, ACC): different Butterworth
-    # cutoffs per track section. Higher bandwidth at S-turn inflection (gate-3)
-    # where error has high-frequency content from centripetal reversal. Lower
-    # bandwidth at smooth sections for noise rejection.
-    # Research: Bristow & Alleyne 2007/2008, Zhang 2024 (segment-wise ILC),
-    # Freeman 2025, van Haren 2024, Longman 2019.
+    # --- Offline per-section ILC (iter-001 A9 — course-agnostic) ----------
+    # Section partition: prefer the course config's explicit
+    # `ilc_section_overrides` block (e.g. race_01's hand-tuned 4-section
+    # helix schedule); else derive from trajectory curvature via
+    # `planning.ilc_sections.derive_section_boundaries`. Global hyper-
+    # parameters live in `config/ilc_defaults.json`; the course may patch
+    # any of them via `ilc_global_overrides`.
+    # Research: Bristow & Alleyne 2007 (ACC) — segment-wise ILC with
+    # per-section Q-filter bandwidth. Zhang 2024 — segment-wise ILC
+    # prevents cross-contamination. van Haren 2024 — class-specific cutoffs.
     from planning.trajectory_optimizer import compute_ilc_offset_table
+    from planning.ilc_sections import derive_section_boundaries, load_ilc_config
+
+    ilc_defaults = load_ilc_config()
+    ilc_global = {**ilc_defaults["global"], **data.get("ilc_global_overrides", {})}
+
+    section_overrides = data.get("ilc_section_overrides")
+    if section_overrides:
+        section_boundaries = [tuple(s) for s in section_overrides]
+    else:
+        section_boundaries = derive_section_boundaries(
+            trajectory, dt, config=ilc_defaults,
+        )
+
     n_total_steps = int(trajectory.total_time / dt) + 50
-    # Section boundaries (iteration 28): 4 sections with per-section bandwidth
-    # Gate-3 at ~2.93s. Inflection region: 2.0s-4.4s (steps 200-440).
-    # Helix boundary: midpoint gate-6/gate-7 (~7.4s, step 740).
-    inflection_start = int(2.0 / dt)   # step 200
-    inflection_end = int(4.4 / dt)     # step 440
-    helix_start = int(7.4 / dt)        # step 740
-    section_boundaries = [
-        # (start, end, alpha, max_correction_m, filter_cutoff_hz, vel_scale)
-        # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007):
-        # Pre-inflection uses 0.0 to recover gate-2; helix uses 0.7 for max benefit.
-        (0, inflection_start, 0.30, 0.15, 0.35, 0.0),               # iter 47: alpha 0.4→0.30 to prevent gate-2 over-correction at 7 ILC iters
-        (inflection_start, inflection_end, 0.46, 0.15, 0.40, 0.4),  # iter 48: alpha 0.50→0.46 — rebalanced for 8 ILC iters, reduces gate-5 spatial coupling
-        (inflection_end, helix_start, 0.50, 0.15, 0.35, 0.5),       # iter 48: alpha 0.4→0.50 for deeper post-inflection convergence
-        (helix_start, n_total_steps, 0.45, 0.50, 0.35, 0.7),        # iter 47: helix alpha 0.4→0.45 for gate-7 with 7 ILC iters
-    ]
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
-    # tuple. Velocity offsets are the smooth time derivative of position offsets,
-    # ensuring the controller's velocity reference is consistent with the shifted
-    # position reference. Research: Schoellig 2012, Kunapuli 2025, Nam 2026.
+    # tuple. Velocity offsets are the smooth time derivative of position
+    # offsets, ensuring the controller's velocity reference is consistent
+    # with the shifted position reference.
     ilc_result = compute_ilc_offset_table(
         trajectory, tuple(start_pos),
-        alpha=0.4,
-        max_iterations=8,              # iter 48: 7→8 for deeper ILC convergence (Longman 2023)
-        smoothing_sigma=10.0,
-        max_correction_m=0.15,
-        convergence_threshold=0.0005,         # iter 48: 0.002→0.0005 to allow deeper ILC convergence
+        alpha=ilc_global["alpha"],
+        max_iterations=ilc_global["max_iterations"],
+        smoothing_sigma=ilc_global["smoothing_sigma"],
+        max_correction_m=ilc_global["max_correction_m"],
+        convergence_threshold=ilc_global["convergence_threshold"],
         dt=dt,
         section_boundaries=section_boundaries,
-        blend_steps=50,
-        filter_cutoff_hz=0.35,  # Global fallback (used by sections without 5th element)
-        momentum_gamma=0.2,    # iter 49: heavy-ball momentum ILC (Wang 2023, Polyak 1964)
+        blend_steps=ilc_global["blend_steps"],
+        filter_cutoff_hz=ilc_global["filter_cutoff_hz"],
+        momentum_gamma=ilc_global["momentum_gamma"],
     )
     if ilc_result is not None:
         ilc_offsets, ilc_vel_offsets = ilc_result
