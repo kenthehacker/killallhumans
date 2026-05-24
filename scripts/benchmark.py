@@ -230,13 +230,23 @@ def run_unit_tests() -> Dict[str, Any]:
 # Synthetic simulation (no PyBullet — pure Python kinematics)
 # ---------------------------------------------------------------------------
 
-def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[str, Any]:
+def run_synthetic_benchmark(
+    duration: float = 30.0,
+    dt: float = 0.01,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Run the full pipeline with synthetic kinematic simulation.
 
-    Uses the same race_01.json gate layout but simulates drone physics with
-    a simple second-order model: PD controller → acceleration → velocity → position.
-    No PyBullet dependency.
+    Uses the same race_01.json gate layout (by default) but simulates drone
+    physics with a simple second-order model: PD controller → acceleration →
+    velocity → position. No PyBullet dependency.
+
+    Args:
+        duration: max sim time in seconds.
+        dt: control loop step.
+        config: if provided, used in place of `race_01.json` (lets unit tests
+            inject a deliberately-crash-inducing course; see iter-001 A7).
 
     This exercises: trajectory optimizer, racing line, speed profiler, EKF,
     gate sequencer, and geometric tracker — the full pipeline minus perception.
@@ -251,13 +261,16 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     from planning.racing_line import RacingLineOptimizer, SpeedProfiler
     from control.mpc_tracker import GeometricTracker, TrackerConfig
 
-    # Load gate layout from config
-    config_path = _REPO / "sim_pybullet" / "configs" / "race_01.json"
-    try:
-        with open(config_path) as f:
-            data = _json.load(f)
-    except FileNotFoundError:
-        return {"skipped": True, "skip_reason": f"Config not found: {config_path}"}
+    # Load gate layout from config (or use the caller-supplied dict).
+    if config is not None:
+        data = config
+    else:
+        config_path = _REPO / "sim_pybullet" / "configs" / "race_01.json"
+        try:
+            with open(config_path) as f:
+                data = _json.load(f)
+        except FileNotFoundError:
+            return {"skipped": True, "skip_reason": f"Config not found: {config_path}"}
 
     gate_defaults = data.get("gate_defaults", {})
     default_w = gate_defaults.get("interior_width_m", 1.2)
@@ -414,7 +427,21 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
             termination_reason = "race_complete"
             break
 
-        # Crash detection (ground or very high)
+        # iter-001 A7: terminal failures come from the sequencer first, then
+        # the kinematic-sim envelope. The sequencer's geometric crash branch
+        # (P1-6) classifies gate-frame strikes; the new out-of-order DQ
+        # branch flags U-turn / skip patterns. Either is a hard fail.
+        if seq.last_crash is not None:
+            crashed = True
+            termination_reason = f"crash_gate:{seq.last_crash[0]}"
+            break
+        if seq.is_disqualified:
+            crashed = True
+            termination_reason = f"disqualified:{seq.dq_reason}"
+            break
+
+        # Crash detection (ground or very high) — kept as the catch-all for
+        # cases the sequencer can't see (e.g. drone exits the airspace bounds).
         if pos[2] < 0.05:
             crashed = True
             termination_reason = "crash_ground"
@@ -542,6 +569,13 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         "dt": dt,
         "termination_reason": termination_reason,
         "crashed": crashed,
+        # iter-001 A7: terminal-failure surface for the synthesised honesty
+        # contract. `crashed` covers physical impacts; `disqualified` covers
+        # rule violations (out-of-order pass, etc). Either makes `sim_passed`
+        # False.
+        "disqualified": bool(seq.is_disqualified),
+        "dq_reason": seq.dq_reason,
+        "last_crash_gate": seq.last_crash[0] if seq.last_crash else None,
         "gates_passed": seq.gates_passed,
         "total_gates": seq.total_gates,
         "gate_pass_rate": seq.gates_passed / seq.total_gates if seq.total_gates > 0 else 0,
@@ -572,6 +606,8 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     failures = []
     if crashed:
         failures.append(f"drone crashed ({termination_reason})")
+    if seq.is_disqualified:
+        failures.append(f"drone disqualified ({seq.dq_reason})")
     if avg_err > THRESHOLDS["max_avg_tracking_error_m"]:
         failures.append(f"avg_tracking_error {avg_err:.2f}m > {THRESHOLDS['max_avg_tracking_error_m']}m")
     if max_err > THRESHOLDS["max_max_tracking_error_m"]:
@@ -734,6 +770,16 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
             termination_reason = "race_complete"
             break
 
+        # iter-001 A7: out-of-order DQ is terminal on the PyBullet path too.
+        # Frame-strut crashes still flow primarily through `env.gate_contact()`
+        # because the contact manifold is authoritative; sequencer's geometric
+        # crash classification is a secondary signal (handled later if env
+        # didn't see a contact this tick).
+        if seq.is_disqualified:
+            crashed = True
+            termination_reason = f"disqualified:{seq.dq_reason}"
+            break
+
         if pos[2] < 0.05:
             crashed = True
             termination_reason = "crash_ground"
@@ -745,8 +791,17 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         # contact remaining here means we've hit a frame strut.
         hit_gate = env.gate_contact()
         if hit_gate is not None:
+            seq.mark_collision(hit_gate)
             crashed = True
             termination_reason = f"crash_gate:{hit_gate}"
+            break
+
+        # If env didn't report a contact but the geometric sequencer's
+        # P1-6 branch flagged a frame strike (e.g. sub-frame proximity not
+        # quite touching), trust it.
+        if seq.last_crash is not None:
+            crashed = True
+            termination_reason = f"crash_gate:{seq.last_crash[0]}"
             break
 
         # Progress-clock advance: only if drone is keeping up with the
@@ -804,6 +859,10 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         "wall_time_s": wall_elapsed,
         "termination_reason": termination_reason,
         "crashed": crashed,
+        # iter-001 A7: same honesty surface as the synthetic bench.
+        "disqualified": bool(seq.is_disqualified),
+        "dq_reason": seq.dq_reason,
+        "last_crash_gate": seq.last_crash[0] if seq.last_crash else None,
         "gates_passed": seq.gates_passed,
         "total_gates": seq.total_gates,
         "gate_pass_rate": seq.gates_passed / seq.total_gates if seq.total_gates > 0 else 0,
@@ -825,6 +884,8 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     failures = []
     if crashed:
         failures.append(f"drone crashed ({termination_reason})")
+    if seq.is_disqualified:
+        failures.append(f"drone disqualified ({seq.dq_reason})")
     if avg_err > THRESHOLDS["max_avg_tracking_error_m"]:
         failures.append(f"avg_tracking_error {avg_err:.2f}m > {THRESHOLDS['max_avg_tracking_error_m']}m")
     if max_err > THRESHOLDS["max_max_tracking_error_m"]:
