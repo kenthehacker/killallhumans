@@ -315,6 +315,52 @@ class GateSequencer:
 
                     if self.is_complete:
                         self._state = RaceState.COMPLETED
+
+                    # Iter-001 review Opus F2: multi-gate-per-tick. If the
+                    # same prev→pos segment also passes through the NEW
+                    # current target's opening, credit that one too — keep
+                    # going until the segment is exhausted or we hit a crash.
+                    while (
+                        not self.is_complete
+                        and self._state == RaceState.RACING
+                    ):
+                        nxt = self._gates[self._current_idx]
+                        if not self._plane_was_crossed(self._prev_position, pos, nxt):
+                            break
+                        nxt_crossing = self._compute_crossing(
+                            self._prev_position, pos, nxt,
+                        )
+                        if nxt_crossing is None:
+                            break
+                        # Test against the lenient pass-through margin
+                        # (same semantics as the first credit).
+                        if not self._point_in_gate_opening(nxt_crossing, nxt):
+                            # Outside the lenient opening — could still be
+                            # a strut hit on this new current target. Apply
+                            # the same crash classification the P1-6 branch
+                            # uses above.
+                            in_outer = self._point_in_outer_frame(nxt_crossing, nxt)
+                            in_crash_zone_opening = (
+                                self._point_in_opening_with_margin(
+                                    nxt_crossing, nxt, self.config.crash_margin,
+                                )
+                            )
+                            if in_outer and not in_crash_zone_opening:
+                                if self._last_event != "crash":
+                                    self._crashes.append(
+                                        (nxt.gate_id,
+                                         tuple(float(c) for c in nxt_crossing))
+                                    )
+                                    self._last_event = "crash"
+                            break
+                        # Inside lenient opening — credit this gate too.
+                        passed_gate = nxt
+                        self._passed.append(nxt.gate_id)
+                        self._current_idx += 1
+                        self._last_event = "pass"
+                        if self.is_complete:
+                            self._state = RaceState.COMPLETED
+                            break
                 elif (
                     not crash_classified
                     and self._plane_was_crossed(self._prev_position, pos, gate)
@@ -348,10 +394,36 @@ class GateSequencer:
                 )
                 if crossing is None:
                     continue
-                if self._point_in_gate_opening(crossing, future_gate):
+                # Iter-001 review Opus F14: use the STRICT crash_margin
+                # opening (default 1.0 = bare opening) for the DQ check,
+                # NOT the lenient pass_through_margin (default 1.0 here
+                # but 1.5 in the synthetic bench). Otherwise a track with
+                # lenient pass-through and tight outer frame creates a
+                # false-DQ region where lenient_opening > outer_frame.
+                in_strict_opening = self._point_in_opening_with_margin(
+                    crossing, future_gate, self.config.crash_margin,
+                )
+                in_outer = self._point_in_outer_frame(crossing, future_gate)
+                if in_strict_opening:
                     self._state = RaceState.DISQUALIFIED
                     self._dq_reason = f"out_of_order:{future_gate.gate_id}"
                     self._last_event = "dq"
+                    break
+                # Iter-001 review Opus F3: future-gate strut hits (inside
+                # outer frame but outside strict opening) are physical
+                # collisions and must be terminal crashes, not silently
+                # ignored. Symmetrises the geometry classification with
+                # the current-gate P1-6 branch above.
+                if in_outer:
+                    if self._last_event != "crash" or (
+                        self._crashes
+                        and self._crashes[-1][0] != future_gate.gate_id
+                    ):
+                        self._crashes.append(
+                            (future_gate.gate_id,
+                             tuple(float(c) for c in crossing))
+                        )
+                        self._last_event = "crash"
                     break
 
         # Check if off-track (suppressed once DQ'd or completed)
