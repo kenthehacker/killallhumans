@@ -23,17 +23,20 @@ def _synth_samples(
     k_t: float, k_d: float, gravity: float = 9.81,
     n: int = 200, seed: int = 7,
 ):
-    """Generate `n` samples that obey `a_z + g = -k_t·u - k_d·v_z`.
+    """Generate `n` physically-correct samples obeying `a_z = g − k_t·u − k_d·v_z`.
 
-    `u` and `v_z` are sampled iid uniform; `a_z` is computed exactly per
-    the model. With zero noise the fit should be near-perfect; we add
-    small Gaussian noise to make the test exercise the least-squares
-    residual surface.
+    NED convention: z points DOWN, so gravity = +g along +z. Thrust opposes
+    gravity (pushes UP, i.e., negative z), so positive normalised thrust
+    `u` produces negative z-acceleration. At hover (u ≈ g/k_t, v_z = 0),
+    a_z ≈ 0 — the IMU reads ~0 because thrust balances gravity.
+
+    Iter-001 review (Opus F1) caught that the original synth fed the
+    `code's` wrong equation back into the regression, masking a sign bug.
     """
     rng = np.random.default_rng(seed)
     u = rng.uniform(0.3, 0.9, size=n)
     v = rng.uniform(-3.0, 3.0, size=n)
-    a = -k_t * u - k_d * v - gravity
+    a = gravity - k_t * u - k_d * v
     # Small accelerometer noise (~0.05 m/s²).
     a += rng.normal(0.0, 0.05, size=n)
     return [
@@ -51,8 +54,41 @@ def test_recovers_seeded_ratios_within_10_percent():
     cal = DroneCalibrator().identify_thrust_drag_ratios(
         _synth_samples(k_t_true, k_d_true)
     )
+    # Iter-001 review (Opus F1): positivity guard catches sign-flip bugs.
+    assert cal.thrust_per_mass > 0, "thrust_per_mass must be positive (upward thrust)"
     assert abs(cal.thrust_per_mass - k_t_true) / k_t_true < 0.10
     assert abs(cal.drag_per_mass - k_d_true) / k_d_true < 0.10
+
+
+def test_hover_only_samples_recover_g_over_u():
+    """At a steady hover, thrust must balance gravity: k_t·u = g, so k_t = g/u.
+
+    This is a physics-anchored test that would have caught the Opus-F1 bug
+    (the old code's regression returned k_t ≈ −22 at hover instead of +21.8).
+    """
+    g = 9.81
+    u_hover = 0.45  # 45% throttle, representative
+    # 50 samples all at hover ± small noise.
+    rng = np.random.default_rng(11)
+    samples = [
+        CalibrationSample(
+            thrust_normalized=float(u_hover + rng.normal(0.0, 0.01)),
+            velocity_z_world=float(rng.normal(0.0, 0.02)),
+            accel_z_world=float(rng.normal(0.0, 0.05)),
+        )
+        for _ in range(50)
+    ]
+    cal = DroneCalibrator(gravity=g).identify_thrust_drag_ratios(samples)
+    # Expected k_t ≈ g / u_hover ≈ 21.8 with NEW (correct) physics.
+    # Under the OLD buggy code, k_t would be ≈ -21.8 (sign-flipped).
+    assert cal.thrust_per_mass > 0, (
+        f"hover thrust_per_mass must be positive; got {cal.thrust_per_mass:.2f}"
+    )
+    expected = g / u_hover
+    assert abs(cal.thrust_per_mass - expected) / expected < 0.15, (
+        f"hover fit deviates >15% from g/u: expected ≈ {expected:.2f}, "
+        f"got {cal.thrust_per_mass:.2f}"
+    )
 
 
 def test_assumed_mass_yields_physical_values():

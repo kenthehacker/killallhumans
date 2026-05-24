@@ -90,22 +90,33 @@ class DroneCalibrator:
         u = np.array([s.thrust_normalized for s in sample_list], dtype=np.float64)
         v = np.array([s.velocity_z_world for s in sample_list], dtype=np.float64)
         a = np.array([s.accel_z_world for s in sample_list], dtype=np.float64)
-        y = a + self.gravity
-        # X @ [k_t, k_d] = y  →  least squares.
-        # Sign: a_z = k_t*u (downward thrust contribution... wait, in NED
-        # thrust opposes gravity so thrust pushes UP = negative z. The
-        # spec says HIGHRES_IMU is body NED with z-down, so a-down is
-        # positive; for a hovering drone the IMU reads ~0 z-accel because
-        # thrust balances gravity. The equation `a + g = k_t*u - k_d*v`
-        # assumes positive thrust input produces NEGATIVE z (upward),
-        # so we use -u in the design matrix. Equivalently we negate k_t
-        # by flipping the sign here — keep the convention consistent with
-        # the controller, which treats thrust as upward-positive.
-        X = np.column_stack([-u, -v])
+        # Physics in NED (z-down, gravity = +g along +z):
+        #   F_z = m·g − k_t_phys·u·m − k_d_phys·v_z·m   (thrust opposes gravity)
+        #   a_z = g − k_t·u − k_d·v_z         where k_t = max_thrust/mass, k_d = drag/mass
+        # Rearranging for the regression:
+        #   g − a_z = k_t·u + k_d·v_z
+        # Iter-001 review (Opus F1, BLOCKER) caught the earlier code's sign
+        # error: it solved `a + g = -k_t·u - k_d·v_z` (off by 2g from the
+        # physics), and the unit test generated synth data matching the
+        # wrong equation, so the bug was invisible.
+        y = self.gravity - a
+        X = np.column_stack([u, v])
         coeffs, _resid, _rank, _sv = np.linalg.lstsq(X, y, rcond=None)
         k_t, k_d = float(coeffs[0]), float(coeffs[1])
         y_hat = X @ coeffs
         rmse = float(np.sqrt(np.mean((y - y_hat) ** 2)))
+
+        # Positivity sanity check — a sign-flipped fit usually means the
+        # caller swapped thrust convention or the bug above regressed.
+        # k_d may legitimately be ≤ 0 for a perfect drag-free model, so
+        # only guard k_t.
+        if k_t <= 0.0:
+            raise ValueError(
+                f"recovered thrust_per_mass {k_t!r} is non-positive — likely a "
+                "sign / convention mismatch in the sample feeder; expected "
+                "samples in NED (gravity = +9.81 along +z) with positive "
+                "thrust input producing UPWARD (negative-z) acceleration"
+            )
 
         result = CalibrationResult(
             thrust_per_mass=k_t,

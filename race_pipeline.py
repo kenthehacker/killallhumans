@@ -268,8 +268,16 @@ class RacePipeline:
             address=address,
         )
         session.on_telemetry = self._control_callback
+        # Iter-001 review (B2, consensus BLOCKER): stop on ANY terminal
+        # sequencer state — completion, out-of-order DQ, or a recorded
+        # crash. The prior version only checked is_complete, so a DQ run
+        # silently kept flying.
         session.should_stop = lambda: (
-            self.sequencer is not None and self.sequencer.is_complete
+            self.sequencer is not None and (
+                self.sequencer.is_complete
+                or self.sequencer.is_disqualified
+                or self.sequencer.last_crash is not None
+            )
         )
 
         self._race_start_time = time.time()
@@ -333,6 +341,18 @@ class RacePipeline:
 
         if self.sequencer.is_complete:
             logger.info("All gates passed! Race complete.")
+            return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+
+        # Iter-001 review (B2): terminal failure must abort the control
+        # loop, not silently keep tracking the next reference. Hover the
+        # vehicle in place; the session-level should_stop will pick up
+        # the same signal and exit the run.
+        if self.sequencer.is_disqualified:
+            logger.error("Race terminated: DQ — %s", self.sequencer.dq_reason)
+            return AttitudeCommand(0, 0, yaw, 0.4)  # hover (run is over)
+        if self.sequencer.last_crash is not None:
+            gate_id, _xyz = self.sequencer.last_crash
+            logger.error("Race terminated: gate-frame crash on %s", gate_id)
             return AttitudeCommand(0, 0, yaw, 0.4)  # hover
 
         # 3a. Dynamic replan: mirrors sim_pybullet/runner._maybe_replan.

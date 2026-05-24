@@ -139,11 +139,16 @@ class PositionCommand:
 
 @dataclass
 class CameraFrame:
-    """A single frame from the forward-facing camera."""
+    """A single frame from the forward-facing camera.
+
+    Iter-001 review (Opus F4, BLOCKER): defaults updated to AIGP spec
+    (640×360, VADR-TS-002 §4.6). Legacy 640×480 callers should pass
+    width/height explicitly.
+    """
     timestamp_us: int
     image: np.ndarray  # BGR uint8, shape (H, W, 3)
     width: int = 640
-    height: int = 480
+    height: int = 360
 
 
 class CompetitionInterface(ABC):
