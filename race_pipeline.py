@@ -293,14 +293,14 @@ class RacePipeline:
             )
         )
 
-        # Iter-002 review B1 (5/7 BLOCKER): use time.monotonic() for elapsed-
-        # time measurement. The previous code initialised this via time.time()
-        # (seconds since epoch ~1.78e9) but compared it against time.monotonic()
-        # (seconds since boot ~1.5e5) in the 8-minute timeout check; the
-        # subtraction produced a huge negative number that never exceeded
-        # the cap, leaving the AIGP VQ1 8-minute rule unenforced. Both
-        # ends of the elapsed calc now use the same monotonic clock.
+        # Iter-002 review B1 (5/7 BLOCKER) + iter-003 M5 (4/7 MAJOR): the
+        # 8-minute timeout check uses BOTH a monotonic wall-clock fallback
+        # AND a sim-time path that takes precedence when telemetry carries
+        # `timestamp_us`. Sim-time is preferred because a non-realtime
+        # simulator (slowed down, paused, or fast-forwarded) would
+        # false-trip or under-trip a wall-clock-only check.
         self._race_start_time = time.monotonic()
+        self._race_start_sim_time_s: Optional[float] = None  # set on first telem tick
         self._ref_progress_time = 0.0
         self.sequencer.start()
 
@@ -384,9 +384,18 @@ class RacePipeline:
             )
             return AttitudeCommand(0, 0, yaw, 0.4)  # hover
 
-        # Wall-time check against the AIGP VQ1 8-minute cap. Trip the
-        # sequencer once; the next tick takes the early-return above.
-        elapsed = time.monotonic() - self._race_start_time
+        # Iter-003 M5: prefer sim-time elapsed (from telem.timestamp_us)
+        # over wall-clock. A simulator running below realtime would
+        # under-time-out under wall-clock; one running above would over-
+        # time-out. With sim time we measure what the COMPETITION sees.
+        # Fall back to monotonic wall-clock if telem has no timestamp.
+        if telem.timestamp_us is not None and telem.timestamp_us > 0:
+            sim_time_s = telem.timestamp_us / 1e6
+            if self._race_start_sim_time_s is None:
+                self._race_start_sim_time_s = sim_time_s
+            elapsed = sim_time_s - self._race_start_sim_time_s
+        else:
+            elapsed = time.monotonic() - self._race_start_time
         if elapsed > AIGP_VQ1_MAX_RUN_DURATION_S and not self.sequencer.is_timed_out:
             self.sequencer.mark_timed_out(
                 f"vq1_max_run_duration_exceeded:{elapsed:.1f}s"

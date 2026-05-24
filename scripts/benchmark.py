@@ -692,6 +692,7 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     result["available"] = True
 
     # Pipeline setup
+    from competition.aigp_geometry import AIGP_VQ1_MAX_RUN_DURATION_S
     from estimation.ekf import DroneEKF, EKFConfig
     from gate_sequencing.sequencer import GateSequencer, GateSpec, SequencerConfig
     from planning.trajectory_optimizer import (
@@ -800,6 +801,16 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
 
         if seq.is_complete:
             termination_reason = "race_complete"
+            break
+
+        # Iter-003 M6 mirror: enforce VQ1 8-minute cap on the PyBullet
+        # bench too. The synthetic bench already has this check; mirror
+        # it here so both platforms honour the competition rule.
+        if sim_time > AIGP_VQ1_MAX_RUN_DURATION_S:
+            seq.mark_timed_out(
+                f"vq1_max_run_duration_exceeded:{sim_time:.1f}s"
+            )
+            termination_reason = f"timed_out:{seq.timeout_reason}"
             break
 
         # iter-001 A7 + iter-002 (composer-25 F6/F7): DQ is terminal on
