@@ -118,6 +118,14 @@ def parse_packet(data: bytes) -> VisionPacket:
             f"chunk_id {cid} out of range for total_chunks {total} "
             f"(frame_id={fid})"
         )
+    # Iter-001 review Opus F9 (a): reject zero-size payloads. The encoder
+    # should never emit empty chunks; accepting them leaves zero-filled
+    # holes in the assembled JPEG that cv2.imdecode silently fails on,
+    # and the caller would just see a None frame with no diagnostic.
+    if pay_sz == 0:
+        raise ValueError(
+            f"zero payload_size (frame_id={fid}, chunk_id={cid})"
+        )
     return VisionPacket(
         frame_id=fid, chunk_id=cid, total_chunks=total,
         jpeg_size=jpeg_sz, payload_size=pay_sz, sim_time_ns=ts,
@@ -215,6 +223,18 @@ class VisionUdpReceiver:
         buf.chunks[pkt.chunk_id] = pkt.payload
 
         if not buf.complete:
+            return None
+
+        # Iter-001 review Opus F9 (b) + 7-way MAJOR consensus: validate
+        # that the chunk payload sizes actually sum to jpeg_size before
+        # yielding. Otherwise a malformed encoder (or a corrupted-on-wire
+        # packet that slipped past payload_size checks) produces a
+        # zero-tailed or over-grown buffer that cv2.imdecode silently
+        # fails on — caller gets None with no diagnostic.
+        total_payload = sum(len(c) for c in buf.chunks.values())
+        if total_payload != buf.jpeg_size:
+            self._buffers.pop(pkt.frame_id, None)
+            self.dropped_partial_frames += 1
             return None
 
         # Complete — emit.

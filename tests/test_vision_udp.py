@@ -81,6 +81,78 @@ def test_parse_zero_total_chunks_raises():
 
 
 # ---------------------------------------------------------------------------
+# Iter-001 review Opus F9 (a): zero-size payload must be rejected
+# ---------------------------------------------------------------------------
+
+def test_parse_zero_payload_size_raises():
+    """A chunk with payload_size=0 is malformed — the encoder should never
+    emit empty chunks. Accepting them would produce a JPEG buffer with
+    zero-filled holes, which cv2.imdecode silently fails on."""
+    bad = struct.pack(HEADER_FMT, 1, 0, 1, 10, 0, 0)
+    with pytest.raises(ValueError, match="zero"):
+        parse_packet(bad)
+
+
+# ---------------------------------------------------------------------------
+# Iter-001 review Opus F9 (b) + 7-way MAJOR: jpeg_size must equal the sum
+# of chunk payload sizes after assembly
+# ---------------------------------------------------------------------------
+
+def test_assembled_payload_smaller_than_jpeg_size_is_dropped():
+    """Three chunks whose total payload < jpeg_size produces a zero-tailed
+    buffer. cv2.imdecode silently fails on that; the receiver must drop
+    the frame, not propagate corrupt bytes."""
+    r = VisionUdpReceiver()
+    # 3 chunks of total payload 6 bytes, but jpeg_size says 10.
+    chunks_payloads = [b"\xff\xd8\xff", b"\xab\xcd", b"\x99"]
+    for cid, pl in enumerate(chunks_payloads):
+        raw = encode_packet(
+            frame_id=99, chunk_id=cid, total_chunks=3,
+            jpeg_size=10,                # claims 10 bytes total
+            sim_time_ns=42, payload=pl,  # but chunks sum to 6
+        )
+        result = r.feed_packet(raw)
+    # The last feed_packet must NOT return a corrupt frame.
+    assert result is None, (
+        "size-mismatched assembly must be dropped, not yielded"
+    )
+    assert r.delivered_frames == 0
+    assert r.dropped_partial_frames >= 1
+
+
+def test_assembled_payload_larger_than_jpeg_size_is_dropped():
+    """Two chunks whose payload > jpeg_size means the encoder lied; drop."""
+    r = VisionUdpReceiver()
+    chunks_payloads = [b"\xff\xd8\xff" + b"\xab" * 5, b"\xcd" * 5]  # total 13
+    for cid, pl in enumerate(chunks_payloads):
+        raw = encode_packet(
+            frame_id=100, chunk_id=cid, total_chunks=2,
+            jpeg_size=8,                  # claims 8 bytes total
+            sim_time_ns=43, payload=pl,
+        )
+        result = r.feed_packet(raw)
+    assert result is None
+    assert r.delivered_frames == 0
+    assert r.dropped_partial_frames >= 1
+
+
+def test_assembled_payload_equals_jpeg_size_succeeds():
+    """Sanity: a correctly-sized frame still works after validation."""
+    r = VisionUdpReceiver()
+    chunks_payloads = [b"\xff\xd8\xff\xab", b"\xcd\xef\x99\xd9"]
+    total = sum(len(c) for c in chunks_payloads)
+    last = None
+    for cid, pl in enumerate(chunks_payloads):
+        raw = encode_packet(
+            frame_id=101, chunk_id=cid, total_chunks=2,
+            jpeg_size=total, sim_time_ns=44, payload=pl,
+        )
+        last = r.feed_packet(raw) or last
+    assert last is not None
+    assert last.jpeg_bytes == b"\xff\xd8\xff\xab\xcd\xef\x99\xd9"
+
+
+# ---------------------------------------------------------------------------
 # Receiver default port and config
 # ---------------------------------------------------------------------------
 

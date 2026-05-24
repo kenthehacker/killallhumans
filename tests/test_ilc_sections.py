@@ -204,3 +204,64 @@ def test_section_tuples_are_six_element_for_compute_ilc_offset_table():
         assert isinstance(max_corr, float) and max_corr > 0
         assert isinstance(cutoff, float) and cutoff > 0
         assert isinstance(vel, float)
+
+
+# ---------------------------------------------------------------------------
+# Iter-001 review Opus F5: bimodal trajectory dominated by low-curvature
+# stretches must still partition the high-curvature minority.
+# ---------------------------------------------------------------------------
+
+def _bimodal_low_dominant(
+    n_low: int = 600, n_high: int = 100, peak_mag: float = 20.0,
+    dt_pt: float = 0.01,
+) -> _StubTraj:
+    """A trajectory where 85% of points have zero acceleration and 15% have
+    a sharp peak in the middle. The 60th-percentile quantile = 0, so the
+    pre-fix code's absolute-threshold fallback collapses everything to one
+    'low' section, hiding the real curvature.
+    """
+    pts = []
+    half_low = n_low // 2
+    # First low stretch
+    for i in range(half_low):
+        pts.append(_StubPoint(time=len(pts) * dt_pt,
+                              acceleration=(0.0, 0.0, 0.0)))
+    # High curvature peak in the middle
+    for i in range(n_high):
+        pts.append(_StubPoint(time=len(pts) * dt_pt,
+                              acceleration=(peak_mag, 0.0, 0.0)))
+    # Trailing low stretch
+    for i in range(n_low - half_low):
+        pts.append(_StubPoint(time=len(pts) * dt_pt,
+                              acceleration=(0.0, 0.0, 0.0)))
+    return _StubTraj(points=pts, total_time=len(pts) * dt_pt)
+
+
+def test_bimodal_low_dominant_high_minority_still_partitions():
+    """Pre-fix: absolute-threshold check `if threshold <= 1e-6` returned
+    a single 'low' section because quantile=0 for the dominant zero-accel
+    points, silencing the real high-curvature section.
+
+    Post-fix: threshold uses a relative floor (e.g. 1e-3 * accels.max()),
+    so a 20 m/s² peak is detected even when surrounded by zeros.
+    """
+    from planning.ilc_sections import derive_section_boundaries, load_ilc_config
+    cfg = load_ilc_config()
+    sections = derive_section_boundaries(_bimodal_low_dominant(), dt=0.01,
+                                          config=cfg)
+    # Expect AT LEAST 2 sections (one or more high, surrounded by lows).
+    # With the fix, the partition picks up the 20 m/s² peak.
+    assert len(sections) >= 2, (
+        f"bimodal traj must produce ≥2 sections; got {len(sections)}: {sections}"
+    )
+    # And at least one section must use the 'high' class tuple.
+    high_cfg = cfg["sections"]["high"]
+    high_match = any(
+        s[2] == pytest.approx(high_cfg["alpha"])
+        and s[3] == pytest.approx(high_cfg["max_correction_m"])
+        for s in sections
+    )
+    assert high_match, (
+        f"bimodal traj must include at least one high-class section; "
+        f"got {sections}"
+    )

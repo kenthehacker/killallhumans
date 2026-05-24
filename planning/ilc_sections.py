@@ -104,7 +104,15 @@ def derive_section_boundaries(
     if accels.size == 0 or float(accels.max()) <= 1e-6:
         return [(0, n_total_steps) + low_args]
 
-    threshold = float(np.quantile(accels, quantile))
+    # Iter-001 review Opus F5: use a RELATIVE threshold (5% of max-accel)
+    # instead of an absolute 1e-6 m/s² floor. A track dominated by
+    # zero-accel straights with one sharp turn has quantile=0; an absolute
+    # 1e-6 floor then collapses everything to "all low," hiding the real
+    # high-curvature minority. The relative floor catches a 20 m/s² peak
+    # (relative threshold = 1.0 m/s²) even when surrounded by zeros.
+    raw_threshold = float(np.quantile(accels, quantile))
+    relative_floor = float(accels.max()) * 0.05
+    threshold = max(raw_threshold, relative_floor)
     if threshold <= 1e-6:
         return [(0, n_total_steps) + low_args]
 
