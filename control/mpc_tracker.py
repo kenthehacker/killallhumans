@@ -279,6 +279,7 @@ class GeometricTracker:
         # envelope. Re-applies max_tilt_rad / thrust limits after the
         # residual is added — clamp composition: residual-clamp first,
         # then physical clamp. Off-switch: `use_residual=False`.
+        residual_accel_delta = None
         if self._residual is not None:
             from control.learned_residual import build_input_features
             x = build_input_features(
@@ -301,6 +302,28 @@ class GeometricTracker:
                 thrust_normalized + d_thrust,
                 c.min_thrust_normalized, c.max_thrust_normalized,
             ))
+            # Iter-027 (ML pipeline): project the residual into the
+            # WORLD-FRAME accel_des the kinematic bench reads from
+            # `last_desired_acceleration`. Without this projection the
+            # residual is invisible to the matrix bench (which doesn't
+            # consume the attitude command), defeating training.
+            # Linearised around hover, in world frame (z-up):
+            #   delta_roll  > 0 → +y body accel via gravity tilt
+            #     ≈ g · roll → world-y delta = g · d_roll · cos(yaw)
+            #                                 + g · d_roll · sin(yaw) (rotate)
+            #   delta_pitch > 0 → +x body accel via gravity tilt
+            #   delta_thrust > 0 → +z world accel (thrust * max_thrust / mass)
+            cos_yaw = math.cos(yaw_des)
+            sin_yaw = math.sin(yaw_des)
+            g = c.gravity
+            ax_body = g * d_pitch
+            ay_body = g * d_roll
+            az_world = d_thrust * c.max_thrust_n / max(c.mass, 1e-6)
+            ax_world = ax_body * cos_yaw - ay_body * sin_yaw
+            ay_world = ax_body * sin_yaw + ay_body * cos_yaw
+            residual_accel_delta = np.array(
+                [ax_world, ay_world, az_world], dtype=float
+            )
 
         cmd = AttitudeCommand(
             roll_rad=float(desired_roll),
@@ -308,8 +331,14 @@ class GeometricTracker:
             yaw_rad=float(yaw_des),
             thrust=float(thrust_normalized),
         )
-        # Store desired acceleration for kinematic sim access
-        self._last_accel_des = accel_des
+        # Store desired acceleration for kinematic sim access. The
+        # residual contribution (if any) is included so the kinematic
+        # bench sees the same correction the attitude command carries
+        # for PyBullet.
+        if residual_accel_delta is not None:
+            self._last_accel_des = np.asarray(accel_des, dtype=float) + residual_accel_delta
+        else:
+            self._last_accel_des = accel_des
         return cmd
 
     @property
