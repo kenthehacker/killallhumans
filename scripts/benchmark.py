@@ -148,10 +148,18 @@ def run_unit_tests() -> Dict[str, Any]:
 
     # --- Speed profiler ---
     def _sp():
+        # Iter-018: max_speed sourced from drone_spec; min_speed is a
+        # planner-policy choice (not a drone-envelope property) so it
+        # stays inline.
+        from competition.drone_spec import DEFAULT_MAX_VELOCITY_MPS
         pts = [(0, 0, -2), (10, 0, -2), (20, 0, -2), (20, 10, -2), (20, 20, -2)]
-        speeds = SpeedProfiler(max_speed=15.0, min_speed=2.0).profile(pts)
+        speeds = SpeedProfiler(
+            max_speed=DEFAULT_MAX_VELOCITY_MPS, min_speed=2.0,
+        ).profile(pts)
         assert len(speeds) == 5
-        assert all(2.0 <= s <= 15.0 for s in speeds), f"speeds out of range: {speeds}"
+        assert all(2.0 <= s <= DEFAULT_MAX_VELOCITY_MPS for s in speeds), (
+            f"speeds out of range: {speeds}"
+        )
     tests.append(("speed_profiler", _sp))
 
     # --- Geometric tracker (tight hover test — Phase 1 requirement) ---

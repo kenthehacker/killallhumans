@@ -137,11 +137,14 @@ def run_unit_tests() -> Tuple[int, int]:
         assert len(out) == 2
     check("Racing line optimization", _rl)
 
-    # Speed profiler
+    # Speed profiler — iter-018: max_speed sourced from drone_spec.
     def _sp():
+        from competition.drone_spec import DEFAULT_MAX_VELOCITY_MPS
         pts = [(0, 0, -2), (10, 0, -2), (20, 0, -2), (20, 10, -2)]
-        sp = SpeedProfiler(max_speed=15.0, min_speed=2.0).profile(pts)
-        assert all(2.0 <= s <= 15.0 for s in sp)
+        sp = SpeedProfiler(
+            max_speed=DEFAULT_MAX_VELOCITY_MPS, min_speed=2.0,
+        ).profile(pts)
+        assert all(2.0 <= s <= DEFAULT_MAX_VELOCITY_MPS for s in sp)
     check("Speed profiler", _sp)
 
     # Geometric tracker
