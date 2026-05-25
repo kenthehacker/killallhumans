@@ -345,16 +345,23 @@ def run_synthetic_benchmark(
     else:
         max_velocity = derive_safe_max_velocity(gate_specs)
 
-    # iter-009 (Opus iter-006 F9): the conceptually-correct fix is to
-    # pass the auto-derived max_velocity into the racing-line optimizer
-    # so its BO scorer evaluates candidates at the right velocity. We
-    # tried that, and it crashed aigp_default — the lower-velocity BO
-    # picks a different line that lands in a worse local minimum. Until
-    # the racing-line cache is velocity-aware (or the BO is made more
-    # robust at low velocities), we leave the racing-line optimizer at
-    # its legacy default. The new `max_velocity_mps` field on
-    # RacingLineConfig is shipped for future use. Deferred to iter-010+.
-    rl_opt = RacingLineOptimizer()
+    # Iter-009i (F9 fix, 4-agent research swarm consensus 2026-05-24):
+    # path-velocity decoupling (Heilmeier 2019, Kapania 2016). The
+    # racing-line geometry is now selected at a fixed `select_velocity_mps=15.0`
+    # (legacy basin, see RacingLineConfig docstring), while the
+    # downstream trajectory generator below executes at the auto-derived
+    # `max_velocity`. This is the conceptually-correct decoupling that
+    # the iter-009 attempt got wrong: it had been coupling SELECTION and
+    # EXECUTION through the same velocity, causing the BO oracle to
+    # pick a different optimal basin at lower velocity (aigp_default
+    # crash at gate-1).
+    from planning.racing_line import RacingLineConfig
+    rl_opt = RacingLineOptimizer(
+        config=RacingLineConfig(
+            max_velocity_mps=max_velocity,  # informational; downstream uses it
+            select_velocity_mps=15.0,        # legacy basin — keeps BO selection stable
+        )
+    )
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
     traj_opt = TrajectoryOptimizer(

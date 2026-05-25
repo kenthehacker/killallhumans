@@ -91,13 +91,26 @@ class RacingLineConfig:
                                        # ILMPC (Zhao 2025): trajectory quality > controller tuning.
     lookahead_gates: int = 3           # gates to consider for corner cutting
     use_cache: bool = True             # use cached racing line offsets for determinism (iter 33)
-    # Iter-009 (Opus iter-006 F9 MAJOR): BO racing-line scorer's trajectory
-    # max_velocity. Default 15.0 preserves the historical race_01 sweep
-    # behaviour; callers pass the auto-derived per-track value via this
-    # config field so the racing line is optimised for the velocity it
-    # will actually run at. Without this, all tracks were scored at v=15.0
-    # which biased line selection toward race_01-class spacing.
+    # Iter-009i (F9 fix, 4-agent research swarm consensus 2026-05-24):
+    # path-velocity decoupling per Heilmeier 2019 / Kapania 2016 TUM
+    # method. The optimal lateral-offset *geometry* is chosen independent
+    # of the velocity it will be flown at; the velocity profile is then
+    # solved separately. Concretely:
+    #
+    #   max_velocity_mps: the velocity the trajectory will be EXECUTED at
+    #     downstream (informational; not used inside the optimizer's
+    #     selection step). Callers may set this from
+    #     planning/auto_velocity.derive_safe_max_velocity.
+    #
+    #   select_velocity_mps: the velocity the BO scorer uses INTERNALLY
+    #     when generating candidate min-snap trajectories for ranking.
+    #     Fixed at 15.0 by design — keeps the scorer in the legacy
+    #     race_01-sweep basin regardless of how slow the actual flight
+    #     will be. Changing this is the F9 regression mechanism (4 agent
+    #     diagnoses: Opus/GPT-5.5/Composer/Gemini all identified the same
+    #     velocity-coupled basin-switching in `.loop/research/f9_*.md`).
     max_velocity_mps: float = 15.0
+    select_velocity_mps: float = 15.0
 
 
 class RacingLineOptimizer:
@@ -149,6 +162,11 @@ class RacingLineOptimizer:
                 "smoothness_weight": config.smoothness_weight,
                 "speed_weight": config.speed_weight,
                 "corner_cut_aggressiveness": config.corner_cut_aggressiveness,
+                # Iter-009i: cache key must split on the selection-reference
+                # speed, since it controls the BO oracle's basin choice.
+                # `max_velocity_mps` is purely informational and intentionally
+                # NOT in the key (changing it shouldn't invalidate the cache).
+                "select_velocity_mps": round(config.select_velocity_mps, 2),
             },
         }
         key_str = json.dumps(key_data, sort_keys=True)
@@ -365,11 +383,18 @@ class RacingLineOptimizer:
             DroneConstraints, TrajectoryOptimizer, TrajectoryPoint,
         )
 
-        # Iter-009 (Opus iter-006 F9 MAJOR): use the configured racing-
-        # line velocity instead of the hard-coded 15.0 literal. Tracks
-        # with tight geometries get scored at their actual race speed.
+        # Iter-009i (F9 fix, 4-agent research swarm consensus): use the
+        # SELECTION reference velocity, NOT the execution velocity. Per
+        # Heilmeier 2019 / Kapania 2016, the racing-line *geometry* is
+        # chosen independent of the velocity it will be flown at —
+        # that's what makes the optimal line velocity-agnostic. The
+        # earlier iter-009 attempt (Opus iter-006 F9 MAJOR) wired
+        # `self.config.max_velocity_mps` in here, and the 4-agent
+        # diagnosis found that's exactly what causes the F9
+        # basin-switching regression. select_velocity_mps stays at 15.0
+        # (legacy basin); max_velocity_mps is informational for callers.
         traj_opt = TrajectoryOptimizer(
-            constraints=DroneConstraints(max_velocity=self.config.max_velocity_mps),
+            constraints=DroneConstraints(max_velocity=self.config.select_velocity_mps),
             dt_sample=0.02,  # coarser than benchmark for speed
         )
 
