@@ -131,6 +131,43 @@ def test_save_feature_trace_rejects_empty(tmp_path):
         save_feature_trace([], tmp_path / "x.npz")
 
 
+def test_init_residual_weights_script_writes_loadable_zero_npz(tmp_path):
+    """Iter-022 connect-the-dots: the init_residual_weights.py script
+    must produce a .npz file that `TrackerResidualMLP.from_npz` can
+    load AND whose forward pass is zero. This is the round-trip
+    contract that lets the pipeline test
+    `use_residual=True + this_file` ≡ baseline.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    out = tmp_path / "weights.npz"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts" / "init_residual_weights.py"),
+            "--out", str(out),
+        ],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, (
+        f"script failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert out.exists()
+    # Load + verify zero behavior.
+    mlp = TrackerResidualMLP.from_npz(out)
+    for sample in (
+        np.zeros(DEFAULT_N_INPUTS),
+        np.ones(DEFAULT_N_INPUTS),
+        np.linspace(-3.0, 3.0, DEFAULT_N_INPUTS),
+    ):
+        y = mlp.forward(sample)
+        assert y.shape == (DEFAULT_N_OUTPUTS,)
+        np.testing.assert_array_equal(y, np.zeros(DEFAULT_N_OUTPUTS))
+
+
 # ---------------------------------------------------------------------------
 # MLP shape + sanity
 # ---------------------------------------------------------------------------

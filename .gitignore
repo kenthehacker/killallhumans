@@ -25,3 +25,8 @@ logs/
 # semantics; cache often ends up with a toy-test layout instead of
 # race_01's offsets).
 planning/racing_line_cache.json
+
+# Iter-022: residual_weights.npz is a regenerable artifact (zero-init
+# placeholder; future iters fit it from collected traces). The
+# script `scripts/init_residual_weights.py` writes it on demand.
+control/residual_weights.npz
