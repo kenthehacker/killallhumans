@@ -10,11 +10,15 @@ from typing import Tuple
 import pytest
 
 from planning.auto_velocity import (
-    DEFAULT_ABSOLUTE_CAP_MPS,
     DEFAULT_DRONE_MAX_ACCEL,
+    DEFAULT_DRONE_MAX_SPEED_MPS,
     DEFAULT_SAFETY_FACTOR,
     derive_safe_max_velocity,
 )
+
+# Iter-009d: alias kept import-time so a future audit can `git grep`
+# for the deprecated name. Tests below use the new name everywhere.
+from planning.auto_velocity import DEFAULT_ABSOLUTE_CAP_MPS  # noqa: F401
 
 
 @dataclass
@@ -23,11 +27,11 @@ class _StubGate:
 
 
 def test_fewer_than_3_gates_returns_cap():
-    assert derive_safe_max_velocity([]) == DEFAULT_ABSOLUTE_CAP_MPS
-    assert derive_safe_max_velocity([_StubGate((0, 0, 0))]) == DEFAULT_ABSOLUTE_CAP_MPS
+    assert derive_safe_max_velocity([]) == DEFAULT_DRONE_MAX_SPEED_MPS
+    assert derive_safe_max_velocity([_StubGate((0, 0, 0))]) == DEFAULT_DRONE_MAX_SPEED_MPS
     assert derive_safe_max_velocity([
         _StubGate((0, 0, 0)), _StubGate((5, 0, 0)),
-    ]) == DEFAULT_ABSOLUTE_CAP_MPS
+    ]) == DEFAULT_DRONE_MAX_SPEED_MPS
 
 
 def test_three_gates_in_a_straight_line_returns_cap():
@@ -36,7 +40,7 @@ def test_three_gates_in_a_straight_line_returns_cap():
         _StubGate((0, 0, 2)), _StubGate((5, 0, 2)), _StubGate((10, 0, 2)),
     ]
     v = derive_safe_max_velocity(gates)
-    assert v == pytest.approx(DEFAULT_ABSOLUTE_CAP_MPS)
+    assert v == pytest.approx(DEFAULT_DRONE_MAX_SPEED_MPS)
 
 
 def test_tight_90_turn_three_gates_at_3m_spacing():
@@ -53,7 +57,7 @@ def test_tight_90_turn_three_gates_at_3m_spacing():
     # Expected: √(15 · 2.121) · 0.8 = √31.82 · 0.8 = 5.64 · 0.8 = 4.51 m/s
     expected = math.sqrt(DEFAULT_DRONE_MAX_ACCEL * (3.0 / (2.0 * math.sin(math.pi / 4)))) * DEFAULT_SAFETY_FACTOR
     assert v == pytest.approx(expected, rel=0.01)
-    assert v < DEFAULT_ABSOLUTE_CAP_MPS  # binding constraint
+    assert v < DEFAULT_DRONE_MAX_SPEED_MPS  # binding constraint
     assert 4.0 < v < 6.0  # rough sanity bound
 
 
@@ -68,7 +72,7 @@ def test_wide_gentle_bend_returns_cap_or_close():
     ]
     v = derive_safe_max_velocity(gates)
     # Should hit the cap (or be very close to it)
-    assert v >= DEFAULT_ABSOLUTE_CAP_MPS * 0.9
+    assert v >= DEFAULT_DRONE_MAX_SPEED_MPS * 0.9
 
 
 def test_returns_min_over_all_triplets():
@@ -82,7 +86,7 @@ def test_returns_min_over_all_triplets():
     ]
     v = derive_safe_max_velocity(gates)
     # Tight 3-gate triplet (gate-2,3,4) dominates.
-    assert v < DEFAULT_ABSOLUTE_CAP_MPS
+    assert v < DEFAULT_DRONE_MAX_SPEED_MPS
 
 
 def test_zero_length_segments_skipped_safely():
