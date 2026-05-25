@@ -331,20 +331,32 @@ def run_synthetic_benchmark(
     ekf = DroneEKF(EKFConfig())
     ekf.initialize(tuple(start_pos), (0, 0, 0), timestamp_s=0.0)
 
-    rl_opt = RacingLineOptimizer()
-    opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
-
     # iter-006 F3 (consensus MAJOR): the 8.0 / per-track 6.0 magic
     # numbers from iter-005 are now replaced with a geometry-derived
     # centripetal-acceleration limit. Per-track explicit overrides via
     # `max_velocity_mps` still take precedence for hand-tuned tracks
     # (race_01 stays at its sweep-tuned value if it sets one); else we
     # auto-derive from gate spacing + bend angle.
+    # Iter-009: compute max_velocity BEFORE building the racing-line
+    # optimizer so its BO scorer uses the right velocity (F9 fix).
     from planning.auto_velocity import derive_safe_max_velocity
     if "max_velocity_mps" in data:
         max_velocity = float(data["max_velocity_mps"])
     else:
         max_velocity = derive_safe_max_velocity(gate_specs)
+
+    # iter-009 (Opus iter-006 F9): the conceptually-correct fix is to
+    # pass the auto-derived max_velocity into the racing-line optimizer
+    # so its BO scorer evaluates candidates at the right velocity. We
+    # tried that, and it crashed aigp_default — the lower-velocity BO
+    # picks a different line that lands in a worse local minimum. Until
+    # the racing-line cache is velocity-aware (or the BO is made more
+    # robust at low velocities), we leave the racing-line optimizer at
+    # its legacy default. The new `max_velocity_mps` field on
+    # RacingLineConfig is shipped for future use. Deferred to iter-010+.
+    rl_opt = RacingLineOptimizer()
+    opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
+
     traj_opt = TrajectoryOptimizer(
         constraints=DroneConstraints(max_velocity=max_velocity), dt_sample=0.02,
     )

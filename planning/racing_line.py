@@ -91,6 +91,13 @@ class RacingLineConfig:
                                        # ILMPC (Zhao 2025): trajectory quality > controller tuning.
     lookahead_gates: int = 3           # gates to consider for corner cutting
     use_cache: bool = True             # use cached racing line offsets for determinism (iter 33)
+    # Iter-009 (Opus iter-006 F9 MAJOR): BO racing-line scorer's trajectory
+    # max_velocity. Default 15.0 preserves the historical race_01 sweep
+    # behaviour; callers pass the auto-derived per-track value via this
+    # config field so the racing line is optimised for the velocity it
+    # will actually run at. Without this, all tracks were scored at v=15.0
+    # which biased line selection toward race_01-class spacing.
+    max_velocity_mps: float = 15.0
 
 
 class RacingLineOptimizer:
@@ -358,8 +365,11 @@ class RacingLineOptimizer:
             DroneConstraints, TrajectoryOptimizer, TrajectoryPoint,
         )
 
+        # Iter-009 (Opus iter-006 F9 MAJOR): use the configured racing-
+        # line velocity instead of the hard-coded 15.0 literal. Tracks
+        # with tight geometries get scored at their actual race speed.
         traj_opt = TrajectoryOptimizer(
-            constraints=DroneConstraints(max_velocity=15.0),
+            constraints=DroneConstraints(max_velocity=self.config.max_velocity_mps),
             dt_sample=0.02,  # coarser than benchmark for speed
         )
 
