@@ -193,8 +193,23 @@ def _yaw_to_quat(yaw: float) -> list:
     return [0.0, 0.0, math.sin(half), math.cos(half)]
 
 
-def _animate(track: str, duration: float, speedup: float, loop: bool) -> None:
-    """Run the bench + drive a 3D PyBullet GUI replay."""
+def _animate(
+    track: str,
+    duration: float,
+    speedup: float,
+    loop: bool,
+    follow_mode: str = "target",
+    follow_distance: float = 8.0,
+    follow_pitch: float = -25.0,
+) -> None:
+    """Run the bench + drive a 3D PyBullet GUI replay.
+
+    follow_mode:
+      - "target": camera target moves with drone; user controls orbit/zoom.
+      - "chase": camera trails behind drone along its yaw direction.
+      - "fpv": camera sits at drone position looking in the drone's yaw direction.
+      - "static": camera never moves (old behavior).
+    """
     import pybullet as p
     import pybullet_data
 
@@ -210,13 +225,13 @@ def _animate(track: str, duration: float, speedup: float, loop: bool) -> None:
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, -9.81, physicsClientId=client)
     p.loadURDF("plane.urdf", physicsClientId=client)
-    # Better camera angle — looking diagonally down at the start.
+    # Initial camera angle — looking diagonally down at the start.
     start_pos = tuple(cfg["start"]["position"])
     p.resetDebugVisualizerCamera(
-        cameraDistance=10.0,
+        cameraDistance=follow_distance,
         cameraYaw=45.0,
-        cameraPitch=-30.0,
-        cameraTargetPosition=[start_pos[0] + 5, start_pos[1], start_pos[2]],
+        cameraPitch=follow_pitch,
+        cameraTargetPosition=list(start_pos),
         physicsClientId=client,
     )
 
@@ -279,6 +294,63 @@ def _animate(track: str, duration: float, speedup: float, loop: bool) -> None:
                     ornObj=_yaw_to_quat(sample["yaw"]),
                     physicsClientId=client,
                 )
+
+                # Follow camera — runs every frame so the drone never
+                # leaves the viewport. User can still mouse-drag to
+                # change cameraYaw/cameraPitch in "target" mode.
+                if follow_mode != "static":
+                    cur_info = p.getDebugVisualizerCamera(physicsClientId=client)
+                    # cur_info indices: [width, height, view_matrix,
+                    #   projection_matrix, cam_up, cam_forward, horizontal,
+                    #   vertical, cameraYaw, cameraPitch, cameraDistance,
+                    #   cameraTarget]
+                    cur_yaw = cur_info[8]
+                    cur_pitch = cur_info[9]
+                    cur_dist = cur_info[10]
+                    if follow_mode == "target":
+                        # Keep user-controlled yaw/pitch/zoom; just
+                        # move the target with the drone.
+                        p.resetDebugVisualizerCamera(
+                            cameraDistance=cur_dist,
+                            cameraYaw=cur_yaw,
+                            cameraPitch=cur_pitch,
+                            cameraTargetPosition=list(sample["pos"]),
+                            physicsClientId=client,
+                        )
+                    elif follow_mode == "chase":
+                        # Camera trails behind the drone along its yaw.
+                        # PyBullet's cameraYaw is measured from +x toward +y
+                        # (CCW from east); the drone's yaw is the same
+                        # convention. To sit "behind" the drone, place
+                        # the camera in the -yaw direction (looking +yaw).
+                        drone_yaw_deg = math.degrees(sample["yaw"])
+                        p.resetDebugVisualizerCamera(
+                            cameraDistance=follow_distance,
+                            cameraYaw=drone_yaw_deg - 90.0,
+                            cameraPitch=follow_pitch,
+                            cameraTargetPosition=list(sample["pos"]),
+                            physicsClientId=client,
+                        )
+                    elif follow_mode == "fpv":
+                        # Camera sits ON the drone looking forward.
+                        # Place target ahead in the drone's yaw direction.
+                        ahead = 5.0
+                        cy = math.cos(sample["yaw"])
+                        sy = math.sin(sample["yaw"])
+                        target_pos = (
+                            sample["pos"][0] + ahead * cy,
+                            sample["pos"][1] + ahead * sy,
+                            sample["pos"][2],
+                        )
+                        drone_yaw_deg = math.degrees(sample["yaw"])
+                        p.resetDebugVisualizerCamera(
+                            cameraDistance=0.5,  # very close ≈ at drone
+                            cameraYaw=drone_yaw_deg - 90.0,
+                            cameraPitch=-5.0,
+                            cameraTargetPosition=list(target_pos),
+                            physicsClientId=client,
+                        )
+
                 # Update HUD every 10 frames (100ms at 100Hz trace).
                 if i % 10 == 0:
                     v = sample["vel"]
@@ -332,6 +404,25 @@ def main():
         "--loop", action="store_true",
         help="Replay continuously until Ctrl+C.",
     )
+    parser.add_argument(
+        "--follow", default="target",
+        choices=("target", "chase", "fpv", "static"),
+        help=(
+            "Camera follow mode (default: target). "
+            "target = target follows drone, user controls orbit/zoom; "
+            "chase = camera trails behind in drone's heading; "
+            "fpv = first-person from drone position; "
+            "static = camera fixed at start (old behavior)."
+        ),
+    )
+    parser.add_argument(
+        "--follow-distance", type=float, default=8.0,
+        help="Camera distance for chase/initial-target modes (default 8.0m).",
+    )
+    parser.add_argument(
+        "--follow-pitch", type=float, default=-25.0,
+        help="Camera pitch in degrees (default -25, looking down).",
+    )
     parser.add_argument("--list-tracks", action="store_true")
     args = parser.parse_args()
 
@@ -340,7 +431,12 @@ def main():
             print(path.stem)
         return
 
-    _animate(args.track, args.duration, args.speedup, args.loop)
+    _animate(
+        args.track, args.duration, args.speedup, args.loop,
+        follow_mode=args.follow,
+        follow_distance=args.follow_distance,
+        follow_pitch=args.follow_pitch,
+    )
 
 
 if __name__ == "__main__":
