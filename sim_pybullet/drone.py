@@ -282,12 +282,37 @@ class QuadrotorDrone:
         HUD readouts and trace_features data collection).
         """
         if getattr(self, "_tracker", None) is None:
+            # Iter-030 (composer's #2 finding): the internal tracker
+            # MUST clamp commanded tilt to the PLANT's max_roll/pitch_angle,
+            # not TrackerConfig's wider 0.85-rad default. Otherwise the
+            # tracker commands tilts the plant proportionally throws
+            # away in apply_command (cmd.roll_rad / 0.35 → clip(1.0)),
+            # silently saturating control authority. Use the smaller
+            # of {plant tilt cap, default tracker cap} to keep the
+            # control chain honest.
             from control.mpc_tracker import GeometricTracker, TrackerConfig
-            self._tracker = GeometricTracker(TrackerConfig())
+            plant_tilt_cap = min(
+                float(self.config.max_roll_angle),
+                float(self.config.max_pitch_angle),
+            )
+            self._tracker = GeometricTracker(
+                TrackerConfig(max_tilt_rad=plant_tilt_cap),
+            )
 
         state = self.get_state()
         cur_yaw = state["yaw"] if current_yaw_override is None else current_yaw_override
 
+        # Iter-030 KNOWN ISSUE: GeometricTracker is hardcoded for NED
+        # (mpc_tracker.py line 203 subtracts (0,0,+g)) but PyBullet
+        # is ENU. Naive z-flip conversion proved insufficient — also
+        # need to flip roll/pitch sign (NED nose-down positive vs ENU
+        # nose-up positive), body_z direction (NED -z vs ENU +z), and
+        # yaw direction (NED CW vs ENU CCW). Multiple coupled sign
+        # flips → fragile. Real fix is to refactor mpc_tracker to be
+        # frame-agnostic OR write an ENU-native tracker for this
+        # backend. Both research-scale. Documented in
+        # .loop/synthesis/iter_030_step_reference_frame_blocker.md;
+        # step_reference left as documented-broken for the next iter.
         cmd = self._tracker.track(
             current_position=state["position"],
             current_velocity=state["velocity"],

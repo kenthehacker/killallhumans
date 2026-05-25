@@ -73,7 +73,21 @@ def main():
     # Build planner artifacts
     waypoints, specs = _build_gates(cfg)
     start_pos = tuple(cfg["start"]["position"])
-    max_v = derive_safe_max_velocity(specs)
+    # Iter-030 (composer's #1 finding): use the SAME max_velocity
+    # resolution the PyBullet matrix path uses
+    # (scripts/benchmark.py:_run_pybullet_bench), not just
+    # derive_safe_max_velocity. Race_01.json sets
+    # plan_max_speed_mps=4.0; without this honoring the JSON, the
+    # smoke planned at 15 m/s (3.75× the matrix path) and the
+    # resulting trajectory had peaks the QuadrotorDrone couldn't
+    # follow — iter-029's "physics blocker" was actually a
+    # mis-configured smoke test.
+    if "max_velocity_mps" in cfg:
+        max_v = float(cfg["max_velocity_mps"])
+    elif "planner" in cfg and "plan_max_speed_mps" in cfg["planner"]:
+        max_v = float(cfg["planner"]["plan_max_speed_mps"])
+    else:
+        max_v = derive_safe_max_velocity(specs)
 
     rl_opt = RacingLineOptimizer()
     opt_wps = rl_opt.optimize(waypoints, start_pos)
@@ -89,9 +103,14 @@ def main():
     seq.start()
 
     # PyBullet setup — headless
+    # Iter-030 fix: timestep = control rate so applyExternalForce is
+    # called every physics step. PyBullet's applyExternalForce queues
+    # a force for the NEXT stepSimulation only; if we ran physics at
+    # 240Hz with control at 120Hz, the drone would only get force
+    # half the time → effective half-gravity hover failure.
     client = p.connect(p.DIRECT)
     p.setGravity(0, 0, -9.81, physicsClientId=client)
-    p.setTimeStep(1.0 / 240.0, physicsClientId=client)
+    p.setTimeStep(1.0 / 120.0, physicsClientId=client)
     # Simple ground plane (no urdf needed for a smoke test)
     p.createCollisionShape(p.GEOM_PLANE, physicsClientId=client)
 
@@ -135,9 +154,9 @@ def main():
         ref = trajectory.sample(progress_t)
         drone.step_reference(ref)
 
-        # PyBullet step (240 Hz physics, 120 Hz control)
-        for _ in range(2):
-            p.stepSimulation(physicsClientId=client)
+        # Single physics step at the control rate so the queued force
+        # actually integrates (see iter-030 fix at p.setTimeStep above).
+        p.stepSimulation(physicsClientId=client)
         sim_time += dt
 
         # Compute tracking error
