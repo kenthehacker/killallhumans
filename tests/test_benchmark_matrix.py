@@ -101,6 +101,31 @@ def test_race_01_regression_gate_passes_at_15s():
     )
 
 
+def test_figure8_8_of_8_after_iter028_coplanar_fix():
+    """Iter-028 regression: figure8 now passes 8/8 gates thanks to the
+    coplanar-gates DQ-skip fix in `gate_sequencing/sequencer.py`. Pre-
+    iter-028 figure8 was 1/8 (crash_gate:gate-5 at sim_time=1.0s) because
+    the sequencer flagged the figure-8 self-crossing as an out-of-order
+    violation. This test pins the win — if anything regresses the
+    coplanar exception, figure8 drops back to 1/8 and this test fails.
+
+    Tracking error tolerance is wider (0.50m) than the matrix gate's
+    0.40m because figure8 has tight 90-deg turns that legitimately have
+    higher tracking error than race_01-class wide courses."""
+    paths = [p for p in _list_configs() if p.stem == "figure8"]
+    assert paths
+    matrix = run_matrix(paths, duration=30.0)
+    track = matrix["tracks"]["figure8"]
+    assert track["sim_passed"] is True, (
+        f"figure8 regressed; reason={track.get('termination_reason')}, "
+        f"gates={track['gates_passed']}/{track['total_gates']}"
+    )
+    assert track["gates_passed"] == 8, (
+        f"figure8 only got {track['gates_passed']}/8 gates"
+    )
+    assert track["avg_tracking_error_m"] < 0.50
+
+
 def test_matrix_pass_rate_at_least_six_of_seven():
     """Iter-009f: locks in the iter-009 multi-track win.
 

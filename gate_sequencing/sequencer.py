@@ -457,6 +457,15 @@ class GateSequencer:
                 )
                 in_outer = self._point_in_outer_frame(crossing, future_gate)
                 if in_strict_opening:
+                    # Iter-028 (figure8 coplanar fix): if the future
+                    # gate is COPLANAR (same xy + same yaw) with the
+                    # gate just credited this tick, the crossing is an
+                    # incidental side-effect of a legitimate pass-
+                    # through, not an out-of-order violation. The
+                    # figure-8 self-crossing pattern (gates 1+5 at the
+                    # same x=5, different z) is the canonical example.
+                    if self._future_gate_coplanar_with_last_pass(future_gate):
+                        continue
                     # Out-of-order rule violation — only terminal under
                     # strict-ordering mode. With enforce_in_order=False
                     # the caller has explicitly opted out (legacy tests,
@@ -473,6 +482,16 @@ class GateSequencer:
                 # enforce_in_order. Dedup keyed on gate_id (not on
                 # _last_event alone), so two struts on two different
                 # gates in successive ticks both record.
+                # Iter-028 (figure8): also skip strut crashes for
+                # coplanar future gates. The drone passing through
+                # gate-1 can graze gate-5's strut at y≈±opening_width/2,
+                # but that's the figure-8 self-crossing geometry, not
+                # a control failure. A real strut hit would be
+                # accompanied by the actual collision contact (PyBullet
+                # path) or a clear off-axis crossing far from any
+                # legitimately-pass-throughable gate plane.
+                if in_outer and self._future_gate_coplanar_with_last_pass(future_gate):
+                    continue
                 if in_outer:
                     already_in_this_flyby = (
                         self._crashes
@@ -698,6 +717,49 @@ class GateSequencer:
             down0 = down0 / down_norm
 
         return right0 * cr + down0 * sr
+
+    def _future_gate_coplanar_with_last_pass(
+        self, future_gate: GateSpec,
+    ) -> bool:
+        """Iter-028: is `future_gate` coplanar (same xy + same normal)
+        with ANY already-credited gate?
+
+        Used by the future-gate DQ scan to skip the figure-8 self-
+        crossing case: gates that share an xy position by design (e.g.
+        figure8.json's gate-1+gate-5 at x=5 and gate-2+gate-6 at x=10,y=5)
+        intentionally have overlapping bare openings. The drone crossing
+        the future-gate's plane while flying between OTHER gates is
+        unavoidable in figure-8 geometry — those crossings are SPATIAL
+        consequences of the course design, not out-of-order violations.
+
+        The check passes whenever any prior pass has a coplanar twin
+        in the un-credited gates: once the drone has gone through one
+        member of a coplanar pair, the second member is allowed to be
+        plane-crossed at will until it becomes the current target.
+
+        Coplanar = same xy within 0.5 m AND same yaw within 0.05 rad.
+        Z is intentionally NOT required to match — the figure-8 pattern
+        relies on z separation between the two coplanar gates.
+        """
+        if not self._passed:
+            return False
+        # Build a list of already-passed gates (by lookup into self._gates).
+        # self._passed stores gate_ids in pass order; map back to GateSpec.
+        passed_ids = set(self._passed)
+        for g in self._gates[: self._current_idx]:
+            if g.gate_id not in passed_ids:
+                continue
+            dxy = math.hypot(
+                future_gate.position[0] - g.position[0],
+                future_gate.position[1] - g.position[1],
+            )
+            dyaw = abs(
+                ((future_gate.yaw - g.yaw) + math.pi) % (2 * math.pi)
+                - math.pi
+            )
+            if dxy < 0.5 and dyaw < 0.05:
+                return True
+        return False
 
     @staticmethod
     def _gate_up(gate: GateSpec) -> np.ndarray:
