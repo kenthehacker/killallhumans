@@ -374,15 +374,37 @@ def run_synthetic_benchmark(
     ilc_defaults = load_ilc_config()
     ilc_global = {**ilc_defaults["global"], **data.get("ilc_global_overrides", {})}
 
+    n_total_steps = int(trajectory.total_time / dt) + 50
+
     section_overrides = data.get("ilc_section_overrides")
     if section_overrides:
-        section_boundaries = [tuple(s) for s in section_overrides]
+        # Iter-009 (Opus F10 MAJOR): support fractional section boundaries
+        # so race_01's sweep-tuned schedule survives velocity changes that
+        # alter trajectory step count. If `ilc_section_overrides_format` is
+        # "fractions" (or any value in the first column is <2.0), the
+        # start/end columns are scaled by n_total_steps. Otherwise the
+        # legacy absolute-step interpretation applies.
+        override_format = data.get("ilc_section_overrides_format", "auto")
+        is_fractions = (
+            override_format == "fractions"
+            or (
+                override_format == "auto"
+                and section_overrides
+                and max(s[0] for s in section_overrides) < 2.0
+                and max(s[1] for s in section_overrides) <= 1.0 + 1e-6
+            )
+        )
+        if is_fractions:
+            section_boundaries = [
+                (int(s[0] * n_total_steps), int(s[1] * n_total_steps)) + tuple(s[2:])
+                for s in section_overrides
+            ]
+        else:
+            section_boundaries = [tuple(s) for s in section_overrides]
     else:
         section_boundaries = derive_section_boundaries(
             trajectory, dt, config=ilc_defaults,
         )
-
-    n_total_steps = int(trajectory.total_time / dt) + 50
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
     # tuple. Velocity offsets are the smooth time derivative of position
     # offsets, ensuring the controller's velocity reference is consistent
