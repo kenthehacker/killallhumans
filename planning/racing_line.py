@@ -563,8 +563,13 @@ class RacingLineOptimizer:
         trajectory,
         start_position: Tuple[float, float, float],
         gates: List[GateWaypoint],
-        max_speed_mps: float = 15.0,
-        max_accel_mps2: float = 15.0,
+        # Iter-012: defaults sourced from competition.drone_spec so the
+        # one canonical source-of-truth covers this eval path too.
+        # Import is function-local (cheap) to keep racing_line.py free
+        # of import-time competition dependencies for callers that
+        # don't instantiate the optimizer.
+        max_speed_mps: Optional[float] = None,
+        max_accel_mps2: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         """
         Lightweight kinematic sim to evaluate trajectory tracking quality.
@@ -585,10 +590,20 @@ class RacingLineOptimizer:
         the trajectory's reference speed). Defaults remain 15.0 so legacy
         callers are unchanged.
         """
+        if max_speed_mps is None or max_accel_mps2 is None:
+            from competition.drone_spec import (
+                DEFAULT_MAX_ACCEL_MPS2,
+                DEFAULT_MAX_VELOCITY_MPS,
+            )
+            if max_speed_mps is None:
+                max_speed_mps = DEFAULT_MAX_VELOCITY_MPS
+            if max_accel_mps2 is None:
+                max_accel_mps2 = DEFAULT_MAX_ACCEL_MPS2
         dt = 0.02
         max_accel = max_accel_mps2
         max_speed = max_speed_mps
-        drag = 0.5
+        from competition.drone_spec import DEFAULT_LINEAR_DRAG_PER_MASS
+        drag = DEFAULT_LINEAR_DRAG_PER_MASS
         kp_xy, kd_xy = 7.0, 5.5
         kp_z, kd_z = 8.0, 5.0
         ff_accel = 0.50

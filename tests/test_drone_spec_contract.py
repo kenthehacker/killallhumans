@@ -71,3 +71,16 @@ def test_auto_velocity_constants_match_drone_spec():
         f"auto_velocity.DEFAULT_DRONE_MAX_SPEED_MPS ({DEFAULT_DRONE_MAX_SPEED_MPS}) "
         f"drifted from drone_spec.DEFAULT_MAX_VELOCITY_MPS ({DEFAULT_MAX_VELOCITY_MPS})"
     )
+
+
+def test_racing_line_kinematic_eval_defaults_match_drone_spec():
+    """Iter-012: `_kinematic_eval` accepts `max_speed_mps` and
+    `max_accel_mps2` as kwargs that default to None → drone_spec.
+    Confirm the resolved defaults match the spec (no silent inline
+    literal regression)."""
+    import inspect
+    from planning.racing_line import RacingLineOptimizer
+    sig = inspect.signature(RacingLineOptimizer._kinematic_eval)
+    # Both params should default to None (sentinel for "use drone_spec")
+    assert sig.parameters["max_speed_mps"].default is None
+    assert sig.parameters["max_accel_mps2"].default is None

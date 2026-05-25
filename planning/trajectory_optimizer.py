@@ -305,9 +305,17 @@ def compute_ilc_offset_table(
             Wn = 0.99  # clamp to valid range
         butter_b, butter_a = butter(4, Wn, btype='low')
 
-    max_accel = 15.0
-    max_speed = 15.0
-    drag = 0.5
+    # Iter-012 (deferred from iter-010 Opus M4 / Codex#1 MAJOR 2): bench-
+    # kinematic limits sourced from competition.drone_spec instead of
+    # inline literals. The PD gains (kp_xy, kd_xy, ...) and feedforward
+    # are controller-tuning parameters, not drone-envelope properties;
+    # they remain inline.
+    max_accel = _DRONE_MAX_ACCEL
+    max_speed = _DRONE_MAX_VELOCITY
+    from competition.drone_spec import (
+        DEFAULT_LINEAR_DRAG_PER_MASS as _DRONE_DRAG,
+    )
+    drag = _DRONE_DRAG
     kp_xy, kd_xy = 6.0, 4.0
     kp_z, kd_z = 8.0, 5.0
     ff_accel = 0.4

@@ -482,11 +482,20 @@ def run_synthetic_benchmark(
     vel = np.zeros(3)
     yaw = 0.0
 
-    # Kinematic parameters (tuned to approximate Crazyflie CF2X dynamics)
-    max_accel = 15.0      # m/s^2 (~1.5g, matches DroneConstraints)
-    max_speed = 15.0      # m/s — increased to match trajectory planner ceiling
-    drag = 0.5            # velocity damping (aerodynamic drag approximation)
-    yaw_rate_max = 4.0    # rad/s
+    # Iter-012 (deferred from iter-010 Opus M4): kinematic parameters
+    # sourced from competition.drone_spec — the single source of truth
+    # for the synthetic-bench drone envelope. Previously inline literals
+    # could drift from `DroneConstraints` (the original 15-vs-20 lie).
+    from competition.drone_spec import (
+        DEFAULT_LINEAR_DRAG_PER_MASS,
+        DEFAULT_MAX_ACCEL_MPS2,
+        DEFAULT_MAX_VELOCITY_MPS,
+        DEFAULT_YAW_RATE_MAX_RAD_S,
+    )
+    max_accel = DEFAULT_MAX_ACCEL_MPS2          # m/s^2 — bench saturation clamp
+    max_speed = DEFAULT_MAX_VELOCITY_MPS        # m/s — bench velocity clamp
+    drag = DEFAULT_LINEAR_DRAG_PER_MASS         # velocity damping
+    yaw_rate_max = DEFAULT_YAW_RATE_MAX_RAD_S   # rad/s
 
     # --- Run loop ---
     tracking_errors = []
