@@ -103,7 +103,7 @@ def run_matrix(
 
         # Acceptance criteria. Placeholder tracks (e.g. aigp_default) only
         # need to reach 50% completion since they're untested geometry;
-        # production tracks must hit `sim_passed`.
+        # production tracks must hit `sim_passed` AND have a legal plan.
         if track_summary["is_placeholder"]:
             if track_summary["gate_pass_rate"] < 0.50:
                 matrix["all_passed"] = False
@@ -125,6 +125,17 @@ def run_matrix(
                 matrix["all_passed"] = False
                 matrix["regressions"].append(
                     f"{name}: gate_pass_rate {track_summary['gate_pass_rate']:.0%} < 75%"
+                )
+            # Iter-006 F11 (Opus): a production track with an illegal
+            # PLAN is a regression even if the sim happens to complete
+            # (e.g., the kinematic noise pushed the drone away from the
+            # illegal crossing). A passing sim with a broken plan would
+            # not transfer to a real drone.
+            pv = track_summary.get("plan_validation") or {}
+            if pv.get("ok") is False:
+                matrix["all_passed"] = False
+                matrix["regressions"].append(
+                    f"{name}: plan_validation.ok=False — {pv.get('reason', 'unknown')}"
                 )
 
     return matrix

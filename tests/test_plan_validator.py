@@ -60,7 +60,7 @@ def _make_line_gates(n: int = 3, spacing: float = 5.0) -> List[GateSpec]:
     return [
         GateSpec(
             gate_id=f"g{i+1}",
-            position=(spacing * (i + 1), 0.0, -2.0),
+            position=(spacing * (i + 1), 0.0, 2.0),
             yaw=0.0,
             sequence_index=i,
         )
@@ -77,11 +77,11 @@ def test_clean_in_order_trajectory_passes():
     gates = _make_line_gates(3, spacing=5.0)
     traj = _StubTrajectory(
         waypoints=[
-            (0.0, 0.0, -2.0),
-            (5.0, 0.0, -2.0),
-            (10.0, 0.0, -2.0),
-            (15.0, 0.0, -2.0),
-            (20.0, 0.0, -2.0),
+            (0.0, 0.0, 2.0),
+            (5.0, 0.0, 2.0),
+            (10.0, 0.0, 2.0),
+            (15.0, 0.0, 2.0),
+            (20.0, 0.0, 2.0),
         ],
         times=[0.0, 1.0, 2.0, 3.0, 4.0],
     )
@@ -110,10 +110,10 @@ def test_trajectory_crossing_future_gate_first_is_dq():
     # entirely and the second hits g2's opening from beyond.
     traj = _StubTrajectory(
         waypoints=[
-            (0.0, 0.0, -2.0),
-            (8.0, 5.0, -2.0),         # away from g1 (at y=5)
-            (10.0, 0.0, -2.0),        # back onto g2's centerline
-            (15.0, 0.0, -2.0),
+            (0.0, 0.0, 2.0),
+            (8.0, 5.0, 2.0),         # away from g1 (at y=5)
+            (10.0, 0.0, 2.0),        # back onto g2's centerline
+            (15.0, 0.0, 2.0),
         ],
         times=[0.0, 1.0, 2.0, 3.0],
     )
@@ -140,9 +140,9 @@ def test_trajectory_grazing_strut_is_crash():
     gates = _make_line_gates(1)
     traj = _StubTrajectory(
         waypoints=[
-            (0.0, 1.0, -2.0),
-            (5.0, 1.0, -2.0),
-            (10.0, 1.0, -2.0),
+            (0.0, 1.0, 2.0),
+            (5.0, 1.0, 2.0),
+            (10.0, 1.0, 2.0),
         ],
         times=[0.0, 1.0, 2.0],
     )
@@ -166,7 +166,7 @@ def test_empty_trajectory_fails_cleanly():
 
 def test_no_gates_fails_cleanly():
     traj = _StubTrajectory(
-        waypoints=[(0.0, 0.0, -2.0), (5.0, 0.0, -2.0)],
+        waypoints=[(0.0, 0.0, 2.0), (5.0, 0.0, 2.0)],
         times=[0.0, 1.0],
     )
     result = validate_trajectory(traj, [], dt=0.02)
@@ -181,7 +181,7 @@ def test_no_gates_fails_cleanly():
 def test_result_has_all_diagnostic_fields():
     gates = _make_line_gates(2)
     traj = _StubTrajectory(
-        waypoints=[(0.0, 0.0, -2.0), (5.0, 0.0, -2.0), (10.0, 0.0, -2.0)],
+        waypoints=[(0.0, 0.0, 2.0), (5.0, 0.0, 2.0), (10.0, 0.0, 2.0)],
         times=[0.0, 1.0, 2.0],
     )
     result = validate_trajectory(traj, gates, dt=0.02)
@@ -191,3 +191,66 @@ def test_result_has_all_diagnostic_fields():
         "disqualified", "dq_reason", "last_crash_gate", "samples_evaluated",
     ):
         assert hasattr(result, field)
+
+
+# ---------------------------------------------------------------------------
+# Iter-006 F5 (Opus MAJOR): airspace bounds
+# ---------------------------------------------------------------------------
+
+def test_trajectory_below_ground_is_flagged_as_crash_ground():
+    """Validator must match the bench's ground crash semantics
+    (z < 0.05 = crash). The bench is z-up convention here."""
+    gates = _make_line_gates(1)
+    traj = _StubTrajectory(
+        waypoints=[
+            (0.0, 0.0, 1.0),
+            (2.0, 0.0, 0.0),     # below ground threshold (0.05)
+            (5.0, 0.0, 2.0),    # well below ground
+        ],
+        times=[0.0, 1.0, 2.0],
+    )
+    result = validate_trajectory(
+        traj, gates, dt=0.02,
+        ground_z_threshold=0.05, ceiling_z_threshold=20.0,
+    )
+    assert not result.ok
+    assert "ground" in result.reason.lower()
+    assert result.first_failure_time_s is not None
+
+
+def test_trajectory_above_ceiling_is_flagged_as_crash_ceiling():
+    """Symmetrical check: z > 20.0 means the drone exited the airspace
+    upward."""
+    gates = _make_line_gates(1)
+    traj = _StubTrajectory(
+        waypoints=[
+            (0.0, 0.0, 1.0),
+            (2.0, 0.0, 25.0),    # above ceiling (20.0)
+            (5.0, 0.0, 30.0),
+        ],
+        times=[0.0, 1.0, 2.0],
+    )
+    result = validate_trajectory(
+        traj, gates, dt=0.02,
+        ground_z_threshold=0.05, ceiling_z_threshold=20.0,
+    )
+    assert not result.ok
+    assert "ceiling" in result.reason.lower()
+
+
+def test_trajectory_within_airspace_no_flag():
+    """A trajectory that stays within bounds shouldn't trigger airspace check."""
+    gates = _make_line_gates(2)
+    # Stay at z=2 throughout (between 0.05 ground and 20.0 ceiling)
+    traj = _StubTrajectory(
+        waypoints=[
+            (0.0, 0.0, 2.0), (5.0, 0.0, 2.0), (10.0, 0.0, 2.0),
+        ],
+        times=[0.0, 1.0, 2.0],
+    )
+    # Note: gates here are at z=-2 from _make_line_gates so the path
+    # doesn't pass them. Result will be incomplete but NOT airspace.
+    result = validate_trajectory(traj, gates, dt=0.02)
+    if not result.ok:
+        assert "ground" not in result.reason.lower()
+        assert "ceiling" not in result.reason.lower()

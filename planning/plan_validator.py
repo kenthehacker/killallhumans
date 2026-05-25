@@ -56,6 +56,8 @@ def validate_trajectory(
     dt: float = 0.01,
     enforce_in_order: bool = True,
     proximity_pass_distance: float = 1.0,
+    ground_z_threshold: float = 0.05,
+    ceiling_z_threshold: float = 20.0,
 ) -> ValidationResult:
     """Replay a fresh GateSequencer against samples of `trajectory`.
 
@@ -64,6 +66,12 @@ def validate_trajectory(
     bench's SequencerConfig (was 0.0, which produced false-negatives
     on plans that legitimately use proximity-credit at gate close-pass).
     Callers wanting the strict no-proximity check can pass 0.0.
+
+    Iter-006 (Opus F5 MAJOR): airspace bounds. The bench terminates a
+    run with `crash_ground` / `crash_ceiling` when the kinematic drone
+    exits the z envelope; the validator now flags trajectories that
+    would do the same. Without this the validator could say "ok" on a
+    plan that the bench would terminate at the first ground clip.
 
     Args:
         trajectory: any object with `.total_time` and `.sample(t)` returning
@@ -77,11 +85,15 @@ def validate_trajectory(
             in-order DQ logic is on — same as the runtime.
         proximity_pass_distance: forward to SequencerConfig. Default 1.0
             matches the synthetic bench's SequencerConfig.
+        ground_z_threshold: if any sample has z < this, fail as
+            `crash_ground` (matches bench at scripts/benchmark.py:445).
+        ceiling_z_threshold: if any sample has z > this, fail as
+            `crash_ceiling` (matches bench at scripts/benchmark.py:449).
 
     Returns:
         ValidationResult. `ok` is True iff the trajectory completes the
-        course without crash or DQ. Otherwise carries the diagnostic
-        fields needed to localise the failure.
+        course without crash, DQ, or airspace exit. Otherwise carries the
+        diagnostic fields needed to localise the failure.
     """
     total_time = float(getattr(trajectory, "total_time", 0.0))
     if total_time <= 0 or not gates:
@@ -106,13 +118,26 @@ def validate_trajectory(
 
     samples = int(total_time / dt) + 1
     first_failure_time: Optional[float] = None
+    airspace_violation: Optional[str] = None
 
     for step in range(samples):
         t = step * dt
         if t > total_time:
             break
         ref = trajectory.sample(t)
-        seq.update(tuple(ref.position))
+        pos = tuple(ref.position)
+        # Iter-006 F5: airspace bounds match the kinematic bench's
+        # ground/ceiling checks. A plan that the bench would terminate
+        # at z<0.05 / z>20 must NOT validate ok.
+        if pos[2] < ground_z_threshold:
+            airspace_violation = "crash_ground"
+            first_failure_time = float(t)
+            break
+        if pos[2] > ceiling_z_threshold:
+            airspace_violation = "crash_ceiling"
+            first_failure_time = float(t)
+            break
+        seq.update(pos)
 
         if first_failure_time is None and (
             seq.is_disqualified or seq.last_crash is not None
@@ -126,10 +151,16 @@ def validate_trajectory(
         seq.is_complete
         and not crashed
         and not disqualified
+        and airspace_violation is None
     )
 
     if ok:
         reason = f"trajectory passes all {seq.total_gates} gates cleanly"
+    elif airspace_violation:
+        reason = (
+            f"airspace exit at t={first_failure_time:.2f}s: "
+            f"{airspace_violation}"
+        )
     elif disqualified:
         reason = f"DQ at t={first_failure_time:.2f}s: {seq.dq_reason}"
     elif crashed:
