@@ -175,6 +175,54 @@ def test_matrix_pass_rate_at_least_six_of_seven():
     )
 
 
+def test_matrix_clamp_engagement_below_iter016_baseline():
+    """Iter-017 regression gate: the bench's accel-clamp engagement
+    is now first-class in the matrix output (iter-016). Pin per-track
+    upper bounds at 1.5× the iter-016 baseline so changes that drive
+    the planner harder (more over-commanding → higher clamp engagement)
+    get caught.
+
+    Per-track baselines (iter-016 measurement, commit ~635e329, all
+    non-figure8, duration=30s):
+      aigp_default     72.2%  → ceiling 95.0%
+      grand_tour        9.9%  → ceiling 25.0%
+      race_01          21.7%  → ceiling 40.0%
+      slalom           36.1%  → ceiling 60.0%
+      straight_hairpin 11.5%  → ceiling 25.0%
+      vertical_cliff    4.2%  → ceiling 15.0%
+
+    Ceilings have headroom — moderate planner-tuning drifts won't
+    flap the test, but a regression that doubles aigp_default's
+    over-commanding (e.g. removing iter-010's accel drop) blows up.
+    """
+    CLAMP_CEILINGS = {
+        "aigp_default": 0.95,
+        "grand_tour": 0.25,
+        "race_01": 0.40,
+        "slalom": 0.60,
+        "straight_hairpin": 0.25,
+        "vertical_cliff": 0.15,
+    }
+    paths = _list_configs()
+    matrix = run_matrix(paths, duration=30.0)
+    regressions = []
+    for name, track in matrix["tracks"].items():
+        if name == "figure8":
+            continue
+        ceiling = CLAMP_CEILINGS.get(name)
+        if ceiling is None:
+            continue  # unknown new track; skip rather than flap
+        observed = track.get("accel_clamp_active_frac", 0.0)
+        if observed > ceiling:
+            regressions.append(
+                f"{name}: accel_clamp_active_frac={observed:.1%} > "
+                f"ceiling {ceiling:.1%} (iter-016 baseline + 50% headroom)"
+            )
+    assert not regressions, (
+        "matrix clamp engagement regressed:\n  " + "\n  ".join(regressions)
+    )
+
+
 def test_run_matrix_empty_configs_returns_empty_tracks():
     matrix = run_matrix([], duration=1.0)
     assert matrix["tracks"] == {}

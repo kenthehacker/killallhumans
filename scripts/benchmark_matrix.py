@@ -84,6 +84,10 @@ def run_matrix(
             matrix["regressions"].append(f"{name}: exception {type(e).__name__}")
             continue
 
+        # Iter-017: surface the clamp-engagement metrics added in
+        # iter-016 so matrix consumers can track planner-vs-bench
+        # over-commanding as a first-class signal.
+        cts = result.get("controller_trace_summary") or {}
         track_summary = {
             "gates_passed": result.get("gates_passed", 0),
             "total_gates": result.get("total_gates", 0),
@@ -98,6 +102,8 @@ def run_matrix(
             "sim_passed": result.get("sim_passed", False),
             "plan_validation": result.get("plan_validation"),  # iter-004 Phase 1
             "is_placeholder": data.get("placeholder", False),
+            "accel_clamp_active_frac": float(cts.get("accel_clamp_active_frac", 0.0)),
+            "max_accel_mag_pre_clamp": float(cts.get("max_accel_mag_pre_clamp", 0.0)),
         }
         matrix["tracks"][name] = track_summary
 
