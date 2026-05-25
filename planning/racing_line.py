@@ -80,6 +80,17 @@ class RacingLineConfig:
                                        # at 0.339m, constraining corner-cutting.
                                        # TOGT (Qin 2024): gates are regions, not points.
                                        # 0.6 * 0.6m half-width = 0.36m offset, leaves 0.24m margin.
+    # Iter-035 (gate-altitude bug fix): vertical offset bound (fraction of
+    # half-height). Default 0.0 = drone passes through the gate center
+    # vertically — the natural optimum given a 1.5m gate opening.
+    # Pre-iter-035 the bound was implicitly equal to max_lateral_offset
+    # AND the `up` vector at `_apply_offsets` was [0,0,-1] (NED) while
+    # the rest of the system is ENU, so the BO's z-offsets pushed gates
+    # DOWN by up to 0.35m on every gate (measured on straight_hairpin —
+    # drone passed at z=1.65 with gates at z=2.0 every time). Two fixes:
+    # bound=0 to lock the BO out of z-tuning, AND fixed `up` direction
+    # in `_apply_offsets` so any future enablement is correct.
+    max_vertical_offset: float = 0.0
     corner_cut_aggressiveness: float = 0.7  # 0=center, 1=max corner cut
     speed_weight: float = 1.0          # importance of minimizing time
     smoothness_weight: float = 0.40    # importance of path smoothness
@@ -278,7 +289,13 @@ class RacingLineOptimizer:
 
         n = len(gates)
         max_off = self.config.max_lateral_offset
-        bounds = [(-max_off, max_off)] * (n * 2)
+        # Iter-035: separate vertical bound (defaults to 0.0). The
+        # first n entries are lateral offsets; the next n are vertical.
+        max_vert = self.config.max_vertical_offset
+        bounds = (
+            [(-max_off, max_off)] * n
+            + [(-max_vert, max_vert)] * n
+        )
 
         def objective(offsets: np.ndarray) -> float:
             points = self._apply_offsets(gates, offsets)
@@ -720,7 +737,14 @@ class RacingLineOptimizer:
         gates: List[GateWaypoint],
         offsets: np.ndarray,
     ) -> List[Tuple[float, float, float]]:
-        """Apply lateral/vertical offsets to gate positions."""
+        """Apply lateral/vertical offsets to gate positions.
+
+        Iter-035: fixed the `up` vector — was [0,0,-1] (NED) but the
+        tracks + bench + visualizer all use ENU (z is UP). Combined
+        with the new `RacingLineConfig.max_vertical_offset=0` default,
+        gates pass at their actual z center. Even if vertical bound is
+        re-enabled, the sign is now correct.
+        """
         n = len(gates)
         positions = []
         for i in range(n):
@@ -728,11 +752,11 @@ class RacingLineOptimizer:
             lat_off = offsets[i]
             vert_off = offsets[n + i]
 
-            # Compute gate local axes
+            # Compute gate local axes (ENU world frame).
             cy = math.cos(gate.yaw)
             sy = math.sin(gate.yaw)
-            right = np.array([-sy, cy, 0])  # local right
-            up = np.array([0, 0, -1])        # NED: -z is up
+            right = np.array([-sy, cy, 0])   # local right
+            up = np.array([0, 0, 1])          # ENU: +z is up (was -1, iter-035 fix)
 
             pos = np.array(gate.position)
             pos = pos + right * lat_off * gate.width * 0.5

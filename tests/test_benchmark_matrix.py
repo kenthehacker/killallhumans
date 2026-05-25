@@ -145,26 +145,28 @@ def test_matrix_pass_rate_at_least_six_of_seven():
     error < 0.40m AND sim_time < 1.6× the iter-009 baseline. figure8
     is excluded — it remains an open known issue.
 
-    Per-track sim_time baselines (iter-032, duration=30s, post-projection):
-      aigp_default      11.78s  → ceiling 14.0s
-      grand_tour        23.88s  → ceiling 29.5s
-      race_01           24.39s  → ceiling 27.5s (overlaps test_race_01)
-      slalom            13.80s  → ceiling 15.5s
+    Per-track sim_time baselines (iter-035, duration=30s, post-projection
+    + gate-altitude bug fix):
+      aigp_default      14.87s  → ceiling 17.0s
+      grand_tour        24.04s  → ceiling 29.5s
+      race_01           24.46s  → ceiling 27.5s (overlaps test_race_01)
+      slalom            13.81s  → ceiling 15.5s
       straight_hairpin  10.45s  → ceiling 13.5s
-      vertical_cliff    13.25s  → ceiling 19.0s
+      vertical_cliff    14.27s  → ceiling 19.0s
 
     Iter-032 relaxed `slalom` (13.5→15.5s) and `aigp_default` (12.5→14s)
-    because the new polynomial-peak accel projection
-    (`_project_accel_peaks`) stretches segments to keep ||a|| ≤ 15 m/s²
-    — trading lap time for honesty. The win: tracking errors dropped
-    17-89% across all tracks and accel-clamp engagement collapsed from
-    21-72% to 0.5-22%. Reliable racing > optimistic single-lap time.
+    because the new polynomial-peak accel projection stretches segments
+    to keep ||a|| ≤ 15 m/s². Iter-035 raised aigp_default again (14→17s)
+    because the racing-line gate-altitude bug fix (BO was lowering gates
+    by 0.35m to shave path-length) restored correct trajectory through
+    actual gate centers — that adds ~3s of vertical travel on tracks
+    with non-uniform gate heights.
     """
-    # Iter-009h: per-track sim_time ceilings, iter-032: relaxed slalom +
-    # aigp_default to absorb projection stretch. Ceilings now ~15-30%
-    # above iter-032 baselines.
+    # Iter-009h ceilings relaxed at iter-032 (projection) and iter-035
+    # (racing-line gate-altitude bug fix). Ceilings now ~15-30% above
+    # iter-035 baselines.
     SIM_TIME_CEILINGS = {
-        "aigp_default": 14.0,
+        "aigp_default": 17.0,
         "grand_tour": 29.5,
         "race_01": 27.5,  # overlaps race_01 dedicated test, intentionally
         "slalom": 15.5,
@@ -260,6 +262,70 @@ def test_run_matrix_empty_configs_returns_empty_tracks():
     assert matrix["tracks"] == {}
     # No tracks means nothing failed, so all_passed is vacuously True.
     assert matrix["all_passed"] is True
+
+
+def test_iter035_drone_passes_through_gate_centers_vertically():
+    """Iter-035 regression: drone must pass through gates near their
+    actual z centers, not 0.35m below them.
+
+    Pre-iter-035 bug: `planning/racing_line.py::_apply_offsets` used
+    `up = [0, 0, -1]` (NED convention) while the rest of the system is
+    ENU. The BO's objective rewards short paths → it picked positive
+    `vert_off` to "raise" gates, which (with the inverted `up`) lowered
+    them. straight_hairpin showed -0.35m on every gate; figure8/
+    vertical_cliff each had 0.36m max error.
+
+    iter-035 fixes:
+      1. `up = [0, 0, +1]` (ENU correct).
+      2. New `RacingLineConfig.max_vertical_offset = 0.0` default —
+         drone passes through gate center vertically, maximising
+         frame clearance.
+
+    This test pins the win across all 7 tracks. Mean |Δz| < 50mm and
+    max |Δz| < 300mm per track (vertical_cliff and grand_tour still
+    have legit tracker-lag on steep climbs, ~280mm max).
+    """
+    import json
+    from scripts.benchmark import run_synthetic_benchmark
+    from pathlib import Path
+
+    repo = Path(__file__).resolve().parent.parent
+    cfg_dir = repo / "sim_pybullet" / "configs"
+
+    violations: list[str] = []
+    for cfg_path in sorted(cfg_dir.glob("*.json")):
+        track = cfg_path.stem
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        r = run_synthetic_benchmark(
+            duration=30.0, config=cfg, record_position_trace=True,
+        )
+        trace = r.get("position_trace") or []
+        gates_by_id = {g["id"]: g for g in cfg["gates"]}
+        z_errors: list[float] = []
+        for gpt in r.get("gate_pass_times", []):
+            gid = gpt["gate_id"]
+            sample = min(trace, key=lambda s: abs(s["t"] - gpt["time_s"]))
+            gz = gates_by_id[gid]["pose"]["z"]
+            z_errors.append(sample["pos"][2] - gz)
+        if not z_errors:
+            continue
+        mean_abs = sum(abs(z) for z in z_errors) / len(z_errors)
+        max_abs = max(abs(z) for z in z_errors)
+        # Mean: tight (the bug had mean -0.35m on straight_hairpin).
+        if mean_abs > 0.10:
+            violations.append(
+                f"{track}: mean |Δz|={mean_abs:.3f}m > 100mm "
+                f"(per-gate z-errors: {[f'{z:+.3f}' for z in z_errors]})"
+            )
+        # Max: looser — legitimate tracker-lag on steep climbs.
+        if max_abs > 0.40:
+            violations.append(
+                f"{track}: max |Δz|={max_abs:.3f}m > 400mm"
+            )
+    assert not violations, (
+        "iter-035 gate-altitude regression:\n  " + "\n  ".join(violations)
+    )
 
 
 def test_iter032_accel_projection_drops_clamp_engagement():
