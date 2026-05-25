@@ -43,6 +43,50 @@ def _hover_ref() -> TrajectoryPoint:
 
 
 # ---------------------------------------------------------------------------
+# Iter-014 — feature-trace hook (ML training infrastructure)
+# ---------------------------------------------------------------------------
+
+def test_feature_trace_empty_by_default():
+    """TrackerConfig.trace_features=False (the default) must produce
+    an empty trace, even after many track() calls. No-overhead contract
+    for production callers."""
+    tracker = GeometricTracker(TrackerConfig())
+    ref = _hover_ref()
+    for _ in range(50):
+        tracker.track(
+            current_position=(0.1, 0.0, -1.9),
+            current_velocity=(0.0, 0.0, 0.0),
+            current_yaw=0.0,
+            reference=ref,
+        )
+    assert tracker.feature_trace == []
+
+
+def test_feature_trace_captures_when_enabled():
+    """Iter-014: with trace_features=True, every track() call appends
+    (features_10d, roll_nom, pitch_nom, thrust_nom, pos_err, vel_err)."""
+    tracker = GeometricTracker(TrackerConfig(trace_features=True))
+    ref = _hover_ref()
+    for _ in range(7):
+        tracker.track(
+            current_position=(0.2, 0.1, -1.8),
+            current_velocity=(0.0, 0.0, 0.0),
+            current_yaw=0.0,
+            reference=ref,
+        )
+    assert len(tracker.feature_trace) == 7
+    for entry in tracker.feature_trace:
+        features, roll, pitch, thrust, pos_err, vel_err = entry
+        assert features.shape == (DEFAULT_N_INPUTS,)
+        assert np.all(np.isfinite(features))
+        assert -math.pi <= roll <= math.pi
+        assert -math.pi <= pitch <= math.pi
+        assert 0.0 <= thrust <= 1.5  # normalized; near ~1.0 at hover
+        assert len(pos_err) == 3
+        assert len(vel_err) == 3
+
+
+# ---------------------------------------------------------------------------
 # MLP shape + sanity
 # ---------------------------------------------------------------------------
 

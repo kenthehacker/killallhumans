@@ -111,6 +111,14 @@ class TrackerConfig:
     residual_clamp_rad: float = 0.05                 # hard clamp on roll/pitch deltas (~2.9°)
     residual_thrust_clamp: float = 0.05              # hard clamp on thrust delta (~5% of full scale)
 
+    # Iter-014: ML training data collection hook. When True, the tracker
+    # appends (features_10d, nominal_roll, nominal_pitch, nominal_thrust)
+    # to `self.feature_trace` each step. Off by default — zero overhead
+    # for production-config callers. A future training script consumes
+    # the trace to fit `TrackerResidualMLP` weights via feedback-error-
+    # learning (Romero 2025 "On Your Own"; Pries 2025 NGTC).
+    trace_features: bool = False
+
 
 class GeometricTracker:
     """
@@ -144,6 +152,12 @@ class GeometricTracker:
                 # byte-identical to baseline (modulo float math from the
                 # extra branch — see test_residual_off_is_baseline).
                 self._residual = TrackerResidualMLP.zero_init()
+        # Iter-014: ML training data collection. Empty list unless
+        # `config.trace_features=True`; each step appends a tuple of
+        # (features_10d, roll_nominal_rad, pitch_nominal_rad, thrust_nominal,
+        #  pos_err_world_xyz, vel_err_world_xyz). A future training
+        # script consumes this trace to fit the residual MLP.
+        self.feature_trace: list = []
 
     def track(
         self,
@@ -236,6 +250,28 @@ class GeometricTracker:
         # Clamp to limits
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
         desired_pitch = np.clip(desired_pitch, -c.max_tilt_rad, c.max_tilt_rad)
+
+        # Iter-014: ML training data capture. The trace records the
+        # tracker's NOMINAL outputs (before residual + clamp) plus the
+        # 10-dim feature vector, so a future training script can fit
+        # `TrackerResidualMLP` to whatever target signal it picks
+        # (e.g. negative tracking error projected onto the
+        # roll/pitch/thrust influence axes). Off by default; zero
+        # overhead when `config.trace_features=False`.
+        if c.trace_features:
+            from control.learned_residual import build_input_features
+            features = build_input_features(
+                pos_err=ep, vel_err=ev, ref_accel=ref_acc,
+                thrust_normalized=thrust_normalized,
+            )
+            self.feature_trace.append((
+                features,
+                float(desired_roll),
+                float(desired_pitch),
+                float(thrust_normalized),
+                tuple(float(v) for v in ep),
+                tuple(float(v) for v in ev),
+            ))
 
         # iter-001 A15: learned residual on (roll, pitch, thrust). Hard-
         # clamped at the consumer so a corrupted weights file or out-of-
