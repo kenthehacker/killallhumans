@@ -20,6 +20,15 @@ except ImportError:
 
 @dataclass
 class DroneConfig:
+    # Iter-021: this is the PyBullet drone proxy — a DIFFERENT model
+    # from the synthetic kinematic bench's drone (in competition.drone_spec).
+    # Some fields coincide (mass_kg, max_thrust_n, gravity), but others
+    # don't (max_roll/pitch=0.35 here vs 0.85 in TrackerConfig; max_yaw_rate
+    # =2.0 here vs 4.0 in drone_spec). Sourcing only the matching fields
+    # from drone_spec would imply unification that doesn't exist — the
+    # PyBullet harness is deliberately a more conservative stability
+    # envelope for the second-order attitude dynamics. Leave inline and
+    # explicit.
     mass_kg: float = 1.0
     arm_length_m: float = 0.175
     body_size: Tuple[float, float, float] = (0.15, 0.15, 0.05)
