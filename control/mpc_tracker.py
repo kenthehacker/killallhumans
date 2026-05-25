@@ -111,11 +111,14 @@ class TrackerConfig:
     residual_clamp_rad: float = 0.05                 # hard clamp on roll/pitch deltas (~2.9°)
     residual_thrust_clamp: float = 0.05              # hard clamp on thrust delta (~5% of full scale)
 
-    # Iter-014: ML training data collection hook. When True, the tracker
-    # appends (features_10d, nominal_roll, nominal_pitch, nominal_thrust)
-    # to `self.feature_trace` each step. Off by default — zero overhead
-    # for production-config callers. A future training script consumes
-    # the trace to fit `TrackerResidualMLP` weights via feedback-error-
+    # Iter-014/iter-031: ML training data collection hook. When True,
+    # the tracker appends a v2 13-tuple to `self.feature_trace` each step
+    # — (features_12d, roll, pitch, thrust, pos_err, vel_err, pos, vel,
+    # yaw_des, ref_pos, ref_vel, ref_accel, accel_des_baseline). Off by
+    # default — zero overhead for production-config callers. The
+    # `scripts/train_tracker_residual.py` trainer consumes the trace
+    # via `control/learned_residual.py::save_feature_trace` to fit
+    # `TrackerResidualMLP` weights via yaw-corrected feedback-error
     # learning (Romero 2025 "On Your Own"; Pries 2025 NGTC).
     trace_features: bool = False
 
@@ -139,24 +142,51 @@ class GeometricTracker:
         self.config = config or TrackerConfig()
         # iter-001 A15: optional learned residual. Loaded lazily so the
         # import / npz-load cost is only paid when the feature is on.
+        # iter-031: when use_residual=True and no explicit path is given,
+        # auto-resolve <repo>/control/residual_weights.npz. If that file
+        # is missing, fall back to zero_init (byte-identical to baseline)
+        # so a clean checkout never crashes on the default config.
         self._residual = None
         if self.config.use_residual:
-            from control.learned_residual import TrackerResidualMLP
-            if self.config.residual_weights_path:
-                self._residual = TrackerResidualMLP.from_npz(
-                    self.config.residual_weights_path
+            from control.learned_residual import (
+                DEFAULT_N_INPUTS, TrackerResidualMLP,
+            )
+            path = self.config.residual_weights_path
+            if path is None:
+                # Auto-resolve: <repo>/control/residual_weights.npz.
+                from pathlib import Path as _Path
+                _default = (
+                    _Path(__file__).resolve().parent / "residual_weights.npz"
                 )
+                if _default.exists():
+                    path = str(_default)
+            if path is not None:
+                # Wide exception net: a corrupt .npz raises OSError/
+                # BadZipFile/KeyError, a stale schema raises ValueError
+                # from __post_init__, and a missing-input-dim weights
+                # file would explode on the first forward(). All of
+                # these should fall back to zero_init (byte-identical
+                # to baseline) so the tracker NEVER crashes at init.
+                try:
+                    candidate = TrackerResidualMLP.from_npz(path)
+                    if candidate.n_inputs != DEFAULT_N_INPUTS:
+                        raise ValueError(
+                            f"residual weights at {path} have "
+                            f"n_inputs={candidate.n_inputs}, expected "
+                            f"{DEFAULT_N_INPUTS} — schema mismatch"
+                        )
+                    self._residual = candidate
+                except (FileNotFoundError, OSError, KeyError, ValueError):
+                    self._residual = TrackerResidualMLP.zero_init()
             else:
                 # Safety baseline: zero-init weights produce zero residual,
                 # so enabling the feature without a trained model is still
                 # byte-identical to baseline (modulo float math from the
                 # extra branch — see test_residual_off_is_baseline).
                 self._residual = TrackerResidualMLP.zero_init()
-        # Iter-014: ML training data collection. Empty list unless
-        # `config.trace_features=True`; each step appends a tuple of
-        # (features_10d, roll_nominal_rad, pitch_nominal_rad, thrust_nominal,
-        #  pos_err_world_xyz, vel_err_world_xyz). A future training
-        # script consumes this trace to fit the residual MLP.
+        # Iter-014/iter-031: ML training data collection. Empty list
+        # unless `config.trace_features=True`; each step appends a v2
+        # 13-tuple consumed by control/learned_residual.py::save_feature_trace.
         self.feature_trace: list = []
 
     def track(
@@ -251,19 +281,25 @@ class GeometricTracker:
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
         desired_pitch = np.clip(desired_pitch, -c.max_tilt_rad, c.max_tilt_rad)
 
-        # Iter-014: ML training data capture. The trace records the
-        # tracker's NOMINAL outputs (before residual + clamp) plus the
-        # 10-dim feature vector, so a future training script can fit
-        # `TrackerResidualMLP` to whatever target signal it picks
-        # (e.g. negative tracking error projected onto the
-        # roll/pitch/thrust influence axes). Off by default; zero
-        # overhead when `config.trace_features=False`.
+        # Iter-014/iter-031: ML training data capture. The trace records
+        # the tracker's NOMINAL outputs (before residual + clamp), the
+        # 12-dim feature vector, and the v2 fields the trainer needs to
+        # compute a yaw-aware target — drone state, yaw_des, reference,
+        # and baseline accel_des. Off by default; zero overhead when
+        # `config.trace_features=False`.
         if c.trace_features:
             from control.learned_residual import build_input_features
             features = build_input_features(
                 pos_err=ep, vel_err=ev, ref_accel=ref_acc,
                 thrust_normalized=thrust_normalized,
+                yaw_des=float(yaw_des),
             )
+            # Iter-031 v2 trace: log the additional fields the trainer
+            # needs to compute the one-step BC-oracle target — drone
+            # state (pos, vel), yaw_des (rotation frame), reference
+            # (ref_pos, ref_vel, ref_accel), and the baseline PD output
+            # (accel_des BEFORE residual was added). Order pinned in
+            # control/learned_residual.py::save_feature_trace.
             self.feature_trace.append((
                 features,
                 float(desired_roll),
@@ -271,6 +307,13 @@ class GeometricTracker:
                 float(thrust_normalized),
                 tuple(float(v) for v in ep),
                 tuple(float(v) for v in ev),
+                tuple(float(v) for v in pos),
+                tuple(float(v) for v in vel),
+                float(yaw_des),
+                tuple(float(v) for v in ref_pos),
+                tuple(float(v) for v in ref_vel),
+                tuple(float(v) for v in ref_acc),
+                tuple(float(v) for v in accel_des),
             ))
 
         # iter-001 A15: learned residual on (roll, pitch, thrust). Hard-
@@ -285,6 +328,7 @@ class GeometricTracker:
             x = build_input_features(
                 pos_err=ep, vel_err=ev, ref_accel=ref_acc,
                 thrust_normalized=thrust_normalized,
+                yaw_des=float(yaw_des),
             )
             r = self._residual.forward(x)
             d_roll = float(np.clip(r[0], -c.residual_clamp_rad, c.residual_clamp_rad))

@@ -1,8 +1,8 @@
 """
-Tests for the learned tracker residual (iter-001 A14).
+Tests for the learned tracker residual (iter-001 A14, iter-031 v2).
 
 These pin the safety contract:
-  - The MLP forward pass produces the right shape for any 10-dim input.
+  - The MLP forward pass produces the right shape for any 12-dim input.
   - Even a model whose raw output is huge (10, 10, 10) gets clamped at the
     consumer to ±residual_clamp_rad / ±residual_thrust_clamp.
   - With `use_residual=False`, the tracker output is byte-identical to the
@@ -63,8 +63,10 @@ def test_feature_trace_empty_by_default():
 
 
 def test_feature_trace_captures_when_enabled():
-    """Iter-014: with trace_features=True, every track() call appends
-    (features_10d, roll_nom, pitch_nom, thrust_nom, pos_err, vel_err)."""
+    """Iter-031 v2: with trace_features=True, every track() call appends
+    a 13-tuple (features_12d, roll_nom, pitch_nom, thrust_nom, pos_err,
+    vel_err, pos, vel, yaw_des, ref_pos, ref_vel, ref_accel,
+    accel_des_baseline)."""
     tracker = GeometricTracker(TrackerConfig(trace_features=True))
     ref = _hover_ref()
     for _ in range(7):
@@ -76,7 +78,10 @@ def test_feature_trace_captures_when_enabled():
         )
     assert len(tracker.feature_trace) == 7
     for entry in tracker.feature_trace:
-        features, roll, pitch, thrust, pos_err, vel_err = entry
+        assert len(entry) == 13
+        (features, roll, pitch, thrust, pos_err, vel_err,
+         pos, vel, yaw_des, ref_pos, ref_vel, ref_accel,
+         accel_des_baseline) = entry
         assert features.shape == (DEFAULT_N_INPUTS,)
         assert np.all(np.isfinite(features))
         assert -math.pi <= roll <= math.pi
@@ -84,6 +89,13 @@ def test_feature_trace_captures_when_enabled():
         assert 0.0 <= thrust <= 1.5  # normalized; near ~1.0 at hover
         assert len(pos_err) == 3
         assert len(vel_err) == 3
+        assert len(pos) == 3
+        assert len(vel) == 3
+        assert -math.pi <= yaw_des <= math.pi
+        assert len(ref_pos) == 3
+        assert len(ref_vel) == 3
+        assert len(ref_accel) == 3
+        assert len(accel_des_baseline) == 3
 
 
 def test_feature_trace_save_load_roundtrip(tmp_path):
@@ -112,14 +124,29 @@ def test_feature_trace_save_load_roundtrip(tmp_path):
     assert loaded["thrust_nom"].shape == (5,)
     assert loaded["pos_err"].shape == (5, 3)
     assert loaded["vel_err"].shape == (5, 3)
+    assert loaded["pos"].shape == (5, 3)
+    assert loaded["vel"].shape == (5, 3)
+    assert loaded["yaw_des"].shape == (5,)
+    assert loaded["ref_pos"].shape == (5, 3)
+    assert loaded["ref_vel"].shape == (5, 3)
+    assert loaded["ref_accel"].shape == (5, 3)
+    assert loaded["accel_des_baseline"].shape == (5, 3)
     # Round-trip integrity: same values
-    for i, (feats, r, p, t, pe, ve) in enumerate(tracker.feature_trace):
+    for i, entry in enumerate(tracker.feature_trace):
+        (feats, r, p, t, pe, ve, po, va, yd, rp, rv, ra, adb) = entry
         np.testing.assert_array_equal(loaded["features"][i], feats)
         assert loaded["roll_nom"][i] == r
         assert loaded["pitch_nom"][i] == p
         assert loaded["thrust_nom"][i] == t
         np.testing.assert_array_equal(loaded["pos_err"][i], pe)
         np.testing.assert_array_equal(loaded["vel_err"][i], ve)
+        np.testing.assert_array_equal(loaded["pos"][i], po)
+        np.testing.assert_array_equal(loaded["vel"][i], va)
+        assert loaded["yaw_des"][i] == yd
+        np.testing.assert_array_equal(loaded["ref_pos"][i], rp)
+        np.testing.assert_array_equal(loaded["ref_vel"][i], rv)
+        np.testing.assert_array_equal(loaded["ref_accel"][i], ra)
+        np.testing.assert_array_equal(loaded["accel_des_baseline"][i], adb)
 
 
 def test_save_feature_trace_rejects_empty(tmp_path):
@@ -135,7 +162,7 @@ def test_bench_exposes_tracker_feature_trace_when_enabled():
     """Iter-024: the synthetic matrix bench exposes the GeometricTracker's
     feature_trace in the result dict so external scripts can collect
     real ML training data. With trace_features=True, the trace has
-    samples in the canonical 10-dim format; with the flag off the list
+    samples in the canonical 12-dim v2 format; with the flag off the list
     is empty (no overhead for production callers)."""
     import json
     from pathlib import Path
@@ -149,7 +176,7 @@ def test_bench_exposes_tracker_feature_trace_when_enabled():
     r_off = run_synthetic_benchmark(duration=1.0, config=cfg)
     assert r_off.get("tracker_feature_trace") == []
 
-    # Enabled path: nonempty trace with canonical 10-dim features.
+    # Enabled path: nonempty v2 trace.
     r_on = run_synthetic_benchmark(
         duration=1.0, config=cfg,
         tracker_config_overrides={"trace_features": True},
@@ -157,7 +184,9 @@ def test_bench_exposes_tracker_feature_trace_when_enabled():
     trace = r_on.get("tracker_feature_trace")
     assert isinstance(trace, list)
     assert len(trace) > 50  # 1s at 100Hz minus startup; should be ~100
-    features, roll, pitch, thrust, pos_err, vel_err = trace[0]
+    entry = trace[0]
+    assert len(entry) == 13  # v2 schema
+    features, roll, pitch, thrust, pos_err, vel_err = entry[:6]
     assert features.shape == (DEFAULT_N_INPUTS,)
     assert np.all(np.isfinite(features))
     assert -math.pi <= roll <= math.pi
@@ -253,15 +282,28 @@ def test_input_dim_mismatch_raises():
         mlp.forward(np.zeros(DEFAULT_N_INPUTS - 1))
 
 
-def test_build_input_features_is_10_dim_and_ordered():
+def test_build_input_features_is_12_dim_and_ordered():
+    """Iter-031: 12-dim feature vector — adds sin(yaw), cos(yaw)."""
     feats = build_input_features(
         pos_err=np.array([1.0, 2.0, 3.0]),
         vel_err=np.array([4.0, 5.0, 6.0]),
         ref_accel=np.array([7.0, 8.0, 9.0]),
         thrust_normalized=0.5,
+        yaw_des=0.0,
     )
     assert feats.shape == (DEFAULT_N_INPUTS,)
-    assert list(feats) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.5]
+    # yaw=0 → sin=0, cos=1
+    assert list(feats) == [
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 0.5, 0.0, 1.0,
+    ]
+    # yaw=π/2 → sin=1, cos=0
+    feats_90 = build_input_features(
+        pos_err=np.zeros(3), vel_err=np.zeros(3),
+        ref_accel=np.zeros(3), thrust_normalized=0.0,
+        yaw_des=math.pi / 2,
+    )
+    assert abs(feats_90[10] - 1.0) < 1e-9
+    assert abs(feats_90[11] - 0.0) < 1e-9
 
 
 def test_npz_roundtrip(tmp_path: Path):
@@ -371,11 +413,20 @@ def test_residual_off_is_byte_identical_to_baseline():
     assert c1.thrust == c2.thrust
 
 
-def test_residual_on_with_zero_init_matches_baseline_within_float_epsilon():
-    """Turn the feature on with no trained weights -> the MLP outputs zero,
-    so the tracker output matches baseline to within numerical noise."""
+def test_residual_on_with_zero_init_matches_baseline_within_float_epsilon(tmp_path):
+    """Turn the feature on with NO weights file present -> the safety
+    fallback initialises zero-init weights, so the tracker output matches
+    baseline to within numerical noise.
+
+    Iter-031 added auto-resolve at `<repo>/control/residual_weights.npz`
+    when `residual_weights_path=None`. To test the zero-init fallback
+    independent of whether the repo happens to ship a trained weights
+    file, point at a path that definitely doesn't exist."""
     cfg_off = TrackerConfig(use_residual=False)
-    cfg_on_zero = TrackerConfig(use_residual=True, residual_weights_path=None)
+    cfg_on_zero = TrackerConfig(
+        use_residual=True,
+        residual_weights_path=str(tmp_path / "does_not_exist.npz"),
+    )
     t_off = GeometricTracker(cfg_off)
     t_on = GeometricTracker(cfg_on_zero)
 

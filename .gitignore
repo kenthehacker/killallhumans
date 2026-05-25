@@ -27,9 +27,12 @@ logs/
 planning/racing_line_cache.json
 
 # Iter-022: residual_weights.npz is a regenerable artifact (zero-init
-# placeholder; future iters fit it from collected traces). The
-# script `scripts/init_residual_weights.py` writes it on demand.
+# placeholder; iter-031 fits it from collected traces). Iter-031: stays
+# gitignored unless tests/test_residual_matrix_gain.py is GREEN — in
+# that case un-comment to commit the validated weights file alongside.
 control/residual_weights.npz
+control/residual_weights_meta.json
+control/residual_weights.tmp.npz
 # Iter-025: residual_dataset.npz is the collected training data
 # (regenerable via scripts/collect_residual_dataset.py); also gitignored.
 control/residual_dataset.npz
