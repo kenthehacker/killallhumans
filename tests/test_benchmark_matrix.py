@@ -51,6 +51,46 @@ def test_run_matrix_single_track_returns_expected_shape():
     assert track["total_gates"] >= 1
 
 
+def test_race_01_regression_gate_passes_at_15s():
+    """Iter-009e: race_01 must continue to PASS the synthetic bench.
+
+    Tracking-error history: iter-9 baseline 0.665m → iter-008 ILC sweep
+    0.159m → iter-009 fractional ILC + auto-velocity 0.089m. A future
+    change that re-introduces overfitting (e.g. velocity defaults
+    creeping back to course-specific values) would crash race_01 again.
+    This test catches that.
+
+    Tolerances:
+      - sim_passed must be True
+      - at least 11/12 gates (leaving 1 gate headroom for minor jitter)
+      - avg_tracking_error_m < 0.30 (3× the iter-009 result; small
+        improvements shouldn't be required, but large regressions should
+        scream)
+
+    Uses duration=30.0s — race_01 completes at ~17.2s on the iter-009
+    baseline; 30s leaves comfortable headroom for moderate slowdowns
+    from future changes without the test ping-ponging. The other tracks
+    aren't asserted to avoid coupling this test to figure8's
+    known-unsolvable coplanar gates.
+    """
+    paths = [p for p in _list_configs() if p.stem == "race_01"]
+    assert paths
+    matrix = run_matrix(paths, duration=30.0)
+    track = matrix["tracks"]["race_01"]
+    assert track["sim_passed"] is True, (
+        f"race_01 must pass; reason={track.get('termination_reason')}, "
+        f"gates={track['gates_passed']}/{track['total_gates']}, "
+        f"avg_err={track['avg_tracking_error_m']:.3f}m"
+    )
+    assert track["gates_passed"] >= track["total_gates"] - 1, (
+        f"race_01 regressed: only {track['gates_passed']}/{track['total_gates']} gates"
+    )
+    assert track["avg_tracking_error_m"] < 0.30, (
+        f"race_01 tracking error regressed to {track['avg_tracking_error_m']:.3f}m "
+        f"(threshold 0.30m; iter-009 baseline 0.089m)"
+    )
+
+
 def test_run_matrix_empty_configs_returns_empty_tracks():
     matrix = run_matrix([], duration=1.0)
     assert matrix["tracks"] == {}
