@@ -89,6 +89,16 @@ def test_race_01_regression_gate_passes_at_15s():
         f"race_01 tracking error regressed to {track['avg_tracking_error_m']:.3f}m "
         f"(threshold 0.30m; iter-009 baseline 0.089m)"
     )
+    # Iter-009g: also catch moderate slowdowns. The current test already
+    # catches catastrophic slowdowns (sim_time > duration → time_limit
+    # termination → sim_passed=False), but a 17.2s → 25s drift would
+    # silently pass. Competition lap-time matters: gate the sim_time at
+    # 1.3× the iter-009 baseline (≈22.4s). Anything slower means the
+    # tracker or planner has regressed in a meaningful way.
+    assert track["sim_time_s"] < 22.5, (
+        f"race_01 sim_time regressed to {track['sim_time_s']:.2f}s "
+        f"(threshold 22.5s; iter-009 baseline 17.17s) — perf regression"
+    )
 
 
 def test_matrix_pass_rate_at_least_six_of_seven():
