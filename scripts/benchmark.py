@@ -338,6 +338,14 @@ def run_synthetic_benchmark(
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
+    # iter-004 Phase 1 (research swarm consensus): validate the planned
+    # trajectory by replaying a fresh sequencer against samples BEFORE
+    # the kinematic sim runs. If the validator says the plan would DQ /
+    # crash, the bench surfaces it via `plan_validation` so we get an
+    # early warning (and a metric for iter-005's corridor work).
+    from planning.plan_validator import validate_trajectory
+    plan_validation = validate_trajectory(trajectory, gate_specs, dt=dt)
+
     # --- Offline per-section ILC (iter-001 A9 — course-agnostic) ----------
     # Section partition: prefer the course config's explicit
     # `ilc_section_overrides` block (e.g. race_01's hand-tuned 4-section
@@ -608,6 +616,19 @@ def run_synthetic_benchmark(
         "disqualified": bool(seq.is_disqualified),
         "dq_reason": seq.dq_reason,
         "last_crash_gate": seq.last_crash[0] if seq.last_crash else None,
+        # iter-004 Phase 1: pre-flight plan validation — does the planned
+        # trajectory itself (under perfect tracking) legally complete?
+        # Distinct from `sim_passed` which folds tracking error etc.
+        "plan_validation": {
+            "ok": plan_validation.ok,
+            "reason": plan_validation.reason,
+            "gates_passed": plan_validation.gates_passed,
+            "crashed": plan_validation.crashed,
+            "disqualified": plan_validation.disqualified,
+            "dq_reason": plan_validation.dq_reason,
+            "last_crash_gate": plan_validation.last_crash_gate,
+            "first_failure_time_s": plan_validation.first_failure_time_s,
+        },
         "gates_passed": seq.gates_passed,
         "total_gates": seq.total_gates,
         "gate_pass_rate": seq.gates_passed / seq.total_gates if seq.total_gates > 0 else 0,

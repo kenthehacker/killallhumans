@@ -96,6 +96,7 @@ def run_matrix(
             "avg_tracking_error_m": result.get("avg_tracking_error_m", 0.0),
             "max_tracking_error_m": result.get("max_tracking_error_m", 0.0),
             "sim_passed": result.get("sim_passed", False),
+            "plan_validation": result.get("plan_validation"),  # iter-004 Phase 1
             "is_placeholder": data.get("placeholder", False),
         }
         matrix["tracks"][name] = track_summary
