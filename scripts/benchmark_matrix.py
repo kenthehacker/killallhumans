@@ -157,37 +157,46 @@ def run_matrix(
 
 def _print_human(matrix: Dict[str, Any], file=sys.stderr) -> None:
     p = lambda *a, **kw: print(*a, **kw, file=file)
-    p(f"\n{'=' * 72}")
+    p(f"\n{'=' * 96}")
     p("AI Grand Prix — Multi-Track Regression Matrix")
-    p(f"{'=' * 72}")
+    p(f"{'=' * 96}")
     p(f"Duration per track: {matrix['duration_s']}s    dt: {matrix['dt']}s\n")
-    fmt = "{:<22} {:>6} {:>5} {:>8} {:>7} {:>8} {:>10} {:<24}"
-    p(fmt.format("track", "gates", "%", "complete",
-                  "crashed", "DQ", "term_reason", "tag"))
-    p("-" * 72)
+    # Iter-019: widened table to show tracking error, sim_time, and the
+    # iter-016/017 clamp engagement metric. Hidden in JSON mode (machine
+    # consumers still read full track_summary dicts).
+    fmt = "{:<20} {:>6} {:>5} {:>6} {:>4} {:>4} {:>6} {:>6} {:>7} {:>9} {:<14}"
+    p(fmt.format(
+        "track", "gates", "%", "time_s", "crash", "DQ",
+        "err_m", "sat_a%", "peak_a", "term", "tag",
+    ))
+    p("-" * 96)
     for name, t in matrix["tracks"].items():
         if "error" in t:
-            p(fmt.format(name, "-", "-", "-", "-", "-", "-", f"ERR: {t['error'][:24]}"))
+            p(fmt.format(name, "-", "-", "-", "-", "-", "-", "-", "-", "-",
+                         f"ERR: {t['error'][:13]}"))
             continue
         tag = "placeholder" if t["is_placeholder"] else "production"
         p(fmt.format(
             name,
             f"{t['gates_passed']}/{t['total_gates']}",
             f"{int(t['gate_pass_rate']*100)}",
-            "Y" if t["complete"] else "N",
+            f"{t['sim_time_s']:.1f}",
             "Y" if t["crashed"] else "N",
             "Y" if t["disqualified"] else "N",
-            t["termination_reason"][:18],
+            f"{t['avg_tracking_error_m']:.3f}",
+            f"{int(t.get('accel_clamp_active_frac', 0.0) * 100)}",
+            f"{t.get('max_accel_mag_pre_clamp', 0.0):.1f}",
+            t["termination_reason"][:9],
             tag,
         ))
-    p("\n" + "=" * 72)
+    p("\n" + "=" * 96)
     if matrix["all_passed"]:
         p("Overall: PASS")
     else:
         p(f"Overall: FAIL ({len(matrix['regressions'])} regression(s))")
         for r in matrix["regressions"]:
             p(f"  - {r}")
-    p("=" * 72)
+    p("=" * 96)
 
 
 def main():
