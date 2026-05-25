@@ -35,12 +35,14 @@ from typing import Iterable, Optional
 
 
 # Drone max lateral accel (m/s²). Matches `scripts/benchmark.py`'s
-# kinematic-sim saturation at line ~478 (`max_accel = 15.0`). Note that
-# `DroneConstraints.max_acceleration` in trajectory_optimizer.py is
-# *20.0* — the optimizer assumes more headroom than the bench actually
-# delivers. We use the bench's value (15.0) because tracking-error
-# bound is dominated by the binding physical limit, not the planner's
-# assumption.
+# kinematic-sim saturation (`max_accel = 15.0` in the bench's main
+# loop). Post-iter-010, `DroneConstraints.max_acceleration` in
+# `planning/trajectory_optimizer.py` also defaults to 15.0 (was 20.0
+# pre-iter-010; the 20 vs 15 cross-module lie was resolved by
+# centralising both in `competition.drone_spec.DEFAULT_MAX_ACCEL_MPS2`).
+# Kept as a separate literal here to avoid the `auto_velocity → competition`
+# import that would cross a packaging boundary; numerically locked to the
+# spec value via `tests/test_drone_spec_contract.py::test_auto_velocity_constants_match_drone_spec`.
 DEFAULT_DRONE_MAX_ACCEL: float = 15.0
 
 # Safety factor on the centripetal limit. The √(a·r) formula is the

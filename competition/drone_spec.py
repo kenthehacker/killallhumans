@@ -31,7 +31,7 @@ chassis dimensions.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # --- Bench-empirical: the kinematic sim's binding clamps ----------------------

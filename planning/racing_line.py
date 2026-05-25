@@ -197,12 +197,15 @@ class RacingLineOptimizer:
                 data = json.load(f)
             if data.get("cache_key") != cache_key:
                 return None
-            # Iter-009l (Opus Mi1): cache schema v2 split on
-            # select_velocity_mps (iter-009i) — pre-v2 caches MAY be
-            # functionally equivalent for the default basin but accepting
-            # them silently hides cases where iter-009b-style work happens
-            # to land the same SHA. Be strict.
-            if data.get("version") != 2:
+            # Iter-009l + iter-011 (Opus M1): cache schema v3.
+            # v2 = iter-009i added select_velocity_mps to the key.
+            # v3 = iter-010 lowered DroneConstraints.max_acceleration
+            #      from 20 → 15. Trajectories built under the v2 basin
+            #      used 20 m/s² inside _select_by_sim; the v3 selector
+            #      uses 15. Geometry-identical configs hash to the same
+            #      key, so reuse without a version bump silently mixes
+            #      pre/post-iter-010 offsets. Strict version check.
+            if data.get("version") != 3:
                 return None
             return np.array(data["offsets"], dtype=np.float64)
         except (json.JSONDecodeError, KeyError, ValueError):
@@ -219,9 +222,11 @@ class RacingLineOptimizer:
         """Save winning offsets to cache file."""
         from datetime import datetime, timezone
         data = {
-            # Iter-009l: bumped v1→v2 alongside the iter-009i cache-key
-            # schema change (added select_velocity_mps to the key).
-            "version": 2,
+            # Iter-011: v3 — bumped to invalidate v2 entries that were
+            # selected under DroneConstraints.max_acceleration=20 (iter-010
+            # dropped it to 15). Schema unchanged; only the basin physics
+            # changed.
+            "version": 3,
             "cache_key": cache_key,
             "offsets": offsets.tolist(),
             "metrics": metrics or {},
