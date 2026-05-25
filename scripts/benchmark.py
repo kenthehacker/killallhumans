@@ -794,10 +794,21 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         PlannerConfig, race_config.planner_overrides
     )
 
+    # iter-005b (Opus F4 BLOCKER + gpt-55-xhigh F1): align with the
+    # synthetic bench's config key. If the track JSON sets
+    # `max_velocity_mps` at the top level (the synthetic bench's
+    # convention), use it. Otherwise fall back to the legacy
+    # `planner_overrides.plan_max_speed_mps`. Same value applies on
+    # both bench paths now.
+    pybullet_max_v = float(
+        getattr(race_config, "max_velocity_mps", None)
+        or planner_cfg.plan_max_speed_mps
+    )
+
     rl_opt = RacingLineOptimizer(config=racing_line_cfg)
     opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=planner_cfg.plan_max_speed_mps),
+        constraints=DroneConstraints(max_velocity=pybullet_max_v),
         dt_sample=0.02,
         planner_config=planner_cfg,
     )

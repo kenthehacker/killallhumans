@@ -87,7 +87,12 @@ class PipelineConfig:
     detection_confidence_threshold: float = 0.3
 
     # Planning
-    max_speed: float = 12.0
+    # iter-005b (Opus F4 BLOCKER): default lowered from 12.0 to 8.0 to
+    # match the synthetic bench's new default. The previous 12.0 was a
+    # competition-path overfit: only race_01-like gate spacing could
+    # follow it. Tracks with tight turns (slalom-like) needed lower
+    # velocities. Callers can still override via `PipelineConfig(max_speed=...)`.
+    max_speed: float = 8.0
     trajectory_dt: float = 0.01
 
     # Control mode

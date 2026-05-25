@@ -55,9 +55,15 @@ def validate_trajectory(
     gates: List[GateSpec],
     dt: float = 0.01,
     enforce_in_order: bool = True,
-    proximity_pass_distance: float = 0.0,
+    proximity_pass_distance: float = 1.0,
 ) -> ValidationResult:
     """Replay a fresh GateSequencer against samples of `trajectory`.
+
+    Iter-005b (Opus F1 / composer F1 / gpt-55-xhigh F3 MAJOR consensus):
+    `proximity_pass_distance` defaults to 1.0 to match the synthetic
+    bench's SequencerConfig (was 0.0, which produced false-negatives
+    on plans that legitimately use proximity-credit at gate close-pass).
+    Callers wanting the strict no-proximity check can pass 0.0.
 
     Args:
         trajectory: any object with `.total_time` and `.sample(t)` returning
@@ -69,7 +75,8 @@ def validate_trajectory(
         dt: sample step in seconds. 0.01 matches the bench default.
         enforce_in_order: if True (default), the sequencer's strict
             in-order DQ logic is on — same as the runtime.
-        proximity_pass_distance: forward to SequencerConfig.
+        proximity_pass_distance: forward to SequencerConfig. Default 1.0
+            matches the synthetic bench's SequencerConfig.
 
     Returns:
         ValidationResult. `ok` is True iff the trajectory completes the
