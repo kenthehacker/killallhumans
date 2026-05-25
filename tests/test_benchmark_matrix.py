@@ -91,6 +91,51 @@ def test_race_01_regression_gate_passes_at_15s():
     )
 
 
+def test_matrix_pass_rate_at_least_six_of_seven():
+    """Iter-009f: locks in the iter-009 multi-track win.
+
+    Iter-001 started at 1/7 (race_01 only — pure overfitting). The
+    geometry-derived auto_velocity + fractional ILC overrides in
+    iter-006..iter-009 unlocked 6/7 (only figure8 still crashes, due
+    to coplanar gates 1 and 5 that share x=5 — known-unsolvable
+    without trajectory pre-shaping or SFC corridor work).
+
+    A future change that erodes the generalisation gain (e.g.
+    re-introducing course-specific magic numbers; a too-aggressive
+    velocity that breaks slalom; a tracker-gain tweak that destabilises
+    grand_tour) would silently drop the pass rate. This test catches
+    that.
+
+    Assertion: at least 6/7 non-figure8 tracks PASS with tracking
+    error < 0.40m. figure8 is excluded — it remains an open known
+    issue.
+    """
+    paths = _list_configs()
+    matrix = run_matrix(paths, duration=30.0)
+
+    expected_pass = []
+    actual_pass = []
+    regressions = []
+    for name, track in matrix["tracks"].items():
+        if name == "figure8":
+            continue  # known-unsolvable; exclude from pass-rate gate
+        expected_pass.append(name)
+        if track["sim_passed"] and track["avg_tracking_error_m"] < 0.40:
+            actual_pass.append(name)
+        else:
+            regressions.append(
+                f"{name}: pass={track['sim_passed']} "
+                f"gates={track['gates_passed']}/{track['total_gates']} "
+                f"err={track['avg_tracking_error_m']:.3f}m "
+                f"reason={track['termination_reason']}"
+            )
+
+    assert len(actual_pass) >= 6, (
+        f"matrix pass-rate regressed: only {len(actual_pass)}/{len(expected_pass)} "
+        f"tracks pass; regressions=\n  " + "\n  ".join(regressions)
+    )
+
+
 def test_run_matrix_empty_configs_returns_empty_tracks():
     matrix = run_matrix([], duration=1.0)
     assert matrix["tracks"] == {}
