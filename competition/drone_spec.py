@@ -54,6 +54,27 @@ the planner commands above this gets vector-clamped, distorting the
 intended trajectory. Was 20.0 in DroneConstraints pre-iter-010 — that
 default was unreachable under the bench's actual saturation."""
 
+DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH: float = 1.5
+"""Per-pass cap on segment-time stretch applied by the iter-032
+polynomial-peak projection in `planning/trajectory_optimizer.py`.
+
+Why 1.5: a single anomalous boundary spike (e.g., min-snap C³
+discontinuity at the finish waypoint forced-decel) can push the
+sqrt(peak/target) ratio above 2× even though the segment's interior is
+fine. Capping per-pass at 1.5 lets the iteration converge over 2-3
+passes for the typical 50-80 m/s² peaks observed on race_01 /
+aigp_default, while preventing one outlier sample from doubling lap
+time. Drone-spec constant (not course-specific) so the cap is uniform
+across tracks."""
+
+DEFAULT_ACCEL_PROJECTION_MIN_SEG_TIME_S: float = 0.15
+"""Below this segment time, the iter-032 projection skips the segment
+even if it's over budget. Avoids fighting the 0.1 s minimum-segment
+floor in `_optimize_time_allocation` and prevents pathological
+oscillation when a sub-0.15 s segment carries a single boundary spike
+that the projection's interior-sampling can't distinguish from a real
+peak."""
+
 DEFAULT_MAX_VELOCITY_MPS: float = 15.0
 """Maximum linear velocity the bench's tracker clamps to.
 

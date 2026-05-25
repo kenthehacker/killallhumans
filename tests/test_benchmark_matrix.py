@@ -89,15 +89,15 @@ def test_race_01_regression_gate_passes_at_15s():
         f"race_01 tracking error regressed to {track['avg_tracking_error_m']:.3f}m "
         f"(threshold 0.30m; iter-009 baseline 0.089m)"
     )
-    # Iter-009g: also catch moderate slowdowns. The current test already
-    # catches catastrophic slowdowns (sim_time > duration → time_limit
-    # termination → sim_passed=False), but a 17.2s → 25s drift would
-    # silently pass. Competition lap-time matters: gate the sim_time at
-    # 1.3× the iter-009 baseline (≈22.4s). Anything slower means the
-    # tracker or planner has regressed in a meaningful way.
-    assert track["sim_time_s"] < 22.5, (
+    # Iter-009g + iter-032: catch moderate slowdowns. Pre-iter-032
+    # baseline was 17.17s but the polynomial-peak projection trades
+    # ~7s of lap time for 27% lower tracking error and a 21.7% → 2.7%
+    # collapse in accel-clamp engagement (planner-vs-bench honesty).
+    # Iter-032 baseline: 24.39s. Ceiling 26s allows ~7% headroom for
+    # tracker-tune drifts before flapping.
+    assert track["sim_time_s"] < 26.0, (
         f"race_01 sim_time regressed to {track['sim_time_s']:.2f}s "
-        f"(threshold 22.5s; iter-009 baseline 17.17s) — perf regression"
+        f"(threshold 26.0s; iter-032 baseline 24.39s) — perf regression"
     )
 
 
@@ -145,22 +145,29 @@ def test_matrix_pass_rate_at_least_six_of_seven():
     error < 0.40m AND sim_time < 1.6× the iter-009 baseline. figure8
     is excluded — it remains an open known issue.
 
-    Per-track sim_time baselines (iter-009f, duration=30s):
-      aigp_default       7.8s   → ceiling 12.5s
-      grand_tour        18.3s   → ceiling 29.5s
-      race_01           17.2s   → ceiling 27.5s (overlaps test_race_01)
-      slalom             8.2s   → ceiling 13.5s
-      straight_hairpin   8.3s   → ceiling 13.5s
-      vertical_cliff    11.5s   → ceiling 19.0s
+    Per-track sim_time baselines (iter-032, duration=30s, post-projection):
+      aigp_default      11.78s  → ceiling 14.0s
+      grand_tour        23.88s  → ceiling 29.5s
+      race_01           24.39s  → ceiling 27.5s (overlaps test_race_01)
+      slalom            13.80s  → ceiling 15.5s
+      straight_hairpin  10.45s  → ceiling 13.5s
+      vertical_cliff    13.25s  → ceiling 19.0s
+
+    Iter-032 relaxed `slalom` (13.5→15.5s) and `aigp_default` (12.5→14s)
+    because the new polynomial-peak accel projection
+    (`_project_accel_peaks`) stretches segments to keep ||a|| ≤ 15 m/s²
+    — trading lap time for honesty. The win: tracking errors dropped
+    17-89% across all tracks and accel-clamp engagement collapsed from
+    21-72% to 0.5-22%. Reliable racing > optimistic single-lap time.
     """
-    # Iter-009h: per-track sim_time ceilings. Baselines measured 2026-05-24
-    # at iter-009g's `aa5aea1`. Ceilings set at ~1.6× to allow moderate
-    # changes without flapping but catch >60% slowdowns.
+    # Iter-009h: per-track sim_time ceilings, iter-032: relaxed slalom +
+    # aigp_default to absorb projection stretch. Ceilings now ~15-30%
+    # above iter-032 baselines.
     SIM_TIME_CEILINGS = {
-        "aigp_default": 12.5,
+        "aigp_default": 14.0,
         "grand_tour": 29.5,
         "race_01": 27.5,  # overlaps race_01 dedicated test, intentionally
-        "slalom": 13.5,
+        "slalom": 15.5,
         "straight_hairpin": 13.5,
         "vertical_cliff": 19.0,
     }
@@ -253,3 +260,43 @@ def test_run_matrix_empty_configs_returns_empty_tracks():
     assert matrix["tracks"] == {}
     # No tracks means nothing failed, so all_passed is vacuously True.
     assert matrix["all_passed"] is True
+
+
+def test_iter032_accel_projection_drops_clamp_engagement():
+    """Iter-032 (charter task #10): the new
+    `_project_accel_peaks` pass in `planning/trajectory_optimizer.py`
+    must drive accel-clamp engagement well below the iter-016 baseline
+    on the two worst-offender tracks.
+
+    iter-016 baseline → iter-032 measurement (post-projection,
+    duration=30s):
+      race_01:      21.7% → 2.7%   (8× drop)
+      aigp_default: 72.2% → 21.8%  (3× drop)
+
+    aigp_default doesn't get below 20% because the placeholder track
+    has aggressive geometry and the per-pass 1.5× cap in
+    `DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH` requires more passes
+    than max_passes=3 to fully converge. The 25% ceiling preserves
+    the 3× empirical win while leaving headroom for tuning drift.
+
+    If this test fails, the projection isn't actually projecting —
+    either it's not being called from `optimize()` or
+    `DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH` is set too low.
+    """
+    TARGET_TRACKS = ("race_01", "aigp_default")
+    CEILINGS = {"race_01": 0.10, "aigp_default": 0.25}
+    paths = [p for p in _list_configs() if p.stem in TARGET_TRACKS]
+    matrix = run_matrix(paths, duration=30.0)
+    violations: list[str] = []
+    for name in TARGET_TRACKS:
+        observed = matrix["tracks"][name].get("accel_clamp_active_frac", 1.0)
+        ceiling = CEILINGS[name]
+        if observed >= ceiling:
+            violations.append(
+                f"{name}: accel_clamp_active_frac={observed:.1%} >= "
+                f"{ceiling:.0%} ceiling (iter-032 projection target)"
+            )
+    assert not violations, (
+        "iter-032 polynomial-peak projection failed to drop clamp "
+        "engagement below ceiling:\n  " + "\n  ".join(violations)
+    )
