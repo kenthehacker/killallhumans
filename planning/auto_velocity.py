@@ -9,16 +9,24 @@ the controller cannot track the trajectory, regardless of how good the
 gains are.
 
 For three consecutive gates A → B → C with bend angle β at B:
-    chord     ≈ min(|AB|, |BC|)
-    turn_radius ≈ chord / (2 · sin(β/2))                        (inscribed-arc approx)
-    v_max     ≈ √(a_max · r_min) · safety_factor
+    chord       ≈ (|AB| + |BC|) / 2                              (arithmetic mean)
+    turn_radius ≈ chord / (2 · sin(β/2))                         (inscribed-arc approx)
+    v_max       ≈ min(√(a_max · r_min) · safety_factor, drone_max_speed)
 
-Per-track tracks with tight bends (slalom β≈90°, |AB|≈3m → r≈2.1m → v_max≈4.6m/s)
-get auto-throttled; race_01 (most gates β<30°, |AB|≈8-10m → r≈30m → v_max≈15m/s)
-gets the full default.
+Tracks with tight bends (slalom β≈90°, chord≈3m → r≈2.1m → v_max≈4.6m/s) get
+auto-throttled; tracks with mostly straight runs (β<30°, chord≈8-10m → r≈30m)
+fall through to the drone's max-speed cap.
 
 This avoids the 15→8→6 sequence of hand-tuned globals and per-track overrides
 that the iter-005 review flagged as charter-violating magic numbers.
+
+Iter-009b: the previously-named `DEFAULT_ABSOLUTE_CAP_MPS` is now
+`DEFAULT_DRONE_MAX_SPEED_MPS`. The value (15.0 m/s) is physically grounded
+— it matches `scripts/benchmark.py`'s kinematic-sim velocity saturation,
+which is the binding constraint in the synthetic bench. The trajectory
+optimizer's `DroneConstraints.max_velocity` also happens to be 15.0 m/s.
+The old name and "race_01 ILC sweep" comment were misleading — this cap
+is a drone-spec property, not a course artifact.
 """
 from __future__ import annotations
 
@@ -26,22 +34,33 @@ import math
 from typing import Iterable, Optional
 
 
-# Drone max lateral accel (m/s²). The synthetic kinematic sim uses 15
-# (matches DroneConstraints.max_acceleration in trajectory_optimizer);
-# realistic ~280mm AIGP drones can exceed this but the bench is the
-# binding constraint right now.
+# Drone max lateral accel (m/s²). Matches `scripts/benchmark.py`'s
+# kinematic-sim saturation at line ~478 (`max_accel = 15.0`). Note that
+# `DroneConstraints.max_acceleration` in trajectory_optimizer.py is
+# *20.0* — the optimizer assumes more headroom than the bench actually
+# delivers. We use the bench's value (15.0) because tracking-error
+# bound is dominated by the binding physical limit, not the planner's
+# assumption.
 DEFAULT_DRONE_MAX_ACCEL: float = 15.0
 
 # Safety factor on the centripetal limit. The √(a·r) formula is the
 # *kinematic* limit; in practice the tracker's PD overshoot, drag, and
-# discretization error eat ~20-30%. 0.8 leaves a margin without being
-# overly conservative on race_01-class tracks.
+# discretization error eat ~20-30%. 0.8 leaves a margin against tracker
+# saturation without flooring achievable velocity on long straights.
 DEFAULT_SAFETY_FACTOR: float = 0.8
 
-# Hard cap regardless of geometry — keeps race_01 from suddenly using
-# 30 m/s on its widest segments. Aligned with the legacy default that
-# the original race_01 ILC sweep targeted.
-DEFAULT_ABSOLUTE_CAP_MPS: float = 15.0
+# Drone max speed cap (m/s) — used as the upper bound when the geometry
+# has no binding bend (mostly-straight tracks). Matches both the bench's
+# kinematic-sim velocity saturation and the trajectory optimizer's
+# `DroneConstraints.max_velocity`. Real AIGP-class drones can exceed
+# this; the cap reflects the *synthetic bench's* drone, not the
+# competition drone (acknowledging the sim-vs-real drone mismatch).
+DEFAULT_DRONE_MAX_SPEED_MPS: float = 15.0
+
+# Iter-009b BACKWARD-COMPAT: keep the old name as an alias so any
+# external imports (notebooks, sweeps) still work. Removable once we've
+# confirmed nothing imports it.
+DEFAULT_ABSOLUTE_CAP_MPS: float = DEFAULT_DRONE_MAX_SPEED_MPS
 
 # Minimum bend angle (radians) to consider a 3-gate sequence "turning."
 # Below this, the centripetal limit is too lax to bound velocity and
@@ -59,7 +78,7 @@ def derive_safe_max_velocity(
     gates: Iterable,
     drone_max_accel: float = DEFAULT_DRONE_MAX_ACCEL,
     safety_factor: float = DEFAULT_SAFETY_FACTOR,
-    absolute_cap_mps: float = DEFAULT_ABSOLUTE_CAP_MPS,
+    absolute_cap_mps: float = DEFAULT_DRONE_MAX_SPEED_MPS,
 ) -> float:
     """Compute a centripetal-acceleration-limited safe max velocity for a
     sequence of gates.
