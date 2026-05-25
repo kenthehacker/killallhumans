@@ -164,7 +164,10 @@ def run_unit_tests() -> Dict[str, Any]:
 
     # --- Geometric tracker (tight hover test — Phase 1 requirement) ---
     def _gt():
-        tr = GeometricTracker(TrackerConfig(max_thrust_n=20.0, mass=1.0, gravity=9.81))
+        # Iter-020: explicit overrides are now redundant since iter-013
+        # routed TrackerConfig defaults through competition.drone_spec.
+        # mass=1.0, gravity=9.81, max_thrust_n=20.0 are the spec defaults.
+        tr = GeometricTracker(TrackerConfig())
         ref = TrajectoryPoint(0, (0, 0, -2), (0, 0, 0), (0, 0, 0), (0, 0, 0), 0, 0)
         cmd = tr.track((0, 0, -2), (0, 0, 0), 0.0, ref)
         assert abs(cmd.roll_rad) < 0.01, f"hover roll={cmd.roll_rad:.4f} (must be <0.01)"
@@ -464,11 +467,14 @@ def run_synthetic_benchmark(
     # tracker overshoot is the dominant failure mode on tight geometries.
     # Letting callers override gains via `tracker_config_overrides` opens
     # an experimentation seam without touching race_01's tuning.
+    # Iter-020: mass/gravity/max_thrust_n stripped — iter-013 routed
+    # TrackerConfig defaults through competition.drone_spec, so passing
+    # them explicitly was redundant. The PD gains and feedforward stay
+    # inline (they're controller-tuning, not drone-envelope).
     tracker_kwargs = dict(
         kp_xy=7.0, kd_xy=5.5, kp_z=8.0, kd_z=5.0,
         feedforward_accel=0.50,
         velocity_feedforward=0.0,
-        mass=1.0, gravity=9.81, max_thrust_n=20.0,
     )
     if tracker_config_overrides:
         tracker_kwargs.update(tracker_config_overrides)
