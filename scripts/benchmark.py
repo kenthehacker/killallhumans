@@ -246,6 +246,7 @@ def run_synthetic_benchmark(
     dt: float = 0.01,
     config: Optional[Dict[str, Any]] = None,
     tracker_config_overrides: Optional[Dict[str, Any]] = None,
+    record_position_trace: bool = False,
 ) -> Dict[str, Any]:
     """
     Run the full pipeline with synthetic kinematic simulation.
@@ -517,6 +518,10 @@ def run_synthetic_benchmark(
     gate_pass_times = []
     per_gate_errors = {}
     controller_trace = []  # Phase 1: record controller outputs
+    # Iter-033: optional per-step position trace so the matrix
+    # visualizer can replay the EXACT drone path the bench produced.
+    # Off by default to keep result-dict size small for tests.
+    position_trace = [] if record_position_trace else None
     crashed = False
     termination_reason = "time_limit"
 
@@ -683,6 +688,15 @@ def run_synthetic_benchmark(
         closest = trajectory.find_closest(tuple(pos))
         err = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, closest.position)))
         tracking_errors.append(err)
+        # Iter-033: optional position trace for the matrix visualizer.
+        if position_trace is not None:
+            position_trace.append({
+                "t": sim_time,
+                "pos": tuple(float(v) for v in pos),
+                "vel": tuple(float(v) for v in vel),
+                "yaw": float(yaw),
+                "tracking_err_m": float(err),
+            })
 
         cur = seq.current_gate
         if cur:
@@ -784,6 +798,11 @@ def run_synthetic_benchmark(
             list(tracker.feature_trace)
             if getattr(tracker, "feature_trace", None) else []
         ),
+        # Iter-033: drone position trace (when record_position_trace=True).
+        # Used by `scripts/visualize_matrix.py` to replay the matrix
+        # bench's drone path. None when the flag is off — keeps the
+        # default result dict small for unit tests.
+        "position_trace": position_trace,
     }
 
     # Threshold checks
