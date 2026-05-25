@@ -167,6 +167,31 @@ def test_bench_exposes_tracker_feature_trace_when_enabled():
     assert len(vel_err) == 3
 
 
+def test_collect_residual_dataset_smoke(tmp_path, monkeypatch):
+    """Iter-025: collect_residual_dataset.collect() runs the bench
+    across non-skip tracks, concatenates traces, saves an .npz that
+    round-trips through `load_feature_trace`. Smoke-tests the
+    pipeline end-to-end; we monkeypatch `_SKIP` to only one track
+    so the test stays under a few seconds."""
+    from control.learned_residual import load_feature_trace
+    from scripts import collect_residual_dataset as col
+
+    # Skip all but race_01 to keep wall-time bounded.
+    monkeypatch.setattr(
+        col, "_SKIP",
+        {"figure8", "aigp_default", "slalom", "grand_tour",
+         "straight_hairpin", "vertical_cliff"},
+    )
+    out = tmp_path / "ds.npz"
+    summary = col.collect(out, duration=2.0)
+    assert summary["total_samples"] > 50
+    # Verify the file round-trips.
+    loaded = load_feature_trace(out)
+    assert loaded["features"].shape[1] == DEFAULT_N_INPUTS
+    assert loaded["features"].shape[0] == summary["total_samples"]
+    assert loaded["pos_err"].shape == (summary["total_samples"], 3)
+
+
 def test_init_residual_weights_script_writes_loadable_zero_npz(tmp_path):
     """Iter-022 connect-the-dots: the init_residual_weights.py script
     must produce a .npz file that `TrackerResidualMLP.from_npz` can

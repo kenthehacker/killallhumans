@@ -30,3 +30,6 @@ planning/racing_line_cache.json
 # placeholder; future iters fit it from collected traces). The
 # script `scripts/init_residual_weights.py` writes it on demand.
 control/residual_weights.npz
+# Iter-025: residual_dataset.npz is the collected training data
+# (regenerable via scripts/collect_residual_dataset.py); also gitignored.
+control/residual_dataset.npz
