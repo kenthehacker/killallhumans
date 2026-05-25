@@ -889,6 +889,15 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
             termination_reason = "crash_ground"
             break
 
+        # Iter-008 F12 (Opus, platform-drift MINOR): synthetic bench has
+        # a ceiling check; PyBullet now matches. Without this the same
+        # trajectory would terminate at z>20 in the synthetic bench but
+        # silently fly out of the airspace in the PyBullet bench.
+        if pos[2] > 20.0:
+            crashed = True
+            termination_reason = "crash_ceiling"
+            break
+
         # Gate-contact crash detection: any contact point against an
         # un-passed gate counts as a crash. Passing through the gate
         # opening triggers the sequencer first (handled above), so a

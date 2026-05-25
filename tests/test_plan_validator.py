@@ -239,18 +239,27 @@ def test_trajectory_above_ceiling_is_flagged_as_crash_ceiling():
 
 
 def test_trajectory_within_airspace_no_flag():
-    """A trajectory that stays within bounds shouldn't trigger airspace check."""
-    gates = _make_line_gates(2)
-    # Stay at z=2 throughout (between 0.05 ground and 20.0 ceiling)
+    """A trajectory that stays within bounds shouldn't trigger airspace check.
+
+    Iter-008 (Opus F5): the prior version was vacuous because both the
+    gates and the trajectory were on the same z plane (z=2 after the
+    iter-006 NED→z-up flip) so the trajectory actually DID pass gates.
+    Now the trajectory completes all gates AND we assert the reason
+    is the success case (not an airspace exit).
+    """
+    gates = _make_line_gates(2)  # gates at z=2
+    # Pass through both gates cleanly, staying well within [0.05, 20.0].
     traj = _StubTrajectory(
         waypoints=[
-            (0.0, 0.0, 2.0), (5.0, 0.0, 2.0), (10.0, 0.0, 2.0),
+            (0.0, 0.0, 2.0),   # behind g1
+            (4.5, 0.0, 2.0),
+            (5.5, 0.0, 2.0),   # crossed g1
+            (9.5, 0.0, 2.0),
+            (10.5, 0.0, 2.0),  # crossed g2
         ],
-        times=[0.0, 1.0, 2.0],
+        times=[0.0, 0.5, 1.0, 1.5, 2.0],
     )
-    # Note: gates here are at z=-2 from _make_line_gates so the path
-    # doesn't pass them. Result will be incomplete but NOT airspace.
     result = validate_trajectory(traj, gates, dt=0.02)
-    if not result.ok:
-        assert "ground" not in result.reason.lower()
-        assert "ceiling" not in result.reason.lower()
+    assert result.ok, f"clean in-bounds trajectory should pass; reason={result.reason}"
+    assert "ground" not in result.reason.lower()
+    assert "ceiling" not in result.reason.lower()

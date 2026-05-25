@@ -126,16 +126,24 @@ def run_matrix(
                 matrix["regressions"].append(
                     f"{name}: gate_pass_rate {track_summary['gate_pass_rate']:.0%} < 75%"
                 )
-            # Iter-006 F11 (Opus): a production track with an illegal
-            # PLAN is a regression even if the sim happens to complete
-            # (e.g., the kinematic noise pushed the drone away from the
-            # illegal crossing). A passing sim with a broken plan would
-            # not transfer to a real drone.
-            pv = track_summary.get("plan_validation") or {}
-            if pv.get("ok") is False:
+            # Iter-006 F11 (Opus) — patched in iter-008: the original
+            # `pv.get("ok") is False` had 3 holes:
+            #   1) missing plan_validation field (None) treated as OK
+            #   2) non-bool ok values (e.g. "yes") accepted as truthy
+            #   3) any non-False value (None, 0, "") slipped through
+            # Now we require an EXPLICIT True bool; anything else is a
+            # regression on production tracks.
+            pv = track_summary.get("plan_validation")
+            if pv is None:
                 matrix["all_passed"] = False
                 matrix["regressions"].append(
-                    f"{name}: plan_validation.ok=False — {pv.get('reason', 'unknown')}"
+                    f"{name}: plan_validation MISSING — bench didn't emit it"
+                )
+            elif pv.get("ok") is not True:
+                # Catches False, None, 0, "", truthy-non-bool, etc.
+                matrix["all_passed"] = False
+                matrix["regressions"].append(
+                    f"{name}: plan_validation.ok={pv.get('ok')!r} — {pv.get('reason', 'unknown')}"
                 )
 
     return matrix

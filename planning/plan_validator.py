@@ -22,13 +22,12 @@ against samples, and returns a structured result.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 from gate_sequencing.sequencer import (
     GateSequencer,
     GateSpec,
-    RaceState,
     SequencerConfig,
 )
 
@@ -47,7 +46,6 @@ class ValidationResult:
     last_crash_gate: Optional[str]      # If crashed, the gate hit
     samples_evaluated: int              # How many trajectory points were sampled
     first_failure_time_s: Optional[float] = None  # Sim time of DQ/crash
-    extras: dict = field(default_factory=dict)    # Per-event metadata
 
 
 def validate_trajectory(
@@ -119,8 +117,13 @@ def validate_trajectory(
     samples = int(total_time / dt) + 1
     first_failure_time: Optional[float] = None
     airspace_violation: Optional[str] = None
+    # Iter-008 (Opus F4 dead-code cleanup): track samples evaluated
+    # explicitly instead of using a brittle `"step" in dir()` guard
+    # that doesn't work if the for-loop body never executes.
+    samples_processed = 0
 
     for step in range(samples):
+        samples_processed = step + 1
         t = step * dt
         if t > total_time:
             break
@@ -185,6 +188,6 @@ def validate_trajectory(
         disqualified=disqualified,
         dq_reason=seq.dq_reason,
         last_crash_gate=seq.last_crash[0] if seq.last_crash else None,
-        samples_evaluated=step + 1 if "step" in dir() else samples,
+        samples_evaluated=samples_processed,
         first_failure_time_s=first_failure_time,
     )
