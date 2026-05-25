@@ -110,7 +110,13 @@ def derive_safe_max_velocity(
         bend = math.pi - interior_angle         # 0 if straight, π if hairpin
         if bend < _MIN_BEND_RAD:
             continue  # essentially straight — no centripetal limit
-        chord = min(len_ab, len_bc)
+        # Iter-006 review Opus F2: arithmetic-mean chord is a better
+        # representative for asymmetric triplets than `min(|AB|, |BC|)`.
+        # `min` aggressively undercounts the radius when one arm is much
+        # longer than the other (e.g. ascent into a tight corner that
+        # exits onto a long straight). Mean averages the two arms and
+        # tracks the polynomial trajectory's smoothed bend more closely.
+        chord = (len_ab + len_bc) / 2.0
         r = chord / (2.0 * math.sin(bend / 2.0))
         if r < min_radius:
             min_radius = r

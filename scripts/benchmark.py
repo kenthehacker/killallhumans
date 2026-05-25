@@ -797,16 +797,20 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         PlannerConfig, race_config.planner_overrides
     )
 
-    # iter-005b (Opus F4 BLOCKER + gpt-55-xhigh F1): align with the
-    # synthetic bench's config key. If the track JSON sets
-    # `max_velocity_mps` at the top level (the synthetic bench's
-    # convention), use it. Otherwise fall back to the legacy
-    # `planner_overrides.plan_max_speed_mps`. Same value applies on
-    # both bench paths now.
-    pybullet_max_v = float(
-        getattr(race_config, "max_velocity_mps", None)
-        or planner_cfg.plan_max_speed_mps
-    )
+    # iter-007 (3-way BLOCKER fix to iter-005b's dead code): RaceConfig
+    # now actually has the max_velocity_mps field, so this getattr does
+    # what iter-005b claimed. Fallback chain matches the synthetic bench:
+    #   1. explicit `max_velocity_mps` in track JSON
+    #   2. legacy `planner_overrides.plan_max_speed_mps`
+    #   3. auto-derive from gate geometry
+    from planning.auto_velocity import derive_safe_max_velocity
+    explicit_max_v = race_config.max_velocity_mps
+    if explicit_max_v is not None:
+        pybullet_max_v = float(explicit_max_v)
+    elif race_config.planner_overrides.get("plan_max_speed_mps") is not None:
+        pybullet_max_v = float(planner_cfg.plan_max_speed_mps)
+    else:
+        pybullet_max_v = derive_safe_max_velocity(gate_specs)
 
     rl_opt = RacingLineOptimizer(config=racing_line_cfg)
     opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
