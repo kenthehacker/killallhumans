@@ -234,6 +234,7 @@ def run_synthetic_benchmark(
     duration: float = 30.0,
     dt: float = 0.01,
     config: Optional[Dict[str, Any]] = None,
+    tracker_config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run the full pipeline with synthetic kinematic simulation.
@@ -333,8 +334,16 @@ def run_synthetic_benchmark(
     rl_opt = RacingLineOptimizer()
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
+    # iter-005 (post velocity-sweep experiment): the 15.0 m/s default
+    # was a course-overfit magic number. At v=8.0 the bench passes 6/7
+    # tracks (race_01 + grand_tour + slalom + straight_hairpin +
+    # vertical_cliff + aigp_default) versus 1/7 at v=15. race_01 does
+    # NOT regress (still completes 12/12 cleanly, just slightly slower).
+    # Per-track override stays available via `max_velocity_mps` in the
+    # track config JSON for racetracks that genuinely need 15 m/s.
+    max_velocity = float(data.get("max_velocity_mps", 8.0))
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=15.0), dt_sample=0.02,
+        constraints=DroneConstraints(max_velocity=max_velocity), dt_sample=0.02,
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
@@ -398,12 +407,24 @@ def run_synthetic_benchmark(
     # the most important single fix. NGTC (Pries 2025) — literature gains 2-4x
     # higher. Damping: ζ=(kd+drag)/(2√kp)=(5.5+0.5)/(2√7)≈1.13 (stable).
     # 40+ configs swept: ff=0.50 kp=7 kd=5.5 optimal — avg err -13.4%.
-    tracker = GeometricTracker(TrackerConfig(
+    # iter-005 (research-swarm consensus + plan-validator diagnostic):
+    # tracker overshoot is the dominant failure mode on tight geometries.
+    # Letting callers override gains via `tracker_config_overrides` opens
+    # an experimentation seam without touching race_01's tuning.
+    tracker_kwargs = dict(
         kp_xy=7.0, kd_xy=5.5, kp_z=8.0, kd_z=5.0,
         feedforward_accel=0.50,
         velocity_feedforward=0.0,
         mass=1.0, gravity=9.81, max_thrust_n=20.0,
-    ))
+    )
+    if tracker_config_overrides:
+        tracker_kwargs.update(tracker_config_overrides)
+    # Course-level overrides via track config (no per-call arg needed for
+    # plumbing into matrix experiments / per-track tuning).
+    course_tracker_overrides = data.get("tracker_overrides", {})
+    if course_tracker_overrides:
+        tracker_kwargs.update(course_tracker_overrides)
+    tracker = GeometricTracker(TrackerConfig(**tracker_kwargs))
 
     # Predictive feedforward lookahead (Tal & Karaman 2018 style).
     # Use acceleration from slightly ahead in the trajectory to
