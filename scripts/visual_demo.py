@@ -408,6 +408,12 @@ class VisualDemo:
         # ── Controller ──
         # Use a tracker for HUD readout; actual sim stepping uses GPDDrone.step()
         # which internally runs DSLPIDControl.
+        # Iter-023: mass=0.027 / max_thrust_n=0.6 are DELIBERATELY different
+        # from `competition.drone_spec` defaults (1.0 kg / 20.0 N). This is
+        # the Crazyflie-class CF2X envelope used by visual_demo's GPDDrone
+        # backend, NOT the synthetic-bench drone. Like sim_pybullet/drone.py
+        # (iter-021), this lives outside the drone_spec SSOT on purpose —
+        # the demo simulates a different platform.
         tc = TrackerConfig(
             kp_xy=6.0, kd_xy=4.0, kp_z=8.0, kd_z=5.0,
             mass=0.027, gravity=9.81, max_thrust_n=0.6,
