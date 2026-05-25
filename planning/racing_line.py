@@ -95,12 +95,8 @@ class RacingLineConfig:
     # path-velocity decoupling per Heilmeier 2019 / Kapania 2016 TUM
     # method. The optimal lateral-offset *geometry* is chosen independent
     # of the velocity it will be flown at; the velocity profile is then
-    # solved separately. Concretely:
-    #
-    #   max_velocity_mps: the velocity the trajectory will be EXECUTED at
-    #     downstream (informational; not used inside the optimizer's
-    #     selection step). Callers may set this from
-    #     planning/auto_velocity.derive_safe_max_velocity.
+    # solved separately by the downstream TrajectoryOptimizer (which the
+    # bench constructs with the auto-derived execution velocity).
     #
     #   select_velocity_mps: the velocity the BO scorer uses INTERNALLY
     #     when generating candidate min-snap trajectories for ranking.
@@ -109,24 +105,26 @@ class RacingLineConfig:
     #     will be. Changing this is the F9 regression mechanism (4 agent
     #     diagnoses: Opus/GPT-5.5/Composer/Gemini all identified the same
     #     velocity-coupled basin-switching in `.loop/research/f9_*.md`).
-    max_velocity_mps: float = 15.0
+    #
+    # Iter-009k: `max_velocity_mps` field REMOVED. The 7-agent review
+    # of iter-009i (4/7 reviewers) flagged it as a "semantic API trap"
+    # — informational-only, read by nothing, but its name suggested it
+    # would control the optimizer. Removing it structurally eliminates
+    # the F9-reintroduction vector. Callers that need the
+    # execution velocity wire it into TrajectoryOptimizer directly.
     select_velocity_mps: float = 15.0
 
     def __post_init__(self):
-        # Iter-009j (Codex#2 MAJOR + Opus M5/M4 + Composer M9): validate
-        # the two velocity fields. NaN/Inf/<=0 in select_velocity_mps would
-        # poison TrajectoryOptimizer's segment-time math AND produce
+        # Iter-009j (Codex#2 MAJOR): NaN/Inf/<=0 in select_velocity_mps
+        # would poison TrajectoryOptimizer's segment-time math AND produce
         # non-standard JSON cache keys. Reject early with a clear error.
         import math as _math
-        for name, val in (
-            ("max_velocity_mps", self.max_velocity_mps),
-            ("select_velocity_mps", self.select_velocity_mps),
-        ):
-            if not _math.isfinite(val) or val <= 0:
-                raise ValueError(
-                    f"RacingLineConfig.{name}={val!r} is invalid; must be a "
-                    f"finite positive float."
-                )
+        if not _math.isfinite(self.select_velocity_mps) or self.select_velocity_mps <= 0:
+            raise ValueError(
+                f"RacingLineConfig.select_velocity_mps="
+                f"{self.select_velocity_mps!r} is invalid; must be a "
+                f"finite positive float."
+            )
 
 
 class RacingLineOptimizer:
@@ -178,10 +176,11 @@ class RacingLineOptimizer:
                 "smoothness_weight": config.smoothness_weight,
                 "speed_weight": config.speed_weight,
                 "corner_cut_aggressiveness": config.corner_cut_aggressiveness,
-                # Iter-009i: cache key must split on the selection-reference
+                # Iter-009i: cache key splits on the selection-reference
                 # speed, since it controls the BO oracle's basin choice.
-                # `max_velocity_mps` is purely informational and intentionally
-                # NOT in the key (changing it shouldn't invalidate the cache).
+                # Execution velocity (used by the downstream
+                # TrajectoryOptimizer at the bench layer) is NOT in this
+                # key — geometry is invariant to execution speed by design.
                 "select_velocity_mps": round(config.select_velocity_mps, 2),
             },
         }
@@ -404,11 +403,10 @@ class RacingLineOptimizer:
         # Heilmeier 2019 / Kapania 2016, the racing-line *geometry* is
         # chosen independent of the velocity it will be flown at —
         # that's what makes the optimal line velocity-agnostic. The
-        # earlier iter-009 attempt (Opus iter-006 F9 MAJOR) wired
-        # `self.config.max_velocity_mps` in here, and the 4-agent
-        # diagnosis found that's exactly what causes the F9
-        # basin-switching regression. select_velocity_mps stays at 15.0
-        # (legacy basin); max_velocity_mps is informational for callers.
+        # earlier iter-009 attempt (Opus iter-006 F9 MAJOR) coupled the
+        # BO oracle to the execution velocity, and the 4-agent diagnosis
+        # found that's exactly what causes the F9 basin-switching
+        # regression on aigp_default at low auto-derived speeds.
         traj_opt = TrajectoryOptimizer(
             constraints=DroneConstraints(max_velocity=self.config.select_velocity_mps),
             dt_sample=0.02,  # coarser than benchmark for speed

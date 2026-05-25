@@ -356,11 +356,13 @@ def run_synthetic_benchmark(
     # pick a different optimal basin at lower velocity (aigp_default
     # crash at gate-1).
     from planning.racing_line import RacingLineConfig
+    # Iter-009k: dropped `max_velocity_mps` from RacingLineConfig (was
+    # the iter-009i informational field; 4/7 review agents flagged as
+    # API hazard). select_velocity_mps=15.0 is the dataclass default,
+    # passing it explicitly here documents the path-velocity-decoupling
+    # contract at the call site.
     rl_opt = RacingLineOptimizer(
-        config=RacingLineConfig(
-            max_velocity_mps=max_velocity,  # informational; downstream uses it
-            select_velocity_mps=15.0,        # legacy basin — keeps BO selection stable
-        )
+        config=RacingLineConfig(select_velocity_mps=15.0)
     )
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
