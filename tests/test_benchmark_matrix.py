@@ -117,9 +117,28 @@ def test_matrix_pass_rate_at_least_six_of_seven():
     that.
 
     Assertion: at least 6/7 non-figure8 tracks PASS with tracking
-    error < 0.40m. figure8 is excluded — it remains an open known
-    issue.
+    error < 0.40m AND sim_time < 1.6× the iter-009 baseline. figure8
+    is excluded — it remains an open known issue.
+
+    Per-track sim_time baselines (iter-009f, duration=30s):
+      aigp_default       7.8s   → ceiling 12.5s
+      grand_tour        18.3s   → ceiling 29.5s
+      race_01           17.2s   → ceiling 27.5s (overlaps test_race_01)
+      slalom             8.2s   → ceiling 13.5s
+      straight_hairpin   8.3s   → ceiling 13.5s
+      vertical_cliff    11.5s   → ceiling 19.0s
     """
+    # Iter-009h: per-track sim_time ceilings. Baselines measured 2026-05-24
+    # at iter-009g's `aa5aea1`. Ceilings set at ~1.6× to allow moderate
+    # changes without flapping but catch >60% slowdowns.
+    SIM_TIME_CEILINGS = {
+        "aigp_default": 12.5,
+        "grand_tour": 29.5,
+        "race_01": 27.5,  # overlaps race_01 dedicated test, intentionally
+        "slalom": 13.5,
+        "straight_hairpin": 13.5,
+        "vertical_cliff": 19.0,
+    }
     paths = _list_configs()
     matrix = run_matrix(paths, duration=30.0)
 
@@ -130,13 +149,23 @@ def test_matrix_pass_rate_at_least_six_of_seven():
         if name == "figure8":
             continue  # known-unsolvable; exclude from pass-rate gate
         expected_pass.append(name)
-        if track["sim_passed"] and track["avg_tracking_error_m"] < 0.40:
+        # Sim-time ceiling only applies if a baseline is recorded.
+        # Unknown tracks (new additions) skip the sim_time check.
+        ceiling = SIM_TIME_CEILINGS.get(name)
+        sim_time_ok = (ceiling is None) or (track["sim_time_s"] < ceiling)
+        if (
+            track["sim_passed"]
+            and track["avg_tracking_error_m"] < 0.40
+            and sim_time_ok
+        ):
             actual_pass.append(name)
         else:
             regressions.append(
                 f"{name}: pass={track['sim_passed']} "
                 f"gates={track['gates_passed']}/{track['total_gates']} "
                 f"err={track['avg_tracking_error_m']:.3f}m "
+                f"sim_time={track['sim_time_s']:.2f}s"
+                f"{f' (ceiling {ceiling:.1f}s)' if ceiling else ''} "
                 f"reason={track['termination_reason']}"
             )
 
