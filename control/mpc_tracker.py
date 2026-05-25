@@ -21,8 +21,17 @@ Based on "On Your Own" (Romero 2025):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
+
+
+def _spec():
+    """Iter-013: lazy import of competition.drone_spec to avoid a
+    hard `control → competition` import-time dependency.  Used by
+    `TrackerConfig` field defaults via `dataclasses.field(default_factory=...)`.
+    """
+    import competition.drone_spec as ds
+    return ds
 
 import numpy as np
 
@@ -68,16 +77,29 @@ class TrackerConfig:
     # Backed by: Tal & Karaman 2018, L1Quad 2025, DATT 2023.
     velocity_feedforward: float = 0.0
 
-    # Physical limits
-    max_tilt_rad: float = 0.85      # ~49 deg — increased for faster turns (Aggressive Maneuvers 2026)
+    # Physical limits — iter-013: sourced from competition.drone_spec
+    # for cross-module consistency. Pre-iter-013 these were inline
+    # literals and could silently drift from `DroneConstraints` /
+    # bench. `max_thrust_normalized` and `min_thrust_normalized` are
+    # tracker-control fractions, not drone-envelope properties, so
+    # they stay inline.
+    max_tilt_rad: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_TILT_RAD
+    )
     max_thrust_normalized: float = 0.95
     min_thrust_normalized: float = 0.05
-    max_body_rate: float = 6.0      # rad/s
+    max_body_rate: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_BODY_RATE_RAD_S
+    )
 
-    # Drone parameters
-    mass: float = 1.0
-    gravity: float = 9.81
-    max_thrust_n: float = 20.0
+    # Drone parameters — iter-013: drone_spec authority.
+    mass: float = field(default_factory=lambda: _spec().DEFAULT_MASS_KG)
+    gravity: float = field(
+        default_factory=lambda: _spec().DEFAULT_GRAVITY_MPS2
+    )
+    max_thrust_n: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_THRUST_N
+    )
 
     # iter-001 A15: learned tracker residual (lightweight ML).
     # Off-by-default — only enable on a track where a trained model has

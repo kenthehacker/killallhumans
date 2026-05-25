@@ -84,3 +84,17 @@ def test_racing_line_kinematic_eval_defaults_match_drone_spec():
     # Both params should default to None (sentinel for "use drone_spec")
     assert sig.parameters["max_speed_mps"].default is None
     assert sig.parameters["max_accel_mps2"].default is None
+
+
+def test_tracker_config_defaults_match_drone_spec():
+    """Iter-013: `control/mpc_tracker.TrackerConfig` field defaults
+    now come from `competition.drone_spec` via `dataclasses.field(default_factory=lambda: ...)`.
+    Pins the contract so a future refactor that flips back to inline
+    literals fails fast."""
+    from control.mpc_tracker import TrackerConfig
+    cfg = TrackerConfig()
+    assert cfg.mass == DEFAULT_MASS_KG
+    assert cfg.gravity == DEFAULT_GRAVITY_MPS2
+    assert cfg.max_thrust_n == DEFAULT_MAX_THRUST_N
+    assert cfg.max_tilt_rad == DEFAULT_MAX_TILT_RAD
+    assert cfg.max_body_rate == DEFAULT_MAX_BODY_RATE_RAD_S
