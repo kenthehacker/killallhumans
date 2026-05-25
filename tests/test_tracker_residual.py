@@ -131,6 +131,42 @@ def test_save_feature_trace_rejects_empty(tmp_path):
         save_feature_trace([], tmp_path / "x.npz")
 
 
+def test_bench_exposes_tracker_feature_trace_when_enabled():
+    """Iter-024: the synthetic matrix bench exposes the GeometricTracker's
+    feature_trace in the result dict so external scripts can collect
+    real ML training data. With trace_features=True, the trace has
+    samples in the canonical 10-dim format; with the flag off the list
+    is empty (no overhead for production callers)."""
+    import json
+    from pathlib import Path
+    from scripts.benchmark import run_synthetic_benchmark
+
+    cfg_path = Path(__file__).resolve().parent.parent / "sim_pybullet" / "configs" / "race_01.json"
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+
+    # Default path: empty trace.
+    r_off = run_synthetic_benchmark(duration=1.0, config=cfg)
+    assert r_off.get("tracker_feature_trace") == []
+
+    # Enabled path: nonempty trace with canonical 10-dim features.
+    r_on = run_synthetic_benchmark(
+        duration=1.0, config=cfg,
+        tracker_config_overrides={"trace_features": True},
+    )
+    trace = r_on.get("tracker_feature_trace")
+    assert isinstance(trace, list)
+    assert len(trace) > 50  # 1s at 100Hz minus startup; should be ~100
+    features, roll, pitch, thrust, pos_err, vel_err = trace[0]
+    assert features.shape == (DEFAULT_N_INPUTS,)
+    assert np.all(np.isfinite(features))
+    assert -math.pi <= roll <= math.pi
+    assert -math.pi <= pitch <= math.pi
+    assert 0.0 <= thrust <= 1.5
+    assert len(pos_err) == 3
+    assert len(vel_err) == 3
+
+
 def test_init_residual_weights_script_writes_loadable_zero_npz(tmp_path):
     """Iter-022 connect-the-dots: the init_residual_weights.py script
     must produce a .npz file that `TrackerResidualMLP.from_npz` can

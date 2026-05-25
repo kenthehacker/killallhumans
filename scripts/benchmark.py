@@ -775,6 +775,15 @@ def run_synthetic_benchmark(
                 ])
             ) if controller_trace else 0,
         } if controller_trace else {},
+        # Iter-024: surface the GeometricTracker's feature_trace
+        # (iter-014 hook) in the result dict so callers passing
+        # `tracker_config_overrides={"trace_features": True}` can
+        # collect ML training data from real matrix runs. Empty when
+        # the flag is off (production callers see no payload).
+        "tracker_feature_trace": (
+            list(tracker.feature_trace)
+            if getattr(tracker, "feature_trace", None) else []
+        ),
     }
 
     # Threshold checks
