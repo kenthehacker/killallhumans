@@ -251,6 +251,70 @@ class QuadrotorDrone:
             "roll": euler[0],
         }
 
+    def step_reference(self, reference, current_yaw_override=None):
+        """Iter-026c (Opus plan step 3): unified control wrapper.
+
+        Wraps an internal `GeometricTracker(TrackerConfig())` so the
+        QuadrotorDrone backend uses the SAME control chain as the
+        matrix bench and the live MAVLink pipeline. Converts the
+        tracker's `AttitudeCommand` to QuadrotorDrone's normalized
+        `apply_command(throttle, roll, pitch, yaw)` inputs:
+
+          - thrust: already normalized [0, 1] by TrackerConfig's
+            min/max_thrust_normalized clamps; passed through.
+          - roll_rad / pitch_rad: normalized via max_roll/pitch_angle
+            (DroneConfig stability caps, NOT TrackerConfig.max_tilt_rad).
+            If the tracker commands a tilt beyond this drone's
+            stability envelope, the value gets clipped — same behavior
+            as the bench's hard saturation.
+          - yaw_rad (desired absolute yaw): converted to a P-controller
+            yaw-rate command, normalized by max_yaw_rate. Angle-wrap
+            handled.
+
+        Args:
+            reference: a TrajectoryPoint (planning.trajectory_optimizer)
+                or any object with `.position`, `.velocity`, `.acceleration`,
+                `.yaw` attributes — what GeometricTracker.track expects.
+            current_yaw_override: optional explicit current yaw (radians).
+                Defaults to the drone's actual yaw from PyBullet.
+
+        Returns the AttitudeCommand the tracker produced (useful for
+        HUD readouts and trace_features data collection).
+        """
+        if getattr(self, "_tracker", None) is None:
+            from control.mpc_tracker import GeometricTracker, TrackerConfig
+            self._tracker = GeometricTracker(TrackerConfig())
+
+        state = self.get_state()
+        cur_yaw = state["yaw"] if current_yaw_override is None else current_yaw_override
+
+        cmd = self._tracker.track(
+            current_position=state["position"],
+            current_velocity=state["velocity"],
+            current_yaw=cur_yaw,
+            reference=reference,
+        )
+
+        # Thrust is already normalized [0, 1] by TrackerConfig clamps.
+        throttle_norm = float(max(0.0, min(1.0, cmd.thrust)))
+        # Roll/pitch radians → normalized [-1, 1] via DroneConfig caps.
+        roll_norm = float(max(-1.0, min(1.0,
+                                        cmd.roll_rad / self.config.max_roll_angle)))
+        pitch_norm = float(max(-1.0, min(1.0,
+                                         cmd.pitch_rad / self.config.max_pitch_angle)))
+        # Yaw: convert desired yaw angle → yaw-rate command via P.
+        # Wrap error to [-π, π] so 359° → 1° error is -2°, not +358°.
+        yaw_err = cmd.yaw_rad - cur_yaw
+        yaw_err = (yaw_err + math.pi) % (2.0 * math.pi) - math.pi
+        # P gain 2.0 — fast enough to follow yaw changes, low enough
+        # not to saturate. yaw_rate_cmd = 2*err clipped to ±max_yaw_rate.
+        yaw_rate_cmd = 2.0 * yaw_err
+        yaw_norm = float(max(-1.0, min(1.0,
+                                       yaw_rate_cmd / self.config.max_yaw_rate)))
+
+        self.apply_command(throttle_norm, roll_norm, pitch_norm, yaw_norm)
+        return cmd
+
     def apply_command(self, throttle: float, roll: float, pitch: float, yaw: float):
         """
         Apply normalized control inputs via per-motor thrust.
