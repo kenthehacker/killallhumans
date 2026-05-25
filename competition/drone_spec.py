@@ -23,11 +23,18 @@ reads. Each value carries provenance — bench-empirical, spec-derived,
 or placeholder pending calibration — so future maintainers can tell
 the difference at a glance.
 
-NB: this is the SYNTHETIC BENCH'S drone, not the AIGP competition
-drone. Real AIGP-class 280×280×160mm racing drones likely exceed
-these limits; calibration.py will bind real values once the SITL
-binary lands. See competition/aigp_geometry.py for the actual
-chassis dimensions.
+NB: this is "AIGP proxy v1" — NOT a verified copy of the AIGP
+competition drone. VADR-TS-002 gives chassis dimensions (280×280×160 mm)
+but does NOT specify mass or thrust. The values below are
+deliberately kept at 1 kg / 20 N for iter-026b to avoid invalidating
+the iter-009i racing-line basin, race_01 ILC schedule, and
+auto-velocity ceiling without SITL telemetry to justify a specific
+number. Iter-027+ rebaselines once calibration.py has real numbers.
+
+Iter-026b: promoted from "synthetic bench drone only" to shared SSOT
+across planner, tracker, kinematic bench, and sim_pybullet.QuadrotorDrone
+(see .loop/synthesis/iter_026_sim_stack_plan.md). Chassis dimensions
+sourced from competition.aigp_geometry.
 """
 from __future__ import annotations
 
@@ -98,6 +105,38 @@ scripts/benchmark.py:489."""
 
 DEFAULT_GRAVITY_MPS2: float = 9.81
 """Standard gravity. Source: physics."""
+
+
+# --- Chassis geometry — iter-026b -------------------------------------------
+# These are the AIGP-spec chassis dimensions (VADR-TS-002 §3.6). The
+# previous sim_pybullet.drone.DroneConfig values (arm 0.175, body
+# 0.15×0.15×0.05) were a generic placeholder; switching to the
+# spec-backed dimensions makes the simulated drone's collision body
+# match the AIGP chassis.
+
+DEFAULT_BODY_SIZE_M: tuple = (0.28, 0.28, 0.16)
+"""Drone body collision dimensions (x, y, z) in meters. Spec-derived
+from VADR-TS-002 §3.6 (280×280×160 mm). Used by sim_pybullet.drone
+for the PyBullet rigid body. See competition.aigp_geometry."""
+
+DEFAULT_ARM_LENGTH_M: float = 0.14
+"""Arm length from body centre to motor (m). Inferred for a 280 mm
+class racing drone (half of body width, leaves room for motors and
+propeller diameter). Not spec-explicit."""
+
+
+# --- PyBullet rigid-body damping — iter-026b --------------------------------
+# Inherited from the iter-021 QuadrotorDrone values. These dampen
+# velocity / angular velocity each PyBullet step (NOT the same as the
+# kinematic-sim's `linear_drag_per_mass` aerodynamic-drag proxy above).
+
+DEFAULT_LINEAR_DAMPING: float = 0.3
+"""PyBullet rigid-body linearDamping. Source: sim_pybullet/drone.py:199.
+Distinct from `DEFAULT_LINEAR_DRAG_PER_MASS` above (kinematic sim
+aerodynamic proxy)."""
+
+DEFAULT_ANGULAR_DAMPING: float = 0.8
+"""PyBullet rigid-body angularDamping. Source: sim_pybullet/drone.py:200."""
 
 
 @dataclass(frozen=True)

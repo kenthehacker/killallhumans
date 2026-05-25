@@ -17,6 +17,8 @@ else. New duplicates added by future iters should be added here.
 from __future__ import annotations
 
 from competition.drone_spec import (
+    DEFAULT_ARM_LENGTH_M,
+    DEFAULT_BODY_SIZE_M,
     DEFAULT_MAX_ACCEL_MPS2,
     DEFAULT_MAX_VELOCITY_MPS,
     DEFAULT_MASS_KG,
@@ -84,6 +86,27 @@ def test_racing_line_kinematic_eval_defaults_match_drone_spec():
     # Both params should default to None (sentinel for "use drone_spec")
     assert sig.parameters["max_speed_mps"].default is None
     assert sig.parameters["max_accel_mps2"].default is None
+
+
+def test_sim_pybullet_drone_config_defaults_match_drone_spec():
+    """Iter-026b: `sim_pybullet/drone.py:DroneConfig` field defaults
+    now come from `competition.drone_spec` via
+    `dataclasses.field(default_factory=lambda: ...)`. Pins the contract
+    so a future refactor that flips back to inline literals fails
+    fast (mirrors `test_tracker_config_defaults_match_drone_spec`
+    from iter-013)."""
+    from sim_pybullet.drone import DroneConfig
+    cfg = DroneConfig()
+    assert cfg.mass_kg == DEFAULT_MASS_KG
+    assert cfg.max_thrust_n == DEFAULT_MAX_THRUST_N
+    assert cfg.gravity == DEFAULT_GRAVITY_MPS2
+    assert cfg.arm_length_m == DEFAULT_ARM_LENGTH_M
+    assert cfg.body_size == DEFAULT_BODY_SIZE_M
+    # Attitude PD caps stay INLINE (iter-021 stability conservatism) —
+    # verify they have NOT been silently routed through drone_spec.
+    assert cfg.max_roll_angle == 0.35
+    assert cfg.max_pitch_angle == 0.35
+    assert cfg.max_yaw_rate == 2.0
 
 
 def test_tracker_config_defaults_match_drone_spec():

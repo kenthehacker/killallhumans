@@ -18,25 +18,43 @@ except ImportError:
     p = None
 
 
+def _spec():
+    """Iter-026b: lazy import of competition.drone_spec to avoid a hard
+    `sim_pybullet → competition` import-time dependency.  Used by
+    `DroneConfig` field defaults via `field(default_factory=...)`."""
+    import competition.drone_spec as ds
+    return ds
+
+
 @dataclass
 class DroneConfig:
-    # Iter-021: this is the PyBullet drone proxy — a DIFFERENT model
-    # from the synthetic kinematic bench's drone (in competition.drone_spec).
-    # Some fields coincide (mass_kg, max_thrust_n, gravity), but others
-    # don't (max_roll/pitch=0.35 here vs 0.85 in TrackerConfig; max_yaw_rate
-    # =2.0 here vs 4.0 in drone_spec). Sourcing only the matching fields
-    # from drone_spec would imply unification that doesn't exist — the
-    # PyBullet harness is deliberately a more conservative stability
-    # envelope for the second-order attitude dynamics. Leave inline and
-    # explicit.
-    mass_kg: float = 1.0
-    arm_length_m: float = 0.175
-    body_size: Tuple[float, float, float] = (0.15, 0.15, 0.05)
-    max_thrust_n: float = 20.0  # total max thrust (all 4 motors)
-    max_roll_angle: float = 0.35  # radians (~20 deg) — keep conservative for stability
+    # Iter-026b: unified with competition.drone_spec per the 3-agent
+    # sim-stack unification plan (.loop/synthesis/iter_026_sim_stack_plan.md).
+    # Mass/thrust/gravity/arm_length/body_size all source from drone_spec,
+    # making this the same drone as the matrix bench's TrackerConfig and
+    # planning/trajectory_optimizer's DroneConstraints.
+    #
+    # Attitude PD gains, tilt limits, and max_yaw_rate STAY inline:
+    # they're plant-local stability tuning (not drone-envelope properties),
+    # and the conservative 0.35-rad tilt cap and 2.0 rad/s yaw rate were
+    # iter-021 stability choices for THIS multibody PD loop. Sourcing
+    # those from drone_spec (TrackerConfig has 0.85 / 4.0) would force
+    # the PyBullet attitude loop to chase tilts it can't stabilise.
+    mass_kg: float = field(default_factory=lambda: _spec().DEFAULT_MASS_KG)
+    arm_length_m: float = field(
+        default_factory=lambda: _spec().DEFAULT_ARM_LENGTH_M
+    )
+    body_size: Tuple[float, float, float] = field(
+        default_factory=lambda: _spec().DEFAULT_BODY_SIZE_M
+    )
+    max_thrust_n: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_THRUST_N
+    )
+    # Attitude limits stay inline — iter-021 stability conservatism.
+    max_roll_angle: float = 0.35  # radians (~20 deg)
     max_pitch_angle: float = 0.35
-    max_yaw_rate: float = 2.0  # rad/s
-    gravity: float = 9.81
+    max_yaw_rate: float = 2.0     # rad/s
+    gravity: float = field(default_factory=lambda: _spec().DEFAULT_GRAVITY_MPS2)
     # Attitude PD gains (tuned for per-motor differential thrust)
     attitude_kp: float = 12.0
     attitude_kd: float = 4.0
