@@ -27,17 +27,40 @@ import numpy as np
 from scipy.optimize import minimize
 
 
+# Iter-010 (Opus + Composer planning consensus, .loop/research/next_iter_*.md):
+# defaults now read from competition.drone_spec — single source of truth for
+# the synthetic-bench drone-dynamics envelope. The previous `max_acceleration
+# = 20.0` was a cross-module lie: the bench saturates at 15 m/s², so any
+# trajectory planned under a 2g budget was actually executed at 1.5g, causing
+# feedforward mismatch and inflating tracking error. Now bench, optimizer,
+# tracker, and auto_velocity all see the same numbers.
+from competition.drone_spec import (
+    DEFAULT_MASS_KG as _DRONE_MASS_KG,
+    DEFAULT_MAX_ACCEL_MPS2 as _DRONE_MAX_ACCEL,
+    DEFAULT_MAX_BODY_RATE_RAD_S as _DRONE_MAX_BODY_RATE,
+    DEFAULT_MAX_JERK_MPS3 as _DRONE_MAX_JERK,
+    DEFAULT_MAX_THRUST_N as _DRONE_MAX_THRUST,
+    DEFAULT_MAX_TILT_RAD as _DRONE_MAX_TILT,
+    DEFAULT_MAX_VELOCITY_MPS as _DRONE_MAX_VELOCITY,
+    DEFAULT_GRAVITY_MPS2 as _DRONE_GRAVITY,
+)
+
+
 @dataclass
 class DroneConstraints:
-    """Physical limits of the drone."""
-    max_velocity: float = 15.0       # m/s
-    max_acceleration: float = 20.0   # m/s^2 (~2g) — relaxed: rough estimate overestimates actual accel at segment boundaries
-    max_jerk: float = 50.0           # m/s^3
-    max_tilt_angle: float = 0.85     # radians (~49 deg) — increased for faster turns (Aggressive Maneuvers 2026)
-    max_thrust: float = 20.0         # Newtons
-    max_body_rate: float = 6.0       # rad/s
-    mass: float = 1.0                # kg
-    gravity: float = 9.81            # m/s^2
+    """Physical limits of the drone. Iter-010: defaults sourced from
+    competition.drone_spec (the synthetic-bench's envelope, not the
+    AIGP competition drone's — that needs calibration)."""
+    max_velocity: float = _DRONE_MAX_VELOCITY       # m/s — was 15.0 inline
+    max_acceleration: float = _DRONE_MAX_ACCEL      # m/s^2 — WAS 20.0
+                                                    # inline; now matches the
+                                                    # 15 m/s² bench saturation
+    max_jerk: float = _DRONE_MAX_JERK               # m/s^3
+    max_tilt_angle: float = _DRONE_MAX_TILT         # radians (~49 deg)
+    max_thrust: float = _DRONE_MAX_THRUST           # Newtons
+    max_body_rate: float = _DRONE_MAX_BODY_RATE     # rad/s
+    mass: float = _DRONE_MASS_KG                    # kg
+    gravity: float = _DRONE_GRAVITY                 # m/s^2
 
 
 @dataclass
