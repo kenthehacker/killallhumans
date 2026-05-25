@@ -112,6 +112,22 @@ class RacingLineConfig:
     max_velocity_mps: float = 15.0
     select_velocity_mps: float = 15.0
 
+    def __post_init__(self):
+        # Iter-009j (Codex#2 MAJOR + Opus M5/M4 + Composer M9): validate
+        # the two velocity fields. NaN/Inf/<=0 in select_velocity_mps would
+        # poison TrajectoryOptimizer's segment-time math AND produce
+        # non-standard JSON cache keys. Reject early with a clear error.
+        import math as _math
+        for name, val in (
+            ("max_velocity_mps", self.max_velocity_mps),
+            ("select_velocity_mps", self.select_velocity_mps),
+        ):
+            if not _math.isfinite(val) or val <= 0:
+                raise ValueError(
+                    f"RacingLineConfig.{name}={val!r} is invalid; must be a "
+                    f"finite positive float."
+                )
+
 
 class RacingLineOptimizer:
     """
@@ -418,7 +434,8 @@ class RacingLineOptimizer:
                 )
 
                 avg_err, worst_gate_err, race_time = self._kinematic_eval(
-                    trajectory, start_position, gates
+                    trajectory, start_position, gates,
+                    max_speed_mps=self.config.select_velocity_mps,
                 )
 
                 raw_metrics.append((avg_err, worst_gate_err, race_time, idx))
@@ -469,7 +486,8 @@ class RacingLineOptimizer:
                         )
 
                         avg_err, worst_gate_err, race_time = self._kinematic_eval(
-                            trajectory, start_position, gates
+                            trajectory, start_position, gates,
+                            max_speed_mps=self.config.select_velocity_mps,
                         )
 
                         raw_metrics.append((avg_err, worst_gate_err, race_time, interp_idx))
@@ -535,6 +553,8 @@ class RacingLineOptimizer:
         trajectory,
         start_position: Tuple[float, float, float],
         gates: List[GateWaypoint],
+        max_speed_mps: float = 15.0,
+        max_accel_mps2: float = 15.0,
     ) -> Tuple[float, float, float]:
         """
         Lightweight kinematic sim to evaluate trajectory tracking quality.
@@ -545,10 +565,19 @@ class RacingLineOptimizer:
         Physics: PD controller + drag + acceleration clamp.
         Gains synced with benchmark (iter 40): kp_xy=7, kd_xy=5.5, ff=0.50.
         Note: gains updated but selection unchanged (same basin wins).
+
+        Iter-009j (Opus M2 / Composer #1+#8 / Codex #1 minor 2): threaded
+        `max_speed_mps` and `max_accel_mps2` so callers can hold the eval
+        clamp in sync with the trajectory generator's velocity cap. Without
+        this threading, the function silently clamped at 15 m/s even when
+        the BO oracle built trajectories at a lower `select_velocity_mps`,
+        producing metric distortion (the eval drone could race ahead of
+        the trajectory's reference speed). Defaults remain 15.0 so legacy
+        callers are unchanged.
         """
         dt = 0.02
-        max_accel = 15.0
-        max_speed = 15.0
+        max_accel = max_accel_mps2
+        max_speed = max_speed_mps
         drag = 0.5
         kp_xy, kd_xy = 7.0, 5.5
         kp_z, kd_z = 8.0, 5.0
