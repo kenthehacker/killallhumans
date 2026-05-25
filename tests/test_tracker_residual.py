@@ -86,6 +86,51 @@ def test_feature_trace_captures_when_enabled():
         assert len(vel_err) == 3
 
 
+def test_feature_trace_save_load_roundtrip(tmp_path):
+    """Iter-015: save_feature_trace + load_feature_trace must round-trip
+    the trace exactly. Crucial for future ML training pipelines: the
+    collected dataset must be persistable across processes."""
+    from control.learned_residual import (
+        save_feature_trace,
+        load_feature_trace,
+    )
+    tracker = GeometricTracker(TrackerConfig(trace_features=True))
+    ref = _hover_ref()
+    for i in range(5):
+        tracker.track(
+            current_position=(0.1 * i, 0.0, -1.8),
+            current_velocity=(0.0, 0.0, 0.0),
+            current_yaw=0.0,
+            reference=ref,
+        )
+    path = tmp_path / "trace.npz"
+    save_feature_trace(tracker.feature_trace, path)
+    loaded = load_feature_trace(path)
+    assert loaded["features"].shape == (5, DEFAULT_N_INPUTS)
+    assert loaded["roll_nom"].shape == (5,)
+    assert loaded["pitch_nom"].shape == (5,)
+    assert loaded["thrust_nom"].shape == (5,)
+    assert loaded["pos_err"].shape == (5, 3)
+    assert loaded["vel_err"].shape == (5, 3)
+    # Round-trip integrity: same values
+    for i, (feats, r, p, t, pe, ve) in enumerate(tracker.feature_trace):
+        np.testing.assert_array_equal(loaded["features"][i], feats)
+        assert loaded["roll_nom"][i] == r
+        assert loaded["pitch_nom"][i] == p
+        assert loaded["thrust_nom"][i] == t
+        np.testing.assert_array_equal(loaded["pos_err"][i], pe)
+        np.testing.assert_array_equal(loaded["vel_err"][i], ve)
+
+
+def test_save_feature_trace_rejects_empty(tmp_path):
+    """Empty trace should raise — saving zero rows wastes disk and
+    breaks the load contract."""
+    from control.learned_residual import save_feature_trace
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="empty"):
+        save_feature_trace([], tmp_path / "x.npz")
+
+
 # ---------------------------------------------------------------------------
 # MLP shape + sanity
 # ---------------------------------------------------------------------------

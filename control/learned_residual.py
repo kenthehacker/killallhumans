@@ -146,6 +146,76 @@ class TrackerResidualMLP:
         return h @ self.W2 + self.b2
 
 
+def save_feature_trace(trace, path: Union[str, Path]) -> None:
+    """Iter-015: persist `GeometricTracker.feature_trace` to .npz.
+
+    The trace is a list of tuples
+    `(features_10d, roll_nom, pitch_nom, thrust_nom, pos_err_xyz, vel_err_xyz)`
+    appended by the tracker each step (see iter-014 commit). This
+    flattens into parallel arrays so a future training script can
+    `np.load(path)` directly.
+
+    File schema (v1):
+      features      (N, 10)   float64
+      roll_nom      (N,)      float64
+      pitch_nom     (N,)      float64
+      thrust_nom    (N,)      float64
+      pos_err       (N, 3)    float64
+      vel_err       (N, 3)    float64
+      version       scalar    int (==1)
+
+    Args:
+        trace: list of tuples as defined by GeometricTracker (iter-014).
+        path: target .npz path.
+    """
+    if not trace:
+        raise ValueError("trace is empty; nothing to save")
+    n = len(trace)
+    features = np.empty((n, DEFAULT_N_INPUTS), dtype=np.float64)
+    roll = np.empty(n, dtype=np.float64)
+    pitch = np.empty(n, dtype=np.float64)
+    thrust = np.empty(n, dtype=np.float64)
+    pos_err = np.empty((n, 3), dtype=np.float64)
+    vel_err = np.empty((n, 3), dtype=np.float64)
+    for i, (feats, r, p, t, pe, ve) in enumerate(trace):
+        features[i] = feats
+        roll[i] = r
+        pitch[i] = p
+        thrust[i] = t
+        pos_err[i] = pe
+        vel_err[i] = ve
+    np.savez(
+        str(path),
+        features=features,
+        roll_nom=roll,
+        pitch_nom=pitch,
+        thrust_nom=thrust,
+        pos_err=pos_err,
+        vel_err=vel_err,
+        version=np.array(1, dtype=np.int64),
+    )
+
+
+def load_feature_trace(path: Union[str, Path]) -> dict:
+    """Inverse of `save_feature_trace`. Returns a dict with keys
+    `features`, `roll_nom`, `pitch_nom`, `thrust_nom`, `pos_err`,
+    `vel_err`. Raises ValueError if the version isn't 1."""
+    with np.load(str(path)) as data:
+        version = int(data["version"])
+        if version != 1:
+            raise ValueError(
+                f"feature trace version {version} unsupported; expected 1"
+            )
+        return {
+            "features": data["features"].copy(),
+            "roll_nom": data["roll_nom"].copy(),
+            "pitch_nom": data["pitch_nom"].copy(),
+            "thrust_nom": data["thrust_nom"].copy(),
+            "pos_err": data["pos_err"].copy(),
+            "vel_err": data["vel_err"].copy(),
+        }
+
+
 def build_input_features(
     pos_err: np.ndarray,
     vel_err: np.ndarray,

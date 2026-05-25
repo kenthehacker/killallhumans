@@ -103,6 +103,14 @@ class PipelineConfig:
     use_pnp: bool = True
     use_state_predictor: bool = True
 
+    # Iter-015: ML training infra (continues iter-014's feature-trace
+    # hook). When True, the underlying GeometricTracker captures
+    # per-step features + nominal commands to `pipeline.tracker.feature_trace`.
+    # Default off — production callers see zero overhead. A future
+    # `scripts/collect_residual_dataset.py` flips this on, runs a race,
+    # and dumps the trace to .npz for training.
+    trace_tracker_features: bool = False
+
 
 class RacePipeline:
     """
@@ -148,7 +156,10 @@ class RacePipeline:
         self.pnp_estimator = GatePnPEstimator(self.camera, self.gate_geometry)
         self.ekf = DroneEKF(EKFConfig())
         self.state_predictor = StatePredictor(LatencyConfig())
-        self.tracker = GeometricTracker(TrackerConfig())
+        # Iter-015: wire trace_features through PipelineConfig so the
+        # collection script can opt in without monkey-patching.
+        _tracker_cfg = TrackerConfig(trace_features=self.config.trace_tracker_features)
+        self.tracker = GeometricTracker(_tracker_cfg)
         self.simple_tracker = SimplePositionTracker(TrackerConfig())
 
         # Phase 1 detector — instantiated once, reused every frame (Phase 3 fix)
