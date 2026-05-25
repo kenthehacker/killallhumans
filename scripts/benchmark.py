@@ -635,16 +635,28 @@ def run_synthetic_benchmark(
         else:
             accel = -drag * vel
 
-        # Clamp acceleration
-        accel_mag = np.linalg.norm(accel)
-        if accel_mag > max_accel:
-            accel = accel / accel_mag * max_accel
+        # Iter-016 (Composer-4 verification, iter-010 review): clamp-active
+        # fraction is a key honesty metric. iter-010 dropped DroneConstraints.
+        # max_acceleration from 20 → 15 on the hypothesis that the bench
+        # was saturating; if the post-iter-010 clamp NEVER engages, the
+        # hypothesis is wrong (and aigp_default's tracking degradation
+        # has a different cause). Track per-step engagement here and
+        # surface in the result dict for downstream analysis.
+        accel_mag_pre = float(np.linalg.norm(accel))
+        accel_clamp_active = accel_mag_pre > max_accel
+        if accel_clamp_active:
+            accel = accel / accel_mag_pre * max_accel
+        controller_trace[-1]["accel_mag_pre_clamp"] = accel_mag_pre
+        controller_trace[-1]["accel_clamp_active"] = accel_clamp_active
 
         # Integrate
         vel = vel + accel * dt
         speed = np.linalg.norm(vel)
-        if speed > max_speed:
+        speed_clamp_active = speed > max_speed
+        if speed_clamp_active:
             vel = vel / speed * max_speed
+        controller_trace[-1]["speed_pre_clamp"] = float(speed)
+        controller_trace[-1]["speed_clamp_active"] = speed_clamp_active
 
         pos = pos + vel * dt
 
@@ -727,6 +739,27 @@ def run_synthetic_benchmark(
             "avg_thrust": float(np.mean([c["thrust"] for c in controller_trace])) if controller_trace else 0,
             "max_abs_roll_rad": float(np.max([abs(c["roll"]) for c in controller_trace])) if controller_trace else 0,
             "max_abs_pitch_rad": float(np.max([abs(c["pitch"]) for c in controller_trace])) if controller_trace else 0,
+            # Iter-016 (Composer-4 verification): clamp engagement metrics.
+            # Bench saturates accel at max_accel (15 m/s²) and speed at
+            # max_speed (15 m/s). High fractions => planner is commanding
+            # capabilities the bench can't deliver; iter-010's
+            # max_acceleration drop hypothesis predicted these should fall
+            # post-iter-010 if the bench was actually saturating.
+            "accel_clamp_active_frac": float(
+                np.mean([
+                    c.get("accel_clamp_active", False) for c in controller_trace
+                ])
+            ) if controller_trace else 0,
+            "speed_clamp_active_frac": float(
+                np.mean([
+                    c.get("speed_clamp_active", False) for c in controller_trace
+                ])
+            ) if controller_trace else 0,
+            "max_accel_mag_pre_clamp": float(
+                np.max([
+                    c.get("accel_mag_pre_clamp", 0.0) for c in controller_trace
+                ])
+            ) if controller_trace else 0,
         } if controller_trace else {},
     }
 
