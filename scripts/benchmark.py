@@ -355,15 +355,14 @@ def run_synthetic_benchmark(
     # EXECUTION through the same velocity, causing the BO oracle to
     # pick a different optimal basin at lower velocity (aigp_default
     # crash at gate-1).
-    from planning.racing_line import RacingLineConfig
-    # Iter-009k: dropped `max_velocity_mps` from RacingLineConfig (was
-    # the iter-009i informational field; 4/7 review agents flagged as
-    # API hazard). select_velocity_mps=15.0 is the dataclass default,
-    # passing it explicitly here documents the path-velocity-decoupling
-    # contract at the call site.
-    rl_opt = RacingLineOptimizer(
-        config=RacingLineConfig(select_velocity_mps=15.0)
-    )
+    # Iter-009l (Opus M5 fix): synthetic and PyBullet bench paths must
+    # resolve to the SAME effective `select_velocity_mps` for the same
+    # track config — Opus's adversarial review flagged that synthetic
+    # explicitly pinning 15.0 (iter-009i) while PyBullet inherited the
+    # dataclass default was a drift risk. Now both paths use the
+    # dataclass default. Single source of truth in
+    # `RacingLineConfig.select_velocity_mps`.
+    rl_opt = RacingLineOptimizer()
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
     traj_opt = TrajectoryOptimizer(

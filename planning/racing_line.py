@@ -197,7 +197,12 @@ class RacingLineOptimizer:
                 data = json.load(f)
             if data.get("cache_key") != cache_key:
                 return None
-            if data.get("version") != 1:
+            # Iter-009l (Opus Mi1): cache schema v2 split on
+            # select_velocity_mps (iter-009i) — pre-v2 caches MAY be
+            # functionally equivalent for the default basin but accepting
+            # them silently hides cases where iter-009b-style work happens
+            # to land the same SHA. Be strict.
+            if data.get("version") != 2:
                 return None
             return np.array(data["offsets"], dtype=np.float64)
         except (json.JSONDecodeError, KeyError, ValueError):
@@ -214,7 +219,9 @@ class RacingLineOptimizer:
         """Save winning offsets to cache file."""
         from datetime import datetime, timezone
         data = {
-            "version": 1,
+            # Iter-009l: bumped v1→v2 alongside the iter-009i cache-key
+            # schema change (added select_velocity_mps to the key).
+            "version": 2,
             "cache_key": cache_key,
             "offsets": offsets.tolist(),
             "metrics": metrics or {},

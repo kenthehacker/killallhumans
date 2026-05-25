@@ -18,3 +18,10 @@ gate_detection/training/val_failures
 
 # Telemetry logs
 logs/
+
+# Iter-009l (Opus Mi2): racing-line cache is a deterministic build
+# artifact, regenerated on first cold run from gate geometry +
+# select_velocity_mps. Committing it is misleading (last-writer-wins
+# semantics; cache often ends up with a toy-test layout instead of
+# race_01's offsets).
+planning/racing_line_cache.json
