@@ -1,6 +1,5 @@
 {
-  "_about": "Slalom has tight lateral turns where 8 m/s trajectories exceed the kinematic drone's centripetal accel envelope. iter-005 velocity sweep confirmed v=6 m/s passes 8/8 gates with 0.48m max tracking error.",
-  "max_velocity_mps": 6.0,
+  "_about": "Slalom has tight lateral turns. iter-006 replaced the explicit max_velocity_mps=6.0 override with derive_safe_max_velocity, which computes the centripetal-acceleration-limited velocity from gate spacing + bend angle (no per-track magic numbers).",
   "field": {
     "name": "slalom",
     "bounds_min": [-5.0, -6.0, 0.0],

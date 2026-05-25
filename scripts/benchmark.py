@@ -334,14 +334,17 @@ def run_synthetic_benchmark(
     rl_opt = RacingLineOptimizer()
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
-    # iter-005 (post velocity-sweep experiment): the 15.0 m/s default
-    # was a course-overfit magic number. At v=8.0 the bench passes 6/7
-    # tracks (race_01 + grand_tour + slalom + straight_hairpin +
-    # vertical_cliff + aigp_default) versus 1/7 at v=15. race_01 does
-    # NOT regress (still completes 12/12 cleanly, just slightly slower).
-    # Per-track override stays available via `max_velocity_mps` in the
-    # track config JSON for racetracks that genuinely need 15 m/s.
-    max_velocity = float(data.get("max_velocity_mps", 8.0))
+    # iter-006 F3 (consensus MAJOR): the 8.0 / per-track 6.0 magic
+    # numbers from iter-005 are now replaced with a geometry-derived
+    # centripetal-acceleration limit. Per-track explicit overrides via
+    # `max_velocity_mps` still take precedence for hand-tuned tracks
+    # (race_01 stays at its sweep-tuned value if it sets one); else we
+    # auto-derive from gate spacing + bend angle.
+    from planning.auto_velocity import derive_safe_max_velocity
+    if "max_velocity_mps" in data:
+        max_velocity = float(data["max_velocity_mps"])
+    else:
+        max_velocity = derive_safe_max_velocity(gate_specs)
     traj_opt = TrajectoryOptimizer(
         constraints=DroneConstraints(max_velocity=max_velocity), dt_sample=0.02,
     )
