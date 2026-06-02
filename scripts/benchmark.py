@@ -148,15 +148,26 @@ def run_unit_tests() -> Dict[str, Any]:
 
     # --- Speed profiler ---
     def _sp():
+        # Iter-018: max_speed sourced from drone_spec; min_speed is a
+        # planner-policy choice (not a drone-envelope property) so it
+        # stays inline.
+        from competition.drone_spec import DEFAULT_MAX_VELOCITY_MPS
         pts = [(0, 0, -2), (10, 0, -2), (20, 0, -2), (20, 10, -2), (20, 20, -2)]
-        speeds = SpeedProfiler(max_speed=15.0, min_speed=2.0).profile(pts)
+        speeds = SpeedProfiler(
+            max_speed=DEFAULT_MAX_VELOCITY_MPS, min_speed=2.0,
+        ).profile(pts)
         assert len(speeds) == 5
-        assert all(2.0 <= s <= 15.0 for s in speeds), f"speeds out of range: {speeds}"
+        assert all(2.0 <= s <= DEFAULT_MAX_VELOCITY_MPS for s in speeds), (
+            f"speeds out of range: {speeds}"
+        )
     tests.append(("speed_profiler", _sp))
 
     # --- Geometric tracker (tight hover test — Phase 1 requirement) ---
     def _gt():
-        tr = GeometricTracker(TrackerConfig(max_thrust_n=20.0, mass=1.0, gravity=9.81))
+        # Iter-020: explicit overrides are now redundant since iter-013
+        # routed TrackerConfig defaults through competition.drone_spec.
+        # mass=1.0, gravity=9.81, max_thrust_n=20.0 are the spec defaults.
+        tr = GeometricTracker(TrackerConfig())
         ref = TrajectoryPoint(0, (0, 0, -2), (0, 0, 0), (0, 0, 0), (0, 0, 0), 0, 0)
         cmd = tr.track((0, 0, -2), (0, 0, 0), 0.0, ref)
         assert abs(cmd.roll_rad) < 0.01, f"hover roll={cmd.roll_rad:.4f} (must be <0.01)"
@@ -230,13 +241,25 @@ def run_unit_tests() -> Dict[str, Any]:
 # Synthetic simulation (no PyBullet — pure Python kinematics)
 # ---------------------------------------------------------------------------
 
-def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[str, Any]:
+def run_synthetic_benchmark(
+    duration: float = 30.0,
+    dt: float = 0.01,
+    config: Optional[Dict[str, Any]] = None,
+    tracker_config_overrides: Optional[Dict[str, Any]] = None,
+    record_position_trace: bool = False,
+) -> Dict[str, Any]:
     """
     Run the full pipeline with synthetic kinematic simulation.
 
-    Uses the same race_01.json gate layout but simulates drone physics with
-    a simple second-order model: PD controller → acceleration → velocity → position.
-    No PyBullet dependency.
+    Uses the same race_01.json gate layout (by default) but simulates drone
+    physics with a simple second-order model: PD controller → acceleration →
+    velocity → position. No PyBullet dependency.
+
+    Args:
+        duration: max sim time in seconds.
+        dt: control loop step.
+        config: if provided, used in place of `race_01.json` (lets unit tests
+            inject a deliberately-crash-inducing course; see iter-001 A7).
 
     This exercises: trajectory optimizer, racing line, speed profiler, EKF,
     gate sequencer, and geometric tracker — the full pipeline minus perception.
@@ -245,23 +268,33 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # Deterministic seed for reproducible benchmark results (SimpleFlight 2024,
     # Testing Pipeline 2025: fixed seeds are a competition deployment best practice).
     np.random.seed(42)
+    from competition.aigp_geometry import AIGP_VQ1_MAX_RUN_DURATION_S
     from estimation.ekf import DroneEKF, EKFConfig
     from gate_sequencing.sequencer import GateSequencer, GateSpec, SequencerConfig
     from planning.trajectory_optimizer import DroneConstraints, GateWaypoint, TrajectoryOptimizer, TrajectoryPoint
     from planning.racing_line import RacingLineOptimizer, SpeedProfiler
     from control.mpc_tracker import GeometricTracker, TrackerConfig
 
-    # Load gate layout from config
-    config_path = _REPO / "sim_pybullet" / "configs" / "race_01.json"
-    try:
-        with open(config_path) as f:
-            data = _json.load(f)
-    except FileNotFoundError:
-        return {"skipped": True, "skip_reason": f"Config not found: {config_path}"}
+    # Load gate layout from config (or use the caller-supplied dict).
+    if config is not None:
+        data = config
+    else:
+        config_path = _REPO / "sim_pybullet" / "configs" / "race_01.json"
+        try:
+            with open(config_path) as f:
+                data = _json.load(f)
+        except FileNotFoundError:
+            return {"skipped": True, "skip_reason": f"Config not found: {config_path}"}
 
     gate_defaults = data.get("gate_defaults", {})
     default_w = gate_defaults.get("interior_width_m", 1.2)
     default_h = gate_defaults.get("interior_height_m", 1.2)
+
+    # Per-track border_width may differ from the AIGP default (0.6 m); race_01
+    # uses 0.18 m, etc. The bench used to drop this and let GateSpec's default
+    # win, which silently changed the geometric crash zone whenever the
+    # default shifted. Propagate it explicitly.
+    default_border = gate_defaults.get("border_width_m")
 
     gate_specs = []
     gate_waypoints = []
@@ -273,12 +306,17 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         pitch = pose.get("pitch", 0)
         w = gc.get("interior_width_m", default_w)
         h = gc.get("interior_height_m", default_h)
+        # Per-gate border override > course-level default > GateSpec default.
+        per_gate_border = gc.get("border_width_m", default_border)
 
-        gate_specs.append(GateSpec(
+        gs_kwargs = dict(
             gate_id=gd["id"], position=(x, y, z), yaw=yaw, pitch=pitch,
             interior_width=w, interior_height=h,
             sequence_index=gd.get("sequence_index", 0),
-        ))
+        )
+        if per_gate_border is not None:
+            gs_kwargs["border_width"] = per_gate_border
+        gate_specs.append(GateSpec(**gs_kwargs))
         cy, sy = math.cos(yaw), math.sin(yaw)
         cp, sp = math.cos(pitch), math.sin(pitch)
         gate_waypoints.append(GateWaypoint(
@@ -290,8 +328,14 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     start_pos = np.array(start_data.get("position", [0.0, 0.0, 1.5]), dtype=float)
 
     # --- Pipeline setup ---
+    # Iter-002 review M7 (4/7 reviews MAJOR): align pass_through_margin
+    # with the platform default (1.0). The previous synthetic bench used
+    # 1.5, which produced different DQ behaviour from the PyBullet bench
+    # for the same trajectory — platform honesty drift. The crash-margin
+    # opening still uses the strict bare-opening test, so this only
+    # tightens what counts as a credited pass.
     seq = GateSequencer(gate_specs, SequencerConfig(
-        pass_through_margin=1.5,
+        pass_through_margin=1.0,
         proximity_pass_distance=1.0,  # pass if within 1.0m of gate center
     ))
     seq.start()
@@ -299,54 +343,116 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     ekf = DroneEKF(EKFConfig())
     ekf.initialize(tuple(start_pos), (0, 0, 0), timestamp_s=0.0)
 
+    # iter-006 F3 (consensus MAJOR): the 8.0 / per-track 6.0 magic
+    # numbers from iter-005 are now replaced with a geometry-derived
+    # centripetal-acceleration limit. Per-track explicit overrides via
+    # `max_velocity_mps` still take precedence for hand-tuned tracks
+    # (race_01 stays at its sweep-tuned value if it sets one); else we
+    # auto-derive from gate spacing + bend angle.
+    # Iter-009: compute max_velocity BEFORE building the racing-line
+    # optimizer so its BO scorer uses the right velocity (F9 fix).
+    from planning.auto_velocity import derive_safe_max_velocity
+    if "max_velocity_mps" in data:
+        max_velocity = float(data["max_velocity_mps"])
+    else:
+        max_velocity = derive_safe_max_velocity(gate_specs)
+
+    # Iter-009i (F9 fix, 4-agent research swarm consensus 2026-05-24):
+    # path-velocity decoupling (Heilmeier 2019, Kapania 2016). The
+    # racing-line geometry is now selected at a fixed `select_velocity_mps=15.0`
+    # (legacy basin, see RacingLineConfig docstring), while the
+    # downstream trajectory generator below executes at the auto-derived
+    # `max_velocity`. This is the conceptually-correct decoupling that
+    # the iter-009 attempt got wrong: it had been coupling SELECTION and
+    # EXECUTION through the same velocity, causing the BO oracle to
+    # pick a different optimal basin at lower velocity (aigp_default
+    # crash at gate-1).
+    # Iter-009l (Opus M5 fix): synthetic and PyBullet bench paths must
+    # resolve to the SAME effective `select_velocity_mps` for the same
+    # track config — Opus's adversarial review flagged that synthetic
+    # explicitly pinning 15.0 (iter-009i) while PyBullet inherited the
+    # dataclass default was a drift risk. Now both paths use the
+    # dataclass default. Single source of truth in
+    # `RacingLineConfig.select_velocity_mps`.
     rl_opt = RacingLineOptimizer()
     opt_wps = rl_opt.optimize(gate_waypoints, tuple(start_pos))
 
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=15.0), dt_sample=0.02,
+        constraints=DroneConstraints(max_velocity=max_velocity), dt_sample=0.02,
     )
     trajectory = traj_opt.optimize(opt_wps, tuple(start_pos), (0, 0, 0))
 
-    # --- Offline per-section ILC with per-section Q-filter bandwidth (iteration 28) ---
-    # Time-varying Q-filter (Bristow & Alleyne 2007, ACC): different Butterworth
-    # cutoffs per track section. Higher bandwidth at S-turn inflection (gate-3)
-    # where error has high-frequency content from centripetal reversal. Lower
-    # bandwidth at smooth sections for noise rejection.
-    # Research: Bristow & Alleyne 2007/2008, Zhang 2024 (segment-wise ILC),
-    # Freeman 2025, van Haren 2024, Longman 2019.
+    # iter-004 Phase 1 (research swarm consensus): validate the planned
+    # trajectory by replaying a fresh sequencer against samples BEFORE
+    # the kinematic sim runs. If the validator says the plan would DQ /
+    # crash, the bench surfaces it via `plan_validation` so we get an
+    # early warning (and a metric for iter-005's corridor work).
+    from planning.plan_validator import validate_trajectory
+    plan_validation = validate_trajectory(trajectory, gate_specs, dt=dt)
+
+    # --- Offline per-section ILC (iter-001 A9 — course-agnostic) ----------
+    # Section partition: prefer the course config's explicit
+    # `ilc_section_overrides` block (e.g. race_01's hand-tuned 4-section
+    # helix schedule); else derive from trajectory curvature via
+    # `planning.ilc_sections.derive_section_boundaries`. Global hyper-
+    # parameters live in `config/ilc_defaults.json`; the course may patch
+    # any of them via `ilc_global_overrides`.
+    # Research: Bristow & Alleyne 2007 (ACC) — segment-wise ILC with
+    # per-section Q-filter bandwidth. Zhang 2024 — segment-wise ILC
+    # prevents cross-contamination. van Haren 2024 — class-specific cutoffs.
     from planning.trajectory_optimizer import compute_ilc_offset_table
+    from planning.ilc_sections import derive_section_boundaries, load_ilc_config
+
+    ilc_defaults = load_ilc_config()
+    ilc_global = {**ilc_defaults["global"], **data.get("ilc_global_overrides", {})}
+
     n_total_steps = int(trajectory.total_time / dt) + 50
-    # Section boundaries (iteration 28): 4 sections with per-section bandwidth
-    # Gate-3 at ~2.93s. Inflection region: 2.0s-4.4s (steps 200-440).
-    # Helix boundary: midpoint gate-6/gate-7 (~7.4s, step 740).
-    inflection_start = int(2.0 / dt)   # step 200
-    inflection_end = int(4.4 / dt)     # step 440
-    helix_start = int(7.4 / dt)        # step 740
-    section_boundaries = [
-        # (start, end, alpha, max_correction_m, filter_cutoff_hz, vel_scale)
-        # Per-section velocity correction scaling (iteration 42, Bristow & Alleyne 2007):
-        # Pre-inflection uses 0.0 to recover gate-2; helix uses 0.7 for max benefit.
-        (0, inflection_start, 0.30, 0.15, 0.35, 0.0),               # iter 47: alpha 0.4→0.30 to prevent gate-2 over-correction at 7 ILC iters
-        (inflection_start, inflection_end, 0.46, 0.15, 0.40, 0.4),  # iter 48: alpha 0.50→0.46 — rebalanced for 8 ILC iters, reduces gate-5 spatial coupling
-        (inflection_end, helix_start, 0.50, 0.15, 0.35, 0.5),       # iter 48: alpha 0.4→0.50 for deeper post-inflection convergence
-        (helix_start, n_total_steps, 0.45, 0.50, 0.35, 0.7),        # iter 47: helix alpha 0.4→0.45 for gate-7 with 7 ILC iters
-    ]
+
+    section_overrides = data.get("ilc_section_overrides")
+    if section_overrides:
+        # Iter-009 (Opus F10 MAJOR): support fractional section boundaries
+        # so race_01's sweep-tuned schedule survives velocity changes that
+        # alter trajectory step count. If `ilc_section_overrides_format` is
+        # "fractions" (or any value in the first column is <2.0), the
+        # start/end columns are scaled by n_total_steps. Otherwise the
+        # legacy absolute-step interpretation applies.
+        override_format = data.get("ilc_section_overrides_format", "auto")
+        is_fractions = (
+            override_format == "fractions"
+            or (
+                override_format == "auto"
+                and section_overrides
+                and max(s[0] for s in section_overrides) < 2.0
+                and max(s[1] for s in section_overrides) <= 1.0 + 1e-6
+            )
+        )
+        if is_fractions:
+            section_boundaries = [
+                (int(s[0] * n_total_steps), int(s[1] * n_total_steps)) + tuple(s[2:])
+                for s in section_overrides
+            ]
+        else:
+            section_boundaries = [tuple(s) for s in section_overrides]
+    else:
+        section_boundaries = derive_section_boundaries(
+            trajectory, dt, config=ilc_defaults,
+        )
     # Velocity-corrected ILC (iteration 41): returns (pos_offsets, vel_offsets)
-    # tuple. Velocity offsets are the smooth time derivative of position offsets,
-    # ensuring the controller's velocity reference is consistent with the shifted
-    # position reference. Research: Schoellig 2012, Kunapuli 2025, Nam 2026.
+    # tuple. Velocity offsets are the smooth time derivative of position
+    # offsets, ensuring the controller's velocity reference is consistent
+    # with the shifted position reference.
     ilc_result = compute_ilc_offset_table(
         trajectory, tuple(start_pos),
-        alpha=0.4,
-        max_iterations=8,              # iter 48: 7→8 for deeper ILC convergence (Longman 2023)
-        smoothing_sigma=10.0,
-        max_correction_m=0.15,
-        convergence_threshold=0.0005,         # iter 48: 0.002→0.0005 to allow deeper ILC convergence
+        alpha=ilc_global["alpha"],
+        max_iterations=ilc_global["max_iterations"],
+        smoothing_sigma=ilc_global["smoothing_sigma"],
+        max_correction_m=ilc_global["max_correction_m"],
+        convergence_threshold=ilc_global["convergence_threshold"],
         dt=dt,
         section_boundaries=section_boundaries,
-        blend_steps=50,
-        filter_cutoff_hz=0.35,  # Global fallback (used by sections without 5th element)
-        momentum_gamma=0.2,    # iter 49: heavy-ball momentum ILC (Wang 2023, Polyak 1964)
+        blend_steps=ilc_global["blend_steps"],
+        filter_cutoff_hz=ilc_global["filter_cutoff_hz"],
+        momentum_gamma=ilc_global["momentum_gamma"],
     )
     if ilc_result is not None:
         ilc_offsets, ilc_vel_offsets = ilc_result
@@ -358,12 +464,27 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     # the most important single fix. NGTC (Pries 2025) — literature gains 2-4x
     # higher. Damping: ζ=(kd+drag)/(2√kp)=(5.5+0.5)/(2√7)≈1.13 (stable).
     # 40+ configs swept: ff=0.50 kp=7 kd=5.5 optimal — avg err -13.4%.
-    tracker = GeometricTracker(TrackerConfig(
+    # iter-005 (research-swarm consensus + plan-validator diagnostic):
+    # tracker overshoot is the dominant failure mode on tight geometries.
+    # Letting callers override gains via `tracker_config_overrides` opens
+    # an experimentation seam without touching race_01's tuning.
+    # Iter-020: mass/gravity/max_thrust_n stripped — iter-013 routed
+    # TrackerConfig defaults through competition.drone_spec, so passing
+    # them explicitly was redundant. The PD gains and feedforward stay
+    # inline (they're controller-tuning, not drone-envelope).
+    tracker_kwargs = dict(
         kp_xy=7.0, kd_xy=5.5, kp_z=8.0, kd_z=5.0,
         feedforward_accel=0.50,
         velocity_feedforward=0.0,
-        mass=1.0, gravity=9.81, max_thrust_n=20.0,
-    ))
+    )
+    if tracker_config_overrides:
+        tracker_kwargs.update(tracker_config_overrides)
+    # Course-level overrides via track config (no per-call arg needed for
+    # plumbing into matrix experiments / per-track tuning).
+    course_tracker_overrides = data.get("tracker_overrides", {})
+    if course_tracker_overrides:
+        tracker_kwargs.update(course_tracker_overrides)
+    tracker = GeometricTracker(TrackerConfig(**tracker_kwargs))
 
     # Predictive feedforward lookahead (Tal & Karaman 2018 style).
     # Use acceleration from slightly ahead in the trajectory to
@@ -376,11 +497,20 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     vel = np.zeros(3)
     yaw = 0.0
 
-    # Kinematic parameters (tuned to approximate Crazyflie CF2X dynamics)
-    max_accel = 15.0      # m/s^2 (~1.5g, matches DroneConstraints)
-    max_speed = 15.0      # m/s — increased to match trajectory planner ceiling
-    drag = 0.5            # velocity damping (aerodynamic drag approximation)
-    yaw_rate_max = 4.0    # rad/s
+    # Iter-012 (deferred from iter-010 Opus M4): kinematic parameters
+    # sourced from competition.drone_spec — the single source of truth
+    # for the synthetic-bench drone envelope. Previously inline literals
+    # could drift from `DroneConstraints` (the original 15-vs-20 lie).
+    from competition.drone_spec import (
+        DEFAULT_LINEAR_DRAG_PER_MASS,
+        DEFAULT_MAX_ACCEL_MPS2,
+        DEFAULT_MAX_VELOCITY_MPS,
+        DEFAULT_YAW_RATE_MAX_RAD_S,
+    )
+    max_accel = DEFAULT_MAX_ACCEL_MPS2          # m/s^2 — bench saturation clamp
+    max_speed = DEFAULT_MAX_VELOCITY_MPS        # m/s — bench velocity clamp
+    drag = DEFAULT_LINEAR_DRAG_PER_MASS         # velocity damping
+    yaw_rate_max = DEFAULT_YAW_RATE_MAX_RAD_S   # rad/s
 
     # --- Run loop ---
     tracking_errors = []
@@ -388,6 +518,10 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
     gate_pass_times = []
     per_gate_errors = {}
     controller_trace = []  # Phase 1: record controller outputs
+    # Iter-033: optional per-step position trace so the matrix
+    # visualizer can replay the EXACT drone path the bench produced.
+    # Off by default to keep result-dict size small for tests.
+    position_trace = [] if record_position_trace else None
     crashed = False
     termination_reason = "time_limit"
 
@@ -414,7 +548,34 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
             termination_reason = "race_complete"
             break
 
-        # Crash detection (ground or very high)
+        # iter-002 review M6 (5/7 reviews MAJOR): enforce the VQ1 8-minute
+        # cap on bench paths too. Without this, the bench could run a
+        # trajectory that exceeds 480 s without surfacing a timeout — the
+        # competition rule would silently be violated.
+        if sim_time > AIGP_VQ1_MAX_RUN_DURATION_S:
+            seq.mark_timed_out(
+                f"vq1_max_run_duration_exceeded:{sim_time:.1f}s"
+            )
+            termination_reason = f"timed_out:{seq.timeout_reason}"
+            break
+
+        # iter-001 A7 + iter-002 (composer-25 F6/F7): terminal failures
+        # come from the sequencer first, then the kinematic-sim envelope.
+        # `crashed` and `disqualified` are SEPARATE signals — a DQ is a
+        # rule violation, not a physical impact. Bench reports both
+        # truthfully so the result-dict consumer can distinguish them.
+        if seq.last_crash is not None:
+            crashed = True
+            termination_reason = f"crash_gate:{seq.last_crash[0]}"
+            break
+        if seq.is_disqualified:
+            # Note: NOT setting crashed=True — DQ is its own terminal
+            # signal, surfaced in the result dict's `disqualified` field.
+            termination_reason = f"disqualified:{seq.dq_reason}"
+            break
+
+        # Crash detection (ground or very high) — kept as the catch-all for
+        # cases the sequencer can't see (e.g. drone exits the airspace bounds).
         if pos[2] < 0.05:
             crashed = True
             termination_reason = "crash_ground"
@@ -493,16 +654,28 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         else:
             accel = -drag * vel
 
-        # Clamp acceleration
-        accel_mag = np.linalg.norm(accel)
-        if accel_mag > max_accel:
-            accel = accel / accel_mag * max_accel
+        # Iter-016 (Composer-4 verification, iter-010 review): clamp-active
+        # fraction is a key honesty metric. iter-010 dropped DroneConstraints.
+        # max_acceleration from 20 → 15 on the hypothesis that the bench
+        # was saturating; if the post-iter-010 clamp NEVER engages, the
+        # hypothesis is wrong (and aigp_default's tracking degradation
+        # has a different cause). Track per-step engagement here and
+        # surface in the result dict for downstream analysis.
+        accel_mag_pre = float(np.linalg.norm(accel))
+        accel_clamp_active = accel_mag_pre > max_accel
+        if accel_clamp_active:
+            accel = accel / accel_mag_pre * max_accel
+        controller_trace[-1]["accel_mag_pre_clamp"] = accel_mag_pre
+        controller_trace[-1]["accel_clamp_active"] = accel_clamp_active
 
         # Integrate
         vel = vel + accel * dt
         speed = np.linalg.norm(vel)
-        if speed > max_speed:
+        speed_clamp_active = speed > max_speed
+        if speed_clamp_active:
             vel = vel / speed * max_speed
+        controller_trace[-1]["speed_pre_clamp"] = float(speed)
+        controller_trace[-1]["speed_clamp_active"] = speed_clamp_active
 
         pos = pos + vel * dt
 
@@ -515,6 +688,15 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         closest = trajectory.find_closest(tuple(pos))
         err = math.sqrt(sum((a - b) ** 2 for a, b in zip(pos, closest.position)))
         tracking_errors.append(err)
+        # Iter-033: optional position trace for the matrix visualizer.
+        if position_trace is not None:
+            position_trace.append({
+                "t": sim_time,
+                "pos": tuple(float(v) for v in pos),
+                "vel": tuple(float(v) for v in vel),
+                "yaw": float(yaw),
+                "tracking_err_m": float(err),
+            })
 
         cur = seq.current_gate
         if cur:
@@ -542,6 +724,26 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
         "dt": dt,
         "termination_reason": termination_reason,
         "crashed": crashed,
+        # iter-001 A7: terminal-failure surface for the synthesised honesty
+        # contract. `crashed` covers physical impacts; `disqualified` covers
+        # rule violations (out-of-order pass, etc). Either makes `sim_passed`
+        # False.
+        "disqualified": bool(seq.is_disqualified),
+        "dq_reason": seq.dq_reason,
+        "last_crash_gate": seq.last_crash[0] if seq.last_crash else None,
+        # iter-004 Phase 1: pre-flight plan validation — does the planned
+        # trajectory itself (under perfect tracking) legally complete?
+        # Distinct from `sim_passed` which folds tracking error etc.
+        "plan_validation": {
+            "ok": plan_validation.ok,
+            "reason": plan_validation.reason,
+            "gates_passed": plan_validation.gates_passed,
+            "crashed": plan_validation.crashed,
+            "disqualified": plan_validation.disqualified,
+            "dq_reason": plan_validation.dq_reason,
+            "last_crash_gate": plan_validation.last_crash_gate,
+            "first_failure_time_s": plan_validation.first_failure_time_s,
+        },
         "gates_passed": seq.gates_passed,
         "total_gates": seq.total_gates,
         "gate_pass_rate": seq.gates_passed / seq.total_gates if seq.total_gates > 0 else 0,
@@ -565,13 +767,50 @@ def run_synthetic_benchmark(duration: float = 30.0, dt: float = 0.01) -> Dict[st
             "avg_thrust": float(np.mean([c["thrust"] for c in controller_trace])) if controller_trace else 0,
             "max_abs_roll_rad": float(np.max([abs(c["roll"]) for c in controller_trace])) if controller_trace else 0,
             "max_abs_pitch_rad": float(np.max([abs(c["pitch"]) for c in controller_trace])) if controller_trace else 0,
+            # Iter-016 (Composer-4 verification): clamp engagement metrics.
+            # Bench saturates accel at max_accel (15 m/s²) and speed at
+            # max_speed (15 m/s). High fractions => planner is commanding
+            # capabilities the bench can't deliver; iter-010's
+            # max_acceleration drop hypothesis predicted these should fall
+            # post-iter-010 if the bench was actually saturating.
+            "accel_clamp_active_frac": float(
+                np.mean([
+                    c.get("accel_clamp_active", False) for c in controller_trace
+                ])
+            ) if controller_trace else 0,
+            "speed_clamp_active_frac": float(
+                np.mean([
+                    c.get("speed_clamp_active", False) for c in controller_trace
+                ])
+            ) if controller_trace else 0,
+            "max_accel_mag_pre_clamp": float(
+                np.max([
+                    c.get("accel_mag_pre_clamp", 0.0) for c in controller_trace
+                ])
+            ) if controller_trace else 0,
         } if controller_trace else {},
+        # Iter-024: surface the GeometricTracker's feature_trace
+        # (iter-014 hook) in the result dict so callers passing
+        # `tracker_config_overrides={"trace_features": True}` can
+        # collect ML training data from real matrix runs. Empty when
+        # the flag is off (production callers see no payload).
+        "tracker_feature_trace": (
+            list(tracker.feature_trace)
+            if getattr(tracker, "feature_trace", None) else []
+        ),
+        # Iter-033: drone position trace (when record_position_trace=True).
+        # Used by `scripts/visualize_matrix.py` to replay the matrix
+        # bench's drone path. None when the flag is off — keeps the
+        # default result dict small for unit tests.
+        "position_trace": position_trace,
     }
 
     # Threshold checks
     failures = []
     if crashed:
         failures.append(f"drone crashed ({termination_reason})")
+    if seq.is_disqualified:
+        failures.append(f"drone disqualified ({seq.dq_reason})")
     if avg_err > THRESHOLDS["max_avg_tracking_error_m"]:
         failures.append(f"avg_tracking_error {avg_err:.2f}m > {THRESHOLDS['max_avg_tracking_error_m']}m")
     if max_err > THRESHOLDS["max_max_tracking_error_m"]:
@@ -624,6 +863,7 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     result["available"] = True
 
     # Pipeline setup
+    from competition.aigp_geometry import AIGP_VQ1_MAX_RUN_DURATION_S
     from estimation.ekf import DroneEKF, EKFConfig
     from gate_sequencing.sequencer import GateSequencer, GateSpec, SequencerConfig
     from planning.trajectory_optimizer import (
@@ -683,10 +923,25 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         PlannerConfig, race_config.planner_overrides
     )
 
+    # iter-007 (3-way BLOCKER fix to iter-005b's dead code): RaceConfig
+    # now actually has the max_velocity_mps field, so this getattr does
+    # what iter-005b claimed. Fallback chain matches the synthetic bench:
+    #   1. explicit `max_velocity_mps` in track JSON
+    #   2. legacy `planner_overrides.plan_max_speed_mps`
+    #   3. auto-derive from gate geometry
+    from planning.auto_velocity import derive_safe_max_velocity
+    explicit_max_v = race_config.max_velocity_mps
+    if explicit_max_v is not None:
+        pybullet_max_v = float(explicit_max_v)
+    elif race_config.planner_overrides.get("plan_max_speed_mps") is not None:
+        pybullet_max_v = float(planner_cfg.plan_max_speed_mps)
+    else:
+        pybullet_max_v = derive_safe_max_velocity(gate_specs)
+
     rl_opt = RacingLineOptimizer(config=racing_line_cfg)
     opt_wps = rl_opt.optimize(gate_waypoints, start_pos)
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=planner_cfg.plan_max_speed_mps),
+        constraints=DroneConstraints(max_velocity=pybullet_max_v),
         dt_sample=0.02,
         planner_config=planner_cfg,
     )
@@ -734,9 +989,39 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
             termination_reason = "race_complete"
             break
 
+        # Iter-003 M6 mirror: enforce VQ1 8-minute cap on the PyBullet
+        # bench too. The synthetic bench already has this check; mirror
+        # it here so both platforms honour the competition rule.
+        if sim_time > AIGP_VQ1_MAX_RUN_DURATION_S:
+            seq.mark_timed_out(
+                f"vq1_max_run_duration_exceeded:{sim_time:.1f}s"
+            )
+            termination_reason = f"timed_out:{seq.timeout_reason}"
+            break
+
+        # iter-001 A7 + iter-002 (composer-25 F6/F7): DQ is terminal on
+        # the PyBullet path too — but it's NOT a crash. Frame-strut
+        # crashes still flow primarily through `env.gate_contact()`
+        # (the contact manifold is authoritative); the sequencer's
+        # geometric crash classification is a secondary signal.
+        if seq.is_disqualified:
+            # Not setting crashed=True — surfaced via the result dict's
+            # disqualified field.
+            termination_reason = f"disqualified:{seq.dq_reason}"
+            break
+
         if pos[2] < 0.05:
             crashed = True
             termination_reason = "crash_ground"
+            break
+
+        # Iter-008 F12 (Opus, platform-drift MINOR): synthetic bench has
+        # a ceiling check; PyBullet now matches. Without this the same
+        # trajectory would terminate at z>20 in the synthetic bench but
+        # silently fly out of the airspace in the PyBullet bench.
+        if pos[2] > 20.0:
+            crashed = True
+            termination_reason = "crash_ceiling"
             break
 
         # Gate-contact crash detection: any contact point against an
@@ -745,8 +1030,17 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         # contact remaining here means we've hit a frame strut.
         hit_gate = env.gate_contact()
         if hit_gate is not None:
+            seq.mark_collision(hit_gate)
             crashed = True
             termination_reason = f"crash_gate:{hit_gate}"
+            break
+
+        # If env didn't report a contact but the geometric sequencer's
+        # P1-6 branch flagged a frame strike (e.g. sub-frame proximity not
+        # quite touching), trust it.
+        if seq.last_crash is not None:
+            crashed = True
+            termination_reason = f"crash_gate:{seq.last_crash[0]}"
             break
 
         # Progress-clock advance: only if drone is keeping up with the
@@ -804,6 +1098,10 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
         "wall_time_s": wall_elapsed,
         "termination_reason": termination_reason,
         "crashed": crashed,
+        # iter-001 A7: same honesty surface as the synthetic bench.
+        "disqualified": bool(seq.is_disqualified),
+        "dq_reason": seq.dq_reason,
+        "last_crash_gate": seq.last_crash[0] if seq.last_crash else None,
         "gates_passed": seq.gates_passed,
         "total_gates": seq.total_gates,
         "gate_pass_rate": seq.gates_passed / seq.total_gates if seq.total_gates > 0 else 0,
@@ -825,6 +1123,8 @@ def run_sim_benchmark(config_path: str, duration: float) -> Dict[str, Any]:
     failures = []
     if crashed:
         failures.append(f"drone crashed ({termination_reason})")
+    if seq.is_disqualified:
+        failures.append(f"drone disqualified ({seq.dq_reason})")
     if avg_err > THRESHOLDS["max_avg_tracking_error_m"]:
         failures.append(f"avg_tracking_error {avg_err:.2f}m > {THRESHOLDS['max_avg_tracking_error_m']}m")
     if max_err > THRESHOLDS["max_max_tracking_error_m"]:

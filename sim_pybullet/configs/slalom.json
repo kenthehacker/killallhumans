@@ -1,4 +1,5 @@
 {
+  "_about": "Slalom has tight lateral turns. iter-006 replaced the explicit max_velocity_mps=6.0 override with derive_safe_max_velocity, which computes the centripetal-acceleration-limited velocity from gate spacing + bend angle (no per-track magic numbers).",
   "field": {
     "name": "slalom",
     "bounds_min": [-5.0, -6.0, 0.0],

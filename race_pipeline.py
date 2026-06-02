@@ -35,6 +35,7 @@ from competition.adapter import (
     CompetitionInterface,
     TelemetryState,
 )
+from competition.aigp_geometry import AIGP_VQ1_MAX_RUN_DURATION_S
 from competition.session import RaceSession
 from control.mpc_tracker import GeometricTracker, SimplePositionTracker, TrackerConfig
 from estimation.ekf import DroneEKF, EKFConfig
@@ -60,25 +61,38 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the racing pipeline."""
+    """Configuration for the racing pipeline.
+
+    Defaults match the AIGP VQ1 spec (VADR-TS-002): 640×360 forward
+    camera tilted 20° up, 1.5 m gate openings. Legacy tracks override
+    via explicit args at construction time.
+    """
     # Control rate
     target_hz: float = 100.0
 
-    # Camera
+    # Camera (AIGP VQ1 — VADR-TS-002 §3.8 + §4.6)
     camera_fov_h: float = 90.0
     image_width: int = 640
-    image_height: int = 480
+    image_height: int = 360
+    # Body→camera tilt in radians, positive = nose-up. AIGP camera is
+    # tilted 20° upward; legacy / debug paths can override to 0.
+    camera_pitch_offset_rad: float = math.radians(20.0)
 
-    # Gate geometry
-    gate_width: float = 1.2
-    gate_height: float = 1.2
+    # Gate geometry (AIGP VQ1 — VADR-TS-002 §3.7)
+    gate_width: float = 1.5
+    gate_height: float = 1.5
 
     # Detection
     use_detection: bool = True
     detection_confidence_threshold: float = 0.3
 
     # Planning
-    max_speed: float = 12.0
+    # iter-005b (Opus F4 BLOCKER): default lowered from 12.0 to 8.0 to
+    # match the synthetic bench's new default. The previous 12.0 was a
+    # competition-path overfit: only race_01-like gate spacing could
+    # follow it. Tracks with tight turns (slalom-like) needed lower
+    # velocities. Callers can still override via `PipelineConfig(max_speed=...)`.
+    max_speed: float = 8.0
     trajectory_dt: float = 0.01
 
     # Control mode
@@ -88,6 +102,14 @@ class PipelineConfig:
     use_ekf: bool = True
     use_pnp: bool = True
     use_state_predictor: bool = True
+
+    # Iter-015: ML training infra (continues iter-014's feature-trace
+    # hook). When True, the underlying GeometricTracker captures
+    # per-step features + nominal commands to `pipeline.tracker.feature_trace`.
+    # Default off — production callers see zero overhead. A future
+    # `scripts/collect_residual_dataset.py` flips this on, runs a race,
+    # and dumps the trace to .npz for training.
+    trace_tracker_features: bool = False
 
 
 class RacePipeline:
@@ -112,18 +134,32 @@ class RacePipeline:
         self.config = config or PipelineConfig()
 
         # Modules
+        # Iter-002 (B5, composer-25-4 F4): thread PipelineConfig's
+        # camera_pitch_offset_rad into the CameraIntrinsics built by
+        # from_fov. Previously the offset was stored on PipelineConfig
+        # but the constructed intrinsics dropped it, leaving
+        # CameraIntrinsics.pitch_offset_rad at its module default. The
+        # offset is irrelevant for position-only PnP with coincident
+        # camera/body origins (spec VADR-TS-002 §3.8), but it matters
+        # for any future code that derives orientation from a gate
+        # detection — wire it through now so the bug class can't
+        # silently regress.
         self.camera = CameraIntrinsics.from_fov(
             self.config.camera_fov_h,
             self.config.image_width,
             self.config.image_height,
         )
+        self.camera.pitch_offset_rad = self.config.camera_pitch_offset_rad
         self.gate_geometry = GateGeometry(
             self.config.gate_width, self.config.gate_height
         )
         self.pnp_estimator = GatePnPEstimator(self.camera, self.gate_geometry)
         self.ekf = DroneEKF(EKFConfig())
         self.state_predictor = StatePredictor(LatencyConfig())
-        self.tracker = GeometricTracker(TrackerConfig())
+        # Iter-015: wire trace_features through PipelineConfig so the
+        # collection script can opt in without monkey-patching.
+        _tracker_cfg = TrackerConfig(trace_features=self.config.trace_tracker_features)
+        self.tracker = GeometricTracker(_tracker_cfg)
         self.simple_tracker = SimplePositionTracker(TrackerConfig())
 
         # Phase 1 detector — instantiated once, reused every frame (Phase 3 fix)
@@ -260,11 +296,27 @@ class RacePipeline:
             address=address,
         )
         session.on_telemetry = self._control_callback
+        # Iter-001 review (B2, consensus BLOCKER): stop on ANY terminal
+        # sequencer state — completion, out-of-order DQ, or a recorded
+        # crash. The prior version only checked is_complete, so a DQ run
+        # silently kept flying.
         session.should_stop = lambda: (
-            self.sequencer is not None and self.sequencer.is_complete
+            self.sequencer is not None and (
+                self.sequencer.is_complete
+                or self.sequencer.is_disqualified
+                or self.sequencer.is_timed_out
+                or self.sequencer.last_crash is not None
+            )
         )
 
-        self._race_start_time = time.time()
+        # Iter-002 review B1 (5/7 BLOCKER) + iter-003 M5 (4/7 MAJOR): the
+        # 8-minute timeout check uses BOTH a monotonic wall-clock fallback
+        # AND a sim-time path that takes precedence when telemetry carries
+        # `timestamp_us`. Sim-time is preferred because a non-realtime
+        # simulator (slowed down, paused, or fast-forwarded) would
+        # false-trip or under-trip a wall-clock-only check.
+        self._race_start_time = time.monotonic()
+        self._race_start_sim_time_s: Optional[float] = None  # set on first telem tick
         self._ref_progress_time = 0.0
         self.sequencer.start()
 
@@ -326,6 +378,44 @@ class RacePipeline:
         if self.sequencer.is_complete:
             logger.info("All gates passed! Race complete.")
             return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+
+        # Iter-001 review (B2): terminal failure must abort the control
+        # loop, not silently keep tracking the next reference. Hover the
+        # vehicle in place; the session-level should_stop will pick up
+        # the same signal and exit the run.
+        if self.sequencer.is_disqualified:
+            logger.error("Race terminated: DQ — %s", self.sequencer.dq_reason)
+            return AttitudeCommand(0, 0, yaw, 0.4)  # hover (run is over)
+        if self.sequencer.last_crash is not None:
+            gate_id, _xyz = self.sequencer.last_crash
+            logger.error("Race terminated: gate-frame crash on %s", gate_id)
+            return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+        # Iter-002 (5/7 reviews): enforce VQ1 8-minute cap. Sequencer's
+        # TIMED_OUT state is set by RaceSession or the bench based on
+        # elapsed sim time; here we just abort the loop cleanly.
+        if self.sequencer.is_timed_out:
+            logger.error(
+                "Race terminated: timeout — %s",
+                self.sequencer.timeout_reason or "max_run_duration_exceeded",
+            )
+            return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+
+        # Iter-003 M5: prefer sim-time elapsed (from telem.timestamp_us)
+        # over wall-clock. A simulator running below realtime would
+        # under-time-out under wall-clock; one running above would over-
+        # time-out. With sim time we measure what the COMPETITION sees.
+        # Fall back to monotonic wall-clock if telem has no timestamp.
+        if telem.timestamp_us is not None and telem.timestamp_us > 0:
+            sim_time_s = telem.timestamp_us / 1e6
+            if self._race_start_sim_time_s is None:
+                self._race_start_sim_time_s = sim_time_s
+            elapsed = sim_time_s - self._race_start_sim_time_s
+        else:
+            elapsed = time.monotonic() - self._race_start_time
+        if elapsed > AIGP_VQ1_MAX_RUN_DURATION_S and not self.sequencer.is_timed_out:
+            self.sequencer.mark_timed_out(
+                f"vq1_max_run_duration_exceeded:{elapsed:.1f}s"
+            )
 
         # 3a. Dynamic replan: mirrors sim_pybullet/runner._maybe_replan.
         #     A crash/miss/off-track surface event rebuilds the

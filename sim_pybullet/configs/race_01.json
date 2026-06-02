@@ -12,6 +12,19 @@
     "depth_m": 0.10,
     "color": "red"
   },
+  "_ilc_about": "race_01 has been heavily tuned for its 12-gate helix (iter 47-49 sweep). Preserve via explicit overrides; new tracks fall through to curvature-derived sections from config/ilc_defaults.json. iter-009 (Opus F10): overrides are now FRACTIONS of trajectory length (0.0-1.0) rather than absolute step indices — survives velocity changes that alter trajectory step count. Original v=15 boundaries (200/440/740 of 1370 steps) ≈ 0.146/0.321/0.540 in fractional form.",
+  "ilc_global_overrides": {
+    "max_iterations": 8,
+    "convergence_threshold": 0.0005,
+    "momentum_gamma": 0.2
+  },
+  "ilc_section_overrides_format": "fractions",
+  "ilc_section_overrides": [
+    [0.0,   0.146, 0.30, 0.15, 0.35, 0.0],
+    [0.146, 0.321, 0.46, 0.15, 0.40, 0.4],
+    [0.321, 0.540, 0.50, 0.15, 0.35, 0.5],
+    [0.540, 1.0,   0.45, 0.50, 0.35, 0.7]
+  ],
   "gates": [
     { "id": "gate-1", "sequence_index": 1, "pose": { "x": 8.0, "y": 0.0, "z": 1.5, "yaw": 0.0 }, "config": { "color": "red" } },
     { "id": "gate-2", "sequence_index": 2, "pose": { "x": 18.0, "y": 4.0, "z": 2.2, "yaw": 0.38 }, "config": { "color": "blue" } },

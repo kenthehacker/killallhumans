@@ -18,16 +18,43 @@ except ImportError:
     p = None
 
 
+def _spec():
+    """Iter-026b: lazy import of competition.drone_spec to avoid a hard
+    `sim_pybullet → competition` import-time dependency.  Used by
+    `DroneConfig` field defaults via `field(default_factory=...)`."""
+    import competition.drone_spec as ds
+    return ds
+
+
 @dataclass
 class DroneConfig:
-    mass_kg: float = 1.0
-    arm_length_m: float = 0.175
-    body_size: Tuple[float, float, float] = (0.15, 0.15, 0.05)
-    max_thrust_n: float = 20.0  # total max thrust (all 4 motors)
-    max_roll_angle: float = 0.35  # radians (~20 deg) — keep conservative for stability
+    # Iter-026b: unified with competition.drone_spec per the 3-agent
+    # sim-stack unification plan (.loop/synthesis/iter_026_sim_stack_plan.md).
+    # Mass/thrust/gravity/arm_length/body_size all source from drone_spec,
+    # making this the same drone as the matrix bench's TrackerConfig and
+    # planning/trajectory_optimizer's DroneConstraints.
+    #
+    # Attitude PD gains, tilt limits, and max_yaw_rate STAY inline:
+    # they're plant-local stability tuning (not drone-envelope properties),
+    # and the conservative 0.35-rad tilt cap and 2.0 rad/s yaw rate were
+    # iter-021 stability choices for THIS multibody PD loop. Sourcing
+    # those from drone_spec (TrackerConfig has 0.85 / 4.0) would force
+    # the PyBullet attitude loop to chase tilts it can't stabilise.
+    mass_kg: float = field(default_factory=lambda: _spec().DEFAULT_MASS_KG)
+    arm_length_m: float = field(
+        default_factory=lambda: _spec().DEFAULT_ARM_LENGTH_M
+    )
+    body_size: Tuple[float, float, float] = field(
+        default_factory=lambda: _spec().DEFAULT_BODY_SIZE_M
+    )
+    max_thrust_n: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_THRUST_N
+    )
+    # Attitude limits stay inline — iter-021 stability conservatism.
+    max_roll_angle: float = 0.35  # radians (~20 deg)
     max_pitch_angle: float = 0.35
-    max_yaw_rate: float = 2.0  # rad/s
-    gravity: float = 9.81
+    max_yaw_rate: float = 2.0     # rad/s
+    gravity: float = field(default_factory=lambda: _spec().DEFAULT_GRAVITY_MPS2)
     # Attitude PD gains (tuned for per-motor differential thrust)
     attitude_kp: float = 12.0
     attitude_kd: float = 4.0
@@ -223,6 +250,95 @@ class QuadrotorDrone:
             "pitch": euler[1],
             "roll": euler[0],
         }
+
+    def step_reference(self, reference, current_yaw_override=None):
+        """Iter-026c (Opus plan step 3): unified control wrapper.
+
+        Wraps an internal `GeometricTracker(TrackerConfig())` so the
+        QuadrotorDrone backend uses the SAME control chain as the
+        matrix bench and the live MAVLink pipeline. Converts the
+        tracker's `AttitudeCommand` to QuadrotorDrone's normalized
+        `apply_command(throttle, roll, pitch, yaw)` inputs:
+
+          - thrust: already normalized [0, 1] by TrackerConfig's
+            min/max_thrust_normalized clamps; passed through.
+          - roll_rad / pitch_rad: normalized via max_roll/pitch_angle
+            (DroneConfig stability caps, NOT TrackerConfig.max_tilt_rad).
+            If the tracker commands a tilt beyond this drone's
+            stability envelope, the value gets clipped — same behavior
+            as the bench's hard saturation.
+          - yaw_rad (desired absolute yaw): converted to a P-controller
+            yaw-rate command, normalized by max_yaw_rate. Angle-wrap
+            handled.
+
+        Args:
+            reference: a TrajectoryPoint (planning.trajectory_optimizer)
+                or any object with `.position`, `.velocity`, `.acceleration`,
+                `.yaw` attributes — what GeometricTracker.track expects.
+            current_yaw_override: optional explicit current yaw (radians).
+                Defaults to the drone's actual yaw from PyBullet.
+
+        Returns the AttitudeCommand the tracker produced (useful for
+        HUD readouts and trace_features data collection).
+        """
+        if getattr(self, "_tracker", None) is None:
+            # Iter-030 (composer's #2 finding): the internal tracker
+            # MUST clamp commanded tilt to the PLANT's max_roll/pitch_angle,
+            # not TrackerConfig's wider 0.85-rad default. Otherwise the
+            # tracker commands tilts the plant proportionally throws
+            # away in apply_command (cmd.roll_rad / 0.35 → clip(1.0)),
+            # silently saturating control authority. Use the smaller
+            # of {plant tilt cap, default tracker cap} to keep the
+            # control chain honest.
+            from control.mpc_tracker import GeometricTracker, TrackerConfig
+            plant_tilt_cap = min(
+                float(self.config.max_roll_angle),
+                float(self.config.max_pitch_angle),
+            )
+            self._tracker = GeometricTracker(
+                TrackerConfig(max_tilt_rad=plant_tilt_cap),
+            )
+
+        state = self.get_state()
+        cur_yaw = state["yaw"] if current_yaw_override is None else current_yaw_override
+
+        # Iter-030 KNOWN ISSUE: GeometricTracker is hardcoded for NED
+        # (mpc_tracker.py line 203 subtracts (0,0,+g)) but PyBullet
+        # is ENU. Naive z-flip conversion proved insufficient — also
+        # need to flip roll/pitch sign (NED nose-down positive vs ENU
+        # nose-up positive), body_z direction (NED -z vs ENU +z), and
+        # yaw direction (NED CW vs ENU CCW). Multiple coupled sign
+        # flips → fragile. Real fix is to refactor mpc_tracker to be
+        # frame-agnostic OR write an ENU-native tracker for this
+        # backend. Both research-scale. Documented in
+        # .loop/synthesis/iter_030_step_reference_frame_blocker.md;
+        # step_reference left as documented-broken for the next iter.
+        cmd = self._tracker.track(
+            current_position=state["position"],
+            current_velocity=state["velocity"],
+            current_yaw=cur_yaw,
+            reference=reference,
+        )
+
+        # Thrust is already normalized [0, 1] by TrackerConfig clamps.
+        throttle_norm = float(max(0.0, min(1.0, cmd.thrust)))
+        # Roll/pitch radians → normalized [-1, 1] via DroneConfig caps.
+        roll_norm = float(max(-1.0, min(1.0,
+                                        cmd.roll_rad / self.config.max_roll_angle)))
+        pitch_norm = float(max(-1.0, min(1.0,
+                                         cmd.pitch_rad / self.config.max_pitch_angle)))
+        # Yaw: convert desired yaw angle → yaw-rate command via P.
+        # Wrap error to [-π, π] so 359° → 1° error is -2°, not +358°.
+        yaw_err = cmd.yaw_rad - cur_yaw
+        yaw_err = (yaw_err + math.pi) % (2.0 * math.pi) - math.pi
+        # P gain 2.0 — fast enough to follow yaw changes, low enough
+        # not to saturate. yaw_rate_cmd = 2*err clipped to ±max_yaw_rate.
+        yaw_rate_cmd = 2.0 * yaw_err
+        yaw_norm = float(max(-1.0, min(1.0,
+                                       yaw_rate_cmd / self.config.max_yaw_rate)))
+
+        self.apply_command(throttle_norm, roll_norm, pitch_norm, yaw_norm)
+        return cmd
 
     def apply_command(self, throttle: float, roll: float, pitch: float, yaw: float):
         """

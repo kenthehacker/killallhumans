@@ -80,6 +80,17 @@ class RacingLineConfig:
                                        # at 0.339m, constraining corner-cutting.
                                        # TOGT (Qin 2024): gates are regions, not points.
                                        # 0.6 * 0.6m half-width = 0.36m offset, leaves 0.24m margin.
+    # Iter-035 (gate-altitude bug fix): vertical offset bound (fraction of
+    # half-height). Default 0.0 = drone passes through the gate center
+    # vertically — the natural optimum given a 1.5m gate opening.
+    # Pre-iter-035 the bound was implicitly equal to max_lateral_offset
+    # AND the `up` vector at `_apply_offsets` was [0,0,-1] (NED) while
+    # the rest of the system is ENU, so the BO's z-offsets pushed gates
+    # DOWN by up to 0.35m on every gate (measured on straight_hairpin —
+    # drone passed at z=1.65 with gates at z=2.0 every time). Two fixes:
+    # bound=0 to lock the BO out of z-tuning, AND fixed `up` direction
+    # in `_apply_offsets` so any future enablement is correct.
+    max_vertical_offset: float = 0.0
     corner_cut_aggressiveness: float = 0.7  # 0=center, 1=max corner cut
     speed_weight: float = 1.0          # importance of minimizing time
     smoothness_weight: float = 0.40    # importance of path smoothness
@@ -91,6 +102,40 @@ class RacingLineConfig:
                                        # ILMPC (Zhao 2025): trajectory quality > controller tuning.
     lookahead_gates: int = 3           # gates to consider for corner cutting
     use_cache: bool = True             # use cached racing line offsets for determinism (iter 33)
+    # Iter-009i (F9 fix, 4-agent research swarm consensus 2026-05-24):
+    # path-velocity decoupling per Heilmeier 2019 / Kapania 2016 TUM
+    # method. The optimal lateral-offset *geometry* is chosen independent
+    # of the velocity it will be flown at; the velocity profile is then
+    # solved separately by the downstream TrajectoryOptimizer (which the
+    # bench constructs with the auto-derived execution velocity).
+    #
+    #   select_velocity_mps: the velocity the BO scorer uses INTERNALLY
+    #     when generating candidate min-snap trajectories for ranking.
+    #     Fixed at 15.0 by design — keeps the scorer in the legacy
+    #     race_01-sweep basin regardless of how slow the actual flight
+    #     will be. Changing this is the F9 regression mechanism (4 agent
+    #     diagnoses: Opus/GPT-5.5/Composer/Gemini all identified the same
+    #     velocity-coupled basin-switching in `.loop/research/f9_*.md`).
+    #
+    # Iter-009k: `max_velocity_mps` field REMOVED. The 7-agent review
+    # of iter-009i (4/7 reviewers) flagged it as a "semantic API trap"
+    # — informational-only, read by nothing, but its name suggested it
+    # would control the optimizer. Removing it structurally eliminates
+    # the F9-reintroduction vector. Callers that need the
+    # execution velocity wire it into TrajectoryOptimizer directly.
+    select_velocity_mps: float = 15.0
+
+    def __post_init__(self):
+        # Iter-009j (Codex#2 MAJOR): NaN/Inf/<=0 in select_velocity_mps
+        # would poison TrajectoryOptimizer's segment-time math AND produce
+        # non-standard JSON cache keys. Reject early with a clear error.
+        import math as _math
+        if not _math.isfinite(self.select_velocity_mps) or self.select_velocity_mps <= 0:
+            raise ValueError(
+                f"RacingLineConfig.select_velocity_mps="
+                f"{self.select_velocity_mps!r} is invalid; must be a "
+                f"finite positive float."
+            )
 
 
 class RacingLineOptimizer:
@@ -142,6 +187,12 @@ class RacingLineOptimizer:
                 "smoothness_weight": config.smoothness_weight,
                 "speed_weight": config.speed_weight,
                 "corner_cut_aggressiveness": config.corner_cut_aggressiveness,
+                # Iter-009i: cache key splits on the selection-reference
+                # speed, since it controls the BO oracle's basin choice.
+                # Execution velocity (used by the downstream
+                # TrajectoryOptimizer at the bench layer) is NOT in this
+                # key — geometry is invariant to execution speed by design.
+                "select_velocity_mps": round(config.select_velocity_mps, 2),
             },
         }
         key_str = json.dumps(key_data, sort_keys=True)
@@ -157,7 +208,15 @@ class RacingLineOptimizer:
                 data = json.load(f)
             if data.get("cache_key") != cache_key:
                 return None
-            if data.get("version") != 1:
+            # Iter-009l + iter-011 (Opus M1): cache schema v3.
+            # v2 = iter-009i added select_velocity_mps to the key.
+            # v3 = iter-010 lowered DroneConstraints.max_acceleration
+            #      from 20 → 15. Trajectories built under the v2 basin
+            #      used 20 m/s² inside _select_by_sim; the v3 selector
+            #      uses 15. Geometry-identical configs hash to the same
+            #      key, so reuse without a version bump silently mixes
+            #      pre/post-iter-010 offsets. Strict version check.
+            if data.get("version") != 3:
                 return None
             return np.array(data["offsets"], dtype=np.float64)
         except (json.JSONDecodeError, KeyError, ValueError):
@@ -174,7 +233,11 @@ class RacingLineOptimizer:
         """Save winning offsets to cache file."""
         from datetime import datetime, timezone
         data = {
-            "version": 1,
+            # Iter-011: v3 — bumped to invalidate v2 entries that were
+            # selected under DroneConstraints.max_acceleration=20 (iter-010
+            # dropped it to 15). Schema unchanged; only the basin physics
+            # changed.
+            "version": 3,
             "cache_key": cache_key,
             "offsets": offsets.tolist(),
             "metrics": metrics or {},
@@ -226,7 +289,13 @@ class RacingLineOptimizer:
 
         n = len(gates)
         max_off = self.config.max_lateral_offset
-        bounds = [(-max_off, max_off)] * (n * 2)
+        # Iter-035: separate vertical bound (defaults to 0.0). The
+        # first n entries are lateral offsets; the next n are vertical.
+        max_vert = self.config.max_vertical_offset
+        bounds = (
+            [(-max_off, max_off)] * n
+            + [(-max_vert, max_vert)] * n
+        )
 
         def objective(offsets: np.ndarray) -> float:
             points = self._apply_offsets(gates, offsets)
@@ -358,8 +427,17 @@ class RacingLineOptimizer:
             DroneConstraints, TrajectoryOptimizer, TrajectoryPoint,
         )
 
+        # Iter-009i (F9 fix, 4-agent research swarm consensus): use the
+        # SELECTION reference velocity, NOT the execution velocity. Per
+        # Heilmeier 2019 / Kapania 2016, the racing-line *geometry* is
+        # chosen independent of the velocity it will be flown at —
+        # that's what makes the optimal line velocity-agnostic. The
+        # earlier iter-009 attempt (Opus iter-006 F9 MAJOR) coupled the
+        # BO oracle to the execution velocity, and the 4-agent diagnosis
+        # found that's exactly what causes the F9 basin-switching
+        # regression on aigp_default at low auto-derived speeds.
         traj_opt = TrajectoryOptimizer(
-            constraints=DroneConstraints(max_velocity=15.0),
+            constraints=DroneConstraints(max_velocity=self.config.select_velocity_mps),
             dt_sample=0.02,  # coarser than benchmark for speed
         )
 
@@ -383,7 +461,8 @@ class RacingLineOptimizer:
                 )
 
                 avg_err, worst_gate_err, race_time = self._kinematic_eval(
-                    trajectory, start_position, gates
+                    trajectory, start_position, gates,
+                    max_speed_mps=self.config.select_velocity_mps,
                 )
 
                 raw_metrics.append((avg_err, worst_gate_err, race_time, idx))
@@ -434,7 +513,8 @@ class RacingLineOptimizer:
                         )
 
                         avg_err, worst_gate_err, race_time = self._kinematic_eval(
-                            trajectory, start_position, gates
+                            trajectory, start_position, gates,
+                            max_speed_mps=self.config.select_velocity_mps,
                         )
 
                         raw_metrics.append((avg_err, worst_gate_err, race_time, interp_idx))
@@ -500,6 +580,13 @@ class RacingLineOptimizer:
         trajectory,
         start_position: Tuple[float, float, float],
         gates: List[GateWaypoint],
+        # Iter-012: defaults sourced from competition.drone_spec so the
+        # one canonical source-of-truth covers this eval path too.
+        # Import is function-local (cheap) to keep racing_line.py free
+        # of import-time competition dependencies for callers that
+        # don't instantiate the optimizer.
+        max_speed_mps: Optional[float] = None,
+        max_accel_mps2: Optional[float] = None,
     ) -> Tuple[float, float, float]:
         """
         Lightweight kinematic sim to evaluate trajectory tracking quality.
@@ -510,11 +597,30 @@ class RacingLineOptimizer:
         Physics: PD controller + drag + acceleration clamp.
         Gains synced with benchmark (iter 40): kp_xy=7, kd_xy=5.5, ff=0.50.
         Note: gains updated but selection unchanged (same basin wins).
+
+        Iter-009j (Opus M2 / Composer #1+#8 / Codex #1 minor 2): threaded
+        `max_speed_mps` and `max_accel_mps2` so callers can hold the eval
+        clamp in sync with the trajectory generator's velocity cap. Without
+        this threading, the function silently clamped at 15 m/s even when
+        the BO oracle built trajectories at a lower `select_velocity_mps`,
+        producing metric distortion (the eval drone could race ahead of
+        the trajectory's reference speed). Defaults remain 15.0 so legacy
+        callers are unchanged.
         """
+        if max_speed_mps is None or max_accel_mps2 is None:
+            from competition.drone_spec import (
+                DEFAULT_MAX_ACCEL_MPS2,
+                DEFAULT_MAX_VELOCITY_MPS,
+            )
+            if max_speed_mps is None:
+                max_speed_mps = DEFAULT_MAX_VELOCITY_MPS
+            if max_accel_mps2 is None:
+                max_accel_mps2 = DEFAULT_MAX_ACCEL_MPS2
         dt = 0.02
-        max_accel = 15.0
-        max_speed = 15.0
-        drag = 0.5
+        max_accel = max_accel_mps2
+        max_speed = max_speed_mps
+        from competition.drone_spec import DEFAULT_LINEAR_DRAG_PER_MASS
+        drag = DEFAULT_LINEAR_DRAG_PER_MASS
         kp_xy, kd_xy = 7.0, 5.5
         kp_z, kd_z = 8.0, 5.0
         ff_accel = 0.50
@@ -631,7 +737,14 @@ class RacingLineOptimizer:
         gates: List[GateWaypoint],
         offsets: np.ndarray,
     ) -> List[Tuple[float, float, float]]:
-        """Apply lateral/vertical offsets to gate positions."""
+        """Apply lateral/vertical offsets to gate positions.
+
+        Iter-035: fixed the `up` vector — was [0,0,-1] (NED) but the
+        tracks + bench + visualizer all use ENU (z is UP). Combined
+        with the new `RacingLineConfig.max_vertical_offset=0` default,
+        gates pass at their actual z center. Even if vertical bound is
+        re-enabled, the sign is now correct.
+        """
         n = len(gates)
         positions = []
         for i in range(n):
@@ -639,11 +752,11 @@ class RacingLineOptimizer:
             lat_off = offsets[i]
             vert_off = offsets[n + i]
 
-            # Compute gate local axes
+            # Compute gate local axes (ENU world frame).
             cy = math.cos(gate.yaw)
             sy = math.sin(gate.yaw)
-            right = np.array([-sy, cy, 0])  # local right
-            up = np.array([0, 0, -1])        # NED: -z is up
+            right = np.array([-sy, cy, 0])   # local right
+            up = np.array([0, 0, 1])          # ENU: +z is up (was -1, iter-035 fix)
 
             pos = np.array(gate.position)
             pos = pos + right * lat_off * gate.width * 0.5

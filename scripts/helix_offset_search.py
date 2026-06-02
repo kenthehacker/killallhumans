@@ -78,9 +78,15 @@ def fast_eval(gate_waypoints, start_pos, offsets, dt=0.01):
     Fast trajectory + kinematic sim evaluation (no ILC).
     Returns per-gate errors and race time.
     """
+    # Iter-013: drone_spec authority. The DroneConstraints default for
+    # max_velocity already matches DEFAULT_MAX_VELOCITY_MPS (15.0) since
+    # iter-010; keeping the explicit construction here to document the
+    # tooling's intent — this script always uses the bench envelope.
+    from competition.drone_spec import DEFAULT_MAX_VELOCITY_MPS
     opt_gates = apply_offsets(gate_waypoints, offsets)
     traj_opt = TrajectoryOptimizer(
-        constraints=DroneConstraints(max_velocity=15.0), dt_sample=0.02,
+        constraints=DroneConstraints(max_velocity=DEFAULT_MAX_VELOCITY_MPS),
+        dt_sample=0.02,
     )
     trajectory = traj_opt.optimize(opt_gates, start_pos, (0, 0, 0))
 
@@ -120,14 +126,20 @@ def fast_eval(gate_waypoints, start_pos, offsets, dt=0.01):
         accel_des[2] = kp_z * pos_err[2] + kd_z * vel_err[2]
         accel_des += ff_accel * ff_acc_vec
 
-        accel = accel_des - 0.5 * vel  # drag
+        # Iter-013: bench-envelope constants from drone_spec
+        from competition.drone_spec import (
+            DEFAULT_LINEAR_DRAG_PER_MASS,
+            DEFAULT_MAX_ACCEL_MPS2,
+            DEFAULT_MAX_VELOCITY_MPS,
+        )
+        accel = accel_des - DEFAULT_LINEAR_DRAG_PER_MASS * vel  # drag
         accel_mag = np.linalg.norm(accel)
-        if accel_mag > 15.0:
-            accel = accel / accel_mag * 15.0
+        if accel_mag > DEFAULT_MAX_ACCEL_MPS2:
+            accel = accel / accel_mag * DEFAULT_MAX_ACCEL_MPS2
         vel = vel + accel * dt
         speed = np.linalg.norm(vel)
-        if speed > 15.0:
-            vel = vel / speed * 15.0
+        if speed > DEFAULT_MAX_VELOCITY_MPS:
+            vel = vel / speed * DEFAULT_MAX_VELOCITY_MPS
         pos = pos + vel * dt
 
         closest = trajectory.find_closest(tuple(pos))

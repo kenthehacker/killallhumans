@@ -27,17 +27,40 @@ import numpy as np
 from scipy.optimize import minimize
 
 
+# Iter-010 (Opus + Composer planning consensus, .loop/research/next_iter_*.md):
+# defaults now read from competition.drone_spec — single source of truth for
+# the synthetic-bench drone-dynamics envelope. The previous `max_acceleration
+# = 20.0` was a cross-module lie: the bench saturates at 15 m/s², so any
+# trajectory planned under a 2g budget was actually executed at 1.5g, causing
+# feedforward mismatch and inflating tracking error. Now bench, optimizer,
+# tracker, and auto_velocity all see the same numbers.
+from competition.drone_spec import (
+    DEFAULT_MASS_KG as _DRONE_MASS_KG,
+    DEFAULT_MAX_ACCEL_MPS2 as _DRONE_MAX_ACCEL,
+    DEFAULT_MAX_BODY_RATE_RAD_S as _DRONE_MAX_BODY_RATE,
+    DEFAULT_MAX_JERK_MPS3 as _DRONE_MAX_JERK,
+    DEFAULT_MAX_THRUST_N as _DRONE_MAX_THRUST,
+    DEFAULT_MAX_TILT_RAD as _DRONE_MAX_TILT,
+    DEFAULT_MAX_VELOCITY_MPS as _DRONE_MAX_VELOCITY,
+    DEFAULT_GRAVITY_MPS2 as _DRONE_GRAVITY,
+)
+
+
 @dataclass
 class DroneConstraints:
-    """Physical limits of the drone."""
-    max_velocity: float = 15.0       # m/s
-    max_acceleration: float = 20.0   # m/s^2 (~2g) — relaxed: rough estimate overestimates actual accel at segment boundaries
-    max_jerk: float = 50.0           # m/s^3
-    max_tilt_angle: float = 0.85     # radians (~49 deg) — increased for faster turns (Aggressive Maneuvers 2026)
-    max_thrust: float = 20.0         # Newtons
-    max_body_rate: float = 6.0       # rad/s
-    mass: float = 1.0                # kg
-    gravity: float = 9.81            # m/s^2
+    """Physical limits of the drone. Iter-010: defaults sourced from
+    competition.drone_spec (the synthetic-bench's envelope, not the
+    AIGP competition drone's — that needs calibration)."""
+    max_velocity: float = _DRONE_MAX_VELOCITY       # m/s — was 15.0 inline
+    max_acceleration: float = _DRONE_MAX_ACCEL      # m/s^2 — WAS 20.0
+                                                    # inline; now matches the
+                                                    # 15 m/s² bench saturation
+    max_jerk: float = _DRONE_MAX_JERK               # m/s^3
+    max_tilt_angle: float = _DRONE_MAX_TILT         # radians (~49 deg)
+    max_thrust: float = _DRONE_MAX_THRUST           # Newtons
+    max_body_rate: float = _DRONE_MAX_BODY_RATE     # rad/s
+    mass: float = _DRONE_MASS_KG                    # kg
+    gravity: float = _DRONE_GRAVITY                 # m/s^2
 
 
 @dataclass
@@ -282,9 +305,17 @@ def compute_ilc_offset_table(
             Wn = 0.99  # clamp to valid range
         butter_b, butter_a = butter(4, Wn, btype='low')
 
-    max_accel = 15.0
-    max_speed = 15.0
-    drag = 0.5
+    # Iter-012 (deferred from iter-010 Opus M4 / Codex#1 MAJOR 2): bench-
+    # kinematic limits sourced from competition.drone_spec instead of
+    # inline literals. The PD gains (kp_xy, kd_xy, ...) and feedforward
+    # are controller-tuning parameters, not drone-envelope properties;
+    # they remain inline.
+    max_accel = _DRONE_MAX_ACCEL
+    max_speed = _DRONE_MAX_VELOCITY
+    from competition.drone_spec import (
+        DEFAULT_LINEAR_DRAG_PER_MASS as _DRONE_DRAG,
+    )
+    drag = _DRONE_DRAG
     kp_xy, kd_xy = 6.0, 4.0
     kp_z, kd_z = 8.0, 5.0
     ff_accel = 0.4
@@ -811,6 +842,22 @@ class TrajectoryOptimizer:
             waypoints, segment_times
         )
 
+        # Iter-032 (charter task #10): hard polynomial-peak acceleration
+        # projection. iter-016 measured 50-80 m/s² peaks on race_01 /
+        # aigp_default while the bench saturates at 15 m/s²; the soft
+        # accel-overflow penalty in _optimize_time_allocation only sees
+        # segment-endpoint finite-difference accels, missing interior
+        # min-snap peaks. This pass samples generated polynomial accel
+        # at dt_sample, stretches any over-budget segment by
+        # sqrt(peak/target) per pass capped at DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH
+        # (1.5×), iterates ≤3 passes. Inserted AFTER vertical-climb
+        # inflate so the final times are projected. Peak target sources
+        # from constraints.max_acceleration (= DEFAULT_MAX_ACCEL_MPS2)
+        # — no course-specific magic.
+        segment_times = self._project_accel_peaks(
+            waypoints, segment_times, start_velocity, gates,
+        )
+
         points = self._generate_trajectory(
             waypoints, segment_times, start_velocity, gates,
         )
@@ -1241,6 +1288,139 @@ class TrajectoryOptimizer:
             if required_vz > vz_ceiling:
                 times[i] = dz / vz_ceiling
 
+        return times
+
+    def _project_accel_peaks(
+        self,
+        waypoints: List[np.ndarray],
+        segment_times: List[float],
+        start_velocity: Tuple[float, float, float],
+        gates: List[GateWaypoint],
+        max_passes: int = 3,
+    ) -> List[float]:
+        """Iter-032: hard polynomial-peak accel projection.
+
+        iter-016 measured 50-80 m/s² polynomial accel peaks while the
+        kinematic bench saturates at DEFAULT_MAX_ACCEL_MPS2 (15 m/s²).
+        The bench's accel_clamp_active_frac hit 72% on aigp_default and
+        22% on race_01 because the soft penalty in
+        ``_optimize_time_allocation`` checks segment-endpoint accels
+        (finite differences) and ``_topp_retime`` works in
+        timing-independent geometric curvature — neither sees the
+        interior min-snap polynomial peaks.
+
+        Algorithm (per pass, up to ``max_passes``):
+          1. Generate trajectory at the current ``segment_times``.
+          2. Per segment, find the max ``||acceleration||`` over INTERIOR
+             samples (excluding first/last per segment — these often
+             carry C³ discontinuity spikes from the min-snap waypoint
+             boundary conditions).
+          3. For each segment with ``peak > target``, stretch time by
+             ``sqrt(peak/target)`` clamped at
+             ``DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH`` (1.5).
+             Min-snap accel scales as 1/T², so this is the exact
+             one-step landing within the cap.
+          4. Stop early when no segment exceeds target.
+
+        Peak target sources from ``constraints.max_acceleration``, which
+        in turn sources from ``DEFAULT_MAX_ACCEL_MPS2`` (SSOT). No
+        course-specific magic.
+
+        Skips segments below 0.15 s — the floor used by other inflation
+        passes to avoid pinned-minimum oscillation.
+        """
+        from competition.drone_spec import (
+            DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH,
+            DEFAULT_ACCEL_PROJECTION_MIN_SEG_TIME_S,
+        )
+
+        peak_target = float(self.constraints.max_acceleration)
+        per_pass_cap = float(DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH)
+        min_seg_time = float(DEFAULT_ACCEL_PROJECTION_MIN_SEG_TIME_S)
+        if peak_target <= 0.0 or len(segment_times) == 0:
+            return list(segment_times)
+
+        times = list(segment_times)
+        n_seg = len(times)
+        for _ in range(max_passes):
+            pts = self._generate_trajectory(
+                waypoints, times, start_velocity, gates,
+            )
+            if not pts:
+                break
+
+            # Bucket points into segments by cumulative time. Note that
+            # `_generate_trajectory` produces TWO samples at every
+            # interior waypoint (one with `t_local=T` ending segment s,
+            # one with `t_local=0` starting segment s+1) — same global
+            # time. Use STRICT `<` for inner segments so each duplicate
+            # sample lands in the segment whose interior it represents
+            # (Opus M1 fix). The final segment uses `<=` to catch the
+            # last endpoint at `cum_end[-1]`.
+            cum_end = []
+            t_run = 0.0
+            for t in times:
+                t_run += t
+                cum_end.append(t_run)
+            per_seg_accels: List[List[float]] = [[] for _ in range(n_seg)]
+            for p in pts:
+                si = n_seg - 1
+                for s in range(n_seg - 1):
+                    if p.time < cum_end[s] - 1e-9:
+                        si = s
+                        break
+                a = math.sqrt(
+                    p.acceleration[0] ** 2
+                    + p.acceleration[1] ** 2
+                    + p.acceleration[2] ** 2
+                )
+                per_seg_accels[si].append(a)
+
+            # Compute interior peak per segment. Min-snap C³ boundary
+            # discontinuities (esp. finish-waypoint forced-decel) live
+            # at the first/last sample of each segment, so drop them
+            # when the segment has enough interior to make the trim
+            # meaningful.
+            seg_peaks: List[float] = [0.0] * n_seg
+            for si, accels in enumerate(per_seg_accels):
+                if not accels:
+                    continue
+                if len(accels) > 4:
+                    interior = accels[1:-1]
+                else:
+                    interior = accels
+                seg_peaks[si] = max(interior)
+
+            # Stretch any over-budget segment by sqrt(peak/target),
+            # capped at per_pass_cap. Composer #1 fix: don't set
+            # `any_over=True` for sub-min_seg_time segments — they're
+            # skipped and would otherwise cause non-convergent loops.
+            new_times = list(times)
+            any_over = False
+            for i, peak in enumerate(seg_peaks):
+                if peak <= peak_target:
+                    continue
+                if times[i] < min_seg_time:
+                    continue  # skip without flagging as over (#1 fix)
+                any_over = True
+                stretch = min(math.sqrt(peak / peak_target), per_pass_cap)
+                new_times[i] = times[i] * stretch
+            times = new_times
+            if not any_over:
+                break
+        # Opus M2: surface unconverged residual via a one-line print on
+        # the final pass if a segment is still > 1.05× target. The bench
+        # is regression-gated, but a future >170 m/s² peak track would
+        # silently exhaust max_passes and slip the projection's intent.
+        residual_max = max(
+            (p for p in seg_peaks if p is not None), default=0.0,
+        )
+        if residual_max > peak_target * 1.05:
+            print(
+                f"[_project_accel_peaks] residual peak {residual_max:.1f} m/s² > "
+                f"target {peak_target:.1f} after {max_passes} passes "
+                f"(cap {per_pass_cap}× per pass) — accept and continue."
+            )
         return times
 
     def _topp_retime(

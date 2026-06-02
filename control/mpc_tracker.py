@@ -21,8 +21,17 @@ Based on "On Your Own" (Romero 2025):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
+
+
+def _spec():
+    """Iter-013: lazy import of competition.drone_spec to avoid a
+    hard `control → competition` import-time dependency.  Used by
+    `TrackerConfig` field defaults via `dataclasses.field(default_factory=...)`.
+    """
+    import competition.drone_spec as ds
+    return ds
 
 import numpy as np
 
@@ -68,16 +77,50 @@ class TrackerConfig:
     # Backed by: Tal & Karaman 2018, L1Quad 2025, DATT 2023.
     velocity_feedforward: float = 0.0
 
-    # Physical limits
-    max_tilt_rad: float = 0.85      # ~49 deg — increased for faster turns (Aggressive Maneuvers 2026)
+    # Physical limits — iter-013: sourced from competition.drone_spec
+    # for cross-module consistency. Pre-iter-013 these were inline
+    # literals and could silently drift from `DroneConstraints` /
+    # bench. `max_thrust_normalized` and `min_thrust_normalized` are
+    # tracker-control fractions, not drone-envelope properties, so
+    # they stay inline.
+    max_tilt_rad: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_TILT_RAD
+    )
     max_thrust_normalized: float = 0.95
     min_thrust_normalized: float = 0.05
-    max_body_rate: float = 6.0      # rad/s
+    max_body_rate: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_BODY_RATE_RAD_S
+    )
 
-    # Drone parameters
-    mass: float = 1.0
-    gravity: float = 9.81
-    max_thrust_n: float = 20.0
+    # Drone parameters — iter-013: drone_spec authority.
+    mass: float = field(default_factory=lambda: _spec().DEFAULT_MASS_KG)
+    gravity: float = field(
+        default_factory=lambda: _spec().DEFAULT_GRAVITY_MPS2
+    )
+    max_thrust_n: float = field(
+        default_factory=lambda: _spec().DEFAULT_MAX_THRUST_N
+    )
+
+    # iter-001 A15: learned tracker residual (lightweight ML).
+    # Off-by-default — only enable on a track where a trained model has
+    # been validated to beat baseline on the holdout set. The MLP is
+    # bypassed entirely when use_residual=False, so default-config
+    # callers get byte-identical behaviour to the pre-A15 tracker.
+    use_residual: bool = False
+    residual_weights_path: Optional[str] = None      # .npz path (see control/learned_residual.py)
+    residual_clamp_rad: float = 0.05                 # hard clamp on roll/pitch deltas (~2.9°)
+    residual_thrust_clamp: float = 0.05              # hard clamp on thrust delta (~5% of full scale)
+
+    # Iter-014/iter-031: ML training data collection hook. When True,
+    # the tracker appends a v2 13-tuple to `self.feature_trace` each step
+    # — (features_12d, roll, pitch, thrust, pos_err, vel_err, pos, vel,
+    # yaw_des, ref_pos, ref_vel, ref_accel, accel_des_baseline). Off by
+    # default — zero overhead for production-config callers. The
+    # `scripts/train_tracker_residual.py` trainer consumes the trace
+    # via `control/learned_residual.py::save_feature_trace` to fit
+    # `TrackerResidualMLP` weights via yaw-corrected feedback-error
+    # learning (Romero 2025 "On Your Own"; Pries 2025 NGTC).
+    trace_features: bool = False
 
 
 class GeometricTracker:
@@ -97,6 +140,54 @@ class GeometricTracker:
 
     def __init__(self, config: TrackerConfig = None):
         self.config = config or TrackerConfig()
+        # iter-001 A15: optional learned residual. Loaded lazily so the
+        # import / npz-load cost is only paid when the feature is on.
+        # iter-031: when use_residual=True and no explicit path is given,
+        # auto-resolve <repo>/control/residual_weights.npz. If that file
+        # is missing, fall back to zero_init (byte-identical to baseline)
+        # so a clean checkout never crashes on the default config.
+        self._residual = None
+        if self.config.use_residual:
+            from control.learned_residual import (
+                DEFAULT_N_INPUTS, TrackerResidualMLP,
+            )
+            path = self.config.residual_weights_path
+            if path is None:
+                # Auto-resolve: <repo>/control/residual_weights.npz.
+                from pathlib import Path as _Path
+                _default = (
+                    _Path(__file__).resolve().parent / "residual_weights.npz"
+                )
+                if _default.exists():
+                    path = str(_default)
+            if path is not None:
+                # Wide exception net: a corrupt .npz raises OSError/
+                # BadZipFile/KeyError, a stale schema raises ValueError
+                # from __post_init__, and a missing-input-dim weights
+                # file would explode on the first forward(). All of
+                # these should fall back to zero_init (byte-identical
+                # to baseline) so the tracker NEVER crashes at init.
+                try:
+                    candidate = TrackerResidualMLP.from_npz(path)
+                    if candidate.n_inputs != DEFAULT_N_INPUTS:
+                        raise ValueError(
+                            f"residual weights at {path} have "
+                            f"n_inputs={candidate.n_inputs}, expected "
+                            f"{DEFAULT_N_INPUTS} — schema mismatch"
+                        )
+                    self._residual = candidate
+                except (FileNotFoundError, OSError, KeyError, ValueError):
+                    self._residual = TrackerResidualMLP.zero_init()
+            else:
+                # Safety baseline: zero-init weights produce zero residual,
+                # so enabling the feature without a trained model is still
+                # byte-identical to baseline (modulo float math from the
+                # extra branch — see test_residual_off_is_baseline).
+                self._residual = TrackerResidualMLP.zero_init()
+        # Iter-014/iter-031: ML training data collection. Empty list
+        # unless `config.trace_features=True`; each step appends a v2
+        # 13-tuple consumed by control/learned_residual.py::save_feature_trace.
+        self.feature_trace: list = []
 
     def track(
         self,
@@ -190,14 +281,108 @@ class GeometricTracker:
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
         desired_pitch = np.clip(desired_pitch, -c.max_tilt_rad, c.max_tilt_rad)
 
+        # Iter-014/iter-031: ML training data capture. The trace records
+        # the tracker's NOMINAL outputs (before residual + clamp), the
+        # 12-dim feature vector, and the v2 fields the trainer needs to
+        # compute a yaw-aware target — drone state, yaw_des, reference,
+        # and baseline accel_des. Off by default; zero overhead when
+        # `config.trace_features=False`.
+        if c.trace_features:
+            from control.learned_residual import build_input_features
+            features = build_input_features(
+                pos_err=ep, vel_err=ev, ref_accel=ref_acc,
+                thrust_normalized=thrust_normalized,
+                yaw_des=float(yaw_des),
+            )
+            # Iter-031 v2 trace: log the additional fields the trainer
+            # needs to compute the one-step BC-oracle target — drone
+            # state (pos, vel), yaw_des (rotation frame), reference
+            # (ref_pos, ref_vel, ref_accel), and the baseline PD output
+            # (accel_des BEFORE residual was added). Order pinned in
+            # control/learned_residual.py::save_feature_trace.
+            self.feature_trace.append((
+                features,
+                float(desired_roll),
+                float(desired_pitch),
+                float(thrust_normalized),
+                tuple(float(v) for v in ep),
+                tuple(float(v) for v in ev),
+                tuple(float(v) for v in pos),
+                tuple(float(v) for v in vel),
+                float(yaw_des),
+                tuple(float(v) for v in ref_pos),
+                tuple(float(v) for v in ref_vel),
+                tuple(float(v) for v in ref_acc),
+                tuple(float(v) for v in accel_des),
+            ))
+
+        # iter-001 A15: learned residual on (roll, pitch, thrust). Hard-
+        # clamped at the consumer so a corrupted weights file or out-of-
+        # distribution input cannot push commands beyond the safety
+        # envelope. Re-applies max_tilt_rad / thrust limits after the
+        # residual is added — clamp composition: residual-clamp first,
+        # then physical clamp. Off-switch: `use_residual=False`.
+        residual_accel_delta = None
+        if self._residual is not None:
+            from control.learned_residual import build_input_features
+            x = build_input_features(
+                pos_err=ep, vel_err=ev, ref_accel=ref_acc,
+                thrust_normalized=thrust_normalized,
+                yaw_des=float(yaw_des),
+            )
+            r = self._residual.forward(x)
+            d_roll = float(np.clip(r[0], -c.residual_clamp_rad, c.residual_clamp_rad))
+            d_pitch = float(np.clip(r[1], -c.residual_clamp_rad, c.residual_clamp_rad))
+            d_thrust = float(
+                np.clip(r[2], -c.residual_thrust_clamp, c.residual_thrust_clamp)
+            )
+            desired_roll = float(np.clip(
+                desired_roll + d_roll, -c.max_tilt_rad, c.max_tilt_rad,
+            ))
+            desired_pitch = float(np.clip(
+                desired_pitch + d_pitch, -c.max_tilt_rad, c.max_tilt_rad,
+            ))
+            thrust_normalized = float(np.clip(
+                thrust_normalized + d_thrust,
+                c.min_thrust_normalized, c.max_thrust_normalized,
+            ))
+            # Iter-027 (ML pipeline): project the residual into the
+            # WORLD-FRAME accel_des the kinematic bench reads from
+            # `last_desired_acceleration`. Without this projection the
+            # residual is invisible to the matrix bench (which doesn't
+            # consume the attitude command), defeating training.
+            # Linearised around hover, in world frame (z-up):
+            #   delta_roll  > 0 → +y body accel via gravity tilt
+            #     ≈ g · roll → world-y delta = g · d_roll · cos(yaw)
+            #                                 + g · d_roll · sin(yaw) (rotate)
+            #   delta_pitch > 0 → +x body accel via gravity tilt
+            #   delta_thrust > 0 → +z world accel (thrust * max_thrust / mass)
+            cos_yaw = math.cos(yaw_des)
+            sin_yaw = math.sin(yaw_des)
+            g = c.gravity
+            ax_body = g * d_pitch
+            ay_body = g * d_roll
+            az_world = d_thrust * c.max_thrust_n / max(c.mass, 1e-6)
+            ax_world = ax_body * cos_yaw - ay_body * sin_yaw
+            ay_world = ax_body * sin_yaw + ay_body * cos_yaw
+            residual_accel_delta = np.array(
+                [ax_world, ay_world, az_world], dtype=float
+            )
+
         cmd = AttitudeCommand(
             roll_rad=float(desired_roll),
             pitch_rad=float(desired_pitch),
             yaw_rad=float(yaw_des),
             thrust=float(thrust_normalized),
         )
-        # Store desired acceleration for kinematic sim access
-        self._last_accel_des = accel_des
+        # Store desired acceleration for kinematic sim access. The
+        # residual contribution (if any) is included so the kinematic
+        # bench sees the same correction the attitude command carries
+        # for PyBullet.
+        if residual_accel_delta is not None:
+            self._last_accel_des = np.asarray(accel_des, dtype=float) + residual_accel_delta
+        else:
+            self._last_accel_des = accel_des
         return cmd
 
     @property

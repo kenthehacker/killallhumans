@@ -20,6 +20,19 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
+# Defaults track VADR-TS-002 §3.8 — single source of truth.
+from competition.aigp_geometry import (
+    AIGP_CAM_CX,
+    AIGP_CAM_CY,
+    AIGP_CAM_FX,
+    AIGP_CAM_FY,
+    AIGP_CAM_HEIGHT_PX,
+    AIGP_CAM_PITCH_OFFSET_RAD,
+    AIGP_CAM_VFOV_DEG,
+    AIGP_CAM_WIDTH_PX,
+    AIGP_GATE_INTERIOR_M,
+)
+
 
 @dataclass
 class GatePose:
@@ -32,20 +45,43 @@ class GatePose:
 
 @dataclass
 class CameraIntrinsics:
-    """Camera calibration parameters."""
-    fx: float = 462.0    # focal length x (pixels)
-    fy: float = 462.0    # focal length y (pixels)
-    cx: float = 320.0    # principal point x (pixels)
-    cy: float = 240.0    # principal point y (pixels)
-    fov_h_deg: float = 90.0
-    image_width: int = 640
-    image_height: int = 480
+    """Camera calibration parameters.
+
+    Defaults match VADR-TS-002 §3.8 (AIGP VQ1): 640×360 pinhole,
+    fx=fy=320, cx=320, cy=180, tilted 20° UPWARD from body frame.
+    Legacy 640×480 calibrations supply explicit args (or use `from_fov`).
+    """
+    fx: float = AIGP_CAM_FX                  # 320 px
+    fy: float = AIGP_CAM_FY                  # 320 px
+    cx: float = AIGP_CAM_CX                  # 320 px
+    cy: float = AIGP_CAM_CY                  # 180 px
+    fov_h_deg: float = 90.0                  # Horizontal FoV; matches AIGP intrinsics
+                                             # (2·atan(320/320) = 90°). The spec's
+                                             # literal "VFoV=90°" is inconsistent with
+                                             # fx=fy=320 — see aigp_geometry.py for the
+                                             # full derivation. We trust the intrinsics.
+    image_width: int = AIGP_CAM_WIDTH_PX     # 640
+    image_height: int = AIGP_CAM_HEIGHT_PX   # 360
+    # Camera tilt about body-Y axis. Positive = nose-up. AIGP camera is
+    # tilted 20° upward, so a feature on the world horizon projects
+    # BELOW cy by `fy·tan(pitch_offset_rad) ≈ 116 px`. PnP must apply
+    # `R_pitch(pitch_offset_rad)` when converting camera-frame pose to
+    # body-frame drone position.
+    pitch_offset_rad: float = AIGP_CAM_PITCH_OFFSET_RAD
 
     @staticmethod
     def from_fov(
         fov_h_deg: float, width: int, height: int
     ) -> "CameraIntrinsics":
-        """Compute intrinsics from horizontal FOV and image dimensions."""
+        """Compute intrinsics from horizontal FOV and image dimensions.
+
+        Preserves the legacy 640×480 path: callers that pass explicit
+        width/height get principal point at (w/2, h/2) — NOT the AIGP
+        default of (320, 180) — because `from_fov` is the "build for a
+        custom camera" entry point. Pitch offset stays at the AIGP
+        default; legacy callers that need a non-tilted camera should
+        construct directly and override `pitch_offset_rad=0.0`.
+        """
         fx = width / (2 * math.tan(math.radians(fov_h_deg / 2)))
         fy = fx  # assume square pixels
         return CameraIntrinsics(
@@ -70,9 +106,14 @@ class CameraIntrinsics:
 
 @dataclass
 class GateGeometry:
-    """Physical gate dimensions for PnP."""
-    interior_width_m: float = 1.2
-    interior_height_m: float = 1.2
+    """Physical gate dimensions for PnP.
+
+    Iter-002 (5/7 reviews MINOR): defaults updated to AIGP VQ1 spec
+    (1.5 m inner opening per VADR-TS-002 §3.7). Legacy tracks supply
+    explicit smaller dimensions via constructor args.
+    """
+    interior_width_m: float = AIGP_GATE_INTERIOR_M
+    interior_height_m: float = AIGP_GATE_INTERIOR_M
 
     @property
     def object_points(self) -> np.ndarray:
@@ -109,7 +150,13 @@ class GatePnPEstimator:
         camera: CameraIntrinsics = None,
         gate: GateGeometry = None,
     ):
-        self.camera = camera or CameraIntrinsics.from_fov(90.0, 640, 480)
+        # Iter-002 review M3 (5/7 MAJOR): when camera is None, fall back to
+        # AIGP defaults (640x360, fx=fy=320, +20deg tilt) instead of the
+        # legacy 640x480 / fov-derived intrinsics. The default CameraIntrinsics
+        # constructor already encodes the spec'd values; using from_fov here
+        # would silently revert anyone who instantiated GatePnPEstimator
+        # without an explicit camera argument back to legacy geometry.
+        self.camera = camera or CameraIntrinsics()
         self.gate = gate or GateGeometry()
         self._last_pose: Optional[GatePose] = None
 

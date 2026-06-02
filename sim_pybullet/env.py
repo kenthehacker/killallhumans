@@ -27,6 +27,13 @@ class RaceConfig:
     timestep: float = 1.0 / 240.0
     gravity: float = -9.81
 
+    # Iter-007 (Opus F3 BLOCKER): top-level max_velocity_mps field so the
+    # PyBullet bench AND the synthetic bench read the same value from the
+    # same JSON key. iter-005b's `getattr(race_config, "max_velocity_mps",
+    # None)` was dead code because the dataclass had no such field —
+    # caught by all 3 iter-006 reviewers.
+    max_velocity_mps: Optional[float] = None
+
     # Iter 10 (Phase A L1): per-race optional overrides for the planner,
     # racing-line, and sequencer knobs that previously lived as magic
     # literals in Python. Empty dict (default) → components use their
@@ -222,6 +229,11 @@ class DroneRaceEnv:
             start_yaw=start_yaw,
             timestep=data.get("timestep", 1.0 / 240.0),
             gravity=data.get("gravity", -9.81),
+            # Iter-007 Opus F3: load the top-level `max_velocity_mps` so
+            # the PyBullet path picks up the same per-track value the
+            # synthetic bench reads. Default None means "fall through to
+            # auto-derive in the bench" (matches synthetic bench logic).
+            max_velocity_mps=data.get("max_velocity_mps", None),
             planner_overrides=dict(planner_data),
             racing_line_overrides=dict(racing_line_data),
             sequencer_overrides=dict(sequencer_data),

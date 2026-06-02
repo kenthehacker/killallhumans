@@ -337,8 +337,17 @@ class VisualDemo:
         self.ekf = DroneEKF(EKFConfig())
         self.ekf.initialize(start_pos, (0, 0, 0), timestamp_s=0.0)
 
-        # PnP estimator
-        cam = CameraIntrinsics.from_fov(self.env.drone.config.camera_fov, 640, 480)
+        # PnP estimator — iter-002 review M3: use AIGP camera resolution by
+        # default. The legacy literal 640x480 silently overrode the AIGP
+        # intrinsics; if a specific demo needs the legacy resolution, pass
+        # explicit args.
+        from competition.aigp_geometry import (
+            AIGP_CAM_HEIGHT_PX, AIGP_CAM_WIDTH_PX,
+        )
+        cam = CameraIntrinsics.from_fov(
+            self.env.drone.config.camera_fov,
+            AIGP_CAM_WIDTH_PX, AIGP_CAM_HEIGHT_PX,
+        )
         g0 = race_config.gates[0].config
         self.pnp = GatePnPEstimator(cam, GateGeometry(g0.interior_width_m, g0.interior_height_m))
 
@@ -399,6 +408,12 @@ class VisualDemo:
         # ── Controller ──
         # Use a tracker for HUD readout; actual sim stepping uses GPDDrone.step()
         # which internally runs DSLPIDControl.
+        # Iter-023: mass=0.027 / max_thrust_n=0.6 are DELIBERATELY different
+        # from `competition.drone_spec` defaults (1.0 kg / 20.0 N). This is
+        # the Crazyflie-class CF2X envelope used by visual_demo's GPDDrone
+        # backend, NOT the synthetic-bench drone. Like sim_pybullet/drone.py
+        # (iter-021), this lives outside the drone_spec SSOT on purpose —
+        # the demo simulates a different platform.
         tc = TrackerConfig(
             kp_xy=6.0, kd_xy=4.0, kp_z=8.0, kd_z=5.0,
             mass=0.027, gravity=9.81, max_thrust_n=0.6,

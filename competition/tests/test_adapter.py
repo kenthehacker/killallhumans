@@ -168,9 +168,17 @@ class TestIMUData:
 
 
 class TestCameraFrame:
-    def test_construction(self):
+    def test_construction_with_explicit_legacy_resolution(self):
+        """Legacy 640×480 calibrations must continue to work via explicit args."""
         img = np.zeros((480, 640, 3), dtype=np.uint8)
-        frame = CameraFrame(timestamp_us=5000, image=img)
+        frame = CameraFrame(timestamp_us=5000, image=img, width=640, height=480)
         assert frame.width == 640
         assert frame.height == 480
         assert frame.image.shape == (480, 640, 3)
+
+    def test_construction_default_is_aigp_360(self):
+        """Iter-001 review (B3): bare CameraFrame() defaults to 640×360 (VADR-TS-002)."""
+        img = np.zeros((360, 640, 3), dtype=np.uint8)
+        frame = CameraFrame(timestamp_us=5000, image=img)
+        assert frame.width == 640
+        assert frame.height == 360

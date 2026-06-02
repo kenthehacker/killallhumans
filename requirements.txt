@@ -2,6 +2,9 @@
 -r gate_detection/requirements.txt
 
 # ── Competition Interface (MAVLink / MAVSDK) ──
+# pymavlink: the official AIGP transport (PyAIPilotExample uses it directly).
+# Used by competition/aigp_recorder.py and the forthcoming pymavlink adapter.
+pymavlink>=2.4.0
 mavsdk>=2.0.0
 
 # ── Core Scientific Computing ──
