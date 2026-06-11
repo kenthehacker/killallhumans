@@ -8,19 +8,32 @@ answer the open questions that only the live binary can settle (plan §4):
   * Are ``LOCAL_POSITION_NED`` / ``ODOMETRY`` populated (local position)?
   * Is the track-info packet actually sent (runtime gate map)?
   * What do ``COLLISION`` / race-status / actuator messages look like?
+  * Vision: does the port-5600 stream arrive, at what rate / size?
+
+Faithfulness over prettiness — this log is how we *discover* the sim's
+behaviour, so the recorder never silently drops data:
+  * messages we model get clean, normalized field names;
+  * everything else is dumped verbatim via ``msg.to_dict()``;
+  * a curated extractor that hits a field the real wire doesn't carry falls
+    back to that same generic dump instead of crashing mid-capture;
+  * the track-info packet logs every gate's full NED pose, not just a count.
 
 The recorded JSONL then doubles as an offline replay fixture so the transport
 adapter can be developed without burning sim time.
 
 Design: the parsing/normalization is pure (``record_for_message``,
-``mavlink_msg_to_fields``, ``race_status_fields``, ``write_jsonl``) and unit
-tested. ``run`` is the thin socket/pymavlink shell — it imports pymavlink
-lazily and is validated on first contact, not in CI.
+``mavlink_msg_to_fields``, ``race_status_fields``, ``track_data_fields``,
+``vision_frame_record``, ``write_jsonl``) and unit tested. ``run`` is the thin
+socket/pymavlink shell (plus a daemon vision-capture thread) — it imports
+pymavlink lazily and is validated on first contact, not in CI.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import queue
+import threading
 import time
 from typing import Dict, Iterable, List, Optional, TextIO
 
@@ -30,6 +43,7 @@ from competition.aigp_messages import (
     TrackInfoReassembler,
     parse_race_status,
 )
+from competition.vision_udp import ReassembledFrame, VisionUdpReceiver
 
 # Defaults from the official PyAIPilotExample (main.py / setup.py).
 DEFAULT_SIM_IP: str = "127.0.0.1"
@@ -61,13 +75,39 @@ def race_status_fields(payload: bytes) -> Dict:
     }
 
 
-def mavlink_msg_to_fields(msg) -> Dict:
-    """Extract the fields of interest from a pymavlink message object.
+def track_data_fields(track) -> Dict:
+    """Flatten a parsed ``TrackData`` to JSON — every gate's full NED pose.
 
-    Unknown / not-yet-modeled types return ``{}`` — they're still recorded by
-    their type label so the first-contact log shows everything the sim emits.
+    The gate map is a primary §4 question, so we log each gate (id, NED
+    position, orientation quaternion w,x,y,z, width, height), not just the
+    count the way the first draft did.
     """
-    t = msg.get_type()
+    return {
+        "num_gates": track.num_gates,
+        "gates": [
+            {
+                "gate_id": g.gate_id,
+                "position_ned": list(g.position_ned),
+                "orientation_wxyz": [
+                    g.orientation.w, g.orientation.x,
+                    g.orientation.y, g.orientation.z,
+                ],
+                "width": g.width,
+                "height": g.height,
+            }
+            for g in track.gates
+        ],
+    }
+
+
+def _curated_fields(t: str, msg) -> Optional[Dict]:
+    """Clean, normalized fields for the message types we model explicitly.
+
+    Returns ``None`` for types we don't model (caller falls back to the
+    generic dump). May raise ``AttributeError`` if the live message lacks a
+    field we assumed — the caller catches that and falls back too, so a wrong
+    field-name guess degrades to a verbatim dump instead of killing capture.
+    """
     if t == "ATTITUDE":
         return {
             "roll": msg.roll, "pitch": msg.pitch, "yaw": msg.yaw,
@@ -103,14 +143,70 @@ def mavlink_msg_to_fields(msg) -> Dict:
         return {"tc1": msg.tc1, "ts1": msg.ts1}
     if t == "ACTUATOR_OUTPUT_STATUS":
         return {"time_usec": msg.time_usec, "actuator": list(msg.actuator)}
-    return {}
+    return None
+
+
+def _generic_fields(msg) -> Dict:
+    """Verbatim dump of every field on a pymavlink message.
+
+    Used for any type ``_curated_fields`` doesn't model (or can't extract).
+    Drops the redundant ``mavpackettype`` tag — the record already carries
+    ``type``.
+    """
+    d = dict(msg.to_dict())
+    d.pop("mavpackettype", None)
+    return d
+
+
+def mavlink_msg_to_fields(msg) -> Dict:
+    """Extract the fields of interest from a pymavlink message object.
+
+    Modeled types return curated, normalized names. Anything else — or any
+    modeled type whose assumed field is missing on the real wire — is dumped
+    verbatim via ``to_dict()`` so the first-contact log never loses data.
+    """
+    t = msg.get_type()
+    try:
+        curated = _curated_fields(t, msg)
+    except AttributeError:
+        curated = None
+    if curated is not None:
+        return curated
+    return _generic_fields(msg)
+
+
+def vision_frame_record(
+    frame: ReassembledFrame, recv_wall_ns: int, jpeg_path: Optional[str] = None
+) -> Dict:
+    """Build a JSONL record for one reassembled vision frame (the frame index).
+
+    Records metadata (frame id, sim timestamp, JPEG size); the JPEG bytes
+    themselves are only persisted when ``jpeg_path`` is given (``--jpeg-dir``).
+    """
+    rec = {
+        "type": "vision_frame",
+        "recv_wall_ns": recv_wall_ns,
+        "frame_id": frame.frame_id,
+        "sim_time_ns": frame.sim_time_ns,
+        "jpeg_size": len(frame.jpeg_bytes),
+    }
+    if jpeg_path is not None:
+        rec["jpeg_path"] = jpeg_path
+    return rec
+
+
+def _json_default(o):
+    """Make non-JSON-native values (e.g. bytes array fields) serializable."""
+    if isinstance(o, (bytes, bytearray)):
+        return list(o)
+    return str(o)
 
 
 def write_jsonl(records: Iterable[Dict], fileobj: TextIO) -> int:
     """Write each record as one JSON object per line. Returns the count."""
     n = 0
     for r in records:
-        fileobj.write(json.dumps(r))
+        fileobj.write(json.dumps(r, default=_json_default))
         fileobj.write("\n")
         n += 1
     return n
@@ -119,18 +215,68 @@ def write_jsonl(records: Iterable[Dict], fileobj: TextIO) -> int:
 # ---------------------------------------------------------------------------
 # Live loop (thin shell — validated on first contact, not in CI)
 # ---------------------------------------------------------------------------
+def _vision_capture_loop(
+    port: int,
+    out_q: "queue.Queue",
+    stop_event: "threading.Event",
+    jpeg_dir: Optional[str],
+) -> None:  # pragma: no cover - requires a live UDP vision stream
+    """Bind UDP ``port`` (5600), reassemble JPEG frames, enqueue a record per
+    completed frame. Daemon thread; the main loop is the sole file writer."""
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    sock.settimeout(0.5)
+    receiver = VisionUdpReceiver(port=port)
+    if jpeg_dir:
+        os.makedirs(jpeg_dir, exist_ok=True)
+    print(f"[recorder] vision capture on udp/{port}", flush=True)
+    while not stop_event.is_set():
+        try:
+            data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            frame = receiver.feed_packet(data)
+        except ValueError:
+            continue
+        if frame is None:
+            continue
+        recv_ns = time.time_ns()
+        jpeg_path = None
+        if jpeg_dir:
+            jpeg_path = os.path.join(jpeg_dir, f"frame_{frame.frame_id:08d}.jpg")
+            try:
+                with open(jpeg_path, "wb") as jf:
+                    jf.write(frame.jpeg_bytes)
+            except OSError:
+                jpeg_path = None
+        out_q.put(vision_frame_record(frame, recv_ns, jpeg_path))
+    sock.close()
+
+
 def run(
     out_path: str,
     ip: str = DEFAULT_SIM_IP,
     port: int = DEFAULT_MAVLINK_PORT,
+    vision_port: int = DEFAULT_VISION_PORT,
+    jpeg_dir: Optional[str] = None,
+    record_vision: bool = True,
     duration_s: Optional[float] = None,
 ) -> None:  # pragma: no cover - requires a live MAVLink endpoint
-    """Connect to the sim and stream every MAVLink message to ``out_path``.
+    """Connect to the sim and stream every MAVLink message (and the vision
+    frame index) to ``out_path``.
 
     Mirrors PyAIPilotExample's connection (``udpin:ip:port`` → wait_heartbeat
     → recv_match). ENCAPSULATED_DATA is dispatched to the race-status parser
     or the track-info reassembler; everything else is normalized by
-    ``mavlink_msg_to_fields``. Stops after ``duration_s`` (None = until Ctrl-C).
+    ``mavlink_msg_to_fields``. A daemon thread captures the port-5600 vision
+    stream in parallel; the main loop drains its queue and is the only writer.
+    Stops after ``duration_s`` (None = until Ctrl-C).
     """
     try:
         from pymavlink import mavutil
@@ -138,6 +284,17 @@ def run(
         raise SystemExit(
             "pymavlink is required for the live recorder: pip install pymavlink"
         ) from exc
+
+    vision_q: "queue.Queue" = queue.Queue()
+    vision_stop = threading.Event()
+    vision_thread: Optional[threading.Thread] = None
+    if record_vision:
+        vision_thread = threading.Thread(
+            target=_vision_capture_loop,
+            args=(vision_port, vision_q, vision_stop, jpeg_dir),
+            daemon=True,
+        )
+        vision_thread.start()
 
     conn = mavutil.mavlink_connection(f"udpin:{ip}:{port}")
     print(f"[recorder] waiting for heartbeat on udpin:{ip}:{port} ...", flush=True)
@@ -147,9 +304,22 @@ def run(
     reassembler = TrackInfoReassembler()
     start = time.monotonic()
     written = 0
+
+    def _drain_vision(fileobj) -> int:
+        n = 0
+        while True:
+            try:
+                vrec = vision_q.get_nowait()
+            except queue.Empty:
+                break
+            write_jsonl([vrec], fileobj)
+            n += 1
+        return n
+
     with open(out_path, "w") as f:
         try:
             while duration_s is None or (time.monotonic() - start) < duration_s:
+                written += _drain_vision(f)
                 msg = conn.recv_match(blocking=False)
                 if msg is None:
                     time.sleep(0.001)
@@ -183,7 +353,7 @@ def run(
                         )
                         if track is not None:
                             rec = record_for_message(
-                                "track_data", {"num_gates": track.num_gates}, recv_ns
+                                "track_data", track_data_fields(track), recv_ns
                             )
                         else:
                             rec = record_for_message(
@@ -205,17 +375,41 @@ def run(
                     print(f"[recorder] {written} records", flush=True)
         except KeyboardInterrupt:
             print("\n[recorder] stopped by user", flush=True)
+        finally:
+            vision_stop.set()
+            written += _drain_vision(f)
+            f.flush()
+    if vision_thread is not None:
+        vision_thread.join(timeout=1.0)
     print(f"[recorder] wrote {written} records to {out_path}", flush=True)
 
 
 def main(argv: Optional[List[str]] = None) -> None:  # pragma: no cover
-    ap = argparse.ArgumentParser(description="AIGP first-contact MAVLink recorder")
+    ap = argparse.ArgumentParser(
+        description="AIGP first-contact MAVLink + vision recorder"
+    )
     ap.add_argument("--out", default="aigp_recording.jsonl", help="output JSONL path")
     ap.add_argument("--ip", default=DEFAULT_SIM_IP)
     ap.add_argument("--port", type=int, default=DEFAULT_MAVLINK_PORT)
-    ap.add_argument("--duration", type=float, default=None, help="seconds (default: until Ctrl-C)")
+    ap.add_argument("--vision-port", type=int, default=DEFAULT_VISION_PORT)
+    ap.add_argument(
+        "--jpeg-dir", default=None,
+        help="if set, dump each frame's JPEG into this dir (frame index always logged)",
+    )
+    ap.add_argument(
+        "--no-vision", action="store_true",
+        help="skip the port-5600 vision capture thread",
+    )
+    ap.add_argument(
+        "--duration", type=float, default=None,
+        help="seconds (default: until Ctrl-C)",
+    )
     args = ap.parse_args(argv)
-    run(out_path=args.out, ip=args.ip, port=args.port, duration_s=args.duration)
+    run(
+        out_path=args.out, ip=args.ip, port=args.port,
+        vision_port=args.vision_port, jpeg_dir=args.jpeg_dir,
+        record_vision=not args.no_vision, duration_s=args.duration,
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover
