@@ -108,7 +108,15 @@ class AIGPMavlinkAdapter(CompetitionInterface):
 
         The RX thread starts before any heartbeat wait so a connect-time
         track transfer cannot be discarded by ``wait_heartbeat()``.
+
+        Idempotent: if already connected, returns immediately without spawning
+        duplicate threads or re-fetching track data. ``RaceSession`` calls
+        ``connect()`` unconditionally; the runner calls it first with the
+        correct address, so this guard is required.
         """
+        if self._conn is not None:
+            return
+
         try:
             from pymavlink import mavutil
         except ImportError as exc:  # pragma: no cover - env-dependent

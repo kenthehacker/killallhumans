@@ -273,3 +273,32 @@ def test_import_does_not_require_pymavlink():
     import competition.aigp_mavlink as aigp_mavlink
 
     assert hasattr(aigp_mavlink, "AIGPMavlinkAdapter")
+
+
+def test_connect_is_idempotent():
+    """Second call to connect() must be a no-op: no new threads, keep existing _track_data."""
+    adapter = AIGPMavlinkAdapter(enable_vision=False, require_track=False)
+    fake_conn = FakeConn()
+    adapter._conn = fake_conn
+    adapter._track_event.set()
+
+    body = _track_payload()
+    transfer_id = 7
+    adapter._handle_message(FakeMsg("DATA_TRANSMISSION_HANDSHAKE", width=transfer_id, packets=2))
+    part1 = bytes([ENCAPSULATED_TRACK_INFO_MSG_ID]) + transfer_id.to_bytes(2, "little") + body[:15]
+    part2 = bytes([ENCAPSULATED_TRACK_INFO_MSG_ID]) + transfer_id.to_bytes(2, "little") + body[15:]
+    adapter._handle_message(FakeMsg("ENCAPSULATED_DATA", data=part1, seqnr=0))
+    adapter._handle_message(FakeMsg("ENCAPSULATED_DATA", data=part2, seqnr=1))
+    first_track = adapter.track_data
+    assert first_track is not None
+
+    original_conn = adapter._conn
+
+    async def _second_connect():
+        await adapter.connect("udpin:127.0.0.1:9999")
+
+    asyncio.get_event_loop().run_until_complete(_second_connect())
+
+    assert adapter._conn is original_conn, "second connect() must not replace existing connection"
+    assert adapter.track_data is first_track, "second connect() must not clear existing track data"
+    assert adapter._rx_thread is None, "second connect() must not spawn a new rx thread"
