@@ -2064,9 +2064,19 @@ class TrajectoryOptimizer:
                     jerks[j] *= scale
 
             # Compute yaw: point toward the gate this segment belongs to.
-            # waypoints = [start, entry0, exit0, entry1, exit1, ...] so
-            # segment i covers gate i//2 (entry and exit share the same gate yaw).
-            gate_yaw = gates[min(i // 2, len(gates) - 1)].yaw
+            # Use the segment travel direction (p1-p0) as the zero-velocity
+            # fallback so the yaw profile is sign-consistent with the
+            # velocity-based atan2 once speed builds up.  Using gate.yaw
+            # (derived from the gate quaternion) as the fallback produced a
+            # ±π sign flip at j=0→j=1: j=0 yaw=+π (gate_yaw) while j=1
+            # yaw≈-π (atan2 from velocity), causing the tracker to oscillate
+            # between "turn right 180°" and "turn left 180°" every other tick.
+            seg_dir_xy = p1[:2] - p0[:2]
+            seg_dir_norm = float(np.linalg.norm(seg_dir_xy))
+            if seg_dir_norm > 0.01:
+                gate_yaw = math.atan2(float(seg_dir_xy[1]), float(seg_dir_xy[0]))
+            else:
+                gate_yaw = gates[min(i // 2, len(gates) - 1)].yaw
 
             for j in range(n_samples):
                 # Yaw: blend between looking at current target and next
