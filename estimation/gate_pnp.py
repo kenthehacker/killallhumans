@@ -350,7 +350,7 @@ def _gate_frame_to_world(
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
 
-    normal = np.array([cy * cp, sy * cp, sp], dtype=np.float64)
+    normal = np.array([cy * cp, sy * cp, -sp], dtype=np.float64)
     right0 = np.array([-sy, cy, 0.0], dtype=np.float64)
     down0 = np.cross(normal, right0)
     down_norm = np.linalg.norm(down0)

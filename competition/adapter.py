@@ -80,6 +80,12 @@ class TelemetryState:
     orientation: Quaternion
     angular_velocity: Tuple[float, float, float]  # rad/s, body frame
     imu: Optional[IMUData] = None
+    # AIGP raw-sim stamps/health. Additive defaults preserve existing
+    # adapters while letting the real transport gate EKF updates by sim time.
+    lpn_time_boot_ms: Optional[int] = None
+    odom_time_usec: Optional[int] = None
+    odom_quality: Optional[int] = None
+    odom_reset_counter: Optional[int] = None
 
     @property
     def roll(self) -> float:

@@ -102,6 +102,19 @@ class DroneEKF:
         self._initialized = True
         self._last_predict_time = timestamp_s
 
+    def set_orientation(self, roll: float, pitch: float, yaw: float) -> None:
+        """Hard-set the telemetry-provided attitude.
+
+        The AIGP sim provides high-quality ODOMETRY orientation; this EKF's
+        measurement model does not observe attitude, so the pipeline treats
+        orientation as a passthrough rather than an estimated state.
+        """
+        if not self._initialized:
+            return
+        self.x[6] = _wrap_angle(roll)
+        self.x[7] = _wrap_angle(pitch)
+        self.x[8] = _wrap_angle(yaw)
+
     def predict(
         self,
         accel_body: Tuple[float, float, float],

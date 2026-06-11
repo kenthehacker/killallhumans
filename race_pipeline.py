@@ -101,6 +101,7 @@ class PipelineConfig:
     # Estimation
     use_ekf: bool = True
     use_pnp: bool = True
+    pnp_mode: str = "backup"
     use_state_predictor: bool = True
 
     # Iter-015: ML training infra (continues iter-014's feature-trace
@@ -204,6 +205,9 @@ class RacePipeline:
         # are rejected as misassociated (another gate in frame, or a
         # spurious detection) rather than fed into the EKF.
         self._pnp_gate_match_radius_m: float = 3.0
+        self._ekf_live_initialized: bool = False
+        self._last_lpn_stamp_ms: Optional[int] = None
+        self._last_odom_reset_counter: Optional[int] = None
 
     def configure(
         self,
@@ -222,8 +226,13 @@ class RacePipeline:
         self._replan_count = 0
         self._last_replan_reasons = []
         self._last_lateral_err = 0.0
+        self._ekf_live_initialized = False
+        self._last_lpn_stamp_ms = None
+        self._last_odom_reset_counter = None
 
         self._build_trajectory_from(start_position, start_velocity, gates)
+        self.ekf.initialize(start_position, start_velocity, timestamp_s=0.0)
+        self._initialized = True
 
     def _build_trajectory_from(
         self,
@@ -275,10 +284,6 @@ class RacePipeline:
             self.trajectory.total_time,
             len(self.trajectory.points),
         )
-
-        # Initialize EKF
-        self.ekf.initialize(start_position, start_velocity, timestamp_s=0.0)
-        self._initialized = True
 
     async def run(self, address: str = "udp://:14540") -> None:
         """
@@ -338,21 +343,7 @@ class RacePipeline:
             return None
 
         # 1. Update state estimation
-        position = telem.position_ned
-        velocity = telem.velocity_ned
-        yaw = telem.yaw
-
-        if self.config.use_ekf:
-            # Feed telemetry to EKF
-            if telem.imu is not None:
-                self.ekf.predict(
-                    telem.imu.accel, telem.imu.gyro,
-                    telem.imu.timestamp_us / 1e6,
-                )
-            self.ekf.update_odometry(position, velocity)
-            position = self.ekf.position
-            velocity = self.ekf.velocity
-            _, _, yaw = self.ekf.orientation
+        position, velocity, yaw = self._update_state_estimate(telem)
 
         # 2. Gate detection and PnP (if camera frame available).
         # ``detection_active`` distinguishes "detector looked but saw
@@ -529,6 +520,66 @@ class RacePipeline:
             self._replan_count, sim_time, trig.reasons,
         )
 
+    def _update_state_estimate(
+        self,
+        telem: TelemetryState,
+    ) -> Tuple[
+        Tuple[float, float, float],
+        Tuple[float, float, float],
+        float,
+    ]:
+        """Fuse the AIGP-provided pose into the EKF and return control state.
+
+        LOCAL_POSITION_NED is the sole position/velocity source. ODOMETRY's
+        quaternion is treated as ground-truth attitude passthrough, because
+        the current EKF does not observe orientation. Updates are gated by
+        sim-clock stamps so repeated telemetry snapshots do not apply the
+        same measurement multiple times.
+        """
+        position = telem.position_ned
+        velocity = telem.velocity_ned
+        roll, pitch, yaw = telem.orientation.to_euler()
+
+        if not self.config.use_ekf:
+            return position, velocity, yaw
+
+        reset_counter = telem.odom_reset_counter
+        reset_changed = (
+            reset_counter is not None
+            and self._last_odom_reset_counter is not None
+            and reset_counter != self._last_odom_reset_counter
+        )
+        init_time_s = _telemetry_timestamp_s(telem)
+        if not self._ekf_live_initialized or reset_changed:
+            self.ekf.initialize(
+                position,
+                velocity,
+                orientation=(roll, pitch, yaw),
+                timestamp_s=init_time_s,
+            )
+            self._ekf_live_initialized = True
+            self._last_lpn_stamp_ms = telem.lpn_time_boot_ms
+            self._last_odom_reset_counter = reset_counter
+            return self.ekf.position, self.ekf.velocity, yaw
+
+        self.ekf.set_orientation(roll, pitch, yaw)
+        if telem.imu is not None:
+            self.ekf.predict(
+                telem.imu.accel,
+                telem.imu.gyro,
+                telem.imu.timestamp_us / 1e6,
+            )
+
+        lpn_stamp = telem.lpn_time_boot_ms
+        source_healthy = telem.odom_quality is None or telem.odom_quality >= 50
+        if lpn_stamp is not None and lpn_stamp != self._last_lpn_stamp_ms:
+            if source_healthy:
+                self.ekf.update_odometry(position, velocity)
+            self._last_lpn_stamp_ms = lpn_stamp
+        self._last_odom_reset_counter = reset_counter
+
+        return self.ekf.position, self.ekf.velocity, yaw
+
     def _process_detection(
         self,
         frame: CameraFrame,
@@ -620,7 +671,17 @@ class RacePipeline:
 def _gate_normal(yaw: float, pitch: float = 0.0) -> Tuple[float, float, float]:
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
-    return (cy * cp, sy * cp, sp)
+    return (cy * cp, sy * cp, -sp)
+
+
+def _telemetry_timestamp_s(telem: TelemetryState) -> float:
+    if telem.imu is not None:
+        return telem.imu.timestamp_us / 1e6
+    if telem.odom_time_usec is not None:
+        return telem.odom_time_usec / 1e6
+    if telem.timestamp_us is not None:
+        return telem.timestamp_us / 1e6
+    return 0.0
 
 
 def _ref_override_position(

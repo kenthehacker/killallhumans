@@ -82,6 +82,15 @@ class TestEKFInitialization:
         unc = ekf.velocity_uncertainty
         assert unc > 0
 
+    def test_set_orientation_hard_sets_wrapped_euler_angles(self):
+        ekf = DroneEKF()
+        ekf.initialize((0, 0, 0), orientation=(0.0, 0.0, 0.0), timestamp_s=0.0)
+        ekf.set_orientation(0.1, -0.2, 3.5)
+        roll, pitch, yaw = ekf.orientation
+        assert roll == pytest.approx(0.1)
+        assert pitch == pytest.approx(-0.2)
+        assert yaw == pytest.approx(_wrap_angle(3.5))
+
 
 # ── Prediction step ──────────────────────────────────────────────────────
 

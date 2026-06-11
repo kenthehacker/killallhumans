@@ -32,6 +32,13 @@ def _make_course() -> list:
     ]
 
 
+class TestGateFrameAxes:
+    def test_positive_pitch_tilts_normal_up_in_ned(self):
+        gate = _make_gate("G1", (0, 0, 0), yaw=0.0, pitch=0.25)
+        normal = GateSequencer._gate_normal(gate)
+        assert normal == pytest.approx((math.cos(0.25), 0.0, -math.sin(0.25)))
+
+
 # ── Gate pass-through detection ──────────────────────────────────────────
 
 

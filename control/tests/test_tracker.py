@@ -154,18 +154,34 @@ class TestGeometricTrackerSigns:
             f"Leftward (-Y) error should give negative roll, got {cmd.roll_rad:.4f}"
         )
 
-    def test_downward_error_increases_thrust(self):
+    def test_yaw_90_forward_world_error_uses_roll_not_pitch(self):
+        """At yaw=90°, +X world error is left in body frame -> negative roll."""
+        tracker = GeometricTracker()
+        ref = _make_reference(position=(10, 0, 0), yaw=math.pi / 2)
+        cmd = tracker.track((0, 0, 0), (0, 0, 0), math.pi / 2, ref)
+        assert cmd.roll_rad < -0.01
+        assert abs(cmd.pitch_rad) < 0.01
+
+    def test_yaw_180_forward_world_error_is_not_inverted(self):
+        """At yaw=180°, +X world error is behind body frame -> positive pitch."""
+        tracker = GeometricTracker()
+        ref = _make_reference(position=(10, 0, 0), yaw=math.pi)
+        cmd = tracker.track((0, 0, 0), (0, 0, 0), math.pi, ref)
+        assert cmd.pitch_rad > 0.01
+
+    def test_downward_error_reduces_thrust_without_tilt_flip(self):
         """
-        Target below drone (larger z in NED) -> more thrust to descend.
+        Target below drone (larger z in NED) -> reduce thrust, not invert
+        the thrust vector and bank sideways.
         """
         tracker = GeometricTracker()
         ref = _make_reference(position=(0, 0, 5))  # target below (NED: +z = down)
         cmd = tracker.track((0, 0, 0), (0, 0, 0), 0.0, ref)
         cfg = TrackerConfig()
         hover_thrust = cfg.mass * cfg.gravity / cfg.max_thrust_n
-        assert cmd.thrust > hover_thrust, (
-            f"Downward error should increase thrust above hover ({hover_thrust:.3f}), got {cmd.thrust:.3f}"
-        )
+        assert cmd.thrust <= hover_thrust
+        assert abs(cmd.roll_rad) < 0.01
+        assert abs(cmd.pitch_rad) < 0.01
 
     def test_upward_error_increases_thrust(self):
         """
@@ -265,6 +281,27 @@ class TestSimplePositionTracker:
             target_position=(5, 0, 0),
         )
         assert abs(cmd.pitch_rad) > 0.01
+
+    def test_forward_error_yaw0_commands_negative_pitch(self):
+        tracker = SimplePositionTracker()
+        cmd = tracker.track(
+            current_position=(0, 0, 0),
+            current_velocity=(0, 0, 0),
+            current_yaw=0.0,
+            target_position=(5, 0, 0),
+        )
+        assert cmd.pitch_rad < -0.01
+
+    def test_right_world_error_at_yaw90_commands_negative_pitch(self):
+        tracker = SimplePositionTracker()
+        cmd = tracker.track(
+            current_position=(0, 0, 0),
+            current_velocity=(0, 0, 0),
+            current_yaw=math.pi / 2,
+            target_position=(0, 5, 0),
+        )
+        assert cmd.pitch_rad < -0.01
+        assert abs(cmd.roll_rad) < 0.01
 
     def test_reset_clears_integral(self):
         tracker = SimplePositionTracker()

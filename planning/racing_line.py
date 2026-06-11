@@ -184,9 +184,11 @@ class RacingLineOptimizer:
             ],
             "config": {
                 "max_lateral_offset": config.max_lateral_offset,
+                "max_vertical_offset": config.max_vertical_offset,
                 "smoothness_weight": config.smoothness_weight,
                 "speed_weight": config.speed_weight,
                 "corner_cut_aggressiveness": config.corner_cut_aggressiveness,
+                "up_vector_schema": "ned_v4",
                 # Iter-009i: cache key splits on the selection-reference
                 # speed, since it controls the BO oracle's basin choice.
                 # Execution velocity (used by the downstream
@@ -216,7 +218,9 @@ class RacingLineOptimizer:
             #      uses 15. Geometry-identical configs hash to the same
             #      key, so reuse without a version bump silently mixes
             #      pre/post-iter-010 offsets. Strict version check.
-            if data.get("version") != 3:
+            # v4 = AIGP Phase 1 NED path: max_vertical_offset enters the
+            #      key and vertical offsets use NED up ([0,0,-1]).
+            if data.get("version") != 4:
                 return None
             return np.array(data["offsets"], dtype=np.float64)
         except (json.JSONDecodeError, KeyError, ValueError):
@@ -233,11 +237,8 @@ class RacingLineOptimizer:
         """Save winning offsets to cache file."""
         from datetime import datetime, timezone
         data = {
-            # Iter-011: v3 — bumped to invalidate v2 entries that were
-            # selected under DroneConstraints.max_acceleration=20 (iter-010
-            # dropped it to 15). Schema unchanged; only the basin physics
-            # changed.
-            "version": 3,
+            # v4 — AIGP Phase 1 NED vertical-offset and cache-key schema.
+            "version": 4,
             "cache_key": cache_key,
             "offsets": offsets.tolist(),
             "metrics": metrics or {},
@@ -739,11 +740,10 @@ class RacingLineOptimizer:
     ) -> List[Tuple[float, float, float]]:
         """Apply lateral/vertical offsets to gate positions.
 
-        Iter-035: fixed the `up` vector — was [0,0,-1] (NED) but the
-        tracks + bench + visualizer all use ENU (z is UP). Combined
-        with the new `RacingLineConfig.max_vertical_offset=0` default,
-        gates pass at their actual z center. Even if vertical bound is
-        re-enabled, the sign is now correct.
+        AIGP Phase 1 uses NED end-to-end. Positive vertical offset means
+        "up" through the gate opening, which decreases NED z. Combined with
+        ``RacingLineConfig.max_vertical_offset=0`` by default, VQ1 still
+        passes through the gate center vertically.
         """
         n = len(gates)
         positions = []
@@ -752,11 +752,11 @@ class RacingLineOptimizer:
             lat_off = offsets[i]
             vert_off = offsets[n + i]
 
-            # Compute gate local axes (ENU world frame).
+            # Compute gate local axes (NED world frame).
             cy = math.cos(gate.yaw)
             sy = math.sin(gate.yaw)
             right = np.array([-sy, cy, 0])   # local right
-            up = np.array([0, 0, 1])          # ENU: +z is up (was -1, iter-035 fix)
+            up = np.array([0, 0, -1])         # NED: -z is up
 
             pos = np.array(gate.position)
             pos = pos + right * lat_off * gate.width * 0.5

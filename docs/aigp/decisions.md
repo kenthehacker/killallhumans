@@ -29,3 +29,11 @@ with covariance + `quality`), rather than vision dead-reckoning, for VQ1.
 **Rationale:** the "no local position" assumption that shaped the old stack is false here. Known
 map + provided local pose ⇒ VQ1 is fly-the-line, with vision as a backup/correction. Revisit for
 VQ2 (confirm whether local pose + map persist with "guidance off").
+
+## D5 — EKF position only; attitude is telemetry passthrough
+**Decision:** Use `LOCAL_POSITION_NED` as the sole position/velocity measurement, use
+`ODOMETRY.q` as the attitude passthrough plus quality/reset health signal, and keep gate PnP in
+backup mode for VQ1.
+**Rationale:** the current EKF does not observe orientation, so estimating yaw from blind init can
+overwrite good simulator attitude. The sim provides high-rate quaternion attitude with quality 100,
+while PnP geometry still uses the inner-aperture model and can poison a healthy state estimate.

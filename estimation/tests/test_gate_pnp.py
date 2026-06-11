@@ -248,7 +248,7 @@ class TestGatePoseToDronePosition:
         normal = np.array([
             math.cos(gate_yaw) * math.cos(gate_pitch),
             math.sin(gate_yaw) * math.cos(gate_pitch),
-            math.sin(gate_pitch),
+            -math.sin(gate_pitch),
         ])
         expected = gate_world_pos - normal * distance
         assert drone_pos == pytest.approx(tuple(expected), abs=1e-6)

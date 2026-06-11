@@ -701,7 +701,7 @@ class GateSequencer:
     def _gate_normal(gate: GateSpec) -> np.ndarray:
         cy, sy = math.cos(gate.yaw), math.sin(gate.yaw)
         cp, sp = math.cos(gate.pitch), math.sin(gate.pitch)
-        return np.array([cy * cp, sy * cp, sp])
+        return np.array([cy * cp, sy * cp, -sp])
 
     @staticmethod
     def _gate_right(gate: GateSpec) -> np.ndarray:
@@ -709,7 +709,7 @@ class GateSequencer:
         cp, sp = math.cos(gate.pitch), math.sin(gate.pitch)
         cr, sr = math.cos(gate.roll), math.sin(gate.roll)
 
-        normal = np.array([cy * cp, sy * cp, sp])
+        normal = np.array([cy * cp, sy * cp, -sp])
         right0 = np.array([-sy, cy, 0.0])
         down0 = np.cross(normal, right0)
         down_norm = np.linalg.norm(down0)
@@ -767,7 +767,7 @@ class GateSequencer:
         cp, sp = math.cos(gate.pitch), math.sin(gate.pitch)
         cr, sr = math.cos(gate.roll), math.sin(gate.roll)
 
-        normal = np.array([cy * cp, sy * cp, sp])
+        normal = np.array([cy * cp, sy * cp, -sp])
         right0 = np.array([-sy, cy, 0.0])
         down0 = np.cross(normal, right0)
         down_norm = np.linalg.norm(down0)

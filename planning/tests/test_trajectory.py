@@ -310,6 +310,24 @@ class TestRacingLineOptimizer:
             # Should be within half the gate width
             assert dist < orig.width
 
+    def test_vertical_offset_positive_moves_up_in_ned(self):
+        """Phase 1 AIGP path is NED: positive vertical offset should reduce z."""
+        opt = RacingLineOptimizer(config=RacingLineConfig(use_cache=False))
+        gate = GateWaypoint(position=(5, 0, 2), normal=(1, 0, 0), yaw=0.0, height=1.5)
+        offsets = np.array([0.0, 0.5])
+        result = opt._apply_offsets([gate], offsets)
+        assert result[0][2] < gate.position[2]
+
+    def test_max_vertical_offset_changes_cache_key(self):
+        gates = [GateWaypoint(position=(5, 0, 2), normal=(1, 0, 0), yaw=0.0)]
+        start = (0, 0, 0)
+        cfg_a = RacingLineConfig(max_vertical_offset=0.0, use_cache=False)
+        cfg_b = RacingLineConfig(max_vertical_offset=0.25, use_cache=False)
+        assert (
+            RacingLineOptimizer._compute_cache_key(gates, start, cfg_a)
+            != RacingLineOptimizer._compute_cache_key(gates, start, cfg_b)
+        )
+
 
 # ── Helper ───────────────────────────────────────────────────────────────
 

@@ -227,6 +227,12 @@ class GeometricTracker:
             c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1] + c.drag_coefficient * vel[1] + c.velocity_feedforward * ref_vel[1],
             c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2] + c.drag_coefficient * vel[2] + c.velocity_feedforward * ref_vel[2],
         ])
+        # Rotor thrust can only point body-up. If commanded down-accel exceeds
+        # gravity minus minimum thrust, the raw thrust vector flips downward
+        # and the attitude extraction banks the drone sideways. Saturate the
+        # requested descent to the least upward thrust we can actually send.
+        a_down_max = c.gravity - c.min_thrust_normalized * c.max_thrust_n / c.mass
+        accel_des[2] = min(accel_des[2], a_down_max)
 
         # In NED: gravity is (0, 0, g) pointing down
         # Total thrust = mass * (accel_des - gravity)
@@ -274,8 +280,11 @@ class GeometricTracker:
         #
         # pitch = -asin(x-component): positive x thrust -> negative pitch (nose down -> forward)
         # roll = atan2(y, -z): positive y thrust -> positive roll (right side down -> eastward)
-        desired_pitch = -math.asin(np.clip(z_b_des[0], -1, 1))
-        desired_roll = math.atan2(z_b_des[1], -z_b_des[2])
+        cpsi, spsi = math.cos(yaw_des), math.sin(yaw_des)
+        zx_h = cpsi * z_b_des[0] + spsi * z_b_des[1]
+        zy_h = -spsi * z_b_des[0] + cpsi * z_b_des[1]
+        desired_pitch = -math.asin(np.clip(zx_h, -1, 1))
+        desired_roll = math.atan2(zy_h, -z_b_des[2])
 
         # Clamp to limits
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
@@ -443,8 +452,8 @@ class SimplePositionTracker:
         ay_body = -sy * ax + cy * ay
 
         # Desired angles
-        desired_pitch = math.atan2(ax_body, c.gravity)
-        desired_roll = -math.atan2(ay_body, c.gravity)
+        desired_pitch = -math.atan2(ax_body, c.gravity)
+        desired_roll = math.atan2(ay_body, c.gravity)
 
         desired_pitch = np.clip(desired_pitch, -c.max_tilt_rad, c.max_tilt_rad)
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
