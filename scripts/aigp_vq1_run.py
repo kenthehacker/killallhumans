@@ -30,7 +30,10 @@ import logging
 import time
 from typing import List, Optional
 
-from competition.adapter import CompetitionInterface, Quaternion, TelemetryState
+import gzip
+import json
+
+from competition.adapter import AttitudeCommand, CameraFrame, CompetitionInterface, Quaternion, TelemetryState
 from competition.aigp_messages import TrackData, TrackGate
 from competition.track_data import track_data_to_gatespecs
 from gate_sequencing.sequencer import GateSpec
@@ -208,13 +211,71 @@ async def run_vq1(
     logger.info("Resetting sim for clean race start…")
     await adapter.reset()
 
-    # 7. Run
+    # 7. Wrap pipeline callback to record actual path vs planned trajectory.
+    telem_log: list = []
+    _orig_callback = pipeline._control_callback
+
+    def _recording_callback(
+        telem: TelemetryState,
+        frame: Optional[CameraFrame],
+    ) -> Optional[AttitudeCommand]:
+        cmd = _orig_callback(telem, frame)
+        pos = list(telem.position_ned)
+        vel = list(telem.velocity_ned)
+        # Find the reference point the tracker is currently tracking.
+        ref_pos = ref_vel = ref_yaw = None
+        if pipeline.trajectory is not None and pipeline._ref_progress_time is not None:
+            try:
+                pt = pipeline.trajectory.at_time(pipeline._ref_progress_time)
+                ref_pos = list(pt.position)
+                ref_vel = list(pt.velocity)
+                ref_yaw = float(pt.yaw)
+            except Exception:
+                pass
+        entry = {
+            "t_wall": time.monotonic(),
+            "t_us": telem.timestamp_us,
+            "pos": pos,
+            "vel": vel,
+            "yaw": _q_to_yaw(telem.orientation),
+            "gates_passed": pipeline.sequencer.gates_passed if pipeline.sequencer else 0,
+            "ref_pos": ref_pos,
+            "ref_vel": ref_vel,
+            "ref_yaw": ref_yaw,
+        }
+        if cmd is not None:
+            entry["cmd_roll"] = round(cmd.roll_rad, 4)
+            entry["cmd_pitch"] = round(cmd.pitch_rad, 4)
+            entry["cmd_yaw"] = round(cmd.yaw_rad, 4)
+            entry["cmd_thrust"] = round(cmd.thrust, 4)
+        telem_log.append(entry)
+        return cmd
+
+    pipeline._control_callback = _recording_callback
+
+    # 8. Run
     wall_start = time.monotonic()
     logger.info("Starting race run…")
     await pipeline.run(address=address)
     elapsed = time.monotonic() - wall_start
 
-    # 8. Summary
+    # 9. Dump telemetry log
+    if record and telem_log:
+        _write_telem_log(telem_log, record)
+        logger.info("Telemetry log: %d samples → %s", len(telem_log), record)
+    elif telem_log:
+        # Always write to a timestamped file beside the script if --record not given
+        default_path = f"captures/telemetry_{int(time.time())}.jsonl.gz"
+        import os
+        os.makedirs("captures", exist_ok=True)
+        _write_telem_log(telem_log, default_path)
+        logger.info("Telemetry log: %d samples → %s", len(telem_log), default_path)
+
+    # 10. Path comparison summary
+    if telem_log:
+        _log_path_comparison(telem_log, gates)
+
+    # 11. Completion summary
     collisions = adapter.drain_collisions()
     gates_passed = pipeline.sequencer.gates_passed if pipeline.sequencer else 0
     total_gates = pipeline.sequencer.total_gates if pipeline.sequencer else len(gates)
@@ -227,6 +288,58 @@ async def run_vq1(
             logger.info("  Collision: id=%s impulse=%.3f", c.get("id"), c.get("impulse", 0))
 
     await adapter.disconnect()
+
+
+def _q_to_yaw(q) -> float:
+    """Extract NED yaw (radians) from a Quaternion."""
+    import math
+    if q is None:
+        return 0.0
+    # ZYX Euler: yaw = atan2(2(wz+xy), 1-2(y²+z²))
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+def _write_telem_log(telem_log: list, path: str) -> None:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "wt") as f:
+        for row in telem_log:
+            f.write(json.dumps(row) + "\n")
+
+
+def _log_path_comparison(telem_log: list, gates: list) -> None:
+    """Log a compact per-gate cross-track error summary."""
+    import math
+    if not telem_log or not gates:
+        return
+    logger.info("--- Path vs plan ---")
+    for i, g in enumerate(gates):
+        gx, gy, gz = g.position
+        errors = []
+        for row in telem_log:
+            if row.get("gates_passed", 0) == i:
+                px, py, pz = row["pos"]
+                errors.append(math.sqrt((px-gx)**2 + (py-gy)**2 + (pz-gz)**2))
+        if errors:
+            logger.info(
+                "  Gate %d: n=%d samples approaching, min_dist=%.2f m avg_dist=%.2f m",
+                i, len(errors), min(errors), sum(errors)/len(errors),
+            )
+    # Overall cross-track error vs reference
+    cross_errs = []
+    for row in telem_log:
+        if row.get("ref_pos") is not None:
+            dx = row["pos"][0] - row["ref_pos"][0]
+            dy = row["pos"][1] - row["ref_pos"][1]
+            dz = row["pos"][2] - row["ref_pos"][2]
+            cross_errs.append(math.sqrt(dx*dx + dy*dy + dz*dz))
+    if cross_errs:
+        logger.info(
+            "  Overall: %d samples, avg_cross_track=%.3f m, p95=%.3f m",
+            len(cross_errs),
+            sum(cross_errs)/len(cross_errs),
+            sorted(cross_errs)[int(0.95*len(cross_errs))],
+        )
 
 
 def main(argv=None) -> None:

@@ -213,6 +213,11 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._require_conn()
         thrust = _clamp_thrust(cmd.thrust)
         q = Quaternion.from_euler(cmd.roll_rad, cmd.pitch_rad, cmd.yaw_rad)
+        # Canonicalize: MAVLink requires w >= 0 (positive scalar convention).
+        # Double-cover means q and -q represent the same rotation, but a
+        # negative w component can cause sim-side interpolation glitches.
+        if q.w < 0:
+            q = Quaternion(-q.w, -q.x, -q.y, -q.z)
         with self._send_lock:
             self._conn.mav.set_attitude_target_send(
                 self._time_boot_ms(),

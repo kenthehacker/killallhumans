@@ -251,9 +251,16 @@ class GeometricTracker:
         else:
             z_b_des = np.array([0, 0, -1])  # NED: hover = thrust upward = -z
 
-        # Extract desired roll and pitch from thrust direction
-        # Using desired yaw to resolve the heading ambiguity
-        yaw_des = reference.yaw
+        # Extract desired roll and pitch from thrust direction.
+        # Wrap yaw to shortest-path from current heading so we never command
+        # a full-circle spin across the ±π seam (VQ1 course runs toward -X,
+        # reference yaw ≈ +π while measured yaw at spawn is ≈ −π — same
+        # physical heading, opposite sign representation).
+        yaw_error = math.atan2(
+            math.sin(reference.yaw - current_yaw),
+            math.cos(reference.yaw - current_yaw),
+        )
+        yaw_des = current_yaw + yaw_error
 
         # Construct desired rotation matrix
         # x_c = [cos(yaw), sin(yaw), 0] — desired heading projection

@@ -2063,8 +2063,10 @@ class TrajectoryOptimizer:
                     accelerations[j] *= scale
                     jerks[j] *= scale
 
-            # Compute yaw: point toward next gate
-            gate_yaw = gates[i].yaw if i < len(gates) else 0.0
+            # Compute yaw: point toward the gate this segment belongs to.
+            # waypoints = [start, entry0, exit0, entry1, exit1, ...] so
+            # segment i covers gate i//2 (entry and exit share the same gate yaw).
+            gate_yaw = gates[min(i // 2, len(gates) - 1)].yaw
 
             for j in range(n_samples):
                 # Yaw: blend between looking at current target and next

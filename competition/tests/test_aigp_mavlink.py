@@ -294,10 +294,7 @@ def test_connect_is_idempotent():
 
     original_conn = adapter._conn
 
-    async def _second_connect():
-        await adapter.connect("udpin:127.0.0.1:9999")
-
-    asyncio.get_event_loop().run_until_complete(_second_connect())
+    asyncio.run(adapter.connect("udpin:127.0.0.1:9999"))
 
     assert adapter._conn is original_conn, "second connect() must not replace existing connection"
     assert adapter.track_data is first_track, "second connect() must not clear existing track data"
