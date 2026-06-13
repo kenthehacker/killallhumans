@@ -19,9 +19,12 @@ inputs can be computed via differential flatness.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from scipy.optimize import minimize
@@ -1416,10 +1419,18 @@ class TrajectoryOptimizer:
             (p for p in seg_peaks if p is not None), default=0.0,
         )
         if residual_max > peak_target * 1.05:
-            print(
-                f"[_project_accel_peaks] residual peak {residual_max:.1f} m/s² > "
-                f"target {peak_target:.1f} after {max_passes} passes "
-                f"(cap {per_pass_cap}× per pass) — accept and continue."
+            # Infeasible reference: the min-snap interior accel still exceeds
+            # the drone's limit after projection (Blocker 11 — the peaks live
+            # in sub-min_seg_time through-gate segments the projection skips,
+            # and the upstream L-BFGS time-allocation penalty ignores
+            # direction-change accel). The tracker clamps and usually still
+            # flies the default course, but margin shrinks with speed. Surfaced
+            # as a real WARNING (was a bare print) so it is visible in logs.
+            logger.warning(
+                "Trajectory accel infeasible: residual peak %.1f m/s2 > "
+                "target %.1f after %d projection passes (cap %.2fx/pass) - "
+                "tracker will saturate; reduce max_speed or fix time allocation.",
+                residual_max, peak_target, max_passes, per_pass_cap,
             )
         return times
 

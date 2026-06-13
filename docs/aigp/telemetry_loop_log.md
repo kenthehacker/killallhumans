@@ -340,3 +340,40 @@ replan + sequencer + watchdog 112 passed; core modules 234 passed.
 peaks, ~108 m/s²; limits the high-speed envelope), Blocker 12 (PnP
 outer/inner-corner scale), and the large-disturbance RECOVERY-state behavior
 (reference-override + thrust-cut can still storm at ≥25 m/s gusts).
+
+---
+
+## Iteration 11 — Blocker 11 investigation (negative result) + observability
+
+**Telemetry read (tilt/thrust saturation vs speed):** at the **default 8 m/s**
+the tracker is at max tilt **11.9 %** of the time (thrust-sat 4.8 %), rising to
+**37 %** at 11 m/s — the trajectory genuinely demands 108–165 m/s² (11–17 g)
+accelerations the drone can't deliver. Confirms Blocker 11 bites (and is what
+crashes the drone at 12 m/s, iter 7).
+
+**Root cause located:** `_project_accel_peaks` stretches over-budget segments
+(min-snap accel ∝ 1/T²) but **skips segments shorter than `min_seg_time`
+(0.15 s)** — and the through-gate segments where the peaks live are ~0.11 s, so
+they're skipped and never corrected (residual stays 108).
+
+**Attempted fix → REVERTED.** Un-skipping short segments (stretching them) and
+adding passes:
+- dropped the peak 108 → 61 m/s² (still > 15), but
+- **slowed the 8 m/s race 15.3 s → 21.9 s (+44 %)**, and
+- **caused out-of-order DQs at 10/12 m/s** — stretching one segment re-solves
+  the *global* min-snap spline and distorts the path/gate geometry.
+
+Post-hoc stretching is the wrong lever. The real fixes are deeper and riskier:
+(a) the upstream L-BFGS time-allocation penalty that ignores direction-change
+accel (audit MAJOR P-2), or (b) wiring the **discarded** curvature-aware
+SpeedProfiler output into `optimize()` (it currently computes per-waypoint
+speeds, logs them, and throws them away — audit MAJOR). Both need careful work
+beyond a safe autonomous change; deferred with this analysis recorded.
+
+**Safe positive delivered:** the infeasibility signal (`residual peak …`) was a
+bare `print()` to stdout; converted it to a proper `logger.warning` with
+actionable guidance, so infeasible trajectories are visible in logs rather than
+lost in noise.
+
+**Tests:** trajectory suite 30 passed; revert verified clean (empty diff,
+8 m/s back to 15.3 s / 6/6).
