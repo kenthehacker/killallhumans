@@ -226,7 +226,14 @@ async def run_vq1(
         ref_pos = ref_vel = ref_yaw = None
         if pipeline.trajectory is not None and pipeline._ref_progress_time is not None:
             try:
-                pt = pipeline.trajectory.at_time(pipeline._ref_progress_time)
+                # ``_ref_progress_time`` is updated to the tracked reference's
+                # time after each control callback, so sampling at that time
+                # reproduces the point the tracker is actually following.
+                # (The old ``at_time`` call did not exist on Trajectory and
+                # silently swallowed an AttributeError, so ``ref_pos`` was
+                # ``None`` in every recorded sample — the planned-vs-actual
+                # comparison never ran.)
+                pt = pipeline.trajectory.sample(pipeline._ref_progress_time)
                 ref_pos = list(pt.position)
                 ref_vel = list(pt.velocity)
                 ref_yaw = float(pt.yaw)
@@ -283,6 +290,14 @@ async def run_vq1(
         "Race finished: %d/%d gates in %.2f s, %d collision(s)",
         gates_passed, total_gates, elapsed, len(collisions),
     )
+    frozen = getattr(pipeline, "_telem_frozen_ticks", 0)
+    if frozen:
+        logger.error(
+            "Telemetry feed was FROZEN for %d control ticks during the run — "
+            "the controller flew (partly) blind on a stale state estimate. "
+            "Investigate the MAVLink RX subscription before trusting this run.",
+            frozen,
+        )
     if collisions:
         for c in collisions:
             logger.info("  Collision: id=%s impulse=%.3f", c.get("id"), c.get("impulse", 0))

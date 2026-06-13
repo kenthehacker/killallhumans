@@ -209,6 +209,22 @@ class RacePipeline:
         self._last_lpn_stamp_ms: Optional[int] = None
         self._last_odom_reset_counter: Optional[int] = None
 
+        # Frozen-telemetry watchdog. A silently-dead telemetry feed (the
+        # mavlink RX subscription dies, or the sim stops publishing) leaves
+        # the controller flying on a stale state estimate: it keeps emitting
+        # the same correction every tick, which on the live path shows up as
+        # the drone "spinning in circles" or drifting while the recorded
+        # state never changes. Nothing previously detected this. We count
+        # consecutive control ticks whose telemetry timestamp has not
+        # advanced and raise a loud, once-per-episode error when the feed has
+        # clearly stalled. Detection only — flight commands are unchanged.
+        self._last_telem_stamp_us: Optional[int] = None
+        self._telem_stale_ticks: int = 0
+        self._telem_frozen_ticks: int = 0  # cumulative, for the run summary
+        self._telem_stale_warned: bool = False
+        # ~0.5 s of a 100 Hz control loop with no new telemetry.
+        self._telem_stale_tick_limit: int = 50
+
     def configure(
         self,
         gates: List[GateSpec],
@@ -341,6 +357,9 @@ class RacePipeline:
         """
         if self.sequencer is None or self.trajectory is None:
             return None
+
+        # 0. Frozen-telemetry watchdog (detection only).
+        self._check_telemetry_freshness(telem)
 
         # 1. Update state estimation
         position, velocity, yaw = self._update_state_estimate(telem)
@@ -579,6 +598,43 @@ class RacePipeline:
         self._last_odom_reset_counter = reset_counter
 
         return self.ekf.position, self.ekf.velocity, yaw
+
+    def _check_telemetry_freshness(self, telem: TelemetryState) -> None:
+        """Watchdog for a frozen/dead telemetry feed.
+
+        Increments a counter every control tick on which the telemetry
+        timestamp has not advanced (or is missing). When the feed has been
+        frozen for ``_telem_stale_tick_limit`` consecutive ticks the
+        controller is provably flying on a stale state estimate, so we log a
+        single loud error per stall. ``_telem_frozen_ticks`` accumulates the
+        total for the end-of-run summary. This only observes telemetry; it
+        does not alter the commands sent to the vehicle.
+        """
+        stamp = telem.timestamp_us
+        if stamp is not None and stamp != self._last_telem_stamp_us:
+            # Fresh sample — reset the consecutive-stall counter.
+            self._last_telem_stamp_us = stamp
+            self._telem_stale_ticks = 0
+            self._telem_stale_warned = False
+            return
+
+        # Same (or missing) timestamp as last tick: the feed has not updated.
+        self._telem_stale_ticks += 1
+        self._telem_frozen_ticks += 1
+        if (
+            self._telem_stale_ticks >= self._telem_stale_tick_limit
+            and not self._telem_stale_warned
+        ):
+            self._telem_stale_warned = True
+            logger.error(
+                "Telemetry feed FROZEN: timestamp %s has not advanced for %d "
+                "control ticks (~%.1f s). The controller is flying on a stale "
+                "state estimate — commands will not respond to the vehicle's "
+                "actual motion (this is the 'spinning in circles' failure mode). "
+                "Check the MAVLink RX subscription / sim publish rate.",
+                stamp, self._telem_stale_ticks,
+                self._telem_stale_ticks / max(1, self.config.target_hz),
+            )
 
     def _process_detection(
         self,

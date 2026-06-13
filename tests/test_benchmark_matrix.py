@@ -27,7 +27,9 @@ def test_list_configs_finds_track_jsons():
     # All should be .json files under sim_pybullet/configs/.
     for p in paths:
         assert p.suffix == ".json"
-        assert "sim_pybullet/configs" in str(p)
+        # Use as_posix() so the check is independent of the OS path separator
+        # (Windows stringifies Path with backslashes).
+        assert "sim_pybullet/configs" in p.as_posix()
 
 
 def test_run_matrix_single_track_returns_expected_shape():
