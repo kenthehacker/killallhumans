@@ -239,3 +239,32 @@ now fails CI even while the unit suites stay green — closing the original
 accidentally tracked in the iter 5-6 commit; removed).
 
 **Tests:** 4 new closed-loop cases pass (7.5 s).
+
+---
+
+## Iteration 8 — recovery-stack resilience test
+
+**Considered EKF probing** (live path uses it) but the VQ1 case is
+odometry-rich, so the EKF mostly fuses clean position/velocity and uses
+telemetry yaw directly (the audit's yaw-unobservable blocker bites only in
+vision dead-reckoning); feeding the IMU with the wrong specific-force
+convention risked false conclusions. Chose the higher-value, lower-risk target
+instead: prove the recovery stack fixed in iters 3 & 6 actually recovers.
+
+**Telemetry read (perturbation injection):** added a one-shot velocity-impulse
+option to the harness (`perturb=(t, (dvx,dvy,dvz))`). A **+15 m/s lateral gust
+at t=5 s** → the replanner fires **1 replan** and the drone **re-converges and
+completes 6/6 gates** (race_complete, 15.8 s). The disturbance is detected and
+handled gracefully (sustained-lateral-error replan, below the harsher RECOVERY
+threshold). Larger impulses escalate to RECOVERY.
+
+**Caveat:** the harness runs replans synchronously (no sim time elapses during
+the ~1.8 s optimize), so it does NOT model the "blind during replan" window
+(audit Blocker 9) — recovery success here validates *detection + re-convergence*,
+not the real-time blind gap. Blocker 9 (async replan) remains a future target.
+
+**Improvement:** `test_recovers_from_midcourse_disturbance` — asserts a mid-
+course gust still finishes 6/6 gates AND was actually noticed (replan or
+RECOVERY). Guards iters 3+6 working together.
+
+**Tests:** closed-loop suite now 5 cases (20.7 s); related suites 116 passed.

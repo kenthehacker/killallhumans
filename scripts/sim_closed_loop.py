@@ -88,7 +88,15 @@ def _wrap(a: float) -> float:
 
 
 def run(max_speed: float = 8.0, start_yaw: float = 0.0,
-        max_sim_s: float = 90.0) -> Tuple[list, dict]:
+        max_sim_s: float = 90.0,
+        perturb: Optional[Tuple[float, Tuple[float, float, float]]] = None,
+        ) -> Tuple[list, dict]:
+    """Run the closed loop.
+
+    ``perturb`` optionally injects a one-shot velocity impulse
+    ``(t_seconds, (dvx, dvy, dvz))`` to simulate a gust/disturbance and
+    exercise the off-track + replanner recovery stack.
+    """
     config = PipelineConfig(
         max_speed=max_speed,
         use_ekf=False,
@@ -126,7 +134,11 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     telem_log: list = []
     n_steps = int(max_sim_s / dt)
     reason = "max_sim_time"
+    perturb_step = int(perturb[0] / dt) if perturb is not None else -1
+    entered_recovery = False
     for i in range(n_steps):
+        if i == perturb_step:
+            vel = vel + np.array(perturb[1], dtype=float)
         # Start at a strictly positive sim timestamp so the callback uses the
         # sim-time elapsed branch (timestamp_us > 0) rather than wall-clock.
         t_us = int((i + 1) * dt * 1e6)
@@ -160,6 +172,9 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
             entry["cmd_yaw"] = round(cmd.yaw_rad, 4)
             entry["cmd_thrust"] = round(cmd.thrust, 4)
         telem_log.append(entry)
+        if pipeline.sequencer is not None and \
+                pipeline.sequencer.state.name == "RECOVERY":
+            entered_recovery = True
 
         if cmd is None:
             reason = "callback_returned_none"
@@ -186,6 +201,7 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
         "total_gates": pipeline.sequencer.total_gates if pipeline.sequencer else len(gates),
         "final_pos": [round(float(p), 2) for p in pos],
         "replans": getattr(pipeline, "_replan_count", 0),
+        "entered_recovery": entered_recovery,
     }
     return telem_log, summary
 

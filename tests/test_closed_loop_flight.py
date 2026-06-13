@@ -62,3 +62,21 @@ def test_no_replan_storm_on_clean_course(flight):
     assert summary["replans"] == 0, (
         f"unexpected replans ({summary['replans']}) on a clean course"
     )
+
+
+def test_recovers_from_midcourse_disturbance():
+    """Resilience: a strong lateral gust mid-course must be detected (the
+    replanner fires) and the drone must still finish the course. Guards the
+    recovery stack fixed in iters 3 (replanner cooldown trigger-loss) and 6
+    (cross-track off-track detection) working together end-to-end."""
+    _, summary = run(
+        max_speed=8.0, start_yaw=0.0, max_sim_s=45.0,
+        perturb=(5.0, (0.0, 15.0, 0.0)),  # +15 m/s lateral kick at t=5 s
+    )
+    assert summary["termination_reason"] == "race_complete"
+    assert summary["gates_passed"] == 6
+    # The disturbance must actually have been noticed and acted on, not
+    # silently ignored — at least one replan (or a RECOVERY excursion).
+    assert summary["replans"] >= 1 or summary["entered_recovery"], (
+        "disturbance was not detected by the recovery stack"
+    )
