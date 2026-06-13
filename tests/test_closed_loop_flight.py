@@ -64,6 +64,20 @@ def test_no_replan_storm_on_clean_course(flight):
     )
 
 
+def test_completes_with_ekf_enabled():
+    """The live competition path runs through the EKF (IMU predict + LOCAL_
+    POSITION_NED odometry fusion). With faithful IMU specific-force and
+    odometry, the closed loop must still complete the course — i.e. the EKF
+    estimate stays accurate enough to fly (no drift/divergence)."""
+    telem_log, summary = run(max_speed=8.0, start_yaw=0.0, max_sim_s=60.0,
+                             use_ekf=True)
+    assert summary["termination_reason"] == "race_complete"
+    assert summary["gates_passed"] == 6
+    # progress, not circling
+    xs = [r["pos"][0] for r in telem_log]
+    assert abs(xs[-1] - xs[0]) > 150.0
+
+
 def test_recovers_from_midcourse_disturbance():
     """Resilience: a strong lateral gust mid-course must be detected (the
     replanner fires) and the drone must still finish the course. Guards the

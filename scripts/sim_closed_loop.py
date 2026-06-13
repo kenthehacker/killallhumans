@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from competition.adapter import Quaternion, TelemetryState
+from competition.adapter import IMUData, Quaternion, TelemetryState
 from gate_sequencing.sequencer import GateSpec
 from race_pipeline import PipelineConfig, RacePipeline
 
@@ -87,11 +87,32 @@ def _wrap(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
 
 
+def _specific_force_body(a_world: np.ndarray, roll: float, pitch: float,
+                         yaw: float, gravity: float) -> tuple:
+    """IMU accelerometer reading: specific force in the body frame.
+
+    f = R_world->body @ (a_world - g_world), with NED g_world = (0,0,+g).
+    Verified against DroneEKF: level hover -> (0,0,-g); free fall -> (0,0,0).
+    """
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    # Body->world ZYX rotation.
+    Rbw = np.array([
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp,     cp * sr,                cp * cr],
+    ])
+    f_world = a_world - np.array([0.0, 0.0, gravity])
+    return tuple(Rbw.T @ f_world)
+
+
 def run(max_speed: float = 8.0, start_yaw: float = 0.0,
         max_sim_s: float = 90.0,
         perturb: Optional[Tuple[float, Tuple[float, float, float]]] = None,
         replan_blind_s: float = 0.0,
         rebuild_sim_s: float = 1.8,
+        use_ekf: bool = False,
         ) -> Tuple[list, dict]:
     """Run the closed loop.
 
@@ -116,7 +137,7 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     """
     config = PipelineConfig(
         max_speed=max_speed,
-        use_ekf=False,
+        use_ekf=use_ekf,
         use_detection=False,
         use_state_predictor=False,
     )
@@ -213,12 +234,29 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
             rebuild_inflight_since = None
         # Strictly positive sim timestamp -> callback uses sim-time elapsed.
         t_us = int((tick + 1) * dt * 1e6)
+        imu = None
+        if use_ekf:
+            # Specific force the accelerometer would read over the last
+            # interval (driven by the previously applied command's attitude).
+            if prev_cmd is not None:
+                a_world = _world_accel(prev_cmd, mass, gravity, max_thrust_n)
+                f_body = _specific_force_body(
+                    a_world, prev_cmd.roll_rad, prev_cmd.pitch_rad, yaw, gravity
+                )
+            else:
+                f_body = (0.0, 0.0, -gravity)  # hover at t=0
+            imu = IMUData(timestamp_us=t_us, accel=f_body, gyro=(0.0, 0.0, 0.0))
         telem = TelemetryState(
             timestamp_us=t_us,
             position_ned=tuple(pos),
             velocity_ned=tuple(vel),
             orientation=Quaternion.from_euler(0.0, 0.0, yaw),
             angular_velocity=(0.0, 0.0, 0.0),
+            imu=imu,
+            lpn_time_boot_ms=(tick if use_ekf else None),
+            odom_time_usec=(t_us if use_ekf else None),
+            odom_quality=(100 if use_ekf else None),
+            odom_reset_counter=(0 if use_ekf else None),
         )
         cmd = pipeline._control_callback(telem, None)
         _record(cmd, t_us, blind=False)

@@ -410,3 +410,37 @@ functional change (logic reverted to original; verified 5/5 closed-loop pass).
 **Net:** the recovery stack is robust to realistic disturbances (≤15 m/s →
 6/6); extreme 3 g impulses (≥25 m/s) hit the same tracker-saturation ceiling as
 the high-speed envelope, all converging on Blocker 11 as the next real lever.
+
+---
+
+## Iteration 13 — exercise the EKF/estimation path (the live-competition path)
+
+**Why:** the live VQ1 pipeline runs state through the EKF (IMU predict +
+`LOCAL_POSITION_NED` odometry fusion); the harness had only run EKF-off. The
+audit flagged EKF concerns (Blocker 4 observability, covariance collapse), so
+broadened coverage to surface any.
+
+**Convention work (read telemetry / verify first):**
+- Odometry-only (no IMU predict) **lags** badly — 100 updates tracking a ramp
+  to (10,0,−5) estimate only (5,0,−2.5): without velocity propagation the
+  filter can't follow motion. So a faithful test **must** include IMU predict.
+- Verified the EKF's IMU input is **body-frame specific force**
+  `R_world→body·(a_world − g)`: hover → (0,0,−9.81) gives no motion; free-fall
+  → (0,0,0) gives z=19.62 m at 2 s (=½·9.81·2²). Added
+  `_specific_force_body` to the harness with this verified convention.
+
+**Telemetry read (EKF-on closed loop):**
+
+| scenario | result |
+|----------|--------|
+| clean 8 m/s | race_complete, **6/6**, 15.5 s (vs 15.3 s EKF-off) |
+| 15 m/s gust | race_complete, **6/6**, 4 replans |
+
+The EKF estimate stays accurate enough to fly the whole course (completing 6/6
+*through the estimate* means no drift/divergence) and survives a disturbance
+together with the recovery stack. The audit's EKF-divergence concerns bite in
+*vision dead-reckoning*, not the odometry-rich VQ1 path exercised here.
+
+**Improvement:** harness gained a faithful `use_ekf` mode (IMU specific force +
+odometry + sim-time stamps); new `test_completes_with_ekf_enabled` regression.
+Closed-loop suite now 6 cases, all pass (26 s).
