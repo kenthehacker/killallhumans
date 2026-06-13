@@ -31,6 +31,25 @@ from competition.aigp_geometry import (
 )
 
 
+def _point_to_segment_distance(
+    p: np.ndarray, a: np.ndarray, b: np.ndarray
+) -> float:
+    """Euclidean distance from point ``p`` to the segment ``[a, b]``.
+
+    Used for cross-track off-track detection: how far the drone is from the
+    straight leg between consecutive gates, clamped so points beyond either
+    endpoint measure to the endpoint (over/undershoot still counts).
+    """
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom < 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = float(np.dot(p - a, ab)) / denom
+    t = max(0.0, min(1.0, t))
+    proj = a + t * ab
+    return float(np.linalg.norm(p - proj))
+
+
 @dataclass
 class GateSpec:
     """Platform-agnostic gate definition.
@@ -113,6 +132,10 @@ class GateSequencer:
         self._current_idx = 0
         self._passed: List[str] = []
         self._prev_position: Optional[np.ndarray] = None
+        # First position seen after start() — the origin of the leg leading to
+        # the first gate. Used as the segment start for cross-track off-track
+        # detection when there is no previous gate yet.
+        self._track_origin: Optional[np.ndarray] = None
         self._state = RaceState.WAITING
         self._frames_without_detection = 0
         self._recovery_target: Optional[Tuple[float, float, float]] = None
@@ -258,6 +281,9 @@ class GateSequencer:
             return None
 
         pos = np.array(position)
+        if self._track_origin is None:
+            # First position after start() — anchors the leg to gate 0.
+            self._track_origin = pos
         passed_gate = None
         # iter-003 (gpt-55-2 F2): tick-local flag for "did the current-gate
         # classification block record a fresh crash this tick?" — used to
@@ -506,11 +532,26 @@ class GateSequencer:
                         self._last_event = "crash"
                     break
 
-        # Check if off-track (suppressed once DQ'd or completed)
+        # Check if off-track (suppressed once DQ'd or completed).
+        #
+        # Off-track means "far from the racing line", NOT "far from the next
+        # gate". Measuring distance-to-gate latched RECOVERY at the start of
+        # every leg on a real course: with gates ~20 m apart the drone is
+        # always > (off_track_distance*3 = 15 m) from its target gate when a
+        # leg begins, even while perfectly on the line — so the pipeline
+        # permanently overrode the reference and cut thrust. Instead measure
+        # the cross-track distance to the current leg's segment
+        # (previous gate → current gate; the start origin for the first leg).
         if not self.is_complete and self._state == RaceState.RACING:
             gate = self._gates[self._current_idx]
-            dist_to_gate = float(np.linalg.norm(pos - np.array(gate.position)))
-            if dist_to_gate > self.config.off_track_distance * 3:
+            if self._current_idx > 0:
+                seg_start = np.array(self._gates[self._current_idx - 1].position)
+            else:
+                seg_start = self._track_origin
+            cross_track = _point_to_segment_distance(
+                pos, seg_start, np.array(gate.position)
+            )
+            if cross_track > self.config.off_track_distance * 3:
                 self._state = RaceState.RECOVERY
                 self._recovery_target = gate.position
 
@@ -780,6 +821,7 @@ class GateSequencer:
         self._current_idx = 0
         self._passed.clear()
         self._prev_position = None
+        self._track_origin = None
         self._state = RaceState.WAITING
         self._frames_without_detection = 0
         self._recovery_target = None

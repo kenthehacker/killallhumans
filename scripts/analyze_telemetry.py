@@ -121,7 +121,12 @@ def analyze(path: str) -> dict:
     def constant(vals):
         return len(vals) > 1 and (max(vals) - min(vals)) < 1e-6
 
-    yaw_sat = (
+    # NOTE: cmd_yaw is a yaw *angle* setpoint, not a rate. A course that runs
+    # toward -X legitimately holds yaw ~ +/-pi (|cmd_yaw| ~ 3.14), so a large
+    # |cmd_yaw| is NOT saturation. The genuine "stuck yaw command" failure is
+    # already covered by CONSTANT COMMAND (identical cmd every tick) and
+    # FROZEN STATE; reported here only as an informational stat.
+    yaw_extreme_frac = (
         sum(1 for c in cmd_yaw if abs(c) > 3.0) / len(cmd_yaw)
         if cmd_yaw else 0.0
     )
@@ -142,7 +147,7 @@ def analyze(path: str) -> dict:
         "circling_ratio": round(pathlen / max(net, 0.01), 1),
         "yaw_revolutions": round(revolutions, 2),
         "max_yaw_rate_radps": round(max_yaw_rate, 1),
-        "cmd_yaw_sat_frac": round(yaw_sat, 3),
+        "cmd_yaw_extreme_frac": round(yaw_extreme_frac, 3),
         "tilt_sat_frac": round(tilt_sat, 3),
         "ref_pos_frac": round(has_ref / len(rows), 3),
     }
@@ -173,8 +178,6 @@ def analyze(path: str) -> dict:
         A("CONSTANT COMMAND: identical attitude command every tick -- "
           "control loop is open / stalled (not responding to state)")
 
-    if yaw_sat > 0.5:
-        A(f"CMD SATURATION (yaw): |cmd_yaw|>3 rad for {yaw_sat:.0%} of ticks")
     if tilt_sat > 0.3:
         W(f"CMD SATURATION (tilt): roll/pitch>40deg for {tilt_sat:.0%} of ticks")
 
@@ -203,7 +206,7 @@ def print_report(res: dict) -> None:
         print(
             f"  yaw: revs={st['yaw_revolutions']} "
             f"max_rate={st['max_yaw_rate_radps']}rad/s "
-            f"yaw_sat={st['cmd_yaw_sat_frac']} ref_pos_frac={st['ref_pos_frac']}"
+            f"yaw_extreme={st['cmd_yaw_extreme_frac']} ref_pos_frac={st['ref_pos_frac']}"
         )
     for a in res["anomalies"]:
         print(f"  [ANOMALY] {a}")

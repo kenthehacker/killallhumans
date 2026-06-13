@@ -226,6 +226,40 @@ class TestRecoveryTransitions:
         seq.update((6, 0, 0))
         assert seq.state == RaceState.RACING
 
+    def test_on_line_far_from_gate_does_not_trigger_recovery(self):
+        """Regression: off-track must be cross-track distance to the racing
+        line, NOT point distance to the next gate. A drone on the straight
+        line to a gate 25 m away (>> off_track_distance*3) used to latch
+        RECOVERY at the start of every leg on a real (gate-spaced) course."""
+        cfg = SequencerConfig(off_track_distance=5.0)
+        gates = [
+            _make_gate("G1", (25, 0, 0), yaw=0.0, idx=0),
+            _make_gate("G2", (50, 0, 0), yaw=0.0, idx=1),
+        ]
+        seq = GateSequencer(gates, config=cfg)
+        seq.start()
+        # Fly straight along the line toward G1 — always far from the gate
+        # itself, but perfectly on the path.
+        for x in (0, 2, 5, 10, 15, 20):
+            seq.update((x, 0, 0))
+            assert seq.state == RaceState.RACING, (
+                f"false RECOVERY at x={x} while on-line"
+            )
+
+    def test_cross_track_excursion_still_triggers_recovery(self):
+        """The cross-track metric must still catch a genuine lateral excursion
+        even when the drone is close (along-track) to the gate."""
+        cfg = SequencerConfig(off_track_distance=5.0)
+        gates = [
+            _make_gate("G1", (25, 0, 0), yaw=0.0, idx=0),
+            _make_gate("G2", (50, 0, 0), yaw=0.0, idx=1),
+        ]
+        seq = GateSequencer(gates, config=cfg)
+        seq.start()
+        seq.update((0, 0, 0))
+        seq.update((12, 20, 0))  # 20 m lateral off the line (> 15 m)
+        assert seq.state == RaceState.RECOVERY
+
     def test_detection_dropout_triggers_slow_down(self):
         cfg = SequencerConfig(detection_dropout_frames=5)
         gates = _make_course()

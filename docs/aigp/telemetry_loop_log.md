@@ -151,3 +151,56 @@ verify-before-fix): Blockers 6/12 (PnP gating/scale), 9 (sync replan in
 control loop), 13/14 (sim-time stamping / gate-normal sign — may be fixed),
 benchmark honesty (15-19), and real-sim validation (blocked on GUI VQ-mode
 entry).
+
+---
+
+## Iteration 5 — closed-loop flight harness (real telemetry without the GUI sim)
+
+**Why:** the GUI sim won't enter VQ mode headlessly and the committed captures
+are frozen dry-runs, so there was *no* source of real flight telemetry to read
+each iteration. Built one.
+
+**Tool:** `scripts/sim_closed_loop.py` drives the **real** `RacePipeline`
+control callback (geometric tracker + gate sequencer + dynamic replanner)
+against textbook NED point-mass dynamics, integrated in sim time — runs in
+<1 s, writes the standard telemetry schema, and the analyzer reads it
+directly. Scope: `use_ekf=False`, `use_detection=False` to isolate
+tracking+sequencing (EKF/detection are a later layer).
+
+**Telemetry read (first clean signal):** with the sequencer inactive the drone
+**tracked the full trajectory to gate-5's position** (net 165 m, circle_ratio
+1.0, ref_pos populated) — confirming the tracker is healthy and *not* spinning
+in closed loop. Two harness-setup bugs were found and fixed along the way
+(must call `sequencer.start()`; must seed a positive sim timestamp / real
+`_race_start_time` or the wall-clock fallback trips the 8-min timeout on tick
+0 — note: a real sim whose first stamp is exactly 0 hits that same fallback).
+
+## Iteration 6 — off-track = cross-track, not distance-to-gate (audit MAJOR)
+
+**Telemetry read:** once the sequencer was active, the harness showed a
+**replan storm** (10 replans/15 s), altitude divergence, and **0 gates**. Trace
+showed `RECOVERY` at t=0.01 with reason `off_track` — the drone, at the start,
+perfectly on the line but 23 m from gate-0.
+
+**Root cause (sequencer.py:510-515):** off-track was point distance to the
+target gate (`off_track_distance*3` = 15 m). On a course with gates ~20 m
+apart the drone is **always > 15 m from its target gate at the start of every
+leg**, so it latched RECOVERY constantly → reference overridden to the raw
+gate centre + thrust cut + replan storm.
+
+**Fix:** off-track now measures **cross-track distance to the current leg's
+segment** (`previous gate → current gate`, with a captured `_track_origin`
+for the first leg) via `_point_to_segment_distance`. Reset clears the origin.
+
+**Result:** the closed-loop harness now reports **`race_complete`, 6/6 gates,
+0 replans, circle_ratio 1.0** in 15.3 s — analyzer says *OK, no anomalies*.
+Also removed a false-positive analyzer rule (a yaw *angle* setpoint near ±π on
+a −X course is the correct heading, not "saturation"; the real frozen-feed
+case is still caught by CONSTANT COMMAND / FROZEN STATE).
+
+**Tests:** 2 new sequencer regression tests (on-line-far-from-gate stays
+RACING; genuine lateral excursion still triggers RECOVERY); regression gate
+**316 passed**. Sequencer suite 69 passed.
+
+**Biggest win so far:** a telemetry-surfaced bug that the benchmark never
+caught took the drone from 0 → 6/6 gates on the VQ1 course.
