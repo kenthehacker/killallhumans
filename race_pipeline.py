@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -103,6 +104,15 @@ class PipelineConfig:
     use_pnp: bool = True
     pnp_mode: str = "backup"
     use_state_predictor: bool = True
+
+    # Replan execution. When True, a mid-race trajectory rebuild runs on a
+    # background thread while the control loop keeps tracking the (still
+    # valid) current trajectory, swapping atomically when the rebuild
+    # completes. The legacy synchronous path ran the ~1.8 s optimisation
+    # inline in the 100 Hz callback, blinding the controller and causing a
+    # recovery death-spiral (audit Blocker 9). Set False for the old
+    # blocking behaviour.
+    async_replan: bool = True
 
     # Iter-015: ML training infra (continues iter-014's feature-trace
     # hook). When True, the underlying GeometricTracker captures
@@ -220,6 +230,16 @@ class RacePipeline:
         # cooldown expires. Cleared only once a rebuild actually succeeds.
         self._pending_trigger = None
 
+        # Async replan state (audit Blocker 9). The rebuild runs on a single
+        # background worker; the control loop keeps flying the current
+        # trajectory until the worker publishes a result, which is swapped in
+        # atomically on the control thread. ``_rebuild_lock`` guards only the
+        # small result handoff.
+        self._rebuild_lock = threading.Lock()
+        self._rebuild_in_flight = False
+        self._rebuild_result = None  # (trajectory_or_None, trigger)
+        self._rebuild_thread = None
+
         # Frozen-telemetry watchdog. A silently-dead telemetry feed (the
         # mavlink RX subscription dies, or the sim stops publishing) leaves
         # the controller flying on a stale state estimate: it keeps emitting
@@ -254,6 +274,8 @@ class RacePipeline:
         self._last_replan_reasons = []
         self._last_lateral_err = 0.0
         self._pending_trigger = None
+        self._rebuild_in_flight = False
+        self._rebuild_result = None
         self._ekf_live_initialized = False
         self._last_lpn_stamp_ms = None
         self._last_odom_reset_counter = None
@@ -268,9 +290,21 @@ class RacePipeline:
         start_velocity: Tuple[float, float, float],
         remaining_gates: List[GateSpec],
     ) -> None:
-        """Build (or rebuild) self.trajectory through ``remaining_gates``
-        starting from the drone's current state. Shared by configure()
-        (initial build) and _maybe_replan() (mid-race rebuild)."""
+        """Build and assign ``self.trajectory`` (synchronous). Used by
+        configure() and the legacy synchronous replan path."""
+        self.trajectory = self._compute_trajectory(
+            start_position, start_velocity, remaining_gates
+        )
+
+    def _compute_trajectory(
+        self,
+        start_position: Tuple[float, float, float],
+        start_velocity: Tuple[float, float, float],
+        remaining_gates: List[GateSpec],
+    ):
+        """Pure trajectory build through ``remaining_gates`` from the current
+        state — returns a RaceTrajectory and touches no shared pipeline state,
+        so it is safe to call from a background replan thread."""
         gate_waypoints = [
             GateWaypoint(
                 position=g.position,
@@ -304,14 +338,15 @@ class RacePipeline:
             constraints=DroneConstraints(max_velocity=self.config.max_speed),
             dt_sample=self.config.trajectory_dt,
         )
-        self.trajectory = traj_optimizer.optimize(
+        trajectory = traj_optimizer.optimize(
             optimized_waypoints, start_position, start_velocity,
         )
         logger.info(
             "Trajectory: %.1fs total, %d points",
-            self.trajectory.total_time,
-            len(self.trajectory.points),
+            trajectory.total_time,
+            len(trajectory.points),
         )
+        return trajectory
 
     async def run(self, address: str = "udp://:14540") -> None:
         """
@@ -520,6 +555,10 @@ class RacePipeline:
         trigger. Mirrors sim_pybullet/runner._maybe_replan."""
         if self.replanner is None or self.sequencer is None:
             return
+
+        # 0. Land any background rebuild that finished since the last tick.
+        self._apply_pending_rebuild(sim_time)
+
         trig = self.replanner.evaluate(
             sim_time=sim_time,
             sequencer=self.sequencer,
@@ -541,17 +580,23 @@ class RacePipeline:
         if not remaining:
             self._pending_trigger = None
             return
+
+        if self.config.async_replan:
+            # Don't block the control loop: kick off a background rebuild and
+            # keep flying the current trajectory until it completes. Only one
+            # rebuild runs at a time; the trigger stays pending until landed.
+            if not self._rebuild_in_flight:
+                self._start_async_rebuild(position, velocity, remaining, trig)
+            self._pending_trigger = trig
+            return
+
+        # Legacy synchronous path (blocks ~1.8 s in the callback — Blocker 9).
         try:
             self._build_trajectory_from(position, velocity, remaining)
         except Exception:
-            # Keep the old trajectory on failure — a partially built one
-            # would be worse than the one we already have. Keep the trigger
-            # pending so the rebuild is retried on a later tick.
             logger.exception("Replanned trajectory rebuild failed; keeping prior.")
             self._pending_trigger = trig
             return
-        # Reset reference anchor so the closest-forward search starts at
-        # the new trajectory's beginning.
         self._ref_progress_time = 0.0
         self.replanner.mark_replanned(sim_time, trig)
         self._pending_trigger = None
@@ -559,6 +604,62 @@ class RacePipeline:
         self._last_replan_reasons = trig.reasons
         logger.info(
             "REPLAN #%d at t=%.2fs reasons=%s",
+            self._replan_count, sim_time, trig.reasons,
+        )
+
+    def _start_async_rebuild(
+        self,
+        position: Tuple[float, float, float],
+        velocity: Tuple[float, float, float],
+        remaining_gates: List[GateSpec],
+        trigger: ReplanTrigger,
+    ) -> None:
+        """Spawn the single background rebuild worker. The worker computes a
+        new trajectory from a snapshot of the current state and publishes the
+        result; it touches no shared pipeline state besides the guarded
+        handoff."""
+        self._rebuild_in_flight = True
+        pos = tuple(position)
+        vel = tuple(velocity)
+        gates = list(remaining_gates)
+
+        def _worker():
+            try:
+                traj = self._compute_trajectory(pos, vel, gates)
+            except Exception:
+                logger.exception("Async replan rebuild failed; keeping prior.")
+                traj = None
+            with self._rebuild_lock:
+                self._rebuild_result = (traj, trigger)
+
+        self._rebuild_thread = threading.Thread(
+            target=_worker, name="aigp-replan", daemon=True
+        )
+        self._rebuild_thread.start()
+
+    def _apply_pending_rebuild(self, sim_time: float) -> None:
+        """On the control thread: swap in a completed background rebuild, if
+        any. Atomic from the loop's perspective (single trajectory
+        assignment)."""
+        with self._rebuild_lock:
+            result = self._rebuild_result
+            self._rebuild_result = None
+        if result is None:
+            return
+        new_traj, trig = result
+        self._rebuild_in_flight = False
+        if new_traj is None:
+            # Build failed — keep the old trajectory and let the still-pending
+            # trigger retry on a later tick.
+            return
+        self.trajectory = new_traj
+        self._ref_progress_time = 0.0
+        self.replanner.mark_replanned(sim_time, trig)
+        self._pending_trigger = None
+        self._replan_count += 1
+        self._last_replan_reasons = trig.reasons
+        logger.info(
+            "REPLAN #%d landed at t=%.2fs reasons=%s",
             self._replan_count, sim_time, trig.reasons,
         )
 

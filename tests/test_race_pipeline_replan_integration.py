@@ -15,8 +15,10 @@ from typing import List, Tuple
 from gate_sequencing.sequencer import (
     GateSequencer, GateSpec, SequencerConfig,
 )
+import threading
+
 from planning.dynamic_replanner import DynamicReplanner, ReplanConfig
-from race_pipeline import RacePipeline
+from race_pipeline import PipelineConfig, RacePipeline
 
 
 def _course() -> List[GateSpec]:
@@ -58,6 +60,9 @@ def _make_pipeline_stub(gates: List[GateSpec]) -> RacePipeline:
     _maybe_replan (and the build/rebuild trajectory path)."""
     pipe = RacePipeline.__new__(RacePipeline)
 
+    # Synchronous replan keeps these unit tests deterministic; the async path
+    # has its own dedicated test below.
+    pipe.config = PipelineConfig(async_replan=False)
     pipe.sequencer = GateSequencer(
         gates, config=SequencerConfig(pass_through_margin=1.0),
     )
@@ -70,6 +75,9 @@ def _make_pipeline_stub(gates: List[GateSpec]) -> RacePipeline:
     pipe._last_lateral_err = 0.0
     pipe._ref_progress_time = 0.0
     pipe._pending_trigger = None
+    pipe._rebuild_lock = threading.Lock()
+    pipe._rebuild_in_flight = False
+    pipe._rebuild_result = None
 
     # Stub _build_trajectory_from so we don't need scipy / RacingLineOptimizer.
     pipe._build_trajectory_calls: List[Tuple] = []
@@ -204,6 +212,51 @@ class TestRacePipelineReplanIntegration:
         )
         assert pipe._replan_count == 2, "deferred crash was lost"
         assert pipe._pending_trigger is None
+
+    def test_async_replan_is_nonblocking_and_swaps_when_ready(self):
+        """Audit Blocker 9 fix: with async_replan the control loop must NOT
+        block on the rebuild — it keeps the current trajectory until the
+        background worker finishes, then swaps atomically on a later tick."""
+        gates = _course()
+        pipe = _make_pipeline_stub(gates)
+        pipe.config = PipelineConfig(async_replan=True)
+
+        started = threading.Event()
+        release = threading.Event()
+        new_traj = _FakeTrajectory()
+
+        def _slow_compute(pos, vel, remaining):
+            started.set()
+            release.wait(2.0)  # hold the "optimisation" open
+            return new_traj
+
+        pipe._compute_trajectory = _slow_compute  # type: ignore[assignment]
+        old_traj = pipe.trajectory
+
+        pipe.sequencer.mark_collision("G1", position=(5.0, 0.7, 1.5))
+        pipe._maybe_replan(sim_time=1.0, position=(4.5, 0.5, 1.5), velocity=(0, 0, 0))
+
+        # Returned promptly without blocking: rebuild in flight, trajectory
+        # unchanged, no replan counted yet.
+        assert pipe._rebuild_in_flight is True
+        assert pipe.trajectory is old_traj
+        assert pipe._replan_count == 0
+        assert started.wait(2.0), "worker never started"
+
+        # A tick while the rebuild is still in flight must not start a second
+        # rebuild nor swap anything.
+        pipe._maybe_replan(sim_time=1.1, position=(4.6, 0.5, 1.5), velocity=(0, 0, 0))
+        assert pipe.trajectory is old_traj
+        assert pipe._replan_count == 0
+
+        # Let the worker finish and publish, then the next tick lands it.
+        release.set()
+        pipe._rebuild_thread.join(2.0)
+        pipe._maybe_replan(sim_time=1.5, position=(4.6, 0.5, 1.5), velocity=(0, 0, 0))
+        assert pipe.trajectory is new_traj
+        assert pipe._replan_count == 1
+        assert pipe._rebuild_in_flight is False
+        assert pipe._ref_progress_time == 0.0
 
     def test_remaining_empty_skips_rebuild(self):
         # Edge case: all gates already passed (race effectively complete);

@@ -91,6 +91,7 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
         max_sim_s: float = 90.0,
         perturb: Optional[Tuple[float, Tuple[float, float, float]]] = None,
         replan_blind_s: float = 0.0,
+        rebuild_sim_s: float = 1.8,
         ) -> Tuple[list, dict]:
     """Run the closed loop.
 
@@ -105,6 +106,13 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     holding the last command (the drone coasts), advancing sim time. This lets
     us measure whether recovery survives the real-time blind gap rather than
     assuming an instantaneous replan.
+
+    For the async pipeline (``PipelineConfig.async_replan=True``, the default)
+    the rebuild runs on a background thread in *wall* time, decoupled from the
+    harness's *sim* time. ``rebuild_sim_s`` models the rebuild taking that much
+    sim time: once an in-flight rebuild has been pending that long (sim), the
+    worker is joined so the result lands on the next tick — the drone having
+    flown the still-valid old trajectory (NOT blind) in the meantime.
     """
     config = PipelineConfig(
         max_speed=max_speed,
@@ -149,6 +157,7 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     prev_cmd = None
     replan_seen = 0
     blind_ticks = 0
+    rebuild_inflight_since = None
     tick = 0
 
     def _integrate(cmd):
@@ -188,6 +197,20 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     while tick < n_steps:
         if tick == perturb_step:
             vel = vel + np.array(perturb[1], dtype=float)
+        # Async rebuild latency, modeled in sim time: once a background
+        # rebuild has been pending rebuild_sim_s of sim time, join the worker
+        # so its result lands on this tick's callback. The drone flew the
+        # still-valid old trajectory (via normal callbacks) in the meantime —
+        # the whole point of the async fix (no blind window).
+        if getattr(pipeline, "_rebuild_in_flight", False):
+            if rebuild_inflight_since is None:
+                rebuild_inflight_since = tick
+            elif (tick - rebuild_inflight_since) * dt >= rebuild_sim_s:
+                th = getattr(pipeline, "_rebuild_thread", None)
+                if th is not None and th.is_alive():
+                    th.join()
+        else:
+            rebuild_inflight_since = None
         # Strictly positive sim timestamp -> callback uses sim-time elapsed.
         t_us = int((tick + 1) * dt * 1e6)
         telem = TelemetryState(

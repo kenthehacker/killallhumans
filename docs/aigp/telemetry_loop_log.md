@@ -299,3 +299,44 @@ carefully (concurrency) rather than rush it.
 
 **Tests:** harness refactor preserves the 5 closed-loop cases (default
 `replan_blind_s=0`).
+
+---
+
+## Iteration 10 — async replan fix (Blocker 9)
+
+**Fix:** `RacePipeline` now rebuilds the trajectory on a **background thread**
+(`async_replan=True`, default) while the control loop keeps tracking the
+still-valid current trajectory; the new trajectory is swapped in atomically on
+the control thread when the worker finishes (`_apply_pending_rebuild`). The
+~1.8 s optimisation no longer blocks the 100 Hz callback, so the loop never
+goes blind. `_build_trajectory_from` was split into a pure `_compute_trajectory`
+(thread-safe; touches no shared state) + a thin assigner; the legacy
+synchronous path is kept under `async_replan=False`. Concurrency is GIL-safe:
+the worker writes only the guarded `_rebuild_result` handoff, and the swap is a
+single `self.trajectory =` assignment.
+
+**Telemetry read (gust at t=5 s, recovery — sync vs async):**
+
+| pipeline | gates | replans | outcome |
+|----------|-------|---------|---------|
+| sync, blind=1.8 s (Blocker 9) | 2/6 | 20 | diverged, timed out (death-spiral) |
+| **async, rebuild=1.8 s sim** | **6/6** | **2** | **race_complete** |
+
+Flying the old trajectory during the rebuild (vs going blind) turns
+catastrophic recovery into clean recovery.
+
+**Harness:** added `rebuild_sim_s` to model the async rebuild's latency in sim
+time (joins the worker after that much sim time so the result lands while the
+drone flew the old trajectory) — needed because the real worker runs in wall
+time, decoupled from harness sim time.
+
+**Tests:** new `test_async_replan_is_nonblocking_and_swaps_when_ready`
+(deterministic: callback returns promptly while a fake slow rebuild is in
+flight, no second rebuild starts, atomic swap on completion). The default
+recovery test now exercises the async path. Regression: closed-loop +
+replan + sequencer + watchdog 112 passed; core modules 234 passed.
+
+**Gaps:** remaining audit items — Blocker 11 (infeasible trajectory accel
+peaks, ~108 m/s²; limits the high-speed envelope), Blocker 12 (PnP
+outer/inner-corner scale), and the large-disturbance RECOVERY-state behavior
+(reference-override + thrust-cut can still storm at ≥25 m/s gusts).
