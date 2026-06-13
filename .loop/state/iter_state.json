@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "loop_started_at": "2026-05-24T14:45:00",
+  "max_iterations": 300,
+  "current_iter": 2,
+  "phase": "implement",
+  "iter_002_plan_source": ".loop/synthesis/iter_001_review.md",
+  "iter_002_priority": ["B4 vision UDP -> mavlink_bridge", "B5 camera tilt in PnP", "Opus F2 multi-gate per tick", "Opus F3 future-gate strut", "Vision reassembly jpeg_size validation", "8-min timeout", "Opus F5 ILC threshold", "Opus F14 pass_through_margin DQ", "composer-25-4 F8 AIGP VFoV math"],
+  "phase_history": [
+    {
+      "iter": 1,
+      "phase": "plan",
+      "started_at": "2026-05-24T14:45:00",
+      "completed_at": "2026-05-24T14:56:57",
+      "run_dir": "/Users/kenichi.matsuo/Projects/chad_ai/cursor_spawn_mcp/runs/20260524_144847_329848_cursor-spawn-async",
+      "status": "completed",
+      "tasks": [
+        {"model": "claude-opus-4-7-thinking-max", "output": ".loop/iter_001_plan/opus-47-max-thinking.md"},
+        {"model": "gpt-5.5-extra-high",            "output": ".loop/iter_001_plan/gpt-55-xhigh.md"},
+        {"model": "composer-2.5",                  "output": ".loop/iter_001_plan/composer-25.md"}
+      ]
+    },
+    {
+      "iter": 1,
+      "phase": "synthesis",
+      "started_at": "2026-05-24T14:57:00",
+      "completed_at": "2026-05-24T14:58:00",
+      "output": ".loop/synthesis/iter_001.md",
+      "status": "completed"
+    },
+    {
+      "iter": 1,
+      "phase": "implement",
+      "started_at": "2026-05-24T14:58:00",
+      "status": "in_progress",
+      "action_order": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11", "A12", "A13", "A14", "A15", "A16", "A17", "A18"],
+      "actions_completed": ["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9", "A10", "A11", "A13", "A14", "A15", "A18"],
+      "actions_remaining": ["A12_deferred_iter_002", "A16_deferred_iter_002", "A17_deferred_iter_002"],
+      "review_round": {
+        "started_at": "2026-05-24T15:40:46",
+        "run_dir": "/Users/kenichi.matsuo/Projects/chad_ai/cursor_spawn_mcp/runs/20260524_154046_740917_cursor-spawn-async",
+        "task_count": 8,
+        "models": {
+          "claude-opus-4-7-thinking-max": 1,
+          "gpt-5.5-extra-high": 2,
+          "composer-2.5": 5
+        },
+        "status": "completed_partial",
+        "delivered_reviews": 7,
+        "missing": ["composer-25-1 (crashed at 2.7s — model error, not output issue)"],
+        "synthesis": ".loop/synthesis/iter_001_review.md",
+        "applied_in_iter_001b": ["B1 calibration physics", "B2 RacePipeline DQ termination", "B3 CameraFrame default 360"],
+        "deferred_to_iter_002": ["B4 vision UDP wiring", "B5 camera tilt in PnP", "MAJORs (multi-gate, strut, jpeg_size, timeout, threshold, margin, VFoV)"]
+      },
+      "commits": [
+        "iter-001 A1-A6: adversarial tests + sequencer in-order DQ + AIGP geometry defaults",
+        "iter-001 A7: bench reads sequencer crash + DQ signals; honesty surface exposed",
+        "iter-001 A8+A9: curvature-derived ILC sections + JSON config; magic numbers gone",
+        "iter-001 A14+A15: lightweight ML tracker residual (10->64->3 MLP, hard-clamped, off-by-default)",
+        "iter-001 A10+A11: vision UDP receiver on :5600 (24B header + JPEG chunk reassembly)"
+      ],
+      "test_matrix_latest": "306 passed / 0 skipped / 0 failed",
+      "milestone_iter_001_honesty_pillar": "complete",
+      "milestone_iter_001_ml_pillar": "complete — tracker residual ships off-by-default; trainer + multi-track eval deferred to iter-002",
+      "milestone_iter_001_vision_pillar": "complete — receiver tested for chunk reassembly, OoO, dup, timeout, eviction; mavlink_bridge wiring still pending in A12"
+    }
+  ],
+  "models": {
+    "plan_round": [
+      "claude-opus-4-7-thinking-max",
+      "gpt-5.5-extra-high",
+      "composer-2.5"
+    ],
+    "review_round": {
+      "claude-opus-4-7-thinking-max": 1,
+      "gpt-5.5-extra-high": 2,
+      "composer-2.5": 5
+    }
+  },
+  "constraints": {
+    "no_giga_chad_investigate_or_code_pipelines": true,
+    "no_course_specific_magic_numbers": true,
+    "crashes_are_terminal": true,
+    "gates_must_be_in_order": true,
+    "testbench_is_suspect": true,
+    "drone_model_mismatch_acknowledged": true,
+    "stay_in_worktree": true
+  }
+}
