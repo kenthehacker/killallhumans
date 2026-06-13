@@ -204,3 +204,38 @@ RACING; genuine lateral excursion still triggers RECOVERY); regression gate
 
 **Biggest win so far:** a telemetry-surfaced bug that the benchmark never
 caught took the drone from 0 → 6/6 gates on the VQ1 course.
+
+---
+
+## Iteration 7 — flight-envelope sweep + closed-loop regression test
+
+**Telemetry read (max_speed sweep through the harness):**
+
+| max_speed | result | gates | replans | note |
+|-----------|--------|-------|---------|------|
+| 6 / 8 / 10 | race_complete | 6/6 | 0 | clean, faster with speed (20→12.8 s) |
+| 12 | **crash** | 0/6 | 2 | clips gate-0 frame (~1.7 m high) |
+| 14 / 16 | race_complete | 6/6 | 4 | completes only via replan recovery |
+
+**Finding (non-monotonic):** at 12 m/s the tracker saturates **max pitch
+(−0.85) and max thrust (0.95) simultaneously** for ~1 s, so the vertical
+thrust component exceeds hover and the drone climbs ~2 m above gate-0's plane
+and clips the frame. This is the infeasible-trajectory / control-saturation
+issue (audit Blocker 11: trajectory accel peaks ~108 m/s² ≈ 11 g) surfacing at
+high speed. **The competition default (8 m/s) is well inside the safe
+envelope.** Re-tuning the high-speed thrust/tilt coupling (or making the
+trajectory feasible) is a candidate future iteration; lower priority than the
+default working.
+
+**Improvement:** `tests/test_closed_loop_flight.py` — a capstone end-to-end
+regression that runs the real control stack vs point-mass physics at the
+default speed and asserts: race completes, 6/6 gates, net progress > 150 m,
+path/net < 1.5 (no spin/circling), ref populated > 99 %, 0 replans on the
+clean course. A regression that reintroduces spinning / off-track / divergence
+now fails CI even while the unit suites stay green — closing the original
+"unit tests pass but the drone spins" gap at the integration level.
+
+**Housekeeping:** harness/sweep telemetry artifacts gitignored (two were
+accidentally tracked in the iter 5-6 commit; removed).
+
+**Tests:** 4 new closed-loop cases pass (7.5 s).
