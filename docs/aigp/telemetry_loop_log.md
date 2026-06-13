@@ -125,3 +125,29 @@ unchanged, so all fire-once edge tests still hold.
 priority than the live path. Audit Blocker 9 (replan runs ~1.8 s of
 optimization synchronously in the 100 Hz control callback) is real and
 architecturally bigger — candidate for a later iteration.
+
+---
+
+## Iteration 4 — closed-loop "no-spin" regression test
+
+**Why:** Blockers 1-3 (the spinning root causes) are fixed in code but had
+**no test that would catch a regression** — exactly the "AI could not catch
+the spinning" gap. The VQ1 start requires facing gate-0 behind the drone
+(yaw ≈ ±π), which is where the world-frame-extraction bug diverged.
+
+**Improvement:** `control/tests/test_tracker_no_spin.py` — a black-box closed
+loop that feeds the tracker's `AttitudeCommand` through textbook NED quad
+dynamics and integrates, asserting the drone **converges** to the target from
+every heading (0, ±π/2, ±π, ±3.0 rad). Verified the test has teeth: with the
+old world-frame extraction the yaw=π case diverges 5.83 m → **293 m** (spin
+signature) and fails; with the fix it converges to 0.00 m.
+
+**Tests:** 10 new cases pass; regression gate **314 passed**.
+
+**Status after 4 iterations:** the user's two core concerns are addressed —
+spinning is fixed *and* now guarded by a regression test, and frozen/blind
+telemetry is now detected live + offline. Remaining backlog (lower urgency,
+verify-before-fix): Blockers 6/12 (PnP gating/scale), 9 (sync replan in
+control loop), 13/14 (sim-time stamping / gate-normal sign — may be fixed),
+benchmark honesty (15-19), and real-sim validation (blocked on GUI VQ-mode
+entry).
