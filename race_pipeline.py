@@ -534,7 +534,16 @@ class RacePipeline:
                 ref.position, ref.velocity, ref.yaw,
             )
 
-        # 7. Speed reduction if needed
+        # 7. Speed reduction if needed.
+        # NOTE: the thrust*0.7 cut here looks like it should sink the drone
+        # (audit MAJOR — and it does in *level* detection-dropout flight), but
+        # it is load-bearing for off-track RECOVERY on the *descending* VQ1
+        # course: during the lateral-recovery phase the tracker saturates
+        # thrust high, and this cut tempers the climb. Both alternatives tried
+        # in iter 12 (floor-at-hover, leave-thrust-unchanged) regressed the
+        # working 15 m/s-gust recovery from 6/6 to 2/6 (altitude divergence).
+        # Left as-is; a proper fix needs the tracker's saturated thrust
+        # allocation reworked (Blocker 11 family), not this scale factor.
         if self.sequencer.should_slow_down():
             cmd = AttitudeCommand(
                 roll_rad=cmd.roll_rad * 0.5,

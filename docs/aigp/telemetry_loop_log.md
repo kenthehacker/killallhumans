@@ -377,3 +377,36 @@ lost in noise.
 
 **Tests:** trajectory suite 30 passed; revert verified clean (empty diff,
 8 m/s back to 15.3 s / 6/6).
+
+---
+
+## Iteration 12 — large-disturbance RECOVERY (async win confirmed; slow-down is load-bearing)
+
+**Telemetry read (large gusts on the current async pipeline):** a **25 m/s**
+lateral gust now triggers only **3 replans** (vs **23** on the pre-async build,
+iter 8) — async (iter 10) crushed the recovery replan-storm. The residual
+failure at 25 m/s is **altitude divergence** (z → −53 m) during RECOVERY, the
+same tracker thrust-saturation coupling as the 12 m/s case (Blocker 11 family),
+not a storm. Moderate gusts (15 m/s) still recover 6/6.
+
+**Attempted two fixes to the `should_slow_down` thrust cut → BOTH REVERTED.**
+The audit flags `thrust*0.7` as sinking the drone toward the floor:
+1. Floor it at hover → broke the 15 m/s recovery (6/6 → 2/6, z → −248 m).
+2. Leave thrust unchanged → also broke it (6/6 → 2/6).
+
+Root insight: the cut is **load-bearing** for off-track recovery on the
+**descending** VQ1 course — during lateral recovery the tracker saturates
+thrust high and the ×0.7 tempers the climb; the course legitimately needs
+thrust *below* hover to descend, so flooring/removing it diverges the drone
+upward. The audit's "sinking" concern is a real but *different* (level-flight
+detection-dropout) scenario not reproducible in the current harness. A correct
+fix needs the tracker's saturated thrust allocation reworked (Blocker 11
+family), not this scale factor.
+
+**Delivered:** a code comment documenting why the cut must stay (so a future
+"obvious fix" doesn't reintroduce the regression) + this analysis. No
+functional change (logic reverted to original; verified 5/5 closed-loop pass).
+
+**Net:** the recovery stack is robust to realistic disturbances (≤15 m/s →
+6/6); extreme 3 g impulses (≥25 m/s) hit the same tracker-saturation ceiling as
+the high-speed envelope, all converging on Blocker 11 as the next real lever.
