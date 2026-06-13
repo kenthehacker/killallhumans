@@ -268,3 +268,34 @@ course gust still finishes 6/6 gates AND was actually noticed (replan or
 RECOVERY). Guards iters 3+6 working together.
 
 **Tests:** closed-loop suite now 5 cases (20.7 s); related suites 116 passed.
+
+---
+
+## Iteration 9 — quantify Blocker 9 (synchronous replan blinds the loop)
+
+**Improvement:** added a `replan_blind_s` option to the harness that models
+the live pipeline's synchronous rebuild — every tick a replan fires is followed
+by that many seconds of "blind" flight holding the last command (the drone
+coasts) while the sequencer still observes physics (so a mid-blind crash is
+caught). This turns an architectural concern into a measurable one.
+
+**Telemetry read (gust at t=5 s, 8 m/s, with vs without the blind window):**
+
+| blind window | gates | replans | blind ticks | outcome |
+|--------------|-------|---------|-------------|---------|
+| 0.0 s (instantaneous replan — prior assumption) | **6/6** | 1 | 0 | race_complete |
+| 1.8 s (realistic synchronous optimize) | **2/6** | 20 | **3425 (~76 % of flight)** | diverged to z=−840 m, timed out |
+
+**Finding:** the synchronous replan blinds the drone ~1.8 s → it drifts
+off-line during the blind gap → triggers another replan → blinds again: a
+**recovery death-spiral**. The instantaneous-replan assumption (iter 8's test)
+completely masked it. Blocker 9 is severe *during recovery* — though the
+nominal clean course (8 m/s, 0 replans) never triggers it.
+
+**Gap / next:** fix Blocker 9 by computing the rebuild **off** the control
+thread (keep flying the still-valid old trajectory, atomic-swap when ready) so
+the control loop never goes blind. Deferred to iteration 10 to implement
+carefully (concurrency) rather than rush it.
+
+**Tests:** harness refactor preserves the 5 closed-loop cases (default
+`replan_blind_s=0`).

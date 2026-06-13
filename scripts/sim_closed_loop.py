@@ -90,12 +90,21 @@ def _wrap(a: float) -> float:
 def run(max_speed: float = 8.0, start_yaw: float = 0.0,
         max_sim_s: float = 90.0,
         perturb: Optional[Tuple[float, Tuple[float, float, float]]] = None,
+        replan_blind_s: float = 0.0,
         ) -> Tuple[list, dict]:
     """Run the closed loop.
 
     ``perturb`` optionally injects a one-shot velocity impulse
     ``(t_seconds, (dvx, dvy, dvz))`` to simulate a gust/disturbance and
     exercise the off-track + replanner recovery stack.
+
+    ``replan_blind_s`` models audit Blocker 9: the live pipeline rebuilds the
+    trajectory synchronously inside the 100 Hz control callback (~1.8 s), so
+    no fresh attitude command is sent while it optimizes. When > 0, every tick
+    on which a replan fires is followed by that many seconds of "blind" flight
+    holding the last command (the drone coasts), advancing sim time. This lets
+    us measure whether recovery survives the real-time blind gap rather than
+    assuming an instantaneous replan.
     """
     config = PipelineConfig(
         max_speed=max_speed,
@@ -135,27 +144,29 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     n_steps = int(max_sim_s / dt)
     reason = "max_sim_time"
     perturb_step = int(perturb[0] / dt) if perturb is not None else -1
+    blind_steps = int(replan_blind_s / dt)
     entered_recovery = False
-    for i in range(n_steps):
-        if i == perturb_step:
-            vel = vel + np.array(perturb[1], dtype=float)
-        # Start at a strictly positive sim timestamp so the callback uses the
-        # sim-time elapsed branch (timestamp_us > 0) rather than wall-clock.
-        t_us = int((i + 1) * dt * 1e6)
-        telem = TelemetryState(
-            timestamp_us=t_us,
-            position_ned=tuple(pos),
-            velocity_ned=tuple(vel),
-            orientation=Quaternion.from_euler(0.0, 0.0, yaw),
-            angular_velocity=(0.0, 0.0, 0.0),
-        )
-        cmd = pipeline._control_callback(telem, None)
+    prev_cmd = None
+    replan_seen = 0
+    blind_ticks = 0
+    tick = 0
 
+    def _integrate(cmd):
+        nonlocal pos, vel, yaw
+        acc = _world_accel(cmd, mass, gravity, max_thrust_n)
+        vel = vel + acc * dt
+        pos = pos + vel * dt
+        yaw = _wrap(yaw + np.clip(k_yaw * _wrap(cmd.yaw_rad - yaw),
+                                  -max_yaw_rate, max_yaw_rate) * dt)
+
+    def _record(cmd, t_us, blind):
         ref_pos = ref_vel = ref_yaw = None
         if pipeline.trajectory is not None:
             try:
                 pt = pipeline.trajectory.sample(pipeline._ref_progress_time)
-                ref_pos, ref_vel, ref_yaw = list(pt.position), list(pt.velocity), float(pt.yaw)
+                ref_pos = list(pt.position)
+                ref_vel = list(pt.velocity)
+                ref_yaw = float(pt.yaw)
             except Exception:
                 pass
         entry = {
@@ -165,6 +176,7 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
             "yaw": yaw,
             "gates_passed": pipeline.sequencer.gates_passed if pipeline.sequencer else 0,
             "ref_pos": ref_pos, "ref_vel": ref_vel, "ref_yaw": ref_yaw,
+            "blind": blind,
         }
         if cmd is not None:
             entry["cmd_roll"] = round(cmd.roll_rad, 4)
@@ -172,6 +184,22 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
             entry["cmd_yaw"] = round(cmd.yaw_rad, 4)
             entry["cmd_thrust"] = round(cmd.thrust, 4)
         telem_log.append(entry)
+
+    while tick < n_steps:
+        if tick == perturb_step:
+            vel = vel + np.array(perturb[1], dtype=float)
+        # Strictly positive sim timestamp -> callback uses sim-time elapsed.
+        t_us = int((tick + 1) * dt * 1e6)
+        telem = TelemetryState(
+            timestamp_us=t_us,
+            position_ned=tuple(pos),
+            velocity_ned=tuple(vel),
+            orientation=Quaternion.from_euler(0.0, 0.0, yaw),
+            angular_velocity=(0.0, 0.0, 0.0),
+        )
+        cmd = pipeline._control_callback(telem, None)
+        _record(cmd, t_us, blind=False)
+        tick += 1
         if pipeline.sequencer is not None and \
                 pipeline.sequencer.state.name == "RECOVERY":
             entered_recovery = True
@@ -186,13 +214,35 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
             reason = "crash"
             break
 
-        # Integrate point-mass dynamics.
-        acc = _world_accel(cmd, mass, gravity, max_thrust_n)
-        vel = vel + acc * dt
-        pos = pos + vel * dt
-        yaw = yaw + np.clip(k_yaw * _wrap(cmd.yaw_rad - yaw),
-                            -max_yaw_rate, max_yaw_rate) * dt
-        yaw = _wrap(yaw)
+        # Blind window (audit Blocker 9): a replan just fired and the live
+        # pipeline would now block ~replan_blind_s optimizing, sending no new
+        # command. Model that as coasting on the previous command while the
+        # sequencer still observes physics (so a crash mid-blind is caught).
+        rc = getattr(pipeline, "_replan_count", 0)
+        crashed_blind = False
+        if blind_steps and rc > replan_seen and prev_cmd is not None:
+            for _ in range(blind_steps):
+                if tick >= n_steps:
+                    break
+                _integrate(prev_cmd)
+                if pipeline.sequencer is not None:
+                    pipeline.sequencer.update(
+                        tuple(pos), gate_detected=False, detection_active=False
+                    )
+                _record(prev_cmd, int((tick + 1) * dt * 1e6), blind=True)
+                blind_ticks += 1
+                tick += 1
+                if pipeline.sequencer is not None and \
+                        pipeline.sequencer.last_crash is not None:
+                    crashed_blind = True
+                    break
+        replan_seen = rc
+        if crashed_blind:
+            reason = "crash"
+            break
+
+        _integrate(cmd)
+        prev_cmd = cmd
 
     summary = {
         "termination_reason": reason,
@@ -202,6 +252,7 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
         "final_pos": [round(float(p), 2) for p in pos],
         "replans": getattr(pipeline, "_replan_count", 0),
         "entered_recovery": entered_recovery,
+        "blind_ticks": blind_ticks,
     }
     return telem_log, summary
 
