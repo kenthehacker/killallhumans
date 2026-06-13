@@ -47,7 +47,7 @@ from estimation.gate_pnp import (
 )
 from estimation.state_predictor import LatencyConfig, StatePredictor
 from gate_sequencing.sequencer import GateSequencer, GateSpec, RaceState
-from planning.dynamic_replanner import DynamicReplanner, ReplanConfig
+from planning.dynamic_replanner import DynamicReplanner, ReplanConfig, ReplanTrigger
 from planning.racing_line import RacingLineOptimizer, SpeedProfiler
 from planning.trajectory_optimizer import (
     DroneConstraints,
@@ -209,6 +209,17 @@ class RacePipeline:
         self._last_lpn_stamp_ms: Optional[int] = None
         self._last_odom_reset_counter: Optional[int] = None
 
+        # Deferred replan trigger. ``DynamicReplanner.evaluate()`` reports
+        # each crash/miss/off-track event exactly once (on its rising edge),
+        # then consumes it. If that single edge happens to land inside the
+        # replan cooldown window, ``should_replan()`` rejects it and — with
+        # no memory of the event — it is lost forever (a strut graze during
+        # cooldown ⇒ no recovery; an off-track entry during cooldown ⇒ stuck
+        # in RECOVERY). We remember an unserved-but-triggered evaluation here
+        # and merge it into later ticks so the replan fires the moment the
+        # cooldown expires. Cleared only once a rebuild actually succeeds.
+        self._pending_trigger = None
+
         # Frozen-telemetry watchdog. A silently-dead telemetry feed (the
         # mavlink RX subscription dies, or the sim stops publishing) leaves
         # the controller flying on a stale state estimate: it keeps emitting
@@ -242,6 +253,7 @@ class RacePipeline:
         self._replan_count = 0
         self._last_replan_reasons = []
         self._last_lateral_err = 0.0
+        self._pending_trigger = None
         self._ekf_live_initialized = False
         self._last_lpn_stamp_ms = None
         self._last_odom_reset_counter = None
@@ -513,25 +525,36 @@ class RacePipeline:
             sequencer=self.sequencer,
             lateral_error=self._last_lateral_err,
         )
+        # Merge with any trigger that fired earlier but could not be served
+        # because of the cooldown, so a cooldown-blocked event is retried
+        # rather than dropped (see _pending_trigger in __init__).
+        trig = _merge_triggers(self._pending_trigger, trig)
         if not self.replanner.should_replan(trig, sim_time):
+            # Cooldown (or no trigger). Remember a live trigger so the next
+            # eligible tick still serves it; otherwise clear.
+            self._pending_trigger = trig if trig.triggered else None
             return
         # Remaining gates from the sequencer's vantage point. The current
         # gate (highlighted target) is the first remaining; passed gates
         # are skipped.
         remaining = self._gate_specs[self.sequencer.gates_passed:]
         if not remaining:
+            self._pending_trigger = None
             return
         try:
             self._build_trajectory_from(position, velocity, remaining)
         except Exception:
             # Keep the old trajectory on failure — a partially built one
-            # would be worse than the one we already have.
+            # would be worse than the one we already have. Keep the trigger
+            # pending so the rebuild is retried on a later tick.
             logger.exception("Replanned trajectory rebuild failed; keeping prior.")
+            self._pending_trigger = trig
             return
         # Reset reference anchor so the closest-forward search starts at
         # the new trajectory's beginning.
         self._ref_progress_time = 0.0
         self.replanner.mark_replanned(sim_time, trig)
+        self._pending_trigger = None
         self._replan_count += 1
         self._last_replan_reasons = trig.reasons
         logger.info(
@@ -728,6 +751,28 @@ def _gate_normal(yaw: float, pitch: float = 0.0) -> Tuple[float, float, float]:
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
     return (cy * cp, sy * cp, -sp)
+
+
+def _merge_triggers(
+    pending: Optional[ReplanTrigger], current: ReplanTrigger
+) -> ReplanTrigger:
+    """OR a deferred (cooldown-blocked) trigger into the current evaluation.
+
+    Lets a replan reason that fired on an earlier tick survive until it is
+    actually served, instead of being consumed by ``evaluate()``'s
+    fire-once edge detection while the cooldown is still active.
+    """
+    if pending is None:
+        return current
+    return ReplanTrigger(
+        gate_collision=pending.gate_collision or current.gate_collision,
+        missed_gate=pending.missed_gate or current.missed_gate,
+        off_track=pending.off_track or current.off_track,
+        sustained_lateral_error=(
+            pending.sustained_lateral_error or current.sustained_lateral_error
+        ),
+        crashed_gate_id=current.crashed_gate_id or pending.crashed_gate_id,
+    )
 
 
 def _telemetry_timestamp_s(telem: TelemetryState) -> float:

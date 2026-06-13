@@ -91,3 +91,37 @@ passed**.
 response (e.g. controlled hover/abort) when frozen, but that needs a
 trustworthy fallback state. Next: audit Blocker 5 (mid-race replan
 re-initializes the EKF — wipes yaw/biases at the worst moment).
+
+---
+
+## Iteration 3 — replanner trigger-loss fix (Blocker 7); triage of 5
+
+**Triage (verify before fixing):**
+- **Blocker 5 (replan re-inits EKF): ALREADY FIXED.** `ekf.initialize` is
+  called only in `configure()`, *outside* `_build_trajectory_from`;
+  `_maybe_replan` rebuilds the trajectory without touching the EKF. No change
+  needed.
+- **Blocker 7 (replanner trigger loss): STILL PRESENT — fixed this iteration.**
+
+**Bug:** `DynamicReplanner.evaluate()` reports each crash/miss/off-track event
+once on its rising edge then consumes it (seen-sets + level latches advance
+every tick). If that single edge lands inside the 0.5 s replan cooldown,
+`should_replan()` rejects it and the event is **lost forever** — a strut graze
+during cooldown ⇒ no recovery; an off-track entry during cooldown ⇒ stuck in
+RECOVERY. The existing unit tests *enshrine* the fire-once `evaluate()`
+contract, so the fix belongs at the integration layer, not in `evaluate()`.
+
+**Fix:** `RacePipeline._maybe_replan` now keeps a `_pending_trigger`: a
+triggered-but-unserved evaluation (blocked by cooldown, or whose rebuild threw)
+is merged (`_merge_triggers`) into later ticks and served the moment the
+cooldown expires. Cleared only after a rebuild succeeds. `evaluate()` is
+unchanged, so all fire-once edge tests still hold.
+
+**Tests:** new `test_cooldown_deferred_crash_is_served_after_cooldown`;
+31 replanner tests pass; regression gate **304 passed**.
+
+**Gaps:** the same consume-on-read loss exists in
+`sim_pybullet/runner.py` (practice sim, audit Blocker 7 cont.) — lower
+priority than the live path. Audit Blocker 9 (replan runs ~1.8 s of
+optimization synchronously in the 100 Hz control callback) is real and
+architecturally bigger — candidate for a later iteration.

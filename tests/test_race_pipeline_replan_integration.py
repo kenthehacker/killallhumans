@@ -69,6 +69,7 @@ def _make_pipeline_stub(gates: List[GateSpec]) -> RacePipeline:
     pipe._last_replan_reasons = []
     pipe._last_lateral_err = 0.0
     pipe._ref_progress_time = 0.0
+    pipe._pending_trigger = None
 
     # Stub _build_trajectory_from so we don't need scipy / RacingLineOptimizer.
     pipe._build_trajectory_calls: List[Tuple] = []
@@ -168,6 +169,41 @@ class TestRacePipelineReplanIntegration:
             sim_time=1.4, position=(4.5, 0.5, 1.5), velocity=(0, 0, 0),
         )
         assert pipe._replan_count == 1
+
+    def test_cooldown_deferred_crash_is_served_after_cooldown(self):
+        """Regression for audit Blocker 7: a crash whose rising edge lands
+        inside the cooldown window must NOT be lost — it should fire a
+        replan the moment the cooldown expires, rather than being consumed
+        by evaluate()'s fire-once edge detection."""
+        gates = _course()
+        pipe = _make_pipeline_stub(gates)
+        pipe.replanner = DynamicReplanner(ReplanConfig(cooldown_seconds=0.5))
+
+        # First replan at t=1.0 starts the cooldown.
+        pipe.sequencer.mark_collision("G1", position=(5.0, 0.7, 1.5))
+        pipe._maybe_replan(
+            sim_time=1.0, position=(4.5, 0.5, 1.5), velocity=(0, 0, 0),
+        )
+        assert pipe._replan_count == 1
+
+        # New crash on G2 at t=1.2 — inside cooldown. evaluate() reports the
+        # edge exactly once and would normally consume it; the pipeline must
+        # remember it instead.
+        pipe.sequencer.mark_collision("G2", position=(10.0, 0.7, 1.5))
+        pipe._maybe_replan(
+            sim_time=1.2, position=(9.5, 0.5, 1.5), velocity=(0, 0, 0),
+        )
+        assert pipe._replan_count == 1  # still cooling down
+        assert pipe._pending_trigger is not None
+        assert pipe._pending_trigger.gate_collision
+
+        # t=1.6 — cooldown expired, no NEW edge from evaluate() (G2 already
+        # seen), but the deferred trigger must now be served.
+        pipe._maybe_replan(
+            sim_time=1.6, position=(9.5, 0.5, 1.5), velocity=(0, 0, 0),
+        )
+        assert pipe._replan_count == 2, "deferred crash was lost"
+        assert pipe._pending_trigger is None
 
     def test_remaining_empty_skips_rebuild(self):
         # Edge case: all gates already passed (race effectively complete);
