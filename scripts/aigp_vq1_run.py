@@ -187,6 +187,7 @@ async def run_vq1(
     arrival_radius: float = 8.0,
     aim_slew: float = 0.0,
     final_aim_z: Optional[float] = None,
+    final_brake_band: float = 0.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -292,6 +293,7 @@ async def run_vq1(
         # --aim-z bias is already baked into the gate map and zeroed here), so a
         # POSITIVE value aims the final gate LOWER to cancel the decel balloon.
         minimal_final_aim_z_offset=final_aim_z,
+        minimal_final_brake_band_m=final_brake_band,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -854,6 +856,16 @@ def main(argv=None) -> None:
              "frame at speed. Try +0.5..+0.8. None=same as other gates. --minimal.",
     )
     parser.add_argument(
+        "--final-brake-band",
+        type=float,
+        default=0.0,
+        dest="final_brake_band",
+        help="Proximity-brake the FINAL leg within this many metres of gate5 "
+             "(m). Keeps the straight fast (peak) but bleeds speed for the "
+             "slalom reversal the rate-limited roll can't make at 50 km/h. "
+             "0=off. Try 12-18. Needs --speed-brake. --minimal.",
+    )
+    parser.add_argument(
         "--lat-lead",
         type=float,
         default=0.0,
@@ -898,6 +910,7 @@ def main(argv=None) -> None:
         arrival_radius=args.arrival_radius,
         aim_slew=args.aim_slew,
         final_aim_z=args.final_aim_z,
+        final_brake_band=args.final_brake_band,
         trajectory=args.trajectory,
     ))
 

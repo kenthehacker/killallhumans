@@ -218,6 +218,14 @@ class PipelineConfig:
     # clearance collapsed to +0.008 m at base 15, a top crash at base 16). Use
     # a SMALLER high-bias for the final gate only. None => use minimal_aim_z_offset.
     minimal_final_aim_z_offset: Optional[float] = None
+    # iter-47: the final leg (g4->g5) is normally UNBRAKED (its gate difficulty
+    # is 0) so it carries the peak speed — but it REVERSES the slalom (-3.6 m Y)
+    # and at ~50 km/h the rate-limited roll (0.53x, the bank builds at the
+    # 0.8 rad/s clamp) can't complete the reversal in time -> overshoot/tumble.
+    # PROXIMITY-brake the final leg: blast the straight first half for the peak,
+    # then bleed speed within this many metres of the gate so the reversal is
+    # made at a speed the roll loop handles. 0 = off (final leg stays full speed).
+    minimal_final_brake_band_m: float = 0.0
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -811,7 +819,22 @@ class RacePipeline:
             # speed they handle cleanly (~9 m/s), not crawling.
             if self.config.minimal_speed_brake > 0.0:
                 base = self.config.minimal_cruise_speed
-                diff = self._gate_difficulty(getattr(gate, "sequence_index", 0))
+                _gidx = getattr(gate, "sequence_index", 0)
+                _lidx = (len(self._gate_specs) - 1) if self._gate_specs else None
+                diff = self._gate_difficulty(_gidx)
+                # iter-47: PROXIMITY brake on the final leg (its own difficulty is
+                # 0). Ramp in the REVERSAL turn (the difficulty at the prior gate,
+                # which the drone must complete on this leg) as it nears gate5, so
+                # the straight stays fast (peak) but the reversal is braked.
+                if (self.config.minimal_final_brake_band_m > 0.0
+                        and _lidx is not None and _gidx == _lidx and _lidx >= 2):
+                    rev = self._gate_difficulty(_lidx - 1)
+                    d_cur = float(np.linalg.norm(
+                        np.array(gate.position, dtype=float)
+                        - np.array(position, dtype=float)))
+                    ramp = max(0.0, min(1.0, 1.0 - d_cur
+                                        / self.config.minimal_final_brake_band_m))
+                    diff = max(diff, rev * ramp)
                 factor = max(self.config.minimal_speed_min_frac,
                              min(1.0, 1.0 - self.config.minimal_speed_brake * diff))
                 target_cruise = base * factor
