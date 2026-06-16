@@ -234,24 +234,33 @@ class PipelineConfig:
     # reversal tumble that capped the gate-by-gate controller at 50. When on,
     # the spline replaces the aim + per-leg-brake block (everything else —
     # inner loop, sequencer, recorder — is reused).
+    # Defaults below are the iter-53 VALIDATED winning config (2/2 clean
+    # SIM-6/6, ~50 km/h, 0 collisions, better margin than the gate-by-gate on
+    # every gate). So `--spline --cruise-speed 16` alone reproduces it.
     minimal_spline_path: bool = False
-    minimal_spline_lookahead_m: float = 6.0   # pursuit lookahead along the spline
-    minimal_spline_a_lat: float = 10.0        # lateral-accel cap for v(curvature)
+    minimal_spline_lookahead_m: float = 8.0   # pursuit lookahead along the spline
+    minimal_spline_a_lat: float = 6.5         # lateral-accel cap for v(curvature)
+    #   (6.5 caps the slalom LATERAL tilt to ~cruise-11 level — the shared
+    #   -z_b[2] with the descent is what tumbled it at speed; the workflow's
+    #   key insight. 10 never engaged until 17 m/s -> hot lateral -> tumble.)
     minimal_spline_a_long: float = 12.0       # long-accel cap (matches cruise slew)
-    minimal_spline_v_min: float = 8.0         # speed floor in the tightest turn
+    minimal_spline_v_min: float = 6.0         # speed floor (6 lets the descent cap engage)
     minimal_spline_vert_ff: float = 1.0       # spline vertical mode: 1.0=glide-
     #   slope feedforward (vz=speed*slope); 0=steady capped-proportional descent
     #   toward the aim (gentler, avoids the aggressive catch-up that swings the
     #   thrust vector into a roll limit cycle at speed).
-    minimal_spline_v_descent: float = 3.0     # vertical descent-RATE cap (m/s);
+    minimal_spline_v_descent: float = 2.0     # vertical descent-RATE cap (m/s);
     #   steep legs slow so v*|tangent_z| <= this (the drone destabilises
     #   descending fast while moving fast; the gate-by-gate braked descents for
-    #   the same reason). 0 = off.
-    minimal_spline_v_final: float = 0.0       # speed cap (m/s) over the closing
+    #   the same reason). 0 = off. 2.0 is the stable ceiling at cruise 16 — the
+    #   steepest leg (gate2, slope 0.33) floors to ~6 m/s (22 km/h); 2.5+ eats
+    #   gate3 margin (lag) and 3.0 tumbles (decel transient). iter-54 tested.
+    minimal_spline_v_final: float = 10.0      # speed cap (m/s) over the closing
     #   reversal region (last minimal_spline_final_region_m metres). The spline's
     #   gentle curvature there doesn't auto-brake the final lateral move, which
     #   the drone undershoots at speed. 0 = off. (Ports --final-brake-band.)
-    minimal_spline_final_region_m: float = 30.0  # length of that final region (m)
+    minimal_spline_final_region_m: float = 50.0  # final region (m): covers the
+    #   whole g3->g4->g5 reversal (30 left g3->g4 unbraked -> gate4 tumble).
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still

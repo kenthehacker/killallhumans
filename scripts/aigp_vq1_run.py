@@ -189,14 +189,14 @@ async def run_vq1(
     final_aim_z: Optional[float] = None,
     final_brake_band: float = 0.0,
     spline_path: bool = False,
-    spline_lookahead: float = 6.0,
-    spline_a_lat: float = 10.0,
+    spline_lookahead: float = 8.0,
+    spline_a_lat: float = 6.5,
     spline_a_long: float = 12.0,
-    spline_v_min: float = 8.0,
-    spline_v_descent: float = 3.0,
+    spline_v_min: float = 6.0,
+    spline_v_descent: float = 2.0,
     spline_vert_ff: float = 1.0,
-    spline_v_final: float = 0.0,
-    spline_final_region: float = 30.0,
+    spline_v_final: float = 10.0,
+    spline_final_region: float = 50.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -880,40 +880,43 @@ def main(argv=None) -> None:
              "gate-by-gate aim + per-leg brake). Removes the sharp-corner "
              "undershoot/reversal-tumble. --minimal.",
     )
-    parser.add_argument("--spline-lookahead", type=float, default=6.0,
+    parser.add_argument("--spline-lookahead", type=float, default=8.0,
                         dest="spline_lookahead",
                         help="Pursuit lookahead (m) along the spline. Try 4-10.")
-    parser.add_argument("--spline-a-lat", type=float, default=10.0,
+    parser.add_argument("--spline-a-lat", type=float, default=6.5,
                         dest="spline_a_lat",
                         help="Lateral-accel cap (m/s^2) for the curvature speed "
-                             "profile. Drone ~10.5 at max-tilt 0.82. Lower=slower turns.")
+                             "profile. 6.5 caps the slalom lateral tilt (the "
+                             "shared -z_b[2] with descent tumbles it at speed); "
+                             "10 never engages. Lower=slower turns.")
     parser.add_argument("--spline-a-long", type=float, default=12.0,
                         dest="spline_a_long",
                         help="Longitudinal-accel cap (m/s^2) for the speed profile.")
-    parser.add_argument("--spline-v-min", type=float, default=8.0,
+    parser.add_argument("--spline-v-min", type=float, default=6.0,
                         dest="spline_v_min",
                         help="Speed floor (m/s) in the tightest turn.")
-    parser.add_argument("--spline-v-descent", type=float, default=3.0,
+    parser.add_argument("--spline-v-descent", type=float, default=2.0,
                         dest="spline_v_descent",
                         help="Vertical descent-RATE cap (m/s): steep legs slow "
                              "so v*|tangent_z|<=this (drone destabilises "
-                             "descending fast at speed). 0=off. Try 2.5-3.5.")
+                             "descending fast at speed). 0=off. 2.0 is the stable "
+                             "ceiling at cruise 16; 2.5+ eats gate3 margin.")
     parser.add_argument("--spline-vert-ff", type=float, default=1.0,
                         dest="spline_vert_ff",
                         help="Spline vertical: 1.0=glide-slope feedforward "
                              "(vz=speed*slope, aggressive); 0=steady capped-"
                              "proportional descent (gentler, avoids the roll "
                              "limit cycle at speed). Try 0.")
-    parser.add_argument("--spline-v-final", type=float, default=0.0,
+    parser.add_argument("--spline-v-final", type=float, default=10.0,
                         dest="spline_v_final",
                         help="Speed cap (m/s) over the closing reversal region "
                              "(ports --final-brake-band to the spline; the gentle "
                              "spline curvature there doesn't auto-brake the final "
-                             "lateral move). 0=off. Try 10-11.")
-    parser.add_argument("--spline-final-region", type=float, default=30.0,
+                             "lateral move). 0=off. 10 validated.")
+    parser.add_argument("--spline-final-region", type=float, default=50.0,
                         dest="spline_final_region",
-                        help="Length (m) of the final-region brake zone. Default 30 "
-                             "(covers g4->g5). With --spline-v-final.")
+                        help="Length (m) of the final-region brake zone. Default 50 "
+                             "(covers the whole g3->g4->g5 reversal). With --spline-v-final.")
     parser.add_argument(
         "--final-brake-band",
         type=float,
