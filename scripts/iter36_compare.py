@@ -24,6 +24,27 @@ HALF_OPENING = 0.75  # interior gate opening is 1.5m => half = 0.75m (frame edge
                      # is the "how close to crashing" margin that bounds cruise.
 
 
+CRASH_GYRO = 10.0  # rad/s — above this the drone is tumbling, not flying.
+
+
+def _crash_index(rows):
+    """First frame where the drone has CRASHED — a severe tumble (|gyro| over
+    CRASH_GYRO) or a sharp BACKWARD shove in X (pushed off / stuck against a
+    gate). Post-crash telemetry is meaningless (the drone is stuck/pushed
+    against a frame, so its position/attitude no longer reflect flight), so the
+    analysis truncates here (user request). Returns len(rows) if the run is
+    clean (no crash detected)."""
+    for k in range(1, len(rows)):
+        g = rows[k].get("gyro") or [0.0, 0.0, 0.0]
+        if math.sqrt(sum(c * c for c in g)) > CRASH_GYRO:
+            return k
+        # A sharp +X step = shoved backward (the course runs -X); a real flight
+        # only ever decreases X. 2 m in one tick is far beyond any telem gap.
+        if rows[k]["pos"][0] - rows[k - 1]["pos"][0] > 2.0:
+            return k
+    return len(rows)
+
+
 def _breach_where(laty, vertz):
     """Which frame edge is the binding/breaching one (user: top/bottom/side?).
     The binding axis is whichever |error| is larger (it hits the 0.75 m edge
@@ -40,11 +61,25 @@ def pct(xs, p):
 
 
 def analyze(path, label=""):
-    rows = [json.loads(l) for l in gzip.open(path, "rt")]
+    rows_all = [json.loads(l) for l in gzip.open(path, "rt")]
+    # User request: IGNORE post-crash telemetry. After a crash the drone is
+    # stuck/pushed against a gate, so its position/attitude are garbage and
+    # pollute the per-gate clearance, gyro, and clamp stats. Truncate at the
+    # crash and analyse only the clean flight up to it.
+    crash = _crash_index(rows_all)
+    rows = rows_all[:crash] if crash < len(rows_all) else rows_all
     n = len(rows)
+    if n < 2:
+        print(f"\n=== {label or path}  (CRASHED at frame {crash} — <2 clean rows) ===")
+        return
     t0 = rows[0]["t_wall"]
     dur = rows[-1]["t_wall"] - t0
-    print(f"\n=== {label or path}  ({n} rows, {dur:.1f}s) ===")
+    crashed = crash < len(rows_all)
+    print(f"\n=== {label or path}  ({n}/{len(rows_all)} rows, {dur:.1f}s) ===")
+    if crashed:
+        ct = rows_all[crash]["t_wall"] - rows_all[0]["t_wall"]
+        print(f"  *** CRASH at t={ct:.1f}s (frame {crash}/{len(rows_all)}) — "
+              f"post-crash telemetry IGNORED (drone stuck/tumbling) ***")
 
     # --- per-gate plane crossing (drone X passes gate X) + closest 3D approach
     worst_lat = 0.0
