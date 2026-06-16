@@ -61,7 +61,19 @@ def pct(xs, p):
 
 
 def analyze(path, label=""):
-    rows_all = [json.loads(l) for l in gzip.open(path, "rt")]
+    # Tolerate non-telemetry rows in the capture: the runner now writes a
+    # one-shot {"sim_health": {...}} record (iter-63) and may write other
+    # non-flight markers. Keep only flight-telemetry rows (those carrying a
+    # "pos"); skip blank lines. Without this filter _crash_index and every
+    # downstream rows[k]["pos"] access KeyError on the sim_health row.
+    rows_all = []
+    for _l in gzip.open(path, "rt"):
+        _l = _l.strip()
+        if not _l:
+            continue
+        _r = json.loads(_l)
+        if isinstance(_r, dict) and "pos" in _r:
+            rows_all.append(_r)
     # User request: IGNORE post-crash telemetry. After a crash the drone is
     # stuck/pushed against a gate, so its position/attitude are garbage and
     # pollute the per-gate clearance, gyro, and clamp stats. Truncate at the
