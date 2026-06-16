@@ -247,6 +247,11 @@ class PipelineConfig:
     #   steep legs slow so v*|tangent_z| <= this (the drone destabilises
     #   descending fast while moving fast; the gate-by-gate braked descents for
     #   the same reason). 0 = off.
+    minimal_spline_v_final: float = 0.0       # speed cap (m/s) over the closing
+    #   reversal region (last minimal_spline_final_region_m metres). The spline's
+    #   gentle curvature there doesn't auto-brake the final lateral move, which
+    #   the drone undershoots at speed. 0 = off. (Ports --final-brake-band.)
+    minimal_spline_final_region_m: float = 30.0  # length of that final region (m)
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -844,6 +849,10 @@ class RacePipeline:
                         v_descent_max=(self.config.minimal_spline_v_descent
                                        if self.config.minimal_spline_v_descent > 0
                                        else None),
+                        v_final_cap=(self.config.minimal_spline_v_final
+                                     if self.config.minimal_spline_v_final > 0
+                                     else None),
+                        final_region_m=self.config.minimal_spline_final_region_m,
                     )
                     # Follow the spline's LOCAL slope vertically: with the aim
                     # only a lookahead ahead, vert_ff makes vz = speed*(dz/horiz)

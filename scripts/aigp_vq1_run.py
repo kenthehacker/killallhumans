@@ -195,6 +195,8 @@ async def run_vq1(
     spline_v_min: float = 8.0,
     spline_v_descent: float = 3.0,
     spline_vert_ff: float = 1.0,
+    spline_v_final: float = 0.0,
+    spline_final_region: float = 30.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -308,6 +310,8 @@ async def run_vq1(
         minimal_spline_v_min=spline_v_min,
         minimal_spline_v_descent=spline_v_descent,
         minimal_spline_vert_ff=spline_vert_ff,
+        minimal_spline_v_final=spline_v_final,
+        minimal_spline_final_region_m=spline_final_region,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -900,6 +904,16 @@ def main(argv=None) -> None:
                              "(vz=speed*slope, aggressive); 0=steady capped-"
                              "proportional descent (gentler, avoids the roll "
                              "limit cycle at speed). Try 0.")
+    parser.add_argument("--spline-v-final", type=float, default=0.0,
+                        dest="spline_v_final",
+                        help="Speed cap (m/s) over the closing reversal region "
+                             "(ports --final-brake-band to the spline; the gentle "
+                             "spline curvature there doesn't auto-brake the final "
+                             "lateral move). 0=off. Try 10-11.")
+    parser.add_argument("--spline-final-region", type=float, default=30.0,
+                        dest="spline_final_region",
+                        help="Length (m) of the final-region brake zone. Default 30 "
+                             "(covers g4->g5). With --spline-v-final.")
     parser.add_argument(
         "--final-brake-band",
         type=float,
@@ -963,6 +977,8 @@ def main(argv=None) -> None:
         spline_v_min=args.spline_v_min,
         spline_v_descent=args.spline_v_descent,
         spline_vert_ff=args.spline_vert_ff,
+        spline_v_final=args.spline_v_final,
+        spline_final_region=args.spline_final_region,
         trajectory=args.trajectory,
     ))
 

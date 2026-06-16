@@ -39,6 +39,8 @@ class RacingSpline:
         v_min=4.0,
         samples=2000,
         v_descent_max=None,
+        v_final_cap=None,
+        final_region_m=0.0,
     ):
         """Fit the spline and precompute the arc-length grid + speed profile.
 
@@ -77,6 +79,8 @@ class RacingSpline:
         self.v_min = float(v_min)
         self.samples = int(samples)
         self.v_descent_max = None if v_descent_max is None else float(v_descent_max)
+        self.v_final_cap = None if v_final_cap is None else float(v_final_cap)
+        self.final_region_m = float(final_region_m)
 
         # ------------------------------------------------------------------
         # 1) Fit a C2 cubic spline parameterized by a CHORD-LENGTH proxy.
@@ -166,6 +170,16 @@ class RacingSpline:
             tz = np.abs(self.T[:, 2])
             v_desc = self.v_descent_max / np.maximum(tz, 1e-6)
             v = np.minimum(v, np.clip(v_desc, self.v_min, self.v_max))
+
+        # 1c) FINAL-REGION brake: the closing slalom reversal (last gates) has
+        #     GENTLE spline curvature so the curvature cap doesn't slow it, but
+        #     the drone can't bank the final lateral move fast enough at speed
+        #     (undershoot). Cap the speed over the last `final_region_m` metres
+        #     (mirrors the gate-by-gate --final-brake-band). The fwd/bwd pass
+        #     below then makes the decel INTO it gradual (bounds the balloon).
+        if self.v_final_cap is not None and self.final_region_m > 0.0:
+            in_final = self.s_grid >= (self.length - self.final_region_m)
+            v[in_final] = np.minimum(v[in_final], max(self.v_final_cap, self.v_min))
 
         # 2a) BACKWARD pass: limit how fast we may be going at i given that we
         #     must be able to DECELERATE to v[i+1] within ds. (Brake into turn.)
