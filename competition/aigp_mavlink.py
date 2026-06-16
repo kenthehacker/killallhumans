@@ -96,6 +96,13 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._collisions: Deque[Dict] = deque(maxlen=128)
         self._actuator_outputs: Optional[Dict] = None
         self._reassembler = TrackInfoReassembler()
+        # Diagnostics for the DSQ investigation (iter-39): the sim announces
+        # human-readable verdicts (e.g. disqualification) via STATUSTEXT, which
+        # we previously dropped silently. Capture them, and log every OTHER
+        # message type the first time we see it so a DSQ on any unexpected
+        # channel becomes visible instead of invisible.
+        self._status_texts: Deque[Dict] = deque(maxlen=256)
+        self._seen_msg_types: set = set()
 
         self._last_heartbeat_monotonic = 0.0
         self._armed = False
@@ -441,8 +448,35 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 self._reassembler.begin_transfer(msg.width, msg.packets)
             elif msg_type == "ENCAPSULATED_DATA":
                 self._handle_encapsulated(msg)
+            elif msg_type == "STATUSTEXT":
+                self._handle_statustext(msg)
+            else:
+                # First-sighting log of any unhandled type. The sim may report a
+                # disqualification (DSQ) or other verdict on a channel we don't
+                # decode; surface it once rather than dropping it silently.
+                if msg_type not in self._seen_msg_types:
+                    self._seen_msg_types.add(msg_type)
+                    logger.info("AIGP: first %s message seen (unhandled): %s",
+                                msg_type, msg.to_dict() if hasattr(msg, "to_dict") else msg)
         except Exception:
             logger.exception("AIGP MAVLink message handler failed")
+
+    def _handle_statustext(self, msg) -> None:
+        """Capture + log STATUSTEXT. The DSQ verdict (if the sim sends one over
+        MAVLink) almost certainly arrives here. Always log it at WARNING so it
+        is impossible to miss in a run's output."""
+        text = getattr(msg, "text", "")
+        if isinstance(text, (bytes, bytearray)):
+            text = text.decode("utf-8", "replace")
+        text = str(text).strip("\x00").strip()
+        severity = getattr(msg, "severity", None)
+        with self._state_lock:
+            self._status_texts.append({
+                "severity": severity,
+                "text": text,
+                "monotonic": time.monotonic(),
+            })
+        logger.warning("AIGP STATUSTEXT (sev=%s): %s", severity, text)
 
     def _handle_heartbeat(self, msg) -> None:
         with self._state_lock:

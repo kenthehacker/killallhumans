@@ -128,6 +128,13 @@ class PipelineConfig:
     # MinimalControllerConfig default.
     minimal_vert_gain: float = -1.0
     minimal_max_vert_speed: float = -1.0
+    # iter-38: vertical glide-slope FEEDFORWARD. 0 = original proportional law
+    # (vz=vert_gain*dz, which lags a descending course and crosses every gate
+    # ABOVE centre — iter-38 baseline measured -0.12..-0.33m at all six gates);
+    # >0 descends at speed*dz/horiz_dist so the drone arrives at gate altitude
+    # on time (1.0 = exact time-to-arrival). A velocity feedforward, not a gain,
+    # so it does not trigger the vert_gain>1 thrust->roll instability.
+    minimal_vert_ff: float = 0.0
     # iter-34: cross-track (Y) convergence gain for the decoupled horizontal
     # law. 0 = original pure pursuit. >0 fixes the cross-track undershoot at
     # speed (verified roadmap #4).
@@ -288,6 +295,7 @@ class RacePipeline:
                    if self.config.minimal_vert_gain > 0 else {}),
                 **({"max_vert_speed": self.config.minimal_max_vert_speed}
                    if self.config.minimal_max_vert_speed > 0 else {}),
+                vert_ff=self.config.minimal_vert_ff,
             )
         )
 

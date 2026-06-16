@@ -76,6 +76,35 @@ class MinimalControllerConfig:
     # collisions) because aggressive vertical accel swings the thrust vector and
     # the roll extraction (atan2(zy_h,-z_b[2])) blows up as -z_b[2] shrinks.
     max_vert_speed: float = 5.0     # cap on commanded vertical speed (m/s)
+    # iter-38 VERTICAL FEEDFORWARD (glide-slope descent). The proportional law
+    # above (vz = vert_gain*dz) always LAGS a descending course: on every gate
+    # the drone crosses the plane ABOVE the opening centre (iter-38 baseline:
+    # vert offset -0.12..-0.33 m at all six gates), because a P controller needs
+    # a standing error to produce descent and the "required altitude" ramps as
+    # the drone flies forward. The fix is a feedforward equal to the descent
+    # rate that arrives at gate altitude exactly when the drone reaches the gate
+    # plane: time-to-plane = horiz_dist/speed, so vz_ff = speed*dz/horiz_dist
+    # (the glide slope to the gate). This holds the drone ON the straight line
+    # to the opening rather than chasing it from above. It is still closed-loop
+    # (recomputed from live pos each tick, so a gust above the line steepens the
+    # descent) and self-steepens near the gate. Crucially it is a VELOCITY
+    # feedforward, not a gain, so it does NOT trigger the thrust->roll
+    # instability that raising vert_gain>1 does (iter-37: vert_gain 2.0 -> gyro
+    # 8.45 limit cycle): once tracking, vz_ff is smooth and kv*(vz_ff-vz) stays
+    # small. 0.0 = OFF (original proportional law); 1.0 = exact time-to-arrival;
+    # >1.0 biases toward arriving slightly low (more top-bar margin).
+    #
+    # TESTED LIVE iter-38 — FALSIFIED, KEEP 0.0. vert_ff=1.0 made vertical
+    # centring WORSE, not better (gate2 vert offset -0.328 -> -0.626 m, frame
+    # clearance 0.42 -> 0.12 m). The glide law descends GENTLY early (8*slope
+    # ~2.4 vs the old capped 5.0 m/s) and front-loads the descent to the END of
+    # the leg where horiz_dist is small — but vertical accel (max_climb_accel)
+    # and speed (max_vert_speed) are capped, so the drone cannot make the late
+    # steep descent and arrives even higher. The drone wants AGGRESSIVE EARLY
+    # descent: the original capped-proportional law (descend at the cap while dz
+    # is large) arrives more centred. The real vertical lever is the CAP
+    # (max_vert_speed), not a glide feedforward. Kept off-by-default as a record.
+    vert_ff: float = 0.0
     # iter-34 cross-track centering (verified roadmap #4) — TESTED LIVE, FAILED.
     # DO NOT ENABLE (leave cross_gain=0). Decoupling the horizontal into
     # X=along-track-cruise + Y=capped-high-gain-convergence DESTABILISES: it
@@ -166,9 +195,16 @@ class MinimalController:
         else:
             v_xy = np.zeros(2)
 
-        v_z = float(
-            np.clip(cfg.vert_gain * to_gate[2], -cfg.max_vert_speed, cfg.max_vert_speed)
-        )
+        if cfg.vert_ff > 0.0 and horiz_dist > 1e-3:
+            # Glide-slope feedforward: descend at the rate that reaches gate
+            # altitude exactly when we reach the gate plane (cancels the
+            # steady-state descent lag the proportional law leaves on a
+            # descending course). Self-steepens as horiz_dist shrinks; the cap
+            # below bounds the near-plane spike.
+            v_z_cmd = cfg.vert_ff * speed * (to_gate[2] / horiz_dist)
+        else:
+            v_z_cmd = cfg.vert_gain * to_gate[2]
+        v_z = float(np.clip(v_z_cmd, -cfg.max_vert_speed, cfg.max_vert_speed))
         return np.array([v_xy[0], v_xy[1], v_z]), dist
 
     def _hover(self, yaw: float) -> AttitudeCommand:

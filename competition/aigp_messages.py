@@ -67,7 +67,28 @@ class RaceStatus:
 
     @property
     def race_started(self) -> bool:
+        """A GO time has been SCHEDULED. NOTE: this is True ~0.6 s after a
+        SIM_RESET — it does NOT mean the race has begun. The sim runs a 3 s
+        countdown after the reset and only starts the race when the race clock
+        reaches the scheduled GO time. Use :pyattr:`race_underway` to know the
+        race has actually started; gating flight on ``race_started`` jumps the
+        start (commands during the countdown) and is DISQUALIFIED."""
         return self.race_start_boot_time_ms >= 0
+
+    @property
+    def race_underway(self) -> bool:
+        """The 3 s countdown has elapsed and the race has actually STARTED: the
+        sim race clock (``sim_boot_time_ms``, reset to ~0 by SIM_RESET) has
+        reached the scheduled GO time (``race_start_boot_time_ms`` ~3300 ms).
+        This is the authoritative "safe to fly" signal. CAVEAT: right after a
+        reset the status can briefly be STALE (a pre-reset frame with a large
+        ``sim_boot_time_ms``), which would read True spuriously — callers must
+        confirm they are in the fresh post-reset countdown first (see
+        ``_reset_and_settle``)."""
+        return (
+            self.race_start_boot_time_ms >= 0
+            and self.sim_boot_time_ms >= self.race_start_boot_time_ms
+        )
 
     @property
     def race_finished(self) -> bool:

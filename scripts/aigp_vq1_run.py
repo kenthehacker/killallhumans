@@ -178,6 +178,7 @@ async def run_vq1(
     kv: float = 3.0,
     vert_gain: float = -1.0,
     max_vert_speed: float = -1.0,
+    vert_ff: float = 0.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -271,6 +272,7 @@ async def run_vq1(
         minimal_kv=kv,
         minimal_vert_gain=vert_gain,
         minimal_max_vert_speed=max_vert_speed,
+        minimal_vert_ff=vert_ff,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -514,25 +516,34 @@ async def _reset_and_settle(
     adapter,
     pos_tol: float = 1.0,
     vel_tol: float = 0.5,
-    countdown_s: float = 3.5,
-    timeout_s: float = 9.0,
+    go_margin_ms: float = 120.0,
+    timeout_s: float = 15.0,
 ) -> None:
-    """SIM_RESET, wait out the race COUNTDOWN, and block until the drone is
-    actually back at spawn before flight commands begin.
+    """SIM_RESET, then block until the sim's 3 s countdown has actually elapsed
+    (the race is GO) AND the drone is settled at spawn, before ANY flight command
+    (arm / setpoint) is issued.
 
-    The sim runs a ~``countdown_s`` countdown after a restart; the drone does
-    NOT accept flight commands during it (commanding through the countdown
-    wastes the first seconds and can leave the sim in a bad state). So we wait
-    at least ``countdown_s`` from the SIM_RESET AND for the drone to be settled
-    at spawn (|pos| & |vel| within tolerance — also guards against a prior run's
-    drone still being airborne) before returning. ``race_status.race_started``
-    is logged for observability (the sim flips it when the countdown ends).
+    DSQ ROOT CAUSE (iter-39, probed live): SIM_RESET resets the sim race clock
+    (``sim_boot_time_ms``) to ~0 and schedules the GO time at
+    ``race_start_boot_time_ms`` ≈ 3300 ms (the 3 s countdown). The race actually
+    starts only when ``sim_boot_time_ms`` reaches that GO time (~3.3 s, and it
+    JITTERS — observed 3.3–3.7 s). The ``race_started`` property
+    (``race_start_boot_time_ms >= 0``) flips True at ~0.6 s and means only that a
+    GO time is SCHEDULED, NOT that racing has begun. Gating on a 3.5 s timer (the
+    old code) or on ``race_started`` (an earlier wrong fix) therefore commands
+    the already-armed drone DURING the countdown → it jumps the start → the run
+    is DISQUALIFIED. We instead read the authoritative GO crossing from
+    telemetry: ``sim_boot_time_ms >= race_start_boot_time_ms`` (+ a small
+    ``go_margin_ms``), confirmed against a FRESH post-reset status so a stale
+    pre-reset frame (large ``sim_boot_time_ms``) cannot read GO spuriously.
     """
     await adapter.reset()
     t0 = time.monotonic()
     settled = False
+    saw_countdown = False  # confirmed we are in the FRESH post-reset countdown
+    go = False
     while time.monotonic() - t0 < timeout_s:
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.05)
         elapsed = time.monotonic() - t0
         telem = adapter.latest_telemetry
         if telem is not None:
@@ -542,18 +553,31 @@ async def _reset_and_settle(
                 pos_mag = math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2)
                 vel_mag = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
                 settled = pos_mag < pos_tol and vel_mag < vel_tol
-        # Require BOTH the countdown to have elapsed AND the drone settled.
-        if settled and elapsed >= countdown_s:
-            rs = getattr(adapter, "race_status", None)
-            started = getattr(rs, "race_started", None) if rs is not None else None
+        rs = getattr(adapter, "race_status", None)
+        if rs is not None:
+            start_ms = rs.race_start_boot_time_ms
+            now_ms = rs.sim_boot_time_ms
+            # Fresh countdown active: the GO time is not yet scheduled (the brief
+            # -1 blip) or the reset race clock has not yet reached GO. Either
+            # proves we are NOT looking at a stale pre-reset (post-GO) frame.
+            if start_ms < 0 or now_ms < start_ms:
+                saw_countdown = True
+            # GO only counts once the fresh countdown has been observed.
+            if saw_countdown and start_ms >= 0 and now_ms >= start_ms + go_margin_ms:
+                go = True
+        if go and settled:
             logger.info(
-                "Countdown elapsed (%.1fs) and drone settled at spawn — starting "
-                "flight (sim race_started=%s).", elapsed, started,
+                "Race GO crossing reached after %.2fs (sim_boot=%dms >= "
+                "start=%dms) and drone settled at spawn — safe to arm + fly "
+                "(countdown fully elapsed, no false start).",
+                elapsed, now_ms, start_ms,
             )
             return
     logger.warning(
-        "Reset wait timed out at %.1fs (settled=%s) — proceeding anyway.",
-        timeout_s, settled,
+        "Reset wait timed out at %.1fs WITHOUT a confirmed GO crossing "
+        "(saw_countdown=%s, go=%s, settled=%s) — proceeding anyway, but this run "
+        "may be a FALSE START / disqualified.",
+        timeout_s, saw_countdown, go, settled,
     )
 
 
@@ -706,6 +730,16 @@ def main(argv=None) -> None:
              "steep climbs keep pace with cruise. Only with --minimal.",
     )
     parser.add_argument(
+        "--vert-ff",
+        type=float,
+        default=0.0,
+        dest="vert_ff",
+        help="Vertical glide-slope FEEDFORWARD. 0=off (proportional law, lags "
+             "descent and crosses gates above centre). 1.0=descend at "
+             "speed*dz/horiz_dist so the drone arrives at gate altitude on time. "
+             ">1.0 biases low (more top-bar margin). Only with --minimal.",
+    )
+    parser.add_argument(
         "--cross-gain",
         type=float,
         default=0.0,
@@ -732,6 +766,7 @@ def main(argv=None) -> None:
         kv=args.kv,
         vert_gain=args.vert_gain,
         max_vert_speed=args.max_vert_speed,
+        vert_ff=args.vert_ff,
         trajectory=args.trajectory,
     ))
 
