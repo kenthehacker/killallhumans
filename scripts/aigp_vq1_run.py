@@ -179,6 +179,7 @@ async def run_vq1(
     vert_gain: float = -1.0,
     max_vert_speed: float = -1.0,
     vert_ff: float = 0.0,
+    lookahead_m: float = 0.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -273,6 +274,7 @@ async def run_vq1(
         minimal_vert_gain=vert_gain,
         minimal_max_vert_speed=max_vert_speed,
         minimal_vert_ff=vert_ff,
+        minimal_lookahead_m=lookahead_m,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -517,7 +519,8 @@ async def _reset_and_settle(
     pos_tol: float = 1.0,
     vel_tol: float = 0.5,
     go_margin_ms: float = 120.0,
-    timeout_s: float = 15.0,
+    per_attempt_s: float = 8.0,
+    max_resets: int = 4,
 ) -> None:
     """SIM_RESET, then block until the sim's 3 s countdown has actually elapsed
     (the race is GO) AND the drone is settled at spawn, before ANY flight command
@@ -536,49 +539,73 @@ async def _reset_and_settle(
     telemetry: ``sim_boot_time_ms >= race_start_boot_time_ms`` (+ a small
     ``go_margin_ms``), confirmed against a FRESH post-reset status so a stale
     pre-reset frame (large ``sim_boot_time_ms``) cannot read GO spuriously.
+
+    RETRY (iter-40): the sim IGNORES a SIM_RESET that arrives too soon after a
+    previous one (the runner already resets once in connect() to fetch the gate
+    map), so the race clock never drops and no fresh countdown appears. If an
+    attempt doesn't reach a fresh GO crossing within ``per_attempt_s``, re-issue
+    the reset (up to ``max_resets`` times) — never just proceed and false-start.
     """
-    await adapter.reset()
-    t0 = time.monotonic()
-    settled = False
-    saw_countdown = False  # confirmed we are in the FRESH post-reset countdown
-    go = False
-    while time.monotonic() - t0 < timeout_s:
-        await asyncio.sleep(0.05)
-        elapsed = time.monotonic() - t0
-        telem = adapter.latest_telemetry
-        if telem is not None:
-            p = telem.position_ned
-            v = telem.velocity_ned
-            if all(math.isfinite(x) for x in (*p, *v)):
-                pos_mag = math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2)
-                vel_mag = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
-                settled = pos_mag < pos_tol and vel_mag < vel_tol
-        rs = getattr(adapter, "race_status", None)
-        if rs is not None:
-            start_ms = rs.race_start_boot_time_ms
-            now_ms = rs.sim_boot_time_ms
-            # Fresh countdown active: the GO time is not yet scheduled (the brief
-            # -1 blip) or the reset race clock has not yet reached GO. Either
-            # proves we are NOT looking at a stale pre-reset (post-GO) frame.
-            if start_ms < 0 or now_ms < start_ms:
-                saw_countdown = True
-            # GO only counts once the fresh countdown has been observed.
-            if saw_countdown and start_ms >= 0 and now_ms >= start_ms + go_margin_ms:
-                go = True
-        if go and settled:
-            logger.info(
-                "Race GO crossing reached after %.2fs (sim_boot=%dms >= "
-                "start=%dms) and drone settled at spawn — safe to arm + fly "
-                "(countdown fully elapsed, no false start).",
-                elapsed, now_ms, start_ms,
-            )
-            return
-    logger.warning(
-        "Reset wait timed out at %.1fs WITHOUT a confirmed GO crossing "
-        "(saw_countdown=%s, go=%s, settled=%s) — proceeding anyway, but this run "
-        "may be a FALSE START / disqualified.",
-        timeout_s, saw_countdown, go, settled,
+    for attempt in range(1, max_resets + 1):
+        # Race clock BEFORE this reset. SIM_RESET resets sim_boot_time_ms to ~0,
+        # so a later value well below this proves the reset took effect (robust
+        # even if reset() returns after the pre-GO window).
+        rs0 = getattr(adapter, "race_status", None)
+        pre_boot_ms = getattr(rs0, "sim_boot_time_ms", None) if rs0 is not None else None
+        await adapter.reset()
+        t0 = time.monotonic()
+        settled = False
+        fresh = False  # confirmed we see the FRESH post-reset race clock
+        go = False
+        now_ms = start_ms = -1
+        while time.monotonic() - t0 < per_attempt_s:
+            await asyncio.sleep(0.05)
+            elapsed = time.monotonic() - t0
+            telem = adapter.latest_telemetry
+            if telem is not None:
+                p = telem.position_ned
+                v = telem.velocity_ned
+                if all(math.isfinite(x) for x in (*p, *v)):
+                    pos_mag = math.sqrt(p[0] ** 2 + p[1] ** 2 + p[2] ** 2)
+                    vel_mag = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2)
+                    settled = pos_mag < pos_tol and vel_mag < vel_tol
+            rs = getattr(adapter, "race_status", None)
+            if rs is not None:
+                start_ms = rs.race_start_boot_time_ms
+                now_ms = rs.sim_boot_time_ms
+                # Fresh post-reset clock: the brief -1 blip, the clock still
+                # before GO, or the clock having dropped well below its pre-reset
+                # value (handles a slow reset() that returns past GO).
+                if (start_ms < 0 or now_ms < start_ms
+                        or (pre_boot_ms is not None and now_ms < pre_boot_ms - 500)):
+                    fresh = True
+                if fresh and start_ms >= 0 and now_ms >= start_ms + go_margin_ms:
+                    go = True
+            if go and settled:
+                logger.info(
+                    "Race GO crossing reached after %.2fs (attempt %d, "
+                    "sim_boot=%dms >= start=%dms) and drone settled at spawn — "
+                    "safe to arm + fly (countdown elapsed, no false start).",
+                    elapsed, attempt, now_ms, start_ms,
+                )
+                return
+            # A real reset drops the clock within ~1 s; if we haven't seen a
+            # fresh countdown by 2.5 s the sim ignored this reset — retry now
+            # instead of burning the full per-attempt budget.
+            if elapsed > 2.5 and not fresh:
+                break
+        logger.warning(
+            "Reset attempt %d/%d did NOT reach a fresh GO crossing in %.1fs "
+            "(fresh=%s, go=%s, settled=%s, sim_boot=%sms, start=%sms) — the sim "
+            "likely ignored the reset; re-issuing.",
+            attempt, max_resets, per_attempt_s, fresh, go, settled, now_ms, start_ms,
+        )
+    logger.error(
+        "Could not reach a clean GO crossing after %d SIM_RESETs — the sim may be "
+        "wedged (needs a GUI restart into VQ mode). NOT flying (would false-start "
+        "/ DSQ).", max_resets,
     )
+    raise RuntimeError("no clean race start after repeated SIM_RESET")
 
 
 def _q_to_yaw(q) -> float:
@@ -740,6 +767,17 @@ def main(argv=None) -> None:
              ">1.0 biases low (more top-bar margin). Only with --minimal.",
     )
     parser.add_argument(
+        "--lookahead",
+        type=float,
+        default=0.0,
+        dest="lookahead_m",
+        help="VERTICAL anticipatory descent: aim the altitude DOWN toward the "
+             "NEXT (lower) gate by up to this many METRES (bounded), ramped in "
+             "over the last ~12 m of approach. Kills the vertical lag (drone "
+             "arriving above the opening at speed) with no lateral corner-cut. "
+             "0=off. Try 0.3-0.5 m. Only with --minimal.",
+    )
+    parser.add_argument(
         "--cross-gain",
         type=float,
         default=0.0,
@@ -767,6 +805,7 @@ def main(argv=None) -> None:
         vert_gain=args.vert_gain,
         max_vert_speed=args.max_vert_speed,
         vert_ff=args.vert_ff,
+        lookahead_m=args.lookahead_m,
         trajectory=args.trajectory,
     ))
 

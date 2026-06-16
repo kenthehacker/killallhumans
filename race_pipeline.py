@@ -155,6 +155,20 @@ class PipelineConfig:
     # which suggests gate.position is not the OPENING centre vertically (e.g.
     # it's the gate base). Negative = aim higher (NED z is down). Swept live.
     minimal_aim_z_offset: float = 0.0
+    # iter-40 VERTICAL ANTICIPATORY DESCENT (bounded, in metres). The drone
+    # arrives ABOVE every gate opening (P-only vertical lag on a descending
+    # course; ~0.3 m at cruise 8, ~0.5-0.65 m at cruise 9 where it becomes the
+    # binding frame clearance). When >0, aim the ALTITUDE down toward the NEXT
+    # (lower) gate by up to this many METRES, ramped in over the last
+    # ``minimal_lookahead_band_m`` metres of approach, so the drone descends early
+    # and crosses centred. Z-ONLY: a full 3D lookahead (iter-40) halved the
+    # vertical lag but its lateral component corner-cut the slalom (gate2 lat
+    # 0.326->0.399 m). BOUNDED in metres, NOT a fraction of the leg drop: iter-40
+    # crash — fraction 0.4 of the 5 m gate0->gate1 drop = 2 m down-aim dove into
+    # gate0's bottom frame (128 collisions). ~0.4 m stays inside the 0.75 m
+    # half-opening even at the near-level gate0. 0 = off. Swept live.
+    minimal_lookahead_m: float = 0.0
+    minimal_lookahead_band_m: float = 12.0
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -713,6 +727,28 @@ class RacePipeline:
                 normal = -normal
             aim = cur + self.config.minimal_through_dist * normal
             aim[2] += self.config.minimal_aim_z_offset
+            # iter-40: VERTICAL-ONLY anticipatory descent, BOUNDED in metres.
+            # The drone arrives ABOVE every opening (P-only vertical lag; ~0.3 m
+            # at cruise 8, ~0.5-0.65 m at cruise 9 where it binds clearance). Aim
+            # the altitude DOWN toward the next (lower) gate to descend early and
+            # cross centred. Z-only (no lateral shift) so it does NOT corner-cut
+            # the slalom (iter-40: a 3D lookahead cut gate2 lat 0.326->0.399 m).
+            # BOUNDED to ``minimal_lookahead_m`` METRES (NOT a fraction of the
+            # leg drop — iter-40 crash: fraction 0.4 of the 5 m gate0->gate1 drop
+            # = 2 m down-aim → dove into gate0's bottom frame, 128 collisions).
+            # A fixed ~0.4 m bound stays well inside the 0.75 m half-opening even
+            # where anticipation isn't needed (e.g. the near-level gate0).
+            look_m = self.config.minimal_lookahead_m
+            if look_m > 0.0:
+                nxt = self.sequencer.next_gate
+                if nxt is not None:
+                    nxt_z = float(nxt.position[2]) + self.config.minimal_aim_z_offset
+                    d_cur = float(np.linalg.norm(
+                        cur - np.array(position, dtype=float)))
+                    band = max(1e-3, self.config.minimal_lookahead_band_m)
+                    ramp = max(0.0, min(1.0, 1.0 - d_cur / band))
+                    # descend only (next gate lower => nxt_z > aim[2]), bounded.
+                    aim[2] += min(look_m, max(0.0, nxt_z - aim[2])) * ramp
             return self.minimal_controller.compute(
                 position, velocity, yaw, tuple(aim), is_final_gate=False,
             )
