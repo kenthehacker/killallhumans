@@ -153,6 +153,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         # turn (racing line / variable speed), not by more inner-loop bandwidth.
         self._att_rate_kp = (1.0, 0.5, 0.5)   # (roll, pitch, yaw)
         self._att_rate_kd = (0.4, 0.2, 0.2)
+        # iter-51 TESTED & NEUTRAL — keep 0.8. Raising ONLY the roll rate clamp
+        # to 1.0 (kp/kd unchanged) is SAFE (gyro p95/max unchanged at 1.16/2.13,
+        # NO limit cycle — so the iter-44 limit cycle was the kp, not the clamp),
+        # but it does NOT help: the roll rate rarely reaches 0.8 on the slalom
+        # turns, so the lateral undershoot (the 50-km/h clearance limiter at
+        # gates 2/3) is TILT/attenuation-limited, not rate-limited. Reverted.
         self._att_rate_max = 0.8      # rad/s clamp per axis
         # Per-axis CLOSED-LOOP sign, corrected 2026-06-13 (iter-023). The
         # open-loop gyro probe suggested all three axes were sign-flipped, but
