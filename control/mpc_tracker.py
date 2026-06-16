@@ -77,6 +77,39 @@ class TrackerConfig:
     # Backed by: Tal & Karaman 2018, L1Quad 2025, DATT 2023.
     velocity_feedforward: float = 0.0
 
+    # --- Drag-aware differential-flatness feedforward (roadmap #1) -----------
+    # Faessler et al., "Differential Flatness of Quadrotor Dynamics Subject
+    # to Rotor Drag for Accurate Tracking of High-Speed Trajectories"
+    # (IEEE RA-L 2018). With a LINEAR rotor-drag model a_drag = -k_d·v, the
+    # body experiences drag -k_d·v_ref while following the reference. The
+    # exact flatness feedforward adds that drag back into accel_des so the
+    # commanded thrust/orientation already accounts for it:
+    #
+    #     accel_des += drag_ff_coeff · ref_vel        (k_d ≥ 0)
+    #
+    # This is the PRINCIPLED form of `velocity_feedforward` above: the
+    # coefficient is the physical linear drag-per-mass (k_d), sourced from
+    # `competition.calibration.OnlineDroneCalibrator` (roadmap #1 estimator)
+    # or `drone_spec.DEFAULT_LINEAR_DRAG_PER_MASS` — not a hand-tuned gain.
+    # On the kinematic bench the realized accel is `accel_des - drag·vel`
+    # (scripts/benchmark.py:653); at steady-state tracking (vel ≈ ref_vel)
+    # this term cancels that drag disturbance, the ~50% RMS-error cut Faessler
+    # reports.
+    #
+    # OFF BY DEFAULT (use_drag_ff=False) so the SIM-validated champion configs
+    # cannot regress — mirrors the use_residual=False pattern. When the flag
+    # is False OR drag_ff_coeff == 0.0 the added term is identically zero, so
+    # behaviour is byte-for-byte the baseline (regression-safe; see
+    # control/tests/test_tracker.py::test_drag_ff_off_is_baseline). Like every
+    # FF path it is applied BEFORE the existing lateral-accel / descent /
+    # thrust clamps, so the hard safety envelope is unchanged.
+    #
+    # NOT validated on DCGame here (no sim/DCL binary on this worktree) — only
+    # unit-tested + checked on the kinematic bench. Re-validate on-sim before
+    # enabling; Faessler's linear-drag model was validated only to ~5 m/s.
+    use_drag_ff: bool = False
+    drag_ff_coeff: float = 0.0      # linear drag-per-mass k_d (1/s); ≥ 0
+
     # Iter-035: optional horizontal-accel clamp (m/s²). The geometric tracker
     # otherwise clamps only the tilt ANGLE, not lateral accel — so a reference
     # demanding >envelope accel (e.g. the ~17 m/s² min-snap peaks at gate kinks)
@@ -248,6 +281,20 @@ class GeometricTracker:
             c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1] + c.drag_coefficient * vel[1] + c.velocity_feedforward * ref_vel[1],
             c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2] + c.drag_coefficient * vel[2] + c.velocity_feedforward * ref_vel[2],
         ])
+
+        # Drag-aware differential-flatness feedforward (Faessler RA-L 2018,
+        # roadmap #1). Additive, opt-in, and EXACTLY zero when disabled or
+        # when the drag coeff is zero — so the default config is byte-for-byte
+        # the baseline. With linear rotor drag a_drag = -k_d·v acting on the
+        # body, tracking the reference at v_ref requires the thrust to also
+        # overcome -k_d·v_ref, i.e. add +k_d·v_ref to the desired accel. Uses
+        # REFERENCE velocity (like velocity_feedforward) so drag's velocity-
+        # error damping is preserved while the drag FORCING is cancelled.
+        # Placed before the lateral-accel / descent / thrust clamps so the
+        # safety envelope is unchanged.
+        if c.use_drag_ff and c.drag_ff_coeff != 0.0:
+            accel_des = accel_des + c.drag_ff_coeff * ref_vel
+
         # Iter-035: clamp horizontal accel to the real envelope BEFORE building
         # the thrust vector (mirrors the proven minimal controller). Without
         # this the tracker only angle-clamps tilt and overshoots realized

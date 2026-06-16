@@ -323,6 +323,122 @@ class TestSimplePositionTracker:
 # ── Cross-validation: GeometricTracker vs SimplePositionTracker ──────────
 
 
+class TestDragAwareFeedforward:
+    """Drag-aware differential-flatness feedforward (Faessler RA-L 2018,
+    roadmap #1). OFF by default behind `use_drag_ff`; reduces to baseline
+    exactly when off or when drag_ff_coeff == 0 (regression-safe), and cuts
+    steady-state tracking error on a synthetic constant-velocity drag case.
+
+    NOTE: validated here only via unit tests + the kinematic-rollout below
+    (which mirrors scripts/benchmark.py's `accel = accel_des - drag·vel`).
+    NOT validated on DCGame — no sim/DCL binary on this worktree.
+    """
+
+    def _rollout_cross_track_error(
+        self, tracker: GeometricTracker, drag: float,
+        speed: float = 8.0, dt: float = 0.01, n_steps: int = 400,
+    ) -> float:
+        """Fly a constant-velocity +Y reference through a drag field and
+        return the mean lateral (cross-track) position error.
+
+        Bench-faithful kinematics: realized accel = accel_des - drag·vel
+        (scripts/benchmark.py:653). The reference moves at constant `speed`
+        along +Y; with linear drag the un-compensated tracker settles at a
+        steady lag, which the drag-FF should largely cancel.
+        """
+        pos = np.zeros(3)
+        vel = np.zeros(3)
+        errs = []
+        for k in range(n_steps):
+            t = k * dt
+            ref_y = speed * t
+            ref = _make_reference(
+                position=(0.0, ref_y, 0.0),
+                velocity=(0.0, speed, 0.0),
+                acceleration=(0.0, 0.0, 0.0),
+            )
+            tracker.track(tuple(pos), tuple(vel), 0.0, ref)
+            accel_des = tracker.last_desired_acceleration
+            accel = np.array(accel_des) - drag * vel
+            vel = vel + accel * dt
+            pos = pos + vel * dt
+            if t > 2.0:  # measure after the startup transient
+                errs.append(abs(ref_y - pos[1]))
+        return float(np.mean(errs))
+
+    def test_drag_ff_off_is_baseline(self):
+        """use_drag_ff=False must be byte-for-byte the baseline tracker."""
+        ref = _make_reference(
+            position=(3.0, -2.0, -1.0), velocity=(5.0, -4.0, 1.0),
+            acceleration=(2.0, 1.0, -0.5), yaw=0.7,
+        )
+        base = GeometricTracker(TrackerConfig())
+        # Flag off but coeff non-zero — must STILL be baseline (flag gates it).
+        off = GeometricTracker(TrackerConfig(use_drag_ff=False, drag_ff_coeff=0.5))
+        cb = base.track((1.0, 0.5, -0.5), (1.0, -1.0, 0.5), 0.3, ref)
+        co = off.track((1.0, 0.5, -0.5), (1.0, -1.0, 0.5), 0.3, ref)
+        assert co.roll_rad == cb.roll_rad
+        assert co.pitch_rad == cb.pitch_rad
+        assert co.thrust == cb.thrust
+        np.testing.assert_array_equal(
+            off.last_desired_acceleration, base.last_desired_acceleration
+        )
+
+    def test_drag_ff_zero_coeff_is_baseline(self):
+        """Flag on but coeff 0 reduces EXACTLY to current behaviour."""
+        ref = _make_reference(
+            position=(3.0, -2.0, -1.0), velocity=(5.0, -4.0, 1.0),
+            acceleration=(2.0, 1.0, -0.5), yaw=0.7,
+        )
+        base = GeometricTracker(TrackerConfig())
+        zero = GeometricTracker(TrackerConfig(use_drag_ff=True, drag_ff_coeff=0.0))
+        cb = base.track((1.0, 0.5, -0.5), (1.0, -1.0, 0.5), 0.3, ref)
+        cz = zero.track((1.0, 0.5, -0.5), (1.0, -1.0, 0.5), 0.3, ref)
+        assert cz.roll_rad == cb.roll_rad
+        assert cz.pitch_rad == cb.pitch_rad
+        assert cz.thrust == cb.thrust
+        np.testing.assert_array_equal(
+            zero.last_desired_acceleration, base.last_desired_acceleration
+        )
+
+    def test_drag_ff_adds_exact_term_to_accel_des(self):
+        """When on, accel_des gains EXACTLY drag_ff_coeff·ref_vel."""
+        ref = _make_reference(
+            position=(0.0, 0.0, 0.0), velocity=(6.0, -3.0, 1.0),
+            acceleration=(0.0, 0.0, 0.0), yaw=0.0,
+        )
+        coeff = 0.5
+        base = GeometricTracker(TrackerConfig())
+        ff = GeometricTracker(TrackerConfig(use_drag_ff=True, drag_ff_coeff=coeff))
+        # Zero state error so only the FF term differs; small velocities keep
+        # the result well clear of the lateral-accel / thrust clamps.
+        base.track((0, 0, 0), (0, 0, 0), 0.0, ref)
+        ff.track((0, 0, 0), (0, 0, 0), 0.0, ref)
+        delta = ff.last_desired_acceleration - base.last_desired_acceleration
+        expected = coeff * np.array(ref.velocity)
+        np.testing.assert_allclose(delta, expected, atol=1e-9)
+
+    def test_drag_ff_reduces_constant_velocity_tracking_error(self):
+        """On a constant-velocity drag case, drag-FF cuts steady-state error.
+
+        Setting drag_ff_coeff to the field's true drag makes the FF cancel
+        the drag forcing, so the tracked lag shrinks substantially vs the
+        un-compensated baseline.
+        """
+        drag = 0.5  # matches drone_spec.DEFAULT_LINEAR_DRAG_PER_MASS
+        base = GeometricTracker(TrackerConfig())
+        ff = GeometricTracker(TrackerConfig(use_drag_ff=True, drag_ff_coeff=drag))
+        err_base = self._rollout_cross_track_error(base, drag)
+        err_ff = self._rollout_cross_track_error(ff, drag)
+        assert err_base > 0.01, (
+            f"baseline drag lag too small to be a meaningful test ({err_base:.4f} m)"
+        )
+        assert err_ff < 0.5 * err_base, (
+            f"drag-FF did not reduce tracking error: baseline {err_base:.4f} m, "
+            f"FF {err_ff:.4f} m"
+        )
+
+
 class TestCrossValidation:
     """Both trackers should agree on basic maneuvers (sanity check)."""
 

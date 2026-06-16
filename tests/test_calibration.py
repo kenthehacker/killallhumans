@@ -16,6 +16,7 @@ import pytest
 from competition.calibration import (
     CalibrationSample,
     DroneCalibrator,
+    OnlineDroneCalibrator,
 )
 
 
@@ -201,3 +202,172 @@ def test_read_calibration_json_rejects_zero_samples(tmp_path: Path):
     }))
     with pytest.raises(ValueError, match="n_samples"):
         DroneCalibrator.read_calibration_json(path)
+
+
+# ===========================================================================
+# Online recursive estimator (roadmap #1) — OnlineDroneCalibrator
+#
+# Same NED physics as the batch path (g − a_z = k_t·u + k_d·v_z); these tests
+# verify the streaming RLS recovers seeded params, CONVERGES under streaming
+# data, TRACKS a drift via the forgetting factor, agrees with the batch
+# lstsq, and keeps the batch path's positivity guard. Real DCL telemetry
+# validation stays deferred to iter ≥ 002 (no DCL binary on this worktree).
+# ===========================================================================
+
+
+def test_online_recovers_seeded_ratios_within_10_percent():
+    """Streaming the same synthetic ticks recovers the seeded ratios."""
+    k_t_true, k_d_true = 22.0, 0.40
+    cal = OnlineDroneCalibrator()
+    res = None
+    for s in _synth_samples(k_t_true, k_d_true, n=400):
+        res = cal.update(s)
+    assert res.thrust_per_mass > 0, "thrust_per_mass must be positive (upward thrust)"
+    assert abs(res.thrust_per_mass - k_t_true) / k_t_true < 0.10
+    assert abs(res.drag_per_mass - k_d_true) / k_d_true < 0.10
+    assert res.n_samples == 400
+
+
+def test_online_converges_under_streaming_data():
+    """Error must DECREASE monotonically-in-trend as ticks accumulate.
+
+    Compare the parameter error after the first 25 ticks vs after all 400:
+    a working recursive estimator is far closer once it has seen the stream.
+    """
+    k_t_true, k_d_true = 22.0, 0.40
+    samples = _synth_samples(k_t_true, k_d_true, n=400, seed=3)
+    cal = OnlineDroneCalibrator(covariance_init=1.0e3)
+
+    truth = np.array([k_t_true, k_d_true])
+    err_early = None
+    for i, s in enumerate(samples):
+        cal.update(s)
+        if i == 24:  # after 25 ticks
+            err_early = np.linalg.norm(
+                np.array([cal.thrust_per_mass, cal.drag_per_mass]) - truth
+            )
+    err_final = np.linalg.norm(
+        np.array([cal.thrust_per_mass, cal.drag_per_mass]) - truth
+    )
+    assert err_early is not None
+    # Converged estimate is markedly better than the early transient, and the
+    # final error is small in absolute terms.
+    assert err_final < 0.5 * err_early, (
+        f"online estimate did not converge: early err {err_early:.3f}, "
+        f"final err {err_final:.3f}"
+    )
+    assert err_final < 0.5, f"final parameter error too large: {err_final:.3f}"
+    # The forgetting-weighted a-priori RMSE should settle near the injected
+    # accelerometer noise floor (~0.05 m/s²), not blow up.
+    assert cal.rmse < 0.5, f"online rmse too high: {cal.rmse:.3f}"
+
+
+def test_online_matches_batch_lstsq():
+    """Fed identical ticks, the streaming RLS and the batch lstsq agree.
+
+    With NO forgetting (λ=1) RLS is exactly recursive least squares, so on
+    the same data it converges to the batch normal-equation solution. Tiny
+    tolerance confirms they solve the SAME regression (not merely similar).
+    """
+    k_t_true, k_d_true = 18.5, 0.62
+    samples = _synth_samples(k_t_true, k_d_true, n=300, seed=5)
+    batch = DroneCalibrator().identify_thrust_drag_ratios(samples)
+    cal = OnlineDroneCalibrator(
+        forgetting_factor=1.0, covariance_init=1.0e6, max_covariance=1.0e9,
+    )
+    res = None
+    for s in samples:
+        res = cal.update(s)
+    assert res.thrust_per_mass == pytest.approx(batch.thrust_per_mass, rel=1e-3, abs=1e-3)
+    assert res.drag_per_mass == pytest.approx(batch.drag_per_mass, rel=1e-3, abs=1e-3)
+
+
+def test_online_forgetting_factor_tracks_drift():
+    """A low forgetting factor must TRACK a step change in k_t.
+
+    Stream 300 ticks at k_t=22, then 300 at k_t=30. A forgetting estimator
+    (λ<1) re-converges to the new value; a growing-memory estimator (λ=1)
+    stays biased toward the stale average. We assert the forgetting estimator
+    lands near 30 AND is closer to it than the no-forgetting one — i.e. the
+    forgetting factor is doing the drift-tracking, not just luck.
+    """
+    k_d_true = 0.40
+    seg1 = _synth_samples(22.0, k_d_true, n=300, seed=1)
+    seg2 = _synth_samples(30.0, k_d_true, n=300, seed=2)
+
+    forget = OnlineDroneCalibrator(forgetting_factor=0.97, covariance_init=1.0e3)
+    noforget = OnlineDroneCalibrator(forgetting_factor=1.0, covariance_init=1.0e3)
+    for s in seg1 + seg2:
+        forget.update(s)
+        noforget.update(s)
+
+    # The forgetting estimator tracks the post-step value closely.
+    assert abs(forget.thrust_per_mass - 30.0) / 30.0 < 0.05, (
+        f"forgetting estimator failed to track drift: k_t={forget.thrust_per_mass:.2f}"
+    )
+    # And it is strictly closer to the new value than the stale-averaging one.
+    assert abs(forget.thrust_per_mass - 30.0) < abs(noforget.thrust_per_mass - 30.0)
+
+
+def test_online_positivity_guard_on_reported_estimate():
+    """The reported thrust_per_mass is floored positive (batch-path guard).
+
+    Before any data, the zero-initialised estimate would report k_t=0; the
+    positivity floor keeps the surfaced value > 0 so downstream consumers
+    (e.g. thrust normalisation) never divide by / configure a non-physical
+    zero/negative thrust. drag_per_mass is NOT floored (drag may be ~0).
+    """
+    cal = OnlineDroneCalibrator(k_t_init=0.0, k_d_init=0.0, min_k_t=1e-6)
+    res = cal.result()
+    assert res.thrust_per_mass >= 1e-6
+    assert res.drag_per_mass == 0.0
+    assert res.n_samples == 0
+
+
+def test_online_update_from_telemetry_hook():
+    """The live-MAVLink hook feeds the same fit without a CalibrationSample."""
+    k_t_true, k_d_true = 22.0, 0.40
+    cal = OnlineDroneCalibrator()
+    res = None
+    for s in _synth_samples(k_t_true, k_d_true, n=300):
+        res = cal.update_from_telemetry(
+            thrust_normalized=s.thrust_normalized,
+            velocity_z_world=s.velocity_z_world,
+            accel_z_world=s.accel_z_world,
+        )
+    assert abs(res.thrust_per_mass - k_t_true) / k_t_true < 0.10
+    assert abs(res.drag_per_mass - k_d_true) / k_d_true < 0.10
+
+
+def test_online_stable_under_low_excitation():
+    """Covariance-windup guard: a near-constant (under-excited) stream with
+    forgetting must NOT blow the estimator up to NaN/inf.
+
+    This is the report's flagged risk — a smooth racing line under-excites a
+    parameter, and with λ<1 the covariance otherwise inflates without bound.
+    Stream thousands of near-identical ticks and assert the estimate stays
+    finite and bounded.
+    """
+    cal = OnlineDroneCalibrator(forgetting_factor=0.99, max_covariance=1.0e6)
+    s = CalibrationSample(thrust_normalized=0.45, velocity_z_world=0.0,
+                          accel_z_world=9.81 - 22.0 * 0.45)
+    res = None
+    for _ in range(20000):
+        res = cal.update(s)
+    assert np.isfinite(res.thrust_per_mass)
+    assert np.isfinite(res.drag_per_mass)
+    assert np.isfinite(res.rmse)
+    # tr(P) is held at/under the cap rather than overflowing.
+    assert float(cal._P[0, 0] + cal._P[1, 1]) <= cal.max_covariance * (1 + 1e-9)
+    assert res.thrust_per_mass > 0
+
+
+def test_online_rejects_bad_forgetting_factor():
+    with pytest.raises(ValueError):
+        OnlineDroneCalibrator(forgetting_factor=0.0)
+    with pytest.raises(ValueError):
+        OnlineDroneCalibrator(forgetting_factor=1.5)
+    with pytest.raises(ValueError):
+        OnlineDroneCalibrator(covariance_init=0.0)
+    with pytest.raises(ValueError):
+        OnlineDroneCalibrator(covariance_init=1.0e3, max_covariance=1.0e3)

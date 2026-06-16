@@ -232,3 +232,233 @@ class DroneCalibrator:
             max_thrust_n=float(max_thrust) if max_thrust is not None else None,
             drag_coefficient=float(drag) if drag is not None else None,
         )
+
+
+class OnlineDroneCalibrator:
+    """Recursive (online) thrust/drag identifier — roadmap item #1.
+
+    Streaming counterpart to `DroneCalibrator.identify_thrust_drag_ratios`.
+    Ingests `CalibrationSample`-style ticks ONE AT A TIME and maintains
+    running estimates of the SAME two ratios the batch solver fits, using
+    the EXACT same NED physics / regression:
+
+        g − a_z = k_t · u + k_d · v_z          (regressors φ = [u, v_z])
+
+    where k_t = max_thrust / mass and k_d = drag / mass. (The batch method
+    names the second term `+ k_d·v_z`; this estimator is byte-for-byte the
+    same model, so an `OnlineDroneCalibrator` fed the batch's samples
+    converges to the batch lstsq solution.)
+
+    Algorithm: recursive least squares (RLS) with an exponential forgetting
+    factor λ (Ljung, *System Identification* 1999; the canonical adaptive
+    estimator). Per tick, given regressor φ and target y:
+
+        e = y − φᵀ θ                              (a-priori error)
+        K = P φ / (λ + φᵀ P φ)                     (Kalman-style gain)
+        θ ← θ + K e
+        P ← (P − K φᵀ P) / λ                       (forget old data)
+
+    λ = 1 → ordinary growing-memory least squares (no forgetting). λ < 1
+    weights recent ticks more, so the estimate TRACKS slow drift (battery
+    sag, prop wear, payload change) at the cost of more variance — the
+    classic forgetting-factor bias/variance knob. Default 0.99 ≈ a ~100-
+    sample effective window, matching the batch test's sample counts.
+
+    Cost per tick is a fixed handful of 2×2 / 2-vector ops — no allocation
+    growth, numpy-only, comfortably inside the <1 ms / >100 Hz control-loop
+    budget, so a live MAVLink loop can call `update()` every telemetry tick
+    (see `update_from_telemetry`). This estimator does NOT require the DCL
+    binary; end-to-end DCL validation stays deferred to iter ≥ 002 exactly
+    as the batch path documents. Validated here only against synthetic
+    streams (see tests/test_calibration.py).
+
+    Why RLS over LMS here: the deep-research report (2026-06-16) notes
+    Smeur et al. prefer LMS for the *INDI control-effectiveness* problem
+    because a finite-window estimator "forgets" outside its window — but
+    that is a design rationale for online-G, not a theorem, and the report
+    explicitly allows "variable-forgetting RLS." For a 2-parameter, well-
+    conditioned thrust/drag fit RLS converges faster from few samples and
+    its forgetting factor gives the drift-tracking the report asks for.
+    """
+
+    def __init__(
+        self,
+        gravity: float = _G_MPS2_NED,
+        forgetting_factor: float = 0.99,
+        k_t_init: float = 0.0,
+        k_d_init: float = 0.0,
+        covariance_init: float = 1.0e3,
+        max_covariance: float = 1.0e6,
+        min_k_t: float = 1.0e-6,
+    ):
+        """
+        Args:
+            gravity: NED gravity magnitude (+z down). Matches the batch path.
+            forgetting_factor: λ in (0, 1]. 1.0 = growing-memory LS (no
+                forgetting); <1 tracks drift. Default 0.99 (~100-sample
+                effective memory). Must be in (0, 1].
+            k_t_init, k_d_init: initial parameter guesses. 0.0 is a neutral
+                start (the large covariance lets the first few ticks move
+                the estimate freely); pass a `drone_spec`-derived prior to
+                warm-start.
+            covariance_init: diagonal value of the initial covariance P₀.
+                Large (1e3) ⇒ low confidence in the init ⇒ fast initial
+                adaptation. Small ⇒ trust the init / adapt slowly.
+            max_covariance: upper bound on tr(P), the COVARIANCE-WINDUP guard.
+                With a forgetting factor (λ<1) and POORLY-EXCITED data (e.g. a
+                near-constant thrust on a smooth racing line — the exact
+                under-excitation risk the report flags), the `/λ` step keeps
+                inflating P every tick because no new information arrives,
+                and P eventually overflows → NaN gain. Capping tr(P) (rescale
+                P when tr(P) > max_covariance) is the standard RLS safeguard;
+                it bounds the adaptation gain so a quiet stream can't blow the
+                estimator up, while leaving normally-excited runs untouched
+                (tr(P) settles well below the cap). Must exceed covariance_init.
+            min_k_t: positivity floor for the reported thrust_per_mass.
+                Mirrors the batch path's "guard k_t only" positivity idea
+                (drag k_d may legitimately be ~0 for a drag-free model, so
+                it is NOT floored). The INTERNAL θ is left untouched so the
+                RLS recursion stays numerically consistent; only the value
+                surfaced in the `CalibrationResult` is clamped.
+        """
+        if not (0.0 < forgetting_factor <= 1.0):
+            raise ValueError(
+                f"forgetting_factor must be in (0, 1]; got {forgetting_factor!r}"
+            )
+        if covariance_init <= 0.0:
+            raise ValueError(
+                f"covariance_init must be positive; got {covariance_init!r}"
+            )
+        if max_covariance <= covariance_init:
+            raise ValueError(
+                f"max_covariance ({max_covariance!r}) must exceed "
+                f"covariance_init ({covariance_init!r})"
+            )
+        self.gravity = float(gravity)
+        self.lam = float(forgetting_factor)
+        self.max_covariance = float(max_covariance)
+        self.min_k_t = float(min_k_t)
+        # θ = [k_t, k_d]ᵀ. P = parameter covariance (2×2).
+        self._theta = np.array([float(k_t_init), float(k_d_init)], dtype=np.float64)
+        self._P = np.eye(2, dtype=np.float64) * float(covariance_init)
+        # Running diagnostics. _sse / _sy2 accumulate the FORGETTING-WEIGHTED
+        # a-priori squared error and target energy so `rmse` reflects the
+        # same effective window as the parameter estimate (a plain mean would
+        # be dominated by stale ticks once thousands have streamed by).
+        self.n_samples: int = 0
+        self._sse: float = 0.0   # Σ λ^(n-i) e_i²   (a-priori prediction error)
+        self._sw: float = 0.0    # Σ λ^(n-i)        (effective sample count)
+
+    @property
+    def thrust_per_mass(self) -> float:
+        """Current k_t estimate, floored at `min_k_t` (positivity guard)."""
+        return max(self.min_k_t, float(self._theta[0]))
+
+    @property
+    def drag_per_mass(self) -> float:
+        """Current k_d estimate (NOT floored — drag may be ~0)."""
+        return float(self._theta[1])
+
+    @property
+    def rmse(self) -> float:
+        """Forgetting-weighted RMS of the a-priori prediction error (m/s²).
+
+        This is the error BEFORE each tick's update, so it reflects how well
+        the current model predicts incoming data — the online analogue of the
+        batch fit's residual RMSE. ~0 until the first update.
+        """
+        if self._sw <= 0.0:
+            return 0.0
+        return float(np.sqrt(self._sse / self._sw))
+
+    def update(self, sample: CalibrationSample) -> CalibrationResult:
+        """Ingest one telemetry tick; return the updated running estimate.
+
+        Performs a single RLS step on the batch model
+        `g − a_z = k_t·u + k_d·v_z` and returns a `CalibrationResult`
+        snapshot (same dataclass the batch path returns) so callers can use
+        the two paths interchangeably. The returned `thrust_per_mass` is
+        positivity-guarded; `n_samples` is the cumulative tick count and
+        `rmse` is the forgetting-weighted a-priori error.
+
+        Cheap and allocation-light — safe to call every control tick.
+        """
+        u = float(sample.thrust_normalized)
+        v = float(sample.velocity_z_world)
+        a = float(sample.accel_z_world)
+        phi = np.array([u, v], dtype=np.float64)
+        y = self.gravity - a
+
+        # A-priori error (prediction BEFORE this tick updates θ).
+        e = y - float(phi @ self._theta)
+
+        # RLS gain. Denominator λ + φᵀPφ > 0 for P ≻ 0, λ > 0.
+        Pphi = self._P @ phi
+        denom = self.lam + float(phi @ Pphi)
+        K = Pphi / denom
+
+        # Parameter + covariance update.
+        self._theta = self._theta + K * e
+        # P ← (P − K φᵀ P)/λ. Symmetrise to fight float drift over long runs
+        # (a classic RLS numerical safeguard — keeps P a valid covariance).
+        self._P = (self._P - np.outer(K, Pphi)) / self.lam
+        self._P = 0.5 * (self._P + self._P.T)
+
+        # Covariance-windup guard: under low excitation the `/λ` step inflates
+        # P without bound (nothing new to learn) until it overflows to NaN.
+        # Cap tr(P) by rescaling — bounds the gain so a quiet/constant stream
+        # can't blow the estimator up. No-op on normally-excited data.
+        trace = float(self._P[0, 0] + self._P[1, 1])
+        if trace > self.max_covariance:
+            self._P *= self.max_covariance / trace
+
+        # Forgetting-weighted error/energy accumulators for `rmse`.
+        self._sse = self.lam * self._sse + e * e
+        self._sw = self.lam * self._sw + 1.0
+        self.n_samples += 1
+
+        return self.result()
+
+    def update_from_telemetry(
+        self,
+        thrust_normalized: float,
+        velocity_z_world: float,
+        accel_z_world: float,
+    ) -> CalibrationResult:
+        """Convenience hook for a live MAVLink loop.
+
+        A real offboard loop holds the last commanded normalized thrust and
+        a `TelemetryState` (NED velocity + IMU accel, both z-down). It can
+        feed this estimator every tick WITHOUT building a `CalibrationSample`:
+
+            cal = OnlineDroneCalibrator(k_t_init=ds.DEFAULT_MAX_THRUST_N / ds.DEFAULT_MASS_KG)
+            ...
+            telem = bridge.latest_telemetry          # TelemetryState (NED)
+            res = cal.update_from_telemetry(
+                thrust_normalized=last_cmd_thrust,    # the [0,1] you sent
+                velocity_z_world=telem.velocity_ned[2],
+                accel_z_world=telem.imu.accel[2],     # IMU z (NED, +down)
+            )
+            tracker.config.drag_ff_coeff = res.drag_per_mass   # feed roadmap #1 FF
+
+        Wiring this into `competition/aigp_mavlink.py`'s telemetry callback is
+        left for on-sim work (it needs the DCL binary to validate end-to-end
+        and a decision on excitation gating — a smooth racing line may under-
+        excite k_d, the same excitation caveat the report flags for online-G).
+        """
+        return self.update(
+            CalibrationSample(
+                thrust_normalized=float(thrust_normalized),
+                velocity_z_world=float(velocity_z_world),
+                accel_z_world=float(accel_z_world),
+            )
+        )
+
+    def result(self) -> CalibrationResult:
+        """Snapshot the current estimate as a `CalibrationResult` (no update)."""
+        return CalibrationResult(
+            thrust_per_mass=self.thrust_per_mass,
+            drag_per_mass=self.drag_per_mass,
+            n_samples=self.n_samples,
+            rmse=self.rmse,
+        )
