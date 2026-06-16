@@ -525,6 +525,9 @@ class RacePipeline:
             rs = getattr(self.interface, "race_status", None)
             if rs is not None and rs.race_finished:
                 return True
+            # iter-38: divergence guard tripped in the control callback.
+            if getattr(self, "_diverged", False):
+                return True
             # Do NOT stop on our geometric sequencer's is_complete — it can fire
             # a beat BEFORE the drone is fully through the last gate, cutting the
             # run off before the SIM credits the final crossing (cruise 3.5:
@@ -547,6 +550,9 @@ class RacePipeline:
         self._race_start_time = time.monotonic()
         self._race_start_sim_time_s: Optional[float] = None  # set on first telem tick
         self._ref_progress_time = 0.0
+        # iter-38: divergence-guard state (see _control_callback + _in_course_box).
+        self._diverged = False
+        self._diverged_ticks = 0
         self.sequencer.start()
 
         logger.info("Starting race...")
@@ -575,6 +581,31 @@ class RacePipeline:
 
         # 1. Update state estimation
         position, velocity, yaw = self._update_state_estimate(telem)
+
+        # 1b. DIVERGENCE / INSTABILITY GUARD (iter-38). Abort a run that has gone
+        # unstable (inner-loop limit cycle — sustained high gyro) or flown clean
+        # off the course box, before it logs more garbage telemetry or risks
+        # wedging the sim. _should_stop ends the run; we also hold a safe hover so
+        # the divergent command isn't sent. (See _GYRO_INSTABILITY_RADS etc.)
+        unstable = _gyro_unstable(telem.angular_velocity)
+        out_of_box = not _in_course_box(position)
+        if unstable or out_of_box:
+            self._diverged_ticks = getattr(self, "_diverged_ticks", 0) + 1
+            if self._diverged_ticks >= _GUARD_TRIP_TICKS and not self._diverged:
+                self._diverged = True
+                logger.error(
+                    "DIVERGENCE GUARD tripped after %d ticks (gyro_unstable=%s, "
+                    "out_of_box=%s, pos=(%.0f,%.0f,%.0f)) — aborting run to avoid "
+                    "garbage telemetry and a wedged sim.",
+                    self._diverged_ticks, unstable, out_of_box,
+                    *(float(c) if math.isfinite(float(c)) else float("nan")
+                      for c in position),
+                )
+        else:
+            self._diverged_ticks = 0
+        if getattr(self, "_diverged", False):
+            yaw_safe = yaw if math.isfinite(yaw) else math.pi
+            return AttitudeCommand(0.0, 0.0, yaw_safe, 0.27)  # safe hover; run ends
 
         # 2. Gate detection and PnP (if camera frame available).
         # ``detection_active`` distinguishes "detector looked but saw
@@ -1114,6 +1145,55 @@ def _gate_normal(yaw: float, pitch: float = 0.0) -> Tuple[float, float, float]:
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
     return (cy * cp, sy * cp, -sp)
+
+
+# iter-38: DIVERGENCE / INSTABILITY GUARD thresholds. Two independent signals,
+# both validated against live captures, feed one consecutive-tick counter; once
+# it reaches _GUARD_TRIP_TICKS the run aborts EARLY (writes its partial capture
+# and SIM_RESETs) so it cannot keep logging garbage telemetry or risk wedging the
+# sim into the stuck post-race state (DCGame mem balloons, SIM_RESET stops
+# returning the track map) that needs a GUI restart — the failure that blocked
+# iter-37.
+#
+# 1) INNER-LOOP INSTABILITY (the PRIMARY, validated signal): the iter-37
+#    vert_gain=2.0 divergence sustained gyro |w| >4 rad/s for ~14 ticks (max
+#    8.4), whereas EVERY clean run — and even a scrapey 84-collision run —
+#    stayed under 3 rad/s (max 2.2). So |w| > 4.0 for 10 consecutive ticks is a
+#    clean separator (no false positives observed) that catches a limit-cycle
+#    tumble. Non-finite gyro also counts (itself a divergence signal).
+# 2) OUT-OF-COURSE-BOX (a cheap secondary net for a true fly-away): real course
+#    is x[-162,0] y[-10,10] z[-1,27] (NED); these generous bounds only trip on a
+#    genuine fly-away (normal end-of-race stops on race_finished long before).
+_GYRO_INSTABILITY_RADS = 4.0
+_GUARD_TRIP_TICKS = 10
+_COURSE_BOX_NED = ((-175.0, 15.0), (-15.0, 15.0), (-10.0, 35.0))
+
+
+def _in_course_box(pos) -> bool:
+    """True if pos (NED x,y,z) is inside the generous course bounding box."""
+    try:
+        px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+    except (TypeError, IndexError, ValueError):
+        return False
+    (xlo, xhi), (ylo, yhi), (zlo, zhi) = _COURSE_BOX_NED
+    return (
+        math.isfinite(px) and math.isfinite(py) and math.isfinite(pz)
+        and xlo <= px <= xhi and ylo <= py <= yhi and zlo <= pz <= zhi
+    )
+
+
+def _gyro_unstable(gyro) -> bool:
+    """True if the body angular rate signals inner-loop instability — magnitude
+    above _GYRO_INSTABILITY_RADS, or non-finite (itself a divergence signal)."""
+    if gyro is None:
+        return False  # no gyro this tick: don't accuse (other signals still run)
+    try:
+        vals = [float(c) for c in gyro]
+    except (TypeError, ValueError):
+        return True
+    if not all(math.isfinite(v) for v in vals):
+        return True
+    return math.sqrt(sum(v * v for v in vals)) > _GYRO_INSTABILITY_RADS
 
 
 def _merge_triggers(
