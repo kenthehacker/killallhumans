@@ -141,6 +141,16 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         # (effective gain ~1.0, matching pitch's proven-safe ~1.05) with kd=0.4
         # to damp the now-faster roll loop; pitch/yaw unchanged (eff ~1.05,
         # already crisp+stable). Watch gyro p95 (<1.0 clean, abort >2.0).
+        # iter-44 TESTED LIVE & FALSIFIED — KEEP 1.0/0.4/0.8. To make the fast
+        # gate5 turn (achieved roll only 0.53x commanded), raising the ROLL loop
+        # to kp 1.3 / kd 0.55 / rate-clamp 1.1 made tracking WORSE, not better:
+        # achieved/cmd roll fell 0.53 -> 0.33, gyro p95 rose 1.0 -> 1.62, and it
+        # nearly clipped gate0 (0.049 m). The higher kp+clamp under-damped the
+        # cascade into oscillation (the 9 Hz limit cycle the kd term suppresses;
+        # the adversarial workflow predicted exactly this). The 0.53 roll
+        # attenuation is the sim's INHERENT behaviour — fighting it with gains
+        # destabilises. The fast-turn cap must be solved by reducing the REQUIRED
+        # turn (racing line / variable speed), not by more inner-loop bandwidth.
         self._att_rate_kp = (1.0, 0.5, 0.5)   # (roll, pitch, yaw)
         self._att_rate_kd = (0.4, 0.2, 0.2)
         self._att_rate_max = 0.8      # rad/s clamp per axis
@@ -653,7 +663,19 @@ def _attitude_error_body_rates(q_cur, q_des, omega=(0.0, 0.0, 0.0),
         2.0 * kpy * ey - kdy * omega[1],
         2.0 * kpz * ez - kdz * omega[2],
     )
-    return tuple(max(-max_rate, min(max_rate, r)) for r in rates)
+    # max_rate may be a scalar or a 3-tuple (per-axis). ROLL gets more rate
+    # headroom (iter-44): at a fast slalom/finish turn the roll command saturates
+    # the clamp and builds too slowly (~1 s to 0.8 rad), so achieved roll is only
+    # ~0.53x commanded -> under-turn -> over-command -> tumble (gate5 @ base 15.5,
+    # gyro 33). A higher ROLL clamp lets the bank build in time; pitch/yaw stay
+    # at the proven 0.8 (they were never the bottleneck).
+    mxx, mxy, mxz = (max_rate, max_rate, max_rate) if isinstance(
+        max_rate, (int, float)) else max_rate
+    return (
+        max(-mxx, min(mxx, rates[0])),
+        max(-mxy, min(mxy, rates[1])),
+        max(-mxz, min(mxz, rates[2])),
+    )
 
 
 def _default_telem() -> TelemetryState:

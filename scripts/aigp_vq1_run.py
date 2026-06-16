@@ -184,6 +184,7 @@ async def run_vq1(
     speed_brake: float = 0.0,
     speed_min_frac: float = 0.5,
     speed_descent_gain: float = 0.0,
+    arrival_radius: float = 8.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -283,6 +284,7 @@ async def run_vq1(
         minimal_speed_brake=speed_brake,
         minimal_speed_min_frac=speed_min_frac,
         minimal_speed_descent_gain=speed_descent_gain,
+        minimal_arrival_radius=arrival_radius,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -811,6 +813,15 @@ def main(argv=None) -> None:
              "max(turn_angle, gain*slope). Try ~1.5. With --speed-brake.",
     )
     parser.add_argument(
+        "--arrival-radius",
+        type=float,
+        default=8.0,
+        dest="arrival_radius",
+        help="Final-gate (gate5) approach-ramp radius (m). Larger brakes the "
+             "finish-gate approach earlier to bleed cross-track velocity and "
+             "stop the high-speed overshoot/tumble. Default 8. Try 12-16. --minimal.",
+    )
+    parser.add_argument(
         "--lat-lead",
         type=float,
         default=0.0,
@@ -852,6 +863,7 @@ def main(argv=None) -> None:
         speed_brake=args.speed_brake,
         speed_min_frac=args.speed_min_frac,
         speed_descent_gain=args.speed_descent_gain,
+        arrival_radius=args.arrival_radius,
         trajectory=args.trajectory,
     ))
 

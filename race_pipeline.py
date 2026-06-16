@@ -200,6 +200,12 @@ class PipelineConfig:
     # incoming leg's vertical SLOPE (|dz|/|dxy|) to the difficulty so descent-
     # heavy gates also brake. difficulty = max(turn_angle, descent_gain*slope).
     minimal_speed_descent_gain: float = 0.0  # >0 also brakes steep descents
+    # iter-44: final-gate arrival ramp radius (m). The drone OVERSHOOTS the
+    # finish gate5's Y at high speed (the only fast leg ends there) and tumbles
+    # on the roll-back. Braking gate5's approach from FARTHER out bleeds the
+    # cross-track velocity before the plane while the mid-leg still carries the
+    # peak. Default 8.0 (the controller's own default).
+    minimal_arrival_radius: float = 8.0
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -324,6 +330,7 @@ class RacePipeline:
         self.minimal_controller = MinimalController(
             MinimalControllerConfig(
                 cruise_speed=self.config.minimal_cruise_speed,
+                arrival_radius=self.config.minimal_arrival_radius,
                 max_tilt_rad=self.config.minimal_max_tilt_rad,
                 cross_gain=self.config.minimal_cross_gain,
                 kv=self.config.minimal_kv,
