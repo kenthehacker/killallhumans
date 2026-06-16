@@ -169,6 +169,31 @@ class PipelineConfig:
     # half-opening even at the near-level gate0. 0 = off. Swept live.
     minimal_lookahead_m: float = 0.0
     minimal_lookahead_band_m: float = 12.0
+    # iter-41 LATERAL LEAD (anti-undershoot, for high cruise). At the Y-staggered
+    # slalom gates the drone arrives SHORT in Y (cross-track tracking lag + turn
+    # authority): undershoot grows 0.34 m @ cruise 9 -> 0.55 m @ cruise 10.5,
+    # where it eats the frame clearance (0.04 m, clip+tumble) and caps speed.
+    # When >0, aim the Y PAST the gate by up to this many metres IN THE SLALOM
+    # TRAVEL DIRECTION (sign of prev-gate -> this-gate Y change), ramped in over
+    # the last ``minimal_lookahead_band_m`` metres, so the undershooting drone
+    # arrives centred. Bounded (stays in the 0.75 m half-opening). This is the
+    # OPPOSITE of a next-gate lookahead (which worsens undershoot by pulling Y
+    # toward the next, opposite-side gate). Swept live; 0 = off.
+    minimal_lat_lead_m: float = 0.0
+    # iter-42 VARIABLE SPEED (turn/descent-aware profile). The binding constraint
+    # at high cruise is the SPEED-DEPENDENT VERTICAL LAG (drone arrives above the
+    # opening; at cruise 10 gates 1/2/4 are vertical-bound, clearance 0.14-0.29 m)
+    # plus the lateral undershoot — both shrink if the drone is SLOWER through the
+    # hard gates. So fly a fast BASE (minimal_cruise_speed = peak/straight speed)
+    # and BRAKE approaching the geometrically-tight gates: leg cruise =
+    # base * clip(1 - speed_brake * turn_angle, speed_min_frac, 1), where
+    # turn_angle is the 3D direction change (incoming vs outgoing leg) at the
+    # TARGET gate — large for steep-descent + Y-reversal gates (g2->g3->g4), ~0
+    # for the near-collinear legs (which keep full speed for the peak-velocity
+    # target). 0 = off (constant cruise). Decouples peak speed from the slalom
+    # turn limit — the user-endorsed unlock. Swept live.
+    minimal_speed_brake: float = 0.0      # 1/rad; >0 enables variable speed
+    minimal_speed_min_frac: float = 0.5   # floor on the braked cruise fraction
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -720,6 +745,28 @@ class RacePipeline:
             # crosses the plane off-centre -> frame collisions + the sequencer
             # crediting an off-centre/early pass, as in min_v9). The sequencer
             # advances on the clean plane crossing.
+            # iter-42: VARIABLE SPEED — brake into the geometrically-tight gates
+            # (steep descent / Y-reversal) where the vertical lag + lateral
+            # undershoot bind, while the near-collinear legs keep full base speed
+            # for the peak-velocity target. Mutate the controller's cruise for
+            # this leg (recomputed every tick; the kv loop smooths transitions).
+            if self.config.minimal_speed_brake > 0.0:
+                base = self.config.minimal_cruise_speed
+                idx = getattr(gate, "sequence_index", 0)
+                theta = 0.0
+                if 0 < idx < len(self._gate_specs):
+                    p_prev = np.array(self._gate_specs[idx - 1].position, dtype=float)
+                    p_cur = np.array(gate.position, dtype=float)
+                    inc = p_cur - p_prev
+                    nxt = (np.array(self._gate_specs[idx + 1].position, dtype=float) - p_cur
+                           if idx + 1 < len(self._gate_specs) else inc)
+                    ni, nn = np.linalg.norm(inc), np.linalg.norm(nxt)
+                    if ni > 1e-6 and nn > 1e-6:
+                        cosang = float(np.clip(np.dot(inc, nxt) / (ni * nn), -1.0, 1.0))
+                        theta = math.acos(cosang)
+                factor = max(self.config.minimal_speed_min_frac,
+                             min(1.0, 1.0 - self.config.minimal_speed_brake * theta))
+                self.minimal_controller.cfg.cruise_speed = base * factor
             cur = np.array(gate.position, dtype=float)
             normal = np.array(_gate_normal(gate.yaw, gate.pitch), dtype=float)
             # Orient the normal in the direction of travel (away from the drone).
@@ -749,6 +796,19 @@ class RacePipeline:
                     ramp = max(0.0, min(1.0, 1.0 - d_cur / band))
                     # descend only (next gate lower => nxt_z > aim[2]), bounded.
                     aim[2] += min(look_m, max(0.0, nxt_z - aim[2])) * ramp
+            # iter-41: lateral lead — aim PAST the gate's Y in the slalom travel
+            # direction so the undershooting drone arrives centred (anti-
+            # undershoot for high cruise). Bounded; ramped near the gate.
+            lead_m = self.config.minimal_lat_lead_m
+            if lead_m > 0.0 and getattr(gate, "sequence_index", 0) > 0:
+                prev = self._gate_specs[gate.sequence_index - 1]
+                d_y = cur[1] - float(prev.position[1])
+                if abs(d_y) > 1e-3:
+                    d_cur = float(np.linalg.norm(
+                        cur - np.array(position, dtype=float)))
+                    band = max(1e-3, self.config.minimal_lookahead_band_m)
+                    ramp = max(0.0, min(1.0, 1.0 - d_cur / band))
+                    aim[1] += lead_m * (1.0 if d_y > 0 else -1.0) * ramp
             return self.minimal_controller.compute(
                 position, velocity, yaw, tuple(aim), is_final_gate=False,
             )
