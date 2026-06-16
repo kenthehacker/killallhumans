@@ -67,13 +67,28 @@ aigp_default, while preventing one outlier sample from doubling lap
 time. Drone-spec constant (not course-specific) so the cap is uniform
 across tracks."""
 
-DEFAULT_ACCEL_PROJECTION_MIN_SEG_TIME_S: float = 0.15
+DEFAULT_ACCEL_PROJECTION_MIN_SEG_TIME_S: float = 0.05
 """Below this segment time, the iter-032 projection skips the segment
 even if it's over budget. Avoids fighting the 0.1 s minimum-segment
 floor in `_optimize_time_allocation` and prevents pathological
-oscillation when a sub-0.15 s segment carries a single boundary spike
+oscillation when a sub-floor segment carries a single boundary spike
 that the projection's interior-sampling can't distinguish from a real
-peak."""
+peak.
+
+Lowered 0.15 → 0.05 (live-sim iter, 2026-06-13): the ~0.10 s
+through-gate (entry→exit) segments were being skipped, and that is
+exactly where the polynomial-peak accel lives. The geometric/min-snap
+curvature mismatch at each gate kink produced 85-109 m/s² interior
+peaks (Blocker 11) that this projection MEASURED but then declined to
+repair, so every replan emitted an infeasible reference and the drone
+went off-track on the real AIGP simulator (0/6 gates, repeated
+`off_track` replans). At 0.05 s the through-gate segments (~0.10 s) are
+inflated like any other; the only sub-0.15 s segments on the VQ1 course
+are these through-gate ones, and their interior peaks respond cleanly
+to 1/T² stretching (no oscillation — verified offline: peak 86→18 m/s²,
+total 26.5→34.6 s). Race time is recoverable later; a feasible 34.6 s
+trajectory the drone can track beats an infeasible 26.5 s one it
+cannot."""
 
 DEFAULT_MAX_VELOCITY_MPS: float = 15.0
 """Maximum linear velocity the bench's tracker clamps to.
@@ -93,11 +108,27 @@ DEFAULT_MASS_KG: float = 1.0
 AIGP-class drones are heavier (~600-900 g for 280mm chassis, with
 batteries). Source: scripts/benchmark.py:159 and TrackerConfig."""
 
-DEFAULT_MAX_THRUST_N: float = 20.0
-"""Maximum collective thrust the tracker can command. 20 N at 1 kg =
-~2g lift envelope. Source: TrackerConfig.max_thrust_n. NOT used by
-the kinematic bench (which is force/acceleration-saturated, not
-thrust-modelled)."""
+DEFAULT_MAX_THRUST_N: float = 42.0
+"""Maximum collective thrust the tracker can command, in Newtons.
+
+CALIBRATED against the live AIGP simulator on 2026-06-13 (was 20.0, an
+uncalibrated PyBullet-fit placeholder). A controlled open-loop bench
+(`scripts/aigp_bench.py`) held level SET_ATTITUDE_TARGET setpoints and
+measured the resulting vertical acceleration `a_z = g - T*Fmax/m`:
+
+    cmd thrust 0.40 -> climb 7.7 m/s^2  -> Fmax ~44 N
+    cmd thrust 0.50 -> climb 11.5 m/s^2 -> Fmax ~43 N
+    cmd thrust 0.60 -> climb 14.9 m/s^2 -> Fmax ~41 N
+    cmd thrust 0.70 -> climb 17.4 m/s^2 -> Fmax ~39 N
+
+i.e. the true envelope is ~42 N (~4.3g at 1 kg), so the real hover
+throttle is m*g/Fmax ~= 0.23, NOT the 0.49 the old 20 N implied. With
+the placeholder the pipeline commanded ~2x the thrust needed and the
+drone climbed away violently on every run (0/6 gates on the live sim).
+
+NOT used by the kinematic bench (`scripts/sim_closed_loop.py` hardcodes
+its own 20.0 and is force-saturated, so it stays self-consistent and its
+regression tests are unaffected by this change)."""
 
 DEFAULT_LINEAR_DRAG_PER_MASS: float = 0.5
 """Linear drag coefficient applied to velocity in the synthetic kinematic

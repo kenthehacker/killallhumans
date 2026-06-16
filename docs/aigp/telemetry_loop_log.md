@@ -444,3 +444,391 @@ together with the recovery stack. The audit's EKF-divergence concerns bite in
 **Improvement:** harness gained a faithful `use_ekf` mode (IMU specific force +
 odometry + sim-time stamps); new `test_completes_with_ekf_enabled` regression.
 Closed-loop suite now 6 cases, all pass (26 s).
+
+---
+
+## Iterations 21-30 (2026-06-13, continuous session) — ROOT-CAUSED the instability; drone now flies
+
+**Mandate restated:** code was written for PyBullet before the real sim; be
+skeptical of all prior "fixes". Test ONLY on the live AIGP sim (offline/harness
+forbidden). Reset the drone every run (stale flight muddies telemetry).
+
+### The P0 minimal controller (new): `control/minimal_controller.py`
+Bypasses the ENTIRE min-snap/racing/replan/should_slow_down stack. Pure-pursuit:
+v_des = cruise*unit(aim - pos); accel = kv*(v_des - vel); horizontal accel
+clamped to g*tan(max_tilt); roll/pitch from NED thrust vector; yaw held at pi.
+Wired via `PipelineConfig.minimal_control` + `scripts/aigp_vq1_run.py --minimal`.
+Uses RAW telemetry (`use_ekf=False` for minimal) — the EKF diverged to NaN ~1s
+in and silently blinded the controller (it fell to a fixed hover and climbed
+away). Robust to non-finite telemetry (hover fallback) so a bad tick can't crash
+the adapter.
+
+### ROOT CAUSES found (all via the live bench `scripts/aigp_bench.py`, reset/phase):
+1. **Inner attitude->rate loop was an unstable ~9Hz limit cycle.** Old gains
+   (kp=2.0,kd=2.5,max=1.0) limit-cycled (gyro p95 4.5) and the jitter rectified
+   thrust into a runaway CLIMB — this, not the trajectory, was the flight
+   failure. Pure ZERO body-rate is perfectly clean (gyro~0). FIX: cut gains to
+   **kp=0.5,kd=0.2,max_rate=0.5** (`competition/aigp_mavlink.py`). Two Opus
+   reviews + bench converged on "gain limit cycle from the ~2.5x sim rate
+   amplification", NOT a sign error on damping.
+2. **Real hover throttle ~0.26-0.27** (not 0.20/0.234). max_thrust_n 42->**37**
+   in MinimalControllerConfig.
+3. **PITCH axis of the inner loop was POSITIVE FEEDBACK.** Commanded pitch -0.5
+   drove measured pitch the WRONG way; in flight pitch -0.62 diverged to +1.5
+   (inverts, then yaw re-charts pi->0 via euler singularity, then climb runaway).
+   FIX: per-axis `_rate_sign = (-1, +1, -1)` — flip PITCH only (roll tracked
+   correctly with -1; bench: roll+0.3 -> measured +0.26). This made X/pitch
+   stable: yaw rock-steady at pi for 95s.
+4. **ROLL extraction direction inverted vs the sim.** Sim does +roll -> +Y at
+   yaw=pi (bench), but the standard NED extraction assumes +roll -> -Y, so the
+   controller fed the Y drift (slid off +Y at constant speed). FIX: negate roll
+   in `minimal_controller` extraction (inner roll loop is fine; this is an outer
+   sign).
+
+### RESULT: stable, accurate flight (HUGE milestone)
+After 1-4: hover hold is rock-solid (20s, 0 drift). The drone flies STRAIGHT and
+STABLE to gate0's centre at cruise 1.5 (e.g. min_v8/min_v10: reached
+(-23.1,-0.34,-0.04) ~= gate0 (-23.3,-0.4,-0.03), yaw steady at pi). The core
+instability (immediate flip / climb / divergence) is SOLVED.
+
+### Gate passing — partially solved, 2 open issues
+- **Aim BEYOND the gate along its NORMAL** (`race_pipeline` minimal branch) so
+  it flies THROUGH instead of parking (parking -> frame collisions + false/early
+  sequencer pass). 
+- **The opening is ~0.86m ABOVE gate.position (NED -z).** Flying at gate.position
+  hit the bottom bar (128 collisions, stuck 0.2m short of the plane). Aiming
+  `--aim-z -1.0` -> **0 collisions** and the drone crossed gate0's plane cleanly.
+  So gate.position is NOT the opening centre vertically — there is a vertical
+  offset to characterise (and apply to BOTH the aim AND the sequencer's opening
+  check, which still assumes gate.position is the centre -> it credits a miss/DQ
+  when the drone crosses at the real opening height).
+- **best gate count so far: 2/6** (min_v9, but off-centre; the SIM's own count
+  was 0 — our sequencer over-credited). Need clean centre passes that the SIM
+  counts.
+
+### CRITICAL RELIABILITY BUG discovered
+**The SIM_RESET track-data transfer INTERMITTENTLY returns GARBAGE gate
+positions.** min_v13 chased an aim of (-922, 6.85, 576) because
+`current_gate.position` was ~(-918, 6.85, 577) instead of (-23.3,-0.4,-0.03) —
+the run before (min_v12) had correct gates. So some "divergent" runs are
+garbage-gate runs, not control failures. **Next: add a gate-position sanity
+guard at configure (bounds-check / re-fetch the track on garbage) so runs are
+trustworthy.**
+
+### NEXT STEPS (priority)
+1. Gate-data sanity guard + re-fetch (the corruption invalidates runs silently).
+2. Characterise the vertical opening offset (sweep --aim-z; find where the SIM
+   credits the pass) and apply it to gate.position for aim AND sequencer.
+3. Once gate0 passes cleanly + SIM-credited, run the full 6-gate course; then
+   raise cruise toward the <10s/gate target.
+4. Decide yaw _rate_sign (currently -1, never excited; revisit if yaw drifts).
+
+Files changed this session: `control/minimal_controller.py` (new),
+`competition/aigp_mavlink.py` (inner-loop gains + per-axis _rate_sign),
+`race_pipeline.py` (PipelineConfig minimal_* fields, minimal control branch,
+configure skip-trajectory), `scripts/aigp_vq1_run.py` (--minimal/--cruise-speed/
+--max-tilt/--aim-z, reset-and-settle, dump-on-crash, dbg logging),
+`scripts/aigp_bench.py` (hover sweep, per-axis rate ID, mask-7 retest, PD sweep).
+
+### Update (same session): 2/6 gates, gate-guard live
+- Baked the ~0.85m vertical opening offset into the gate map (runner, after the
+  sanity check) so the AIM and the SEQUENCER both use the real opening centre.
+  Result (min_v15): **gate 0 AND gate 1 pass cleanly (2/6)**, drone tracks the
+  gate line exactly (-23.4, -46.9).
+- Gate-map sanity guard (`_gate_map_is_sane` + reset/re-fetch) is working — it
+  caught two corrupt maps this session (gates at ~-1400 and ~-2680) and
+  recovered to the correct course.
+- REMAINING blocker to 6/6: the pure-pursuit DESCENT LAGS the horizontal on the
+  steeper descending legs, so the drone arrives ~1 m too high at gate 2
+  (z=11.7 vs opening ~12.8) and oscillates without passing. Next: decouple the
+  vertical channel in `minimal_controller` (track a desired vertical velocity to
+  close the z-gap independent of horizontal cruise), or slow horizontal cruise
+  when the altitude error is large. Then full 6/6, then raise cruise toward the
+  <10s/gate target.
+
+### *** 6/6 GATES — full course complete, 0 collisions (min_v17) ***
+Decoupled the vertical channel in `minimal_controller.desired_velocity`
+(horizontal pure-pursuit at cruise + INDEPENDENT vertical-velocity tracking of
+the altitude error, `vert_gain=1.0`, `max_vert_speed=2.0`) — this fixed the
+descent lag. At cruise 1.5 -> 5/6 (ran out of time at gate5). At **cruise 2.5
+-> 6/6 in 66.9s, 0 collisions**, "All gates passed! Race complete." Gates at
+t=9.8/19.4/30.8/46.0/55.9/65.6s (~10-15s/gate). The whole-stack fix chain:
+inner-loop gains (kill 9Hz limit cycle) + pitch _rate_sign +1 (was positive
+feedback) + roll extraction negate + EKF bypass (raw telem) + hover cal 37N +
+fly-through aim along gate normal + vertical opening offset baked into the gate
+map (aim+sequencer) + gate-map sanity guard + decoupled vertical descent.
+
+CAVEAT TO VERIFY NEXT: `competition.session` printed the SIM's race_status as
+"0 gates" while our geometric sequencer credits 6/6 with 0 collisions and exact
+gate-line tracking. Confirm the SIM officially credits these passes (the drone
+clearly flew through every opening) — check race_status / active_gate_index
+parsing; if the sim wants a different trigger, align to it.
+
+NEXT: (1) verify sim-credited passes; (2) raise cruise toward <10 s/gate
+(currently ~11s/gate avg) — the controller is stable, so push speed and re-tune
+max_tilt/gains as needed; (3) tighten centering (still ~80 collisions at cruise
+1.5, 0 at 2.5 — interesting; characterise).
+
+### *** SPEED SWEEP — 6.45 s/gate clean (cruise 4.5), sim-credited ***
+Optimizations (2 Opus reviews): through_dist 4->2 (halve geometric crossing
+offset), inner-loop max_rate 0.5->0.8 (attitude bandwidth, no limit cycle),
+max_vert_speed 2->3, and — key — make the SIM's race_finished the SOLE
+completion authority (stop on it, not our geometric is_complete which can lead
+the sim and cut the run before the drone is through the last gate; keep flying
+THROUGH the last gate until the sim credits it).
+
+SIM-credited (race_finished=True) results, full 6-gate course:
+| cruise m/s | total s | s/gate | collisions | gyro p95/max | max gate offset |
+|---|---|---|---|---|---|
+| 3.0 | 55.3 | 9.2 | 0 | 0.14/0.72 | 0.31 |
+| 3.5 | 48.9 | 8.15 | 0 | 0.21/0.82 | 0.25 |
+| 4.0 | 42.4 | 7.07 | 0 | 0.27/0.85 | 0.27 |
+| 4.5 | 38.7 | 6.45 | 0 | 0.37/0.88 | 0.48 |
+| 5.0 | 35.5 | 5.9  | 2 | 0.46/16.2 | 0.48 |
+
+**Clean limit = cruise 4.5 (6.45 s/gate, 0 collisions).** At 5.0 the centering at
+the later/faster descending gates degrades past the frame margin -> 2 collisions
++ a gyro spike (16 rad/s, a frame-clip kick). The crossing offset is mostly
+cross-track (Y); vertical is nailed by the decoupled descent. NEXT lever to go
+faster cleanly: a cross-track / centerline-tracking term (reviewer B fix 2) to
+tighten the offset, and/or inner-loop kp 0.5->0.7 (reviewer A) for crisper
+tracking. Recommended stable race config TODAY: `--minimal --cruise-speed 4.5
+--max-tilt 0.62 --aim-z -0.85`.
+
+### *** PER-AXIS ROLL GAIN -> 4.6 s/gate (cruise 6.5), sim-credited, 0 collisions ***
+Two Opus reviews both isolated the ROLL axis as the high-speed limiter: the sim
+amplifies pitch/yaw ~2.1x but roll only ~1.0x, so a uniform inner-loop kp=0.5
+left roll at HALF the closed-loop bandwidth of pitch (roll under-tracked 0.46x
+amplitude, ~0.6s lag) -> the cross-track centering oscillated and clipped frames
+at cruise >=5. FIX: PER-AXIS inner-loop gains in `_attitude_error_body_rates`
+(now accepts scalar or 3-tuple kp/kd) -> roll kp 0.5->1.0, kd 0.2->0.4 (effective
+gain ~1.0, matching pitch's proven-safe ~1.05); pitch/yaw unchanged. This killed
+the 16 rad/s frame-clip spike and roughly HALVED the high-speed gate offsets.
+
+Full SIM-credited (race_finished=True) speed sweep, 0 collisions unless noted:
+| cruise | s/gate | gyro p95/max | max gate offset | note |
+|---|---|---|---|---|
+| 4.5 | 6.45 | 0.37/0.88 | 0.48 | pre roll-fix |
+| 5.0 | 5.86 | 0.45/1.52 | 0.27 | roll-fix (was 2 collisions pre-fix) |
+| 5.5 | 5.37 | 0.50/1.60 | 0.35 | |
+| 6.0 | 5.00 | 0.53/1.68 | 0.44 | RECOMMENDED (margin) |
+| 6.5 | 4.60 | 0.57/1.86 | 0.48 | clean edge (gyro near 2.0 abort) |
+
+**RECOMMENDED RACE CONFIG: `--minimal --cruise-speed 6.0 --max-tilt 0.62
+--aim-z -0.85` = 5.0 s/gate (30s course), 0 collisions, comfortable margins.**
+Aggressive: cruise 6.5 = 4.6 s/gate (at the centering/gyro edge).
+
+NEXT LEVERS to push past 6.5 cleanly (diminishing returns): (1) reviewer A's
+cross-track / centerline term in `minimal_controller.desired_velocity`
+(along-track along the gate normal + a capped perpendicular pull, kc~1.0,
+max_cross_speed~1.5; needs the gate normal threaded into compute) to tighten the
+gate-4/5 offset; (2) further inner-loop headroom if gyro p95 becomes the limit.
+We went 0/6 (flipping) -> 6/6 sim-credited @ 4.6 s/gate, 0 collisions this session.
+
+### *** CRUISE SWEEP (roadmap #1+#2) -> 4.09 s/gate, sim-credited ***
+A 5-dimension workflow (each finding adversarially verified) deflated the
+speculative levers and ranked the cruise sweep as the proven #1. Executed it:
+| cruise | course s | s/gate | gyro MAX | worst gate offset (margin) | sim-credited |
+|---|---|---|---|---|---|
+| 6.5 | 27.8 | 4.6  | 1.86 | 0.48 (0.27) | yes |
+| 6.8 | 26.7 | 4.44 | 2.02 | 0.50 (0.25) | yes |
+| 7.0 | 26.0 | 4.33 | 1.56 | 0.50 (0.25) | yes |
+| 7.5 | 24.6 | 4.09 | 1.67 | 0.59 (0.16) | yes |
+(gyro MAX is stochastic gate-transition transients, not monotonic in speed.)
+
+**RECOMMENDED RACE CONFIG: `--minimal --cruise-speed 7.0 --max-tilt 0.62
+--aim-z -0.85` = ~26.0 s (4.33 s/gate), comfortable centering margin (0.25m).**
+Aggressive: cruise 7.5 = 24.6 s (4.09 s/gate) but gate-2 margin only 0.16m
+(repeatability risk). The BINDING CONSTRAINT is now CENTERING (cross-track
+UNDERSHOOT/lag, not oscillation — verified): worst gate offset grows
+0.48->0.59 over cruise 6.5->7.5 vs the 0.75m half-opening. NEXT LEVER (roadmap
+#4) to push past 7.5: a cross-track centerline term (or anticipatory aim toward
+the next gate's Y) in minimal_controller.desired_velocity to cut the undershoot
+lag — A/B at the SAME cruise first; watch lateral-accel-clamp fraction + gyro
+MAX. NOT worth: variable speed profile / kv (startup is accel-saturation
+limited, 75/101 startup frames pinned on the 7.0 m/s2 clamp). Journey: 0/6
+flipping -> 6/6 sim-credited @ 4.09 s/gate, 0 collisions.
+
+### iter-34: cross-track centering term (roadmap #4) — TESTED, NEGATIVE RESULT
+Implemented the verified roadmap's last lever: a decoupled horizontal law
+(X=along-track cruise, Y=capped high-gain convergence) behind a `cross_gain`
+flag (default 0 = pure pursuit). A/B at the SAME cruise 7.0 (vs pure-pursuit
+baseline: 0 collisions, gyro MAX 1.56, worst offset 0.50):
+- cross_gain 1.5 -> 3 collisions, gyro MAX 2.22 (over abort line), lateral-accel
+  clamp 22% (was ~3%), gate1 OVERSHOT to 0.70.
+- cross_gain 0.5 -> 14 collisions, gyro spike 38 rad/s, offsets 0.86/0.73.
+Root cause: decoupling loses pure pursuit's natural cross-track DECELERATION, so
+the Y converges then OVERSHOOTS (bandwidth without damping) and clips frames —
+exactly what the workflow's adversarial verifier predicted. Left OFF by default
+(cross_gain=0); pure pursuit is the clean law. **The cross-track lever is
+exhausted.**
+
+CONCLUSION: we are at the practical optimum for this controller architecture.
+Fastest clean = cruise 7.0 (26.0s / 4.33 s/gate) reliable, 7.5 (24.6s / 4.09)
+aggressive. Going meaningfully faster would need a fundamentally different
+approach (a smooth trajectory / racing line with DAMPED cross-track tracking),
+which reintroduces the min-snap complexity we stripped out — diminishing returns
+vs the (crushed) <10 s/gate goal. NEXT highest-value work is REPEATABILITY
+validation (all results are single runs; gyro MAX and offsets vary run-to-run),
+not chasing more tenths.
+
+### iter-35: re-enable the TRAJECTORY STACK (racing-line + GeometricTracker) — implemented + reviewed, LIVE A/B PENDING (sim out of VQ mode)
+User direction: stop iterating the pure-pursuit optimum; test the principled
+alternative — a smooth racing-line trajectory flown with DAMPED feedforward
+tracking (the thing the failed hand-rolled cross_gain term couldn't do) — and
+A/B it live vs minimal cruise-7.0.
+
+IMPLEMENTED a clean `--trajectory` mode (race_pipeline.PipelineConfig.trajectory_race):
+flies the precomputed min-snap trajectory with control/mpc_tracker.GeometricTracker
+on RAW telemetry, BYPASSING replan/state-predictor/should_slow_down (apples-to-
+apples: only the controller differs from minimal). The tracker routes through the
+SAME fixed body-rate inner loop (send_attitude mask 128). Key correctness work —
+the GeometricTracker's attitude extraction is BYTE-IDENTICAL to the minimal
+controller's EXCEPT minimal adds `roll=-roll` (live-sim convention) and holds
+yaw=pi; so the tracker now has `sim_roll_sign=-1` + the trajectory path pins
+ref.yaw=pi. Tracker also given the calibrated 37 N thrust (not 42) + tilt clamp
+0.62. Optimizer constrained to the REAL envelope.
+
+TWO Opus-4.8 reviewers (correctness + tuning), fixes applied:
+- (correctness BLOCKER, fixed) GeometricTracker had NO non-finite guard; on raw
+  telem a single NaN would crash the run ("thrust must be finite"). Added input+
+  output hover guards to the trajectory_race branch (mirrors minimal).
+- (correctness RISK, fixed) tracker clamps tilt ANGLE not lateral ACCEL, so the
+  ~17 m/s2 min-snap kink peaks would use the unclamped thrust magnitude ->
+  realized-accel overshoot + a spurious CLIMB transient at every kink. Added an
+  optional `TrackerConfig.max_lateral_accel` (clamps accel_des[:2] BEFORE thrust
+  extraction, like minimal); set to g*tan(0.62)=7.0 for the live sim. Now
+  "plan-smooth/clamp-safe" actually caps at the envelope.
+- (tuning) 7.5 m/s2 PLANNING budget made _project_accel_peaks over-stretch every
+  through-gate segment -> 35.7s (slower than minimal's 26s). NOT inflation
+  (helix/proximity/climb don't fire on this descending slalom; S-turn only
+  3-4%). Raised planning budget to 15 -> 27.6s, kink peaks clamped at tracker.
+- (tuning) Raising entry_exit_offset is WRONG here (min-snap corner-cuts the
+  entry/exit chord -> reference leaves gate center: 0.4m->17cm, 2.5m->112cm).
+  Kept ee=0.4. The real centering lever was RacingLineOptimizer's
+  max_lateral_offset=0.6 (=0.45m fixed offset on every 1.5m gate); dropped to
+  0.15 (~0.11m) -> worst-gate reference offset 45cm->13cm at ~no time cost.
+
+VALIDATED OFFLINE (dry-run): trajectory 27.6s / 2759 pts, residual interior peak
+22.5 m/s2 (clamped to ~7 at the tracker). Expected live: ~13cm gate centering vs
+minimal's 0.48-0.59m undershoot — the hypothesis. Run-1 config:
+  --trajectory --max-speed 10 --aim-z -0.85   (A/B vs --minimal --cruise-speed 7.0)
+
+BLOCKER: the live AIGP sim is out of Virtual Qualifier mode — MAVLink heartbeat
++ telemetry flow on 14550 but SIM_RESET returns NO track map across retries
+(connect() fails at "AIGP track data not received after SIM_RESET"). DCGame is
+responding, memory normal (~249MB), no zombie python / port holder — classic
+wedged post-race state. Cannot re-enter VQ mode over MAVLink; needs the sim
+restarted into Virtual Qualifier in the GUI. Implementation is ready; run the
+live A/B the moment VQ mode is restored.
+
+---
+
+## Iteration 36 (2026-06-15) — trajectory-mode FALSIFIED live; kv lever FALSIFIED live; binding constraint re-diagnosed
+
+Fresh 75-iteration budget (user-granted). Sim restarted into VQ mode. All runs
+below are LIVE, each with the runner's built-in fresh SIM_RESET + settle.
+
+**Baseline re-confirmed (minimal cruise 7.0, --max-tilt 0.62 --aim-z -0.85):**
+6/6 SIM-credited (race_finished=True), 0 collisions, 26.26 s (4.38 s/gate),
+worst plane-cross lat(Y) 0.47 m (gate4). gyro p95 0.65 / max 2.04. Controller
+healthy on the restarted sim. (Our geometric sequencer credits 5–6/6 run to run;
+the SIM is authoritative.)
+
+**Trajectory-race mode (iter-35's pending A/B) — FALSIFIED.** `--trajectory
+--max-speed 10 --aim-z -0.85`: 1/6 gates, **2 collisions**, stopped 10.35 s. The
+min-snap reference is INFEASIBLE (residual peak 27.5 m/s² vs the drone's ~7 m/s²
+real lateral limit), so the damped GeometricTracker clamps + lags badly (overall
+cross-track avg 0.99 m) and clips the gate-1 frame. The iter-35 hypothesis
+(racing-line → 13 cm centering) is dead: the offline 13 cm reference offset is
+meaningless when the drone physically can't track the reference. Racing-line /
+min-snap is a dead end for this drone+course; pure-pursuit is the law.
+
+**kv (velocity-tracking gain) lever — FALSIFIED.** A 4-agent workflow (control /
+adversarial / alternatives + synthesis, all grounded in the capture) recommended
+sweeping kv 3.0→4.5. Live sweep (cruise 7.0, fresh resets):
+
+| kv | worst lat(Y) | gate2 | gate4 | clamp% | gyro max |
+|----|------|------|------|------|------|
+| 3.0 | 0.47 | -0.34 | -0.47 | 3.5 | 2.04 |
+| 3.5 | 0.54 | -0.30 | -0.54 | 8.9 | 1.51 |
+| 4.0 | 0.56 | -0.29 | -0.53 | 11.7 | 1.51 |
+
+kv IMPROVES the non-saturated gate (gate2 monotonically better) but WORSENS the
+binding/saturated gates (gate4/5); worst-case lat(Y) rises monotonically and
+clamp engagement climbs. **Root cause (live-confirmed): the worst gates are
+tilt-SATURATED at the gate-flip (cmd_roll pinned 94–100% even at kv=3.0) and
+suffer a ~2× inner-loop roll attenuation (measured_roll/cmd_roll≈0.45–0.57), so
+they are lateral-AUTHORITY-limited, not kv-limited.** kv only feeds the
+discontinuous v_des flip step → more saturation. kv default stays 3.0.
+
+**Also falsified:** anticipatory aim toward the next gate (HARMFUL on this slalom
+— next gate is always the opposite Y side → corner-cutting); raising
+max_lateral_accel alone (the clamp is 0% engaged in the steady approach window).
+
+**Delivered:** `--kv` CLI knob (default 3.0); coupled `max_lateral_accel =
+g·tan(max_tilt)` in the minimal config so `--max-tilt` is no longer a no-op
+(it was clamped at 7.0 first → 0.62 rad regardless); new comparator
+`scripts/iter36_compare.py` (per-gate plane-cross lat/vert decomposition, gyro,
+clamp, per-flip windows) — and per user request, **FRAME CLEARANCE**
+(0.75 − max(|lat|,|vert|)) = the "how close to crashing" margin.
+
+---
+
+## Iteration 37 (2026-06-15) — VERTICAL channel unlocks speed; cruise 8.0 reliable @ 3.85 s/gate
+
+With centering levers exhausted, pushed CRUISE directly (sim collisions + frame
+clearance = ground truth). The frame-clearance metric immediately re-diagnosed
+the binding constraint at speed: it is the **VERTICAL channel**, not lateral.
+(Course is DESCENDING — NED z increases gate0→gate5 — so at speed the drone
+arrives ~0.6–0.7 m ABOVE each opening, skimming the TOP bar.)
+
+| cruise | mvs | s/gate | collisions | worst frame clearance | gyro max | verdict |
+|----|----|------|------|------|------|------|
+| 7.0 | 3.0 | 4.33 | 0 | 0.28 m | 2.04 | prior baseline |
+| 8.0 | 3.0 | 3.87 | 0 | **0.11 m** (gate2 vert) | 2.12 | vertical lag → unsafe |
+| **8.0** | **5.0** | **3.85** | **0 (3/3)** | **0.42 m** | 1.74 | ✅ RELIABLE — new config |
+| 8.5 | 5.5 | 3.66 | 0 (2/2) | 0.35 m | 2.03 | aggressive (3rd run blocked by wedge) |
+| 9.0 | 6.0 | 3.50 | **0 then 84** | 0.23 m | 2.19 | ❌ collision COIN-FLIP |
+| 10.0 | 8.0 | 3.20 | 0 | **0.006 m** | 2.18 | ❌ razor-thin |
+| 10.0 | 8.0 + **vert_gain 2.0** | — | **128** | diverged | **8.45** | ❌ vert_gain destabilises |
+
+**Key findings (all live):**
+1. **The vertical CAP (`max_vert_speed`) is the speed lever, not lateral.** At
+   cruise 8.0 the descent lagged (gate2 clearance 0.11 m); raising mvs 3.0→5.0
+   restored 0.42 m and made cruise 8.0 reliably 0-collision (3/3). Default mvs
+   bumped 3.0→**5.0** (`control/minimal_controller.py`).
+2. **Only the vertical CAP is safe to raise — NOT the vertical GAIN.** vert_gain
+   2.0 → gyro 8.45 limit cycle, 128 collisions, divergence (aggressive vertical
+   accel swings the thrust vector → roll extraction atan2(zy_h,−z_b[2]) blows up
+   as −z_b[2] shrinks). Keep vert_gain=1.0.
+3. **Collisions are decoupled from my plane-cross clearance below ~0.25 m.**
+   Cruise 9.0 logged 0 collisions on run 1 and **84 on run 2 with near-identical
+   trajectories** (both min-clearance ~0.23 m, zero ticks <0.15 m). At ~0.23 m
+   center-clearance the drone's finite body + cm-level sim non-determinism flip
+   between clean and scrape. **Reliable 0-collision needs worst frame clearance
+   ≳0.35–0.4 m** → cruise 8.0 (0.42 m) is the safe sweet spot; 8.5 (0.35 m) is
+   borderline-aggressive (2/2 clean but needs a 3rd confirm); ≥9.0 is unsafe.
+
+**NEW RECOMMENDED RACE CONFIG (reliable, 3/3 clean):**
+`--minimal --cruise-speed 8.0 --max-tilt 0.70 --aim-z -0.85 --max-vert-speed 5.0`
+= **3.85 s/gate** (~23.1 s course), 0 collisions, 0.42 m worst clearance, gyro
+p95 0.74 — a reliable ~11 % speedup over the old cruise-7.0 (4.33 s/gate).
+Aggressive (verify a 3rd run): cruise 8.5 = 3.66 s/gate, 0.35 m.
+
+**NEXT LEVERS to go faster than 8.0–8.5 cleanly** (the binding constraint is now
+vertical descent lag + the ~2× inner-loop roll attenuation):
+1. Improve vertical descent tracking WITHOUT raising vert_gain — e.g. a vertical
+   FEEDFORWARD (descend along the known leg slope) so the cap-limited lag shrinks
+   without the destabilising high-gain accel swing.
+2. Recover the ~2× inner-loop roll attenuation (raise the attitude→body-rate gain
+   in `aigp_mavlink.py` — DOCUMENTED limit-cycle hazard; do it on the bench).
+3. Slew-limit / low-pass the discontinuous v_des gate-flip step (~0.15–0.2 s) to
+   cut the flip transient that pins cmd_roll at the clamp.
+
+**SIM WEDGED at end of iter-37:** after the cruise-10/vert_gain-2 divergence run
+(flew far past the finish to x≈−50), DCGame memory ballooned 490→1891 MB and
+SIM_RESET stopped returning a track map ("AIGP track data not received") — the
+documented post-race wedge. Needs a GUI restart into Virtual Qualifier to
+continue. Regression gate green (302 passed; fixed the stale per-axis
+`_rate_sign` test in `competition/tests/test_aigp_mavlink.py`).

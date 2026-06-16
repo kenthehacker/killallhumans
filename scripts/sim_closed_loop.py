@@ -148,6 +148,15 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
 
     start = (0.0, 0.0, 0.0)
     pipeline.configure(gates, start_position=start)
+    # This point-mass harness is a CONTROL-LOGIC regression guard (spin,
+    # circling, sequencing, replan recovery) on an idealized 20 N reference
+    # drone — NOT a real-sim-fidelity tool (it cannot see the sim's attitude
+    # frame, rate convention, or thrust scale; that is what the live AIGP runs
+    # are for). Pin BOTH the tracker and the point-mass physics below to the
+    # same 20 N so the loop stays self-consistent regardless of how the live-
+    # sim-calibrated drone_spec.DEFAULT_MAX_THRUST_N is set.
+    if getattr(pipeline, "tracker", None) is not None:
+        pipeline.tracker.config.max_thrust_n = 20.0
     # Normally set at the top of the async run(); we drive the callback
     # directly, so seed the race-clock anchors the callback expects.
     # The callback falls back to wall-clock when a telemetry stamp is <= 0,
@@ -159,7 +168,10 @@ def run(max_speed: float = 8.0, start_yaw: float = 0.0,
     # we drive the control callback directly (else update() no-ops forever).
     pipeline.sequencer.start()
 
-    # Drone dynamics constants (match TrackerConfig defaults / drone_spec).
+    # Point-mass dynamics: 20 N reference, MATCHING the tracker override above
+    # so thrust normalization is self-consistent in the harness. (Decoupled
+    # from drone_spec.DEFAULT_MAX_THRUST_N, which is the live-sim-calibrated
+    # value used by the real flight path.)
     mass, gravity, max_thrust_n = 1.0, 9.81, 20.0
     k_yaw = 4.0           # first-order yaw tracking gain (rad/s per rad)
     max_yaw_rate = 4.0    # rad/s saturation (realistic racing-drone slew)

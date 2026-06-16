@@ -137,6 +137,60 @@ def analyze(path: str) -> dict:
             if abs(r) > 0.69 or abs(p) > 0.69  # ~40 deg
         ) / len(cmd_roll)
 
+    # ---- MEASURED attitude / body-rate analysis (erratic-flight detection) --
+    # Needs the roll/pitch/gyro fields added 2026-06-13. Without them the
+    # bounce/tumble that a human sees is invisible to this analyzer (that gap
+    # is exactly why "bouncing left/right" had to be reported by eye).
+    def _reversals(vals):
+        """Direction reversals (local extrema) — the oscillation/jitter count."""
+        if len(vals) < 3:
+            return 0
+        n = 0
+        for i in range(1, len(vals) - 1):
+            d0 = vals[i] - vals[i - 1]
+            d1 = vals[i + 1] - vals[i]
+            if d0 * d1 < 0:
+                n += 1
+        return n
+
+    m_roll = col("roll")
+    m_pitch = col("pitch")
+    gyros = [r["gyro"] for r in rows if r.get("gyro") is not None]
+    have_attitude = bool(m_roll) and bool(m_pitch)
+    have_gyro = bool(gyros)
+
+    roll_rev_hz = pitch_rev_hz = 0.0
+    flip_frac = 0.0
+    gyro_p95 = 0.0
+    if have_attitude and dur > 1:
+        roll_rev_hz = _reversals(m_roll) / (2 * dur)
+        pitch_rev_hz = _reversals(m_pitch) / (2 * dur)
+        # "Flip": tilted past ~75 deg (1.3 rad) — drone on its side / inverted.
+        flips = sum(1 for r, p in zip(m_roll, m_pitch)
+                    if abs(r) > 1.3 or abs(p) > 1.3)
+        flip_frac = flips / max(len(m_roll), 1)
+    if have_gyro:
+        mags = sorted(
+            math.sqrt(g[0] ** 2 + g[1] ** 2 + g[2] ** 2) for g in gyros
+        )
+        gyro_p95 = mags[int(0.95 * (len(mags) - 1))]
+
+    # Closest approach to each gate the drone TARGETED (sequencer's current
+    # gate). "How close did we get to the gate we were trying to fly through"
+    # — far more informative than distance to gate 0. Needs the
+    # target_gate/dist_target_gate fields added 2026-06-13.
+    gate_closest = {}  # gate index -> min dist while it was the target
+    for r in rows:
+        gi = r.get("target_gate")
+        d = r.get("dist_target_gate")
+        if gi is None or d is None:
+            continue
+        if gi not in gate_closest or d < gate_closest[gi]:
+            gate_closest[gi] = d
+    # final target + how far the run ended from it
+    last_target = rows[-1].get("target_gate")
+    last_dist = rows[-1].get("dist_target_gate")
+
     result["stats"] = {
         "duration_s": round(dur, 1),
         "records": len(rows),
@@ -150,6 +204,15 @@ def analyze(path: str) -> dict:
         "cmd_yaw_extreme_frac": round(yaw_extreme_frac, 3),
         "tilt_sat_frac": round(tilt_sat, 3),
         "ref_pos_frac": round(has_ref / len(rows), 3),
+        "roll_osc_hz": round(roll_rev_hz, 1),
+        "pitch_osc_hz": round(pitch_rev_hz, 1),
+        "flip_frac": round(flip_frac, 3),
+        "gyro_p95_radps": round(gyro_p95, 2),
+        "z_min": round(min(zs), 1),
+        "z_max": round(max(zs), 1),
+        "gate_closest_m": {int(k): round(v, 1) for k, v in sorted(gate_closest.items())},
+        "final_target_gate": last_target,
+        "final_dist_to_target_m": round(last_dist, 1) if last_dist is not None else None,
     }
 
     # ---- Anomaly rules -------------------------------------------------
@@ -188,6 +251,28 @@ def analyze(path: str) -> dict:
     if gates == 0 and dur > 30:
         A(f"GATE STALL: 0 gates passed in {dur:.0f} s")
 
+    # ---- Erratic-flight rules (measured attitude / body rates) ----------
+    if have_attitude:
+        # Sustained roll/pitch oscillation = the "bouncing / jittery" failure.
+        if roll_rev_hz > 2.0 or pitch_rev_hz > 2.0:
+            A(f"ATTITUDE OSCILLATION: roll {roll_rev_hz:.1f} Hz / pitch "
+              f"{pitch_rev_hz:.1f} Hz direction reversals -- jittery/bouncing "
+              f"attitude (control oscillation, e.g. undamped or wrong-sign loop)")
+        if flip_frac > 0.05:
+            A(f"ATTITUDE FLIP/TUMBLE: tilted past 75 deg for {flip_frac:.0%} of "
+              f"ticks -- drone going on its side / inverting")
+    else:
+        W("no measured roll/pitch in capture -- attitude oscillation/flip "
+          "detection disabled (re-record with the upgraded recorder)")
+    if have_gyro and gyro_p95 > 4.0:
+        A(f"HIGH BODY RATES: gyro p95 = {gyro_p95:.1f} rad/s -- tumbling / "
+          f"violent attitude motion (a stable flight stays well under ~3)")
+    # Vertical divergence: the VQ1 course spans z in [-2, 27] m. Leaving that
+    # envelope by a wide margin is a climb/dive runaway (altitude control bug).
+    if max(zs) > 80 or min(zs) < -80:
+        A(f"VERTICAL DIVERGENCE: z range [{min(zs):.0f}, {max(zs):.0f}] m far "
+          f"outside the ~[-2,27] m course envelope -- altitude runaway")
+
     return result
 
 
@@ -208,6 +293,20 @@ def print_report(res: dict) -> None:
             f"max_rate={st['max_yaw_rate_radps']}rad/s "
             f"yaw_extreme={st['cmd_yaw_extreme_frac']} ref_pos_frac={st['ref_pos_frac']}"
         )
+        if "roll_osc_hz" in st:
+            print(
+                f"  attitude: roll_osc={st['roll_osc_hz']}Hz pitch_osc={st['pitch_osc_hz']}Hz "
+                f"flip_frac={st['flip_frac']} gyro_p95={st['gyro_p95_radps']}rad/s "
+                f"z=[{st['z_min']},{st['z_max']}]m"
+            )
+        if st.get("gate_closest_m"):
+            print(
+                f"  next-gate: closest approach per targeted gate = {st['gate_closest_m']} m"
+            )
+            print(
+                f"  ended targeting gate {st['final_target_gate']} at "
+                f"{st['final_dist_to_target_m']} m from it"
+            )
     for a in res["anomalies"]:
         print(f"  [ANOMALY] {a}")
     for w in res["warnings"]:

@@ -103,6 +103,57 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._have_lpn = False
         self._have_odometry = False
 
+        # The live AIGP sim MISHANDLES SET_ATTITUDE_TARGET attitude mode
+        # (type_mask 0b111): a held level attitude makes the drone spin up to
+        # ~9 rad/s the moment it is airborne (bench-confirmed 2026-06-13,
+        # scripts/aigp_bench.py). It DOES honor body-rate mode (mask 128).
+        # So `send_attitude` converts the commanded attitude into a body-rate
+        # setpoint via a quaternion attitude-error P loop and sends rate mode.
+        # Off-switch + gains exposed for tuning / fallback.
+        self._use_rate_control = True
+        # Inner attitude->rate loop gains, RE-tuned 2026-06-13 (iter-022) after
+        # an isolation bench overturned the prior tuning. Key findings
+        # (scripts/aigp_bench.py): (1) pure zero body-rate is perfectly clean
+        # (gyro p95~0); (2) the old (2.0,2.5,1.0) loop LIMIT-CYCLES at ~9 Hz
+        # (gyro p95~4.5) and the jitter rectifies thrust into a runaway climb
+        # — this was THE flight failure, not the trajectory; (3) per-axis rate
+        # ID shows the sim sign-flips all axes (so _rate_sign=-1 is right) but
+        # the gain is axis-dependent (~1.0 roll, ~2.1 pitch/yaw), NOT a uniform
+        # 2.5x. The old loop gain (2*kp * ~2.1 amp = ~8.4) was far past the
+        # delay-limited stability margin -> the limit cycle. Cutting the gain
+        # ~4x removes the oscillation AND the climb while still tracking a 0.3
+        # rad roll step cleanly (gyro p95<0.6, no flip). kd is the SAME sign as
+        # before (genuine damping: the sim's flip applies to the kd term too,
+        # so it stays negative feedback) — just much smaller.
+        # PER-AXIS body-rate P/D gains (roll, pitch, yaw). The sim amplifies
+        # the rate channels asymmetrically (~1.0x roll vs ~2.1x pitch/yaw,
+        # bench rate-ID), so a uniform kp=0.5 leaves ROLL at HALF the
+        # closed-loop bandwidth of pitch — roll under-tracks (0.46x amplitude,
+        # ~0.6s lag, captures min_v28) and the cross-track centering oscillates
+        # and clips frames at cruise >=5. iter-32: raise ROLL only to kp=1.0
+        # (effective gain ~1.0, matching pitch's proven-safe ~1.05) with kd=0.4
+        # to damp the now-faster roll loop; pitch/yaw unchanged (eff ~1.05,
+        # already crisp+stable). Watch gyro p95 (<1.0 clean, abort >2.0).
+        self._att_rate_kp = (1.0, 0.5, 0.5)   # (roll, pitch, yaw)
+        self._att_rate_kd = (0.4, 0.2, 0.2)
+        self._att_rate_max = 0.8      # rad/s clamp per axis
+        # Per-axis CLOSED-LOOP sign, corrected 2026-06-13 (iter-023). The
+        # open-loop gyro probe suggested all three axes were sign-flipped, but
+        # that conflated the body-rate actuator sign with the spawn yaw=pi
+        # frame rotation and the euler-rate mapping. The CLOSED loop is the
+        # ground truth, and it disagrees per axis:
+        #   * ROLL  (-1): bench att-hold commanding roll +0.30 drove measured
+        #     roll to +0.26 — converges. Correct.
+        #   * PITCH (+1): commanding pitch -0.50 drove measured pitch the WRONG
+        #     way (-0.31 -> -0.08), and in flight pitch -0.62 diverged to +1.5
+        #     (positive feedback) — the cause of "hover-stable, flips the moment
+        #     it translates". Un-flip pitch so the loop is negative feedback.
+        #   * YAW   (-1): held cleanly at pi in every run (never excited with a
+        #     real error); left at -1. Revisit if yaw drifts after this fix.
+        # Two independent Opus reviews + the bench/flight captures all point to
+        # the pitch axis being the single inverted sign.
+        self._rate_sign = (-1.0, 1.0, -1.0)
+
     async def connect(self, address: str = DEFAULT_MAVLINK_URL) -> None:
         """Open the UDP MAVLink socket, announce as GCS, then fetch track data.
 
@@ -218,6 +269,34 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         # negative w component can cause sim-side interpolation glitches.
         if q.w < 0:
             q = Quaternion(-q.w, -q.x, -q.y, -q.z)
+
+        # The sim mishandles attitude mode (it spins) — convert the desired
+        # attitude into a body-rate command it DOES honor. See __init__.
+        if self._use_rate_control:
+            with self._state_lock:
+                telem = self._latest_telem
+            q_cur = telem.orientation if (telem and telem.orientation) else Quaternion()
+            omega = (telem.angular_velocity if (telem and telem.angular_velocity)
+                     else (0.0, 0.0, 0.0))
+            # Desired body rate in our FRD convention (kp on attitude error,
+            # kd damping on measured gyro — gyro is FRD-consistent).
+            rr, pr, yr = _attitude_error_body_rates(
+                q_cur, q, omega=omega, kp=self._att_rate_kp,
+                kd=self._att_rate_kd, max_rate=self._att_rate_max,
+            )
+            sx, sy, sz = self._rate_sign  # sim applies rates with opposite sign
+            with self._send_lock:
+                self._conn.mav.set_attitude_target_send(
+                    self._time_boot_ms(),
+                    self._target_system,
+                    self._target_component,
+                    SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
+                    [1.0, 0.0, 0.0, 0.0],
+                    sx * rr, sy * pr, sz * yr,
+                    thrust,
+                )
+            return
+
         with self._send_lock:
             self._conn.mav.set_attitude_target_send(
                 self._time_boot_ms(),
@@ -234,6 +313,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
     async def send_attitude_rate(self, cmd: AttitudeRateCommand) -> None:
         self._require_conn()
         thrust = _clamp_thrust(cmd.thrust)
+        sx, sy, sz = self._rate_sign  # sim applies body rates with opposite sign
         with self._send_lock:
             self._conn.mav.set_attitude_target_send(
                 self._time_boot_ms(),
@@ -241,9 +321,9 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 self._target_component,
                 SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
                 [1.0, 0.0, 0.0, 0.0],
-                cmd.roll_rate,
-                cmd.pitch_rate,
-                cmd.yaw_rate,
+                sx * cmd.roll_rate,
+                sy * cmd.pitch_rate,
+                sz * cmd.yaw_rate,
                 thrust,
             )
 
@@ -498,6 +578,48 @@ def _clamp_thrust(thrust: float) -> float:
     if not math.isfinite(thrust):
         raise ValueError("thrust must be finite")
     return max(0.0, min(1.0, thrust))
+
+
+def _attitude_error_body_rates(q_cur, q_des, omega=(0.0, 0.0, 0.0),
+                               kp=5.0, kd=0.0, max_rate=4.0):
+    """PD body-rate command (FRD) that drives q_cur toward q_des.
+
+    The error quaternion ``q_err = conj(q_cur) (x) q_des`` is expressed in the
+    body frame; its vector part is ``sin(theta/2)*axis``, so ``2*kp*vec`` is a
+    proportional, singularity-free body-rate (euler-error control cross-couples
+    when tilted). The ``-kd*omega`` term damps the cascade (sim rate loop + our
+    P loop limit-cycles ~5 Hz without it). Shortest-path via ``w >= 0``.
+    Returns (roll_rate, pitch_rate, yaw_rate) in FRD, clamped to +/- max_rate.
+    The CALLER applies the sim's per-axis rate sign — see __init__._rate_sign.
+
+    ``kp``/``kd`` may be scalars or 3-tuples (per-axis roll/pitch/yaw). PER-AXIS
+    gains matter because the sim amplifies the rate channels asymmetrically
+    (~1.0x roll vs ~2.1x pitch/yaw, bench-measured), so a single kp leaves the
+    ROLL loop at half the closed-loop bandwidth of pitch — roll under-tracks
+    (0.46x amplitude, ~0.6s lag) and the cross-track centering oscillates at
+    speed. Raising ONLY roll's kp equalises the bandwidth.
+
+    Used because the AIGP sim honors body-rate (mask 128) but spins under
+    attitude mode (mask 7) — see AIGPMavlinkAdapter.__init__.
+    """
+    kpx, kpy, kpz = (kp, kp, kp) if isinstance(kp, (int, float)) else kp
+    kdx, kdy, kdz = (kd, kd, kd) if isinstance(kd, (int, float)) else kd
+    qc = (q_cur.w, q_cur.x, q_cur.y, q_cur.z)
+    qd = (q_des.w, q_des.x, q_des.y, q_des.z)
+    # conj(qc) (x) qd
+    cw, cx, cy, cz = qc[0], -qc[1], -qc[2], -qc[3]
+    ew = cw * qd[0] - cx * qd[1] - cy * qd[2] - cz * qd[3]
+    ex = cw * qd[1] + cx * qd[0] + cy * qd[3] - cz * qd[2]
+    ey = cw * qd[2] - cx * qd[3] + cy * qd[0] + cz * qd[1]
+    ez = cw * qd[3] + cx * qd[2] - cy * qd[1] + cz * qd[0]
+    if ew < 0:
+        ex, ey, ez = -ex, -ey, -ez
+    rates = (
+        2.0 * kpx * ex - kdx * omega[0],
+        2.0 * kpy * ey - kdy * omega[1],
+        2.0 * kpz * ez - kdz * omega[2],
+    )
+    return tuple(max(-max_rate, min(max_rate, r)) for r in rates)
 
 
 def _default_telem() -> TelemetryState:

@@ -853,7 +853,7 @@ class TrajectoryOptimizer:
         # min-snap peaks. This pass samples generated polynomial accel
         # at dt_sample, stretches any over-budget segment by
         # sqrt(peak/target) per pass capped at DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH
-        # (1.5×), iterates ≤3 passes. Inserted AFTER vertical-climb
+        # (1.5×), iterates ≤8 passes. Inserted AFTER vertical-climb
         # inflate so the final times are projected. Peak target sources
         # from constraints.max_acceleration (= DEFAULT_MAX_ACCEL_MPS2)
         # — no course-specific magic.
@@ -1299,7 +1299,7 @@ class TrajectoryOptimizer:
         segment_times: List[float],
         start_velocity: Tuple[float, float, float],
         gates: List[GateWaypoint],
-        max_passes: int = 3,
+        max_passes: int = 8,
     ) -> List[float]:
         """Iter-032: hard polynomial-peak accel projection.
 
@@ -1329,8 +1329,12 @@ class TrajectoryOptimizer:
         in turn sources from ``DEFAULT_MAX_ACCEL_MPS2`` (SSOT). No
         course-specific magic.
 
-        Skips segments below 0.15 s — the floor used by other inflation
-        passes to avoid pinned-minimum oscillation.
+        Skips segments below ``DEFAULT_ACCEL_PROJECTION_MIN_SEG_TIME_S``
+        (0.05 s as of the 2026-06-13 live-sim iter; was 0.15 s, which
+        skipped the ~0.10 s through-gate segments where the real peaks
+        live — see the constant's docstring). Default ``max_passes`` is 8
+        (was 3): the per-pass 1.5× cap means the through-gate kink peaks
+        (~86 m/s²) need ~6-8 passes to converge below the 15 m/s² target.
         """
         from competition.drone_spec import (
             DEFAULT_ACCEL_PEAK_PROJECTION_MAX_STRETCH,

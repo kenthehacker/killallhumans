@@ -17,8 +17,19 @@ from competition.aigp_messages import (
     encode_race_status,
     encode_track_data,
 )
-from competition.adapter import Quaternion
+from competition.adapter import Quaternion, TelemetryState
 from competition.aigp_mavlink import AIGPMavlinkAdapter, SIM_RESET_COMMAND
+
+
+def _default_telem_identity() -> TelemetryState:
+    """Telemetry with identity orientation + zero gyro for rate-control tests."""
+    return TelemetryState(
+        timestamp_us=0,
+        position_ned=(0.0, 0.0, 0.0),
+        velocity_ned=(0.0, 0.0, 0.0),
+        orientation=Quaternion(1.0, 0.0, 0.0, 0.0),
+        angular_velocity=(0.0, 0.0, 0.0),
+    )
 
 
 class FakeMsg:
@@ -212,8 +223,10 @@ def test_side_state_race_status_collision_actuator_and_heartbeat():
     assert adapter.is_armed is False
 
 
-def test_send_attitude_rate_position_reset_and_arm_wires():
+def test_send_attitude_legacy_attitude_mode_wires():
+    # Fallback path (use_rate_control=False): raw attitude quaternion, mask 7.
     adapter = _adapter_with_fake_conn()
+    adapter._use_rate_control = False
 
     asyncio.run(adapter.send_attitude(AttitudeCommand(
         roll_rad=0.1,
@@ -231,12 +244,43 @@ def test_send_attitude_rate_position_reset_and_arm_wires():
     with pytest.raises(ValueError, match="finite"):
         asyncio.run(adapter.send_attitude(AttitudeCommand(0.0, 0.0, 0.0, float("nan"))))
 
+
+def test_send_attitude_rate_control_default_emits_body_rates():
+    # Default path: the sim spins under attitude mode, so send_attitude
+    # converts the desired attitude to a body-RATE command (mask 128) with the
+    # sim's per-axis sign correction applied. From an identity measured
+    # attitude, a desired +yaw error -> +yaw rate in FRD -> NEGATED on the wire
+    # (sim applies rates with opposite sign); roll/pitch error ~0 -> ~0.
+    adapter = _adapter_with_fake_conn()
+    assert adapter._use_rate_control is True
+    adapter._latest_telem = _default_telem_identity()
+
+    asyncio.run(adapter.send_attitude(AttitudeCommand(0.0, 0.0, 0.5, 0.4)))
+    name, args = adapter._conn.mav.calls[-1]
+    assert name == "set_attitude_target_send"
+    assert args[3] == 128                      # body-rate mode
+    assert args[4] == [1.0, 0.0, 0.0, 0.0]     # attitude ignored
+    rr, pr, yr = args[5], args[6], args[7]
+    assert abs(rr) < 1e-6 and abs(pr) < 1e-6   # no roll/pitch error
+    # desired +yaw -> +yaw rate (FRD) -> sign-flipped to negative on the wire
+    assert yr < 0.0
+    assert args[8] == pytest.approx(0.4)
+
+
+def test_send_attitude_rate_position_reset_and_arm_wires():
+    adapter = _adapter_with_fake_conn()
+
+    # send_attitude_rate applies the PER-AXIS _rate_sign=(-1,+1,-1): roll & yaw
+    # are sign-flipped (the sim applies them opposite-signed) but PITCH is NOT —
+    # the bench gyro ID + flight validation (iter-22/23) found pitch was positive
+    # feedback under (-1,-1,-1) and only stabilised at +1 (see _rate_sign comment
+    # in aigp_mavlink.py). So (0.4,0.5,0.6) -> (-0.4,+0.5,-0.6) on the wire.
     asyncio.run(adapter.send_attitude_rate(AttitudeRateCommand(0.4, 0.5, 0.6, -1.0)))
     name, args = adapter._conn.mav.calls[-1]
     assert name == "set_attitude_target_send"
     assert args[3] == 128
     assert args[4] == [1.0, 0.0, 0.0, 0.0]
-    assert args[5:8] == (0.4, 0.5, 0.6)
+    assert args[5:8] == pytest.approx((-0.4, 0.5, -0.6))
     assert args[8] == pytest.approx(0.0)
 
     asyncio.run(adapter.send_position(PositionCommand(

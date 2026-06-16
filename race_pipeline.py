@@ -99,6 +99,78 @@ class PipelineConfig:
     # Control mode
     use_geometric_tracker: bool = True
 
+    # Iter-021 (P0 strip-down): minimal pure-pursuit gate-to-gate control.
+    # When True, the pipeline BYPASSES the entire min-snap trajectory stack
+    # (RacingLineOptimizer, TrajectoryOptimizer, TOPP, accel projection,
+    # dynamic replan, should_slow_down) and instead flies a feasible
+    # velocity-tracking reference straight at the current sequencer gate at
+    # ``minimal_cruise_speed``, with horizontal accel hard-clamped to the
+    # real tilt envelope. This is the handoff's "get a repeatable 6/6 at low
+    # speed before any optimization" path — the min-snap reference demands
+    # ~18 m/s²/61° tilt the drone cannot make, which is what flips it.
+    minimal_control: bool = False
+    minimal_cruise_speed: float = 3.0
+    minimal_max_tilt_rad: float = 0.62
+    # iter-36: velocity-tracking gain (1/s). accel = kv*(v_des - v). The
+    # cross-track UNDERSHOOT at the Y-staggered gates is kv-limited, NOT
+    # accel-clamp-limited (the g*tan(max_tilt) clamp is ~0% engaged near the
+    # worst gates while the drone's Y-velocity lags v_des) — so raising kv
+    # tightens lateral tracking while preserving pure-pursuit's natural
+    # cross-track damping (v_des decelerates to 0 at the gate regardless of kv),
+    # unlike iter-34's cross_gain term which removed that damping and overshot.
+    minimal_kv: float = 3.0
+    # iter-37: vertical-channel knobs. The decoupled vertical law is
+    # vz = clip(vert_gain*dz, -max_vert_speed, +max_vert_speed). At higher
+    # cruise the steep CLIMB legs (e.g. gate1->gate2, +8.6m) become the binding
+    # constraint: the drone arrives LOW and nearly clips the bottom bar (cruise
+    # 8.0: gate2 vertical frame clearance only 0.11m, vs 0.51m lateral). Raise
+    # these to keep the climb pace with cruise. -1.0 sentinel => use the
+    # MinimalControllerConfig default.
+    minimal_vert_gain: float = -1.0
+    minimal_max_vert_speed: float = -1.0
+    # iter-34: cross-track (Y) convergence gain for the decoupled horizontal
+    # law. 0 = original pure pursuit. >0 fixes the cross-track undershoot at
+    # speed (verified roadmap #4).
+    minimal_cross_gain: float = 0.0
+    # Aim the pure-pursuit target this many metres BEYOND the current gate
+    # (toward the next gate). Pursuing the gate centre directly makes the drone
+    # arrive and hover AT the gate (parking in the frame -> collisions, and the
+    # sequencer never sees a plane crossing -> no pass). Aiming through the
+    # gate makes it fly across the plane and on to the next gate.
+    # iter-31 speed-up: 4.0->2.0. The cross-track crossing offset is a
+    # geometric pure-pursuit lag ~ leg/(leg+through_dist) and is SPEED-
+    # INVARIANT; halving through_dist halves the offset (gate3/4 ~0.54->~0.30 m,
+    # restoring centring margin in the 1.5 m opening) while still flying THROUGH
+    # the gate (parking only happened at through_dist≈0).
+    minimal_through_dist: float = 2.0
+    # Vertical offset (NED z, metres) added to the aim point. The drone parks
+    # dead-centre on gate.position but gets blocked ~0.2 m short of the plane,
+    # which suggests gate.position is not the OPENING centre vertically (e.g.
+    # it's the gate base). Negative = aim higher (NED z is down). Swept live.
+    minimal_aim_z_offset: float = 0.0
+
+    # Iter-035: clean trajectory-race harness (the principled alternative to
+    # minimal pure-pursuit). minimal_control stays False so configure() still
+    # builds the trajectory, but the control loop flies that precomputed
+    # trajectory with the GeometricTracker on RAW telemetry and SKIPS the
+    # replan / state-predictor / should_slow_down machinery — an apples-to-
+    # apples A/B vs minimal where only the controller (racing-line + velocity
+    # feedforward tracking vs gate-by-gate pure pursuit) differs. The optimizer
+    # is constrained to the REAL measured envelope (NOT the bench placeholders
+    # that made the old min-snap reference infeasible), and the tracker is
+    # given the calibrated thrust + the live-sim roll sign.
+    trajectory_race: bool = False
+    # PLANNING accel budget for the optimizer. 7.5 (the real usable lateral
+    # accel) made the accel-peak projection over-stretch every through-gate
+    # segment chasing an unreachable target -> 36 s (slower than minimal's
+    # 26 s). 15.0 lets the optimizer plan smoothly; the ~17 m/s² interior kink
+    # peaks that remain are CLAMPED to the real ~7 m/s² envelope at the tracker
+    # (max_lateral_accel), so it stays feasible. Recovers ~8 s at no centering
+    # cost (measured offline). "Plan smooth, clamp safe."
+    traj_max_accel_mps2: float = 15.0
+    traj_max_tilt_rad: float = 0.62       # real usable tilt (also caps tracker lateral accel ~7)
+    traj_max_thrust_n: float = 37.0       # calibrated hover thrust (not 42)
+
     # Estimation
     use_ekf: bool = True
     use_pnp: bool = True
@@ -169,9 +241,55 @@ class RacePipeline:
         self.state_predictor = StatePredictor(LatencyConfig())
         # Iter-015: wire trace_features through PipelineConfig so the
         # collection script can opt in without monkey-patching.
-        _tracker_cfg = TrackerConfig(trace_features=self.config.trace_tracker_features)
+        _tracker_kwargs = dict(trace_features=self.config.trace_tracker_features)
+        if self.config.trajectory_race:
+            # Iter-035: fly the live AIGP sim — calibrated thrust (37 N, not the
+            # 42 N drone_spec placeholder, which under-commands hover), the real
+            # usable tilt clamp (0.62 rad, which also bounds lateral accel to
+            # ~7 m/s²), and the live-sim roll-convention sign that the minimal
+            # controller proved is needed (+roll -> +Y at yaw=pi).
+            _tracker_kwargs.update(
+                max_thrust_n=self.config.traj_max_thrust_n,
+                max_tilt_rad=self.config.traj_max_tilt_rad,
+                sim_roll_sign=-1.0,
+                # Cap lateral accel at the real envelope (g·tan(0.62)≈7) BEFORE
+                # attitude extraction, so the ~17 m/s² min-snap kink peaks are
+                # clamped cleanly (no realized-accel overshoot, no climb
+                # transient) — matches the proven minimal-controller envelope.
+                max_lateral_accel=9.81 * math.tan(self.config.traj_max_tilt_rad),
+            )
+        _tracker_cfg = TrackerConfig(**_tracker_kwargs)
         self.tracker = GeometricTracker(_tracker_cfg)
         self.simple_tracker = SimplePositionTracker(TrackerConfig())
+
+        # Iter-021 (P0): minimal pure-pursuit controller. Cheap to build; only
+        # used when config.minimal_control is True (bypasses the whole
+        # trajectory stack — see _control_callback).
+        from control.minimal_controller import (
+            MinimalController,
+            MinimalControllerConfig,
+        )
+        self.minimal_controller = MinimalController(
+            MinimalControllerConfig(
+                cruise_speed=self.config.minimal_cruise_speed,
+                max_tilt_rad=self.config.minimal_max_tilt_rad,
+                cross_gain=self.config.minimal_cross_gain,
+                kv=self.config.minimal_kv,
+                # Keep the lateral-accel clamp CONSISTENT with the tilt clamp
+                # (g*tan(max_tilt)). Otherwise raising --max-tilt is a no-op:
+                # accel[:2] is clamped to the default max_lateral_accel (7.0)
+                # FIRST, and 7.0 maps back to atan2(7.0,g)=0.62 rad, so the
+                # higher tilt clamp never binds. iter-36: the binding gates are
+                # tilt-SATURATED at the flip (cmd_roll 94-100%), so lateral
+                # authority is the real limiter — make --max-tilt actually
+                # change it. Backward-compatible: 0.62 -> 7.0 (unchanged).
+                max_lateral_accel=9.81 * math.tan(self.config.minimal_max_tilt_rad),
+                **({"vert_gain": self.config.minimal_vert_gain}
+                   if self.config.minimal_vert_gain > 0 else {}),
+                **({"max_vert_speed": self.config.minimal_max_vert_speed}
+                   if self.config.minimal_max_vert_speed > 0 else {}),
+            )
+        )
 
         # Phase 1 detector — instantiated once, reused every frame (Phase 3 fix)
         self._detector = None
@@ -280,7 +398,12 @@ class RacePipeline:
         self._last_lpn_stamp_ms = None
         self._last_odom_reset_counter = None
 
-        self._build_trajectory_from(start_position, start_velocity, gates)
+        # Iter-021 (P0): minimal control flies straight at the sequencer's
+        # current gate — no precomputed trajectory needed. Skip the (slow)
+        # min-snap optimization entirely; that stack is exactly what we are
+        # bypassing.
+        if not self.config.minimal_control:
+            self._build_trajectory_from(start_position, start_velocity, gates)
         self.ekf.initialize(start_position, start_velocity, timestamp_s=0.0)
         self._initialized = True
 
@@ -319,7 +442,18 @@ class RacePipeline:
         logger.info(
             "Optimizing racing line through %d gates...", len(remaining_gates),
         )
-        line_optimizer = RacingLineOptimizer()
+        if self.config.trajectory_race:
+            # The default max_lateral_offset=0.6 (fraction of half-width) puts a
+            # fixed ~0.45 m offset on every VQ1 gate — most of the 0.75 m
+            # half-opening, gone before the tracker even runs. Tighten to 0.15
+            # (~0.11 m) for the narrow 1.5 m gates; cuts the worst-gate
+            # reference offset 45 cm -> 13 cm at ~no time cost (measured).
+            from planning.racing_line import RacingLineConfig
+            line_optimizer = RacingLineOptimizer(
+                RacingLineConfig(max_lateral_offset=0.15)
+            )
+        else:
+            line_optimizer = RacingLineOptimizer()
         optimized_waypoints = line_optimizer.optimize(
             gate_waypoints, start_position,
         )
@@ -334,8 +468,22 @@ class RacePipeline:
         )
 
         logger.info("Computing time-optimal trajectory...")
+        if self.config.trajectory_race:
+            # Iter-035: constrain to the REAL measured AIGP envelope, not the
+            # bench placeholders (15 m/s² / 0.85 rad). The old min-snap demanded
+            # ~18 m/s² / 61° the drone cannot make and flipped it; planning at
+            # the true ~7 m/s² / 35° budget yields a trajectory the fixed inner
+            # loop can actually track.
+            constraints = DroneConstraints(
+                max_velocity=self.config.max_speed,
+                max_acceleration=self.config.traj_max_accel_mps2,
+                max_tilt_angle=self.config.traj_max_tilt_rad,
+                max_thrust=self.config.traj_max_thrust_n,
+            )
+        else:
+            constraints = DroneConstraints(max_velocity=self.config.max_speed)
         traj_optimizer = TrajectoryOptimizer(
-            constraints=DroneConstraints(max_velocity=self.config.max_speed),
+            constraints=constraints,
             dt_sample=self.config.trajectory_dt,
         )
         trajectory = traj_optimizer.optimize(
@@ -368,14 +516,27 @@ class RacePipeline:
         # sequencer state — completion, out-of-order DQ, or a recorded
         # crash. The prior version only checked is_complete, so a DQ run
         # silently kept flying.
-        session.should_stop = lambda: (
-            self.sequencer is not None and (
-                self.sequencer.is_complete
-                or self.sequencer.is_disqualified
+        # Stop on the SIM's authoritative race_finished (it credits passes,
+        # and its detection can lead our geometric sequencer — at higher
+        # speed our sequencer lagged gate 5 by seconds, so the run flew well
+        # past the sim's actual finish before stopping). Also stop on any
+        # terminal sequencer state (completion / DQ / crash).
+        def _should_stop() -> bool:
+            rs = getattr(self.interface, "race_status", None)
+            if rs is not None and rs.race_finished:
+                return True
+            # Do NOT stop on our geometric sequencer's is_complete — it can fire
+            # a beat BEFORE the drone is fully through the last gate, cutting the
+            # run off before the SIM credits the final crossing (cruise 3.5:
+            # our 6/6 but sim only 5/6). The SIM's race_finished above is the
+            # sole completion authority. Still stop on terminal failures.
+            return self.sequencer is not None and (
+                self.sequencer.is_disqualified
                 or self.sequencer.is_timed_out
                 or self.sequencer.last_crash is not None
             )
-        )
+
+        session.should_stop = _should_stop
 
         # Iter-002 review B1 (5/7 BLOCKER) + iter-003 M5 (4/7 MAJOR): the
         # 8-minute timeout check uses BOTH a monotonic wall-clock fallback
@@ -402,7 +563,11 @@ class RacePipeline:
 
         Returns an AttitudeCommand to send to the simulator.
         """
-        if self.sequencer is None or self.trajectory is None:
+        if self.sequencer is None:
+            return None
+        # Minimal control needs no precomputed trajectory; every other mode
+        # tracks one, so require it there.
+        if not self.config.minimal_control and self.trajectory is None:
             return None
 
         # 0. Frozen-telemetry watchdog (detection only).
@@ -432,9 +597,13 @@ class RacePipeline:
                 passed.gate_id, self.sequencer.gates_passed, self.sequencer.total_gates,
             )
 
-        if self.sequencer.is_complete:
+        if self.sequencer.is_complete and not self.config.trajectory_race:
             logger.info("All gates passed! Race complete.")
             return AttitudeCommand(0, 0, yaw, 0.4)  # hover
+        # trajectory_race: our geometric sequencer can flag complete a beat
+        # before the SIM credits the final crossing, so do NOT hover here —
+        # keep flying the trajectory's tail (the virtual finish sits 2 m past
+        # the last gate) until the SIM's race_finished stops the run.
 
         # Iter-001 review (B2): terminal failure must abort the control
         # loop, not silently keep tracking the next reference. Hover the
@@ -473,6 +642,90 @@ class RacePipeline:
             self.sequencer.mark_timed_out(
                 f"vq1_max_run_duration_exceeded:{elapsed:.1f}s"
             )
+
+        # 3z. Iter-021 (P0): minimal pure-pursuit path. Bypasses the entire
+        # trajectory/replan/predictor/should_slow_down stack below — fly a
+        # feasible velocity reference straight at the current gate. State
+        # estimate (EKF), sequencer pass-detection and terminal handling
+        # above are all reused.
+        if self.config.minimal_control:
+            gate = self.sequencer.current_gate
+            if gate is None:
+                # Our geometric sequencer thinks the course is done, but the SIM
+                # is the authority. If the sim hasn't flagged race_finished yet,
+                # KEEP flying forward THROUGH the last gate so the sim fully
+                # registers the final crossing (our is_complete can lead the sim
+                # by a beat). Otherwise hover.
+                rs = getattr(self.interface, "race_status", None)
+                if rs is not None and not rs.race_finished and self._gate_specs:
+                    gate = self._gate_specs[-1]
+                else:
+                    return AttitudeCommand(0, 0, yaw, 0.4)  # done: hover
+            # Aim BEYOND the gate, ALONG ITS NORMAL, so the drone approaches
+            # perpendicular and flies straight through the CENTRE of the
+            # opening (not toward the next gate, which cuts the corner and
+            # crosses the plane off-centre -> frame collisions + the sequencer
+            # crediting an off-centre/early pass, as in min_v9). The sequencer
+            # advances on the clean plane crossing.
+            cur = np.array(gate.position, dtype=float)
+            normal = np.array(_gate_normal(gate.yaw, gate.pitch), dtype=float)
+            # Orient the normal in the direction of travel (away from the drone).
+            if float(np.dot(normal, cur - np.array(position, dtype=float))) < 0:
+                normal = -normal
+            aim = cur + self.config.minimal_through_dist * normal
+            aim[2] += self.config.minimal_aim_z_offset
+            return self.minimal_controller.compute(
+                position, velocity, yaw, tuple(aim), is_final_gate=False,
+            )
+
+        # 3z'. Iter-035 (P-traj): clean trajectory-race path. Fly the
+        # precomputed (real-envelope) trajectory with the GeometricTracker on
+        # RAW telemetry. Deliberately BYPASSES the replan / state-predictor /
+        # should_slow_down stack below so the only difference vs the minimal
+        # A/B baseline is the controller (racing-line + velocity feedforward
+        # tracking vs gate-by-gate pure pursuit). Same reset/countdown, same
+        # body-rate inner loop, same SIM-authoritative stop.
+        if self.config.trajectory_race:
+            # Iter-035 (reviewer fix): the GeometricTracker — unlike the minimal
+            # controller — has NO non-finite guard, and on raw telemetry a
+            # single NaN/inf sample (odom reset, dropped field) becomes a NaN
+            # command the adapter rejects ("thrust must be finite"), killing the
+            # whole run. Mirror the minimal controller: hover on bad telemetry.
+            tc = self.tracker.config
+            hover_thrust = float(np.clip(
+                tc.mass * tc.gravity / tc.max_thrust_n,
+                tc.min_thrust_normalized, tc.max_thrust_normalized,
+            ))
+            if not (np.all(np.isfinite(position)) and np.all(np.isfinite(velocity))):
+                return AttitudeCommand(0.0, 0.0, math.pi, hover_thrust)
+            # Forward-anchored reference (never snap backward on the descending
+            # slalom) + the same 0.3 s lookahead the trajectory path uses.
+            closest = self.trajectory.find_closest_forward(
+                tuple(position),
+                self._ref_progress_time,
+                search_window_s=2.0,
+            )
+            self._ref_progress_time = closest.time
+            self._last_lateral_err = float(
+                np.linalg.norm(np.array(position) - np.array(closest.position))
+            )
+            lookahead_t = min(
+                closest.time + self._ref_lookahead_s,
+                self.trajectory.total_time,
+            )
+            ref = self.trajectory.sample(lookahead_t)
+            # Hold the proven -X heading (yaw=pi). All VQ1 gates pass with a
+            # fixed heading (the minimal controller proves this), and pinning
+            # yaw keeps the roll/pitch extraction frame identical to the
+            # minimal controller's so the sim_roll_sign=-1 fix applies cleanly.
+            ref = _ref_override_yaw(ref, math.pi)
+            cmd = self.tracker.track(position, velocity, yaw, ref)
+            # Output guard: never hand the adapter a non-finite command.
+            if not all(math.isfinite(x) for x in (
+                cmd.roll_rad, cmd.pitch_rad, cmd.yaw_rad, cmd.thrust,
+            )):
+                return AttitudeCommand(0.0, 0.0, math.pi, hover_thrust)
+            return cmd
 
         # 3a. Dynamic replan: mirrors sim_pybullet/runner._maybe_replan.
         #     A crash/miss/off-track surface event rebuilds the
@@ -909,3 +1162,16 @@ def _ref_override_position(
     from dataclasses import replace
 
     return replace(ref, position=tuple(target_position))
+
+
+def _ref_override_yaw(ref, yaw: float):
+    """Return a TrajectoryPoint with its yaw replaced by ``yaw``.
+
+    Iter-035: the trajectory-race path pins the reference heading to the
+    proven -X course heading (yaw=pi) regardless of the yaw the optimizer
+    assigned, so the GeometricTracker's attitude-extraction frame matches the
+    minimal controller's (the one the live sim's roll convention was measured
+    against)."""
+    from dataclasses import replace
+
+    return replace(ref, yaw=float(yaw))

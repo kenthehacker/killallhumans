@@ -77,6 +77,27 @@ class TrackerConfig:
     # Backed by: Tal & Karaman 2018, L1Quad 2025, DATT 2023.
     velocity_feedforward: float = 0.0
 
+    # Iter-035: optional horizontal-accel clamp (m/s²). The geometric tracker
+    # otherwise clamps only the tilt ANGLE, not lateral accel — so a reference
+    # demanding >envelope accel (e.g. the ~17 m/s² min-snap peaks at gate kinks)
+    # still extracts a tilt that gets angle-clamped, but at the UN-clamped
+    # thrust magnitude, which overshoots realized lateral accel AND injects a
+    # spurious vertical-climb transient at every kink. Clamping accel_des[:2]
+    # BEFORE building the thrust vector (exactly as the proven minimal
+    # controller does) makes "plan smooth, clamp safe" actually cap at the
+    # envelope and removes the climb transient. None = disabled (kinematic
+    # bench unchanged); set ~7.0 (g·tan(0.62)) for the live AIGP sim.
+    max_lateral_accel: Optional[float] = None
+
+    # Iter-035: LIVE-SIM roll-convention sign. The AIGP sim does +roll -> +Y
+    # motion at yaw=pi, whereas the standard NED extraction below assumes
+    # +roll -> -Y. The minimal controller (which flies the live sim cleanly)
+    # corrects this with a `roll = -roll` after extraction; the geometric
+    # tracker historically did NOT, so flying it on the live sim reproduced
+    # the original sideways-divergence/flip. Default +1.0 preserves the
+    # kinematic-bench behaviour byte-for-byte; set -1.0 for the live AIGP sim.
+    sim_roll_sign: float = 1.0
+
     # Physical limits — iter-013: sourced from competition.drone_spec
     # for cross-module consistency. Pre-iter-013 these were inline
     # literals and could silently drift from `DroneConstraints` /
@@ -227,6 +248,19 @@ class GeometricTracker:
             c.kp_xy * ep[1] + c.kd_xy * ev[1] + c.feedforward_accel * ref_acc[1] + c.drag_coefficient * vel[1] + c.velocity_feedforward * ref_vel[1],
             c.kp_z * ep[2] + c.kd_z * ev[2] + c.feedforward_accel * ref_acc[2] + c.drag_coefficient * vel[2] + c.velocity_feedforward * ref_vel[2],
         ])
+        # Iter-035: clamp horizontal accel to the real envelope BEFORE building
+        # the thrust vector (mirrors the proven minimal controller). Without
+        # this the tracker only angle-clamps tilt and overshoots realized
+        # lateral accel + injects a climb transient at the high-accel gate
+        # kinks. Disabled (None) leaves the kinematic-bench behaviour intact.
+        if c.max_lateral_accel is not None:
+            ah = accel_des[:2]
+            ah_mag = float(np.linalg.norm(ah))
+            if ah_mag > c.max_lateral_accel:
+                scale = c.max_lateral_accel / ah_mag
+                accel_des[0] = ah[0] * scale
+                accel_des[1] = ah[1] * scale
+
         # Rotor thrust can only point body-up. If commanded down-accel exceeds
         # gravity minus minimum thrust, the raw thrust vector flips downward
         # and the attitude extraction banks the drone sideways. Saturate the
@@ -292,6 +326,12 @@ class GeometricTracker:
         zy_h = -spsi * z_b_des[0] + cpsi * z_b_des[1]
         desired_pitch = -math.asin(np.clip(zx_h, -1, 1))
         desired_roll = math.atan2(zy_h, -z_b_des[2])
+
+        # Iter-035: apply the live-sim roll-convention sign (see
+        # TrackerConfig.sim_roll_sign). On the AIGP sim this is -1.0, matching
+        # the proven `roll = -roll` correction in the minimal controller; the
+        # default +1.0 is a no-op so the kinematic bench is unchanged.
+        desired_roll = desired_roll * c.sim_roll_sign
 
         # Clamp to limits
         desired_roll = np.clip(desired_roll, -c.max_tilt_rad, c.max_tilt_rad)
