@@ -95,6 +95,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._track_data: Optional[TrackData] = None
         self._collisions: Deque[Dict] = deque(maxlen=128)
         self._actuator_outputs: Optional[Dict] = None
+        self._indi_debug: Optional[Dict] = None
         self._reassembler = TrackInfoReassembler()
         # Diagnostics for the DSQ investigation (iter-39): the sim announces
         # human-readable verdicts (e.g. disqualification) via STATUSTEXT, which
@@ -176,6 +177,37 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         # Two independent Opus reviews + the bench/flight captures all point to
         # the pitch axis being the single inverted sign.
         self._rate_sign = (-1.0, 1.0, -1.0)
+
+        # --- OPT-IN measured-accel INDI inner loop (roadmap #2) -------------
+        # OFF by default. When _use_indi is True, send_attitude computes the
+        # body-rate setpoint via control.indi_inner_loop.IndiInnerLoop (filtered
+        # gyro-derivative inversion + online-G) INSTEAD of the PD law in
+        # _attitude_error_body_rates. It STILL applies self._rate_sign and sends
+        # rates mode exactly as the PD path, so the only difference is how the
+        # rate vector is produced. When False, the code path below is unchanged
+        # (byte-identical to the validated champion PD path). The INDI object is
+        # lazily built on first use so importing this module never requires the
+        # control package. See the module docstring for the discriminator
+        # read-out ("recovered => mismatch; still clamped => bandwidth limit").
+        self._use_indi = False
+        self._indi_config = None  # optional control.indi_inner_loop.IndiConfig
+        self._indi = None         # lazily-built IndiInnerLoop
+        self._indi_last_t_us: Optional[int] = None
+
+    def _ensure_indi(self):
+        """Lazily construct the IndiInnerLoop (kept out of __init__ so importing
+        this module does not pull in the control package)."""
+        if self._indi is None:
+            from control.indi_inner_loop import IndiInnerLoop
+            # Default the INDI rate clamp to the SAME envelope as the PD path
+            # (_att_rate_max) so the opt-in branch never commands outside the
+            # validated rate range, unless the caller supplied an explicit cfg.
+            cfg = self._indi_config
+            if cfg is None:
+                from control.indi_inner_loop import IndiConfig
+                cfg = IndiConfig(max_rate=self._att_rate_max)
+            self._indi = IndiInnerLoop(cfg)
+        return self._indi
 
     async def connect(self, address: str = DEFAULT_MAVLINK_URL) -> None:
         """Open the UDP MAVLink socket, announce as GCS, then fetch track data.
@@ -301,12 +333,28 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             q_cur = telem.orientation if (telem and telem.orientation) else Quaternion()
             omega = (telem.angular_velocity if (telem and telem.angular_velocity)
                      else (0.0, 0.0, 0.0))
-            # Desired body rate in our FRD convention (kp on attitude error,
-            # kd damping on measured gyro — gyro is FRD-consistent).
-            rr, pr, yr = _attitude_error_body_rates(
-                q_cur, q, omega=omega, kp=self._att_rate_kp,
-                kd=self._att_rate_kd, max_rate=self._att_rate_max,
-            )
+            if self._use_indi:
+                # OPT-IN: measured-accel INDI inner loop. dt from telemetry
+                # timestamps (us). Produces the SAME (roll,pitch,yaw) rate
+                # setpoint contract as the PD law; sign + send below are
+                # identical. See control/indi_inner_loop.py.
+                t_us = telem.timestamp_us if telem else None
+                if t_us is not None and self._indi_last_t_us is not None:
+                    dt = (t_us - self._indi_last_t_us) * 1e-6
+                else:
+                    dt = 0.0  # first tick (or no stamp): INDI guard holds command
+                self._indi_last_t_us = t_us
+                indi = self._ensure_indi()
+                rr, pr, yr = indi.compute(q_cur, q, omega=omega, dt=dt)
+                with self._state_lock:
+                    self._indi_debug = indi.debug_dict()
+            else:
+                # Desired body rate in our FRD convention (kp on attitude error,
+                # kd damping on measured gyro — gyro is FRD-consistent).
+                rr, pr, yr = _attitude_error_body_rates(
+                    q_cur, q, omega=omega, kp=self._att_rate_kp,
+                    kd=self._att_rate_kd, max_rate=self._att_rate_max,
+                )
             sx, sy, sz = self._rate_sign  # sim applies rates with opposite sign
             with self._send_lock:
                 self._conn.mav.set_attitude_target_send(
@@ -415,6 +463,16 @@ class AIGPMavlinkAdapter(CompetitionInterface):
     def actuator_outputs(self) -> Optional[Dict]:
         with self._state_lock:
             return self._actuator_outputs
+
+    @property
+    def indi_debug(self) -> Optional[Dict]:
+        """Latest INDI inner-loop debug snapshot (None unless _use_indi is on).
+
+        Mirrors ``actuator_outputs`` so the recorder/runner can log the INDI
+        read-out (alpha_des, alpha_meas, Ghat, saturation flags, u) per tick.
+        """
+        with self._state_lock:
+            return self._indi_debug
 
     def drain_collisions(self):
         with self._state_lock:

@@ -198,6 +198,7 @@ async def run_vq1(
     spline_v_final: float = 10.0,
     spline_final_region: float = 50.0,
     trajectory: bool = False,
+    indi: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
 
@@ -218,6 +219,22 @@ async def run_vq1(
     else:
         from competition.aigp_mavlink import AIGPMavlinkAdapter
         adapter = AIGPMavlinkAdapter(enable_vision=True)
+        # OPT-IN measured-accel INDI inner loop (roadmap #2). Default OFF: the
+        # validated champion PD body-rate path is byte-identical unless --indi
+        # is passed. When on, send_attitude computes the body-rate setpoint via
+        # control.indi_inner_loop.IndiInnerLoop with online-G. CANNOT be
+        # validated without the DCGame sim — this is the crux DISCRIMINATOR
+        # experiment, not a claimed lap-time win. Read-out: achieved roll
+        # restored => model mismatch (recoverable); still clamped => true
+        # rate/bandwidth limit. See control/indi_inner_loop.py.
+        if indi:
+            adapter._use_indi = True
+            logger.warning(
+                "INDI inner loop ENABLED (--indi): EXPERIMENTAL measured-accel "
+                "rate-INDI with online-G replaces the PD body-rate law. This is "
+                "the crux discriminator, NOT a validated speed lever — watch the "
+                "achieved-vs-commanded roll to read mismatch vs bandwidth limit."
+            )
 
     # 2. Connect + wait for heartbeat + telemetry
     logger.info("Connecting to sim at %s …", address)
@@ -429,6 +446,13 @@ async def run_vq1(
         dbg = getattr(getattr(pipeline, "minimal_controller", None), "last_debug", None)
         if dbg is not None:
             entry["dbg"] = dbg
+        # INDI inner-loop read-out (only present when --indi is on). Logs
+        # alpha_des/alpha_meas/Ghat/saturation/u per tick so the achieved-vs-
+        # commanded roll (mismatch vs bandwidth-limit) can be read off the
+        # capture. Mirrors actuator_outputs; None on the PD path.
+        indi_dbg = getattr(adapter, "indi_debug", None)
+        if indi_dbg is not None:
+            entry["indi"] = indi_dbg
         # iter-45 (user): live "how close to the opening centre" metric (lateral
         # Y, vertical Z, and the in-plane distance to the current gate's centre).
         gco = getattr(pipeline, "_gate_center_offset", None)
@@ -752,6 +776,17 @@ def main(argv=None) -> None:
              "--aim-z for the vertical opening offset.",
     )
     parser.add_argument(
+        "--indi",
+        action="store_true",
+        help="OPT-IN (default OFF): use the measured-accel INDI inner loop with "
+             "online-G (control/indi_inner_loop.py) for the body-rate setpoint "
+             "instead of the validated PD law. EXPERIMENTAL crux DISCRIMINATOR — "
+             "NOT a validated speed lever, cannot be confirmed without DCGame. "
+             "Read-out: achieved roll restored => model mismatch (recoverable); "
+             "still clamped => true rate/bandwidth limit. Leaves the PD path "
+             "byte-identical when omitted.",
+    )
+    parser.add_argument(
         "--cruise-speed",
         type=float,
         default=3.0,
@@ -983,6 +1018,7 @@ def main(argv=None) -> None:
         spline_v_final=args.spline_v_final,
         spline_final_region=args.spline_final_region,
         trajectory=args.trajectory,
+        indi=args.indi,
     ))
 
 
