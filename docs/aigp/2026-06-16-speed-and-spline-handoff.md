@@ -148,16 +148,45 @@ unless a faster lap is mission-critical.**
 
 ---
 
+## Deep-research follow-up — new opt-in levers & tooling (iters 57–61)
+
+A two-run deep-research effort (2026-06-16) produced
+**`docs/aigp/2026-06-16-deep-research-improvement-report.md`** (full cited
+rationale + roadmaps). Net additions, all **opt-in / off by default** so the
+validated champions above are untouched:
+
+- **Online thrust/drag estimator + drag-aware feedforward** (iter 58):
+  `competition/calibration.py` `OnlineDroneCalibrator` (recursive least-squares);
+  Faessler drag-aware FF in `control/mpc_tracker.py` behind
+  `TrackerConfig(use_drag_ff=True, drag_ff_coeff=<k_d>)` — byte-identical
+  baseline when off.
+- **Measured-accel INDI + online-G** (iter 59) — the *bench-ID-free* form of
+  item 2 below. Enable with `--indi`; logs per-tick
+  `(alpha_des, alpha_meas, ghat, saturated, u)`. **This is the crux experiment:**
+  run it on the sim, then `python -m scripts.analyze_indi_run captures/<run>.jsonl.gz`
+  prints the verdict — **achieved roll restored ⇒ recoverable mismatch (a real
+  speed lever); still ~0.53× clamped ⇒ true bandwidth wall** (then stop fighting
+  the inner loop and use the trajectory side).
+- **Gate-map corruption monitor** (iter 60) — `competition/gate_map_integrity.py`,
+  wired into the runner. Catches the degraded-transfer signatures (sign-flipped
+  X, Z≈−350, **and in-bounds uniform drift** via a persisted session reference:
+  `--gate-map-ref`, `--refresh-gate-map-ref`); logs the diagnosis + suggested fix.
+
 ## Open items / next levers (ranked)
 
-1. **Reliability hardening** (low risk, high race-day value): harden the
-   gate-map sanity check against *uniform* shifts (current check catches
-   out-of-bounds but not a uniform offset); add automatic sim-degradation
-   detection + abort.
-2. **Full measured-accel INDI** (high risk/effort, uncertain): the only path to
-   a faster lap; needs bench ID of `G`.
-3. **Perception / VQ2** (out of scope here): onboard gate detection + EKF fusion
-   (AlphaPilot/Swift recipe) — a separate, larger effort.
+1. **Reliability hardening** — *partially DONE* (iter 60): the gate-map monitor
+   now catches uniform shifts / sign-flips + cross-run drift. Remaining:
+   automatic mid-run sim-degradation detection + abort (over-climb / collision-
+   rate triggers), and an EKF innovation (NIS/CUSUM) integrity monitor (no racing
+   precedent — see report Part 2).
+2. **Full measured-accel INDI** — *IMPLEMENTED as an opt-in experiment* (iter 59,
+   `--indi`): bench-ID-free via online-G, so it no longer *needs* a bench-
+   identified `G`. Run it (+ the analyzer read-out above) to resolve whether the
+   0.53× deficit is recoverable before investing further.
+3. **Perception / VQ2** (larger effort): onboard gate detection + EKF/VIO fusion
+   + gate-based drift correction — the verified champion recipe (corners → PnP →
+   translational-drift KF; Swift / On-Your-Own / KAIST). See report Part 2 for
+   the ranked VQ2 roadmap.
 
 Full iteration-by-iteration detail: `docs/aigp/telemetry_loop_log.md` and the
 `aigp-loop iter NN` commit messages.
