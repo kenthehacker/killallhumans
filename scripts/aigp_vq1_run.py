@@ -42,6 +42,7 @@ from competition.gate_map_integrity import (
     read_reference_json,
     write_reference_json,
 )
+from competition.sim_health import SimHealthProbe
 from gate_sequencing.sequencer import GateSpec
 from race_pipeline import PipelineConfig, RacePipeline
 
@@ -212,6 +213,7 @@ async def run_vq1(
     indi: bool = False,
     gate_map_ref: Optional[str] = DEFAULT_GATE_MAP_REF,
     refresh_gate_map_ref: bool = False,
+    abort_on_degraded: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
 
@@ -425,7 +427,37 @@ async def run_vq1(
 
     # 7. Wrap pipeline callback to record actual path vs planned trajectory.
     telem_log: list = []
+    # Collisions drained live inside the callback (so the health probe can see
+    # them in real time) are accumulated here; the end-of-run summary reads this
+    # list instead of re-draining, so no collision is lost to the probe.
+    all_collisions: list = []
     _orig_callback = pipeline._control_callback
+
+    # --- Sim-degradation health probe (race-day reliability item 1, half 2) ---
+    # The companion to the gate-map integrity check above: that catches a CORRUPT
+    # gate map; this watches the FLIGHT-DYNAMICS degradation signature — the
+    # start OVER-CLIMB growing past the healthy ~-1.7 m toward the degraded
+    # <= -2.4 m (NED, climb = negative Z), and/or a wildly-high early collision
+    # count (see docs/aigp/2026-06-16-speed-and-spline-handoff.md "Operational
+    # notes"). We feed the first ~window_s of post-GO flight to the streaming
+    # probe and EVALUATE ONCE when the window elapses. This block is purely
+    # ADDITIVE: it reads telemetry the recorder already has and NEVER alters the
+    # control command or the GO logic. Default behaviour is WARN-ONLY; the
+    # opt-in --abort-on-degraded ends the run early (clean disconnect) after the
+    # warning. Skipped on --dry-run (FakeAdapter has no real climb/collisions —
+    # the probe would just read insufficient_data; we avoid the noise entirely).
+    health_probe: Optional[SimHealthProbe] = None if dry_run else SimHealthProbe()
+    # Mutable cell so the nested callback can flip it; read after run() returns
+    # to record the verdict into the capture and (optionally) report the abort.
+    health_state = {"verdict": None, "abort": False, "t0": None}
+
+    def _health_time_s(telem: TelemetryState) -> float:
+        """Seconds clock for the probe: prefer the sim stamp (matches the clock
+        the pipeline uses; immune to a non-realtime sim), else wall monotonic."""
+        ts = telem.timestamp_us
+        if ts is not None and ts > 0:
+            return ts / 1e6
+        return time.monotonic()
 
     def _recording_callback(
         telem: TelemetryState,
@@ -434,6 +466,41 @@ async def run_vq1(
         cmd = _orig_callback(telem, frame)
         pos = list(telem.position_ned)
         vel = list(telem.velocity_ned)
+        # --- Feed the sim-degradation health probe (additive; never touches cmd).
+        # Sample z (NED, down-positive) + any collisions drained THIS tick, and
+        # evaluate ONCE when the window has elapsed. Collisions are drained into
+        # ``all_collisions`` so the end-of-run summary still sees every one (it
+        # reads that list instead of re-draining). Wrapped so a probe hiccup can
+        # never break the control loop / the run.
+        if health_probe is not None and not health_probe.done:
+            try:
+                t_h = _health_time_s(telem)
+                if health_state["t0"] is None:
+                    health_state["t0"] = t_h
+                health_probe.add_sample(t_h, pos[2])
+                drained = adapter.drain_collisions()
+                if drained:
+                    all_collisions.extend(drained)
+                    health_probe.add_collisions(len(drained))
+                if health_probe.window_elapsed(t_h):
+                    verdict = health_probe.evaluate()
+                    health_state["verdict"] = verdict
+                    if verdict.degraded:
+                        # LOUD warning naming the signal + the action.
+                        logger.warning("SIM HEALTH PROBE: %s", verdict.message)
+                        if abort_on_degraded:
+                            logger.warning(
+                                "--abort-on-degraded set: ending this run early "
+                                "(clean disconnect) — restart the DCGame .exe "
+                                "into VQ mode before the next run."
+                            )
+                            health_state["abort"] = True
+                            pipeline._diverged = True  # _should_stop ends the run
+                    else:
+                        # healthy or insufficient_data — informational only.
+                        logger.info("SIM HEALTH PROBE: %s", verdict.message)
+            except Exception:
+                logger.debug("sim health probe tick failed (ignored)", exc_info=True)
         # Find the reference point the tracker is currently tracking.
         ref_pos = ref_vel = ref_yaw = None
         if pipeline.trajectory is not None and pipeline._ref_progress_time is not None:
@@ -559,6 +626,39 @@ async def run_vq1(
         )
     elapsed = time.monotonic() - wall_start
 
+    # 8b. Record the sim-health verdict as a ONE-SHOT entry in the capture so
+    #     post-run analysis sees it. If the window never elapsed (a very short
+    #     run), evaluate now to capture the (likely insufficient_data) verdict.
+    if health_probe is not None:
+        try:
+            hv = health_state["verdict"]
+            if hv is None:
+                hv = health_probe.evaluate()
+                health_state["verdict"] = hv
+            telem_log.append({
+                "sim_health": {
+                    "healthy": hv.healthy,
+                    "degraded": hv.degraded,
+                    "diagnosis": hv.diagnosis,
+                    "message": hv.message,
+                    "details": hv.details,
+                    "aborted_run": bool(health_state["abort"]),
+                },
+            })
+            if hv.degraded:
+                logger.warning(
+                    "SIM HEALTH VERDICT (recorded into capture): [%s] %s%s",
+                    hv.diagnosis, hv.message,
+                    " — RUN ABORTED EARLY" if health_state["abort"] else "",
+                )
+            else:
+                logger.info(
+                    "SIM HEALTH VERDICT (recorded into capture): [%s]",
+                    hv.diagnosis,
+                )
+        except Exception:
+            logger.debug("recording sim-health verdict failed (ignored)", exc_info=True)
+
     # 9. Dump telemetry log
     if record and telem_log:
         _write_telem_log(telem_log, record)
@@ -575,8 +675,11 @@ async def run_vq1(
     if telem_log:
         _log_path_comparison(telem_log, gates)
 
-    # 11. Completion summary
-    collisions = adapter.drain_collisions()
+    # 11. Completion summary. The health probe drains collisions live into
+    #     ``all_collisions``; combine those with any drained after the probe
+    #     finished (or all of them on --dry-run, where the probe is off) so the
+    #     reported count is complete regardless of when collisions arrived.
+    collisions = all_collisions + adapter.drain_collisions()
     gates_passed = pipeline.sequencer.gates_passed if pipeline.sequencer else 0
     total_gates = pipeline.sequencer.total_gates if pipeline.sequencer else len(gates)
     logger.info(
@@ -794,6 +897,9 @@ def _log_path_comparison(telem_log: list, gates: list) -> None:
         gx, gy, gz = g.position
         errors = []
         for row in telem_log:
+            # Skip non-telemetry rows (e.g. the one-shot sim_health record).
+            if "pos" not in row:
+                continue
             if row.get("gates_passed", 0) == i:
                 px, py, pz = row["pos"]
                 errors.append(math.sqrt((px-gx)**2 + (py-gy)**2 + (pz-gz)**2))
@@ -805,6 +911,8 @@ def _log_path_comparison(telem_log: list, gates: list) -> None:
     # Overall cross-track error vs reference
     cross_errs = []
     for row in telem_log:
+        if "pos" not in row:
+            continue
         if row.get("ref_pos") is not None:
             dx = row["pos"][0] - row["ref_pos"][0]
             dy = row["pos"][1] - row["ref_pos"][1]
@@ -896,6 +1004,19 @@ def main(argv=None) -> None:
         help="Ignore any existing gate-map reference and OVERWRITE it with this "
              "run's sane map (use after a legitimate course/sim change so a new "
              "healthy baseline is captured). No-op if --gate-map-ref is ''.",
+    )
+    parser.add_argument(
+        "--abort-on-degraded",
+        action="store_true",
+        dest="abort_on_degraded",
+        help="OPT-IN (default OFF = WARN ONLY): if the sim-health probe finds "
+             "the run DEGRADED in its first ~3 s (start over-climb Z <= -2.4 m "
+             "vs healthy ~-1.7, or a wildly-high early collision count), end the "
+             "run early with a clean disconnect after the warning. Default is to "
+             "WARN ONLY and let the run continue (never surprise-abort). Either "
+             "way the verdict is logged loudly and recorded into the capture; a "
+             "degraded sim needs a full DCGame .exe restart into VQ mode (a "
+             "SIM_RESET does NOT fix it). No-op on --dry-run.",
     )
     parser.add_argument(
         "--cruise-speed",
@@ -1133,6 +1254,7 @@ def main(argv=None) -> None:
         # Empty string disables the reference entirely.
         gate_map_ref=(args.gate_map_ref or None),
         refresh_gate_map_ref=args.refresh_gate_map_ref,
+        abort_on_degraded=args.abort_on_degraded,
     ))
 
 
