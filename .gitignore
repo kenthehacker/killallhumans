@@ -36,7 +36,7 @@ control/residual_weights.tmp.npz
 # Iter-025: residual_dataset.npz is the collected training data
 # (regenerable via scripts/collect_residual_dataset.py); also gitignored.
 control/residual_dataset.npz
-# Closed-loop harness / sweep telemetry artifacts (regenerate locally)
-captures/sim_closed_loop.jsonl.gz
-captures/sim_cl_short.jsonl.gz
-captures/sweep_*.jsonl.gz
+# Closed-loop harness / sweep / live-run telemetry artifacts (regenerate
+# locally). All captures/*.jsonl.gz are per-run telemetry recordings — large
+# binary, regenerable by re-flying the sim; never commit them.
+captures/*.jsonl.gz

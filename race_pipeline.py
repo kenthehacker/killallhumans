@@ -206,6 +206,10 @@ class PipelineConfig:
     # cross-track velocity before the plane while the mid-leg still carries the
     # peak. Default 8.0 (the controller's own default).
     minimal_arrival_radius: float = 8.0
+    # iter-45 (user): slew-limit the aim's lateral (Y) target (m/s) so the
+    # cross-track course correction is spread across the leg instead of applied
+    # INSTANTLY at the gate pass (the "rock backwards"). 0 = off (instant).
+    minimal_aim_slew: float = 0.0
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -853,6 +857,36 @@ class RacePipeline:
                     band = max(1e-3, self.config.minimal_lookahead_band_m)
                     ramp = max(0.0, min(1.0, 1.0 - d_cur / band))
                     aim[1] += lead_m * (1.0 if d_y > 0 else -1.0) * ramp
+            # iter-45 (user): the "rock backwards after each gate pass" is the
+            # INSTANT cross-track course-correction when the target gate switches
+            # (v_des Y steps, the drone jerks to redirect). SPREAD the correction
+            # across the gap: SLEW the aim's lateral (Y) target at a limited rate
+            # so the redirect RAMPS over ~0.5 s instead of stepping. X (forward)
+            # and Z (descent — handled by the bounded lookahead, must not lag)
+            # stay instant. On a straight approach the slew converges (no lag);
+            # only the gate-switch jump is smoothed.
+            if self.config.minimal_aim_slew > 0.0:
+                now = time.monotonic()
+                prev_t = getattr(self, "_aim_slew_t", now)
+                dt = max(1e-3, min(0.1, now - prev_t))
+                self._aim_slew_t = now
+                prev_y = getattr(self, "_aim_y_cmd", float(aim[1]))
+                step = self.config.minimal_aim_slew * dt
+                self._aim_y_cmd = prev_y + max(-step, min(step, float(aim[1]) - prev_y))
+                aim[1] = self._aim_y_cmd
+            # iter-45 (user): live "how close to the opening centre" metric —
+            # the drone's current cross-track offset from the target gate's
+            # opening centre (lateral Y, vertical Z; gates face -X so these are
+            # the in-plane axes). Stashed for the recorder so centring is a
+            # tracked telemetry channel, not just a post-hoc plane-cross number.
+            gc_z = float(cur[2]) + self.config.minimal_aim_z_offset
+            self._gate_center_offset = {
+                "gate": getattr(gate, "sequence_index", None),
+                "lat": float(position[1]) - float(cur[1]),
+                "vert": float(position[2]) - gc_z,
+                "dist": math.hypot(float(position[1]) - float(cur[1]),
+                                   float(position[2]) - gc_z),
+            }
             return self.minimal_controller.compute(
                 position, velocity, yaw, tuple(aim), is_final_gate=False,
             )

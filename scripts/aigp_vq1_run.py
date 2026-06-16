@@ -185,6 +185,7 @@ async def run_vq1(
     speed_min_frac: float = 0.5,
     speed_descent_gain: float = 0.0,
     arrival_radius: float = 8.0,
+    aim_slew: float = 0.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -285,6 +286,7 @@ async def run_vq1(
         minimal_speed_min_frac=speed_min_frac,
         minimal_speed_descent_gain=speed_descent_gain,
         minimal_arrival_radius=arrival_radius,
+        minimal_aim_slew=aim_slew,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -402,6 +404,12 @@ async def run_vq1(
         dbg = getattr(getattr(pipeline, "minimal_controller", None), "last_debug", None)
         if dbg is not None:
             entry["dbg"] = dbg
+        # iter-45 (user): live "how close to the opening centre" metric (lateral
+        # Y, vertical Z, and the in-plane distance to the current gate's centre).
+        gco = getattr(pipeline, "_gate_center_offset", None)
+        if gco is not None:
+            entry["gate_center"] = {k: round(v, 4) if isinstance(v, float) else v
+                                    for k, v in gco.items()}
         # SIM's authoritative race status — does the sim itself credit our gate
         # passes? active_gate_index = the gate the SIM wants next (it increments
         # when the sim credits a pass); race_finished = the sim flagged the race
@@ -813,6 +821,15 @@ def main(argv=None) -> None:
              "max(turn_angle, gain*slope). Try ~1.5. With --speed-brake.",
     )
     parser.add_argument(
+        "--aim-slew",
+        type=float,
+        default=0.0,
+        dest="aim_slew",
+        help="Slew-limit the aim's lateral (Y) target (m/s): spreads the "
+             "cross-track course correction across the leg instead of an instant "
+             "jerk at the gate pass (smooths the rock-back). 0=off. Try 6-12. --minimal.",
+    )
+    parser.add_argument(
         "--arrival-radius",
         type=float,
         default=8.0,
@@ -864,6 +881,7 @@ def main(argv=None) -> None:
         speed_min_frac=args.speed_min_frac,
         speed_descent_gain=args.speed_descent_gain,
         arrival_radius=args.arrival_radius,
+        aim_slew=args.aim_slew,
         trajectory=args.trajectory,
     ))
 
