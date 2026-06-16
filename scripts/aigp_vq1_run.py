@@ -188,6 +188,13 @@ async def run_vq1(
     aim_slew: float = 0.0,
     final_aim_z: Optional[float] = None,
     final_brake_band: float = 0.0,
+    spline_path: bool = False,
+    spline_lookahead: float = 6.0,
+    spline_a_lat: float = 10.0,
+    spline_a_long: float = 12.0,
+    spline_v_min: float = 8.0,
+    spline_v_descent: float = 3.0,
+    spline_vert_ff: float = 1.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -294,6 +301,13 @@ async def run_vq1(
         # POSITIVE value aims the final gate LOWER to cancel the decel balloon.
         minimal_final_aim_z_offset=final_aim_z,
         minimal_final_brake_band_m=final_brake_band,
+        minimal_spline_path=spline_path,
+        minimal_spline_lookahead_m=spline_lookahead,
+        minimal_spline_a_lat=spline_a_lat,
+        minimal_spline_a_long=spline_a_long,
+        minimal_spline_v_min=spline_v_min,
+        minimal_spline_v_descent=spline_v_descent,
+        minimal_spline_vert_ff=spline_vert_ff,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -856,6 +870,37 @@ def main(argv=None) -> None:
              "frame at speed. Try +0.5..+0.8. None=same as other gates. --minimal.",
     )
     parser.add_argument(
+        "--spline", action="store_true", dest="spline_path",
+        help="STRUCTURAL racing line: fly ONE continuous arc-length spline "
+             "through all gates with curvature-limited speed (replaces the "
+             "gate-by-gate aim + per-leg brake). Removes the sharp-corner "
+             "undershoot/reversal-tumble. --minimal.",
+    )
+    parser.add_argument("--spline-lookahead", type=float, default=6.0,
+                        dest="spline_lookahead",
+                        help="Pursuit lookahead (m) along the spline. Try 4-10.")
+    parser.add_argument("--spline-a-lat", type=float, default=10.0,
+                        dest="spline_a_lat",
+                        help="Lateral-accel cap (m/s^2) for the curvature speed "
+                             "profile. Drone ~10.5 at max-tilt 0.82. Lower=slower turns.")
+    parser.add_argument("--spline-a-long", type=float, default=12.0,
+                        dest="spline_a_long",
+                        help="Longitudinal-accel cap (m/s^2) for the speed profile.")
+    parser.add_argument("--spline-v-min", type=float, default=8.0,
+                        dest="spline_v_min",
+                        help="Speed floor (m/s) in the tightest turn.")
+    parser.add_argument("--spline-v-descent", type=float, default=3.0,
+                        dest="spline_v_descent",
+                        help="Vertical descent-RATE cap (m/s): steep legs slow "
+                             "so v*|tangent_z|<=this (drone destabilises "
+                             "descending fast at speed). 0=off. Try 2.5-3.5.")
+    parser.add_argument("--spline-vert-ff", type=float, default=1.0,
+                        dest="spline_vert_ff",
+                        help="Spline vertical: 1.0=glide-slope feedforward "
+                             "(vz=speed*slope, aggressive); 0=steady capped-"
+                             "proportional descent (gentler, avoids the roll "
+                             "limit cycle at speed). Try 0.")
+    parser.add_argument(
         "--final-brake-band",
         type=float,
         default=0.0,
@@ -911,6 +956,13 @@ def main(argv=None) -> None:
         aim_slew=args.aim_slew,
         final_aim_z=args.final_aim_z,
         final_brake_band=args.final_brake_band,
+        spline_path=args.spline_path,
+        spline_lookahead=args.spline_lookahead,
+        spline_a_lat=args.spline_a_lat,
+        spline_a_long=args.spline_a_long,
+        spline_v_min=args.spline_v_min,
+        spline_v_descent=args.spline_v_descent,
+        spline_vert_ff=args.spline_vert_ff,
         trajectory=args.trajectory,
     ))
 

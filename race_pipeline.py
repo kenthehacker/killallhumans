@@ -226,6 +226,27 @@ class PipelineConfig:
     # then bleed speed within this many metres of the gate so the reversal is
     # made at a speed the roll loop handles. 0 = off (final leg stays full speed).
     minimal_final_brake_band_m: float = 0.0
+    # iter-52 (STRUCTURAL racing line): fly ONE continuous arc-length spline
+    # through all gates with a CURVATURE-LIMITED speed, instead of straight-line-
+    # to-gate + sharp corners. The slalom's true curvature is gentle (~30 m
+    # radius => ~8.5 m/s^2 lateral at 16 m/s, within the drone's ~10.5 m/s^2),
+    # so the smooth path removes the sharp-corner lateral undershoot + the
+    # reversal tumble that capped the gate-by-gate controller at 50. When on,
+    # the spline replaces the aim + per-leg-brake block (everything else —
+    # inner loop, sequencer, recorder — is reused).
+    minimal_spline_path: bool = False
+    minimal_spline_lookahead_m: float = 6.0   # pursuit lookahead along the spline
+    minimal_spline_a_lat: float = 10.0        # lateral-accel cap for v(curvature)
+    minimal_spline_a_long: float = 12.0       # long-accel cap (matches cruise slew)
+    minimal_spline_v_min: float = 8.0         # speed floor in the tightest turn
+    minimal_spline_vert_ff: float = 1.0       # spline vertical mode: 1.0=glide-
+    #   slope feedforward (vz=speed*slope); 0=steady capped-proportional descent
+    #   toward the aim (gentler, avoids the aggressive catch-up that swings the
+    #   thrust vector into a roll limit cycle at speed).
+    minimal_spline_v_descent: float = 3.0     # vertical descent-RATE cap (m/s);
+    #   steep legs slow so v*|tangent_z| <= this (the drone destabilises
+    #   descending fast while moving fast; the gate-by-gate braked descents for
+    #   the same reason). 0 = off.
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -800,6 +821,70 @@ class RacePipeline:
                     gate = self._gate_specs[-1]
                 else:
                     return AttitudeCommand(0, 0, yaw, 0.4)  # done: hover
+            # iter-52 (STRUCTURAL racing line): fly the continuous spline +
+            # curvature-limited speed instead of gate-by-gate aim. Built lazily
+            # on the first call from the spawn position + all gate centres.
+            if self.config.minimal_spline_path:
+                if getattr(self, "_racing_spline", None) is None:
+                    from planning.racing_spline import RacingSpline
+                    # Build from the FIXED gate centres only (NOT the live
+                    # position — iter-52: building from a drifted spawn gave a
+                    # garbage 145 m spline + a start dive). The drone flies the
+                    # pursuit to g0, then follows the g0->g5 spline; project()
+                    # handles the approach. This also drops the awkward
+                    # spawn->g0 vertical reversal (g0 sits ABOVE spawn).
+                    wpts = [list(map(float, g.position)) for g in self._gate_specs]
+                    self._racing_spline = RacingSpline(
+                        np.array(wpts, dtype=float),
+                        v_max=self.config.minimal_cruise_speed,
+                        a_lat_max=self.config.minimal_spline_a_lat,
+                        a_long_max=self.config.minimal_spline_a_long,
+                        v_min=self.config.minimal_spline_v_min,
+                        v_descent_max=(self.config.minimal_spline_v_descent
+                                       if self.config.minimal_spline_v_descent > 0
+                                       else None),
+                    )
+                    # Follow the spline's LOCAL slope vertically: with the aim
+                    # only a lookahead ahead, vert_ff makes vz = speed*(dz/horiz)
+                    # = speed * local-spline-slope = the 3-D-tangent descent rate.
+                    # (vert_ff was falsified for the gate-by-gate controller — far
+                    # aim, gentle early descent — but is exactly right here, where
+                    # the aim tracks the path. Without it the decoupled P-vertical
+                    # under-descends at 16 m/s and the drone diverges UPWARD.)
+                    self.minimal_controller.cfg.vert_ff = self.config.minimal_spline_vert_ff
+                    logger.info(
+                        "Racing spline built: length=%.1f m, v in [%.1f, %.1f] m/s "
+                        "(vert_ff glide-slope ON)",
+                        self._racing_spline.length,
+                        float(np.min(self._racing_spline.v)),
+                        float(np.max(self._racing_spline.v)),
+                    )
+                aim_pt, tgt_speed = self._racing_spline.aim(
+                    np.array(position, dtype=float),
+                    self.config.minimal_spline_lookahead_m,
+                )
+                # Slew the commanded cruise (same 12 m/s^2 as the per-leg brake)
+                # so curvature speed changes RAMP; the kv loop smooths further.
+                now = time.monotonic()
+                prev_t = getattr(self, "_cruise_t", now)
+                dt = max(1e-3, min(0.1, now - prev_t))
+                self._cruise_t = now
+                prev_c = getattr(self, "_cruise_cmd", float(tgt_speed))
+                step = 12.0 * dt
+                self._cruise_cmd = prev_c + max(-step, min(step, float(tgt_speed) - prev_c))
+                self.minimal_controller.cfg.cruise_speed = self._cruise_cmd
+                # gate-centre telemetry metric (reuse the current target gate)
+                _gc = np.array(gate.position, dtype=float)
+                self._gate_center_offset = {
+                    "gate": getattr(gate, "sequence_index", None),
+                    "lat": float(position[1]) - float(_gc[1]),
+                    "vert": float(position[2]) - float(_gc[2]),
+                    "dist": math.hypot(float(position[1]) - float(_gc[1]),
+                                       float(position[2]) - float(_gc[2])),
+                }
+                return self.minimal_controller.compute(
+                    position, velocity, yaw, tuple(aim_pt), is_final_gate=False,
+                )
             # Aim BEYOND the gate, ALONG ITS NORMAL, so the drone approaches
             # perpendicular and flies straight through the CENTRE of the
             # opening (not toward the next gate, which cuts the corner and
