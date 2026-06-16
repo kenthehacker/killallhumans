@@ -827,13 +827,14 @@ class RacePipeline:
             if self.config.minimal_spline_path:
                 if getattr(self, "_racing_spline", None) is None:
                     from planning.racing_spline import RacingSpline
-                    # Build from the FIXED gate centres only (NOT the live
-                    # position — iter-52: building from a drifted spawn gave a
-                    # garbage 145 m spline + a start dive). The drone flies the
-                    # pursuit to g0, then follows the g0->g5 spline; project()
-                    # handles the approach. This also drops the awkward
-                    # spawn->g0 vertical reversal (g0 sits ABOVE spawn).
-                    wpts = [list(map(float, g.position)) for g in self._gate_specs]
+                    # Build from a FIXED spawn (0,0,0) + the gate centres. The
+                    # spawn-INCLUDED spline tracks the start/g0 cleanly (gates-
+                    # only made the drone tumble trying to engage from far off
+                    # the s=0 endpoint); using a FIXED (0,0,0) instead of the
+                    # live position avoids the drifted-build bug (iter-52: a
+                    # drifted spawn gave a garbage 145 m spline).
+                    wpts = [[0.0, 0.0, 0.0]] + [
+                        list(map(float, g.position)) for g in self._gate_specs]
                     self._racing_spline = RacingSpline(
                         np.array(wpts, dtype=float),
                         v_max=self.config.minimal_cruise_speed,
