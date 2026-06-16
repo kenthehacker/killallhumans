@@ -186,6 +186,7 @@ async def run_vq1(
     speed_descent_gain: float = 0.0,
     arrival_radius: float = 8.0,
     aim_slew: float = 0.0,
+    final_aim_z: Optional[float] = None,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -287,6 +288,10 @@ async def run_vq1(
         minimal_speed_descent_gain=speed_descent_gain,
         minimal_arrival_radius=arrival_radius,
         minimal_aim_slew=aim_slew,
+        # iter-46: applied at RUNTIME relative to the baked opening centre (the
+        # --aim-z bias is already baked into the gate map and zeroed here), so a
+        # POSITIVE value aims the final gate LOWER to cancel the decel balloon.
+        minimal_final_aim_z_offset=final_aim_z,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -839,6 +844,16 @@ def main(argv=None) -> None:
              "stop the high-speed overshoot/tumble. Default 8. Try 12-16. --minimal.",
     )
     parser.add_argument(
+        "--final-aim-z",
+        type=float,
+        default=None,
+        dest="final_aim_z",
+        help="Vertical aim offset for the FINAL gate only (m, NED, applied at "
+             "runtime vs the baked opening centre). POSITIVE aims LOWER to cancel "
+             "the decel pitch-up balloon that makes the drone clip gate5's TOP "
+             "frame at speed. Try +0.5..+0.8. None=same as other gates. --minimal.",
+    )
+    parser.add_argument(
         "--lat-lead",
         type=float,
         default=0.0,
@@ -882,6 +897,7 @@ def main(argv=None) -> None:
         speed_descent_gain=args.speed_descent_gain,
         arrival_radius=args.arrival_radius,
         aim_slew=args.aim_slew,
+        final_aim_z=args.final_aim_z,
         trajectory=args.trajectory,
     ))
 

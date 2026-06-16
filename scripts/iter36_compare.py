@@ -24,6 +24,16 @@ HALF_OPENING = 0.75  # interior gate opening is 1.5m => half = 0.75m (frame edge
                      # is the "how close to crashing" margin that bounds cruise.
 
 
+def _breach_where(laty, vertz):
+    """Which frame edge is the binding/breaching one (user: top/bottom/side?).
+    The binding axis is whichever |error| is larger (it hits the 0.75 m edge
+    first). NED Z is DOWN, so vert<0 => drone is ABOVE the centre => TOP edge;
+    vert>0 => BOTTOM. Lateral +Y/-Y are the two side bars."""
+    if abs(vertz) >= abs(laty):
+        return "TOP (too high)" if vertz < 0 else "BOTTOM (too low)"
+    return "+Y side" if laty > 0 else "-Y side"
+
+
 def pct(xs, p):
     xs = sorted(xs)
     return xs[min(len(xs) - 1, int(p * len(xs)))] if xs else float("nan")
@@ -60,14 +70,20 @@ def analyze(path, label=""):
             worst_lat = max(worst_lat, abs(laty))
             clear = HALF_OPENING - max(abs(laty), abs(vertz))  # frame clearance (binding axis)
             if clear < min_clear[0]:
-                min_clear = (clear, gi)
-            flag = "  <-- CLOSE TO FRAME" if clear < 0.20 else ""
-            print(f"    gate{gi}: lat(Y)={laty:+.3f} vert(Z)={vertz:+.3f}  clearance={clear:+.3f}m  closest3D={closest:.3f}{flag}")
+                min_clear = (clear, gi, _breach_where(laty, vertz))
+            # WHERE on the frame is the binding edge (user: top/bottom/side?).
+            # NED Z is DOWN, so vert<0 => drone ABOVE centre => TOP edge.
+            where = _breach_where(laty, vertz)
+            flag = (f"  <-- {'BREACH' if clear < 0 else 'CLOSE TO'} FRAME ({where})"
+                    if clear < 0.20 else "")
+            print(f"    gate{gi}: lat(Y)={laty:+.3f} vert(Z)={vertz:+.3f}  "
+                  f"clearance={clear:+.3f}m [{where}]  closest3D={closest:.3f}{flag}")
         else:
             print(f"    gate{gi}: (no plane crossing found)  closest3D={closest:.3f}")
     print(f"  WORST plane-cross |lat(Y)| = {worst_lat:.3f}")
-    print(f"  >>> CLOSEST-TO-CRASH: {min_clear[0]:+.3f}m frame clearance at gate{min_clear[1]} "
-          f"(0=clip; race-limiting margin) <<<")
+    mc = min_clear if len(min_clear) == 3 else (min_clear[0], min_clear[1], "?")
+    print(f"  >>> CLOSEST-TO-CRASH: {mc[0]:+.3f}m frame clearance at gate{mc[1]} "
+          f"on the {mc[2]} edge (0=clip; race-limiting margin) <<<")
 
     # --- gyro stats (|w| magnitude, and roll-rate gyro[0])
     wmag = [math.sqrt(sum(c * c for c in (r.get("gyro") or [0, 0, 0]))) for r in rows]

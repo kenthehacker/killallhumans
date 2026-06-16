@@ -210,6 +210,14 @@ class PipelineConfig:
     # cross-track course correction is spread across the leg instead of applied
     # INSTANTLY at the gate pass (the "rock backwards"). 0 = off (instant).
     minimal_aim_slew: float = 0.0
+    # iter-46 (user "we crashed on the TOP -> flew too high"): the normal
+    # aim_z_offset aims ~0.85 m ABOVE centre to pre-empt the controller's
+    # vertical SAG. On the long mid-legs the drone sags ~0.5 m and lands
+    # centred, but the SHORT, FAST final leg (g4->g5) gives no time to sag, so
+    # the drone arrives ~0.74-0.96 m high and clips the TOP frame (gate5
+    # clearance collapsed to +0.008 m at base 15, a top crash at base 16). Use
+    # a SMALLER high-bias for the final gate only. None => use minimal_aim_z_offset.
+    minimal_final_aim_z_offset: Optional[float] = None
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -821,7 +829,15 @@ class RacePipeline:
             if float(np.dot(normal, cur - np.array(position, dtype=float))) < 0:
                 normal = -normal
             aim = cur + self.config.minimal_through_dist * normal
-            aim[2] += self.config.minimal_aim_z_offset
+            # iter-46 (user): smaller vertical high-bias on the FINAL gate (the
+            # short fast finish leg gives no time to sag, so the full 0.85 m
+            # high-bias makes the drone clip the TOP frame). None => normal bias.
+            _last_idx = (len(self._gate_specs) - 1) if self._gate_specs else None
+            _is_final = (getattr(gate, "sequence_index", None) == _last_idx)
+            _z_off = self.config.minimal_aim_z_offset
+            if _is_final and self.config.minimal_final_aim_z_offset is not None:
+                _z_off = self.config.minimal_final_aim_z_offset
+            aim[2] += _z_off
             # iter-40: VERTICAL-ONLY anticipatory descent, BOUNDED in metres.
             # The drone arrives ABOVE every opening (P-only vertical lag; ~0.3 m
             # at cruise 8, ~0.5-0.65 m at cruise 9 where it binds clearance). Aim
@@ -866,6 +882,14 @@ class RacePipeline:
             # stay instant. On a straight approach the slew converges (no lag);
             # only the gate-switch jump is smoothed.
             if self.config.minimal_aim_slew > 0.0:
+                # iter-46: tested EXEMPTING the final leg from the slew (command
+                # the finish turn promptly instead of lagging) — at base 16 it
+                # caused a VIOLENT Y step at the gate4->gate5 switch -> roll
+                # saturated (clamp 69%), drone flew 2.8 m high, 90 collisions.
+                # WORSE than the lag. Neither lag nor step works at 50.7 km/h:
+                # the -3.6 m final turn is past the envelope at that speed. The
+                # right lever is to BRAKE the final leg for its turn (below), not
+                # to tweak the slew — so the slew stays uniform across all legs.
                 now = time.monotonic()
                 prev_t = getattr(self, "_aim_slew_t", now)
                 dt = max(1e-3, min(0.1, now - prev_t))
