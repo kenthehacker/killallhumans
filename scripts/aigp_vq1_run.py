@@ -37,10 +37,21 @@ import json
 from competition.adapter import AttitudeCommand, CameraFrame, CompetitionInterface, Quaternion, TelemetryState
 from competition.aigp_messages import TrackData, TrackGate
 from competition.track_data import track_data_to_gatespecs
+from competition.gate_map_integrity import (
+    check_gate_map,
+    read_reference_json,
+    write_reference_json,
+)
 from gate_sequencing.sequencer import GateSpec
 from race_pipeline import PipelineConfig, RacePipeline
 
 logger = logging.getLogger(__name__)
+
+# Default location of the SESSION gate-map reference (see --gate-map-ref). The
+# first sane fetched map in a session is written here; subsequent runs compare
+# against it so a UNIFORM offset / drift (the failure the bounds miss — e.g. the
+# sim degrading after ~25 runs) is caught ACROSS separate run processes.
+DEFAULT_GATE_MAP_REF = "captures/gate_map_reference.json"
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +210,8 @@ async def run_vq1(
     spline_final_region: float = 50.0,
     trajectory: bool = False,
     indi: bool = False,
+    gate_map_ref: Optional[str] = DEFAULT_GATE_MAP_REF,
+    refresh_gate_map_ref: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
 
@@ -241,31 +254,74 @@ async def run_vq1(
     await adapter.connect(address)
     logger.info("Connected")
 
-    # 3. Fetch gate map — with a sanity check + retry. The SIM_RESET track
+    # 3. Fetch gate map — with an integrity check + retry. The SIM_RESET track
     #    transfer (chunked) intermittently delivers GARBAGE gate positions
-    #    (observed: gate0 at (-918, 6.85, 577) instead of (-23.3,-0.4,-0.03)),
-    #    which silently sends the controller chasing a point ~1 km away. Reject
-    #    out-of-bounds maps and re-fetch rather than fly a corrupt course.
+    #    (observed: gate0 at (-918, 6.85, 577) instead of (-23.3,-0.4,-0.03);
+    #    also sign-flipped X and Z≈-350 once the sim process degrades after ~25
+    #    runs), which silently sends the controller chasing a bad course. The
+    #    monitor (competition.gate_map_integrity) diagnoses WHICH corruption it
+    #    is, not just that the map "looks corrupt", and — when a SESSION
+    #    reference exists — also catches a UNIFORM offset / drift that stays in
+    #    bounds. Reject and re-fetch rather than fly a corrupt course.
+    #
+    #    SESSION REFERENCE: a known-good map from the first healthy run of the
+    #    session, persisted to ``gate_map_ref`` so a uniform drift is caught
+    #    across SEPARATE run processes (the sim-degradation signature). Absent
+    #    file => no reference (default behaviour unchanged for a fresh checkout).
+    #    Skipped entirely on --dry-run: a dry run is offline testing on a fixed
+    #    fake map, not a real session, so it neither reads nor writes the
+    #    persistent baseline (keeps the offline flow side-effect-free).
+    session_ref_path = None if dry_run else gate_map_ref
+    reference = _load_gate_map_reference(session_ref_path, refresh_gate_map_ref)
+
     track = await adapter.wait_for_track_data(timeout_s=10.0)
     if track is None:
         raise RuntimeError("No track data received — is the sim in Virtual Qualifier mode?")
     gates: List[GateSpec] = track_data_to_gatespecs(track)
+    verdict = check_gate_map(gates, reference=reference)
     for attempt in range(4):
-        if _gate_map_is_sane(gates):
+        if verdict.ok:
             break
         logger.error(
-            "Track map attempt %d looks CORRUPT (out-of-bounds gate positions): %s — "
+            "Track map attempt %d FAILED integrity check [%s]: %s — positions=%s — "
             "re-fetching via SIM_RESET.",
-            attempt + 1, [tuple(round(c, 1) for c in g.position) for g in gates],
+            attempt + 1, verdict.diagnosis, verdict.message,
+            [tuple(round(c, 1) for c in g.position) for g in gates],
         )
+        if verdict.suggested_correction:
+            logger.error(
+                "  Suggested correction for [%s]: %s (NOT auto-applied — the "
+                "runner re-fetches a clean map instead of flying a 'fixed' one).",
+                verdict.diagnosis, verdict.suggested_correction,
+            )
         track = await adapter.reset()
         if track is not None:
             gates = track_data_to_gatespecs(track)
-    if not _gate_map_is_sane(gates):
+        verdict = check_gate_map(gates, reference=reference)
+    if not verdict.ok:
         raise RuntimeError(
-            "Track map still corrupt after retries — aborting rather than flying a "
-            "garbage course."
+            f"Track map still corrupt after retries [{verdict.diagnosis}]: "
+            f"{verdict.message} — aborting rather than flying a garbage course."
         )
+    logger.info("Gate map integrity: OK (%s)", verdict.message)
+
+    # Persist this map as the SESSION reference the first time we see a sane map
+    # and no reference exists yet (or --refresh-gate-map-ref was passed). Done
+    # BEFORE the aim-z offset is baked in below, so the reference is the raw
+    # sim-transferred geometry, comparable to future raw fetches.
+    if session_ref_path and (reference is None or refresh_gate_map_ref):
+        try:
+            write_reference_json(gates, session_ref_path)
+            logger.info(
+                "Wrote SESSION gate-map reference (%d gates) -> %s — future runs "
+                "will be checked for uniform drift against it.",
+                len(gates), session_ref_path,
+            )
+        except Exception:
+            logger.warning(
+                "Could not write gate-map reference to %s (continuing — "
+                "reference is optional).", gate_map_ref, exc_info=True,
+            )
     # The passable OPENING sits ~0.85 m above gate.position in NED -z (the
     # drone hit the bottom bar when flying at gate.position). Bake the vertical
     # offset into the gate map ONCE so BOTH the controller aim AND the
@@ -563,22 +619,58 @@ async def run_vq1(
     await adapter.disconnect()
 
 
-def _gate_map_is_sane(gates: List[GateSpec]) -> bool:
+def _gate_map_is_sane(gates: List[GateSpec], reference=None) -> bool:
     """Reject obviously-corrupt gate maps from a bad SIM_RESET track transfer.
 
-    The real VQ1 course spans x in [-160, 0], |y| < 10, z in [-1, 27] (NED).
-    Garbage transfers have produced gates ~1 km out. Bounds are generous so
-    only true corruption is rejected, not legitimate course variation.
+    Thin bool wrapper over :func:`competition.gate_map_integrity.check_gate_map`
+    so the existing fetch-and-retry call sites keep their boolean contract while
+    gaining sign-flip, self-consistency, and (when ``reference`` is supplied)
+    uniform-offset / drift detection. The new module's OUTER bounds floor is a
+    strict superset of this function's historical box (x in [-300, 20],
+    |y| <= 50, z in [-50, 60]), so behaviour can only get stricter.
+
+    The real VQ1 course spans x in ~[-160, 0], |y| < 10, z in ~[-1, 27] (NED);
+    garbage transfers have produced gates ~1 km out, sign-flipped X, or Z≈-350.
     """
-    if not gates:
-        return False
-    for g in gates:
-        x, y, z = g.position
-        if not all(math.isfinite(c) for c in (x, y, z)):
-            return False
-        if not (-300.0 <= x <= 20.0 and -50.0 <= y <= 50.0 and -50.0 <= z <= 60.0):
-            return False
-    return True
+    return check_gate_map(gates, reference=reference).ok
+
+
+def _load_gate_map_reference(path: Optional[str], refresh: bool):
+    """Load the session gate-map reference, or None.
+
+    Returns None (so the run behaves exactly as before) when: no path is given,
+    ``--refresh-gate-map-ref`` was passed (we will OVERWRITE it with this run's
+    map), the file is absent, or the file is malformed (a broken reference must
+    never block an otherwise-healthy run). Logs why on each None path.
+    """
+    if not path:
+        return None
+    if refresh:
+        logger.info(
+            "--refresh-gate-map-ref: ignoring any existing reference; this "
+            "run's sane map will overwrite %s.", path,
+        )
+        return None
+    import os
+    if not os.path.exists(path):
+        logger.info(
+            "No gate-map reference at %s yet — the first sane map this session "
+            "will be saved there as the drift baseline.", path,
+        )
+        return None
+    try:
+        ref = read_reference_json(path)
+        logger.info(
+            "Loaded gate-map reference (%d gates) from %s — fetched maps will be "
+            "checked for uniform drift against it.", len(ref), path,
+        )
+        return ref
+    except Exception:
+        logger.warning(
+            "Gate-map reference at %s is unreadable/malformed — ignoring it "
+            "(run continues without drift comparison).", path, exc_info=True,
+        )
+        return None
 
 
 async def _reset_and_settle(
@@ -785,6 +877,25 @@ def main(argv=None) -> None:
              "Read-out: achieved roll restored => model mismatch (recoverable); "
              "still clamped => true rate/bandwidth limit. Leaves the PD path "
              "byte-identical when omitted.",
+    )
+    parser.add_argument(
+        "--gate-map-ref",
+        default=DEFAULT_GATE_MAP_REF,
+        dest="gate_map_ref",
+        help="Path to the SESSION gate-map reference JSON. On the first run "
+             "whose fetched map is sane AND this file is absent, the map is "
+             "saved here; on later runs it is loaded and the fetched map is "
+             "checked for a UNIFORM offset / drift against it (catches the sim "
+             "degrading across separate run processes). Absent file = no "
+             "reference (default behaviour unchanged). Set to '' to disable.",
+    )
+    parser.add_argument(
+        "--refresh-gate-map-ref",
+        action="store_true",
+        dest="refresh_gate_map_ref",
+        help="Ignore any existing gate-map reference and OVERWRITE it with this "
+             "run's sane map (use after a legitimate course/sim change so a new "
+             "healthy baseline is captured). No-op if --gate-map-ref is ''.",
     )
     parser.add_argument(
         "--cruise-speed",
@@ -1019,6 +1130,9 @@ def main(argv=None) -> None:
         spline_final_region=args.spline_final_region,
         trajectory=args.trajectory,
         indi=args.indi,
+        # Empty string disables the reference entirely.
+        gate_map_ref=(args.gate_map_ref or None),
+        refresh_gate_map_ref=args.refresh_gate_map_ref,
     ))
 
 
