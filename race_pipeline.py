@@ -194,6 +194,12 @@ class PipelineConfig:
     # turn limit — the user-endorsed unlock. Swept live.
     minimal_speed_brake: float = 0.0      # 1/rad; >0 enables variable speed
     minimal_speed_min_frac: float = 0.5   # floor on the braked cruise fraction
+    # The turn-angle brake misses the steep-but-straight DESCENT gates (g1: legs
+    # nearly collinear in 3D -> tiny turn angle, but it must lose ~5-9 m and so
+    # arrives above the opening -> vertical-bound, 0.34 m @ base 13.5). Add the
+    # incoming leg's vertical SLOPE (|dz|/|dxy|) to the difficulty so descent-
+    # heavy gates also brake. difficulty = max(turn_angle, descent_gain*slope).
+    minimal_speed_descent_gain: float = 0.0  # >0 also brakes steep descents
 
     # Iter-035: clean trajectory-race harness (the principled alternative to
     # minimal pure-pursuit). minimal_control stays False so configure() still
@@ -606,6 +612,34 @@ class RacePipeline:
         metrics = await session.run()
         logger.info("Race finished: %s", metrics)
 
+    def _gate_difficulty(self, idx: int) -> float:
+        """Static per-gate difficulty for the variable-speed brake (cached):
+        the 3D direction-change angle (incoming vs outgoing leg) combined with
+        the incoming leg's vertical SLOPE (|dz|/|dxy|) so steep-but-straight
+        descent gates also brake. Returns 0 for gate0 and the final gate (no
+        brake — they keep full speed for the peak)."""
+        cache = getattr(self, "_gate_diff_cache", None)
+        if cache is None:
+            cache = self._gate_diff_cache = {}
+        if idx in cache:
+            return cache[idx]
+        specs = self._gate_specs
+        diff = 0.0
+        if 0 < idx < len(specs):
+            p_prev = np.array(specs[idx - 1].position, dtype=float)
+            p_cur = np.array(specs[idx].position, dtype=float)
+            inc = p_cur - p_prev
+            nxt = (np.array(specs[idx + 1].position, dtype=float) - p_cur
+                   if idx + 1 < len(specs) else inc)
+            ni, nn = float(np.linalg.norm(inc)), float(np.linalg.norm(nxt))
+            theta = 0.0
+            if ni > 1e-6 and nn > 1e-6:
+                theta = math.acos(float(np.clip(np.dot(inc, nxt) / (ni * nn), -1.0, 1.0)))
+            slope = abs(float(inc[2])) / max(1e-6, float(np.linalg.norm(inc[:2])))
+            diff = max(theta, self.config.minimal_speed_descent_gain * slope)
+        cache[idx] = diff
+        return diff
+
     def _control_callback(
         self,
         telem: TelemetryState,
@@ -745,28 +779,31 @@ class RacePipeline:
             # crosses the plane off-centre -> frame collisions + the sequencer
             # crediting an off-centre/early pass, as in min_v9). The sequencer
             # advances on the clean plane crossing.
-            # iter-42: VARIABLE SPEED — brake into the geometrically-tight gates
-            # (steep descent / Y-reversal) where the vertical lag + lateral
-            # undershoot bind, while the near-collinear legs keep full base speed
-            # for the peak-velocity target. Mutate the controller's cruise for
-            # this leg (recomputed every tick; the kv loop smooths transitions).
+            # iter-43: VARIABLE SPEED — PER-LEG brake + SLEW-limited transitions.
+            # The binding constraint at high base is the speed-dependent VERTICAL
+            # LAG: on a steep descent leg the drone must lose altitude over the
+            # WHOLE leg, so it must be slow for the WHOLE leg (a proximity/near-
+            # gate brake let it barrel down g1->g2 at full speed and arrive 3.9 m
+            # high -> crash). So the brake is per-leg (set by the current TARGET
+            # gate's difficulty = max(turn angle, descent slope)). To avoid the
+            # "rocks too hard / discrete flight plans" jolt at a gate pass (user),
+            # SLEW-limit the cruise so it RAMPS between legs instead of stepping;
+            # the kv loop smooths further. min_frac keeps the braked gates at a
+            # speed they handle cleanly (~9 m/s), not crawling.
             if self.config.minimal_speed_brake > 0.0:
                 base = self.config.minimal_cruise_speed
-                idx = getattr(gate, "sequence_index", 0)
-                theta = 0.0
-                if 0 < idx < len(self._gate_specs):
-                    p_prev = np.array(self._gate_specs[idx - 1].position, dtype=float)
-                    p_cur = np.array(gate.position, dtype=float)
-                    inc = p_cur - p_prev
-                    nxt = (np.array(self._gate_specs[idx + 1].position, dtype=float) - p_cur
-                           if idx + 1 < len(self._gate_specs) else inc)
-                    ni, nn = np.linalg.norm(inc), np.linalg.norm(nxt)
-                    if ni > 1e-6 and nn > 1e-6:
-                        cosang = float(np.clip(np.dot(inc, nxt) / (ni * nn), -1.0, 1.0))
-                        theta = math.acos(cosang)
+                diff = self._gate_difficulty(getattr(gate, "sequence_index", 0))
                 factor = max(self.config.minimal_speed_min_frac,
-                             min(1.0, 1.0 - self.config.minimal_speed_brake * theta))
-                self.minimal_controller.cfg.cruise_speed = base * factor
+                             min(1.0, 1.0 - self.config.minimal_speed_brake * diff))
+                target_cruise = base * factor
+                now = time.monotonic()
+                prev_t = getattr(self, "_cruise_t", now)
+                dt = max(1e-3, min(0.1, now - prev_t))
+                self._cruise_t = now
+                prev_c = getattr(self, "_cruise_cmd", target_cruise)
+                step = 12.0 * dt  # m/s per s slew (ramps a 5 m/s change in ~0.4 s)
+                self._cruise_cmd = prev_c + max(-step, min(step, target_cruise - prev_c))
+                self.minimal_controller.cfg.cruise_speed = self._cruise_cmd
             cur = np.array(gate.position, dtype=float)
             normal = np.array(_gate_normal(gate.yaw, gate.pitch), dtype=float)
             # Orient the normal in the direction of travel (away from the drone).

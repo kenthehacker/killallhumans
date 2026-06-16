@@ -183,6 +183,7 @@ async def run_vq1(
     lat_lead_m: float = 0.0,
     speed_brake: float = 0.0,
     speed_min_frac: float = 0.5,
+    speed_descent_gain: float = 0.0,
     trajectory: bool = False,
 ) -> None:
     """Full Phase 1.5/1.6 run sequence.
@@ -281,6 +282,7 @@ async def run_vq1(
         minimal_lat_lead_m=lat_lead_m,
         minimal_speed_brake=speed_brake,
         minimal_speed_min_frac=speed_min_frac,
+        minimal_speed_descent_gain=speed_descent_gain,
         trajectory_race=trajectory,
         # Both the minimal and the trajectory-race paths use the sim's raw
         # LOCAL_POSITION_NED directly. The EKF was diverging to NaN ~1 s into
@@ -801,6 +803,14 @@ def main(argv=None) -> None:
         help="Floor on the braked cruise fraction (default 0.5). With --speed-brake.",
     )
     parser.add_argument(
+        "--speed-descent-gain",
+        type=float,
+        default=0.0,
+        dest="speed_descent_gain",
+        help="Also brake steep-but-straight DESCENT gates: difficulty = "
+             "max(turn_angle, gain*slope). Try ~1.5. With --speed-brake.",
+    )
+    parser.add_argument(
         "--lat-lead",
         type=float,
         default=0.0,
@@ -841,6 +851,7 @@ def main(argv=None) -> None:
         lat_lead_m=args.lat_lead_m,
         speed_brake=args.speed_brake,
         speed_min_frac=args.speed_min_frac,
+        speed_descent_gain=args.speed_descent_gain,
         trajectory=args.trajectory,
     ))
 
