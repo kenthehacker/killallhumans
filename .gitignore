@@ -40,3 +40,9 @@ control/residual_dataset.npz
 # locally). All captures/*.jsonl.gz are per-run telemetry recordings — large
 # binary, regenerable by re-flying the sim; never commit them.
 captures/*.jsonl.gz
+# Per-run logs, analysis dumps, and the session gate-map reference are all
+# regenerable run artifacts too (real-sim loop, iters 1-70) — never commit them.
+captures/*.log
+captures/*.txt
+captures/*.json
+captures/*.npz
