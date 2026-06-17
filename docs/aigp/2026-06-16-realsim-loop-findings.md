@@ -1,0 +1,117 @@
+# AIGP — Real-Sim Validation Loop Findings (2026-06-16)
+
+First end-to-end **real-DCGame-sim** validation of the deep-research work (the
+prior report `2026-06-16-deep-research-improvement-report.md` was offline-only).
+8 live flights. **Use `python -m scripts.sim_connect_check` + the `aigp-sim-connect`
+skill to connect** (the sim was reachable: VQ mode, MAVLink udp 14550).
+
+## TL;DR
+
+- **Performance envelope (live):** gate-by-gate **cruise 16 = clean 6/6, 16.2 s
+  g0→g5, 0.27 m worst frame margin** — the practical SPEED CEILING. Spline =
+  clean 6/6 ~21.5 s, big margins (0.35–0.69 m), but *curvature-limited*
+  (cruise-insensitive — cruise 20 ≈ cruise 16). Both verified by the SIM's own
+  `race_finished=True` scoring.
+- **The 0.53 roll crux is a TRUE rate/bandwidth wall** — confirmed FOUR ways
+  (below). Not recoverable by the inner loop.
+- **INDI is shelved** — it diverges on the real sim (a sign/frame bug); off by
+  default, not race-usable.
+- **The new monitors work live:** gate-map integrity + session-reference drift
+  check + sim-health probe all fired correctly. One real tool bug fixed
+  (`iter36_compare`).
+- **Next real speed lever = a racing-line / speed-profile redesign that reduces
+  the *required* roll rate and the vertical balloon** — a substantial planner
+  effort (the team's prior focus), uncertain incremental payoff.
+
+## The envelope (8 flights)
+
+| iter | config | result (SIM-authoritative) |
+|---|---|---|
+| 1 | spline, cruise 16 | clean **6/6**, 21.3 s, worst margin 0.33 m @ gate3 |
+| 2 | gate-by-gate, cruise 16 | clean **6/6**, **16.2 s** g0→g5, worst 0.268 m @ gate5 |
+| 3 | gate-by-gate, cruise 16, **--indi** | **DIVERGED** (out-of-box, 2.3 s) |
+| 4 | --indi, cruise 8 | **DIVERGED** (out-of-box, 1.9 s) |
+| 5 | --indi (clamp+gentler gains), cruise 8 | **DIVERGED** (sign bug) |
+| 6 | gate-by-gate, cruise 18 | **CRASH @ gate0** (1 collision) |
+| 7 | spline, cruise 20 | clean **6/6**, 21.5 s (≈ cruise 16 → curvature-limited) |
+| 8 | gate-by-gate, cruise 17 | **5/6**, 1.3 cm margin @ gate1, **tumble @ gate5** |
+
+Scoring note: trust the SIM's `race_status.race_finished` / `active_gate_index`,
+NOT our center-based sequencer — the sequencer undercounts the final gate by
+~0.16 m (it credits *center*-crossing; the sim credits *body*-crossing). Iter 1
+logged "5/6" but the sim scored `race_finished=True` (full 6/6).
+
+## The bandwidth wall — four independent confirmations
+
+1. **PD champion telemetry (iter 2):** the roll-rate command saturates the ±0.8
+   rad/s clamp **60–66 %** of the hard-turn ticks (gates 1, 2, 4) while achieved
+   roll stays < commanded — the controller is already asking for max roll rate.
+2. **INDI online-G (iters 3–5):** converges to a low roll effectiveness (~0.42),
+   and a measured-accel inversion does NOT restore the roll.
+3. **Cruise 18 (iter 6):** +2 m/s over the clean run → immediate gate-0 crash
+   (the harder bank exceeds the rate-limited roll).
+4. **Cruise 17 (iter 8):** gates ballooned to **1.3 cm** from the TOP bar and the
+   final reversal tumbled — the same balloon/overshoot the bandwidth limit causes.
+
+Matches the handoff's own conclusion: *reduce the required roll via the
+trajectory, don't add inner-loop bandwidth.*
+
+## INDI status — diagnosed and shelved (off by default)
+
+The opt-in measured-accel INDI loop **diverges on the real sim** (climbs out of
+box in ~2 s). Telemetry root cause:
+- **Gyro-derivative spikes:** the telem feed updates slower than the control
+  loop → `alpha_meas = dω/dt` spikes to ±89 rad/s² while barely rolling.
+  *Fixed* (iter 66): clamp the raw derivative to ±`max_ang_accel` (30) +
+  freeze online-G on a clamped axis.
+- **Hot startup gains:** module-default `kp_att=18` slams the rate clamp on the
+  large startup attitude error → windup. *Fixed* (iter 66): gentler live gains
+  `kp_att=(6,6,4)`.
+- **RESIDUAL SIGN/FRAME BUG (open):** the sim applies body rates with
+  `_rate_sign=(−1,+1,−1)`, so the true roll/yaw control-effectiveness is
+  **negative**, but the online-G is clamped positive-only → it can't represent
+  it (g floors at 0.05, achieved/commanded roll goes *negative*) → positive
+  feedback → divergence. To make INDI fly, the online-G + `g_clip` must be
+  per-axis SIGNED (seed `(−1, +2.1, −2.1)` to match `_rate_sign`), or the INDI
+  must work in the sim command frame (apply `_rate_sign` internally and not
+  re-apply at the caller). **Even fixed, the evidence says INDI won't beat the
+  wall** — it would only confirm BANDWIDTH-LIMITED cleanly.
+
+## Monitors validated LIVE (the iter 57–63 work)
+
+- **Gate-map integrity (iter 60):** "Gate map integrity: OK (6 gates)" on every
+  run; wrote `captures/gate_map_reference.json` on iter 1; iter 2+ confirmed
+  cross-run stability ("matches the reference within tolerance, max residual
+  0.021 m"). The uniform-drift detector is live.
+- **Sim-health probe (iter 63):** reported healthy peak climb Z≈−1.67…−1.72
+  (vs the −2.4 degraded threshold) on clean runs; `insufficient_data` on the
+  early-abort runs (correctly non-alarming).
+- **`iter36_compare` bug fix (iter 65):** it `KeyError`'d on the iter-63
+  `sim_health` capture row (hard `["pos"]` index); now filters to telemetry rows.
+
+## What's left (ranked)
+
+1. **Racing-line / speed-profile redesign** (the only real speed lever): cut the
+   *required* roll rate at the binding gates (1, 2, 4) and the vertical balloon at
+   the early gates, so the line can carry more speed within the ±0.8 roll-rate
+   budget. This is roadmap #3 (bandwidth-aware re-timing) made concrete now that
+   the bandwidth (±0.8 rad/s clamp, ~0.42 roll effectiveness) is measured.
+   Substantial, multi-iteration, uncertain payoff (the team already optimized the
+   line heavily). Validate every change on the live sim.
+2. **INDI sign fix** (medium effort): per-axis signed online-G → a clean crux
+   verdict. Likely confirms BANDWIDTH-LIMITED; low race payoff.
+3. **Reliability stress test:** run toward the ~25-run degradation point to
+   confirm the sim-health + gate-map monitors catch it live (they're wired and
+   passed the clean-run checks).
+
+## Reproduce
+
+```
+python -m scripts.sim_connect_check                      # confirm READY
+python -m scripts.aigp_vq1_run --minimal --cruise-speed 16 --max-tilt 0.82 \
+  --aim-z -0.85 --kv 3.0 --max-vert-speed 9.5 --lookahead 0.7 --speed-brake 1.3 \
+  --speed-min-frac 0.55 --speed-descent-gain 1.5 --aim-slew 12 --final-aim-z 0.5 \
+  --final-brake-band 26 --record captures/run.jsonl.gz --max-seconds 75   # 16.2s 6/6
+python -m scripts.iter36_compare captures/run.jsonl.gz   # per-gate margins
+```
+Captures from this loop: `captures/iter{1..8}_*.jsonl.gz` (+ `*_run.log`).
