@@ -205,7 +205,16 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             cfg = self._indi_config
             if cfg is None:
                 from control.indi_inner_loop import IndiConfig
-                cfg = IndiConfig(max_rate=self._att_rate_max)
+                # Gentler accel-PD than the module default (18/3): real-sim
+                # iters 3-4 showed the hot default slams the rate clamp on the
+                # large startup attitude error and winds up -> divergence. Plus
+                # the physical gyro-derivative clamp (max_ang_accel) that kills
+                # the telem-rate spikes. Tuned against the live sim, not offline.
+                cfg = IndiConfig(
+                    max_rate=self._att_rate_max,
+                    kp_att=(6.0, 6.0, 4.0), kd_att=(2.5, 2.5, 2.0),
+                    max_ang_accel=30.0,
+                )
             self._indi = IndiInnerLoop(cfg)
         return self._indi
 

@@ -128,6 +128,15 @@ class IndiConfig:
     filter_cutoff_hz: float = 20.0
     filter_order: int = 2  # 1 (single-pole) or 2 (critically-damped biquad)
 
+    # Physical clamp (rad/s^2) on the RAW gyro-derivative angular accel BEFORE
+    # filtering. On the real sim the gyro/telemetry updates slower than the
+    # control loop, so a fresh frame's Delta-omega over a small dt yields
+    # unphysical spikes (observed +/-89 rad/s^2 while barely rolling) that wreck
+    # the inversion and drive online-G to its floor -> divergence (real-sim iters
+    # 3-4). A real quad's angular accel is bounded; clamp the spikes and FREEZE
+    # the G update on any axis whose accel was clamped (the reading is unreliable).
+    max_ang_accel: float = 30.0
+
     # --- Online-G (per-axis scalar RLS with forgetting) ---
     g_seed: Tuple[float, float, float] = DEFAULT_G_SEED
     forgetting_factor: float = 0.995  # lambda in (0, 1]; <1 tracks drift.
@@ -161,6 +170,8 @@ class IndiConfig:
             raise ValueError("filter_order must be 1 or 2")
         if self.filter_cutoff_hz <= 0.0:
             raise ValueError("filter_cutoff_hz must be positive")
+        if self.max_ang_accel <= 0.0:
+            raise ValueError("max_ang_accel must be positive")
         lo, hi = self.g_clip
         if not (0.0 < lo < hi):
             raise ValueError("g_clip must be (lo, hi) with 0 < lo < hi")
@@ -373,6 +384,12 @@ class IndiInnerLoop:
         else:
             alpha_meas_raw = (omega_arr - self._omega_prev) / dt
             have_deriv = True
+        # Clamp unphysical gyro-derivative spikes (the telem feed updates slower
+        # than the control loop, so a fresh frame's Delta-omega / small-dt can be
+        # huge) BEFORE filtering. Track which axes were clamped so the online-G
+        # update can skip them (a clamped reading is not the true response).
+        accel_clamped = np.abs(alpha_meas_raw) > c.max_ang_accel
+        alpha_meas_raw = np.clip(alpha_meas_raw, -c.max_ang_accel, c.max_ang_accel)
         alpha_meas = np.array([
             self._accel_filt[i].apply(float(alpha_meas_raw[i]), dt) for i in range(3)
         ], dtype=np.float64)
@@ -391,6 +408,8 @@ class IndiInnerLoop:
             for i in range(3):
                 if prev_saturated[i]:
                     continue  # anti-windup: don't learn from a clipped command
+                if accel_clamped[i]:
+                    continue  # spike-clamped accel reading is unreliable; freeze
                 if abs(du[i]) < c.excitation_min_du:
                     continue  # under-excitation: freeze, don't corrupt
                 self._rls[i].update(float(du[i]), float(dalpha[i]))
