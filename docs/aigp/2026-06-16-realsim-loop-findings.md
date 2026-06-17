@@ -115,3 +115,36 @@ python -m scripts.aigp_vq1_run --minimal --cruise-speed 16 --max-tilt 0.82 \
 python -m scripts.iter36_compare captures/run.jsonl.gz   # per-gate margins
 ```
 Captures from this loop: `captures/iter{1..8}_*.jsonl.gz` (+ `*_run.log`).
+
+## Racing-line redesign attempt (iter 9) — the lap is DESCENT-FLOORED
+
+Pushed the spline speed profile toward the bandwidth budget: `--spline-v-descent
+2.0→3.0`, `--spline-a-lat 6.5→8.0`, cruise 18. Result: **1/6, gate2 breached by
+8.6 m on the TOP edge** (vert Z=−8.59), gates 1 & 3 also breached high; roll-rate
+clamp 67% saturated. The failure mode is decisive:
+
+- **Faster descent → the drone flies HIGH over gates 1–3.** Raising `v_descent`
+  lets it go faster horizontally on the steep legs, so it covers the ground
+  before it can descend the forced Δz → arrives above the gate → sails over the
+  top. `v_descent=2.0` isn't conservative — it's holding horizontal speed down
+  so the (bandwidth-limited ~2 m/s) vertical can keep up. The descent cap is the
+  binding wall.
+- **`a_lat=8.0` saturates roll (67%)** — the smooth spline has *less* lateral
+  roll-rate headroom than hoped; pushing it just re-hits the roll wall.
+
+**The lap time is physics-floored, not tuning-limited.** Gates 1–3 force a
+~19.5 m (gate0→gate3: ~24.6 m) descent; the descent rate is walled at ~2 m/s
+vertical (faster → tumble or fly-high). That's a hard ~10–12 s floor for the
+descent section alone. The gate-by-gate champion already flies **gate0→gate3 in
+10.8 s (≈2.27 m/s vertical — AT the wall)**; the near-level gate3→gate5 finish is
+fast. Net: **16.2 s is essentially the physical floor for this course on this
+sim.** The racing line cannot beat it — pushing the descent flies high, pushing
+the lateral saturates roll. Confirmed across iters 2, 6, 8, 9.
+
+**Implication:** further *speed* work is futile without beating the descent/roll
+bandwidth wall (RL-territory, deep-research-ranked not-first). The achievable
+race-day value is **RELIABILITY** — guaranteeing the 16.2 s 6/6 every race
+despite sim degradation / gate-map corruption (monitors already built + validated
+live). Optionally, port gate-by-gate's descent handling into the spline to get a
+*fast-AND-high-margin* controller (~matches 16.2 s with more clearance) — a
+reliability win, not a speed win.
