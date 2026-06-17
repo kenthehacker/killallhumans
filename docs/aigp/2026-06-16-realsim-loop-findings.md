@@ -179,3 +179,48 @@ needs a different control architecture (RL — deep-research-ranked not-first fo
 this deadline/single-track setting), not tuning. **Race-day posture: fly the
 champion; the armed gate-map + sim-health monitors plus the `.exe`-restart
 procedure (`aigp-sim-connect` skill) cover the documented sim-degradation risk.**
+
+## Best-of-many speed hunt (2026-06-17) — objective INVERTED
+
+**Competition format: every run is uploaded and only your BEST run counts** —
+there is no single race. This inverts the strategy: reliability is NOT the goal;
+the single fastest sim-credited 6/6 is, and **crashes are free**. So the "16.2 s
+floor" (a *reliability*-conservative limit) re-opens — push past the safe envelope
+and keep the lucky fast landings.
+
+**Result — a faster best run:**
+
+| config | total | g0→g5 | completion | notes |
+|---|---|---|---|---|
+| champion `--cruise-speed 16` (band 26) | 19.05 s | 16.2 s | ~100% | clean, the SAFE upload (guaranteed 6/6) |
+| **`--cruise-speed 17 --final-brake-band 38`** | **18.27 s** | **15.45 s** | **~30–50%** | the FAST upload; sim-credited 6/6, achievable 0-collision |
+
+~0.8 s (~5%) faster. Achieved repeatedly (batches 1 & 3). Full command:
+```
+python -m scripts.aigp_vq1_run --minimal --cruise-speed 17 --max-tilt 0.82 \
+  --aim-z -0.85 --kv 3.0 --max-vert-speed 9.5 --lookahead 0.7 --speed-brake 1.3 \
+  --speed-min-frac 0.55 --speed-descent-gain 1.5 --aim-slew 12 --final-aim-z 0.5 \
+  --final-brake-band 38 --record captures/run.jsonl.gz --max-seconds 75
+```
+
+**Key findings:**
+- **The aggressive margin is stochastic** (unlike the deterministic champion,
+  ±0.04 s). The *same* cruise-17/band-38 config completed 6/6 (18.27 s) on some
+  runs and diverged on others — so **best-of-many luck IS exploitable here**: run
+  it many times, keep the best clean 6/6.
+- **cruise 17 is the sweet spot.** cruise 17.5+ fails at the **gate-0 launch**
+  (too aggressive on the initial accel/bank), not the descent. cruise 18 lands
+  *only* with launch-softening so heavy (aim-slew 6, lookahead 1.6, descent-gain
+  2.5) that it's **slower** (24.33 s) — no good.
+- **Decoupling (fast straights + hard descent braking) did NOT unlock cruise 18**
+  — the limiter is the launch, not the descent. The descent is still walled
+  (~10.8 s), and that + the gate-0 launch cap a *fast* landing at ~cruise 17, so
+  **~18.3 s is near the best-of-many floor** for this control architecture.
+- One 18.27 s landing logged 1 collision (grazed a frame but the sim credited
+  6/6); the other was clean — so **clean 18.27 s runs exist**; upload a clean one.
+
+**Race-day upload strategy:** bank the champion (cruise 16, ~100%, 19.05 s) as a
+guaranteed 6/6, AND run cruise-17/band-38 several times — upload the fastest clean
+sim-credited 6/6 (≈18.27 s when it lands). Monitors (gate-map + sim-health) stay
+armed to discard degraded runs. Beating ~18 s needs a different controller
+(descent wall) — RL was ruled out (see `rl/FIDELITY_VERDICT.md`).
