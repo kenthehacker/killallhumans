@@ -682,24 +682,36 @@ async def run_vq1(
     collisions = all_collisions + adapter.drain_collisions()
     gates_passed = pipeline.sequencer.gates_passed if pipeline.sequencer else 0
     total_gates = pipeline.sequencer.total_gates if pipeline.sequencer else len(gates)
-    logger.info(
-        "Race finished: %d/%d gates in %.2f s, %d collision(s)",
-        gates_passed, total_gates, elapsed, len(collisions),
-    )
-    # SIM-authoritative result (the sim credits the passes, not our sequencer).
-    # active_gate_index = the next gate the SIM wants; == total_gates and
-    # race_finished both mean the SIM scored a full clean run.
+    # OFFICIAL RESULT: the SIM credits the passes, not our geometric sequencer
+    # (which is center-based and undercounts the FINAL gate by ~0.16 m -- it
+    # often logs 5/6 on a run the SIM actually scored 6/6, see the reliability
+    # batch in docs/aigp/2026-06-16-realsim-loop-findings.md). Lead with the
+    # SIM's authoritative scoring so a race-day operator reads the TRUE result,
+    # not the misleading proxy.
+    sim_finished = sim_gates = None
     try:
         rs = adapter.race_status
         if rs is not None:
-            logger.info(
-                "SIM race_status: active_gate_index=%d/%d, race_finished=%s "
-                "(the SIM's official scoring%s)",
-                rs.active_gate_index, total_gates, rs.race_finished,
-                " — FULL COURSE COMPLETE ✓" if rs.race_finished else "",
-            )
+            sim_finished = bool(rs.race_finished)
+            sim_gates = int(rs.active_gate_index)
     except Exception:
-        pass
+        rs = None
+    if sim_finished is not None:
+        headline = (
+            "FULL COURSE COMPLETE [OK] -- %d/%d gates" % (total_gates, total_gates)
+            if sim_finished else
+            "INCOMPLETE -- %d/%d gates credited (race_finished=False)"
+            % (sim_gates, total_gates)
+        )
+        logger.info("OFFICIAL RESULT (SIM): %s in %.2f s, %d collision(s)",
+                    headline, elapsed, len(collisions))
+        logger.info("  (geometric sequencer reported %d/%d -- proxy only, it "
+                    "undercounts the final gate ~0.16 m; trust the SIM result)",
+                    gates_passed, total_gates)
+    else:
+        logger.info("Race finished: %d/%d gates in %.2f s, %d collision(s) "
+                    "(sequencer; no SIM race_status available)",
+                    gates_passed, total_gates, elapsed, len(collisions))
     frozen = getattr(pipeline, "_telem_frozen_ticks", 0)
     if frozen:
         logger.error(
