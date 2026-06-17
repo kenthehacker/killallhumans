@@ -200,6 +200,13 @@ class PipelineConfig:
     # incoming leg's vertical SLOPE (|dz|/|dxy|) to the difficulty so descent-
     # heavy gates also brake. difficulty = max(turn_angle, descent_gain*slope).
     minimal_speed_descent_gain: float = 0.0  # >0 also brakes steep descents
+    # iter-74 LAUNCH cap (best-of-many speed hunt). The spawn->gate0 leg is
+    # ~straight, so the curvature brake doesn't slow it; at high cruise (>=18)
+    # the drone over-runs the first gate and clips/tumbles at gate0. Cap the
+    # speed ONLY while the target is gate0 (the launch leg) so the rest of the
+    # lap keeps full cruise -> a fast lap that still threads gate0. 0 = off
+    # (champion unchanged). m/s.
+    minimal_launch_speed: float = 0.0
     # iter-44: final-gate arrival ramp radius (m). The drone OVERSHOOTS the
     # finish gate5's Y at high speed (the only fast leg ends there) and tumbles
     # on the roll-back. Braking gate5's approach from FARTHER out bleeds the
@@ -942,6 +949,10 @@ class RacePipeline:
                 factor = max(self.config.minimal_speed_min_frac,
                              min(1.0, 1.0 - self.config.minimal_speed_brake * diff))
                 target_cruise = base * factor
+                # iter-74: cap the LAUNCH leg only (target gate 0). Lets cruise
+                # go high for the rest of the lap while gate0 entry stays landable.
+                if self.config.minimal_launch_speed > 0.0 and _gidx == 0:
+                    target_cruise = min(target_cruise, self.config.minimal_launch_speed)
                 now = time.monotonic()
                 prev_t = getattr(self, "_cruise_t", now)
                 dt = max(1e-3, min(0.1, now - prev_t))

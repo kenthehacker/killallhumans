@@ -224,3 +224,15 @@ guaranteed 6/6, AND run cruise-17/band-38 several times — upload the fastest c
 sim-credited 6/6 (≈18.27 s when it lands). Monitors (gate-map + sim-health) stay
 armed to discard degraded runs. Beating ~18 s needs a different controller
 (descent wall) — RL was ruled out (see `rl/FIDELITY_VERDICT.md`).
+
+**Launch-cap experiment (iter 74, `--launch-speed`):** added an opt-in cap on the
+spawn→gate0 leg only (champion untouched, default 0=off; sanity-verified: launch
+off → 6/6 @ 19.05 s). Hypothesis: the gate-0 launch caps fast cruise. Result:
+with `--cruise-speed 18 --launch-speed 16` cruise-18 **does now land 6/6 — but at
+23.78 s (slow).** Capping the launch fixed gate0, but then the **descent at cruise
+18 overshoots/struggles** and the lap is slow. So the launch was *a* limiter but
+the **descent wall is the binding one** — cruise 18 cannot do a *fast* clean lap
+regardless of launch handling. **Conclusion: cruise-17 / 18.27 s is the firm
+best-of-many floor**; the only way below it is beating the descent bandwidth wall
+(new controller / RL — ruled out). `--launch-speed` is kept as a (harmless,
+opt-in) tool.

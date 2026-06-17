@@ -196,6 +196,7 @@ async def run_vq1(
     speed_brake: float = 0.0,
     speed_min_frac: float = 0.5,
     speed_descent_gain: float = 0.0,
+    launch_speed: float = 0.0,
     arrival_radius: float = 8.0,
     aim_slew: float = 0.0,
     final_aim_z: Optional[float] = None,
@@ -370,6 +371,7 @@ async def run_vq1(
         minimal_lat_lead_m=lat_lead_m,
         minimal_speed_brake=speed_brake,
         minimal_speed_min_frac=speed_min_frac,
+        minimal_launch_speed=launch_speed,
         minimal_speed_descent_gain=speed_descent_gain,
         minimal_arrival_radius=arrival_radius,
         minimal_aim_slew=aim_slew,
@@ -1079,6 +1081,15 @@ def main(argv=None) -> None:
              "steep climbs keep pace with cruise. Only with --minimal.",
     )
     parser.add_argument(
+        "--launch-speed",
+        type=float,
+        default=0.0,
+        dest="launch_speed",
+        help="Cap speed (m/s) ONLY on the spawn->gate0 launch leg, so a high "
+             "--cruise-speed over-runs gate0 less (best-of-many speed hunt). "
+             "0=off. Only with --minimal.",
+    )
+    parser.add_argument(
         "--vert-ff",
         type=float,
         default=0.0,
@@ -1248,6 +1259,7 @@ def main(argv=None) -> None:
         speed_brake=args.speed_brake,
         speed_min_frac=args.speed_min_frac,
         speed_descent_gain=args.speed_descent_gain,
+        launch_speed=args.launch_speed,
         arrival_radius=args.arrival_radius,
         aim_slew=args.aim_slew,
         final_aim_z=args.final_aim_z,
