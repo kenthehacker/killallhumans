@@ -148,3 +148,34 @@ despite sim degradation / gate-map corruption (monitors already built + validate
 live). Optionally, port gate-by-gate's descent handling into the spline to get a
 *fast-AND-high-margin* controller (~matches 16.2 s with more clearance) — a
 reliability win, not a speed win.
+
+## Reliability campaign (15/15) + the controller frontier
+
+**Champion reliability — PROVEN.** 15 consecutive champion runs (gate-by-gate
+cruise-16, `--abort-on-degraded`): **15/15 sim-credited 6/6** (`race_finished=True`),
+total **19.0–19.08 s (g0->g5 16.2 s) +/- 0.04 s**, **0 collisions**, worst frame
+margin 0.235–0.295 m. Monitors held across all 15: gate-map <=0.021 m drift vs the
+session reference; sim-health Z=-1.66..-1.74 (healthy). The sim did NOT degrade
+this session (~24 runs), so the monitors are proven to NOT false-trigger live; the
+degradation *catch* stays offline-validated (unit tests on synthetic over-climb /
+sign-flip / drift).
+
+**Reporting fix (iter 69):** the runner now headlines the SIM-authoritative result
+(`OFFICIAL RESULT (SIM): FULL COURSE COMPLETE [OK]`), so the geometric sequencer's
+center-based 5/6 undercount no longer reads as a failure on race day.
+
+**"Fast-AND-high-margin" (option b) is NOT achievable — speed and margin trade off
+via the same wall.** Spline with `--spline-v-descent` raised from 2.0 to the
+champion's measured 2.27 m/s (2.3): 6/6, g0->g5 16.94 s, but worst margin 0.219 m
+at gate3 (the steep descent leg now arrives high). The spline's margin advantage
+*came from* its slow descent; speeding it up tightens the descent gate to match.
+spline-vd2.3 (16.94 s, 0.219 m) is slightly *dominated* by gate-by-gate
+(16.2 s, 0.235 m).
+
+**FRONTIER CONCLUSION:** the gate-by-gate champion (16.2 s, 6/6, 0.235 m worst
+margin, 15/15 reliable) sits on the speed/margin frontier set by the descent/roll
+bandwidth wall — no config is both faster and higher-margin. Further improvement
+needs a different control architecture (RL — deep-research-ranked not-first for
+this deadline/single-track setting), not tuning. **Race-day posture: fly the
+champion; the armed gate-map + sim-health monitors plus the `.exe`-restart
+procedure (`aigp-sim-connect` skill) cover the documented sim-degradation risk.**
