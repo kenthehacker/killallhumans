@@ -70,10 +70,21 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         vision_port: int = AIGP_CAM_UDP_PORT,
         require_track: bool = True,
         track_retries: int = 3,
+        telemetry_mode: str = "pose",
+        fetch_track_on_connect: bool = True,
     ) -> None:
+        if telemetry_mode not in {"pose", "imu"}:
+            raise ValueError("telemetry_mode must be 'pose' or 'imu'")
+        if require_track and not fetch_track_on_connect:
+            raise ValueError(
+                "require_track=True is incompatible with "
+                "fetch_track_on_connect=False"
+            )
         self.enable_vision = enable_vision
         self.require_track = require_track
         self.track_retries = int(track_retries)
+        self.telemetry_mode = telemetry_mode
+        self.fetch_track_on_connect = bool(fetch_track_on_connect)
 
         self._conn = None
         self._target_system = 1
@@ -93,6 +104,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._latest_telem: Optional[TelemetryState] = None
         self._race_status: Optional[RaceStatus] = None
         self._track_data: Optional[TrackData] = None
+        self._imu_samples: Deque[IMUData] = deque(maxlen=1024)
         self._collisions: Deque[Dict] = deque(maxlen=128)
         self._actuator_outputs: Optional[Dict] = None
         self._indi_debug: Optional[Dict] = None
@@ -106,10 +118,15 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._seen_msg_types: set = set()
 
         self._last_heartbeat_monotonic = 0.0
+        self._heartbeat_sequence = 0
+        self._last_imu_monotonic = 0.0
+        self._last_race_status_monotonic = 0.0
+        self._last_actuator_monotonic = 0.0
         self._armed = False
         self._have_attitude = False
         self._have_lpn = False
         self._have_odometry = False
+        self._have_imu = False
 
         # The live AIGP sim MISHANDLES SET_ATTITUDE_TARGET attitude mode
         # (type_mask 0b111): a held level attitude makes the drone spin up to
@@ -177,6 +194,13 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         # Two independent Opus reviews + the bench/flight captures all point to
         # the pitch axis being the single inverted sign.
         self._rate_sign = (-1.0, 1.0, -1.0)
+        if self.telemetry_mode == "imu":
+            # VQ2 build 3385 live rate-ID (2026-07-18) differs from the older
+            # pose-enabled build on PITCH.  At 0.24 thrust, desired +0.10 with
+            # wire +0.10 produced measured q=-0.19 rad/s; wire -0.10 is
+            # therefore required.  Roll retained the proven -1 mapping.
+            # Yaw remains deliberately unexcited by the VQ2 runner.
+            self._rate_sign = (-1.0, -1.0, -1.0)
 
         # --- OPT-IN measured-accel INDI inner loop (roadmap #2) -------------
         # OFF by default. When _use_indi is True, send_attitude computes the
@@ -232,6 +256,32 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         if self._conn is not None:
             return
 
+        # A new socket is a new simulator epoch.  Never let reconnect reuse
+        # readiness events, pose/IMU snapshots, race status, or decoded vision
+        # from the prior connection.
+        self._heartbeat_event.clear()
+        self._telemetry_ready_event.clear()
+        self._track_event.clear()
+        self._last_heartbeat_monotonic = 0.0
+        self._heartbeat_sequence = 0
+        self._last_imu_monotonic = 0.0
+        self._last_race_status_monotonic = 0.0
+        self._last_actuator_monotonic = 0.0
+        self._armed = False
+        self._have_attitude = False
+        self._have_lpn = False
+        self._have_odometry = False
+        self._have_imu = False
+        with self._state_lock:
+            self._latest_telem = None
+            self._race_status = None
+            self._track_data = None
+            self._actuator_outputs = None
+            self._imu_samples.clear()
+            self._collisions.clear()
+        if self._vision is not None:
+            self._vision.reset()
+
         try:
             from pymavlink import mavutil
         except ImportError as exc:  # pragma: no cover - env-dependent
@@ -263,7 +313,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             except OSError:
                 logger.exception("Could not start AIGP vision listener")
 
-        if self._track_data is None:
+        if self.fetch_track_on_connect and self._track_data is None:
             for _ in range(max(1, self.track_retries)):
                 await self._send_sim_reset(clear_track_event=True)
                 if await asyncio.to_thread(self._track_event.wait, 5.0):
@@ -309,6 +359,25 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         if not self._armed:
             logger.warning("Arm command sent but vehicle still reports disarmed")
 
+    async def disarm(self) -> None:
+        """Disarm the simulated vehicle as an emergency reset fallback."""
+
+        self._require_conn()
+        with self._send_lock:
+            self._conn.mav.command_long_send(
+                self._target_system,
+                self._target_component,
+                MAV_CMD_COMPONENT_ARM_DISARM,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+
     async def start_offboard(self) -> None:
         """No-op: the sim accepts setpoints without a PX4 offboard handshake."""
 
@@ -325,6 +394,11 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         return self._vision.latest_frame() if self._vision is not None else None
 
     async def send_attitude(self, cmd: AttitudeCommand) -> None:
+        if self.telemetry_mode == "imu":
+            raise RuntimeError(
+                "send_attitude() requires pose telemetry; VQ2 IMU mode must "
+                "use an external estimator with send_attitude_rate()"
+            )
         self._require_conn()
         thrust = _clamp_thrust(cmd.thrust)
         q = Quaternion.from_euler(cmd.roll_rad, cmd.pitch_rad, cmd.yaw_rad)
@@ -392,6 +466,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
 
     async def send_attitude_rate(self, cmd: AttitudeRateCommand) -> None:
         self._require_conn()
+        if not all(math.isfinite(value) for value in (
+            cmd.roll_rate,
+            cmd.pitch_rate,
+            cmd.yaw_rate,
+        )):
+            raise ValueError("body rates must be finite")
         thrust = _clamp_thrust(cmd.thrust)
         sx, sy, sz = self._rate_sign  # sim applies body rates with opposite sign
         with self._send_lock:
@@ -437,7 +517,24 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             )
 
     async def reset(self) -> Optional[TrackData]:
+        if not self.fetch_track_on_connect:
+            # VQ2 has no track-transfer acknowledgement.  Clear the local
+            # epoch before sending and require the runner to prove an IMU/race
+            # clock rollback before it can command flight.
+            with self._state_lock:
+                self._telemetry_ready_event.clear()
+                self._have_imu = False
+                self._last_imu_monotonic = 0.0
+                self._last_race_status_monotonic = 0.0
+                self._last_actuator_monotonic = 0.0
+                self._latest_telem = None
+                self._race_status = None
+                self._actuator_outputs = None
+                self._imu_samples.clear()
+                self._collisions.clear()
         await self._send_sim_reset(clear_track_event=True)
+        if not self.fetch_track_on_connect:
+            return None
         await asyncio.to_thread(self._track_event.wait, 5.0)
         return self.track_data
 
@@ -454,9 +551,48 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         return self._armed
 
     @property
+    def heartbeat_age_s(self) -> float:
+        """Wall-clock age of the newest simulator heartbeat."""
+
+        return _monotonic_age(self._last_heartbeat_monotonic)
+
+    @property
+    def heartbeat_sequence(self) -> int:
+        """Monotonic token incremented for every received heartbeat."""
+
+        with self._state_lock:
+            return self._heartbeat_sequence
+
+    @property
+    def imu_age_s(self) -> float:
+        """Wall-clock age of the newest ``HIGHRES_IMU`` sample."""
+
+        return _monotonic_age(self._last_imu_monotonic)
+
+    @property
+    def race_status_age_s(self) -> float:
+        """Wall-clock age of the newest decoded race-status packet."""
+
+        return _monotonic_age(self._last_race_status_monotonic)
+
+    @property
+    def actuator_age_s(self) -> float:
+        """Wall-clock age of the newest actuator-output status packet."""
+
+        return _monotonic_age(self._last_actuator_monotonic)
+
+    @property
     def latest_telemetry(self) -> Optional[TelemetryState]:
         with self._state_lock:
             return self._latest_telem
+
+    def drain_imu_samples(self) -> list[IMUData]:
+        """Return every buffered IMU sample in receive order and clear it."""
+
+        with self._state_lock:
+            samples = list(self._imu_samples)
+            self._imu_samples.clear()
+            return samples
 
     @property
     def race_status(self) -> Optional[RaceStatus]:
@@ -493,6 +629,8 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._require_conn()
         if clear_track_event:
             self._track_event.clear()
+        if self._vision is not None:
+            self._vision.reset()
         with self._send_lock:
             self._conn.mav.command_long_send(
                 self._target_system,
@@ -564,6 +702,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
     def _handle_heartbeat(self, msg) -> None:
         with self._state_lock:
             self._last_heartbeat_monotonic = time.monotonic()
+            self._heartbeat_sequence += 1
             self._armed = bool(msg.base_mode & 0x80)
             if self._conn is not None:
                 self._target_system = getattr(self._conn, "target_system", self._target_system) or self._target_system
@@ -620,10 +759,15 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             mag=None,
         )
         with self._state_lock:
+            self._last_imu_monotonic = time.monotonic()
+            self._imu_samples.append(imu)
             self._latest_telem = _telem_with(self._latest_telem, imu=imu)
+            self._have_imu = True
+            self._maybe_ready()
 
     def _handle_actuator(self, msg) -> None:
         with self._state_lock:
+            self._last_actuator_monotonic = time.monotonic()
             self._actuator_outputs = {
                 "time_usec": getattr(msg, "time_usec", None),
                 "active": getattr(msg, "active", None),
@@ -646,6 +790,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         if data_type == ENCAPSULATED_RACE_STATUS_MSG_ID:
             race_status = parse_race_status(payload)
             with self._state_lock:
+                self._last_race_status_monotonic = time.monotonic()
                 self._race_status = race_status
             return
         if data_type == ENCAPSULATED_TRACK_INFO_MSG_ID:
@@ -659,7 +804,11 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                     self._track_event.set()
 
     def _maybe_ready(self) -> None:
-        if self._have_attitude and self._have_lpn:
+        if self.telemetry_mode == "imu":
+            ready = self._have_imu
+        else:
+            ready = self._have_attitude and self._have_lpn
+        if ready:
             self._telemetry_ready_event.set()
 
     def _rx_loop(self) -> None:  # pragma: no cover - live socket loop
@@ -695,6 +844,14 @@ def _clamp_thrust(thrust: float) -> float:
     if not math.isfinite(thrust):
         raise ValueError("thrust must be finite")
     return max(0.0, min(1.0, thrust))
+
+
+def _monotonic_age(received_at: float) -> float:
+    """Return a non-negative stream age, or infinity before first receipt."""
+
+    if received_at <= 0.0:
+        return math.inf
+    return max(0.0, time.monotonic() - received_at)
 
 
 def _attitude_error_body_rates(q_cur, q_des, omega=(0.0, 0.0, 0.0),

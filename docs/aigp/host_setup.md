@@ -1,5 +1,12 @@
 # AIGP Sim Host Setup (Task 0.1)
 
+> **Current VQ2 host (2026-07-18):** build 3385 is running locally at
+> `C:\Users\John\AIGP\AIGP_3385\FlightSim.exe`, with the repository at
+> `C:\Users\John\killallhumans`. See
+> [`2026-07-18-vq2-handoff.md`](2026-07-18-vq2-handoff.md) for the active setup.
+> The Ken/3364 setup below is retained as VQ1 history and should not be used as
+> build-3385 interface documentation.
+
 The plan's primary host was ShadowPC; we used the §3.1 sanctioned alternative — **Ken's own
 RTX PC** — since it was available (best latency, free, unlimited hours).
 

@@ -258,6 +258,19 @@ class VisionUdpReceiver:
         """Return the most recent completed frame, or None."""
         return self._latest_frame
 
+    def reset(self) -> None:
+        """Discard all pre-reset frame state.
+
+        ``SIM_RESET`` may restart frame ids.  Keeping delivered ids or a cached
+        pre-reset image would make a fresh race consume stale vision (or drop
+        the first repeated ids), so callers must clear the reassembler at the
+        same boundary as the simulator clock reset.
+        """
+
+        self._buffers.clear()
+        self._delivered_ids.clear()
+        self._latest_frame = None
+
     def _gc_stale(self, now_sim_ns: int) -> None:
         """Drop in-flight buffers whose first packet is older than the
         reassembly timeout, measured in SIM time (not wall time)."""
@@ -402,6 +415,13 @@ class VisionUdpListener:
             self._transport.close()
             self._transport = None
             self._protocol = None
+
+    def reset(self) -> None:
+        """Clear reassembly and decoded-image caches after ``SIM_RESET``."""
+
+        self.receiver.reset()
+        self._last_decoded_frame_id = -1
+        self._last_decoded_camera_frame = None
 
     @property
     def is_listening(self) -> bool:

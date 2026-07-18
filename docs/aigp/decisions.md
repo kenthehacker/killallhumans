@@ -37,3 +37,18 @@ backup mode for VQ1.
 **Rationale:** the current EKF does not observe orientation, so estimating yaw from blind init can
 overwrite good simulator attitude. The sim provides high-rate quaternion attitude with quality 100,
 while PnP geometry still uses the inner-aperture model and can poison a healthy state estimate.
+
+## D6 — VQ2 build 3385 uses vision plus HIGHRES_IMU, not VQ1 pose/map
+**Decision:** Run the build-3385 training stack with `telemetry_mode="imu"`, disable track fetching,
+estimate attitude from `HIGHRES_IMU`, and navigate from the live camera feed.
+**Rationale:** live inspection of build 3385 found `ATTITUDE`, `LOCAL_POSITION_NED`, `ODOMETRY`, and
+usable gate-map geometry unavailable. Heartbeat, race status, actuator status, collision events,
+`HIGHRES_IMU`, and UDP vision remain live. The older D3-D5 choices still describe VQ1 only.
+
+## D7 — Advance live VQ2 control through bounded, reset-proved stages
+**Decision:** Permit powered commands only after race and IMU clock rollback prove a fresh reset,
+countdown is witnessed, GO has passed, and a newer heartbeat confirms arm. Keep stages bounded and
+always reset/disarm in cleanup; hold yaw command at zero until calibrated.
+**Rationale:** build 3385 removes pose telemetry, its vision epoch does not reset with race/IMU time,
+and the simulator can boot with the heartbeat armed bit set despite zero actuator demand. Explicit
+epoch, freshness, and cleanup proofs make early calibration failures observable and fail-closed.

@@ -189,6 +189,113 @@ def test_telemetry_population_and_odometry_orientation_wxyz():
     assert telem.lpn_time_boot_ms == 124
 
 
+def test_vq2_imu_mode_becomes_ready_without_pose_or_track():
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+    )
+
+    adapter._handle_message(FakeMsg(
+        "HIGHRES_IMU",
+        xacc=-3.0,
+        yacc=0.0,
+        zacc=-9.34,
+        xgyro=0.0,
+        ygyro=0.0,
+        zgyro=0.0,
+        time_usec=125000,
+    ))
+
+    assert adapter._telemetry_ready_event.is_set()
+    assert adapter.latest_telemetry.imu.timestamp_us == 125000
+    assert [sample.timestamp_us for sample in adapter.drain_imu_samples()] == [125000]
+    assert adapter.drain_imu_samples() == []
+    assert adapter.track_data is None
+
+    adapter._conn = FakeConn()
+    with pytest.raises(RuntimeError, match="send_attitude_rate"):
+        asyncio.run(adapter.send_attitude(AttitudeCommand(0.0, 0.0, 0.0, 0.2)))
+
+
+def test_vq2_rate_wire_uses_live_measured_pitch_flip():
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+    )
+    adapter._conn = FakeConn()
+
+    asyncio.run(adapter.send_attitude_rate(
+        AttitudeRateCommand(0.10, 0.20, 0.0, 0.24)
+    ))
+
+    name, args = adapter._conn.mav.calls[-1]
+    assert name == "set_attitude_target_send"
+    assert args[5:8] == pytest.approx((-0.10, -0.20, 0.0))
+
+
+def test_pose_mode_still_requires_attitude_and_local_position():
+    adapter = AIGPMavlinkAdapter(enable_vision=False)
+    adapter._handle_message(FakeMsg(
+        "HIGHRES_IMU",
+        xacc=0.0,
+        yacc=0.0,
+        zacc=-9.81,
+        xgyro=0.0,
+        ygyro=0.0,
+        zgyro=0.0,
+        time_usec=1,
+    ))
+
+    assert not adapter._telemetry_ready_event.is_set()
+
+
+def test_vq2_mode_rejects_incompatible_track_requirement():
+    with pytest.raises(ValueError, match="require_track"):
+        AIGPMavlinkAdapter(
+            enable_vision=False,
+            require_track=True,
+            telemetry_mode="imu",
+            fetch_track_on_connect=False,
+        )
+
+
+def test_vq2_reset_clears_stale_epoch_before_returning():
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+    )
+    adapter._conn = FakeConn()
+    adapter._handle_message(FakeMsg(
+        "HIGHRES_IMU",
+        xacc=0.0,
+        yacc=0.0,
+        zacc=-9.81,
+        xgyro=0.0,
+        ygyro=0.0,
+        zgyro=0.0,
+        time_usec=100_000,
+    ))
+    adapter._race_status = object()
+
+    asyncio.run(adapter.reset())
+
+    assert adapter.latest_telemetry is None
+    assert adapter.race_status is None
+    assert not adapter._telemetry_ready_event.is_set()
+    assert not adapter._have_imu
+    assert adapter.drain_imu_samples() == []
+    assert math.isinf(adapter.imu_age_s)
+    assert math.isinf(adapter.race_status_age_s)
+    assert math.isinf(adapter.actuator_age_s)
+    assert adapter._conn.mav.calls[-1][1][2] == SIM_RESET_COMMAND
+
+
 def test_side_state_race_status_collision_actuator_and_heartbeat():
     adapter = AIGPMavlinkAdapter(enable_vision=False)
     race_payload = encode_race_status(
@@ -218,9 +325,14 @@ def test_side_state_race_status_collision_actuator_and_heartbeat():
     assert adapter.drain_collisions() == []
     assert adapter.actuator_outputs["active"] == 15
     assert adapter.is_armed is True
+    assert adapter.heartbeat_age_s < 0.1
+    assert adapter.heartbeat_sequence == 1
+    assert adapter.race_status_age_s < 0.1
+    assert adapter.actuator_age_s < 0.1
 
     adapter._handle_message(FakeMsg("HEARTBEAT", base_mode=65, custom_mode=0))
     assert adapter.is_armed is False
+    assert adapter.heartbeat_sequence == 2
 
 
 def test_send_attitude_legacy_attitude_mode_wires():
@@ -283,6 +395,11 @@ def test_send_attitude_rate_position_reset_and_arm_wires():
     assert args[5:8] == pytest.approx((-0.4, 0.5, -0.6))
     assert args[8] == pytest.approx(0.0)
 
+    with pytest.raises(ValueError, match="rates must be finite"):
+        asyncio.run(adapter.send_attitude_rate(
+            AttitudeRateCommand(float("nan"), 0.0, 0.0, 0.2)
+        ))
+
     asyncio.run(adapter.send_position(PositionCommand(
         position_ned=(1.0, 2.0, 3.0),
         velocity_ned=(4.0, 5.0, 6.0),
@@ -311,6 +428,12 @@ def test_send_attitude_rate_position_reset_and_arm_wires():
     assert name == "command_long_send"
     assert args[2] == 400
     assert args[4] == 1
+
+    asyncio.run(adapter.disarm())
+    name, args = adapter._conn.mav.calls[-1]
+    assert name == "command_long_send"
+    assert args[2] == 400
+    assert args[4] == 0
 
 
 def test_import_does_not_require_pymavlink():

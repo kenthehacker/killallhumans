@@ -291,6 +291,31 @@ def test_pop_latest_frame_returns_most_recent_completion():
     assert latest.jpeg_bytes == jpeg_b
 
 
+def test_reset_allows_frame_ids_to_restart_without_stale_image():
+    r = VisionUdpReceiver()
+    jpeg = b"fresh-jpeg"
+    packet = encode_packet(
+        frame_id=7,
+        chunk_id=0,
+        total_chunks=1,
+        jpeg_size=len(jpeg),
+        sim_time_ns=1_000_000,
+        payload=jpeg,
+    )
+
+    assert r.feed_packet(packet) is not None
+    assert r.pop_latest_frame() is not None
+    # A duplicate delivered id is ignored until the simulator reset boundary.
+    assert r.feed_packet(packet) is None
+
+    r.reset()
+
+    assert r.pop_latest_frame() is None
+    restarted = r.feed_packet(packet)
+    assert restarted is not None
+    assert restarted.frame_id == 7
+
+
 # ---------------------------------------------------------------------------
 # Eviction under buffer pressure
 # ---------------------------------------------------------------------------

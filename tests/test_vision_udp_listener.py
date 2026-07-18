@@ -228,3 +228,8 @@ def test_listener_latest_frame_caches_by_frame_id():
     cf3 = listener.latest_frame()
     assert cf3 is not None
     assert cf3 is not cf1, "new frame_id must trigger a fresh decode"
+
+    listener.reset()
+    assert listener.receiver.pop_latest_frame() is None
+    assert listener._last_decoded_frame_id == -1
+    assert listener._last_decoded_camera_frame is None
