@@ -28,6 +28,8 @@ from scripts.aigp_vq2_run import (
     gate_vertical_reference_px,
     gate_control_center_y_px,
     gate_vertical_thrust,
+    crossing_status_decision,
+    is_close_gate_crossing_candidate,
     is_benign_pad_contact,
     next_control_deadline,
     select_primary_gate,
@@ -152,6 +154,114 @@ def test_gate_vertical_thrust_has_position_and_motion_damping():
     assert 0.21 <= gate_vertical_thrust(0.0, -999.0) <= 0.32
 
 
+def test_close_crossing_requires_large_centered_both_edge_clipped_gate():
+    target = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=1.0,
+        center_x=336,
+        center_y=180,
+        bbox=(61, 0, 551, 360),
+        confidence=0.8,
+    )
+    assert is_close_gate_crossing_candidate(
+        target,
+        initial_gate_area=6480,
+        control_y=217.0,
+    )
+    assert not is_close_gate_crossing_candidate(
+        target,
+        initial_gate_area=6480,
+        control_y=270.0,
+    )
+
+    insufficient_growth = vq2_module.GateTarget(
+        frame_id=2,
+        sim_time_ns=2,
+        received_monotonic_s=1.1,
+        center_x=320,
+        center_y=180,
+        bbox=(160, 0, 320, 360),
+        confidence=0.8,
+    )
+    assert not is_close_gate_crossing_candidate(
+        insufficient_growth,
+        initial_gate_area=6480,
+        control_y=180.0,
+    )
+
+    no_vertical_clip = vq2_module.GateTarget(
+        frame_id=3,
+        sim_time_ns=3,
+        received_monotonic_s=1.2,
+        center_x=320,
+        center_y=180,
+        bbox=(44, 10, 551, 340),
+        confidence=0.8,
+    )
+    assert not is_close_gate_crossing_candidate(
+        no_vertical_clip,
+        initial_gate_area=6480,
+        control_y=180.0,
+    )
+
+    off_center = vq2_module.GateTarget(
+        frame_id=4,
+        sim_time_ns=4,
+        received_monotonic_s=1.3,
+        # A clipped asymmetric contour can have a centroid substantially away
+        # from its image-bounded bbox midpoint.
+        center_x=410,
+        center_y=180,
+        bbox=(120, 0, 520, 360),
+        confidence=0.8,
+    )
+    assert not is_close_gate_crossing_candidate(
+        off_center,
+        initial_gate_area=6480,
+        control_y=180.0,
+    )
+
+
+def test_crossing_wait_requires_authoritative_new_race_status():
+    common = {
+        "baseline_race_boot_ms": 5998,
+        "elapsed_s": 0.10,
+    }
+    assert crossing_status_decision(
+        **common,
+        current_race_boot_ms=5998,
+        active_gate_index=0,
+    ) == "waiting"
+    assert crossing_status_decision(
+        **common,
+        current_race_boot_ms=5998,
+        active_gate_index=1,
+    ) == "waiting"
+    assert crossing_status_decision(
+        **common,
+        current_race_boot_ms=6249,
+        active_gate_index=1,
+    ) == "passed"
+    assert crossing_status_decision(
+        **common,
+        current_race_boot_ms=6249,
+        active_gate_index=0,
+    ) == "not_credited"
+    assert crossing_status_decision(
+        baseline_race_boot_ms=5998,
+        current_race_boot_ms=5998,
+        active_gate_index=0,
+        elapsed_s=0.40,
+    ) == "status_timeout"
+    assert crossing_status_decision(
+        baseline_race_boot_ms=5998,
+        current_race_boot_ms=5998,
+        active_gate_index=2,
+        elapsed_s=0.01,
+    ) == "invalid_gate_index"
+
+
 def test_attitude_loop_is_finite_clamped_and_never_commands_yaw():
     command = attitude_rate_command(
         _estimate(),
@@ -198,6 +308,8 @@ class _FakeAdapter:
         self.reset_calls = 0
         self.arm_calls = 0
         self.imu_samples = []
+        self.collisions = []
+        self.commands = []
 
     async def reset(self):
         self.reset_calls += 1
@@ -208,8 +320,8 @@ class _FakeAdapter:
     async def disarm(self):
         pass
 
-    async def send_attitude_rate(self, _command):
-        pass
+    async def send_attitude_rate(self, command):
+        self.commands.append(command)
 
     def drain_imu_samples(self):
         samples = self.imu_samples
@@ -217,7 +329,9 @@ class _FakeAdapter:
         return samples
 
     def drain_collisions(self):
-        return []
+        collisions = self.collisions
+        self.collisions = []
+        return collisions
 
 
 def test_emergency_reset_is_sent_even_with_no_fresh_baseline(monkeypatch):
@@ -350,3 +464,162 @@ def test_only_tiny_spawn_pad_contact_is_classified_benign():
     assert not is_benign_pad_contact(
         {"id": 1002, "threat_level": 1, "impulse": 0.02}
     )
+
+
+def test_repeated_tiny_pad_contacts_exceed_cumulative_launch_budget(monkeypatch):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    monkeypatch.setattr(runner, "_stream_failures", lambda **_kwargs: [])
+
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.004}
+        for _ in range(12)
+    ]
+    runner._watchdog(
+        allow_benign_pad_contact=True,
+        enforce_benign_pad_budget=True,
+    )
+
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.004}
+    ]
+    with pytest.raises(SafetyAbort, match="repeated pad contacts"):
+        runner._watchdog(
+            allow_benign_pad_contact=True,
+            enforce_benign_pad_budget=True,
+        )
+
+    impulse_adapter = _FakeAdapter()
+    impulse_runner = VQ2Runner(impulse_adapter, _FakeVision())
+    monkeypatch.setattr(impulse_runner, "_stream_failures", lambda **_kwargs: [])
+    impulse_adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.009}
+        for _ in range(6)
+    ]
+    with pytest.raises(SafetyAbort, match="repeated pad contacts"):
+        impulse_runner._watchdog(
+            allow_benign_pad_contact=True,
+            enforce_benign_pad_budget=True,
+        )
+
+    late_adapter = _FakeAdapter()
+    late_runner = VQ2Runner(late_adapter, _FakeVision())
+    monkeypatch.setattr(late_runner, "_stream_failures", lambda **_kwargs: [])
+    late_adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.001}
+    ]
+    with pytest.raises(SafetyAbort, match="collision reported"):
+        late_runner._watchdog(
+            allow_benign_pad_contact=False,
+            enforce_benign_pad_budget=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("post_cross_gate_index", "expected_reason"),
+    [(1, None), (0, "not credited")],
+)
+def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
+    monkeypatch,
+    post_cross_gate_index,
+    expected_reason,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(
+        sim_boot_time_ms=1000,
+        race_start_boot_time_ms=0,
+        race_finish_time_ns=-1,
+        active_gate_index=0,
+        last_gate_race_time=-1,
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate()
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=10,
+        sim_time_ns=10,
+        received_monotonic_s=0.0,
+        center_x=336,
+        center_y=180,
+        bbox=(61, 0, 551, 360),
+        confidence=0.8,
+    )
+    runner.tracker.consecutive = 3
+
+    clock = [0.0]
+    sample_count = [0]
+    watchdog_target_requirements = []
+
+    def fake_monotonic():
+        return clock[0]
+
+    async def fake_sleep(seconds):
+        clock[0] += max(float(seconds), 0.02)
+
+    def fake_sample():
+        sample_count[0] += 1
+        if sample_count[0] == 7:
+            # A fresh contour and a same-timestamp gate-1 value must not leave
+            # the latched zero-thrust confirmation phase or prove passage.
+            runner.tracker.target = vq2_module.GateTarget(
+                frame_id=11,
+                sim_time_ns=11,
+                received_monotonic_s=clock[0],
+                center_x=336,
+                center_y=180,
+                bbox=(61, 0, 551, 360),
+                confidence=0.8,
+            )
+            adapter.race_status = RaceStatus(
+                sim_boot_time_ms=1000,
+                race_start_boot_time_ms=0,
+                race_finish_time_ns=-1,
+                active_gate_index=post_cross_gate_index,
+                last_gate_race_time=(123 if post_cross_gate_index == 1 else -1),
+            )
+        elif sample_count[0] >= 8:
+            adapter.race_status = RaceStatus(
+                sim_boot_time_ms=1250,
+                race_start_boot_time_ms=0,
+                race_finish_time_ns=-1,
+                active_gate_index=post_cross_gate_index,
+                last_gate_race_time=(123 if post_cross_gate_index == 1 else -1),
+            )
+
+    def fake_watchdog(**kwargs):
+        watchdog_target_requirements.append(kwargs["require_target"])
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
+
+    context = vq2_module.StartContext(
+        spawn_roll_rad=0.0,
+        spawn_pitch_rad=-0.31,
+        initial_gate_x=322,
+        initial_gate_y=174,
+        initial_gate_area=6480,
+        go_boot_ms=1000,
+    )
+    if expected_reason is None:
+        result = asyncio.run(runner._run_gate0(context))
+        assert result["gate0_passed"]
+        assert result["crossing_confirmation_used"]
+    else:
+        with pytest.raises(SafetyAbort, match=expected_reason):
+            asyncio.run(runner._run_gate0(context))
+
+    first_zero = next(
+        index
+        for index, command in enumerate(adapter.commands)
+        if command.thrust == 0.0
+    )
+    assert all(
+        command.thrust == 0.0
+        and command.roll_rate == 0.0
+        and command.pitch_rate == 0.0
+        and command.yaw_rate == 0.0
+        for command in adapter.commands[first_zero:]
+    )
+    assert False in watchdog_target_requirements

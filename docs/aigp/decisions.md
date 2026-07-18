@@ -52,3 +52,12 @@ always reset/disarm in cleanup; hold yaw command at zero until calibrated.
 **Rationale:** build 3385 removes pose telemetry, its vision epoch does not reset with race/IMU time,
 and the simulator can boot with the heartbeat armed bit set despite zero actuator demand. Explicit
 epoch, freshness, and cleanup proofs make early calibration failures observable and fail-closed.
+
+## D8 — Race status is the sole gate-pass authority
+**Decision:** A close/full-frame visual approach may arm a crossing-confirmation state, but vision
+never declares passage. Once the target disappears, command zero rate/thrust and wait at most
+0.40 seconds for a race-status packet with a strictly newer simulator clock. Gate index 1 passes;
+a newer index 0, invalid index, timeout, stale stream, or collision aborts.
+**Rationale:** the first stable gate-0 trace reset exactly when the next 4 Hz race packet arrived,
+discarding its gate index. Preserving that packet proved the same trajectory was a valid,
+collision-free pass. Timestamp causality prevents stale gate values from authorizing flight.

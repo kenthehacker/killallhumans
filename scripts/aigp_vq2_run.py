@@ -63,6 +63,14 @@ MAX_ACTUATOR_AGE_S = 0.10
 MAX_VISION_AGE_S = 0.10
 MAX_TARGET_LOSS_S = 0.25
 
+CROSSING_TARGET_LOSS_S = 0.08
+CROSSING_STATUS_TIMEOUT_S = 0.40
+CROSSING_MIN_AREA_RATIO = 25.0
+CROSSING_MIN_WIDTH_PX = 512
+
+MAX_BENIGN_PAD_CONTACTS = 12
+MAX_BENIGN_PAD_IMPULSE = 0.05
+
 MAX_ROLL_RAD = math.radians(25.0)
 MIN_PITCH_RAD = math.radians(-35.0)
 MAX_PITCH_RAD = math.radians(10.0)
@@ -311,6 +319,62 @@ def gate_vertical_thrust(control_y: float, control_y_rate: float) -> float:
     return max(0.21, min(0.32, 0.275 + proportional + damping))
 
 
+def is_close_gate_crossing_candidate(
+    target: GateTarget,
+    *,
+    initial_gate_area: int,
+    control_y: float,
+) -> bool:
+    """Whether target loss may be the aperture expanding beyond the camera.
+
+    This does not infer a pass. It only permits a bounded wait for the next
+    authoritative race-status packet after a centered, monotonically expanded
+    gate has clipped both vertical image edges.
+    """
+
+    if initial_gate_area <= 0 or not math.isfinite(control_y):
+        return False
+    _x, y, width, height = target.bbox
+    return bool(
+        target.bbox_area >= CROSSING_MIN_AREA_RATIO * initial_gate_area
+        and width >= CROSSING_MIN_WIDTH_PX
+        and y <= 2
+        and y + height >= 358
+        and abs(target.center_x - 320.0) <= 0.15 * width
+        and abs(control_y - 180.0) <= 75.0
+    )
+
+
+def crossing_status_decision(
+    *,
+    baseline_race_boot_ms: int,
+    current_race_boot_ms: int,
+    active_gate_index: int,
+    elapsed_s: float,
+    timeout_s: float = CROSSING_STATUS_TIMEOUT_S,
+) -> str:
+    """Classify the bounded authoritative-status wait after visual commit."""
+
+    if (
+        not math.isfinite(elapsed_s)
+        or elapsed_s < 0.0
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0.0
+    ):
+        raise ValueError("crossing status timing must be finite with timeout_s > 0")
+    if active_gate_index not in (0, 1):
+        return "invalid_gate_index"
+    if current_race_boot_ms < baseline_race_boot_ms:
+        return "race_clock_regressed"
+    if current_race_boot_ms == baseline_race_boot_ms:
+        return "status_timeout" if elapsed_s >= timeout_s else "waiting"
+    if active_gate_index == 1:
+        return "passed"
+    if active_gate_index == 0:
+        return "not_credited"
+    raise AssertionError("unreachable gate crossing decision")
+
+
 def attitude_rate_command(
     estimate: AttitudeEstimate,
     *,
@@ -439,6 +503,8 @@ class VQ2Runner:
         self._detection_error: Optional[str] = None
         self._estimator_unhealthy_latched = False
         self._estimator_failure_reason: Optional[str] = None
+        self._benign_pad_contact_count = 0
+        self._benign_pad_contact_impulse = 0.0
         self._high_rate_samples = 0
         self._abort_latched = False
 
@@ -461,6 +527,8 @@ class VQ2Runner:
         self._detection_error = None
         self._estimator_unhealthy_latched = False
         self._estimator_failure_reason = None
+        self._benign_pad_contact_count = 0
+        self._benign_pad_contact_impulse = 0.0
         self._high_rate_samples = 0
         self.tracker.reset()
 
@@ -599,6 +667,7 @@ class VQ2Runner:
         *,
         require_target: bool = True,
         allow_benign_pad_contact: bool = False,
+        enforce_benign_pad_budget: bool = False,
     ) -> None:
         if self._abort_latched:
             raise SafetyAbort("abort already latched")
@@ -613,11 +682,27 @@ class VQ2Runner:
             for collision in collisions:
                 benign_pad = allow_benign_pad_contact and is_benign_pad_contact(collision)
                 if benign_pad:
-                    self.recorder.emit("benign_pad_contact", collision=collision)
+                    self._benign_pad_contact_count += 1
+                    self._benign_pad_contact_impulse += abs(float(collision["impulse"]))
+                    self.recorder.emit(
+                        "benign_pad_contact",
+                        collision=collision,
+                        cumulative_count=self._benign_pad_contact_count,
+                        cumulative_impulse=self._benign_pad_contact_impulse,
+                    )
                 else:
                     harmful.append(collision)
             if harmful:
                 failures.append(f"collision reported: {harmful!r}")
+            if enforce_benign_pad_budget and (
+                self._benign_pad_contact_count > MAX_BENIGN_PAD_CONTACTS
+                or self._benign_pad_contact_impulse > MAX_BENIGN_PAD_IMPULSE
+            ):
+                failures.append(
+                    "repeated pad contacts exceeded launch budget "
+                    f"(count={self._benign_pad_contact_count}, "
+                    f"impulse={self._benign_pad_contact_impulse:.3f})"
+                )
         if self.estimate is not None:
             roll, pitch, _yaw = self.estimate.orientation.to_euler()
             rates = self.estimate.body_rates
@@ -851,6 +936,11 @@ class VQ2Runner:
                 attempt=attempt,
                 emergency=False,
                 pre_race_boot_ms=pre_race,
+                pre_gate_index=(
+                    self.adapter.race_status.active_gate_index
+                    if self.adapter.race_status is not None
+                    else None
+                ),
                 pre_imu_us=pre_imu,
             )
             await self.adapter.reset()
@@ -881,6 +971,7 @@ class VQ2Runner:
                 attempt=attempt,
                 emergency=True,
                 pre_race_boot_ms=pre_race,
+                pre_gate_index=(int(race.active_gate_index) if race is not None else None),
                 pre_imu_us=pre_imu,
             )
             # This send is deliberately unconditional.  Stale/missing streams
@@ -1015,11 +1106,26 @@ class VQ2Runner:
         """Latch command production, cut thrust, confirm disarm, then reset."""
 
         self._abort_latched = True
+        race_before_cleanup = self.adapter.race_status
+        gate_index_before_cleanup = (
+            int(race_before_cleanup.active_gate_index)
+            if race_before_cleanup is not None
+            else None
+        )
+        race_boot_before_cleanup = (
+            int(race_before_cleanup.sim_boot_time_ms)
+            if race_before_cleanup is not None
+            else None
+        )
         try:
             if self.adapter.is_armed:
                 zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
                 await self.adapter.send_attitude_rate(zero)
-                self.recorder.emit("zero_thrust_sent")
+                self.recorder.emit(
+                    "zero_thrust_sent",
+                    gate_index=gate_index_before_cleanup,
+                    race_boot_ms=race_boot_before_cleanup,
+                )
         except Exception:
             logger.exception("Could not send the one-shot zero-thrust command")
         # Do not delay the unconditional reset fallback behind a long heartbeat
@@ -1042,6 +1148,8 @@ class VQ2Runner:
             disarmed=disarmed,
             reset_proved=reset_proved,
             confirmed=confirmed,
+            gate_index_before_cleanup=gate_index_before_cleanup,
+            race_boot_before_cleanup=race_boot_before_cleanup,
         )
         if not confirmed:
             logger.critical("UNRESOLVED EMERGENCY: stop/reset state was not fully confirmed")
@@ -1127,7 +1235,10 @@ class VQ2Runner:
             if elapsed >= 2.5:
                 break
             self._sample()
-            self._watchdog(allow_benign_pad_contact=elapsed < 1.0)
+            self._watchdog(
+                allow_benign_pad_contact=elapsed < 0.35,
+                enforce_benign_pad_budget=True,
+            )
             assert self.estimate is not None
             blend = min(1.0, elapsed / 0.8)
             target_pitch = (1.0 - blend) * context.spawn_pitch_rad
@@ -1167,24 +1278,17 @@ class VQ2Runner:
         last_control_y: Optional[float] = None
         last_target_time: Optional[float] = None
         control_y_rate = 0.0
+        crossing_armed = False
+        crossing_started_s: Optional[float] = None
+        crossing_race_boot_ms: Optional[int] = None
         while True:
             now = time.monotonic()
             elapsed = now - flight_start
             if elapsed >= 5.0:
                 raise SafetyAbort("gate-0 wall-time limit reached")
             self._sample()
-            self._watchdog(allow_benign_pad_contact=elapsed < 1.0)
             race = self.adapter.race_status
             assert race is not None and self.estimate is not None
-            if race.active_gate_index > 1:
-                raise SafetyAbort(f"unexpected gate-index jump to {race.active_gate_index}")
-            if race.active_gate_index == 1:
-                return {
-                    "gate0_passed": True,
-                    "race_boot_ms": race.sim_boot_time_ms,
-                    "last_gate_race_time": race.last_gate_race_time,
-                    "max_gate_area_px": max_gate_area,
-                }
             target = self.tracker.target
             assert target is not None
             max_gate_area = max(max_gate_area, target.bbox_area)
@@ -1200,6 +1304,92 @@ class VQ2Runner:
                 target,
                 previous_center_y=last_control_y,
             )
+            if (
+                not crossing_armed
+                and target.age_s(now) <= CROSSING_TARGET_LOSS_S
+                and self.tracker.consecutive >= 3
+                and race.active_gate_index == 0
+                and is_close_gate_crossing_candidate(
+                    target,
+                    initial_gate_area=context.initial_gate_area,
+                    control_y=control_y,
+                )
+            ):
+                crossing_armed = True
+                self.recorder.emit(
+                    "crossing_candidate_armed",
+                    elapsed_s=elapsed,
+                    race_boot_ms=race.sim_boot_time_ms,
+                    target=asdict(target),
+                    control_y=control_y,
+                )
+
+            crossing_confirming = bool(
+                crossing_started_s is not None
+                or (
+                    crossing_armed
+                    and target.age_s(now) > CROSSING_TARGET_LOSS_S
+                )
+            )
+            self._watchdog(
+                require_target=not (
+                    crossing_confirming or race.active_gate_index == 1
+                ),
+                allow_benign_pad_contact=elapsed < 0.35,
+                enforce_benign_pad_budget=True,
+            )
+            if race.active_gate_index not in (0, 1):
+                raise SafetyAbort(f"unexpected gate-index jump to {race.active_gate_index}")
+            if not crossing_confirming and race.active_gate_index == 1:
+                return {
+                    "gate0_passed": True,
+                    "race_boot_ms": race.sim_boot_time_ms,
+                    "last_gate_race_time": race.last_gate_race_time,
+                    "max_gate_area_px": max_gate_area,
+                    "crossing_confirmation_used": crossing_started_s is not None,
+                }
+
+            if crossing_confirming:
+                if crossing_started_s is None:
+                    crossing_started_s = now
+                    crossing_race_boot_ms = int(race.sim_boot_time_ms)
+                    self.recorder.emit(
+                        "crossing_confirmation_started",
+                        elapsed_s=elapsed,
+                        baseline_race_boot_ms=crossing_race_boot_ms,
+                        target_age_s=target.age_s(now),
+                    )
+                assert crossing_race_boot_ms is not None
+                decision = crossing_status_decision(
+                    baseline_race_boot_ms=crossing_race_boot_ms,
+                    current_race_boot_ms=int(race.sim_boot_time_ms),
+                    active_gate_index=int(race.active_gate_index),
+                    elapsed_s=now - crossing_started_s,
+                )
+                if decision != "waiting":
+                    self.recorder.emit(
+                        "crossing_status_decision",
+                        decision=decision,
+                        baseline_race_boot_ms=crossing_race_boot_ms,
+                        current_race_boot_ms=race.sim_boot_time_ms,
+                        gate_index=race.active_gate_index,
+                    )
+                    if decision == "passed":
+                        return {
+                            "gate0_passed": True,
+                            "race_boot_ms": race.sim_boot_time_ms,
+                            "last_gate_race_time": race.last_gate_race_time,
+                            "max_gate_area_px": max_gate_area,
+                            "crossing_confirmation_used": True,
+                        }
+                    raise SafetyAbort(f"gate-0 crossing {decision.replace('_', ' ')}")
+                command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+                await self.adapter.send_attitude_rate(command)
+                self._record_tick("gate0/confirm", elapsed, command)
+                next_tick = next_control_deadline(next_tick, time.monotonic())
+                await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+                continue
+
             if target.frame_id != last_target_frame:
                 if last_control_y is not None and last_target_time is not None:
                     dt_target = target.received_monotonic_s - last_target_time

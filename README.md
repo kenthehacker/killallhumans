@@ -22,8 +22,9 @@ and confirms disarm/reset on exit:
 .\.venv\Scripts\python.exe -m scripts.aigp_vq2_run --stage sign-id --record
 ```
 
-`gate0` is currently an instrumented first-gate development stage, not a full
-race runner. Captures are written under `captures/` and ignored by Git.
+`gate0` has completed a simulator-credited, collision-free first-gate pass. It
+is still a bounded development stage, not a full race runner. Captures are
+written under `captures/` and ignored by Git.
 
 See the [VQ2 build 3385 handoff](docs/aigp/2026-07-18-vq2-handoff.md) for the
 current live-test results, safety invariants, simulator paths, and next step.
