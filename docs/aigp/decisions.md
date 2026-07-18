@@ -61,3 +61,14 @@ a newer index 0, invalid index, timeout, stale stream, or collision aborts.
 **Rationale:** the first stable gate-0 trace reset exactly when the next 4 Hz race packet arrived,
 discarding its gate index. Preserving that packet proved the same trajectory was a valid,
 collision-free pass. Timestamp causality prevents stale gate values from authorizing flight.
+
+## D9 — Reacquire after credit with a tracker-only reset and zero command
+**Decision:** After a strictly newer race packet proves gate index 1, a diagnostic stage may reset
+only `GateTargetTracker`, preserve the camera generation/frame watermark, and send only exact
+zero-rate/zero-thrust commands for at most 0.20 seconds. Require three consecutive detections on
+distinct newer frames; do not steer toward gate 1.
+**Rationale:** the credited gate-0 contour fills the frame and prevents the much smaller next gate
+from satisfying the old tracker's continuity ratio. Live observation proved gate 1 was already
+visible before credit, then acquired it in 0.093 seconds immediately after the tracker-only reset.
+The fixed pass/crossing/flight deadlines and unchanged watchdogs keep this measurement from
+silently becoming a gate-1 attempt.

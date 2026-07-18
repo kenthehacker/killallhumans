@@ -13,6 +13,9 @@ map.  This runner therefore performs only bounded training stages:
 ``gate0``
     Approach only the first visible gate and reset immediately when race status
     advances from gate 0 to gate 1.
+``gate0-observe``
+    Run the proved gate-0 stage, then hold zero thrust for at most 0.20 seconds
+    while recording a three-frame observation of the next gate.
 
 Every powered stage proves both the race and IMU clocks rolled back after
 ``SIM_RESET``, calibrates a gyro-only flight estimator during the countdown,
@@ -67,6 +70,13 @@ CROSSING_TARGET_LOSS_S = 0.08
 CROSSING_STATUS_TIMEOUT_S = 0.40
 CROSSING_MIN_AREA_RATIO = 25.0
 CROSSING_MIN_WIDTH_PX = 512
+GATE0_FLIGHT_TIMEOUT_S = 5.0
+
+POST_GATE_OBSERVATION_TIMEOUT_S = 0.20
+POST_GATE_REQUIRED_FRAMES = 3
+POST_GATE_MAX_ATTITUDE_DELTA_RAD = math.radians(5.0)
+POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S = 1.0
+POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 
 MAX_BENIGN_PAD_CONTACTS = 12
 MAX_BENIGN_PAD_IMPULSE = 0.05
@@ -145,6 +155,23 @@ class StartContext:
     initial_gate_y: int
     initial_gate_area: int
     go_boot_ms: int
+
+
+@dataclass(frozen=True)
+class GateTransitionProof:
+    """Internal authority and timing handoff from gate 0 to observation."""
+
+    pre_gate_race_boot_ms: int
+    post_gate_race_boot_ms: int
+    flight_started_monotonic_s: float
+    crossing_started_monotonic_s: Optional[float]
+    pass_confirmed_monotonic_s: float
+    next_control_deadline_s: float
+    vision_generation: int
+    vision_frame_id: int
+    vision_sim_time_ns: int
+    vision_received_monotonic_s: float
+    pass_rpy_rad: Tuple[float, float, float]
 
 
 @dataclass(frozen=True)
@@ -375,6 +402,164 @@ def crossing_status_decision(
     raise AssertionError("unreachable gate crossing decision")
 
 
+def post_gate_observation_deadline(
+    *,
+    pass_confirmed_s: float,
+    flight_started_s: float,
+    crossing_started_s: Optional[float],
+) -> float:
+    """Fixed observation deadline nested inside every existing flight bound."""
+
+    values = [float(pass_confirmed_s), float(flight_started_s)]
+    if crossing_started_s is not None:
+        values.append(float(crossing_started_s))
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("post-gate deadline inputs must be finite")
+    candidates = [
+        float(pass_confirmed_s) + POST_GATE_OBSERVATION_TIMEOUT_S,
+        float(flight_started_s) + GATE0_FLIGHT_TIMEOUT_S,
+    ]
+    if crossing_started_s is not None:
+        candidates.append(float(crossing_started_s) + CROSSING_STATUS_TIMEOUT_S)
+    return min(candidates)
+
+
+def is_crossing_residue(
+    target: GateTarget | GateDetection,
+    *,
+    image_width: int = 640,
+    image_height: int = 360,
+) -> bool:
+    """Reject a large clipped remnant of gate 0 during gate-1 reacquisition.
+
+    The predicate is deliberately scoped to the post-pass tracker.  Large
+    clipped contours are useful evidence during the gate-0 approach, but they
+    must not seed a fresh tracker after race status authoritatively advances.
+    """
+
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be positive")
+    x, y, width, height = (int(value) for value in target.bbox)
+    if (
+        x < 0
+        or y < 0
+        or width <= 0
+        or height <= 0
+        or x + width > image_width
+        or y + height > image_height
+    ):
+        return False
+
+    width_fraction = width / image_width
+    height_fraction = height / image_height
+    area_fraction = width_fraction * height_fraction
+    left = x < 3
+    top = y < 3
+    right = x + width > image_width - 3
+    bottom = y + height > image_height - 3
+    opposing_edges = (top and bottom) or (left and right)
+    edge_count = sum((left, top, right, bottom))
+    return bool(
+        (opposing_edges and area_fraction >= 0.25)
+        or (
+            edge_count >= 1
+            and area_fraction >= 0.60
+            and width_fraction >= 0.70
+            and height_fraction >= 0.70
+        )
+        or (width_fraction >= 0.90 and height_fraction >= 0.90)
+    )
+
+
+def _finite_float(value: Any) -> Optional[float]:
+    try:
+        converted = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return converted if math.isfinite(converted) else None
+
+
+def gate_detection_summary(
+    detection: GateDetection,
+    *,
+    detector_index: int,
+    image_width: int = 640,
+    image_height: int = 360,
+    reject_crossing_residue: bool = False,
+) -> Dict[str, Any]:
+    """Return JSON-safe pixel diagnostics for one raw detector result."""
+
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("image dimensions must be positive")
+    x, y, width, height = (int(value) for value in detection.bbox)
+    valid_bbox = bool(
+        x >= 0
+        and y >= 0
+        and width > 0
+        and height > 0
+        and x + width <= image_width
+        and y + height <= image_height
+    )
+    confidence = _finite_float(detection.confidence)
+    axis_aspect = (
+        max(width, height) / min(width, height)
+        if width > 0 and height > 0
+        else None
+    )
+    rejections: List[str] = []
+    if not valid_bbox:
+        rejections.append("invalid_bbox")
+    if width < 20:
+        rejections.append("min_width")
+    if height < 20:
+        rejections.append("min_height")
+    if axis_aspect is None or axis_aspect > 1.85:
+        rejections.append("axis_aspect_gt_1.85")
+    if confidence is None:
+        rejections.append("nonfinite_confidence")
+    elif confidence < 0.10:
+        rejections.append("confidence_below_0.10")
+    residue = is_crossing_residue(
+        detection,
+        image_width=image_width,
+        image_height=image_height,
+    )
+    base_selector_eligible = not rejections
+    if residue and reject_crossing_residue:
+        rejections.append("crossing_residue")
+    return {
+        "detector_index": int(detector_index),
+        "center_px": [int(detection.center_x), int(detection.center_y)],
+        "bbox_xywh_px": [x, y, width, height],
+        "reported_area_px": int(detection.area),
+        "bbox_area_px": width * height,
+        "bbox_area_fraction": (
+            (width * height) / (image_width * image_height) if valid_bbox else None
+        ),
+        "axis_aspect_ratio": axis_aspect,
+        "apparent_size_px": [
+            _finite_float(detection.apparent_width_px),
+            _finite_float(detection.apparent_height_px),
+        ],
+        "min_rect_aspect_ratio": _finite_float(detection.aspect_ratio),
+        "rotation_deg": _finite_float(detection.rotation_deg),
+        "rectangularity": _finite_float(detection.rectangularity),
+        "confidence": confidence,
+        "method": str(detection.detection_method),
+        "edge_touch": {
+            "left": valid_bbox and x < 3,
+            "top": valid_bbox and y < 3,
+            "right": valid_bbox and x + width > image_width - 3,
+            "bottom": valid_bbox and y + height > image_height - 3,
+        },
+        "base_selector_eligible": base_selector_eligible,
+        "post_pass_selector_eligible": base_selector_eligible and not residue,
+        "selector_eligible": not rejections,
+        "selector_rejections": rejections,
+        "crossing_residue": residue,
+    }
+
+
 def attitude_rate_command(
     estimate: AttitudeEstimate,
     *,
@@ -454,6 +639,27 @@ class JsonlRecorder:
         row = {"event": event, "wall_time_ns": time.time_ns(), **fields}
         self._handle.write(json.dumps(row, separators=(",", ":")) + "\n")
 
+    def save_png(self, label: str, image: Any) -> Optional[str]:
+        """Persist one deferred diagnostic image beside the JSONL capture."""
+
+        if self.path is None:
+            return None
+        import cv2
+
+        base = self.path
+        if base.suffix == ".gz":
+            base = base.with_suffix("")
+        if base.suffix == ".jsonl":
+            base = base.with_suffix("")
+        safe_label = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in str(label)
+        ).strip("_") or "frame"
+        output = base.parent / f"{base.name}_{safe_label}.png"
+        if not cv2.imwrite(str(output), image):
+            raise OSError(f"OpenCV could not write diagnostic image {output}")
+        return str(output.resolve())
+
     def close(self) -> None:
         if self._handle is not None:
             self._handle.close()
@@ -507,6 +713,20 @@ class VQ2Runner:
         self._benign_pad_contact_impulse = 0.0
         self._high_rate_samples = 0
         self._abort_latched = False
+        self._latest_raw_detections: List[GateDetection] = []
+        self._latest_accepted_target: Optional[GateTarget] = None
+        self._latest_detection_frame_id: Optional[int] = None
+        self._latest_detection_frame_sim_ns: Optional[int] = None
+        self._latest_detection_generation: Optional[int] = None
+        self._latest_detection_received_s: Optional[float] = None
+        self._latest_detection_image: Any = None
+        self._post_gate_last_frame: Optional[Tuple[Tuple[int, int, int], Any]] = None
+        self._vision_diagnostic_logging = False
+        self._post_gate_reacquisition = False
+        self._last_flight_command: Optional[AttitudeRateCommand] = None
+        self._last_flight_command_sent_s: Optional[float] = None
+        self._gate0_transition_proof: Optional[GateTransitionProof] = None
+        self._deferred_pngs: List[Tuple[str, Any]] = []
 
     def _clear_epoch_state(self) -> None:
         self.estimator.reset()
@@ -530,6 +750,18 @@ class VQ2Runner:
         self._benign_pad_contact_count = 0
         self._benign_pad_contact_impulse = 0.0
         self._high_rate_samples = 0
+        self._latest_raw_detections = []
+        self._latest_accepted_target = None
+        self._latest_detection_frame_id = None
+        self._latest_detection_frame_sim_ns = None
+        self._latest_detection_generation = None
+        self._latest_detection_received_s = None
+        self._latest_detection_image = None
+        self._vision_diagnostic_logging = False
+        self._post_gate_reacquisition = False
+        self._last_flight_command = None
+        self._last_flight_command_sent_s = None
+        self._gate0_transition_proof = None
         self.tracker.reset()
 
     def _sample(self) -> None:
@@ -600,15 +832,107 @@ class VQ2Runner:
         snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
         if snapshot is not None and snapshot.sim_time_ns != self._last_frame_sim_ns:
             self._last_frame_sim_ns = snapshot.sim_time_ns
+            self._latest_detection_frame_id = int(snapshot.frame_id)
+            self._latest_detection_frame_sim_ns = int(snapshot.sim_time_ns)
+            self._latest_detection_generation = int(snapshot.generation)
+            self._latest_detection_received_s = float(snapshot.received_monotonic_s)
             try:
-                detections = self.detector.detect(snapshot.camera_frame.image)
-                self.tracker.update(
-                    detections,
+                image = snapshot.camera_frame.image
+                self._latest_detection_image = image
+                image_height, image_width = image.shape[:2]
+                detections = list(self.detector.detect(image))
+                self._latest_raw_detections = detections
+                tracking_detections = detections
+                if self._post_gate_reacquisition:
+                    tracking_detections = [
+                        detection
+                        for detection in detections
+                        if not is_crossing_residue(
+                            detection,
+                            image_width=image_width,
+                            image_height=image_height,
+                        )
+                        and gate_detection_summary(
+                            detection,
+                            detector_index=0,
+                            image_width=image_width,
+                            image_height=image_height,
+                            reject_crossing_residue=True,
+                        )["selector_eligible"]
+                    ]
+                accepted = self.tracker.update(
+                    tracking_detections,
                     frame_id=snapshot.frame_id,
                     sim_time_ns=snapshot.sim_time_ns,
                     received_monotonic_s=snapshot.received_monotonic_s,
                 )
+                self._latest_accepted_target = accepted
+                if self._post_gate_reacquisition:
+                    self._post_gate_last_frame = (
+                        (
+                            int(snapshot.generation),
+                            int(snapshot.frame_id),
+                            int(snapshot.sim_time_ns),
+                        ),
+                        image,
+                    )
+                if self._vision_diagnostic_logging:
+                    summaries = [
+                        gate_detection_summary(
+                            detection,
+                            detector_index=index,
+                            image_width=image_width,
+                            image_height=image_height,
+                            reject_crossing_residue=self._post_gate_reacquisition,
+                        )
+                        for index, detection in enumerate(detections)
+                    ]
+                    selected = select_primary_gate(tracking_detections)
+                    selected_index = next(
+                        (
+                            index
+                            for index, detection in enumerate(detections)
+                            if detection is selected
+                        ),
+                        None,
+                    )
+                    race = self.adapter.race_status
+                    estimate = self.estimate
+                    self.recorder.emit(
+                        "vision_detection_frame",
+                        phase=(
+                            "gate1_reacquisition"
+                            if self._post_gate_reacquisition
+                            else "gate0_crossing"
+                        ),
+                        frame_id=snapshot.frame_id,
+                        sim_time_ns=snapshot.sim_time_ns,
+                        generation=snapshot.generation,
+                        received_monotonic_s=snapshot.received_monotonic_s,
+                        receive_age_s=snapshot.age_s(now),
+                        image_size_px=[image_width, image_height],
+                        race_boot_ms=(race.sim_boot_time_ms if race else None),
+                        gate_index=(race.active_gate_index if race else None),
+                        detections=summaries,
+                        selected_detection_index=selected_index,
+                        tracker_streak=self.tracker.consecutive,
+                        accepted_target=(asdict(accepted) if accepted else None),
+                        tracker_target=(
+                            asdict(self.tracker.target) if self.tracker.target else None
+                        ),
+                        rpy=(
+                            list(estimate.orientation.to_euler()) if estimate else None
+                        ),
+                        body_rates=(list(estimate.body_rates) if estimate else None),
+                        last_command=(
+                            asdict(self._last_flight_command)
+                            if self._last_flight_command
+                            else None
+                        ),
+                    )
             except Exception as exc:  # OpenCV errors must fail closed in flight.
+                self._latest_raw_detections = []
+                self._latest_accepted_target = None
                 self._detection_error = f"{type(exc).__name__}: {exc}"
 
     def _stream_failures(
@@ -668,6 +992,7 @@ class VQ2Runner:
         require_target: bool = True,
         allow_benign_pad_contact: bool = False,
         enforce_benign_pad_budget: bool = False,
+        count_rate_sample: bool = True,
     ) -> None:
         if self._abort_latched:
             raise SafetyAbort("abort already latched")
@@ -715,9 +1040,10 @@ class VQ2Runner:
             peak_rate = max(abs(value) for value in rates)
             if peak_rate > IMMEDIATE_MAX_BODY_RATE_RAD_S:
                 failures.append(f"body rate immediate limit exceeded ({peak_rate:.2f}rad/s)")
-            self._high_rate_samples = self._high_rate_samples + 1 if (
-                peak_rate > MAX_BODY_RATE_RAD_S
-            ) else 0
+            if count_rate_sample:
+                self._high_rate_samples = self._high_rate_samples + 1 if (
+                    peak_rate > MAX_BODY_RATE_RAD_S
+                ) else 0
             if self._high_rate_samples >= 2:
                 failures.append(f"body rate sustained limit exceeded ({peak_rate:.2f}rad/s)")
         if failures:
@@ -749,6 +1075,75 @@ class VQ2Runner:
             target=(asdict(target) if target else None),
             command=(asdict(command) if command else None),
         )
+
+    async def _send_flight_command(self, command: AttitudeRateCommand) -> None:
+        """Send one validated setpoint and remember its completion time."""
+
+        validate_command(command)
+        await self.adapter.send_attitude_rate(command)
+        self._last_flight_command = command
+        self._last_flight_command_sent_s = time.monotonic()
+
+    @staticmethod
+    def _is_exact_zero_command(command: Optional[AttitudeRateCommand]) -> bool:
+        return bool(
+            command is not None
+            and command.roll_rate == 0.0
+            and command.pitch_rate == 0.0
+            and command.yaw_rate == 0.0
+            and command.thrust == 0.0
+        )
+
+    def _defer_snapshot(self, label: str) -> Optional[Dict[str, Any]]:
+        """Copy a diagnostic frame in memory; encoding happens after cleanup."""
+
+        if self.recorder.path is None:
+            return None
+        snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
+        if snapshot is None:
+            self.recorder.emit("diagnostic_snapshot_unavailable", label=label)
+            return None
+        image = getattr(snapshot.camera_frame, "image", None)
+        if image is None:
+            self.recorder.emit("diagnostic_snapshot_unavailable", label=label)
+            return None
+        # VQ2 snapshots publish a new read-only ndarray per decoded frame.
+        # Holding the reference is sufficient; copy/encode only after cleanup.
+        self._deferred_pngs.append((str(label), image))
+        metadata = {
+            "label": str(label),
+            "frame_id": int(snapshot.frame_id),
+            "sim_time_ns": int(snapshot.sim_time_ns),
+            "generation": int(snapshot.generation),
+            "received_monotonic_s": float(snapshot.received_monotonic_s),
+        }
+        return metadata
+
+    def _flush_deferred_snapshots(self) -> Tuple[List[str], List[str]]:
+        paths: List[str] = []
+        errors: List[str] = []
+        pending = self._deferred_pngs
+        self._deferred_pngs = []
+        for label, image in pending:
+            try:
+                path = self.recorder.save_png(label, image)
+                if path is not None:
+                    paths.append(path)
+                    self.recorder.emit(
+                        "diagnostic_snapshot_saved",
+                        label=label,
+                        path=path,
+                    )
+            except Exception as exc:
+                message = f"{label}: {type(exc).__name__}: {exc}"
+                errors.append(message)
+                logger.exception("Could not save deferred diagnostic snapshot %s", label)
+                self.recorder.emit(
+                    "diagnostic_snapshot_save_failed",
+                    label=label,
+                    reason=message,
+                )
+        return paths, errors
 
     async def preflight(self, timeout_s: float = 10.0) -> Dict[str, Any]:
         """Passively validate feeds, estimator bootstrap, detector, and rate."""
@@ -1120,12 +1515,27 @@ class VQ2Runner:
         try:
             if self.adapter.is_armed:
                 zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
-                await self.adapter.send_attitude_rate(zero)
-                self.recorder.emit(
-                    "zero_thrust_sent",
-                    gate_index=gate_index_before_cleanup,
-                    race_boot_ms=race_boot_before_cleanup,
+                zero_is_recent = bool(
+                    self._is_exact_zero_command(self._last_flight_command)
+                    and self._last_flight_command_sent_s is not None
+                    and time.monotonic() - self._last_flight_command_sent_s
+                    < CONTROL_PERIOD_S
                 )
+                if zero_is_recent:
+                    self.recorder.emit(
+                        "zero_thrust_already_active",
+                        gate_index=gate_index_before_cleanup,
+                        race_boot_ms=race_boot_before_cleanup,
+                    )
+                else:
+                    await self.adapter.send_attitude_rate(zero)
+                    self._last_flight_command = zero
+                    self._last_flight_command_sent_s = time.monotonic()
+                    self.recorder.emit(
+                        "zero_thrust_sent",
+                        gate_index=gate_index_before_cleanup,
+                        race_boot_ms=race_boot_before_cleanup,
+                    )
         except Exception:
             logger.exception("Could not send the one-shot zero-thrust command")
         # Do not delay the unconditional reset fallback behind a long heartbeat
@@ -1188,7 +1598,7 @@ class VQ2Runner:
                     )
                 command = AttitudeRateCommand(rates[0], rates[1], 0.0, 0.235)
                 validate_command(command)
-                await self.adapter.send_attitude_rate(command)
+                await self._send_flight_command(command)
                 elapsed = time.monotonic() - flight_start
                 self._record_tick(f"sign-id/{name}", elapsed, command)
                 if name == "settle" and segment_elapsed > 0.15:
@@ -1258,7 +1668,7 @@ class VQ2Runner:
                 target_pitch_rad=target_pitch,
                 thrust=thrust,
             )
-            await self.adapter.send_attitude_rate(command)
+            await self._send_flight_command(command)
             max_abs_roll = max(max_abs_roll, abs(self.estimate.roll))
             max_abs_rate = max(max_abs_rate, max(abs(v) for v in self.estimate.body_rates))
             self._record_tick("hover", elapsed, command)
@@ -1270,7 +1680,83 @@ class VQ2Runner:
             "final_rpy_rad": list(self.estimate.orientation.to_euler()),
         }
 
-    async def _run_gate0(self, context: StartContext) -> Dict[str, Any]:
+    def _complete_gate0_pass(
+        self,
+        *,
+        race: Any,
+        pre_gate_race_boot_ms: int,
+        flight_start_s: float,
+        crossing_started_s: Optional[float],
+        next_tick_s: float,
+        max_gate_area: int,
+        capture_transition: bool,
+    ) -> Dict[str, Any]:
+        """Build the sole authoritative gate-0 pass handoff."""
+
+        post_gate_boot_ms = int(race.sim_boot_time_ms)
+        if int(race.active_gate_index) != 1:
+            raise SafetyAbort("gate-0 pass handoff did not contain gate index 1")
+        if post_gate_boot_ms <= int(pre_gate_race_boot_ms):
+            raise SafetyAbort(
+                "gate-1 race status was not strictly newer than recorded gate 0"
+            )
+        if self.estimate is None:
+            raise SafetyAbort("attitude estimate unavailable at gate-0 pass")
+        snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
+        if snapshot is None:
+            raise SafetyAbort("camera unavailable at authoritative gate-0 pass")
+
+        pass_confirmed_s = time.monotonic()
+        paced_deadline = float(next_tick_s)
+        if self._last_flight_command_sent_s is not None:
+            paced_deadline = max(
+                paced_deadline,
+                self._last_flight_command_sent_s + CONTROL_PERIOD_S,
+            )
+        proof = GateTransitionProof(
+            pre_gate_race_boot_ms=int(pre_gate_race_boot_ms),
+            post_gate_race_boot_ms=post_gate_boot_ms,
+            flight_started_monotonic_s=float(flight_start_s),
+            crossing_started_monotonic_s=(
+                float(crossing_started_s) if crossing_started_s is not None else None
+            ),
+            pass_confirmed_monotonic_s=pass_confirmed_s,
+            next_control_deadline_s=paced_deadline,
+            vision_generation=int(snapshot.generation),
+            vision_frame_id=int(snapshot.frame_id),
+            vision_sim_time_ns=int(snapshot.sim_time_ns),
+            vision_received_monotonic_s=float(snapshot.received_monotonic_s),
+            pass_rpy_rad=tuple(
+                float(value) for value in self.estimate.orientation.to_euler()
+            ),
+        )
+        self._gate0_transition_proof = proof
+        if capture_transition:
+            self._defer_snapshot("gate1_race_credit")
+        result = {
+            "gate0_passed": True,
+            "gate_transition_proved": True,
+            "pre_gate_race_boot_ms": proof.pre_gate_race_boot_ms,
+            "race_boot_ms": proof.post_gate_race_boot_ms,
+            "last_gate_race_time": race.last_gate_race_time,
+            "max_gate_area_px": int(max_gate_area),
+            "crossing_confirmation_used": crossing_started_s is not None,
+            "crossing_confirmation_elapsed_s": (
+                pass_confirmed_s - crossing_started_s
+                if crossing_started_s is not None
+                else None
+            ),
+            "flight_elapsed_s": pass_confirmed_s - flight_start_s,
+        }
+        self.recorder.emit("gate0_pass_proved", **result)
+        return result
+
+    async def _run_gate0(
+        self,
+        context: StartContext,
+        *,
+        capture_transition: bool = False,
+    ) -> Dict[str, Any]:
         flight_start = time.monotonic()
         next_tick = flight_start
         max_gate_area = context.initial_gate_area
@@ -1281,14 +1767,17 @@ class VQ2Runner:
         crossing_armed = False
         crossing_started_s: Optional[float] = None
         crossing_race_boot_ms: Optional[int] = None
+        last_gate0_race_boot_ms: Optional[int] = int(context.go_boot_ms)
         while True:
             now = time.monotonic()
             elapsed = now - flight_start
-            if elapsed >= 5.0:
+            if elapsed >= GATE0_FLIGHT_TIMEOUT_S:
                 raise SafetyAbort("gate-0 wall-time limit reached")
             self._sample()
             race = self.adapter.race_status
             assert race is not None and self.estimate is not None
+            if int(race.active_gate_index) == 0:
+                last_gate0_race_boot_ms = int(race.sim_boot_time_ms)
             target = self.tracker.target
             assert target is not None
             max_gate_area = max(max_gate_area, target.bbox_area)
@@ -1316,6 +1805,8 @@ class VQ2Runner:
                 )
             ):
                 crossing_armed = True
+                if capture_transition:
+                    self._vision_diagnostic_logging = True
                 self.recorder.emit(
                     "crossing_candidate_armed",
                     elapsed_s=elapsed,
@@ -1341,18 +1832,29 @@ class VQ2Runner:
             if race.active_gate_index not in (0, 1):
                 raise SafetyAbort(f"unexpected gate-index jump to {race.active_gate_index}")
             if not crossing_confirming and race.active_gate_index == 1:
-                return {
-                    "gate0_passed": True,
-                    "race_boot_ms": race.sim_boot_time_ms,
-                    "last_gate_race_time": race.last_gate_race_time,
-                    "max_gate_area_px": max_gate_area,
-                    "crossing_confirmation_used": crossing_started_s is not None,
-                }
+                if last_gate0_race_boot_ms is None:
+                    raise SafetyAbort("gate 1 appeared without a recorded gate-0 packet")
+                return self._complete_gate0_pass(
+                    race=race,
+                    pre_gate_race_boot_ms=last_gate0_race_boot_ms,
+                    flight_start_s=flight_start,
+                    crossing_started_s=crossing_started_s,
+                    next_tick_s=next_tick,
+                    max_gate_area=max_gate_area,
+                    capture_transition=capture_transition,
+                )
 
             if crossing_confirming:
                 if crossing_started_s is None:
                     crossing_started_s = now
-                    crossing_race_boot_ms = int(race.sim_boot_time_ms)
+                    if last_gate0_race_boot_ms is None:
+                        raise SafetyAbort(
+                            "crossing confirmation lacks a recorded gate-0 packet"
+                        )
+                    crossing_race_boot_ms = last_gate0_race_boot_ms
+                    if capture_transition:
+                        self._vision_diagnostic_logging = True
+                        self._defer_snapshot("gate0_visual_loss")
                     self.recorder.emit(
                         "crossing_confirmation_started",
                         elapsed_s=elapsed,
@@ -1375,16 +1877,18 @@ class VQ2Runner:
                         gate_index=race.active_gate_index,
                     )
                     if decision == "passed":
-                        return {
-                            "gate0_passed": True,
-                            "race_boot_ms": race.sim_boot_time_ms,
-                            "last_gate_race_time": race.last_gate_race_time,
-                            "max_gate_area_px": max_gate_area,
-                            "crossing_confirmation_used": True,
-                        }
+                        return self._complete_gate0_pass(
+                            race=race,
+                            pre_gate_race_boot_ms=crossing_race_boot_ms,
+                            flight_start_s=flight_start,
+                            crossing_started_s=crossing_started_s,
+                            next_tick_s=next_tick,
+                            max_gate_area=max_gate_area,
+                            capture_transition=capture_transition,
+                        )
                     raise SafetyAbort(f"gate-0 crossing {decision.replace('_', ' ')}")
                 command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
-                await self.adapter.send_attitude_rate(command)
+                await self._send_flight_command(command)
                 self._record_tick("gate0/confirm", elapsed, command)
                 next_tick = next_control_deadline(next_tick, time.monotonic())
                 await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
@@ -1426,13 +1930,296 @@ class VQ2Runner:
                 target_pitch_rad=target_pitch,
                 thrust=thrust,
             )
-            await self.adapter.send_attitude_rate(command)
+            await self._send_flight_command(command)
             self._record_tick("gate0", elapsed, command)
             next_tick = next_control_deadline(next_tick, time.monotonic())
             await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
 
+    async def _observe_gate1(
+        self,
+        gate0_details: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Collect a bounded, zero-thrust view after a proved gate-0 pass."""
+
+        proof = self._gate0_transition_proof
+        if proof is None or not gate0_details.get("gate_transition_proved"):
+            raise SafetyAbort("gate-1 observation lacks an authoritative transition proof")
+        if (
+            int(gate0_details.get("pre_gate_race_boot_ms", -1))
+            != proof.pre_gate_race_boot_ms
+            or int(gate0_details.get("race_boot_ms", -1))
+            != proof.post_gate_race_boot_ms
+            or proof.post_gate_race_boot_ms <= proof.pre_gate_race_boot_ms
+        ):
+            raise SafetyAbort("gate-1 observation transition proof is inconsistent")
+
+        race = self.adapter.race_status
+        if (
+            race is None
+            or int(race.active_gate_index) != 1
+            or int(race.sim_boot_time_ms) < proof.post_gate_race_boot_ms
+        ):
+            raise SafetyAbort("race status no longer matches the proved gate-1 transition")
+        watermark = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
+        if watermark is None:
+            raise SafetyAbort("camera unavailable at gate-1 observation handoff")
+        if int(watermark.generation) != proof.vision_generation:
+            raise SafetyAbort("vision generation changed after gate-0 passage")
+        if (
+            int(watermark.frame_id) < proof.vision_frame_id
+            or int(watermark.sim_time_ns) < proof.vision_sim_time_ns
+            or float(watermark.received_monotonic_s)
+            < proof.vision_received_monotonic_s
+        ):
+            raise SafetyAbort("camera snapshot regressed after gate-0 passage")
+
+        # Deliberately skip any frame that existed before the tracker reset.
+        # The vision receiver and its generation remain untouched.
+        self._last_frame_sim_ns = int(watermark.sim_time_ns)
+        self._latest_detection_frame_id = int(watermark.frame_id)
+        self._latest_detection_frame_sim_ns = int(watermark.sim_time_ns)
+        self._latest_detection_generation = int(watermark.generation)
+        self._latest_detection_received_s = float(watermark.received_monotonic_s)
+        self._latest_raw_detections = []
+        self.tracker.reset()
+        self._latest_accepted_target = None
+        self._post_gate_reacquisition = True
+        self._vision_diagnostic_logging = True
+
+        hard_deadline = post_gate_observation_deadline(
+            pass_confirmed_s=proof.pass_confirmed_monotonic_s,
+            flight_started_s=proof.flight_started_monotonic_s,
+            crossing_started_s=proof.crossing_started_monotonic_s,
+        )
+        observation_started_s = time.monotonic()
+        if observation_started_s >= hard_deadline:
+            self._post_gate_reacquisition = False
+            raise SafetyAbort("gate-1 observation has no remaining safety budget")
+
+        next_tick = max(
+            proof.next_control_deadline_s,
+            (
+                self._last_flight_command_sent_s + CONTROL_PERIOD_S
+                if self._last_flight_command_sent_s is not None
+                else observation_started_s
+            ),
+        )
+        zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+        last_processed_token = (
+            int(watermark.generation),
+            int(watermark.frame_id),
+            int(watermark.sim_time_ns),
+        )
+        qualifying_frames: List[Dict[str, Any]] = []
+        strict_high_rate_samples = 0
+        self.recorder.emit(
+            "post_gate_observation_started",
+            pre_gate_race_boot_ms=proof.pre_gate_race_boot_ms,
+            post_gate_race_boot_ms=proof.post_gate_race_boot_ms,
+            hard_deadline_monotonic_s=hard_deadline,
+            budget_s=hard_deadline - observation_started_s,
+            watermark={
+                "generation": watermark.generation,
+                "frame_id": watermark.frame_id,
+                "sim_time_ns": watermark.sim_time_ns,
+                "received_monotonic_s": watermark.received_monotonic_s,
+            },
+        )
+
+        try:
+            initial_wait = min(next_tick, hard_deadline) - time.monotonic()
+            if initial_wait > 0.0:
+                await asyncio.sleep(initial_wait)
+            while True:
+                if time.monotonic() >= hard_deadline:
+                    raise SafetyAbort("gate-1 observation timed out before three frames")
+                self._sample()
+                self._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=False,
+                    enforce_benign_pad_budget=False,
+                )
+                now = time.monotonic()
+                if now >= hard_deadline:
+                    raise SafetyAbort("gate-1 observation timed out before three frames")
+                race = self.adapter.race_status
+                if race is None or int(race.active_gate_index) != 1:
+                    gate_index = race.active_gate_index if race is not None else None
+                    raise SafetyAbort(
+                        f"gate index changed during gate-1 observation ({gate_index})"
+                    )
+                if int(race.sim_boot_time_ms) < proof.post_gate_race_boot_ms:
+                    raise SafetyAbort("race clock regressed below the gate-1 proof")
+                assert self.estimate is not None
+                roll, pitch, _yaw = self.estimate.orientation.to_euler()
+                if (
+                    abs(roll - proof.pass_rpy_rad[0])
+                    > POST_GATE_MAX_ATTITUDE_DELTA_RAD
+                    or abs(pitch - proof.pass_rpy_rad[1])
+                    > POST_GATE_MAX_ATTITUDE_DELTA_RAD
+                ):
+                    raise SafetyAbort("attitude changed over 5deg during zero-thrust observation")
+                peak_rate = max(abs(value) for value in self.estimate.body_rates)
+                if peak_rate > POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S:
+                    raise SafetyAbort(
+                        "body rate exceeded 1.0rad/s during gate-1 observation"
+                    )
+                strict_high_rate_samples = (
+                    strict_high_rate_samples + 1
+                    if peak_rate > POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S
+                    else 0
+                )
+                if strict_high_rate_samples >= 2:
+                    raise SafetyAbort(
+                        "body rate exceeded 0.5rad/s for two gate-1 observation samples"
+                    )
+
+                frame_token: Optional[Tuple[int, int, int]] = None
+                if (
+                    self._latest_detection_generation is not None
+                    and self._latest_detection_frame_id is not None
+                    and self._latest_detection_frame_sim_ns is not None
+                ):
+                    frame_token = (
+                        self._latest_detection_generation,
+                        self._latest_detection_frame_id,
+                        self._latest_detection_frame_sim_ns,
+                    )
+                if frame_token is not None and frame_token != last_processed_token:
+                    generation, frame_id, sim_time_ns = frame_token
+                    received_s = self._latest_detection_received_s
+                    if generation != int(watermark.generation):
+                        raise SafetyAbort("vision generation changed during gate-1 observation")
+                    if (
+                        frame_id <= int(watermark.frame_id)
+                        or sim_time_ns <= int(watermark.sim_time_ns)
+                        or received_s is None
+                        or received_s <= float(watermark.received_monotonic_s)
+                    ):
+                        raise SafetyAbort("post-pass camera frame did not advance strictly")
+                    last_processed_token = frame_token
+                    accepted = self._latest_accepted_target
+                    if accepted is None or is_crossing_residue(accepted):
+                        self.recorder.emit(
+                            "post_gate_candidate_reset",
+                            frame_id=frame_id,
+                            sim_time_ns=sim_time_ns,
+                            reason=(
+                                "crossing_residue"
+                                if accepted is not None
+                                else "no_continuous_candidate"
+                            ),
+                        )
+                        self.tracker.reset()
+                        qualifying_frames = []
+                    else:
+                        record = {
+                            "frame_id": accepted.frame_id,
+                            "sim_time_ns": accepted.sim_time_ns,
+                            "received_monotonic_s": accepted.received_monotonic_s,
+                            "center_px": [accepted.center_x, accepted.center_y],
+                            "bbox_xywh_px": list(accepted.bbox),
+                            "confidence": accepted.confidence,
+                            "tracker_streak": self.tracker.consecutive,
+                            "rpy_rad": list(self.estimate.orientation.to_euler()),
+                            "body_rates_rad_s": list(self.estimate.body_rates),
+                        }
+                        if self.tracker.consecutive == 1:
+                            qualifying_frames = [record]
+                        else:
+                            qualifying_frames.append(record)
+                            qualifying_frames = qualifying_frames[
+                                -self.tracker.consecutive :
+                            ]
+                        self.recorder.emit("post_gate_candidate_frame", **record)
+                        candidate_checked_s = time.monotonic()
+                        if candidate_checked_s >= hard_deadline:
+                            raise SafetyAbort(
+                                "gate-1 observation timed out before three frames"
+                            )
+                        if (
+                            self.tracker.consecutive >= POST_GATE_REQUIRED_FRAMES
+                            and len(qualifying_frames) >= POST_GATE_REQUIRED_FRAMES
+                            and accepted.age_s(candidate_checked_s) <= MAX_VISION_AGE_S
+                        ):
+                            # Recheck every generic guard immediately before
+                            # accepting the observation result.
+                            self._watchdog(
+                                require_target=False,
+                                allow_benign_pad_contact=False,
+                                enforce_benign_pad_budget=False,
+                            )
+                            accepted_at_s = time.monotonic()
+                            if accepted_at_s >= hard_deadline:
+                                raise SafetyAbort(
+                                    "gate-1 observation timed out before three frames"
+                                )
+                            final_race = self.adapter.race_status
+                            if (
+                                final_race is None
+                                or int(final_race.active_gate_index) != 1
+                                or int(final_race.sim_boot_time_ms)
+                                < proof.post_gate_race_boot_ms
+                            ):
+                                raise SafetyAbort(
+                                    "race status changed at gate-1 observation acceptance"
+                                )
+                            result = {
+                                "gate1_observed": True,
+                                "observation_elapsed_s": (
+                                    accepted_at_s - observation_started_s
+                                ),
+                                "frame_count": POST_GATE_REQUIRED_FRAMES,
+                                "frames": qualifying_frames[-POST_GATE_REQUIRED_FRAMES:],
+                                "final_gate_bbox": list(accepted.bbox),
+                                "final_gate_center": [
+                                    accepted.center_x,
+                                    accepted.center_y,
+                                ],
+                                "race_boot_ms": int(final_race.sim_boot_time_ms),
+                                "gate_index": int(final_race.active_gate_index),
+                            }
+                            return result
+
+                # Leave the final setpoint slot for cleanup, preventing a
+                # zero-command burst at an odd nested deadline.
+                if hard_deadline - time.monotonic() <= CONTROL_PERIOD_S:
+                    raise SafetyAbort("gate-1 observation timed out before three frames")
+                self._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=False,
+                    enforce_benign_pad_budget=False,
+                    count_rate_sample=False,
+                )
+                send_checked_s = time.monotonic()
+                if hard_deadline - send_checked_s <= CONTROL_PERIOD_S:
+                    raise SafetyAbort("gate-1 observation timed out before three frames")
+                send_race = self.adapter.race_status
+                if (
+                    send_race is None
+                    or int(send_race.active_gate_index) != 1
+                    or int(send_race.sim_boot_time_ms)
+                    < proof.post_gate_race_boot_ms
+                ):
+                    raise SafetyAbort(
+                        "race status changed before gate-1 observation setpoint"
+                    )
+
+                await self._send_flight_command(zero)
+                self._record_tick(
+                    "gate0-observe/post-pass",
+                    send_checked_s - observation_started_s,
+                    zero,
+                )
+                next_tick = next_control_deadline(next_tick, time.monotonic())
+                await asyncio.sleep(
+                    max(0.0, min(next_tick, hard_deadline) - time.monotonic())
+                )
+        finally:
+            self._post_gate_reacquisition = False
+
     async def run_powered_stage(self, stage: str) -> StageResult:
-        if stage not in {"sign-id", "hover", "gate0"}:
+        if stage not in {"sign-id", "hover", "gate0", "gate0-observe"}:
             raise ValueError(f"unsupported powered stage: {stage}")
         started = time.monotonic()
         reason = "unknown"
@@ -1442,6 +2229,8 @@ class VQ2Runner:
         gate_after: Optional[int] = None
         cleanup_confirmed = False
         try:
+            self._deferred_pngs = []
+            self._post_gate_last_frame = None
             self._abort_latched = False
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
@@ -1453,8 +2242,24 @@ class VQ2Runner:
                 details = await self._run_sign_id()
             elif stage == "hover":
                 details = await self._run_hover(context)
-            else:
+            elif stage == "gate0":
                 details = await self._run_gate0(context)
+            else:
+                gate0_details = await self._run_gate0(
+                    context,
+                    capture_transition=True,
+                )
+                details = {"gate0": gate0_details}
+                try:
+                    details["gate1_observation"] = await self._observe_gate1(
+                        gate0_details
+                    )
+                except SafetyAbort as exc:
+                    details["gate1_observation"] = {
+                        "gate1_observed": False,
+                        "reason": str(exc),
+                    }
+                    raise
             success = True
             reason = "stage completed"
         except (SafetyAbort, asyncio.CancelledError) as exc:
@@ -1471,6 +2276,41 @@ class VQ2Runner:
             cleanup_confirmed = await self.safe_cleanup()
             race = self.adapter.race_status
             gate_after = race.active_gate_index if race else None
+            post_cleanup_diagnostic_errors: List[str] = []
+            if cleanup_confirmed and self._post_gate_last_frame is not None:
+                token, image = self._post_gate_last_frame
+                observation = details.get("gate1_observation", {})
+                if observation.get("gate1_observed"):
+                    final_frame = observation.get("frames", [{}])[-1]
+                    if (
+                        token[1] == final_frame.get("frame_id")
+                        and token[2] == final_frame.get("sim_time_ns")
+                    ):
+                        self._deferred_pngs.append(("gate1_acquired", image))
+                        self.recorder.emit("next_gate_reacquired", **observation)
+                    else:
+                        post_cleanup_diagnostic_errors.append(
+                            "acquired-frame PNG token did not match the accepted target"
+                        )
+                else:
+                    self._deferred_pngs.append(
+                        ("gate1_observation_terminal", image)
+                    )
+            if cleanup_confirmed:
+                diagnostic_paths, diagnostic_errors = self._flush_deferred_snapshots()
+                diagnostic_errors = (
+                    post_cleanup_diagnostic_errors + diagnostic_errors
+                )
+            else:
+                self._deferred_pngs = []
+                diagnostic_paths = []
+                diagnostic_errors = [
+                    "diagnostic images not encoded because cleanup was unconfirmed"
+                ]
+            if diagnostic_paths:
+                details["diagnostic_pngs"] = diagnostic_paths
+            if diagnostic_errors:
+                details["diagnostic_errors"] = diagnostic_errors
         return StageResult(
             stage=stage,
             success=success and cleanup_confirmed,
@@ -1526,7 +2366,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Bounded AIGP VQ2 training runner")
     parser.add_argument(
         "--stage",
-        choices=("preflight", "sign-id", "hover", "gate0"),
+        choices=("preflight", "sign-id", "hover", "gate0", "gate0-observe"),
         default="preflight",
     )
     parser.add_argument("--address", default=DEFAULT_MAVLINK_URL)

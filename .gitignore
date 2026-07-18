@@ -46,3 +46,5 @@ captures/*.log
 captures/*.txt
 captures/*.json
 captures/*.npz
+# VQ2 writes diagnostic frames beside each per-run trace after safe cleanup.
+captures/*.png
