@@ -122,7 +122,6 @@ def test_basic_detection():
     assert abs(det.center_y - 240) < 20, f"Y center off by {abs(det.center_y - 240)}"
     
     print("  ✓ PASSED")
-    return image, detections
 
 
 def test_offset_detection():
@@ -151,7 +150,6 @@ def test_offset_detection():
     assert abs(det.center_y - 120) < 20
     
     print("  ✓ PASSED")
-    return image, detections
 
 
 def test_steering_error():
@@ -237,7 +235,6 @@ def test_rotated_gate():
     print(f"  Confidence: {det.confidence:.2f}")
     
     print("  ✓ PASSED")
-    return image, detections
 
 
 def test_angled_gate_3d_like():

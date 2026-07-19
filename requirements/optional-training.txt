@@ -1,0 +1,7 @@
+# Optional learned-detector/training tools. They are not imported by the VQ2
+# runtime. Do not start a long campaign until its dataset and full transitive
+# environment have their own immutable provenance record.
+-r runtime-vq2.txt
+onnxruntime==1.27.0
+torch==2.13.0
+ultralytics==8.4.100

@@ -9,7 +9,9 @@ import time
 
 import pytest
 
+import scripts.aigp_vq1_run as vq1_module
 from scripts.aigp_vq1_run import FakeAdapter, run_vq1
+from competition.session import MAX_RUN_DURATION_S, RaceSession
 from competition.track_data import track_data_to_gatespecs
 
 
@@ -73,14 +75,91 @@ def test_fake_adapter_drain_collisions_empty():
     assert adapter.drain_collisions() == []
 
 
+def test_production_session_timeout_remains_eight_minutes():
+    session = RaceSession(FakeAdapter())
+    assert MAX_RUN_DURATION_S == 480
+    assert session.max_run_duration_s == MAX_RUN_DURATION_S
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value", "error"),
+    [
+        pytest.param("max_run_duration_s", True, TypeError, id="duration-bool"),
+        pytest.param("max_run_duration_s", "1", TypeError, id="duration-string"),
+        pytest.param("max_run_duration_s", 0.0, ValueError, id="duration-zero"),
+        pytest.param("max_run_duration_s", -1.0, ValueError, id="duration-negative"),
+        pytest.param("max_run_duration_s", math.nan, ValueError, id="duration-nan"),
+        pytest.param("max_run_duration_s", math.inf, ValueError, id="duration-infinite"),
+        pytest.param("target_hz", False, TypeError, id="rate-bool"),
+        pytest.param("target_hz", "100", TypeError, id="rate-string"),
+        pytest.param("target_hz", 0.0, ValueError, id="rate-zero"),
+        pytest.param("target_hz", math.nan, ValueError, id="rate-nan"),
+    ],
+)
+def test_race_session_rejects_ambiguous_or_invalid_numeric_boundaries(
+    keyword, value, error
+):
+    with pytest.raises(error, match=keyword):
+        RaceSession(FakeAdapter(), **{keyword: value})
+
+
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        pytest.param(True, TypeError, id="bool"),
+        pytest.param("0.1", TypeError, id="string"),
+        pytest.param(0.0, ValueError, id="zero"),
+        pytest.param(-0.1, ValueError, id="negative"),
+        pytest.param(math.nan, ValueError, id="nan"),
+        pytest.param(math.inf, ValueError, id="infinite"),
+    ],
+)
+def test_run_vq1_rejects_invalid_programmatic_duration_before_adapter(
+    monkeypatch, value, error
+):
+    def adapter_must_not_be_built():
+        raise AssertionError("duration validation must precede adapter construction")
+
+    monkeypatch.setattr(vq1_module, "FakeAdapter", adapter_must_not_be_built)
+    with pytest.raises(error, match="max_seconds"):
+        asyncio.run(run_vq1(dry_run=True, max_seconds=value))
+
+
 # ---------------------------------------------------------------------------
 # Full dry-run flow test
 # ---------------------------------------------------------------------------
 
 @pytest.mark.slow
-def test_dry_run_full_flow():
-    """``run_vq1(dry_run=True)`` exercises the full offline flow."""
-    asyncio.run(run_vq1(dry_run=True, max_speed=4.0))
+@pytest.mark.timeout(15)
+def test_dry_run_full_flow(monkeypatch):
+    """``run_vq1(dry_run=True)`` exercises a bounded offline flow."""
+    adapter = FakeAdapter()
+    monkeypatch.setattr(vq1_module, "FakeAdapter", lambda: adapter)
+    original_wait_for = asyncio.wait_for
+    outer_guard_timed_out = [False]
+
+    async def tracked_wait_for(awaitable, timeout):
+        try:
+            return await original_wait_for(awaitable, timeout)
+        except asyncio.TimeoutError:
+            outer_guard_timed_out[0] = True
+            raise
+
+    monkeypatch.setattr(vq1_module.asyncio, "wait_for", tracked_wait_for)
+    started = time.monotonic()
+    asyncio.run(
+        run_vq1(
+            dry_run=True,
+            max_speed=4.0,
+            max_seconds=0.10,
+            minimal=True,
+        )
+    )
+    assert time.monotonic() - started < 10.0
+    assert not outer_guard_timed_out[0]
+    assert adapter._attitude_send_count > 0
+    assert adapter._reset_count >= 2
+    assert not adapter.is_connected
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +192,7 @@ class OrderCheckAdapter(FakeAdapter):
 
 
 @pytest.mark.slow
+@pytest.mark.timeout(15)
 def test_call_order_connect_track_configure_reset_before_send():
     """connect → wait_for_track_data → (configure) → reset → send_attitude."""
     adapter = OrderCheckAdapter()
@@ -124,14 +204,21 @@ def test_call_order_connect_track_configure_reset_before_send():
         track = await adapter.wait_for_track_data()
         gates = track_data_to_gatespecs(track)
         telem = await adapter.get_telemetry()
-        pipeline = RacePipeline(adapter, PipelineConfig(max_speed=4.0))
+        pipeline = RacePipeline(
+            adapter,
+            PipelineConfig(max_speed=4.0, minimal_control=True),
+        )
         pipeline.configure(gates, start_position=telem.position_ned)
         await adapter.reset()
-        await pipeline.run(address="udpin:127.0.0.1:14550")
+        await pipeline.run(
+            address="udpin:127.0.0.1:14550",
+            max_run_duration_s=0.10,
+        )
 
     asyncio.run(_instrumented_run())
 
     log = adapter.call_log
+    assert "send_attitude" in log, "bounded flow must still exercise command send"
     assert log.index("connect") < log.index("wait_for_track_data"), "connect must precede wait_for_track_data"
     assert log.index("wait_for_track_data") < log.index("reset"), "wait_for_track_data must precede reset"
     reset_idx = log.index("reset")

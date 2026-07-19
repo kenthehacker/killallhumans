@@ -25,6 +25,7 @@ Tests below codify the invariants:
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from planning.racing_line import RacingLineConfig, RacingLineOptimizer
 from planning.trajectory_optimizer import GateWaypoint
@@ -88,6 +89,7 @@ def test_racing_line_config_rejects_invalid_velocities():
             RacingLineConfig(select_velocity_mps=bad)
 
 
+@pytest.mark.benchmark
 def test_select_velocity_sweep_produces_well_formed_geometry():
     """Sweeping select_velocity_mps across {5, 8, 12, 15} must return
     well-formed geometry every time: same length, all finite offsets,

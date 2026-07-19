@@ -1,0 +1,4 @@
+{
+  "candidate_parameters": {},
+  "notes": "Copy this file, then bind reviewed T0-T4 evidence and exact command-plan hashes with aigp_trials prepare-ladder-config --commands."
+}

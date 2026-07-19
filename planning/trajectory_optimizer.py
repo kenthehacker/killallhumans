@@ -1995,6 +1995,14 @@ class TrajectoryOptimizer:
 
         return self.fov.penalty_weight * penalty
 
+    def _gate_throat_endpoint_speed(self, distance: float, duration: float) -> float:
+        """Speed that makes a gate throat a constant normal-velocity segment."""
+
+        return min(
+            distance / max(duration, 1e-9),
+            self.constraints.max_velocity,
+        )
+
     def _generate_trajectory(
         self,
         waypoints: List[np.ndarray],
@@ -2019,8 +2027,27 @@ class TrajectoryOptimizer:
             p1 = waypoints[i + 1]
             T = segment_times[i]
 
-            # Desired velocity at endpoint: direction toward next gate
-            if i + 1 < len(waypoints) - 1:
+            # Preserve a single gate-normal velocity all the way through each
+            # real gate throat.  The preceding approach segment already ends
+            # with this value (its look-ahead target is the entry->exit
+            # vector).  Repointing the *exit* velocity toward the following
+            # gate instead concentrates the whole inter-gate turn inside the
+            # short entry->exit segment, producing infeasible acceleration at
+            # the gate plane and avoidable closed-loop misses.
+            is_gate_throat = i % 2 == 1 and i < len(waypoints) - 2
+            if is_gate_throat:
+                through_dir = np.array(p1, dtype=float) - np.array(p0, dtype=float)
+                through_dist = float(np.linalg.norm(through_dir))
+                if through_dist > 0:
+                    through_speed = self._gate_throat_endpoint_speed(
+                        through_dist, T
+                    )
+                    end_vel = through_dir / through_dist * through_speed
+                else:
+                    end_vel = np.zeros(3)
+            # Other segments end in the direction of their following
+            # waypoint, preserving the existing inter-gate turn behavior.
+            elif i + 1 < len(waypoints) - 1:
                 next_dir = np.array(waypoints[i + 2], dtype=float) - np.array(p1, dtype=float)
                 next_dist = float(np.linalg.norm(next_dir))
                 if next_dist > 0:

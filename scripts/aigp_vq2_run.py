@@ -34,9 +34,9 @@ import logging
 import math
 import statistics
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from competition.adapter import AttitudeRateCommand, Quaternion
 from competition.aigp_mavlink import (
@@ -52,6 +52,9 @@ from estimation.imu_attitude import (
 )
 from gate_detection.src.gate_detector import GateDetection
 from gate_detection.src.vq2_detector import VQ2GateDetector
+
+if TYPE_CHECKING:
+    from aigp_loop.replay import AsyncReplayRecorder
 
 
 logger = logging.getLogger("aigp.vq2")
@@ -92,6 +95,20 @@ RESET_RACE_DROP_MS = 500
 RESET_IMU_DROP_US = 100_000
 RESET_PROOF_TIMEOUT_S = 2.8
 RESET_MAX_ATTEMPTS = 4
+
+
+def _replay_capture_dependencies():
+    """Load optional evidence tooling only when private capture is requested."""
+
+    from aigp_loop._util import environment_fingerprint, git_provenance
+    from aigp_loop.replay import AsyncReplayRecorder, ReplayBundleWriter
+
+    return (
+        AsyncReplayRecorder,
+        ReplayBundleWriter,
+        environment_fingerprint,
+        git_provenance,
+    )
 
 
 class SafetyAbort(RuntimeError):
@@ -501,6 +518,22 @@ def gate_detection_summary(
         and y + height <= image_height
     )
     confidence = _finite_float(detection.confidence)
+    raw_corners = getattr(detection, "corners", None)
+    corners_px: Optional[List[List[float]]] = None
+    try:
+        candidate_corners = [
+            [_finite_float(point[0]), _finite_float(point[1])]
+            for point in raw_corners
+        ]
+        if (
+            len(candidate_corners) == 4
+            and all(value is not None for point in candidate_corners for value in point)
+        ):
+            corners_px = [
+                [float(point[0]), float(point[1])] for point in candidate_corners
+            ]
+    except (TypeError, IndexError):
+        corners_px = None
     axis_aspect = (
         max(width, height) / min(width, height)
         if width > 0 and height > 0
@@ -530,6 +563,7 @@ def gate_detection_summary(
     return {
         "detector_index": int(detector_index),
         "center_px": [int(detection.center_x), int(detection.center_y)],
+        "corners_px": corners_px,
         "bbox_xywh_px": [x, y, width, height],
         "reported_area_px": int(detection.area),
         "bbox_area_px": width * height,
@@ -623,8 +657,14 @@ def is_benign_pad_contact(collision: Dict[str, Any]) -> bool:
 
 
 class JsonlRecorder:
-    def __init__(self, path: Optional[str]) -> None:
+    def __init__(
+        self,
+        path: Optional[str],
+        *,
+        replay: Optional[AsyncReplayRecorder] = None,
+    ) -> None:
         self.path = Path(path).resolve() if path else None
+        self.replay = replay
         self._handle = None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -633,11 +673,48 @@ class JsonlRecorder:
             else:
                 self._handle = self.path.open("w", encoding="utf-8")
 
+    @property
+    def capture_enabled(self) -> bool:
+        return self.replay is not None
+
     def emit(self, event: str, **fields: Any) -> None:
-        if self._handle is None:
-            return
-        row = {"event": event, "wall_time_ns": time.time_ns(), **fields}
-        self._handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        if self._handle is not None:
+            row = {"event": event, "wall_time_ns": time.time_ns(), **fields}
+            self._handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+        if self.replay is not None:
+            self.replay.record_event(event, **fields)
+
+    def record_imu(self, imu: Any, estimator: Optional[Dict[str, Any]], now_s: float) -> None:
+        if self.replay is not None:
+            self.replay.record_imu(
+                imu,
+                estimator=estimator,
+                received_monotonic_s=now_s,
+            )
+
+    def record_race(self, race: Any, now_s: float) -> None:
+        if self.replay is not None:
+            self.replay.record_race(race, received_monotonic_s=now_s)
+
+    def record_command(
+        self,
+        kind: str,
+        command: AttitudeRateCommand,
+        *,
+        monotonic_s: float,
+        frame_token: Optional[Tuple[int, int, int]],
+    ) -> None:
+        if self.replay is not None:
+            self.replay.record_command(
+                kind,
+                command,
+                monotonic_s=monotonic_s,
+                frame_token=frame_token,
+            )
+
+    def capture_frame(self, image: Any, **fields: Any) -> None:
+        if self.replay is not None:
+            self.replay.capture_frame(image, **fields)
 
     def save_png(self, label: str, image: Any) -> Optional[str]:
         """Persist one deferred diagnostic image beside the JSONL capture."""
@@ -660,10 +737,50 @@ class JsonlRecorder:
             raise OSError(f"OpenCV could not write diagnostic image {output}")
         return str(output.resolve())
 
-    def close(self) -> None:
+    def close(self, *, outcome: Optional[Dict[str, Any]] = None) -> Any:
+        handle_error: Optional[BaseException] = None
+        handle_traceback = None
         if self._handle is not None:
-            self._handle.close()
+            handle = self._handle
             self._handle = None
+            try:
+                handle.close()
+            except BaseException as exc:
+                handle_error = exc
+                handle_traceback = exc.__traceback__
+        replay_result = None
+        replay_error: Optional[BaseException] = None
+        if self.replay is not None:
+            expected = None
+            if outcome is not None:
+                vision_stats = outcome.get("vision_capture_stats")
+                if isinstance(vision_stats, dict):
+                    expected = vision_stats.get("frames_decoded")
+            if handle_error is not None:
+                try:
+                    self.replay.fail(
+                        "legacy JSONL recorder close failed before replay seal: "
+                        f"{type(handle_error).__name__}: {handle_error}"
+                    )
+                except BaseException as exc:
+                    replay_error = exc
+            try:
+                replay_result = self.replay.close(
+                    outcome=outcome,
+                    expected_decoded_frames=expected,
+                )
+            except BaseException as exc:
+                replay_error = replay_error or exc
+        if handle_error is not None:
+            if replay_error is not None:
+                handle_error.add_note(
+                    "Replay cleanup also failed: "
+                    f"{type(replay_error).__name__}: {replay_error}"
+                )
+            raise handle_error.with_traceback(handle_traceback)
+        if replay_error is not None:
+            raise replay_error
+        return replay_result
 
 
 class VQ2Runner:
@@ -727,6 +844,39 @@ class VQ2Runner:
         self._last_flight_command_sent_s: Optional[float] = None
         self._gate0_transition_proof: Optional[GateTransitionProof] = None
         self._deferred_pngs: List[Tuple[str, Any]] = []
+
+    def _replay_estimator_fields(self) -> Optional[Dict[str, Any]]:
+        estimate = self.estimate
+        if estimate is None:
+            return None
+        return {
+            "timestamp_us": int(estimate.timestamp_us),
+            "rpy_rad": list(estimate.orientation.to_euler()),
+            "orientation_wxyz": [
+                estimate.orientation.w,
+                estimate.orientation.x,
+                estimate.orientation.y,
+                estimate.orientation.z,
+            ],
+            "body_rates": list(estimate.body_rates),
+            "gyro_bias": list(estimate.gyro_bias),
+            "healthy": bool(estimate.healthy),
+            "reason": estimate.reason,
+            "propagated": bool(estimate.propagated),
+        }
+
+    def _latest_frame_token(self) -> Optional[Tuple[int, int, int]]:
+        if (
+            self._latest_detection_generation is None
+            or self._latest_detection_frame_id is None
+            or self._latest_detection_frame_sim_ns is None
+        ):
+            return None
+        return (
+            self._latest_detection_generation,
+            self._latest_detection_frame_id,
+            self._latest_detection_frame_sim_ns,
+        )
 
     def _clear_epoch_state(self) -> None:
         self.estimator.reset()
@@ -806,6 +956,9 @@ class VQ2Runner:
                         self._estimator_failure_reason = estimate.reason or "unhealthy estimate"
             elif stamp < self._last_imu_us:
                 self._imu_regressed = True
+            record_imu = getattr(self.recorder, "record_imu", None)
+            if callable(record_imu):
+                record_imu(imu, self._replay_estimator_fields(), now)
 
         race = self.adapter.race_status
         if race is not None:
@@ -826,6 +979,9 @@ class VQ2Runner:
                 self._last_race_advance_s = now
                 if race.race_start_boot_time_ms < 0 or boot < race.race_start_boot_time_ms:
                     self._countdown_observed = True
+                record_race = getattr(self.recorder, "record_race", None)
+                if callable(record_race):
+                    record_race(race, now)
             elif boot < self._last_race_boot_ms:
                 self._race_regressed = True
 
@@ -836,11 +992,20 @@ class VQ2Runner:
             self._latest_detection_frame_sim_ns = int(snapshot.sim_time_ns)
             self._latest_detection_generation = int(snapshot.generation)
             self._latest_detection_received_s = float(snapshot.received_monotonic_s)
+            capture_enabled = bool(
+                getattr(self.recorder, "capture_enabled", False)
+            )
+            detector_started_ns = time.perf_counter_ns() if capture_enabled else None
+            detector_latency_ms: Optional[float] = None
             try:
                 image = snapshot.camera_frame.image
                 self._latest_detection_image = image
                 image_height, image_width = image.shape[:2]
                 detections = list(self.detector.detect(image))
+                if detector_started_ns is not None:
+                    detector_latency_ms = (
+                        time.perf_counter_ns() - detector_started_ns
+                    ) / 1_000_000.0
                 self._latest_raw_detections = detections
                 tracking_detections = detections
                 if self._post_gate_reacquisition:
@@ -876,8 +1041,8 @@ class VQ2Runner:
                         ),
                         image,
                     )
-                if self._vision_diagnostic_logging:
-                    summaries = [
+                summaries = (
+                    [
                         gate_detection_summary(
                             detection,
                             detector_index=index,
@@ -887,6 +1052,10 @@ class VQ2Runner:
                         )
                         for index, detection in enumerate(detections)
                     ]
+                    if self._vision_diagnostic_logging or capture_enabled
+                    else []
+                )
+                if self._vision_diagnostic_logging:
                     selected = select_primary_gate(tracking_detections)
                     selected_index = next(
                         (
@@ -930,10 +1099,57 @@ class VQ2Runner:
                             else None
                         ),
                     )
+                capture_frame = getattr(self.recorder, "capture_frame", None)
+                if capture_enabled and callable(capture_frame):
+                    current_telemetry = self.adapter.latest_telemetry
+                    current_imu = (
+                        current_telemetry.imu
+                        if current_telemetry is not None
+                        else None
+                    )
+                    current_command = (
+                        asdict(self._last_flight_command)
+                        if self._last_flight_command is not None
+                        else None
+                    )
+                    capture_frame(
+                        image,
+                        generation=int(snapshot.generation),
+                        frame_id=int(snapshot.frame_id),
+                        sim_time_ns=int(snapshot.sim_time_ns),
+                        received_monotonic_s=float(snapshot.received_monotonic_s),
+                        detector_latency_ms=detector_latency_ms,
+                        detections=summaries,
+                        tracker={
+                            "consecutive": self.tracker.consecutive,
+                            "target": asdict(self.tracker.target) if self.tracker.target else None,
+                        },
+                        imu=current_imu,
+                        estimator=self._replay_estimator_fields(),
+                        race_status=self.adapter.race_status,
+                        generated_command=current_command,
+                        sent_command=current_command,
+                        phase=(
+                            "gate1_reacquisition"
+                            if self._post_gate_reacquisition
+                            else "gate0_or_preflight"
+                        ),
+                    )
             except Exception as exc:  # OpenCV errors must fail closed in flight.
+                if detector_started_ns is not None:
+                    detector_latency_ms = (
+                        time.perf_counter_ns() - detector_started_ns
+                    ) / 1_000_000.0
                 self._latest_raw_detections = []
                 self._latest_accepted_target = None
                 self._detection_error = f"{type(exc).__name__}: {exc}"
+                self.recorder.emit(
+                    "frame_processing_error",
+                    generation=int(snapshot.generation),
+                    frame_id=int(snapshot.frame_id),
+                    sim_time_ns=int(snapshot.sim_time_ns),
+                    reason=self._detection_error,
+                )
 
     def _stream_failures(
         self,
@@ -1079,10 +1295,27 @@ class VQ2Runner:
     async def _send_flight_command(self, command: AttitudeRateCommand) -> None:
         """Send one validated setpoint and remember its completion time."""
 
+        generated_at = time.monotonic()
+        frame_token = self._latest_frame_token()
+        record_command = getattr(self.recorder, "record_command", None)
+        if callable(record_command):
+            record_command(
+                "generated",
+                command,
+                monotonic_s=generated_at,
+                frame_token=frame_token,
+            )
         validate_command(command)
         await self.adapter.send_attitude_rate(command)
         self._last_flight_command = command
         self._last_flight_command_sent_s = time.monotonic()
+        if callable(record_command):
+            record_command(
+                "sent",
+                command,
+                monotonic_s=self._last_flight_command_sent_s,
+                frame_token=frame_token,
+            )
 
     @staticmethod
     def _is_exact_zero_command(command: Optional[AttitudeRateCommand]) -> bool:
@@ -1528,9 +1761,26 @@ class VQ2Runner:
                         race_boot_ms=race_boot_before_cleanup,
                     )
                 else:
+                    cleanup_send_started = time.monotonic()
+                    frame_token = self._latest_frame_token()
+                    record_command = getattr(self.recorder, "record_command", None)
+                    if callable(record_command):
+                        record_command(
+                            "generated",
+                            zero,
+                            monotonic_s=cleanup_send_started,
+                            frame_token=frame_token,
+                        )
                     await self.adapter.send_attitude_rate(zero)
                     self._last_flight_command = zero
                     self._last_flight_command_sent_s = time.monotonic()
+                    if callable(record_command):
+                        record_command(
+                            "sent",
+                            zero,
+                            monotonic_s=self._last_flight_command_sent_s,
+                            frame_token=frame_token,
+                        )
                     self.recorder.emit(
                         "zero_thrust_sent",
                         gate_index=gate_index_before_cleanup,
@@ -2323,23 +2573,111 @@ class VQ2Runner:
         )
 
 
-async def run_live(stage: str, address: str, record: Optional[str]) -> StageResult:
+async def run_live(
+    stage: str,
+    address: str,
+    record: Optional[str],
+    *,
+    replay_bundle: Optional[str] = None,
+    recording_approved: bool = False,
+) -> StageResult:
+    if type(recording_approved) is not bool:
+        raise TypeError("recording_approved must be an exact bool")
+    if replay_bundle is not None and recording_approved is not True:
+        raise PermissionError(
+            "programmatic replay capture requires explicit recording_approved=True"
+        )
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
         require_track=False,
         telemetry_mode="imu",
         fetch_track_on_connect=False,
     )
-    vision = VQ2VisionThread()
-    recorder = JsonlRecorder(record)
-    runner = VQ2Runner(adapter, vision, recorder=recorder)
+    replay = None
+    if replay_bundle is not None:
+        (
+            async_replay_recorder,
+            replay_bundle_writer,
+            capture_environment_fingerprint,
+            capture_git_provenance,
+        ) = _replay_capture_dependencies()
+        repo_root = Path(__file__).resolve().parents[1]
+        commit_hash, dirty_diff_hash, code_hash = capture_git_provenance(repo_root)
+        replay_writer = replay_bundle_writer(
+            replay_bundle,
+            metadata={
+                    "simulator_build": "3385",
+                    "stage": stage,
+                    "mavlink_address": address,
+                    "capture_kind": "private-development-session",
+                    "commit_hash": commit_hash,
+                    "dirty_diff_hash": dirty_diff_hash,
+                    "code_hash": code_hash,
+                    "environment_fingerprint": capture_environment_fingerprint(),
+                    "runner_evaluator_version": "vq2-runner-capture/1",
+                    # Frozen replay-evaluator RNG seed.  This is independent
+                    # of simulator randomness and is bound into T1 identity.
+                    "seed": 42,
+                    "detector": {
+                        "class": "VQ2GateDetector",
+                        "image_size_px": [640, 360],
+                        "min_area": 500,
+                        "max_area": 500000,
+                        "max_aspect_ratio": 3.0,
+                        "min_confidence": 0.10,
+                        "hsv_ranges": [
+                            [[0, 50, 100], [12, 255, 255]],
+                            [[150, 50, 100], [180, 255, 255]],
+                        ],
+                    },
+                    "controller_envelope": {
+                        "control_hz": CONTROL_HZ,
+                        "max_roll_pitch_command_rate_rad_s": MAX_COMMAND_RATE_RAD_S,
+                        "yaw_rate_rad_s": 0.0,
+                        "max_thrust": 0.35,
+                    },
+            },
+            repo_root=repo_root,
+        )
+        try:
+            replay = async_replay_recorder(replay_writer)
+        except BaseException as exc:
+            try:
+                replay_writer.abort(
+                    "async replay recorder construction failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            except BaseException as cleanup_exc:
+                exc.add_note(
+                    "Replay writer abort also failed: "
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+            raise
+    vision: Optional[VQ2VisionThread] = None
+    recorder: Optional[JsonlRecorder] = None
+    runner: Optional[VQ2Runner] = None
     connected = False
+    result: Optional[StageResult] = None
+    failure: Optional[str] = None
+    capture_stats = None
+    primary_exception: Optional[BaseException] = None
+    primary_traceback = None
+    cleanup_exceptions: List[BaseException] = []
     try:
+        # The replay writer thread already exists at this point.  Every later
+        # constructor is therefore inside the same cleanup ownership region.
+        vision = VQ2VisionThread(
+            on_snapshot=(
+                replay.capture_decoded_snapshot if replay is not None else None
+            )
+        )
+        recorder = JsonlRecorder(record, replay=replay)
+        runner = VQ2Runner(adapter, vision, recorder=recorder)
         await adapter.connect(address)
         connected = True
         preflight = await runner.preflight()
         if stage == "preflight":
-            return StageResult(
+            result = StageResult(
                 stage=stage,
                 success=True,
                 reason="passive preflight completed; no flight command sent",
@@ -2349,17 +2687,110 @@ async def run_live(stage: str, address: str, record: Optional[str]) -> StageResu
                 cleanup_confirmed=True,
                 details=preflight,
             )
-        return await runner.run_powered_stage(stage)
+        else:
+            result = await runner.run_powered_stage(stage)
+    except BaseException as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+        primary_exception = exc
+        primary_traceback = exc.__traceback__
     finally:
-        vision.stop()
-        if connected:
-            await adapter.disconnect()
-        recorder.close()
+        if vision is not None:
+            try:
+                vision.stop()
+            except BaseException as exc:
+                cleanup_exceptions.append(exc)
+                if replay is not None:
+                    replay.fail(
+                        f"vision termination not proved before replay seal: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            try:
+                vision_capture_stats = asdict(vision.stats())
+            except BaseException as exc:
+                cleanup_exceptions.append(exc)
+                vision_capture_stats = {
+                    "stats_error": f"{type(exc).__name__}: {exc}"
+                }
+                if replay is not None:
+                    replay.fail(
+                        f"vision stats unavailable: {type(exc).__name__}: {exc}"
+                    )
+        else:
+            vision_capture_stats = {"unavailable": True}
+            if replay is not None:
+                replay.fail("vision construction failed before capture ownership")
+        try:
+            if connected:
+                await adapter.disconnect()
+        except BaseException as exc:
+            cleanup_exceptions.append(exc)
+        base_outcome = (
+            asdict(result)
+            if result is not None
+            else {"success": False, "failure": failure or "runner did not return"}
+        )
+        base_outcome["vision_capture_stats"] = vision_capture_stats
+        if cleanup_exceptions:
+            base_outcome["transport_cleanup_errors"] = [
+                f"{type(exc).__name__}: {exc}" for exc in cleanup_exceptions
+            ]
+        try:
+            if recorder is not None:
+                capture_stats = recorder.close(outcome=base_outcome)
+            elif replay is not None:
+                replay.fail("recorder construction failed before capture ownership")
+                capture_stats = replay.close(outcome=base_outcome)
+        except BaseException as exc:
+            cleanup_exceptions.append(exc)
+    if primary_exception is not None:
+        raise primary_exception.with_traceback(primary_traceback)
+    if cleanup_exceptions:
+        raise cleanup_exceptions[0]
+    assert result is not None
+    return replay_capture_result(
+        result,
+        capture_requested=replay is not None,
+        capture_stats=capture_stats,
+    )
+
+
+def replay_capture_result(
+    result: StageResult,
+    *,
+    capture_requested: bool,
+    capture_stats: Any,
+) -> StageResult:
+    """Fail closed when an explicitly requested replay is incomplete."""
+
+    if capture_requested and (capture_stats is None or not capture_stats.complete):
+        replay_details = (
+            asdict(capture_stats)
+            if capture_stats is not None
+            else {"complete": False, "reason": "capture stats unavailable"}
+        )
+        details = dict(result.details or {})
+        details["replay_capture"] = replay_details
+        result = replace(
+            result,
+            success=False,
+            reason=f"{result.reason}; replay capture incomplete",
+            details=details,
+        )
+    elif capture_requested and capture_stats is not None:
+        details = dict(result.details or {})
+        details["replay_capture"] = asdict(capture_stats)
+        result = replace(result, details=details)
+    return result
 
 
 def _default_record_path(stage: str) -> str:
     stamp = time.strftime("%Y%m%dT%H%M%S")
     return str(Path("captures") / f"vq2_{stage}_{stamp}.jsonl.gz")
+
+
+def _default_replay_path(stage: str) -> str:
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    return str(Path("captures") / "replays" / f"vq2_{stage}_{stamp}.vq2replay")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2377,14 +2808,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=None,
         help="write JSONL capture; omit the value for an automatic gzip path",
     )
+    parser.add_argument(
+        "--replay-bundle",
+        nargs="?",
+        const="auto",
+        default=None,
+        help=(
+            "write a private decoded-frame replay bundle outside normal Git; "
+            "requires --recording-approved"
+        ),
+    )
+    parser.add_argument(
+        "--recording-approved",
+        action="store_true",
+        help="attest that organizer approval/credentials permit this recording",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
+    if args.replay_bundle is not None and not args.recording_approved:
+        parser.error("--replay-bundle requires explicit --recording-approved")
     record = _default_record_path(args.stage) if args.record == "auto" else args.record
+    replay_bundle = (
+        _default_replay_path(args.stage)
+        if args.replay_bundle == "auto"
+        else args.replay_bundle
+    )
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    result = asyncio.run(run_live(args.stage, args.address, record))
+    result = asyncio.run(
+        run_live(
+            args.stage,
+            args.address,
+            record,
+            replay_bundle=replay_bundle,
+            recording_approved=args.recording_approved,
+        )
+    )
     print(json.dumps(asdict(result), indent=2, sort_keys=True))
     return 0 if result.success else 2
 

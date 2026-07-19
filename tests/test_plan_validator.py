@@ -92,6 +92,22 @@ def test_clean_in_order_trajectory_passes():
     assert not result.crashed
 
 
+def test_default_validator_does_not_credit_a_near_plane_stop():
+    """Validity evidence requires crossing the plane, not mere proximity."""
+
+    gates = _make_line_gates(1, spacing=5.0)
+    traj = _StubTrajectory(
+        waypoints=[(0.0, 0.0, 2.0), (4.6, 0.0, 2.0)],
+        times=[0.0, 1.0],
+    )
+
+    result = validate_trajectory(traj, gates, dt=0.02)
+
+    assert not result.ok
+    assert result.gates_passed == 0
+    assert "incomplete" in result.reason.lower()
+
+
 # ---------------------------------------------------------------------------
 # Out-of-order DQ detection (the overfitting failure mode)
 # ---------------------------------------------------------------------------

@@ -133,6 +133,101 @@ class TestTrajectoryOptimizer:
         assert traj.points[0].position[0] == pytest.approx(0, abs=0.01)
         assert traj.points[0].position[1] == pytest.approx(0, abs=0.01)
 
+    def test_gate_throat_keeps_one_normal_velocity(self):
+        """Do not squeeze the following-gate turn into the gate opening."""
+
+        opt = TrajectoryOptimizer(dt_sample=0.02)
+        waypoints = [
+            np.array((0.0, 0.0, 0.0)),
+            np.array((4.6, 0.0, 0.0)),   # gate 0 entry
+            np.array((5.4, 0.0, 0.0)),   # gate 0 exit
+            np.array((5.0, 4.6, 0.0)),   # gate 1 entry
+            np.array((5.0, 5.4, 0.0)),   # gate 1 exit
+            np.array((5.0, 7.4, 0.0)),   # virtual finish
+        ]
+        segment_times = [1.0, 0.2, 1.0, 0.2, 1.0]
+        gates = [
+            GateWaypoint(position=(5, 0, 0), normal=(1, 0, 0)),
+            GateWaypoint(position=(5, 5, 0), normal=(0, 1, 0)),
+            GateWaypoint(position=(5, 7.4, 0), normal=(0, 1, 0)),
+        ]
+
+        points = opt._generate_trajectory(
+            waypoints, segment_times, (0.0, 0.0, 0.0), gates
+        )
+        approach_samples = max(int(segment_times[0] / opt.dt_sample), 2)
+        throat_samples = max(int(segment_times[1] / opt.dt_sample), 2)
+        throat = points[
+            approach_samples : approach_samples + throat_samples
+        ]
+        expected_velocity = np.array((4.0, 0.0, 0.0))
+
+        np.testing.assert_allclose(throat[0].velocity, expected_velocity, atol=1e-9)
+        np.testing.assert_allclose(throat[-1].velocity, expected_velocity, atol=1e-9)
+        np.testing.assert_allclose(
+            [point.acceleration for point in throat], 0.0, atol=1e-8
+        )
+
+    @pytest.mark.benchmark
+    def test_vq1_reference_is_accel_feasible_at_every_gate_plane(self):
+        constraints = DroneConstraints(max_velocity=8.0)
+        gates = [
+            GateWaypoint(
+                position=position,
+                normal=(-1.0, 0.0, 0.0),
+                width=2.72,
+                height=2.72,
+                yaw=math.pi,
+            )
+            for position in [
+                (-23.3, -0.4, -0.03),
+                (-46.9, -2.5, 5.07),
+                (-74.6, 1.2, 13.67),
+                (-111.5, -5.1, 24.57),
+                (-135.5, -0.8, 25.36),
+                (-159.2, -4.4, 25.97),
+            ]
+        ]
+        trajectory = TrajectoryOptimizer(
+            constraints=constraints, dt_sample=0.01
+        ).optimize(gates)
+
+        peak_acceleration = max(
+            np.linalg.norm(point.acceleration) for point in trajectory.points
+        )
+        assert peak_acceleration <= constraints.max_acceleration + 1e-6
+
+        # Enumerate both exact samples and interpolated sign changes. The
+        # reference may intersect a plane at an exact sample, so looking only
+        # for strict sign changes would incorrectly report no crossing.
+        for gate in gates:
+            center = np.asarray(gate.position, dtype=float)
+            normal = np.asarray(gate.normal, dtype=float)
+            crossings = []
+            previous_position = None
+            previous_distance = None
+            for point in trajectory.points:
+                position = np.asarray(point.position, dtype=float)
+                distance = float(np.dot(position - center, normal))
+                if abs(distance) <= 1e-9:
+                    crossings.append(position)
+                elif (
+                    previous_distance is not None
+                    and previous_distance * distance < 0.0
+                ):
+                    alpha = previous_distance / (previous_distance - distance)
+                    crossings.append(
+                        previous_position + alpha * (position - previous_position)
+                    )
+                previous_position = position
+                previous_distance = distance
+
+            assert crossings, f"reference never crossed gate at {gate.position}"
+            for crossing in crossings:
+                offset = crossing - center
+                assert abs(float(offset[1])) <= gate.width / 2.0 + 1e-9
+                assert abs(float(offset[2])) <= gate.height / 2.0 + 1e-9
+
     def test_trajectory_passes_near_gates(self, three_gates):
         opt = TrajectoryOptimizer(dt_sample=0.02)
         traj = opt.optimize(three_gates)
@@ -249,6 +344,7 @@ class TestRacingLineOptimizer:
         result = opt.optimize(gates)
         assert len(result) == 1
 
+    @pytest.mark.benchmark
     def test_path_length_decreases_vs_centerline(self):
         """Optimized racing line should be shorter than center-to-center."""
         opt = RacingLineOptimizer(config=RacingLineConfig(
@@ -282,6 +378,7 @@ class TestRacingLineOptimizer:
         # Optimized should be shorter or equal
         assert opt_length <= center_length + 0.01
 
+    @pytest.mark.benchmark
     def test_optimized_gates_preserve_count(self):
         opt = RacingLineOptimizer(config=RacingLineConfig(use_cache=False))
         gates = [
@@ -292,6 +389,7 @@ class TestRacingLineOptimizer:
         result = opt.optimize(gates)
         assert len(result) == len(gates)
 
+    @pytest.mark.benchmark
     def test_optimized_gates_stay_near_originals(self):
         """Optimized positions shouldn't stray far from gate centers."""
         opt = RacingLineOptimizer(config=RacingLineConfig(

@@ -1,39 +1,64 @@
 # killallhumans
-bytedancers 
 
-# Directories:
-* gate_detection (houses logic to enable existence of all gates)
-* gate_sequencing (logic for determining which gate to go through next)
+Autonomy software for the AI Grand Prix. The active target is FlightSim build
+3385 in Training mode. VQ2 provides vision, `HIGHRES_IMU`, race status,
+actuator status, and collisions; it does not provide usable pose or gate-map
+data.
 
-## AIGP VQ2 training runner
+The current runner safely passes gate 0 and observes gate 1, but it is not a
+full-race controller. See the
+[build-3385 VQ2 handoff](docs/aigp/2026-07-18-vq2-handoff.md) before changing
+flight behavior.
 
-Start FlightSim in **Training**. It may be windowed and unfocused, but keep it
-unminimized and unpaused. From this repository:
+## Windows development
 
-```powershell
-.\.venv\Scripts\python.exe -m scripts.aigp_vq2_run --stage preflight --record
-```
-
-The bounded powered stages are `sign-id`, `hover`, `gate0`, and
-`gate0-observe`. Each stage proves a fresh simulator reset, waits for GO,
-checks every required stream, and confirms disarm/reset on exit:
+Create the exact development/test environment:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.aigp_vq2_run --stage sign-id --record
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements\development-test.lock.txt
 ```
 
-`gate0` has completed a simulator-credited, collision-free first-gate pass. It
-is still a bounded development stage, not a full race runner. The observation
-variant repeats that proved trajectory, then sends only zero-rate/zero-thrust
-commands for at most 0.20 seconds while acquiring gate 1 for three frames:
+Use one command surface from the repository root:
 
 ```powershell
-.\.venv\Scripts\python.exe -m scripts.aigp_vq2_run --stage gate0-observe --record
+.\scripts\dev.cmd test-target tests/test_aigp_vq2_runner.py
+.\scripts\dev.cmd test-fast
+.\scripts\dev.cmd test-unit
+.\scripts\dev.cmd test-vq2
+.\scripts\dev.cmd test-slow
+.\scripts\dev.cmd test-benchmark
+.\scripts\dev.cmd test-full-non-live
 ```
 
-`gate0-observe` has also completed successfully, but it does not steer toward
-or attempt gate 1. Captures are written under `captures/` and ignored by Git.
+Normal pytest selection excludes `slow`, `benchmark`, and `live`, rejects
+unknown markers, and enforces a hard per-test wall timeout. The benchmark and
+full non-live tiers are explicit promotion gates, not the per-edit loop.
+Tests marked `live` are invoked directly with `python -m pytest -m live` only
+after explicit authorization; there is intentionally no generic powered task.
 
-See the [VQ2 build 3385 handoff](docs/aigp/2026-07-18-vq2-handoff.md) for the
-current live-test results, safety invariants, simulator paths, and next step.
+Passive simulator health check:
 
+```powershell
+.\scripts\dev.cmd preflight
+```
+
+Preflight does not arm or send flight targets. Every powered FlightSim stage
+requires explicit authorization and must retain the reset/countdown/watchdog/
+cleanup contract in the handoff.
+
+The simulator launcher accepts `AIGP_FLIGHTSIM_PATH` or an explicit path,
+discovers the active interactive Windows session, and refuses to double-launch:
+
+```powershell
+$env:AIGP_FLIGHTSIM_PATH = 'C:\path\to\AIGP_3385\FlightSim.exe'
+.\scripts\dev.cmd launch-sim
+```
+
+Training-mode selection may still require an interactive desktop action.
+
+Environment profiles, lock updates, dependency inventory generation, and the
+AI/tool disclosure template are documented in
+[development environments](docs/development_environment.md). Keep generated
+inventories and new/private full captures out of Git; preserve existing
+tracked historical capture evidence.

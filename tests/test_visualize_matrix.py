@@ -18,6 +18,12 @@ from scripts.benchmark import run_synthetic_benchmark
 _REPO = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _isolated_benchmark_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIGP_CACHE_ROOT", str(tmp_path / "artifacts"))
+
+
+@pytest.mark.benchmark
 def test_position_trace_off_by_default():
     """Default benchmark run must NOT populate `position_trace` — kept
     None so the result dict stays small for matrix tests."""
@@ -28,6 +34,7 @@ def test_position_trace_off_by_default():
     assert r.get("position_trace") is None
 
 
+@pytest.mark.benchmark
 def test_position_trace_populated_when_enabled():
     """With `record_position_trace=True`, every sim step appends a
     dict with t/pos/vel/yaw/tracking_err_m. Monotonic time."""

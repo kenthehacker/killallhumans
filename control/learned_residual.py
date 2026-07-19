@@ -77,8 +77,14 @@ class TrackerResidualMLP:
         self.b2 = np.asarray(self.b2, dtype=np.float64)
         if self.W1.ndim != 2:
             raise ValueError(f"W1 must be 2D, got shape {self.W1.shape}")
+        if self.b1.ndim != 1:
+            raise ValueError(f"b1 must be 1D, got shape {self.b1.shape}")
         if self.W2.ndim != 2:
             raise ValueError(f"W2 must be 2D, got shape {self.W2.shape}")
+        if self.b2.ndim != 1:
+            raise ValueError(f"b2 must be 1D, got shape {self.b2.shape}")
+        if min(*self.W1.shape, *self.W2.shape) <= 0:
+            raise ValueError("residual model dimensions must be positive")
         if self.W1.shape[1] != self.b1.shape[0]:
             raise ValueError(
                 f"W1 hidden dim {self.W1.shape[1]} != b1 dim {self.b1.shape[0]}"
@@ -91,6 +97,14 @@ class TrackerResidualMLP:
             raise ValueError(
                 f"W2 output dim {self.W2.shape[1]} != b2 dim {self.b2.shape[0]}"
             )
+        for name, value in (
+            ("W1", self.W1),
+            ("b1", self.b1),
+            ("W2", self.W2),
+            ("b2", self.b2),
+        ):
+            if not np.all(np.isfinite(value)):
+                raise ValueError(f"{name} must contain only finite values")
         if self.feat_mean is not None or self.feat_std is not None:
             if self.feat_mean is None or self.feat_std is None:
                 raise ValueError("feat_mean and feat_std must both be set or both None")
@@ -104,12 +118,20 @@ class TrackerResidualMLP:
                 raise ValueError(
                     f"feat_std shape {self.feat_std.shape} != ({self.n_inputs},)"
                 )
+            if not np.all(np.isfinite(self.feat_mean)):
+                raise ValueError("feat_mean must contain only finite values")
+            if not np.all(np.isfinite(self.feat_std)):
+                raise ValueError("feat_std must contain only finite values")
+            if not np.all(self.feat_std > 0):
+                raise ValueError("feat_std values must be > 0")
         if self.output_clamp is not None:
             self.output_clamp = np.asarray(self.output_clamp, dtype=np.float64).reshape(-1)
             if self.output_clamp.shape != (self.n_outputs,):
                 raise ValueError(
                     f"output_clamp shape {self.output_clamp.shape} != ({self.n_outputs},)"
                 )
+            if not np.all(np.isfinite(self.output_clamp)):
+                raise ValueError("output_clamp must contain only finite values")
             if not np.all(self.output_clamp > 0):
                 raise ValueError("output_clamp values must be > 0")
 
@@ -164,7 +186,7 @@ class TrackerResidualMLP:
         """Load weights from an .npz file. Keys: W1, b1, W2, b2, and
         optionally feat_mean/feat_std (iter-031 normalization) and
         output_clamp (iter-031 output bound)."""
-        with np.load(str(path)) as data:
+        with np.load(str(path), allow_pickle=False) as data:
             keys = set(data.files)
             feat_mean = data["feat_mean"] if "feat_mean" in keys else None
             feat_std = data["feat_std"] if "feat_std" in keys else None
@@ -206,13 +228,20 @@ class TrackerResidualMLP:
             raise ValueError(
                 f"input dim {x.shape[0]} != model n_inputs {self.n_inputs}"
             )
+        if not np.all(np.isfinite(x)):
+            raise ValueError("residual input must contain only finite values")
         if self.feat_mean is not None:
             x = (x - self.feat_mean) / self.feat_std
         h = np.tanh(x @ self.W1 + self.b1)
         raw = h @ self.W2 + self.b2
-        if self.output_clamp is not None:
-            return self.output_clamp * np.tanh(raw / self.output_clamp)
-        return raw
+        output = (
+            self.output_clamp * np.tanh(raw / self.output_clamp)
+            if self.output_clamp is not None
+            else raw
+        )
+        if not np.all(np.isfinite(output)):
+            raise ValueError("residual output must contain only finite values")
+        return output
 
 
 def save_feature_trace(trace, path: Union[str, Path]) -> None:
@@ -304,28 +333,78 @@ def save_feature_trace(trace, path: Union[str, Path]) -> None:
 
 def load_feature_trace(path: Union[str, Path]) -> dict:
     """Inverse of `save_feature_trace`. Returns a dict with the v2 keys.
-    Raises ValueError if the version isn't 2."""
-    with np.load(str(path)) as data:
-        version = int(data["version"])
-        if version != 2:
-            raise ValueError(
-                f"feature trace version {version} unsupported; expected 2"
-            )
-        return {
-            "features": data["features"].copy(),
-            "roll_nom": data["roll_nom"].copy(),
-            "pitch_nom": data["pitch_nom"].copy(),
-            "thrust_nom": data["thrust_nom"].copy(),
-            "pos_err": data["pos_err"].copy(),
-            "vel_err": data["vel_err"].copy(),
-            "pos": data["pos"].copy(),
-            "vel": data["vel"].copy(),
-            "yaw_des": data["yaw_des"].copy(),
-            "ref_pos": data["ref_pos"].copy(),
-            "ref_vel": data["ref_vel"].copy(),
-            "ref_accel": data["ref_accel"].copy(),
-            "accel_des_baseline": data["accel_des_baseline"].copy(),
+    Raises ValueError if the schema, shapes, or numeric values are invalid."""
+    with np.load(str(path), allow_pickle=False) as data:
+        required = {
+            "features",
+            "roll_nom",
+            "pitch_nom",
+            "thrust_nom",
+            "pos_err",
+            "vel_err",
+            "pos",
+            "vel",
+            "yaw_des",
+            "ref_pos",
+            "ref_vel",
+            "ref_accel",
+            "accel_des_baseline",
+            "version",
         }
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise ValueError(f"feature trace is missing required fields: {missing}")
+        version_array = np.asarray(data["version"])
+        if (
+            version_array.shape != ()
+            or not np.issubdtype(version_array.dtype, np.integer)
+            or int(version_array.item()) != 2
+        ):
+            raise ValueError(
+                "feature trace version must be the scalar integer 2"
+            )
+        features = np.asarray(data["features"])
+        if (
+            features.ndim != 2
+            or features.shape[0] == 0
+            or features.shape[1] != DEFAULT_N_INPUTS
+        ):
+            raise ValueError(
+                "features must have non-empty shape "
+                f"(N, {DEFAULT_N_INPUTS}), got {features.shape}"
+            )
+        n_samples = features.shape[0]
+        expected_shapes = {
+            "features": (n_samples, DEFAULT_N_INPUTS),
+            "roll_nom": (n_samples,),
+            "pitch_nom": (n_samples,),
+            "thrust_nom": (n_samples,),
+            "pos_err": (n_samples, 3),
+            "vel_err": (n_samples, 3),
+            "pos": (n_samples, 3),
+            "vel": (n_samples, 3),
+            "yaw_des": (n_samples,),
+            "ref_pos": (n_samples, 3),
+            "ref_vel": (n_samples, 3),
+            "ref_accel": (n_samples, 3),
+            "accel_des_baseline": (n_samples, 3),
+        }
+        payload: dict[str, np.ndarray] = {}
+        for name, expected_shape in expected_shapes.items():
+            value = np.asarray(data[name])
+            if value.shape != expected_shape:
+                raise ValueError(
+                    f"{name} shape {value.shape} != expected {expected_shape}"
+                )
+            if not (
+                np.issubdtype(value.dtype, np.integer)
+                or np.issubdtype(value.dtype, np.floating)
+            ):
+                raise ValueError(f"{name} must contain real numeric values")
+            if not np.all(np.isfinite(value)):
+                raise ValueError(f"{name} must contain only finite values")
+            payload[name] = value.copy()
+        return payload
 
 
 def build_input_features(
@@ -357,7 +436,10 @@ def build_input_features(
             f"got {pe.size}, {ve.size}, {ra.size}"
         )
     y = float(yaw_des)
-    return np.concatenate([
+    values = np.concatenate([
         pe, ve, ra,
         np.array([float(thrust_normalized), np.sin(y), np.cos(y)]),
     ])
+    if not np.all(np.isfinite(values)):
+        raise ValueError("residual features must contain only finite values")
+    return values

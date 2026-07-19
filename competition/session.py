@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from numbers import Real
 from typing import Callable, List, Optional
 
 from .adapter import (
@@ -34,6 +36,17 @@ from .adapter import (
 logger = logging.getLogger(__name__)
 
 MAX_RUN_DURATION_S = 480  # 8 minutes per tech spec
+
+
+def _positive_finite_float(name: str, value: object) -> float:
+    """Normalize a numeric boundary without accepting booleans/coercions."""
+
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number, not {type(value).__name__}")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
+    return normalized
 
 
 class SessionState(Enum):
@@ -96,11 +109,20 @@ class RaceSession:
         interface: CompetitionInterface,
         target_hz: float = 100.0,
         address: str = "udp://:14540",
+        max_run_duration_s: float = MAX_RUN_DURATION_S,
     ):
+        target_hz = _positive_finite_float("target_hz", target_hz)
+        max_run_duration_s = _positive_finite_float(
+            "max_run_duration_s", max_run_duration_s
+        )
         self.interface = interface
         self.target_hz = target_hz
         self.target_dt = 1.0 / target_hz
         self.address = address
+        # The competition limit remains the production default. Tests and
+        # explicitly bounded offline callers may inject a shorter duration
+        # without monkeypatching or weakening that default.
+        self.max_run_duration_s = max_run_duration_s
         self.state = SessionState.IDLE
         self.metrics = RaceMetrics()
 
@@ -112,6 +134,7 @@ class RaceSession:
         self.should_stop: Optional[Callable[[], bool]] = None
 
         self._stop_event = asyncio.Event()
+        self._run_started_monotonic: Optional[float] = None
 
     async def run(self) -> RaceMetrics:
         """
@@ -135,6 +158,7 @@ class RaceSession:
             await self.interface.start_offboard()
             self.state = SessionState.RACING
             self.metrics.start_time = time.time()
+            self._run_started_monotonic = time.monotonic()
             logger.info("Race started!")
 
             await self._race_loop()
@@ -166,8 +190,15 @@ class RaceSession:
             loop_start = time.perf_counter()
 
             # Check timeout
-            if self.metrics.elapsed_s >= MAX_RUN_DURATION_S:
-                logger.warning("Race timeout reached (%.0fs)", MAX_RUN_DURATION_S)
+            elapsed_monotonic = (
+                time.monotonic() - self._run_started_monotonic
+                if self._run_started_monotonic is not None
+                else 0.0
+            )
+            if elapsed_monotonic >= self.max_run_duration_s:
+                logger.warning(
+                    "Race timeout reached (%.3fs)", self.max_run_duration_s
+                )
                 break
 
             # Check external stop condition

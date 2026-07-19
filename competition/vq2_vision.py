@@ -92,6 +92,7 @@ class VQ2VisionStats:
     reset_generation_drops: int
     processing_errors: int
     socket_errors: int
+    snapshot_callback_errors: int
     resets: int
     remembered_chunk_keys: int
     receiver_dropped_partial_frames: int
@@ -119,6 +120,7 @@ class VQ2VisionThread:
         receive_buffer_bytes: int = 4 * 1024 * 1024,
         socket_timeout_s: float = 0.10,
         socket_factory: Optional[Callable[[], socket.socket]] = None,
+        on_snapshot: Optional[Callable[[VQ2VisionSnapshot], object]] = None,
     ) -> None:
         if not 0 <= int(port) <= 65_535:
             raise ValueError("port must be in [0, 65535]")
@@ -137,6 +139,7 @@ class VQ2VisionThread:
         self.receive_buffer_bytes = int(receive_buffer_bytes)
         self.socket_timeout_s = float(socket_timeout_s)
         self._socket_factory = socket_factory or self._new_udp_socket
+        self._on_snapshot = on_snapshot
 
         self._data_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
@@ -161,6 +164,7 @@ class VQ2VisionThread:
         self._reset_generation_drops = 0
         self._processing_errors = 0
         self._socket_errors = 0
+        self._snapshot_callback_errors = 0
         self._resets = 0
 
     @staticmethod
@@ -225,6 +229,11 @@ class VQ2VisionThread:
                 pass
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=float(timeout_s))
+
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            raise RuntimeError(
+                "VQ2 vision thread did not terminate before stop timeout"
+            )
 
         with self._lifecycle_lock:
             if self._socket is sock:
@@ -340,6 +349,11 @@ class VQ2VisionThread:
             if camera_frame is None:
                 self._decode_failures += 1
                 return None
+            # Snapshots are shared with control and the asynchronous replay
+            # writer without a copy.  Enforce the documented ownership
+            # contract at publication so no consumer can mutate evidence
+            # before persistence.
+            camera_frame.image.setflags(write=False)
             if (
                 self._latest_snapshot is not None
                 and completed.sim_time_ns <= self._latest_snapshot.sim_time_ns
@@ -357,7 +371,17 @@ class VQ2VisionThread:
             )
             self._latest_snapshot = snapshot
             self._frames_decoded += 1
-            return snapshot
+        # A replay listener must be non-blocking by contract.  It runs outside
+        # the publication lock so even a faulty optional recorder cannot delay
+        # freshness reads/reset.  Callback failures affect capture diagnostics,
+        # never receiver/control liveness.
+        if self._on_snapshot is not None:
+            try:
+                self._on_snapshot(snapshot)
+            except Exception:
+                with self._data_lock:
+                    self._snapshot_callback_errors += 1
+        return snapshot
 
     def snapshot(
         self,
@@ -412,6 +436,7 @@ class VQ2VisionThread:
                 reset_generation_drops=self._reset_generation_drops,
                 processing_errors=self._processing_errors,
                 socket_errors=self._socket_errors,
+                snapshot_callback_errors=self._snapshot_callback_errors,
                 resets=self._resets,
                 remembered_chunk_keys=len(self._seen_keys),
                 receiver_dropped_partial_frames=receiver.dropped_partial_frames,

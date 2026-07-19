@@ -1,4 +1,6 @@
 /external_data
+.artifacts/
+/.cache/
 
 # Python virtual envs and bytecode caches
 .venv/
@@ -19,11 +21,9 @@ gate_detection/training/val_failures
 # Telemetry logs
 logs/
 
-# Iter-009l (Opus Mi2): racing-line cache is a deterministic build
-# artifact, regenerated on first cold run from gate geometry +
-# select_velocity_mps. Committing it is misleading (last-writer-wins
-# semantics; cache often ends up with a toy-test layout instead of
-# race_01's offsets).
+# Obsolete pre-content-addressed racing-line artifact. Current artifacts live
+# under `.cache/racing-lines/<sha256>.json`; keep a locally lingering legacy
+# file ignored so it cannot be mistaken for current optimizer state.
 planning/racing_line_cache.json
 
 # Iter-022: residual_weights.npz is a regenerable artifact (zero-init
@@ -33,6 +33,8 @@ planning/racing_line_cache.json
 control/residual_weights.npz
 control/residual_weights_meta.json
 control/residual_weights.tmp.npz
+# Atomic trainer resume state (model + optimizer + RNG + split/history).
+control/residual_weights_checkpoint.npz
 # Iter-025: residual_dataset.npz is the collected training data
 # (regenerable via scripts/collect_residual_dataset.py); also gitignored.
 control/residual_dataset.npz
@@ -48,3 +50,9 @@ captures/*.json
 captures/*.npz
 # VQ2 writes diagnostic frames beside each per-run trace after safe cleanup.
 captures/*.png
+# Full decoded-frame replay sessions are private competition recordings.
+# Keep them out of Git pending explicit organizer approval and an intentional
+# artifact-store/Git-LFS decision; never commit actual frames by default.
+captures/replays/
+# Structured autonomous-loop state and isolated-worktree metadata are local.
+.aigp-loop/

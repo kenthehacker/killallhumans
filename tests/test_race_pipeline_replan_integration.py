@@ -10,15 +10,54 @@ runner rebuilds its racing line.
 
 from __future__ import annotations
 
+import math
+import threading
 from typing import List, Tuple
+
+import pytest
 
 from gate_sequencing.sequencer import (
     GateSequencer, GateSpec, SequencerConfig,
 )
-import threading
 
 from planning.dynamic_replanner import DynamicReplanner, ReplanConfig
-from race_pipeline import PipelineConfig, RacePipeline
+from race_pipeline import PipelineConfig, RacePipeline, _ref_override_position
+
+
+def test_pipeline_tracker_preclamps_lateral_acceleration_to_tilt_envelope():
+    pipe = RacePipeline(interface=None, config=PipelineConfig())
+    tracker = pipe.tracker.config
+
+    assert tracker.max_lateral_accel == pytest.approx(
+        tracker.gravity * math.tan(tracker.max_tilt_rad)
+    )
+
+
+def test_recovery_reference_discards_incompatible_derivative_hints():
+    from planning.trajectory_optimizer import TrajectoryPoint
+
+    original = TrajectoryPoint(
+        time=1.25,
+        position=(10.0, 20.0, 30.0),
+        velocity=(4.0, 5.0, 6.0),
+        acceleration=(7.0, 8.0, 9.0),
+        jerk=(1.0, 2.0, 3.0),
+        yaw=0.75,
+        yaw_rate=0.25,
+        ff_acceleration=(3.0, 2.0, 1.0),
+    )
+
+    recovery = _ref_override_position(original, (1.0, 2.0, 3.0))
+
+    assert recovery.position == (1.0, 2.0, 3.0)
+    assert recovery.velocity == (0.0, 0.0, 0.0)
+    assert recovery.acceleration == (0.0, 0.0, 0.0)
+    assert recovery.jerk == (0.0, 0.0, 0.0)
+    assert recovery.time == original.time
+    assert recovery.yaw == original.yaw
+    assert recovery.yaw_rate == original.yaw_rate
+    assert recovery.ff_acceleration == (0.0, 0.0, 0.0)
+    assert original.position == (10.0, 20.0, 30.0)
 
 
 def _course() -> List[GateSpec]:

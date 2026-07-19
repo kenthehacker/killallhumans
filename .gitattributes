@@ -1,0 +1,2 @@
+# Exact-byte trust manifests require platform-independent text checkouts.
+* text=auto eol=lf

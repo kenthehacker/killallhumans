@@ -1,79 +1,89 @@
-# Background
-You are a cracked software engineer that is competing in the AI Grand Prix Drone Racing competition hosted by Anduril
-Scan this website for more background information: https://theaigrandprix.com/
+# AI Grand Prix engineering instructions
 
-We will be developing software that will enable a drone to autonomously fly through gates in the correct sequencing. 
-The first phase is to create the MVP
+## Current target
 
-This is the most recent email sent to us by the competition:
+The active target is FlightSim **build 3385** in **Training** mode. Treat
+`docs/aigp/2026-07-18-vq2-handoff.md` as authoritative for live flight status,
+the verified interface, and the safety contract.
 
-```
-Hi, 
- 
-As promised, here are more details about the 1st Virtual Qualifier (Round 1) - and what you should prepare for. 
- 
-What Round 1 Looks Like: 
-The first qualifier will take place inside a virtual environment designed to focus purely on autonomy performance. No visual gimmics. 
- 
-You can expect: 
-A structured 3D racecourse with a defined number of standardized gates. 
-Clear gate sequencing — all gates must be passed in the correct order. 
-Realistic drone physics and flight dynamics. 
-A time-based scoring system — fastest valid run wins but the main goal is to pass gates. 
-The emphasis is on precision, stability, and speed under realistic physical constraints. 
-Technical Framework & Code Submission: 
-Round 1 will be executed through a Windows-based downloadable application built on DCL’s competition platform. Exact hardware requirements will be communicated in the upcoming newsletters, but a recent mid-tier PC with a dedicated graphics card should generally do. We will make sure that the team with the best coding skills is fastest, not the one with the most hardware budget. 
- 
-Your task: 
-Prepare your Python-based autonomy stack, which will be integrated into the simulator and executed in a controlled evaluation environment. In the coming weeks, we will provide more information on interface specifications, input/output definitions, detailed submission instructions, exact opening & deadline dates, etc. 
- 
-Your Code needs to handle the following: 
-Gate recognition: Detect and locate gates in the virtual environment using available sensor data and a visual data feed. Gates will mostly be standardized. 
-Drone control: Command the drone's flight dynamics (speed, orientation, thrust) with precision. There will be a balance to be found between speed and accuracy. 
-Path planning & navigation: Plot and follow an efficient route through all gates in the correct order, under realistic physical limitations of the drone’s capabilities.  
+Public VQ1 material is useful historical context, but it does not match every
+empirical build-3385 behavior. In VQ2 there is no usable pose or gate-map
+stream. The production path is:
 
-Code Ownership — Important Clarification: 
-We’ve received several questions regarding intellectual property. You retain full ownership of your algorithm, source code, and documentation. By submitting your entry, you grant the AI Grand Prix permission to use your code strictly for operating, monitoring, and judging the competition and only for the duration of the competition period. We will use this access to monitor the code to avoid cheating, exploitation and human interference, but there is no transfer of IP to Anduril or any founding partner. 
- 
-Entry Fee: 
-We would like to emphasize again that there are no entry fees for teams. However, each participating team is responsible for covering its own expenses related to the AI Grand Prix, including travel, accommodation, and any additional costs incurred. 
- 
-What’s Next: 
-Next week, we will share preliminary technical interface details and additional specifications and updated FAQs to help you prepare.  
- 
-Now is the time to test, iterate, and stress-test your autonomy stack. 
-
-```
-# Roadmap
-
-This is a high level overview of a potential architecture:
-```
-Camera → [Gate Detection (CV/ML)] → Gate Position
-                                         ↓
-                              [Path Planner (optimization)]
-                                         ↓
-                              [MPC Controller (deterministic)]
-                                         ↓
-                              [Low-level PID (deterministic)]
-                                         ↓
-                                   Motor Commands
+```text
+UDP JPEG vision + HIGHRES_IMU + race status
+                  -> target tracking and IMU attitude estimation
+                  -> safety-gated body-rate/thrust commands
 ```
 
-We do not have to follow this exact architecture; its one of many possible set ups. For now, we are inteested in gate-detection & gate position detection due to the lack of information at the current moment.
+Do not invent qualifier dates or assume an older public interface overrides a
+verified build-specific finding. Flag any conflict for human review.
 
-## MVP Roadmap Plan:
+## Default development loop
 
-Because the API and technical documents have not yet been released, we should focus on the aspects that are agnostic to whatever new information will come out.
+Use the canonical Windows task surface from the repository root:
 
-### Gate Detection:
-We need to write software such that given a live camera feed we will detect the presence of all the gates in the camera's field of view with very low latency
+```powershell
+.\scripts\dev.cmd test-target tests/test_aigp_vq2_runner.py
+.\scripts\dev.cmd test-fast
+.\scripts\dev.cmd test-unit
+.\scripts\dev.cmd test-vq2
+```
 
+Run directly affected tests after each edit. Run `test-vq2` for each accepted
+candidate; it is the fast, dedicated non-live safety suite, and its collected
+test count is expected to grow with the stack. The default pytest policy
+excludes `slow`, `benchmark`, and `live`, enforces strict markers, and applies
+a hard wall timeout.
 
+Synthetic and PyBullet matrices are module-specific or pre-merge evidence, not
+the universal optimization objective. Invoke them explicitly with
+`test-benchmark`; use `test-full-non-live` only at a promotion boundary. Do not
+append to `benchmark_history.jsonl`, whose historical records are multiline
+objects and whose skipped PyBullet tier made old `overall_passed` values
+misleading.
 
+The explicit isolated and bounded legacy tiers are
+`.\scripts\dev.cmd test-unit` and `.\scripts\dev.cmd test-slow`. A `live` marker is
+run directly with `python -m pytest -m live` only after explicit authorization;
+there is intentionally no generic powered-test task.
 
+## Simulator boundary
 
+`preflight` is passive and sends no arm or flight targets:
 
-# Misc:
+```powershell
+.\scripts\dev.cmd preflight
+```
 
+Any powered FlightSim stage requires the user's explicit authorization. Never
+put `sign-id`, `hover`, `gate0`, `gate0-observe`, or a future powered stage in a
+generic test command. Powered work must preserve the proved reset epoch,
+countdown/GO, fresh-stream checks, watchdogs, command bounds, disarm/reset, and
+cleanup confirmation in the VQ2 handoff. A cleanup failure is a failed stage.
 
+The parameterized Windows launcher is:
 
+```powershell
+$env:AIGP_FLIGHTSIM_PATH = 'C:\path\to\AIGP_3385\FlightSim.exe'
+.\scripts\dev.cmd launch-sim
+```
+
+It discovers the active interactive desktop and refuses to double-launch.
+Training-mode GUI selection can still require a human desktop action.
+
+## Data, dependencies, and disclosure
+
+Use `requirements/development-test.lock.txt` for normal development. Keep the
+VQ2 runtime, test, legacy simulation, and optional training environments
+separate as documented in `docs/development_environment.md`.
+
+Keep new/private full captures, credentials, simulator data, and generated
+dependency inventories out of Git; preserve existing tracked historical
+capture evidence. Before a submission, generate an inventory with
+`.\scripts\dev.cmd sbom` and complete
+`docs/disclosures/ai-and-tools-template.md` through human review. The generated
+metadata is evidence, not a guarantee of license or rules compliance.
+
+Historical `.loop` and `.research_loop` files are evidence. Preserve them, but
+exclude them from routine searches unless the task explicitly needs history.

@@ -9,6 +9,10 @@ Research basis:
 
 Varies gate-7 and gate-8 offsets, evaluates with fast kinematic sim
 (no ILC — ILC will be recomputed for the final winner).
+
+This is an exploratory legacy diagnostic, not promotion evidence. Its compact
+plant/controller approximation is intentionally different from evaluator v4;
+validate any proposed offsets with ``scripts.benchmark_matrix`` before use.
 """
 
 import json
@@ -23,7 +27,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from planning.trajectory_optimizer import DroneConstraints, GateWaypoint, TrajectoryOptimizer
-from planning.racing_line import RacingLineConfig
+from planning.racing_line import RacingLineConfig, RacingLineOptimizer
 
 
 def load_track():
@@ -168,12 +172,29 @@ def main():
     gate_waypoints, start_pos = load_track()
     n = len(gate_waypoints)
 
-    cache_path = os.path.join(REPO, "planning", "racing_line_cache.json")
-    with open(cache_path) as f:
-        cache = json.load(f)
-    offsets = np.array(cache["offsets"], dtype=float)
+    # Seed the coordinate search through the current optimizer.  This uses the
+    # content-addressed artifact store internally and remains valid on both a
+    # cold cache and a cache hit; the removed last-writer-wins JSON file is not
+    # an API or a source of truth anymore.
+    racing_config = RacingLineConfig()
+    racing_optimizer = RacingLineOptimizer(racing_config)
+    optimized_gates = racing_optimizer.optimize(gate_waypoints, start_pos)
+    if len(optimized_gates) != n:
+        raise RuntimeError("racing-line optimizer returned an incomplete gate set")
+    lateral_offsets = []
+    vertical_offsets = []
+    for gate, optimized in zip(gate_waypoints, optimized_gates):
+        delta = np.asarray(optimized.position) - np.asarray(gate.position)
+        right = np.array([-math.sin(gate.yaw), math.cos(gate.yaw), 0.0])
+        up = np.array([0.0, 0.0, -1.0])  # NED
+        if gate.width <= 0.0 or gate.height <= 0.0:
+            raise ValueError("gate dimensions must be positive")
+        lateral_offsets.append(float(np.dot(delta, right) / (gate.width * 0.5)))
+        vertical_offsets.append(float(np.dot(delta, up) / (gate.height * 0.5)))
+    offsets = np.asarray(lateral_offsets + vertical_offsets, dtype=float)
 
-    print(f"Gate count: {n}, Offset count: {len(offsets)}")
+    cache_state = "hit" if racing_optimizer.last_cache_hit else "miss"
+    print(f"Gate count: {n}, Offset count: {len(offsets)}, cache={cache_state}")
     print(f"Gate-7 (idx 6): lat={offsets[6]:.4f}, vert={offsets[n+6]:.4f}")
     print(f"Gate-8 (idx 7): lat={offsets[7]:.4f}, vert={offsets[n+7]:.4f}")
     print(f"Gate-6 (idx 5): lat={offsets[5]:.4f}, vert={offsets[n+5]:.4f}")

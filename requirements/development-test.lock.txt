@@ -1,0 +1,14 @@
+# Exact Windows development/test lock, resolved with CPython 3.12.2.
+# Regenerate only in a fresh environment, then run test-fast and test-vq2.
+-r runtime-vq2.txt
+colorama==0.4.6
+iniconfig==2.3.0
+packaging==26.2
+pip==26.1.2
+pluggy==1.6.0
+Pygments==2.20.0
+pytest==9.1.1
+pytest-timeout==2.4.0
+scipy==1.18.0
+setuptools==83.0.0
+wheel==0.47.0

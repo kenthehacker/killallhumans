@@ -29,6 +29,7 @@ import asyncio
 import logging
 import math
 import time
+from types import SimpleNamespace
 from typing import List, Optional
 
 import gzip
@@ -43,6 +44,7 @@ from competition.gate_map_integrity import (
     write_reference_json,
 )
 from competition.sim_health import SimHealthProbe
+from competition.session import _positive_finite_float
 from gate_sequencing.sequencer import GateSpec
 from race_pipeline import PipelineConfig, RacePipeline
 
@@ -87,6 +89,7 @@ class FakeAdapter(CompetitionInterface):
         self._reset_count = 0
         self._attitude_send_count = 0
         self._track: Optional[TrackData] = None
+        self._epoch_started = time.monotonic()
 
     def _make_track(self) -> TrackData:
         gates = []
@@ -107,6 +110,7 @@ class FakeAdapter(CompetitionInterface):
         self._connected_address = address
         self._connected = True
         self._track = self._make_track()
+        self._epoch_started = time.monotonic()
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -120,7 +124,7 @@ class FakeAdapter(CompetitionInterface):
     async def stop_offboard(self) -> None:
         pass
 
-    async def get_telemetry(self) -> TelemetryState:
+    def _make_telemetry(self) -> TelemetryState:
         return TelemetryState(
             timestamp_us=int(time.monotonic() * 1_000_000),
             position_ned=(0.0, 0.0, 0.0),
@@ -128,6 +132,9 @@ class FakeAdapter(CompetitionInterface):
             orientation=Quaternion(w=1.0, x=0.0, y=0.0, z=0.0),
             angular_velocity=(0.0, 0.0, 0.0),
         )
+
+    async def get_telemetry(self) -> TelemetryState:
+        return self._make_telemetry()
 
     async def get_camera_frame(self):
         return None
@@ -146,6 +153,7 @@ class FakeAdapter(CompetitionInterface):
 
     async def reset(self) -> Optional[TrackData]:
         self._reset_count += 1
+        self._epoch_started = time.monotonic()
         return self._track
 
     def drain_collisions(self):
@@ -161,11 +169,21 @@ class FakeAdapter(CompetitionInterface):
 
     @property
     def latest_telemetry(self) -> Optional[TelemetryState]:
-        return None
+        return self._make_telemetry()
 
     @property
     def race_status(self):
-        return None
+        # Exercise the same reset/countdown/GO contract as the real runner
+        # without sleeping for the simulator's multi-second countdown. The
+        # first poll sees pre-GO time, proving freshness; later polls cross GO.
+        sim_boot_ms = int((time.monotonic() - self._epoch_started) * 1000.0)
+        return SimpleNamespace(
+            race_start_boot_time_ms=100,
+            sim_boot_time_ms=sim_boot_ms,
+            race_started=sim_boot_ms >= 100,
+            race_finished=False,
+            active_gate_index=0,
+        )
 
     @property
     def track_data(self) -> Optional[TrackData]:
@@ -220,12 +238,19 @@ async def run_vq1(
     ``max_seconds`` caps the race wall-clock. The pipeline's own race
     timeout is 480 s, so a run that never completes (e.g. the drone is
     stuck off-track and replanning) otherwise costs the full 8 minutes
-    before the capture is written. With ``max_seconds`` set, the run is
-    cancelled cleanly after the cap and the telemetry log is STILL
-    written (it is accumulated live in the recording callback), so a
-    failing run produces an analyzable capture in seconds-to-minutes
-    rather than 8 minutes. Used for fast live-sim iteration.
+    before the capture is written. With ``max_seconds`` set, that shorter
+    duration is injected into the session so it returns through normal
+    cleanup; a slightly larger outer guard catches a stuck transport cleanup.
+    The telemetry log is still written, so a failing run produces an
+    analyzable capture in seconds-to-minutes rather than 8 minutes. Used for
+    fast live-sim iteration.
     """
+
+    # Validate the programmatic boundary before constructing or connecting an
+    # adapter. ``bool`` is an ``int`` subclass and strings can be coerced by
+    # ``float()``, but neither is an intentional race-duration request.
+    if max_seconds is not None:
+        max_seconds = _positive_finite_float("max_seconds", max_seconds)
 
     # 1. Build adapter
     if dry_run:
@@ -602,17 +627,31 @@ async def run_vq1(
     # 8. Run
     wall_start = time.monotonic()
     logger.info("Starting race run…")
-    timed_out = False
+    outer_guard_timed_out = False
     try:
         if max_seconds is not None:
-            await asyncio.wait_for(pipeline.run(address=address), timeout=max_seconds)
+            # Inject the short duration into RaceSession so it exits through
+            # its normal timeout and cleanup path. Keep a slightly larger
+            # outer guard only for a stuck cleanup/transport implementation.
+            cleanup_guard_s = max(1.0, min(5.0, max_seconds * 0.1))
+            await asyncio.wait_for(
+                pipeline.run(
+                    address=address,
+                    max_run_duration_s=max_seconds,
+                ),
+                timeout=max_seconds + cleanup_guard_s,
+            )
         else:
             await pipeline.run(address=address)
     except asyncio.TimeoutError:
-        timed_out = True
+        if max_seconds is None:
+            raise
+        outer_guard_timed_out = True
         logger.warning(
-            "Run hit --max-seconds=%.0fs cap before completion — cancelling "
-            "cleanly and writing the partial capture for analysis.",
+            "Run failed to finish cleanup within %.1fs after the "
+            "--max-seconds=%.1fs race bound — cancelling and writing the "
+            "partial capture for analysis.",
+            cleanup_guard_s,
             max_seconds,
         )
     except Exception:
@@ -625,6 +664,12 @@ async def run_vq1(
             "collected so far for analysis."
         )
     elapsed = time.monotonic() - wall_start
+    if max_seconds is not None and not outer_guard_timed_out:
+        logger.info(
+            "Bounded run returned through normal session cleanup "
+            "(--max-seconds=%.1fs).",
+            max_seconds,
+        )
 
     # 8b. Record the sim-health verdict as a ONE-SHOT entry in the capture so
     #     post-run analysis sees it. If the window never elapsed (a very short

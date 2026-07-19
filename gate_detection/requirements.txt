@@ -1,6 +1,5 @@
-# Core dependencies for gate detection
-opencv-python>=4.5.0
-numpy>=1.20.0
-
-# For visualization and debugging
-matplotlib>=3.5.0
+# Standalone gate-detection development profile. Production VQ2 uses the
+# central requirements/runtime-vq2.txt profile instead.
+numpy==2.5.1
+opencv-python==5.0.0.93
+matplotlib==3.11.1

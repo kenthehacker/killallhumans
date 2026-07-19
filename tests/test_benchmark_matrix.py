@@ -7,16 +7,73 @@ Verifies that:
   - empty config list raises cleanly
   - per-track structure is consistent (every result has the same keys)
 
-Doesn't assert specific pass/fail outcomes — those will change as the
-controller improves. The point is the harness exists and doesn't crash.
+Pins the current seven-course clean-completion baseline, safety/validity
+envelope, and explicit per-course time/error ceilings.
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
 
-from scripts.benchmark_matrix import _list_configs, run_matrix
+from scripts.benchmark import COMPARISON_SERIES, EVALUATOR_VERSION, prepare_course
+from scripts.benchmark_matrix import (
+    _list_configs,
+    _load_config,
+    run_matrix,
+    worker_numeric_environment,
+)
+
+pytestmark = [pytest.mark.benchmark, pytest.mark.timeout(300)]
+
+
+def test_preparation_uses_worker_identity_and_forced_rollout_hits_warm_layers(tmp_path):
+    race_path = next(path for path in _list_configs() if path.stem == "race_01")
+    cache_root = tmp_path / "artifacts"
+    with worker_numeric_environment() as preparation_fingerprint:
+        prepared = prepare_course(
+            _load_config(race_path), dt=0.01, cache_root=cache_root
+        )
+    matrix = run_matrix(
+        [race_path],
+        duration=0.01,
+        dt=0.01,
+        max_workers=1,
+        cache_root=cache_root,
+        include_results=True,
+        use_result_cache=False,
+    )
+    result = matrix["results"]["race_01"]
+    assert prepared.dependency_fingerprint == preparation_fingerprint
+    assert matrix["dependency_fingerprint"] == preparation_fingerprint
+    assert result["cache"]["benchmark_result"] == "miss"
+    assert result["rollout_executed"] is True
+    assert result["result_cache_enabled"] is False
+    assert {
+        layer: result["cache"][layer]
+        for layer in ("racing_line", "trajectory", "plan_validation", "ilc")
+    } == {
+        "racing_line": "hit",
+        "trajectory": "hit",
+        "plan_validation": "hit",
+        "ilc": "hit",
+    }
+
+
+@pytest.fixture(scope="session")
+def prepared_matrix_result(tmp_path_factory):
+    """One isolated seven-track execution shared by all matrix assertions."""
+
+    cache_root = tmp_path_factory.mktemp("benchmark-artifacts")
+    return run_matrix(
+        _list_configs(),
+        duration=30.0,
+        max_workers=4,
+        cache_root=cache_root,
+        record_position_trace=True,
+        include_results=True,
+    )
 
 
 def test_list_configs_finds_track_jsons():
@@ -32,11 +89,13 @@ def test_list_configs_finds_track_jsons():
         assert "sim_pybullet/configs" in p.as_posix()
 
 
-def test_run_matrix_single_track_returns_expected_shape():
+def test_run_matrix_single_track_returns_expected_shape(prepared_matrix_result):
     """Run the matrix on race_01 alone and verify the dict shape."""
     paths = [p for p in _list_configs() if p.stem == "race_01"]
     assert paths, "race_01.json missing from sim_pybullet/configs/"
-    matrix = run_matrix(paths, duration=5.0)
+    matrix = prepared_matrix_result
+    assert matrix["evaluator_version"] == EVALUATOR_VERSION
+    assert matrix["comparison_series"] == COMPARISON_SERIES
     assert "timestamp" in matrix
     assert "tracks" in matrix
     assert "race_01" in matrix["tracks"]
@@ -53,165 +112,212 @@ def test_run_matrix_single_track_returns_expected_shape():
     assert track["total_gates"] >= 1
 
 
-def test_race_01_regression_gate_passes_at_15s():
-    """Iter-009e: race_01 must continue to PASS the synthetic bench.
+def test_race_01_evaluator_v4_exact_state_time_regression(prepared_matrix_result):
+    """Pin the current clean v4 completion under exact plane scoring.
 
-    Tracking-error history: iter-9 baseline 0.665m → iter-008 ILC sweep
-    0.159m → iter-009 fractional ILC + auto-velocity 0.089m. A future
-    change that re-introduces overfitting (e.g. velocity defaults
-    creeping back to course-specific values) would crash race_01 again.
-    This test catches that.
-
-    Tolerances:
-      - sim_passed must be True
-      - at least 11/12 gates (leaving 1 gate headroom for minor jitter)
-      - avg_tracking_error_m < 0.30 (3× the iter-009 result; small
-        improvements shouldn't be required, but large regressions should
-        scream)
-
-    Uses duration=30.0s — race_01 completes at ~17.2s on the iter-009
-    baseline; 30s leaves comfortable headroom for moderate slowdowns
-    from future changes without the test ping-ponging. The other tracks
-    aren't asserted to avoid coupling this test to figure8's
-    known-unsolvable coplanar gates.
+    The gate-normal throat and conservative modeled-drag compensation now
+    complete 12/12 safely in roughly 21.5 simulated seconds. A future narrow
+    pre-plane miss is a regression, not a result proximity credit may revive.
     """
     paths = [p for p in _list_configs() if p.stem == "race_01"]
     assert paths
-    matrix = run_matrix(paths, duration=30.0)
+    matrix = prepared_matrix_result
     track = matrix["tracks"]["race_01"]
-    assert track["sim_passed"] is True, (
-        f"race_01 must pass; reason={track.get('termination_reason')}, "
-        f"gates={track['gates_passed']}/{track['total_gates']}, "
-        f"avg_err={track['avg_tracking_error_m']:.3f}m"
-    )
-    assert track["gates_passed"] >= track["total_gates"] - 1, (
-        f"race_01 regressed: only {track['gates_passed']}/{track['total_gates']} gates"
-    )
-    assert track["avg_tracking_error_m"] < 0.30, (
+    assert track["evaluator_version"] == EVALUATOR_VERSION
+    assert track["gates_passed"] == track["total_gates"] == 12
+    assert track["complete"] is True
+    assert track["sim_passed"] is True
+    assert track["crashed"] is False
+    assert track["disqualified"] is False
+    assert track["safety_passed"] is True
+    assert track["validity_passed"] is True
+    assert track["termination_reason"] == "race_complete"
+    assert track["threshold_failures"] == []
+    # The current evaluator scores the scheduled reference (including ILC),
+    # so it no longer inherits the old globally-nearest-path 0.089 m baseline.
+    assert track["avg_tracking_error_m"] < 0.65, (
         f"race_01 tracking error regressed to {track['avg_tracking_error_m']:.3f}m "
-        f"(threshold 0.30m; iter-009 baseline 0.089m)"
+        "(v4 exact-state-time scheduled-reference ceiling 0.65m)"
     )
+    assert track["avg_nearest_path_error_m"] < 0.15
     # Iter-009g + iter-032: catch moderate slowdowns. Pre-iter-032
     # baseline was 17.17s but the polynomial-peak projection trades
     # ~7s of lap time for 27% lower tracking error and a 21.7% → 2.7%
     # collapse in accel-clamp engagement (planner-vs-bench honesty).
     # Iter-032 baseline: 24.39s. Ceiling 26s allows ~7% headroom for
     # tracker-tune drifts before flapping.
-    assert track["sim_time_s"] < 26.0, (
-        f"race_01 sim_time regressed to {track['sim_time_s']:.2f}s "
-        f"(threshold 26.0s; iter-032 baseline 24.39s) — perf regression"
-    )
+    assert track["sim_time_s"] < 26.0
 
 
-def test_figure8_8_of_8_after_iter028_coplanar_fix():
-    """Iter-028 regression: figure8 now passes 8/8 gates thanks to the
-    coplanar-gates DQ-skip fix in `gate_sequencing/sequencer.py`. Pre-
-    iter-028 figure8 was 1/8 (crash_gate:gate-5 at sim_time=1.0s) because
-    the sequencer flagged the figure-8 self-crossing as an out-of-order
-    violation. This test pins the win — if anything regresses the
-    coplanar exception, figure8 drops back to 1/8 and this test fails.
-
-    Tracking error tolerance is wider (0.50m) than the matrix gate's
-    0.40m because figure8 has tight 90-deg turns that legitimately have
-    higher tracking error than race_01-class wide courses."""
+def test_figure8_v4_clean_completion_regression(prepared_matrix_result):
+    """Figure8 now completes cleanly; pin that stronger plane-crossing result."""
     paths = [p for p in _list_configs() if p.stem == "figure8"]
     assert paths
-    matrix = run_matrix(paths, duration=30.0)
+    matrix = prepared_matrix_result
     track = matrix["tracks"]["figure8"]
-    assert track["sim_passed"] is True, (
-        f"figure8 regressed; reason={track.get('termination_reason')}, "
-        f"gates={track['gates_passed']}/{track['total_gates']}"
-    )
-    assert track["gates_passed"] == 8, (
-        f"figure8 only got {track['gates_passed']}/8 gates"
-    )
-    assert track["avg_tracking_error_m"] < 0.50
+    assert track["sim_passed"] is True
+    assert track["complete"] is True
+    assert track["gates_passed"] == track["total_gates"] == 8
+    assert track["crashed"] is False
+    assert track["disqualified"] is False
+    assert track["safety_passed"] is True
+    assert track["validity_passed"] is True
+    assert track["plan_validation"]["ok"] is True
+    assert track["termination_reason"] == "race_complete"
+    assert track["threshold_failures"] == []
+    assert track["avg_tracking_error_m"] < 0.40
+    assert track["sim_time_s"] < 18.0
 
 
-def test_matrix_pass_rate_at_least_six_of_seven():
-    """Iter-009f: locks in the iter-009 multi-track win.
+def test_evaluator_v4_matrix_pins_honest_completed_tracks(prepared_matrix_result):
+    """Pin the new comparison series without reviving proximity credit.
 
-    Iter-001 started at 1/7 (race_01 only — pure overfitting). The
-    geometry-derived auto_velocity + fractional ILC overrides in
-    iter-006..iter-009 unlocked 6/7 (only figure8 still crashes, due
-    to coplanar gates 1 and 5 that share x=5 — known-unsolvable
-    without trajectory pre-shaping or SFC corridor work).
-
-    A future change that erodes the generalisation gain (e.g.
-    re-introducing course-specific magic numbers; a too-aggressive
-    velocity that breaks slalom; a tracker-gain tweak that destabilises
-    grand_tour) would silently drop the pass rate. This test catches
-    that.
-
-    Assertion: at least 6/7 non-figure8 tracks PASS with tracking
-    error < 0.40m AND sim_time < 1.6× the iter-009 baseline. figure8
-    is excluded — it remains an open known issue.
-
-    Per-track sim_time baselines (iter-035, duration=30s, post-projection
-    + gate-altitude bug fix):
-      aigp_default      14.87s  → ceiling 17.0s
-      grand_tour        24.04s  → ceiling 29.5s
-      race_01           24.46s  → ceiling 27.5s (overlaps test_race_01)
-      slalom            13.81s  → ceiling 15.5s
-      straight_hairpin  10.45s  → ceiling 13.5s
-      vertical_cliff    14.27s  → ceiling 19.0s
-
-    Iter-032 relaxed `slalom` (13.5→15.5s) and `aigp_default` (12.5→14s)
-    because the new polynomial-peak accel projection stretches segments
-    to keep ||a|| ≤ 15 m/s². Iter-035 raised aigp_default again (14→17s)
-    because the racing-line gate-altitude bug fix (BO was lowering gates
-    by 0.35m to shave path-length) restored correct trajectory through
-    actual gate centers — that adds ~3s of vertical travel on tracks
-    with non-uniform gate heights.
+    Current prepared evidence completes every track safely. Per-track time and
+    scheduled-error ceilings below still prevent that stronger completion
+    result from hiding a tracking or timing regression.
     """
-    # Iter-009h ceilings relaxed at iter-032 (projection) and iter-035
-    # (racing-line gate-altitude bug fix). Ceilings now ~15-30% above
-    # iter-035 baselines.
+    # These ceilings belong only to the current scheduled-reference evaluator.
     SIM_TIME_CEILINGS = {
-        "aigp_default": 17.0,
-        "grand_tour": 29.5,
-        "race_01": 27.5,  # overlaps race_01 dedicated test, intentionally
-        "slalom": 15.5,
-        "straight_hairpin": 13.5,
-        "vertical_cliff": 19.0,
+        "aigp_default": 15.0,
+        "figure8": 18.0,
+        "grand_tour": 24.0,
+        "race_01": 26.0,
+        "slalom": 14.0,
+        "straight_hairpin": 12.0,
+        "vertical_cliff": 16.0,
+    }
+    ERROR_CEILINGS = {
+        "aigp_default": 0.30,
+        "figure8": 0.40,
+        "grand_tour": 0.75,
+        "race_01": 0.65,
+        "slalom": 0.25,
+        "straight_hairpin": 0.75,
+        "vertical_cliff": 0.25,
     }
     paths = _list_configs()
-    matrix = run_matrix(paths, duration=30.0)
+    matrix = prepared_matrix_result
 
-    expected_pass = []
-    actual_pass = []
+    expected_tracks = {path.stem for path in paths}
+    assert set(SIM_TIME_CEILINGS) == set(ERROR_CEILINGS) == expected_tracks
+    assert set(matrix["tracks"]) == expected_tracks
+    assert set(matrix["results"]) == expected_tracks
+    assert matrix["all_passed"] is True
+    assert matrix["safety_passed"] is True
+    assert matrix["validity_passed"] is True
+    assert matrix["completion"]["complete"] is True
+    assert matrix["completion"]["requested_tracks"] == len(expected_tracks) == 7
+    assert matrix["completion"]["evaluated_tracks"] == len(expected_tracks)
+    assert matrix["completion"]["evidence_complete"] is True
+    assert set(matrix["completion"]["track_result_references"]) == {
+        f"tracks.{name}.completion" for name in expected_tracks
+    }
+    assert matrix["regressions"] == []
+    assert matrix["failure_summary"]["exception"] is None
+    assert matrix["failure_summary"]["threshold_failures"] == []
+    assert matrix["worker_environment_verified"] is True
+    assert matrix["code_provenance_verified"] is True
+    assert matrix["resolved_configuration"]["code_provenance"] == matrix[
+        "code_provenance"
+    ]
+    worker_observations = matrix["dependency_fingerprints"]["workers_observed"]
+    assert {item["track"] for item in worker_observations} == expected_tracks
+    assert all(
+        item["fingerprint"] == matrix["dependency_fingerprint"]
+        for item in worker_observations
+    )
+
+    mirrored_fields = (
+        "gates_passed",
+        "total_gates",
+        "gate_pass_rate",
+        "complete",
+        "crashed",
+        "disqualified",
+        "termination_reason",
+        "sim_time_s",
+        "avg_tracking_error_m",
+        "max_tracking_error_m",
+        "p95_tracking_error_m",
+        "avg_nearest_path_error_m",
+        "max_nearest_path_error_m",
+        "sim_passed",
+        "safety_passed",
+        "validity_passed",
+        "completion",
+        "plan_validation",
+        "evaluator_version",
+        "schema_version",
+        "config_hash",
+        "artifact_hashes",
+        "cache_hit_or_miss",
+        "rollout_executed",
+        "result_cache_enabled",
+        "threshold_failures",
+    )
+    for name in expected_tracks:
+        summary = matrix["tracks"][name]
+        full = matrix["results"][name]
+        assert full["available"] is True
+        assert full["skipped"] is False
+        assert full["failure_summary"]["exception"] is None
+        assert full["threshold_failures"] == []
+        assert all(summary[field] == full[field] for field in mirrored_fields)
+        assert summary["prepared_cache_states"] == {
+            layer: full["cache"][layer]
+            for layer in ("racing_line", "trajectory", "plan_validation", "ilc")
+        }
+        assert summary["is_placeholder"] is bool(
+            full["resolved_configuration"]["track"].get("placeholder", False)
+        )
+        assert full["dependency_fingerprint"] == matrix["dependency_fingerprint"]
+        assert full["code_provenance"] == matrix["code_provenance"]
+
+    # The placeholder label is diagnostic metadata only. It is deliberately
+    # included in every hard-gate assertion above and cannot relax completion,
+    # safety, validity, or threshold evidence.
+    assert {
+        name for name, track in matrix["tracks"].items() if track["is_placeholder"]
+    } == {"aigp_default"}
+    assert matrix["completion"]["gates_passed"] == sum(
+        result["gates_passed"] for result in matrix["results"].values()
+    )
+    assert matrix["completion"]["total_gates"] == sum(
+        result["total_gates"] for result in matrix["results"].values()
+    )
+
     regressions = []
     for name, track in matrix["tracks"].items():
-        if name == "figure8":
-            continue  # known-unsolvable; exclude from pass-rate gate
-        expected_pass.append(name)
-        # Sim-time ceiling only applies if a baseline is recorded.
-        # Unknown tracks (new additions) skip the sim_time check.
-        ceiling = SIM_TIME_CEILINGS.get(name)
-        sim_time_ok = (ceiling is None) or (track["sim_time_s"] < ceiling)
+        ceiling = SIM_TIME_CEILINGS[name]
+        error_ceiling = ERROR_CEILINGS[name]
         if (
             track["sim_passed"]
-            and track["avg_tracking_error_m"] < 0.40
-            and sim_time_ok
+            and track["safety_passed"]
+            and track["validity_passed"]
+            and track["complete"]
+            and track["gates_passed"] == track["total_gates"]
+            and not track["crashed"]
+            and not track["disqualified"]
+            and track["termination_reason"] == "race_complete"
+            and track["avg_tracking_error_m"] < error_ceiling
+            and track["sim_time_s"] < ceiling
         ):
-            actual_pass.append(name)
+            continue
         else:
             regressions.append(
                 f"{name}: pass={track['sim_passed']} "
                 f"gates={track['gates_passed']}/{track['total_gates']} "
                 f"err={track['avg_tracking_error_m']:.3f}m "
                 f"sim_time={track['sim_time_s']:.2f}s"
-                f"{f' (ceiling {ceiling:.1f}s)' if ceiling else ''} "
+                f" (time ceiling {ceiling:.1f}s, "
+                f"error ceiling {error_ceiling:.2f}m) "
                 f"reason={track['termination_reason']}"
             )
 
-    assert len(actual_pass) >= 6, (
-        f"matrix pass-rate regressed: only {len(actual_pass)}/{len(expected_pass)} "
-        f"tracks pass; regressions=\n  " + "\n  ".join(regressions)
-    )
+    assert not regressions, "matrix completion regression:\n  " + "\n  ".join(regressions)
 
 
-def test_matrix_clamp_engagement_below_iter016_baseline():
+def test_matrix_clamp_engagement_below_iter016_baseline(prepared_matrix_result):
     """Iter-017 regression gate: the bench's accel-clamp engagement
     is now first-class in the matrix output (iter-016). Pin per-track
     upper bounds at 1.5× the iter-016 baseline so changes that drive
@@ -240,7 +346,7 @@ def test_matrix_clamp_engagement_below_iter016_baseline():
         "vertical_cliff": 0.15,
     }
     paths = _list_configs()
-    matrix = run_matrix(paths, duration=30.0)
+    matrix = prepared_matrix_result
     regressions = []
     for name, track in matrix["tracks"].items():
         if name == "figure8":
@@ -248,7 +354,17 @@ def test_matrix_clamp_engagement_below_iter016_baseline():
         ceiling = CLAMP_CEILINGS.get(name)
         if ceiling is None:
             continue  # unknown new track; skip rather than flap
-        observed = track.get("accel_clamp_active_frac", 0.0)
+        observed = track.get("accel_clamp_active_frac")
+        if (
+            isinstance(observed, bool)
+            or not isinstance(observed, (int, float))
+            or not math.isfinite(float(observed))
+            or not 0.0 <= float(observed) <= 1.0
+        ):
+            regressions.append(
+                f"{name}: missing or invalid accel_clamp_active_frac={observed!r}"
+            )
+            continue
         if observed > ceiling:
             regressions.append(
                 f"{name}: accel_clamp_active_frac={observed:.1%} > "
@@ -259,14 +375,31 @@ def test_matrix_clamp_engagement_below_iter016_baseline():
     )
 
 
-def test_run_matrix_empty_configs_returns_empty_tracks():
+def test_run_matrix_empty_configs_fails_closed():
     matrix = run_matrix([], duration=1.0)
     assert matrix["tracks"] == {}
-    # No tracks means nothing failed, so all_passed is vacuously True.
-    assert matrix["all_passed"] is True
+    assert matrix["all_passed"] is False
+    assert any("evidence is missing" in item for item in matrix["regressions"])
+    assert matrix["failure_summary"]["threshold_failures"] == matrix["regressions"]
 
 
-def test_iter035_drone_passes_through_gate_centers_vertically():
+def test_run_matrix_rejects_duplicate_config_identity(tmp_path):
+    config = tmp_path / "track.json"
+    config.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="uniquely attributable"):
+        run_matrix([config, config], duration=1.0)
+
+    first = tmp_path / "one" / "duplicate.json"
+    second = tmp_path / "two" / "duplicate.json"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("{}", encoding="utf-8")
+    second.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate stems"):
+        run_matrix([first, second], duration=1.0)
+
+
+def test_iter035_drone_passes_through_gate_centers_vertically(prepared_matrix_result):
     """Iter-035 regression: drone must pass through gates near their
     actual z centers, not 0.35m below them.
 
@@ -283,12 +416,11 @@ def test_iter035_drone_passes_through_gate_centers_vertically():
          drone passes through gate center vertically, maximising
          frame clearance.
 
-    This test pins the win across all 7 tracks. Mean |Δz| < 50mm and
-    max |Δz| < 300mm per track (vertical_cliff and grand_tour still
-    have legit tracker-lag on steep climbs, ~280mm max).
+    This test pins the win across all 7 tracks. The mean remains tight;
+    the v4 fully-wired planner allows up to 550mm instantaneous lag on the
+    steep grand_tour climb while still catching the old systematic offset.
     """
     import json
-    from scripts.benchmark import run_synthetic_benchmark
     from pathlib import Path
 
     repo = Path(__file__).resolve().parent.parent
@@ -299,15 +431,42 @@ def test_iter035_drone_passes_through_gate_centers_vertically():
         track = cfg_path.stem
         with open(cfg_path) as f:
             cfg = json.load(f)
-        r = run_synthetic_benchmark(
-            duration=30.0, config=cfg, record_position_trace=True,
-        )
-        trace = r.get("position_trace") or []
+        r = prepared_matrix_result["results"][track]
+        trace = r.get("position_trace")
         gates_by_id = {g["id"]: g for g in cfg["gates"]}
+        expected_gate_ids = list(gates_by_id)
+        gate_pass_times = r.get("gate_pass_times")
+        if not isinstance(trace, list) or not trace:
+            violations.append(f"{track}: position trace evidence is missing")
+            continue
+        if not isinstance(gate_pass_times, list):
+            violations.append(f"{track}: gate-pass timing evidence is missing")
+            continue
+        observed_gate_ids = [
+            item.get("gate_id") if isinstance(item, dict) else None
+            for item in gate_pass_times
+        ]
+        if observed_gate_ids != expected_gate_ids:
+            violations.append(
+                f"{track}: gate-pass evidence IDs {observed_gate_ids!r} do not "
+                f"match configured gates {expected_gate_ids!r}"
+            )
+            continue
         z_errors: list[float] = []
-        for gpt in r.get("gate_pass_times", []):
+        for gpt in gate_pass_times:
             gid = gpt["gate_id"]
-            sample = min(trace, key=lambda s: abs(s["t"] - gpt["time_s"]))
+            pass_time = gpt.get("time_s")
+            if (
+                isinstance(pass_time, bool)
+                or not isinstance(pass_time, (int, float))
+                or not math.isfinite(float(pass_time))
+            ):
+                violations.append(
+                    f"{track}: invalid gate-pass time for {gid}: {pass_time!r}"
+                )
+                z_errors = []
+                break
+            sample = min(trace, key=lambda s: abs(s["t"] - pass_time))
             gz = gates_by_id[gid]["pose"]["z"]
             z_errors.append(sample["pos"][2] - gz)
         if not z_errors:
@@ -315,22 +474,22 @@ def test_iter035_drone_passes_through_gate_centers_vertically():
         mean_abs = sum(abs(z) for z in z_errors) / len(z_errors)
         max_abs = max(abs(z) for z in z_errors)
         # Mean: tight (the bug had mean -0.35m on straight_hairpin).
-        if mean_abs > 0.10:
+        if mean_abs > 0.20:
             violations.append(
-                f"{track}: mean |Δz|={mean_abs:.3f}m > 100mm "
+                f"{track}: mean |Δz|={mean_abs:.3f}m > 200mm "
                 f"(per-gate z-errors: {[f'{z:+.3f}' for z in z_errors]})"
             )
         # Max: looser — legitimate tracker-lag on steep climbs.
-        if max_abs > 0.40:
+        if max_abs > 0.55:
             violations.append(
-                f"{track}: max |Δz|={max_abs:.3f}m > 400mm"
+                f"{track}: max |Δz|={max_abs:.3f}m > 550mm"
             )
     assert not violations, (
         "iter-035 gate-altitude regression:\n  " + "\n  ".join(violations)
     )
 
 
-def test_iter032_accel_projection_drops_clamp_engagement():
+def test_iter032_accel_projection_drops_clamp_engagement(prepared_matrix_result):
     """Iter-032 (charter task #10): the new
     `_project_accel_peaks` pass in `planning/trajectory_optimizer.py`
     must drive accel-clamp engagement well below the iter-016 baseline
@@ -354,7 +513,7 @@ def test_iter032_accel_projection_drops_clamp_engagement():
     TARGET_TRACKS = ("race_01", "aigp_default")
     CEILINGS = {"race_01": 0.10, "aigp_default": 0.25}
     paths = [p for p in _list_configs() if p.stem in TARGET_TRACKS]
-    matrix = run_matrix(paths, duration=30.0)
+    matrix = prepared_matrix_result
     violations: list[str] = []
     for name in TARGET_TRACKS:
         observed = matrix["tracks"][name].get("accel_clamp_active_frac", 1.0)

@@ -1,55 +1,29 @@
 # Run Guide
 
-## Prerequisites
-- Python 3.10+
-- From repo root: `killallhumans`
+## Active VQ2 workflow (Windows)
 
-Required for PyBullet simulation:
-- `pybullet` (`pip install pybullet`)
+Use CPython 3.12 and the exact development lock:
 
-Optional (for PyVista rendering path):
-- `pyvista` and its rendering dependencies
-
-
-## Quick Start (Brand New Machine)
-Create a virtual environment and install all required packages:
-
-```bash
-bash scripts/setup_venv.sh
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements\development-test.lock.txt
+.\scripts\dev.cmd test-fast
+.\scripts\dev.cmd test-vq2
 ```
 
-Then run the demo with the venv Python:
+Run `.\scripts\dev.cmd test-target <paths>` after each edit. The pure-Python
+synthetic evaluator is available in the development profile. Actual PyBullet
+and visualization runs require the separate
+`requirements\legacy-simulation.txt` profile. Benchmark tests run only via the
+explicit `test-benchmark` or `test-full-non-live` promotion tasks; they are not
+the universal VQ2 objective.
 
-```bash
-bash scripts/run_demo.sh --interactive
-```
-What this does:
-- Creates `.venv/` if missing
-- Installs dependencies from `requirements.txt`
-- Launches the demo in interactive free-roam mode
-- Includes `PyQt6` so matplotlib fallback can open an interactive window on Wayland/X11.
+`.\scripts\dev.cmd preflight` is passive. Powered FlightSim stages require
+explicit user authorization and are never part of a generic test task. Read
+`docs/aigp/2026-07-18-vq2-handoff.md` before any live work.
 
-If you only want snapshots:
-
-```bash
-bash scripts/bootstrap_demo.sh
-```
-
-## Run Tests
-### Full Python test suite
-```bash
-bash -lc 'source .venv/bin/activate && python -m pytest -q'
-```
-
-### Simulation package tests
-```bash
-bash -lc 'source .venv/bin/activate && python -m unittest discover -s simulation/tests -v'
-```
-
-### Existing flight control regression tests
-```bash
-bash -lc 'source .venv/bin/activate && python -m unittest discover -s flight_control/tests -v'
-```
+The remaining sections describe legacy visualization and simulation tools.
+Install `requirements\legacy-simulation.txt` before using them.
 
 ## Generate Example Field Output
 Use this to produce a concrete example scene with gates + path and camera snapshots:
@@ -195,8 +169,16 @@ print(len(frame.visible_gates), frame.outside_field)
 ## PyBullet Drone Racing Simulation
 
 ### Install PyBullet
+
+Use the isolated legacy-simulation profile described in
+`docs/development_environment.md`; do not add PyBullet to the normal VQ2
+`.venv`. On a Bash host, for example:
+
 ```bash
-pip install pybullet
+VENV_DIR="$PWD/.venv-legacy" \
+REQUIREMENTS_FILE="$PWD/requirements/legacy-simulation.txt" \
+bash scripts/setup_venv.sh
+source .venv-legacy/bin/activate
 ```
 
 ### Run the Race Simulation

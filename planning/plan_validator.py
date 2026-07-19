@@ -53,17 +53,17 @@ def validate_trajectory(
     gates: List[GateSpec],
     dt: float = 0.01,
     enforce_in_order: bool = True,
-    proximity_pass_distance: float = 1.0,
+    proximity_pass_distance: float = 0.0,
     ground_z_threshold: float = 0.05,
     ceiling_z_threshold: float = 20.0,
+    sequencer_config: Optional[SequencerConfig] = None,
 ) -> ValidationResult:
     """Replay a fresh GateSequencer against samples of `trajectory`.
 
-    Iter-005b (Opus F1 / composer F1 / gpt-55-xhigh F3 MAJOR consensus):
-    `proximity_pass_distance` defaults to 1.0 to match the synthetic
-    bench's SequencerConfig (was 0.0, which produced false-negatives
-    on plans that legitimately use proximity-credit at gate close-pass).
-    Callers wanting the strict no-proximity check can pass 0.0.
+    Exact plane crossing is the default.  Proximity credit can declare a gate
+    before the trajectory crosses its plane, so it is unsuitable for current
+    evaluator validity evidence.  Legacy callers that intentionally model a
+    permissive practice course must opt in with a positive distance.
 
     Iter-006 (Opus F5 MAJOR): airspace bounds. The bench terminates a
     run with `crash_ground` / `crash_ceiling` when the kinematic drone
@@ -81,8 +81,11 @@ def validate_trajectory(
         dt: sample step in seconds. 0.01 matches the bench default.
         enforce_in_order: if True (default), the sequencer's strict
             in-order DQ logic is on — same as the runtime.
-        proximity_pass_distance: forward to SequencerConfig. Default 1.0
-            matches the synthetic bench's SequencerConfig.
+        proximity_pass_distance: forward to SequencerConfig. The default 0.0
+            requires an observed plane crossing.
+        sequencer_config: resolved runtime sequencing policy. When provided,
+            it is used verbatim so cached validation and rollout cannot drift;
+            the legacy enforce/proximity arguments are then ignored.
         ground_z_threshold: if any sample has z < this, fail as
             `crash_ground` (matches bench at scripts/benchmark.py:445).
         ceiling_z_threshold: if any sample has z > this, fail as
@@ -107,7 +110,7 @@ def validate_trajectory(
             samples_evaluated=0,
         )
 
-    cfg = SequencerConfig(
+    cfg = sequencer_config or SequencerConfig(
         enforce_in_order=enforce_in_order,
         proximity_pass_distance=proximity_pass_distance,
     )

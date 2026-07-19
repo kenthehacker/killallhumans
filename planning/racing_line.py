@@ -40,13 +40,13 @@ pool diagnosed in iter 23.
 Research: QuayPoints (2025) — λ-interpolation between racing lines;
 Spatially-Aware CMA-ES (Wachter 2026) — population-based basin exploration.
 
-Iteration 33: racing line offset caching for determinism. The multi-start
-L-BFGS + _select_by_sim() pipeline has near-equal-energy basins at current
-parameters, causing non-deterministic racing line selection across runs.
-This blocks all further parameter tuning (diagnosed in iters 29-32).
-Solution: cache the winning offsets to a JSON file. On subsequent runs,
-load cached offsets instead of re-optimizing. Cache is keyed by a hash of
-gate positions + config, so it auto-invalidates on track/config changes.
+Iteration 33 and evaluator v2: content-addressed racing-line artifacts make
+the near-equal-energy multi-start result deterministic without a shared
+last-writer-wins file. Each key covers geometry, start state, numerical
+configuration, source digests, schema, and numerical dependency identity.
+Artifacts are checksum-verified and published atomically under a per-key
+lock; missing, corrupt, or semantically invalid entries fail closed and are
+rebuilt. Independent course/config keys therefore never overwrite each other.
 Research: On Your Own (Romero 2025) — pre-computed reference trajectories;
 QuayPoints (2025) — offline racing line computation;
 BO Racing Line (Heilmeier 2020) — sim oracle with cached results;
@@ -55,21 +55,25 @@ F1-Init (Shehadeh 2026) — initialization sensitivity in multi-modal landscapes
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
-import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy.optimize import minimize
 
+from .artifact_cache import ArtifactStore, artifact_key, dependency_fingerprint
 from .trajectory_optimizer import GateWaypoint
 
-# Cache file location — alongside this module
-_CACHE_DIR = os.path.dirname(os.path.abspath(__file__))
-_CACHE_FILE = os.path.join(_CACHE_DIR, "racing_line_cache.json")
+# Content-addressed artifact schema; storage location is an explicit policy.
+RACING_LINE_CACHE_SCHEMA = "racing-line-v5-content-addressed"
+_SOURCE_FILES = (
+    Path(__file__),
+    Path(__file__).with_name("trajectory_optimizer.py"),
+    Path(__file__).resolve().parent.parent / "competition" / "drone_spec.py",
+)
 
 
 @dataclass
@@ -102,6 +106,9 @@ class RacingLineConfig:
                                        # ILMPC (Zhao 2025): trajectory quality > controller tuning.
     lookahead_gates: int = 3           # gates to consider for corner cutting
     use_cache: bool = True             # use cached racing line offsets for determinism (iter 33)
+    # Storage policy is deliberately excluded from numerical cache keys.
+    # Tests pass a temporary directory here (or via AIGP_CACHE_ROOT).
+    cache_root: Optional[str] = None
     # Iter-009i (F9 fix, 4-agent research swarm consensus 2026-05-24):
     # path-velocity decoupling per Heilmeier 2019 / Kapania 2016 TUM
     # method. The optimal lateral-offset *geometry* is chosen independent
@@ -126,11 +133,35 @@ class RacingLineConfig:
     select_velocity_mps: float = 15.0
 
     def __post_init__(self):
-        # Iter-009j (Codex#2 MAJOR): NaN/Inf/<=0 in select_velocity_mps
-        # would poison TrajectoryOptimizer's segment-time math AND produce
-        # non-standard JSON cache keys. Reject early with a clear error.
-        import math as _math
-        if not _math.isfinite(self.select_velocity_mps) or self.select_velocity_mps <= 0:
+        # Reject coerced/non-finite numerical policy before SciPy or cache-key
+        # construction. A malformed bound must not spend a cold multi-start
+        # solve or publish ambiguous artifact provenance.
+        exact_numbers = {
+            "max_lateral_offset": self.max_lateral_offset,
+            "max_vertical_offset": self.max_vertical_offset,
+            "corner_cut_aggressiveness": self.corner_cut_aggressiveness,
+            "speed_weight": self.speed_weight,
+            "smoothness_weight": self.smoothness_weight,
+            "select_velocity_mps": self.select_velocity_mps,
+        }
+        for name, value in exact_numbers.items():
+            if type(value) not in {int, float} or not math.isfinite(value):
+                raise ValueError(f"RacingLineConfig.{name} must be a finite number")
+        if self.max_lateral_offset < 0 or self.max_vertical_offset < 0:
+            raise ValueError("racing-line offset bounds must be non-negative")
+        if not 0.0 <= self.corner_cut_aggressiveness <= 1.0:
+            raise ValueError("corner_cut_aggressiveness must be between 0 and 1")
+        if self.speed_weight < 0 or self.smoothness_weight < 0 or (
+            self.speed_weight == 0 and self.smoothness_weight == 0
+        ):
+            raise ValueError("racing-line objective weights must be non-negative and nonzero")
+        if type(self.lookahead_gates) is not int or self.lookahead_gates < 1:
+            raise ValueError("lookahead_gates must be a positive exact integer")
+        if type(self.use_cache) is not bool:
+            raise TypeError("use_cache must be an exact bool")
+        if self.cache_root is not None and type(self.cache_root) is not str:
+            raise TypeError("cache_root must be a string path or None")
+        if self.select_velocity_mps <= 0:
             raise ValueError(
                 f"RacingLineConfig.select_velocity_mps="
                 f"{self.select_velocity_mps!r} is invalid; must be a "
@@ -157,7 +188,31 @@ class RacingLineOptimizer:
     N_STARTS = 10  # 1 zero + 1 late-apex + 8 random (deterministic seed)
 
     def __init__(self, config: RacingLineConfig = None):
-        self.config = config or RacingLineConfig()
+        self.config = RacingLineConfig() if config is None else config
+        if not isinstance(self.config, RacingLineConfig):
+            raise TypeError("config must be a RacingLineConfig or None")
+        self._artifact_store = ArtifactStore(self.config.cache_root)
+        self.last_cache_hit = False
+        self.last_artifact_key: Optional[str] = None
+        self.last_cache_lookup_s = 0.0
+        self._last_selected_offsets: Optional[np.ndarray] = None
+        self._last_candidate_count = 0
+        self._last_selected_idx = 0
+
+    def _gates_with_offsets(
+        self, gates: List[GateWaypoint], offsets: np.ndarray
+    ) -> List[GateWaypoint]:
+        positions = self._apply_offsets(gates, offsets)
+        return [
+            GateWaypoint(
+                position=positions[index],
+                normal=gate.normal,
+                width=gate.width,
+                height=gate.height,
+                yaw=gate.yaw,
+            )
+            for index, gate in enumerate(gates)
+        ]
 
     @staticmethod
     def _compute_cache_key(
@@ -168,17 +223,18 @@ class RacingLineOptimizer:
         """Compute a hash-based cache key from inputs.
 
         Includes gate positions, normals, yaw, and config parameters.
-        Rounded to 6 decimal places for floating-point stability.
+        Floating-point values are retained exactly: a numerical config or
+        geometry change must never alias a previous optimization.
         """
         key_data = {
-            "start": [round(x, 6) for x in start_position],
+            "start": list(start_position),
             "gates": [
                 {
-                    "pos": [round(x, 6) for x in g.position],
-                    "normal": [round(x, 6) for x in g.normal],
-                    "yaw": round(g.yaw, 6),
-                    "width": round(g.width, 6),
-                    "height": round(g.height, 6),
+                    "pos": list(g.position),
+                    "normal": list(g.normal),
+                    "yaw": g.yaw,
+                    "width": g.width,
+                    "height": g.height,
                 }
                 for g in gates
             ],
@@ -188,43 +244,70 @@ class RacingLineOptimizer:
                 "smoothness_weight": config.smoothness_weight,
                 "speed_weight": config.speed_weight,
                 "corner_cut_aggressiveness": config.corner_cut_aggressiveness,
+                "lookahead_gates": config.lookahead_gates,
                 "up_vector_schema": "ned_v4",
                 # Iter-009i: cache key splits on the selection-reference
                 # speed, since it controls the BO oracle's basin choice.
                 # Execution velocity (used by the downstream
                 # TrajectoryOptimizer at the bench layer) is NOT in this
                 # key — geometry is invariant to execution speed by design.
-                "select_velocity_mps": round(config.select_velocity_mps, 2),
+                "select_velocity_mps": config.select_velocity_mps,
+                "n_starts": RacingLineOptimizer.N_STARTS,
+                "selector_weights": [
+                    RacingLineOptimizer._W_AVG_ERR,
+                    RacingLineOptimizer._W_WORST,
+                    RacingLineOptimizer._W_TIME,
+                ],
             },
         }
-        key_str = json.dumps(key_data, sort_keys=True)
-        return hashlib.sha256(key_str.encode()).hexdigest()[:16]
+        return artifact_key(
+            "racing-lines",
+            key_data,
+            schema_version=RACING_LINE_CACHE_SCHEMA,
+            source_files=_SOURCE_FILES,
+            environment=dependency_fingerprint(),
+        )
 
     @staticmethod
-    def _load_cache(cache_key: str) -> Optional[np.ndarray]:
-        """Load cached offsets if cache file exists and key matches."""
-        try:
-            if not os.path.exists(_CACHE_FILE):
-                return None
-            with open(_CACHE_FILE, "r") as f:
-                data = json.load(f)
-            if data.get("cache_key") != cache_key:
-                return None
-            # Iter-009l + iter-011 (Opus M1): cache schema v3.
-            # v2 = iter-009i added select_velocity_mps to the key.
-            # v3 = iter-010 lowered DroneConstraints.max_acceleration
-            #      from 20 → 15. Trajectories built under the v2 basin
-            #      used 20 m/s² inside _select_by_sim; the v3 selector
-            #      uses 15. Geometry-identical configs hash to the same
-            #      key, so reuse without a version bump silently mixes
-            #      pre/post-iter-010 offsets. Strict version check.
-            # v4 = AIGP Phase 1 NED path: max_vertical_offset enters the
-            #      key and vertical offsets use NED up ([0,0,-1]).
-            if data.get("version") != 4:
-                return None
-            return np.array(data["offsets"], dtype=np.float64)
-        except (json.JSONDecodeError, KeyError, ValueError):
+    def _load_cache(
+        cache_key: str,
+        cache_root: Optional[str] = None,
+        expected_size: Optional[int] = None,
+        expected_lateral_bound: Optional[float] = None,
+        expected_vertical_bound: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        """Load and integrity-check one content-addressed offset artifact."""
+
+        data = ArtifactStore(cache_root).load_json("racing-lines", cache_key)
+        if not isinstance(data, dict) or data.get("schema") != RACING_LINE_CACHE_SCHEMA:
             return None
+        try:
+            offsets = np.asarray(data["offsets"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if offsets.ndim != 1 or not np.all(np.isfinite(offsets)):
+            return None
+        if expected_size is not None and offsets.size != expected_size:
+            return None
+        if (
+            expected_size is not None
+            and expected_lateral_bound is not None
+            and expected_vertical_bound is not None
+        ):
+            gate_count = expected_size // 2
+            if expected_size != gate_count * 2:
+                return None
+            lateral_tolerance = 1e-12 * max(1.0, abs(expected_lateral_bound))
+            vertical_tolerance = 1e-12 * max(1.0, abs(expected_vertical_bound))
+            if np.any(
+                np.abs(offsets[:gate_count])
+                > abs(expected_lateral_bound) + lateral_tolerance
+            ) or np.any(
+                np.abs(offsets[gate_count:])
+                > abs(expected_vertical_bound) + vertical_tolerance
+            ):
+                return None
+        return offsets
 
     @staticmethod
     def _save_cache(
@@ -233,13 +316,14 @@ class RacingLineOptimizer:
         metrics: Optional[dict] = None,
         n_candidates: int = 0,
         selected_idx: int = 0,
+        cache_root: Optional[str] = None,
     ) -> None:
-        """Save winning offsets to cache file."""
+        """Atomically publish winning offsets under their content address."""
+
         from datetime import datetime, timezone
+
         data = {
-            # v4 — AIGP Phase 1 NED vertical-offset and cache-key schema.
-            "version": 4,
-            "cache_key": cache_key,
+            "schema": RACING_LINE_CACHE_SCHEMA,
             "offsets": offsets.tolist(),
             "metrics": metrics or {},
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -247,12 +331,76 @@ class RacingLineOptimizer:
             "selected_candidate_idx": selected_idx,
         }
         try:
-            with open(_CACHE_FILE, "w") as f:
-                json.dump(data, f, indent=2)
-        except OSError:
-            pass  # cache write failure is non-fatal
+            ArtifactStore(cache_root).save_json("racing-lines", cache_key, data)
+        except (OSError, TypeError, ValueError):
+            pass
 
     def optimize(
+        self,
+        gates: List[GateWaypoint],
+        start_position: Tuple[float, float, float] = (0, 0, 0),
+    ) -> List[GateWaypoint]:
+        """Return one cached/materialized winner for this exact content key.
+
+        The initial lock-free lookup keeps warm calls cheap. After a miss, the
+        per-key OS lease covers the second lookup *and* the dominant multi-start
+        solve. Same-key cold callers therefore wait and reuse one published
+        winner instead of duplicating roughly a minute of deterministic work;
+        distinct keys still optimize concurrently.
+        """
+
+        if len(gates) < 2 or not self.config.use_cache:
+            return self._optimize_impl(gates, start_position)
+
+        cache_key = self._compute_cache_key(gates, start_position, self.config)
+        self.last_artifact_key = cache_key
+        self.last_cache_hit = False
+        self.last_cache_lookup_s = 0.0
+        self._last_selected_offsets = None
+        expected = {
+            "expected_size": len(gates) * 2,
+            "expected_lateral_bound": self.config.max_lateral_offset,
+            "expected_vertical_bound": self.config.max_vertical_offset,
+        }
+        lookup_started = time.perf_counter()
+        cached_offsets = self._load_cache(
+            cache_key, self.config.cache_root, **expected
+        )
+        self.last_cache_lookup_s += time.perf_counter() - lookup_started
+        if cached_offsets is not None:
+            self.last_cache_hit = True
+            self._last_selected_offsets = cached_offsets.copy()
+            return self._gates_with_offsets(gates, cached_offsets)
+
+        with self._artifact_store.lock("racing-lines", cache_key):
+            lookup_started = time.perf_counter()
+            cached_offsets = self._load_cache(
+                cache_key, self.config.cache_root, **expected
+            )
+            self.last_cache_lookup_s += time.perf_counter() - lookup_started
+            if cached_offsets is not None:
+                self.last_cache_hit = True
+                self._last_selected_offsets = cached_offsets.copy()
+                return self._gates_with_offsets(gates, cached_offsets)
+
+            uncached = RacingLineOptimizer(replace(self.config, use_cache=False))
+            optimized = uncached._optimize_impl(gates, start_position)
+            if uncached._last_selected_offsets is None:
+                raise RuntimeError("uncached racing-line solve produced no offsets")
+            selected_offsets = uncached._last_selected_offsets.copy()
+            self._last_selected_offsets = selected_offsets
+            self._last_candidate_count = uncached._last_candidate_count
+            self._last_selected_idx = uncached._last_selected_idx
+            self._save_cache(
+                cache_key,
+                selected_offsets,
+                n_candidates=self._last_candidate_count,
+                selected_idx=self._last_selected_idx,
+                cache_root=self.config.cache_root,
+            )
+            return optimized
+
+    def _optimize_impl(
         self,
         gates: List[GateWaypoint],
         start_position: Tuple[float, float, float] = (0, 0, 0),
@@ -273,9 +421,21 @@ class RacingLineOptimizer:
 
         # --- Cache check (iteration 33) ---
         cache_key = self._compute_cache_key(gates, start_position, self.config)
+        self.last_artifact_key = cache_key
+        self.last_cache_hit = False
+        self.last_cache_lookup_s = 0.0
         if self.config.use_cache:
-            cached_offsets = self._load_cache(cache_key)
+            lookup_started = time.perf_counter()
+            cached_offsets = self._load_cache(
+                cache_key,
+                self.config.cache_root,
+                expected_size=len(gates) * 2,
+                expected_lateral_bound=self.config.max_lateral_offset,
+                expected_vertical_bound=self.config.max_vertical_offset,
+            )
+            self.last_cache_lookup_s += time.perf_counter() - lookup_started
             if cached_offsets is not None:
+                self.last_cache_hit = True
                 optimized_positions = self._apply_offsets(gates, cached_offsets)
                 optimized_gates = []
                 for i, gate in enumerate(gates):
@@ -368,17 +528,45 @@ class RacingLineOptimizer:
             gates, all_results, start_position
         )
         best_result = all_results[best_idx]
+        selected_offsets = np.asarray(best_result.x, dtype=np.float64)
+        self._last_selected_offsets = selected_offsets.copy()
+        self._last_candidate_count = len(all_results)
+        self._last_selected_idx = best_idx
 
         # --- Save to cache (iteration 33) ---
         if self.config.use_cache:
-            self._save_cache(
-                cache_key,
-                best_result.x,
-                n_candidates=len(all_results),
-                selected_idx=best_idx,
-            )
+            # Lock only this content address. Distinct tracks proceed in
+            # parallel; same-key publishers double-check after waiting so a
+            # completed winner is never overwritten by a racing process.
+            with self._artifact_store.lock("racing-lines", cache_key):
+                lookup_started = time.perf_counter()
+                locked_cached = self._load_cache(
+                    cache_key,
+                    self.config.cache_root,
+                    expected_size=len(gates) * 2,
+                    expected_lateral_bound=self.config.max_lateral_offset,
+                    expected_vertical_bound=self.config.max_vertical_offset,
+                )
+                self.last_cache_lookup_s += time.perf_counter() - lookup_started
+                if locked_cached is None:
+                    self._save_cache(
+                        cache_key,
+                        selected_offsets,
+                        n_candidates=len(all_results),
+                        selected_idx=best_idx,
+                        cache_root=self.config.cache_root,
+                    )
+                else:
+                    # Another same-key process published while this cold
+                    # optimization was running.  Use the immutable published
+                    # winner for this call too; otherwise concurrent callers
+                    # could return different near-equal basins under one
+                    # content address even though subsequent warm calls agree.
+                    selected_offsets = locked_cached
 
-        optimized_positions = self._apply_offsets(gates, best_result.x)
+        self._last_selected_offsets = selected_offsets.copy()
+
+        optimized_positions = self._apply_offsets(gates, selected_offsets)
         optimized_gates = []
         for i, gate in enumerate(gates):
             optimized_gates.append(GateWaypoint(

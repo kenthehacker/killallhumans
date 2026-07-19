@@ -29,8 +29,15 @@ import pytest
 from scripts.benchmark import run_synthetic_benchmark
 from scripts.benchmark_matrix import _list_configs
 
+pytestmark = pytest.mark.benchmark
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _WEIGHTS = _REPO_ROOT / "control" / "residual_weights.npz"
+
+
+@pytest.fixture(autouse=True)
+def _isolated_benchmark_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIGP_CACHE_ROOT", str(tmp_path / "artifacts"))
 
 # Tracks the residual is trained on (figure8 excluded — see
 # scripts/collect_residual_dataset.py::_SKIP).

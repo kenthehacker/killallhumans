@@ -1,0 +1,10 @@
+# Historical autonomous-agent archives are preserved in Git but excluded from
+# normal ripgrep/editor indexing. Use `rg --no-ignore --hidden` deliberately
+# when auditing them.
+.loop/
+.research_loop/
+
+# Private/generated autonomous-loop state is never routine source context.
+captures/replays/
+.aigp-loop/
+*.vq2replay/

@@ -1,0 +1,7 @@
+# Direct inputs for resolving a development/test environment. Use the lock
+# beside this file for normal installs; this file exists to make updates
+# deliberate and reviewable.
+-r runtime-vq2.txt
+pytest==9.1.1
+pytest-timeout==2.4.0
+scipy==1.18.0

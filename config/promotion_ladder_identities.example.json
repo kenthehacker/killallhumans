@@ -1,0 +1,45 @@
+{
+  "schema": "aigp-promotion-ladder-evidence-identities/1",
+  "tiers": [
+    {
+      "tier": 0,
+      "dataset_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed": 42,
+      "repetitions": 1,
+      "evaluator_version": "REPLACE_WITH_T0_EVALUATOR_VERSION"
+    },
+    {
+      "tier": 1,
+      "dataset_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed": 42,
+      "repetitions": 2,
+      "evaluator_version": "REPLACE_WITH_REPLAY_EVALUATOR_VERSION"
+    },
+    {
+      "tier": 2,
+      "dataset_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed": 42,
+      "repetitions": 1,
+      "evaluator_version": "REPLACE_WITH_NONLIVE_EVALUATOR_VERSION"
+    },
+    {
+      "tier": 3,
+      "dataset_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed": 42,
+      "repetitions": 1,
+      "evaluator_version": "REPLACE_WITH_NONLIVE_EVALUATOR_VERSION"
+    },
+    {
+      "tier": 4,
+      "dataset_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "config_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "seed": 42,
+      "repetitions": 1,
+      "evaluator_version": "REPLACE_WITH_NONLIVE_EVALUATOR_VERSION"
+    }
+  ]
+}

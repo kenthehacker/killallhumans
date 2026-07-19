@@ -96,6 +96,23 @@ def test_load_ilc_config_returns_required_keys():
             assert fld in cfg["sections"][cls], f"missing {cls}.{fld!r}"
 
 
+@pytest.mark.parametrize(
+    ("payload", "error"),
+    [
+        ('{"global": {}, "global": {}}', ValueError),
+        ('{"global": {"alpha": NaN}}', ValueError),
+        ('[{"global": {}}]', TypeError),
+    ],
+)
+def test_load_ilc_config_rejects_ambiguous_json(tmp_path, payload, error):
+    from planning.ilc_sections import load_ilc_config
+
+    path = tmp_path / "invalid.json"
+    path.write_text(payload, encoding="utf-8")
+    with pytest.raises(error):
+        load_ilc_config(path)
+
+
 # ---------------------------------------------------------------------------
 # Smooth track → single section
 # ---------------------------------------------------------------------------

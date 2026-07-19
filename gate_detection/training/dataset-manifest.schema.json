@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://killallhumans.invalid/schemas/gate-pose-dataset-v1.json",
+  "title": "Gate-pose dataset provenance manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "dataset_id",
+    "created_at",
+    "provenance",
+    "content_sha256",
+    "label_schema",
+    "groups",
+    "split"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "dataset_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "license_or_permission", "acquisition_notes"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "license_or_permission": {"type": "string", "minLength": 1},
+        "acquisition_notes": {"type": "string", "minLength": 1}
+      }
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "label_schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "keypoint_order"],
+      "properties": {
+        "task": {"const": "pose"},
+        "keypoint_order": {
+          "type": "array",
+          "minItems": 4,
+          "items": {"type": "string", "minLength": 1},
+          "uniqueItems": true
+        }
+      }
+    },
+    "groups": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["group_id", "session_or_track", "sample_count"],
+        "properties": {
+          "group_id": {"type": "string", "minLength": 1},
+          "session_or_track": {"type": "string", "minLength": 1},
+          "sample_count": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
+    "split": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "train_groups", "validation_groups", "test_groups"],
+      "properties": {
+        "method": {"const": "grouped_by_session_or_track"},
+        "train_groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "validation_groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"},
+          "uniqueItems": true
+        },
+        "test_groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

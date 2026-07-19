@@ -1,63 +1,161 @@
-# launch_sim.ps1 — launch the AI-GP sim (FlightSim.exe) on DESKTOP-M5VJ10H so it
-# renders on the GPU desktop, even when triggered over SSH.
-#
-# WHY THIS EXISTS: an SSH command runs in Windows session 0 (services). The GPU
-# desktop is session 1 (`query session` -> "console Kenichi 1 Active"). A plain
-# `ssh ... FlightSim.exe` launches in session 0 and NEVER renders / gets the GPU.
-# `schtasks /IT` routes the launch into the logged-on user's interactive session 1,
-# and with /RU = the logged-on user it needs NO password (/RP is only for
-# non-interactive run-as). We create a one-shot task, run it, verify, delete it.
-#
-# Run from the Mac:
-#   ssh -i ~/.ssh/id_ed25519_winpc -o IdentitiesOnly=yes Kenichi@100.122.0.79 \
-#     'powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Kenichi\killallhumans\scripts\launch_sim.ps1"'
-#
-# LOGIN: the game persists the logged-in account to
-#   %LOCALAPPDATA%\FlightSim\Saved\SaveGames\DCLSave-LocalPlayer.sav
-# and has an AutoLogin path, so a relaunch SHOULD silently re-login IF the PGOS
-# session token is still valid. If it lands on the email/password screen, do a
-# ONE-TIME login (Parsec/console) — ideally with "remember me" — or store the
-# credential once via `cmdkey /generic:AIGP_PGOS /user:<email> /pass` (DPAPI,
-# per-user) + a small autotype shim. Never put the password in this repo.
-#
-# Source: Phase 0 launch-automation investigation (2026-06-10). See
-# docs/aigp/2026-06-10-first-contact-findings.md.
+# Launch FlightSim in the active Windows desktop when invoked locally or over
+# SSH. Training-mode selection may still require an interactive desktop action.
+param(
+    [string]$SimulatorPath,
+    [string]$RunAsUser,
+    [string]$TaskName,
+    [ValidateRange(5, 300)]
+    [int]$StartupTimeoutSeconds = 60
+)
 
 $ErrorActionPreference = 'Stop'
-$SimDir   = 'C:\Users\Kenichi\Downloads\AI-GP Simulator v1.0.3364\AIGP_3364'
-$SimExe   = Join-Path $SimDir 'FlightSim.exe'
-$TaskName = 'LaunchAIGP'
+Set-StrictMode -Version Latest
 
-# 0) Guard: never double-launch (a live MAVLink/vision capture may be in progress).
-if (Get-Process -Name 'DCGame-Win64-Shipping','FlightSim' -ErrorAction SilentlyContinue) {
-    Write-Output 'Sim already running - refusing to relaunch.'; exit 0
+# Serialize the process check and launch lifecycle across shells/sessions. A
+# plain Get-Process check has a TOCTOU window in which two concurrent launchers
+# can both observe no simulator and create different randomly named tasks.
+$LaunchMutexName = 'Global\AIGP-FlightSim-Launch'
+$LaunchMutex = [System.Threading.Mutex]::new($false, $LaunchMutexName)
+$LaunchMutexOwned = $false
+try {
+    try {
+        $LaunchMutexOwned = $LaunchMutex.WaitOne(
+            [TimeSpan]::FromSeconds($StartupTimeoutSeconds)
+        )
+    } catch [System.Threading.AbandonedMutexException] {
+        # The previous launcher died while holding the mutex. Windows has
+        # transferred ownership to this process, so the guarded proof can be
+        # repeated from the beginning.
+        $LaunchMutexOwned = $true
+    }
+    if (-not $LaunchMutexOwned) {
+        throw "Timed out waiting for the FlightSim launch guard '$LaunchMutexName'."
+    }
+
+    # Never double-launch: an existing process may own a live MAVLink/vision run.
+    $existing = Get-Process -Name 'DCGame-Win64-Shipping', 'FlightSim' -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Output 'Sim already running - refusing to relaunch.'
+        exit 0
+    }
+
+if (-not $SimulatorPath) {
+    $SimulatorPath = if ($env:AIGP_FLIGHTSIM_PATH) {
+        $env:AIGP_FLIGHTSIM_PATH
+    } else {
+        Join-Path $env:USERPROFILE 'AIGP\AIGP_3385\FlightSim.exe'
+    }
+}
+if (-not (Test-Path -LiteralPath $SimulatorPath -PathType Leaf)) {
+    throw "Launcher not found: $SimulatorPath"
+}
+$SimulatorPath = (Resolve-Path -LiteralPath $SimulatorPath).Path
+$SimulatorDirectory = Split-Path -Parent $SimulatorPath
+
+# `query session` reports the real interactive session IDs. Prefer the session
+# attached to this shell, then console, then another active RDP desktop.
+$querySession = Join-Path $env:SystemRoot 'System32\query.exe'
+$sessionLines = & $querySession session 2>$null
+if ($LASTEXITCODE -ne 0) {
+    throw 'Unable to query Windows sessions; cannot safely target a GUI desktop.'
+}
+$activeSessions = @(
+    foreach ($line in $sessionLines) {
+        if ($line -match '^\s*(?<current>>)?\s*(?<session>\S+)\s+(?<user>\S+)\s+(?<id>\d+)\s+Active\b') {
+            [pscustomobject]@{
+                Current = [bool]$Matches.current
+                Session = $Matches.session
+                User = $Matches.user
+                Id = [int]$Matches.id
+            }
+        }
+    }
+)
+if ($activeSessions.Count -eq 0) {
+    throw 'No active interactive Windows session; log in before launching FlightSim.'
+}
+$interactive = $activeSessions |
+    Sort-Object -Property @(
+        @{ Expression = 'Current'; Descending = $true },
+        @{ Expression = { $_.Session -eq 'console' }; Descending = $true },
+        @{ Expression = 'Id'; Descending = $false }
+    ) |
+    Select-Object -First 1
+$InteractiveSessionId = $interactive.Id
+
+if (-not $RunAsUser) {
+    $RunAsUser = if ($interactive.User -match '[\\@]') {
+        $interactive.User
+    } else {
+        "$env:COMPUTERNAME\$($interactive.User)"
+    }
+}
+if (-not $TaskName) {
+    $TaskName = "LaunchAIGP-$PID-$([Guid]::NewGuid().ToString('N'))"
 }
 
-# 1) Require an interactive desktop session to render into (the /IT target).
-$console = (query session 2>$null | Select-String -Pattern '^\s*console\s+(\S+)\s+(\d+)\s+Active')
-if (-not $console) { throw 'No active console session - nobody is logged on; cannot launch a GUI app.' }
-$consoleUser = $console.Matches[0].Groups[1].Value      # e.g. Kenichi
-$runAs       = "$env:COMPUTERNAME\$consoleUser"
+# Never overwrite an unrelated scheduled task. `/Create` intentionally omits
+# `/F` as a second race-safe guard if a task appears after this query.
+& schtasks.exe /Query /TN $TaskName 2>$null | Out-Null
+$taskQueryExit = $LASTEXITCODE
+if ($taskQueryExit -eq 0) {
+    throw "Scheduled task '$TaskName' already exists; refusing to overwrite it."
+}
+if ($taskQueryExit -ne 1) {
+    throw "Could not prove scheduled task name '$TaskName' is unused."
+}
 
-if (-not (Test-Path $SimExe)) { throw "Launcher not found: $SimExe" }
-
-# 2) Action: cd into the sim dir first (UE thin launcher resolves relative paths from CWD).
-$action = 'cmd.exe /c cd /d "{0}" && start "" "{1}"' -f $SimDir, $SimExe
-
-# 3) (Re)create a one-shot, interactive, elevated task that runs as the logged-on user.
-schtasks /Create /TN $TaskName /TR $action /SC ONCE /ST 00:00 `
-         /RU $runAs /IT /RL HIGHEST /F | Out-Null
-
-# 4) Fire it now (the only trigger this task will ever have).
-schtasks /Run /TN $TaskName | Out-Null
-
-# 5) Confirm the game came up in the interactive session, then clean up the task.
+# The UE thin launcher resolves payloads relative to its working directory.
+$action = 'cmd.exe /c cd /d "{0}" && start "" "{1}"' -f $SimulatorDirectory, $SimulatorPath
+$taskCreated = $false
 $ok = $false
-foreach ($i in 1..30) {
-    Start-Sleep -Seconds 2
-    $p = Get-Process -Name 'DCGame-Win64-Shipping' -ErrorAction SilentlyContinue
-    if ($p -and ($p.SessionId -contains 1)) { $ok = $true; break }
+$primaryError = $null
+$cleanupError = $null
+try {
+    & schtasks.exe /Create /TN $TaskName /TR $action /SC ONCE /ST 00:00 `
+        /RU $RunAsUser /IT /RL HIGHEST | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not create launcher task '$TaskName'." }
+    $taskCreated = $true
+
+    & schtasks.exe /Run /TN $TaskName | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not run launcher task '$TaskName'." }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
+    do {
+        Start-Sleep -Milliseconds 500
+        $processes = Get-Process -Name 'DCGame-Win64-Shipping', 'FlightSim' -ErrorAction SilentlyContinue
+        if ($processes -and ($processes.SessionId -contains $InteractiveSessionId)) {
+            $ok = $true
+            break
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+} catch {
+    $primaryError = $_
+} finally {
+    if ($taskCreated) {
+        & schtasks.exe /Delete /TN $TaskName /F | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            $cleanupError = "Could not delete temporary launcher task '$TaskName'."
+        }
+    }
 }
-schtasks /Delete /TN $TaskName /F | Out-Null    # leave no persistent artifact
-if ($ok) { Write-Output 'Sim launched in interactive session.' }
-else     { Write-Output 'WARNING: sim process not observed in session 1 within 60s.' }
+
+if ($primaryError -and $cleanupError) {
+    throw "$($primaryError.Exception.Message) Cleanup also failed: $cleanupError"
+}
+if ($primaryError) { throw $primaryError }
+if ($cleanupError) { throw $cleanupError }
+
+if (-not $ok) {
+    throw "FlightSim was not observed in interactive session $InteractiveSessionId within $StartupTimeoutSeconds seconds."
+}
+Write-Output (
+    "Sim launched in interactive session {0} as {1}: {2}" -f `
+        $InteractiveSessionId, $RunAsUser, $SimulatorPath
+)
+} finally {
+    if ($LaunchMutexOwned) {
+        $LaunchMutex.ReleaseMutex()
+    }
+    $LaunchMutex.Dispose()
+}

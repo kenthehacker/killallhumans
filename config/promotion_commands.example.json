@@ -1,0 +1,129 @@
+{
+  "schema": "aigp-promotion-commands/1",
+  "tiers": [
+    {
+      "tier": 0,
+      "argv": [
+        "{python}",
+        "-I",
+        "scripts/aigp_pytest.py",
+        "affected",
+        "tests/test_aigp_loop_replay.py"
+      ],
+      "timeout_s": 30,
+      "metrics_from_stdout": false,
+      "require_hard_gates": false,
+      "trusted_manifest": "config/promotion_trusted_files.json"
+    },
+    {
+      "tier": 1,
+      "steps": [
+        {
+          "argv": [
+            "{python}",
+            "-I",
+            "scripts/aigp_pytest.py",
+            "vq2"
+          ],
+          "timeout_s": 60,
+          "metrics_from_stdout": false,
+          "require_hard_gates": false,
+          "trusted_manifest": "config/promotion_trusted_files.json",
+          "isolation_wrapper": "REPLACE_WITH_ABSOLUTE_PINNED_OS_ISOLATION_WRAPPER",
+          "isolation_wrapper_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        },
+        {
+          "argv": [
+            "{python}",
+            "-I",
+            "{trusted_replay}",
+            "corpus",
+            "REPLACE_WITH_PRIVATE_GOLDEN_CORPUS_MANIFEST",
+            "--processor",
+            "REPLACE_WITH_CANDIDATE_MODULE:FUNCTION",
+            "--isolation-wrapper",
+            "REPLACE_WITH_PINNED_OS_ISOLATION_WRAPPER",
+            "--isolation-wrapper-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--trusted-manifest",
+            "config/promotion_trusted_files.json"
+          ],
+          "timeout_s": 30,
+          "metrics_from_stdout": true,
+          "require_hard_gates": false,
+          "trusted_manifest": "config/promotion_trusted_files.json",
+          "trusted_host": true
+        }
+      ]
+    },
+    {
+      "tier": 2,
+      "argv": [
+        "{python}",
+        "-I",
+        "scripts/aigp_nonlive.py",
+        "--tier",
+        "2",
+        "--configs",
+        "race_01",
+        "--duration",
+        "30",
+        "--workers",
+        "1",
+        "--trusted-manifest",
+        "config/promotion_trusted_files.json"
+      ],
+      "timeout_s": 120,
+      "metrics_from_stdout": true,
+      "require_hard_gates": true,
+      "trusted_manifest": "config/promotion_trusted_files.json"
+    },
+    {
+      "tier": 3,
+      "argv": [
+        "{python}",
+        "-I",
+        "scripts/aigp_nonlive.py",
+        "--tier",
+        "3",
+        "--configs",
+        "grand_tour,slalom,vertical_cliff",
+        "--duration",
+        "30",
+        "--workers",
+        "3",
+        "--trusted-manifest",
+        "config/promotion_trusted_files.json"
+      ],
+      "timeout_s": 120,
+      "metrics_from_stdout": true,
+      "require_hard_gates": true,
+      "trusted_manifest": "config/promotion_trusted_files.json"
+    },
+    {
+      "tier": 4,
+      "argv": [
+        "{python}",
+        "-I",
+        "scripts/aigp_nonlive.py",
+        "--tier",
+        "4",
+        "--configs",
+        "aigp_default,figure8,grand_tour,race_01,slalom,straight_hairpin,vertical_cliff",
+        "--duration",
+        "30",
+        "--workers",
+        "4",
+        "--full-suite",
+        "--full-suite-timeout-s",
+        "900",
+        "--trusted-manifest",
+        "config/promotion_trusted_files.json"
+      ],
+      "timeout_s": 1200,
+      "metrics_from_stdout": true,
+      "require_hard_gates": true,
+      "trusted_manifest": "config/promotion_trusted_files.json"
+    }
+  ]
+}

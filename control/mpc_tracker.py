@@ -203,7 +203,9 @@ class GeometricTracker:
         self._residual = None
         if self.config.use_residual:
             from control.learned_residual import (
-                DEFAULT_N_INPUTS, TrackerResidualMLP,
+                DEFAULT_N_INPUTS,
+                DEFAULT_N_OUTPUTS,
+                TrackerResidualMLP,
             )
             path = self.config.residual_weights_path
             if path is None:
@@ -215,12 +217,11 @@ class GeometricTracker:
                 if _default.exists():
                     path = str(_default)
             if path is not None:
-                # Wide exception net: a corrupt .npz raises OSError/
-                # BadZipFile/KeyError, a stale schema raises ValueError
-                # from __post_init__, and a missing-input-dim weights
-                # file would explode on the first forward(). All of
-                # these should fall back to zero_init (byte-identical
-                # to baseline) so the tracker NEVER crashes at init.
+                # A selected model is promotion evidence, not an optional
+                # hint.  Missing, corrupt, or schema-incompatible bytes must
+                # fail closed; silently substituting a zero model would make
+                # an A/B run claim to exercise a residual while measuring the
+                # baseline controller.
                 try:
                     candidate = TrackerResidualMLP.from_npz(path)
                     if candidate.n_inputs != DEFAULT_N_INPUTS:
@@ -229,9 +230,17 @@ class GeometricTracker:
                             f"n_inputs={candidate.n_inputs}, expected "
                             f"{DEFAULT_N_INPUTS} — schema mismatch"
                         )
+                    if candidate.n_outputs != DEFAULT_N_OUTPUTS:
+                        raise ValueError(
+                            f"residual weights at {path} have "
+                            f"n_outputs={candidate.n_outputs}, expected "
+                            f"{DEFAULT_N_OUTPUTS}; schema mismatch"
+                        )
                     self._residual = candidate
-                except (FileNotFoundError, OSError, KeyError, ValueError):
-                    self._residual = TrackerResidualMLP.zero_init()
+                except (FileNotFoundError, OSError, EOFError, KeyError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"selected residual weights are invalid: {path}"
+                    ) from exc
             else:
                 # Safety baseline: zero-init weights produce zero residual,
                 # so enabling the feature without a trained model is still

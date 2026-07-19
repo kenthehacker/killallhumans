@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://killallhumans.invalid/schemas/gate-pose-campaign-contract-v1.json",
+  "title": "Gate-pose training campaign readiness contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "created_at",
+    "dataset_manifest_sha256",
+    "pipeline",
+    "budgets",
+    "checkpointing",
+    "evaluation",
+    "runtime"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "contract_id": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "dataset_manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_files", "resolved_config", "transitive_lock", "lock_kind"],
+      "properties": {
+        "source_files": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/artifact"},
+          "allOf": [
+            {"contains": {"properties": {"path": {"const": "gate_detection/training/extract_frames.py"}}}},
+            {"contains": {"properties": {"path": {"const": "gate_detection/training/train.py"}}}},
+            {"contains": {"properties": {"path": {"const": "gate_detection/training/validate.py"}}}},
+            {"contains": {"properties": {"path": {"const": "gate_detection/training/export.py"}}}}
+          ]
+        },
+        "resolved_config": {"$ref": "#/$defs/artifact"},
+        "transitive_lock": {"$ref": "#/$defs/artifact"},
+        "lock_kind": {"const": "fully_transitive_exact_with_sha256_hashes"}
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["smoke_epochs", "successive_halving_epochs", "evidence"],
+      "properties": {
+        "smoke_epochs": {"enum": [1, 2]},
+        "successive_halving_epochs": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "evidence": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "checkpointing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["atomic_periodic", "state_fields", "resume_rejects_drift", "evidence"],
+      "properties": {
+        "atomic_periodic": {"const": true},
+        "state_fields": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "optimizer",
+              "scheduler",
+              "scaler",
+              "rng",
+              "epoch",
+              "history",
+              "split_manifest_hash",
+              "best_candidate"
+            ]
+          }
+        },
+        "resume_rejects_drift": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"enum": ["dataset", "config", "code"]}
+        },
+        "evidence": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "evaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "split_method",
+        "grouped_holdout",
+        "classical_baseline",
+        "onnx_comparison",
+        "tensorrt_comparison"
+      ],
+      "properties": {
+        "split_method": {"const": "grouped_by_session_or_track"},
+        "grouped_holdout": {"$ref": "#/$defs/artifact"},
+        "classical_baseline": {"$ref": "#/$defs/artifact"},
+        "onnx_comparison": {"$ref": "#/$defs/artifact"},
+        "tensorrt_comparison": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["integration", "replay_evidence"],
+      "properties": {
+        "integration": {"$ref": "#/$defs/artifact"},
+        "replay_evidence": {"$ref": "#/$defs/artifact"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+        },
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  }
+}

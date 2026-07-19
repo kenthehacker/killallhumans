@@ -1,0 +1,11 @@
+# Legacy synthetic/PyBullet tooling. This is intentionally outside the VQ2
+# runtime and default inner loop. Direct dependencies are pinned; resolve a
+# platform-specific transitive lock before a reproducibility-critical matrix.
+-r development-test.lock.txt
+matplotlib==3.11.1
+mavsdk==3.15.3
+pybullet==3.2.7
+PyQt6==6.11.0
+PyYAML==6.0.3
+pyvista==0.48.4
+gym-pybullet-drones @ git+https://github.com/utiasDSL/gym-pybullet-drones.git@e712698a05a80728b06572819dcf044596707754

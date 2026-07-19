@@ -38,6 +38,7 @@ from scripts.aigp_vq2_run import (
     next_control_deadline,
     post_gate_observation_deadline,
     select_primary_gate,
+    replay_capture_result,
 )
 
 
@@ -446,6 +447,49 @@ def test_post_pass_sampling_filters_residue_before_tracker_selection():
     assert runner._latest_accepted_target is not None
     assert runner._latest_accepted_target.bbox == gate1.bbox
     assert runner.tracker.consecutive == 1
+
+
+def test_no_replay_or_diagnostics_skips_detection_summary_capture_path(monkeypatch):
+    adapter = _FakeAdapter()
+    vision = _FakeVision()
+    vision.current_snapshot = _vision_snapshot(
+        frame_id=101, sim_time_ns=1_010, received_monotonic_s=1.0
+    )
+    runner = VQ2Runner(adapter, vision)
+    runner.detector = SimpleNamespace(detect=lambda _image: [_detection(10, 10, 40, 40)])
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("diagnostic summary added work to production path")
+
+    monkeypatch.setattr(vq2_module, "gate_detection_summary", must_not_run)
+    runner._sample()
+    assert runner.tracker.target is not None
+
+
+def test_incomplete_requested_replay_fails_stage_result_without_changing_cleanup():
+    original = vq2_module.StageResult(
+        stage="preflight",
+        success=True,
+        reason="pass",
+        duration_s=1.0,
+        cleanup_confirmed=True,
+        details={},
+    )
+    stats = SimpleNamespace(complete=False)
+    # replay_capture_result uses dataclasses.asdict for the production stats;
+    # use that exact frozen dataclass shape through a minimal real instance.
+    from aigp_loop.replay import AsyncCaptureStats
+
+    failed = replay_capture_result(
+        original,
+        capture_requested=True,
+        capture_stats=AsyncCaptureStats(
+            1, 0, 1, 0, 0, 1, 1, 0, 1, False, None, "queue overflow"
+        ),
+    )
+    assert not failed.success
+    assert failed.cleanup_confirmed
+    assert "replay capture incomplete" in failed.reason
 
 
 def test_post_pass_diagnostic_reference_stays_on_exact_processed_frame():
@@ -1327,3 +1371,122 @@ def test_diagnostic_png_encoding_is_deferred_until_explicit_flush(tmp_path):
     assert errors == []
     assert len(paths) == 1
     assert (tmp_path / "trace_gate1_acquired.png").is_file()
+
+
+def test_programmatic_replay_capture_requires_exact_recording_approval(tmp_path):
+    with pytest.raises(PermissionError, match="recording_approved=True"):
+        asyncio.run(
+            vq2_module.run_live(
+                "preflight",
+                "udp://127.0.0.1:14550",
+                None,
+                replay_bundle=str(tmp_path / "private.vq2replay"),
+            )
+        )
+    with pytest.raises(TypeError, match="exact bool"):
+        asyncio.run(
+            vq2_module.run_live(
+                "preflight",
+                "udp://127.0.0.1:14550",
+                None,
+                recording_approved="true",
+            )
+        )
+
+
+def test_replay_writer_is_cleaned_up_when_later_runner_construction_fails(
+    tmp_path, monkeypatch
+):
+    created = []
+    real_dependencies = vq2_module._replay_capture_dependencies()
+    real_recorder = real_dependencies[0]
+
+    def tracking_recorder(*args, **kwargs):
+        recorder = real_recorder(*args, **kwargs)
+        created.append(recorder)
+        return recorder
+
+    class ConstructorFailure:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("vision constructor failed")
+
+    monkeypatch.setattr(
+        vq2_module,
+        "_replay_capture_dependencies",
+        lambda: (tracking_recorder, *real_dependencies[1:]),
+    )
+    monkeypatch.setattr(vq2_module, "VQ2VisionThread", ConstructorFailure)
+    bundle = tmp_path / "constructor-failure.vq2replay"
+    with pytest.raises(RuntimeError, match="vision constructor failed"):
+        asyncio.run(
+            vq2_module.run_live(
+                "preflight",
+                "udp://127.0.0.1:14550",
+                None,
+                replay_bundle=str(bundle),
+                recording_approved=True,
+            )
+        )
+    assert len(created) == 1
+    assert not created[0]._thread.is_alive()
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is False
+    assert manifest["metadata"]["seed"] == 42
+
+
+def test_replay_writer_is_aborted_when_async_recorder_construction_fails(
+    tmp_path, monkeypatch
+):
+    class ConstructorFailure:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("async recorder construction failed")
+
+    real_dependencies = vq2_module._replay_capture_dependencies()
+    monkeypatch.setattr(
+        vq2_module,
+        "_replay_capture_dependencies",
+        lambda: (ConstructorFailure, *real_dependencies[1:]),
+    )
+    bundle = tmp_path / "async-constructor-failure.vq2replay"
+    with pytest.raises(RuntimeError, match="async recorder construction failed"):
+        asyncio.run(
+            vq2_module.run_live(
+                "preflight",
+                "udp://127.0.0.1:14550",
+                None,
+                replay_bundle=str(bundle),
+                recording_approved=True,
+            )
+        )
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["complete"] is False
+    assert "async replay recorder construction failed" in manifest["abort_reason"]
+
+
+def test_jsonl_close_failure_still_invalidates_and_closes_replay():
+    calls = []
+
+    class BrokenHandle:
+        def close(self):
+            calls.append("jsonl-close")
+            raise OSError("legacy close failed")
+
+    class FakeReplay:
+        def fail(self, reason):
+            calls.append(("replay-fail", reason))
+
+        def close(self, *, outcome, expected_decoded_frames):
+            calls.append(("replay-close", outcome, expected_decoded_frames))
+            return object()
+
+    recorder = vq2_module.JsonlRecorder(None, replay=FakeReplay())
+    recorder._handle = BrokenHandle()
+    outcome = {"vision_capture_stats": {"frames_decoded": 7}}
+    with pytest.raises(OSError, match="legacy close failed"):
+        recorder.close(outcome=outcome)
+
+    assert recorder._handle is None
+    assert calls[0] == "jsonl-close"
+    assert calls[1][0] == "replay-fail"
+    assert "legacy close failed" in calls[1][1]
+    assert calls[2] == ("replay-close", outcome, 7)

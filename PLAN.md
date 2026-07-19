@@ -1,6 +1,16 @@
 # AI Grand Prix — Official Competition Port Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **HISTORICAL / SUPERSEDED (build 3364 and early VQ1 planning).** Do not use
+> this file as an execution plan or current interface contract. The authoritative
+> build-3385 VQ2 flight-status, interface, and safety handoff is
+> `docs/aigp/2026-07-18-vq2-handoff.md`; the workflow handoff is
+> `docs/2026-07-18-development-cycle-handoff.md`. Use `RUN.md`, `Agents.md`, and
+> `docs/autonomous_iteration.md` for current commands and safety policy. The
+> speculative dates, telemetry assumptions, host paths, and VQ1 priorities below
+> are preserved only as development evidence.
+
+> Archived workflow note: the checkbox plan below is not an instruction to
+> agents working on the current build.
 
 **Goal:** Take the autonomy stack we practiced with on PyBullet and make it fly the **official AI-GP simulator** end-to-end — VQ1 (completion) first, then VQ2 (fastest valid time).
 

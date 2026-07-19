@@ -1,0 +1,718 @@
+# AIGP VQ2 execution-plan handoff
+
+**Date:** 2026-07-18
+**Target:** DCL FlightSim build 3385, VQ2 Training and Qualification
+**Repository:** C:\Users\John\killallhumans
+**Baseline before the current tooling batch:** c7c37c047039bcac055d77c57a234effe36f73e1
+
+## Purpose
+
+This document turns the VQ2 research into a resumable implementation program.
+It is intentionally detailed about boundaries, evidence, safety, and integration,
+while leaving room to choose algorithms from measured results.
+
+Read these first:
+
+1. 2026-07-18-vq2-handoff.md for the authoritative build-3385 flight state.
+2. ../2026-07-18-development-cycle-handoff.md for the testing/tooling program.
+3. durable_improvement_loop.md for replay, promotion, ledger, and campaign rules.
+4. decisions.md for the current live safety decisions.
+
+## Program outcome
+
+The immediate objective is a conservative valid full VQ2 lap using the available
+camera, HIGHRES_IMU, race status, actuator output, and collision telemetry.
+Speed optimization follows only after completion is repeatable.
+
+The recommended progression is:
+
+1. Stabilize and commit the in-progress evaluation foundation.
+2. Establish simulator timing and closed-loop plant truth.
+3. Recover robust gate geometry, including clipped inner apertures.
+4. Predict relative gate state to command-effect time.
+5. Recenter and pass Gate 1 through separately bounded stages.
+6. Generalize the gate state machine to a conservative full lap.
+7. Establish repeatability.
+8. Optimize speed, crossing points, lookahead, and course-specific behavior.
+9. Evaluate advanced state estimation and control only where evidence supports it.
+
+## Non-negotiable operating contract
+
+### Main stays clean
+
+After the one-time bootstrap below:
+
+- No agent edits files directly in the main worktree.
+- Main is used only as a clean integration and release reference.
+- Every implementation task uses its own branch and worktree.
+- A task is not eligible for integration until all intended changes are committed.
+- A dirty candidate is rejected rather than silently snapshotted or merged.
+- Generated captures, caches, ledgers, profiles, and training artifacts stay outside
+  Git or in explicitly ignored roots.
+- Main must report an empty git status after every merge.
+
+### Safety authority stays separate
+
+The VQ2 safety supervisor remains the only component allowed to own:
+
+- reset-epoch proof;
+- countdown and GO proof;
+- arm/disarm freshness;
+- stream watchdogs;
+- command envelopes;
+- collision handling;
+- expected gate-index transitions;
+- exact-zero crossing confirmation;
+- cleanup proof;
+- stage timeout and latched aborts.
+
+Perception never declares passage. Planning never sends commands. Experimental
+control never arms, resets, or performs cleanup. Race status remains the sole
+VQ2 gate-pass authority, and crossing confirmation continues to send exact zero
+rate and zero thrust unless a later safety decision explicitly replaces it.
+
+### FlightSim is an exclusive resource
+
+- Offline work may run concurrently.
+- Only one process or agent may own the live simulator lease.
+- Only the integration worktree may run powered FlightSim stages.
+- Passive probes must still coordinate through the simulator lease so they do not
+  compete for UDP ports or invalidate a powered trial.
+- Every new powered stage requires explicit authorization and bounded cleanup.
+
+## Current repository snapshot
+
+The development-cycle work is much farther along than its original handoff:
+
+- strict pytest markers and timeouts are implemented;
+- the two production-length VQ1 tests are bounded;
+- a VQ2-first Windows task surface exists;
+- runtime, development, legacy, and training dependency profiles exist;
+- content-addressed prepared artifacts and atomic writes exist;
+- benchmark phase timing and provenance are substantially implemented;
+- replay bundle capture, verification, scoring, and splitting exist;
+- promotion, successive halving, SQLite leases, resumability, detached worktrees,
+  and a merger exist;
+- a warm live-campaign safety abstraction exists;
+- dependency inventory and disclosure tooling exist.
+
+The foundation batch is implemented and is awaiting normal review/commit rather
+than more architectural bootstrap work:
+
+- the main worktree intentionally contains the uncommitted P0-P2 batch; no user
+  changes were discarded and no scheduler worktree may be derived from it;
+- the default fast, unit, scoped VQ2, slow, and benchmark tiers are independently
+  selectable and fail closed on missing plugins, unknown markers, or timeouts;
+- the VQ2 policy pins the exact reviewed discovery inputs and 303-test count;
+- the trajectory gate-metadata round trip, cache corruption/recovery,
+  cold/warm equivalence, concurrent publication, and invalidation paths have
+  regression coverage;
+- `scripts\dev.cmd` is the canonical Windows entry point and works even when the
+  host policy blocks direct `.ps1` execution;
+- T0-T4 command shapes, tier-specific evidence, successive halving, immutable
+  checkpoints, exact detached worktrees, and a single merger are implemented;
+- T2-T4 are operational, nonpowered synthetic evaluators. T1 remains
+  intentionally non-runnable until an operator replaces the example's private
+  corpus, processor, and administrator-owned isolation-wrapper placeholders;
+- T5 is absent from the ordinary scheduler. The campaign command freezes and
+  hashes a plan but always refuses before any lease, preflight, simulator, or
+  powered action because no reviewed out-of-process watchdog executor is shipped;
+- no approved golden replay corpus, labels, calibrated production policy, or
+  authorized powered campaign exists in this checkout.
+
+The checked-in promotion files are examples, not evidence that the missing
+private T1 inputs or a live boundary exist. See `docs/aigp/durable_improvement_loop.md`
+for the exact trust, isolation, and provenance contract.
+
+## One-time dirty-worktree bootstrap
+
+The current dirty batch is the only planned exception to the clean-main rule.
+Do not create feature worktrees from it: detached worktrees cannot see its
+uncommitted files, and the scheduler correctly rejects dirty candidates.
+
+Bootstrap procedure:
+
+1. Confirm one owner has exclusive write ownership of the current working tree.
+2. Create or switch the current working tree to a named integration branch such
+   as integration/testing-foundation-20260718 without discarding any changes.
+3. Inventory tracked, untracked, generated, and ignored state.
+4. Reverify the completed stabilization work:
+   - trajectory/gate metadata round trips;
+   - green default fast and scoped VQ2 suites;
+   - cold/warm prepared-artifact equivalence;
+   - the `scripts\dev.cmd` Windows task contract;
+   - interpreter selection for each dependency profile;
+   - tier-scoped, provenance-bound promotion evidence.
+5. Split the batch into reviewable commits:
+   - test safety and bounded VQ1 behavior;
+   - VQ2 workflow, Windows tasks, and launcher;
+   - dependency profiles;
+   - prepared artifacts and benchmark provenance;
+   - matrix reuse and worker execution;
+   - replay bundle and scoring;
+   - promotion, ledger, scheduler, and merger;
+   - live-campaign scaffold and documentation.
+6. Run directly affected tests after each commit and the VQ2 suite for every
+   accepted commit.
+7. Run the final non-live promotion gates on the clean integration branch.
+8. Merge or fast-forward the finished integration branch into main.
+9. Verify main has an empty git status.
+10. Create all later worktrees from that clean main commit.
+
+Never use reset --hard, checkout-based discard, or bulk cleanup to make this
+batch appear clean. Preserve and classify every existing change.
+
+## Run-to-completion orchestration
+
+The program can run autonomously without dirty-worktree ambiguity once the
+bootstrap completes. Use the existing ledger and scheduler as the durable source
+of task state.
+
+### Task lifecycle
+
+Each task moves through:
+
+    queued
+      -> leased
+      -> active
+      -> tested
+      -> committed
+      -> integration_pending
+      -> integrated
+      -> post_merge_verified
+
+Failure, timeout, or interruption records evidence and returns the task to a
+reviewable or resumable state. It does not leave an anonymous dirty worktree.
+
+### Task manifest
+
+Every implementation task should record:
+
+- task and parent identifiers;
+- objective and explicit non-goals;
+- starting main commit;
+- branch and worktree path;
+- owned files or module boundary;
+- dependencies and interface versions;
+- required tests and acceptance metrics;
+- simulator access level: none, passive, or powered;
+- artifact/cache roots;
+- lease owner and heartbeat;
+- final commit hash;
+- result and failure provenance.
+
+### Start checks
+
+Before an agent writes:
+
+1. Main commit matches the task's declared base or the task is rebased deliberately.
+2. The task worktree has an empty status.
+3. No other active task owns the same integration-hot file or schema.
+4. Required interface/schema versions match.
+5. The appropriate cache and artifact roots are isolated.
+6. Live simulator lease is held if needed.
+
+If any check fails, the task waits or is replanned; it does not improvise inside
+another task's worktree.
+
+### Completion checks
+
+A task is finished only when:
+
+- the worktree is clean;
+- all intended changes are committed;
+- directly affected tests pass;
+- the required promotion tier passes;
+- artifacts and metrics have hashes and provenance;
+- documentation or decision records are updated when behavior changed;
+- the branch is ready for integration without hidden local state.
+
+### Integration checks
+
+Use one integration owner:
+
+1. Rebase or merge the candidate onto current main in its own worktree.
+2. Resolve conflicts there, never through uncommitted edits on main.
+3. Re-run affected tests and the VQ2 suite.
+4. Run any higher promotion gate required by the change.
+5. Merge or fast-forward the committed branch into main.
+6. Run a short post-merge verification.
+7. Verify main is clean.
+8. Mark the ledger task integrated and retire the worktree only after evidence
+   is safely stored.
+
+Main may advance frequently. Finished, green work should be merged rather than
+accumulating a long-lived integration branch.
+
+### Resume and recovery
+
+- Leases expire and may be reclaimed.
+- Completed checkpoints are not repeated.
+- A dirty abandoned worktree is quarantined and attributed to its task.
+- Its diff and untracked inventory are recorded before human or integration-owner
+  review.
+- Automation never erases an unexplained dirty state.
+- Live trials resume only from a fresh reset and preflight, never from an assumed
+  in-flight state.
+
+## Target architecture and ownership boundaries
+
+    Sensor ingress
+      -> immutable timestamped frame / IMU / race data
+      -> perception: GateObservation[]
+      -> active and shadow tracking
+      -> relative-state estimator
+      -> guidance objective
+      -> pure controller: CommandProposal
+      -> safety supervisor and phase authority
+      -> MAVLink transport
+
+Recording is a non-blocking side channel at each boundary.
+
+Suggested versioned contracts:
+
+GateObservation:
+
+- generation, frame ID, and measurement timestamp;
+- candidate identity;
+- normalized center;
+- visible inner and outer edges;
+- inner corners when available;
+- apparent scale and skew;
+- clipping mask;
+- confidence, covariance, and residual diagnostics.
+
+RelativeGateState:
+
+- measurement and prediction times;
+- authoritative gate epoch/index;
+- normalized bearing and bearing rates;
+- log scale and expansion rate;
+- optional relative pose and velocity;
+- covariance;
+- clipping and visibility flags;
+- innovation and health state.
+
+CommandProposal:
+
+- proposal timestamp and source-state timestamp;
+- requested body rates and thrust;
+- phase and reason;
+- saturation and uncertainty diagnostics;
+- no transport, arm, reset, or cleanup authority.
+
+## Milestones
+
+| Milestone | Outcome | Main prerequisite |
+|---|---|---|
+| M0 | Stable, green, committed evaluation foundation | Bootstrap |
+| M1 | Runtime timing and simulator semantics dossier | M0 |
+| M2 | Robust clipped Gate 1 geometry with uncertainty | M0 and replay evidence |
+| M3 | Bounded Gate 1 recentering without passage | M1 and M2 |
+| M4 | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M5 | Separately reviewed Gate 1 passage | M3 and M4 |
+| M6 | Conservative valid full lap | M5 |
+| M7 | Repeatable baseline across fresh and warm sessions | M6 |
+| M8 | Safe time optimization | M7 |
+| M9 | Advanced pose, mapping, MPC, ILC, or learned residuals | Evidence after M7 |
+
+M0-M4 allow substantial offline parallelism. M5 onward is increasingly
+serialized around integration and live evidence.
+
+## Workstream A: evaluation foundation
+
+Tasks:
+
+- review and commit the completed dirty-worktree foundation without discarding or
+  silently absorbing unrelated changes;
+- run a clean committed candidate through the already implemented scheduler,
+  resume, deduplication, exact-worktree, and merger paths;
+- provision an administrator-owned pinned isolation wrapper and approved private
+  replay corpus before attempting T1 outside its synthetic/mocked tests;
+- implement and review the competition-specific replay processor once the final
+  interface is known;
+- obtain approved replay sessions and calibrate a production policy.
+
+Acceptance:
+
+- test-fast, test-unit, test-vq2, bounded slow, and explicit benchmark tiers are
+  green;
+- prepared cold/warm metrics match within declared tolerance;
+- no skipped evaluator can satisfy a promotion gate;
+- T0/T1 never claim closed-loop completion and T2-T4 identify their synthetic
+  nonpowered domain;
+- dirty or provenance-mismatched candidates are rejected;
+- the canonical Windows command works on the target host.
+
+## Workstream B: runtime timing
+
+Instrument:
+
+    camera epoch timestamp
+      -> first and last packet arrival
+      -> reassembly
+      -> decode
+      -> detection
+      -> tracking
+      -> estimator update
+      -> prediction
+      -> controller decision
+      -> command send
+      -> actuator and gyro response
+
+Measure p50, p95, p99, and maximum latency; command intervals; deadline misses;
+repeated-frame ticks; frame drops; queue depth; duplicate packets; stream rates;
+simulator/wall ratio; graphics preset; focus state; process uptime; and host load.
+
+Scheduler outcome:
+
+- at least 20 ms between command sends;
+- near-50-Hz steady operation when work fits;
+- missed ticks are skipped;
+- catch-up bursts are impossible;
+- perception updates only on distinct frames;
+- state predicts at IMU/control rate.
+
+Remain at the reviewed 50-Hz cap initially.
+
+## Workstream C: gate geometry and perception
+
+Stages:
+
+1. Treat missing top, bottom, left, and right edges as censored observations.
+2. Extract inner aperture edges and corners.
+3. Fit a planar/square aperture with residuals and uncertainty.
+4. Maintain separate active and shadow tracks.
+5. Evaluate IPPE/PnP only when corner quality and calibration support it.
+6. Add multiple-gate association only after single-gate behavior is stable.
+
+Acceptance:
+
+- Gate 0 replay does not regress;
+- the recorded top-clipped Gate 1 has stable center and honest uncertainty;
+- partial geometry increases uncertainty instead of inventing precision;
+- crossing residue cannot seed the next active track;
+- placeholder distance or pose does not reach production control.
+
+If corners remain unreliable under clipping, use edge, bearing, and scale
+features rather than forcing a metric pose.
+
+## Workstream D: filtering and state estimation
+
+Initial estimator:
+
+- small Kalman or alpha-beta feature filter;
+- one update per distinct frame;
+- normalized bearing, log scale, and their rates;
+- IMU derotation from capture to prediction time;
+- confidence- and clipping-dependent covariance;
+- normalized-innovation gating;
+- bounded dropout prediction;
+- explicit unhealthy and uncertain states.
+
+Attitude work:
+
+- retain short-horizon gyro propagation;
+- measure stationary bias and lap-duration drift;
+- gate accelerometer correction by dynamics;
+- calibrate camera/IMU temporal offset;
+- keep yaw command zero until independently calibrated.
+
+Later candidates:
+
+- gate-relative error-state filter;
+- optional VIO in shadow mode;
+- gate-based translation/yaw drift correction.
+
+Acceptance:
+
+- deterministic replay;
+- no duplicate-frame double update;
+- lower future-frame center error than zero-order hold, especially p95;
+- bounded dropout uncertainty;
+- shadow-mode evidence before command authority.
+
+## Workstream E: control and gate progression
+
+Extract a pure deterministic controller:
+
+    controller(relative_state, attitude, phase, config)
+      -> CommandProposal and diagnostics
+
+Stages:
+
+1. Reproduce the current Gate 0 command behavior.
+2. Add a bounded Gate 1 recenter stage after proved 0-to-1 credit.
+3. Control normalized bearing and bearing-rate damping.
+4. Schedule forward progress from scale expansion/time-to-contact.
+5. Predict to measured command-effect time.
+6. Add saturation-aware scheduling and slew limits.
+7. Generalize phases:
+   - acquire;
+   - align;
+   - accelerate;
+   - approach;
+   - commit;
+   - exact-zero confirmation;
+   - post-credit reacquisition.
+8. Pass Gate 1 through a separately reviewed stage.
+9. Generalize the expected i-to-i+1 loop.
+
+Gate 1 recentering must end at its corridor or timeout and must not attempt
+passage. An unexpected gate-index transition aborts the stage.
+
+Relative visual NMPC is a later candidate, not an MVP prerequisite.
+
+## Workstream F: navigation and planning
+
+Mapless core:
+
+- one authoritative active gate at a time;
+- keep aperture visible;
+- uncertainty-aware crossing margin;
+- approximately normal approach when skew is observable;
+- shadow next gate without authority;
+- generic expected-index sequencing.
+
+Local lookahead:
+
+- small local gate map;
+- two- or three-gate horizon;
+- crossing point selected partly for the next turn;
+- visibility and predicted image velocity objectives;
+- center-crossing fallback under uncertainty.
+
+Optional simulator priors:
+
+- keyed by build, course signature, calibration, code, and schema;
+- validated before use;
+- never override current observations or authoritative sequence;
+- mapless cold-start remains functional;
+- disabled for the physical/no-prior profile.
+
+Global time optimization begins only after a repeatable full lap and credible
+metric state. It should optimize finite apertures and include measured hidden
+rate-loop lag. MPCC, aperture-aware trajectory optimization, retiming, ILC, and
+learned residuals remain evidence-driven candidates.
+
+## Workstream G: simulator characterization and system identification
+
+Passive:
+
+- packet and field census;
+- race-status cadence and jitter;
+- camera/IMU/race timestamps versus wall time;
+- graphics preset and focus/minimize A/B tests;
+- pilot-feed invariance;
+- simulator-time/wall-time behavior;
+- reset and initial-state repeatability.
+
+Bounded powered:
+
+- repeat sign identification;
+- hover equilibrium;
+- small rate doublets/chirps;
+- thrust steps;
+- per-axis command delay, lag, slew, saturation, and cross coupling.
+
+Later flight identification:
+
+- pitch/thrust to image expansion;
+- forward acceleration and braking;
+- drag;
+- command/gyro/visual/race-event alignment;
+- low-speed valid crossings for pass-plane and scoring-time inference.
+
+Fit simple models first and validate them on held-out pulses. Preserve model
+uncertainty. Do not deliberately crash merely to map the collision envelope.
+
+## Workstream H: promotion, reliability, and qualification
+
+Evidence ladder:
+
+| Tier | Evidence |
+|---|---|
+| T0 | Unit and interface correctness |
+| T1 | Golden replay perception, estimation, and open-loop commands |
+| T2 | VQ2-specific deterministic closed-loop surrogate |
+| T3 | Changed-domain scenarios and repetitions |
+| T4 | Full non-live matrix and regression suite |
+| T5 | Explicit bounded Training-mode FlightSim trial |
+
+The T2 evaluator should include 30-Hz timestamped vision, clipping, IMU
+propagation, measured rate lag, latency/jitter, race-status delay, bounds, and
+authoritative sequencing. It is regression evidence, not official-simulator
+equivalence.
+
+After the first full lap:
+
+- measure warm and fresh-session repeatability;
+- interleave baseline and candidate trials;
+- record process uptime and trial count;
+- stop on baseline drift;
+- use successive halving before live evaluation;
+- retain conservative and aggressive configurations.
+
+A provisional reliability target is ten consecutive conservative valid laps
+across mixed warm and fresh sessions. Adjust the final sample requirement after
+measuring simulator repeatability.
+
+Before Qualification:
+
+- freeze commit, configuration, dependencies, calibration, build, and artifacts;
+- complete dependency and tool disclosure review;
+- disable online search and human interaction;
+- preserve a reliable fallback candidate;
+- submit only previously promoted frozen candidates.
+
+## Workstream I: sim-to-real optionality
+
+The simulator may use resets and track-specific priors. The physical core must
+not require them.
+
+- Version intrinsics, extrinsics, time offsets, IMU characteristics, thrust
+  mapping, rate dynamics, and command envelopes.
+- Keep mapless relative visual operation as fallback.
+- Put reset automation, course priors, and ILC behind optional providers.
+- Add held-out robustness tests for delay, loss, blur, lighting, clipping,
+  calibration error, and dynamics variation.
+- Keep transport-specific MAVLink below the controller.
+- Make physical gate-progress authority a separate reviewed provider rather
+  than reusing a visual heuristic as simulator race status.
+
+## Worktrees and parallel execution
+
+Recommended root:
+
+    C:\Users\John\aigp-worktrees
+
+Create only the worktrees needed for the active wave:
+
+| Worktree | Ownership |
+|---|---|
+| wt-runtime-timing | Timebase, latency instrumentation, scheduler tests |
+| wt-gate-geometry | Clipping, aperture, corners, replay metrics |
+| wt-relative-estimation | Feature filter, prediction, estimator health |
+| wt-vq2-control | Pure predictive controller modules |
+| wt-system-id | Offline fitting and bounded experiment definitions |
+| wt-vq2-planning | Mapless guidance, lookahead, optional priors |
+| wt-evaluation | VQ2 surrogate, scoped evidence, tuning |
+| wt-vq2-integration | Sole runner, safety, and live integration owner |
+
+Always serialize ownership of:
+
+- scripts\aigp_vq2_run.py and live stage sequencing;
+- safety constants, reset, confirmation, and cleanup;
+- replay/observation schema changes until versioned;
+- benchmark schema and cache-key changes;
+- ledger merger and promotion decisions;
+- every live simulator connection.
+
+Each worktree uses its own cache/artifact root and no ad hoc shared writable
+SQLite database. A locked environment may be shared read-only. Do not install
+dependencies during a performance experiment.
+
+### Four-slot execution waves
+
+Wave 0, bootstrap:
+
+- Agent 1 owns and stabilizes the current dirty testing foundation.
+- Agent 2 defines versioned timing, observation, estimator, and evidence contracts.
+- Agent 3 completes passive simulator characterization and catalogs existing
+  Gate 0/Gate 1 evidence.
+- The coordinating agent reviews and integrates.
+
+Only Agent 1 writes the current dirty tree.
+
+Wave 1, after clean M0:
+
+- runtime timing;
+- clipped gate geometry;
+- relative-state filter;
+- coordinator reviews interfaces and preserves Gate 0.
+
+Wave 2:
+
+- pure predictive IBVS;
+- system-identification tooling;
+- mapless guidance/state machine;
+- coordinator designs the bounded Gate 1 recenter integration.
+
+Wave 3:
+
+- one integration owner merges M1-M4;
+- one exclusive live agent runs the Gate 1 recenter stage;
+- other agents continue offline on pose, replay scoring, and the VQ2 surrogate.
+
+Wave 4, after conservative completion:
+
+- metric pose/VIO;
+- local map/lookahead;
+- MPC/MPCC comparisons;
+- simulator-only course learning/ILC;
+- sim-to-real robustness profile.
+
+## Passive simulator findings from 2026-07-18
+
+No reset, arm/disarm, attitude target, graphics, or powered command was sent.
+
+- passive preflight passed at about 31 decoded frames/s;
+- six-second census camera rate: 30.36 Hz;
+- HIGHRES_IMU: 118.17 Hz;
+- ACTUATOR_OUTPUT_STATUS: 95.43 Hz;
+- HEARTBEAT: 9.95 Hz;
+- race status: 3.990 Hz;
+- blocked pose/odometry/gate messages were absent;
+- low-load simulator/wall ratio: 1.00006;
+- camera timestamps are epoch scale, not reset-relative time;
+- the centered square gate appeared about 80 by 81 pixels, supporting fx=fy=320
+  and a 90-degree horizontal / 58.7-degree vertical FOV interpretation;
+- the simulator produced almost 300,000 camera datagrams in six seconds, of
+  which about 292,000 were duplicates;
+- the spawn heartbeat armed bit was true despite no actuator demand.
+
+Still requiring controlled evidence:
+
+- final scoring time basis;
+- lockstep behavior under load;
+- command application tick and saturation;
+- exact camera timestamp meaning;
+- calibrated FOV/extrinsics;
+- pass-plane and collision-envelope details;
+- gate-credit delay distribution.
+
+## Immediate next actions
+
+1. Review and split the completed foundation batch into the documented commit
+   sequence, then verify main is clean.
+2. Regenerate/review the trusted evaluator manifest on that exact clean commit.
+3. Freeze/version the integration contracts and create Wave 1 worktrees from it.
+4. Provision the private golden replay corpus and administrator-owned isolation
+   wrapper before enabling T1.
+5. Exercise T0-T4 on a real clean candidate and retain the ledger/checkpoint
+   evidence; do not reinterpret synthetic T2-T4 results as FlightSim evidence.
+6. Continue only authorized passive probes while offline work proceeds.
+7. Integrate only after each branch is committed and promoted.
+8. Treat every powered system-identification or Gate 1 stage as a separate,
+   explicitly authorized workflow outside the shipped scheduler.
+
+## Open authorization item
+
+The replay tooling requires an explicit attestation before storing full decoded
+competition frames. Confirm organizer permission before building the private
+golden corpus. Without it, use existing approved captures, isolated stills, and
+synthetic/derived test data.
+
+## Definition of program completion
+
+The program is complete when:
+
+- main is clean and contains only reviewed, committed integrations;
+- a frozen candidate completes the full VQ2 course in correct sequence;
+- completion is repeatable across the chosen reliability campaign;
+- every powered result proves reset, countdown/GO, freshness, watchdogs,
+  collision/sequence state, and cleanup;
+- simulator-only priors are optional and the mapless fallback remains functional;
+- performance candidates are promoted by paired evidence rather than a lucky lap;
+- qualification artifacts, dependencies, calibration, configuration, and
+  disclosures are frozen and reproducible.

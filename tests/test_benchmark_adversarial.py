@@ -34,6 +34,11 @@ from gate_sequencing.sequencer import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_benchmark_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIGP_CACHE_ROOT", str(tmp_path / "artifacts"))
+
+
 # ---------------------------------------------------------------------------
 # I-2: synthetic frame-strut crash is terminal
 # ---------------------------------------------------------------------------
@@ -57,6 +62,7 @@ def test_sequencer_records_geometric_frame_strike():
     assert seq.last_crash[0] == "g1"
 
 
+@pytest.mark.benchmark
 def test_synthetic_bench_exposes_honesty_fields():
     """`run_synthetic_benchmark` result must expose the new honesty surface.
 
@@ -98,9 +104,18 @@ def test_synthetic_bench_exposes_honesty_fields():
     for key in ("crashed", "disqualified", "dq_reason", "last_crash_gate",
                 "sim_passed", "threshold_failures"):
         assert key in result, f"missing honesty field {key!r} in result dict"
-    # sim_passed is False iff there is a terminal failure (crash or DQ).
-    terminal = bool(result["crashed"] or result["disqualified"])
-    assert (result["sim_passed"] is False) == terminal or result["sim_passed"] is True
+    expected_pass = (
+        result["safety_passed"] is True
+        and result["validity_passed"] is True
+        and result["complete"] is True
+        and not result["threshold_failures"]
+    )
+    assert result["sim_passed"] is expected_pass
+    if result["crashed"] or result["disqualified"]:
+        assert result["safety_passed"] is False
+        assert result["sim_passed"] is False
+    if not result["validity_passed"] or not result["complete"]:
+        assert result["sim_passed"] is False
     # If we crashed, threshold_failures must mention it (operator surface).
     if result["crashed"]:
         joined = " ".join(result["threshold_failures"])
@@ -110,6 +125,7 @@ def test_synthetic_bench_exposes_honesty_fields():
         assert "disqualified" in joined
 
 
+@pytest.mark.benchmark
 def test_synthetic_bench_terminal_failure_makes_sim_passed_false():
     """A run that hits a crash condition must report sim_passed=False.
 
@@ -152,6 +168,7 @@ def test_synthetic_bench_terminal_failure_makes_sim_passed_false():
 # Iter-002 (composer-25 F6/F7): crashed and disqualified are SEPARATE signals
 # ---------------------------------------------------------------------------
 
+@pytest.mark.benchmark
 def test_bench_does_not_overload_crashed_for_dq():
     """A bench run that DQs must report `crashed=False` and
     `disqualified=True`. Pre-fix the bench conflated the two by setting

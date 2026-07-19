@@ -36,8 +36,27 @@ DEFAULT_CONFIG_PATH = _REPO_ROOT / "config" / "ilc_defaults.json"
 def load_ilc_config(path: Optional[Path] = None) -> dict:
     """Load `config/ilc_defaults.json` (or a caller-provided override path)."""
     p = path or DEFAULT_CONFIG_PATH
-    with open(p) as f:
-        return json.load(f)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key in ILC config: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"non-standard JSON numeric constant in ILC config: {value}")
+
+    with open(p, encoding="utf-8") as handle:
+        config = json.load(
+            handle,
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
+        )
+    if not isinstance(config, dict):
+        raise TypeError("ILC config root must be a JSON object")
+    return config
 
 
 def derive_section_boundaries(

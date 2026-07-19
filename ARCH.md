@@ -2,7 +2,8 @@
 
 ## Current System Layout
 - `flight_control/`: controller stack (`MPCPlanner`, PID, `TRPYMixer`, target adapters)
-- `gate_detection/`: classical CV + YOLOv8-pose fused gate detection, Phase 1 detector
+- `gate_detection/`: build-3385 VQ2 classical red-gate detector plus historical/general classical detectors; no fused or learned detector is integrated
+- `competition/` + `scripts/aigp_vq2_run.py`: current build-3385 camera, `HIGHRES_IMU`, race-status, safety, and staged-control runtime
 - `simulation/`: lightweight synthetic field/gate/path/camera environment (no physics)
 - `sim_pybullet/`: PyBullet-based closed-loop simulation with real physics, gate sequencing, dual-camera rendering
 - `scripts/`: environment bootstrap and demo execution helpers
@@ -116,6 +117,10 @@ autonomy stack: camera → detection → sequencing → planning → control →
 - **Real detection** (`--use-detection`): runs actual `gate_detection` pipeline on rendered frames
 - **Phase 1** (`--detector phase1`): optimized for highlighted gates in desaturated environment
 
+These modes describe the secondary PyBullet runner. The competition-facing
+build-3385 runtime uses `VQ2GateDetector` with the asynchronous VQ2 vision
+receiver and gyro-only post-bootstrap attitude estimator.
+
 ## Flight Control Architecture
 
 ### Control Pipeline
@@ -155,28 +160,35 @@ Converts world-frame accelerations to competition-format controls:
 ### Detectors
 - `GateDetector` — color-agnostic classical pipeline (edge + clustering + HSV)
 - `Phase1GateDetector` — saturation/brightness thresholding for VQ1
+- `VQ2GateDetector` — low-latency red-gate segmentation used by the build-3385 runtime
 - (`FusedGateDetector` was removed — module never landed; the `--detector fused`
   branch was deleted 2026-05-09 with P0-4.)
 
 ### Training Pipeline
-- `training/extract_frames.py` — extracts TII dataset frames with YOLO-pose labels
-- `training/train.py` — trains YOLOv8n-pose on the extracted dataset
-- `training/validate.py` — validation metrics + problem frame analysis
-- `training/export.py` — exports to ONNX for deployment
+
+There is no reproducible learned-detector pipeline in this checkout. The
+historical `training/runs/gate_pose_v1/` outputs remain for evidence, but the
+dataset and the previously documented extraction/train/validate/export scripts
+are absent, and no VQ2 runtime path references those weights. See
+`gate_detection/training/README.md` and use the read-only
+`scripts/audit_yolo_experiment.py` audit before making any future training
+decision. The dataset-manifest schema is prerequisite scaffolding, not a claim
+that the missing data has known provenance.
 
 ## Tradeoffs
 - Two simulation systems: lightweight (fast, testable) + PyBullet (realistic, heavy)
 - TRPY mixer is a linear approximation; works for moderate attitudes but degrades at extreme angles
-- Phase 1 detector is deliberately simple — will need retuning once we see the actual VQ1 environment
+- The production VQ2 detector is deliberately small and build-specific; any
+  threshold change needs private replay evidence before a powered trial. The
+  historical Phase 1 and YOLO-pose artifacts are not production fallbacks.
 - The attitude-control path is single-loop PD (no cascaded angle→rate PID inner
   loop). Acceptable around hover and low-speed manoeuvres; structurally unstable
   beyond hover (P0-5, deferred). Until the cascaded loop ships, target attitudes
   must stay clamped.
-- Production `pass_through_margin = 1.5` keeps imprecise-flight tolerance for
-  pass classification, but the geometric crash zone collapses under it. The
-  authoritative crash signal in production is `mark_collision` (PyBullet's
-  contact manifold). `crash_margin = 1.0` (separate from `pass_through_margin`)
-  keeps the geometric crash zone non-empty for tests and debug.
+- Secondary geometric simulations may use a lenient `pass_through_margin`, but
+  the current synthetic benchmark evaluator requires an actual plane crossing
+  and keeps `crash_margin` separate. In the build-3385 competition runtime, organizer
+  race-status/collision telemetry—not PyBullet geometry—is authoritative.
 
 ## Maintenance Rule
 Keep this file updated whenever:

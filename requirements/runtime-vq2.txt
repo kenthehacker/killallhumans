@@ -1,0 +1,7 @@
+# FlightSim build-3385 VQ2 runtime, validated with CPython 3.12 on Windows.
+# Keep this profile small: vision + HIGHRES_IMU + raw MAVLink transport.
+fastcrc==0.3.6
+lxml==6.1.1
+numpy==2.5.1
+opencv-python==5.0.0.93
+pymavlink==2.4.49

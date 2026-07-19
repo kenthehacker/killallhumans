@@ -19,6 +19,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolated_benchmark_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIGP_CACHE_ROOT", str(tmp_path / "artifacts"))
+
 from control.learned_residual import (
     DEFAULT_N_HIDDEN,
     DEFAULT_N_INPUTS,
@@ -158,6 +163,7 @@ def test_save_feature_trace_rejects_empty(tmp_path):
         save_feature_trace([], tmp_path / "x.npz")
 
 
+@pytest.mark.benchmark
 def test_bench_exposes_tracker_feature_trace_when_enabled():
     """Iter-024: the synthetic matrix bench exposes the GeometricTracker's
     feature_trace in the result dict so external scripts can collect
@@ -195,7 +201,20 @@ def test_bench_exposes_tracker_feature_trace_when_enabled():
     assert len(pos_err) == 3
     assert len(vel_err) == 3
 
+    # JSON-backed cache hits must preserve the same in-memory feature-vector
+    # contract as the cold evaluator path.
+    r_cached = run_synthetic_benchmark(
+        duration=1.0,
+        config=cfg,
+        tracker_config_overrides={"trace_features": True},
+    )
+    assert r_cached["cache"]["benchmark_result"] == "hit"
+    assert r_cached["tracker_feature_trace"][0][0].shape == (
+        DEFAULT_N_INPUTS,
+    )
 
+
+@pytest.mark.benchmark
 def test_collect_residual_dataset_smoke(tmp_path, monkeypatch):
     """Iter-025: collect_residual_dataset.collect() runs the bench
     across non-skip tracks, concatenates traces, saves an .npz that
@@ -212,7 +231,7 @@ def test_collect_residual_dataset_smoke(tmp_path, monkeypatch):
          "straight_hairpin", "vertical_cliff"},
     )
     out = tmp_path / "ds.npz"
-    summary = col.collect(out, duration=2.0)
+    summary = col.collect(out, duration=2.0, allow_prefix=True)
     assert summary["total_samples"] > 50
     # Verify the file round-trips.
     loaded = load_feature_trace(out)
@@ -280,6 +299,86 @@ def test_input_dim_mismatch_raises():
     mlp = TrackerResidualMLP.zero_init()
     with pytest.raises(ValueError):
         mlp.forward(np.zeros(DEFAULT_N_INPUTS - 1))
+
+
+@pytest.mark.parametrize("field", ["W1", "b1", "W2", "b2"])
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+def test_model_rejects_nonfinite_parameters(field, bad_value):
+    values = {
+        "W1": np.zeros((DEFAULT_N_INPUTS, DEFAULT_N_HIDDEN)),
+        "b1": np.zeros(DEFAULT_N_HIDDEN),
+        "W2": np.zeros((DEFAULT_N_HIDDEN, DEFAULT_N_OUTPUTS)),
+        "b2": np.zeros(DEFAULT_N_OUTPUTS),
+    }
+    values[field].flat[0] = bad_value
+    with pytest.raises(ValueError, match="finite"):
+        TrackerResidualMLP(**values)
+
+
+@pytest.mark.parametrize("bad_std", [0.0, -1.0, float("nan"), float("inf")])
+def test_model_rejects_invalid_feature_standard_deviation(bad_std):
+    with pytest.raises(ValueError, match="feat_std"):
+        TrackerResidualMLP(
+            W1=np.zeros((DEFAULT_N_INPUTS, DEFAULT_N_HIDDEN)),
+            b1=np.zeros(DEFAULT_N_HIDDEN),
+            W2=np.zeros((DEFAULT_N_HIDDEN, DEFAULT_N_OUTPUTS)),
+            b2=np.zeros(DEFAULT_N_OUTPUTS),
+            feat_mean=np.zeros(DEFAULT_N_INPUTS),
+            feat_std=np.full(DEFAULT_N_INPUTS, bad_std),
+        )
+
+
+@pytest.mark.parametrize("bad_clamp", [0.0, -1.0, float("nan"), float("inf")])
+def test_model_rejects_invalid_output_clamp(bad_clamp):
+    with pytest.raises(ValueError, match="output_clamp"):
+        TrackerResidualMLP(
+            W1=np.zeros((DEFAULT_N_INPUTS, DEFAULT_N_HIDDEN)),
+            b1=np.zeros(DEFAULT_N_HIDDEN),
+            W2=np.zeros((DEFAULT_N_HIDDEN, DEFAULT_N_OUTPUTS)),
+            b2=np.zeros(DEFAULT_N_OUTPUTS),
+            output_clamp=np.full(DEFAULT_N_OUTPUTS, bad_clamp),
+        )
+
+
+def test_model_rejects_nonfinite_input_before_command_generation():
+    mlp = TrackerResidualMLP.zero_init()
+    sample = np.zeros(DEFAULT_N_INPUTS)
+    sample[0] = np.nan
+    with pytest.raises(ValueError, match="input.*finite"):
+        mlp.forward(sample)
+
+
+@pytest.mark.parametrize("n_outputs", [1, 2, 4])
+def test_tracker_rejects_selected_model_with_wrong_output_dimension(
+    tmp_path: Path, n_outputs: int
+):
+    malformed = TrackerResidualMLP.zero_init(n_outputs=n_outputs)
+    path = tmp_path / f"wrong-output-{n_outputs}.npz"
+    malformed.to_npz(path)
+
+    with pytest.raises(RuntimeError, match="selected residual weights are invalid"):
+        GeometricTracker(
+            TrackerConfig(use_residual=True, residual_weights_path=str(path))
+        )
+
+
+def test_tracker_rejects_explicit_missing_residual_weights(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="selected residual weights are invalid"):
+        GeometricTracker(
+            TrackerConfig(
+                use_residual=True,
+                residual_weights_path=str(tmp_path / "missing.npz"),
+            )
+        )
+
+
+def test_tracker_rejects_explicit_corrupt_residual_weights(tmp_path: Path):
+    path = tmp_path / "corrupt.npz"
+    path.write_bytes(b"not a NumPy archive")
+    with pytest.raises(RuntimeError, match="selected residual weights are invalid"):
+        GeometricTracker(
+            TrackerConfig(use_residual=True, residual_weights_path=str(path))
+        )
 
 
 def test_build_input_features_is_12_dim_and_ordered():
@@ -413,20 +512,27 @@ def test_residual_off_is_byte_identical_to_baseline():
     assert c1.thrust == c2.thrust
 
 
-def test_residual_on_with_zero_init_matches_baseline_within_float_epsilon(tmp_path):
+def test_residual_on_with_no_selected_weights_matches_baseline_within_float_epsilon(
+    monkeypatch,
+):
     """Turn the feature on with NO weights file present -> the safety
     fallback initialises zero-init weights, so the tracker output matches
     baseline to within numerical noise.
 
     Iter-031 added auto-resolve at `<repo>/control/residual_weights.npz`
-    when `residual_weights_path=None`. To test the zero-init fallback
-    independent of whether the repo happens to ship a trained weights
-    file, point at a path that definitely doesn't exist."""
-    cfg_off = TrackerConfig(use_residual=False)
-    cfg_on_zero = TrackerConfig(
-        use_residual=True,
-        residual_weights_path=str(tmp_path / "does_not_exist.npz"),
+    when `residual_weights_path=None`. Force that optional default absent so
+    this test remains independent of locally generated ignored weights."""
+    import control.mpc_tracker as tracker_module
+
+    default_weights = Path(tracker_module.__file__).resolve().parent / "residual_weights.npz"
+    original_exists = Path.exists
+    monkeypatch.setattr(
+        Path,
+        "exists",
+        lambda self: False if self.resolve() == default_weights else original_exists(self),
     )
+    cfg_off = TrackerConfig(use_residual=False)
+    cfg_on_zero = TrackerConfig(use_residual=True, residual_weights_path=None)
     t_off = GeometricTracker(cfg_off)
     t_on = GeometricTracker(cfg_on_zero)
 

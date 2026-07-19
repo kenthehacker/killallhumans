@@ -71,6 +71,38 @@ def test_rejects_duplicate_chunk_keys_before_reassembly_and_decodes_once():
     assert stats.receiver_dropped_late_packets == 0
 
 
+def test_snapshot_callback_receives_every_published_decoded_frame_once():
+    delivered = []
+    receiver = VQ2VisionThread(on_snapshot=delivered.append)
+    for frame_id in (7, 8):
+        packet = _jpeg_packets(
+            frame_id=frame_id,
+            sim_time_ns=frame_id * 1_000,
+            total_chunks=1,
+        )[0]
+        assert receiver.feed_datagram(packet) is not None
+        assert receiver.feed_datagram(packet) is None
+    assert [(item.frame_id, item.sim_time_ns) for item in delivered] == [
+        (7, 7_000),
+        (8, 8_000),
+    ]
+    assert receiver.stats().frames_decoded == len(delivered)
+    assert delivered[0].camera_frame.image.flags.writeable is False
+    with pytest.raises(ValueError):
+        delivered[0].camera_frame.image[0, 0, 0] = 255
+
+
+def test_snapshot_callback_failure_is_counted_without_losing_publication():
+    def broken(_snapshot):
+        raise RuntimeError("capture callback failed")
+
+    receiver = VQ2VisionThread(on_snapshot=broken)
+    snapshot = receiver.feed_datagram(_jpeg_packets(total_chunks=1)[0])
+    assert snapshot is not None
+    assert receiver.snapshot() is snapshot
+    assert receiver.stats().snapshot_callback_errors == 1
+
+
 def test_snapshot_freshness_and_reset_accept_restarted_frame_ids():
     receiver = VQ2VisionThread()
     packet = _jpeg_packets(frame_id=19, total_chunks=1)[0]
@@ -138,6 +170,36 @@ def test_reset_prevents_in_progress_old_generation_decode_from_publishing(monkey
     assert not worker.is_alive()
     assert receiver.snapshot() is None
     assert receiver.stats().reset_generation_drops == 1
+
+
+def test_stop_fails_if_decode_thread_survives_and_success_proves_no_late_callback(monkeypatch):
+    delivered = []
+    receiver = VQ2VisionThread(on_snapshot=delivered.append)
+    packet = _jpeg_packets(frame_id=32, total_chunks=1)[0]
+    decode_started = threading.Event()
+    allow_decode = threading.Event()
+    real_decode = vq2_vision_module.decode_jpeg_to_camera_frame
+
+    def delayed_decode(frame):
+        decode_started.set()
+        assert allow_decode.wait(timeout=2.0)
+        return real_decode(frame)
+
+    monkeypatch.setattr(vq2_vision_module, "decode_jpeg_to_camera_frame", delayed_decode)
+    worker = threading.Thread(target=receiver.feed_datagram, args=(packet,))
+    with receiver._lifecycle_lock:
+        receiver._thread = worker
+    worker.start()
+    assert decode_started.wait(timeout=1.0)
+    with pytest.raises(RuntimeError, match="did not terminate"):
+        receiver.stop(timeout_s=0.01)
+    assert delivered == []
+    allow_decode.set()
+    worker.join(timeout=1.0)
+    receiver.stop(timeout_s=0.1)
+    delivered_after_success = len(delivered)
+    time.sleep(0.02)
+    assert len(delivered) == delivered_after_success
 
 
 def test_older_frame_completing_late_cannot_regress_published_snapshot():

@@ -18,6 +18,8 @@ import pytest
 
 from scripts.sim_closed_loop import run
 
+pytestmark = pytest.mark.benchmark
+
 
 @pytest.fixture(scope="module")
 def flight():

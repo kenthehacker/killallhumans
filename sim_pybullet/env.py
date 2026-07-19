@@ -6,6 +6,7 @@ Uses gym-pybullet-drones (CtrlAviary + DSLPIDControl) for real Crazyflie physics
 """
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
@@ -96,7 +97,12 @@ class DroneRaceEnv:
 
     @property
     def step_count(self) -> int:
-        """Number of control steps taken (1 step = race_config.timestep seconds)."""
+        """Number of GPD control steps taken (1 step = 1 / ctrl_freq seconds).
+
+        ``race_config.timestep`` describes the historical physics timestep and
+        is not the elapsed time of one :meth:`GPDDrone.step` call, which may
+        execute multiple physics substeps.
+        """
         return self.drone.step_count
 
     def get_sim_time(self) -> float:
@@ -161,65 +167,191 @@ class DroneRaceEnv:
     def load_config(config_path: str) -> RaceConfig:
         """Load a race configuration from a JSON file."""
         path = Path(config_path)
-        with open(path) as f:
-            data = json.load(f)
 
-        field_data = data.get("field", {})
-        bounds_min = tuple(field_data.get("bounds_min", [-5.0, -15.0, 0.0]))
-        bounds_max = tuple(field_data.get("bounds_max", [50.0, 15.0, 15.0]))
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError(f"duplicate JSON key in race config: {key}")
+                result[key] = value
+            return result
 
-        gate_defaults = data.get("gate_defaults", {})
-        default_config = GateConfig(
-            gate_type=gate_defaults.get("gate_type", "square"),
-            interior_width_m=gate_defaults.get("interior_width_m", 1.0),
-            interior_height_m=gate_defaults.get("interior_height_m", 1.0),
-            border_width_m=gate_defaults.get("border_width_m", 0.15),
-            depth_m=gate_defaults.get("depth_m", 0.08),
-            color=gate_defaults.get("color", "red"),
+        def reject_constant(value):
+            raise ValueError(f"non-standard JSON numeric constant: {value}")
+
+        data = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=reject_constant,
         )
+        if not isinstance(data, dict):
+            raise TypeError("race config root must be a JSON object")
 
-        gates = []
-        for gd in data.get("gates", []):
-            pose_data = gd.get("pose", {})
-            pose = Pose3D(
-                x=pose_data.get("x", 0.0),
-                y=pose_data.get("y", 0.0),
-                z=pose_data.get("z", 1.5),
-                yaw=pose_data.get("yaw", 0.0),
-                pitch=pose_data.get("pitch", 0.0),
-                roll=pose_data.get("roll", 0.0),
+        def mapping(name, value):
+            if not isinstance(value, dict):
+                raise TypeError(f"{name} must be a JSON object")
+            return value
+
+        def finite(name, value, *, positive=False):
+            if type(value) not in {int, float}:
+                raise TypeError(f"{name} must be an exact JSON number")
+            resolved = float(value)
+            if not math.isfinite(resolved):
+                raise ValueError(f"{name} must be finite")
+            if positive and resolved <= 0.0:
+                raise ValueError(f"{name} must be strictly positive")
+            return resolved
+
+        def vector3(name, value):
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                raise ValueError(f"{name} must contain exactly three numbers")
+            return tuple(
+                finite(f"{name}[{index}]", item)
+                for index, item in enumerate(value)
             )
 
-            gc = gd.get("config", {})
+        def exact_string(name, value):
+            if type(value) is not str or not value:
+                raise TypeError(f"{name} must be a non-empty string")
+            return value
+
+        field_data = mapping("field", data.get("field", {}))
+        bounds_min = vector3(
+            "field.bounds_min", field_data.get("bounds_min", [-5.0, -15.0, 0.0])
+        )
+        bounds_max = vector3(
+            "field.bounds_max", field_data.get("bounds_max", [50.0, 15.0, 15.0])
+        )
+        if any(lower >= upper for lower, upper in zip(bounds_min, bounds_max)):
+            raise ValueError("field bounds_min must be strictly below bounds_max")
+
+        gate_defaults = mapping("gate_defaults", data.get("gate_defaults", {}))
+        default_config = GateConfig(
+            gate_type=exact_string(
+                "gate_defaults.gate_type", gate_defaults.get("gate_type", "square")
+            ),
+            interior_width_m=finite(
+                "gate_defaults.interior_width_m",
+                gate_defaults.get("interior_width_m", 1.0),
+                positive=True,
+            ),
+            interior_height_m=finite(
+                "gate_defaults.interior_height_m",
+                gate_defaults.get("interior_height_m", 1.0),
+                positive=True,
+            ),
+            border_width_m=finite(
+                "gate_defaults.border_width_m",
+                gate_defaults.get("border_width_m", 0.15),
+                positive=True,
+            ),
+            depth_m=finite(
+                "gate_defaults.depth_m",
+                gate_defaults.get("depth_m", 0.08),
+                positive=True,
+            ),
+            color=exact_string(
+                "gate_defaults.color", gate_defaults.get("color", "red")
+            ),
+        )
+
+        raw_gates = data.get("gates", [])
+        if not isinstance(raw_gates, list):
+            raise TypeError("gates must be a JSON list")
+        gates = []
+        gate_ids = set()
+        sequence_indices = set()
+        for gate_number, raw_gate in enumerate(raw_gates):
+            gd = mapping(f"gates[{gate_number}]", raw_gate)
+            gate_id = exact_string(f"gates[{gate_number}].id", gd.get("id"))
+            if gate_id in gate_ids:
+                raise ValueError(f"duplicate gate id: {gate_id}")
+            gate_ids.add(gate_id)
+            sequence_index = gd.get("sequence_index", gate_number)
+            if type(sequence_index) is not int or sequence_index < 0:
+                raise TypeError(
+                    f"gates[{gate_number}].sequence_index must be a non-negative integer"
+                )
+            if sequence_index in sequence_indices:
+                raise ValueError(f"duplicate gate sequence_index: {sequence_index}")
+            sequence_indices.add(sequence_index)
+            pose_data = mapping(f"gates[{gate_number}].pose", gd.get("pose", {}))
+            pose = Pose3D(
+                x=finite(f"gates[{gate_number}].pose.x", pose_data.get("x", 0.0)),
+                y=finite(f"gates[{gate_number}].pose.y", pose_data.get("y", 0.0)),
+                z=finite(f"gates[{gate_number}].pose.z", pose_data.get("z", 1.5)),
+                yaw=finite(
+                    f"gates[{gate_number}].pose.yaw", pose_data.get("yaw", 0.0)
+                ),
+                pitch=finite(
+                    f"gates[{gate_number}].pose.pitch", pose_data.get("pitch", 0.0)
+                ),
+                roll=finite(
+                    f"gates[{gate_number}].pose.roll", pose_data.get("roll", 0.0)
+                ),
+            )
+
+            gc = mapping(f"gates[{gate_number}].config", gd.get("config", {}))
             config = GateConfig(
-                gate_type=gc.get("gate_type", default_config.gate_type),
-                interior_width_m=gc.get("interior_width_m", default_config.interior_width_m),
-                interior_height_m=gc.get("interior_height_m", default_config.interior_height_m),
-                border_width_m=gc.get("border_width_m", default_config.border_width_m),
-                depth_m=gc.get("depth_m", default_config.depth_m),
-                color=gc.get("color", default_config.color),
+                gate_type=exact_string(
+                    f"gates[{gate_number}].config.gate_type",
+                    gc.get("gate_type", default_config.gate_type),
+                ),
+                interior_width_m=finite(
+                    f"gates[{gate_number}].config.interior_width_m",
+                    gc.get("interior_width_m", default_config.interior_width_m),
+                    positive=True,
+                ),
+                interior_height_m=finite(
+                    f"gates[{gate_number}].config.interior_height_m",
+                    gc.get("interior_height_m", default_config.interior_height_m),
+                    positive=True,
+                ),
+                border_width_m=finite(
+                    f"gates[{gate_number}].config.border_width_m",
+                    gc.get("border_width_m", default_config.border_width_m),
+                    positive=True,
+                ),
+                depth_m=finite(
+                    f"gates[{gate_number}].config.depth_m",
+                    gc.get("depth_m", default_config.depth_m),
+                    positive=True,
+                ),
+                color=exact_string(
+                    f"gates[{gate_number}].config.color",
+                    gc.get("color", default_config.color),
+                ),
             )
 
             gate = Gate(
-                gate_id=gd["id"],
+                gate_id=gate_id,
                 config=config,
                 pose=pose,
-                sequence_index=gd.get("sequence_index"),
+                sequence_index=sequence_index,
             )
             gates.append(gate)
 
-        start_data = data.get("start", {})
-        start_pos = tuple(start_data.get("position", [0.0, 0.0, 1.5]))
-        start_yaw = start_data.get("yaw", 0.0)
+        start_data = mapping("start", data.get("start", {}))
+        start_pos = vector3(
+            "start.position", start_data.get("position", [0.0, 0.0, 1.5])
+        )
+        start_yaw = finite("start.yaw", start_data.get("yaw", 0.0))
 
         # Iter 10 (Phase A L1): optional top-level ``planner``,
         # ``racing_line``, and ``sequencer`` sections carry per-race
         # overrides of knobs that used to be hardcoded in the planners
         # and the visual demo. Unknown keys are ignored so the loader
         # is forward-compatible with future additions.
-        planner_data = data.get("planner", {})
-        racing_line_data = data.get("racing_line", {})
-        sequencer_data = data.get("sequencer", {})
+        planner_data = mapping("planner", data.get("planner", {}))
+        racing_line_data = mapping("racing_line", data.get("racing_line", {}))
+        sequencer_data = mapping("sequencer", data.get("sequencer", {}))
+        timestep = finite("timestep", data.get("timestep", 1.0 / 240.0), positive=True)
+        gravity = finite("gravity", data.get("gravity", -9.81))
+        if gravity >= 0.0:
+            raise ValueError("gravity must be negative")
+        max_velocity = data.get("max_velocity_mps")
+        if max_velocity is not None:
+            max_velocity = finite("max_velocity_mps", max_velocity, positive=True)
 
         return RaceConfig(
             field_bounds_min=bounds_min,
@@ -227,13 +359,13 @@ class DroneRaceEnv:
             gates=gates,
             start_position=start_pos,
             start_yaw=start_yaw,
-            timestep=data.get("timestep", 1.0 / 240.0),
-            gravity=data.get("gravity", -9.81),
+            timestep=timestep,
+            gravity=gravity,
             # Iter-007 Opus F3: load the top-level `max_velocity_mps` so
             # the PyBullet path picks up the same per-track value the
             # synthetic bench reads. Default None means "fall through to
             # auto-derive in the bench" (matches synthetic bench logic).
-            max_velocity_mps=data.get("max_velocity_mps", None),
+            max_velocity_mps=max_velocity,
             planner_overrides=dict(planner_data),
             racing_line_overrides=dict(racing_line_data),
             sequencer_overrides=dict(sequencer_data),

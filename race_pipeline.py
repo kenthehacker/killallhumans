@@ -372,6 +372,14 @@ class RacePipeline:
                 max_lateral_accel=9.81 * math.tan(self.config.traj_max_tilt_rad),
             )
         _tracker_cfg = TrackerConfig(**_tracker_kwargs)
+        if _tracker_cfg.max_lateral_accel is None:
+            # Keep the commanded thrust direction inside the attitude
+            # envelope before extracting roll/pitch. Clipping attitude after
+            # computing an infeasible thrust magnitude rotates the excess
+            # force vertically, which can inject a climb into a gate frame.
+            _tracker_cfg.max_lateral_accel = (
+                _tracker_cfg.gravity * math.tan(_tracker_cfg.max_tilt_rad)
+            )
         self.tracker = GeometricTracker(_tracker_cfg)
         self.simple_tracker = SimplePositionTracker(TrackerConfig())
 
@@ -451,6 +459,8 @@ class RacePipeline:
         self._ekf_live_initialized: bool = False
         self._last_lpn_stamp_ms: Optional[int] = None
         self._last_odom_reset_counter: Optional[int] = None
+        self._diverged = False
+        self._diverged_ticks = 0
 
         # Deferred replan trigger. ``DynamicReplanner.evaluate()`` reports
         # each crash/miss/off-track event exactly once (on its rising edge),
@@ -611,7 +621,11 @@ class RacePipeline:
         )
         return trajectory
 
-    async def run(self, address: str = "udp://:14540") -> None:
+    async def run(
+        self,
+        address: str = "udp://:14540",
+        max_run_duration_s: float = AIGP_VQ1_MAX_RUN_DURATION_S,
+    ) -> None:
         """
         Execute the race.
 
@@ -625,6 +639,7 @@ class RacePipeline:
             self.interface,
             target_hz=self.config.target_hz,
             address=address,
+            max_run_duration_s=max_run_duration_s,
         )
         session.on_telemetry = self._control_callback
         # Iter-001 review (B2, consensus BLOCKER): stop on ANY terminal
@@ -1159,8 +1174,9 @@ class RacePipeline:
         # thrust high, and this cut tempers the climb. Both alternatives tried
         # in iter 12 (floor-at-hover, leave-thrust-unchanged) regressed the
         # working 15 m/s-gust recovery from 6/6 to 2/6 (altitude divergence).
-        # Left as-is; a proper fix needs the tracker's saturated thrust
-        # allocation reworked (Blocker 11 family), not this scale factor.
+        # The tracker now bounds lateral acceleration before attitude
+        # extraction and receives a stationary recovery reference; retain the
+        # established slowdown as a separate recovery-speed policy.
         if self.sequencer.should_slow_down():
             cmd = AttitudeCommand(
                 roll_rad=cmd.roll_rad * 0.5,
@@ -1564,17 +1580,24 @@ def _telemetry_timestamp_s(telem: TelemetryState) -> float:
 def _ref_override_position(
     ref, target_position: Tuple[float, float, float]
 ):
-    """Return a TrajectoryPoint with its position replaced by ``target_position``.
+    """Return a stationary recovery reference at ``target_position``.
 
     Used by ``RacePipeline._control_callback`` when the sequencer signals
-    RECOVERY: we want the tracker to fly *toward the recovery target*
-    without discarding the precomputed reference's velocity/yaw hints.
-    ``TrajectoryPoint`` is a frozen dataclass, so this rebuilds a shallow
-    copy with the overridden position tuple.
+    RECOVERY. Velocity, acceleration, and jerk from the old racing line point
+    toward a different downstream target and must not be combined with the
+    recovery position. Keep only its yaw/time metadata and rebuild a shallow
+    copy so the shared trajectory is not mutated.
     """
     from dataclasses import replace
 
-    return replace(ref, position=tuple(target_position))
+    return replace(
+        ref,
+        position=tuple(target_position),
+        velocity=(0.0, 0.0, 0.0),
+        acceleration=(0.0, 0.0, 0.0),
+        jerk=(0.0, 0.0, 0.0),
+        ff_acceleration=(0.0, 0.0, 0.0),
+    )
 
 
 def _ref_override_yaw(ref, yaw: float):
