@@ -969,8 +969,9 @@ def _fit_candidate(
     *,
     delay_ns: int,
     time_constant_s: float,
-    config: SystemIdConfig,
 ) -> Optional[_CandidateFit]:
+    """Fit under the pinned selector; caller-tightened bounds never prune grids."""
+
     base, design, targets = _build_affine_design(
         gyro,
         commands,
@@ -982,7 +983,7 @@ def _fit_candidate(
     condition = float(np.linalg.cond(design))
     if (
         not math.isfinite(condition)
-        or condition > config.maximum_design_condition_number
+        or condition > _DEFAULT_MAXIMUM_DESIGN_CONDITION_NUMBER
     ):
         return None
     try:
@@ -994,9 +995,9 @@ def _fit_candidate(
     if rank != 2 or not np.all(np.isfinite(coefficients)):
         return None
     gain, bias = float(coefficients[0]), float(coefficients[1])
-    if not config.minimum_gain <= gain <= config.maximum_gain:
+    if not _DEFAULT_MINIMUM_GAIN <= gain <= _DEFAULT_MAXIMUM_GAIN:
         return None
-    if abs(bias) > config.maximum_abs_bias_rad_s:
+    if abs(bias) > _DEFAULT_MAXIMUM_ABS_BIAS_RAD_S:
         return None
     errors = targets - design @ coefficients
     sse = float(errors @ errors)
@@ -1184,7 +1185,6 @@ class VQ2RateSystemIdentifier:
                     training_commands,
                     delay_ns=delay_ns,
                     time_constant_s=time_constant_s,
-                    config=config,
                 )
                 if candidate is not None:
                     candidates.append(candidate)
@@ -1263,6 +1263,28 @@ class VQ2RateSystemIdentifier:
             > config.maximum_time_constant_uncertainty_s
         ):
             raise IdentifiabilityError("time-constant uncertainty is too wide")
+
+        # Candidate construction, ranking, and both profile intervals above
+        # always use the immutable reviewed selector bounds.  Caller-tightened
+        # condition/gain/bias policy can only reject that one default-selected
+        # result here; it never removes candidates, reselects a model, or
+        # narrows a profile by omission.
+        if best.condition_number > config.maximum_design_condition_number:
+            raise IdentifiabilityError(
+                "default-selected model exceeds tightened condition bound"
+            )
+        if best.gain < config.minimum_gain:
+            raise IdentifiabilityError(
+                "default-selected model is below tightened minimum gain"
+            )
+        if best.gain > config.maximum_gain:
+            raise IdentifiabilityError(
+                "default-selected model exceeds tightened maximum gain"
+            )
+        if abs(best.bias) > config.maximum_abs_bias_rad_s:
+            raise IdentifiabilityError(
+                "default-selected model exceeds tightened bias bound"
+            )
 
         model = RateAxisModel(
             model_id="vq2-rate-axis-fopdt-offline-v1",

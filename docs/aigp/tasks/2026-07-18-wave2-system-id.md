@@ -50,16 +50,20 @@
   Held-out residuals may only conservatively inflate the conditional gain/bias
   covariance. The full reviewed `0..100 ms` delay grid, `0.020..0.300 s` lag
   grid, and 95% profile cutoff are pinned; every other configuration override
-  is tighten-only. A canonical SHA-256 policy/config identity covering every
-  field is retained by the result, model, uncertainty, and diagnostics.
+  is tighten-only. Candidate construction, ranking, and profile calculation
+  always use the pinned default physical and conditioning selector bounds.
+  Tighter gain, bias, or condition bounds run only as rejection checks on the
+  default-selected result, so they cannot reselect a model or narrow a profile.
+  A canonical SHA-256 policy/config identity covering every field is retained
+  by the result, model, uncertainty, and diagnostics.
   Inert experiment data additionally limits total duration, adjacent rate
   step, signed prefix-angle excursion, and final exact-zero settling. Zero net
   rate-command area is not claimed to restore attitude on a lagged biased
   plant.
 - Candidate evidence:
-  - direct adversarial system-ID suite: `60 passed`;
-  - dedicated non-live `test-vq2`: `478 passed`;
-  - repository `test-fast`: `1570 passed, 20 skipped, 42 deselected`;
+  - direct adversarial system-ID suite: `66 passed`;
+  - dedicated non-live `test-vq2`: `484 passed`;
+  - repository `test-fast`: `1576 passed, 20 skipped, 42 deselected`;
   - `git diff --check`: clean before commit.
 - Evidence limits: all recovery evidence is deterministic synthetic math, not
   measured FlightSim or vehicle truth. The model is an independent-axis FOPDT
@@ -75,7 +79,8 @@
   target, transport, or powered action occurred. Executing even the inert
   experiment definitions would require a separately reviewed and explicitly
   authorized powered workflow outside this module.
-- Superseded pre-audit commit:
-  `a709a332d0d4571f1122459ea9d7da6df6f4f427`. The hardened candidate commit is
-  reported to the integration owner after commit because a commit cannot embed
-  its own final hash.
+- Superseded audit candidates:
+  `a709a332d0d4571f1122459ea9d7da6df6f4f427` and
+  `63ffe6873fba10ef88de152ca29b108ef89ba9ca`. The selector-invariant candidate
+  commit is reported to the integration owner after commit because a commit
+  cannot embed its own final hash.

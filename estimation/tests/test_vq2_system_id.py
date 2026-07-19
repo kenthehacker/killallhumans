@@ -261,6 +261,32 @@ def _holdout() -> ChronologicalHoldout:
     )
 
 
+def _noisy_training_clean_holdout_trace() -> RateAxisTrace:
+    """Reviewer regression: noisy training labels and untouched holdout labels."""
+
+    holdout = _holdout()
+    base = _synthetic_trace(noise_scale=0.0)
+    changed = list(base.gyro)
+    for index, sample in enumerate(changed):
+        if (
+            holdout.training.start_monotonic_ns
+            <= sample.monotonic_ns
+            <= holdout.training.end_monotonic_ns
+        ):
+            changed[index] = replace(
+                sample,
+                measured_rate_rad_s=(
+                    sample.measured_rate_rad_s
+                    + 0.10
+                    * (
+                        math.sin(0.37 * index)
+                        + 0.35 * math.cos(0.11 * index)
+                    )
+                ),
+            )
+    return replace(base, gyro=tuple(changed))
+
+
 def _renumber_gyro(
     samples: tuple[GyroRateSample, ...],
 ) -> tuple[GyroRateSample, ...]:
@@ -519,6 +545,99 @@ def test_corrupted_heldout_outcomes_reject_the_training_only_model():
         )
 
 
+@pytest.mark.parametrize(
+    "config",
+    [
+        SystemIdConfig(),
+        SystemIdConfig(minimum_gain=0.90),
+        SystemIdConfig(maximum_gain=0.85),
+        SystemIdConfig(maximum_design_condition_number=10.0),
+        SystemIdConfig(maximum_abs_bias_rad_s=0.015),
+    ],
+)
+def test_tightened_selector_cannot_escape_default_profile_rejection(
+    config: SystemIdConfig,
+):
+    with pytest.raises(IdentifiabilityError, match="delay uncertainty is too wide"):
+        fit_rate_axis_model(
+            _noisy_training_clean_holdout_trace(),
+            _holdout(),
+            config=config,
+        )
+
+
+def test_tightened_selector_either_rejects_or_preserves_model_and_profiles():
+    trace = _synthetic_trace()
+    holdout = _holdout()
+    default = fit_rate_axis_model(trace, holdout, config=SystemIdConfig())
+    accepted_config = SystemIdConfig(
+        minimum_gain=default.model.steady_state_gain - 0.01,
+        maximum_gain=default.model.steady_state_gain + 0.01,
+        maximum_abs_bias_rad_s=abs(default.model.gyro_bias_rad_s) + 0.01,
+        maximum_design_condition_number=(
+            default.diagnostics.design_condition_number + 1.0
+        ),
+    )
+
+    tightened = fit_rate_axis_model(trace, holdout, config=accepted_config)
+
+    assert tightened.config_semantic_id == accepted_config.semantic_identity
+    assert tightened.config_semantic_id != default.config_semantic_id
+    assert tightened.model.delay_ns == default.model.delay_ns
+    assert tightened.model.time_constant_s == default.model.time_constant_s
+    assert tightened.model.steady_state_gain == default.model.steady_state_gain
+    assert tightened.model.gyro_bias_rad_s == default.model.gyro_bias_rad_s
+    assert (
+        tightened.diagnostics.evaluated_candidates
+        == default.diagnostics.evaluated_candidates
+    )
+    assert (
+        tightened.diagnostics.design_condition_number
+        == default.diagnostics.design_condition_number
+    )
+    assert (
+        tightened.uncertainty.delay_interval_ns
+        == default.uncertainty.delay_interval_ns
+    )
+    assert (
+        tightened.uncertainty.time_constant_interval_s
+        == default.uncertainty.time_constant_interval_s
+    )
+
+    rejecting_configs = (
+        (
+            SystemIdConfig(
+                minimum_gain=default.model.steady_state_gain + 0.01
+            ),
+            "minimum gain",
+        ),
+        (
+            SystemIdConfig(
+                maximum_gain=default.model.steady_state_gain - 0.01
+            ),
+            "maximum gain",
+        ),
+        (
+            SystemIdConfig(
+                maximum_abs_bias_rad_s=abs(default.model.gyro_bias_rad_s) * 0.5
+            ),
+            "bias bound",
+        ),
+        (
+            SystemIdConfig(
+                maximum_design_condition_number=max(
+                    1.000001,
+                    default.diagnostics.design_condition_number * 0.99,
+                )
+            ),
+            "condition bound",
+        ),
+    )
+    for rejecting_config, error_match in rejecting_configs:
+        with pytest.raises(IdentifiabilityError, match=error_match):
+            fit_rate_axis_model(trace, holdout, config=rejecting_config)
+
+
 def test_weak_excitation_and_tight_uncertainty_gate_fail_closed():
     trace = _synthetic_trace()
     weak_commands = tuple(
@@ -539,8 +658,8 @@ def test_weak_excitation_and_tight_uncertainty_gate_fail_closed():
         )
 
 
-def test_ill_conditioned_design_is_rejected_before_a_model_is_reported():
-    with pytest.raises(IdentifiabilityError, match="no finite, well-conditioned"):
+def test_tightened_condition_bound_rejects_default_selected_model():
+    with pytest.raises(IdentifiabilityError, match="tightened condition bound"):
         fit_rate_axis_model(
             _synthetic_trace(),
             _holdout(),
