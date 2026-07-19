@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Optional
 
 import numpy as np
 
@@ -30,6 +30,9 @@ from competition.vq2_contracts import (
     validate_relative_gate_state_sequence,
     validate_relative_gate_state_source,
 )
+
+if TYPE_CHECKING:
+    from estimation.vq2_imu_derotation import VQ2DerotationEvidence
 
 
 _STATE_FEATURE_ORDER = (
@@ -224,6 +227,73 @@ class RelativeEstimatorUpdate:
     reason: Optional[str]
 
 
+@dataclass(frozen=True, slots=True)
+class VQ2ImuCorrelatedEstimatorUpdate:
+    """An ordinary camera-state update paired with exact local IMU evidence.
+
+    The estimator state deliberately remains in the unchanged ``/1`` camera
+    bearing model.  ``evidence.derotated_center_norm`` is *not* injected into
+    that capture-time filter: doing so would mix a target-attitude bearing with
+    a capture-time posterior and then predict it twice.  The retained evidence
+    instead proves which bounded attitude sample was correlated with the same
+    observation and target for the outer offline attitude adapter.
+    """
+
+    estimator_update: RelativeEstimatorUpdate
+    evidence: "VQ2DerotationEvidence"
+
+    def __post_init__(self) -> None:
+        from estimation.vq2_imu_derotation import VQ2DerotationEvidence
+
+        if type(self.estimator_update) is not RelativeEstimatorUpdate:
+            raise TypeError("estimator_update must be exact RelativeEstimatorUpdate")
+        if type(self.evidence) is not VQ2DerotationEvidence:
+            raise TypeError("evidence must be exact VQ2DerotationEvidence")
+        observation = self.evidence.observation
+        target = self.evidence.prediction_target
+        update = self.estimator_update
+        if update.observed_candidate_id != observation.candidate_id:
+            raise ValueError("IMU evidence candidate does not match estimator update")
+        state = update.state
+        if (
+            state.timing.host_clock_id != target.host_clock_id
+            or state.timing.decision_time_monotonic_ns
+            != target.decision_time_monotonic_ns
+            or state.timing.prediction_time_monotonic_ns
+            != target.prediction_time_monotonic_ns
+            or state.timing.prediction_basis is not target.prediction_basis
+            or state.timing.delay_model_id != target.delay_model_id
+            or state.timing.delay_uncertainty_ns != target.delay_uncertainty_ns
+        ):
+            raise ValueError(
+                "IMU-correlated estimator state does not match its prediction target"
+            )
+        if update.measurement_accepted:
+            validate_relative_gate_state_source(state, observation)
+
+    def validate_integrity(self) -> None:
+        """Revalidate nested state/evidence and their exact correlation."""
+
+        state = replace(self.estimator_update.state)
+        estimator_update = replace(self.estimator_update, state=state)
+        self.evidence.validate_integrity()
+        replace(self, estimator_update=estimator_update)
+
+    @property
+    def state(self) -> RelativeGateStateV1:
+        return self.estimator_update.state
+
+    @property
+    def current_observation_accepted(self) -> bool:
+        return self.estimator_update.measurement_accepted
+
+    @property
+    def derotation_applied_to_state(self) -> bool:
+        """The frozen ``/1`` state never claims the target-basis correction."""
+
+        return False
+
+
 class VQ2RelativeGateEstimator:
     """Single-track, deterministic 6D bearing/scale Kalman filter."""
 
@@ -276,6 +346,44 @@ class VQ2RelativeGateEstimator:
         self._validate_update_input(observation, target)
         measurement = self._measurement_vector(observation)
         measurement_covariance = self._measurement_covariance(observation)
+        return self._update_validated_measurement(
+            observation,
+            target,
+            measurement,
+            measurement_covariance,
+        )
+
+    def update_with_imu_correlation(
+        self,
+        evidence: "VQ2DerotationEvidence",
+    ) -> VQ2ImuCorrelatedEstimatorUpdate:
+        """Update from the raw camera observation and retain IMU correlation.
+
+        Rotation-only correction stays in ``VQ2DerotationEvidence`` for
+        offline evaluation.  It cannot be represented honestly in the current
+        capture-time ``/1`` filter, so this method intentionally delegates to
+        the ordinary camera update without changing its measurement basis.
+        """
+
+        from estimation.vq2_imu_derotation import VQ2DerotationEvidence
+
+        if type(evidence) is not VQ2DerotationEvidence:
+            raise TypeError("evidence must be exact VQ2DerotationEvidence")
+        update = self.update(
+            evidence.observation,
+            evidence.prediction_target,
+        )
+        return VQ2ImuCorrelatedEstimatorUpdate(update, evidence)
+
+    def _update_validated_measurement(
+        self,
+        observation: GateObservationV1,
+        target: RelativePredictionTarget,
+        measurement: np.ndarray,
+        measurement_covariance: np.ndarray,
+    ) -> RelativeEstimatorUpdate:
+        """Advance from already validated source and measurement inputs."""
+
         epoch_changed = self._epoch_changed(observation)
         gap_reinitialize = False
 
@@ -909,5 +1017,6 @@ __all__ = [
     "RelativeEstimatorUpdate",
     "RelativePredictionTarget",
     "StaleObservationError",
+    "VQ2ImuCorrelatedEstimatorUpdate",
     "VQ2RelativeGateEstimator",
 ]

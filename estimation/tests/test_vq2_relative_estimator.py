@@ -29,8 +29,17 @@ from estimation.vq2_relative_estimator import (
     RelativeEstimatorError,
     RelativePredictionTarget,
     StaleObservationError,
+    VQ2ImuCorrelatedEstimatorUpdate,
     VQ2RelativeGateEstimator,
 )
+from estimation.vq2_imu_derotation import (
+    SUPPORTED_CAMERA_RAY_MODEL_ID,
+    VQ2AttitudeDerotationInput,
+    VQ2CameraToBodyCalibration,
+    VQ2DerotationModel,
+    derotate_gate_observation,
+)
+from estimation.vq2_imu_provenance import VQ2ImuSource, VQ2TimestampedAttitude
 
 
 _HOST_CLOCK_ID = "host-monotonic-test"
@@ -279,6 +288,79 @@ def _forecast_target(
 
 def _coast_target(monotonic_ns: int, host_clock_id: str = _HOST_CLOCK_ID):
     return RelativePredictionTarget.at_decision(host_clock_id, monotonic_ns)
+
+
+def _derotation_attitude(
+    observation: GateObservationV1,
+    *,
+    sequence: int,
+    receive_monotonic_ns: int,
+    yaw_rad: float = 0.0,
+) -> VQ2AttitudeDerotationInput:
+    half = yaw_rad * 0.5
+    return VQ2AttitudeDerotationInput(
+        attitude=VQ2TimestampedAttitude(
+            source=VQ2ImuSource(
+                session_id=observation.authority.session_id,
+                reset_epoch=observation.authority.reset_epoch,
+                host_clock_id=observation.host_clock_id,
+                stream_id="highres-imu-test",
+                generation=1,
+            ),
+            sample_sequence=sequence,
+            source_time_us=1_000_000 + sequence * 10_000,
+            receive_monotonic_ns=receive_monotonic_ns,
+            orientation_body_to_ned_wxyz=(
+                math.cos(half),
+                0.0,
+                0.0,
+                math.sin(half),
+            ),
+            body_rates_rad_s=(0.0, 0.0, 0.0),
+            gyro_bias_rad_s=(0.0, 0.0, 0.0),
+            accel_trust=1.0,
+            propagated=True,
+        ),
+        orientation_uncertainty_rad=0.001,
+        host_time_uncertainty_ns=100_000,
+    )
+
+
+def _derotation_evidence(
+    observation: GateObservationV1,
+    *,
+    target_yaw_rad: float = 0.05,
+):
+    target = _decision_target(observation)
+    return derotate_gate_observation(
+        observation,
+        target,
+        capture_attitude=_derotation_attitude(
+            observation,
+            sequence=10,
+            receive_monotonic_ns=observation.measurement_time_monotonic_ns,
+        ),
+        target_attitude=_derotation_attitude(
+            observation,
+            sequence=11,
+            receive_monotonic_ns=target.prediction_time_monotonic_ns,
+            yaw_rad=target_yaw_rad,
+        ),
+        calibration=VQ2CameraToBodyCalibration(
+            calibration_id="synthetic-camera-body-test-v1",
+            camera_ray_model_id=SUPPORTED_CAMERA_RAY_MODEL_ID,
+            camera_to_body_wxyz=(1.0, 0.0, 0.0, 0.0),
+            rotation_uncertainty_rad=0.001,
+        ),
+        model=VQ2DerotationModel(
+            model_id="synthetic-derotation-test-v1",
+            attitude_time_model_id="synthetic-host-aligned-attitude-v1",
+            max_capture_alignment_ns=20_000_000,
+            max_target_extrapolation_ns=20_000_000,
+            max_total_timing_uncertainty_ns=50_000_000,
+            angular_rate_uncertainty_rad_s=0.01,
+        ),
+    )
 
 
 def _assert_psd(state) -> None:
@@ -749,3 +831,83 @@ def test_same_replay_produces_bitwise_identical_contract_primitives():
         return trace
 
     assert run_replay() == run_replay()
+
+
+def test_imu_correlated_update_preserves_raw_camera_filter_basis_and_source():
+    observation = _observation(
+        frame_id=0,
+        measurement_offset_ns=0,
+        center=(0.20, -0.10),
+    )
+    evidence = _derotation_evidence(observation, target_yaw_rad=0.05)
+    estimator = VQ2RelativeGateEstimator("correlated-filter")
+    ordinary_estimator = VQ2RelativeGateEstimator("correlated-filter")
+
+    result = estimator.update_with_imu_correlation(evidence)
+    ordinary = ordinary_estimator.update(
+        observation,
+        evidence.prediction_target,
+    )
+
+    assert type(result) is VQ2ImuCorrelatedEstimatorUpdate
+    assert result.evidence is evidence
+    assert result.current_observation_accepted
+    assert not result.derotation_applied_to_state
+    assert result.estimator_update.measurement_accepted
+    assert result.estimator_update == ordinary
+    assert result.state.bearing_norm == observation.center_norm
+    assert result.state.bearing_norm != evidence.derotated_center_norm
+    assert result.state.source_candidate_id == observation.candidate_id
+    assert result.state.timing.source_frame == observation.frame
+    assert result.state.timing.measurement_time_monotonic_ns == (
+        observation.measurement_time_monotonic_ns
+    )
+    assert result.state.timing.measurement_time_basis is (
+        observation.measurement_time_basis
+    )
+    _assert_psd(result.state)
+
+
+def test_imu_correlated_rejection_does_not_relabel_retained_camera_source():
+    estimator = VQ2RelativeGateEstimator("correlated-filter")
+    first = _observation(frame_id=0, measurement_offset_ns=0, center=(0.0, 0.0))
+    second = _observation(
+        frame_id=1,
+        measurement_offset_ns=30_000_000,
+        center=(0.01, 0.0),
+    )
+    accepted = estimator.update_with_imu_correlation(
+        _derotation_evidence(first, target_yaw_rad=0.0)
+    )
+    accepted = estimator.update_with_imu_correlation(
+        _derotation_evidence(second, target_yaw_rad=0.0)
+    )
+    outlier = _observation(
+        frame_id=2,
+        measurement_offset_ns=60_000_000,
+        center=(0.85, -0.75),
+        measurement_variance=1e-6,
+    )
+    evidence = _derotation_evidence(outlier, target_yaw_rad=0.0)
+
+    rejected = estimator.update_with_imu_correlation(evidence)
+
+    assert not rejected.current_observation_accepted
+    assert not rejected.derotation_applied_to_state
+    assert not rejected.estimator_update.measurement_accepted
+    assert rejected.evidence is evidence
+    assert rejected.state.source_candidate_id == accepted.state.source_candidate_id
+    assert rejected.state.source_candidate_id != outlier.candidate_id
+    assert rejected.state.measurement_update_sequence == (
+        accepted.state.measurement_update_sequence
+    )
+    with pytest.raises(StaleObservationError, match="already processed"):
+        estimator.update_with_imu_correlation(evidence)
+
+
+def test_imu_correlated_update_requires_exact_evidence_before_mutating_estimator():
+    estimator = VQ2RelativeGateEstimator("correlated-filter")
+    with pytest.raises(TypeError, match="exact VQ2DerotationEvidence"):
+        estimator.update_with_imu_correlation(object())
+    assert estimator.last_state is None
+    assert not estimator.is_initialized
