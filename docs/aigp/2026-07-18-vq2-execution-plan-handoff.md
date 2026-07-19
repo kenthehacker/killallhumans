@@ -3,7 +3,10 @@
 **Date:** 2026-07-18
 **Target:** DCL FlightSim build 3385, VQ2 Training and Qualification
 **Repository:** C:\Users\John\killallhumans
-**Baseline before the current tooling batch:** c7c37c047039bcac055d77c57a234effe36f73e1
+**Integrated foundation baseline:** b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8
+**Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
+**Plan state:** M0 complete; Wave 1A contract freeze is next; main was clean at
+this update.
 
 ## Purpose
 
@@ -24,9 +27,11 @@ The immediate objective is a conservative valid full VQ2 lap using the available
 camera, HIGHRES_IMU, race status, actuator output, and collision telemetry.
 Speed optimization follows only after completion is repeatable.
 
-The recommended progression is:
+The recommended progression is now:
 
-1. Stabilize and commit the in-progress evaluation foundation.
+1. Freeze the shared timing, observation, estimator, command, and evidence
+   contracts, while dogfooding the committed evaluation foundation on a clean
+   candidate.
 2. Establish simulator timing and closed-loop plant truth.
 3. Recover robust gate geometry, including clipped inner apertures.
 4. Predict relative gate state to command-effect time.
@@ -40,7 +45,7 @@ The recommended progression is:
 
 ### Main stays clean
 
-After the one-time bootstrap below:
+From the integrated foundation baseline onward:
 
 - No agent edits files directly in the main worktree.
 - Main is used only as a clean integration and release reference.
@@ -96,11 +101,25 @@ The development-cycle work is much farther along than its original handoff:
 - a warm live-campaign safety abstraction exists;
 - dependency inventory and disclosure tooling exist.
 
-The foundation batch is implemented and is awaiting normal review/commit rather
-than more architectural bootstrap work:
+The foundation batch was committed to main as
+`b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8` (`aigp: implement durable offline
+development loop`). Main was clean after the commit and the checks below. This
+closes the M0 implementation/bootstrap milestone and makes that commit, or any
+later clean main commit, a safe worktree base.
 
-- the main worktree intentionally contains the uncommitted P0-P2 batch; no user
-  changes were discarded and no scheduler worktree may be derived from it;
+Post-commit validation on 2026-07-18 used the canonical `scripts\dev.cmd`
+entry point and did not connect to or command FlightSim:
+
+- `test-vq2`: 303 passed in 5.54 seconds;
+- `test-fast`: 1,273 passed, 20 skipped, 42 deselected in 65.51 seconds;
+- `test-unit`: 1,273 passed, 20 skipped, 42 deselected in 62.67 seconds;
+- `test-slow`: 2 passed, 1,333 deselected in 2.74 seconds;
+- `test-benchmark`: 39 passed, 1 skipped, 1,295 deselected in 358.05 seconds;
+- all 113 entries in `config/promotion_trusted_files.json` were present and
+  matched their recorded SHA-256 hashes.
+
+The committed foundation now provides the following:
+
 - the default fast, unit, scoped VQ2, slow, and benchmark tiers are independently
   selectable and fail closed on missing plugins, unknown markers, or timeouts;
 - the VQ2 policy pins the exact reviewed discovery inputs and 303-test count;
@@ -124,49 +143,37 @@ The checked-in promotion files are examples, not evidence that the missing
 private T1 inputs or a live boundary exist. See `docs/aigp/durable_improvement_loop.md`
 for the exact trust, isolation, and provenance contract.
 
-## One-time dirty-worktree bootstrap
+## Completed foundation bootstrap
 
-The current dirty batch is the only planned exception to the clean-main rule.
-Do not create feature worktrees from it: detached worktrees cannot see its
-uncommitted files, and the scheduler correctly rejects dirty candidates.
+The former dirty-worktree exception is closed:
 
-Bootstrap procedure:
+- the P0-P2 batch was preserved and committed as `b9382da`;
+- no later feature worktree needs uncommitted state from the old main tree;
+- clean implementation worktrees may branch from `b9382da` or a later clean
+  integration commit;
+- `c7c37c0` is retained only as the historical pre-foundation reference.
 
-1. Confirm one owner has exclusive write ownership of the current working tree.
-2. Create or switch the current working tree to a named integration branch such
-   as integration/testing-foundation-20260718 without discarding any changes.
-3. Inventory tracked, untracked, generated, and ignored state.
-4. Reverify the completed stabilization work:
-   - trajectory/gate metadata round trips;
-   - green default fast and scoped VQ2 suites;
-   - cold/warm prepared-artifact equivalence;
-   - the `scripts\dev.cmd` Windows task contract;
-   - interpreter selection for each dependency profile;
-   - tier-scoped, provenance-bound promotion evidence.
-5. Split the batch into reviewable commits:
-   - test safety and bounded VQ1 behavior;
-   - VQ2 workflow, Windows tasks, and launcher;
-   - dependency profiles;
-   - prepared artifacts and benchmark provenance;
-   - matrix reuse and worker execution;
-   - replay bundle and scoring;
-   - promotion, ledger, scheduler, and merger;
-   - live-campaign scaffold and documentation.
-6. Run directly affected tests after each commit and the VQ2 suite for every
-   accepted commit.
-7. Run the final non-live promotion gates on the clean integration branch.
-8. Merge or fast-forward the finished integration branch into main.
-9. Verify main has an empty git status.
-10. Create all later worktrees from that clean main commit.
+Two operationalization items remain, but neither requires reopening the old
+dirty batch or blocks Wave 1A:
 
-Never use reset --hard, checkout-based discard, or bulk cleanup to make this
-batch appear clean. Preserve and classify every existing change.
+1. Exercise a real clean candidate through T0-T4, including scheduler leases,
+   immutable checkpoints, interruption/resume, deduplication, exact worktrees,
+   and the reviewed merger path.
+2. Replace the T1 example placeholders only after an approved private corpus,
+   production replay processor, calibrated policy, and administrator-owned
+   isolation wrapper exist.
+
+If main ever becomes dirty unexpectedly, stop integration, attribute and
+inventory the changes, and move the owned work onto a task branch/worktree before
+continuing. Quarantine unexplained state. Never erase it with `reset --hard`,
+checkout-based discard, or bulk cleanup merely to make status appear clean.
 
 ## Run-to-completion orchestration
 
-The program can run autonomously without dirty-worktree ambiguity once the
-bootstrap completes. Use the existing ledger and scheduler as the durable source
-of task state.
+The program can now proceed without dirty-bootstrap ambiguity. Use the existing
+ledger and scheduler as the durable source of evaluator/trial state, and use the
+task manifests, branches, and worktrees below for implementation state. The trial
+scheduler does not silently snapshot or own arbitrary uncommitted code.
 
 ### Task lifecycle
 
@@ -303,46 +310,56 @@ CommandProposal:
 
 ## Milestones
 
-| Milestone | Outcome | Main prerequisite |
-|---|---|---|
-| M0 | Stable, green, committed evaluation foundation | Bootstrap |
-| M1 | Runtime timing and simulator semantics dossier | M0 |
-| M2 | Robust clipped Gate 1 geometry with uncertainty | M0 and replay evidence |
-| M3 | Bounded Gate 1 recentering without passage | M1 and M2 |
-| M4 | Predictive relative state and delay-compensated IBVS | M1 and M2 |
-| M5 | Separately reviewed Gate 1 passage | M3 and M4 |
-| M6 | Conservative valid full lap | M5 |
-| M7 | Repeatable baseline across fresh and warm sessions | M6 |
-| M8 | Safe time optimization | M7 |
-| M9 | Advanced pose, mapping, MPC, ILC, or learned residuals | Evidence after M7 |
+| Milestone | Status | Outcome | Main prerequisite |
+|---|---|---|---|
+| M0 | Complete at `b9382da` | Stable, green, committed evaluation foundation | Historical bootstrap |
+| M1 | Ready after Wave 1A | Runtime timing and simulator semantics dossier | M0 |
+| M2 | Ready for offline work; final acceptance awaits replay evidence | Robust clipped Gate 1 geometry with uncertainty | M0 and replay evidence |
+| M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
+| M4 | Pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
+| M6 | Pending | Conservative valid full lap | M5 |
+| M7 | Pending | Repeatable baseline across fresh and warm sessions | M6 |
+| M8 | Pending | Safe time optimization | M7 |
+| M9 | Pending | Advanced pose, mapping, MPC, ILC, or learned residuals | Evidence after M7 |
 
 M0-M4 allow substantial offline parallelism. M5 onward is increasingly
 serialized around integration and live evidence.
 
+M0 completion records the committed implementation and green core, slow, and
+benchmark tiers. The clean-candidate T0-T4 scheduler/resume/merger exercise below
+is still required as operational hardening, but it no longer blocks clean Wave 1A
+branches.
+
 ## Workstream A: evaluation foundation
 
-Tasks:
+State: the foundation is committed and its canonical test tiers are green.
 
-- review and commit the completed dirty-worktree foundation without discarding or
-  silently absorbing unrelated changes;
-- run a clean committed candidate through the already implemented scheduler,
-  resume, deduplication, exact-worktree, and merger paths;
+Remaining tasks:
+
+- run a clean committed candidate through T0-T4 using the implemented scheduler,
+  and retain evidence for leases, interruption/resume, deduplication, immutable
+  checkpoints, exact worktrees, and the merger path;
 - provision an administrator-owned pinned isolation wrapper and approved private
   replay corpus before attempting T1 outside its synthetic/mocked tests;
 - implement and review the competition-specific replay processor once the final
   interface is known;
 - obtain approved replay sessions and calibrate a production policy.
 
-Acceptance:
+Already verified at `b9382da`:
 
 - test-fast, test-unit, test-vq2, bounded slow, and explicit benchmark tiers are
   green;
+- all trusted-manifest files match their committed hashes;
 - prepared cold/warm metrics match within declared tolerance;
 - no skipped evaluator can satisfy a promotion gate;
 - T0/T1 never claim closed-loop completion and T2-T4 identify their synthetic
   nonpowered domain;
 - dirty or provenance-mismatched candidates are rejected;
 - the canonical Windows command works on the target host.
+
+Operational acceptance still requires the real clean-candidate scheduler exercise
+and, for production T1 specifically, the private trust-boundary inputs above.
 
 ## Workstream B: runtime timing
 
@@ -614,22 +631,37 @@ dependencies during a performance experiment.
 
 ### Four-slot execution waves
 
-Wave 0, bootstrap:
+Wave 0, completed:
 
-- Agent 1 owns and stabilizes the current dirty testing foundation.
-- Agent 2 defines versioned timing, observation, estimator, and evidence contracts.
-- Agent 3 completes passive simulator characterization and catalogs existing
-  Gate 0/Gate 1 evidence.
-- The coordinating agent reviews and integrates.
+- the testing/evaluation foundation was stabilized and committed as `b9382da`;
+- the passive simulator characterization and existing Gate 0/Gate 1 evidence
+  inventory were completed;
+- main returned to a clean state;
+- the planned shared contract freeze did not land in the foundation commit and is
+  explicitly carried into Wave 1A. No dirty-tree owner remains.
 
-Only Agent 1 writes the current dirty tree.
+Wave 1A, short shared-contract freeze:
 
-Wave 1, after clean M0:
+- Agent 1 drafts the timestamp, frame-identity, prediction-time, and latency-event
+  contract;
+- Agent 2 drafts versioned `GateObservation` and `RelativeGateState` contracts,
+  including clipping, confidence/covariance, health, and reset/gate epochs;
+- Agent 3 drafts `CommandProposal` and tier-scoped evidence contracts plus
+  compatibility fixtures;
+- the coordinating/integration owner reconciles and lands the shared schemas,
+  adapters, and contract tests before downstream branches depend on them.
 
-- runtime timing;
-- clipped gate geometry;
-- relative-state filter;
-- coordinator reviews interfaces and preserves Gate 0.
+The three agents may prepare proposals concurrently in clean worktrees, but only
+the integration owner changes shared schemas. Production T1 inputs are not a
+prerequisite for this freeze.
+
+Wave 1, current parallel implementation wave after 1A:
+
+- Agent 1: runtime timing and latest-value scheduling;
+- Agent 2: clipped gate geometry and aperture uncertainty;
+- Agent 3: relative-state filter and prediction;
+- coordinator: interface review, clean integrations, scheduler dogfood, and Gate 0
+  behavior preservation.
 
 Wave 2:
 
@@ -683,18 +715,30 @@ Still requiring controlled evidence:
 
 ## Immediate next actions
 
-1. Review and split the completed foundation batch into the documented commit
-   sequence, then verify main is clean.
-2. Regenerate/review the trusted evaluator manifest on that exact clean commit.
-3. Freeze/version the integration contracts and create Wave 1 worktrees from it.
-4. Provision the private golden replay corpus and administrator-owned isolation
-   wrapper before enabling T1.
-5. Exercise T0-T4 on a real clean candidate and retain the ledger/checkpoint
-   evidence; do not reinterpret synthetic T2-T4 results as FlightSim evidence.
+The foundation commit, clean-main check, trusted-manifest verification, and all
+explicit canonical test tiers are complete. Do not repeat them merely because an
+agent resumes the plan; rerun affected gates when the base or trust set changes.
+
+1. Use the latest clean main commit at or after `b9382da` as every new task's
+   declared base. If the remote is the intended disaster-recovery copy, back up
+   the clean baseline according to repository policy before a long autonomous
+   wave; this handoff does not authorize an external push by itself.
+2. Start Wave 1A. Three agents may draft the timing, observation/state, and
+   command/evidence contracts in parallel while the coordinator exercises T0-T4
+   on a disposable clean candidate and retains scheduler/resume/merger evidence.
+3. Have the integration owner reconcile, version, test, commit, and merge the
+   shared contracts. Confirm main is clean after the merge.
+4. Create the three Wave 1 implementation worktrees from that contract commit and
+   run runtime timing, clipped geometry, and relative-state filtering in parallel.
+5. Provision the private golden replay corpus and administrator-owned isolation
+   wrapper before enabling production T1. This may proceed independently when a
+   slot and the required authorization are available; it does not block Wave 1.
 6. Continue only authorized passive probes while offline work proceeds.
-7. Integrate only after each branch is committed and promoted.
+7. Integrate finished branches frequently, but only after each branch is committed
+   and promoted. Quarantine a dirty failed worktree without touching clean main.
 8. Treat every powered system-identification or Gate 1 stage as a separate,
-   explicitly authorized workflow outside the shipped scheduler.
+   explicitly authorized workflow outside the shipped scheduler. Never reinterpret
+   synthetic T2-T4 results as FlightSim evidence.
 
 ## Open authorization item
 
