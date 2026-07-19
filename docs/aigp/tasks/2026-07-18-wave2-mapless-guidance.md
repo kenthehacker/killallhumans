@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave2-mapless-guidance`.
 - Parent: `vq2-wave2-offline-integration`.
-- State: `tested`.
+- State: `integration_pending`.
 - Objective: implement deterministic, mapless local guidance/state logic that
   consumes an exact frozen `RelativeGateStateV1` plus caller-supplied safety
   authority/race/phase-time state and emits a local objective without command
@@ -122,5 +122,7 @@
 - The generated scenario has no vehicle dynamics and cannot support replay,
   passage, collision-clearance, official-simulator, powered, or race-readiness
   claims.
-- Implementation commit and final evidence-record commit: pending until the
-  committed Git object IDs exist.
+- Implementation commit:
+  `b758684ca89bcddf70ae4e630061e64c3f04b215`. The final evidence-record
+  commit is this follow-up changeset and is reported directly to the
+  integration owner because a commit cannot contain its own immutable ID.
