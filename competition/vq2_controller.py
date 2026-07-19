@@ -51,6 +51,7 @@ from competition.vq2_contracts import (
 
 
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+_GATE1_CORRIDOR_SIGMA_MULTIPLIER = 3.0
 
 
 class VQ2ControlPhase(str, Enum):
@@ -389,9 +390,17 @@ class PredictiveControllerConfig:
                 raise ValueError(
                     f"{name} is frozen to its reviewed Gate 1 corridor value"
                 )
-        hard_float_maxima = {
+        frozen_gate1_law_values = {
             "gate1_roll_gain_rad_per_norm": 0.12,
             "gate1_roll_rate_gain_rad_s_per_norm_s": 0.025,
+            "gate1_min_thrust": 0.21,
+        }
+        for name, frozen_value in frozen_gate1_law_values.items():
+            if getattr(self, name) != frozen_value:
+                raise ValueError(
+                    f"{name} is frozen to its reviewed Gate 1 control-law value"
+                )
+        hard_float_maxima = {
             "gate1_max_roll_rad": 0.05,
             "gate1_max_body_rate_rad_s": 0.12,
             "gate1_max_thrust": 0.30,
@@ -421,13 +430,6 @@ class PredictiveControllerConfig:
             if getattr(self, name) > hard_maximum:
                 raise ValueError(
                     f"{name} cannot loosen its reviewed hard maximum"
-                )
-        for name, hard_minimum in (
-            ("gate1_min_thrust", 0.21),
-        ):
-            if getattr(self, name) < hard_minimum:
-                raise ValueError(
-                    f"{name} cannot loosen its reviewed hard minimum"
                 )
         if self.gate0_launch_end_s >= self.gate0_boost_end_s:
             raise ValueError("Gate 0 launch window must end before boost window")
@@ -607,6 +609,39 @@ def _inside_gate1_corridor(
     )
 
 
+def _gate1_corridor_is_conservatively_confirmed(
+    state: RelativeGateStateV1,
+    phase: ControllerPhaseInput,
+    config: PredictiveControllerConfig,
+) -> bool:
+    """Require fixed three-sigma bearing and rate margins for completion."""
+
+    covariance = state.covariance.matrix
+    bearing_error = (
+        state.bearing_norm[0] - phase.target_bearing_norm[0],
+        state.bearing_norm[1] - phase.target_bearing_norm[1],
+    )
+    bearing_limits = (
+        config.gate1_corridor_x_norm,
+        config.gate1_corridor_y_norm,
+    )
+    for axis, limit in enumerate(bearing_limits):
+        conservative_error = abs(bearing_error[axis]) + (
+            _GATE1_CORRIDOR_SIGMA_MULTIPLIER
+            * math.sqrt(covariance[axis][axis])
+        )
+        if conservative_error > limit:
+            return False
+    for axis, covariance_index in enumerate((3, 4)):
+        conservative_rate = abs(state.bearing_rate_norm_s[axis]) + (
+            _GATE1_CORRIDOR_SIGMA_MULTIPLIER
+            * math.sqrt(covariance[covariance_index][covariance_index])
+        )
+        if conservative_rate > config.gate1_corridor_rate_norm_s:
+            return False
+    return True
+
+
 def _eligibility_failure(
     state: RelativeGateStateV1,
     tick: ControllerTickInput,
@@ -784,19 +819,24 @@ def propose_vq2_command(
     bearing_error_y = state.bearing_norm[1] - phase.target_bearing_norm[1]
     if phase.mode is VQ2ControlPhase.GATE1_RECENTER:
         if _inside_gate1_corridor(state, phase, config):
-            corridor_limited = (
-                state.health is RelativeStateHealth.DEGRADED
-                or bool(state.last_clipping)
+            corridor_confirmed = (
+                state.health is RelativeStateHealth.HEALTHY
+                and not state.last_clipping
+                and _gate1_corridor_is_conservatively_confirmed(
+                    state,
+                    phase,
+                    config,
+                )
             )
             return _failsafe_proposal(
                 tick,
                 phase,
                 (
-                    "gate1_recenter_corridor_unconfirmed_limited"
-                    if corridor_limited
-                    else "gate1_recenter_corridor_reached"
+                    "gate1_recenter_corridor_reached"
+                    if corridor_confirmed
+                    else "gate1_recenter_corridor_unconfirmed_limited"
                 ),
-                uncertainty_limited=corridor_limited,
+                uncertainty_limited=not corridor_confirmed,
             )
         target_roll_unclamped = (
             config.gate1_roll_gain_rad_per_norm * bearing_error_x

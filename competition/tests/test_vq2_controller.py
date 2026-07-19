@@ -94,6 +94,10 @@ def _covariance(
     )
 
 
+def _confirmed_corridor_covariance() -> FeatureCovarianceV1:
+    return _covariance((1e-6, 1e-6, 0.04, 1e-6, 1e-6, 0.25))
+
+
 def _timing(
     *,
     decision_ns: int = _DECISION_NS,
@@ -822,7 +826,12 @@ def test_gate1_low_uncertainty_degraded_clipped_state_is_explicitly_limited():
 
 
 def test_gate1_corridor_and_timeout_are_source_less_zero_not_passage():
-    state = _state(gate_index=1, bearing=(0.05, -0.05), bearing_rate=(0.1, -0.1))
+    state = _state(
+        gate_index=1,
+        bearing=(0.05, -0.05),
+        bearing_rate=(0.1, -0.1),
+        covariance=_confirmed_corridor_covariance(),
+    )
     corridor = _propose(
         state,
         phase=_phase(
@@ -845,6 +854,69 @@ def test_gate1_corridor_and_timeout_are_source_less_zero_not_passage():
     assert "corridor_reached" in corridor.reason
     assert corridor.uncertainty.limited is False
     assert "time_limit" in timeout.reason
+
+
+@pytest.mark.parametrize(
+    ("covariance_index", "corridor_limit"),
+    (
+        (0, 0.10),
+        (1, 0.12),
+        (3, 0.25),
+        (4, 0.25),
+    ),
+    ids=("bearing-x", "bearing-y", "rate-x", "rate-y"),
+)
+def test_gate1_corridor_confirmation_uses_exact_three_sigma_boundaries(
+    covariance_index: int,
+    corridor_limit: float,
+):
+    phase = _phase(
+        mode=VQ2ControlPhase.GATE1_RECENTER,
+        phase_started_ns=_PROPOSAL_NS - 200_000_000,
+    )
+    diagonal = [1e-12, 1e-12, 0.04, 1e-12, 1e-12, 0.25]
+    diagonal[covariance_index] = (corridor_limit / 3.0) ** 2
+    exact = _propose(
+        _state(
+            gate_index=1,
+            covariance=_covariance(tuple(diagonal)),
+        ),
+        phase=phase,
+    )
+    assert exact.reason == "withheld:gate1_recenter_corridor_reached"
+    assert exact.uncertainty.limited is False
+
+    diagonal[covariance_index] = (corridor_limit / 3.0 + 1e-12) ** 2
+    outside = _propose(
+        _state(
+            gate_index=1,
+            covariance=_covariance(tuple(diagonal)),
+        ),
+        phase=phase,
+    )
+    assert outside.reason == (
+        "withheld:gate1_recenter_corridor_unconfirmed_limited"
+    )
+    assert outside.uncertainty.limited is True
+
+
+def test_gate1_point_inside_with_broad_covariance_is_not_confirmed():
+    state = _state(
+        gate_index=1,
+        bearing=(0.05, -0.05),
+        bearing_rate=(0.1, -0.1),
+    )
+    proposal = _propose(
+        state,
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS - 200_000_000,
+        ),
+    )
+    assert proposal.reason == (
+        "withheld:gate1_recenter_corridor_unconfirmed_limited"
+    )
+    assert proposal.uncertainty.limited is True
 
 
 def test_gate1_time_limit_boundary_is_exact():
@@ -982,15 +1054,29 @@ def test_gate1_corridor_thresholds_are_exactly_frozen(name, default, direction):
         )
 
 
+_FROZEN_GATE1_LAW_DEFAULTS = {
+    "gate1_roll_gain_rad_per_norm": 0.12,
+    "gate1_roll_rate_gain_rad_s_per_norm_s": 0.025,
+    "gate1_min_thrust": 0.21,
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    tuple(
+        (name, math.nextafter(default, direction))
+        for name, default in _FROZEN_GATE1_LAW_DEFAULTS.items()
+        for direction in (0.0, math.inf)
+    ),
+)
+def test_gate1_control_law_constants_are_frozen_both_directions(name, value):
+    with pytest.raises(ValueError, match="frozen.*Gate 1 control-law"):
+        PredictiveControllerConfig(**{name: value})
+
+
 @pytest.mark.parametrize(
     "changes",
     (
-        {"gate1_roll_gain_rad_per_norm": math.nextafter(0.12, math.inf)},
-        {
-            "gate1_roll_rate_gain_rad_s_per_norm_s": math.nextafter(
-                0.025, math.inf
-            )
-        },
         {"gate1_max_roll_rad": math.nextafter(0.05, math.inf)},
         {"gate1_max_body_rate_rad_s": math.nextafter(0.12, math.inf)},
         {"gate1_max_thrust": math.nextafter(0.30, math.inf)},
@@ -1008,7 +1094,6 @@ def test_gate1_corridor_thresholds_are_exactly_frozen(name, default, direction):
         {"max_log_scale_variance": math.nextafter(1.0, math.inf)},
         {"max_bearing_rate_variance": math.nextafter(16.0, math.inf)},
         {"max_expansion_rate_variance": math.nextafter(16.0, math.inf)},
-        {"gate1_min_thrust": math.nextafter(0.21, 0.0)},
     ),
 )
 def test_configuration_cannot_loosen_reviewed_safeguards(changes):
@@ -1016,13 +1101,10 @@ def test_configuration_cannot_loosen_reviewed_safeguards(changes):
         PredictiveControllerConfig(**changes)
 
 
-def test_gate1_gains_envelopes_and_evidence_thresholds_can_tighten():
+def test_gate1_output_ceilings_and_evidence_thresholds_can_tighten():
     config = PredictiveControllerConfig(
-        gate1_roll_gain_rad_per_norm=0.06,
-        gate1_roll_rate_gain_rad_s_per_norm_s=0.0125,
         gate1_max_roll_rad=0.04,
         gate1_max_body_rate_rad_s=0.10,
-        gate1_min_thrust=0.22,
         gate1_max_thrust=0.28,
         gate1_max_duration_s=0.50,
         max_phase_objective_age_ns=50_000_000,
@@ -1043,7 +1125,7 @@ def test_gate1_gains_envelopes_and_evidence_thresholds_can_tighten():
     )
     assert not proposal.is_exact_zero
     assert all(abs(rate) <= 0.10 for rate in proposal.requested_body_rates_rad_s)
-    assert 0.22 <= proposal.requested_thrust <= 0.28
+    assert 0.21 <= proposal.requested_thrust <= 0.28
     assert proposal.saturation.body_rate_axes[:2] == (True, True)
     assert proposal.saturation.thrust is True
 

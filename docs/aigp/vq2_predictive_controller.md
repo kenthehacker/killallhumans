@@ -76,7 +76,7 @@ therefore cannot be mistaken for a sourced nonzero proposal. Withholding covers:
 
 Gate 1 additionally admits a `DEGRADED` state only when its clipping mask is
 nonzero, guidance explicitly permits the objective, and all ordinary age,
-authority, bearing, and covariance gates pass. Any accepted Gate 1 proposal
+authority, bearing, and covariance gates pass. Any nonzero Gate 1 proposal
 from a degraded or clipped state sets `uncertainty.limited=true` with reason
 `bounded_gate1_recenter_degraded_or_clipped`.
 
@@ -84,10 +84,14 @@ Every Gate 0 legacy-law and schedule constant is frozen to its documented
 default: roll gain/limit, pitch blend, launch/boost boundaries and thrusts,
 shared vertical coefficients, attitude gains, and Gate 0 body-rate/thrust
 envelopes. A configuration deviation is rejected before any proposal can carry
-the `legacy_gate0_pixel_pd` reason. Gate 1 gains and output envelopes, plus
-state/objective timing, bearing, and covariance evidence thresholds, are
-tighten-only. Gate 1's completion corridor is not tunable in either direction:
-its exact reviewed thresholds remain `(x, y, rate)=(0.10, 0.12, 0.25 norm/s)`.
+the `legacy_gate0_pixel_pd` reason. Gate 1's roll position/rate gains and lower
+thrust clamp are also frozen: decreasing either gain is not safety-monotone
+when the position and rate terms oppose, and raising the lower thrust clamp can
+increase the requested thrust. Gate 1 target-roll/body-rate/upper-thrust/time
+ceilings, plus state/objective timing, bearing, and covariance evidence
+thresholds, are tighten-only. Gate 1's completion corridor is not tunable in
+either direction: its exact reviewed thresholds remain
+`(x, y, rate)=(0.10, 0.12, 0.25 norm/s)`.
 
 ## Gate 0 regression mapping
 
@@ -146,11 +150,14 @@ are intentionally tighter than Gate 0:
 - roll/pitch body-rate clamp `+/-0.12 rad/s`, yaw exact zero;
 - the same normalized vertical PD with thrust clamped to `[0.21, 0.30]`;
 - a hard 0.60-second proposal window; and
-- an inclusive bearing/rate corridor that returns exact zero when reached.
+- an inclusive point bearing/rate corridor whose completion decision also
+  requires fixed three-sigma bearing and rate covariance margins.
 
-Only a `HEALTHY`, unclipped state may return the source-less
-`gate1_recenter_corridor_reached` result. A degraded or clipped state inside
-the same corridor instead returns the distinct source-less
+Only a `HEALTHY`, unclipped state whose bearing and bearing-rate three-sigma
+bounds remain inside every fixed corridor threshold may return the source-less
+`gate1_recenter_corridor_reached` result. A degraded, clipped, or insufficiently
+confident state whose point estimate is inside the corridor instead returns the
+distinct source-less
 `gate1_recenter_corridor_unconfirmed_limited` result with
 `uncertainty.limited=true`; it never claims completion. Corridor withholding
 and timeout contain no passage claim. They are not cleanup proof and do not
@@ -163,7 +170,8 @@ Gate 0 regression fixtures, host-derived phase schedule/timeout boundaries,
 stable phase-start and objective-evaluation watermarks, source binding,
 determinism, yaw zero, saturation diagnostics, health/age/covariance gates,
 unconditional prediction-delay budget arithmetic, metric-pose independence,
-fully frozen Gate 0 tuning and Gate 1 corridor thresholds, the degraded/clipped
-Gate 1 exception, tighter recenter envelopes, and source-less corridor/timeout
+fully frozen Gate 0 tuning, Gate 1 law constants, and Gate 1 corridor
+thresholds, fixed three-sigma completion margins, the degraded/clipped Gate 1
+exception, tighter recenter envelopes, and source-less corridor/timeout
 behavior. They are offline unit evidence, not replay, simulator,
 actuator-response, powered, or safety-supervisor evidence.
