@@ -6,11 +6,13 @@
 **Integrated foundation baseline:** b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8
 **Integrated Wave 1A implementation:** a6782cd9dcc34aee94e0f064021399985e0f6839
 **Integrated Wave 1 offline record:** 1cf17ea5f4e0a330bee89b0128d30b13657899a2
+**Integrated Wave 2 offline implementation:** 8176cbac20ff16bfa4b8c24764596d9366fe98cf
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
 **Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
-foundations are integrated on main and post-merge verified; M1/M2/M4 acceptance
-remains incomplete, and Wave 2 offline work is active. No new FlightSim
-evidence was collected.
+foundations and the Wave 2 controller/system-ID/guidance tranche are integrated
+on main and post-merge verified. M1/M2/M4 runtime acceptance remains incomplete;
+the next work remains offline until its explicit data or powered boundary. No
+new FlightSim evidence was collected.
 
 ## Purpose
 
@@ -223,6 +225,55 @@ measurements. Main fast-forwarded from
 `1cf17ea5f4e0a330bee89b0128d30b13657899a2`; post-merge `test-vq2` passed all
 418 tests in 6.31 seconds and tracked Git status on main was empty.
 
+## Wave 2 offline integration record
+
+The pure predictive controller, offline system-identification tooling, and
+mapless guidance candidates were independently hardened and merged with the
+integration-owned offline adapter in
+`8176cbac20ff16bfa4b8c24764596d9366fe98cf`:
+
+- the controller maps exact `RelativeGateStateV1` inputs to bounded
+  `CommandProposalV1` values for Gate 0 approach and Gate 1 recentering, with
+  covariance, source, timing, health, dwell, and command-envelope withholding;
+- system-ID tooling defines bounded offline experiments and fits/selects
+  delay/plant profiles without granting those profiles runtime authority;
+- guidance owns gate-scoped active/shadow track ownership and chronology,
+  countdown/GO and terminal lifecycle, Gate 0 initialization,
+  credit/reacquisition, and conservative clipped-target behavior;
+- the adapter is the sole guidance caller in the composition, threads accepted
+  memory, latches the Gate 0 pitch basis, exact-binds decision/state/tick
+  provenance, maps only the two reviewed controller modes, and emits
+  source-less exact zero for every other phase including commit; and
+- a generated, already-decoded timed image-space path reaches detector,
+  aperture fit, relative estimator, guidance, and controller while proving
+  bbox-only geometry remains withheld. It is not JPEG receiver/reassembly or
+  recorded replay evidence.
+
+Accepted offline evidence is:
+
+- 36 direct adapter tests and 378 combined affected tests;
+- exactly 743 VQ2 policy tests in canonical, isolated-manifest, immutable
+  committed-candidate, and post-merge main runs;
+- `test-fast` and `test-unit`: 1,835 passed, 20 skipped, 42 deselected each;
+- promotion-boundary `test-full-non-live`: 1,876 passed and 21 skipped in
+  500.10 seconds; skipped optional coverage is not positive evidence;
+- a reviewed 123-entry trusted manifest with semantic identity
+  `4b8bae1511225f4ed79baa14ec015721069b8c37e98b81de7454bcabe7388988`
+  and file SHA-256
+  `79b8769f04902c2b2f87a45109b7a9aaa6b5cbf4ad3c4122593a8347ec57c689`;
+  and
+- main fast-forwarded from `e9a416714b01c2845786a0a22b168a9037f379ec`
+  to the integrated candidate; post-merge `test-vq2` passed all 743 tests in
+  29.64 seconds and tracked Git status was empty.
+
+No FlightSim process was launched or contacted and no preflight, reset,
+arm/disarm, target, transport, or powered action occurred. The adapter remains
+offline-only: attitude and Gate 0 pitch lack timestamp/source correlation,
+caller-threaded pure memory is a trust boundary, no approved replay corpus or
+final processor is present, and measured delay/plant and tracker-isolation
+replay evidence remain absent. Nothing in Wave 2 changes the established live
+status or authorizes shadow, runtime, supervisor, transport, or powered wiring.
+
 ## Completed foundation bootstrap
 
 The former dirty-worktree exception is closed:
@@ -397,7 +448,7 @@ CommandProposal:
 | M1 | Active; offline timing/scheduler foundation integrated, full runtime trace and simulator dossier pending | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
 | M2 | Active offline; censored aperture fitter integrated, recorded replay and tracker-isolation acceptance pending | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
 | M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
-| M4 | Active offline; feature estimator/predictor integrated, delay-compensated IBVS and runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M4 | Active offline; estimator, pure controller, guidance, and exact adapter integrated; timestamped attitude/derotation, measured delay, and runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
 | M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
 | M6 | Pending | Conservative valid full lap | M5 |
 | M7 | Pending | Repeatable baseline across fresh and warm sessions | M6 |
@@ -480,11 +531,12 @@ Remain at the reviewed 50-Hz cap initially.
 
 ## Workstream C: gate geometry and perception
 
-State: stages 1-2 and a bounded image-space subset of stage 3 are integrated
-with deterministic synthetic evidence. The fitter uses an
+State: stages 1-2, a bounded image-space subset of stage 3, and gate-scoped
+active/shadow guidance ownership are integrated with deterministic synthetic
+evidence. The fitter uses an
 explicitly censored pixel-square prior, not a calibrated planar/physical-square
-or metric-pose model. Gate 0 replay, recorded Gate 1 stability, active/shadow
-tracking, and crossing-residue isolation remain open.
+or metric-pose model. Gate 0 replay, recorded Gate 1 stability, and
+tracker/crossing-residue isolation replay remain open.
 
 Stages:
 
@@ -510,9 +562,9 @@ features rather than forcing a metric pose.
 
 State: the feature filter, distinct-frame updates, innovation gating,
 covariance growth, coasting/loss, and bounded prediction are integrated
-offline. IMU derotation, calibrated command-effect prediction, runtime wiring,
-p95 replay comparison against zero-order hold, shadow evidence, and IBVS remain
-open.
+offline, along with the pure controller/guidance composition. IMU derotation,
+calibrated command-effect prediction, runtime wiring, p95 replay comparison
+against zero-order hold, and shadow/runtime IBVS evidence remain open.
 
 Initial estimator:
 
@@ -548,6 +600,13 @@ Acceptance:
 - shadow-mode evidence before command authority.
 
 ## Workstream E: control and gate progression
+
+State: the pure controller, bounded Gate 0 approach and Gate 1 recenter proposal
+modes, normalized bearing/rate damping, bounded elapsed-time and vertical-error
+thrust scheduling/control, uncertainty withholding, saturation/dwell limits,
+mapless guidance lifecycle, and exact offline adapter are integrated. Measured
+command-effect timing, timestamped attitude provenance, supervisor/runtime
+wiring, and any powered Gate 1 recenter or passage remain open.
 
 Extract a pure deterministic controller:
 
@@ -611,6 +670,11 @@ rate-loop lag. MPCC, aperture-aware trajectory optimization, retiming, ILC, and
 learned residuals remain evidence-driven candidates.
 
 ## Workstream G: simulator characterization and system identification
+
+State: bounded experiment definitions, offline fitting, and deterministic
+profile selection are integrated. Wave 2 ran no FlightSim experiment and
+selected no profile for runtime authority; new passive or powered evidence
+retains the authorization and simulator-lease boundaries below.
 
 Passive:
 
@@ -770,18 +834,23 @@ acceptance remains incomplete:
 The new scheduler, geometry adapter, and estimator are not connected into the
 powered command path, and no official-simulator or powered evidence is claimed.
 
-Wave 2:
+Wave 2, completed offline and post-merge verified:
 
-- pure predictive IBVS;
-- system-identification tooling;
+- pure predictive IBVS/controller proposals;
+- system-identification tooling and bounded experiment definitions;
 - mapless guidance/state machine;
-- coordinator designs the bounded Gate 1 recenter integration.
+- exact offline guidance/controller adapter and generated cross-layer path.
 
-Wave 3:
+Wave 3, next offline tranche before any separately authorized live work:
 
-- one integration owner merges M1-M4;
-- one exclusive live agent runs the Gate 1 recenter stage;
-- other agents continue offline on pose, replay scoring, and the VQ2 surrogate.
+- timestamp and source-bind attitude/Gate 0 pitch inputs and add bounded IMU
+  derotation evidence;
+- connect detection-through-gyro timing and the fixed-rate scheduler only in an
+  offline/shadow-disabled composition behind the supervisor seam;
+- exercise a disposable clean candidate through T0-T4;
+- perform recorded replay scoring only after approved inputs and the final
+  processor exist;
+- keep Gate 1 recentering as an exclusive, separately authorized live stage.
 
 Wave 4, after conservative completion:
 
@@ -827,22 +896,26 @@ trusted-manifest verification, and explicit canonical test tiers are complete.
 Do not repeat them merely because an agent resumes the plan; rerun affected
 gates whenever the base or trust set changes.
 
-1. Build the pure predictive controller from `RelativeGateStateV1` to
-   `CommandProposalV1`, initially reproducing Gate 0 behavior without transport
-   authority.
-2. Add an offline end-to-end observation-to-estimator-to-controller replay path.
+1. Add a reviewed timestamp/source seam for attitude and the Gate 0 pitch basis,
+   then implement bounded offline IMU derotation without changing transport or
+   supervisor authority.
+2. Extend the generated observation-to-estimator-to-guidance/controller path
+   through that seam and full detection-through-gyro latency accounting. Keep
+   the already-decoded synthetic path distinct from receiver/reassembly and
+   recorded replay evidence.
 3. Validate Gate 0 non-regression and recorded top-clipped Gate 1 geometry once
    approved replay inputs and the final processor exist.
-4. Connect full detection-through-gyro latency tracing in an offline/shadow
-   path and integrate the fixed-rate scheduler only behind the reviewed
-   supervisor/transport seam. Do not select scheduler output for transport;
-   transport enablement remains a separately authorized powered workflow.
+4. Integrate the fixed-rate scheduler only in an offline or shadow-disabled
+   composition behind the reviewed supervisor/transport seam. Do not select
+   scheduler output for transport; transport enablement remains a separately
+   authorized powered workflow.
 5. Exercise a disposable clean candidate through T0-T4 scheduler leases,
    interruption/resume, deduplication, exact worktrees, and merger evidence; this
    operational dogfood remains outstanding and does not broaden tier claims.
 6. Provision the private golden replay corpus and administrator-owned isolation
    wrapper before enabling production T1. This may proceed independently when a
-   slot and the required authorization are available; it does not block Wave 2.
+   slot and the required authorization are available; it does not block the
+   remaining synthetic/offline work.
 7. Continue only authorized passive probes while offline work proceeds.
 8. Integrate finished branches frequently, but only after each branch is committed
    and promoted. Quarantine a dirty failed worktree without touching clean main.

@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave2-offline-integration`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `candidate_complete`
+- State: `post_merge_verified`
 - Objective: integrate a pure predictive controller, offline system-
   identification tooling, and mapless guidance/state logic on the post-Wave 1
   frozen `/1` contracts, with deterministic evidence and no transport authority.
@@ -44,17 +44,21 @@
   - system identification: `0c15b7c`;
   - predictive controller: `692d55e`;
   - mapless guidance: `833d6b0`.
+- Integrated candidate commit:
+  `8176cbac20ff16bfa4b8c24764596d9366fe98cf`.
 - Integration-owned adapter:
   `competition/vq2_wave2_adapter.py`. It owns accepted guidance memory, latches
   the Gate 0 pitch basis, exact-binds guidance/state/tick correlation, maps only
   Gate 0 approach and Gate 1 alignment/recenter, and emits source-less exact
   zero for every other phase including commit. It has no transport, runtime,
   supervisor, simulator, or system-ID import.
-- Accepted integration evidence so far:
+- Accepted integration evidence:
   - adapter target: `36 passed`;
   - combined contracts/controller/adapter/guidance/system-ID target:
     `378 passed`;
   - canonical `test-vq2`: exactly `743 passed`;
+  - immutable committed-candidate `test-vq2`: exactly `743 passed` in
+    `29.30s`;
   - isolated exact-policy VQ2: exactly `743 passed` against the reviewed
     manifest;
   - repository `test-fast`: `1,835 passed, 20 skipped, 42 deselected`;
@@ -69,9 +73,13 @@
   - independent adversarial adapter review: cleared with no remaining P0 or
     structurally checkable integration blocker; caller-threaded pure memory is
     explicitly a trust boundary rather than authenticated runtime state.
-- Pending after candidate completion: clean/cache checks, exact integration
-  commit, shared handoff update, promotion to main, and post-merge
-  verification.
+  - main fast-forward: `e9a416714b01c2845786a0a22b168a9037f379ec`
+    to `8176cbac20ff16bfa4b8c24764596d9366fe98cf`;
+  - post-merge main `test-vq2`: exactly `743 passed` in `29.64s`, followed
+    by an empty tracked Git status.
+- Wave 2 implementation, candidate promotion, and post-merge verification are
+  complete. Shared handoff synchronization is the closeout record; it does not
+  broaden the offline evidence claim.
 - Residual blockers remain explicit: attitude and Gate 0 pitch provenance are
   untimestamped; no approved replay corpus or final processor is present;
   measured delay/plant response and tracker-isolation replay are absent; and no
