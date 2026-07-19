@@ -466,6 +466,49 @@ def test_no_replay_or_diagnostics_skips_detection_summary_capture_path(monkeypat
     assert runner.tracker.target is not None
 
 
+def test_sampling_uses_frame_identity_not_opaque_camera_source_timestamp():
+    adapter = _FakeAdapter()
+    vision = _FakeVision()
+    detections = [0]
+
+    def detect(_image):
+        detections[0] += 1
+        return [_detection(10, 10, 40, 40)]
+
+    runner = VQ2Runner(adapter, vision)
+    runner.detector = SimpleNamespace(detect=detect)
+    vision.current_snapshot = _vision_snapshot(
+        generation=3,
+        frame_id=101,
+        sim_time_ns=1_000,
+        received_monotonic_s=1.0,
+    )
+    runner._sample()
+    assert detections[0] == 1
+
+    # A changed source token cannot relabel and re-run one camera identity.
+    vision.current_snapshot = _vision_snapshot(
+        generation=3,
+        frame_id=101,
+        sim_time_ns=9_999,
+        received_monotonic_s=1.1,
+    )
+    runner._sample()
+    assert detections[0] == 1
+    assert runner._last_frame_sim_ns == 1_000
+
+    # Receiver generation is part of identity, so a restart may reuse the ID.
+    vision.current_snapshot = _vision_snapshot(
+        generation=4,
+        frame_id=101,
+        sim_time_ns=5,
+        received_monotonic_s=1.2,
+    )
+    runner._sample()
+    assert detections[0] == 2
+    assert runner._last_frame_identity == (4, 101)
+
+
 def test_incomplete_requested_replay_fails_stage_result_without_changing_cleanup():
     original = vq2_module.StageResult(
         stage="preflight",
