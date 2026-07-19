@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3-merger-dogfood`.
 - Parent: `2026-07-18-vq2-execution-plan-handoff`.
-- State: `candidate_complete`.
+- State: `integration_pending`.
 - Objective: exercise the real `SingleMerger` positive fast-forward path with
   a fully promotion-valid synthetic T0-T4 ledger chain and an exact descendant
   commit in a disposable local Git repository.
@@ -46,6 +46,16 @@
   - canonical `test-vq2`: `743 passed`;
   - repository `test-fast`: `1,838 passed, 20 skipped, 42 deselected`;
   - `git diff --check`: clean before commit.
+- Behavioral commit:
+  `fe59e42a27ad84a4d9a8b10d5311a4b1bc44ad69`.
+- Integration-owned review:
+  - the three new merger cases independently reproduced: `3 passed`;
+  - trusted-manifest inventory remained exactly `123 -> 123`, with no added or
+    removed files and only `tests/test_aigp_loop_scheduler.py` changing;
+  - reviewed manifest semantic identity:
+    `60680aec1f26b3661576b65221ab4aeba4fab5df8959e46076dd8f99fce8fe41`;
+  - reviewed/tracked manifest file SHA-256:
+    `0658ef17b864ce60312917aca208cd66263144f44d8fcc86ba4c37be1ebb2be5`.
 - Evidence limits: all promotion rows and evaluator results are synthetic unit
   fixtures. They exercise validation and merge mechanics only; they are not a
   scheduler-run candidate, replay result, simulator result, or promotion of
