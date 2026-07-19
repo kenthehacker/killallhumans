@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-relative-estimation`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `candidate_accepted`
+- State: `integration_pending`
 - Objective: implement the highest-value fully offline feature-space filter,
   prediction, innovation gating, dropout/coasting, and estimator-health path
   required before M4. The implementation consumes frozen
@@ -44,9 +44,7 @@
   - repository `test-fast`: `1462 passed, 20 skipped, 42 deselected`;
   - isolated legacy `test-unit`: `1462 passed, 20 skipped, 42 deselected`;
   - `git diff --check`: clean.
-- Final commit: this accepted candidate changeset; its Git object ID is
-  reported to the integration owner after commit because a commit cannot
-  contain its own object ID.
+- Final commit: `4a9833abbbcdd1d88b1f2e4d378fcf14c39de4d2`.
 - Result/failure provenance: all evidence was produced offline in the named
   worktree with `AIGP_PYTHON` bound to the repository development environment.
   No simulator, preflight, network, reset, arm, target, command-send, or

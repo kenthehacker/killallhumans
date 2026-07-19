@@ -60,8 +60,10 @@
 - Superseded pre-acceptance runs include 87 focused contract/evidence tests,
   281 scheduler/promotion tests with 12 expected skips, and a 350-test VQ2
   policy run. The accepted contract policy now collects exactly 356 tests.
-- Simulator access remained `none`; no preflight, process launch, network
-  connection, reset, arm/disarm, target, or powered command occurred.
+- Simulator access remained `none`; no FlightSim process launch or connection,
+  preflight, external network access, reset, arm/disarm, target, or powered
+  command occurred. Offline tests may use local Python workers and loopback
+  test sockets.
 
 - Trusted manifest: 116 entries; builder identity
   `d6e4cd31177281fe9010eeeeb7df1667c248c464a45444d692d5a8225a6dc033`;

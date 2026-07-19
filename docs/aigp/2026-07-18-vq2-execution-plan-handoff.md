@@ -5,9 +5,12 @@
 **Repository:** C:\Users\John\killallhumans
 **Integrated foundation baseline:** b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8
 **Integrated Wave 1A implementation:** a6782cd9dcc34aee94e0f064021399985e0f6839
+**Wave 1 offline integration candidate:** 361d0060f16dbaec753de00ba491f1a085707eb1
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
-**Plan state:** M0 and Wave 1A complete; Wave 1 is active; main was clean after
-post-merge verification at this update.
+**Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
+foundations are integrated on the candidate branch and candidate-verified;
+main integration and post-merge verification remain pending at this update.
+No new FlightSim evidence was collected.
 
 ## Purpose
 
@@ -180,6 +183,43 @@ These results do not alter the historical M0 counts above and do not claim a
 private golden corpus, calibrated production geometry, powered execution, or
 official-simulator evidence.
 
+## Wave 1 offline integration candidate
+
+The three Wave 1 implementation branches are merged on candidate
+`361d0060f16dbaec753de00ba491f1a085707eb1`:
+
+- runtime timing adds exact camera publication timing, one-shot latest-value
+  consumption, a no-burst 50 Hz scheduler, latency traces, and percentile
+  summaries;
+- gate geometry adds opt-in visible/censored inner-aperture fitting with
+  conservative uncertainty and an explicit degraded bbox-only fallback that
+  the estimator withholds;
+- relative estimation adds variable-time feature filtering, innovation gating,
+  bounded caller-supplied prediction, coasting/loss, same-session
+  contract-validated gate/reset reinitialization, retained replay history, and
+  cross-session rejection;
+- the cross-workstream test binds a synthetic timed, read-only frame through
+  detection, aperture fitting, and exact-source relative-state initialization,
+  while proving that bbox-only geometry is withheld from the estimator.
+
+Accepted candidate evidence, with zero FlightSim access, is:
+
+- 187 combined affected tests;
+- exactly 418 VQ2 policy tests in both canonical and isolated candidate runs;
+- `test-fast` and `test-unit`: 1,510 passed, 20 skipped, 42 deselected each;
+- a reviewed 119-entry trusted manifest with semantic identity
+  `fd1d09e16c34dd3c77fb45877102dda56ca1da888b8b6c3cf5bf1408ffe0d4b8`
+  and file SHA-256
+  `44f985274eb41a5c6d12b6fa17e4d553facb14f8b854901d084eabc99c88af5e`;
+- `git diff --check`: clean.
+
+These are offline foundations. The scheduler, geometry adapter, and estimator
+are not connected to the powered command path. Remaining M1/M2/M4 acceptance
+requires production event wiring, recorded replay, IMU derotation and measured
+delay evidence, controller integration, and separately authorized simulator
+measurements. Main/post-merge verification is intentionally recorded only after
+it occurs.
+
 ## Completed foundation bootstrap
 
 The former dirty-worktree exception is closed:
@@ -351,10 +391,10 @@ CommandProposal:
 | Milestone | Status | Outcome | Main prerequisite |
 |---|---|---|---|
 | M0 | Complete at `b9382da` | Stable, green, committed evaluation foundation | Historical bootstrap |
-| M1 | Active | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
-| M2 | Active offline; final acceptance awaits replay evidence | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
+| M1 | Active; offline timing/scheduler foundation candidate-verified, full runtime trace and simulator dossier pending | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
+| M2 | Active offline; censored aperture fitter candidate-verified, recorded replay and tracker-isolation acceptance pending | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
 | M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
-| M4 | Pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M4 | Active offline; feature estimator/predictor candidate-verified, delay-compensated IBVS and runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
 | M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
 | M6 | Pending | Conservative valid full lap | M5 |
 | M7 | Pending | Repeatable baseline across fresh and warm sessions | M6 |
@@ -401,6 +441,11 @@ and, for production T1 specifically, the private trust-boundary inputs above.
 
 ## Workstream B: runtime timing
 
+State: the offline timing and scheduler foundation is candidate-verified. Real
+detection-to-actuator/gyro tracing, production send-path scheduling, simulator
+load measurements, and calibrated measurement/command-delay models remain
+open.
+
 Instrument:
 
     camera epoch timestamp
@@ -432,6 +477,12 @@ Remain at the reviewed 50-Hz cap initially.
 
 ## Workstream C: gate geometry and perception
 
+State: stages 1-2 and a bounded image-space subset of stage 3 are
+candidate-verified with deterministic synthetic evidence. The fitter uses an
+explicitly censored pixel-square prior, not a calibrated planar/physical-square
+or metric-pose model. Gate 0 replay, recorded Gate 1 stability, active/shadow
+tracking, and crossing-residue isolation remain open.
+
 Stages:
 
 1. Treat missing top, bottom, left, and right edges as censored observations.
@@ -453,6 +504,12 @@ If corners remain unreliable under clipping, use edge, bearing, and scale
 features rather than forcing a metric pose.
 
 ## Workstream D: filtering and state estimation
+
+State: the feature filter, distinct-frame updates, innovation gating,
+covariance growth, coasting/loss, and bounded prediction are candidate-verified
+offline. IMU derotation, calibrated command-effect prediction, runtime wiring,
+p95 replay comparison against zero-order hold, shadow evidence, and IBVS remain
+open.
 
 Initial estimator:
 
@@ -694,13 +751,21 @@ The freeze is implemented by `fd51af3c` and hardened by `a6782cd9`; its exact
 reference is `docs/aigp/vq2_contracts.md`. Production T1 inputs were not a
 prerequisite for the freeze.
 
-Wave 1, current parallel implementation wave after 1A:
+Wave 1 offline foundations are candidate-verified; M1/M2/M4 acceptance and main
+integration remain incomplete:
 
-- Agent 1: runtime timing and latest-value scheduling;
-- Agent 2: clipped gate geometry and aperture uncertainty;
-- Agent 3: relative-state filter and prediction;
-- coordinator: interface review, clean integrations, scheduler dogfood, and Gate 0
-  behavior preservation.
+- runtime timing: exact camera publication timing, latest-value consumption,
+  fixed-rate scheduling, and latency summaries;
+- gate geometry: opt-in visible/censored inner-aperture fitting with conservative
+  uncertainty;
+- relative estimation: variable-time feature filtering, innovation gating,
+  bounded prediction, coasting/loss, same-session gate/reset reinitialization,
+  retained replay history, and cross-session rejection;
+- coordinator: cross-workstream source binding, exact 418-test policy, and
+  reviewed 119-entry trusted manifest.
+
+The new scheduler, geometry adapter, and estimator are not connected into the
+powered command path, and no official-simulator or powered evidence is claimed.
 
 Wave 2:
 
@@ -754,31 +819,37 @@ Still requiring controlled evidence:
 
 ## Immediate next actions
 
-The foundation commit, clean-main check, trusted-manifest verification, and all
-explicit canonical test tiers are complete. Do not repeat them merely because an
-agent resumes the plan; rerun affected gates when the base or trust set changes.
+The recorded M0/Wave 1A foundation commits, clean-main checks,
+trusted-manifest verification, and explicit canonical test tiers are complete.
+Do not repeat them merely because an agent resumes the plan; rerun affected
+gates whenever the base or trust set changes. Wave 1 changed both and therefore
+still requires action 1 below.
 
-1. Use the latest clean main commit at or after `b9382da` as every new task's
-   declared base. If the remote is the intended disaster-recovery copy, back up
-   the clean baseline according to repository policy before a long autonomous
-   wave; this handoff does not authorize an external push by itself.
-2. Create `wt-runtime-timing`, `wt-gate-geometry`, and
-   `wt-relative-estimation` from the integrated Wave 1A contract baseline.
-3. Run runtime timing/latest-value scheduling, clipped geometry/aperture
-   uncertainty, and relative-state filtering/prediction in parallel without
-   changing the frozen `/1` wire meanings.
-4. Have the coordinator review interfaces, integrate green branches frequently,
-   and preserve the proved Gate 0 and safety-supervisor behavior.
-5. Exercise a disposable clean candidate through T0-T4 scheduler leases,
+1. Complete Wave 1 main integration and post-merge VQ2 verification, retaining
+   the exact policy, reviewed manifest, clean-main proof, and zero-simulator
+   provenance.
+2. Build the pure predictive controller from `RelativeGateStateV1` to
+   `CommandProposalV1`, initially reproducing Gate 0 behavior without transport
+   authority.
+3. Add an offline end-to-end observation-to-estimator-to-controller replay path.
+4. Validate Gate 0 non-regression and recorded top-clipped Gate 1 geometry once
+   approved replay inputs and the final processor exist.
+5. Connect full detection-through-gyro latency tracing in an offline/shadow
+   path and integrate the fixed-rate scheduler only behind the reviewed
+   supervisor/transport seam. Do not select scheduler output for transport;
+   transport enablement remains a separately authorized powered workflow.
+6. Exercise a disposable clean candidate through T0-T4 scheduler leases,
    interruption/resume, deduplication, exact worktrees, and merger evidence; this
    operational dogfood remains outstanding and does not broaden tier claims.
-6. Provision the private golden replay corpus and administrator-owned isolation
+7. Provision the private golden replay corpus and administrator-owned isolation
    wrapper before enabling production T1. This may proceed independently when a
-   slot and the required authorization are available; it does not block Wave 1.
-7. Continue only authorized passive probes while offline work proceeds.
-8. Integrate finished branches frequently, but only after each branch is committed
+   slot and the required authorization are available; it does not block Wave 2.
+8. Continue only authorized passive probes while offline work proceeds.
+9. Integrate finished branches frequently, but only after each branch is committed
    and promoted. Quarantine a dirty failed worktree without touching clean main.
-9. Treat every powered system-identification or Gate 1 stage as a separate,
+10. Keep the first live change a separately reviewed, explicitly authorized,
+   bounded Gate 1 recenter stage. Treat every powered system-identification or
+   later Gate 1 stage as a separate,
    explicitly authorized workflow outside the shipped scheduler. Never reinterpret
    synthetic T2-T4 results as FlightSim evidence.
 
