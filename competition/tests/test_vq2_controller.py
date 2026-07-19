@@ -36,6 +36,7 @@ _HOST = "host-monotonic-1"
 _DECISION_NS = 2_000_000_000
 _PROPOSAL_NS = 2_010_000_000
 _DEADLINE_NS = 2_030_000_000
+_DEFAULT_PHASE_START_NS = _PROPOSAL_NS - 500_000_000
 _STATE_FEATURE_ORDER = (
     "bearing_x_norm",
     "bearing_y_norm",
@@ -209,6 +210,8 @@ def _tick(
     authority: GateAuthorityEpochV1 | None = None,
     minimum_decision_ns: int | None = None,
     minimum_state_sequence: int | None = None,
+    expected_phase_started_ns: int = _DEFAULT_PHASE_START_NS,
+    minimum_phase_evaluation_ns: int | None = None,
 ) -> ControllerTickInput:
     return ControllerTickInput(
         proposal_id=72,
@@ -226,6 +229,12 @@ def _tick(
             if minimum_state_sequence is None
             else minimum_state_sequence
         ),
+        expected_phase_started_monotonic_ns=expected_phase_started_ns,
+        minimum_phase_evaluation_monotonic_ns=(
+            proposal_ns
+            if minimum_phase_evaluation_ns is None
+            else minimum_phase_evaluation_ns
+        ),
         expected_authority=authority or state.authority,
     )
 
@@ -233,14 +242,18 @@ def _tick(
 def _phase(
     *,
     mode: VQ2ControlPhase = VQ2ControlPhase.GATE0_APPROACH,
-    elapsed_s: float = 0.50,
+    phase_host_clock_id: str = _HOST,
+    phase_started_ns: int = _DEFAULT_PHASE_START_NS,
+    evaluation_ns: int = _PROPOSAL_NS,
     initial_pitch_rad: float = 0.0,
     target_bearing: tuple[float, float] = (0.0, 0.0),
     permitted: bool = True,
 ) -> ControllerPhaseInput:
     return ControllerPhaseInput(
         mode=mode,
-        elapsed_s=elapsed_s,
+        phase_host_clock_id=phase_host_clock_id,
+        phase_started_monotonic_ns=phase_started_ns,
+        evaluation_monotonic_ns=evaluation_ns,
         initial_pitch_rad=initial_pitch_rad,
         target_bearing_norm=target_bearing,
         objective_permitted=permitted,
@@ -256,10 +269,30 @@ def _propose(
     attitude: ControllerAttitudeInput | None = None,
     config: PredictiveControllerConfig | None = None,
 ) -> CommandProposalV1:
+    if phase is None:
+        phase = _phase(
+            phase_host_clock_id=(tick.host_clock_id if tick is not None else _HOST),
+            phase_started_ns=(
+                tick.expected_phase_started_monotonic_ns
+                if tick is not None
+                else _DEFAULT_PHASE_START_NS
+            ),
+            evaluation_ns=(
+                tick.proposal_monotonic_ns
+                if tick is not None
+                else _PROPOSAL_NS
+            ),
+        )
+    if tick is None:
+        tick = _tick(
+            state,
+            expected_phase_started_ns=phase.phase_started_monotonic_ns,
+            minimum_phase_evaluation_ns=phase.evaluation_monotonic_ns,
+        )
     return propose_vq2_command(
         state,
-        tick=tick or _tick(state),
-        phase=phase or _phase(),
+        tick=tick,
+        phase=phase,
         attitude=attitude or _attitude(),
         config=config or PredictiveControllerConfig(),
     )
@@ -272,19 +305,22 @@ def _legacy_vertical_thrust(control_y: float, control_y_rate: float) -> float:
 
 
 @pytest.mark.parametrize(
-    ("elapsed_s", "expected_thrust"),
+    ("elapsed_ns", "expected_thrust"),
     (
-        (0.0, 0.26),
-        (math.nextafter(0.15, 0.0), 0.26),
-        (0.15, 0.32),
-        (math.nextafter(0.45, 0.0), 0.32),
-        (0.45, 0.275),
+        (0, 0.26),
+        (149_999_999, 0.26),
+        (150_000_000, 0.32),
+        (449_999_999, 0.32),
+        (450_000_000, 0.275),
     ),
 )
 def test_gate0_elapsed_boundaries_match_legacy_thrust_schedule(
-    elapsed_s: float, expected_thrust: float
+    elapsed_ns: int, expected_thrust: float
 ):
-    proposal = _propose(_state(), phase=_phase(elapsed_s=elapsed_s))
+    proposal = _propose(
+        _state(),
+        phase=_phase(phase_started_ns=_PROPOSAL_NS - elapsed_ns),
+    )
     assert proposal.requested_thrust == pytest.approx(expected_thrust, abs=1e-15)
     assert proposal.reason == "legacy_gate0_pixel_pd"
 
@@ -308,7 +344,10 @@ def test_gate0_normalized_vertical_pd_matches_legacy_pixel_fixtures(
 
 def test_gate0_attitude_rate_fixture_matches_legacy_quaternion_pd():
     state = _state(bearing=(0.25, 0.0))
-    proposal = _propose(state, phase=_phase(elapsed_s=0.8))
+    proposal = _propose(
+        state,
+        phase=_phase(phase_started_ns=_PROPOSAL_NS - 800_000_000),
+    )
     expected_roll_rate = 2.0 * math.sin((0.15 * 0.25) / 2.0)
     assert proposal.requested_body_rates_rad_s == pytest.approx(
         (expected_roll_rate, 0.0, 0.0), abs=1e-15
@@ -317,15 +356,23 @@ def test_gate0_attitude_rate_fixture_matches_legacy_quaternion_pd():
 
 
 @pytest.mark.parametrize(
-    ("elapsed_s", "expected_pitch"),
-    ((0.0, -0.1), (0.4, -0.05), (0.8, 0.0), (1.2, 0.0)),
+    ("elapsed_ns", "expected_pitch"),
+    (
+        (0, -0.1),
+        (400_000_000, -0.05),
+        (800_000_000, 0.0),
+        (1_200_000_000, 0.0),
+    ),
 )
 def test_gate0_pitch_blend_matches_legacy_boundary_fixtures(
-    elapsed_s: float, expected_pitch: float
+    elapsed_ns: int, expected_pitch: float
 ):
     proposal = _propose(
         _state(),
-        phase=_phase(elapsed_s=elapsed_s, initial_pitch_rad=-0.1),
+        phase=_phase(
+            phase_started_ns=_PROPOSAL_NS - elapsed_ns,
+            initial_pitch_rad=-0.1,
+        ),
     )
     expected_pitch_rate = math.sin(expected_pitch / 2.0)
     assert proposal.requested_body_rates_rad_s[1] == pytest.approx(
@@ -409,6 +456,83 @@ def test_authority_host_phase_and_objective_mismatches_fail_closed():
         assert proposal.source_frame is None
     assert "authority" in authority_mismatch.reason
     assert "objective_withheld" in objective_withheld.reason
+
+
+def test_phase_clock_start_and_evaluation_are_safety_bound_and_fresh():
+    state = _state()
+    original_tick = _tick(state)
+
+    clock_mismatch = _propose(
+        state,
+        tick=original_tick,
+        phase=_phase(phase_host_clock_id="other-clock"),
+    )
+    renewed_start = _propose(
+        state,
+        tick=original_tick,
+        phase=_phase(phase_started_ns=_DEFAULT_PHASE_START_NS + 1),
+    )
+    future_start = _propose(
+        state,
+        tick=original_tick,
+        phase=_phase(
+            phase_started_ns=_PROPOSAL_NS + 1,
+            evaluation_ns=_PROPOSAL_NS + 1,
+        ),
+    )
+    future_evaluation = _propose(
+        state,
+        tick=original_tick,
+        phase=_phase(evaluation_ns=_PROPOSAL_NS + 1),
+    )
+    regressed_evaluation = _propose(
+        state,
+        tick=original_tick,
+        phase=_phase(evaluation_ns=_PROPOSAL_NS - 1),
+    )
+    stale_evaluation = _propose(
+        state,
+        tick=_tick(state, minimum_phase_evaluation_ns=0),
+        phase=_phase(evaluation_ns=_PROPOSAL_NS - 100_000_001),
+    )
+
+    expected_reasons = (
+        (clock_mismatch, "phase_host_clock_mismatch"),
+        (renewed_start, "phase_start_mismatch"),
+        (future_start, "phase_start_from_future"),
+        (future_evaluation, "phase_evaluation_from_future"),
+        (regressed_evaluation, "phase_evaluation_regressed"),
+        (stale_evaluation, "phase_objective_stale"),
+    )
+    for proposal, reason in expected_reasons:
+        assert proposal.is_exact_zero
+        assert proposal.source_frame is None
+        assert proposal.reason == f"withheld:{reason}"
+
+
+def test_phase_evaluation_age_boundary_and_transition_start_are_inclusive():
+    state = _state()
+    evaluation_boundary = _PROPOSAL_NS - 100_000_000
+    boundary = _propose(
+        state,
+        tick=_tick(
+            state,
+            minimum_phase_evaluation_ns=evaluation_boundary,
+        ),
+        phase=_phase(evaluation_ns=evaluation_boundary),
+    )
+    assert not boundary.is_exact_zero
+
+    gate1_state = _state(gate_index=1, bearing=(0.5, -0.5))
+    transition = _propose(
+        gate1_state,
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS,
+            evaluation_ns=_PROPOSAL_NS,
+        ),
+    )
+    assert not transition.is_exact_zero
 
 
 def test_decision_age_future_and_both_regression_watermarks_fail_closed():
@@ -503,6 +627,31 @@ def test_prediction_delay_uncertainty_cap_is_tighten_only_and_inclusive():
     assert rejected.uncertainty.reason == "prediction_delay_uncertainty"
 
 
+@pytest.mark.parametrize(
+    "prediction_ns",
+    (_PROPOSAL_NS, _PROPOSAL_NS - 1),
+    ids=("nominal-lead-zero", "prediction-before-proposal"),
+)
+def test_prediction_budget_always_includes_delay_uncertainty(prediction_ns: int):
+    exact = _state(
+        timing=_timing(
+            prediction_ns=prediction_ns,
+            delay_uncertainty_ns=50_000_000,
+        )
+    )
+    assert not _propose(
+        exact,
+        config=PredictiveControllerConfig(max_prediction_lead_ns=50_000_000),
+    ).is_exact_zero
+
+    rejected = _propose(
+        exact,
+        config=PredictiveControllerConfig(max_prediction_lead_ns=49_999_999),
+    )
+    assert rejected.is_exact_zero
+    assert rejected.uncertainty.reason == "state_prediction_too_far_ahead"
+
+
 def test_measurement_and_covariance_uncertainty_gates_are_inclusive():
     config = PredictiveControllerConfig()
     exact = _state(
@@ -576,7 +725,7 @@ def test_gate1_recenter_uses_tighter_no_forward_progress_envelope():
         state,
         phase=_phase(
             mode=VQ2ControlPhase.GATE1_RECENTER,
-            elapsed_s=0.2,
+            phase_started_ns=_PROPOSAL_NS - 200_000_000,
         ),
     )
     assert not proposal.is_exact_zero
@@ -594,10 +743,25 @@ def test_gate1_low_uncertainty_degraded_clipped_state_is_explicitly_limited():
         bearing=(0.6, -0.5),
         health=RelativeStateHealth.DEGRADED,
     )
-    phase = _phase(mode=VQ2ControlPhase.GATE1_RECENTER, elapsed_s=0.2)
+    phase = _phase(
+        mode=VQ2ControlPhase.GATE1_RECENTER,
+        phase_started_ns=_PROPOSAL_NS - 200_000_000,
+    )
     rejected_unclipped = _propose(degraded_unclipped, phase=phase)
     assert rejected_unclipped.is_exact_zero
     assert "degraded_without_clipping" in rejected_unclipped.reason
+
+    degraded_unclipped_inside = dataclasses.replace(
+        degraded_unclipped,
+        bearing_norm=(0.05, -0.05),
+        bearing_rate_norm_s=(0.1, -0.1),
+    )
+    unconfirmed_unclipped = _propose(degraded_unclipped_inside, phase=phase)
+    assert unconfirmed_unclipped.is_exact_zero
+    assert unconfirmed_unclipped.reason == (
+        "withheld:gate1_recenter_corridor_unconfirmed_limited"
+    )
+    assert unconfirmed_unclipped.uncertainty.limited is True
 
     degraded = dataclasses.replace(
         degraded_unclipped,
@@ -610,6 +774,33 @@ def test_gate1_low_uncertainty_degraded_clipped_state_is_explicitly_limited():
     assert proposal.uncertainty.reason == (
         "bounded_gate1_recenter_degraded_or_clipped"
     )
+
+    degraded_inside = dataclasses.replace(
+        degraded,
+        bearing_norm=(0.05, -0.05),
+        bearing_rate_norm_s=(0.1, -0.1),
+    )
+    degraded_corridor = _propose(degraded_inside, phase=phase)
+    assert degraded_corridor.is_exact_zero
+    assert degraded_corridor.source_frame is None
+    assert degraded_corridor.reason == (
+        "withheld:gate1_recenter_corridor_unconfirmed_limited"
+    )
+    assert degraded_corridor.uncertainty.limited is True
+
+    healthy_clipped_inside = dataclasses.replace(
+        degraded_inside,
+        health=RelativeStateHealth.HEALTHY,
+        health_reason=None,
+    )
+    clipped_corridor = _propose(healthy_clipped_inside, phase=phase)
+    assert clipped_corridor.is_exact_zero
+    assert clipped_corridor.source_frame is None
+    assert clipped_corridor.reason == (
+        "withheld:gate1_recenter_corridor_unconfirmed_limited"
+    )
+    assert clipped_corridor.uncertainty.limited is True
+    assert "corridor_reached" not in clipped_corridor.reason
 
     withheld = _propose(degraded, phase=dataclasses.replace(
         phase,
@@ -634,11 +825,17 @@ def test_gate1_corridor_and_timeout_are_source_less_zero_not_passage():
     state = _state(gate_index=1, bearing=(0.05, -0.05), bearing_rate=(0.1, -0.1))
     corridor = _propose(
         state,
-        phase=_phase(mode=VQ2ControlPhase.GATE1_RECENTER, elapsed_s=0.2),
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS - 200_000_000,
+        ),
     )
     timeout = _propose(
         dataclasses.replace(state, bearing_norm=(0.5, -0.5)),
-        phase=_phase(mode=VQ2ControlPhase.GATE1_RECENTER, elapsed_s=0.60),
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS - 600_000_000,
+        ),
     )
     for proposal in (corridor, timeout):
         assert proposal.is_exact_zero
@@ -646,6 +843,7 @@ def test_gate1_corridor_and_timeout_are_source_less_zero_not_passage():
         assert proposal.phase == "gate1_recenter"
         assert "pass" not in proposal.reason
     assert "corridor_reached" in corridor.reason
+    assert corridor.uncertainty.limited is False
     assert "time_limit" in timeout.reason
 
 
@@ -655,15 +853,26 @@ def test_gate1_time_limit_boundary_is_exact():
         state,
         phase=_phase(
             mode=VQ2ControlPhase.GATE1_RECENTER,
-            elapsed_s=math.nextafter(0.60, 0.0),
+            phase_started_ns=_PROPOSAL_NS - 599_999_999,
         ),
     )
     at_limit = _propose(
         state,
-        phase=_phase(mode=VQ2ControlPhase.GATE1_RECENTER, elapsed_s=0.60),
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS - 600_000_000,
+        ),
+    )
+    above_limit = _propose(
+        state,
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS - 600_000_001,
+        ),
     )
     assert not below.is_exact_zero
     assert at_limit.is_exact_zero
+    assert above_limit.is_exact_zero
 
 
 def test_source_less_withholding_preserves_tick_authority_and_ids():
@@ -681,9 +890,38 @@ def test_source_less_withholding_preserves_tick_authority_and_ids():
 def test_local_inputs_and_configuration_reject_unsafe_ambiguity():
     authority = _authority()
     with pytest.raises(ControllerInputError, match="deadline predates"):
-        ControllerTickInput(1, 1, _HOST, 10, 9, 0, 0, authority)
-    with pytest.raises(ControllerInputError, match="watermark postdates"):
-        ControllerTickInput(1, 1, _HOST, 10, 10, 11, 0, authority)
+        ControllerTickInput(
+            proposal_id=1,
+            control_tick_id=1,
+            host_clock_id=_HOST,
+            proposal_monotonic_ns=10,
+            control_tick_deadline_monotonic_ns=9,
+            minimum_state_decision_monotonic_ns=0,
+            minimum_state_sequence=0,
+            expected_phase_started_monotonic_ns=0,
+            minimum_phase_evaluation_monotonic_ns=0,
+            expected_authority=authority,
+        )
+    with pytest.raises(ControllerInputError, match="state decision watermark"):
+        dataclasses.replace(
+            _tick(_state()),
+            minimum_state_decision_monotonic_ns=_PROPOSAL_NS + 1,
+        )
+    with pytest.raises(ControllerInputError, match="expected phase start"):
+        dataclasses.replace(
+            _tick(_state()),
+            expected_phase_started_monotonic_ns=_PROPOSAL_NS + 1,
+        )
+    with pytest.raises(ControllerInputError, match="phase evaluation watermark"):
+        dataclasses.replace(
+            _tick(_state()),
+            minimum_phase_evaluation_monotonic_ns=_PROPOSAL_NS + 1,
+        )
+    with pytest.raises(ControllerInputError, match="evaluation predates"):
+        _phase(
+            phase_started_ns=_DEFAULT_PHASE_START_NS,
+            evaluation_ns=_DEFAULT_PHASE_START_NS - 1,
+        )
     with pytest.raises(ValueError, match="exact-zero target pitch"):
         _phase(
             mode=VQ2ControlPhase.GATE1_RECENTER,
@@ -691,15 +929,68 @@ def test_local_inputs_and_configuration_reject_unsafe_ambiguity():
         )
 
 
+_FROZEN_GATE0_CONFIG_DEFAULTS = {
+    "gate0_roll_gain_rad_per_norm": 0.15,
+    "gate0_max_roll_rad": 0.08,
+    "gate0_pitch_blend_s": 0.8,
+    "gate0_launch_end_s": 0.15,
+    "gate0_boost_end_s": 0.45,
+    "gate0_launch_thrust": 0.26,
+    "gate0_boost_thrust": 0.32,
+    "gate0_max_body_rate_rad_s": 0.25,
+    "gate0_min_thrust": 0.21,
+    "gate0_max_thrust": 0.32,
+    "attitude_kp_roll": 1.0,
+    "attitude_kp_pitch": 0.5,
+    "attitude_kd_roll": 0.4,
+    "attitude_kd_pitch": 0.2,
+    "legacy_vertical_half_image_px": 180.0,
+    "legacy_vertical_error_scale_px": 90.0,
+    "legacy_vertical_rate_limit_px_s": 300.0,
+    "vertical_neutral_thrust": 0.275,
+    "vertical_position_gain": 0.040,
+    "vertical_rate_damping_per_px_s": 0.00070,
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    tuple(
+        (name, math.nextafter(default, direction))
+        for name, default in _FROZEN_GATE0_CONFIG_DEFAULTS.items()
+        for direction in (0.0, math.inf)
+    ),
+)
+def test_every_gate0_legacy_law_and_schedule_constant_is_frozen(name, value):
+    with pytest.raises(ValueError, match="frozen.*Gate 0 legacy"):
+        PredictiveControllerConfig(**{name: value})
+
+
+@pytest.mark.parametrize(
+    ("name", "default"),
+    (
+        ("gate1_corridor_x_norm", 0.10),
+        ("gate1_corridor_y_norm", 0.12),
+        ("gate1_corridor_rate_norm_s", 0.25),
+    ),
+)
+@pytest.mark.parametrize("direction", (0.0, math.inf), ids=("smaller", "larger"))
+def test_gate1_corridor_thresholds_are_exactly_frozen(name, default, direction):
+    with pytest.raises(ValueError, match="frozen.*Gate 1 corridor"):
+        PredictiveControllerConfig(
+            **{name: math.nextafter(default, direction)}
+        )
+
+
 @pytest.mark.parametrize(
     "changes",
     (
-        {"gate0_max_roll_rad": math.nextafter(0.08, math.inf)},
-        {"gate0_pitch_blend_s": math.nextafter(0.8, math.inf)},
-        {"gate0_launch_end_s": math.nextafter(0.15, math.inf)},
-        {"gate0_boost_end_s": math.nextafter(0.45, math.inf)},
-        {"gate0_max_body_rate_rad_s": math.nextafter(0.25, math.inf)},
-        {"gate0_max_thrust": math.nextafter(0.32, math.inf)},
+        {"gate1_roll_gain_rad_per_norm": math.nextafter(0.12, math.inf)},
+        {
+            "gate1_roll_rate_gain_rad_s_per_norm_s": math.nextafter(
+                0.025, math.inf
+            )
+        },
         {"gate1_max_roll_rad": math.nextafter(0.05, math.inf)},
         {"gate1_max_body_rate_rad_s": math.nextafter(0.12, math.inf)},
         {"gate1_max_thrust": math.nextafter(0.30, math.inf)},
@@ -707,6 +998,7 @@ def test_local_inputs_and_configuration_reject_unsafe_ambiguity():
         {"max_state_age_ns": 100_000_001},
         {"max_measurement_age_ns": 150_000_001},
         {"max_prediction_lead_ns": 100_000_001},
+        {"max_phase_objective_age_ns": 100_000_001},
         {"max_measurement_uncertainty_ns": 50_000_001},
         {"max_delay_uncertainty_ns": 50_000_001},
         {"max_abs_initial_pitch_rad": math.nextafter(0.6108652381980153, math.inf)},
@@ -716,11 +1008,7 @@ def test_local_inputs_and_configuration_reject_unsafe_ambiguity():
         {"max_log_scale_variance": math.nextafter(1.0, math.inf)},
         {"max_bearing_rate_variance": math.nextafter(16.0, math.inf)},
         {"max_expansion_rate_variance": math.nextafter(16.0, math.inf)},
-        {"gate0_min_thrust": math.nextafter(0.21, 0.0)},
         {"gate1_min_thrust": math.nextafter(0.21, 0.0)},
-        {"gate1_corridor_x_norm": math.nextafter(0.10, 0.0)},
-        {"gate1_corridor_y_norm": math.nextafter(0.12, 0.0)},
-        {"gate1_corridor_rate_norm_s": math.nextafter(0.25, math.inf)},
     ),
 )
 def test_configuration_cannot_loosen_reviewed_safeguards(changes):
@@ -728,28 +1016,36 @@ def test_configuration_cannot_loosen_reviewed_safeguards(changes):
         PredictiveControllerConfig(**changes)
 
 
-def test_gain_tuning_remains_bounded_by_hard_output_envelopes():
+def test_gate1_gains_envelopes_and_evidence_thresholds_can_tighten():
     config = PredictiveControllerConfig(
-        gate0_roll_gain_rad_per_norm=100.0,
-        attitude_kp_roll=100.0,
-        attitude_kp_pitch=100.0,
-        vertical_position_gain=100.0,
-        vertical_rate_damping_per_px_s=100.0,
+        gate1_roll_gain_rad_per_norm=0.06,
+        gate1_roll_rate_gain_rad_s_per_norm_s=0.0125,
+        gate1_max_roll_rad=0.04,
+        gate1_max_body_rate_rad_s=0.10,
+        gate1_min_thrust=0.22,
+        gate1_max_thrust=0.28,
+        gate1_max_duration_s=0.50,
+        max_phase_objective_age_ns=50_000_000,
+        max_state_age_ns=50_000_000,
     )
     proposal = _propose(
-        _state(bearing=(1.0, -1.0), bearing_rate=(1.0, -1.0)),
+        _state(
+            gate_index=1,
+            bearing=(1.0, -1.0),
+            bearing_rate=(1.0, -1.0),
+        ),
+        phase=_phase(
+            mode=VQ2ControlPhase.GATE1_RECENTER,
+            phase_started_ns=_PROPOSAL_NS - 200_000_000,
+        ),
         attitude=_attitude(roll=-0.5, pitch=0.5),
         config=config,
     )
-    assert all(abs(rate) <= 0.25 for rate in proposal.requested_body_rates_rad_s)
-    assert proposal.requested_thrust <= 0.32
+    assert not proposal.is_exact_zero
+    assert all(abs(rate) <= 0.10 for rate in proposal.requested_body_rates_rad_s)
+    assert 0.22 <= proposal.requested_thrust <= 0.28
     assert proposal.saturation.body_rate_axes[:2] == (True, True)
     assert proposal.saturation.thrust is True
-
-
-def test_tighter_gate1_completion_rate_is_allowed():
-    config = PredictiveControllerConfig(gate1_corridor_rate_norm_s=0.20)
-    assert config.gate1_corridor_rate_norm_s == 0.20
 
 
 def test_controller_module_has_no_transport_or_powered_imports():

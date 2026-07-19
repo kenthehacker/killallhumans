@@ -21,26 +21,35 @@ proposal remains untrusted intent until the external safety supervisor checks
 it and issues a separate `SupervisorApprovedCommandV1`.
 
 The local tick input echoes caller-owned proposal/tick IDs, host-monotonic
-times, exact expected `GateAuthorityEpochV1`, and minimum state-decision/state-
-sequence watermarks. The controller is stateless: those explicit watermarks
-let it reject a regressing source while allowing equality on a repeated
-evaluation. The local attitude input is a unit body-to-world quaternion in
-`(w, x, y, z)` order plus FRD body rates, but has no timestamp, clock identity,
-or source correlation. `CommandProposalV1` cannot bind attitude provenance.
-This candidate is therefore ineligible for shadow, runtime, or powered wiring
-until a reviewed IMU timing/derotation seam exists. The phase input carries
-only the reviewed mode, elapsed time, initial Gate 0 pitch basis, guidance
-target bearing, and paired objective-permission/withholding fields. This
-bounded candidate freezes that target bearing to exact image center `(0, 0)`;
-an off-center objective is rejected rather than permitted to steer toward an
-unreviewed image-edge target.
+times, exact expected `GateAuthorityEpochV1`, minimum state-decision/state-
+sequence watermarks, the safety-owned expected phase start, and a minimum
+guidance/safety evaluation-time watermark. The phase input carries the same
+host-clock identity, a stable `phase_started_monotonic_ns`, the objective's
+`evaluation_monotonic_ns`, the reviewed mode, initial Gate 0 pitch basis,
+guidance target bearing, and paired objective-permission/withholding fields.
+The controller requires an exact phase-clock/start echo and
+`start <= evaluation <= proposal`, rejects an evaluation below the tick
+watermark, and applies a tighten-only 100 ms objective-age ceiling. It computes
+phase elapsed time from `proposal_monotonic_ns - phase_started_monotonic_ns`;
+there is no caller-supplied elapsed duration to renew.
 
-A future guidance adapter must validate the guidance value's echoed authority
-and complete source correlation against the exact relative state before
-mapping its objective kind, phase, target bearing, corridor permission, and
-withholding reason into `ControllerPhaseInput`. The controller independently
-binds every nonzero proposal source field to the state with
-`validate_command_proposal_source`.
+The pure controller can compare these local values but cannot authenticate
+that safety owns them, and frozen `CommandProposalV1` has no fields that bind
+phase start or objective evaluation provenance. The integration adapter and
+supervisor must validate the guidance decision's exact authority, complete
+source correlation, and evaluation-time echo before mapping it to
+`ControllerPhaseInput`; set transition phase start equal to that evaluation;
+and preserve the exact same start on every later evaluation in that phase.
+The controller independently binds every nonzero proposal source field that
+the frozen command contract can carry with `validate_command_proposal_source`.
+
+The local attitude input is a unit body-to-world quaternion in `(w, x, y, z)`
+order plus FRD body rates, but has no timestamp, clock identity, or source
+correlation. `CommandProposalV1` cannot bind attitude provenance. This
+candidate is therefore ineligible for shadow, runtime, or powered wiring until
+a reviewed IMU timing/derotation seam exists. The bounded guidance target is
+also frozen to exact image center `(0, 0)`; an off-center objective is rejected
+rather than permitted to steer toward an unreviewed image-edge target.
 
 ## Fail-closed eligibility
 
@@ -50,10 +59,13 @@ them. A well-formed but ineligible state returns an exact-zero, source-less
 therefore cannot be mistaken for a sourced nonzero proposal. Withholding covers:
 
 - host clock, exact authority, expected gate, or active-track mismatch;
+- a mismatched/future phase start, a future/regressing objective evaluation,
+  or an objective evaluation older than 100 ms;
 - a decision timestamp or state sequence below the caller watermark;
 - a future or older-than-100 ms decision, an effective measurement age above
-  150 ms after adding measurement-time uncertainty, or an effective future
-  prediction lead above 100 ms after adding delay uncertainty;
+  150 ms after adding measurement-time uncertainty, or a prediction budget
+  `max(0, prediction - proposal) + delay_uncertainty` above 100 ms, including
+  when nominal prediction lead is zero or in the past;
 - camera measurement-time or prediction-delay uncertainty above 50 ms;
 - out-of-envelope bearing/rate or covariance diagonal;
 - a guidance-withheld objective;
@@ -68,15 +80,14 @@ authority, bearing, and covariance gates pass. Any accepted Gate 1 proposal
 from a degraded or clipped state sets `uncertainty.limited=true` with reason
 `bounded_gate1_recenter_degraded_or_clipped`.
 
-Caller configuration is tighten-only for every reviewed safeguard. Hard
-ceilings include Gate 0 roll/rate/thrust `0.08 rad`, `0.25 rad/s`, and `0.32`;
-Gate 1 roll/rate/thrust/duration `0.05 rad`, `0.12 rad/s`, `0.30`, and `0.60 s`;
-the default state/measurement/prediction/uncertainty ages; the 35-degree
-initial-pitch bound; bearing/rate bounds; and every covariance cap. The Gate 1
-minimum thrust and completion corridors cannot be widened in the less-
-conservative direction: position half-widths cannot shrink and the allowed
-completion rate cannot grow beyond `0.25 norm/s`. Gains remain tunable because
-the hard target-angle, body-rate, and thrust clamps are applied after them.
+Every Gate 0 legacy-law and schedule constant is frozen to its documented
+default: roll gain/limit, pitch blend, launch/boost boundaries and thrusts,
+shared vertical coefficients, attitude gains, and Gate 0 body-rate/thrust
+envelopes. A configuration deviation is rejected before any proposal can carry
+the `legacy_gate0_pixel_pd` reason. Gate 1 gains and output envelopes, plus
+state/objective timing, bearing, and covariance evidence thresholds, are
+tighten-only. Gate 1's completion corridor is not tunable in either direction:
+its exact reviewed thresholds remain `(x, y, rate)=(0.10, 0.12, 0.25 norm/s)`.
 
 ## Gate 0 regression mapping
 
@@ -94,6 +105,7 @@ The default Gate 0 law is exactly:
 
 ```text
 target_roll = clamp(0.15 * normalized_x, -0.08, +0.08)
+elapsed_s = (proposal_monotonic_ns - phase_started_monotonic_ns) / 1e9
 target_pitch = (1 - min(1, elapsed_s / 0.8)) * initial_pitch_rad
 
 thrust = 0.26                         when elapsed_s < 0.15
@@ -136,16 +148,22 @@ are intentionally tighter than Gate 0:
 - a hard 0.60-second proposal window; and
 - an inclusive bearing/rate corridor that returns exact zero when reached.
 
-Both corridor completion and timeout are source-less exact-zero withholding
-results whose reasons contain no passage claim. They are not cleanup proof and
-do not authorize a future powered stage.
+Only a `HEALTHY`, unclipped state may return the source-less
+`gate1_recenter_corridor_reached` result. A degraded or clipped state inside
+the same corridor instead returns the distinct source-less
+`gate1_recenter_corridor_unconfirmed_limited` result with
+`uncertainty.limited=true`; it never claims completion. Corridor withholding
+and timeout contain no passage claim. They are not cleanup proof and do not
+authorize a future powered stage.
 
 ## Evidence boundary
 
 Direct tests use constructed immutable contract values only. They cover fixed
-Gate 0 regression fixtures, exact elapsed/timing boundaries, source binding,
+Gate 0 regression fixtures, host-derived phase schedule/timeout boundaries,
+stable phase-start and objective-evaluation watermarks, source binding,
 determinism, yaw zero, saturation diagnostics, health/age/covariance gates,
-authority and watermark mismatch, metric-pose independence, the degraded-
-clipped Gate 1 exception, tighter recenter envelopes, and source-less corridor/
-timeout behavior. They are offline unit evidence, not replay, simulator,
+unconditional prediction-delay budget arithmetic, metric-pose independence,
+fully frozen Gate 0 tuning and Gate 1 corridor thresholds, the degraded/clipped
+Gate 1 exception, tighter recenter envelopes, and source-less corridor/timeout
+behavior. They are offline unit evidence, not replay, simulator,
 actuator-response, powered, or safety-supervisor evidence.

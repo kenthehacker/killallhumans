@@ -13,6 +13,13 @@ runtime, or powered wiring until a reviewed IMU timing/derotation seam exists.
 Likewise, its body-rate clamp limits requested intent only; supervisor
 watchdogs still own actual attitude/body-rate aborts.
 
+Phase elapsed time is derived only from a host-monotonic phase start and the
+proposal timestamp.  The tick carries the safety-expected phase start and a
+minimum objective-evaluation watermark.  This pure module can compare those
+local values but cannot authenticate their ownership, and the frozen proposal
+cannot bind them; the integration adapter and supervisor must retain that
+responsibility.
+
 Gate 0 preserves the representable parts of the proved legacy controller:
 normalized horizontal bearing to roll target, the launch/boost thrust schedule,
 the 640x360 vertical pixel PD law, and the same quaternion attitude-to-rate PD.
@@ -147,6 +154,8 @@ class ControllerTickInput:
     control_tick_deadline_monotonic_ns: int
     minimum_state_decision_monotonic_ns: int
     minimum_state_sequence: int
+    expected_phase_started_monotonic_ns: int
+    minimum_phase_evaluation_monotonic_ns: int
     expected_authority: GateAuthorityEpochV1
 
     def __post_init__(self) -> None:
@@ -165,11 +174,27 @@ class ControllerTickInput:
             "minimum_state_decision_monotonic_ns",
         )
         _exact_nonnegative_int(self.minimum_state_sequence, "minimum_state_sequence")
+        expected_phase_start = _exact_nonnegative_int(
+            self.expected_phase_started_monotonic_ns,
+            "expected_phase_started_monotonic_ns",
+        )
+        minimum_phase_evaluation = _exact_nonnegative_int(
+            self.minimum_phase_evaluation_monotonic_ns,
+            "minimum_phase_evaluation_monotonic_ns",
+        )
         if deadline < proposal_time:
             raise ControllerInputError("control tick deadline predates proposal time")
         if minimum_state_decision > proposal_time:
             raise ControllerInputError(
                 "minimum state decision watermark postdates proposal time"
+            )
+        if expected_phase_start > proposal_time:
+            raise ControllerInputError(
+                "expected phase start postdates proposal time"
+            )
+        if minimum_phase_evaluation > proposal_time:
+            raise ControllerInputError(
+                "minimum phase evaluation watermark postdates proposal time"
             )
         if type(self.expected_authority) is not GateAuthorityEpochV1:
             raise TypeError("expected_authority must be exact GateAuthorityEpochV1")
@@ -180,7 +205,9 @@ class ControllerPhaseInput:
     """Explicit local phase/objective input, suitable for a guidance adapter."""
 
     mode: VQ2ControlPhase
-    elapsed_s: float
+    phase_host_clock_id: str
+    phase_started_monotonic_ns: int
+    evaluation_monotonic_ns: int
     initial_pitch_rad: float
     target_bearing_norm: tuple[float, float] = (0.0, 0.0)
     objective_permitted: bool = True
@@ -189,7 +216,19 @@ class ControllerPhaseInput:
     def __post_init__(self) -> None:
         if type(self.mode) is not VQ2ControlPhase:
             raise TypeError("mode must be VQ2ControlPhase")
-        elapsed = _nonnegative_float(self.elapsed_s, "elapsed_s")
+        _bounded_token(self.phase_host_clock_id, "phase_host_clock_id")
+        phase_started = _exact_nonnegative_int(
+            self.phase_started_monotonic_ns,
+            "phase_started_monotonic_ns",
+        )
+        evaluation = _exact_nonnegative_int(
+            self.evaluation_monotonic_ns,
+            "evaluation_monotonic_ns",
+        )
+        if evaluation < phase_started:
+            raise ControllerInputError(
+                "phase evaluation predates phase start"
+            )
         initial_pitch = _finite_float(self.initial_pitch_rad, "initial_pitch_rad")
         target = _float_tuple(self.target_bearing_norm, 2, "target_bearing_norm")
         if any(abs(component) > 4.0 for component in target):
@@ -207,7 +246,6 @@ class ControllerPhaseInput:
             )
         if self.mode is VQ2ControlPhase.GATE1_RECENTER and initial_pitch != 0.0:
             raise ValueError("Gate 1 recenter requires an exact-zero target pitch basis")
-        object.__setattr__(self, "elapsed_s", elapsed)
         object.__setattr__(self, "initial_pitch_rad", initial_pitch)
         object.__setattr__(self, "target_bearing_norm", target)
         object.__setattr__(self, "withholding_reason", reason)
@@ -253,6 +291,7 @@ class PredictiveControllerConfig:
     max_state_age_ns: int = 100_000_000
     max_measurement_age_ns: int = 150_000_000
     max_prediction_lead_ns: int = 100_000_000
+    max_phase_objective_age_ns: int = 100_000_000
     max_measurement_uncertainty_ns: int = 50_000_000
     max_delay_uncertainty_ns: int = 50_000_000
     max_bearing_variance: float = 0.25
@@ -307,18 +346,52 @@ class PredictiveControllerConfig:
             "max_state_age_ns",
             "max_measurement_age_ns",
             "max_prediction_lead_ns",
+            "max_phase_objective_age_ns",
             "max_measurement_uncertainty_ns",
             "max_delay_uncertainty_ns",
         ):
             if _exact_nonnegative_int(getattr(self, name), name) == 0:
                 raise ValueError(f"{name} must be positive")
-        hard_float_maxima = {
+        frozen_gate0_legacy_values = {
+            "gate0_roll_gain_rad_per_norm": 0.15,
             "gate0_max_roll_rad": 0.08,
             "gate0_pitch_blend_s": 0.8,
             "gate0_launch_end_s": 0.15,
             "gate0_boost_end_s": 0.45,
+            "gate0_launch_thrust": 0.26,
+            "gate0_boost_thrust": 0.32,
             "gate0_max_body_rate_rad_s": 0.25,
+            "gate0_min_thrust": 0.21,
             "gate0_max_thrust": 0.32,
+            "attitude_kp_roll": 1.0,
+            "attitude_kp_pitch": 0.5,
+            "attitude_kd_roll": 0.4,
+            "attitude_kd_pitch": 0.2,
+            "legacy_vertical_half_image_px": 180.0,
+            "legacy_vertical_error_scale_px": 90.0,
+            "legacy_vertical_rate_limit_px_s": 300.0,
+            "vertical_neutral_thrust": 0.275,
+            "vertical_position_gain": 0.040,
+            "vertical_rate_damping_per_px_s": 0.00070,
+        }
+        for name, frozen_value in frozen_gate0_legacy_values.items():
+            if getattr(self, name) != frozen_value:
+                raise ValueError(
+                    f"{name} is frozen to its reviewed Gate 0 legacy value"
+                )
+        frozen_gate1_corridor_values = {
+            "gate1_corridor_x_norm": 0.10,
+            "gate1_corridor_y_norm": 0.12,
+            "gate1_corridor_rate_norm_s": 0.25,
+        }
+        for name, frozen_value in frozen_gate1_corridor_values.items():
+            if getattr(self, name) != frozen_value:
+                raise ValueError(
+                    f"{name} is frozen to its reviewed Gate 1 corridor value"
+                )
+        hard_float_maxima = {
+            "gate1_roll_gain_rad_per_norm": 0.12,
+            "gate1_roll_rate_gain_rad_s_per_norm_s": 0.025,
             "gate1_max_roll_rad": 0.05,
             "gate1_max_body_rate_rad_s": 0.12,
             "gate1_max_thrust": 0.30,
@@ -326,7 +399,6 @@ class PredictiveControllerConfig:
             "max_abs_initial_pitch_rad": 0.6108652381980153,
             "max_abs_bearing_error_norm": 1.50,
             "max_abs_bearing_rate_norm_s": 4.0,
-            "gate1_corridor_rate_norm_s": 0.25,
             "max_bearing_variance": 0.25,
             "max_log_scale_variance": 1.0,
             "max_bearing_rate_variance": 16.0,
@@ -336,6 +408,7 @@ class PredictiveControllerConfig:
             "max_state_age_ns": 100_000_000,
             "max_measurement_age_ns": 150_000_000,
             "max_prediction_lead_ns": 100_000_000,
+            "max_phase_objective_age_ns": 100_000_000,
             "max_measurement_uncertainty_ns": 50_000_000,
             "max_delay_uncertainty_ns": 50_000_000,
         }
@@ -350,10 +423,7 @@ class PredictiveControllerConfig:
                     f"{name} cannot loosen its reviewed hard maximum"
                 )
         for name, hard_minimum in (
-            ("gate0_min_thrust", 0.21),
             ("gate1_min_thrust", 0.21),
-            ("gate1_corridor_x_norm", 0.10),
-            ("gate1_corridor_y_norm", 0.12),
         ):
             if getattr(self, name) < hard_minimum:
                 raise ValueError(
@@ -520,6 +590,23 @@ def _failsafe_proposal(
     )
 
 
+def _inside_gate1_corridor(
+    state: RelativeGateStateV1,
+    phase: ControllerPhaseInput,
+    config: PredictiveControllerConfig,
+) -> bool:
+    bearing_error_x = state.bearing_norm[0] - phase.target_bearing_norm[0]
+    bearing_error_y = state.bearing_norm[1] - phase.target_bearing_norm[1]
+    return (
+        abs(bearing_error_x) <= config.gate1_corridor_x_norm
+        and abs(bearing_error_y) <= config.gate1_corridor_y_norm
+        and abs(state.bearing_rate_norm_s[0])
+        <= config.gate1_corridor_rate_norm_s
+        and abs(state.bearing_rate_norm_s[1])
+        <= config.gate1_corridor_rate_norm_s
+    )
+
+
 def _eligibility_failure(
     state: RelativeGateStateV1,
     tick: ControllerTickInput,
@@ -531,6 +618,27 @@ def _eligibility_failure(
     )
     if tick.host_clock_id != tick.expected_authority.camera_host_clock_id:
         return "tick_host_clock_authority_mismatch", False
+    if phase.phase_host_clock_id != tick.host_clock_id:
+        return "phase_host_clock_mismatch", False
+    if phase.phase_started_monotonic_ns > tick.proposal_monotonic_ns:
+        return "phase_start_from_future", False
+    if (
+        phase.phase_started_monotonic_ns
+        != tick.expected_phase_started_monotonic_ns
+    ):
+        return "phase_start_mismatch", False
+    if phase.evaluation_monotonic_ns > tick.proposal_monotonic_ns:
+        return "phase_evaluation_from_future", False
+    if (
+        phase.evaluation_monotonic_ns
+        < tick.minimum_phase_evaluation_monotonic_ns
+    ):
+        return "phase_evaluation_regressed", False
+    if (
+        tick.proposal_monotonic_ns - phase.evaluation_monotonic_ns
+        > config.max_phase_objective_age_ns
+    ):
+        return "phase_objective_stale", False
     if state.timing.host_clock_id != tick.host_clock_id:
         return "state_host_clock_mismatch", False
     if state.authority != tick.expected_authority:
@@ -552,12 +660,6 @@ def _eligibility_failure(
     )
     if state.health not in allowed_health:
         return f"state_health_{state.health.value}", True
-    if (
-        phase.mode is VQ2ControlPhase.GATE1_RECENTER
-        and state.health is RelativeStateHealth.DEGRADED
-        and not state.last_clipping
-    ):
-        return "gate1_degraded_without_clipping", True
     decision_time = state.timing.decision_time_monotonic_ns
     measurement_time = state.timing.measurement_time_monotonic_ns
     prediction_time = state.timing.prediction_time_monotonic_ns
@@ -578,11 +680,11 @@ def _eligibility_failure(
         return "state_measurement_stale", True
     if state.timing.delay_uncertainty_ns > config.max_delay_uncertainty_ns:
         return "prediction_delay_uncertainty", True
+    prediction_lead_ns = max(
+        0, prediction_time - tick.proposal_monotonic_ns
+    )
     if (
-        prediction_time > tick.proposal_monotonic_ns
-        and prediction_time
-        - tick.proposal_monotonic_ns
-        + state.timing.delay_uncertainty_ns
+        prediction_lead_ns + state.timing.delay_uncertainty_ns
         > config.max_prediction_lead_ns
     ):
         return "state_prediction_too_far_ahead", True
@@ -617,9 +719,12 @@ def _eligibility_failure(
         return "initial_pitch_outside_control_envelope", True
     if (
         phase.mode is VQ2ControlPhase.GATE1_RECENTER
-        and phase.elapsed_s >= config.gate1_max_duration_s
+        and state.health is RelativeStateHealth.DEGRADED
+        and not state.last_clipping
     ):
-        return "gate1_recenter_time_limit", False
+        if _inside_gate1_corridor(state, phase, config):
+            return "gate1_recenter_corridor_unconfirmed_limited", True
+        return "gate1_degraded_without_clipping", True
     return None, False
 
 
@@ -661,23 +766,37 @@ def propose_vq2_command(
             uncertainty_limited=uncertainty_limited,
         )
 
+    elapsed_s = (
+        tick.proposal_monotonic_ns - phase.phase_started_monotonic_ns
+    ) / 1_000_000_000
+    if (
+        phase.mode is VQ2ControlPhase.GATE1_RECENTER
+        and elapsed_s >= config.gate1_max_duration_s
+    ):
+        return _failsafe_proposal(
+            tick,
+            phase,
+            "gate1_recenter_time_limit",
+            uncertainty_limited=False,
+        )
+
     bearing_error_x = state.bearing_norm[0] - phase.target_bearing_norm[0]
     bearing_error_y = state.bearing_norm[1] - phase.target_bearing_norm[1]
     if phase.mode is VQ2ControlPhase.GATE1_RECENTER:
-        inside_corridor = (
-            abs(bearing_error_x) <= config.gate1_corridor_x_norm
-            and abs(bearing_error_y) <= config.gate1_corridor_y_norm
-            and abs(state.bearing_rate_norm_s[0])
-            <= config.gate1_corridor_rate_norm_s
-            and abs(state.bearing_rate_norm_s[1])
-            <= config.gate1_corridor_rate_norm_s
-        )
-        if inside_corridor:
+        if _inside_gate1_corridor(state, phase, config):
+            corridor_limited = (
+                state.health is RelativeStateHealth.DEGRADED
+                or bool(state.last_clipping)
+            )
             return _failsafe_proposal(
                 tick,
                 phase,
-                "gate1_recenter_corridor_reached",
-                uncertainty_limited=False,
+                (
+                    "gate1_recenter_corridor_unconfirmed_limited"
+                    if corridor_limited
+                    else "gate1_recenter_corridor_reached"
+                ),
+                uncertainty_limited=corridor_limited,
             )
         target_roll_unclamped = (
             config.gate1_roll_gain_rad_per_norm * bearing_error_x
@@ -714,13 +833,13 @@ def propose_vq2_command(
             -config.gate0_max_roll_rad,
             config.gate0_max_roll_rad,
         )
-        blend = min(1.0, phase.elapsed_s / config.gate0_pitch_blend_s)
+        blend = min(1.0, elapsed_s / config.gate0_pitch_blend_s)
         target_pitch = (1.0 - blend) * phase.initial_pitch_rad
         rate_limit = config.gate0_max_body_rate_rad_s
-        if phase.elapsed_s < config.gate0_launch_end_s:
+        if elapsed_s < config.gate0_launch_end_s:
             thrust = config.gate0_launch_thrust
             thrust_limited = False
-        elif phase.elapsed_s < config.gate0_boost_end_s:
+        elif elapsed_s < config.gate0_boost_end_s:
             thrust = config.gate0_boost_thrust
             thrust_limited = False
         else:
