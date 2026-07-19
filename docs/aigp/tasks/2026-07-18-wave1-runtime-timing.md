@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-runtime-timing`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `tested`
+- State: `committed_integration_pending`
 - Objective: implement the fully offline M1 foundation for end-to-end host
   timing, latest-value camera consumption, and 50 Hz control-tick scheduling
   using the frozen VQ2 `/1` timing and latency contracts.
@@ -51,7 +51,7 @@
 
 ## Evidence record
 
-- Implementation commit: pending.
+- Implementation commit: `11c35a5431587b892fd3950c7a589ce3ff312652`.
 - Implemented files:
   `competition/vq2_runtime.py`, `competition/vq2_vision.py`, and the narrow
   frame-identity correction in `scripts/aigp_vq2_run.py`; direct tests live in
