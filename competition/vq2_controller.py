@@ -16,6 +16,7 @@ watchdogs still own actual attitude/body-rate aborts.
 Gate 0 preserves the representable parts of the proved legacy controller:
 normalized horizontal bearing to roll target, the launch/boost thrust schedule,
 the 640x360 vertical pixel PD law, and the same quaternion attitude-to-rate PD.
+This bounded candidate accepts only the exact centered image objective.
 Upstream filtering must supply ``bearing_rate_norm_s`` corresponding to the
 legacy filtered pixel rate for exact rate-term equivalence.  Legacy bbox-area
 crossing/corridor logic is intentionally absent because it is neither present
@@ -193,6 +194,10 @@ class ControllerPhaseInput:
         target = _float_tuple(self.target_bearing_norm, 2, "target_bearing_norm")
         if any(abs(component) > 4.0 for component in target):
             raise ValueError("target_bearing_norm must remain within contract bounds")
+        if target != (0.0, 0.0):
+            raise ValueError(
+                "this bounded controller candidate requires an exact centered target"
+            )
         if type(self.objective_permitted) is not bool:
             raise TypeError("objective_permitted must be an exact bool")
         reason = _optional_reason(self.withholding_reason, "withholding_reason")
@@ -249,6 +254,7 @@ class PredictiveControllerConfig:
     max_measurement_age_ns: int = 150_000_000
     max_prediction_lead_ns: int = 100_000_000
     max_measurement_uncertainty_ns: int = 50_000_000
+    max_delay_uncertainty_ns: int = 50_000_000
     max_bearing_variance: float = 0.25
     max_log_scale_variance: float = 1.0
     max_bearing_rate_variance: float = 16.0
@@ -302,6 +308,7 @@ class PredictiveControllerConfig:
             "max_measurement_age_ns",
             "max_prediction_lead_ns",
             "max_measurement_uncertainty_ns",
+            "max_delay_uncertainty_ns",
         ):
             if _exact_nonnegative_int(getattr(self, name), name) == 0:
                 raise ValueError(f"{name} must be positive")
@@ -319,6 +326,7 @@ class PredictiveControllerConfig:
             "max_abs_initial_pitch_rad": 0.6108652381980153,
             "max_abs_bearing_error_norm": 1.50,
             "max_abs_bearing_rate_norm_s": 4.0,
+            "gate1_corridor_rate_norm_s": 0.25,
             "max_bearing_variance": 0.25,
             "max_log_scale_variance": 1.0,
             "max_bearing_rate_variance": 16.0,
@@ -329,6 +337,7 @@ class PredictiveControllerConfig:
             "max_measurement_age_ns": 150_000_000,
             "max_prediction_lead_ns": 100_000_000,
             "max_measurement_uncertainty_ns": 50_000_000,
+            "max_delay_uncertainty_ns": 50_000_000,
         }
         for name, hard_maximum in hard_float_maxima.items():
             if getattr(self, name) > hard_maximum:
@@ -345,7 +354,6 @@ class PredictiveControllerConfig:
             ("gate1_min_thrust", 0.21),
             ("gate1_corridor_x_norm", 0.10),
             ("gate1_corridor_y_norm", 0.12),
-            ("gate1_corridor_rate_norm_s", 0.25),
         ):
             if getattr(self, name) < hard_minimum:
                 raise ValueError(
@@ -535,6 +543,8 @@ def _eligibility_failure(
         return "inactive_source_track", False
     if not phase.objective_permitted:
         return f"objective_withheld:{phase.withholding_reason}", False
+    if state.innovation_accepted is False:
+        return "state_innovation_rejected", True
     allowed_health = (
         {RelativeStateHealth.HEALTHY}
         if phase.mode is VQ2ControlPhase.GATE0_APPROACH
@@ -560,13 +570,19 @@ def _eligibility_failure(
     if measurement_time > tick.proposal_monotonic_ns:
         return "state_measurement_from_future", True
     if (
-        tick.proposal_monotonic_ns - measurement_time
+        tick.proposal_monotonic_ns
+        - measurement_time
+        + state.timing.measurement_uncertainty_ns
         > config.max_measurement_age_ns
     ):
         return "state_measurement_stale", True
+    if state.timing.delay_uncertainty_ns > config.max_delay_uncertainty_ns:
+        return "prediction_delay_uncertainty", True
     if (
         prediction_time > tick.proposal_monotonic_ns
-        and prediction_time - tick.proposal_monotonic_ns
+        and prediction_time
+        - tick.proposal_monotonic_ns
+        + state.timing.delay_uncertainty_ns
         > config.max_prediction_lead_ns
     ):
         return "state_prediction_too_far_ahead", True

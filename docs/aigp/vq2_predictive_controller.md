@@ -30,7 +30,10 @@ or source correlation. `CommandProposalV1` cannot bind attitude provenance.
 This candidate is therefore ineligible for shadow, runtime, or powered wiring
 until a reviewed IMU timing/derotation seam exists. The phase input carries
 only the reviewed mode, elapsed time, initial Gate 0 pitch basis, guidance
-target bearing, and paired objective-permission/withholding fields.
+target bearing, and paired objective-permission/withholding fields. This
+bounded candidate freezes that target bearing to exact image center `(0, 0)`;
+an off-center objective is rejected rather than permitted to steer toward an
+unreviewed image-edge target.
 
 A future guidance adapter must validate the guidance value's echoed authority
 and complete source correlation against the exact relative state before
@@ -48,11 +51,13 @@ therefore cannot be mistaken for a sourced nonzero proposal. Withholding covers:
 
 - host clock, exact authority, expected gate, or active-track mismatch;
 - a decision timestamp or state sequence below the caller watermark;
-- a future or older-than-100 ms decision, an older-than-150 ms measurement, or
-  a prediction more than 100 ms ahead of proposal creation;
-- camera measurement-time uncertainty above 50 ms;
+- a future or older-than-100 ms decision, an effective measurement age above
+  150 ms after adding measurement-time uncertainty, or an effective future
+  prediction lead above 100 ms after adding delay uncertainty;
+- camera measurement-time or prediction-delay uncertainty above 50 ms;
 - out-of-envelope bearing/rate or covariance diagonal;
 - a guidance-withheld objective;
+- a state carrying an explicitly rejected innovation;
 - all `INITIALIZING`, `COASTING`, `UNHEALTHY`, and `LOST` states;
 - every non-`HEALTHY` Gate 0 state; and
 - an expired Gate 1 recenter window.
@@ -69,8 +74,9 @@ Gate 1 roll/rate/thrust/duration `0.05 rad`, `0.12 rad/s`, `0.30`, and `0.60 s`;
 the default state/measurement/prediction/uncertainty ages; the 35-degree
 initial-pitch bound; bearing/rate bounds; and every covariance cap. The Gate 1
 minimum thrust and completion corridors cannot be widened in the less-
-conservative direction. Gains remain tunable because the hard target-angle,
-body-rate, and thrust clamps are applied after them.
+conservative direction: position half-widths cannot shrink and the allowed
+completion rate cannot grow beyond `0.25 norm/s`. Gains remain tunable because
+the hard target-angle, body-rate, and thrust clamps are applied after them.
 
 ## Gate 0 regression mapping
 

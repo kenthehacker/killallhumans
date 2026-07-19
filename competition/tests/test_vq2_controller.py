@@ -99,11 +99,17 @@ def _timing(
     measurement_ns: int | None = None,
     prediction_ns: int | None = None,
     measurement_uncertainty_ns: int = 2_000_000,
+    delay_uncertainty_ns: int | None = None,
 ) -> PredictionTimeV1:
     measurement = decision_ns - 70_000_000 if measurement_ns is None else measurement_ns
     prediction = decision_ns if prediction_ns is None else prediction_ns
     publication = max(1_990_000_000, measurement)
     estimated = prediction != decision_ns
+    delay_uncertainty = (
+        (1_000_000 if delay_uncertainty_ns is None else delay_uncertainty_ns)
+        if estimated
+        else 0
+    )
     return PredictionTimeV1(
         host_clock_id=_HOST,
         source_frame=FrameIdentityV1("camera0", 3, 41),
@@ -121,7 +127,7 @@ def _timing(
             else PredictionBasis.DECISION_TIME
         ),
         delay_model_id="controller-test-delay-v1" if estimated else None,
-        delay_uncertainty_ns=1_000_000 if estimated else 0,
+        delay_uncertainty_ns=delay_uncertainty,
     )
 
 
@@ -449,17 +455,52 @@ def test_decision_age_future_and_both_regression_watermarks_fail_closed():
 
 def test_measurement_age_and_prediction_lead_boundaries_are_inclusive():
     config = PredictiveControllerConfig()
-    measurement_boundary = _PROPOSAL_NS - config.max_measurement_age_ns
-    state = _state(timing=_timing(measurement_ns=measurement_boundary))
+    measurement_uncertainty = 2_000_000
+    measurement_boundary = _PROPOSAL_NS - (
+        config.max_measurement_age_ns - measurement_uncertainty
+    )
+    state = _state(timing=_timing(
+        measurement_ns=measurement_boundary,
+        measurement_uncertainty_ns=measurement_uncertainty,
+    ))
     assert not _propose(state).is_exact_zero
-    stale = _state(timing=_timing(measurement_ns=measurement_boundary - 1))
+    stale = _state(timing=_timing(
+        measurement_ns=measurement_boundary - 1,
+        measurement_uncertainty_ns=measurement_uncertainty,
+    ))
     assert "measurement_stale" in _propose(stale).reason
 
-    prediction_boundary = _PROPOSAL_NS + config.max_prediction_lead_ns
-    predicted = _state(timing=_timing(prediction_ns=prediction_boundary))
+    delay_uncertainty = 1_000_000
+    prediction_boundary = _PROPOSAL_NS + (
+        config.max_prediction_lead_ns - delay_uncertainty
+    )
+    predicted = _state(timing=_timing(
+        prediction_ns=prediction_boundary,
+        delay_uncertainty_ns=delay_uncertainty,
+    ))
     assert not _propose(predicted).is_exact_zero
-    too_far = _state(timing=_timing(prediction_ns=prediction_boundary + 1))
+    too_far = _state(timing=_timing(
+        prediction_ns=prediction_boundary + 1,
+        delay_uncertainty_ns=delay_uncertainty,
+    ))
     assert "prediction_too_far_ahead" in _propose(too_far).reason
+
+
+def test_prediction_delay_uncertainty_cap_is_tighten_only_and_inclusive():
+    config = PredictiveControllerConfig()
+    prediction = _DECISION_NS + 1
+    exact = _state(timing=_timing(
+        prediction_ns=prediction,
+        delay_uncertainty_ns=config.max_delay_uncertainty_ns,
+    ))
+    assert not _propose(exact).is_exact_zero
+    excessive = _state(timing=_timing(
+        prediction_ns=prediction,
+        delay_uncertainty_ns=config.max_delay_uncertainty_ns + 1,
+    ))
+    rejected = _propose(excessive)
+    assert rejected.is_exact_zero
+    assert rejected.uncertainty.reason == "prediction_delay_uncertainty"
 
 
 def test_measurement_and_covariance_uncertainty_gates_are_inclusive():
@@ -519,14 +560,10 @@ def test_metric_pose_and_uncontrolled_scale_values_do_not_affect_output():
     assert _propose(with_metric) == _propose(state)
 
 
-def test_guidance_target_bearing_is_an_explicit_local_objective():
-    state = _state(bearing=(0.3, -0.2))
-    proposal = _propose(
-        state,
-        phase=_phase(target_bearing=(0.3, -0.2)),
-    )
-    assert proposal.requested_body_rates_rad_s == (0.0, 0.0, 0.0)
-    assert proposal.requested_thrust == 0.275
+def test_bounded_candidate_freezes_the_guidance_target_to_image_center():
+    assert _phase().target_bearing_norm == (0.0, 0.0)
+    with pytest.raises(ValueError, match="exact centered target"):
+        _phase(target_bearing=(0.01, 0.0))
 
 
 def test_gate1_recenter_uses_tighter_no_forward_progress_envelope():
@@ -581,6 +618,16 @@ def test_gate1_low_uncertainty_degraded_clipped_state_is_explicitly_limited():
     ))
     assert withheld.is_exact_zero
     assert withheld.source_frame is None
+
+    rejected_innovation = dataclasses.replace(
+        degraded,
+        normalized_innovation_squared=12.0,
+        innovation_gate_threshold=10.0,
+        innovation_accepted=False,
+    )
+    innovation_withheld = _propose(rejected_innovation, phase=phase)
+    assert innovation_withheld.is_exact_zero
+    assert "innovation_rejected" in innovation_withheld.reason
 
 
 def test_gate1_corridor_and_timeout_are_source_less_zero_not_passage():
@@ -661,6 +708,7 @@ def test_local_inputs_and_configuration_reject_unsafe_ambiguity():
         {"max_measurement_age_ns": 150_000_001},
         {"max_prediction_lead_ns": 100_000_001},
         {"max_measurement_uncertainty_ns": 50_000_001},
+        {"max_delay_uncertainty_ns": 50_000_001},
         {"max_abs_initial_pitch_rad": math.nextafter(0.6108652381980153, math.inf)},
         {"max_abs_bearing_error_norm": math.nextafter(1.50, math.inf)},
         {"max_abs_bearing_rate_norm_s": math.nextafter(4.0, math.inf)},
@@ -672,7 +720,7 @@ def test_local_inputs_and_configuration_reject_unsafe_ambiguity():
         {"gate1_min_thrust": math.nextafter(0.21, 0.0)},
         {"gate1_corridor_x_norm": math.nextafter(0.10, 0.0)},
         {"gate1_corridor_y_norm": math.nextafter(0.12, 0.0)},
-        {"gate1_corridor_rate_norm_s": math.nextafter(0.25, 0.0)},
+        {"gate1_corridor_rate_norm_s": math.nextafter(0.25, math.inf)},
     ),
 )
 def test_configuration_cannot_loosen_reviewed_safeguards(changes):
@@ -697,6 +745,11 @@ def test_gain_tuning_remains_bounded_by_hard_output_envelopes():
     assert proposal.requested_thrust <= 0.32
     assert proposal.saturation.body_rate_axes[:2] == (True, True)
     assert proposal.saturation.thrust is True
+
+
+def test_tighter_gate1_completion_rate_is_allowed():
+    config = PredictiveControllerConfig(gate1_corridor_rate_norm_s=0.20)
+    assert config.gate1_corridor_rate_norm_s == 0.20
 
 
 def test_controller_module_has_no_transport_or_powered_imports():
