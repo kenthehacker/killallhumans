@@ -4,9 +4,10 @@
 **Target:** DCL FlightSim build 3385, VQ2 Training and Qualification
 **Repository:** C:\Users\John\killallhumans
 **Integrated foundation baseline:** b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8
+**Integrated Wave 1A implementation:** a6782cd9dcc34aee94e0f064021399985e0f6839
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
-**Plan state:** M0 complete; Wave 1A contract freeze is next; main was clean at
-this update.
+**Plan state:** M0 and Wave 1A complete; Wave 1 is active; main was clean after
+post-merge verification at this update.
 
 ## Purpose
 
@@ -143,6 +144,42 @@ The checked-in promotion files are examples, not evidence that the missing
 private T1 inputs or a live boundary exist. See `docs/aigp/durable_improvement_loop.md`
 for the exact trust, isolation, and provenance contract.
 
+## Completed Wave 1A shared-contract freeze
+
+Wave 1A was implemented in `fd51af3c587e7c3431719b79c1713344e7cc6d6f`,
+hardened in `a6782cd9dcc34aee94e0f064021399985e0f6839`, and integrated
+through the evidence-record commit `7b0d84ad9be969b303f8919bba10fd80381c65e5`.
+It freezes exact `/1` contracts for host/frame timing, prediction horizons,
+latency events, gate authority, raw observations, relative state, command
+proposals, supervisor approvals, and ordinary T0-T4 evidence scope. The
+production authority seam is now explicit:
+
+```text
+CommandProposal -> safety supervisor -> SupervisorApprovedCommand -> transport
+```
+
+The transport compatibility projection is pure and performs no send. The
+external safety supervisor and stateful transport still own caller trust,
+single-use enforcement, pacing, watchdogs, arm state, and cleanup. The mutable
+legacy `AttitudeRateCommand` remains an integration boundary, not an authority
+token.
+
+Accepted offline evidence, with zero FlightSim access, was:
+
+- 53 direct VQ2 contract tests;
+- 183 final evidence/promotion/scheduler tests with 6 expected skips;
+- the exact 356-test VQ2 policy in both canonical and isolated-cache runs;
+- 1,448 fast tests with 20 expected skips and 42 deselections;
+- a reviewed 116-entry trusted manifest with builder identity
+  `d6e4cd31177281fe9010eeeeb7df1667c248c464a45444d692d5a8225a6dc033`
+  and file SHA-256
+  `45514d8edaad2874c79a95946ff4b7632d5b4ada7a0294bf1f08c3f730701253`;
+- post-merge `test-vq2`: 356 passed, followed by an empty Git status on main.
+
+These results do not alter the historical M0 counts above and do not claim a
+private golden corpus, calibrated production geometry, powered execution, or
+official-simulator evidence.
+
 ## Completed foundation bootstrap
 
 The former dirty-worktree exception is closed:
@@ -272,6 +309,7 @@ accumulating a long-lived integration branch.
       -> guidance objective
       -> pure controller: CommandProposal
       -> safety supervisor and phase authority
+      -> SupervisorApprovedCommand
       -> MAVLink transport
 
 Recording is a non-blocking side channel at each boundary.
@@ -313,8 +351,8 @@ CommandProposal:
 | Milestone | Status | Outcome | Main prerequisite |
 |---|---|---|---|
 | M0 | Complete at `b9382da` | Stable, green, committed evaluation foundation | Historical bootstrap |
-| M1 | Ready after Wave 1A | Runtime timing and simulator semantics dossier | M0 |
-| M2 | Ready for offline work; final acceptance awaits replay evidence | Robust clipped Gate 1 geometry with uncertainty | M0 and replay evidence |
+| M1 | Active | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
+| M2 | Active offline; final acceptance awaits replay evidence | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
 | M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
 | M4 | Pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
 | M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
@@ -640,20 +678,21 @@ Wave 0, completed:
 - the planned shared contract freeze did not land in the foundation commit and is
   explicitly carried into Wave 1A. No dirty-tree owner remains.
 
-Wave 1A, short shared-contract freeze:
+Wave 1A, shared-contract freeze completed:
 
-- Agent 1 drafts the timestamp, frame-identity, prediction-time, and latency-event
-  contract;
-- Agent 2 drafts versioned `GateObservation` and `RelativeGateState` contracts,
+- Agent 1 drafted the timestamp, frame-identity, prediction-time, and
+  latency-event contract;
+- Agent 2 drafted versioned `GateObservation` and `RelativeGateState` contracts,
   including clipping, confidence/covariance, health, and reset/gate epochs;
-- Agent 3 drafts `CommandProposal` and tier-scoped evidence contracts plus
+- Agent 3 drafted `CommandProposal`, `SupervisorApprovedCommand`, and
+  tier-scoped evidence contracts plus
   compatibility fixtures;
-- the coordinating/integration owner reconciles and lands the shared schemas,
-  adapters, and contract tests before downstream branches depend on them.
+- the coordinating/integration owner reconciled and landed the shared schemas,
+  adapters, and contract tests before downstream branches depended on them.
 
-The three agents may prepare proposals concurrently in clean worktrees, but only
-the integration owner changes shared schemas. Production T1 inputs are not a
-prerequisite for this freeze.
+The freeze is implemented by `fd51af3c` and hardened by `a6782cd9`; its exact
+reference is `docs/aigp/vq2_contracts.md`. Production T1 inputs were not a
+prerequisite for the freeze.
 
 Wave 1, current parallel implementation wave after 1A:
 
@@ -723,20 +762,23 @@ agent resumes the plan; rerun affected gates when the base or trust set changes.
    declared base. If the remote is the intended disaster-recovery copy, back up
    the clean baseline according to repository policy before a long autonomous
    wave; this handoff does not authorize an external push by itself.
-2. Start Wave 1A. Three agents may draft the timing, observation/state, and
-   command/evidence contracts in parallel while the coordinator exercises T0-T4
-   on a disposable clean candidate and retains scheduler/resume/merger evidence.
-3. Have the integration owner reconcile, version, test, commit, and merge the
-   shared contracts. Confirm main is clean after the merge.
-4. Create the three Wave 1 implementation worktrees from that contract commit and
-   run runtime timing, clipped geometry, and relative-state filtering in parallel.
-5. Provision the private golden replay corpus and administrator-owned isolation
+2. Create `wt-runtime-timing`, `wt-gate-geometry`, and
+   `wt-relative-estimation` from the integrated Wave 1A contract baseline.
+3. Run runtime timing/latest-value scheduling, clipped geometry/aperture
+   uncertainty, and relative-state filtering/prediction in parallel without
+   changing the frozen `/1` wire meanings.
+4. Have the coordinator review interfaces, integrate green branches frequently,
+   and preserve the proved Gate 0 and safety-supervisor behavior.
+5. Exercise a disposable clean candidate through T0-T4 scheduler leases,
+   interruption/resume, deduplication, exact worktrees, and merger evidence; this
+   operational dogfood remains outstanding and does not broaden tier claims.
+6. Provision the private golden replay corpus and administrator-owned isolation
    wrapper before enabling production T1. This may proceed independently when a
    slot and the required authorization are available; it does not block Wave 1.
-6. Continue only authorized passive probes while offline work proceeds.
-7. Integrate finished branches frequently, but only after each branch is committed
+7. Continue only authorized passive probes while offline work proceeds.
+8. Integrate finished branches frequently, but only after each branch is committed
    and promoted. Quarantine a dirty failed worktree without touching clean main.
-8. Treat every powered system-identification or Gate 1 stage as a separate,
+9. Treat every powered system-identification or Gate 1 stage as a separate,
    explicitly authorized workflow outside the shipped scheduler. Never reinterpret
    synthetic T2-T4 results as FlightSim evidence.
 

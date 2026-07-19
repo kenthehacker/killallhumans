@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1a-contract-freeze`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `integration_pending`
+- State: `post_merge_verified`
 - Objective: freeze the build-3385 timestamp, frame identity, latency,
   observation, relative-state, command-proposal, and tier-evidence interfaces
   needed by the three Wave 1 implementation branches.
@@ -79,7 +79,10 @@
   - final `test-fast`: `1448 passed, 20 skipped, 42 deselected`;
   - pre-closeout `test-unit`: `1445 passed, 20 skipped, 42 deselected`;
   - `git diff --check`: clean.
-- Integration/post-merge verification: pending.
+- Integration/post-merge verification: main fast-forwarded from
+  `1e5ec01f16a102f14e2a5b5cf9ab70c5061d5cf1` through candidate record
+  `7b0d84ad9be969b303f8919bba10fd80381c65e5`; post-merge `test-vq2`
+  passed all 356 tests in 5.73 seconds; tracked Git status on main was empty.
 - Implementation commits:
   `fd51af3c587e7c3431719b79c1713344e7cc6d6f` (`Freeze VQ2 Wave 1 shared
   contracts`) and `a6782cd9dcc34aee94e0f064021399985e0f6839`
