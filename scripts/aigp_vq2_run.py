@@ -814,6 +814,7 @@ class VQ2Runner:
         self._last_imu_advance_s = 0.0
         self._last_race_boot_ms: Optional[int] = None
         self._last_race_advance_s = 0.0
+        self._last_frame_identity: Optional[Tuple[int, int]] = None
         self._last_frame_sim_ns: Optional[int] = None
         self._imu_regressed = False
         self._race_regressed = False
@@ -885,6 +886,7 @@ class VQ2Runner:
         self._last_imu_advance_s = 0.0
         self._last_race_boot_ms = None
         self._last_race_advance_s = 0.0
+        self._last_frame_identity = None
         self._last_frame_sim_ns = None
         self._imu_regressed = False
         self._race_regressed = False
@@ -986,7 +988,16 @@ class VQ2Runner:
                 self._race_regressed = True
 
         snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
-        if snapshot is not None and snapshot.sim_time_ns != self._last_frame_sim_ns:
+        frame_identity = (
+            None
+            if snapshot is None
+            else (int(snapshot.generation), int(snapshot.frame_id))
+        )
+        if snapshot is not None and frame_identity != self._last_frame_identity:
+            # The camera source timestamp is an opaque ordering token, not
+            # frame identity.  Repeated control polls consume one publication
+            # once, while a receiver generation restart can reuse frame IDs.
+            self._last_frame_identity = frame_identity
             self._last_frame_sim_ns = snapshot.sim_time_ns
             self._latest_detection_frame_id = int(snapshot.frame_id)
             self._latest_detection_frame_sim_ns = int(snapshot.sim_time_ns)
@@ -2225,6 +2236,10 @@ class VQ2Runner:
 
         # Deliberately skip any frame that existed before the tracker reset.
         # The vision receiver and its generation remain untouched.
+        self._last_frame_identity = (
+            int(watermark.generation),
+            int(watermark.frame_id),
+        )
         self._last_frame_sim_ns = int(watermark.sim_time_ns)
         self._latest_detection_frame_id = int(watermark.frame_id)
         self._latest_detection_frame_sim_ns = int(watermark.sim_time_ns)
