@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-relative-estimation`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `integration_pending`
+- State: `post_merge_verified`
 - Objective: implement the highest-value fully offline feature-space filter,
   prediction, innovation gating, dropout/coasting, and estimator-health path
   required before M4. The implementation consumes frozen

@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-gate-geometry`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `integration_pending`
+- State: `post_merge_verified`
 - Objective: add a deterministic, fully offline VQ2 inner-aperture fitter that
   treats frame-clipped edges as censored, infers a conservative square-aperture
   model only when the visible support is sufficient, and publishes honest

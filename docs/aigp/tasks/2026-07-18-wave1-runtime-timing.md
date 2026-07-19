@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-runtime-timing`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `integration_pending`
+- State: `post_merge_verified`
 - Objective: implement the fully offline M1 foundation for end-to-end host
   timing, latest-value camera consumption, and 50 Hz control-tick scheduling
   using the frozen VQ2 `/1` timing and latency contracts.

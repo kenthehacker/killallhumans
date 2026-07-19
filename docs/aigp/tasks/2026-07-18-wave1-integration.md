@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-offline-integration`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `integration_pending`
+- State: `post_merge_verified`
 - Objective: integrate the runtime-timing, clipped-geometry, and relative-state
   branches on the frozen Wave 1A `/1` contracts, preserve Gate 0 behavior, and
   produce green offline evidence for the M1/M2/M4 prerequisites.
@@ -84,5 +84,10 @@
   acceptance, active/shadow tracking, and crossing-residue isolation.
 - M4 still needs IMU derotation, measured command-effect prediction, replay p95
   comparison, the pure controller, and runtime/shadow evidence.
-- Main integration, post-merge `test-vq2`, clean-main proof, and the final record
-  commit remain pending.
+
+## Main integration closeout
+
+- Main fast-forwarded from `3de33c3a568bc86638d9d7ac4dac6124f1e15397`
+  through `1cf17ea5f4e0a330bee89b0128d30b13657899a2`. Post-merge
+  `test-vq2` passed all 418 tests in 6.31 seconds; tracked Git status on main
+  was empty. This final record commit closes the offline integration task.
