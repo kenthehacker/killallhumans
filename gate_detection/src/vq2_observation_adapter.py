@@ -18,8 +18,15 @@ from competition.vq2_contracts import (
     FrameTimingV1,
     GateAuthorityEpochV1,
     GateObservationV1,
+    LineSegmentV1,
     MeasurementTimeBasis,
     ObservationHealth,
+)
+from gate_detection.src.vq2_geometry import (
+    ApertureSide,
+    VQ2ApertureConfig,
+    VQ2ApertureFit,
+    fit_vq2_aperture_bgr,
 )
 
 
@@ -161,6 +168,258 @@ def gate_detection_to_observation_v1(
     )
 
 
+def _normalized_point(
+    point: tuple[float, float], width: int, height: int
+) -> tuple[float, float]:
+    return (
+        max(-1.0, min(1.0, _bearing_x(point[0], width))),
+        max(-1.0, min(1.0, _bearing_y(point[1], height))),
+    )
+
+
+def _normalized_fitted_point(
+    point: tuple[float, float], width: int, height: int
+) -> tuple[float, float]:
+    return _bearing_x(point[0], width), _bearing_y(point[1], height)
+
+
+def _edge_set_from_aperture_fit(fit: VQ2ApertureFit) -> EdgeSetV1:
+    width, height = fit.image_size_px
+    values: dict[str, LineSegmentV1 | None] = {}
+    for index, name in enumerate(("left", "top", "right", "bottom")):
+        segment = fit.visible_segments_px[index]
+        if segment is None:
+            values[name] = None
+        else:
+            values[name] = LineSegmentV1(
+                start_norm=_normalized_point(segment[0], width, height),
+                end_norm=_normalized_point(segment[1], width, height),
+            )
+    return EdgeSetV1(**values)
+
+
+def _fitted_geometry_values(
+    corners: tuple[
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+        tuple[float, float],
+    ],
+) -> tuple[float, tuple[float, float], tuple[float, float]]:
+    area = 0.5 * abs(
+        sum(
+            corners[index][0] * corners[(index + 1) % 4][1]
+            - corners[(index + 1) % 4][0] * corners[index][1]
+            for index in range(4)
+        )
+    )
+    lengths = tuple(
+        math.hypot(
+            corners[(index + 1) % 4][0] - corners[index][0],
+            corners[(index + 1) % 4][1] - corners[index][1],
+        )
+        for index in range(4)
+    )
+    top, right, bottom, left = lengths
+    first_diagonal = (
+        corners[2][0] - corners[0][0],
+        corners[2][1] - corners[0][1],
+    )
+    second_diagonal = (
+        corners[3][0] - corners[1][0],
+        corners[3][1] - corners[1][1],
+    )
+    diagonal_offset = (
+        corners[1][0] - corners[0][0],
+        corners[1][1] - corners[0][1],
+    )
+    diagonal_cross = (
+        first_diagonal[0] * second_diagonal[1]
+        - first_diagonal[1] * second_diagonal[0]
+    )
+    first_fraction = (
+        diagonal_offset[0] * second_diagonal[1]
+        - diagonal_offset[1] * second_diagonal[0]
+    ) / diagonal_cross
+    center = (
+        corners[0][0] + first_fraction * first_diagonal[0],
+        corners[0][1] + first_fraction * first_diagonal[1],
+    )
+    return (
+        math.log(math.sqrt(area)),
+        (math.log(right / left), math.log(bottom / top)),
+        center,
+    )
+
+
+def gate_detection_with_aperture_to_observation_v1(
+    detection: Any,
+    image_bgr: Any,
+    *,
+    frame_timing: FrameTimingV1,
+    authority: GateAuthorityEpochV1,
+    candidate_id: str,
+    measurement_uncertainty_ns: int,
+    fallback_center_covariance: FeatureCovarianceV1,
+    image_width: int = 640,
+    image_height: int = 360,
+    geometry_config: VQ2ApertureConfig = VQ2ApertureConfig(),
+) -> GateObservationV1:
+    """Fit inner geometry or return an explicit bbox-only degraded fallback.
+
+    The existing :func:`gate_detection_to_observation_v1` remains the exact
+    legacy path.  This opt-in path uses only the frame pixels and bbox support;
+    it never copies the legacy placeholder corners or metric distance.
+    """
+
+    if type(geometry_config) is not VQ2ApertureConfig:
+        raise TypeError("geometry_config must be VQ2ApertureConfig")
+    fallback = gate_detection_to_observation_v1(
+        detection,
+        frame_timing=frame_timing,
+        authority=authority,
+        candidate_id=candidate_id,
+        measurement_uncertainty_ns=measurement_uncertainty_ns,
+        center_covariance=fallback_center_covariance,
+        image_width=image_width,
+        image_height=image_height,
+        boundary_margin_px=geometry_config.boundary_margin_px,
+    )
+    shape = getattr(image_bgr, "shape", None)
+    if type(shape) is not tuple or len(shape) != 3:
+        raise TypeError("image_bgr must be a three-dimensional NumPy image")
+    if shape[:2] != (image_height, image_width):
+        raise ValueError("image_bgr dimensions do not match the declared image")
+    fit = fit_vq2_aperture_bgr(
+        image_bgr,
+        getattr(detection, "bbox"),
+        detection_confidence=fallback.confidence,
+        config=geometry_config,
+    )
+    if not fit.succeeded:
+        return GateObservationV1(
+            frame_timing=fallback.frame_timing,
+            measurement_time_monotonic_ns=fallback.measurement_time_monotonic_ns,
+            measurement_time_basis=fallback.measurement_time_basis,
+            measurement_time_model_id=fallback.measurement_time_model_id,
+            measurement_uncertainty_ns=fallback.measurement_uncertainty_ns,
+            authority=fallback.authority,
+            candidate_id=fallback.candidate_id,
+            image_size_px=fallback.image_size_px,
+            center_norm=fallback.center_norm,
+            support_bounds_norm=fallback.support_bounds_norm,
+            outer_edges=fallback.outer_edges,
+            inner_edges=fallback.inner_edges,
+            inner_corners_norm=fallback.inner_corners_norm,
+            fitted_inner_aperture_corners_norm=None,
+            geometry_model_id=None,
+            log_scale=None,
+            projective_skew=None,
+            clipping=fallback.clipping,
+            confidence=fallback.confidence,
+            covariance=fallback.covariance,
+            fit=fallback.fit,
+            health=ObservationHealth.DEGRADED,
+            health_reason=f"aperture_fit_rejected:{fit.rejection_reason}",
+            provenance="vq2_aperture_fit_rejected",
+        )
+
+    if (
+        fit.fitted_corners_px is None
+        or fit.geometry_model_id is None
+        or fit.covariance_model_id is None
+        or fit.covariance_diagonal is None
+        or fit.residual_rms_px is None
+    ):
+        raise RuntimeError("successful aperture fit omitted required diagnostics")
+    fitted_corners = tuple(
+        _normalized_fitted_point(point, image_width, image_height)
+        for point in fit.fitted_corners_px
+    )
+    log_scale, projective_skew, center = _fitted_geometry_values(fitted_corners)
+    inner_corners = tuple(
+        fitted_corners[index] if fit.visible_corners[index] else None
+        for index in range(4)
+    )
+    covariance = FeatureCovarianceV1(
+        model_id=fit.covariance_model_id,
+        feature_order=(
+            "center_x_norm",
+            "center_y_norm",
+            "log_scale",
+            "skew_x",
+            "skew_y",
+        ),
+        matrix=tuple(
+            tuple(
+                fit.covariance_diagonal[row] if row == column else 0.0
+                for column in range(5)
+            )
+            for row in range(5)
+        ),
+    )
+    clipping = FrameEdge(int(fit.clipping))
+    clipped_names = "_".join(
+        name
+        for name, side in (
+            ("left", ApertureSide.LEFT),
+            ("top", ApertureSide.TOP),
+            ("right", ApertureSide.RIGHT),
+            ("bottom", ApertureSide.BOTTOM),
+        )
+        if fit.clipping & side
+    )
+    complete_visibility = fit.visible_edges == (
+        ApertureSide.LEFT
+        | ApertureSide.TOP
+        | ApertureSide.RIGHT
+        | ApertureSide.BOTTOM
+    )
+    nominal = (
+        clipping == FrameEdge.NONE
+        and complete_visibility
+        and fit.confidence >= 0.25
+    )
+    if nominal:
+        health_reason = None
+    elif clipping != FrameEdge.NONE or not complete_visibility:
+        health_reason = f"censored_image_aperture:{clipped_names}"
+    else:
+        health_reason = "low_confidence_image_aperture"
+    return GateObservationV1(
+        frame_timing=fallback.frame_timing,
+        measurement_time_monotonic_ns=fallback.measurement_time_monotonic_ns,
+        measurement_time_basis=fallback.measurement_time_basis,
+        measurement_time_model_id=fallback.measurement_time_model_id,
+        measurement_uncertainty_ns=fallback.measurement_uncertainty_ns,
+        authority=fallback.authority,
+        candidate_id=fallback.candidate_id,
+        image_size_px=fallback.image_size_px,
+        center_norm=center,
+        support_bounds_norm=fallback.support_bounds_norm,
+        # The coloured support contour is still not promoted to an outer edge.
+        outer_edges=EdgeSetV1(),
+        inner_edges=_edge_set_from_aperture_fit(fit),
+        inner_corners_norm=inner_corners,  # type: ignore[arg-type]
+        fitted_inner_aperture_corners_norm=fitted_corners,  # type: ignore[arg-type]
+        geometry_model_id=fit.geometry_model_id,
+        log_scale=log_scale,
+        projective_skew=projective_skew,
+        clipping=clipping,
+        confidence=fit.confidence,
+        covariance=covariance,
+        fit=FitDiagnosticsV1(
+            # Residual is in normalized image units, scaled by the smaller axis.
+            residual_rms=2.0 * fit.residual_rms_px / min(image_width, image_height),
+            inlier_count=fit.inlier_count,
+            support_count=fit.support_count,
+        ),
+        health=ObservationHealth.NOMINAL if nominal else ObservationHealth.DEGRADED,
+        health_reason=health_reason,
+        provenance="vq2_inner_aperture_scanline_fit",
+    )
+
+
 def observation_to_legacy_gate_target_fields(
     observation: GateObservationV1,
     *,
@@ -263,6 +522,7 @@ def observation_to_replay_detection_v1(
 
 __all__ = [
     "gate_detection_to_observation_v1",
+    "gate_detection_with_aperture_to_observation_v1",
     "observation_to_legacy_gate_target_fields",
     "observation_to_replay_detection_v1",
 ]
