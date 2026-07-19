@@ -1,6 +1,6 @@
 {
   "schema": "aigp-t1-pytest-policy/1",
-  "expected_passed": 418,
+  "expected_passed": 743,
   "pytest_version": "9.1.1",
   "pytest_timeout_version": "2.4.0",
   "test_files": [
@@ -13,15 +13,19 @@
     "competition/tests/test_sim_health.py",
     "competition/tests/test_track_data.py",
     "competition/tests/test_vq2_contracts.py",
+    "competition/tests/test_vq2_controller.py",
     "competition/tests/test_vq2_runtime.py",
     "competition/tests/test_vq2_vision.py",
     "competition/tests/test_vq2_wave1_pipeline.py",
+    "competition/tests/test_vq2_wave2_adapter.py",
     "estimation/tests/test_ekf.py",
     "estimation/tests/test_gate_pnp.py",
     "estimation/tests/test_imu_attitude.py",
     "estimation/tests/test_vq2_relative_estimator.py",
+    "estimation/tests/test_vq2_system_id.py",
     "gate_detection/tests/test_detection.py",
     "gate_detection/tests/test_vq2_detector.py",
+    "planning/tests/test_vq2_guidance.py",
     "tests/test_aigp_vq2_runner.py",
     "tests/test_vision_udp.py",
     "tests/test_vision_udp_listener.py"

@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave2-offline-integration`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `active`
+- State: `candidate_complete`
 - Objective: integrate a pure predictive controller, offline system-
   identification tooling, and mapless guidance/state logic on the post-Wave 1
   frozen `/1` contracts, with deterministic evidence and no transport authority.
@@ -14,7 +14,7 @@
 - Branch: `wave2-integration`.
 - Worktree: `C:\Users\John\aigp-worktrees\wt-wave2-integration`.
 - Integration owner and lease owner: `/root`.
-- Heartbeat date: `2026-07-18`.
+- Heartbeat date: `2026-07-19`.
 - Simulator access: `none`.
 - Candidate branches: `wave2-predictive-control`, `wave2-system-id`, and
   `wave2-mapless-guidance`.
@@ -33,5 +33,47 @@
 - Promotion claim: offline unit/synthetic evidence only. A pure proposal or
   experiment definition is never relabeled as a supervised command, actuator
   response, replay result, official-simulator result, or powered evidence.
-- Final commits, counts, hashes, integration record, and remaining authorization
-  or data blockers: pending.
+- Independently cleared branch tips:
+  - predictive controller:
+    `3aa958dbceeb2ec4a75ad7b4ef576e01a83ac816`;
+  - offline system identification:
+    `d21fec7e34aa0861a8c3cf5ce36e8f9971745fef`;
+  - mapless guidance:
+    `f581c763127fe34d70d99ed2b0c6c112074e3ec6`.
+- Integration merge commits:
+  - system identification: `0c15b7c`;
+  - predictive controller: `692d55e`;
+  - mapless guidance: `833d6b0`.
+- Integration-owned adapter:
+  `competition/vq2_wave2_adapter.py`. It owns accepted guidance memory, latches
+  the Gate 0 pitch basis, exact-binds guidance/state/tick correlation, maps only
+  Gate 0 approach and Gate 1 alignment/recenter, and emits source-less exact
+  zero for every other phase including commit. It has no transport, runtime,
+  supervisor, simulator, or system-ID import.
+- Accepted integration evidence so far:
+  - adapter target: `36 passed`;
+  - combined contracts/controller/adapter/guidance/system-ID target:
+    `378 passed`;
+  - canonical `test-vq2`: exactly `743 passed`;
+  - isolated exact-policy VQ2: exactly `743 passed` against the reviewed
+    manifest;
+  - repository `test-fast`: `1,835 passed, 20 skipped, 42 deselected`;
+  - repository `test-unit`: `1,835 passed, 20 skipped, 42 deselected`;
+  - promotion-boundary `test-full-non-live`: `1,876 passed, 21 skipped`
+    in `500.10s`; skipped optional coverage is not positive evidence;
+  - trusted-manifest review: `119 -> 123` entries, exactly four added test
+    files, one changed policy hash, and no removals; builder semantic identity
+    `4b8bae1511225f4ed79baa14ec015721069b8c37e98b81de7454bcabe7388988`,
+    manifest file SHA-256
+    `79b8769f04902c2b2f87a45109b7a9aaa6b5cbf4ad3c4122593a8347ec57c689`.
+  - independent adversarial adapter review: cleared with no remaining P0 or
+    structurally checkable integration blocker; caller-threaded pure memory is
+    explicitly a trust boundary rather than authenticated runtime state.
+- Pending after candidate completion: clean/cache checks, exact integration
+  commit, shared handoff update, promotion to main, and post-merge
+  verification.
+- Residual blockers remain explicit: attitude and Gate 0 pitch provenance are
+  untimestamped; no approved replay corpus or final processor is present;
+  measured delay/plant response and tracker-isolation replay are absent; and no
+  shadow, runtime, supervisor, transport, simulator, or powered integration is
+  claimed or authorized.
