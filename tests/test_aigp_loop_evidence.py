@@ -223,6 +223,7 @@ def test_t2_to_t4_reject_contradictory_nested_domain_claims(claim):
         {"scope": "powered"},
         {"verdict": "powered"},
         {"environment": "official FlightSim"},
+        {"kind": "powered"},
         {"phase": "live"},
     ],
 )

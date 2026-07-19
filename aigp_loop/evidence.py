@@ -71,6 +71,7 @@ _SCALAR_CLAIM_VALUE_WORDS = frozenset(
         "backend",
         "context",
         "environment",
+        "kind",
         "outcome",
         "phase",
         "resource",
@@ -436,7 +437,7 @@ def _reject_scope_relabeling_claims(
                 continue
             visited.add(identity)
             if value is allowed_synthetic_provenance:
-                # validate_tier_evidence checks this exact two-field mapping
+                # validate_tier_evidence checks this exact six-field mapping
                 # before calling here. It is the one payload-owned scope claim.
                 continue
             for key, child in value.items():

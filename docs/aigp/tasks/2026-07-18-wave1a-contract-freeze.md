@@ -64,20 +64,24 @@
   connection, reset, arm/disarm, target, or powered command occurred.
 
 - Trusted manifest: 116 entries; builder identity
-  `3ac311644f5a1ed4921cab46153081c15f78f1a49048fbe46f3f2d419efd9728`;
+  `d6e4cd31177281fe9010eeeeb7df1667c248c464a45444d692d5a8225a6dc033`;
   canonical file SHA-256
-  `a842fa24c058dfed2de5ad0ad25bcf30ec1c718e10bfd5377848a43eee0257b9`.
-  Review and canonical copies matched byte-for-byte; exactly nine existing
-  trusted paths changed hash and no path entered or left the trust boundary.
+  `45514d8edaad2874c79a95946ff4b7632d5b4ada7a0294bf1f08c3f730701253`.
+  Review and canonical copies matched byte-for-byte. Relative to the 113-entry
+  starting manifest, the three new files under already trusted roots entered
+  the inventory and ten existing entries changed hash; no trust root expanded.
 - Candidate acceptance:
   - affected promotion/contract group: `450 passed, 12 skipped`;
+  - final evidence/promotion/scheduler regression group after closeout audit:
+    `183 passed, 6 skipped`;
   - direct contract suite: `53 passed`;
   - canonical and isolated-cache VQ2 gates: `356 passed` each;
-  - `test-fast`: `1445 passed, 20 skipped, 42 deselected`;
-  - isolated legacy `test-unit`: `1445 passed, 20 skipped, 42 deselected`;
+  - final `test-fast`: `1448 passed, 20 skipped, 42 deselected`;
+  - pre-closeout `test-unit`: `1445 passed, 20 skipped, 42 deselected`;
   - `git diff --check`: clean.
 - Integration/post-merge verification: pending.
-- Final commit: pending.
+- Implementation commit: `fd51af3c` (`Freeze VQ2 Wave 1 shared contracts`);
+  final closeout commit pending.
 - Result/failure provenance: all accepted evidence was produced in the named
   offline worktree with the repository development environment and external
   bytecode caches. Three ignored source-tree cache directories created during

@@ -157,15 +157,17 @@ Zero denotes symmetric fronto-parallel projection. A fitted aperture requires
 positive support and inlier counts plus a residual, and nominal health requires
 a fitted aperture. Degraded and unusable observations require a health reason.
 
-Every covariance has a model ID, exact feature order, symmetric
-positive-semidefinite matrix, and strictly positive variances. Center features
-are mandatory; scale and both skew covariance features appear exactly when the
-corresponding estimates do. Feature names are unique and covariance dimension
-is at most nine.
+Every covariance has a model ID, exact feature order, a symmetric
+positive-semidefinite matrix within the validator's scale-relative numerical
+tolerance `1e-10 * max(1, max(abs(entry)))`, and strictly positive variances.
+Center features are mandatory; scale and both skew covariance features appear
+exactly when the corresponding estimates do. Feature names are unique and
+covariance dimension is at most nine.
 
-One observation batch uses one exact frame timing and authority binding per
-camera frame, and candidate IDs are unique within that frame. This prevents two
-different candidates from sharing an indistinguishable source identity.
+One observation batch uses one exact host-clock/frame timing and authority
+binding per camera frame, and candidate IDs are unique within that host-clock
+frame. This prevents two different candidates from sharing an indistinguishable
+source identity while allowing independent clock domains to remain distinct.
 
 ## Legacy observation adapter
 
@@ -199,11 +201,13 @@ Bearing uses x-right/y-down normalized image coordinates and may extend to
 is keyed by host clock, session, reset epoch, gate epoch, expected gate index,
 and tracker. It requires strictly increasing state sequence and nondecreasing
 prediction time. Every previously seen `(source_frame, source_candidate_id)`
-keeps its original measurement-update sequence, even after intervening frames;
-a new source advances it. Active/shadow ownership is keyed by stable
-session/reset/gate/index identity, so refreshing race-status snapshot fields
-cannot transfer one frame/candidate to another tracker. Snapshot race/camera
-metadata must progress without regression within that stable epoch.
+remains bound to its original measurement-update sequence. A tracker may keep
+predicting from its immediately current source without advancing that sequence;
+after it advances to a new source, revisiting an older source is rejected as
+stale. Active/shadow ownership is keyed by stable
+host-clock/session/reset/gate/index identity, so refreshing race-status snapshot
+fields cannot transfer one frame/candidate to another tracker. Snapshot
+race/camera metadata must progress without regression within that stable epoch.
 
 `validate_relative_gate_state_source` rejects unusable observations and binds
 authority, host clock, frame, publication sequence/time, candidate,
@@ -279,7 +283,10 @@ by this shared schema. A shadow-track proposal may be evaluated open loop, but
 the supervisor can approve it only after reducing it to exact zero; any nonzero
 approved command requires an active source track.
 
-The trusted projection additionally receives the current host clock, send
+Neither the dataclass type nor its schema authenticates the process that claims
+to be the supervisor. Trust comes from the external safety-supervisor boundary
+and the caller-supplied expected values checked during projection. The trusted
+projection additionally receives the current host clock, send
 time, control-tick ID, trusted tick deadline, authority, safety-policy ID, and a
 positive maximum approval age in nanoseconds. All identities must match; send
 time is at or after approval, at or before validity expiry, and no older than
@@ -336,10 +343,12 @@ centering_proxy: negative_worst_p95_tracking_error_m
 stability_proxy: negative_worst_max_tracking_error_m
 ```
 
-Evidence discovery accepts one canonical replay-corpus envelope as one unit
-without relabeling its per-session children as sibling evidence. Distinct or
-aliased sibling payloads are ambiguous and rejected. Both scheduler checkpoint
-binding and final promotion-chain validation enforce these rules.
+Evidence discovery accepts one canonical replay-corpus envelope as one unit by
+suppressing only each direct session replay-score root. Descendants of those
+session roots are still searched, so a hidden extra payload remains ambiguous
+and is rejected. Distinct or aliased sibling payloads are likewise rejected.
+Both scheduler checkpoint binding and final promotion-chain validation enforce
+these rules.
 
 ## Current limitations
 

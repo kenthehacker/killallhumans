@@ -87,8 +87,9 @@ boundary, compare it, then use the explicit overwrite flag.
 
 `aigp_nonlive` refuses a trusted manifest that omits its complete local import
 bootstrap (`aigp_loop/__init__.py`, `_util.py`, `evidence.py`, `ledger.py`,
-`nonlive.py`, and `promotion.py`, plus the non-live/benchmark scripts) and verifies stable byte
-snapshots before any repository package import. The exact seven track JSON
+`nonlive.py`, `promotion.py`, and `scheduler.py`; `planning/__init__.py` and
+`artifact_cache.py`; plus the non-live/benchmark scripts) and verifies stable
+byte snapshots before any repository package import. The exact seven track JSON
 files and their directory inventory are pinned too; extra or case-colliding
 configs fail closed. T4 also compares every file
 below its ten explicit test roots, including non-Python fixtures/assets, plus
@@ -192,9 +193,10 @@ adapter. It declares deterministic synthetic kinematic execution,
 `powered_resources_used: false`, the fixed cleanup/stale-stream gate semantics,
 and the fixed centering/stability proxy meanings. Other
 powered, official-simulator, or live-evidence claims remain contradictory and
-fail closed. One canonical replay-corpus envelope counts as one T1 payload and
-only its `sessions` descendants are suppressed during uniqueness discovery;
-matching payloads in any sibling or other nested location are ambiguous.
+fail closed. One canonical replay-corpus envelope counts as one T1 payload;
+only each direct session replay-score root is suppressed during uniqueness
+discovery, while its descendants remain searchable. Matching payloads in any
+sibling or other nested location are ambiguous.
 
 The scheduler validates this scope before accepting a fresh result and again
 when it reuses a completed checkpoint. Reuse also recomputes the metrics hash.
@@ -335,9 +337,9 @@ processor modules require every local parent to have a secure `__init__.py`,
 preventing namespace-package fallback. Candidate worker/processor provenance
 is therefore bound by `processor_code_sha256`; the worker is not claimed as a
 base-evaluator source. The base evaluator identity exactly binds its executed
-package initializer, utility, ledger, promotion, replay, and CLI sources. The
-trusted host still validates every request ID, schema, output bound, deadline,
-and returned control/perception value.
+package initializer, utility, evidence, ledger, promotion, replay, and CLI
+sources. The trusted host still validates every request ID, schema, output
+bound, deadline, and returned control/perception value.
 
 The measured IPC plus full-stack wall time is reported as
 `full_stack_latency_ms`, never mislabeled detector latency. A recorded detector
