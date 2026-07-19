@@ -97,6 +97,7 @@ class VQ2GuidanceWithholdingReason(str, Enum):
     ACTIVE_STATE_REQUIRED = "active_state_required"
     ACTIVE_ROLE_REQUIRED = "active_role_required"
     ACTIVE_AUTHORITY_MISMATCH = "active_authority_mismatch"
+    ACTIVE_ASSOCIATION_INVALID = "active_association_invalid"
     ACTIVE_TRACK_CHANGED = "active_track_changed"
     RETIRED_ACTIVE_TRACK_REUSED = "retired_active_track_reused"
     ACTIVE_STATE_STALE = "active_state_stale"
@@ -308,7 +309,12 @@ class VQ2GuidanceConfig:
 
 @dataclass(frozen=True, slots=True)
 class VQ2GuidanceSource:
-    """Exact active-state correlation copied without reinterpretation."""
+    """Exact track-state correlation copied without reinterpretation.
+
+    Decisions may expose only an ``ACTIVE`` source.  Guidance memory also uses
+    this local value to retain the owner and chronology of ignored ``SHADOW``
+    inputs so an observation cannot change owner or role on a later call.
+    """
 
     host_clock_id: str
     decision_time_monotonic_ns: int
@@ -343,36 +349,25 @@ class VQ2GuidanceSource:
             raise ValueError("source frame publication cannot postdate decision time")
         if type(self.track_role) is not TrackRole:
             raise TypeError("track_role must be an exact TrackRole")
-        if self.track_role is not TrackRole.ACTIVE:
-            raise ValueError("guidance source correlation must be active")
 
 
 _MeasurementUse = tuple[FrameIdentityV1, str, int]
 
 
 @dataclass(frozen=True, slots=True)
-class VQ2GuidanceMemory:
-    """Minimal immutable history needed to reject stale or transferred state."""
+class VQ2GuidanceTrackHistory:
+    """Gate-scoped immutable chronology for one stable track owner."""
 
-    safety: VQ2SafetyGuidanceInput
-    active_source: Optional[VQ2GuidanceSource]
-    seen_active_measurements: tuple[_MeasurementUse, ...]
-    retired_active_tracker_ids: tuple[str, ...]
+    latest_source: VQ2GuidanceSource
+    seen_measurements: tuple[_MeasurementUse, ...]
 
     def __post_init__(self) -> None:
-        if type(self.safety) is not VQ2SafetyGuidanceInput:
-            raise TypeError("safety must be an exact VQ2SafetyGuidanceInput")
-        if (
-            self.safety.phase_started_monotonic_ns
-            > self.safety.evaluation_monotonic_ns
-        ):
-            raise ValueError("accepted phase start cannot postdate evaluation")
-        if self.active_source is not None and type(self.active_source) is not VQ2GuidanceSource:
-            raise TypeError("active_source must be VQ2GuidanceSource or None")
-        if type(self.seen_active_measurements) is not tuple:
-            raise TypeError("seen_active_measurements must be an exact tuple")
+        if type(self.latest_source) is not VQ2GuidanceSource:
+            raise TypeError("latest_source must be an exact VQ2GuidanceSource")
+        if type(self.seen_measurements) is not tuple or not self.seen_measurements:
+            raise TypeError("seen_measurements must be a non-empty exact tuple")
         seen_keys: set[tuple[FrameIdentityV1, str]] = set()
-        for item in self.seen_active_measurements:
+        for item in self.seen_measurements:
             if type(item) is not tuple or len(item) != 3:
                 raise TypeError("measurement history entries must be exact triples")
             frame, candidate_id, update_sequence = item
@@ -385,19 +380,68 @@ class VQ2GuidanceMemory:
             if key in seen_keys:
                 raise ValueError("measurement history cannot repeat a source")
             seen_keys.add(key)
+        last_frame, last_candidate, last_update = self.seen_measurements[-1]
+        if (
+            last_frame != self.latest_source.source_frame
+            or last_candidate != self.latest_source.source_candidate_id
+            or last_update != self.latest_source.measurement_update_sequence
+        ):
+            raise ValueError("latest source must match the last measurement history entry")
+
+
+@dataclass(frozen=True, slots=True)
+class VQ2GuidanceMemory:
+    """Immutable safety state plus gate-scoped track ownership/chronology."""
+
+    safety: VQ2SafetyGuidanceInput
+    active_source: Optional[VQ2GuidanceSource]
+    track_histories: tuple[VQ2GuidanceTrackHistory, ...]
+    retired_active_tracker_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.safety) is not VQ2SafetyGuidanceInput:
+            raise TypeError("safety must be an exact VQ2SafetyGuidanceInput")
+        if (
+            self.safety.phase_started_monotonic_ns
+            > self.safety.evaluation_monotonic_ns
+        ):
+            raise ValueError("accepted phase start cannot postdate evaluation")
+        if self.active_source is not None and type(self.active_source) is not VQ2GuidanceSource:
+            raise TypeError("active_source must be VQ2GuidanceSource or None")
+        if type(self.track_histories) is not tuple:
+            raise TypeError("track_histories must be an exact tuple")
+        tracker_ids: set[str] = set()
+        source_owners: dict[tuple[FrameIdentityV1, str], tuple[str, TrackRole]] = {}
+        active_histories: list[VQ2GuidanceTrackHistory] = []
+        for history in self.track_histories:
+            if type(history) is not VQ2GuidanceTrackHistory:
+                raise TypeError("track_histories must contain exact history values")
+            source = history.latest_source
+            if source.tracker_id in tracker_ids:
+                raise ValueError("track history cannot repeat a tracker")
+            tracker_ids.add(source.tracker_id)
+            if source.track_role is TrackRole.ACTIVE:
+                active_histories.append(history)
+            for frame, candidate_id, _update in history.seen_measurements:
+                key = (frame, candidate_id)
+                owner = (source.tracker_id, source.track_role)
+                previous_owner = source_owners.get(key)
+                if previous_owner is not None and previous_owner != owner:
+                    raise ValueError("one measurement source cannot have multiple owners")
+                source_owners[key] = owner
+        if len(active_histories) > 1:
+            raise ValueError("guidance memory cannot retain multiple active tracks")
         if self.active_source is None:
-            if self.seen_active_measurements:
-                raise ValueError("measurement history requires an active source")
+            if active_histories:
+                raise ValueError("an active track history requires active_source")
         else:
-            if not self.seen_active_measurements:
-                raise ValueError("active source requires measurement history")
-            last_frame, last_candidate, last_update = self.seen_active_measurements[-1]
+            if self.active_source.track_role is not TrackRole.ACTIVE:
+                raise ValueError("active_source must carry the active role")
             if (
-                last_frame != self.active_source.source_frame
-                or last_candidate != self.active_source.source_candidate_id
-                or last_update != self.active_source.measurement_update_sequence
+                len(active_histories) != 1
+                or active_histories[0].latest_source != self.active_source
             ):
-                raise ValueError("active source must match the last measurement history entry")
+                raise ValueError("active_source must match the active track history")
         if type(self.retired_active_tracker_ids) is not tuple:
             raise TypeError("retired_active_tracker_ids must be an exact tuple")
         if any(type(item) is not str or not item for item in self.retired_active_tracker_ids):
@@ -411,6 +455,11 @@ class VQ2GuidanceMemory:
             and self.active_source.tracker_id in self.retired_active_tracker_ids
         ):
             raise ValueError("the active tracker cannot also be retired")
+        if any(
+            history.latest_source.tracker_id in self.retired_active_tracker_ids
+            for history in self.track_histories
+        ):
+            raise ValueError("a current gate track cannot also be retired")
 
 
 @dataclass(frozen=True, slots=True)
@@ -480,6 +529,8 @@ class VQ2GuidanceDecision:
         if self.source is not None and type(self.source) is not VQ2GuidanceSource:
             raise TypeError("source must be VQ2GuidanceSource or None")
         if self.source is not None:
+            if self.source.track_role is not TrackRole.ACTIVE:
+                raise ValueError("a guidance decision source must be active")
             if self.source.host_clock_id != self.authority.camera_host_clock_id:
                 raise ValueError("guidance source host clock does not match authority")
             if self.source.source_frame.stream_id != self.authority.camera_stream_id:
@@ -557,8 +608,9 @@ def step_vq2_guidance(
     Semantic trust failures return a withheld decision.  Exact Python type
     violations raise immediately because they are programmer/interface errors.
     A rejected safety transition, including phase-start rewind or renewal,
-    preserves prior memory; rejected visual input cannot poison accepted
-    active-track history.
+    preserves prior memory.  A separately valid safety transition remains
+    accepted when visual input is rejected, but that rejected visual batch
+    cannot poison retained active/shadow ownership or chronology.
     """
 
     if memory is not None and type(memory) is not VQ2GuidanceMemory:
@@ -588,10 +640,17 @@ def step_vq2_guidance(
             raise ValueError(
                 "initial guidance phase start must equal evaluation time"
             )
+        if (
+            safety.authority.gate_epoch != 0
+            or safety.authority.expected_gate_index != 0
+        ):
+            raise ValueError(
+                "fresh guidance memory must initialize at gate epoch/index zero"
+            )
         base_memory = VQ2GuidanceMemory(
             safety=safety,
             active_source=None,
-            seen_active_measurements=(),
+            track_histories=(),
             retired_active_tracker_ids=(),
         )
     else:
@@ -615,42 +674,63 @@ def step_vq2_guidance(
             transition_kind=transition_kind,
         )
 
-    shadow_rejection = _validate_shadow_isolation(
+    current_shadow_rejection = _validate_current_visual_ownership(
+        active_state,
         shadow_states,
-        safety,
-        active_state=active_state,
-        config=config,
     )
-    if shadow_rejection is not None:
+    if current_shadow_rejection is not None:
         return VQ2GuidanceTransition(
             memory=base_memory,
             decision=_withheld_decision(
                 safety,
-                shadow_rejection,
+                current_shadow_rejection,
                 config=config,
                 shadow_track_count=len(shadow_states),
             ),
         )
 
-    accepted_memory = base_memory
+    visual_memory = base_memory
     source: Optional[VQ2GuidanceSource] = None
     active_rejection: Optional[VQ2GuidanceWithholdingReason] = None
+    for shadow_state in shadow_states:
+        shadow_source = _source_from_state(shadow_state)
+        shadow_rejection = _validate_shadow_state(
+            visual_memory,
+            safety,
+            shadow_state,
+            shadow_source,
+            config=config,
+        )
+        if shadow_rejection is not None:
+            return VQ2GuidanceTransition(
+                memory=base_memory,
+                decision=_withheld_decision(
+                    safety,
+                    shadow_rejection,
+                    config=config,
+                    shadow_track_count=len(shadow_states),
+                ),
+            )
+        visual_memory = _memory_with_track_state(visual_memory, shadow_source)
+
     if active_state is not None:
         if active_state.track_role is not TrackRole.ACTIVE:
             active_rejection = VQ2GuidanceWithholdingReason.ACTIVE_ROLE_REQUIRED
         else:
             source = _source_from_state(active_state)
             active_rejection = _validate_active_state(
-                base_memory,
+                visual_memory,
                 safety,
                 active_state,
                 source,
                 config=config,
             )
             if active_rejection is None:
-                accepted_memory = _memory_with_active_state(base_memory, source)
+                visual_memory = _memory_with_track_state(visual_memory, source)
             else:
                 source = None
+
+    accepted_memory = visual_memory if active_rejection is None else base_memory
 
     decision = _evaluate_decision(
         safety,
@@ -806,6 +886,42 @@ def _validate_safety_transition(
             "invalid",
             VQ2GuidanceWithholdingReason.SAFETY_RACE_STATE_TRANSITION_REJECTED,
         )
+    if (
+        previous.race_state is VQ2GuidanceRaceState.NOT_UNDERWAY
+        and (
+            previous.phase is not VQ2GuidancePhase.ACQUIRE
+            or current.phase is not VQ2GuidancePhase.ACQUIRE
+        )
+    ):
+        return (
+            "invalid",
+            VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED,
+        )
+    if (
+        current.race_state is VQ2GuidanceRaceState.NOT_UNDERWAY
+        and current.phase is not VQ2GuidancePhase.ACQUIRE
+    ):
+        return (
+            "invalid",
+            VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED,
+        )
+    if phase_changed and (
+        previous.race_state is not VQ2GuidanceRaceState.UNDERWAY
+        or current.race_state is not VQ2GuidanceRaceState.UNDERWAY
+    ):
+        return (
+            "invalid",
+            VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED,
+        )
+    if (
+        current.race_state
+        in {VQ2GuidanceRaceState.FINISHED, VQ2GuidanceRaceState.ABORTED}
+        and current.phase is not previous.phase
+    ):
+        return (
+            "invalid",
+            VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED,
+        )
     if phase_changed:
         if current.phase_started_monotonic_ns != current.evaluation_monotonic_ns:
             return (
@@ -830,7 +946,7 @@ def _memory_after_safety_transition(
         return VQ2GuidanceMemory(
             safety=safety,
             active_source=None,
-            seen_active_measurements=(),
+            track_histories=(),
             retired_active_tracker_ids=(),
         )
     if transition_kind == "gate":
@@ -843,45 +959,63 @@ def _memory_after_safety_transition(
         return VQ2GuidanceMemory(
             safety=safety,
             active_source=None,
-            seen_active_measurements=(),
+            track_histories=(),
             retired_active_tracker_ids=retired,
         )
     return VQ2GuidanceMemory(
         safety=safety,
         active_source=memory.active_source,
-        seen_active_measurements=memory.seen_active_measurements,
+        track_histories=memory.track_histories,
         retired_active_tracker_ids=memory.retired_active_tracker_ids,
     )
 
 
-def _validate_shadow_isolation(
-    shadow_states: tuple[RelativeGateStateV1, ...],
+def _validate_shadow_state(
+    memory: VQ2GuidanceMemory,
     safety: VQ2SafetyGuidanceInput,
+    state: RelativeGateStateV1,
+    source: VQ2GuidanceSource,
     *,
-    active_state: Optional[RelativeGateStateV1],
     config: VQ2GuidanceConfig,
 ) -> Optional[VQ2GuidanceWithholdingReason]:
+    if (
+        state.track_role is not TrackRole.SHADOW
+        or source.track_role is not TrackRole.SHADOW
+        or state.authority != safety.authority
+        or source.tracker_id in memory.retired_active_tracker_ids
+        or _validate_state_timing(state, safety, config=config) is not None
+        or _validate_track_chronology(memory, source) is not None
+    ):
+        return VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+    return None
+
+
+def _validate_current_visual_ownership(
+    active_state: Optional[RelativeGateStateV1],
+    shadow_states: tuple[RelativeGateStateV1, ...],
+) -> Optional[VQ2GuidanceWithholdingReason]:
+    """Reject owner collisions inside one visual batch before staging history."""
+
     tracker_ids: set[str] = set()
     sources: set[tuple[FrameIdentityV1, str]] = set()
     if active_state is not None:
         tracker_ids.add(active_state.tracker_id)
-        source_frame = active_state.timing.source_frame
-        if source_frame is not None:
-            sources.add((source_frame, active_state.source_candidate_id))
+        if active_state.timing.source_frame is not None:
+            sources.add(
+                (active_state.timing.source_frame, active_state.source_candidate_id)
+            )
     for state in shadow_states:
         if (
             state.track_role is not TrackRole.SHADOW
-            or state.authority != safety.authority
             or state.tracker_id in tracker_ids
             or state.timing.source_frame is None
-            or _validate_state_timing(state, safety, config=config) is not None
         ):
             return VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
-        source = (state.timing.source_frame, state.source_candidate_id)
-        if source in sources:
+        source_key = (state.timing.source_frame, state.source_candidate_id)
+        if source_key in sources:
             return VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
         tracker_ids.add(state.tracker_id)
-        sources.add(source)
+        sources.add(source_key)
     return None
 
 
@@ -902,11 +1036,45 @@ def _validate_active_state(
         return timing_rejection
     if source.tracker_id in memory.retired_active_tracker_ids:
         return VQ2GuidanceWithholdingReason.RETIRED_ACTIVE_TRACK_REUSED
-    previous = memory.active_source
-    if previous is None:
-        return None
-    if source.tracker_id != previous.tracker_id:
+    if (
+        memory.active_source is not None
+        and source.tracker_id != memory.active_source.tracker_id
+    ):
         return VQ2GuidanceWithholdingReason.ACTIVE_TRACK_CHANGED
+    chronology_rejection = _validate_track_chronology(memory, source)
+    if chronology_rejection == "association":
+        return VQ2GuidanceWithholdingReason.ACTIVE_ASSOCIATION_INVALID
+    if chronology_rejection == "stale":
+        return VQ2GuidanceWithholdingReason.ACTIVE_STATE_STALE
+    return None
+
+
+def _validate_track_chronology(
+    memory: VQ2GuidanceMemory,
+    source: VQ2GuidanceSource,
+) -> Optional[str]:
+    """Return ``association`` or ``stale`` for a gate-scoped source violation."""
+
+    source_key = (source.source_frame, source.source_candidate_id)
+    tracker_history: Optional[VQ2GuidanceTrackHistory] = None
+    for history in memory.track_histories:
+        owner = history.latest_source
+        if owner.tracker_id == source.tracker_id:
+            tracker_history = history
+            if owner.track_role is not source.track_role:
+                return "association"
+        if any(
+            (frame, candidate_id) == source_key
+            for frame, candidate_id, _update in history.seen_measurements
+        ) and (
+            owner.tracker_id != source.tracker_id
+            or owner.track_role is not source.track_role
+        ):
+            return "association"
+
+    if tracker_history is None:
+        return None
+    previous = tracker_history.latest_source
     if (
         source.state_sequence <= previous.state_sequence
         or source.decision_time_monotonic_ns < previous.decision_time_monotonic_ns
@@ -916,13 +1084,12 @@ def _validate_active_state(
         or source.source_frame_publish_monotonic_ns
         < previous.source_frame_publish_monotonic_ns
     ):
-        return VQ2GuidanceWithholdingReason.ACTIVE_STATE_STALE
+        return "stale"
 
-    source_key = (source.source_frame, source.source_candidate_id)
     previous_key = (previous.source_frame, previous.source_candidate_id)
     history = {
         (frame, candidate): update
-        for frame, candidate, update in memory.seen_active_measurements
+        for frame, candidate, update in tracker_history.seen_measurements
     }
     if source_key == previous_key:
         if (
@@ -933,7 +1100,7 @@ def _validate_active_state(
             or source.source_frame_publish_monotonic_ns
             != previous.source_frame_publish_monotonic_ns
         ):
-            return VQ2GuidanceWithholdingReason.ACTIVE_STATE_STALE
+            return "stale"
     else:
         if (
             source_key in history
@@ -944,7 +1111,7 @@ def _validate_active_state(
             or source.source_frame_publish_monotonic_ns
             <= previous.source_frame_publish_monotonic_ns
         ):
-            return VQ2GuidanceWithholdingReason.ACTIVE_STATE_STALE
+            return "stale"
     return None
 
 
@@ -987,11 +1154,18 @@ def _validate_state_timing(
     return None
 
 
-def _memory_with_active_state(
+def _memory_with_track_state(
     memory: VQ2GuidanceMemory,
     source: VQ2GuidanceSource,
 ) -> VQ2GuidanceMemory:
-    history = memory.seen_active_measurements
+    histories = list(memory.track_histories)
+    history_index: Optional[int] = None
+    history: tuple[_MeasurementUse, ...] = ()
+    for index, existing in enumerate(histories):
+        if existing.latest_source.tracker_id == source.tracker_id:
+            history_index = index
+            history = existing.seen_measurements
+            break
     source_key = (source.source_frame, source.source_candidate_id)
     if not history or (history[-1][0], history[-1][1]) != source_key:
         history = (
@@ -1002,10 +1176,20 @@ def _memory_with_active_state(
                 source.measurement_update_sequence,
             ),
         )
+    updated_history = VQ2GuidanceTrackHistory(
+        latest_source=source,
+        seen_measurements=history,
+    )
+    if history_index is None:
+        histories.append(updated_history)
+    else:
+        histories[history_index] = updated_history
     return VQ2GuidanceMemory(
         safety=memory.safety,
-        active_source=source,
-        seen_active_measurements=history,
+        active_source=(
+            source if source.track_role is TrackRole.ACTIVE else memory.active_source
+        ),
+        track_histories=tuple(histories),
         retired_active_tracker_ids=memory.retired_active_tracker_ids,
     )
 
@@ -1083,8 +1267,14 @@ def _evaluate_decision(
         reason = VQ2GuidanceWithholdingReason.ACTIVE_INNOVATION_REJECTED
     elif (
         safety.phase is VQ2GuidancePhase.ALIGN
-        and state.health
-        not in {RelativeStateHealth.HEALTHY, RelativeStateHealth.DEGRADED}
+        and (
+            state.health
+            not in {RelativeStateHealth.HEALTHY, RelativeStateHealth.DEGRADED}
+            or (
+                state.health is RelativeStateHealth.DEGRADED
+                and state.last_clipping == FrameEdge.NONE
+            )
+        )
     ) or (
         safety.phase in {VQ2GuidancePhase.APPROACH, VQ2GuidancePhase.COMMIT}
         and state.health is not RelativeStateHealth.HEALTHY
@@ -1359,6 +1549,7 @@ __all__ = [
     "VQ2GuidancePhase",
     "VQ2GuidanceRaceState",
     "VQ2GuidanceSource",
+    "VQ2GuidanceTrackHistory",
     "VQ2GuidanceTransition",
     "VQ2GuidanceWithholdingReason",
     "VQ2SafetyGuidanceInput",

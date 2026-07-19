@@ -79,12 +79,15 @@ class VQ2SyntheticGuidanceStep:
 @dataclass(frozen=True, slots=True)
 class VQ2SyntheticGuidanceReport:
     evidence_scope: str
+    fresh_nonzero_gate_initialization_rejected: bool
+    gate0_countdown_phase_change_rejected: bool
     gate0_visual_phase_non_regression: bool
     gate0_same_snapshot_phase_change_rejected: bool
     gate0_phase_start_stable: bool
     gate0_phase_start_renewal_rejected: bool
     gate0_forward_phase_accepted: bool
     gate1_shadow_isolated: bool
+    gate1_shadow_promotion_rejected: bool
     gate1_high_uncertainty_withheld: bool
     gate1_low_uncertainty_recenter_permitted: bool
     steps: tuple[VQ2SyntheticGuidanceStep, ...]
@@ -94,12 +97,15 @@ class VQ2SyntheticGuidanceReport:
     def all_checks_passed(self) -> bool:
         return all(
             (
+                self.fresh_nonzero_gate_initialization_rejected,
+                self.gate0_countdown_phase_change_rejected,
                 self.gate0_visual_phase_non_regression,
                 self.gate0_same_snapshot_phase_change_rejected,
                 self.gate0_phase_start_stable,
                 self.gate0_phase_start_renewal_rejected,
                 self.gate0_forward_phase_accepted,
                 self.gate1_shadow_isolated,
+                self.gate1_shadow_promotion_rejected,
                 self.gate1_high_uncertainty_withheld,
                 self.gate1_low_uncertainty_recenter_permitted,
             )
@@ -124,6 +130,40 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
     )
     records.append(_record("gate0_not_underway_initialization", transition))
     gate0_phase_start_ns = transition.memory.safety.phase_started_monotonic_ns
+
+    nonzero_gate_authority = _authority(0, gate_epoch=1, gate_index=1)
+    try:
+        step_vq2_guidance(
+            None,
+            _safety(
+                nonzero_gate_authority,
+                VQ2GuidancePhase.ACQUIRE,
+                VQ2GuidanceRaceState.NOT_UNDERWAY,
+            ),
+            active_state=None,
+        )
+    except ValueError as exc:
+        fresh_nonzero_gate_initialization_rejected = (
+            "gate epoch/index zero" in str(exc)
+        )
+    else:
+        fresh_nonzero_gate_initialization_rejected = False
+
+    countdown_phase_change = step_vq2_guidance(
+        transition.memory,
+        _safety(
+            _authority(1),
+            VQ2GuidancePhase.ALIGN,
+            VQ2GuidanceRaceState.NOT_UNDERWAY,
+        ),
+        active_state=None,
+    )
+    records.append(_record("gate0_countdown_align_rejected", countdown_phase_change))
+    gate0_countdown_phase_change_rejected = bool(
+        countdown_phase_change.memory == transition.memory
+        and countdown_phase_change.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED
+    )
 
     gate0_acquire_authority = _authority(1)
     acquire_safety = _safety(
@@ -268,17 +308,6 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
         gate1_align_authority,
         VQ2GuidancePhase.ALIGN,
     )
-    high_uncertainty = _state(
-        gate1_align_authority,
-        state_sequence=1,
-        frame_id=101,
-        tracker_id="synthetic-active-gate-1",
-        candidate_id="gate1-high-uncertainty",
-        bearing_norm=(0.45, -0.35),
-        bearing_variance=0.09,
-        clipping=FrameEdge.TOP,
-        health=RelativeStateHealth.DEGRADED,
-    )
     tempting_shadow = _state(
         gate1_align_authority,
         state_sequence=1,
@@ -292,11 +321,46 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
         track_role=TrackRole.SHADOW,
         publication_offset=2,
     )
-    high_result = step_vq2_guidance(
+    shadow_only = step_vq2_guidance(
         transition.memory,
         gate1_align_safety,
-        active_state=high_uncertainty,
+        active_state=None,
         shadow_states=(tempting_shadow,),
+    )
+    records.append(_record("gate1_shadow_owner_recorded", shadow_only))
+    promoted_shadow = replace(
+        tempting_shadow,
+        state_sequence=2,
+        track_role=TrackRole.ACTIVE,
+    )
+    promotion_result = step_vq2_guidance(
+        shadow_only.memory,
+        gate1_align_safety,
+        active_state=promoted_shadow,
+    )
+    records.append(_record("gate1_shadow_promotion_rejected", promotion_result))
+    gate1_shadow_promotion_rejected = bool(
+        promotion_result.memory == shadow_only.memory
+        and promotion_result.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.ACTIVE_ASSOCIATION_INVALID
+    )
+    fresh_shadow = replace(tempting_shadow, state_sequence=2)
+    high_uncertainty = _state(
+        gate1_align_authority,
+        state_sequence=1,
+        frame_id=101,
+        tracker_id="synthetic-active-gate-1",
+        candidate_id="gate1-high-uncertainty",
+        bearing_norm=(0.45, -0.35),
+        bearing_variance=0.09,
+        clipping=FrameEdge.TOP,
+        health=RelativeStateHealth.DEGRADED,
+    )
+    high_result = step_vq2_guidance(
+        promotion_result.memory,
+        gate1_align_safety,
+        active_state=high_uncertainty,
+        shadow_states=(fresh_shadow,),
     )
     records.append(_record("gate1_top_clipped_high_uncertainty", high_result))
     gate1_high_uncertainty_withheld = bool(
@@ -336,9 +400,17 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
         and low_result.decision.source.tracker_id == "synthetic-active-gate-1"
     )
 
+    # This digest deliberately binds the deterministic outcome summary below,
+    # not implementation identity, configuration provenance, or full inputs.
     primitive = {
         "evidence_scope": SYNTHETIC_GUIDANCE_SCOPE,
         "checks": {
+            "fresh_nonzero_gate_initialization_rejected": (
+                fresh_nonzero_gate_initialization_rejected
+            ),
+            "gate0_countdown_phase_change_rejected": (
+                gate0_countdown_phase_change_rejected
+            ),
             "gate0_visual_phase_non_regression": gate0_visual_phase_non_regression,
             "gate0_same_snapshot_phase_change_rejected": (
                 gate0_same_snapshot_phase_change_rejected
@@ -349,6 +421,7 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
             ),
             "gate0_forward_phase_accepted": gate0_forward_phase_accepted,
             "gate1_shadow_isolated": gate1_shadow_isolated,
+            "gate1_shadow_promotion_rejected": gate1_shadow_promotion_rejected,
             "gate1_high_uncertainty_withheld": gate1_high_uncertainty_withheld,
             "gate1_low_uncertainty_recenter_permitted": (
                 gate1_low_uncertainty_recenter_permitted
@@ -364,6 +437,12 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
     digest = hashlib.sha256(encoded).hexdigest()
     return VQ2SyntheticGuidanceReport(
         evidence_scope=SYNTHETIC_GUIDANCE_SCOPE,
+        fresh_nonzero_gate_initialization_rejected=(
+            fresh_nonzero_gate_initialization_rejected
+        ),
+        gate0_countdown_phase_change_rejected=(
+            gate0_countdown_phase_change_rejected
+        ),
         gate0_visual_phase_non_regression=gate0_visual_phase_non_regression,
         gate0_same_snapshot_phase_change_rejected=(
             gate0_same_snapshot_phase_change_rejected
@@ -374,6 +453,7 @@ def evaluate_synthetic_vq2_guidance_scenario() -> VQ2SyntheticGuidanceReport:
         ),
         gate0_forward_phase_accepted=gate0_forward_phase_accepted,
         gate1_shadow_isolated=gate1_shadow_isolated,
+        gate1_shadow_promotion_rejected=gate1_shadow_promotion_rejected,
         gate1_high_uncertainty_withheld=gate1_high_uncertainty_withheld,
         gate1_low_uncertainty_recenter_permitted=(
             gate1_low_uncertainty_recenter_permitted

@@ -15,6 +15,7 @@ from competition.vq2_contracts import (
     RelativeGateStateV1,
     RelativeStateHealth,
     TrackRole,
+    validate_relative_gate_state_sequence,
 )
 from planning.vq2_guidance import (
     VQ2GuidanceConfig,
@@ -48,7 +49,7 @@ _PHASE_PATH = (
     VQ2GuidancePhase.CONFIRMATION,
 )
 _EXPECTED_SCENARIO_DIGEST = (
-    "510eeaa21a4b476e389379394786c781ca2369f1401aff43a1596dfdb634d5ec"
+    "13b5a7b3120826780e529b0d183a4298ba562937d47edf15773092471d4516df"
 )
 
 
@@ -114,14 +115,8 @@ def _safety(
 def _initial(
     *,
     sequence: int = 0,
-    gate_epoch: int = 0,
-    gate_index: int = 0,
 ):
-    authority = _authority(
-        sequence,
-        gate_epoch=gate_epoch,
-        gate_index=gate_index,
-    )
+    authority = _authority(sequence)
     safety = _safety(
         authority,
         VQ2GuidancePhase.ACQUIRE,
@@ -134,14 +129,8 @@ def _ready_phase(
     phase: VQ2GuidancePhase,
     *,
     start_sequence: int = 0,
-    gate_epoch: int = 0,
-    gate_index: int = 0,
 ):
-    transition = _initial(
-        sequence=start_sequence,
-        gate_epoch=gate_epoch,
-        gate_index=gate_index,
-    )
+    transition = _initial(sequence=start_sequence)
     target_index = _PHASE_PATH.index(phase)
     safety = transition.memory.safety
     for offset, selected_phase in enumerate(
@@ -150,8 +139,6 @@ def _ready_phase(
     ):
         authority = _authority(
             start_sequence + offset,
-            gate_epoch=gate_epoch,
-            gate_index=gate_index,
         )
         safety = _safety(
             authority,
@@ -370,6 +357,44 @@ def test_initialization_requires_phase_start_at_evaluation_boundary() -> None:
 
     with pytest.raises(ValueError, match="phase start must equal evaluation time"):
         step_vq2_guidance(None, safety, active_state=None)
+
+
+@pytest.mark.parametrize(
+    ("gate_epoch", "gate_index"),
+    [(1, 1), (0, 1), (1, 0), (41, 41)],
+)
+def test_fresh_memory_requires_gate_epoch_and_index_zero(
+    gate_epoch: int,
+    gate_index: int,
+) -> None:
+    authority = _authority(
+        0,
+        gate_epoch=gate_epoch,
+        gate_index=gate_index,
+    )
+    safety = _safety(
+        authority,
+        VQ2GuidancePhase.ACQUIRE,
+        VQ2GuidanceRaceState.NOT_UNDERWAY,
+    )
+
+    with pytest.raises(ValueError, match="gate epoch/index zero"):
+        step_vq2_guidance(None, safety, active_state=None)
+
+
+def test_fresh_memory_allows_nonzero_reset_epoch_at_gate_zero() -> None:
+    authority = _authority(0, reset_epoch=7)
+    safety = _safety(
+        authority,
+        VQ2GuidancePhase.ACQUIRE,
+        VQ2GuidanceRaceState.NOT_UNDERWAY,
+    )
+
+    result = step_vq2_guidance(None, safety, active_state=None)
+
+    assert result.memory.safety.authority.reset_epoch == 7
+    assert result.memory.safety.authority.gate_epoch == 0
+    assert result.memory.safety.authority.expected_gate_index == 0
 
 
 def test_safety_input_rejects_phase_start_one_ns_after_evaluation() -> None:
@@ -608,6 +633,148 @@ def test_race_only_transition_preserves_phase_start_exactly() -> None:
     assert result.decision.phase_started_monotonic_ns == previous_start_ns
 
 
+@pytest.mark.parametrize(
+    "phase",
+    [
+        VQ2GuidancePhase.ALIGN,
+        VQ2GuidancePhase.APPROACH,
+        VQ2GuidancePhase.COMMIT,
+        VQ2GuidancePhase.CONFIRMATION,
+        VQ2GuidancePhase.POST_CREDIT_REACQUIRE,
+    ],
+)
+def test_countdown_cannot_advance_from_acquire(phase) -> None:
+    transition = _initial()
+    attempted = _safety(
+        _authority(1),
+        phase,
+        VQ2GuidanceRaceState.NOT_UNDERWAY,
+    )
+
+    rejected = step_vq2_guidance(
+        transition.memory,
+        attempted,
+        active_state=None,
+    )
+
+    assert rejected.memory == transition.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED
+    )
+
+
+def test_go_and_align_require_two_distinct_forward_transitions() -> None:
+    transition = _initial()
+    initial_start_ns = transition.memory.safety.phase_started_monotonic_ns
+    simultaneous = _safety(
+        _authority(1),
+        VQ2GuidancePhase.ALIGN,
+        VQ2GuidanceRaceState.UNDERWAY,
+    )
+    rejected = step_vq2_guidance(
+        transition.memory,
+        simultaneous,
+        active_state=None,
+    )
+    assert rejected.memory == transition.memory
+
+    go_safety = _safety(
+        _authority(1),
+        VQ2GuidancePhase.ACQUIRE,
+        VQ2GuidanceRaceState.UNDERWAY,
+        phase_started_monotonic_ns=initial_start_ns,
+    )
+    go = step_vq2_guidance(
+        transition.memory,
+        go_safety,
+        active_state=None,
+    )
+    assert go.memory.safety == go_safety
+    assert go.memory.safety.phase_started_monotonic_ns == initial_start_ns
+
+    align_safety = _safety(
+        _authority(2),
+        VQ2GuidancePhase.ALIGN,
+        VQ2GuidanceRaceState.UNDERWAY,
+    )
+    aligned = step_vq2_guidance(
+        go.memory,
+        align_safety,
+        active_state=None,
+    )
+    assert aligned.memory.safety == align_safety
+    assert aligned.memory.safety.phase_started_monotonic_ns == (
+        align_safety.evaluation_monotonic_ns
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [VQ2GuidanceRaceState.FINISHED, VQ2GuidanceRaceState.ABORTED],
+)
+def test_terminal_transition_cannot_simultaneously_advance_phase(
+    terminal_state,
+) -> None:
+    transition, _safety_value, next_sequence = _ready_phase(
+        VQ2GuidancePhase.ALIGN
+    )
+    attempted = _safety(
+        _authority(next_sequence),
+        VQ2GuidancePhase.APPROACH,
+        terminal_state,
+    )
+
+    rejected = step_vq2_guidance(
+        transition.memory,
+        attempted,
+        active_state=None,
+    )
+
+    assert rejected.memory == transition.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal_state",
+    [VQ2GuidanceRaceState.FINISHED, VQ2GuidanceRaceState.ABORTED],
+)
+def test_terminal_state_freezes_phase_on_later_snapshots(terminal_state) -> None:
+    transition, safety, next_sequence = _ready_phase(VQ2GuidancePhase.ALIGN)
+    phase_start_ns = safety.phase_started_monotonic_ns
+    terminal_safety = _safety(
+        _authority(next_sequence),
+        VQ2GuidancePhase.ALIGN,
+        terminal_state,
+        phase_started_monotonic_ns=phase_start_ns,
+    )
+    terminal = step_vq2_guidance(
+        transition.memory,
+        terminal_safety,
+        active_state=None,
+    )
+    attempted = _safety(
+        _authority(next_sequence + 1),
+        VQ2GuidancePhase.APPROACH,
+        terminal_state,
+    )
+
+    rejected = step_vq2_guidance(
+        terminal.memory,
+        attempted,
+        active_state=None,
+    )
+
+    assert rejected.memory == terminal.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SAFETY_PHASE_TRANSITION_REJECTED
+    )
+
+
 @pytest.mark.parametrize("offset_ns", [-1, 1])
 @pytest.mark.parametrize(
     "race_state",
@@ -809,8 +976,65 @@ def _confirmation_with_active_track():
     return transition, next_sequence
 
 
+def _ready_gate1_align():
+    """Reach Gate 1 ALIGN only through GO, phases, and exact gate credit."""
+
+    transition, next_sequence = _confirmation_with_active_track()
+    post_safety = _safety(
+        _authority(next_sequence, gate_epoch=1, gate_index=1),
+        VQ2GuidancePhase.POST_CREDIT_REACQUIRE,
+        VQ2GuidanceRaceState.UNDERWAY,
+    )
+    transition = step_vq2_guidance(
+        transition.memory,
+        post_safety,
+        active_state=None,
+    )
+    next_sequence += 1
+    acquire_safety = _safety(
+        _authority(next_sequence, gate_epoch=1, gate_index=1),
+        VQ2GuidancePhase.ACQUIRE,
+        VQ2GuidanceRaceState.UNDERWAY,
+    )
+    transition = step_vq2_guidance(
+        transition.memory,
+        acquire_safety,
+        active_state=None,
+    )
+    next_sequence += 1
+    align_safety = _safety(
+        _authority(next_sequence, gate_epoch=1, gate_index=1),
+        VQ2GuidancePhase.ALIGN,
+        VQ2GuidanceRaceState.UNDERWAY,
+    )
+    transition = step_vq2_guidance(
+        transition.memory,
+        align_safety,
+        active_state=None,
+    )
+    return transition, align_safety, next_sequence + 1
+
+
 def test_forward_gate_credit_retires_active_track_and_holds() -> None:
     transition, next_sequence = _confirmation_with_active_track()
+    confirmation_safety = transition.memory.safety
+    transition = step_vq2_guidance(
+        transition.memory,
+        confirmation_safety,
+        active_state=None,
+        shadow_states=(
+            _state(
+                confirmation_safety,
+                state_sequence=101,
+                frame_id=101,
+                candidate_id="gate0-shadow",
+                tracker_id="gate0-shadow",
+                track_role=TrackRole.SHADOW,
+                publication_offset=2,
+            ),
+        ),
+    )
+    assert len(transition.memory.track_histories) == 2
     gate1_authority = _authority(next_sequence, gate_epoch=1, gate_index=1)
     gate1_safety = _safety(
         gate1_authority,
@@ -824,6 +1048,7 @@ def test_forward_gate_credit_retires_active_track_and_holds() -> None:
     )
 
     assert credited.memory.active_source is None
+    assert credited.memory.track_histories == ()
     assert credited.memory.retired_active_tracker_ids == ("active-gate-0",)
     assert (
         credited.memory.safety.phase_started_monotonic_ns
@@ -906,13 +1131,42 @@ def test_retired_tracker_cannot_seed_next_active_gate() -> None:
     )
 
 
+def test_distinct_gate_scoped_tracker_can_seed_gate1_after_exact_credit() -> None:
+    transition, safety, _ = _ready_gate1_align()
+
+    accepted = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=_state(
+            safety,
+            tracker_id="active-gate-1",
+        ),
+    )
+
+    assert accepted.decision.objective_permitted
+    assert accepted.memory.active_source is not None
+    assert accepted.memory.active_source.tracker_id == "active-gate-1"
+    assert "active-gate-0" in accepted.memory.retired_active_tracker_ids
+
+
 def test_reset_restarts_gate_zero_and_clears_track_history() -> None:
     transition, safety, next_sequence = _ready_phase(VQ2GuidancePhase.ALIGN)
     transition = step_vq2_guidance(
         transition.memory,
         safety,
         active_state=_state(safety),
+        shadow_states=(
+            _state(
+                safety,
+                frame_id=101,
+                candidate_id="reset-shadow",
+                tracker_id="reset-shadow",
+                track_role=TrackRole.SHADOW,
+                publication_offset=2,
+            ),
+        ),
     )
+    assert len(transition.memory.track_histories) == 2
     reset_authority = _authority(
         next_sequence,
         reset_epoch=1,
@@ -933,7 +1187,7 @@ def test_reset_restarts_gate_zero_and_clears_track_history() -> None:
     )
 
     assert reset.memory.active_source is None
-    assert reset.memory.seen_active_measurements == ()
+    assert reset.memory.track_histories == ()
     assert reset.memory.retired_active_tracker_ids == ()
     assert reset.memory.safety.authority.reset_epoch == 1
     assert (
@@ -1124,6 +1378,333 @@ def test_active_shadow_collision_fails_closed() -> None:
     assert result.memory == transition.memory
     assert (
         result.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+    )
+
+
+@pytest.mark.parametrize("collision", ["tracker", "source"])
+def test_same_call_shadow_owner_collisions_are_atomic(collision) -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    first = _state(
+        safety,
+        frame_id=101,
+        candidate_id="shadow-a",
+        tracker_id="shadow-a",
+        track_role=TrackRole.SHADOW,
+    )
+    second_kwargs = {
+        "state_sequence": 2,
+        "frame_id": 102,
+        "candidate_id": "shadow-b",
+        "tracker_id": "shadow-b",
+        "track_role": TrackRole.SHADOW,
+        "publication_offset": 2,
+    }
+    if collision == "tracker":
+        second_kwargs["tracker_id"] = first.tracker_id
+    else:
+        second_kwargs["frame_id"] = first.timing.source_frame.frame_id
+        second_kwargs["candidate_id"] = first.source_candidate_id
+    second = _state(safety, **second_kwargs)
+
+    rejected = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=None,
+        shadow_states=(first, second),
+    )
+
+    assert rejected.memory == transition.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+    )
+
+
+def test_late_invalid_shadow_rolls_back_earlier_staged_shadow() -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    valid_shadow = _state(
+        safety,
+        frame_id=101,
+        candidate_id="valid-shadow",
+        tracker_id="valid-shadow",
+        track_role=TrackRole.SHADOW,
+    )
+    stale_decision_ns = safety.evaluation_monotonic_ns - 100_000_001
+    stale_shadow = _state(
+        safety,
+        frame_id=102,
+        candidate_id="stale-shadow",
+        tracker_id="stale-shadow",
+        track_role=TrackRole.SHADOW,
+        publication_offset=2,
+        publish_monotonic_ns=stale_decision_ns - 2,
+        measurement_monotonic_ns=stale_decision_ns - 3,
+        decision_monotonic_ns=stale_decision_ns,
+        prediction_monotonic_ns=stale_decision_ns,
+    )
+
+    rejected = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=None,
+        shadow_states=(valid_shadow, stale_shadow),
+    )
+
+    assert rejected.memory == transition.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+    )
+
+
+def test_prior_shadow_source_cannot_be_promoted_to_active() -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    shadow = _state(
+        safety,
+        tracker_id="shadow-owner",
+        track_role=TrackRole.SHADOW,
+    )
+    recorded = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=None,
+        shadow_states=(shadow,),
+    )
+    promoted = replace(
+        shadow,
+        state_sequence=2,
+        track_role=TrackRole.ACTIVE,
+    )
+
+    rejected = step_vq2_guidance(
+        recorded.memory,
+        safety,
+        active_state=promoted,
+    )
+
+    with pytest.raises(ValueError, match="multiple active/shadow tracks"):
+        validate_relative_gate_state_sequence((shadow, promoted))
+    assert rejected.memory == recorded.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.ACTIVE_ASSOCIATION_INVALID
+    )
+
+
+def test_prior_active_source_cannot_be_relabelled_shadow() -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    active = _state(safety, tracker_id="active-owner")
+    recorded = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=active,
+    )
+    demoted = replace(
+        active,
+        state_sequence=2,
+        track_role=TrackRole.SHADOW,
+    )
+
+    rejected = step_vq2_guidance(
+        recorded.memory,
+        safety,
+        active_state=None,
+        shadow_states=(demoted,),
+    )
+
+    assert rejected.memory == recorded.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+    )
+
+
+def test_prior_shadow_source_cannot_change_tracker_owner() -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    shadow = _state(
+        safety,
+        tracker_id="shadow-owner-a",
+        track_role=TrackRole.SHADOW,
+    )
+    recorded = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=None,
+        shadow_states=(shadow,),
+    )
+    transferred = replace(
+        shadow,
+        state_sequence=2,
+        tracker_id="shadow-owner-b",
+    )
+
+    rejected = step_vq2_guidance(
+        recorded.memory,
+        safety,
+        active_state=None,
+        shadow_states=(transferred,),
+    )
+
+    assert rejected.memory == recorded.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+    )
+
+
+def test_shadow_tracker_role_cannot_change_on_a_new_source() -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    shadow = _state(
+        safety,
+        frame_id=101,
+        candidate_id="shadow-source-a",
+        tracker_id="shadow-owner",
+        track_role=TrackRole.SHADOW,
+    )
+    recorded = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=None,
+        shadow_states=(shadow,),
+    )
+    promoted = _state(
+        safety,
+        state_sequence=2,
+        measurement_update_sequence=2,
+        frame_id=102,
+        candidate_id="shadow-source-b",
+        tracker_id="shadow-owner",
+        track_role=TrackRole.ACTIVE,
+        publication_offset=2,
+    )
+
+    rejected = step_vq2_guidance(
+        recorded.memory,
+        safety,
+        active_state=promoted,
+    )
+
+    assert rejected.memory == recorded.memory
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.ACTIVE_ASSOCIATION_INVALID
+    )
+
+
+def test_shadow_prediction_chronology_advances_but_duplicate_and_revisit_fail() -> None:
+    transition, safety, _ = _ready_phase(VQ2GuidancePhase.ALIGN)
+    source_a = _state(
+        safety,
+        state_sequence=1,
+        measurement_update_sequence=1,
+        frame_id=101,
+        candidate_id="shadow-a",
+        tracker_id="shadow-owner",
+        track_role=TrackRole.SHADOW,
+    )
+    first = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=None,
+        shadow_states=(source_a,),
+    )
+    duplicate = step_vq2_guidance(
+        first.memory,
+        safety,
+        active_state=None,
+        shadow_states=(source_a,),
+    )
+    same_source_prediction = replace(source_a, state_sequence=2)
+    predicted = step_vq2_guidance(
+        first.memory,
+        safety,
+        active_state=None,
+        shadow_states=(same_source_prediction,),
+    )
+    source_b = _state(
+        safety,
+        state_sequence=3,
+        measurement_update_sequence=2,
+        frame_id=102,
+        candidate_id="shadow-b",
+        tracker_id="shadow-owner",
+        track_role=TrackRole.SHADOW,
+        publication_offset=2,
+    )
+    advanced = step_vq2_guidance(
+        predicted.memory,
+        safety,
+        active_state=None,
+        shadow_states=(source_b,),
+    )
+    revisit = replace(source_a, state_sequence=4)
+    revisited = step_vq2_guidance(
+        advanced.memory,
+        safety,
+        active_state=None,
+        shadow_states=(revisit,),
+    )
+
+    validate_relative_gate_state_sequence(
+        (source_a, same_source_prediction, source_b)
+    )
+    assert duplicate.memory == first.memory
+    assert predicted.memory != first.memory
+    assert advanced.memory != predicted.memory
+    assert revisited.memory == advanced.memory
+    for rejected in (duplicate, revisited):
+        assert (
+            rejected.decision.withholding_reason
+            is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
+        )
+
+
+def test_invalid_visual_batch_keeps_valid_safety_progress_only() -> None:
+    transition, safety, next_sequence = _ready_phase(VQ2GuidancePhase.ALIGN)
+    first_active = _state(safety, state_sequence=1)
+    recorded = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=first_active,
+    )
+    approach_safety = _safety(
+        _authority(next_sequence),
+        VQ2GuidancePhase.APPROACH,
+        VQ2GuidanceRaceState.UNDERWAY,
+    )
+    stale_decision_ns = approach_safety.evaluation_monotonic_ns - 100_000_001
+    stale_shadow = _state(
+        approach_safety,
+        frame_id=101,
+        candidate_id="stale-shadow",
+        tracker_id="stale-shadow",
+        track_role=TrackRole.SHADOW,
+        publish_monotonic_ns=stale_decision_ns - 2,
+        measurement_monotonic_ns=stale_decision_ns - 3,
+        decision_monotonic_ns=stale_decision_ns,
+        prediction_monotonic_ns=stale_decision_ns,
+    )
+    concurrent_active = _state(
+        approach_safety,
+        state_sequence=2,
+        measurement_update_sequence=2,
+        frame_id=2,
+        publication_offset=2,
+    )
+
+    rejected = step_vq2_guidance(
+        recorded.memory,
+        approach_safety,
+        active_state=concurrent_active,
+        shadow_states=(stale_shadow,),
+    )
+
+    assert rejected.memory.safety == approach_safety
+    assert rejected.memory.active_source == recorded.memory.active_source
+    assert rejected.memory.track_histories == recorded.memory.track_histories
+    assert (
+        rejected.decision.withholding_reason
         is VQ2GuidanceWithholdingReason.SHADOW_INPUT_INVALID
     )
 
@@ -1372,11 +1953,7 @@ def test_prediction_lead_including_uncertainty_boundary_and_plus_one_ns() -> Non
 
 
 def test_high_uncertainty_top_clipped_gate1_align_is_withheld() -> None:
-    transition, safety, _ = _ready_phase(
-        VQ2GuidancePhase.ALIGN,
-        gate_epoch=1,
-        gate_index=1,
-    )
+    transition, safety, _ = _ready_gate1_align()
     result = step_vq2_guidance(
         transition.memory,
         safety,
@@ -1399,11 +1976,7 @@ def test_high_uncertainty_top_clipped_gate1_align_is_withheld() -> None:
 
 
 def test_lower_uncertainty_top_clipped_gate1_can_only_recenter() -> None:
-    transition, safety, _ = _ready_phase(
-        VQ2GuidancePhase.ALIGN,
-        gate_epoch=1,
-        gate_index=1,
-    )
+    transition, safety, _ = _ready_gate1_align()
     result = step_vq2_guidance(
         transition.memory,
         safety,
@@ -1421,6 +1994,23 @@ def test_lower_uncertainty_top_clipped_gate1_can_only_recenter() -> None:
     assert result.decision.objective_kind is VQ2GuidanceObjectiveKind.RECENTER_ACTIVE_GATE
     assert result.decision.source is not None
     assert result.decision.source.tracker_id == "active-gate-1"
+
+
+def test_degraded_unclipped_align_is_recorded_but_motion_withheld() -> None:
+    result = _with_active(
+        VQ2GuidancePhase.ALIGN,
+        health=RelativeStateHealth.DEGRADED,
+        clipping=FrameEdge.NONE,
+    )
+
+    assert not result.decision.objective_permitted
+    assert (
+        result.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.ACTIVE_STATE_HEALTH
+    )
+    assert result.decision.source is not None
+    assert result.memory.active_source == result.decision.source
+    assert len(result.memory.track_histories) == 1
 
 
 @pytest.mark.parametrize(
@@ -1603,12 +2193,15 @@ def test_generated_guidance_scenario_passes_narrow_checks() -> None:
     report = evaluate_synthetic_vq2_guidance_scenario()
 
     assert report.all_checks_passed
+    assert report.fresh_nonzero_gate_initialization_rejected
+    assert report.gate0_countdown_phase_change_rejected
     assert report.gate0_visual_phase_non_regression
     assert report.gate0_same_snapshot_phase_change_rejected
     assert report.gate0_phase_start_stable
     assert report.gate0_phase_start_renewal_rejected
     assert report.gate0_forward_phase_accepted
     assert report.gate1_shadow_isolated
+    assert report.gate1_shadow_promotion_rejected
     assert report.gate1_high_uncertainty_withheld
     assert report.gate1_low_uncertainty_recenter_permitted
 
@@ -1630,9 +2223,9 @@ def test_generated_guidance_scenario_is_deterministic_and_digest_bound() -> None
 
     assert first == second
     assert first.digest_sha256 == _EXPECTED_SCENARIO_DIGEST
-    assert len(first.steps) == 13
-    assert first.steps[1].phase == "acquire"
-    assert not first.steps[1].objective_permitted
+    assert len(first.steps) == 16
+    assert first.steps[2].phase == "acquire"
+    assert not first.steps[2].objective_permitted
     assert first.steps[-2].withholding_reason == "outside_uncertainty_corridor"
     assert first.steps[-1].objective_kind == "recenter_active_gate"
     assert first.steps[-1].objective_permitted
