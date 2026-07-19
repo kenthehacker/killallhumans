@@ -11,6 +11,7 @@ import pytest
 
 from aigp_loop._util import sha256_file
 from aigp_loop._util import json_hash
+from aigp_loop.evidence import validate_tier_evidence
 from aigp_loop.nonlive import (
     CORE_EVALUATOR_FILES,
     FULL_TRACK_SET,
@@ -164,6 +165,7 @@ def test_t2_adapter_derives_hard_gates_and_quality_from_exact_track_evidence():
         "race_time_s": 10.0,
     }
     assert result["domain_provenance"]["powered_resources_used"] is False
+    assert validate_tier_evidence(Tier.T2_WARM_SIM, result) is result
 
 
 def test_adapter_itself_rejects_evidence_that_omits_core_evaluator_sources():
@@ -216,6 +218,7 @@ def test_t4_requires_exact_seven_tracks_and_passing_full_nonlive_suite():
         full_nonlive_suite=suite,
     )
     assert result["promotion"]["hard_gates"]["valid"] is True
+    assert validate_tier_evidence(Tier.T4_FULL_NON_LIVE, result) is result
     failed = dict(suite, passed=False, returncode=1)
     result = adapt_matrix_evidence(
         _matrix(FULL_TRACK_SET),

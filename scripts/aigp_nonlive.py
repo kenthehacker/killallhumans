@@ -60,6 +60,7 @@ _STARTUP_CORE_FILES = frozenset(
     {
         "aigp_loop/__init__.py",
         "aigp_loop/_util.py",
+        "aigp_loop/evidence.py",
         "aigp_loop/ledger.py",
         "aigp_loop/nonlive.py",
         "aigp_loop/promotion.py",

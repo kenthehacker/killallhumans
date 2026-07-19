@@ -18,6 +18,7 @@ from aigp_loop.ledger import TrialKey, TrialLedger
 from aigp_loop.nonlive import CORE_EVALUATOR_FILES
 from aigp_loop.promotion import (
     _REPLAY_PROMOTION_REQUIRED_BOUNDS,
+    Tier,
     validate_promotion_chain,
 )
 from scripts.aigp_campaign import main as campaign_plan_main
@@ -170,7 +171,14 @@ def _source(ledger: TrialLedger, name: str) -> str:
                     "vertical_cliff",
                 ],
             }[tier],
-            "domain_provenance": {"powered_resources_used": False},
+            "domain_provenance": {
+                "execution": "deterministic_synthetic_kinematic_nonpowered",
+                "powered_resources_used": False,
+                "cleanup_gate_semantics": "vacuously_true_only_after_synthetic_domain_proof",
+                "stale_stream_gate_semantics": "vacuously_true_only_after_synthetic_domain_proof",
+                "centering_proxy": "negative_worst_p95_tracking_error_m",
+                "stability_proxy": "negative_worst_max_tracking_error_m",
+            },
             "evaluator_identity": {"source_sha256": trusted_sources},
             "evaluation_input_hash": identities[tier]["dataset_hash"],
             "evaluation_config_sha256": identities[tier]["config_hash"],
@@ -377,6 +385,38 @@ def test_promotion_chain_recomputes_manifest_identity_and_exact_processor_hash(t
         )
     with pytest.raises(ValueError, match="differs from frozen TrialKey"):
         validate_promotion_chain(third, source)
+
+
+@pytest.mark.parametrize(
+    ("tier", "claim"),
+    [
+        (Tier.T0_AFFECTED, {"nested": {"closed_loop": False}}),
+        (Tier.T1_VQ2_REPLAY, {"nested": {"gate_authority": "none"}}),
+    ],
+)
+def test_promotion_chain_revalidates_nonflight_evidence_scope(
+    tmp_path, tier, claim
+):
+    ledger = TrialLedger(tmp_path / f"scope-{int(tier)}.sqlite3")
+    source = _source(ledger, f"scope-{int(tier)}")
+    checkpoint = ledger.get_checkpoint(source, int(tier))
+    metrics = dict(checkpoint["metrics"])
+    metrics.update(claim)
+    artifacts = dict(checkpoint["artifact_hashes"])
+    artifacts["metrics_sha256"] = json_hash(metrics)
+    with sqlite3.connect(ledger.path) as db:
+        db.execute(
+            """UPDATE checkpoints SET metrics=?,artifact_hashes=?
+               WHERE trial_id=? AND tier=?""",
+            (
+                canonical_json(metrics),
+                canonical_json(artifacts),
+                source,
+                int(tier),
+            ),
+        )
+    with pytest.raises(ValueError, match=f"{tier.name} evidence scope is invalid"):
+        validate_promotion_chain(ledger, source)
 
 
 def test_campaign_never_materializes_t5_without_shipped_watchdog_supervisor(tmp_path):

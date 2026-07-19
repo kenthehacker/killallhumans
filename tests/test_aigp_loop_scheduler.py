@@ -14,7 +14,7 @@ import aigp_loop.scheduler as scheduler_module
 
 from aigp_loop._util import environment_fingerprint, git_provenance, json_hash
 from aigp_loop.ledger import TrialKey, TrialLedger
-from aigp_loop.promotion import PromotionLadder, Tier
+from aigp_loop.promotion import PromotionLadder, QualityVector, Tier, TierEligibility
 from aigp_loop.scheduler import (
     CommandStep,
     GitWorktreePool,
@@ -659,6 +659,40 @@ def test_run_once_reconciles_failed_checkpoint_without_rerunning(tmp_path, monke
     assert ledger.get_trial(identifier)["status"] == "failed"
 
 
+def test_resume_verifier_revalidates_historical_completed_checkpoint_scope(tmp_path):
+    repo = _repo(tmp_path / "repo")
+    ledger = TrialLedger(tmp_path / "ledger.sqlite3")
+    identifier = _trial(ledger, repo)
+    assert ledger.lease_trial(identifier, "historical", ttl_s=3.0)
+    metrics = {"results": [{"closedLoop": False}]}
+    ledger.checkpoint(
+        identifier,
+        0,
+        owner="historical",
+        status="completed",
+        metrics=metrics,
+        artifact_hashes={"metrics_sha256": json_hash(metrics)},
+    )
+    ledger.yield_trial(identifier, "historical")
+    scheduler = TrialScheduler(
+        ledger,
+        GitWorktreePool(repo, tmp_path / "worktrees"),
+        {
+            Tier.T0_AFFECTED: TierCommand(
+                Tier.T0_AFFECTED, ("{python}", "-c", "pass"), 5.0
+            )
+        },
+        owner="resume-scope",
+        lease_ttl_s=3.0,
+    )
+    with pytest.raises(
+        RuntimeError, match="completed T0_AFFECTED checkpoint evidence is invalid"
+    ):
+        scheduler._verify_completed_checkpoint_identities(
+            ledger.get_trial(identifier)
+        )
+
+
 def test_run_round_reconciles_completed_checkpoint_before_yield(tmp_path, monkeypatch):
     repo = _repo(tmp_path / "repo")
     ledger = TrialLedger(tmp_path / "ledger.sqlite3")
@@ -674,9 +708,10 @@ def test_run_round_reconciles_completed_checkpoint_before_yield(tmp_path, monkey
         owner="resume-round",
         lease_ttl_s=3.0,
     )
-    calls = {"commands": 0, "yields": 0}
+    calls = {"commands": 0, "yields": 0, "verifies": 0}
     real_run = scheduler._run_tier_command
     real_yield = ledger.yield_trial
+    real_verify = scheduler._verify_completed_checkpoint_identities
 
     def counted(*args, **kwargs):
         calls["commands"] += 1
@@ -688,14 +723,168 @@ def test_run_round_reconciles_completed_checkpoint_before_yield(tmp_path, monkey
             raise RuntimeError("crash before yield")
         return real_yield(*args, **kwargs)
 
+    def counted_verify(*args, **kwargs):
+        calls["verifies"] += 1
+        return real_verify(*args, **kwargs)
+
     monkeypatch.setattr(scheduler, "_run_tier_command", counted)
     monkeypatch.setattr(ledger, "yield_trial", crash_once)
+    monkeypatch.setattr(
+        scheduler, "_verify_completed_checkpoint_identities", counted_verify
+    )
     with pytest.raises(RuntimeError, match="crash before yield"):
         scheduler.run_round(Tier.T0_AFFECTED)
     decision = scheduler.run_round(Tier.T0_AFFECTED)
     assert set(decision["promoted"]) == set(identifiers)
     assert calls["commands"] == 2
+    assert calls["verifies"] >= 1
     assert all(ledger.get_trial(item)["status"] == "pending" for item in identifiers)
+
+
+def test_decided_round_revalidates_completed_evidence_before_application(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path / "repo")
+    ledger = TrialLedger(tmp_path / "ledger.sqlite3")
+    identifier = _trial(ledger, repo)
+    scheduler = TrialScheduler(
+        ledger,
+        GitWorktreePool(repo, tmp_path / "worktrees"),
+        {
+            Tier.T0_AFFECTED: TierCommand(
+                Tier.T0_AFFECTED, ("{python}", "-c", "pass"), 5.0
+            )
+        },
+        owner="resume-decided-scope",
+        lease_ttl_s=3.0,
+    )
+    real_mark_applied = ledger.mark_promotion_round_applied
+    calls = {"marks": 0}
+
+    def crash_after_decision(round_id):
+        calls["marks"] += 1
+        if calls["marks"] == 1:
+            raise RuntimeError("crash before decided round application commit")
+        return real_mark_applied(round_id)
+
+    monkeypatch.setattr(
+        ledger, "mark_promotion_round_applied", crash_after_decision
+    )
+    with pytest.raises(RuntimeError, match="crash before decided"):
+        scheduler.run_round(Tier.T0_AFFECTED)
+    round_row = ledger.open_promotion_round(int(Tier.T0_AFFECTED))
+    assert round_row is not None and round_row["status"] == "decided"
+
+    # Model an evidence record accepted by older code while keeping its local
+    # metrics digest self-consistent. The resumed decided path must apply the
+    # current tier-scope contract before it applies the persisted decision.
+    stale_metrics = {"results": [{"closedLoop": False}]}
+    checkpoint = ledger.get_checkpoint(identifier, int(Tier.T0_AFFECTED))
+    artifacts = dict(checkpoint["artifact_hashes"])
+    artifacts["metrics_sha256"] = json_hash(stale_metrics)
+    with ledger._connect() as db:
+        db.execute(
+            "UPDATE checkpoints SET metrics=?, artifact_hashes=? "
+            "WHERE trial_id=? AND tier=?",
+            (
+                json.dumps(stale_metrics, sort_keys=True),
+                json.dumps(artifacts, sort_keys=True),
+                identifier,
+                int(Tier.T0_AFFECTED),
+            ),
+        )
+    with pytest.raises(
+        RuntimeError, match="completed T0_AFFECTED checkpoint evidence is invalid"
+    ):
+        scheduler.run_round(Tier.T0_AFFECTED)
+    assert ledger.open_promotion_round(0)["status"] == "decided"
+
+
+def test_decided_round_rejects_a_decision_that_does_not_partition_members(
+    tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path / "repo")
+    ledger = TrialLedger(tmp_path / "ledger.sqlite3")
+    identifier = _trial(ledger, repo)
+    scheduler = TrialScheduler(
+        ledger,
+        GitWorktreePool(repo, tmp_path / "worktrees"),
+        {
+            Tier.T0_AFFECTED: TierCommand(
+                Tier.T0_AFFECTED, ("{python}", "-c", "pass"), 5.0
+            )
+        },
+        owner="resume-decided-members",
+        lease_ttl_s=3.0,
+    )
+    monkeypatch.setattr(
+        ledger,
+        "mark_promotion_round_applied",
+        lambda _round_id: (_ for _ in ()).throw(RuntimeError("crash after decision")),
+    )
+    with pytest.raises(RuntimeError, match="crash after decision"):
+        scheduler.run_round(Tier.T0_AFFECTED)
+    round_row = ledger.open_promotion_round(0)
+    decision = dict(round_row["decision"])
+    decision["promoted"] = [identifier, "not-a-round-member"]
+    with ledger._connect() as db:
+        db.execute(
+            "UPDATE promotion_rounds SET decision=? WHERE round_id=?",
+            (json.dumps(decision, sort_keys=True), round_row["round_id"]),
+        )
+    with pytest.raises(RuntimeError, match="does not partition its members"):
+        scheduler.run_round(Tier.T0_AFFECTED)
+
+
+def test_decided_round_rejects_a_mutated_successive_halving_cutoff(monkeypatch):
+    members = ("candidate-a", "candidate-b", "candidate-c", "candidate-d")
+    ledger = SimpleNamespace(
+        get_trial=lambda trial_id: {"trial_id": trial_id, "status": "pending"},
+        get_checkpoint=lambda _trial_id, _tier: {
+            "status": "completed",
+            "metrics": {},
+        },
+    )
+    scheduler = object.__new__(TrialScheduler)
+    scheduler.ledger = ledger
+    monkeypatch.setattr(
+        scheduler, "_verify_completed_checkpoint_identities", lambda _row: None
+    )
+    evaluations = {
+        candidate: SimpleNamespace(
+            candidate_id=candidate,
+            quality=QualityVector(completion_reliability=float(4 - index)),
+            eligibility=TierEligibility(
+                "golden-replay", True, evidence_hash="a" * 64
+            ),
+            hard_gates=None,
+        )
+        for index, candidate in enumerate(members)
+    }
+    monkeypatch.setattr(
+        scheduler,
+        "_promotion_evaluation",
+        lambda trial_id, _tier, _metrics: evaluations[trial_id],
+    )
+    round_row = {
+        "status": "decided",
+        "tier": int(Tier.T1_VQ2_REPLAY),
+        "member_trial_ids": members,
+        "decision": {
+            "tier": int(Tier.T1_VQ2_REPLAY),
+            "keep_fraction": 0.5,
+            "minimum_survivors": 1,
+            "promoted": list(members),
+            "rejected_hard_gate": {},
+            "eliminated_by_halving": [],
+            "next_tier": int(Tier.T2_WARM_SIM),
+            "failed_evaluation": {},
+        },
+    }
+    with pytest.raises(RuntimeError, match="successive-halving cutoff is stale"):
+        scheduler._validate_decided_promotion_round(
+            round_row, Tier.T1_VQ2_REPLAY
+        )
 
 
 def test_invalid_t1_replay_is_ineligible_before_any_later_tier():

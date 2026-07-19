@@ -339,16 +339,12 @@ class PromotionLadder:
 
 
 def _find_evidence(metrics: Mapping[str, Any], schemas: set[str]) -> Optional[Mapping[str, Any]]:
-    pending: list[Any] = [metrics]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, Mapping):
-            if value.get("schema") in schemas:
-                return value
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    return None
+    # Import locally because evidence scope depends on the Tier enum defined in
+    # this module.  Ambiguous duplicate payloads must fail closed rather than
+    # whichever nested mapping happens to be visited first winning.
+    from .evidence import find_unique_schema_evidence
+
+    return find_unique_schema_evidence(metrics, schemas)
 
 
 _REPLAY_PROMOTION_REQUIRED_BOUNDS: Mapping[str, Mapping[str, float]] = {
@@ -538,6 +534,9 @@ def validate_promotion_chain(ledger: Any, trial_id: str) -> Mapping[str, Any]:
     if trial.get("evaluator_version") != f"aigp-ladder/2:{manifest_hash}":
         raise ValueError("promotion source evaluator version does not bind its ladder manifest")
 
+    from .evidence import validate_tier_evidence
+
+    tier_evidence: dict[int, Mapping[str, Any]] = {}
     for tier_number in range(5):
         checkpoint = ledger.get_checkpoint(trial_id, tier_number)
         assert checkpoint is not None
@@ -559,6 +558,15 @@ def validate_promotion_chain(ledger: Any, trial_id: str) -> Mapping[str, Any]:
                 raise ValueError(f"promotion checkpoint lacks {name}")
         if artifacts["metrics_sha256"] != json_hash(checkpoint["metrics"]):
             raise ValueError("promotion checkpoint metrics hash is stale")
+        tier = Tier(tier_number)
+        try:
+            tier_evidence[tier_number] = validate_tier_evidence(
+                tier, checkpoint["metrics"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"promotion checkpoint {tier.name} evidence scope is invalid: {exc}"
+            ) from exc
         if artifacts["manifest_tier_identity_sha256"] != json_hash(
             identities[tier_number]
         ):
@@ -582,10 +590,7 @@ def validate_promotion_chain(ledger: Any, trial_id: str) -> Mapping[str, Any]:
 
     t1_checkpoint = ledger.get_checkpoint(trial_id, int(Tier.T1_VQ2_REPLAY))
     assert t1_checkpoint is not None
-    replay = _find_evidence(
-        t1_checkpoint["metrics"],
-        {"aigp-vq2-replay-score/1", "aigp-vq2-replay-corpus-score/1"},
-    )
+    replay = tier_evidence[int(Tier.T1_VQ2_REPLAY)]
     t1_identity = identities[int(Tier.T1_VQ2_REPLAY)]
     t1_observed = (
         {
@@ -661,9 +666,7 @@ def validate_promotion_chain(ledger: Any, trial_id: str) -> Mapping[str, Any]:
     for tier in (Tier.T2_WARM_SIM, Tier.T3_DOMAIN_TRACKS, Tier.T4_FULL_NON_LIVE):
         checkpoint = ledger.get_checkpoint(trial_id, int(tier))
         assert checkpoint is not None
-        evidence = _find_evidence(
-            checkpoint["metrics"], {"aigp-nonlive-promotion-evidence/1"}
-        )
+        evidence = tier_evidence[int(tier)]
         identity = identities[int(tier)]
         observed = (
             {

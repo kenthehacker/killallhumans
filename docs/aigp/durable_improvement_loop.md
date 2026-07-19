@@ -64,7 +64,8 @@ change:
   --ledger .aigp-loop\trials.sqlite3 build-trusted-manifest `
   --repo . --out config\promotion_trusted_files.json --overwrite `
   .gitattributes `
-  aigp_loop\__init__.py aigp_loop\_util.py aigp_loop\ledger.py `
+  aigp_loop\__init__.py aigp_loop\_util.py aigp_loop\evidence.py `
+  aigp_loop\ledger.py `
   aigp_loop\campaign.py aigp_loop\nonlive.py aigp_loop\promotion.py `
   aigp_loop\replay.py aigp_loop\scheduler.py `
   scripts\aigp_nonlive.py scripts\aigp_pytest.py scripts\aigp_replay.py `
@@ -85,8 +86,8 @@ inside the repository. Generate to a review path first when changing the trust
 boundary, compare it, then use the explicit overwrite flag.
 
 `aigp_nonlive` refuses a trusted manifest that omits its complete local import
-bootstrap (`aigp_loop/__init__.py`, `_util.py`, `ledger.py`, `nonlive.py`, and
-`promotion.py`, plus the non-live/benchmark scripts) and verifies stable byte
+bootstrap (`aigp_loop/__init__.py`, `_util.py`, `evidence.py`, `ledger.py`,
+`nonlive.py`, and `promotion.py`, plus the non-live/benchmark scripts) and verifies stable byte
 snapshots before any repository package import. The exact seven track JSON
 files and their directory inventory are pinned too; extra or case-colliding
 configs fail closed. T4 also compares every file
@@ -171,7 +172,35 @@ worktree. Run cohort rounds in order with a shared external worktree root:
 T0 ignores the halving fraction and advances every eligible member. Reissuing
 an interrupted round reuses immutable completed checkpoints and terminally
 reconciles a durable failed checkpoint; it does not rerun either. Planned and
-decided round records are idempotent and immutable.
+decided round records are idempotent and immutable. The round identity binds
+the normalized effective keep fraction and minimum-survivor policy. A resumed
+decided round revalidates that policy, the eligible/rejected partition, rank
+order, and exact successive-halving cutoff before its decision is reused.
+
+## Tier evidence claim validation
+
+Tier scope is an exact claim boundary, not a label supplied by an evaluator.
+T0 may contain affected-test evidence only. T1 requires one causal open-loop
+replay payload with exact recorded or candidate provenance. Both tiers reject
+recursive flight-domain claims, including composite/camel-case spellings and
+claims whose value is `false`; absence of a claim is not evidence that the
+claim was verified.
+
+T2-T4 require one `aigp-nonlive-promotion-evidence/1` payload, the exact track
+set for that tier, and the exact six-field provenance emitted by the trusted
+adapter. It declares deterministic synthetic kinematic execution,
+`powered_resources_used: false`, the fixed cleanup/stale-stream gate semantics,
+and the fixed centering/stability proxy meanings. Other
+powered, official-simulator, or live-evidence claims remain contradictory and
+fail closed. One canonical replay-corpus envelope counts as one T1 payload and
+only its `sessions` descendants are suppressed during uniqueness discovery;
+matching payloads in any sibling or other nested location are ambiguous.
+
+The scheduler validates this scope before accepting a fresh result and again
+when it reuses a completed checkpoint. Reuse also recomputes the metrics hash.
+Promotion revalidates every T0-T4 checkpoint and its bound identity, so old or
+mutated evidence cannot acquire a broader domain claim during resume or final
+selection.
 
 ## Scheduler integrity
 

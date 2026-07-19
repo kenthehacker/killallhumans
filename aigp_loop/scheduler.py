@@ -61,6 +61,7 @@ _TRUSTED_REPLAY_HOST_FILES = frozenset(
     {
         "aigp_loop/__init__.py",
         "aigp_loop/_util.py",
+        "aigp_loop/evidence.py",
         "aigp_loop/ledger.py",
         "aigp_loop/promotion.py",
         "aigp_loop/replay.py",
@@ -82,6 +83,7 @@ _TRUSTED_T1_PYTEST_FILES = frozenset(
         "competition/tests/test_gate_map_integrity.py",
         "competition/tests/test_sim_health.py",
         "competition/tests/test_track_data.py",
+        "competition/tests/test_vq2_contracts.py",
         "competition/tests/test_vq2_vision.py",
         "estimation/tests/test_ekf.py",
         "estimation/tests/test_gate_pnp.py",
@@ -97,6 +99,7 @@ _TRUSTED_NONLIVE_FILES = frozenset(
     {
         "aigp_loop/__init__.py",
         "aigp_loop/_util.py",
+        "aigp_loop/evidence.py",
         "aigp_loop/ledger.py",
         "aigp_loop/nonlive.py",
         "aigp_loop/promotion.py",
@@ -1314,9 +1317,24 @@ class TrialScheduler:
             checkpoint = self.ledger.get_checkpoint(
                 str(trial["trial_id"]), completed_tier
             )
+            if checkpoint is None:
+                raise RuntimeError(f"completed {tier.name} checkpoint is missing")
+            if checkpoint["artifact_hashes"].get("metrics_sha256") != json_hash(
+                checkpoint["metrics"]
+            ):
+                raise RuntimeError(
+                    f"completed {tier.name} checkpoint has stale metrics identity"
+                )
+            binding_failure = self._tier_evidence_binding_failure(
+                trial, tier, checkpoint["metrics"]
+            )
+            if binding_failure is not None:
+                raise RuntimeError(
+                    f"completed {tier.name} checkpoint evidence is invalid: "
+                    f"{binding_failure}"
+                )
             if expected is not None and (
-                checkpoint is None
-                or checkpoint["artifact_hashes"].get(
+                checkpoint["artifact_hashes"].get(
                     "manifest_tier_identity_sha256"
                 )
                 != base_expected
@@ -1336,16 +1354,9 @@ class TrialScheduler:
     def _find_schema_evidence(
         metrics: Mapping[str, Any], schemas: set[str]
     ) -> Optional[Mapping[str, Any]]:
-        pending: list[Any] = [metrics]
-        while pending:
-            candidate = pending.pop()
-            if isinstance(candidate, Mapping):
-                if candidate.get("schema") in schemas:
-                    return candidate
-                pending.extend(candidate.values())
-            elif isinstance(candidate, list):
-                pending.extend(candidate)
-        return None
+        from .evidence import find_unique_schema_evidence
+
+        return find_unique_schema_evidence(metrics, schemas)
 
     def _tier_evidence_binding_failure(
         self,
@@ -1353,6 +1364,15 @@ class TrialScheduler:
         tier: Tier,
         metrics: Mapping[str, Any],
     ) -> Optional[str]:
+        # Domain-scope validation is independent of a frozen ladder manifest.
+        # In particular, T0 must not bypass the non-flight claim boundary via
+        # the manifest/T0 early return below.
+        from .evidence import validate_tier_evidence
+
+        try:
+            evidence = validate_tier_evidence(tier, metrics)
+        except (TypeError, ValueError) as exc:
+            return f"{tier.name} tier evidence scope is invalid: {exc}"
         config = trial.get("resolved_config")
         manifest = (
             config.get("promotion_ladder_manifest")
@@ -1367,17 +1387,6 @@ class TrialScheduler:
         identity = next(
             item for item in manifest["tiers"] if item["tier"] == int(tier)
         )
-        schemas = (
-            {
-                "aigp-vq2-replay-score/1",
-                "aigp-vq2-replay-corpus-score/1",
-            }
-            if tier is Tier.T1_VQ2_REPLAY
-            else {"aigp-nonlive-promotion-evidence/1"}
-        )
-        evidence = self._find_schema_evidence(metrics, schemas)
-        if evidence is None:
-            return f"{tier.name} is missing identity-bound evaluator evidence"
         if tier >= Tier.T2_WARM_SIM:
             from .nonlive import DOMAIN_TRACK_SET, FULL_TRACK_SET
 
@@ -2469,6 +2478,172 @@ class TrialScheduler:
             quality = QualityVector()
         return CandidateEvaluation(trial_id, tier, gates, quality, metrics=dict(metrics))
 
+    def _validate_decided_promotion_round(
+        self,
+        round_row: Mapping[str, Any],
+        tier: Tier,
+    ) -> Dict[str, Any]:
+        """Revalidate a durable decision before applying any side effects."""
+
+        if (
+            round_row.get("status") != "decided"
+            or type(round_row.get("tier")) is not int
+            or round_row["tier"] != int(tier)
+        ):
+            raise RuntimeError("promotion round is not a decided round for this tier")
+        raw_members = round_row.get("member_trial_ids")
+        if (
+            type(raw_members) is not tuple
+            or not raw_members
+            or any(type(member) is not str or not member for member in raw_members)
+            or len(raw_members) != len(set(raw_members))
+        ):
+            raise RuntimeError("promotion round member identity is invalid")
+        members = set(raw_members)
+        raw_decision = round_row.get("decision")
+        expected_fields = {
+            "tier",
+            "keep_fraction",
+            "minimum_survivors",
+            "promoted",
+            "rejected_hard_gate",
+            "eliminated_by_halving",
+            "next_tier",
+            "failed_evaluation",
+        }
+        if type(raw_decision) is not dict or set(raw_decision) != expected_fields:
+            raise RuntimeError("promotion round decision fields are invalid")
+        if type(raw_decision["tier"]) is not int or raw_decision["tier"] != int(tier):
+            raise RuntimeError("promotion round decision tier is stale")
+        keep_fraction = raw_decision["keep_fraction"]
+        minimum_survivors = raw_decision["minimum_survivors"]
+        if (
+            type(keep_fraction) is not float
+            or not math.isfinite(keep_fraction)
+            or not 0.0 < keep_fraction <= 1.0
+            or (tier is Tier.T0_AFFECTED and keep_fraction != 1.0)
+            or type(minimum_survivors) is not int
+            or minimum_survivors < 1
+        ):
+            raise RuntimeError("promotion round halving policy is invalid")
+
+        promoted = raw_decision["promoted"]
+        eliminated = raw_decision["eliminated_by_halving"]
+        rejected = raw_decision["rejected_hard_gate"]
+        failed = raw_decision["failed_evaluation"]
+        if any(
+            type(values) is not list
+            or any(type(value) is not str or not value for value in values)
+            or len(values) != len(set(values))
+            for values in (promoted, eliminated)
+        ):
+            raise RuntimeError("promotion round decision member lists are invalid")
+        if (
+            type(rejected) is not dict
+            or any(type(candidate) is not str or not candidate for candidate in rejected)
+            or any(
+                type(reasons) is not list
+                or not reasons
+                or any(type(reason) is not str or not reason for reason in reasons)
+                for reasons in rejected.values()
+            )
+        ):
+            raise RuntimeError("promotion round hard-gate rejection map is invalid")
+        if (
+            type(failed) is not dict
+            or any(type(candidate) is not str or not candidate for candidate in failed)
+            or any(type(reason) is not str or not reason for reason in failed.values())
+        ):
+            raise RuntimeError("promotion round failed-evaluation map is invalid")
+        partitions = [set(promoted), set(eliminated), set(rejected), set(failed)]
+        if (
+            set().union(*partitions) != members
+            or sum(len(partition) for partition in partitions) != len(members)
+        ):
+            raise RuntimeError("promotion round decision does not partition its members")
+
+        eligible: list[CandidateEvaluation] = []
+        expected_rejected: Dict[str, list[str]] = {}
+        for trial_id in raw_members:
+            row = self.ledger.get_trial(trial_id)
+            # This rechecks every immutable completed checkpoint, including its
+            # metrics hash and tier-domain scope, on the decided/resume path.
+            self._verify_completed_checkpoint_identities(row)
+            checkpoint = self.ledger.get_checkpoint(trial_id, int(tier))
+            if trial_id in failed:
+                if (
+                    row.get("status") not in {"failed", "cancelled"}
+                    or row.get("failure_reason") != failed[trial_id]
+                    or (
+                        checkpoint is not None
+                        and checkpoint.get("status") == "completed"
+                    )
+                ):
+                    raise RuntimeError(
+                        "promotion round failed-evaluation state is inconsistent"
+                    )
+                continue
+            if checkpoint is None or checkpoint.get("status") != "completed":
+                raise RuntimeError(
+                    "promotion round decision references an incomplete evaluation"
+                )
+            evaluation = self._promotion_evaluation(
+                trial_id, tier, checkpoint["metrics"]
+            )
+            if tier <= Tier.T1_VQ2_REPLAY:
+                eligibility = evaluation.eligibility
+                if eligibility is None:
+                    raise RuntimeError("promotion round eligibility evidence is missing")
+                failures = () if eligibility.passed else eligibility.failures
+            else:
+                hard_gates = evaluation.hard_gates
+                if hard_gates is None:
+                    raise RuntimeError("promotion round hard-gate evidence is missing")
+                failures = hard_gates.failures()
+            if failures:
+                expected_rejected[trial_id] = list(failures)
+            else:
+                eligible.append(evaluation)
+
+        if rejected != expected_rejected:
+            raise RuntimeError("promotion round hard-gate decision is stale")
+        eligible.sort(
+            key=lambda item: (item.quality.ordering_key(), item.candidate_id),
+            reverse=True,
+        )
+        if promoted + eliminated != [item.candidate_id for item in eligible]:
+            raise RuntimeError("promotion round quality ordering is stale")
+        if eligible and not promoted:
+            raise RuntimeError("promotion round eliminated every eligible candidate")
+        if tier is Tier.T0_AFFECTED and eliminated:
+            raise RuntimeError("T0 promotion round cannot halve eligible candidates")
+        expected_promoted = (
+            len(eligible)
+            if tier is Tier.T0_AFFECTED
+            else min(
+                len(eligible),
+                max(
+                    minimum_survivors,
+                    int(math.ceil(len(eligible) * keep_fraction)),
+                ),
+            )
+            if eligible
+            else 0
+        )
+        if len(promoted) != expected_promoted:
+            raise RuntimeError("promotion round successive-halving cutoff is stale")
+        expected_next_tier = (
+            int(tier) + 1
+            if eligible or expected_rejected or tier < Tier.T4_FULL_NON_LIVE
+            else None
+        )
+        if (
+            type(raw_decision["next_tier"]) not in {int, type(None)}
+            or raw_decision["next_tier"] != expected_next_tier
+        ):
+            raise RuntimeError("promotion round next-tier decision is stale")
+        return dict(raw_decision)
+
     def run_round(
         self,
         tier: Tier,
@@ -2480,6 +2655,15 @@ class TrialScheduler:
 
         if tier is Tier.T5_AUTHORIZED_LIVE:
             raise PermissionError("live trials are not scheduler promotion rounds")
+        effective_keep_fraction = (
+            1.0 if tier is Tier.T0_AFFECTED else keep_fraction
+        )
+        round_ladder = PromotionLadder(
+            keep_fraction=effective_keep_fraction,
+            minimum_survivors=minimum_survivors,
+        )
+        effective_keep_fraction = round_ladder.keep_fraction
+        minimum_survivors = round_ladder.minimum_survivors
         if not self.ledger.acquire_global_lease(
             _ORCHESTRATION_LEASE, self.owner, ttl_s=self.lease_ttl_s
         ):
@@ -2508,6 +2692,10 @@ class TrialScheduler:
                         "environment_fingerprint": row.get(
                             "environment_fingerprint"
                         ),
+                        "promotion_policy": {
+                            "keep_fraction": effective_keep_fraction,
+                            "minimum_survivors": minimum_survivors,
+                        },
                     }
                 )
 
@@ -2578,6 +2766,33 @@ class TrialScheduler:
                         continue
                     if checkpoint is not None and checkpoint["status"] == "completed":
                         row = self.ledger.get_trial(trial_id)
+                        try:
+                            self._verify_completed_checkpoint_identities(row)
+                        except (RuntimeError, TypeError, ValueError) as exc:
+                            reason = (
+                                f"completed promotion member {trial_id} has invalid "
+                                f"evidence: {exc}"
+                            )
+                            if row["status"] in {"pending", "running"}:
+                                if not self.ledger.lease_trial(
+                                    trial_id, self.owner, ttl_s=self.lease_ttl_s
+                                ):
+                                    raise RuntimeError(
+                                        f"invalid promotion member {trial_id} has an active lease"
+                                    )
+                                self.ledger.finish_trial(
+                                    trial_id,
+                                    self.owner,
+                                    success=False,
+                                    failure_reason=reason,
+                                    phase_timings=self._checkpoint_phase_timings(trial_id),
+                                    artifact_hashes=self._checkpoint_artifacts(trial_id),
+                                    stdout_stderr_tail=checkpoint.get(
+                                        "stdout_stderr_tail"
+                                    ),
+                                )
+                            failed[trial_id] = reason
+                            continue
                         if row["status"] in {"pending", "running"}:
                             if not self.ledger.lease_trial(
                                 trial_id, self.owner, ttl_s=self.lease_ttl_s
@@ -2685,12 +2900,7 @@ class TrialScheduler:
                     )
 
                 if evaluations:
-                    ladder_decision = PromotionLadder(
-                        keep_fraction=(
-                            1.0 if tier is Tier.T0_AFFECTED else keep_fraction
-                        ),
-                        minimum_survivors=minimum_survivors,
-                    ).decide(evaluations)
+                    ladder_decision = round_ladder.decide(evaluations)
                     decision: Dict[str, Any] = dataclasses.asdict(ladder_decision)
                     decision["tier"] = int(tier)
                     decision["next_tier"] = (
@@ -2706,11 +2916,13 @@ class TrialScheduler:
                         "eliminated_by_halving": [],
                         "next_tier": int(tier) + 1 if tier < Tier.T4_FULL_NON_LIVE else None,
                     }
+                decision["keep_fraction"] = effective_keep_fraction
+                decision["minimum_survivors"] = minimum_survivors
                 decision["failed_evaluation"] = failed
                 self.ledger.decide_promotion_round(round_row["round_id"], decision)
                 round_row = self.ledger.get_promotion_round(round_row["round_id"])
 
-            decision = dict(round_row["decision"])
+            decision = self._validate_decided_promotion_round(round_row, tier)
             promoted = set(decision.get("promoted", []))
             rejected = set(decision.get("rejected_hard_gate", {}))
             eliminated = set(decision.get("eliminated_by_halving", [])) | rejected
