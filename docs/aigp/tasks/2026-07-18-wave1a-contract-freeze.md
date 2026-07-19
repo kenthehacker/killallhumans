@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1a-contract-freeze`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `tested`
+- State: `integration_pending`
 - Objective: freeze the build-3385 timestamp, frame identity, latency,
   observation, relative-state, command-proposal, and tier-evidence interfaces
   needed by the three Wave 1 implementation branches.
@@ -80,8 +80,10 @@
   - pre-closeout `test-unit`: `1445 passed, 20 skipped, 42 deselected`;
   - `git diff --check`: clean.
 - Integration/post-merge verification: pending.
-- Implementation commit: `fd51af3c` (`Freeze VQ2 Wave 1 shared contracts`);
-  final closeout commit pending.
+- Implementation commits:
+  `fd51af3c587e7c3431719b79c1713344e7cc6d6f` (`Freeze VQ2 Wave 1 shared
+  contracts`) and `a6782cd9dcc34aee94e0f064021399985e0f6839`
+  (`Harden Wave 1A evidence scope`).
 - Result/failure provenance: all accepted evidence was produced in the named
   offline worktree with the repository development environment and external
   bytecode caches. Three ignored source-tree cache directories created during
