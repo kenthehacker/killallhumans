@@ -13,8 +13,21 @@ import pytest
 import aigp_loop.scheduler as scheduler_module
 
 from aigp_loop._util import environment_fingerprint, git_provenance, json_hash
+from aigp_loop.evidence import (
+    EvidenceDomain,
+    GateAuthorityClaim,
+    scope_for_tier,
+    validate_tier_evidence,
+)
 from aigp_loop.ledger import TrialKey, TrialLedger
-from aigp_loop.promotion import PromotionLadder, QualityVector, Tier, TierEligibility
+from aigp_loop.nonlive import CORE_EVALUATOR_FILES, DOMAIN_TRACK_SET, FULL_TRACK_SET
+from aigp_loop.promotion import (
+    _REPLAY_PROMOTION_REQUIRED_BOUNDS,
+    PromotionLadder,
+    QualityVector,
+    Tier,
+    TierEligibility,
+)
 from aigp_loop.scheduler import (
     CommandStep,
     GitWorktreePool,
@@ -49,6 +62,243 @@ def _trial(ledger: TrialLedger, repo: Path, name: str = "one") -> str:
         environment_fingerprint=environment_fingerprint(),
     )
     return identifier
+
+
+def _completed_synthetic_promotion_trial(
+    ledger: TrialLedger, repo: Path, *, name: str
+) -> str:
+    """Publish an identity-bound T0-T4 unit fixture for merger tests."""
+
+    commit, dirty, code_hash = git_provenance(repo)
+    command_plans = tuple(
+        json_hash({"synthetic_merger_command": tier}) for tier in range(5)
+    )
+    identities = tuple(
+        {
+            "tier": tier,
+            "dataset_hash": json_hash(
+                {"candidate_code_sha256": code_hash, "synthetic_tier": tier}
+            ),
+            "config_hash": json_hash(
+                {"schema": "aigp-merger-unit-config/1", "tier": tier}
+            ),
+            "seed": 1,
+            "repetitions": 1,
+            "evaluator_version": f"aigp-merger-unit-tier-{tier}/1",
+            "command_plan_sha256": command_plans[tier],
+        }
+        for tier in range(5)
+    )
+    manifest = {
+        "schema": "aigp-promotion-ladder-manifest/2",
+        "tiers": list(identities),
+    }
+    manifest_hash = json_hash(manifest)
+    config = {
+        "candidate": name,
+        "promotion_ladder_manifest": manifest,
+        "scope": "synthetic-unit-fixture-only",
+    }
+    identifier, created = ledger.create_or_get_trial(
+        key=TrialKey(
+            code_hash,
+            json_hash(config),
+            manifest_hash,
+            1,
+            f"aigp-ladder/2:{manifest_hash}",
+        ),
+        commit_hash=commit,
+        dirty_diff_hash=dirty,
+        resolved_config=config,
+        environment_fingerprint="synthetic-merger-unit-environment",
+        candidate_name=name,
+    )
+    assert created
+    assert ledger.lease_trial(identifier, "synthetic-merger-fixture")
+
+    def artifacts(
+        tier: int, metrics: dict, **extra: str
+    ) -> dict[str, str]:
+        manifest_identity = json_hash(identities[tier])
+        command_plan = command_plans[tier]
+        return {
+            "metrics_sha256": json_hash(metrics),
+            "manifest_tier_identity_sha256": manifest_identity,
+            "command_plan_sha256": command_plan,
+            "tier_identity_sha256": json_hash(
+                {
+                    "manifest_tier_identity_sha256": manifest_identity,
+                    "command_plan_sha256": command_plan,
+                }
+            ),
+            **extra,
+        }
+
+    t0_metrics = {"affected_tests": {"passed": True}}
+    ledger.checkpoint(
+        identifier,
+        int(Tier.T0_AFFECTED),
+        owner="synthetic-merger-fixture",
+        status="completed",
+        metrics=t0_metrics,
+        artifact_hashes=artifacts(int(Tier.T0_AFFECTED), t0_metrics),
+    )
+
+    constraints = {
+        path: dict(bounds)
+        for path, bounds in _REPLAY_PROMOTION_REQUIRED_BOUNDS.items()
+    }
+    observed = {
+        path: bounds["min"] if "min" in bounds else bounds["max"]
+        for path, bounds in constraints.items()
+    }
+    t1_metrics = {
+        "schema": "aigp-vq2-replay-score/1",
+        "processor": "candidate:synthetic_unit_processor",
+        "processor_code_sha256": code_hash,
+        "candidate_isolation": {
+            "schema": "aigp-replay-isolation-attestation/1",
+            "network": "denied",
+            "filesystem": "readonly-worktree-only",
+            "non_interactive": True,
+            "process_tree_containment": "kill-on-wrapper-exit",
+            "host_process_access": "denied",
+            "wrapper_sha256": "f" * 64,
+        },
+        "evaluation_input_hash": identities[int(Tier.T1_VQ2_REPLAY)][
+            "dataset_hash"
+        ],
+        "evaluation_config_sha256": identities[int(Tier.T1_VQ2_REPLAY)][
+            "config_hash"
+        ],
+        "seed": identities[int(Tier.T1_VQ2_REPLAY)]["seed"],
+        "repetitions": identities[int(Tier.T1_VQ2_REPLAY)]["repetitions"],
+        "evaluator_version": identities[int(Tier.T1_VQ2_REPLAY)][
+            "evaluator_version"
+        ],
+        "policy": {
+            "schema": "aigp-vq2-replay-policy-result/1",
+            "policy_hash": json_hash(
+                {
+                    "schema": "aigp-vq2-replay-policy/1",
+                    "metrics": constraints,
+                }
+            ),
+            "passed": True,
+            "constraints": constraints,
+            "observed": observed,
+            "violations": [],
+        },
+        "domain_provenance": {
+            "perception": "candidate_detector_on_all_decoded_frames",
+            "estimator": "candidate_estimator_on_ordered_sanitized_stream",
+            "open_loop_commands": "candidate_generator_on_ordered_sanitized_stream",
+        },
+    }
+    ledger.checkpoint(
+        identifier,
+        int(Tier.T1_VQ2_REPLAY),
+        owner="synthetic-merger-fixture",
+        status="completed",
+        metrics=t1_metrics,
+        artifact_hashes=artifacts(int(Tier.T1_VQ2_REPLAY), t1_metrics),
+    )
+
+    hard_gates = {
+        "valid": True,
+        "completed": True,
+        "correct_gate_sequence": True,
+        "cleanup_confirmed": True,
+        "no_collision": True,
+        "no_disqualification": True,
+        "no_stale_stream_flight": True,
+    }
+    tracks = {
+        Tier.T2_WARM_SIM: ("race_01",),
+        Tier.T3_DOMAIN_TRACKS: DOMAIN_TRACK_SET,
+        Tier.T4_FULL_NON_LIVE: FULL_TRACK_SET,
+    }
+    trusted_sources = {name: "f" * 64 for name in CORE_EVALUATOR_FILES}
+    for tier in (
+        Tier.T2_WARM_SIM,
+        Tier.T3_DOMAIN_TRACKS,
+        Tier.T4_FULL_NON_LIVE,
+    ):
+        number = int(tier)
+        metrics = {
+            "schema": "aigp-nonlive-promotion-evidence/1",
+            "tier": number,
+            "track_identity": list(tracks[tier]),
+            "domain_provenance": {
+                "execution": "deterministic_synthetic_kinematic_nonpowered",
+                "powered_resources_used": False,
+                "cleanup_gate_semantics": (
+                    "vacuously_true_only_after_synthetic_domain_proof"
+                ),
+                "stale_stream_gate_semantics": (
+                    "vacuously_true_only_after_synthetic_domain_proof"
+                ),
+                "centering_proxy": "negative_worst_p95_tracking_error_m",
+                "stability_proxy": "negative_worst_max_tracking_error_m",
+            },
+            "evaluator_identity": {"source_sha256": trusted_sources},
+            "evaluation_input_hash": identities[number]["dataset_hash"],
+            "evaluation_config_sha256": identities[number]["config_hash"],
+            "seed": identities[number]["seed"],
+            "repetitions": identities[number]["repetitions"],
+            "evaluator_version": identities[number]["evaluator_version"],
+            "promotion": {"hard_gates": hard_gates},
+        }
+        ledger.checkpoint(
+            identifier,
+            number,
+            owner="synthetic-merger-fixture",
+            status="completed",
+            metrics=metrics,
+            artifact_hashes=artifacts(
+                number,
+                metrics,
+                trusted_evaluator_files_sha256=json_hash(trusted_sources),
+            ),
+        )
+    ledger.finish_trial(identifier, "synthetic-merger-fixture", success=True)
+    return identifier
+
+
+def _descendant_promotion_candidate(
+    tmp_path: Path, *, name: str
+) -> tuple[Path, TrialLedger, str, str, str]:
+    repo = _repo(tmp_path / f"repo-{name}")
+    base_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "candidate.py").write_text("VALUE = 2\n", encoding="utf-8")
+    subprocess.run(["git", "add", "candidate.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "promoted candidate"], cwd=repo, check=True
+    )
+    candidate_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    ledger = TrialLedger(tmp_path / f"ledger-{name}.sqlite3")
+    identifier = _completed_synthetic_promotion_trial(
+        ledger, repo, name=name
+    )
+    subprocess.run(
+        ["git", "branch", "merge-target", base_commit], cwd=repo, check=True
+    )
+    subprocess.run(
+        ["git", "checkout", "-q", "merge-target"], cwd=repo, check=True
+    )
+    return repo, ledger, identifier, base_commit, candidate_commit
 
 
 @pytest.mark.parametrize("link_kind", ["file", "parent"])
@@ -1201,6 +1451,163 @@ def test_single_merger_requires_complete_checkpoint_chain(tmp_path):
     ledger.finish_trial(identifier, "worker", success=True)
     with pytest.raises(ValueError, match="T0-T4 checkpoint chain"):
         SingleMerger(ledger, repo).merge_completed(identifier)
+
+
+def test_single_merger_fast_forwards_exact_completed_candidate_without_scope_overclaim(
+    tmp_path,
+):
+    repo, ledger, identifier, base_commit, candidate_commit = (
+        _descendant_promotion_candidate(tmp_path, name="positive")
+    )
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", base_commit, candidate_commit],
+        cwd=repo,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+    checkpoint_hashes = {}
+    expected_domains = {
+        Tier.T0_AFFECTED: EvidenceDomain.AFFECTED_TESTS,
+        Tier.T1_VQ2_REPLAY: EvidenceDomain.REPLAY_OPEN_LOOP,
+        Tier.T2_WARM_SIM: EvidenceDomain.SYNTHETIC_CLOSED_LOOP,
+        Tier.T3_DOMAIN_TRACKS: EvidenceDomain.SYNTHETIC_CLOSED_LOOP,
+        Tier.T4_FULL_NON_LIVE: EvidenceDomain.SYNTHETIC_CLOSED_LOOP,
+    }
+    for tier in Tier:
+        if tier is Tier.T5_AUTHORIZED_LIVE:
+            continue
+        checkpoint = ledger.get_checkpoint(identifier, int(tier))
+        checkpoint_hashes[tier] = json_hash(checkpoint)
+        evidence = validate_tier_evidence(tier, checkpoint["metrics"])
+        scope = scope_for_tier(tier)
+        assert scope.domain is expected_domains[tier]
+        assert scope.powered is False
+        if tier <= Tier.T1_VQ2_REPLAY:
+            assert scope.closed_loop is False
+            assert scope.gate_authority is GateAuthorityClaim.NONE
+        if tier is Tier.T1_VQ2_REPLAY:
+            assert evidence["domain_provenance"]["open_loop_commands"] == (
+                "candidate_generator_on_ordered_sanitized_stream"
+            )
+        elif tier >= Tier.T2_WARM_SIM:
+            assert scope.closed_loop is True
+            assert scope.gate_authority is GateAuthorityClaim.SYNTHETIC_SEQUENCE
+            assert evidence["domain_provenance"]["powered_resources_used"] is False
+
+    merged = SingleMerger(
+        ledger, repo, owner="positive-merger"
+    ).merge_completed(identifier)
+
+    assert merged == candidate_commit
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == candidate_commit
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+    assert {
+        tier: json_hash(ledger.get_checkpoint(identifier, int(tier)))
+        for tier in checkpoint_hashes
+    } == checkpoint_hashes
+    assert ledger.acquire_global_lease(
+        scheduler_module._ORCHESTRATION_LEASE,
+        "positive-after-merge",
+    )
+    assert ledger.release_global_lease(
+        scheduler_module._ORCHESTRATION_LEASE,
+        "positive-after-merge",
+    )
+
+
+def test_single_merger_refuses_dirty_target_without_advancing(tmp_path):
+    repo, ledger, identifier, base_commit, candidate_commit = (
+        _descendant_promotion_candidate(tmp_path, name="dirty-target")
+    )
+    assert base_commit != candidate_commit
+    (repo / "unreviewed.txt").write_text("dirty\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="merge checkout is not clean"):
+        SingleMerger(
+            ledger, repo, owner="dirty-target-merger"
+        ).merge_completed(identifier)
+
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == base_commit
+    assert ledger.acquire_global_lease(
+        scheduler_module._ORCHESTRATION_LEASE,
+        "dirty-target-after-failure",
+    )
+    assert ledger.release_global_lease(
+        scheduler_module._ORCHESTRATION_LEASE,
+        "dirty-target-after-failure",
+    )
+
+
+def test_single_merger_refuses_divergent_target_without_advancing(tmp_path):
+    repo, ledger, identifier, _base_commit, candidate_commit = (
+        _descendant_promotion_candidate(tmp_path, name="divergent-target")
+    )
+    (repo / "sibling.py").write_text("VALUE = 3\n", encoding="utf-8")
+    subprocess.run(["git", "add", "sibling.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "divergent target"], cwd=repo, check=True
+    )
+    divergent_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with pytest.raises(subprocess.CalledProcessError):
+        SingleMerger(
+            ledger, repo, owner="divergent-target-merger"
+        ).merge_completed(identifier)
+
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == divergent_commit
+    assert subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+    assert candidate_commit != divergent_commit
+    assert ledger.acquire_global_lease(
+        scheduler_module._ORCHESTRATION_LEASE,
+        "divergent-target-after-failure",
+    )
+    assert ledger.release_global_lease(
+        scheduler_module._ORCHESTRATION_LEASE,
+        "divergent-target-after-failure",
+    )
 
 
 def test_t1_replay_scores_rank_by_reliability_then_centering_and_stability():

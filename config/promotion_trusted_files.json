@@ -92,7 +92,7 @@
     "tests/test_aigp_loop_nonlive.py": "8148ddcb643c0c0e6da92d97715518fc20d8bf8f28c5881e29aaa4314ab5621e",
     "tests/test_aigp_loop_promotion.py": "29f300c03cf27758de47fbe90cab296e8d0ef2e2e561e8ecf73eaf24b8595319",
     "tests/test_aigp_loop_replay.py": "96c0f03981a6c58a7f0cdb0e99e3d4f6668c9537ef5a27400070d5236fa121ad",
-    "tests/test_aigp_loop_scheduler.py": "74e0269c0c1f390895aa5aac796f40d71f03af2161a6f9597c879754f791ae24",
+    "tests/test_aigp_loop_scheduler.py": "88fda3419e6c3dbbfc1b688d8762560342ef22bcbce153f8ec04932525086a9f",
     "tests/test_aigp_loop_util.py": "87a8726dea26d2b20825f8ded8db49ba992ee14989f143a7b3712bf127c147b2",
     "tests/test_aigp_vq1_runner.py": "af3612764af47f7e645893c90e2f8688a02f74662fa5c7713dc712a42a32ccb8",
     "tests/test_aigp_vq2_runner.py": "aa1e3a2b27cb3352a9278f5b025c9aedcc03a0e6dd3e9a6636c564ba834a77ee",
