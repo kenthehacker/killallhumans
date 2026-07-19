@@ -22,9 +22,11 @@ are deliberately not wire schemas and do not amend any frozen VQ2 interface.
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Optional
 
@@ -34,12 +36,36 @@ import numpy as np
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 _MINIMUM_COMMAND_PERIOD_NS = 20_000_000
 _MAXIMUM_EXPERIMENT_DURATION_NS = 10_000_000_000
+_MINIMUM_FINAL_ZERO_SETTLING_NS = 500_000_000
+_MAXIMUM_SIGNED_PREFIX_ANGLE_RAD = 0.20
+_MAXIMUM_ADJACENT_RATE_STEP_RAD_S = 0.20
 _VQ2_MAX_ROLL_PITCH_RATE_RAD_S = 0.25
+_CONFIG_POLICY_SCHEMA = "vq2-rate-system-id-policy-v1"
 
 _DEFAULT_DELAY_CANDIDATES_NS = tuple(range(0, 100_000_001, 5_000_000))
 _DEFAULT_TIME_CONSTANT_CANDIDATES_S = tuple(
     value / 1_000.0 for value in range(20, 301, 10)
 )
+_DEFAULT_MINIMUM_TRAINING_SAMPLES = 80
+_DEFAULT_MINIMUM_VALIDATION_SAMPLES = 40
+_DEFAULT_MINIMUM_TRAINING_DURATION_S = 2.0
+_DEFAULT_MINIMUM_VALIDATION_DURATION_S = 1.0
+_DEFAULT_MAXIMUM_GYRO_GAP_S = 0.050
+_DEFAULT_MAXIMUM_ABS_COMMAND_RATE_RAD_S = 0.25
+_DEFAULT_MAXIMUM_ABS_GYRO_RATE_RAD_S = 4.0
+_DEFAULT_MINIMUM_COMMAND_SPAN_RAD_S = 0.10
+_DEFAULT_MINIMUM_COMMAND_STANDARD_DEVIATION_RAD_S = 0.025
+_DEFAULT_MINIMUM_OUTPUT_STANDARD_DEVIATION_RAD_S = 0.010
+_DEFAULT_MAXIMUM_DESIGN_CONDITION_NUMBER = 1.0e5
+_DEFAULT_MINIMUM_GAIN = 0.05
+_DEFAULT_MAXIMUM_GAIN = 2.0
+_DEFAULT_MAXIMUM_ABS_BIAS_RAD_S = 0.30
+_DEFAULT_PROFILE_DELTA_SIGMA2 = 3.841458820694124
+_DEFAULT_MINIMUM_RESIDUAL_VARIANCE = 1.0e-12
+_DEFAULT_MAXIMUM_DELAY_UNCERTAINTY_NS = 25_000_000
+_DEFAULT_MAXIMUM_TIME_CONSTANT_UNCERTAINTY_S = 0.060
+_DEFAULT_MAXIMUM_VALIDATION_NORMALIZED_RMSE = 0.35
+_DEFAULT_MINIMUM_VALIDATION_IMPROVEMENT_FRACTION = 0.10
 
 
 class SystemIdentificationError(ValueError):
@@ -264,32 +290,54 @@ class ChronologicalHoldout:
 
 @dataclass(frozen=True, slots=True)
 class SystemIdConfig:
-    """Reviewed finite search and identifiability bounds."""
+    """Reviewed finite search and tighten-only identifiability bounds.
+
+    Candidate grids are pinned to the reviewed full hard domains so a caller
+    cannot truncate or coarsen a profile and report artificially narrow
+    uncertainty.  Every other override must be at least as conservative as
+    the default.  :attr:`semantic_identity` covers every dataclass field plus
+    the local policy schema using canonical JSON and SHA-256; it never uses
+    Python's process-randomized ``hash``.
+    """
 
     delay_candidates_ns: tuple[int, ...] = _DEFAULT_DELAY_CANDIDATES_NS
     time_constant_candidates_s: tuple[float, ...] = (
         _DEFAULT_TIME_CONSTANT_CANDIDATES_S
     )
-    minimum_training_samples: int = 80
-    minimum_validation_samples: int = 40
-    minimum_training_duration_s: float = 2.0
-    minimum_validation_duration_s: float = 1.0
-    maximum_gyro_gap_s: float = 0.050
-    maximum_abs_command_rate_rad_s: float = 0.25
-    maximum_abs_gyro_rate_rad_s: float = 4.0
-    minimum_command_span_rad_s: float = 0.10
-    minimum_command_standard_deviation_rad_s: float = 0.025
-    minimum_output_standard_deviation_rad_s: float = 0.010
-    maximum_design_condition_number: float = 1.0e5
-    minimum_gain: float = 0.05
-    maximum_gain: float = 2.0
-    maximum_abs_bias_rad_s: float = 0.30
-    profile_delta_sigma2: float = 3.841458820694124
-    minimum_residual_variance: float = 1.0e-12
-    maximum_delay_uncertainty_ns: int = 25_000_000
-    maximum_time_constant_uncertainty_s: float = 0.060
-    maximum_validation_normalized_rmse: float = 0.35
-    minimum_validation_improvement_fraction: float = 0.10
+    minimum_training_samples: int = _DEFAULT_MINIMUM_TRAINING_SAMPLES
+    minimum_validation_samples: int = _DEFAULT_MINIMUM_VALIDATION_SAMPLES
+    minimum_training_duration_s: float = _DEFAULT_MINIMUM_TRAINING_DURATION_S
+    minimum_validation_duration_s: float = _DEFAULT_MINIMUM_VALIDATION_DURATION_S
+    maximum_gyro_gap_s: float = _DEFAULT_MAXIMUM_GYRO_GAP_S
+    maximum_abs_command_rate_rad_s: float = (
+        _DEFAULT_MAXIMUM_ABS_COMMAND_RATE_RAD_S
+    )
+    maximum_abs_gyro_rate_rad_s: float = _DEFAULT_MAXIMUM_ABS_GYRO_RATE_RAD_S
+    minimum_command_span_rad_s: float = _DEFAULT_MINIMUM_COMMAND_SPAN_RAD_S
+    minimum_command_standard_deviation_rad_s: float = (
+        _DEFAULT_MINIMUM_COMMAND_STANDARD_DEVIATION_RAD_S
+    )
+    minimum_output_standard_deviation_rad_s: float = (
+        _DEFAULT_MINIMUM_OUTPUT_STANDARD_DEVIATION_RAD_S
+    )
+    maximum_design_condition_number: float = (
+        _DEFAULT_MAXIMUM_DESIGN_CONDITION_NUMBER
+    )
+    minimum_gain: float = _DEFAULT_MINIMUM_GAIN
+    maximum_gain: float = _DEFAULT_MAXIMUM_GAIN
+    maximum_abs_bias_rad_s: float = _DEFAULT_MAXIMUM_ABS_BIAS_RAD_S
+    profile_delta_sigma2: float = _DEFAULT_PROFILE_DELTA_SIGMA2
+    minimum_residual_variance: float = _DEFAULT_MINIMUM_RESIDUAL_VARIANCE
+    maximum_delay_uncertainty_ns: int = _DEFAULT_MAXIMUM_DELAY_UNCERTAINTY_NS
+    maximum_time_constant_uncertainty_s: float = (
+        _DEFAULT_MAXIMUM_TIME_CONSTANT_UNCERTAINTY_S
+    )
+    maximum_validation_normalized_rmse: float = (
+        _DEFAULT_MAXIMUM_VALIDATION_NORMALIZED_RMSE
+    )
+    minimum_validation_improvement_fraction: float = (
+        _DEFAULT_MINIMUM_VALIDATION_IMPROVEMENT_FRACTION
+    )
 
     def __post_init__(self) -> None:
         if type(self.delay_candidates_ns) is not tuple:
@@ -302,6 +350,10 @@ class SystemIdConfig:
         )
         if any(later <= earlier for earlier, later in zip(delays, delays[1:])):
             raise ValueError("delay candidates must increase strictly")
+        if delays != _DEFAULT_DELAY_CANDIDATES_NS:
+            raise ValueError(
+                "delay_candidates_ns is pinned to the reviewed 0..100 ms grid"
+            )
         if type(self.time_constant_candidates_s) is not tuple:
             raise TypeError("time_constant_candidates_s must be an exact tuple")
         if len(self.time_constant_candidates_s) < 3:
@@ -315,13 +367,32 @@ class SystemIdConfig:
             for earlier, later in zip(time_constants, time_constants[1:])
         ):
             raise ValueError("time-constant candidates must increase strictly")
-        for name in (
-            "minimum_training_samples",
-            "minimum_validation_samples",
+        if time_constants != _DEFAULT_TIME_CONSTANT_CANDIDATES_S:
+            raise ValueError(
+                "time_constant_candidates_s is pinned to the reviewed "
+                "0.020..0.300 s grid"
+            )
+
+        integer_floors = {
+            "minimum_training_samples": _DEFAULT_MINIMUM_TRAINING_SAMPLES,
+            "minimum_validation_samples": _DEFAULT_MINIMUM_VALIDATION_SAMPLES,
+        }
+        for name, reviewed_minimum in integer_floors.items():
+            value = _exact_positive_int(getattr(self, name), name)
+            if value < reviewed_minimum:
+                raise ValueError(
+                    f"{name} cannot be lower than the reviewed default"
+                )
+        delay_uncertainty = _exact_positive_int(
+            self.maximum_delay_uncertainty_ns,
             "maximum_delay_uncertainty_ns",
-        ):
-            _exact_positive_int(getattr(self, name), name)
-        for name in (
+        )
+        if delay_uncertainty > _DEFAULT_MAXIMUM_DELAY_UNCERTAINTY_NS:
+            raise ValueError(
+                "maximum_delay_uncertainty_ns cannot exceed the reviewed default"
+            )
+
+        float_names = (
             "minimum_training_duration_s",
             "minimum_validation_duration_s",
             "maximum_gyro_gap_s",
@@ -339,22 +410,110 @@ class SystemIdConfig:
             "maximum_time_constant_uncertainty_s",
             "maximum_validation_normalized_rmse",
             "minimum_validation_improvement_fraction",
-        ):
-            _finite_positive(getattr(self, name), name)
-        if self.maximum_abs_command_rate_rad_s > _VQ2_MAX_ROLL_PITCH_RATE_RAD_S:
-            raise ValueError("command bound exceeds frozen VQ2 roll/pitch envelope")
+        )
+        for name in float_names:
+            object.__setattr__(
+                self, name, _finite_positive(getattr(self, name), name)
+            )
+
+        float_floors = {
+            "minimum_training_duration_s": _DEFAULT_MINIMUM_TRAINING_DURATION_S,
+            "minimum_validation_duration_s": (
+                _DEFAULT_MINIMUM_VALIDATION_DURATION_S
+            ),
+            "minimum_command_span_rad_s": _DEFAULT_MINIMUM_COMMAND_SPAN_RAD_S,
+            "minimum_command_standard_deviation_rad_s": (
+                _DEFAULT_MINIMUM_COMMAND_STANDARD_DEVIATION_RAD_S
+            ),
+            "minimum_output_standard_deviation_rad_s": (
+                _DEFAULT_MINIMUM_OUTPUT_STANDARD_DEVIATION_RAD_S
+            ),
+            "minimum_gain": _DEFAULT_MINIMUM_GAIN,
+            "minimum_residual_variance": _DEFAULT_MINIMUM_RESIDUAL_VARIANCE,
+            "minimum_validation_improvement_fraction": (
+                _DEFAULT_MINIMUM_VALIDATION_IMPROVEMENT_FRACTION
+            ),
+        }
+        for name, reviewed_minimum in float_floors.items():
+            if getattr(self, name) < reviewed_minimum:
+                raise ValueError(
+                    f"{name} cannot be lower than the reviewed default"
+                )
+
+        float_caps = {
+            "maximum_gyro_gap_s": _DEFAULT_MAXIMUM_GYRO_GAP_S,
+            "maximum_abs_command_rate_rad_s": (
+                _DEFAULT_MAXIMUM_ABS_COMMAND_RATE_RAD_S
+            ),
+            "maximum_abs_gyro_rate_rad_s": _DEFAULT_MAXIMUM_ABS_GYRO_RATE_RAD_S,
+            "maximum_design_condition_number": (
+                _DEFAULT_MAXIMUM_DESIGN_CONDITION_NUMBER
+            ),
+            "maximum_gain": _DEFAULT_MAXIMUM_GAIN,
+            "maximum_abs_bias_rad_s": _DEFAULT_MAXIMUM_ABS_BIAS_RAD_S,
+            "maximum_time_constant_uncertainty_s": (
+                _DEFAULT_MAXIMUM_TIME_CONSTANT_UNCERTAINTY_S
+            ),
+            "maximum_validation_normalized_rmse": (
+                _DEFAULT_MAXIMUM_VALIDATION_NORMALIZED_RMSE
+            ),
+        }
+        for name, reviewed_maximum in float_caps.items():
+            if getattr(self, name) > reviewed_maximum:
+                raise ValueError(
+                    f"{name} cannot exceed the reviewed default"
+                )
+
+        if self.profile_delta_sigma2 != _DEFAULT_PROFILE_DELTA_SIGMA2:
+            raise ValueError(
+                "profile_delta_sigma2 is pinned to the reviewed 95% cutoff"
+            )
         if self.minimum_gain >= self.maximum_gain:
             raise ValueError("minimum_gain must be less than maximum_gain")
         if self.maximum_design_condition_number <= 1.0:
             raise ValueError("maximum_design_condition_number must exceed one")
-        if self.maximum_validation_normalized_rmse >= 1.0:
-            raise ValueError("maximum_validation_normalized_rmse must be < 1")
         if self.minimum_validation_improvement_fraction >= 1.0:
             raise ValueError("minimum_validation_improvement_fraction must be < 1")
+        if (
+            self.minimum_command_span_rad_s
+            > 2.0 * self.maximum_abs_command_rate_rad_s
+        ):
+            raise ValueError("command span floor exceeds the retained command range")
+        if (
+            self.minimum_command_standard_deviation_rad_s
+            > self.maximum_abs_command_rate_rad_s
+        ):
+            raise ValueError(
+                "command deviation floor exceeds the retained command range"
+            )
+        if (
+            self.minimum_output_standard_deviation_rad_s
+            > self.maximum_abs_gyro_rate_rad_s
+        ):
+            raise ValueError("output deviation floor exceeds the gyro bound")
+        if self.maximum_abs_bias_rad_s > self.maximum_abs_gyro_rate_rad_s:
+            raise ValueError("bias bound exceeds the retained gyro bound")
         object.__setattr__(self, "delay_candidates_ns", delays)
-        object.__setattr__(
-            self, "time_constant_candidates_s", time_constants
-        )
+        object.__setattr__(self, "time_constant_candidates_s", time_constants)
+
+    @property
+    def semantic_identity(self) -> str:
+        """Canonical identity for every reviewed config field and policy schema."""
+
+        payload = {
+            "config": {
+                field.name: getattr(self, field.name) for field in fields(self)
+            },
+            "policy_schema": _CONFIG_POLICY_SCHEMA,
+        }
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        digest = hashlib.sha256(encoded).hexdigest()
+        return f"{_CONFIG_POLICY_SCHEMA}:sha256:{digest}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,7 +533,12 @@ class RateExperimentSegment:
 
 @dataclass(frozen=True, slots=True)
 class RateExperimentDefinition:
-    """Bounded inert data only; it has no execution or command conversion API."""
+    """Conservatively bounded inert data with no execution/conversion API.
+
+    Zero net command area is only a definition-shape constraint.  A lagged
+    biased plant need not return to its initial attitude, so this class never
+    calls the definition attitude-restoring, safe to execute, or approved.
+    """
 
     experiment_id: str
     axis: RateAxis
@@ -406,28 +570,45 @@ class RateExperimentDefinition:
                 > _VQ2_MAX_ROLL_PITCH_RATE_RAD_S
             ):
                 raise ValueError("experiment rate exceeds frozen VQ2 envelope")
+        total_duration = sum(segment.duration_ns for segment in self.segments)
+        if total_duration > _MAXIMUM_EXPERIMENT_DURATION_NS:
+            raise ValueError("experiment exceeds the inert ten-second definition bound")
         if self.segments[0].commanded_rate_rad_s != 0.0:
             raise ValueError("experiment must begin at exact zero rate")
         if self.segments[-1].commanded_rate_rad_s != 0.0:
             raise ValueError("experiment must end at exact zero rate")
+        if self.final_zero_settling_duration_ns < _MINIMUM_FINAL_ZERO_SETTLING_NS:
+            raise ValueError(
+                "experiment requires at least 0.5 s of final exact-zero settling"
+            )
         values = tuple(segment.commanded_rate_rad_s for segment in self.segments)
+        if any(
+            abs(later - earlier) > _MAXIMUM_ADJACENT_RATE_STEP_RAD_S
+            for earlier, later in zip(values, values[1:])
+        ):
+            raise ValueError("experiment adjacent rate step exceeds 0.20 rad/s")
         if not any(value > 0.0 for value in values) or not any(
             value < 0.0 for value in values
         ):
             raise ValueError("experiment must contain positive and negative excitation")
-        total_duration = sum(segment.duration_ns for segment in self.segments)
-        if total_duration > _MAXIMUM_EXPERIMENT_DURATION_NS:
-            raise ValueError("experiment exceeds the inert ten-second definition bound")
-        signed_area = sum(
-            segment.commanded_rate_rad_s * segment.duration_ns
+        segment_areas_rad = tuple(
+            segment.commanded_rate_rad_s * (segment.duration_ns / 1e9)
             for segment in self.segments
         )
+        prefix_areas_rad = tuple(
+            math.fsum(segment_areas_rad[: index + 1])
+            for index in range(len(segment_areas_rad))
+        )
+        if max(abs(value) for value in prefix_areas_rad) > (
+            _MAXIMUM_SIGNED_PREFIX_ANGLE_RAD
+        ):
+            raise ValueError(
+                "experiment signed prefix angle exceeds the inert 0.20 rad bound"
+            )
+        signed_area = math.fsum(segment_areas_rad)
         area_scale = max(
             1.0,
-            sum(
-                abs(segment.commanded_rate_rad_s) * segment.duration_ns
-                for segment in self.segments
-            ),
+            math.fsum(abs(value) for value in segment_areas_rad),
         )
         if abs(signed_area) > 1e-12 * area_scale:
             raise ValueError("experiment must have zero net rate-command area")
@@ -440,10 +621,38 @@ class RateExperimentDefinition:
     def maximum_abs_rate_rad_s(self) -> float:
         return max(abs(segment.commanded_rate_rad_s) for segment in self.segments)
 
+    @property
+    def maximum_signed_prefix_angle_rad(self) -> float:
+        prefix = 0.0
+        maximum = 0.0
+        for segment in self.segments:
+            prefix = math.fsum(
+                (prefix, segment.commanded_rate_rad_s * segment.duration_ns / 1e9)
+            )
+            maximum = max(maximum, abs(prefix))
+        return maximum
+
+    @property
+    def final_zero_settling_duration_ns(self) -> int:
+        duration_ns = 0
+        for segment in reversed(self.segments):
+            if segment.commanded_rate_rad_s != 0.0:
+                break
+            duration_ns += segment.duration_ns
+        return duration_ns
+
+    @property
+    def maximum_adjacent_rate_step_rad_s(self) -> float:
+        values = tuple(segment.commanded_rate_rad_s for segment in self.segments)
+        return max(
+            abs(later - earlier) for earlier, later in zip(values, values[1:])
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class RateAxisModel:
     model_id: str
+    config_semantic_id: str
     host_clock_id: str
     axis: RateAxis
     delay_ns: int
@@ -453,6 +662,7 @@ class RateAxisModel:
 
     def __post_init__(self) -> None:
         _bounded_token(self.model_id, "model_id")
+        _bounded_token(self.config_semantic_id, "config_semantic_id")
         _bounded_token(self.host_clock_id, "host_clock_id")
         if type(self.axis) is not RateAxis:
             raise TypeError("axis must be RateAxis")
@@ -472,6 +682,7 @@ class RateAxisModelUncertainty:
     or either profile interval.
     """
 
+    config_semantic_id: str
     method_id: str
     confidence_level: float
     delay_interval_ns: tuple[int, int]
@@ -481,6 +692,7 @@ class RateAxisModelUncertainty:
     gain_bias_covariance: tuple[tuple[float, float], tuple[float, float]]
 
     def __post_init__(self) -> None:
+        _bounded_token(self.config_semantic_id, "config_semantic_id")
         _bounded_token(self.method_id, "uncertainty method_id")
         confidence = _finite_float(self.confidence_level, "confidence_level")
         if not 0.0 < confidence < 1.0:
@@ -547,6 +759,7 @@ class RateAxisModelUncertainty:
 
 @dataclass(frozen=True, slots=True)
 class RateAxisFitDiagnostics:
+    config_semantic_id: str
     selection_basis: str
     validation_basis: str
     training_scored_samples: int
@@ -566,6 +779,7 @@ class RateAxisFitDiagnostics:
     residual_standard_deviation_rad_s: float
 
     def __post_init__(self) -> None:
+        _bounded_token(self.config_semantic_id, "config_semantic_id")
         _bounded_token(self.selection_basis, "selection_basis")
         _bounded_token(self.validation_basis, "validation_basis")
         for name in (
@@ -600,17 +814,28 @@ class RateAxisFitDiagnostics:
 
 @dataclass(frozen=True, slots=True)
 class RateAxisFitResult:
+    config_semantic_id: str
     model: RateAxisModel
     uncertainty: RateAxisModelUncertainty
     diagnostics: RateAxisFitDiagnostics
 
     def __post_init__(self) -> None:
+        _bounded_token(self.config_semantic_id, "config_semantic_id")
         if type(self.model) is not RateAxisModel:
             raise TypeError("model must be RateAxisModel")
         if type(self.uncertainty) is not RateAxisModelUncertainty:
             raise TypeError("uncertainty must be RateAxisModelUncertainty")
         if type(self.diagnostics) is not RateAxisFitDiagnostics:
             raise TypeError("diagnostics must be RateAxisFitDiagnostics")
+        if not (
+            self.config_semantic_id
+            == self.model.config_semantic_id
+            == self.uncertainty.config_semantic_id
+            == self.diagnostics.config_semantic_id
+        ):
+            raise ValueError(
+                "result/model/uncertainty/diagnostics config identities disagree"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -890,6 +1115,7 @@ class VQ2RateSystemIdentifier:
         if type(holdout) is not ChronologicalHoldout:
             raise TypeError("holdout must be ChronologicalHoldout")
         config = self.config
+        config_semantic_id = config.semantic_identity
         self._validate_trace_bounds(trace)
         training = _gyro_partition(trace, holdout.training)
         validation = _gyro_partition(trace, holdout.validation)
@@ -1040,6 +1266,7 @@ class VQ2RateSystemIdentifier:
 
         model = RateAxisModel(
             model_id="vq2-rate-axis-fopdt-offline-v1",
+            config_semantic_id=config_semantic_id,
             host_clock_id=trace.host_clock_id,
             axis=trace.axis,
             delay_ns=best.delay_ns,
@@ -1109,6 +1336,7 @@ class VQ2RateSystemIdentifier:
         if not np.all(np.isfinite(gain_bias_covariance)):
             raise IdentifiabilityError("gain/bias uncertainty became non-finite")
         uncertainty = RateAxisModelUncertainty(
+            config_semantic_id=config_semantic_id,
             method_id="training-profile-plus-heldout-residual-v1",
             confidence_level=0.95,
             delay_interval_ns=delay_interval,
@@ -1126,6 +1354,7 @@ class VQ2RateSystemIdentifier:
         )
         training_rmse = math.sqrt(best.sse / best.design.shape[0])
         diagnostics = RateAxisFitDiagnostics(
+            config_semantic_id=config_semantic_id,
             selection_basis="chronological_training_only_grid_v1",
             validation_basis="heldout_free_run_one_initializer_v1",
             training_scored_samples=len(training) - 1,
@@ -1147,6 +1376,7 @@ class VQ2RateSystemIdentifier:
             residual_standard_deviation_rad_s=math.sqrt(uncertainty_variance),
         )
         return RateAxisFitResult(
+            config_semantic_id=config_semantic_id,
             model=model,
             uncertainty=uncertainty,
             diagnostics=diagnostics,

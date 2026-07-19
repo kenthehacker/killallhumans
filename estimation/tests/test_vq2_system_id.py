@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import bisect
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import numpy as np
 import pytest
@@ -26,6 +26,7 @@ from estimation.vq2_system_id import (
     RateExperimentSegment,
     SystemIdConfig,
     TraceValidationError,
+    _advance_affine_state,
     fit_rate_axis_model,
 )
 
@@ -36,6 +37,55 @@ _TRUE_DELAY_NS = 35_000_000
 _TRUE_TIME_CONSTANT_S = 0.120
 _TRUE_GAIN = 0.82
 _TRUE_BIAS_RAD_S = 0.018
+_REVIEWED_DELAY_GRID_NS = tuple(range(0, 100_000_001, 5_000_000))
+_REVIEWED_TIME_CONSTANT_GRID_S = tuple(
+    value / 1_000.0 for value in range(20, 301, 10)
+)
+
+_LOOSENED_CONFIG_OVERRIDES = (
+    ("minimum_training_samples", 79),
+    ("minimum_validation_samples", 39),
+    ("minimum_training_duration_s", 1.99),
+    ("minimum_validation_duration_s", 0.99),
+    ("maximum_gyro_gap_s", 0.051),
+    ("maximum_abs_command_rate_rad_s", 0.251),
+    ("maximum_abs_gyro_rate_rad_s", 4.01),
+    ("minimum_command_span_rad_s", 0.099),
+    ("minimum_command_standard_deviation_rad_s", 0.024),
+    ("minimum_output_standard_deviation_rad_s", 0.009),
+    ("maximum_design_condition_number", 100_001.0),
+    ("minimum_gain", 0.049),
+    ("maximum_gain", 2.01),
+    ("maximum_abs_bias_rad_s", 0.301),
+    ("profile_delta_sigma2", 3.84),
+    ("minimum_residual_variance", 0.9e-12),
+    ("maximum_delay_uncertainty_ns", 25_000_001),
+    ("maximum_time_constant_uncertainty_s", 0.061),
+    ("maximum_validation_normalized_rmse", 0.351),
+    ("minimum_validation_improvement_fraction", 0.099),
+)
+
+_TIGHTENED_CONFIG_OVERRIDES = (
+    ("minimum_training_samples", 81),
+    ("minimum_validation_samples", 41),
+    ("minimum_training_duration_s", 2.1),
+    ("minimum_validation_duration_s", 1.1),
+    ("maximum_gyro_gap_s", 0.049),
+    ("maximum_abs_command_rate_rad_s", 0.24),
+    ("maximum_abs_gyro_rate_rad_s", 3.9),
+    ("minimum_command_span_rad_s", 0.11),
+    ("minimum_command_standard_deviation_rad_s", 0.026),
+    ("minimum_output_standard_deviation_rad_s", 0.011),
+    ("maximum_design_condition_number", 90_000.0),
+    ("minimum_gain", 0.051),
+    ("maximum_gain", 1.9),
+    ("maximum_abs_bias_rad_s", 0.29),
+    ("minimum_residual_variance", 2.0e-12),
+    ("maximum_delay_uncertainty_ns", 24_000_000),
+    ("maximum_time_constant_uncertainty_s", 0.050),
+    ("maximum_validation_normalized_rmse", 0.34),
+    ("minimum_validation_improvement_fraction", 0.11),
+)
 
 _COMMAND_SCHEDULE = (
     (0.00, 0.00),
@@ -72,14 +122,7 @@ _COMMAND_SCHEDULE = (
 
 
 def _test_config(**overrides: object) -> SystemIdConfig:
-    values: dict[str, object] = {
-        "delay_candidates_ns": tuple(range(0, 70_000_001, 5_000_000)),
-        "time_constant_candidates_s": tuple(
-            value / 1_000.0 for value in range(60, 201, 10)
-        ),
-    }
-    values.update(overrides)
-    return SystemIdConfig(**values)
+    return SystemIdConfig(**overrides)
 
 
 def _commands(
@@ -226,12 +269,111 @@ def _renumber_gyro(
     )
 
 
+@pytest.mark.parametrize("field_name,loosened_value", _LOOSENED_CONFIG_OVERRIDES)
+def test_reviewed_config_rejects_every_looser_override(
+    field_name: str,
+    loosened_value: object,
+):
+    with pytest.raises(ValueError, match="reviewed"):
+        SystemIdConfig(**{field_name: loosened_value})
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"delay_candidates_ns": _REVIEWED_DELAY_GRID_NS[:-1]},
+        {"delay_candidates_ns": _REVIEWED_DELAY_GRID_NS + (105_000_000,)},
+        {
+            "delay_candidates_ns": tuple(
+                sorted(_REVIEWED_DELAY_GRID_NS + (2_500_000,))
+            )
+        },
+        {"time_constant_candidates_s": _REVIEWED_TIME_CONSTANT_GRID_S[1:]},
+        {
+            "time_constant_candidates_s": (
+                _REVIEWED_TIME_CONSTANT_GRID_S + (0.310,)
+            )
+        },
+        {
+            "time_constant_candidates_s": tuple(
+                sorted(_REVIEWED_TIME_CONSTANT_GRID_S + (0.025,))
+            )
+        },
+        {"profile_delta_sigma2": 3.841458820694125},
+    ],
+)
+def test_profile_grids_and_95_percent_cutoff_are_pinned(override: dict[str, object]):
+    with pytest.raises(ValueError, match="pinned"):
+        SystemIdConfig(**override)
+
+
+def test_config_semantic_identity_is_canonical_and_change_sensitive():
+    default = SystemIdConfig()
+    numerically_equivalent = SystemIdConfig(
+        minimum_training_duration_s=2,
+        minimum_validation_duration_s=1,
+    )
+
+    assert default.semantic_identity == SystemIdConfig().semantic_identity
+    assert default.semantic_identity == numerically_equivalent.semantic_identity
+    assert default.semantic_identity.startswith(
+        "vq2-rate-system-id-policy-v1:sha256:"
+    )
+    assert len(default.semantic_identity.rsplit(":", 1)[1]) == 64
+
+    tightened_identities = {
+        SystemIdConfig(**{field_name: value}).semantic_identity
+        for field_name, value in _TIGHTENED_CONFIG_OVERRIDES
+    }
+    assert default.semantic_identity not in tightened_identities
+    assert len(tightened_identities) == len(_TIGHTENED_CONFIG_OVERRIDES)
+
+    identity_covered_fields = {
+        field_name for field_name, _value in _TIGHTENED_CONFIG_OVERRIDES
+    } | {
+        "delay_candidates_ns",
+        "time_constant_candidates_s",
+        "profile_delta_sigma2",
+    }
+    assert identity_covered_fields == {
+        field.name for field in fields(SystemIdConfig)
+    }
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"minimum_gain": 1.9, "maximum_gain": 1.8},
+        {"maximum_abs_command_rate_rad_s": 0.04},
+        {
+            "minimum_command_standard_deviation_rad_s": 0.21,
+            "maximum_abs_command_rate_rad_s": 0.20,
+        },
+        {"maximum_abs_gyro_rate_rad_s": 0.20},
+        {
+            "maximum_abs_gyro_rate_rad_s": 0.009,
+            "maximum_abs_bias_rad_s": 0.008,
+        },
+    ],
+)
+def test_individually_tighter_but_physically_inconsistent_config_is_rejected(
+    override: dict[str, object],
+):
+    with pytest.raises(ValueError):
+        SystemIdConfig(**override)
+
+
 def test_irregular_trace_recovers_model_with_heldout_diagnostics_and_uncertainty():
     trace = _synthetic_trace()
     holdout = _holdout()
+    config = SystemIdConfig()
 
-    result = fit_rate_axis_model(trace, holdout, config=SystemIdConfig())
+    result = fit_rate_axis_model(trace, holdout, config=config)
 
+    assert result.config_semantic_id == config.semantic_identity
+    assert result.model.config_semantic_id == config.semantic_identity
+    assert result.uncertainty.config_semantic_id == config.semantic_identity
+    assert result.diagnostics.config_semantic_id == config.semantic_identity
     assert result.model.host_clock_id == _CLOCK
     assert result.model.axis is RateAxis.ROLL
     assert result.model.delay_ns == pytest.approx(_TRUE_DELAY_NS, abs=5_000_000)
@@ -286,7 +428,7 @@ def test_irregular_trace_recovers_model_with_heldout_diagnostics_and_uncertainty
 def test_fit_is_deterministic_for_identical_irregular_evidence():
     trace = _synthetic_trace()
     holdout = _holdout()
-    config = _test_config()
+    config = _test_config(minimum_training_samples=81)
 
     first = fit_rate_axis_model(trace, holdout, config=config)
     second = fit_rate_axis_model(trace, holdout, config=config)
@@ -303,6 +445,13 @@ def test_fit_is_deterministic_for_identical_irregular_evidence():
 
     assert first == second
     assert first == changed_future
+    assert first.config_semantic_id == config.semantic_identity
+    assert first.config_semantic_id != SystemIdConfig().semantic_identity
+    with pytest.raises(ValueError, match="config identities disagree"):
+        replace(
+            first,
+            config_semantic_id=SystemIdConfig().semantic_identity,
+        )
 
 
 def test_later_validation_labels_cannot_change_training_selected_model():
@@ -332,6 +481,14 @@ def test_later_validation_labels_cannot_change_training_selected_model():
     perturbed = fit_rate_axis_model(changed_trace, holdout, config=config)
 
     assert original.model == perturbed.model
+    assert (
+        original.uncertainty.delay_interval_ns
+        == perturbed.uncertainty.delay_interval_ns
+    )
+    assert (
+        original.uncertainty.time_constant_interval_s
+        == perturbed.uncertainty.time_constant_interval_s
+    )
     assert (
         original.diagnostics.validation_rmse_rad_s
         != perturbed.diagnostics.validation_rmse_rad_s
@@ -381,14 +538,68 @@ def test_weak_excitation_and_tight_uncertainty_gate_fail_closed():
             config=_test_config(maximum_delay_uncertainty_ns=1),
         )
 
-    with pytest.raises(IdentifiabilityError, match="optimum reached"):
+
+def test_ill_conditioned_design_is_rejected_before_a_model_is_reported():
+    with pytest.raises(IdentifiabilityError, match="no finite, well-conditioned"):
         fit_rate_axis_model(
-            trace,
+            _synthetic_trace(),
             _holdout(),
-            config=_test_config(
-                time_constant_candidates_s=(0.020, 0.030, 0.040)
-            ),
+            config=_test_config(maximum_design_condition_number=1.000001),
         )
+
+
+@pytest.mark.parametrize(
+    "plant_override",
+    [
+        {"gain": 0.01, "noise_scale": 0.0},
+        {"bias": 0.50, "noise_scale": 0.0},
+    ],
+)
+def test_nonphysical_gain_and_bias_fits_are_rejected(
+    plant_override: dict[str, float],
+):
+    with pytest.raises(IdentifiabilityError, match="no finite, well-conditioned"):
+        fit_rate_axis_model(
+            _synthetic_trace(**plant_override),
+            _holdout(),
+            config=SystemIdConfig(),
+        )
+
+
+def test_nonzero_yaw_fit_is_rejected_by_the_frozen_envelope():
+    with pytest.raises(TraceValidationError, match="nonzero yaw"):
+        fit_rate_axis_model(
+            _synthetic_trace(axis=RateAxis.YAW),
+            _holdout(),
+            config=SystemIdConfig(),
+        )
+
+
+def test_exact_zoh_transition_at_interval_boundary_is_not_applied_early():
+    time_constant_s = 0.100
+    transition_ns = 100_000_000
+    command_times = (0, transition_ns)
+    command_values = (0.0, 1.0)
+
+    at_transition = _advance_affine_state(
+        np.zeros(3, dtype=np.float64),
+        start_ns=0,
+        end_ns=transition_ns,
+        time_constant_s=time_constant_s,
+        command_times=command_times,
+        command_values=command_values,
+    )
+    after_transition = _advance_affine_state(
+        at_transition,
+        start_ns=transition_ns,
+        end_ns=2 * transition_ns,
+        time_constant_s=time_constant_s,
+        command_times=command_times,
+        command_values=command_values,
+    )
+
+    assert at_transition[1] == pytest.approx(0.0, abs=1e-15)
+    assert after_transition[1] == pytest.approx(1.0 - math.exp(-1.0), abs=1e-15)
 
 
 def test_delayed_fit_requires_causal_command_history():
@@ -492,15 +703,20 @@ def test_inert_experiment_definition_is_symmetric_bounded_data_only():
         segments=(
             RateExperimentSegment(200_000_000, 0.0),
             RateExperimentSegment(400_000_000, 0.12),
-            RateExperimentSegment(400_000_000, -0.12),
             RateExperimentSegment(200_000_000, 0.0),
+            RateExperimentSegment(400_000_000, -0.12),
+            RateExperimentSegment(500_000_000, 0.0),
         ),
     )
 
-    assert definition.total_duration_ns == 1_200_000_000
+    assert definition.total_duration_ns == 1_700_000_000
     assert definition.maximum_abs_rate_rad_s == 0.12
+    assert definition.maximum_signed_prefix_angle_rad == pytest.approx(0.048)
+    assert definition.final_zero_settling_duration_ns == 500_000_000
+    assert definition.maximum_adjacent_rate_step_rad_s == 0.12
     assert not hasattr(definition, "send")
     assert not hasattr(definition, "execute")
+    assert not hasattr(definition, "restores_attitude")
 
 
 @pytest.mark.parametrize(
@@ -525,6 +741,73 @@ def test_inert_experiment_definition_rejects_unsafe_shapes(
                 RateExperimentSegment(200_000_000, 0.0),
                 RateExperimentSegment(400_000_000, rate),
                 RateExperimentSegment(400_000_000, -rate),
-                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(500_000_000, 0.0),
             ),
+        )
+
+
+@pytest.mark.parametrize(
+    "segments,error_match",
+    [
+        (
+            (
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(4_600_000_000, 0.10),
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(4_600_000_000, -0.10),
+                RateExperimentSegment(500_000_000, 0.0),
+            ),
+            "ten-second",
+        ),
+        (
+            (
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(400_000_000, 0.10),
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(200_000_000, -0.10),
+                RateExperimentSegment(500_000_000, 0.0),
+            ),
+            "zero net",
+        ),
+        (
+            (
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(2_100_000_000, 0.10),
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(2_100_000_000, -0.10),
+                RateExperimentSegment(500_000_000, 0.0),
+            ),
+            "prefix angle",
+        ),
+        (
+            (
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(400_000_000, 0.10),
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(400_000_000, -0.10),
+                RateExperimentSegment(480_000_000, 0.0),
+            ),
+            "final exact-zero settling",
+        ),
+        (
+            (
+                RateExperimentSegment(200_000_000, 0.0),
+                RateExperimentSegment(400_000_000, 0.12),
+                RateExperimentSegment(400_000_000, -0.12),
+                RateExperimentSegment(500_000_000, 0.0),
+            ),
+            "adjacent rate step",
+        ),
+    ],
+)
+def test_inert_experiment_definition_rejects_duration_area_prefix_settle_and_step(
+    segments: tuple[RateExperimentSegment, ...],
+    error_match: str,
+):
+    with pytest.raises(ValueError, match=error_match):
+        RateExperimentDefinition(
+            experiment_id="rejected-inert-shape",
+            axis=RateAxis.ROLL,
+            command_period_ns=20_000_000,
+            segments=segments,
         )
