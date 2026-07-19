@@ -7,6 +7,7 @@
 **Integrated Wave 1A implementation:** a6782cd9dcc34aee94e0f064021399985e0f6839
 **Integrated Wave 1 offline record:** 1cf17ea5f4e0a330bee89b0128d30b13657899a2
 **Integrated Wave 2 offline implementation:** 8176cbac20ff16bfa4b8c24764596d9366fe98cf
+**Integrated Wave 3 control-plane increment:** ab62cde9464442e4b448f293ba8efd31ad601c27
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
 **Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
 foundations and the Wave 2 controller/system-ID/guidance tranche are integrated
@@ -273,6 +274,27 @@ caller-threaded pure memory is a trust boundary, no approved replay corpus or
 final processor is present, and measured delay/plant and tracker-isolation
 replay evidence remain absent. Nothing in Wave 2 changes the established live
 status or authorizes shadow, runtime, supervisor, transport, or powered wiring.
+
+## Wave 3 control-plane dogfood increment
+
+Offline increment `ab62cde9464442e4b448f293ba8efd31ad601c27` closes the
+missing positive `SingleMerger` unit path. A fully promotion-valid synthetic
+T0-T4 ledger fixture now proves exact fast-forward to a descendant candidate,
+clean target state, unchanged checkpoints, correct nonpowered evidence domains,
+and orchestration-lease release. Dirty and divergent targets fail without
+advancing. The three new cases passed; the scheduler module passed 62 tests
+with 6 skips, `test-fast` passed 1,838 tests with 20 skips and 42 deselections,
+and candidate/post-merge `test-vq2` passed all 743 tests.
+
+The 123-entry trusted manifest changed only the scheduler-test hash; its
+semantic identity is
+`60680aec1f26b3661576b65221ab4aeba4fab5df8959e46076dd8f99fce8fe41`
+and file SHA-256 is
+`0658ef17b864ce60312917aca208cd66263144f44d8fcc86ba4c37be1ebb2be5`.
+This is a unit fixture, not an operational scheduler-run candidate. A genuine
+T0-T4 exercise remains blocked by the approved replay corpus, production
+processor, and administrator-owned isolation wrapper required by T1. Campaign
+and T5 remain outside this work.
 
 ## Completed foundation bootstrap
 
@@ -909,9 +931,11 @@ gates whenever the base or trust set changes.
    composition behind the reviewed supervisor/transport seam. Do not select
    scheduler output for transport; transport enablement remains a separately
    authorized powered workflow.
-5. Exercise a disposable clean candidate through T0-T4 scheduler leases,
-   interruption/resume, deduplication, exact worktrees, and merger evidence; this
-   operational dogfood remains outstanding and does not broaden tier claims.
+5. The positive exact `SingleMerger` path now has unit evidence. Exercise a
+   disposable clean candidate through T0-T4 scheduler leases,
+   interruption/resume, deduplication, exact worktrees, and merger evidence
+   only after the three real T1 prerequisites exist; this operational dogfood
+   remains outstanding and does not broaden tier claims.
 6. Provision the private golden replay corpus and administrator-owned isolation
    wrapper before enabling production T1. This may proceed independently when a
    slot and the required authorization are available; it does not block the

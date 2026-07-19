@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3-merger-dogfood`.
 - Parent: `2026-07-18-vq2-execution-plan-handoff`.
-- State: `integration_pending`.
+- State: `post_merge_verified`.
 - Objective: exercise the real `SingleMerger` positive fast-forward path with
   a fully promotion-valid synthetic T0-T4 ledger chain and an exact descendant
   commit in a disposable local Git repository.
@@ -56,6 +56,12 @@
     `60680aec1f26b3661576b65221ab4aeba4fab5df8959e46076dd8f99fce8fe41`;
   - reviewed/tracked manifest file SHA-256:
     `0658ef17b864ce60312917aca208cd66263144f44d8fcc86ba4c37be1ebb2be5`.
+  - integrated candidate commit:
+    `ab62cde9464442e4b448f293ba8efd31ad601c27`;
+  - main fast-forward: `a5c11ab9924b1f250948e9ebdee459427489c924`
+    to the integrated candidate;
+  - post-merge main `test-vq2`: `743 passed` in `30.05s`, followed by an
+    empty tracked Git status.
 - Evidence limits: all promotion rows and evaluator results are synthetic unit
   fixtures. They exercise validation and merge mechanics only; they are not a
   scheduler-run candidate, replay result, simulator result, or promotion of
