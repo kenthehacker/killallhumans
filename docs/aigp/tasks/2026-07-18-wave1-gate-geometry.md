@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave1-gate-geometry`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `tested`
+- State: `committed`
 - Objective: add a deterministic, fully offline VQ2 inner-aperture fitter that
   treats frame-clipped edges as censored, infers a conservative square-aperture
   model only when the visible support is sufficient, and publishes honest
@@ -68,4 +68,5 @@
   target, or powered command was used. An initial patch-placement error made the
   legacy adapter return `None`; it was corrected before acceptance, after which
   the original 53 contract tests passed and remained green.
-- Final commit hash: pending.
+- Final implementation commit hash:
+  `0db37d89c2045bde8461622c4ed22543a960442c`.
