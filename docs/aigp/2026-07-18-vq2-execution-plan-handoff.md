@@ -1,6 +1,7 @@
 # AIGP VQ2 execution-plan handoff
 
 **Date:** 2026-07-18
+**Current offline update:** 2026-07-20
 **Target:** DCL FlightSim build 3385, VQ2 Training and Qualification
 **Repository:** C:\Users\John\killallhumans
 **Integrated foundation baseline:** b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8
@@ -12,14 +13,17 @@
 **Integrated Wave 3B generated offline runtime:** 28b7d782404d6b825cebae3b65a8443d756be234
 **Integrated Wave 3C correlated coast:** 168220ba7060d07743335d0e9c56bcd2d05d669d
 **Integrated Wave 3D stable-reference prototype:** 46df0adee76070e10509fa5e807b986a9469c68e
+**Integrated Wave 3E local-differential reducer:** 16dd5c84995cafb5158e277d730e670557ba69f2
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
 **Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
 foundations, Wave 2 controller/system-ID/guidance tranche, Wave 3 control-plane
 dogfood, Wave 3 local IMU provenance/rotation-only tranche, Wave 3B generated
 scheduler composition, Wave 3C proof-bound one-tick coast, and Wave 3D
-standalone stable-reference local-feature transform are integrated on main and
+standalone stable-reference local-feature transform, and Wave 3E standalone
+rectified-homography local-differential reducer are integrated on main and
 post-merge verified. M1/M2/M4 runtime acceptance remains incomplete; the next
-work remains offline until its explicit data or powered boundary. No new
+high-value state-estimation work is blocked on real calibration, a reviewed
+dense homography-covariance producer, and approved replay evidence. No new
 FlightSim evidence was collected.
 
 ## Purpose
@@ -500,6 +504,64 @@ preflight, external network, replay, reset, arm/disarm, target, transport,
 shadow/runtime, or powered action occurred. All prior live evidence and safety
 limits remain unchanged.
 
+## Wave 3E rectified-homography local-measurement integration record
+
+Contract freeze `c7dcb612318eb9d26868fa1364c1a027d2b8edcd`, review-driven
+contract correction `aab44d48a032444faeaf5cd1020e90dc9dbd24ed`, behavioral
+implementation `ceed9c854b0066d4f00d4add796fb968d449593a`, and promotion/trust
+integration `16dd5c84995cafb5158e277d730e670557ba69f2` add a standalone,
+immutable reducer with no production call site.
+
+The reducer begins only after an external producer supplies a rectified,
+center-gauge-fixed full homography and dense conditional `8x8` covariance. It
+returns center bearing plus local differential log scale, an analytic `3x8`
+Jacobian, dense conditional covariance by full congruence, exact frame and
+authority provenance, raw and canonical covariance views, deterministic
+fingerprints, and bounded projective/numerical diagnostics. It does not accept
+frozen `/1` observations, corners, rates, states, or total covariance and does
+not call Wave 3D, the estimator, runtime, controller, or supervisor.
+
+This closes only the homography-to-local-feature T0 algebra and lifecycle
+boundary. The current fitted-observation/observation-adapter path publishes
+only a heuristic covariance over five image-space summaries and uncalibrated
+geometry. The differential of those five summaries has rank at most five over
+eight homography degrees of freedom, so it cannot determine an honest full-
+homography covariance or Wave 3E input. Production use remains blocked on
+calibrated image-to-ray rectification, an independently reviewed
+full-homography fit covariance, shared nuisance treatment, approved recorded
+replay, cross-frame association, sequential filtering, estimator/runtime
+integration, and authority review.
+No production module produces `VQ2RectifiedHomographyInput`; do not derive it
+from `/1`, fitted corners, residuals, guessed covariance, or border-normalized
+image coordinates, and do not wire its evidence downstream before those
+prerequisites are independently reviewed.
+
+Accepted offline evidence is:
+
+- `224` direct reducer tests and a `450`-test compatibility matrix;
+- three independent final reviews clearing mathematics/numerics,
+  lifecycle/provenance/no-wiring, and API/test coverage;
+- canonical, cache-clean isolated-manifest, and post-merge main VQ2 runs each
+  passed exactly `1,325` tests;
+- `test-fast` and `test-unit`: `2,420` passed, `20` skipped, and `42`
+  deselected each;
+- promotion-boundary `test-full-non-live`: `2,461` passed and `21` skipped in
+  `487.69s`; and
+- a strict `129`-file trusted manifest with semantic identity
+  `46e77cbbe8a131517444b141293b1fe8c2bab546a6f5630f711ffe0d621d5ea2`,
+  file identity
+  `e88363ef096bba83fe4660a4903abb6ae063f41682246b38ba9c69481008fffc`,
+  and policy file identity
+  `7daa46ec4dfd025c18f12076add06d70b6463f07d6320b20487a63bd78d0851e`.
+
+The trust review added only the new `224`-test file, changed only the policy
+digest, removed nothing, and independently matched all `129/129` files. Main
+fast-forwarded cleanly and post-merge VQ2 passed all `1,325` tests. No
+FlightSim process was launched or contacted, and no preflight, external
+network, replay, reset, arm/disarm, target, transport, shadow/runtime, or
+powered action occurred. All prior live evidence and safety limits remain
+unchanged.
+
 ## Completed foundation bootstrap
 
 The former dirty-worktree exception is closed:
@@ -674,7 +736,7 @@ CommandProposal:
 | M1 | Active; generated scheduler/trace composition integrated, production receiver/runtime trace and simulator dossier pending | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
 | M2 | Active offline; censored aperture fitter integrated, recorded replay and tracker-isolation acceptance pending | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
 | M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
-| M4 | Active offline; estimator, controller, guidance, exact adapters, timestamped attitude provenance, rotation-only evidence, generated runtime composition, proof-bound one-tick correlated coast, and standalone stable-reference local-feature math integrated; an honest local-scale producer or shape-augmented state, sequential nuisance model, calibrated timing/extrinsics, measured delay, replay comparison, estimator wiring, and production runtime evidence remain pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M4 | Active offline; estimator, controller, guidance, exact adapters, timestamped attitude provenance, rotation-only evidence, generated runtime composition, proof-bound one-tick correlated coast, standalone stable-reference math, and the standalone full-homography-to-local-measurement reducer are integrated; calibrated rectification, a dense full-homography covariance producer, approved replay, sequential nuisance/state design, measured delay, estimator wiring, and production runtime evidence remain pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
 | M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
 | M6 | Pending | Conservative valid full lap | M5 |
 | M7 | Pending | Repeatable baseline across fresh and warm sessions | M6 |
@@ -793,11 +855,14 @@ the pure controller/guidance composition. The corrected bearing remains
 standalone evidence and is not applied to the raw-camera filter. A reviewed
 standalone stable-reference transform now proves the local differential
 coordinate math, but it intentionally cannot transform frozen `/1` finite-quad
-scale and has no estimator/runtime call site. An honest local-scale producer or
-shape-augmented state, sequential nuisance treatment, calibrated camera/IMU
-timing and extrinsics, calibrated command-effect prediction, runtime wiring,
-p95 replay comparison against zero-order hold, and shadow/runtime IBVS evidence
-remain open.
+scale and has no estimator/runtime call site. Wave 3E now proves the separate
+full-homography-to-local-measurement algebra and first-order dense conditional-
+covariance congruence, but the current detector cannot produce its calibrated
+full-homography input and no production consumer is wired. A reviewed producer,
+calibrated camera/IMU timing and extrinsics, shared and sequential nuisance
+treatment, cross-frame association, calibrated command-effect prediction,
+runtime wiring, p95 replay comparison against zero-order hold, and
+shadow/runtime IBVS evidence remain open.
 
 Initial estimator:
 
@@ -1092,13 +1157,19 @@ Wave 3, active offline before any separately authorized live work:
   distinctly named local differential feature state, with exact reference
   lineage, forward/inverse rate chain rules, dense covariance congruence, and
   no `/1`, estimator, runtime, or authority wiring;
+- completed: add a standalone rectified full-homography reducer for center
+  bearing and local differential scale with an analytic `3x8` Jacobian, dense
+  conditional-covariance propagation, exact provenance and integrity, and no
+  detector, Wave 3D, estimator, runtime, or authority wiring;
 - next: provision approved replay inputs/final processing and exercise the
   operational T0-T4 promotion path without relabeling generated evidence;
-- next state-estimation decision: either design an honest local-scale
-  measurement/covariance producer from the full fitted homography in a new
-  provenance envelope, or retain finite `/1` semantics in a shape-augmented
-  state. Do not wire the standalone transform until that contract plus a
-  sequential nuisance model is independently reviewed;
+- next state-estimation prerequisite: provide calibrated rectification and an
+  independently reviewed producer of the full homography plus dense covariance
+  required by Wave 3E, with approved replay and explicit shared-nuisance
+  treatment. A shape-augmented finite-quad state remains a separate redesign;
+  do not wire Wave 3E, or use Wave 3E evidence in Wave 3D, until the producer,
+  association/rate state, and sequential nuisance model are independently
+  reviewed;
 - perform recorded replay scoring only after approved inputs and the final
   processor exist;
 - keep Gate 1 recentering as an exclusive, separately authorized live stage.
@@ -1144,16 +1215,19 @@ Still requiring controlled evidence:
 
 The recorded M0, Wave 1A, Wave 1, Wave 2, Wave 3 control-plane dogfood, Wave 3
 IMU, Wave 3B generated runtime, Wave 3C correlated-coast, and Wave 3D
-stable-reference integration commits, clean-main checks, trusted-manifest
-verification, and explicit canonical test tiers are complete.
+stable-reference and Wave 3E local-measurement integration commits, clean-main
+checks, trusted-manifest verification, and explicit canonical test tiers are
+complete.
 Do not repeat them merely because an agent resumes the plan; rerun affected
 gates whenever the base or trust set changes.
 
 1. The reviewed local timestamp/source seam for attitude and the Gate 0 pitch
    basis plus bounded rotation-only derotation evidence is integrated at
    `ecaa794aeaed87a169b7b87b284d1440f1768a28`. Keep the corrected ray
-   standalone; Wave 3D now proves only the distinct local-feature coordinate
-   transform, not an honest `/1` measurement conversion or filter input.
+   standalone; Wave 3D proves only the distinct local-feature coordinate
+   transform, and Wave 3E proves only a reducer after an external calibrated
+   full-homography producer. Neither is an honest `/1` conversion or filter
+   input.
 2. The exact generated observation/IMU-to-proposal scheduler composition is
    integrated at `28b7d782404d6b825cebae3b65a8443d756be234`. Keep it
    distinct from receiver/reassembly, recorded replay, and measured
@@ -1165,11 +1239,14 @@ gates whenever the base or trust set changes.
 4. Validate Gate 0 non-regression and recorded top-clipped Gate 1 geometry once
    approved replay inputs and the final processor exist.
 5. Wave 3D stable-reference math is integrated at
-   `46df0adee76070e10509fa5e807b986a9469c68e` with no production call site.
-   Before any filter use, choose and review either a full-homography local-scale
-   measurement/covariance producer in a new provenance envelope or a
-   shape-augmented finite-quad state, plus sequential nuisance handling,
-   calibrated production timing/extrinsics, replay, and estimator integration.
+   `46df0adee76070e10509fa5e807b986a9469c68e`, and the standalone Wave 3E
+   homography-to-local-measurement reducer is integrated at
+   `16dd5c84995cafb5158e277d730e670557ba69f2`; neither has a production call
+   site. Before using Wave 3E evidence in a filter, supply and independently
+   review calibrated rectification and a dense full-homography covariance
+   producer, approved replay, cross-frame association/rate state, sequential
+   nuisance handling, calibrated production timing/extrinsics, and
+   estimator/runtime integration and authority review.
 6. The positive exact `SingleMerger` path now has unit evidence. Exercise a
    disposable clean candidate through T0-T4 scheduler leases,
    interruption/resume, deduplication, exact worktrees, and merger evidence

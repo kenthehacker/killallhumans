@@ -266,12 +266,28 @@ cross-frame association, rate/state construction, shared nuisance
 cross-covariance, estimator integration, and runtime/authority review. Powered
 work remains separately authorized under the authoritative VQ2 handoff.
 
-## Current offline implementation evidence
+## Integrated offline evidence
 
-The standalone reducer is behavior-verified with `224` direct tests, `450`
-focused compatibility tests, `1,325` canonical VQ2 tests, and `2,420` fast/unit
-passes with `20` skips and `42` deselections in each broad tier. Independent
-math, lifecycle, and API/test reviews are clear.
+Contract freeze `c7dcb612318eb9d26868fa1364c1a027d2b8edcd`, review-driven
+contract correction `aab44d48a032444faeaf5cd1020e90dc9dbd24ed`, behavioral
+implementation `ceed9c854b0066d4f00d4add796fb968d449593a`, and promotion/main
+integration `16dd5c84995cafb5158e277d730e670557ba69f2` are post-merge verified.
+Accepted evidence is `224` direct tests and `450` focused compatibility tests.
+Canonical candidate, cache-clean isolated, and post-merge main VQ2 runs each
+passed exactly `1,325` tests.
+`test-fast` and `test-unit` each passed `2,420` with `20` skips and `42`
+deselections. Promotion-boundary `test-full-non-live` passed `2,461` with `21`
+skips. Independent math, lifecycle, API/test, trust, and documentation reviews
+are clear.
+
+The canonical policy advanced expected passes from `1,101` to `1,325` and
+added only `estimation/tests/test_vq2_local_differential_measurement.py` to its
+sorted, unique inventory. The trusted manifest advanced from `128` to `129`
+files, added only that test, changed only the policy digest, removed nothing,
+and independently matched all `129/129` on-disk files. Its semantic identity is
+`46e77cbbe8a131517444b141293b1fe8c2bab546a6f5630f711ffe0d621d5ea2`;
+its file identity is
+`e88363ef096bba83fe4660a4903abb6ae063f41682246b38ba9c69481008fffc`.
 
 The independent numerical matrix covered `2,000` admitted randomized
 homographies and covariance scales from `1e-250` through `1e6`. Review-driven
@@ -282,4 +298,6 @@ dense covariance behavior.
 
 This remains T0 proof-only evidence. It adds no full-homography producer,
 calibration artifact, replay result, estimator input, runtime selection, or
-authority claim.
+authority claim. No simulator, preflight, external network, replay, reset,
+arm/disarm, target, transport, shadow/runtime, or powered action contributed
+to integration or verification.

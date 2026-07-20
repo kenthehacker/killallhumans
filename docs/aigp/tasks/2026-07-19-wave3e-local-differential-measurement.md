@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3e-local-differential-measurement`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `promotion_verified`
+- State: `post_merge_verified`
 - Objective: add a standalone, immutable reducer from one externally produced,
   rectified, center-gauge-fixed full homography and dense conditional
   covariance to a three-component measurement that shares Wave 3D's local
@@ -26,8 +26,8 @@
 - `docs/aigp/vq2_local_differential_measurement.md`
 - this task record
 
-Promotion policy and trusted-manifest metadata remain integration-owner files
-and belong in a separate commit after behavioral review. Shared handoffs are
+Promotion policy and trusted-manifest metadata were integration-owner files
+and were committed separately from behavior after review. Shared handoffs were
 updated only after integration and post-merge verification.
 
 This tranche does not own or modify `competition/vq2_contracts.py`, the gate
@@ -647,9 +647,21 @@ Observed promotion evidence is:
 - `test-unit`: `2,420` passed, `20` skipped, `42` deselected; and
 - `test-full-non-live`: `2,461` passed, `21` skipped in `487.69s`.
 
-The full non-live boundary was rerun to an observed pytest summary after two
-shorter outer shell ceilings expired; neither interrupted attempt produced a
-test failure, and no orphaned runner remained. Promotion used no simulator,
+The completed full non-live boundary rerun produced the observed pytest
+summary after two earlier attempts ended at shorter outer shell ceilings.
+Those interrupted attempts had no completed summaries and are not counted as
+pass evidence; no orphaned runner remained. Promotion used no simulator,
 preflight, external network, replay, reset, arm/disarm, target, transport,
-shadow/runtime, or powered surface. Post-merge status and the integrated main
-commit remain to be recorded after fast-forward and canonical verification.
+shadow/runtime, or powered surface.
+
+The three ignored telemetry files written by those non-live full-tier attempts
+were inspected as deterministic zero-state synthetic test output and removed,
+along with the regenerable pytest cache. No tracked historical capture was
+changed or removed.
+
+Promotion/trust and integrated-main commit
+`16dd5c84995cafb5158e277d730e670557ba69f2` fast-forwarded cleanly to
+`main` from `f8b0e4095a15413bf04601bc5264f12842bdbc66`. Post-merge canonical
+`test-vq2` passed exactly `1,325` tests in `33.72s`, and tracked main status was
+empty before documentation closeout. The committed candidate's final clean,
+isolated hash-pinned run also passed exactly `1,325` tests in `33.50s`.
