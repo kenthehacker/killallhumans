@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `R1 complete - stopped at absent R2 clearance; no simulator contact`
+- State: `P0 scope pivot recorded - stopped before P1 admission; no simulator contact`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -31,18 +31,30 @@ in-scope work, but no later semantic change, second attempt, different stage,
 Gate 0 or Gate 1 flight, or other package inherits this task's exact attempt or
 safety contract. Any such work requires its own frozen scope and entry gates.
 
+On 2026-07-20 the user then selected the active reference and data boundary:
+
+- do not inspect, extract, or otherwise read the cooked PAK for this task;
+- gate dimensions and similar target facts may be explicit, configurable
+  nominal inputs whose values and applicability can change;
+- camera, IMU, timing, resolution, and stream facts must come from the actual
+  build-3385 JPEG, `HIGHRES_IMU`, heartbeat, and race-status boundary; and
+- private decoded-frame capture and analysis are permitted for this simulation
+  task only, not for a later physical, HIL, submitted, or public-release phase.
+
 The approval does not create facts that are absent from the build, waive the
-authoritative VQ2 safety contract, establish organizer permission to derive or
-use cooked simulator assets, or turn an unverified target into calibration
-truth. Missing reference, rules, process, lease, test, cleanup, or evidence
-proof stops the task without simulator contact or powered execution.
+authoritative VQ2 safety contract, establish organizer media credentials, or
+turn configured target geometry into simulator-observed calibration truth.
+Missing reference, process, lease, test, cleanup, or evidence proof stops the
+task without simulator contact or powered execution.
 
 ## Objective and exact exit
 
 This pilot may establish only whether one bounded build-3385 session can
 preserve exact camera/IMU lineage while applying a predeclared, nonparallel,
-reversing roll/pitch command plan against an independently admitted static
-target. Its output is discovery/fit-only acquisition evidence.
+reversing roll/pitch command plan while viewing a hash-admitted nominal target
+configuration whose build-3385 geometry linkage remains unverified. Its output
+is discovery/fit-only acquisition evidence, not an independently admitted
+Package 2 calibration reference.
 
 The pilot does not fit or accept camera intrinsics, distortion, camera-to-body
 rotation, clock skew, time offset, an absolute source-to-host map, covariance,
@@ -53,7 +65,9 @@ command, approach or pass a gate, or authorize another live stage.
 A valid capture exits at one clean, independently reviewed discovery artifact.
 It makes no structural-rank, conditioning, practical-identifiability, or
 calibration-feasibility claim. Observed motion and image support are descriptive
-only. A later immutable pre-fit design must freeze the camera/distortion model,
+only. A later immutable pre-fit design and a new hash-bound simulation-only
+data-use authority naming the exact F00 artifact hashes must be admitted before
+that successor may open or use F00. It must freeze the camera/distortion model,
 parameter order/units/scaling, visual-rotation construction, gyro interpolation
 and integration, nuisance model, covariance construction, rejection rules, and
 profiled Jacobian before it may inspect this session for rank or propose the
@@ -61,33 +75,44 @@ full `F01-F04`, `L01-L02`, `H01-H02`, and `R01-R02` collection. Failure exits
 at an immutable invalidation record and cleanup proof. Either exit returns to a
 new reviewed task before further powered work.
 
-## Phase gates
+## Superseding active phase gates
 
-The phases are strictly ordered:
+The former cooked-PAK route is retired from the active path. Commits `49b331f`
+and `444a1b3` remain historical evidence that the original contract and the
+synthetic-only parser were reviewed; no production PAK read occurred. The
+parser and its tests may remain in history and in the worktree, but neither is
+an active prerequisite or permitted production invocation. Reopening that route
+requires a new explicit contract.
 
-1. `R0 contract`: this task is independently reviewed and committed on its
-   exact base.
-2. `R1 reference tooling`: only the strict standard-library reference parser,
-   validator, schemas, and direct tests are implemented against synthetic
-   fixtures. It may not read the real PAK or derive any cooked build asset.
-3. `R2 pre-derivation clearance`: a human-reviewed organizer-rules, license,
-   and disclosure record explicitly permits the exact local read-only
-   derivation and intended competition use before the tool reads the real PAK.
-4. `R3 reference admission`: after R2, a build-3385 target-reference candidate
-   passes every admission rule below. No simulator process or port is touched
-   before this gate.
-5. `I0 powered implementation`: the remaining owned executable surfaces and
+The active phases are strictly ordered:
+
+1. `P0 scope pivot`: record the four user decisions above, independently review
+   this correction, and commit it on the exact candidate. This supersedes only
+   the former PAK-specific R2/R3 route; the powered safety contract is unchanged.
+2. `P1 nominal protocol admission`: implement, validate, hash, and independently
+   admit one explicit collection configuration defining the nominal target,
+   observed-stream contract, and simulation-only data scope. This authorizes
+   discovery collection only. It does not verify the configured geometry against
+   build 3385 or accept any calibration value. No simulator process or port is
+   touched before this gate.
+3. `I0 powered implementation`: the remaining owned executable surfaces and
    direct tests are implemented from the frozen contract.
-6. `T0 non-live`: direct, VQ2, fast, unit, full-non-live, and exact hash-pinned
+4. `T0 non-live`: direct, VQ2, fast, unit, full-non-live, and exact hash-pinned
    VQ2 evidence passes from the required clean worktrees.
-7. `L0 live freeze`: the exact candidate commit, detached live worktree,
+5. `L0 live freeze`: the exact candidate commit, detached live worktree,
    interpreter/environment/import inventory, launch command, child command,
-   private paths, reference ID, excitation ID, attempt ID, build/process proof,
-   lease, outbound allowlist, phase deadlines, cleanup fallback, and
-   invalidation rules pass independent review.
-8. `L1 pilot`: at most one powered discovery session is attempted.
-9. `E0 review`: evidence is validated offline and independently reviewed
+   private paths, configuration and authorization hashes, excitation ID,
+   attempt ID, build/process proof, lease, outbound allowlist, phase deadlines,
+   cleanup fallback, and invalidation rules pass independent review.
+6. `L1 pilot`: at most one powered discovery session is attempted.
+7. `E0 review`: evidence is validated offline and independently reviewed
    before any fit or successor collection is proposed.
+8. `F0 pre-fit successor`: before opening or using F00, admit a new hash-bound
+   simulation-only data-use authority naming its exact hashes, then freeze a
+   separate model/reference design, geometry-uncertainty treatment, nuisance
+   ledger, splits, rank definition, and later held-out/repeat collection.
+   Simulation artifacts cannot enter a physical phase without a new authority
+   and calibration chain.
 
 Failure or incompleteness at one phase cannot be repaired by skipping to a
 later phase.
@@ -97,8 +122,10 @@ later phase.
 The implementation candidate may own only:
 
 - this task record;
-- `scripts/aigp_vq2_build_reference.py` for strict, offline, read-only PAK and
-  supplied-reference validation;
+- `config/aigp_vq2_calibration_target_build3385.json` for the explicit nominal
+  target and simulation-only collection policy; it is never an implicit default;
+- `scripts/aigp_vq2_calibration_target.py` for strict offline configuration
+  validation and identity;
 - `scripts/aigp_vq2_run.py` for one additive fixed
   `calibration-excite` stage;
 - `scripts/aigp_vq2_powered_calibration_probe.py` for the exact live wrapper;
@@ -106,10 +133,15 @@ The implementation candidate may own only:
   validation and acquisition-support summaries;
 - `scripts/aigp_vq2_powered_cleanup.py` for a cleanup-only out-of-process
   fallback after a confirmed child exit;
-- direct tests named after those four scripts;
+- direct tests named after those five scripts;
 - additive direct cases in `tests/test_aigp_vq2_runner.py`; and
 - `scripts/dev.ps1` only if needed to include the new offline tests in the
   explicit VQ2 suite.
+
+The already committed `scripts/aigp_vq2_build_reference.py`, its direct test,
+and its VQ2 test registration are inert historical surfaces. This candidate
+does not invoke, extend, or use them. Their presence grants no PAK authority and
+no PAK identity may enter the active configuration, attempt, capture, or report.
 
 The behavior candidate does not own promotion policy or trusted-manifest
 files. Any later integration-owner change to those files occurs only after
@@ -122,15 +154,332 @@ The task must not change detector behavior, fitted gate geometry, guidance,
 controller envelopes, estimator state, runtime selection, supervisor
 authority, MAVLink rate signs, command masks, the passive timing collector,
 replay acceptance, Package 1 data policy, or gate-passage logic. It must not
-reuse VQ1 camera/gate constants, the pixel-square prior, bbox corners, fitted
-`/1` corners, synthetic identity calibration, candidate-generated labels, or
-the completed static passive tranche as reference truth.
+reuse VQ1 camera intrinsics, camera tilt, FOV, distortion, pose/map streams, the
+pixel-square prior, bbox corners, fitted `/1` corners, synthetic identity
+calibration, candidate-generated labels, or the completed static passive tranche
+as reference truth. Public VQ1 gate dimensions are permitted only through the
+explicit nominal configuration and must remain labeled unverified for build
+3385 Training.
 
-Private images, decoded assets, reference manifests, captures, invalidation
-records, analysis reports, dependency inventories, and operational configs
-remain outside Git. Generated evidence is not organizer or license approval.
+Private images, decoded frames, captures, annotations, invalidation records,
+analysis reports, dependency inventories, and operational authorization records
+remain outside Git. The public nominal configuration may be tracked. Generated
+evidence is not organizer or license approval and is never physical-phase or
+public-release authority.
 
-## R1 tooling, R2 clearance, and R3 reference admission
+## Active P1 nominal protocol admission
+
+P1 uses only `scripts/aigp_vq2_calibration_target.py`, the tracked nominal
+configuration, and a private simulation-capture authorization. The validator is
+standard-library-only and offline. It has no simulator, socket, PAK, asset,
+network, subprocess, or write-back path. It reads only paths explicitly supplied
+on its command line and emits no derived camera or geometry value.
+
+The tracked `aigp-vq2-sim-calibration-collection-config/1` document has exact
+top-level keys `schema`, `config_id`, `revision`, `simulator`, `source`,
+`applicability`, `geometry`, `observed_streams`, `calibration_status`, and
+`data_scope`. All nested objects reject unknown or missing keys:
+
+- `config_id` and `revision` are nonempty strings. A changed value, feature,
+  stream contract, or use scope requires a new ID/revision and hash; existing
+  files and results are never overwritten or relabeled.
+- `simulator` is exact integer build `3385` and mode `Training`.
+- `source` records kind `public_technical_spec`, document `VADR-TS-002`, issue
+  `00.02`, publication date `2026-05-08`, the official document URL, stated
+  scope `Virtual Qualifier 1`, and use scope `nominal_geometry_only`. It is not
+  provenance for the camera, IMU, stream, build linkage, or any calibration.
+- `applicability.status` is exactly
+  `nominal_unverified_for_build_3385_training`; configured values are never
+  described as build-reported, PAK-derived, or independently measured.
+- `geometry` uses metres and explicitly freezes a right-handed target frame,
+  outer width/height `2.7/2.7`, inner width/height `1.5/1.5`, depth `0.26`, and
+  the clockwise front-view feature order `top_left`, `top_right`,
+  `bottom_right`, `bottom_left` for front-inner-aperture boundary intersections.
+  These are configurable nominal values, not hidden code constants. Geometry
+  uncertainty is `unpublished_unknown`; this is allowed for collection only and
+  blocks any calibration fit or acceptance until F0 supplies a reviewed bound.
+- `observed_streams` separates measurement, lifecycle, and safety/audit
+  streams. Measurement inputs are UDP JPEG and `HIGHRES_IMU`; heartbeat and
+  race status provide lifecycle/safety authority; actuator output and collision
+  events are mandatory watchdog/audit evidence. The latter four are never
+  calibration measurements. The camera contract includes frame, stream,
+  generation, publication, decode, consume/work, and host-timing lineage. The IMU contract
+  includes raw accelerometer/gyro values, source token, MAVLink generation and
+  sequence, and host receipt. Decoded dimensions are observed from the first
+  decoded frame, must equal the parent-frozen `640 x 360` before arm, and must
+  remain stable. A different first shape stops before arm and requires a revised
+  contract/config; it is not resized or silently accepted. This is a runtime
+  observation gate, not an intrinsic prior. No focal length, principal point,
+  FOV, distortion, exposure timing, or mount is supplied as a default. The
+  config explicitly rejects `ATTITUDE`, pose, odometry, and track/gate-map
+  geometry as build-3385 truth.
+  `ACTUATOR_OUTPUT_STATUS` carries the admitted MAVLink ingress/host receipt.
+  `COLLISION` currently carries only runner drain/observation order plus ID,
+  threat, and impulse; it has no receiver receipt or source timestamp, and this
+  task must not manufacture one.
+- `calibration_status` fixes intrinsics, distortion, camera-to-body rotation,
+  camera/IMU time model, rank, covariance, and empirical limits to `uncomputed`.
+- `data_scope` fixes `private_simulation_capture=true`,
+  `physical_or_hil_use=false`, `submitted_run_use=false`,
+  `public_release=false`, `external_service_upload=false`,
+  `git_storage=false`, and `pak_access=false`.
+
+Every JSON number is an exact JSON integer or finite JSON number as required;
+booleans never satisfy numeric fields. Build is the exact integer `3385`.
+Geometry width, height, and depth are finite and strictly positive; inner width
+and height are strictly smaller than their corresponding outer dimensions. The
+feature array contains exactly four finite three-vectors in the frozen order,
+and must exactly equal the four `(+/- inner.width/2,
++/- inner.height/2, 0.0)` combinations specified below. A mismatch between
+dimensions, coordinates, frame convention, or order fails validation.
+
+The initial tracked value is frozen before implementation as:
+
+```json
+{
+  "schema": "aigp-vq2-sim-calibration-collection-config/1",
+  "config_id": "vq2-build3385-training-gate0-nominal-v1",
+  "revision": "1",
+  "simulator": {"build": 3385, "mode": "Training"},
+  "source": {
+    "kind": "public_technical_spec",
+    "document_id": "VADR-TS-002",
+    "issue": "00.02",
+    "publication_date": "2026-05-08",
+    "url": "https://www.theaigrandprix.com/wp-content/uploads/2026/05/260508_Technical_Spec_0002.pdf",
+    "stated_scope": "Virtual Qualifier 1",
+    "use_scope": "nominal_geometry_only"
+  },
+  "applicability": {
+    "status": "nominal_unverified_for_build_3385_training",
+    "result_semantics": "conditional_on_nominal_gate_config",
+    "replacement_policy": "new_config_id_revision_and_hash"
+  },
+  "geometry": {
+    "units": "m",
+    "target_frame": {
+      "handedness": "right",
+      "origin": "front_inner_aperture_center",
+      "x_axis": "front_view_right",
+      "y_axis": "front_view_down",
+      "z_axis": "front_to_back"
+    },
+    "outer": {"width": 2.7, "height": 2.7},
+    "inner": {"width": 1.5, "height": 1.5},
+    "depth": 0.26,
+    "feature": {
+      "kind": "front_inner_aperture_boundary_intersections",
+      "order": ["top_left", "top_right", "bottom_right", "bottom_left"],
+      "coordinates": [
+        [-0.75, -0.75, 0.0],
+        [0.75, -0.75, 0.0],
+        [0.75, 0.75, 0.0],
+        [-0.75, 0.75, 0.0]
+      ]
+    },
+    "uncertainty_status": "unpublished_unknown"
+  },
+  "observed_streams": {
+    "camera": {
+      "transport": "udp_jpeg",
+      "stream_id": "vq2-camera-udp-5600",
+      "frame_id_field": "frame_id",
+      "source_time_field": "sim_time_ns",
+      "source_time_semantics": "opaque_ordering_token_not_calibrated_capture_time",
+      "identity_schema": "aigp-vq2-frame-identity/1",
+      "timing_schema": "aigp-vq2-frame-timing/1",
+      "consume_timing_schema": "aigp-vq2-camera-frame-timing-observation/1",
+      "expected_decoded_dimensions": {"width": 640, "height": 360},
+      "decoded_dimensions_policy": "observe_require_exact_before_arm_and_session_stability",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "imu": {
+      "message": "HIGHRES_IMU",
+      "source_time_field": "time_usec",
+      "source_time_semantics": "opaque_source_clock_for_ordering_and_integration",
+      "accel_fields": ["xacc", "yacc", "zacc"],
+      "gyro_fields": ["xgyro", "ygyro", "zgyro"],
+      "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+      "sample_schema": "aigp-vq2-received-imu/1",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "race_status": {
+      "required_fields": [
+        "active_gate_index",
+        "last_gate_race_time",
+        "race_finish_time_ns",
+        "race_start_boot_time_ms",
+        "sim_boot_time_ms"
+      ],
+      "source_time_field": "sim_boot_time_ms",
+      "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "heartbeat": {
+      "required_fields": ["base_mode", "custom_mode"],
+      "source_time_semantics": "no_admitted_source_timestamp",
+      "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "safety_audit": {
+      "actuator": {
+        "message": "ACTUATOR_OUTPUT_STATUS",
+        "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+        "host_receipt_clock": "host-perf-counter"
+      },
+      "collision": {
+        "message": "COLLISION",
+        "lineage_semantics": "runner_drain_observation_order_only_no_receiver_receipt_timestamp"
+      },
+      "semantics": "watchdog_and_evidence_only_not_calibration_inputs"
+    },
+    "unavailable_as_truth": [
+      "ATTITUDE",
+      "LOCAL_POSITION_NED",
+      "ODOMETRY",
+      "track_gate_map"
+    ]
+  },
+  "calibration_status": {
+    "intrinsics": "uncomputed",
+    "distortion": "uncomputed",
+    "camera_to_body_rotation": "uncomputed",
+    "camera_imu_time_model": "uncomputed",
+    "rank": "uncomputed",
+    "covariance": "uncomputed",
+    "empirical_limits": "uncomputed"
+  },
+  "data_scope": {
+    "private_simulation_capture": true,
+    "physical_or_hil_use": false,
+    "submitted_run_use": false,
+    "public_release": false,
+    "external_service_upload": false,
+    "git_storage": false,
+    "pak_access": false
+  }
+}
+```
+
+The private `aigp-vq2-simulation-capture-authorization/1` record has exact keys
+`schema`, `authority`, `task_id`, `domain`, `simulator`, `session_ids`,
+`allowed_purposes`, `allowed_classes`, `storage`, `retention`, `transfer`,
+`organizer_media_credential`, and `publication_permitted`. It records the
+2026-07-20 user/operator decision, this exact task, domain `simulator_only`,
+build 3385 Training, and only session `F00`. Its allowed purposes are collection
+discovery, offline replay/analysis, integrity audit, and independent review.
+Allowed classes cover UDP/JPEG/decoded frames, exact stream and host timing,
+HIGHRES_IMU/race/heartbeat/actuator/collision/command records, process/lease/
+cleanup evidence, annotations/crops/features, and content-bound derivatives.
+
+Storage is restricted to the current-user-only private task root, never Git,
+public release, network export, or external-service upload. Evidence is retained
+through this simulator audit, then sealed and quarantined pending an explicit
+disposition; it is not automatically deleted. No successor task, new session,
+build/mode, submitted run, physical/HIL phase, or publication inherits the
+authority. This is user/operator authority, not an organizer media credential.
+Every session and derivative binds the authorization byte SHA-256, target-config
+byte SHA-256, candidate commit, and parent hashes.
+
+The private record's semantic value is frozen as follows; P1 records its exact
+stable bytes and byte SHA-256 without adding identity-bearing commentary:
+
+```json
+{
+  "schema": "aigp-vq2-simulation-capture-authorization/1",
+  "authority": {
+    "kind": "user_operator",
+    "authority_id": "conversation-2026-07-20-package2-sim-capture",
+    "authorized_on": "2026-07-20",
+    "source": "direct_user_instruction"
+  },
+  "task_id": "vq2-package2-powered-calibration-pilot",
+  "domain": "simulator_only",
+  "simulator": {"build": 3385, "mode": "Training"},
+  "session_ids": ["F00"],
+  "allowed_purposes": [
+    "calibration_discovery",
+    "independent_review",
+    "integrity_audit",
+    "offline_replay_and_analysis"
+  ],
+  "allowed_classes": [
+    "annotations_crops_features",
+    "commands",
+    "decoded_frames",
+    "derived_replay_and_analysis",
+    "highres_imu",
+    "process_lease_cleanup",
+    "race_heartbeat_actuator_collision",
+    "reconstructed_jpegs",
+    "source_and_host_timestamps",
+    "udp_camera_datagrams"
+  ],
+  "storage": {
+    "private_root": "C:\\Users\\John\\aigp-evidence\\2026-07-20-package2-powered-calibration-pilot",
+    "git": false,
+    "public_release": false,
+    "network_export": false,
+    "external_service_upload": false
+  },
+  "retention": {
+    "through": "package2_simulator_audit_closeout",
+    "after": "sealed_quarantine_pending_explicit_disposition",
+    "automatic_deletion": false
+  },
+  "transfer": {
+    "successor_task": false,
+    "new_session": false,
+    "new_build_or_mode": false,
+    "submitted_run": false,
+    "physical_or_hil": false
+  },
+  "organizer_media_credential": false,
+  "publication_permitted": false
+}
+```
+
+Both JSON inputs reject duplicate keys, non-UTF-8, BOM, nonfinite numbers,
+booleans where numbers are required, unknown/missing keys, unsorted/duplicate
+set-like arrays, and noncanonical hash text. Their identities are SHA-256 over
+the exact stable bytes after strict semantic validation. There is no default
+path and no field-level CLI override. The live wrapper requires both absolute
+paths and exact reviewed hashes before simulator contact.
+
+P1 admission additionally requires independent review to verify that:
+
+1. no PAK path, PAK identity, asset package, mesh, LOD, material, or map linkage
+   is active or enters any collection identity;
+2. no public/VQ1 camera value is a default, prior, or acceptance oracle;
+3. the frozen collector schema requires every captured frame to carry actual
+   decoded dimensions, content hash, frame/stream/generation/publication
+   identity, opaque camera token, and complete `FrameTimingV1` host lineage;
+4. the frozen collector schema requires every IMU occurrence to carry actual
+   raw `HIGHRES_IMU` accelerometer/gyro values, opaque source token, ingress
+   generation/sequence, and host receipt;
+5. nominal geometry feature semantics and corner order are frozen for a future
+   F0 design only. P1 and L1 neither label nor admit/reject feature
+   correspondences; F0 must freeze visibility, ambiguity, correspondence,
+   rejection, annotation, and uncertainty policies before opening F00;
+6. configuration cannot alter excitation, thrust, rate, duration, safety,
+   watchdog, lease, deadline, cleanup, or attempt bounds; and
+7. review accepts collection readiness only, not calibration readiness.
+
+P1 proves only these schemas, literals, policies, and offline identities. I0
+implements their binding, T0 proves the mechanism with non-live tests, L0
+freezes the exact implementation, and only L1/E0 can prove actual occurrences.
+No future-phase evidence is back-claimed at P1.
+
+The published dimensions condition the discovery protocol but do not prove the
+active rendered geometry. The simulator wire cannot verify metric gate size,
+mesh/LOD, lens model, camera mount, or exposure delay. Every result therefore
+says `conditional_on_nominal_gate_config`, never `verified_build_geometry`.
+
+## Historical inactive R1/R2/R3 PAK route
+
+Everything in this historical subsection through the discovery identities is
+retained for audit only and is superseded by P0/P1 above. It creates no active
+entry gate, and none of its production commands may be invoked in this task.
 
 R1 may implement only `scripts/aigp_vq2_build_reference.py`, its strict schemas,
 and its direct test. It uses only the Python standard library and synthetic PAK
@@ -418,7 +767,9 @@ $env:PYTHONNOUSERSITE = '1'
 $env:PYTHONDONTWRITEBYTECODE = '1'
 & 'C:\Users\John\killallhumans\.venv\Scripts\python.exe' `
   -E -s -B -m scripts.aigp_vq2_powered_calibration_probe `
-  --reference-manifest <private-absolute-reference-json> `
+  --target-config `
+  <live-worktree-absolute-config-json> `
+  --capture-authorization <private-absolute-authorization-json> `
   --session-id F00 `
   --output-root `
   C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot
@@ -438,6 +789,11 @@ The wrapper alone constructs and records the exact child command:
   --recording-approved
 ```
 
+For this wrapper-only child invocation, `--recording-approved` means that the
+wrapper validated and hash-bound the exact task-scoped user/operator capture
+authorization above. It does not assert organizer credentials and cannot be
+used by another stage, session, build/mode, or physical/publication consumer.
+
 Those four internal options are wrapper-only and mandatory for this stage.
 Their values are generated and validated by the wrapper; the capability secret
 travels through the inherited pipe, never as argument text. The runner rejects
@@ -456,9 +812,15 @@ wrapper repeats this audit before simulator launch and before child creation.
 
 It rejects relative, reused, pre-existing, symlink/reparse, cross-root,
 world-writable, dirty-candidate, wrong-commit, wrong-build, wrong-mode,
-unreviewed-reference, or selector-bearing input. Session `F00` is permanently
-assigned to discovery/fit and every duplicate or derived artifact remains in
-that split. It can never become limit, held-out, or repeat evidence.
+unreviewed configuration/authorization, or selector-bearing input. Session
+`F00` is permanently assigned to discovery/fit and every duplicate or derived
+artifact remains in that split. It can never become limit, held-out, or repeat
+evidence.
+
+That split label does not transfer access. After this task's E0 audit, no
+successor may open, replay, annotate, derive from, or fit F00 until a new
+simulation-only data-use authority names the exact admitted artifact hashes and
+permitted purpose. A pre-fit design alone is not access authority.
 
 Content-hash grouping is global across every Package 2 session, not merely
 local to F00. If any decoded frame SHA-256 occurs in runs assigned to different
@@ -474,7 +836,8 @@ run-level rule is applied before any future split is opened.
 Before simulator contact, the wrapper completes its offline identity checks and
 durably creates the new attempt envelope. It then follows this exact order:
 
-1. Prove the exact clean committed candidate and approved reference hash.
+1. Prove the exact clean committed candidate and admitted target-config plus
+   capture-authorization hashes.
 2. Create, without overwrite, a private ACL-restricted session directory and
    durable attempt/invalidation envelope.
 3. Acquire `Global\AIGP-FlightSim-LiveLease-v1` within `5.0 s` and publish its
@@ -501,8 +864,8 @@ durably creates the new attempt envelope. It then follows this exact order:
 6. Prove UDP ports `14550` and `5600` unowned, repeat the build/process proof,
    and only then create the powered child.
 7. Bind QPC frequency, host boot, process starts, graphics/focus context,
-   reference ID, candidate commit, exact commands, and private paths into
-   provenance before the first child packet.
+   target-config and capture-authorization identities, candidate commit, exact
+   commands, and private paths into provenance before the first child packet.
 
 The launcher phase has a `60.0 s` limit, the powered child has an independent
 `60.0 s` creation-to-exit wall limit, fallback cleanup has a `15.0 s` limit,
@@ -525,8 +888,9 @@ prove successful takeover, unavailable/wrong-token refusal, injected parent
 death, and a stalled child operation.
 
 The task permits one live attempt total. A busy/abandoned/inaccessible lease,
-bind conflict, process/build change, stale stream, missing reference, child
-timeout, unexpected outbound category, capture drop/overflow, incomplete
+bind conflict, process/build change, stale stream, missing or changed
+configuration/authorization, child timeout, unexpected outbound category,
+capture drop/overflow, incomplete
 bundle, cleanup uncertainty, powered-child/transport/port residue, or artifact
 mismatch
 permanently invalidates the attempt and ends live work.
@@ -609,7 +973,9 @@ One accepted artifact must include:
 - exact excitation-plan ID/hash and complete segment/tick accounting;
 - raw gyro, accelerometer, race, heartbeat, actuator, collision, generated and
   sent command lineage;
-- reference ID and independently labeled target feature observations;
+- target-config and capture-authorization identities, actual decoded dimensions,
+  and descriptive target visibility/support; feature annotations, correspondence
+  uncertainty, and fit eligibility remain `uncomputed` and unaccepted until F0;
 - descriptive observed rotation-axis diversity, reversals, rate changes,
   angular acceleration, and image-region/scale/tilt support, with rank,
   singular-value, conditioning, identifiability, model, parameter-order,
@@ -624,9 +990,13 @@ One accepted artifact must include:
 
 Direct tests must cover at least:
 
-- strict PAK/reference schemas, hashes, paths, transforms, uniform-scale and
-  visible-feature admission plus the complete label schema, covariance, and
-  independence fields; all incomplete or inferred references fail;
+- strict target-config and simulation-capture-authorization schemas, exact
+  stable-byte hashes, change/replacement behavior, no default or field override,
+  and rejection of incomplete, inferred, PAK-bearing, camera-default-bearing,
+  physical/publication-enabled, or wrong-build/mode/session inputs;
+- actual decoded-dimension observation and within-session stability, raw
+  camera/IMU/race/heartbeat source and host lineage, absence of pose/map truth,
+  and exact config/authorization binding through attempt, capture, and report;
 - the exact 245 tick/index partition, every segment boundary, absolute deadline
   selection, multi-tick skip behavior, duration, rate/yaw/thrust bounds, no
   unsafe override, fixed gate zero, and no crossing path;
@@ -654,7 +1024,7 @@ clean candidates:
 
 ```powershell
 .\scripts\dev.cmd test-target tests/test_aigp_vq2_runner.py
-.\scripts\dev.cmd test-target tests/test_aigp_vq2_build_reference.py
+.\scripts\dev.cmd test-target tests/test_aigp_vq2_calibration_target.py
 .\scripts\dev.cmd test-target tests/test_aigp_vq2_powered_calibration_probe.py
 .\scripts\dev.cmd test-target tests/test_aigp_vq2_powered_calibration_analysis.py
 .\scripts\dev.cmd test-target tests/test_aigp_vq2_powered_cleanup.py
@@ -668,7 +1038,7 @@ promotion worktree, then the exact hash-pinned VQ2 suite from a separate fresh
 worktree. Integrate the unchanged candidate and run post-merge VQ2. No test
 command may launch or contact FlightSim.
 
-## R1 completion evidence
+## Historical inactive R1 completion evidence
 
 R1 is complete on the synthetic-only candidate. The exact reviewed identities
 before this record-only update were:
@@ -694,33 +1064,31 @@ passed. No test or review read a real build asset or contacted FlightSim.
 
 ## Current entry audit and stop
 
-R0 is committed and R1 is complete. R2 pre-derivation clearance remains absent,
-so R3 reference admission is not satisfied.
+P0 records the user's four scope decisions. The cooked-PAK route is inactive
+and no organizer PAK clearance is an active prerequisite. The separately
+authorized-collection disjunct in the parent Package 2 entry gate is satisfied
+only for this one bounded build-3385 Training simulation discovery pilot.
 
-The official build-3385 devkit exposes no camera intrinsic, distortion, mount,
-render/exposure phase, or camera/IMU clock-map oracle. Local saved config has
-display settings but no camera calibration. The PAK index proves candidate
-Anduril mesh/map assets exist, but current evidence does not yet prove the
-render LOD/rim, transform chain, active Training instance, uniform scaling,
-UDP view linkage or annotation systematics required by R3. No R2 record yet
-establishes permission for another real-PAK read or intended competition use.
-The native/runtime FPV camera defaults also remain opaque and are not used.
+The actual runtime boundary supplies UDP JPEG frame/generation identities and
+opaque `sim_time_ns`, decoded image contents and dimensions, `HIGHRES_IMU` raw
+gyro plus opaque `time_usec`, host performance-counter receipts, heartbeat, and
+race status. It supplies no intrinsic, distortion, FOV, camera mount, exposure
+phase, calibrated camera/IMU clock map, pose, odometry, or usable track/gate map.
+Those absent values remain `uncomputed`; 640x360 is an observed historical
+decoded shape and the parent-frozen compatibility requirement. The collector
+must observe it from the actual decoded frame before arm and continuously; it is
+not a wire-header field or intrinsic prior. Any different shape stops for a
+revised config/contract rather than being resized or silently accepted.
 
-The 2026-07-20 [official-rules](https://www.theaigrandprix.com/official-rules/)
-audit did not find an explicit permission for read-only cooked-PAK metadata
-extraction or use of derived constants in the competition. The public
+The public
 [technical specification issue 00.02](https://www.theaigrandprix.com/wp-content/uploads/2026/05/260508_Technical_Spec_0002.pdf)
-describes a public interface that conflicts with verified build-3385 behavior
-and therefore remains a cross-check, not a build-3385 oracle. R2 needs an
-organizer-backed record that answers whether the exact local unencrypted-PAK
-metadata read is permitted, whether its derived geometry/constants may be used
-(and under what publication limits), whether the public camera/gate values
-apply unchanged to build 3385 Training UDP, and whether private decoded
-UDP-frame storage/analysis is allowed.
+publishes the nominal gate dimensions used above, but states a Virtual Qualifier
+1 scope. The configuration therefore treats them as editable, hash-pinned,
+unverified inputs for build 3385 Training. No public camera constants are used.
 
-Therefore execution stops at R2. No new or production-tool real-PAK read occurs
-before its exact private clearance record exists, and the tool cannot
-self-authorize that record. No FlightSim process, port, private capture, reset,
-arm/disarm, target, or powered command occurs until an independently reviewed
-correction records the exact R3 artifact and advances the task to I0. The
-completed static passive timing tranche was not repeated.
+Execution currently stops before P1. The strict config/authorization validator,
+tracked nominal configuration, private stable authorization bytes/hash, direct
+tests, and independent P1 admission review do not yet exist. No FlightSim
+process, port, private capture, reset, arm/disarm, target, or powered command
+occurs before those exact artifacts are admitted and I0/T0/L0 subsequently pass.
+No PAK is read, and the completed passive timing tranche is not repeated.
