@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-maintenance-nonlive-artifact-isolation`
 - Parent: `2026-07-20-vq2-development-continuation-handoff`
-- State: `active`
+- State: `tested`
 - Objective: keep the bounded VQ1 dry-run slow test from writing an ignored
   timestamped telemetry capture into the repository while preserving the
   runner's intentional default recording behavior.
@@ -71,10 +71,11 @@ or simulator authority is required or authorized.
   `C:\Users\John\killallhumans\.venv\Scripts\python.exe` through
   `AIGP_PYTHON` and the canonical `scripts\dev.cmd` surface.
 - Test telemetry: a pytest-managed `tmp_path` outside the worktree, passed
-  explicitly as `record=str(record_path)` and checked as valid nonempty gzip
-  JSONL telemetry.
+  explicitly as `record=str(record_path)` and checked as a nonempty temporary
+  artifact.
 - Canonical launcher bytecode and pytest caches remain process-scoped outside
-  the candidate. Candidate-local caches or bytecode are not permitted.
+  the repository. Promotion candidate-local caches or bytecode are not
+  permitted; the development worktree is not a strict promotion candidate.
 
 ## Frozen behavioral change
 
@@ -114,6 +115,25 @@ Acceptance additionally requires:
   state; and
 - exact trust-delta and pass-count arithmetic.
 
+Observed pre-promotion evidence:
+
+- affected target: `1` passed in `1.28s`;
+- slow compatibility tier: `2` passed, `2,480` deselected in `3.96s`;
+- `test-fast`: `2,420` passed, `20` skipped, `42` deselected in
+  `99.96s`;
+- `test-unit`: `2,420` passed, `20` skipped, `42` deselected in
+  `99.89s`;
+- canonical `test-vq2`: exactly `1,325` passed in `32.83s`; and
+- capture inventories before and after the successful target and complete
+  slow-tier runs remained exactly five files at
+  `d8beecdd3abc1c8b9668b00bceb8435e91f1bad26593ab103f2090a79cdd501d`.
+
+Independent behavioral/API and lifecycle/authority reviews found no scope,
+production-semantics, replay, simulator, live-authority, or test-design
+blocker after task-record corrections. The development worktree contains the
+explained pytest cache produced by these runs and is not eligible as the
+strict promotion candidate; promotion uses new exact worktrees.
+
 ## Frozen trust delta
 
 The VQ2 policy must remain byte-identical with file SHA-256
@@ -125,15 +145,23 @@ canonical JSON SHA-256
 The trusted manifest must remain at 129 sorted, unique, case-safe paths. Only
 the mapping for `tests/test_aigp_vq1_runner.py` may change from
 `af3612764af47f7e645893c90e2f8688a02f74662fa5c7713dc712a42a32ccb8`.
+The tested replacement file SHA-256 is
+`977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07`.
 No path may be added or removed. The new manifest file and canonical JSON
 identities must be recorded after independent `129/129` rehash verification.
 
 ## Lifecycle evidence
 
-- Contract/task-record commit: pending.
+- Contract/task-record commit:
+  `060fd479988cf1214039f1618c7fc4f4d083e44d`.
 - Behavioral commit: pending.
 - Promotion/trust commit: pending.
 - Integration commit: pending.
 - Post-merge verification: pending.
-- Result: active; no failure provenance recorded.
-
+- Result: tested; all required pre-promotion gates passed.
+- Failure provenance: the first affected-target attempt failed while opening
+  the explicit record because its pytest `tmp_path` directory disappeared
+  during the run. The repository capture inventory was unchanged. With no
+  intervening code edit, the identical command passed on immediate rerun with
+  the same unchanged inventory; this is retained as a transient shared-host
+  temporary-directory event, not accepted pass evidence.

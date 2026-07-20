@@ -131,8 +131,9 @@ def test_run_vq1_rejects_invalid_programmatic_duration_before_adapter(
 
 @pytest.mark.slow
 @pytest.mark.timeout(15)
-def test_dry_run_full_flow(monkeypatch):
+def test_dry_run_full_flow(monkeypatch, tmp_path):
     """``run_vq1(dry_run=True)`` exercises a bounded offline flow."""
+    record_path = tmp_path / "dry-run-telemetry.jsonl.gz"
     adapter = FakeAdapter()
     monkeypatch.setattr(vq1_module, "FakeAdapter", lambda: adapter)
     original_wait_for = asyncio.wait_for
@@ -151,6 +152,7 @@ def test_dry_run_full_flow(monkeypatch):
         run_vq1(
             dry_run=True,
             max_speed=4.0,
+            record=str(record_path),
             max_seconds=0.10,
             minimal=True,
         )
@@ -160,6 +162,8 @@ def test_dry_run_full_flow(monkeypatch):
     assert adapter._attitude_send_count > 0
     assert adapter._reset_count >= 2
     assert not adapter.is_connected
+    assert record_path.is_file()
+    assert record_path.stat().st_size > 0
 
 
 # ---------------------------------------------------------------------------
