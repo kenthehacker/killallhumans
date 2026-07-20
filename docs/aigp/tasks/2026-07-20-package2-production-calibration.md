@@ -2,7 +2,8 @@
 
 - Task ID: `vq2-package2-production-calibration`
 - Parent: `2026-07-20-vq2-development-continuation-handoff`
-- State: `committed — stopped at empirical readiness gate; Package 2 not accepted`
+- State:
+  `post_merge_verified — stopped at empirical readiness gate; Package 2 not accepted`
 - Objective: freeze Package 2's algorithm-independent calibration obligations
   and determine whether current authorized inputs can honestly support
   build-3385 pixel-to-camera-FRD, camera-to-body, and camera/IMU timing evidence.
@@ -13,6 +14,9 @@
   `C:\Users\John\aigp-worktrees\wt-package2-production-calibration`.
 - Owner and integration owner: `/root`.
 - Heartbeat date: `2026-07-20`.
+- Contract/readiness freeze:
+  `d52652452de130e8d3990316e156c340dac5e785`.
+- Behavioral and promotion commits: `not applicable`.
 - Simulator access exercised: `none`.
 - Maximum future access under this freeze: `none`; passive collection requires
   an exact reviewed successor contract and current authority reconciliation.
@@ -372,3 +376,28 @@ No new simulator probe or behavioral module is authorized by this finding.
 Resumption requires either an approved build-3385
 oracle/non-flight reference protocol satisfying every readiness item or fresh
 explicit authorization for a separately frozen powered calibration stage.
+
+## Review and integration record
+
+Independent calibration/identifiability review cleared the active FRD/optical
+and SO(3) conventions, joint nuisance treatment, split isolation, pre-fit rank
+rule, empirical-limit sequencing, and the conclusion that current intrinsics,
+extrinsics, and temporal alignment are unidentifiable. Independent timing
+review cleared the relative source-clock estimand, oracle-only absolute host
+map, phase-gauge prohibition, arrival-boundary semantics, uncertainty split,
+and discontinuity invalidation. Independent lifecycle/provenance/authority
+review cleared only this documentation/readiness boundary and explicitly did
+not clear capture, simulator access, or behavioral implementation.
+
+The exact staged delta was one new `374`-line task record. `git diff --check`
+was clean, UTF-8 validation succeeded, and no line exceeded 88 characters.
+Behavioral, canonical, broad, promotion, hash-pinned, and post-merge test gates
+are `not applicable` under the frozen documentation-only scope. No executable,
+policy, trusted-manifest, private artifact, dependency, or generated inventory
+changed.
+
+Integration owner `/root` committed the reviewed freeze at `d526524` and
+fast-forwarded tracked-clean local `main` from `094dd6f` to that exact commit.
+Post-merge tracked status was empty. No FlightSim process was launched or
+contacted; no network/port, private capture, replay, reset, arm/disarm, target,
+transport, shadow, or powered action occurred.

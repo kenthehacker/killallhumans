@@ -65,6 +65,11 @@ inform a design, but it cannot replace empirical build-specific evidence.
   `docs/aigp/tasks/2026-07-20-package3b-m1-passive-timing.md`.
 - Exact distributions, artifact identities, and remaining unmeasured claims:
   `docs/aigp/vq2_runtime_timing.md`.
+- Package 2 calibration/readiness contract:
+  `d52652452de130e8d3990316e156c340dac5e785`.
+- `d526524` is documentation-only evidence that the current passive/static
+  inputs fail Package 2 intrinsic, extrinsic, and temporal-alignment readiness;
+  Package 2 is not accepted.
 - `ef92041` is the bounded non-live telemetry-artifact isolation and trust
   integration.
 - Continuation-handoff introduction:
@@ -98,8 +103,10 @@ M0 and Wave 1A are complete. Waves 1 through 3E are integrated and
 post-merge verified offline, the bounded promotion-hygiene maintenance is
 complete, and the passive capture-ingress tranche has accepted 2026-07-20
 FlightSim evidence. M1, M2, and M4 runtime acceptance remain incomplete. The
-new evidence is capture-loaded and passive only; the authoritative 2026-07-18
-handoff still governs live flight state and every powered safety rule.
+new receiver evidence is capture-loaded and passive only. The later Package 2
+readiness freeze adds no simulator or behavioral evidence. The authoritative
+2026-07-18 handoff still governs live flight state and every powered safety
+rule.
 
 The system is not race-ready. Gate 0 has one credited collision-free pass and
 Gate 1 has three-frame post-credit reacquisition evidence, but no control
@@ -218,12 +225,13 @@ imports. Preserve it, but there is no operational T0-T4 run to resume.
 
 ## Repository, worktrees, and physical hygiene
 
-Immediately before the closeout documentation edits, Git tracked status on
-`main` was empty. Twenty-four non-main worktrees remain registered: fifteen
-pre-maintenance historical worktrees, four maintenance worktrees, and five
-passive-timing tranche worktrees. Their commits are ancestors of `main`; they
-are inactive historical or promotion evidence, not current leases or candidate
-bases. Do not resume or remove them automatically. Inspect with:
+Immediately before the Package 2 closeout documentation edits, Git tracked
+status on `main` was empty. Twenty-five non-main worktrees remain registered:
+fifteen pre-maintenance historical worktrees, four maintenance worktrees, five
+passive-timing tranche worktrees, and the Package 2 readiness worktree. Their
+commits are ancestors of `main`; they are inactive historical, readiness, or
+promotion evidence, not current leases or candidate bases. Do not resume or
+remove them automatically. Inspect with:
 
 ```powershell
 git worktree list --porcelain
@@ -233,8 +241,9 @@ git status --short --branch
 The completed maintenance added one development, one full-suite, one isolated
 VQ2, and one documentation-closeout worktree. The passive tranche added one
 development worktree plus the `candidate`, `candidate2`, `final`, and
-`promotion-final` evidence worktrees. All nine are inactive evidence after
-this closeout, not reusable candidate bases; do not remove them automatically.
+`promotion-final` evidence worktrees. Package 2 added one documentation-only
+readiness worktree. All ten are inactive evidence after this closeout, not
+reusable candidate bases; do not remove them automatically.
 
 Git-clean is not promotion-pristine. Current `main` has six ignored
 source-adjacent `.pyc` files under `__pycache__/`, `aigp_loop/__pycache__/`,
@@ -394,6 +403,24 @@ FlightSim stage also requires fresh explicit powered authorization. Absent one
 of those remaining prerequisites, do not reinterpret the passive tranche,
 canonical tests, or Wave 3D/E synthetic evidence as calibration, operational
 replay, completed runtime, or powered evidence.
+
+The current continuation selected Package 2 because its entry gate permits
+separately authorized collection, then froze and independently reviewed the
+algorithm-independent readiness contract at `d526524`. No calibration
+implementation or new collection followed. Accepted passive sessions 02
+through 04 contain `182`/`181`/`181` frames but only `6`/`5`/`5` unique decoded
+hashes, one exact target box `(282, 134, 80, 80)`, and `2,110` exact-zero gyro
+vectors. They contain no independent known-geometry label. They therefore
+provide no across-image intrinsic support, hand-eye rotation, or temporal-
+offset excitation and cannot be upgraded into Package 2 calibration.
+
+Package 2 remains incomplete. Do not repeat the static passive collection or
+implement a detached fitter against it. Resume Package 2 only after an approved
+build-3385 render/mount/time oracle or non-flight reference protocol satisfies
+the frozen readiness conditions, or after the user freshly authorizes a
+separately frozen powered calibration stage. The previous collection authority
+does not transfer through this handoff into new simulator contact or private
+capture creation.
 
 ## Consequential development roadmap
 
