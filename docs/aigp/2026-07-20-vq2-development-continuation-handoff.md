@@ -7,9 +7,10 @@ production wiring, transport selection, or powered flight.
 The strongest current conclusion is deliberately narrow: the existing offline
 stack is integrated and green, but no new high-value VQ2 behavior tranche is
 unblocked without real calibration, approved replay, or separately authorized
-simulator evidence. One bounded test-artifact hygiene task is immediately
-available and is described below. Do not create another detached proof-only
-state-estimation wave merely to keep coding.
+simulator evidence. The one bounded test-artifact hygiene task is integrated
+and post-merge verified at `ef92041bb3f05b1d8f3ef69182db8d51184c9cce`.
+Do not repeat it or create another detached proof-only state-estimation wave
+merely to keep coding.
 
 ## Precedence and required reading
 
@@ -39,8 +40,10 @@ inform a design, but it cannot replace empirical build-specific evidence.
    `origin/main` or an old feature worktree.
 3. Inventory which concrete entry gate below is actually satisfied.
 4. If no new data, calibration, replay infrastructure, or simulator authority
-   exists, take only the bounded telemetry-artifact isolation task.
-5. Otherwise freeze one package contract in a fresh worktree, record its
+   exists, report the exact missing prerequisite and stop behavioral
+   development. The bounded telemetry-artifact isolation task is complete.
+5. If an entry gate is satisfied, freeze one package contract in a fresh
+   worktree, record its
    access level and non-goals, obtain the required reviews, and implement only
    that package.
 6. Stop when its exit boundary is reached. Do not silently continue into a
@@ -49,8 +52,12 @@ inform a design, but it cannot replace empirical build-specific evidence.
 ## Current integrated baseline
 
 - Target: FlightSim build 3385 in Training mode.
-- Current Git-clean `main` at handoff drafting:
-  `e71d284750376005645686b515a14c1ccd8a56d3`.
+- Current reviewed implementation baseline before this documentation closeout:
+  `ef92041bb3f05b1d8f3ef69182db8d51184c9cce`.
+- `ef92041` is the bounded non-live telemetry-artifact isolation and trust
+  integration.
+- Continuation-handoff introduction:
+  `8472869264e70d0a3c06890423fc80b7af94ff59`.
 - `e71d284` is the documentation-only Wave 3E closeout.
 - Wave 3E code and trust integration:
   `16dd5c84995cafb5158e277d730e670557ba69f2`.
@@ -77,9 +84,9 @@ Earlier integrated milestones remain recorded in the execution-plan handoff:
 - Wave 3D stable reference: `46df0adee76070e10509fa5e807b986a9469c68e`.
 
 M0 and Wave 1A are complete. Waves 1 through 3E are integrated and
-post-merge verified offline. M1, M2, and M4 runtime acceptance remain
-incomplete. No FlightSim evidence newer than the authoritative 2026-07-18 live
-record is claimed.
+post-merge verified offline, and the bounded promotion-hygiene maintenance is
+complete. M1, M2, and M4 runtime acceptance remain incomplete. No FlightSim
+evidence newer than the authoritative 2026-07-18 live record is claimed.
 
 The system is not race-ready. Gate 0 has one credited collision-free pass and
 Gate 1 has three-frame post-credit reacquisition evidence, but no control
@@ -130,9 +137,10 @@ transport without the later reviewed contracts below.
 
 ## Verification and trust baseline
 
-The hash-pinned trusted code state is Wave 3E integration commit `16dd5c8`;
-current `main` adds only the four Wave 3E closeout documents. Accepted evidence
-is:
+The hash-pinned trusted code state is maintenance integration commit
+`ef92041`. Relative to reviewed task base `8472869`, it changes only the
+bounded slow test, its trusted-manifest mapping, and task documentation;
+production code and the VQ2 policy are byte-identical. Accepted evidence is:
 
 | Evidence | Observed result |
 |---|---|
@@ -142,9 +150,14 @@ is:
 | Final cache-clean isolated hash-pinned VQ2 | `1,325` passed in `33.50s` |
 | Post-merge VQ2 at `16dd5c8` | `1,325` passed in `33.72s` |
 | Post-closeout VQ2 at `e71d284` | `1,325` passed in `33.51s` |
+| Maintenance affected target | `1` passed in `1.28s` |
+| Maintenance slow tier | `2` passed, `2,480` deselected in `3.96s` |
 | `test-fast` | `2,420` passed, `20` skipped, `42` deselected |
 | `test-unit` | `2,420` passed, `20` skipped, `42` deselected |
-| Promotion-boundary `test-full-non-live` | `2,461` passed, `21` skipped in `487.69s` |
+| Maintenance candidate VQ2 | `1,325` passed in `32.83s` |
+| Maintenance promotion `test-full-non-live` | `2,461` passed, `21` skipped in `483.73s` |
+| Maintenance isolated hash-pinned VQ2 | `1,325` passed in `34.70s` |
+| Maintenance post-merge VQ2 | `1,325` passed in `34.46s` |
 
 The independent numerical matrix covered `2,000` admitted homographies,
 one-ULP boundaries, dense covariance scales from `1e-250` through `1e6`, and
@@ -157,16 +170,18 @@ Current trust identities are:
 |---|---|
 | Policy file SHA-256 | `7daa46ec4dfd025c18f12076add06d70b6463f07d6320b20487a63bd78d0851e` |
 | Policy canonical JSON SHA-256 | `b8bc5228b12eafc75c10b3d2aa658cfe57a0d1ed820b3fefa6e0317d7c5cdc90` |
-| Trusted manifest file SHA-256 | `e88363ef096bba83fe4660a4903abb6ae063f41682246b38ba9c69481008fffc` |
-| Trusted manifest canonical JSON SHA-256 | `46e77cbbe8a131517444b141293b1fe8c2bab546a6f5630f711ffe0d621d5ea2` |
+| Trusted manifest file SHA-256 | `3855243e7b3675ebff14731bbd073b7850bb87fb9d9d35267b7ca0fa2982d08f` |
+| Trusted manifest canonical JSON SHA-256 | `ac2700e5cfed1c9aece92446d7aef665ddfff923d790e62628c35cbbbf4978a2` |
 | Wave 3E test SHA-256 | `683aa081103e6e9ae22281b1e1f573bc821218f57df75cdfa688587b0ad84382` |
+| VQ1 runner test SHA-256 | `977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07` |
 
 The policy contains `31` sorted, unique test files plus `2` discovery inputs
 and expects `1,325` passes. The trusted manifest contains `129` sorted, unique
 paths; independent review matched all `129/129` regular on-disk files. Its
-Wave 3D-to-3E delta was one added test, only the policy digest changed, and no
-removal. Canonical JSON identities are SHA-256 over parsed JSON serialized
-with sorted keys and compact separators.
+maintenance delta from Wave 3E is exactly the one changed
+`tests/test_aigp_vq1_runner.py` digest, with no path addition/removal and no
+policy change. Canonical JSON identities are SHA-256 over parsed JSON
+serialized with sorted keys and compact separators.
 
 The `1,325`-test result is not operational T1 replay. The checked-in promotion
 command and ladder identity files are examples with placeholders or zero
@@ -188,6 +203,10 @@ git worktree list --porcelain
 git status --short --branch
 ```
 
+The completed maintenance added one development, one full-suite, one isolated
+VQ2, and one documentation-closeout worktree. They are inactive evidence after
+this closeout, not reusable candidate bases; do not remove them automatically.
+
 Git-clean is not promotion-pristine. Current `main` has six ignored
 source-adjacent `.pyc` files under `__pycache__/`, `aigp_loop/__pycache__/`,
 and `scripts/__pycache__/`. Do not delete unexplained ignored state merely to
@@ -195,16 +214,25 @@ make a report clean, and do not use `main` as a strict promotion candidate.
 Create a fresh exact worktree for every new task and another fresh exact
 candidate for the final hash-pinned promotion run.
 
+At maintenance entry, the main worktree also contained 40 ignored capture
+files alongside five tracked historical captures. They were preserved as
+task-external state and were not used as evidence. Post-merge verification
+proved the complete 45-file inventory byte-identical at aggregate SHA-256
+`e3ece19f6b58b235d8c78b8041c287939efd0f6c29bb0072935271336aed747e`.
+The digest uses newline-joined UTF-8 `relative-path|size|sha256` rows in
+ordinal relative-path order, with no trailing newline.
+Do not delete, relabel, or infer provenance for those files automatically.
+
 Use the current deliberately reviewed local `main` containing this handoff as
-the base. `e71d284` is the last implementation closeout reference, not a reason
-to discard a later documentation-only handoff commit. A typical new task starts
-as follows, after selecting unique names and confirming they do not already
-exist:
+the base. `ef92041` is the latest implementation/trust integration reference,
+not a reason to discard this later documentation-only closeout commit. A
+future task starts as follows only after one entry gate is actually satisfied,
+using unique names confirmed not to exist:
 
 ```powershell
 $vq2TaskBase = (git rev-parse main).Trim()
-$vq2TaskBranch = 'maintenance-nonlive-artifact-isolation'
-$vq2TaskWorktree = 'C:\Users\John\aigp-worktrees\wt-nonlive-artifact-isolation'
+$vq2TaskBranch = 'replace-with-unique-authorized-task'
+$vq2TaskWorktree = 'C:\Users\John\aigp-worktrees\wt-unique-authorized-task'
 git worktree add -b $vq2TaskBranch $vq2TaskWorktree $vq2TaskBase
 git -C $vq2TaskWorktree status --short --branch
 ```
@@ -290,59 +318,43 @@ Do not append to `benchmark_history.jsonl`. Never run
 `python -m pytest -m live`, `preflight`, a simulator launcher, or any powered
 stage as a side effect of ordinary development testing.
 
-## Immediate bounded maintenance task
+## Completed bounded maintenance task
 
-This is the only verified, useful implementation task that can start without
-new VQ2 data or authority. It improves promotion hygiene but does not advance
-M1, M2, or M4.
+The slow dry-run telemetry isolation is integrated and post-merge verified at
+`ef92041bb3f05b1d8f3ef69182db8d51184c9cce`; its exact lifecycle and failure
+provenance are recorded in
+`docs/aigp/tasks/2026-07-20-maintenance-nonlive-artifact-isolation.md`. Do not
+repeat this task.
 
-### Isolate the slow dry-run telemetry artifact
+The accepted test-only change passes an explicit pytest `tmp_path` record to
+`run_vq1(dry_run=True, ...)` and checks the nonempty temporary artifact. The
+runner's intentional default recording behavior is byte-unchanged. The target,
+slow, fast, unit, canonical VQ2, full non-live, isolated hash-pinned VQ2, and
+post-merge VQ2 gates all passed with the counts recorded above.
 
-Root cause:
+The promotion full suite left the fresh candidate's five tracked captures
+byte-identical and produced only an inventoried `.pytest_cache`. A separate
+fresh exact candidate retained an identical physical inventory across the
+hash-pinned VQ2 run. The manifest remains 129 entries and changes only the VQ1
+runner-test digest; the VQ2 policy remains byte-identical at 1,325 expected
+passes.
 
-- `tests/test_aigp_vq1_runner.py::test_dry_run_full_flow` calls
-  `run_vq1(dry_run=True, ...)` without a `record` path;
-- `scripts/aigp_vq1_run.py` intentionally writes a timestamped
-  `captures/telemetry_*.jsonl.gz` whenever telemetry exists and `record` is
-  absent; and
-- each of the three Wave 3E `test-full-non-live` attempts therefore left one
-  small ignored synthetic capture in the candidate. Those files were inspected
-  as deterministic zero-state test output and removed; no tracked historical
-  capture was changed.
+This maintenance improves promotion hygiene only. It advances neither M1, M2,
+nor M4 and unlocks no replay, calibration, producer, estimator, runtime,
+transport, simulator, or powered stage. If no consequential package entry gate
+below is now satisfied, stop behavioral development and report the missing
+prerequisite honestly.
 
-Preferred bounded fix:
+## Current resume decision
 
-1. Create a fresh maintenance task/worktree and task record.
-2. Change only the slow test to accept `tmp_path`, pass an explicit temporary
-   `record` path, and assert the expected temporary output if useful.
-3. Do not change the runner's intentional default recording behavior in this
-   maintenance task.
-4. Before and after the test, inventory the repository `captures` directory and
-   prove that the test creates no new repository-local capture.
-5. Run:
-
-   ```powershell
-   .\scripts\dev.cmd test-target `
-     tests/test_aigp_vq1_runner.py::test_dry_run_full_flow
-   .\scripts\dev.cmd test-slow
-   .\scripts\dev.cmd test-fast
-   .\scripts\dev.cmd test-unit
-   .\scripts\dev.cmd test-vq2
-   ```
-
-6. At promotion, run `test-full-non-live` once with a sufficient outer timeout
-   and prove it leaves no new repository-local telemetry capture.
-7. `tests/test_aigp_vq1_runner.py` is already a trusted-manifest entry but is
-   not a canonical VQ2 policy test. The expected promotion delta is therefore:
-   manifest entry count remains `129`; within its mapping, only that test digest
-   changes; the VQ2 policy and expected `1,325` count remain byte-identical; and
-   no path is added or removed. The current stored test digest is
-   `af3612764af47f7e645893c90e2f8688a02f74662fa5c7713dc712a42a32ccb8`.
-   Updating that mapping necessarily changes the manifest file and canonical
-   JSON identities; record both new identities explicitly.
-
-Stop and reassess if the fix requires changing production recording semantics,
-test counts, policy discovery, historical captures, or any live surface.
+No approved replay corpus, final processor, calibrated policy, or pinned OS
+isolation boundary was supplied. No build-3385 calibration/timing dossier or
+producer evidence was supplied. No new simulator authority or exclusive lease
+was supplied. Therefore no consequential roadmap entry gate is currently
+satisfied. Human/operator provision of one of those prerequisites is the next
+step; absent it, create no new implementation worktree and stop. Do not
+reinterpret this maintenance, canonical tests, or Wave 3D/E synthetic evidence
+as replay, calibration, runtime, simulator, or powered evidence.
 
 ## Consequential development roadmap
 
@@ -693,5 +705,5 @@ Stop rather than manufacture progress when:
 
 Quarantine and inventory unexplained state. Never erase it with `reset --hard`,
 checkout discard, bulk cleanup, or automatic worktree deletion. If no entry
-gate is satisfied after the bounded artifact-hygiene task, report the exact
-missing prerequisite and stop behavioral development honestly.
+gate is satisfied, report the exact missing prerequisite and stop behavioral
+development honestly; the completed maintenance is not fallback work.

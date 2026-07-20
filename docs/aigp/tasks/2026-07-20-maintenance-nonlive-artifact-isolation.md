@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-maintenance-nonlive-artifact-isolation`
 - Parent: `2026-07-20-vq2-development-continuation-handoff`
-- State: `committed`
+- State: `post_merge_verified`
 - Objective: keep the bounded VQ1 dry-run slow test from writing an ignored
   timestamped telemetry capture into the repository while preserving the
   runner's intentional default recording behavior.
@@ -32,7 +32,7 @@
   documented bytecode. They are unexplained task-external state and will not
   be modified, deleted, copied into the candidate, or treated as evidence.
 - The fresh task worktree's initial `captures/` inventory contained exactly
-  the five tracked historical telemetry files. Its canonical sorted
+  the five tracked historical telemetry files. Its canonical ordinal-sorted
   `relative-path|size|sha256` inventory SHA-256 was
   `d8beecdd3abc1c8b9668b00bceb8435e91f1bad26593ab103f2090a79cdd501d`.
 
@@ -73,9 +73,12 @@ or simulator authority is required or authorized.
 - Test telemetry: a pytest-managed `tmp_path` outside the worktree, passed
   explicitly as `record=str(record_path)` and checked as a nonempty temporary
   artifact.
-- Canonical launcher bytecode and pytest caches remain process-scoped outside
-  the repository. Promotion candidate-local caches or bytecode are not
-  permitted; the development worktree is not a strict promotion candidate.
+- Canonical launcher bytecode remains process-scoped outside the repository.
+  Pytest may create an explained `.pytest_cache` in development or full-suite
+  worktrees. Candidate-local caches or bytecode are forbidden at the pre-run
+  exactness audit. An audited post-run cache disqualifies that physical tree
+  from reuse; the separate strict candidate must remain cache-free before and
+  after its run.
 
 ## Frozen behavioral change
 
@@ -163,16 +166,59 @@ with no addition or removal. The tracked manifest identities are:
 These identities freeze the candidate trust metadata but do not replace the
 fresh full non-live and isolated hash-pinned promotion runs.
 
+## Promotion and integration evidence
+
+The complete immutable promotion candidate is
+`ef92041bb3f05b1d8f3ef69182db8d51184c9cce`. A fresh detached worktree at
+that exact commit passed the promotion-boundary `test-full-non-live` tier with
+`2,461` passes and `21` skips in `483.73s`. Its `captures/` inventory remained
+exactly the five tracked files at
+`d8beecdd3abc1c8b9668b00bceb8435e91f1bad26593ab103f2090a79cdd501d`.
+The only candidate-worktree physical side effect was an eight-entry
+`.pytest_cache` tree; every path and file digest was inventoried, tracked
+status remained empty, and that worktree was not reused as the strict
+candidate.
+
+A separate fresh detached worktree at the same unchanged commit passed the
+pristine lexical/physical audit, contained `807` non-`.git` physical entries,
+and passed the isolated hash-pinned VQ2 suite with exactly `1,325` tests in
+`34.70s`. Its physical inventory remained exactly `807` entries before and
+after, with empty tracked and ignored status.
+
+Local `main` remained at the declared starting commit and tracked-clean until
+the exact candidate fast-forward. It then advanced directly from `8472869` to
+`ef92041`. Post-merge canonical `test-vq2` passed exactly `1,325` tests in
+`34.46s`; tracked status was empty. The main worktree's pre-existing 45-file
+capture inventory remained byte-identical at aggregate SHA-256
+`e3ece19f6b58b235d8c78b8041c287939efd0f6c29bb0072935271336aed747e`.
+That identity is SHA-256 over newline-joined UTF-8
+`relative-path|size|sha256` rows in ordinal relative-path order, with no
+trailing newline.
+
+No FlightSim process was launched or contacted, and no preflight, external
+network, replay corpus, private/full-frame/live/repository-local capture,
+reset, arm/disarm, target, transport, shadow/runtime, or powered action
+contributed to this task. The temporary synthetic pytest artifact is the only
+new telemetry file created by the accepted test.
+
 ## Lifecycle evidence
 
 - Contract/task-record commit:
   `060fd479988cf1214039f1618c7fc4f4d083e44d`.
 - Behavioral commit: `5a9fa4ae231fec4ede4476157b72b090249a59a9`.
-- Promotion/trust commit: pending.
-- Integration commit: pending.
-- Post-merge verification: pending.
-- Result: committed; all required pre-promotion gates passed and the bounded
-  behavior is frozen for trust promotion.
+- Behavioral-acceptance record:
+  `1fb409706893c8d00c8d2d1ed516569c97692574`.
+- Promotion/trust commit:
+  `ef92041bb3f05b1d8f3ef69182db8d51184c9cce`.
+- Integration commit:
+  `ef92041bb3f05b1d8f3ef69182db8d51184c9cce` (exact fast-forward).
+- Post-merge verification: exactly `1,325` VQ2 tests passed in `34.46s` with
+  empty tracked main status and no capture-inventory change.
+- Result: `post_merge_verified`; the bounded maintenance stop condition is
+  reached. Default runner recording, production code, VQ2 policy/count, trust
+  path inventory, and historical captures remain unchanged. The task improves
+  promotion hygiene only and advances neither M1, M2, nor M4. No further
+  implementation task is authorized by this record.
 - Failure provenance: the first affected-target attempt failed while opening
   the explicit record because its pytest `tmp_path` directory disappeared
   during the run. The repository capture inventory was unchanged. With no

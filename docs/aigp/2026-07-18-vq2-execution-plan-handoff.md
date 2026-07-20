@@ -15,6 +15,9 @@
 **Integrated Wave 3C correlated coast:** 168220ba7060d07743335d0e9c56bcd2d05d669d
 **Integrated Wave 3D stable-reference prototype:** 46df0adee76070e10509fa5e807b986a9469c68e
 **Integrated Wave 3E local-differential reducer:** 16dd5c84995cafb5158e277d730e670557ba69f2
+**Integrated non-live artifact-isolation maintenance:** ef92041bb3f05b1d8f3ef69182db8d51184c9cce
+**Maintenance behavior:** 5a9fa4ae231fec4ede4476157b72b090249a59a9
+**Maintenance task record:** docs/aigp/tasks/2026-07-20-maintenance-nonlive-artifact-isolation.md
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
 **Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
 foundations, Wave 2 controller/system-ID/guidance tranche, Wave 3 control-plane
@@ -22,10 +25,11 @@ dogfood, Wave 3 local IMU provenance/rotation-only tranche, Wave 3B generated
 scheduler composition, Wave 3C proof-bound one-tick coast, and Wave 3D
 standalone stable-reference local-feature transform, and Wave 3E standalone
 rectified-homography local-differential reducer are integrated on main and
-post-merge verified. M1/M2/M4 runtime acceptance remains incomplete; the next
-high-value state-estimation work is blocked on real calibration, a reviewed
-dense homography-covariance producer, and approved replay evidence. No new
-FlightSim evidence was collected.
+post-merge verified. The bounded test-artifact promotion hygiene is also
+integrated and post-merge verified without advancing M1, M2, or M4. Runtime
+acceptance remains incomplete; the next high-value state-estimation work is
+blocked on real calibration, a reviewed dense homography-covariance producer,
+and approved replay evidence. No new FlightSim evidence was collected.
 
 ## Purpose
 
@@ -562,6 +566,28 @@ FlightSim process was launched or contacted, and no preflight, external
 network, replay, reset, arm/disarm, target, transport, shadow/runtime, or
 powered action occurred. All prior live evidence and safety limits remain
 unchanged.
+
+## Non-live telemetry-artifact isolation maintenance record
+
+Behavior `5a9fa4ae231fec4ede4476157b72b090249a59a9` and trust integration
+`ef92041bb3f05b1d8f3ef69182db8d51184c9cce` redirect only the bounded VQ1
+dry-run slow test's telemetry output to pytest `tmp_path`. The production
+runner and its intentional default recording behavior are unchanged. This is
+promotion hygiene only and advances no VQ2 milestone.
+
+The 129-file trusted manifest changed exactly the existing VQ1 runner-test
+mapping to
+`977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07`,
+with no path addition/removal. Its current file and canonical JSON identities
+are `3855243e7b3675ebff14731bbd073b7850bb87fb9d9d35267b7ca0fa2982d08f`
+and `ac2700e5cfed1c9aece92446d7aef665ddfff923d790e62628c35cbbbf4978a2`.
+The VQ2 policy remains byte-identical at exactly `1,325` expected passes.
+
+The promotion full suite passed `2,461` tests with `21` skips while leaving
+the repository capture inventory unchanged. A separate pristine candidate and
+the post-merge main run each passed exactly `1,325` VQ2 tests. No simulator,
+preflight, external network, replay, reset, arm/disarm, target, transport,
+shadow/runtime, or powered action occurred.
 
 ## Completed foundation bootstrap
 
@@ -1217,10 +1243,11 @@ Still requiring controlled evidence:
 The recorded M0, Wave 1A, Wave 1, Wave 2, Wave 3 control-plane dogfood, Wave 3
 IMU, Wave 3B generated runtime, Wave 3C correlated-coast, and Wave 3D
 stable-reference and Wave 3E local-measurement integration commits, clean-main
-checks, trusted-manifest verification, and explicit canonical test tiers are
-complete.
-Do not repeat them merely because an agent resumes the plan; rerun affected
-gates whenever the base or trust set changes.
+checks, bounded telemetry-artifact isolation maintenance, trusted-manifest
+verification, and explicit canonical test tiers are complete. The maintenance
+is not a resume point and advances no milestone. Do not repeat completed work
+merely because an agent resumes the plan; rerun affected gates whenever the
+base or trust set changes.
 
 1. The reviewed local timestamp/source seam for attitude and the Gate 0 pitch
    basis plus bounded rotation-only derotation evidence is integrated at
@@ -1254,10 +1281,11 @@ gates whenever the base or trust set changes.
    only after the three real T1 prerequisites exist; this operational dogfood
    remains outstanding and does not broaden tier claims.
 7. Provision the private golden replay corpus and administrator-owned isolation
-   wrapper before enabling production T1. This may proceed independently when a
-   slot and the required authorization are available; it does not block the
-   remaining synthetic/offline work.
-8. Continue only authorized passive probes while offline work proceeds.
+   wrapper before enabling production T1. Until the required authorization and
+   inputs exist, Package 1 remains blocked; do not substitute more detached
+   synthetic scaffolding.
+8. No passive simulator probe is authorized by this closeout. Run one only
+   after separate user authorization and exclusive lease coordination.
 9. Integrate finished branches frequently, but only after each branch is committed
    and promoted. Quarantine a dirty failed worktree without touching clean main.
 10. Keep the first live change a separately reviewed, explicitly authorized,
