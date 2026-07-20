@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3e-local-differential-measurement`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `contract_frozen`
+- State: `behavior_verified`
 - Objective: add a standalone, immutable reducer from one externally produced,
   rectified, center-gauge-fixed full homography and dense conditional
   covariance to a three-component measurement that shares Wave 3D's local
@@ -15,6 +15,9 @@
 - Owner: `/root`.
 - Heartbeat date: `2026-07-19`.
 - Simulator access: `none`.
+- Contract freeze: `c7dcb612318eb9d26868fa1364c1a027d2b8edcd`.
+- Review-driven contract correction:
+  `aab44d48a032444faeaf5cd1020e90dc9dbd24ed`.
 
 ## Owned files
 
@@ -577,3 +580,36 @@ the new test path to the exact policy/trusted manifest, verify every digest,
 and retain the no-wiring boundary. No simulator, preflight, external network,
 replay, reset, arm/disarm, target, transport, shadow/runtime, or powered action
 is permitted for this task.
+
+## Behavioral evidence
+
+The pure reducer and its dedicated direct suite are implemented in the two
+owned estimation files with no production call site. Accepted candidate
+evidence before promotion is:
+
+- `224` direct tests;
+- `450` focused compatibility tests across the reducer, stable-reference,
+  derotation, relative estimator, detector, and frozen contracts;
+- exactly `1,325` canonical VQ2 tests;
+- `test-fast`: `2,420` passed, `20` skipped, `42` deselected;
+- `test-unit`: `2,420` passed, `20` skipped, `42` deselected; and
+- three independent final reviews clearing lifecycle/provenance/no-wiring,
+  API/test coverage, and mathematics/numerics.
+
+The mathematical re-review independently exercised `2,000` admitted random
+homographies, `11` exact one-ULP boundaries, `260` raw/canonical covariance
+cases from `1e-250` through `1e6`, and tolerated/material negative modes. The
+largest reported value, scaled finite-difference Jacobian, finite-difference
+covariance, and `det(H)-det(L)` errors were respectively `4.44e-16`,
+`2.11e-10`, `5.88e-10`, and `4.44e-16`.
+
+Review found and closed two evidence-integrity bugs before behavioral freeze:
+raw covariance is now retained and fingerprinted until the active model
+admits a separate canonical symmetric view, and exact stored float types plus
+bit-exact same-process rederivation now reject one-ULP or equal-valued
+float-to-int low-level mutation.
+
+No detector producer, `/1` conversion, corner covariance, rate/state object,
+Wave 3D call, estimator/runtime/controller/supervisor/transport wiring,
+simulator, preflight, external network, replay, reset, arm/disarm, target,
+shadow/runtime, or powered action contributed to this evidence.

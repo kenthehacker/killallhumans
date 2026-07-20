@@ -263,3 +263,21 @@ against approved recorded replay. A later filter design must address
 cross-frame association, rate/state construction, shared nuisance
 cross-covariance, estimator integration, and runtime/authority review. Powered
 work remains separately authorized under the authoritative VQ2 handoff.
+
+## Current offline implementation evidence
+
+The standalone reducer is behavior-verified with `224` direct tests, `450`
+focused compatibility tests, `1,325` canonical VQ2 tests, and `2,420` fast/unit
+passes with `20` skips and `42` deselections in each broad tier. Independent
+math, lifecycle, and API/test reviews are clear.
+
+The independent numerical matrix covered `2,000` admitted randomized
+homographies and covariance scales from `1e-250` through `1e6`. Review-driven
+tests freeze raw-versus-canonical covariance identity, strict active-model
+tolerance, bit-exact evidence rederivation, exact stored numeric types,
+inclusive cutovers, fingerprints, projective geometry, analytic Jacobian, and
+dense covariance behavior.
+
+This remains T0 proof-only evidence. It adds no full-homography producer,
+calibration artifact, replay result, estimator input, runtime selection, or
+authority claim.
