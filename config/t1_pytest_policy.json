@@ -1,6 +1,6 @@
 {
   "schema": "aigp-t1-pytest-policy/1",
-  "expected_passed": 910,
+  "expected_passed": 1019,
   "pytest_version": "9.1.1",
   "pytest_timeout_version": "2.4.0",
   "test_files": [
