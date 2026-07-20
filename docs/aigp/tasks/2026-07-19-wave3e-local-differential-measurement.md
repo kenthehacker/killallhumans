@@ -215,6 +215,7 @@ class VQ2RectifiedHomographyMeasurementEvidence:
     local_differential: Matrix2
     local_area_jacobian_determinant: float
     measurement_jacobian: Matrix3x8
+    canonical_homography_covariance: Matrix8
     conditional_covariance: Matrix3
     minimum_canonical_forward: float
     homography_condition: float
@@ -249,14 +250,16 @@ HARD_MAX_ABS_LOCAL_LOG_SCALE = 20.0
 HARD_MAX_INPUT_VARIANCE = 1e6
 HARD_MAX_OUTPUT_VARIANCE = 1e6
 HARD_MAX_COVARIANCE_PSD_TOLERANCE = 1e-10
-DERIVED_ABS_TOLERANCE = 1e-12
 ```
 
 `max_measurement_uncertainty_ns` is an exact positive integer no greater than
 its hard maximum. Every `minimum_*` model value is finite, positive, and no
 smaller than its corresponding hard minimum; increasing it only tightens
-admission. Every `max_*` numeric value is finite, positive, and no greater than
-its corresponding hard maximum; decreasing it only tightens admission.
+admission. The two condition-number caps are finite and in
+`[1.0, corresponding hard maximum]`, because a spectral condition number
+cannot be below one. Every other `max_*` numeric value is finite, positive, and
+no greater than its corresponding hard maximum; decreasing it only tightens
+admission.
 `covariance_psd_tolerance` is finite and in
 `(0, HARD_MAX_COVARIANCE_PSD_TOLERANCE]`; decreasing it only tightens
 admission. A model cannot relax any hard limit.
@@ -280,20 +283,29 @@ tolerance = model.covariance_psd_tolerance * scale.
 
 Strictly positive marginals make `scale > 0`. Reject nonfinite data, any
 diagonal `<= 0`, or any marginal above the applicable input/output variance
-limit. Reject when `max(abs(P-P^T)) > tolerance`; otherwise store
-`(P+P^T)/2`. On that symmetrized matrix, reject when
+limit. The standalone input carrier retains its exact submitted `P_H`, after
+only the hard-tolerance structural check, so a later reducer model can enforce
+a tighter tolerance and so its input fingerprint covers the submitted matrix.
+During derivation, reject when `max(abs(P_H-P_H^T))` exceeds the active model
+tolerance; otherwise expose `(P_H+P_H^T)/2` separately as
+`canonical_homography_covariance`. On that symmetrized matrix, reject when
 `lambda_min(P) < -tolerance`. A negative eigenvalue within tolerance is
 accepted as numerical roundoff and retained; it is never clipped, floored, or
 represented as exactly positive semidefinite. There is no artificial
 covariance floor.
-The derived congruence is subjected to the same symmetry/PSD and strictly
-positive output-marginal checks before storage.
+The congruence uses only `canonical_homography_covariance`; its result is
+subjected to the same symmetry/PSD and strictly positive output-marginal checks
+before storage. Evidence retains both the exact raw source and canonical
+derived view, and integrity rederives the latter. A stricter model must reject
+raw asymmetry that a looser model would admit; input construction must not
+erase that evidence.
 
-Evidence rederivation uses the same deterministic operations and requires
-fingerprints and exact enums/orders to match exactly. Derived floating values
-and matrices must match the recomputation with zero relative tolerance and
-absolute tolerance `DERIVED_ABS_TOLERANCE`; this comparison tolerance never
-widens geometry or covariance admission.
+Evidence rederivation uses the same deterministic in-process operations and
+requires fingerprints, enums/orders, derived floating values, vectors, and
+matrices to match exactly. There is no evidence-comparison tolerance. This
+proof-only local value is not a cross-platform or wire serialization contract;
+any low-level mutation, including one smaller than covariance admission
+tolerance, must fail `validate_integrity()`.
 
 ## Exact source and lifecycle binding
 
@@ -347,7 +359,8 @@ model are exactly those in the retained model; its host clock, camera
 measurement time, basis/model/uncertainty, frame, and candidate are exactly
 those in the retained source; its covariance scope is exactly
 `CONDITIONAL_FIT`; and `conditional_covariance` is exactly the rederived
-`J P_H J^T`.
+`J P_H_canonical J^T`, where `P_H_canonical` is the separately retained
+active-model-admitted symmetric view of the raw source covariance.
 
 `geometry_producer_config_sha256` covers every geometry-producer,
 homography-fit, and covariance-setting value, not merely a detector subset.
@@ -430,12 +443,13 @@ d_delta = [
 ].
 ```
 
-The local-scale row is `0.5*d_delta/delta`. For dense conditional homography
-covariance `P_H`, the only output covariance is the first-order conditional
-congruence
+The local-scale row is `0.5*d_delta/delta`. For raw dense conditional
+homography covariance `P_H`, let the active-model-admitted canonical view be
+`P_H_canonical = (P_H + P_H^T)/2`. The only output covariance is the
+first-order conditional congruence
 
 ```text
-P_local = J P_H J^T.
+P_local = J P_H_canonical J^T.
 ```
 
 Every off-diagonal term is retained. No calibration, timing, detector-model,
@@ -538,9 +552,11 @@ Direct tests must cover:
 - the analytic `3x8` Jacobian against central finite differences across a
   randomized matrix;
 - dense covariance congruence, off-diagonal influence, scale-separated
-  symmetry/PSD cases, within-tolerance symmetrization, retained tiny-negative
+  symmetry/PSD cases, raw-input preservation, active-model tolerance before
+  canonical symmetrization, stricter-model rejection, retained tiny-negative
   roundoff, rejection below tolerance, zero-marginal rejection, no-floor
-  behavior, and deterministic integrity rederivation;
+  behavior, sub-tolerance covariance/derived-field tamper rejection, and exact
+  deterministic integrity rederivation;
 - rejection/non-acceptance of `/1`, corner, rate, state, derotation, and total
   covariance inputs; and
 - static proof that no production module imports or calls the reducer, no

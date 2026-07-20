@@ -143,6 +143,12 @@ For dense gauge-fixed homography covariance `P_H`, the reducer returns
 P_local = J P_H J^T.
 ```
 
+Here the multiplication uses the active-model-admitted canonical view
+`(P_H + P_H^T)/2`. The immutable input and its fingerprint retain the exact
+submitted matrix; the indivisible evidence separately carries the canonical
+`8x8` view used by the congruence. This ordering is required so a stricter
+model can reject asymmetry that a looser model would admit.
+
 This is a first-order conditional covariance. It conditions on the exact
 rectification/calibration artifact, fit model, producer configuration, and
 timing declarations identified by the input. It does not include calibration,
@@ -220,15 +226,20 @@ tolerance, numerically positive-semidefinite with no eigenvalue below negative
 tolerance, have positive marginal variances, and remain within explicit model
 bounds. Symmetry and PSD tolerances are relative to the covariance's actual
 scale. Evidence integrity rederives every output and diagnostic from the
-retained immutable input and model.
+retained immutable input and model and requires exact same-process equality
+for every derived field. Covariance tolerance never becomes
+evidence-integrity tolerance; even a smaller low-level mutation is rejected.
 
 More exactly, covariance scale is the maximum absolute matrix entry and the
 admissible roundoff is that scale times the model tolerance, which itself
-cannot exceed `1e-10`. Asymmetry within tolerance is averaged; greater
-asymmetry is rejected. An eigenvalue below negative tolerance is rejected. A
-negative eigenvalue within tolerance remains unmodified numerical roundoff:
-the reducer never clips eigenvalues or adds a variance floor. Input and output
-marginals must remain strictly positive and at or below their explicit caps.
+cannot exceed `1e-10`. The input carrier preserves raw asymmetry after a hard
+structural check. The active reducer model then rejects asymmetry beyond its
+possibly tighter tolerance and exposes the within-tolerance average as a
+separate canonical covariance. An eigenvalue below negative tolerance is
+rejected. A negative eigenvalue within tolerance remains unmodified numerical
+roundoff: the reducer never clips eigenvalues or adds a variance floor. Input
+and output marginals must remain strictly positive and at or below their
+explicit caps.
 
 Hard limits cap measurement-time uncertainty at `200,000,000 ns`, both
 spectral condition numbers at `1e6`, absolute center/corner bearings at `4`,
@@ -236,6 +247,8 @@ absolute local log scale at `20`, input/output marginal variance at `1e6`, and
 the covariance tolerance at `1e-10`. Non-relaxable geometry floors are `1e-6`
 for forward denominator and projected edge, and `1e-12` for local determinant
 and signed corner cross. A concrete model may only tighten those limits.
+Condition-number caps cannot be below `1.0`; all other maximum envelopes must
+remain strictly positive.
 
 ## Promotion boundary
 
