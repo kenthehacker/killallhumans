@@ -9,13 +9,15 @@
 **Integrated Wave 2 offline implementation:** 8176cbac20ff16bfa4b8c24764596d9366fe98cf
 **Integrated Wave 3 control-plane increment:** ab62cde9464442e4b448f293ba8efd31ad601c27
 **Integrated Wave 3 offline IMU provenance:** ecaa794aeaed87a169b7b87b284d1440f1768a28
+**Integrated Wave 3B generated offline runtime:** 28b7d782404d6b825cebae3b65a8443d756be234
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
 **Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
 foundations, Wave 2 controller/system-ID/guidance tranche, Wave 3 control-plane
-dogfood, and Wave 3 local IMU provenance/rotation-only tranche are integrated on
-main and post-merge verified. M1/M2/M4 runtime acceptance remains incomplete;
-the next work remains offline until its explicit data or powered boundary. No
-new FlightSim evidence was collected.
+dogfood, Wave 3 local IMU provenance/rotation-only tranche, and Wave 3B
+generated scheduler composition are integrated on main and post-merge
+verified. M1/M2/M4 runtime acceptance remains incomplete; the next work remains
+offline until its explicit data or powered boundary. No new FlightSim evidence
+was collected.
 
 ## Purpose
 
@@ -347,6 +349,53 @@ ray still requires a stable-frame or explicitly time-aligned filter. Measured
 command/actuator/gyro delay, approved replay, tracker-isolation, shadow/runtime,
 and powered evidence remain absent.
 
+## Wave 3B generated offline runtime integration record
+
+Behavioral implementation
+`8eab146e3a9a7a1a1b28070d3e0234adff900595`, main reconciliation merge
+`7904fbadbc4b220b81afb846a69b15a7b30ef4bb`, and promotion/trust closeout
+`28b7d782404d6b825cebae3b65a8443d756be234` add the deterministic
+already-decoded runtime composition without connecting any authority surface:
+
+- one owner contains the exact latest-frame cursor, fixed-rate scheduler,
+  local IMU estimator/history, raw-camera relative estimator, Wave 3 adapter
+  memory, proposal sequence, and cumulative trace;
+- nested camera metadata/storage, safety/camera/IMU epochs, timing plans,
+  selected attitudes, pipeline outcomes, diagnostic reasons, and exported
+  result/trace correlations fail closed before commit;
+- distinct publications run perception once; repeated frames run no perception
+  and remain source-less exact zero; deadline and planned-overrun skips never
+  advance pipeline state or create catch-up bursts;
+- corrected bearing remains standalone evidence and is not applied to the
+  raw-camera state, guidance, or proposal; and
+- `GYRO_SAMPLE` is an occurrence-only fact. The result and trace reject send,
+  actuator, command, simulator, network, and powered authority.
+
+Accepted offline evidence is:
+
+- 38 focused runtime tests and 181 coupled runtime/IMU/adapter/estimator tests;
+- an independent 199-test compatibility/adversarial matrix with explicit
+  clearance and no remaining tranche-local blocker;
+- exactly 910 canonical and isolated-manifest VQ2 policy tests, including the
+  post-merge main run;
+- `test-fast` and `test-unit`: 2,005 passed, 20 skipped, and 42 deselected each;
+- promotion-boundary `test-full-non-live`: 2,046 passed and 21 skipped;
+- a strict 127-file trusted manifest with semantic identity
+  `cdd0db402b6f1c8bb0c90c1b8d445ca64741d3bfc3aa03a78c3fe4d73c8dcce2`
+  and file SHA-256
+  `e270a194031d463accfb50b28bd3296eb672004d1c41241fab3cb368bab1640a`;
+- exact VQ2 policy SHA-256
+  `64cfefc083a52fc925ad98c2e3a99e8f6eefcaebb0f4243d214c1e87729a864c`.
+
+The trust review added only the new runtime test and changed only the policy
+hash; no file was removed and the trust root did not expand. No FlightSim
+process was launched or contacted, and no preflight, external network access,
+reset, arm/disarm, target, transport, shadow, or powered action occurred.
+Receiver/reassembly and recorded replay evidence, production per-sample arrival
+capture, calibrated timing/extrinsics, a supervisor-verifiable provenance
+envelope, measured command/actuator/gyro response, and powered evidence remain
+absent.
+
 ## Completed foundation bootstrap
 
 The former dirty-worktree exception is closed:
@@ -518,10 +567,10 @@ CommandProposal:
 | Milestone | Status | Outcome | Main prerequisite |
 |---|---|---|---|
 | M0 | Complete at `b9382da` | Stable, green, committed evaluation foundation | Historical bootstrap |
-| M1 | Active; offline timing/scheduler foundation integrated, full runtime trace and simulator dossier pending | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
+| M1 | Active; generated scheduler/trace composition integrated, production receiver/runtime trace and simulator dossier pending | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
 | M2 | Active offline; censored aperture fitter integrated, recorded replay and tracker-isolation acceptance pending | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
 | M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
-| M4 | Active offline; estimator, controller, guidance, exact adapter, local timestamped attitude provenance, and rotation-only evidence integrated; corrected-ray filter application, calibrated timing/extrinsics, measured delay, replay comparison, and runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M4 | Active offline; estimator, controller, guidance, exact adapters, timestamped attitude provenance, rotation-only evidence, and generated runtime composition integrated; one-tick correlated coast, corrected-ray filter design, calibrated timing/extrinsics, measured delay, replay comparison, and production runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
 | M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
 | M6 | Pending | Conservative valid full lap | M5 |
 | M7 | Pending | Repeatable baseline across fresh and warm sessions | M6 |
@@ -925,11 +974,13 @@ Wave 3, active offline before any separately authorized live work:
 - completed: timestamp and source-bind attitude/Gate 0 pitch inputs and add
   bounded rotation-only IMU derotation evidence while leaving the raw-camera
   estimator unchanged;
-- next: connect the generated, already-decoded perception path through the
-  Wave 3 adapter and fixed-rate scheduler only in an offline/shadow-disabled
-  composition behind the supervisor seam. Record honest stage timing and IMU
-  sample occurrence, but do not relabel it as measured detection-through-gyro
-  response latency;
+- completed: connect the exact generated, already-decoded perception and IMU
+  path through the Wave 3 adapter and fixed-rate scheduler, terminate at a
+  quarantined proposal, and bind honest generated stage/IMU occurrence facts;
+- next: add only a default-off, proof-bound one-tick IMU-correlated coast for
+  the immediate repeated-frame tick. Consume the lease on a skip, new-frame
+  attempt or failure, lifecycle change, invalid IMU, or reuse; retain exact-zero
+  behavior everywhere else;
 - exercise a disposable clean candidate through T0-T4;
 - perform recorded replay scoring only after approved inputs and the final
   processor exist;
@@ -974,43 +1025,45 @@ Still requiring controlled evidence:
 
 ## Immediate next actions
 
-The recorded M0, Wave 1A, Wave 1, Wave 2, Wave 3 control-plane dogfood, and
-Wave 3 IMU integration commits, clean-main checks, trusted-manifest
-verification, and explicit canonical test tiers are complete. Do not repeat
-them merely because an agent resumes the plan; rerun affected gates whenever
-the base or trust set changes.
+The recorded M0, Wave 1A, Wave 1, Wave 2, Wave 3 control-plane dogfood, Wave 3
+IMU, and Wave 3B generated-runtime integration commits, clean-main checks,
+trusted-manifest verification, and explicit canonical test tiers are complete.
+Do not repeat them merely because an agent resumes the plan; rerun affected
+gates whenever the base or trust set changes.
 
 1. The reviewed local timestamp/source seam for attitude and the Gate 0 pitch
    basis plus bounded rotation-only derotation evidence is integrated at
    `ecaa794aeaed87a169b7b87b284d1440f1768a28`. Keep the corrected ray
    standalone until a stable-frame or explicitly time-aligned filter is
    reviewed.
-2. Extend the generated, already-decoded
-   observation-to-estimator-to-guidance/controller path through the Wave 3
-   adapter and record honest perception, estimation, prediction, controller,
-   tick, and IMU-occurrence timing. Keep it distinct from receiver/reassembly,
-   recorded replay, and measured command/actuator/gyro response evidence.
-3. Validate Gate 0 non-regression and recorded top-clipped Gate 1 geometry once
+2. The exact generated observation/IMU-to-proposal scheduler composition is
+   integrated at `28b7d782404d6b825cebae3b65a8443d756be234`. Keep it
+   distinct from receiver/reassembly, recorded replay, and measured
+   command/actuator/gyro response evidence.
+3. Implement the separately reviewed Wave 3C one-tick correlated-coast lease.
+   Require a healthy immediately preceding accepted update, exact tick
+   adjacency, a strictly newer causal target attitude, first-dropout
+   `COASTING`, and default-off guidance/controller behavior. A skip, any new
+   frame attempt, lifecycle change, invalid evidence, or lease reuse consumes
+   or rejects it; a second repeat remains exact zero.
+4. Validate Gate 0 non-regression and recorded top-clipped Gate 1 geometry once
    approved replay inputs and the final processor exist.
-4. Integrate the fixed-rate scheduler only in that offline or shadow-disabled
-   composition behind the reviewed supervisor/transport seam. Terminate at a
-   quarantined proposal, retain exact-zero inter-frame behavior at the current
-   accepted-observation boundary, and prove the 20 ms floor, deadline skips,
-   and no-catch-up behavior. Do not select scheduler output for transport;
-   transport enablement remains a separately authorized powered workflow.
-5. The positive exact `SingleMerger` path now has unit evidence. Exercise a
+5. Keep stable-frame corrected-ray application separate from Wave 3C. It still
+   requires a reviewed reference lifecycle, inverse output transform, and full
+   bearing/rate/log-scale covariance transform before filter use.
+6. The positive exact `SingleMerger` path now has unit evidence. Exercise a
    disposable clean candidate through T0-T4 scheduler leases,
    interruption/resume, deduplication, exact worktrees, and merger evidence
    only after the three real T1 prerequisites exist; this operational dogfood
    remains outstanding and does not broaden tier claims.
-6. Provision the private golden replay corpus and administrator-owned isolation
+7. Provision the private golden replay corpus and administrator-owned isolation
    wrapper before enabling production T1. This may proceed independently when a
    slot and the required authorization are available; it does not block the
    remaining synthetic/offline work.
-7. Continue only authorized passive probes while offline work proceeds.
-8. Integrate finished branches frequently, but only after each branch is committed
+8. Continue only authorized passive probes while offline work proceeds.
+9. Integrate finished branches frequently, but only after each branch is committed
    and promoted. Quarantine a dirty failed worktree without touching clean main.
-9. Keep the first live change a separately reviewed, explicitly authorized,
+10. Keep the first live change a separately reviewed, explicitly authorized,
    bounded Gate 1 recenter stage. Treat every powered system-identification or
    later Gate 1 stage as a separate,
    explicitly authorized workflow outside the shipped scheduler. Never reinterpret

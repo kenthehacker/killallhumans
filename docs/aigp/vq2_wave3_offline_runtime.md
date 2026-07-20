@@ -79,3 +79,24 @@ per-sample arrival capture, calibrated timing and extrinsics, a
 supervisor-verifiable provenance envelope, approved replay, and separate
 review. Operational T0-T4 and every powered stage retain their existing
 external prerequisites and authorization boundary.
+
+## Verification record
+
+Behavior commit `8eab146e3a9a7a1a1b28070d3e0234adff900595`, reconciliation
+merge `7904fbadbc4b220b81afb846a69b15a7b30ef4bb`, and promotion/trust
+commit `28b7d782404d6b825cebae3b65a8443d756be234` are integrated on main.
+The focused runtime suite passed 38 tests; the coupled matrix passed 181; an
+independent compatibility/adversarial matrix passed 199 and explicitly cleared
+the tranche. Canonical and isolated-manifest VQ2 runs passed exactly 910 tests,
+fast and unit each passed 2,005 with 20 skips and 42 deselections, and the full
+non-live boundary passed 2,046 with 21 skips. The 127-file trusted manifest has
+semantic identity
+`cdd0db402b6f1c8bb0c90c1b8d445ca64741d3bfc3aa03a78c3fe4d73c8dcce2`
+and file SHA-256
+`e270a194031d463accfb50b28bd3296eb672004d1c41241fab3cb368bab1640a`.
+
+No simulator, network, preflight, reset, arm/disarm, target, transport, shadow,
+or powered action was used. The next offline mechanism may add only a
+proof-bound, one-tick correlated coast behind a default-off allowance. It must
+not silently apply the corrected ray to the raw-camera filter or weaken the
+current repeated-frame exact-zero default.
