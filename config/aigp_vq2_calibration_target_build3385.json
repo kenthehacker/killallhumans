@@ -1,0 +1,123 @@
+{
+  "schema": "aigp-vq2-sim-calibration-collection-config/1",
+  "config_id": "vq2-build3385-training-gate0-nominal-v1",
+  "revision": "1",
+  "simulator": {"build": 3385, "mode": "Training"},
+  "source": {
+    "kind": "public_technical_spec",
+    "document_id": "VADR-TS-002",
+    "issue": "00.02",
+    "publication_date": "2026-05-08",
+    "url": "https://www.theaigrandprix.com/wp-content/uploads/2026/05/260508_Technical_Spec_0002.pdf",
+    "stated_scope": "Virtual Qualifier 1",
+    "use_scope": "nominal_geometry_only"
+  },
+  "applicability": {
+    "status": "nominal_unverified_for_build_3385_training",
+    "result_semantics": "conditional_on_nominal_gate_config",
+    "replacement_policy": "new_config_id_revision_and_hash"
+  },
+  "geometry": {
+    "units": "m",
+    "target_frame": {
+      "handedness": "right",
+      "origin": "front_inner_aperture_center",
+      "x_axis": "front_view_right",
+      "y_axis": "front_view_down",
+      "z_axis": "front_to_back"
+    },
+    "outer": {"width": 2.7, "height": 2.7},
+    "inner": {"width": 1.5, "height": 1.5},
+    "depth": 0.26,
+    "feature": {
+      "kind": "front_inner_aperture_boundary_intersections",
+      "order": ["top_left", "top_right", "bottom_right", "bottom_left"],
+      "coordinates": [
+        [-0.75, -0.75, 0.0],
+        [0.75, -0.75, 0.0],
+        [0.75, 0.75, 0.0],
+        [-0.75, 0.75, 0.0]
+      ]
+    },
+    "uncertainty_status": "unpublished_unknown"
+  },
+  "observed_streams": {
+    "camera": {
+      "transport": "udp_jpeg",
+      "stream_id": "vq2-camera-udp-5600",
+      "frame_id_field": "frame_id",
+      "source_time_field": "sim_time_ns",
+      "source_time_semantics": "opaque_ordering_token_not_calibrated_capture_time",
+      "identity_schema": "aigp-vq2-frame-identity/1",
+      "timing_schema": "aigp-vq2-frame-timing/1",
+      "consume_timing_schema": "aigp-vq2-camera-frame-timing-observation/1",
+      "expected_decoded_dimensions": {"width": 640, "height": 360},
+      "decoded_dimensions_policy": "observe_require_exact_before_arm_and_session_stability",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "imu": {
+      "message": "HIGHRES_IMU",
+      "source_time_field": "time_usec",
+      "source_time_semantics": "opaque_source_clock_for_ordering_and_integration",
+      "accel_fields": ["xacc", "yacc", "zacc"],
+      "gyro_fields": ["xgyro", "ygyro", "zgyro"],
+      "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+      "sample_schema": "aigp-vq2-received-imu/1",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "race_status": {
+      "required_fields": [
+        "active_gate_index",
+        "last_gate_race_time",
+        "race_finish_time_ns",
+        "race_start_boot_time_ms",
+        "sim_boot_time_ms"
+      ],
+      "source_time_field": "sim_boot_time_ms",
+      "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "heartbeat": {
+      "required_fields": ["base_mode", "custom_mode"],
+      "source_time_semantics": "no_admitted_source_timestamp",
+      "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+      "host_receipt_clock": "host-perf-counter"
+    },
+    "safety_audit": {
+      "actuator": {
+        "message": "ACTUATOR_OUTPUT_STATUS",
+        "ingress_schema": "aigp-vq2-mavlink-ingress/1",
+        "host_receipt_clock": "host-perf-counter"
+      },
+      "collision": {
+        "message": "COLLISION",
+        "lineage_semantics": "runner_drain_observation_order_only_no_receiver_receipt_timestamp"
+      },
+      "semantics": "watchdog_and_evidence_only_not_calibration_inputs"
+    },
+    "unavailable_as_truth": [
+      "ATTITUDE",
+      "LOCAL_POSITION_NED",
+      "ODOMETRY",
+      "track_gate_map"
+    ]
+  },
+  "calibration_status": {
+    "intrinsics": "uncomputed",
+    "distortion": "uncomputed",
+    "camera_to_body_rotation": "uncomputed",
+    "camera_imu_time_model": "uncomputed",
+    "rank": "uncomputed",
+    "covariance": "uncomputed",
+    "empirical_limits": "uncomputed"
+  },
+  "data_scope": {
+    "private_simulation_capture": true,
+    "physical_or_hil_use": false,
+    "submitted_run_use": false,
+    "public_release": false,
+    "external_service_upload": false,
+    "git_storage": false,
+    "pak_access": false
+  }
+}

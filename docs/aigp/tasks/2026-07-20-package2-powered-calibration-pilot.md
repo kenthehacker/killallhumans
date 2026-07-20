@@ -2,10 +2,11 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `P0 scope pivot recorded - stopped before P1 admission; no simulator contact`
+- State: `P1 admitted - stopped before I0 contract correction; no simulator contact`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
+- P0 scope-pivot commit: `76dbebb`.
 - Branch: `package2-powered-calibration`.
 - Worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration`.
@@ -1038,6 +1039,38 @@ promotion worktree, then the exact hash-pinned VQ2 suite from a separate fresh
 worktree. Integrate the unchanged candidate and run post-merge VQ2. No test
 command may launch or contact FlightSim.
 
+## P1 admission evidence
+
+P1 is admitted on the exact offline candidate. Its tracked identities before
+this record-only update are:
+
+- nominal target-config SHA-256
+  `e16e2a70e6be8d6d083e5739773473090c62d244a1b69f120ce027f51b84f82b`;
+- validator source SHA-256
+  `768969dfb1b77f9e99de1da18aa9248c94ca7536fd889c039e2cc0dc0a948ae6`;
+- direct-test source SHA-256
+  `26bef1c5ac81b1b71cd4721ca4946a728c9aa144861b3260cacc6ed743da83e3`;
+- private authorization path
+  `C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot\capture-authorization.json`;
+- private authorization SHA-256
+  `5fb440b48ae7d1d60d8c59399eadb5c01f74ffa049bc7245da01c9cea3d04b9a`;
+- direct suite: `85 passed` in `0.22s`; and
+- canonical `test-vq2`: `1648 passed, 1 skipped` in `40.82s`.
+
+The protected private root is owned by `DESKTOP-1RCQP2L\John`; its ACL has
+inheritance disabled and grants only that user full control. The authorization
+file inherits only that effective user access. The hash-pinned CLI validated the
+tracked config and real authorization together and emitted only their two exact
+hashes. Independent schema/security review returned `CLEAR`, including strict
+JSON/types, geometry consistency and replacement identity, stable file/hash
+reads, simulation-only non-transfer scope, no defaults/field overrides, and no
+PAK or camera-prior path.
+
+P1 admits only this collection protocol and these exact identities. It does not
+admit target/build linkage, geometry uncertainty, labels, calibration values,
+powered implementation, or simulator execution. No PAK, FlightSim process,
+port, frame capture, reset, arm/disarm, target, or powered command was touched.
+
 ## Historical inactive R1 completion evidence
 
 R1 is complete on the synthetic-only candidate. The exact reviewed identities
@@ -1086,9 +1119,20 @@ publishes the nominal gate dimensions used above, but states a Virtual Qualifier
 1 scope. The configuration therefore treats them as editable, hash-pinned,
 unverified inputs for build 3385 Training. No public camera constants are used.
 
-Execution currently stops before P1. The strict config/authorization validator,
-tracked nominal configuration, private stable authorization bytes/hash, direct
-tests, and independent P1 admission review do not yet exist. No FlightSim
-process, port, private capture, reset, arm/disarm, target, or powered command
-occurs before those exact artifacts are admitted and I0/T0/L0 subsequently pass.
-No PAK is read, and the completed passive timing tranche is not repeated.
+P1 now passes with the exact identities and evidence above. The collection
+configuration remains conditional on nominal, VQ1-scoped public gate geometry;
+all absent camera and timing quantities remain `uncomputed`.
+
+Execution stops before I0 because a read-only implementation audit found
+contract/code mismatches that must be corrected before powered behavior: raw
+receiver lineage exceeds the currently owned surfaces; abandoned-lease takeover
+and an exclusive cleanup bind are not supported by the current lease/transport;
+the authoritative rich command record, attempt/poison/report schemas, candidate
+and Training attestation, nested phase deadlines, global split registry, and
+fallback trigger are not yet frozen. No I0 code is written until an exact
+documentation-only correction owns and resolves those interfaces and passes
+independent review.
+
+No FlightSim process, port, frame capture, reset, arm/disarm, target, or powered
+command has occurred. No PAK is read, and the completed passive timing tranche
+is not repeated.
