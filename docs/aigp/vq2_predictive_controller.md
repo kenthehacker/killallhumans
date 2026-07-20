@@ -43,12 +43,18 @@ and preserve the exact same start on every later evaluation in that phase.
 The controller independently binds every nonzero proposal source field that
 the frozen command contract can carry with `validate_command_proposal_source`.
 
-The local attitude input is a unit body-to-world quaternion in `(w, x, y, z)`
-order plus FRD body rates, but has no timestamp, clock identity, or source
-correlation. `CommandProposalV1` cannot bind attitude provenance. This
-candidate is therefore ineligible for shadow, runtime, or powered wiring until
-a reviewed IMU timing/derotation seam exists. The bounded guidance target is
-also frozen to exact image center `(0, 0)`; an off-center objective is rejected
+The controller's direct local attitude input is a unit body-to-world quaternion
+in `(w, x, y, z)` order plus FRD body rates, so that value alone has no
+timestamp, clock identity, or source correlation. The integrated Wave 3 outer
+adapter now gates it behind exact local timestamped IMU, rotation-only
+derotation, controller-time propagation, and Gate 0 pitch-basis evidence. This
+is a reviewed deterministic offline seam, not supervisor-verifiable wire
+evidence: frozen `CommandProposalV1` still cannot carry attitude, pitch-basis,
+calibration, or derotation identity. Shadow, runtime, or powered promotion
+therefore still requires a separately reviewed `/2` envelope or
+supervisor-owned registry, production per-sample host-arrival capture, and
+calibrated camera/IMU timing and extrinsics. The bounded guidance target is also
+frozen to exact image center `(0, 0)`; an off-center objective is rejected
 rather than permitted to steer toward an unreviewed image-edge target.
 
 ## Fail-closed eligibility

@@ -86,6 +86,35 @@ safety transition also preserves prior outer attitude lineage. Caller-threaded
 pure memory remains a trust boundary; neither inner nor outer Python values
 authenticate an untrusted owner.
 
+## Integration and verification
+
+Behavioral implementation
+`f53718da892c4ab5aecc567a61249b21a8cb6ffa` was reconciled with main in
+`e3f386d460d012c7b9710ae440c2ac405447f1f3`; promotion policy and trust
+closeout landed as `ecaa794aeaed87a169b7b87b284d1440f1768a28`.
+
+Accepted offline evidence comprises 143 affected tests; exactly 872 canonical
+VQ2 policy tests, including the post-merge main run; and `test-fast` plus
+`test-unit` results of 1,967 passed, 20 skipped, and 42 deselected each. The
+promotion-boundary full non-live suite passed 2,008 tests with 21 skips.
+Skipped optional coverage is not positive evidence.
+
+The strict trusted manifest contains 126 files. Its semantic identity is
+`f074019f30858b9fcc5fb06a90a8df7cf57770e84791893ddbaa082861eca5eb`
+and its file SHA-256 is
+`ba07b6ea73b5fc88f99e6c8824ea4d7039c956391de2c5730e6716af76cad9b1`;
+the exact VQ2 policy file SHA-256 is
+`4352163c57b06f8bb12a7b7750c8a279d76b0c45d933dacf3d5149238ee970ef`.
+Independent lifecycle and adversarial review cleared the integrated candidate.
+Main fast-forwarded to the trust closeout, post-merge `test-vq2` passed all 872
+tests, and tracked Git status was empty.
+
+No FlightSim process was launched or contacted, and no preflight, external
+network access, reset, arm/disarm, target, transport, shadow, simulator, or
+powered action occurred. These results close the deterministic offline tranche;
+they do not relax any runtime, supervisor, replay, calibration, or powered
+prerequisite below.
+
 ## Evidence boundary
 
 Tests use exact immutable synthetic samples, generated bearings, explicit test

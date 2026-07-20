@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3-imu-provenance-derotation`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `active`
+- State: `post_merge_verified`
 - Objective: add an exact local provenance envelope for HIGHRES_IMU-derived
   attitude, a bounded pure camera-ray derotation primitive, and an outer
   offline-only adapter that derives the Gate 0 pitch basis from a correlated
@@ -74,5 +74,41 @@
   stable-frame or explicitly time-aligned filter. The current capture-time
   camera estimator cannot ingest a target-attitude bearing without mixing
   coordinate/time bases and potentially double-predicting it.
-- Final commits, exact counts/hashes, independent findings, and residuals:
-  pending.
+
+## Integration and evidence record
+
+- Behavioral implementation:
+  `f53718da892c4ab5aecc567a61249b21a8cb6ffa`.
+- Main reconciliation merge:
+  `e3f386d460d012c7b9710ae440c2ac405447f1f3`.
+- Promotion-policy and trusted-manifest closeout:
+  `ecaa794aeaed87a169b7b87b284d1440f1768a28`.
+- Affected IMU-adapter, provenance, derotation, and relative-estimator tests:
+  143 passed.
+- Canonical exact `test-vq2`: 872 passed. Main fast-forwarded to
+  `ecaa794aeaed87a169b7b87b284d1440f1768a28`; post-merge `test-vq2` also
+  passed all 872 tests and tracked Git status was empty.
+- `test-fast` and `test-unit`: 1,967 passed, 20 skipped, and 42 deselected
+  each.
+- Promotion-boundary `test-full-non-live`: 2,008 passed and 21 skipped.
+  Skipped optional coverage is not positive evidence.
+- Strict trusted manifest: 126 files, semantic identity
+  `f074019f30858b9fcc5fb06a90a8df7cf57770e84791893ddbaa082861eca5eb`,
+  file SHA-256
+  `ba07b6ea73b5fc88f99e6c8824ea4d7039c956391de2c5730e6716af76cad9b1`,
+  and exact VQ2 policy file SHA-256
+  `4352163c57b06f8bb12a7b7750c8a279d76b0c45d933dacf3d5149238ee970ef`.
+- Independent lifecycle and adversarial review cleared the integrated
+  candidate with no remaining tranche-local blocker.
+- Simulator access remained `none`. No FlightSim launch or connection,
+  preflight, external network access, reset, arm/disarm, target, transport,
+  shadow selection, or powered command occurred.
+
+## Residual boundary
+
+The promotion and state-estimation blockers above remain open. In particular,
+the corrected ray is standalone rotation-only evidence and is not applied to
+the raw-camera estimator, guidance, or a `/1` proposal. Full production
+arrival correlation, calibrated camera/IMU timing and extrinsics, measured
+command/actuator/gyro latency, supervisor-verifiable provenance, recorded
+replay, shadow/runtime evidence, and all powered evidence remain future work.
