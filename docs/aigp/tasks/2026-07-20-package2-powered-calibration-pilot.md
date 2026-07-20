@@ -2,9 +2,10 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `contract freeze candidate - no simulator contact`
+- State: `R1 complete - stopped at absent R2 clearance; no simulator contact`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
+- R0 contract commit: `49b331f`.
 - Branch: `package2-powered-calibration`.
 - Worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration`.
@@ -173,6 +174,13 @@ current-user-only. Creation uses exclusive mode, flush plus `fsync`, and no
 replacement. The tool has no network, subprocess, simulator, port, or write-back
 path. A failed parse or validation creates no success artifact and exits nonzero.
 
+On Windows, `current-user-only` requires the current user as owner and permits
+nonzero allow ACEs only for that user, LocalSystem, or built-in Administrators;
+compound, object, and callback allow ACEs fail closed. Component and artifact
+handles remain held and are revalidated for disk type, non-reparse status,
+identity, and final path through exclusive creation, complete write, flush, and
+handle-based ACL verification; failed owned creation cleans up by exact handle.
+
 Every JSON input rejects duplicate keys, non-finite numbers, non-UTF-8, BOM,
 unknown keys, missing keys, booleans where integers are required, and noncanonical
 hash text. Canonical payload bytes are UTF-8 without BOM, ASCII-escaped, sorted
@@ -228,10 +236,14 @@ The remaining group types are frozen as follows:
 
 Finite numbers exclude booleans. Arrays have exact dimensionality where stated;
 IDs are nonempty, unique within scope, and references must resolve. Numeric
-bounds are evidence inputs, never tool-invented defaults. The validation report
-records per-group structural checks, exact input hashes, `structurally_valid`,
-`admitted: false`, and `independent_review_required: true`. R3 alone can admit a
-structurally valid candidate through an independently reviewed task correction.
+bounds are evidence inputs, never tool-invented defaults. Mechanism-only
+floating-point validation uses frozen relative-uniformity and normalized-dot
+roundoff tolerances of `1e-6`; both values are included in the parser config
+hash, create no measurement or uncertainty evidence, and cannot replace an R3
+bound. The validation report records per-group structural checks, exact input
+hashes, `structurally_valid`, `admitted: false`, and
+`independent_review_required: true`. R3 alone can admit a structurally valid
+candidate through an independently reviewed task correction.
 
 The only admissible reference branches remain those in the parent Package 2
 contract:
@@ -656,10 +668,34 @@ promotion worktree, then the exact hash-pinned VQ2 suite from a separate fresh
 worktree. Integrate the unchanged candidate and run post-merge VQ2. No test
 command may launch or contact FlightSim.
 
+## R1 completion evidence
+
+R1 is complete on the synthetic-only candidate. The exact reviewed identities
+before this record-only update were:
+
+- parser source SHA-256
+  `3573390cf7377eac306cf10085b2621dcd0ec017d9fb0bfcf656460ceedf18cf`;
+- direct-test source SHA-256
+  `82991ae67e91871fd126f016d3a117a1b305ccd5c82c1e956ca9f017cb401cc7`;
+- direct suite: `83 passed, 1 skipped` in `0.74s`;
+- `test-vq2`: `1563 passed, 1 skipped` in `42.43s`;
+- `test-fast`: `2661 passed, 21 skipped, 42 deselected` in `115.10s`;
+  and
+- isolated `test-unit` rerun: `2661 passed, 21 skipped, 42 deselected` in
+  `105.89s`.
+
+The single direct skip is the real Windows symlink-creation case because this
+account lacks `SeCreateSymbolicLinkPrivilege`; deterministic device, namespace,
+fixed-drive, disk-handle, reparse-attribute, final-path, identity, collision,
+cleanup, and ACL cases still execute. Independent calibration/schema and
+filesystem/security reviews both returned `CLEAR` on the exact hashes. A native
+Win32 private-ACL create, flush, identity, ACL, readback, and cleanup smoke also
+passed. No test or review read a real build asset or contacted FlightSim.
+
 ## Current entry audit and stop
 
-The R0 contract can be reviewed. R1 tooling is not yet implemented, R2
-pre-derivation clearance is absent, and R3 reference admission is not satisfied.
+R0 is committed and R1 is complete. R2 pre-derivation clearance remains absent,
+so R3 reference admission is not satisfied.
 
 The official build-3385 devkit exposes no camera intrinsic, distortion, mount,
 render/exposure phase, or camera/IMU clock-map oracle. Local saved config has
@@ -670,9 +706,21 @@ UDP view linkage or annotation systematics required by R3. No R2 record yet
 establishes permission for another real-PAK read or intended competition use.
 The native/runtime FPV camera defaults also remain opaque and are not used.
 
-Therefore this contract authorizes R1 offline reference-tool implementation
-against synthetic fixtures only after R0. No real PAK read occurs before R2. No
-FlightSim process, port, private capture, reset, arm/disarm, target, or powered
-command occurs until an independently reviewed correction records the exact R3
-artifact and advances the task to I0. The completed static passive timing
-tranche is not repeated.
+The 2026-07-20 [official-rules](https://www.theaigrandprix.com/official-rules/)
+audit did not find an explicit permission for read-only cooked-PAK metadata
+extraction or use of derived constants in the competition. The public
+[technical specification issue 00.02](https://www.theaigrandprix.com/wp-content/uploads/2026/05/260508_Technical_Spec_0002.pdf)
+describes a public interface that conflicts with verified build-3385 behavior
+and therefore remains a cross-check, not a build-3385 oracle. R2 needs an
+organizer-backed record that answers whether the exact local unencrypted-PAK
+metadata read is permitted, whether its derived geometry/constants may be used
+(and under what publication limits), whether the public camera/gate values
+apply unchanged to build 3385 Training UDP, and whether private decoded
+UDP-frame storage/analysis is allowed.
+
+Therefore execution stops at R2. No new or production-tool real-PAK read occurs
+before its exact private clearance record exists, and the tool cannot
+self-authorize that record. No FlightSim process, port, private capture, reset,
+arm/disarm, target, or powered command occurs until an independently reviewed
+correction records the exact R3 artifact and advances the task to I0. The
+completed static passive timing tranche was not repeated.
