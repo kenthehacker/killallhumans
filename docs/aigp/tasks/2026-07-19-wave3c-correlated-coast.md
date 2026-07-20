@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3c-correlated-coast`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `candidate_complete`
+- State: `post_merge_verified`
 - Objective: permit exactly one proof-bound first-dropout prediction on the
   immediate repeated-frame scheduler tick while preserving the existing
   source-less exact-zero default and quarantined proposal boundary.
@@ -83,7 +83,7 @@ Stable-frame corrected-ray application remains separate. It still requires a
 reviewed reference lifecycle, inverse output transform, and full
 bearing/rate/log-scale covariance transform before filter use.
 
-## Candidate verification
+## Closeout record
 
 - Direct focused tests cover estimator-envelope forgeries, public
   lower-layer rejection and private-call ownership, Gate 0 and full credited
@@ -93,7 +93,33 @@ bearing/rate/log-scale covariance transform before filter use.
   contract review passes a `201`-test deep matrix and explicitly clears the
   coast envelope, lease, memory, transition, result, reconstruction, scheduler,
   and cumulative-trace scope with no remaining promotion blocker.
-- Canonical VQ2 policy, promotion-boundary non-live suites, trusted-manifest
-  reconciliation, merge, and post-merge verification remain pending and must
-  replace this section at closeout.
-- Simulator access for the implementation and tests is `none`.
+- Behavioral implementation:
+  `84674fd8c7379b327e25725010ca58a57f4fd910`.
+- Promotion-policy and trusted-manifest closeout:
+  `168220ba7060d07743335d0e9c56bcd2d05d669d`.
+- Focused runtime, Wave 3 adapter, and relative-estimator suites pass 74, 95,
+  and 32 tests respectively. The six-module affected matrix passes 477.
+- Canonical and isolated-manifest VQ2 policy runs pass exactly 1,019 tests,
+  including the post-merge main run.
+- `test-fast` and `test-unit` each pass 2,114 tests with 20 skips and 42
+  deselections. Promotion-boundary `test-full-non-live` passes 2,155 tests
+  with 21 skips; skipped optional coverage is not positive evidence.
+- The strict trusted manifest remains 127 files, with semantic identity
+  `f9118fad5fdbdd8e5e355cf0e153492525b853b9b7c32239ab4d2d81f6d63b2b`,
+  file SHA-256
+  `29b306e41a6954552ef7693f0e0c3d853cc4b60aeedfb59f6a2c9592ece9d8c6`,
+  and exact policy SHA-256
+  `29eb2dcd627a8f5dbbea4bf88c249a87ca741ca5c9d743c0c646404f40e8748e`.
+  The trust review replaced exactly the six changed test hashes plus the
+  policy hash, with no file added or removed and no trust-root expansion.
+- Main fast-forwarded to the promotion commit. Post-merge `test-vq2` passed all
+  1,019 tests, and tracked Git status was empty before this documentation
+  closeout.
+- Simulator access remained `none`. No FlightSim launch or connection,
+  preflight, external network access, reset, arm/disarm, target, transport,
+  shadow selection, or powered command occurred.
+
+Recorded replay, calibrated production timing/extrinsics, a
+supervisor-verifiable proof carrier, stable-frame corrected-ray application,
+shadow/runtime acceptance, and all powered work remain outside this completed
+task.

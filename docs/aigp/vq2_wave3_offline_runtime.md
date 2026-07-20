@@ -163,7 +163,7 @@ supervisor-verifiable provenance envelope, approved replay, and separate
 review. Operational T0-T4 and every powered stage retain their existing
 external prerequisites and authorization boundary.
 
-## Baseline record and candidate status
+## Baseline and Wave 3C integration record
 
 Behavior commit `8eab146e3a9a7a1a1b28070d3e0234adff900595`, reconciliation
 merge `7904fbadbc4b220b81afb846a69b15a7b30ef4bb`, and promotion/trust
@@ -178,14 +178,31 @@ semantic identity
 and file SHA-256
 `e270a194031d463accfb50b28bd3296eb672004d1c41241fab3cb368bab1640a`.
 
-Those commits, counts, and manifest identities are the integrated Wave 3B
-baseline; they do not verify or promote the Wave 3C coast candidate described
-above. Wave 3C remains in candidate review. Its focused and independent offline
-review, canonical VQ2 policy reconciliation, promotion-boundary non-live suites,
-trusted-manifest update, integration, and post-integration verification must be
-recorded before this section can claim acceptance.
+Those commits, counts, and manifest identities remain the historical Wave 3B
+baseline. Wave 3C is now integrated by behavioral commit
+`84674fd8c7379b327e25725010ca58a57f4fd910` and promotion/trust commit
+`168220ba7060d07743335d0e9c56bcd2d05d669d`.
+
+Wave 3C focused runtime, Wave 3 adapter, and relative-estimator suites pass 74,
+95, and 32 tests; the frozen six-module affected matrix passes 477. Independent
+final contract review passes a 201-test deep matrix and explicitly clears the
+coast envelope, lease, memory, transition, reconstruction, scheduler edge, and
+cumulative-trace scope. Canonical and isolated-manifest VQ2 runs pass exactly
+1,019 tests, including the post-merge main run. Fast and unit each pass 2,114
+with 20 skips and 42 deselections; full non-live passes 2,155 with 21 skips.
+
+The reviewed manifest remains 127 files with semantic identity
+`f9118fad5fdbdd8e5e355cf0e153492525b853b9b7c32239ab4d2d81f6d63b2b`,
+file SHA-256
+`29b306e41a6954552ef7693f0e0c3d853cc4b60aeedfb59f6a2c9592ece9d8c6`,
+and policy SHA-256
+`29eb2dcd627a8f5dbbea4bf88c249a87ca741ca5c9d743c0c646404f40e8748e`.
+Exactly six changed test hashes plus the policy hash were replaced; no trusted
+file was added or removed. Main fast-forwarded to the promotion commit,
+post-merge VQ2 passed all 1,019 tests, and tracked status was empty before this
+documentation closeout.
 
 No simulator, network, preflight, reset, arm/disarm, target, transport, shadow,
-or powered action was used for the baseline or Wave 3C candidate work described
+or powered action was used for the baseline or integrated Wave 3C work described
 here. No live, recorded-replay, production timing/extrinsics, measured command
 response, or supervisor-verifiable provenance claim follows from this document.

@@ -10,14 +10,15 @@
 **Integrated Wave 3 control-plane increment:** ab62cde9464442e4b448f293ba8efd31ad601c27
 **Integrated Wave 3 offline IMU provenance:** ecaa794aeaed87a169b7b87b284d1440f1768a28
 **Integrated Wave 3B generated offline runtime:** 28b7d782404d6b825cebae3b65a8443d756be234
+**Integrated Wave 3C correlated coast:** 168220ba7060d07743335d0e9c56bcd2d05d669d
 **Historical pre-foundation baseline:** c7c37c047039bcac055d77c57a234effe36f73e1
 **Plan state:** M0 and Wave 1A are complete. The three Wave 1 offline
 foundations, Wave 2 controller/system-ID/guidance tranche, Wave 3 control-plane
-dogfood, Wave 3 local IMU provenance/rotation-only tranche, and Wave 3B
-generated scheduler composition are integrated on main and post-merge
-verified. M1/M2/M4 runtime acceptance remains incomplete; the next work remains
-offline until its explicit data or powered boundary. No new FlightSim evidence
-was collected.
+dogfood, Wave 3 local IMU provenance/rotation-only tranche, Wave 3B generated
+scheduler composition, and Wave 3C proof-bound one-tick coast are integrated on
+main and post-merge verified. M1/M2/M4 runtime acceptance remains incomplete;
+the next work remains offline until its explicit data or powered boundary. No
+new FlightSim evidence was collected.
 
 ## Purpose
 
@@ -396,6 +397,56 @@ capture, calibrated timing/extrinsics, a supervisor-verifiable provenance
 envelope, measured command/actuator/gyro response, and powered evidence remain
 absent.
 
+## Wave 3C proof-bound correlated coast integration record
+
+Behavioral implementation
+`84674fd8c7379b327e25725010ca58a57f4fd910` and promotion/trust closeout
+`168220ba7060d07743335d0e9c56bcd2d05d669d` add the default-off,
+single-successor correlated coast without changing the public dropout default
+or connecting any authority surface:
+
+- a healthy accepted active update may arm one lease only when its source
+  scheduler tick starts exactly on due; a valid late proposal remains accepted
+  but opens no unusable lease after scheduler rebasing;
+- the exact immediate repeated-frame successor may advance only constant-
+  velocity prediction state to first-dropout `COASTING`, using a strictly newer
+  causal same-source attitude and strictly growing marginal uncertainty;
+- public guidance, controller, and Wave 2 paths still reject dropout. Only the
+  Wave 3-owned private capability path may produce an explicitly uncertainty-
+  limited coast proposal;
+- skips, new-frame selection or failure, lifecycle mismatch, malformed or
+  unavailable evidence, coast success, and reuse consume the lease; the second
+  repeat remains source-less exact zero; and
+- every consuming result retains and reconstructs its exact prior source
+  transition, then binds source/current camera, perception, IMU, scheduler,
+  estimator, controller, terminal, and cumulative-trace facts before commit.
+
+Accepted offline evidence is:
+
+- 74 focused runtime tests, 95 Wave 3 adapter tests, 32 relative-estimator
+  tests, and a 477-test six-module affected matrix;
+- an independent 201-test deep contract matrix with explicit clearance and no
+  remaining tranche-local blocker;
+- exactly 1,019 canonical and isolated-manifest VQ2 policy tests, including the
+  post-merge main run;
+- `test-fast` and `test-unit`: 2,114 passed, 20 skipped, and 42 deselected each;
+- promotion-boundary `test-full-non-live`: 2,155 passed and 21 skipped;
+- a strict 127-file trusted manifest with semantic identity
+  `f9118fad5fdbdd8e5e355cf0e153492525b853b9b7c32239ab4d2d81f6d63b2b`,
+  file SHA-256
+  `29b306e41a6954552ef7693f0e0c3d853cc4b60aeedfb59f6a2c9592ece9d8c6`,
+  and exact policy SHA-256
+  `29eb2dcd627a8f5dbbea4bf88c249a87ca741ca5c9d743c0c646404f40e8748e`.
+
+The trust review replaced exactly the six changed test hashes plus the policy
+hash, with no file addition/removal or trust-root expansion. Main fast-forwarded
+to the promotion commit and post-merge VQ2 passed all 1,019 tests. No FlightSim
+process was launched or contacted, and no preflight, external network access,
+reset, arm/disarm, target, transport, shadow, or powered action occurred.
+Receiver/reassembly, recorded replay, production timing/extrinsics, a
+supervisor-verifiable proof carrier, stable-frame corrected-ray application,
+measured response, shadow/runtime acceptance, and powered evidence remain open.
+
 ## Completed foundation bootstrap
 
 The former dirty-worktree exception is closed:
@@ -570,7 +621,7 @@ CommandProposal:
 | M1 | Active; generated scheduler/trace composition integrated, production receiver/runtime trace and simulator dossier pending | Runtime timing and simulator semantics dossier | M0 and frozen Wave 1A timing contracts |
 | M2 | Active offline; censored aperture fitter integrated, recorded replay and tracker-isolation acceptance pending | Robust clipped Gate 1 geometry with uncertainty | M0, frozen Wave 1A observation contracts, and replay evidence |
 | M3 | Pending | Bounded Gate 1 recentering without passage | M1 and M2 |
-| M4 | Active offline; estimator, controller, guidance, exact adapters, timestamped attitude provenance, rotation-only evidence, and generated runtime composition integrated; one-tick correlated coast, corrected-ray filter design, calibrated timing/extrinsics, measured delay, replay comparison, and production runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
+| M4 | Active offline; estimator, controller, guidance, exact adapters, timestamped attitude provenance, rotation-only evidence, generated runtime composition, and proof-bound one-tick correlated coast integrated; corrected-ray filter design, calibrated timing/extrinsics, measured delay, replay comparison, and production runtime evidence pending | Predictive relative state and delay-compensated IBVS | M1 and M2 |
 | M5 | Pending | Separately reviewed Gate 1 passage | M3 and M4 |
 | M6 | Pending | Conservative valid full lap | M5 |
 | M7 | Pending | Repeatable baseline across fresh and warm sessions | M6 |
@@ -977,11 +1028,12 @@ Wave 3, active offline before any separately authorized live work:
 - completed: connect the exact generated, already-decoded perception and IMU
   path through the Wave 3 adapter and fixed-rate scheduler, terminate at a
   quarantined proposal, and bind honest generated stage/IMU occurrence facts;
-- next: add only a default-off, proof-bound one-tick IMU-correlated coast for
-  the immediate repeated-frame tick. Consume the lease on a skip, new-frame
+- completed: add only a default-off, proof-bound one-tick IMU-correlated coast
+  for the immediate repeated-frame tick. Consume the lease on a skip, new-frame
   attempt or failure, lifecycle change, invalid IMU, or reuse; retain exact-zero
   behavior everywhere else;
-- exercise a disposable clean candidate through T0-T4;
+- next: provision approved replay inputs/final processing and exercise the
+  operational T0-T4 promotion path without relabeling generated evidence;
 - perform recorded replay scoring only after approved inputs and the final
   processor exist;
 - keep Gate 1 recentering as an exclusive, separately authorized live stage.
@@ -1026,8 +1078,9 @@ Still requiring controlled evidence:
 ## Immediate next actions
 
 The recorded M0, Wave 1A, Wave 1, Wave 2, Wave 3 control-plane dogfood, Wave 3
-IMU, and Wave 3B generated-runtime integration commits, clean-main checks,
-trusted-manifest verification, and explicit canonical test tiers are complete.
+IMU, Wave 3B generated runtime, and Wave 3C correlated-coast integration
+commits, clean-main checks, trusted-manifest verification, and explicit
+canonical test tiers are complete.
 Do not repeat them merely because an agent resumes the plan; rerun affected
 gates whenever the base or trust set changes.
 
@@ -1040,12 +1093,10 @@ gates whenever the base or trust set changes.
    integrated at `28b7d782404d6b825cebae3b65a8443d756be234`. Keep it
    distinct from receiver/reassembly, recorded replay, and measured
    command/actuator/gyro response evidence.
-3. Implement the separately reviewed Wave 3C one-tick correlated-coast lease.
-   Require a healthy immediately preceding accepted update, exact tick
-   adjacency, a strictly newer causal target attitude, first-dropout
-   `COASTING`, and default-off guidance/controller behavior. A skip, any new
-   frame attempt, lifecycle change, invalid evidence, or lease reuse consumes
-   or rejects it; a second repeat remains exact zero.
+3. The separately reviewed Wave 3C one-tick correlated-coast lease is integrated
+   at `168220ba7060d07743335d0e9c56bcd2d05d669d`. Keep it default-off outside
+   its proof-bound generated runtime, preserve public lower-layer dropout
+   rejection, and do not treat its local proof as supervisor-verifiable.
 4. Validate Gate 0 non-regression and recorded top-clipped Gate 1 geometry once
    approved replay inputs and the final processor exist.
 5. Keep stable-frame corrected-ray application separate from Wave 3C. It still
