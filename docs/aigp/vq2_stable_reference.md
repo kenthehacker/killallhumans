@@ -330,3 +330,22 @@ decision remains explicit: either introduce a local-scale measurement with
 full fitted-homography covariance in a new local/provenance envelope, or retain
 finite `/1` semantics by carrying complete quadrilateral shape, rates, and
 covariance. Neither may be inferred from this six-state prototype.
+
+## Integrated offline evidence
+
+Contract freeze `ede0edca3025ad03db3032e371a37c86dc8fdc00`, behavioral
+implementation `c21a742004d1d3bc485a866babb9759b6aee62fb`, and promotion/main
+integration `46df0adee76070e10509fa5e807b986a9469c68e` are post-merge
+verified. Direct tests pass `82`; the compatibility matrix passes `186`;
+canonical, isolated-manifest, and post-merge VQ2 runs pass exactly `1,101`;
+fast and unit each pass `2,196` with `20` skips and `42` deselections; and full
+non-live passes `2,237` with `21` skips. Three independent final reviews
+cleared the mathematical, lifecycle, documentation, test, trust, and no-wiring
+boundaries.
+
+The reviewed 128-file manifest has semantic identity
+`2f70415dd7cdfa0675c6dc778406cdccfdca09757e79b1a8f1a3e0d4752e9268`
+and file SHA-256
+`2c965f2f5a6486f506d51c8e290b09d6a22166f6f277fbff1234690e510d63d9`.
+No simulator, network, replay, preflight, runtime/shadow, transport, reset,
+arm/disarm, target, or powered action contributed to this evidence.

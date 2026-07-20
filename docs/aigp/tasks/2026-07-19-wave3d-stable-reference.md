@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3d-stable-reference`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `promotion_verified`
+- State: `post_merge_verified`
 - Objective: add a standalone, immutable, bidirectional stable-orientation
   transform for a distinctly named six-dimensional local-differential pinhole
   feature state, with exact reference lineage, rate chain rules, and full
@@ -313,6 +313,8 @@ permitted for this task.
 
 - Behavioral implementation commit:
   `c21a742004d1d3bc485a866babb9759b6aee62fb`.
+- Promotion/trust and integrated main commit:
+  `46df0adee76070e10509fa5e807b986a9469c68e`.
 - The exact T1 policy advances from `1,019` to `1,101` passed tests and adds
   only `estimation/tests/test_vq2_stable_reference.py` to its sorted inventory.
   The policy file SHA-256 is
@@ -335,6 +337,9 @@ permitted for this task.
   sorted/unique policy inventory, manifest delta, every on-disk digest, and
   file/semantic identities. Generated cache directories were removed before
   the final isolated run; they contained no source or evidence.
+- Main fast-forwarded from the reviewed Wave 3C closeout to the promotion
+  commit. Post-merge canonical `test-vq2` passed all `1,101` tests, and tracked
+  Git status was empty before documentation closeout.
 - No simulator, external network, replay corpus, preflight, runtime/shadow,
   transport, reset, arm/disarm, target, or powered action was used.
 
