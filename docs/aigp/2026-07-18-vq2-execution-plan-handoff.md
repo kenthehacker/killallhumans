@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-18
 **Current offline update:** 2026-07-20
+**Continuation handoff:** docs/aigp/2026-07-20-vq2-development-continuation-handoff.md
 **Target:** DCL FlightSim build 3385, VQ2 Training and Qualification
 **Repository:** C:\Users\John\killallhumans
 **Integrated foundation baseline:** b9382da162c1c1e2984288ad7f3cfa7e5a1b11f8
