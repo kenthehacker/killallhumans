@@ -1,6 +1,6 @@
 {
   "schema": "aigp-t1-pytest-policy/1",
-  "expected_passed": 1101,
+  "expected_passed": 1325,
   "pytest_version": "9.1.1",
   "pytest_timeout_version": "2.4.0",
   "test_files": [
@@ -25,6 +25,7 @@
     "estimation/tests/test_imu_attitude.py",
     "estimation/tests/test_vq2_imu_derotation.py",
     "estimation/tests/test_vq2_imu_provenance.py",
+    "estimation/tests/test_vq2_local_differential_measurement.py",
     "estimation/tests/test_vq2_relative_estimator.py",
     "estimation/tests/test_vq2_stable_reference.py",
     "estimation/tests/test_vq2_system_id.py",

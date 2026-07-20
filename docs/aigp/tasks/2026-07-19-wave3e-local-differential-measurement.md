@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3e-local-differential-measurement`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `behavior_verified`
+- State: `promotion_verified`
 - Objective: add a standalone, immutable reducer from one externally produced,
   rectified, center-gauge-fixed full homography and dense conditional
   covariance to a three-component measurement that shares Wave 3D's local
@@ -13,7 +13,7 @@
 - Worktree:
   `C:\Users\John\aigp-worktrees\wt-wave3e-local-measurement`.
 - Owner: `/root`.
-- Heartbeat date: `2026-07-19`.
+- Heartbeat date: `2026-07-20`.
 - Simulator access: `none`.
 - Contract freeze: `c7dcb612318eb9d26868fa1364c1a027d2b8edcd`.
 - Review-driven contract correction:
@@ -613,3 +613,43 @@ No detector producer, `/1` conversion, corner covariance, rate/state object,
 Wave 3D call, estimator/runtime/controller/supervisor/transport wiring,
 simulator, preflight, external network, replay, reset, arm/disarm, target,
 shadow/runtime, or powered action contributed to this evidence.
+
+## Promotion review
+
+The accepted behavioral implementation is commit
+`ceed9c854b0066d4f00d4add796fb968d449593a`. Promotion changed the canonical
+VQ2 policy only from `1,101` to `1,325` expected passes and added only
+`estimation/tests/test_vq2_local_differential_measurement.py`; the policy
+inventory remains sorted and unique. The policy file identity is
+`7daa46ec4dfd025c18f12076add06d70b6463f07d6320b20487a63bd78d0851e`
+and its canonical semantic identity is
+`b8bc5228b12eafc75c10b3d2aa658cfe57a0d1ed820b3fefa6e0317d7c5cdc90`.
+
+The trusted manifest advanced from `128` to `129` files. It added the new
+test digest
+`683aa081103e6e9ae22281b1e1f573bc821218f57df75cdfa688587b0ad84382`,
+changed only the policy digest, and removed nothing. Independent strict
+review found all `129/129` files present, regular, and digest-matching. The
+manifest file identity is
+`e88363ef096bba83fe4660a4903abb6ae063f41682246b38ba9c69481008fffc`
+and its canonical semantic identity is
+`46e77cbbe8a131517444b141293b1fe8c2bab546a6f5630f711ffe0d621d5ea2`.
+Canonical semantic identities are SHA-256 over parsed JSON serialized with
+sorted keys and compact separators.
+
+Observed promotion evidence is:
+
+- direct: `224` passed;
+- focused compatibility: `450` passed;
+- canonical VQ2: `1,325` passed;
+- cache-clean isolated hash-pinned VQ2: `1,325` passed;
+- `test-fast`: `2,420` passed, `20` skipped, `42` deselected;
+- `test-unit`: `2,420` passed, `20` skipped, `42` deselected; and
+- `test-full-non-live`: `2,461` passed, `21` skipped in `487.69s`.
+
+The full non-live boundary was rerun to an observed pytest summary after two
+shorter outer shell ceilings expired; neither interrupted attempt produced a
+test failure, and no orphaned runner remained. Promotion used no simulator,
+preflight, external network, replay, reset, arm/disarm, target, transport,
+shadow/runtime, or powered surface. Post-merge status and the integrated main
+commit remain to be recorded after fast-forward and canonical verification.

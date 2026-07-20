@@ -137,17 +137,18 @@ evidence.
 
 ## Conditional covariance only
 
-For dense gauge-fixed homography covariance `P_H`, the reducer returns
+For dense gauge-fixed homography covariance `P_H`, let the
+active-model-admitted canonical view be
+`P_H_canonical = (P_H + P_H^T)/2`. The reducer returns
 
 ```text
-P_local = J P_H J^T.
+P_local = J P_H_canonical J^T.
 ```
 
-Here the multiplication uses the active-model-admitted canonical view
-`(P_H + P_H^T)/2`. The immutable input and its fingerprint retain the exact
-submitted matrix; the indivisible evidence separately carries the canonical
-`8x8` view used by the congruence. This ordering is required so a stricter
-model can reject asymmetry that a looser model would admit.
+The immutable input and its fingerprint retain the exact submitted matrix;
+the indivisible evidence separately carries the canonical `8x8` view used by
+the congruence. This ordering is required so a stricter model can reject
+asymmetry that a looser model would admit.
 
 This is a first-order conditional covariance. It conditions on the exact
 rectification/calibration artifact, fit model, producer configuration, and
@@ -187,14 +188,15 @@ quality. Those omissions are another reason this proof-only result cannot by
 itself be admitted as an estimator measurement. All candidate, algorithm, and
 content-hash fields remain caller assertions.
 
-SHA-256 content identities bind the producer configuration and rectification
-calibration artifacts. They identify exact external content; they do not make
-that content available, validate its rules compliance, or establish its
-physical accuracy. The local input fingerprint additionally covers the entire
-source value, homography, and covariance. A separate derivation fingerprint
-covers the complete model plus complete input, so changing a numerical or
-semantic admission envelope changes the result identity. They are integrity
-identities, not wire schemas or signatures.
+The caller asserts SHA-256 content identities for the complete producer
+configuration and rectification-calibration artifacts. Those asserted hashes
+must cover every relevant external parameter, but the reducer cannot inspect
+that content, prove the hashes were computed truthfully, validate rules
+compliance, or establish physical accuracy. The local input fingerprint
+additionally covers the entire source value, homography, and covariance. A
+separate derivation fingerprint covers the complete model plus complete input,
+so changing a numerical or semantic admission envelope changes the result
+identity. They are integrity identities, not wire schemas or signatures.
 
 The module deliberately has no detached measurement dataclass. Values and
 conditional covariance remain inside the complete evidence with their exact
