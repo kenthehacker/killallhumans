@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3d-stable-reference`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `behavior_accepted`
+- State: `promotion_verified`
 - Objective: add a standalone, immutable, bidirectional stable-orientation
   transform for a distinctly named six-dimensional local-differential pinhole
   feature state, with exact reference lineage, rate chain rules, and full
@@ -308,6 +308,35 @@ permitted for this task.
   finite-quad coupling.
 - Simulator access remained `none`. No network, preflight, replay, transport,
   shadow/runtime, reset, arm/disarm, target, or powered action occurred.
+
+## Promotion review
+
+- Behavioral implementation commit:
+  `c21a742004d1d3bc485a866babb9759b6aee62fb`.
+- The exact T1 policy advances from `1,019` to `1,101` passed tests and adds
+  only `estimation/tests/test_vq2_stable_reference.py` to its sorted inventory.
+  The policy file SHA-256 is
+  `a98b2d4d618b6999927d1c997ca0a65c63aebef742c53bef31a6c05dcd53b020`;
+  its semantic SHA-256 is
+  `0053eaf52fa6a9b273abb558e83c89aa1b4560888eaa7f9db11a371d5c3c9ab4`.
+- The reviewed trusted manifest advances from `127` to `128` files. Its only
+  addition is the new test digest
+  `b9dddab8dffca4417c651e85aac07d661c2429dd42edb76cd919d72934efbf45`;
+  its only changed existing digest is the policy; and no entry is removed. All
+  `128` hashes independently match disk. Manifest semantic identity is
+  `2f70415dd7cdfa0675c6dc778406cdccfdca09757e79b1a8f1a3e0d4752e9268`;
+  manifest file SHA-256 is
+  `2c965f2f5a6486f506d51c8e290b09d6a22166f6f277fbff1234690e510d63d9`.
+- Canonical and cache-clean isolated-manifest VQ2 gates each pass exactly
+  `1,101` tests. `test-fast` and `test-unit` each pass `2,196` with `20`
+  skips and `42` deselections. Promotion-boundary `test-full-non-live` passes
+  `2,237` with `21` skips. The direct and focused counts remain `82` and `186`.
+- Independent promotion metadata review cleared the exact count arithmetic,
+  sorted/unique policy inventory, manifest delta, every on-disk digest, and
+  file/semantic identities. Generated cache directories were removed before
+  the final isolated run; they contained no source or evidence.
+- No simulator, external network, replay corpus, preflight, runtime/shadow,
+  transport, reset, arm/disarm, target, or powered action was used.
 
 ## Contract-freeze review
 
