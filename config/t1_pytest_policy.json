@@ -1,6 +1,6 @@
 {
   "schema": "aigp-t1-pytest-policy/1",
-  "expected_passed": 872,
+  "expected_passed": 910,
   "pytest_version": "9.1.1",
   "pytest_timeout_version": "2.4.0",
   "test_files": [
@@ -19,6 +19,7 @@
     "competition/tests/test_vq2_wave1_pipeline.py",
     "competition/tests/test_vq2_wave2_adapter.py",
     "competition/tests/test_vq2_wave3_imu_adapter.py",
+    "competition/tests/test_vq2_wave3_offline_runtime.py",
     "estimation/tests/test_ekf.py",
     "estimation/tests/test_gate_pnp.py",
     "estimation/tests/test_imu_attitude.py",
