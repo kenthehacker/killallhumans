@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-wave3d-stable-reference`
 - Parent: `2026-07-18-vq2-execution-plan-handoff`
-- State: `contract_frozen`
+- State: `behavior_accepted`
 - Objective: add a standalone, immutable, bidirectional stable-orientation
   transform for a distinctly named six-dimensional local-differential pinhole
   feature state, with exact reference lineage, rate chain rules, and full
@@ -63,10 +63,12 @@ The frozen public surface is local and non-wire:
 
 - `VQ2StableReferenceModel` carries an explicit local-feature semantic,
   synthetic chart calibration, reference-age/conditioning/output bounds,
-  attitude/rate/timing limits, and an angular-acceleration bound;
+  attitude/rate/timing limits, and explicit angular- and feature-acceleration
+  bounds;
 - `VQ2StableReferenceKey` carries the stable owner/source/model identity;
 - `VQ2StableReference` retains the immutable seed evidence and derived
-  capture-time chart;
+  capture-time chart, and exposes a deterministic local `basis_id` fingerprint
+  over the caller reference ID plus the complete key, seed, and orientation;
 - `VQ2LocalDifferentialFeatureState` carries the exact local six-vector,
   basis/time/model identity, and dense covariance;
 - `VQ2StableFeatureTransformEvidence` retains forward/inverse inputs, derived
@@ -110,9 +112,10 @@ validate_stable_measurement_sequence(
 `CAPTURE` binds the camera state time exactly to the observation measurement
 time. `TARGET` binds it exactly to the prediction-target time. Forward input
 must use the selected camera basis; inverse input must use the stable reference
-basis at that same time. Feature semantic, chart model, basis ID, host clock,
-and covariance model must match exactly. The sequence validator accepts only
-camera-to-stable `CAPTURE` measurement transforms.
+basis at that same time. Feature semantic, chart model, derived seed-bound basis
+ID, host clock, and covariance model must match exactly. Reusing the same
+caller-supplied reference ID cannot alias two distinct seed charts. The sequence
+validator accepts only camera-to-stable `CAPTURE` measurement transforms.
 
 ## Reference lifecycle
 
@@ -121,6 +124,11 @@ camera-to-stable `CAPTURE` measurement transforms.
   owner tracker ID, owner role, reference ID, and stable-transform model.
 - The reference orientation is immutable. There is no implicit rebase or
   rollover of a live posterior.
+- The caller-supplied reference ID is a label, not sufficient chart identity.
+  Stable states bind the deterministic local `reference.basis_id` fingerprint
+  over that label and the complete reference key, seed evidence, and derived
+  orientation. The fingerprint is an in-process integrity identity, not a wire
+  schema or cross-version persistence format.
 - Its lifecycle key binds owner tracker and role; session, reset, gate epoch,
   expected gate index, camera host clock/stream/generation; exact IMU
   `epoch_key`; calibration and camera-ray model; derotation and attitude-time
@@ -133,19 +141,25 @@ camera-to-stable `CAPTURE` measurement transforms.
   measurement sequence, race-status sequence/boot time and cutover watermarks
   follow the complete same-epoch authority-snapshot transition rules: they are
   monotonic, and an unchanged `race_status_sequence` requires exactly unchanged
-  `race_status_boot_ms`. Publication sequence, publish time, and measurement
-  time are strictly increasing, and decision/prediction time cannot regress.
-  An exact attitude input may be reused. Otherwise sample sequence, opaque
-  source time, and host receipt time must all advance coherently; source time is
-  never subtracted from host time.
+  `race_status_boot_ms`. Camera opaque source time within the fixed generation,
+  publication sequence, publish time, and measurement time are strictly
+  increasing, and decision/prediction time cannot regress. Camera and IMU
+  opaque source times are ordering tokens and are never subtracted from host
+  time. Each capture and target attitude input may be exactly reused;
+  otherwise its sample sequence, opaque source time, and host receipt time must
+  all advance coherently.
 - Reference establishment requires a usable, complete fitted quadrilateral
   with all four visible, non-clipped corners. Establishment latches only
   reference orientation and lineage. The seed may be paired once with an
   independently supplied local-differential feature whose value and covariance
   were produced under the exact canonical local-scale model. Wave 3D never
   derives that feature from `/1` center, finite scale, skew, or covariance
-  summaries. Every later source must be a strictly newer distinct frame with
-  advancing publication and measurement chronology and coherent IMU lineage.
+  summaries. Reuse of the seed frame requires the exact original complete
+  evidence context; it cannot be retargeted or relabelled. Every later source
+  must be a strictly newer distinct frame with advancing source/publication/
+  measurement chronology and coherent capture and target IMU lineage. Because
+  the local feature is independently supplied, a later usable derotation
+  source need not retain complete finite-quad `/1` scale/skew/corners.
 - A lifecycle-key change, tracker replacement, or explicit retirement requires
   discarding the old reference and
   rebootstrap. Innovation rejection, a transient missing frame, or missing IMU
@@ -192,15 +206,21 @@ camera-to-stable `CAPTURE` measurement transforms.
   nuisance envelope, model floor, and total matrices deterministically.
 - The result is a one-shot conditional envelope whose input covariance excludes
   previously added transform nuisances and feature/nuisance cross-covariance.
-  A total covariance from an earlier transform cannot be fed through and have
-  the same nuisance envelope added again. Sequential filtering requires an
-  augmented/Schmidt state, retained cross-covariance, or a separately proved
-  dominating common-mode construction.
-- Rate and expansion timing uncertainty uses the full time sensitivity of `A`
-  and `A_dot`, including angular-rate-squared/projective terms and `A_ddot`.
-  Bounding `A_ddot` requires an explicit angular-acceleration bound. If timing
-  uncertainty also moves physical feature time, a feature-acceleration/model
-  bound is additionally required; otherwise the rate transform is withheld.
+  The functions reject a directly returned state while it remains marked
+  `TRANSFORM_TOTAL`. `covariance_scope` is nevertheless a caller assertion: a
+  stateless value transform cannot detect a newly constructed or dishonestly
+  relabelled covariance. No stronger anti-recycling, sequential-filter, or
+  averaging claim is made. Sequential use requires an approved provenance
+  carrier plus an augmented/Schmidt state, retained cross-covariance, or a
+  separately proved dominating common-mode construction.
+- Rate and expansion timing sensitivity includes `A`, `A_dot`, rate-squared/
+  projective terms, and `A_ddot`; physical feature-time displacement may also
+  require a feature-acceleration bound. The stable model therefore requires
+  explicit angular- and feature-acceleration bounds and binds them into the
+  reference. In this standalone version, those scalars and the supplied joint
+  nuisance matrix are declarative model assumptions: the model author asserts
+  that the matrix dominates the full bounded sensitivity. The module hard-
+  validates the values and matrix but does not derive or prove that dominance.
 - Every input, reference, rotation, derivative, Jacobian, covariance component,
   and output is finite, dimensionally exact, symmetric where required, and
   positive semidefinite within a scale-aware tolerance. Numerical stabilization
@@ -212,7 +232,9 @@ camera-to-stable `CAPTURE` measurement transforms.
   orientation uncertainty, rate uncertainty, and timing uncertainty remain
   bounded. No uncalibrated default model exists.
 - A frozen transform result re-derives all nested and derived values during
-  `validate_integrity()` so low-level mutation cannot relabel evidence.
+  `validate_integrity()`. Nested public observations are round-tripped through
+  the public `/1` primitive schema so shallow frozen-object mutation cannot
+  relabel frame timing, authority, geometry, or covariance evidence.
 
 ## Authority and evidence boundary
 
@@ -247,9 +269,10 @@ the production path.
 - Static boundary tests proving no production import/call site, no private
   derotation-helper import, no `/1` contract edit, and no authority/transport
   dependency.
-- Tests proving the joint nuisance envelope remains a single one-shot bound and
-  cannot be presented as independent per-frame noise, fed back as fresh input,
-  or averaged away by this stateless primitive.
+- Tests proving the joint nuisance envelope remains a single one-shot bound,
+  directly returned total-labelled states are rejected, and the stateless
+  primitive makes no claim to detect caller reconstruction/relabeling or to
+  support independent-noise averaging.
 - Direct target, the new test plus existing derotation/provenance/relative-
   estimator compatibility matrix, canonical and isolated-manifest `test-vq2`,
   `test-fast`, `test-unit`, promotion-boundary `test-full-non-live`, independent
@@ -258,6 +281,33 @@ the production path.
 Skipped optional coverage is never positive evidence. No simulator, network,
 preflight, reset, arm/disarm, target, transport, shadow, or powered action is
 permitted for this task.
+
+## Behavioral review
+
+- The standalone implementation adds only the owned module, direct tests, and
+  these design/task records. Repository-wide static inspection finds no
+  production import or call site and no private derotation-helper dependency.
+- Direct stable-reference tests pass `82`; the stable-reference plus existing
+  derotation/provenance/relative-estimator compatibility matrix passes `186`;
+  and the pre-promotion canonical VQ2 candidate passes exactly `1,101` tests
+  (`1,019 + 82`).
+- Independent mathematical re-review cleared the homography and derivative,
+  local-area scale/expansion law, inverse, analytic `6x6` Jacobian, covariance
+  congruence, normalized extrinsic, and PSD changes. A 2,000-case independent
+  sweep bounded oracle error at `8.88e-16`, finite-difference Jacobian error at
+  `4.52e-9`, inverse-state error at `1.11e-15`, inverse-Jacobian composition at
+  `1.78e-15`, and finite-time rate/scale error at `4.13e-10`.
+- Independent lifecycle and test re-reviews cleared source/authority/IMU
+  chronology, exact seed context, derived basis identity, nested public-schema
+  integrity, uncertainty/geometry boundaries, covariance labeling, public
+  signatures/types, finite-quad semantic separation, and no-wiring scope.
+- Review-discovered defects were corrected before acceptance: scale-insensitive
+  PSD tolerance, shallow nested observation validation, target-IMU relabeling,
+  same-label reference aliasing, camera source-time replay, corrupted model
+  establishment, near-unit extrinsic rate scaling, and unnecessary later-frame
+  finite-quad coupling.
+- Simulator access remained `none`. No network, preflight, replay, transport,
+  shadow/runtime, reset, arm/disarm, target, or powered action occurred.
 
 ## Contract-freeze review
 

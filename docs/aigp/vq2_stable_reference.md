@@ -2,7 +2,7 @@
 
 ## Purpose and non-authority
 
-This proposed Wave 3D module freezes the pure mathematics and lifecycle for a
+This standalone Wave 3D module implements the pure mathematics and lifecycle for a
 fixed-orientation feature basis. It consumes integrity-checked public
 `VQ2DerotationEvidence` only for attitude, time, calibration, and source
 lineage. It neither changes nor feeds the existing estimator.
@@ -202,17 +202,25 @@ covariance, or an explicit proved common-mode construction; Wave 3D does not
 hide that choice.
 
 `P_output = G P G^T + ...` is a one-shot conditional envelope only when `P`
-excludes prior transform nuisances and feature/nuisance cross-covariance. A
-total covariance from an earlier transform cannot be fed through and have the
-same common terms added again.
+excludes prior transform nuisances and feature/nuisance cross-covariance. The
+implementation rejects a directly returned state while its scope remains
+`TRANSFORM_TOTAL`. That scope is a caller assertion, not an unforgeable
+provenance carrier: a stateless mathematical transform cannot detect a newly
+constructed or dishonestly relabelled covariance. Therefore Wave 3D makes no
+stronger anti-recycling, sequential-filter, or independent-noise averaging
+claim. Any such use needs an approved provenance carrier and retained nuisance
+cross-covariance or another separately proved construction.
 
 Current provenance provides point angular rate but not angular acceleration.
-Rate and expansion timing uncertainty requires the full time sensitivity of
-`A` and `A_dot`, including angular-rate-squared/projective terms and `A_ddot`.
-The stable model therefore requires an explicit angular-acceleration bound. If
-the uncertainty moves the physical feature measurement time rather than only
-attitude evaluation time, feature-acceleration/model uncertainty is also
-required. Missing or excessive bounds withhold rate transformation.
+Rate and expansion timing sensitivity includes the full time sensitivity of
+`A` and `A_dot`, angular-rate-squared/projective terms, and `A_ddot`. If timing
+uncertainty moves physical feature time, feature acceleration also matters.
+The stable model therefore requires explicit angular- and feature-acceleration
+bounds. In this standalone version those scalars and the supplied joint
+nuisance envelope are declarative model assumptions: the model author asserts
+that the matrix dominates the full bounded sensitivity. The module validates
+and binds the values and matrix, but it does not derive or independently prove
+that dominance.
 
 Positive-semidefinite validation is scale-aware. Tiny symmetric roundoff may
 be floored only within an explicit tolerance. A materially negative
@@ -235,6 +243,13 @@ Reference creation binds:
 - the seed frame, publication, measurement time, candidate, capture attitude,
   and derived capture camera-to-NED orientation.
 
+The caller reference ID is only a label. `reference.basis_id` is a deterministic
+local fingerprint over that label plus the complete key, seed evidence, and
+derived reference orientation. Stable-basis feature states bind this
+fingerprint, so reusing a caller ID cannot alias two distinct seed charts. The
+fingerprint is an in-process integrity identity, not a wire schema or promised
+cross-version persistence format.
+
 The key binds the entire exact immutable camera-to-body calibration,
 derotation model, stable model, and chart matrix values, not their IDs alone.
 
@@ -243,23 +258,29 @@ quadrilateral, although Wave 3D still cannot derive an honest local-scale
 covariance from the current summaries. Establishment latches orientation and
 lineage only. The seed may be paired once with an independently supplied local-
 differential feature produced under the exact canonical semantic; no `/1`
-feature or covariance is converted. The reference orientation never rolls
-forward. A later transform must use a distinct newer frame with
-strictly advancing publication and measurement time, causal evidence available
-at decision, nonregressing IMU sample/source/receipt lineage, and the same
-lifecycle key. Any lifecycle change requires explicit retirement and a fresh
-filter bootstrap; no posterior is silently re-expressed under a new reference.
+feature or covariance is converted. Reuse of the seed frame requires the exact
+original evidence context; it cannot be retargeted. The reference orientation
+never rolls forward. A later transform must use a distinct newer frame with
+strictly advancing camera opaque source time within the fixed generation,
+publication and measurement time, causal evidence available at decision,
+coherent capture and target IMU sample/source/receipt lineage, and the same
+lifecycle key. Because the local feature is supplied independently, a later
+usable derotation source need not contain complete finite-quad `/1` scale,
+skew, or corner summaries. Any lifecycle change requires explicit retirement
+and a fresh filter bootstrap; no posterior is silently re-expressed under a new
+reference.
 
 Race-status refresh sequence, race boot time, and authority cutover watermarks
 remain checked inside each observation but are not themselves the stable chart
 identity. The sequence validator additionally requires those snapshot fields
 to obey the complete same-epoch transition semantics: they are monotonic, and
 an unchanged `race_status_sequence` requires exactly unchanged
-`race_status_boot_ms`. It also requires strictly increasing publication
-sequence, publish time, and measurement time, and nonregressing
-decision/prediction times. An IMU input may be exactly reused; otherwise sample
-sequence, opaque source time, and host receipt time all advance coherently.
-Source time is never subtracted from host time.
+`race_status_boot_ms`. It also requires strictly increasing camera opaque
+source time within a generation, publication sequence, publish time, and
+measurement time, and nonregressing decision/prediction times. Each capture and
+target IMU input may be exactly reused; otherwise its sample sequence, opaque
+source time, and host receipt time all advance coherently. Camera and IMU source
+times are ordering tokens and are never subtracted from host time.
 Innovation rejection or temporary missing evidence withholds an update and
 does not move the reference. Estimator gap reinitialization must retire the
 reference when integration eventually exists.
@@ -284,14 +305,16 @@ validate_stable_measurement_sequence(reference, transforms) -> None
 
 `camera_time` is exact enum `CAPTURE` or `TARGET`. Capture basis/time equals
 the observation measurement time; target basis/time equals the prediction-
-target time. The local semantic, model, basis ID, host clock, and covariance
-identity must match. Sequence validation accepts only camera-to-stable capture-
-measurement transforms.
+target time. The local semantic, model, derived seed-bound basis ID, host clock,
+and covariance identity must match. Sequence validation accepts only camera-
+to-stable capture-measurement transforms.
 
 The standalone implementation independently evaluates the small quaternion
 propagation and chart kernel from public values. It never imports private
 derotation helpers. Compatibility tests cover negative capture alignment and
 cross-check point bearings against the existing public derotation evidence.
+Integrity validation additionally round-trips every nested source observation
+through the public `/1` primitive schema before re-deriving transform fields.
 
 ## Evidence boundary and next decision
 
