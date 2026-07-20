@@ -11,6 +11,11 @@ import numpy as np
 import pytest
 
 import scripts.aigp_vq2_run as vq2_module
+from aigp_loop.replay import (
+    AsyncReplayRecorder,
+    ReplayBundleReader,
+    ReplayBundleWriter,
+)
 from competition.adapter import IMUData, Quaternion, TelemetryState
 from competition.aigp_messages import RaceStatus
 from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
@@ -536,6 +541,75 @@ def test_capture_loaded_sampling_records_exact_passive_frame_timing(monkeypatch)
     assert observation.tracking_end_monotonic_ns == 25
     assert observation.work_end_monotonic_ns == 26
     assert len(replay.frames) == 1
+
+
+def test_async_replay_boundary_preserves_exact_vq2_contract_schemas(tmp_path):
+    bundle = tmp_path / "exact-async.vq2replay"
+    replay = AsyncReplayRecorder(
+        ReplayBundleWriter(bundle, require_private=False)
+    )
+    imu_ingress = MavlinkIngressV1(
+        stream_id="vq2-mavlink-udp-14550",
+        generation=1,
+        sequence=0,
+        message_type="HIGHRES_IMU",
+        host_clock_id="host-perf-counter",
+        received_monotonic_ns=100,
+        source_time_value=500,
+        source_time_unit="us",
+    )
+    received_imu = ReceivedIMUSampleV1(
+        ingress=imu_ingress,
+        imu=IMUData(
+            timestamp_us=500,
+            accel=(1.0, 2.0, -9.0),
+            gyro=(0.1, 0.2, 0.3),
+        ),
+    )
+    heartbeat = MavlinkIngressV1(
+        stream_id="vq2-mavlink-udp-14550",
+        generation=1,
+        sequence=1,
+        message_type="HEARTBEAT",
+        host_clock_id="host-perf-counter",
+        received_monotonic_ns=200,
+        source_time_value=None,
+        source_time_unit=None,
+    )
+    snapshot = _vision_snapshot(
+        generation=2,
+        frame_id=101,
+        sim_time_ns=1_010,
+        received_monotonic_s=1.0,
+    )
+
+    assert replay.record_imu(
+        received_imu.imu,
+        received_monotonic_s=0.0000001,
+        received_sample=received_imu,
+    )
+    assert replay.record_mavlink_ingress(heartbeat)
+    assert replay.capture_decoded_snapshot(snapshot)
+    stats = replay.close(expected_decoded_frames=1)
+
+    assert stats.complete is True
+    _summary, records = ReplayBundleReader(bundle).verify_and_read(
+        verify_frames=True
+    )
+    events = {
+        row["event"]: row
+        for row in records
+        if row["type"] == "event"
+    }
+    assert ReceivedIMUSampleV1.from_primitive(
+        events["received_imu"]["observation"]
+    ) == received_imu
+    assert MavlinkIngressV1.from_primitive(
+        events["mavlink_ingress"]["observation"]
+    ) == heartbeat
+    assert FrameTimingV1.from_primitive(
+        events["camera_frame_timing"]["observation"]
+    ) == snapshot.timing
 
 
 def test_non_passive_capture_uses_latest_snapshot_not_passive_fifo(monkeypatch):

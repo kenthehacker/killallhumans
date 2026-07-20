@@ -1060,6 +1060,15 @@ class AsyncReplayRecorder:
                     frozen = np.array(value, copy=True, order="C")
                     frozen.setflags(write=False)
                     return frozen
+                if type(value) in {
+                    FrameTimingV1,
+                    MavlinkIngressV1,
+                    ReceivedIMUSampleV1,
+                }:
+                    # Generic dataclass normalization omits ClassVar schema
+                    # tags.  Cross the worker boundary as the exact public
+                    # primitive so the synchronous writer can revalidate it.
+                    return value.to_primitive()
                 return _json_safe(value)
 
             safe_args = tuple(snapshot(value) for value in args)
