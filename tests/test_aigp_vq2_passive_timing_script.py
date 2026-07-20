@@ -131,6 +131,11 @@ def _vision_stats(frame_count: int) -> dict:
         "receiver_buffered_partial_frames": 0,
         "receiver_buffer_high_watermark": 2,
         "receiver_buffer_capacity": 8,
+        "capture_snapshot_queue_entries": 0,
+        "capture_snapshot_queue_high_watermark": 2,
+        "capture_snapshot_queue_capacity": 256,
+        "capture_snapshot_queue_dropped": 0,
+        "capture_snapshot_queue_enabled": True,
         "receiver_dropped_partial_frames": 0,
         "receiver_duplicate_chunks": 0,
         "receiver_dropped_late_packets": 0,
@@ -358,6 +363,7 @@ def test_analyzer_fully_verifies_and_emits_deterministic_aggregate_only(tmp_path
     assert "command_to_gyro_causal_response" in first["unmeasured_items"]
     assert "simulator_wall_ratio" in first["unmeasured_items"]
     assert "training_mode_machine_detection" in first["unmeasured_items"]
+    assert "calibrated_camera_imu_offset" in first["unmeasured_items"]
 
     encoded = json.dumps(first, sort_keys=True)
     assert "123.456" not in encoded
@@ -607,6 +613,26 @@ def test_analyzer_rejects_incomplete_capture_counts_or_timing_overflow(tmp_path)
     )
     with pytest.raises(ValueError, match="failure/drop counters"):
         analyze_bundle(capture_error)
+
+    queued = _bundle(tmp_path, "capture-queue-not-drained.vq2replay")
+    _mutate_manifest(
+        queued,
+        lambda manifest: manifest["outcome"]["vision_capture_stats"].__setitem__(
+            "capture_snapshot_queue_entries", 1
+        ),
+    )
+    with pytest.raises(ValueError, match="snapshot queue was not completely drained"):
+        analyze_bundle(queued)
+
+    queue_drop = _bundle(tmp_path, "capture-queue-drop.vq2replay")
+    _mutate_manifest(
+        queue_drop,
+        lambda manifest: manifest["outcome"]["vision_capture_stats"].__setitem__(
+            "capture_snapshot_queue_dropped", 1
+        ),
+    )
+    with pytest.raises(ValueError, match="failure/drop counters"):
+        analyze_bundle(queue_drop)
 
     missing_diagnostic = _bundle(tmp_path, "missing-diagnostic.vq2replay")
     _mutate_manifest(

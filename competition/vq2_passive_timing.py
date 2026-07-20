@@ -32,6 +32,7 @@ UNMEASURED_PASSIVE_TIMING_ITEMS = (
     "command_to_gyro_causal_response",
     "camera_measurement_clock_model",
     "imu_measurement_clock_model",
+    "calibrated_camera_imu_offset",
     "command_effect_delay_model",
 )
 
@@ -75,9 +76,10 @@ class CameraFrameTimingObservationV1:
     """One passively consumed camera frame and its same-clock work stages.
 
     The nested ``FrameTimingV1`` proves receiver through publication timing.
-    These additional points begin only after publication and terminate before
-    the caller releases this frame's passive work.  Equal adjacent points are
-    allowed because a host clock may observe a zero-duration stage.
+    These additional points begin only after publication and terminate after
+    the capture-loaded path has synchronously copied/enqueued the processed
+    frame evidence.  Equal adjacent points are allowed because a host clock
+    may observe a zero-duration stage.
     """
 
     SCHEMA: ClassVar[str] = "aigp-vq2-camera-frame-timing-observation/1"

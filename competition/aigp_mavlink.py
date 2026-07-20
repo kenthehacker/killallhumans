@@ -18,8 +18,9 @@ import math
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Dict, Optional
+from typing import TYPE_CHECKING, Callable, Deque, Dict, Optional
 
 from competition.adapter import (
     AttitudeCommand,
@@ -47,7 +48,11 @@ from competition.aigp_recorder import (
     track_data_fields,
     write_jsonl,
 )
+from competition.vq2_runtime import VQ2_HOST_CLOCK_ID
 from competition.vision_udp import VisionUdpListener
+
+if TYPE_CHECKING:
+    from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +63,56 @@ SET_ATTITUDE_TARGET_MASK_ATTITUDE_THRUST = 0b00000111
 SET_ATTITUDE_TARGET_MASK_RATES_THRUST = 128
 SET_POSITION_TARGET_LOCAL_NED_MASK = 2496
 MAV_FRAME_LOCAL_NED = 1
+
+VQ2_MAVLINK_STREAM_ID = "vq2-mavlink-udp-14550"
+DEFAULT_INGRESS_BUFFER_CAPACITY = 4096
+
+
+@dataclass(frozen=True)
+class MavlinkIngressStats:
+    """Bounded receiver-ingress diagnostics for one adapter connection."""
+
+    generation: int
+    next_sequence: int
+    highres_imu_received: int
+    heartbeat_received: int
+    race_status_received: int
+    actuator_received: int
+    dropped: int
+    high_watermark: int
+    imu_capacity: int
+    other_capacity: int
+    imu_dropped: int
+    other_dropped: int
+    imu_high_watermark: int
+    other_high_watermark: int
+    buffered_imu: int
+    buffered_other: int
+
+
+@dataclass(frozen=True)
+class MavlinkOutboundAudit:
+    """Attempted outbound MAVLink messages, separated by passive authority."""
+
+    timesync: int
+    gcs_heartbeat: int
+    sim_reset: int
+    arm: int
+    disarm: int
+    attitude_target: int
+    position_target: int
+    other_command: int
+
+    @property
+    def disallowed_count(self) -> int:
+        return (
+            self.sim_reset
+            + self.arm
+            + self.disarm
+            + self.attitude_target
+            + self.position_target
+            + self.other_command
+        )
 
 
 class AIGPMavlinkAdapter(CompetitionInterface):
@@ -72,6 +127,9 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         track_retries: int = 3,
         telemetry_mode: str = "pose",
         fetch_track_on_connect: bool = True,
+        ingress_buffer_capacity: int = DEFAULT_INGRESS_BUFFER_CAPACITY,
+        host_clock_id: str = VQ2_HOST_CLOCK_ID,
+        monotonic_ns: Optional[Callable[[], int]] = None,
     ) -> None:
         if telemetry_mode not in {"pose", "imu"}:
             raise ValueError("telemetry_mode must be 'pose' or 'imu'")
@@ -80,16 +138,38 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 "require_track=True is incompatible with "
                 "fetch_track_on_connect=False"
             )
+        if (
+            type(ingress_buffer_capacity) is not int
+            or ingress_buffer_capacity < 1
+        ):
+            raise ValueError("ingress_buffer_capacity must be a positive exact integer")
+        if host_clock_id != VQ2_HOST_CLOCK_ID:
+            raise ValueError(
+                f"host_clock_id must be exact {VQ2_HOST_CLOCK_ID!r}"
+            )
+        if monotonic_ns is not None and not callable(monotonic_ns):
+            raise TypeError("monotonic_ns must be callable or None")
         self.enable_vision = enable_vision
         self.require_track = require_track
         self.track_retries = int(track_retries)
         self.telemetry_mode = telemetry_mode
         self.fetch_track_on_connect = bool(fetch_track_on_connect)
+        self.ingress_buffer_capacity = ingress_buffer_capacity
+        self.host_clock_id = host_clock_id
+        self._monotonic_ns = monotonic_ns or time.perf_counter_ns
+        from competition.vq2_capture import (
+            MavlinkIngressV1,
+            ReceivedIMUSampleV1,
+        )
+
+        self._mavlink_ingress_type = MavlinkIngressV1
+        self._received_imu_type = ReceivedIMUSampleV1
 
         self._conn = None
         self._target_system = 1
         self._target_component = 1
         self._send_lock = threading.Lock()
+        self._audit_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._heartbeat_event = threading.Event()
@@ -104,7 +184,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._latest_telem: Optional[TelemetryState] = None
         self._race_status: Optional[RaceStatus] = None
         self._track_data: Optional[TrackData] = None
-        self._imu_samples: Deque[IMUData] = deque(maxlen=1024)
+        self._imu_samples: Deque[ReceivedIMUSampleV1] = deque(
+            maxlen=ingress_buffer_capacity
+        )
+        self._mavlink_arrivals: Deque[MavlinkIngressV1] = deque(
+            maxlen=ingress_buffer_capacity
+        )
         self._collisions: Deque[Dict] = deque(maxlen=128)
         self._actuator_outputs: Optional[Dict] = None
         self._indi_debug: Optional[Dict] = None
@@ -122,6 +207,30 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._last_imu_monotonic = 0.0
         self._last_race_status_monotonic = 0.0
         self._last_actuator_monotonic = 0.0
+        self._ingress_generation = 0
+        self._ingress_next_sequence = 0
+        self._ingress_counts = {
+            "HIGHRES_IMU": 0,
+            "HEARTBEAT": 0,
+            "RACE_STATUS": 0,
+            "ACTUATOR_OUTPUT_STATUS": 0,
+        }
+        self._ingress_dropped = 0
+        self._ingress_high_watermark = 0
+        self._imu_ingress_dropped = 0
+        self._other_ingress_dropped = 0
+        self._imu_ingress_high_watermark = 0
+        self._other_ingress_high_watermark = 0
+        self._outbound_counts = {
+            "timesync": 0,
+            "gcs_heartbeat": 0,
+            "sim_reset": 0,
+            "arm": 0,
+            "disarm": 0,
+            "attitude_target": 0,
+            "position_target": 0,
+            "other_command": 0,
+        }
         self._armed = False
         self._have_attitude = False
         self._have_lpn = False
@@ -277,8 +386,11 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             self._race_status = None
             self._track_data = None
             self._actuator_outputs = None
-            self._imu_samples.clear()
+            self._begin_ingress_generation_locked()
             self._collisions.clear()
+        with self._audit_lock:
+            for name in self._outbound_counts:
+                self._outbound_counts[name] = 0
         if self._vision is not None:
             self._vision.reset()
 
@@ -325,24 +437,59 @@ class AIGPMavlinkAdapter(CompetitionInterface):
 
     async def disconnect(self) -> None:
         self._stop_event.set()
-        for thread in (self._rx_thread, self._announce_thread):
-            if thread is not None:
-                thread.join(timeout=2.0)
-        self._rx_thread = None
-        self._announce_thread = None
-        if self._vision is not None:
-            await self._vision.stop()
+        threads = tuple(
+            thread
+            for thread in (self._rx_thread, self._announce_thread)
+            if thread is not None
+        )
+        for thread in threads:
+            thread.join(timeout=2.0)
+        close_error: Optional[BaseException] = None
         if self._conn is not None:
             close = getattr(self._conn, "close", None)
             if close is not None:
-                close()
-        self._conn = None
+                try:
+                    close()
+                except BaseException as exc:
+                    close_error = exc
+        # Closing the transport is a second unblock for a receiver that did
+        # not leave recv_match during the first bounded join.
+        for thread in threads:
+            if thread.is_alive():
+                thread.join(timeout=2.0)
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        if not alive:
+            self._rx_thread = None
+            self._announce_thread = None
+        if close_error is None:
+            self._conn = None
+        failures = []
+        if alive:
+            failures.append(
+                "MAVLink worker termination unproved: " + ", ".join(alive)
+            )
+        if close_error is not None:
+            failures.append(
+                "MAVLink transport close failed: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        if self._vision is not None:
+            try:
+                await self._vision.stop()
+            except BaseException as exc:
+                failures.append(
+                    "legacy vision termination failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if failures:
+            raise RuntimeError("; ".join(failures))
 
     async def arm(self) -> None:
         if self._armed:
             return
         self._require_conn()
         with self._send_lock:
+            self._audit_outbound("arm")
             self._conn.mav.command_long_send(
                 self._target_system,
                 self._target_component,
@@ -364,6 +511,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
 
         self._require_conn()
         with self._send_lock:
+            self._audit_outbound("disarm")
             self._conn.mav.command_long_send(
                 self._target_system,
                 self._target_component,
@@ -440,6 +588,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 )
             sx, sy, sz = self._rate_sign  # sim applies rates with opposite sign
             with self._send_lock:
+                self._audit_outbound("attitude_target")
                 self._conn.mav.set_attitude_target_send(
                     self._time_boot_ms(),
                     self._target_system,
@@ -452,6 +601,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             return
 
         with self._send_lock:
+            self._audit_outbound("attitude_target")
             self._conn.mav.set_attitude_target_send(
                 self._time_boot_ms(),
                 self._target_system,
@@ -475,6 +625,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         thrust = _clamp_thrust(cmd.thrust)
         sx, sy, sz = self._rate_sign  # sim applies body rates with opposite sign
         with self._send_lock:
+            self._audit_outbound("attitude_target")
             self._conn.mav.set_attitude_target_send(
                 self._time_boot_ms(),
                 self._target_system,
@@ -497,6 +648,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         n, e, d = cmd.position_ned
         vn, ve, vd = cmd.velocity_ned
         with self._send_lock:
+            self._audit_outbound("position_target")
             self._conn.mav.set_position_target_local_ned_send(
                 self._time_boot_ms(),
                 self._target_system,
@@ -530,7 +682,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 self._latest_telem = None
                 self._race_status = None
                 self._actuator_outputs = None
-                self._imu_samples.clear()
+                self._begin_ingress_generation_locked()
                 self._collisions.clear()
         await self._send_sim_reset(clear_track_event=True)
         if not self.fetch_track_on_connect:
@@ -590,9 +742,71 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         """Return every buffered IMU sample in receive order and clear it."""
 
         with self._state_lock:
+            samples = [received.imu for received in self._imu_samples]
+            self._imu_samples.clear()
+            return samples
+
+    def drain_received_imu_samples(self) -> list[ReceivedIMUSampleV1]:
+        """Return exact receiver-boundary IMU envelopes and clear the queue."""
+
+        with self._state_lock:
             samples = list(self._imu_samples)
             self._imu_samples.clear()
             return samples
+
+    def drain_mavlink_arrivals(self) -> list[MavlinkIngressV1]:
+        """Return non-IMU passive stream arrivals in strict receive order."""
+
+        with self._state_lock:
+            arrivals = list(self._mavlink_arrivals)
+            self._mavlink_arrivals.clear()
+            return arrivals
+
+    def drain_received_ingress(
+        self,
+    ) -> list[MavlinkIngressV1 | ReceivedIMUSampleV1]:
+        """Atomically drain both exact ingress queues in global receive order."""
+
+        with self._state_lock:
+            values = list(self._mavlink_arrivals)
+            values.extend(self._imu_samples)
+            self._mavlink_arrivals.clear()
+            self._imu_samples.clear()
+        values.sort(
+            key=lambda item: (
+                item.ingress.sequence
+                if isinstance(item, self._received_imu_type)
+                else item.sequence
+            )
+        )
+        return values
+
+    def ingress_stats(self) -> MavlinkIngressStats:
+        with self._state_lock:
+            return MavlinkIngressStats(
+                generation=self._ingress_generation,
+                next_sequence=self._ingress_next_sequence,
+                highres_imu_received=self._ingress_counts["HIGHRES_IMU"],
+                heartbeat_received=self._ingress_counts["HEARTBEAT"],
+                race_status_received=self._ingress_counts["RACE_STATUS"],
+                actuator_received=self._ingress_counts[
+                    "ACTUATOR_OUTPUT_STATUS"
+                ],
+                dropped=self._ingress_dropped,
+                high_watermark=self._ingress_high_watermark,
+                imu_capacity=self.ingress_buffer_capacity,
+                other_capacity=self.ingress_buffer_capacity,
+                imu_dropped=self._imu_ingress_dropped,
+                other_dropped=self._other_ingress_dropped,
+                imu_high_watermark=self._imu_ingress_high_watermark,
+                other_high_watermark=self._other_ingress_high_watermark,
+                buffered_imu=len(self._imu_samples),
+                buffered_other=len(self._mavlink_arrivals),
+            )
+
+    def outbound_audit(self) -> MavlinkOutboundAudit:
+        with self._audit_lock:
+            return MavlinkOutboundAudit(**self._outbound_counts)
 
     @property
     def race_status(self) -> Optional[RaceStatus]:
@@ -632,6 +846,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         if self._vision is not None:
             self._vision.reset()
         with self._send_lock:
+            self._audit_outbound("sim_reset")
             self._conn.mav.command_long_send(
                 self._target_system,
                 self._target_component,
@@ -646,13 +861,90 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 0,
             )
 
-    def _handle_message(self, msg) -> None:
+    def _begin_ingress_generation_locked(self) -> None:
+        self._ingress_generation += 1
+        self._ingress_next_sequence = 0
+        for name in self._ingress_counts:
+            self._ingress_counts[name] = 0
+        self._ingress_dropped = 0
+        self._ingress_high_watermark = 0
+        self._imu_ingress_dropped = 0
+        self._other_ingress_dropped = 0
+        self._imu_ingress_high_watermark = 0
+        self._other_ingress_high_watermark = 0
+        self._imu_samples.clear()
+        self._mavlink_arrivals.clear()
+
+    def _new_ingress_locked(
+        self,
+        message_type: str,
+        received_monotonic_ns: int,
+        *,
+        source_time_value: Optional[int] = None,
+        source_time_unit: Optional[str] = None,
+    ) -> MavlinkIngressV1:
+        ingress = self._mavlink_ingress_type(
+            stream_id=VQ2_MAVLINK_STREAM_ID,
+            generation=self._ingress_generation,
+            sequence=self._ingress_next_sequence,
+            message_type=message_type,
+            host_clock_id=self.host_clock_id,
+            received_monotonic_ns=received_monotonic_ns,
+            source_time_value=source_time_value,
+            source_time_unit=source_time_unit,
+        )
+        self._ingress_next_sequence += 1
+        self._ingress_counts[message_type] += 1
+        return ingress
+
+    def _append_ingress_locked(self, queue: Deque, value) -> None:
+        is_imu_queue = queue is self._imu_samples
+        if len(queue) >= self.ingress_buffer_capacity:
+            self._ingress_dropped += 1
+            if is_imu_queue:
+                self._imu_ingress_dropped += 1
+            else:
+                self._other_ingress_dropped += 1
+        queue.append(value)
+        if is_imu_queue:
+            self._imu_ingress_high_watermark = max(
+                self._imu_ingress_high_watermark, len(queue)
+            )
+        else:
+            self._other_ingress_high_watermark = max(
+                self._other_ingress_high_watermark, len(queue)
+            )
+        self._ingress_high_watermark = max(
+            self._ingress_high_watermark,
+            len(self._imu_samples) + len(self._mavlink_arrivals),
+        )
+
+    def _read_monotonic_ns(self) -> int:
+        value = self._monotonic_ns()
+        if type(value) is not int or value < 0:
+            raise ValueError("monotonic_ns clock must return a non-negative exact int")
+        return value
+
+    def _audit_outbound(self, name: str) -> None:
+        with self._audit_lock:
+            self._outbound_counts[name] += 1
+
+    def _handle_message(self, msg, *, received_monotonic_ns: Optional[int] = None) -> None:
         try:
+            received_ns = (
+                self._read_monotonic_ns()
+                if received_monotonic_ns is None
+                else received_monotonic_ns
+            )
+            if type(received_ns) is not int or received_ns < 0:
+                raise ValueError(
+                    "received_monotonic_ns must be a non-negative exact int"
+                )
             msg_type = msg.get_type()
             if msg_type == "BAD_DATA":
                 return
             if msg_type == "HEARTBEAT":
-                self._handle_heartbeat(msg)
+                self._handle_heartbeat(msg, received_ns)
             elif msg_type == "LOCAL_POSITION_NED":
                 self._handle_local_position(msg)
             elif msg_type == "ODOMETRY":
@@ -660,15 +952,15 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             elif msg_type == "ATTITUDE":
                 self._handle_attitude(msg)
             elif msg_type == "HIGHRES_IMU":
-                self._handle_highres_imu(msg)
+                self._handle_highres_imu(msg, received_ns)
             elif msg_type == "ACTUATOR_OUTPUT_STATUS":
-                self._handle_actuator(msg)
+                self._handle_actuator(msg, received_ns)
             elif msg_type == "COLLISION":
                 self._handle_collision(msg)
             elif msg_type == "DATA_TRANSMISSION_HANDSHAKE":
                 self._reassembler.begin_transfer(msg.width, msg.packets)
             elif msg_type == "ENCAPSULATED_DATA":
-                self._handle_encapsulated(msg)
+                self._handle_encapsulated(msg, received_ns)
             elif msg_type == "STATUSTEXT":
                 self._handle_statustext(msg)
             else:
@@ -699,8 +991,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             })
         logger.warning("AIGP STATUSTEXT (sev=%s): %s", severity, text)
 
-    def _handle_heartbeat(self, msg) -> None:
+    def _handle_heartbeat(self, msg, received_monotonic_ns: int) -> None:
         with self._state_lock:
+            ingress = self._new_ingress_locked(
+                "HEARTBEAT", received_monotonic_ns
+            )
+            self._append_ingress_locked(self._mavlink_arrivals, ingress)
             self._last_heartbeat_monotonic = time.monotonic()
             self._heartbeat_sequence += 1
             self._armed = bool(msg.base_mode & 0x80)
@@ -751,7 +1047,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             self._have_attitude = True
             self._maybe_ready()
 
-    def _handle_highres_imu(self, msg) -> None:
+    def _handle_highres_imu(self, msg, received_monotonic_ns: int) -> None:
         imu = IMUData(
             timestamp_us=int(msg.time_usec),
             accel=(msg.xacc, msg.yacc, msg.zacc),
@@ -759,14 +1055,31 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             mag=None,
         )
         with self._state_lock:
+            ingress = self._new_ingress_locked(
+                "HIGHRES_IMU",
+                received_monotonic_ns,
+                source_time_value=imu.timestamp_us,
+                source_time_unit="us",
+            )
+            received = self._received_imu_type(ingress=ingress, imu=imu)
             self._last_imu_monotonic = time.monotonic()
-            self._imu_samples.append(imu)
+            self._append_ingress_locked(self._imu_samples, received)
             self._latest_telem = _telem_with(self._latest_telem, imu=imu)
             self._have_imu = True
             self._maybe_ready()
 
-    def _handle_actuator(self, msg) -> None:
+    def _handle_actuator(self, msg, received_monotonic_ns: int) -> None:
         with self._state_lock:
+            source_time = getattr(msg, "time_usec", None)
+            if type(source_time) is not int or source_time < 0:
+                source_time = None
+            ingress = self._new_ingress_locked(
+                "ACTUATOR_OUTPUT_STATUS",
+                received_monotonic_ns,
+                source_time_value=source_time,
+                source_time_unit="us" if source_time is not None else None,
+            )
+            self._append_ingress_locked(self._mavlink_arrivals, ingress)
             self._last_actuator_monotonic = time.monotonic()
             self._actuator_outputs = {
                 "time_usec": getattr(msg, "time_usec", None),
@@ -782,7 +1095,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 "impulse": msg.horizontal_minimum_delta,
             })
 
-    def _handle_encapsulated(self, msg) -> None:
+    def _handle_encapsulated(self, msg, received_monotonic_ns: int) -> None:
         payload = bytes(msg.data)
         if not payload:
             return
@@ -790,6 +1103,13 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         if data_type == ENCAPSULATED_RACE_STATUS_MSG_ID:
             race_status = parse_race_status(payload)
             with self._state_lock:
+                ingress = self._new_ingress_locked(
+                    "RACE_STATUS",
+                    received_monotonic_ns,
+                    source_time_value=race_status.sim_boot_time_ms,
+                    source_time_unit="ms",
+                )
+                self._append_ingress_locked(self._mavlink_arrivals, ingress)
                 self._last_race_status_monotonic = time.monotonic()
                 self._race_status = race_status
             return
@@ -819,7 +1139,10 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 logger.exception("AIGP MAVLink recv failed")
                 continue
             if msg is not None:
-                self._handle_message(msg)
+                received_monotonic_ns = self._read_monotonic_ns()
+                self._handle_message(
+                    msg, received_monotonic_ns=received_monotonic_ns
+                )
 
     def _announce_loop(self) -> None:  # pragma: no cover - live socket loop
         while not self._stop_event.is_set():
@@ -827,7 +1150,9 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 now_ns = time.time_ns()
                 with self._send_lock:
                     self._conn.mav.timesync_send(0, now_ns)
+                    self._audit_outbound("timesync")
                     self._conn.mav.heartbeat_send(6, 8, 0, 0, 4)
+                    self._audit_outbound("gcs_heartbeat")
             except Exception:
                 logger.exception("AIGP MAVLink announce failed")
             self._stop_event.wait(0.1)

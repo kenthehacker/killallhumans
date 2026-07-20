@@ -44,7 +44,9 @@ from competition.aigp_mavlink import (
     AIGPMavlinkAdapter,
     _attitude_error_body_rates,
 )
+from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
 from competition.vq2_vision import VQ2VisionThread
+from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from estimation.imu_attitude import (
     AttitudeEstimate,
     ImuAttitudeConfig,
@@ -662,9 +664,15 @@ class JsonlRecorder:
         path: Optional[str],
         *,
         replay: Optional[AsyncReplayRecorder] = None,
+        capture_fifo_enabled: bool = False,
     ) -> None:
+        if type(capture_fifo_enabled) is not bool:
+            raise TypeError("capture_fifo_enabled must be an exact bool")
+        if capture_fifo_enabled and replay is None:
+            raise ValueError("capture FIFO requires a replay recorder")
         self.path = Path(path).resolve() if path else None
         self.replay = replay
+        self.capture_fifo_enabled = capture_fifo_enabled
         self._handle = None
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -684,12 +692,33 @@ class JsonlRecorder:
         if self.replay is not None:
             self.replay.record_event(event, **fields)
 
-    def record_imu(self, imu: Any, estimator: Optional[Dict[str, Any]], now_s: float) -> None:
+    def record_imu(
+        self,
+        imu: Any,
+        estimator: Optional[Dict[str, Any]],
+        now_s: float,
+        *,
+        received_sample: Optional[Any] = None,
+    ) -> None:
         if self.replay is not None:
             self.replay.record_imu(
                 imu,
                 estimator=estimator,
                 received_monotonic_s=now_s,
+                received_sample=received_sample,
+            )
+
+    def record_mavlink_ingress(self, ingress: Any) -> None:
+        if self.replay is not None:
+            self.replay.record_mavlink_ingress(ingress)
+
+    def record_camera_timing(
+        self, observation: CameraFrameTimingObservationV1
+    ) -> None:
+        if self.replay is not None:
+            self.replay.record_event(
+                "camera_frame_timing_observation",
+                observation=observation.to_primitive(),
             )
 
     def record_race(self, race: Any, now_s: float) -> None:
@@ -916,51 +945,122 @@ class VQ2Runner:
         self._gate0_transition_proof = None
         self.tracker.reset()
 
+    def _consume_imu_sample(
+        self,
+        imu: Any,
+        received_sample: Optional[Any],
+        now: float,
+    ) -> None:
+        stamp = int(imu.timestamp_us)
+        if (
+            self._epoch_imu_anchor_us is not None
+            and not clock_within_epoch_envelope(
+                self._epoch_imu_anchor_us,
+                stamp,
+                now - self._epoch_anchor_monotonic_s,
+                units_per_second=1_000_000.0,
+                slack=500_000,
+            )
+        ):
+            self._imu_forward_jump = True
+        elif self._last_imu_us is None or stamp > self._last_imu_us:
+            estimator_was_ready = self.estimator.is_ready
+            estimate = self.estimator.update_imu(imu)
+            self._last_imu_us = stamp
+            self._last_imu_advance_s = now
+            if estimate is None and estimator_was_ready:
+                # Transport freshness is not estimator health. Once the
+                # estimator is ready, any rejected newer sample must latch
+                # an abort instead of letting an old estimate look current.
+                self._estimator_unhealthy_latched = True
+                self._estimator_failure_reason = (
+                    self.estimator.last_rejection_reason or "sample rejected"
+                )
+            elif estimate is not None:
+                self.estimate = estimate
+                if not estimate.healthy:
+                    self._estimator_unhealthy_latched = True
+                    self._estimator_failure_reason = (
+                        estimate.reason or "unhealthy estimate"
+                    )
+        elif stamp < self._last_imu_us:
+            self._imu_regressed = True
+        record_imu = getattr(self.recorder, "record_imu", None)
+        if callable(record_imu):
+            record_imu(
+                imu,
+                self._replay_estimator_fields(),
+                now,
+                received_sample=received_sample,
+            )
+
     def _sample(self) -> None:
         now = time.monotonic()
         telemetry = self.adapter.latest_telemetry
-        drain_imu = getattr(self.adapter, "drain_imu_samples", None)
-        if callable(drain_imu):
-            imu_samples = drain_imu()
-        else:
-            imu = telemetry.imu if telemetry is not None else None
-            imu_samples = [imu] if imu is not None else []
-        for imu in imu_samples:
-            stamp = int(imu.timestamp_us)
-            if (
-                self._epoch_imu_anchor_us is not None
-                and not clock_within_epoch_envelope(
-                    self._epoch_imu_anchor_us,
-                    stamp,
-                    now - self._epoch_anchor_monotonic_s,
-                    units_per_second=1_000_000.0,
-                    slack=500_000,
-                )
-            ):
-                self._imu_forward_jump = True
-            elif self._last_imu_us is None or stamp > self._last_imu_us:
-                estimator_was_ready = self.estimator.is_ready
-                estimate = self.estimator.update_imu(imu)
-                self._last_imu_us = stamp
-                self._last_imu_advance_s = now
-                if estimate is None and estimator_was_ready:
-                    # Transport freshness is not estimator health. Once the
-                    # estimator is ready, any rejected newer sample must latch
-                    # an abort instead of letting an old estimate look current.
-                    self._estimator_unhealthy_latched = True
-                    self._estimator_failure_reason = (
-                        self.estimator.last_rejection_reason or "sample rejected"
+        drain_received_ingress = getattr(
+            self.adapter, "drain_received_ingress", None
+        )
+        ordered_ingress = []
+        untimed_imu = []
+        if callable(drain_received_ingress):
+            for item in drain_received_ingress():
+                if type(item) is ReceivedIMUSampleV1:
+                    ordered_ingress.append(
+                        (item.ingress.sequence, "imu", (item.imu, item))
                     )
-                elif estimate is not None:
-                    self.estimate = estimate
-                    if not estimate.healthy:
-                        self._estimator_unhealthy_latched = True
-                        self._estimator_failure_reason = estimate.reason or "unhealthy estimate"
-            elif stamp < self._last_imu_us:
-                self._imu_regressed = True
-            record_imu = getattr(self.recorder, "record_imu", None)
-            if callable(record_imu):
-                record_imu(imu, self._replay_estimator_fields(), now)
+                elif type(item) is MavlinkIngressV1:
+                    ordered_ingress.append((item.sequence, "arrival", item))
+                else:
+                    raise TypeError("exact receiver ingress item has invalid type")
+        else:
+            drain_received_imu = getattr(
+                self.adapter, "drain_received_imu_samples", None
+            )
+            if callable(drain_received_imu):
+                received_imu_samples = [
+                    (received.imu, received) for received in drain_received_imu()
+                ]
+            else:
+                drain_imu = getattr(self.adapter, "drain_imu_samples", None)
+                if callable(drain_imu):
+                    received_imu_samples = [
+                        (imu, None) for imu in drain_imu()
+                    ]
+                else:
+                    imu = telemetry.imu if telemetry is not None else None
+                    received_imu_samples = (
+                        [(imu, None)] if imu is not None else []
+                    )
+            drain_arrivals = getattr(
+                self.adapter, "drain_mavlink_arrivals", None
+            )
+            arrivals = drain_arrivals() if callable(drain_arrivals) else []
+            for arrival in arrivals:
+                ordered_ingress.append(
+                    (arrival.sequence, "arrival", arrival)
+                )
+            for imu, received_sample in received_imu_samples:
+                if received_sample is None:
+                    untimed_imu.append((imu, received_sample))
+                else:
+                    ordered_ingress.append(
+                        (
+                            received_sample.ingress.sequence,
+                            "imu",
+                            (imu, received_sample),
+                        )
+                    )
+        record_arrival = getattr(self.recorder, "record_mavlink_ingress", None)
+        ordered_ingress.sort(key=lambda item: item[0])
+        for _sequence, kind, value in ordered_ingress:
+            if kind == "arrival":
+                if callable(record_arrival):
+                    record_arrival(value)
+            else:
+                imu, received_sample = value
+                self._consume_imu_sample(imu, received_sample, now)
+        for imu, received_sample in untimed_imu:
+            self._consume_imu_sample(imu, received_sample, now)
 
         race = self.adapter.race_status
         if race is not None:
@@ -987,13 +1087,26 @@ class VQ2Runner:
             elif boot < self._last_race_boot_ms:
                 self._race_regressed = True
 
-        snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
+        capture_enabled = bool(
+            getattr(self.recorder, "capture_enabled", False)
+        )
+        capture_fifo_enabled = (
+            getattr(self.recorder, "capture_fifo_enabled", False) is True
+        )
+        pop_capture_snapshot = getattr(self.vision, "pop_capture_snapshot", None)
+        if capture_fifo_enabled and callable(pop_capture_snapshot):
+            snapshot = pop_capture_snapshot()
+        else:
+            snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
         frame_identity = (
             None
             if snapshot is None
             else (int(snapshot.generation), int(snapshot.frame_id))
         )
         if snapshot is not None and frame_identity != self._last_frame_identity:
+            consume_monotonic_ns = (
+                time.perf_counter_ns() if capture_enabled else None
+            )
             # The camera source timestamp is an opaque ordering token, not
             # frame identity.  Repeated control polls consume one publication
             # once, while a receiver generation restart can reuse frame IDs.
@@ -1003,19 +1116,24 @@ class VQ2Runner:
             self._latest_detection_frame_sim_ns = int(snapshot.sim_time_ns)
             self._latest_detection_generation = int(snapshot.generation)
             self._latest_detection_received_s = float(snapshot.received_monotonic_s)
-            capture_enabled = bool(
-                getattr(self.recorder, "capture_enabled", False)
+            work_started_ns = (
+                time.perf_counter_ns() if capture_enabled else None
             )
-            detector_started_ns = time.perf_counter_ns() if capture_enabled else None
+            detector_started_ns = (
+                time.perf_counter_ns() if capture_enabled else None
+            )
             detector_latency_ms: Optional[float] = None
             try:
                 image = snapshot.camera_frame.image
                 self._latest_detection_image = image
                 image_height, image_width = image.shape[:2]
                 detections = list(self.detector.detect(image))
+                detector_ended_ns = (
+                    time.perf_counter_ns() if capture_enabled else None
+                )
                 if detector_started_ns is not None:
                     detector_latency_ms = (
-                        time.perf_counter_ns() - detector_started_ns
+                        detector_ended_ns - detector_started_ns
                     ) / 1_000_000.0
                 self._latest_raw_detections = detections
                 tracking_detections = detections
@@ -1036,11 +1154,17 @@ class VQ2Runner:
                             reject_crossing_residue=True,
                         )["selector_eligible"]
                     ]
+                tracking_started_ns = (
+                    time.perf_counter_ns() if capture_enabled else None
+                )
                 accepted = self.tracker.update(
                     tracking_detections,
                     frame_id=snapshot.frame_id,
                     sim_time_ns=snapshot.sim_time_ns,
                     received_monotonic_s=snapshot.received_monotonic_s,
+                )
+                tracking_ended_ns = (
+                    time.perf_counter_ns() if capture_enabled else None
                 )
                 self._latest_accepted_target = accepted
                 if self._post_gate_reacquisition:
@@ -1110,6 +1234,24 @@ class VQ2Runner:
                             else None
                         ),
                     )
+                if capture_enabled:
+                    if snapshot.timing is None:
+                        raise ValueError(
+                            "capture-loaded frame lacks exact FrameTimingV1"
+                        )
+                    assert work_started_ns is not None
+                    assert consume_monotonic_ns is not None
+                    assert detector_started_ns is not None
+                    assert detector_ended_ns is not None
+                    assert tracking_started_ns is not None
+                    assert tracking_ended_ns is not None
+                    record_timing = getattr(
+                        self.recorder, "record_camera_timing", None
+                    )
+                    if not callable(record_timing):
+                        raise ValueError(
+                            "capture recorder cannot preserve camera timing"
+                        )
                 capture_frame = getattr(self.recorder, "capture_frame", None)
                 if capture_enabled and callable(capture_frame):
                     current_telemetry = self.adapter.latest_telemetry
@@ -1146,6 +1288,21 @@ class VQ2Runner:
                             else "gate0_or_preflight"
                         ),
                     )
+                if capture_enabled:
+                    # End-to-end passive frame work includes the synchronous
+                    # replay snapshot/copy enqueue above.  The asynchronous
+                    # writer remains separately diagnosed by capture stats.
+                    observation = CameraFrameTimingObservationV1(
+                        frame_timing=snapshot.timing,
+                        consume_monotonic_ns=consume_monotonic_ns,
+                        work_start_monotonic_ns=work_started_ns,
+                        detection_start_monotonic_ns=detector_started_ns,
+                        detection_end_monotonic_ns=detector_ended_ns,
+                        tracking_start_monotonic_ns=tracking_started_ns,
+                        tracking_end_monotonic_ns=tracking_ended_ns,
+                        work_end_monotonic_ns=time.perf_counter_ns(),
+                    )
+                    record_timing(observation)
             except Exception as exc:  # OpenCV errors must fail closed in flight.
                 if detector_started_ns is not None:
                     detector_latency_ms = (
@@ -1389,8 +1546,21 @@ class VQ2Runner:
                 )
         return paths, errors
 
-    async def preflight(self, timeout_s: float = 10.0) -> Dict[str, Any]:
+    async def preflight(
+        self,
+        timeout_s: float = 10.0,
+        *,
+        healthy_dwell_s: float = 0.0,
+    ) -> Dict[str, Any]:
         """Passively validate feeds, estimator bootstrap, detector, and rate."""
+
+        if (
+            type(healthy_dwell_s) not in {int, float}
+            or not math.isfinite(healthy_dwell_s)
+            or not 0.0 <= float(healthy_dwell_s) <= 8.0
+        ):
+            raise ValueError("healthy_dwell_s must be finite and in [0, 8]")
+        dwell_s = float(healthy_dwell_s)
 
         if not self.vision.is_running:
             self.vision.start()
@@ -1398,6 +1568,7 @@ class VQ2Runner:
         start = time.monotonic()
         initial_frames = self.vision.stats().frames_decoded
         last_log = start
+        ready_since: Optional[float] = None
         while time.monotonic() - start < timeout_s:
             self._sample()
             elapsed = time.monotonic() - start
@@ -1408,7 +1579,20 @@ class VQ2Runner:
                 require_target=True,
                 require_armed=False,
             )
-            if elapsed >= 1.0 and fps >= 20.0 and self.tracker.consecutive >= 3 and not failures:
+            ready = (
+                elapsed >= 1.0
+                and fps >= 20.0
+                and self.tracker.consecutive >= 3
+                and not failures
+            )
+            if ready:
+                if ready_since is None:
+                    ready_since = time.monotonic()
+                healthy_elapsed = time.monotonic() - ready_since
+            else:
+                ready_since = None
+                healthy_elapsed = 0.0
+            if ready and healthy_elapsed >= dwell_s:
                 assert self.estimate is not None and self.tracker.target is not None
                 roll, pitch, yaw = self.estimate.orientation.to_euler()
                 result = {
@@ -1422,6 +1606,9 @@ class VQ2Runner:
                     "gate_center": [self.tracker.target.center_x, self.tracker.target.center_y],
                     "gate_confidence": self.tracker.target.confidence,
                     "race_gate_index": self.adapter.race_status.active_gate_index,
+                    "healthy_dwell_s": healthy_elapsed,
+                    "requested_healthy_dwell_s": dwell_s,
+                    "observation_duration_s": elapsed,
                     # Build 3385 can boot Training with this bit already set,
                     # despite zero actuator demand.  Powered stages explicitly
                     # normalize to disarmed after their proved reset.
@@ -2588,6 +2775,23 @@ class VQ2Runner:
         )
 
 
+def _consume_stopped_capture_tail(runner: VQ2Runner, vision: VQ2VisionThread) -> None:
+    """Consume every pending publication after vision termination is proved."""
+
+    if vision.is_running:
+        raise RuntimeError("cannot consume capture tail while vision is running")
+    queue_depth = getattr(vision, "capture_snapshot_queue_depth", None)
+    if not callable(queue_depth):
+        runner._sample()
+        return
+    while queue_depth() > 0:
+        before = queue_depth()
+        runner._sample()
+        after = queue_depth()
+        if after >= before:
+            raise RuntimeError("stopped capture queue did not advance")
+
+
 async def run_live(
     stage: str,
     address: str,
@@ -2595,6 +2799,7 @@ async def run_live(
     *,
     replay_bundle: Optional[str] = None,
     recording_approved: bool = False,
+    preflight_healthy_dwell_s: float = 0.0,
 ) -> StageResult:
     if type(recording_approved) is not bool:
         raise TypeError("recording_approved must be an exact bool")
@@ -2602,6 +2807,16 @@ async def run_live(
         raise PermissionError(
             "programmatic replay capture requires explicit recording_approved=True"
         )
+    if (
+        type(preflight_healthy_dwell_s) not in {int, float}
+        or not math.isfinite(preflight_healthy_dwell_s)
+        or not 0.0 <= float(preflight_healthy_dwell_s) <= 8.0
+    ):
+        raise ValueError(
+            "preflight_healthy_dwell_s must be finite and in [0, 8]"
+        )
+    if stage != "preflight" and float(preflight_healthy_dwell_s) != 0.0:
+        raise ValueError("preflight dwell is valid only for the preflight stage")
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
         require_track=False,
@@ -2622,7 +2837,12 @@ async def run_live(
             replay_bundle,
             metadata={
                     "simulator_build": "3385",
+                    "simulator_mode": "Training",
+                    "simulator_mode_basis": "operator-attested-2026-07-20",
                     "stage": stage,
+                    "preflight_healthy_dwell_s": float(
+                        preflight_healthy_dwell_s
+                    ),
                     "mavlink_address": address,
                     "capture_kind": "private-development-session",
                     "commit_hash": commit_hash,
@@ -2630,6 +2850,11 @@ async def run_live(
                     "code_hash": code_hash,
                     "environment_fingerprint": capture_environment_fingerprint(),
                     "runner_evaluator_version": "vq2-runner-capture/1",
+                    "timing_evidence_schemas": [
+                        "aigp-vq2-mavlink-ingress/1",
+                        "aigp-vq2-received-imu/1",
+                        "aigp-vq2-camera-frame-timing-observation/1",
+                    ],
                     # Frozen replay-evaluator RNG seed.  This is independent
                     # of simulator randomness and is bound into T1 identity.
                     "seed": 42,
@@ -2671,7 +2896,6 @@ async def run_live(
     vision: Optional[VQ2VisionThread] = None
     recorder: Optional[JsonlRecorder] = None
     runner: Optional[VQ2Runner] = None
-    connected = False
     result: Optional[StageResult] = None
     failure: Optional[str] = None
     capture_stats = None
@@ -2684,13 +2908,21 @@ async def run_live(
         vision = VQ2VisionThread(
             on_snapshot=(
                 replay.capture_decoded_snapshot if replay is not None else None
-            )
+            ),
+            capture_snapshot_queue_enabled=(
+                replay is not None and stage == "preflight"
+            ),
         )
-        recorder = JsonlRecorder(record, replay=replay)
+        recorder = JsonlRecorder(
+            record,
+            replay=replay,
+            capture_fifo_enabled=(replay is not None and stage == "preflight"),
+        )
         runner = VQ2Runner(adapter, vision, recorder=recorder)
         await adapter.connect(address)
-        connected = True
-        preflight = await runner.preflight()
+        preflight = await runner.preflight(
+            healthy_dwell_s=float(preflight_healthy_dwell_s)
+        )
         if stage == "preflight":
             result = StageResult(
                 stage=stage,
@@ -2710,13 +2942,30 @@ async def run_live(
         primary_traceback = exc.__traceback__
     finally:
         if vision is not None:
+            vision_stopped = False
             try:
                 vision.stop()
+                vision_stopped = True
             except BaseException as exc:
                 cleanup_exceptions.append(exc)
                 if replay is not None:
                     replay.fail(
                         f"vision termination not proved before replay seal: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            if (
+                vision_stopped
+                and replay is not None
+                and runner is not None
+                and result is not None
+                and stage == "preflight"
+            ):
+                try:
+                    _consume_stopped_capture_tail(runner, vision)
+                except BaseException as exc:
+                    cleanup_exceptions.append(exc)
+                    replay.fail(
+                        "stopped-vision capture tail was not consumed: "
                         f"{type(exc).__name__}: {exc}"
                     )
             try:
@@ -2735,10 +2984,66 @@ async def run_live(
             if replay is not None:
                 replay.fail("vision construction failed before capture ownership")
         try:
-            if connected:
-                await adapter.disconnect()
+            await adapter.disconnect()
         except BaseException as exc:
             cleanup_exceptions.append(exc)
+        if recorder is not None:
+            try:
+                final_estimator = (
+                    runner._replay_estimator_fields()
+                    if runner is not None
+                    else None
+                )
+                final_receive_s = time.monotonic()
+                for value in adapter.drain_received_ingress():
+                    if type(value) is ReceivedIMUSampleV1:
+                        recorder.record_imu(
+                            value.imu,
+                            final_estimator,
+                            final_receive_s,
+                            received_sample=value,
+                        )
+                    elif type(value) is MavlinkIngressV1:
+                        recorder.record_mavlink_ingress(value)
+                    else:
+                        raise TypeError(
+                            "exact receiver ingress item has invalid type"
+                        )
+            except BaseException as exc:
+                cleanup_exceptions.append(exc)
+                if replay is not None:
+                    replay.fail(
+                        "final receiver ingress drain failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        try:
+            ingress_stats = asdict(adapter.ingress_stats())
+        except BaseException as exc:
+            cleanup_exceptions.append(exc)
+            ingress_stats = {"stats_error": f"{type(exc).__name__}: {exc}"}
+        try:
+            audit_value = adapter.outbound_audit()
+            outbound_audit = asdict(audit_value)
+            outbound_audit["disallowed_count"] = audit_value.disallowed_count
+        except BaseException as exc:
+            cleanup_exceptions.append(exc)
+            outbound_audit = {"audit_error": f"{type(exc).__name__}: {exc}"}
+        if result is not None:
+            details = dict(result.details or {})
+            details["mavlink_ingress_stats"] = ingress_stats
+            details["mavlink_outbound_audit"] = outbound_audit
+            result = replace(result, details=details)
+            if (
+                stage == "preflight"
+                and outbound_audit.get("disallowed_count") != 0
+            ):
+                result = replace(
+                    result,
+                    success=False,
+                    reason=(
+                        f"{result.reason}; passive outbound audit was not zero"
+                    ),
+                )
         base_outcome = (
             asdict(result)
             if result is not None
@@ -2838,10 +3143,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="attest that organizer approval/credentials permit this recording",
     )
+    parser.add_argument(
+        "--preflight-healthy-dwell-s",
+        type=float,
+        default=0.0,
+        help="continue an already-healthy passive preflight for up to 8 seconds",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args(argv)
     if args.replay_bundle is not None and not args.recording_approved:
         parser.error("--replay-bundle requires explicit --recording-approved")
+    if args.stage != "preflight" and args.preflight_healthy_dwell_s != 0.0:
+        parser.error("--preflight-healthy-dwell-s requires --stage preflight")
     record = _default_record_path(args.stage) if args.record == "auto" else args.record
     replay_bundle = (
         _default_replay_path(args.stage)
@@ -2859,6 +3172,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             record,
             replay_bundle=replay_bundle,
             recording_approved=args.recording_approved,
+            preflight_healthy_dwell_s=args.preflight_healthy_dwell_s,
         )
     )
     print(json.dumps(asdict(result), indent=2, sort_keys=True))

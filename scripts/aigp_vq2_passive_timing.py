@@ -127,12 +127,16 @@ _VISION_INTEGER_DIAGNOSTICS = (
     "receiver_buffered_partial_frames",
     "receiver_buffer_high_watermark",
     "receiver_buffer_capacity",
+    "capture_snapshot_queue_entries",
+    "capture_snapshot_queue_high_watermark",
+    "capture_snapshot_queue_capacity",
+    "capture_snapshot_queue_dropped",
     "receiver_dropped_partial_frames",
     "receiver_duplicate_chunks",
     "receiver_dropped_late_packets",
 )
 _VISION_DIAGNOSTIC_FIELDS = frozenset(_VISION_INTEGER_DIAGNOSTICS) | frozenset(
-    {"timing_overflow_latched"}
+    {"timing_overflow_latched", "capture_snapshot_queue_enabled"}
 )
 _VISION_CAPTURE_FAILURE_COUNTERS = (
     "malformed_datagrams",
@@ -142,6 +146,7 @@ _VISION_CAPTURE_FAILURE_COUNTERS = (
     "processing_errors",
     "socket_errors",
     "snapshot_callback_errors",
+    "capture_snapshot_queue_dropped",
     "receiver_dropped_partial_frames",
 )
 
@@ -293,6 +298,9 @@ def _vision_diagnostics(outcome: Mapping[str, Any]) -> dict[str, Any]:
     if stats["timing_overflow_latched"] is not False:
         raise ValueError("vision timing ledger overflowed")
     result["timing_overflow_latched"] = False
+    if stats["capture_snapshot_queue_enabled"] is not True:
+        raise ValueError("passive capture snapshot queue was not enabled")
+    result["capture_snapshot_queue_enabled"] = True
     capacity = result["timing_ledger_capacity"]
     if capacity < 1:
         raise ValueError("vision timing ledger capacity must be positive")
@@ -301,6 +309,14 @@ def _vision_diagnostics(outcome: Mapping[str, Any]) -> dict[str, Any]:
         or result["timing_ledger_high_watermark"] > capacity
     ):
         raise ValueError("vision timing ledger diagnostics exceed capacity")
+    capture_capacity = result["capture_snapshot_queue_capacity"]
+    if capture_capacity < 1:
+        raise ValueError("vision capture snapshot queue capacity must be positive")
+    if (
+        result["capture_snapshot_queue_entries"] != 0
+        or result["capture_snapshot_queue_high_watermark"] > capture_capacity
+    ):
+        raise ValueError("vision capture snapshot queue was not completely drained")
     failed = [name for name in _VISION_CAPTURE_FAILURE_COUNTERS if result[name]]
     if failed:
         raise ValueError(

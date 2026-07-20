@@ -36,6 +36,9 @@ from typing import Any, Callable, Dict, Iterable, Iterator, Mapping, MutableMapp
 
 import numpy as np
 
+from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
+from competition.vq2_contracts import FrameTimingV1
+
 from ._util import (
     canonical_json,
     git_provenance,
@@ -528,12 +531,47 @@ class ReplayBundleWriter:
         *,
         estimator: Optional[Any] = None,
         received_monotonic_s: Optional[float] = None,
+        received_sample: Optional[Any] = None,
     ) -> int:
-        return self.append(
+        try:
+            if received_sample is not None:
+                if type(received_sample) is not ReceivedIMUSampleV1:
+                    received_sample = ReceivedIMUSampleV1.from_primitive(
+                        received_sample
+                    )
+                if _json_safe(imu) != received_sample.to_primitive()["imu"]:
+                    raise ValueError(
+                        "received IMU envelope differs from the core IMU payload"
+                    )
+        except Exception as exc:
+            self._latch_failure(f"{type(exc).__name__}: {exc}")
+            raise
+        sequence = self.append(
             "imu",
             received_monotonic_s=received_monotonic_s,
             imu=imu,
             estimator=estimator,
+        )
+        if received_sample is not None:
+            self.append(
+                "event",
+                event="received_imu",
+                observation=received_sample.to_primitive(),
+                linked_imu_record_sequence=sequence,
+            )
+        return sequence
+
+    def record_mavlink_ingress(self, ingress: Any) -> int:
+        try:
+            if type(ingress) is not MavlinkIngressV1:
+                ingress = MavlinkIngressV1.from_primitive(ingress)
+        except Exception as exc:
+            self._latch_failure(f"{type(exc).__name__}: {exc}")
+            raise
+        return self.append(
+            "event",
+            event="mavlink_ingress",
+            observation=ingress.to_primitive(),
         )
 
     def record_race(self, race_status: Any, *, received_monotonic_s: Optional[float] = None) -> int:
@@ -615,18 +653,38 @@ class ReplayBundleWriter:
         frame_id: int,
         sim_time_ns: int,
         received_monotonic_s: float,
+        frame_timing: Optional[Any] = None,
     ) -> Optional[int]:
         """Persist every frame published by the duplicate-suppressing receiver."""
 
-        if (
-            type(received_monotonic_s) not in {int, float}
-            or not math.isfinite(received_monotonic_s)
-            or received_monotonic_s < 0
-        ):
-            raise ValueError("received_monotonic_s must be finite and non-negative")
-        token = (generation, frame_id, sim_time_ns)
-        if any(type(value) is not int or value < 0 for value in token):
-            raise ValueError("frame generation/id/sim time must be non-negative exact integers")
+        try:
+            if (
+                type(received_monotonic_s) not in {int, float}
+                or not math.isfinite(received_monotonic_s)
+                or received_monotonic_s < 0
+            ):
+                raise ValueError(
+                    "received_monotonic_s must be finite and non-negative"
+                )
+            token = (generation, frame_id, sim_time_ns)
+            if any(type(value) is not int or value < 0 for value in token):
+                raise ValueError(
+                    "frame generation/id/sim time must be non-negative exact integers"
+                )
+            if frame_timing is not None:
+                if type(frame_timing) is not FrameTimingV1:
+                    frame_timing = FrameTimingV1.from_primitive(frame_timing)
+                if (
+                    frame_timing.identity.generation != generation
+                    or frame_timing.identity.frame_id != frame_id
+                    or frame_timing.camera_source_time_ns != sim_time_ns
+                ):
+                    raise ValueError(
+                        "frame timing identity differs from decoded frame"
+                    )
+        except Exception as exc:
+            self._latch_failure(f"{type(exc).__name__}: {exc}")
+            raise
         with self._lock:
             if token in self._decoded_frame_tokens:
                 return None
@@ -643,7 +701,7 @@ class ReplayBundleWriter:
                 array, digest = self._persist_frame_blob(image)
                 self._decoded_frame_tokens.add(token)
                 self._decoded_frame_label_keys.add(label_key)
-                return self.append(
+                sequence = self.append(
                     "decoded_frame",
                     generation=token[0],
                     frame_id=token[1],
@@ -654,6 +712,14 @@ class ReplayBundleWriter:
                     image_shape=list(array.shape),
                     image_dtype=array.dtype.str,
                 )
+                if frame_timing is not None:
+                    self.append(
+                        "event",
+                        event="camera_frame_timing",
+                        observation=frame_timing.to_primitive(),
+                        linked_decoded_frame_record_sequence=sequence,
+                    )
+                return sequence
             except Exception as exc:
                 self._latch_failure(f"{type(exc).__name__}: {exc}")
                 raise
@@ -1033,13 +1099,24 @@ class AsyncReplayRecorder:
             self._high_watermark = max(self._high_watermark, self._queue.qsize())
         return True
 
-    def record_imu(self, imu: Any, *, estimator: Optional[Any] = None, received_monotonic_s: Optional[float] = None) -> bool:
+    def record_imu(
+        self,
+        imu: Any,
+        *,
+        estimator: Optional[Any] = None,
+        received_monotonic_s: Optional[float] = None,
+        received_sample: Optional[Any] = None,
+    ) -> bool:
         return self._enqueue(
             "record_imu",
             imu,
             estimator=estimator,
             received_monotonic_s=received_monotonic_s,
+            received_sample=received_sample,
         )
+
+    def record_mavlink_ingress(self, ingress: Any) -> bool:
+        return self._enqueue("record_mavlink_ingress", ingress)
 
     def record_race(self, race_status: Any, *, received_monotonic_s: Optional[float] = None) -> bool:
         return self._enqueue(
@@ -1122,6 +1199,7 @@ class AsyncReplayRecorder:
             )
             received = snapshot.received_monotonic_s
             image = snapshot.camera_frame.image
+            timing = getattr(snapshot, "timing", None)
         except (AttributeError, TypeError):
             return self._reject_capture(
                 "invalid decoded-frame callback fields", decoded=True
@@ -1134,6 +1212,15 @@ class AsyncReplayRecorder:
             return self._reject_capture(
                 "invalid exact decoded-frame callback token/time", decoded=True
             )
+        if timing is not None:
+            if type(timing) is not FrameTimingV1 or (
+                timing.identity.generation != token[0]
+                or timing.identity.frame_id != token[1]
+                or timing.camera_source_time_ns != token[2]
+            ):
+                return self._reject_capture(
+                    "invalid exact decoded-frame timing identity", decoded=True
+                )
         with self._lock:
             if self._closed:
                 return False
@@ -1162,6 +1249,7 @@ class AsyncReplayRecorder:
                 frame_id=token[1],
                 sim_time_ns=token[2],
                 received_monotonic_s=received,
+                frame_timing=timing,
             )
             if accepted:
                 self._decoded_enqueued += 1

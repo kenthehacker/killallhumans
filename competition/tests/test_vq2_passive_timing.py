@@ -288,6 +288,7 @@ def test_summary_reports_all_distributions_gaps_shortfalls_and_unmeasured_items(
     assert "command_to_actuator_causal_response" in summary.unmeasured_items
     assert "command_to_gyro_causal_response" in summary.unmeasured_items
     assert "camera_measurement_clock_model" in summary.unmeasured_items
+    assert "calibrated_camera_imu_offset" in summary.unmeasured_items
 
 
 @pytest.mark.parametrize(

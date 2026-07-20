@@ -76,11 +76,21 @@ def test_rejects_duplicate_chunk_keys_before_reassembly_and_decodes_once():
     assert stats.frames_decoded == 1
     assert stats.receiver_duplicate_chunks == 0
     assert stats.receiver_dropped_late_packets == 0
+    assert stats.timing_ledger_entries == 0
+    assert stats.timing_ledger_high_watermark == 1
+    assert stats.timing_ledger_capacity == receiver.max_remembered_chunks
+    assert stats.timing_overflow_latched is False
+    assert stats.receiver_buffered_partial_frames == 0
+    assert stats.receiver_buffer_high_watermark == 1
+    assert stats.receiver_buffer_capacity == receiver.max_buffered_frames
 
 
 def test_snapshot_callback_receives_every_published_decoded_frame_once():
     delivered = []
-    receiver = VQ2VisionThread(on_snapshot=delivered.append)
+    receiver = VQ2VisionThread(
+        on_snapshot=delivered.append,
+        capture_snapshot_queue_enabled=True,
+    )
     for frame_id in (7, 8):
         packet = _jpeg_packets(
             frame_id=frame_id,
@@ -97,6 +107,48 @@ def test_snapshot_callback_receives_every_published_decoded_frame_once():
     assert delivered[0].camera_frame.image.flags.writeable is False
     with pytest.raises(ValueError):
         delivered[0].camera_frame.image[0, 0, 0] = 255
+    assert receiver.capture_snapshot_queue_depth() == 2
+    assert receiver.pop_capture_snapshot().frame_id == 7
+    assert receiver.pop_capture_snapshot().frame_id == 8
+    assert receiver.pop_capture_snapshot() is None
+    stats = receiver.stats()
+    assert stats.capture_snapshot_queue_entries == 0
+    assert stats.capture_snapshot_queue_high_watermark == 2
+    assert stats.capture_snapshot_queue_capacity == 256
+    assert stats.capture_snapshot_queue_dropped == 0
+
+
+def test_capture_snapshot_queue_overflow_is_latched_in_diagnostics():
+    delivered = []
+    receiver = VQ2VisionThread(
+        on_snapshot=delivered.append,
+        capture_snapshot_queue_enabled=True,
+        capture_snapshot_queue_capacity=1,
+    )
+    for frame_id in (7, 8):
+        packet = _jpeg_packets(
+            frame_id=frame_id,
+            sim_time_ns=frame_id * 1_000,
+            total_chunks=1,
+        )[0]
+        assert receiver.feed_datagram(packet) is not None
+
+    stats = receiver.stats()
+    assert len(delivered) == 2
+    assert stats.capture_snapshot_queue_entries == 1
+    assert stats.capture_snapshot_queue_high_watermark == 1
+    assert stats.capture_snapshot_queue_dropped == 1
+    assert stats.processing_errors == 1
+
+
+def test_capture_snapshot_queue_requires_explicit_callback_and_exact_flag():
+    with pytest.raises(ValueError, match="requires an on_snapshot"):
+        VQ2VisionThread(capture_snapshot_queue_enabled=True)
+    with pytest.raises(TypeError, match="exact bool"):
+        VQ2VisionThread(
+            on_snapshot=lambda _snapshot: None,
+            capture_snapshot_queue_enabled=1,
+        )
 
 
 def test_published_snapshot_has_complete_same_clock_frame_timing():

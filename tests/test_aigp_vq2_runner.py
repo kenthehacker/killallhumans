@@ -13,6 +13,9 @@ import pytest
 import scripts.aigp_vq2_run as vq2_module
 from competition.adapter import IMUData, Quaternion, TelemetryState
 from competition.aigp_messages import RaceStatus
+from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
+from competition.vq2_contracts import FrameIdentityV1, FrameTimingV1
+from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from estimation.imu_attitude import (
     AttitudeEstimate,
     ImuAttitudeConfig,
@@ -73,11 +76,26 @@ def _vision_snapshot(
     received_monotonic_s=0.0,
     generation=1,
 ):
+    timing = FrameTimingV1(
+        identity=FrameIdentityV1(
+            "vq2-camera-udp-5600", generation, frame_id
+        ),
+        camera_source_time_ns=sim_time_ns,
+        host_clock_id="host-perf-counter",
+        publication_sequence=frame_id,
+        first_unique_packet_monotonic_ns=10,
+        final_unique_packet_monotonic_ns=11,
+        reassembly_complete_monotonic_ns=12,
+        decode_start_monotonic_ns=13,
+        decode_end_monotonic_ns=14,
+        publish_monotonic_ns=15,
+    )
     return SimpleNamespace(
         frame_id=frame_id,
         sim_time_ns=sim_time_ns,
         received_monotonic_s=received_monotonic_s,
         generation=generation,
+        timing=timing,
         camera_frame=SimpleNamespace(
             image=np.zeros((360, 640, 3), dtype=np.uint8)
         ),
@@ -462,8 +480,201 @@ def test_no_replay_or_diagnostics_skips_detection_summary_capture_path(monkeypat
         raise AssertionError("diagnostic summary added work to production path")
 
     monkeypatch.setattr(vq2_module, "gate_detection_summary", must_not_run)
+    monkeypatch.setattr(vq2_module.time, "perf_counter_ns", must_not_run)
     runner._sample()
     assert runner.tracker.target is not None
+
+
+def test_capture_loaded_sampling_records_exact_passive_frame_timing(monkeypatch):
+    class FakeReplay:
+        def __init__(self):
+            self.events = []
+            self.frames = []
+
+        def record_event(self, event, **fields):
+            self.events.append((event, fields))
+            return True
+
+        def capture_frame(self, image, **fields):
+            self.frames.append((image, fields))
+            return True
+
+    adapter = _FakeAdapter()
+    vision = _FakeVision()
+    vision.current_snapshot = _vision_snapshot(
+        frame_id=101,
+        sim_time_ns=1_010,
+        received_monotonic_s=1.0,
+    )
+    replay = FakeReplay()
+    recorder = vq2_module.JsonlRecorder(
+        None, replay=replay, capture_fifo_enabled=True
+    )
+    runner = VQ2Runner(adapter, vision, recorder=recorder)
+    runner.detector = SimpleNamespace(
+        detect=lambda _image: [_detection(10, 10, 40, 40)]
+    )
+    clock = iter((20, 21, 22, 23, 24, 25, 26))
+    monkeypatch.setattr(vq2_module.time, "perf_counter_ns", lambda: next(clock))
+
+    runner._sample()
+
+    timing_events = [
+        fields["observation"]
+        for event, fields in replay.events
+        if event == "camera_frame_timing_observation"
+    ]
+    assert len(timing_events) == 1
+    observation = CameraFrameTimingObservationV1.from_primitive(
+        timing_events[0]
+    )
+    assert observation.frame_timing == vision.current_snapshot.timing
+    assert observation.consume_monotonic_ns == 20
+    assert observation.detection_start_monotonic_ns == 22
+    assert observation.detection_end_monotonic_ns == 23
+    assert observation.tracking_start_monotonic_ns == 24
+    assert observation.tracking_end_monotonic_ns == 25
+    assert observation.work_end_monotonic_ns == 26
+    assert len(replay.frames) == 1
+
+
+def test_non_passive_capture_uses_latest_snapshot_not_passive_fifo(monkeypatch):
+    class LatestOnlyVision(_FakeVision):
+        def pop_capture_snapshot(self):
+            raise AssertionError("passive FIFO entered outside passive preflight")
+
+    class FakeReplay:
+        def __init__(self):
+            self.events = []
+            self.frames = []
+
+        def record_event(self, event, **fields):
+            self.events.append((event, fields))
+            return True
+
+        def capture_frame(self, image, **fields):
+            self.frames.append((image, fields))
+            return True
+
+    vision = LatestOnlyVision()
+    vision.current_snapshot = _vision_snapshot(frame_id=101, sim_time_ns=1_010)
+    replay = FakeReplay()
+    recorder = vq2_module.JsonlRecorder(
+        None,
+        replay=replay,
+        capture_fifo_enabled=False,
+    )
+    runner = VQ2Runner(_FakeAdapter(), vision, recorder=recorder)
+    runner.detector = SimpleNamespace(detect=lambda _image: [])
+    clock = iter(range(20, 27))
+    monkeypatch.setattr(vq2_module.time, "perf_counter_ns", lambda: next(clock))
+
+    runner._sample()
+
+    assert len(replay.frames) == 1
+    assert replay.frames[0][1]["frame_id"] == 101
+
+
+def test_stopped_vision_tail_consumes_a_final_capture_publication(monkeypatch):
+    class FakeReplay:
+        def __init__(self):
+            self.events = []
+            self.frames = []
+
+        def record_event(self, event, **fields):
+            self.events.append((event, fields))
+            return True
+
+        def capture_frame(self, image, **fields):
+            self.frames.append((image, fields))
+            return True
+
+    vision = _FakeVision()
+    vision.current_snapshot = _vision_snapshot(frame_id=101, sim_time_ns=1_010)
+    replay = FakeReplay()
+    recorder = vq2_module.JsonlRecorder(None, replay=replay)
+    runner = VQ2Runner(_FakeAdapter(), vision, recorder=recorder)
+    runner.detector = SimpleNamespace(
+        detect=lambda _image: [_detection(10, 10, 40, 40)]
+    )
+    clock = iter(range(20, 34))
+    monkeypatch.setattr(vq2_module.time, "perf_counter_ns", lambda: next(clock))
+    runner._sample()
+
+    # Model a publication completing while stop() joins the receiver thread.
+    vision.current_snapshot = _vision_snapshot(frame_id=102, sim_time_ns=1_020)
+    vision.is_running = False
+    vq2_module._consume_stopped_capture_tail(runner, vision)
+
+    timing_events = [
+        fields
+        for event, fields in replay.events
+        if event == "camera_frame_timing_observation"
+    ]
+    assert len(timing_events) == 2
+    assert len(replay.frames) == 2
+
+
+def test_stopped_vision_tail_rejects_a_live_receiver():
+    vision = _FakeVision()
+    vision.is_running = True
+    runner = VQ2Runner(_FakeAdapter(), vision)
+
+    with pytest.raises(RuntimeError, match="while vision is running"):
+        vq2_module._consume_stopped_capture_tail(runner, vision)
+
+
+def test_stopped_vision_tail_drains_two_publications_between_polls(monkeypatch):
+    class QueuedVision(_FakeVision):
+        def __init__(self):
+            super().__init__()
+            self.pending = [
+                _vision_snapshot(frame_id=101, sim_time_ns=1_010),
+                _vision_snapshot(frame_id=102, sim_time_ns=1_020),
+            ]
+
+        def pop_capture_snapshot(self):
+            return self.pending.pop(0) if self.pending else None
+
+        def capture_snapshot_queue_depth(self):
+            return len(self.pending)
+
+    class FakeReplay:
+        def __init__(self):
+            self.events = []
+            self.frames = []
+
+        def record_event(self, event, **fields):
+            self.events.append((event, fields))
+            return True
+
+        def capture_frame(self, image, **fields):
+            self.frames.append((image, fields))
+            return True
+
+    vision = QueuedVision()
+    replay = FakeReplay()
+    recorder = vq2_module.JsonlRecorder(
+        None, replay=replay, capture_fifo_enabled=True
+    )
+    runner = VQ2Runner(_FakeAdapter(), vision, recorder=recorder)
+    runner.detector = SimpleNamespace(
+        detect=lambda _image: [_detection(10, 10, 40, 40)]
+    )
+    clock = iter(range(20, 34))
+    monkeypatch.setattr(vq2_module.time, "perf_counter_ns", lambda: next(clock))
+
+    vq2_module._consume_stopped_capture_tail(runner, vision)
+
+    assert vision.capture_snapshot_queue_depth() == 0
+    assert len(replay.frames) == 2
+    assert len(
+        [
+            event
+            for event, _fields in replay.events
+            if event == "camera_frame_timing_observation"
+        ]
+    ) == 2
 
 
 def test_sampling_uses_frame_identity_not_opaque_camera_source_timestamp():
@@ -625,6 +836,158 @@ def test_invalid_imu_after_bootstrap_latches_estimator_failure():
         require_armed=False,
     )
     assert any("attitude estimator failure latched" in failure for failure in failures)
+
+
+def test_sampling_threads_exact_receiver_imu_envelope_to_recorder():
+    imu = IMUData(
+        timestamp_us=1_000_000,
+        accel=(0.0, 0.0, -9.80665),
+        gyro=(0.0, 0.0, 0.0),
+    )
+    received = ReceivedIMUSampleV1(
+        ingress=MavlinkIngressV1(
+            stream_id="vq2-mavlink-udp-14550",
+            generation=1,
+            sequence=0,
+            message_type="HIGHRES_IMU",
+            host_clock_id="host-perf-counter",
+            received_monotonic_ns=123,
+            source_time_value=imu.timestamp_us,
+            source_time_unit="us",
+        ),
+        imu=imu,
+    )
+
+    class TimedAdapter(_FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.received = [received]
+
+        def drain_received_imu_samples(self):
+            values = self.received
+            self.received = []
+            return values
+
+        def drain_mavlink_arrivals(self):
+            return []
+
+    class Recorder:
+        capture_enabled = False
+
+        def __init__(self):
+            self.received = []
+
+        def record_imu(self, sample, estimator, now_s, *, received_sample):
+            self.received.append((sample, estimator, now_s, received_sample))
+
+        def record_mavlink_ingress(self, _arrival):
+            raise AssertionError("no non-IMU arrival was supplied")
+
+        def emit(self, *_args, **_kwargs):
+            pass
+
+    adapter = TimedAdapter()
+    recorder = Recorder()
+    runner = VQ2Runner(adapter, _FakeVision(), recorder=recorder)
+    runner.estimator = ImuAttitudeEstimator(
+        ImuAttitudeConfig(
+            calibration_min_samples=1,
+            calibration_min_duration_s=0.0,
+            gravity_correction_kp=0.0,
+            gyro_bias_ki=0.0,
+        )
+    )
+
+    runner._sample()
+
+    assert len(recorder.received) == 1
+    assert recorder.received[0][0] == received.imu
+    assert recorder.received[0][3] is received
+
+
+def test_sampling_records_mixed_receiver_ingress_in_global_sequence_order():
+    def ingress(sequence, message_type, source_value=None, source_unit=None):
+        return MavlinkIngressV1(
+            stream_id="vq2-mavlink-udp-14550",
+            generation=1,
+            sequence=sequence,
+            message_type=message_type,
+            host_clock_id="host-perf-counter",
+            received_monotonic_ns=100 + sequence,
+            source_time_value=source_value,
+            source_time_unit=source_unit,
+        )
+
+    imu_one = IMUData(
+        timestamp_us=1_000_000,
+        accel=(0.0, 0.0, -9.80665),
+        gyro=(0.0, 0.0, 0.0),
+    )
+    imu_two = IMUData(
+        timestamp_us=1_010_000,
+        accel=(0.0, 0.0, -9.80665),
+        gyro=(0.0, 0.0, 0.0),
+    )
+    received = [
+        ReceivedIMUSampleV1(
+            ingress=ingress(1, "HIGHRES_IMU", imu_one.timestamp_us, "us"),
+            imu=imu_one,
+        ),
+        ReceivedIMUSampleV1(
+            ingress=ingress(3, "HIGHRES_IMU", imu_two.timestamp_us, "us"),
+            imu=imu_two,
+        ),
+    ]
+    other = [
+        ingress(0, "HEARTBEAT"),
+        ingress(2, "RACE_STATUS", 10, "ms"),
+    ]
+
+    class TimedAdapter(_FakeAdapter):
+        def drain_received_imu_samples(self):
+            values = list(received)
+            received.clear()
+            return values
+
+        def drain_mavlink_arrivals(self):
+            values = list(other)
+            other.clear()
+            return values
+
+    class Recorder:
+        capture_enabled = False
+
+        def __init__(self):
+            self.order = []
+
+        def record_imu(self, _sample, _estimator, _now_s, *, received_sample):
+            self.order.append(("imu", received_sample.ingress.sequence))
+
+        def record_mavlink_ingress(self, arrival):
+            self.order.append(("other", arrival.sequence))
+
+        def emit(self, *_args, **_kwargs):
+            pass
+
+    recorder = Recorder()
+    runner = VQ2Runner(TimedAdapter(), _FakeVision(), recorder=recorder)
+    runner.estimator = ImuAttitudeEstimator(
+        ImuAttitudeConfig(
+            calibration_min_samples=1,
+            calibration_min_duration_s=0.0,
+            gravity_correction_kp=0.0,
+            gyro_bias_ki=0.0,
+        )
+    )
+
+    runner._sample()
+
+    assert recorder.order == [
+        ("other", 0),
+        ("imu", 1),
+        ("other", 2),
+        ("imu", 3),
+    ]
 
 
 def test_delayed_pre_reset_clocks_cannot_unlock_go():
@@ -1398,6 +1761,60 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
     assert result.details == {"gate0_passed": True}
 
 
+def test_passive_preflight_requires_the_requested_continuous_healthy_dwell(
+    monkeypatch,
+):
+    clock = [0.0]
+
+    class DwellVision(_FakeVision):
+        is_running = True
+
+        def stats(self):
+            return SimpleNamespace(
+                frames_decoded=int(clock[0] * 31.0),
+                duplicate_datagrams=0,
+            )
+
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1_000, -1, -1, 0, -1)
+    runner = VQ2Runner(adapter, DwellVision())
+    runner.estimate = _estimate()
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=0.0,
+        center_x=322,
+        center_y=174,
+        bbox=(282, 134, 80, 81),
+        confidence=0.8,
+    )
+    runner.tracker.consecutive = 3
+    monkeypatch.setattr(runner, "_clear_epoch_state", lambda: None)
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+    monkeypatch.setattr(runner, "_stream_failures", lambda **_kwargs: [])
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+
+    async def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+
+    result = asyncio.run(
+        runner.preflight(timeout_s=2.0, healthy_dwell_s=0.05)
+    )
+
+    assert result["requested_healthy_dwell_s"] == pytest.approx(0.05)
+    assert result["healthy_dwell_s"] >= 0.05
+    assert result["observation_duration_s"] >= 1.05
+    assert result["vision_frames"] >= 32
+
+
+def test_passive_preflight_rejects_an_unbounded_dwell_before_receiving():
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    with pytest.raises(ValueError, match=r"\[0, 8\]"):
+        asyncio.run(runner.preflight(healthy_dwell_s=8.1))
+
+
 def test_diagnostic_png_encoding_is_deferred_until_explicit_flush(tmp_path):
     recorder = vq2_module.JsonlRecorder(str(tmp_path / "trace.jsonl.gz"))
     vision = _FakeVision()
@@ -1435,6 +1852,63 @@ def test_programmatic_replay_capture_requires_exact_recording_approval(tmp_path)
                 recording_approved="true",
             )
         )
+
+
+def test_connect_failure_still_disconnects_partially_started_transport(monkeypatch):
+    from competition.aigp_mavlink import MavlinkIngressStats, MavlinkOutboundAudit
+
+    class FailingConnectAdapter(_FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.disconnect_called = False
+
+        async def connect(self, _address):
+            raise ConnectionError("connect failed after transport start")
+
+        async def disconnect(self):
+            self.disconnect_called = True
+
+        def drain_received_ingress(self):
+            return []
+
+        def ingress_stats(self):
+            return MavlinkIngressStats(
+                generation=1,
+                next_sequence=0,
+                highres_imu_received=0,
+                heartbeat_received=0,
+                race_status_received=0,
+                actuator_received=0,
+                dropped=0,
+                high_watermark=0,
+                imu_capacity=1,
+                other_capacity=1,
+                imu_dropped=0,
+                other_dropped=0,
+                imu_high_watermark=0,
+                other_high_watermark=0,
+                buffered_imu=0,
+                buffered_other=0,
+            )
+
+        def outbound_audit(self):
+            return MavlinkOutboundAudit(0, 0, 0, 0, 0, 0, 0, 0)
+
+    adapter = FailingConnectAdapter()
+    monkeypatch.setattr(
+        vq2_module, "AIGPMavlinkAdapter", lambda **_kwargs: adapter
+    )
+
+    with pytest.raises(ConnectionError, match="after transport start"):
+        asyncio.run(
+            vq2_module.run_live(
+                "preflight",
+                "udpin:127.0.0.1:14550",
+                None,
+            )
+        )
+
+    assert adapter.disconnect_called is True
 
 
 def test_replay_writer_is_cleaned_up_when_later_runner_construction_fails(

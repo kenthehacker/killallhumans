@@ -15,6 +15,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from competition.adapter import IMUData
+from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
+from competition.vq2_contracts import FrameIdentityV1, FrameTimingV1
 from aigp_loop.replay import (
     AsyncReplayRecorder,
     ReplayBundleReader,
@@ -36,6 +39,44 @@ from scripts.aigp_replay import main as replay_main
 
 def _image(value=0):
     return np.full((4, 6, 3), value, dtype=np.uint8)
+
+
+def _frame_timing(*, generation=0, frame_id=1, sim_time_ns=10, base_ns=100):
+    return FrameTimingV1(
+        identity=FrameIdentityV1(
+            "vq2-camera-udp-5600", generation, frame_id
+        ),
+        camera_source_time_ns=sim_time_ns,
+        host_clock_id="host-perf-counter",
+        publication_sequence=frame_id,
+        first_unique_packet_monotonic_ns=base_ns,
+        final_unique_packet_monotonic_ns=base_ns + 1,
+        reassembly_complete_monotonic_ns=base_ns + 2,
+        decode_start_monotonic_ns=base_ns + 3,
+        decode_end_monotonic_ns=base_ns + 4,
+        publish_monotonic_ns=base_ns + 5,
+    )
+
+
+def _received_imu(*, sequence=0, source_us=500, received_ns=90):
+    ingress = MavlinkIngressV1(
+        stream_id="vq2-mavlink-udp-14550",
+        generation=1,
+        sequence=sequence,
+        message_type="HIGHRES_IMU",
+        host_clock_id="host-perf-counter",
+        received_monotonic_ns=received_ns,
+        source_time_value=source_us,
+        source_time_unit="us",
+    )
+    return ReceivedIMUSampleV1(
+        ingress=ingress,
+        imu=IMUData(
+            timestamp_us=source_us,
+            accel=(1.0, 2.0, -9.0),
+            gyro=(0.1, 0.2, 0.3),
+        ),
+    )
 
 
 def _patch_wrapper_attestation(monkeypatch, replay_module, wrapper, payload):
@@ -156,6 +197,135 @@ def test_bundle_deduplicates_decoded_pixels_and_verifies_all_hashes(tmp_path):
         "unique_frame_blobs": 1,
     }
     assert len(list((path / "frames").glob("*.npy"))) == 1
+
+
+def test_bundle_additively_preserves_exact_camera_and_imu_ingress(tmp_path):
+    path = tmp_path / "timed-session.vq2replay"
+    writer = ReplayBundleWriter(path, require_private=False)
+    received_imu = _received_imu()
+    imu_sequence = writer.record_imu(
+        received_imu.imu,
+        estimator={"healthy": True},
+        received_monotonic_s=1.0,
+        received_sample=received_imu,
+    )
+    timing = _frame_timing()
+    frame_sequence = writer.capture_decoded_frame(
+        _image(4),
+        generation=0,
+        frame_id=1,
+        sim_time_ns=10,
+        received_monotonic_s=1.1,
+        frame_timing=timing,
+    )
+    writer.record_mavlink_ingress(
+        MavlinkIngressV1(
+            stream_id="vq2-mavlink-udp-14550",
+            generation=1,
+            sequence=1,
+            message_type="HEARTBEAT",
+            host_clock_id="host-perf-counter",
+            received_monotonic_ns=95,
+            source_time_value=None,
+            source_time_unit=None,
+        )
+    )
+    writer.close()
+
+    reader = ReplayBundleReader(path)
+    _summary, records = reader.verify_and_read()
+    assert [record["type"] for record in records] == [
+        "imu",
+        "event",
+        "decoded_frame",
+        "event",
+        "event",
+    ]
+    received_event = records[1]
+    assert received_event["event"] == "received_imu"
+    assert received_event["linked_imu_record_sequence"] == imu_sequence
+    assert ReceivedIMUSampleV1.from_primitive(
+        received_event["observation"]
+    ) == received_imu
+    camera_event = records[3]
+    assert camera_event["event"] == "camera_frame_timing"
+    assert camera_event["linked_decoded_frame_record_sequence"] == frame_sequence
+    assert FrameTimingV1.from_primitive(camera_event["observation"]) == timing
+    assert records[4]["event"] == "mavlink_ingress"
+
+
+def test_bundle_rejects_mismatched_exact_timing_bindings(tmp_path):
+    writer = ReplayBundleWriter(
+        tmp_path / "mismatch.vq2replay", require_private=False
+    )
+    received_imu = _received_imu()
+    different = IMUData(
+        timestamp_us=500,
+        accel=(9.0, 9.0, 9.0),
+        gyro=(0.1, 0.2, 0.3),
+    )
+    with pytest.raises(ValueError, match="differs from the core IMU"):
+        writer.record_imu(different, received_sample=received_imu)
+    with pytest.raises(ValueError, match="timing identity"):
+        writer.capture_decoded_frame(
+            _image(),
+            generation=0,
+            frame_id=2,
+            sim_time_ns=10,
+            received_monotonic_s=1.0,
+            frame_timing=_frame_timing(frame_id=1),
+        )
+    writer.abort("expected binding rejection")
+
+
+def test_swallowed_exact_capture_validation_cannot_seal_complete(tmp_path):
+    received_imu = _received_imu()
+
+    imu_path = tmp_path / "swallowed-imu-rejection.vq2replay"
+    writer = ReplayBundleWriter(imu_path, require_private=False)
+    with pytest.raises(ValueError, match="differs from the core IMU"):
+        writer.record_imu(
+            IMUData(
+                timestamp_us=500,
+                accel=(9.0, 9.0, 9.0),
+                gyro=(0.1, 0.2, 0.3),
+            ),
+            received_sample=received_imu,
+        )
+    with pytest.raises(RuntimeError, match="cannot seal replay bundle"):
+        writer.close()
+    assert json.loads((imu_path / "manifest.json").read_text())["complete"] is False
+
+    ingress_path = tmp_path / "swallowed-ingress-rejection.vq2replay"
+    writer = ReplayBundleWriter(ingress_path, require_private=False)
+    invalid_ingress = received_imu.ingress.to_primitive()
+    invalid_ingress["sequence"] = True
+    with pytest.raises((TypeError, ValueError)):
+        writer.record_mavlink_ingress(invalid_ingress)
+    with pytest.raises(RuntimeError, match="cannot seal replay bundle"):
+        writer.close()
+    assert (
+        json.loads((ingress_path / "manifest.json").read_text())["complete"]
+        is False
+    )
+
+    frame_path = tmp_path / "swallowed-frame-rejection.vq2replay"
+    writer = ReplayBundleWriter(frame_path, require_private=False)
+    with pytest.raises(ValueError, match="timing identity"):
+        writer.capture_decoded_frame(
+            _image(),
+            generation=0,
+            frame_id=2,
+            sim_time_ns=10,
+            received_monotonic_s=1.0,
+            frame_timing=_frame_timing(frame_id=1),
+        )
+    with pytest.raises(RuntimeError, match="cannot seal replay bundle"):
+        writer.close()
+    assert (
+        json.loads((frame_path / "manifest.json").read_text())["complete"]
+        is False
+    )
 
 
 def test_bundle_verify_detects_blob_and_manifest_dataset_corruption(tmp_path):

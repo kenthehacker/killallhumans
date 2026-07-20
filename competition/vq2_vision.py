@@ -101,6 +101,18 @@ class VQ2VisionStats:
     snapshot_callback_errors: int
     resets: int
     remembered_chunk_keys: int
+    timing_ledger_entries: int
+    timing_ledger_high_watermark: int
+    timing_ledger_capacity: int
+    timing_overflow_latched: bool
+    receiver_buffered_partial_frames: int
+    receiver_buffer_high_watermark: int
+    receiver_buffer_capacity: int
+    capture_snapshot_queue_entries: int
+    capture_snapshot_queue_high_watermark: int
+    capture_snapshot_queue_capacity: int
+    capture_snapshot_queue_dropped: int
+    capture_snapshot_queue_enabled: bool
     receiver_dropped_partial_frames: int
     receiver_duplicate_chunks: int
     receiver_dropped_late_packets: int
@@ -127,6 +139,8 @@ class VQ2VisionThread:
         socket_timeout_s: float = 0.10,
         socket_factory: Optional[Callable[[], socket.socket]] = None,
         on_snapshot: Optional[Callable[[VQ2VisionSnapshot], object]] = None,
+        capture_snapshot_queue_enabled: bool = False,
+        capture_snapshot_queue_capacity: int = 256,
         stream_id: str = "vq2-camera-udp-5600",
         host_clock_id: str = VQ2_HOST_CLOCK_ID,
         monotonic_ns: Optional[Callable[[], int]] = None,
@@ -139,6 +153,17 @@ class VQ2VisionThread:
             raise ValueError("max_buffered_frames must be >= 1")
         if int(receive_buffer_bytes) < 1:
             raise ValueError("receive_buffer_bytes must be >= 1")
+        if (
+            type(capture_snapshot_queue_capacity) is not int
+            or capture_snapshot_queue_capacity < 1
+        ):
+            raise ValueError("capture_snapshot_queue_capacity must be >= 1")
+        if type(capture_snapshot_queue_enabled) is not bool:
+            raise TypeError("capture_snapshot_queue_enabled must be an exact bool")
+        if capture_snapshot_queue_enabled and on_snapshot is None:
+            raise ValueError(
+                "capture snapshot queue requires an on_snapshot capture callback"
+            )
         if not math.isfinite(socket_timeout_s) or socket_timeout_s <= 0.0:
             raise ValueError("socket_timeout_s must be finite and > 0")
         if monotonic_ns is not None and not callable(monotonic_ns):
@@ -153,6 +178,10 @@ class VQ2VisionThread:
         self.socket_timeout_s = float(socket_timeout_s)
         self._socket_factory = socket_factory or self._new_udp_socket
         self._on_snapshot = on_snapshot
+        self._capture_snapshot_queue_enabled = capture_snapshot_queue_enabled
+        self.capture_snapshot_queue_capacity = int(
+            capture_snapshot_queue_capacity
+        )
         self.stream_id = stream_id
         self.host_clock_id = host_clock_id
         # Windows ``time.monotonic`` is backed by coarse GetTickCount64 on the
@@ -188,7 +217,12 @@ class VQ2VisionThread:
         self._frame_first_packet_ns: OrderedDict[int, int] = OrderedDict()
         self._published_frame_ids: set[int] = set()
         self._timing_overflow_latched = False
+        self._timing_ledger_high_watermark = 0
+        self._receiver_buffer_high_watermark = 0
         self._latest_snapshot: Optional[VQ2VisionSnapshot] = None
+        self._capture_snapshot_queue: Deque[VQ2VisionSnapshot] = deque()
+        self._capture_snapshot_queue_high_watermark = 0
+        self._capture_snapshot_queue_dropped = 0
         self._generation = 0
         self._publication_sequence = 0
         self._last_publish_monotonic_ns: Optional[int] = None
@@ -308,6 +342,7 @@ class VQ2VisionThread:
             self._published_frame_ids.clear()
             self._timing_overflow_latched = False
             self._latest_snapshot = None
+            self._capture_snapshot_queue.clear()
             self._resets += 1
 
     def feed_datagram(
@@ -404,6 +439,14 @@ class VQ2VisionThread:
                 self._malformed_datagrams += 1
                 self._frame_first_packet_ns.pop(packet.frame_id, None)
                 return None
+            self._timing_ledger_high_watermark = max(
+                self._timing_ledger_high_watermark,
+                len(self._frame_first_packet_ns),
+            )
+            self._receiver_buffer_high_watermark = max(
+                self._receiver_buffer_high_watermark,
+                len(self._receiver._buffers),
+            )
             if completed is None:
                 return None
             self._frames_reassembled += 1
@@ -498,7 +541,33 @@ class VQ2VisionThread:
             except Exception:
                 with self._data_lock:
                     self._snapshot_callback_errors += 1
+            if self._capture_snapshot_queue_enabled:
+                with self._data_lock:
+                    if (
+                        len(self._capture_snapshot_queue)
+                        >= self.capture_snapshot_queue_capacity
+                    ):
+                        self._capture_snapshot_queue_dropped += 1
+                        self._processing_errors += 1
+                    else:
+                        self._capture_snapshot_queue.append(snapshot)
+                        self._capture_snapshot_queue_high_watermark = max(
+                            self._capture_snapshot_queue_high_watermark,
+                            len(self._capture_snapshot_queue),
+                        )
         return snapshot
+
+    def pop_capture_snapshot(self) -> Optional[VQ2VisionSnapshot]:
+        """Pop the oldest capture-loaded publication, if capture is enabled."""
+
+        with self._data_lock:
+            if not self._capture_snapshot_queue:
+                return None
+            return self._capture_snapshot_queue.popleft()
+
+    def capture_snapshot_queue_depth(self) -> int:
+        with self._data_lock:
+            return len(self._capture_snapshot_queue)
 
     def snapshot(
         self,
@@ -556,6 +625,30 @@ class VQ2VisionThread:
                 snapshot_callback_errors=self._snapshot_callback_errors,
                 resets=self._resets,
                 remembered_chunk_keys=len(self._seen_keys),
+                timing_ledger_entries=len(self._frame_first_packet_ns),
+                timing_ledger_high_watermark=self._timing_ledger_high_watermark,
+                timing_ledger_capacity=self.max_remembered_chunks,
+                timing_overflow_latched=self._timing_overflow_latched,
+                receiver_buffered_partial_frames=len(receiver._buffers),
+                receiver_buffer_high_watermark=(
+                    self._receiver_buffer_high_watermark
+                ),
+                receiver_buffer_capacity=receiver.max_buffered,
+                capture_snapshot_queue_entries=len(
+                    self._capture_snapshot_queue
+                ),
+                capture_snapshot_queue_high_watermark=(
+                    self._capture_snapshot_queue_high_watermark
+                ),
+                capture_snapshot_queue_capacity=(
+                    self.capture_snapshot_queue_capacity
+                ),
+                capture_snapshot_queue_dropped=(
+                    self._capture_snapshot_queue_dropped
+                ),
+                capture_snapshot_queue_enabled=(
+                    self._capture_snapshot_queue_enabled
+                ),
                 receiver_dropped_partial_frames=receiver.dropped_partial_frames,
                 receiver_duplicate_chunks=receiver.duplicate_chunks,
                 receiver_dropped_late_packets=receiver.dropped_late_packets,

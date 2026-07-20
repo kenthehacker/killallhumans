@@ -19,6 +19,7 @@ from competition.aigp_messages import (
 )
 from competition.adapter import Quaternion, TelemetryState
 from competition.aigp_mavlink import AIGPMavlinkAdapter, SIM_RESET_COMMAND
+from competition.vq2_capture import ReceivedIMUSampleV1
 
 
 def _default_telem_identity() -> TelemetryState:
@@ -219,6 +220,179 @@ def test_vq2_imu_mode_becomes_ready_without_pose_or_track():
         asyncio.run(adapter.send_attitude(AttitudeCommand(0.0, 0.0, 0.0, 0.2)))
 
 
+def test_vq2_receiver_ingress_preserves_qpc_sequence_and_source_binding():
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+    )
+    adapter._handle_message(
+        FakeMsg("HEARTBEAT", base_mode=65, custom_mode=0),
+        received_monotonic_ns=100,
+    )
+    adapter._handle_message(
+        FakeMsg(
+            "HIGHRES_IMU",
+            xacc=1.0,
+            yacc=2.0,
+            zacc=-9.0,
+            xgyro=0.1,
+            ygyro=0.2,
+            zgyro=0.3,
+            time_usec=500,
+        ),
+        received_monotonic_ns=110,
+    )
+    race_payload = encode_race_status(
+        sim_boot_time_ms=600,
+        race_start_boot_time_ms=-1,
+        race_finish_time_ns=-1,
+        active_gate_index=0,
+        last_gate_race_time=-1,
+    )
+    adapter._handle_message(
+        FakeMsg("ENCAPSULATED_DATA", data=race_payload, seqnr=0),
+        received_monotonic_ns=120,
+    )
+    adapter._handle_message(
+        FakeMsg(
+            "ACTUATOR_OUTPUT_STATUS",
+            time_usec=700,
+            active=15,
+            actuator=[0.0] * 32,
+        ),
+        received_monotonic_ns=130,
+    )
+
+    stats = adapter.ingress_stats()
+    assert stats.next_sequence == 4
+    assert stats.highres_imu_received == 1
+    assert stats.heartbeat_received == 1
+    assert stats.race_status_received == 1
+    assert stats.actuator_received == 1
+    assert stats.dropped == 0
+    assert stats.high_watermark == 4
+    assert stats.imu_capacity == 4096
+    assert stats.other_capacity == 4096
+    assert stats.imu_dropped == 0
+    assert stats.other_dropped == 0
+    assert stats.imu_high_watermark == 1
+    assert stats.other_high_watermark == 3
+
+    received = adapter.drain_received_imu_samples()
+    assert len(received) == 1
+    assert received[0].ingress.sequence == 1
+    assert received[0].ingress.received_monotonic_ns == 110
+    assert received[0].ingress.source_time_value == 500
+    assert received[0].imu.timestamp_us == 500
+    arrivals = adapter.drain_mavlink_arrivals()
+    assert [item.sequence for item in arrivals] == [0, 2, 3]
+    assert [item.received_monotonic_ns for item in arrivals] == [100, 120, 130]
+    assert [item.source_time_unit for item in arrivals] == [None, "ms", "us"]
+
+
+def test_vq2_receiver_ingress_overflow_is_counted_and_sequence_remains_strict():
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        ingress_buffer_capacity=2,
+    )
+    for sequence in range(3):
+        adapter._handle_message(
+            FakeMsg("HEARTBEAT", base_mode=65, custom_mode=0),
+            received_monotonic_ns=100 + sequence,
+        )
+
+    stats = adapter.ingress_stats()
+    assert stats.next_sequence == 3
+    assert stats.dropped == 1
+    assert stats.high_watermark == 2
+    assert stats.imu_capacity == 2
+    assert stats.other_capacity == 2
+    assert stats.imu_dropped == 0
+    assert stats.other_dropped == 1
+    assert stats.imu_high_watermark == 0
+    assert stats.other_high_watermark == 2
+    assert [item.sequence for item in adapter.drain_mavlink_arrivals()] == [1, 2]
+
+
+def test_vq2_receiver_ingress_atomic_drain_preserves_cross_queue_order():
+    adapter = AIGPMavlinkAdapter(enable_vision=False)
+    adapter._handle_message(
+        FakeMsg("HEARTBEAT", base_mode=65, custom_mode=0),
+        received_monotonic_ns=100,
+    )
+    adapter._handle_message(
+        FakeMsg(
+            "HIGHRES_IMU",
+            xacc=1.0,
+            yacc=2.0,
+            zacc=-9.0,
+            xgyro=0.1,
+            ygyro=0.2,
+            zgyro=0.3,
+            time_usec=500,
+        ),
+        received_monotonic_ns=110,
+    )
+    adapter._handle_message(
+        FakeMsg("HEARTBEAT", base_mode=65, custom_mode=0),
+        received_monotonic_ns=120,
+    )
+
+    values = adapter.drain_received_ingress()
+
+    assert [
+        value.ingress.sequence
+        if isinstance(value, ReceivedIMUSampleV1)
+        else value.sequence
+        for value in values
+    ] == [0, 1, 2]
+    assert isinstance(values[1], ReceivedIMUSampleV1)
+    assert adapter.ingress_stats().buffered_imu == 0
+    assert adapter.ingress_stats().buffered_other == 0
+
+
+def test_disconnect_rejects_an_unterminated_mavlink_worker_after_close_retry():
+    class StuckThread:
+        name = "stuck-rx"
+
+        def __init__(self):
+            self.join_calls = 0
+
+        def join(self, timeout):
+            assert timeout == 2.0
+            self.join_calls += 1
+
+        def is_alive(self):
+            return True
+
+    class Connection:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    adapter = AIGPMavlinkAdapter(enable_vision=False)
+    thread = StuckThread()
+    connection = Connection()
+    adapter._rx_thread = thread
+    adapter._conn = connection
+
+    with pytest.raises(RuntimeError, match="termination unproved"):
+        asyncio.run(adapter.disconnect())
+
+    assert thread.join_calls == 2
+    assert connection.closed is True
+    assert adapter._rx_thread is thread
+
+
+def test_vq2_adapter_rejects_a_non_qpc_capture_clock():
+    with pytest.raises(ValueError, match="host-perf-counter"):
+        AIGPMavlinkAdapter(enable_vision=False, host_clock_id="coarse-clock")
+
+
 def test_vq2_rate_wire_uses_live_measured_pitch_flip():
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
@@ -235,6 +409,34 @@ def test_vq2_rate_wire_uses_live_measured_pitch_flip():
     name, args = adapter._conn.mav.calls[-1]
     assert name == "set_attitude_target_send"
     assert args[5:8] == pytest.approx((-0.10, -0.20, 0.0))
+    audit = adapter.outbound_audit()
+    assert audit.attitude_target == 1
+    assert audit.disallowed_count == 1
+
+
+def test_outbound_audit_separates_allowed_announcements_from_commands():
+    adapter = _adapter_with_fake_conn()
+    adapter._audit_outbound("timesync")
+    adapter._audit_outbound("gcs_heartbeat")
+    asyncio.run(adapter.arm())
+    asyncio.run(adapter.disarm())
+    asyncio.run(
+        adapter.send_position(
+            PositionCommand(
+                position_ned=(0.0, 0.0, 0.0),
+                velocity_ned=(0.0, 0.0, 0.0),
+                yaw_rad=0.0,
+            )
+        )
+    )
+
+    audit = adapter.outbound_audit()
+    assert audit.timesync == 1
+    assert audit.gcs_heartbeat == 1
+    assert audit.arm == 1
+    assert audit.disarm == 1
+    assert audit.position_target == 1
+    assert audit.disallowed_count == 3
 
 
 def test_pose_mode_still_requires_attitude_and_local_position():
