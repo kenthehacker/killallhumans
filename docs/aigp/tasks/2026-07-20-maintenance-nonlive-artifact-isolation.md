@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-maintenance-nonlive-artifact-isolation`
 - Parent: `2026-07-20-vq2-development-continuation-handoff`
-- State: `tested`
+- State: `committed`
 - Objective: keep the bounded VQ1 dry-run slow test from writing an ignored
   timestamped telemetry capture into the repository while preserving the
   runner's intentional default recording behavior.
@@ -154,11 +154,12 @@ identities must be recorded after independent `129/129` rehash verification.
 
 - Contract/task-record commit:
   `060fd479988cf1214039f1618c7fc4f4d083e44d`.
-- Behavioral commit: pending.
+- Behavioral commit: `5a9fa4ae231fec4ede4476157b72b090249a59a9`.
 - Promotion/trust commit: pending.
 - Integration commit: pending.
 - Post-merge verification: pending.
-- Result: tested; all required pre-promotion gates passed.
+- Result: committed; all required pre-promotion gates passed and the bounded
+  behavior is frozen for trust promotion.
 - Failure provenance: the first affected-target attempt failed while opening
   the explicit record because its pytest `tmp_path` directory disappeared
   during the run. The repository capture inventory was unchanged. With no
