@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package3b-m1-passive-timing`
 - Parent: `2026-07-20-vq2-development-continuation-handoff`
-- State: `active`
+- State: `complete — passive tranche accepted`
 - Objective: preserve and summarize real build-3385 camera receiver,
   reassembly, decode, publication, passive detection, and tracker timing from
   bounded Training-mode preflights, without sending an arm request, reset, or
@@ -232,3 +232,60 @@ separately compare timing-only/no-frame-write load before runtime promotion.
 All acceptance output must explicitly report control scheduler deadlines,
 command send, actuator effect, gyro effect, calibrated camera/IMU offset,
 simulator/wall ratio, and Training-mode machine detection as `unmeasured`.
+
+## Execution result
+
+The accepted behavior candidate is
+`a50f4ea0e18b2f5a295fdb1cc94e183734616601`. Its exact, hash-pinned VQ2
+inventory passed 1,480 tests from a fresh detached worktree before collection.
+Independent capture-pipeline review found no blocking passive-path issue.
+
+Four of the five permitted post-instrumentation probes were used:
+
+| Attempt | Commit | Result | Camera / exact IMU | Dataset |
+| --- | --- | --- | ---: | --- |
+| Session 01 | `923c24bf4c6f0257f292cd407296347b88bdbf2c` | rejected and permanently marked invalid: async generic dataclass normalization omitted exact schema fields | not accepted | incomplete; no dataset identity |
+| Session 02 | `a50f4ea0e18b2f5a295fdb1cc94e183734616601` | accepted | 182 / 700 | `b92b28209eac340b4c7f9397666ba2fe781fed86648f500f025556c6a0e1cfc0` |
+| Session 03 | `a50f4ea0e18b2f5a295fdb1cc94e183734616601` | accepted | 181 / 705 | `591844c0b6679bf3aed205e77d9e520c5d615eead8f9ed0e2fa04e7cf6daede4` |
+| Session 04 | `a50f4ea0e18b2f5a295fdb1cc94e183734616601` | accepted | 181 / 705 | `7539af300d1d03861f44c5c55cb5793c88bb60de04892355d79e4ee757409cd6` |
+
+The rejected attempt stopped collection pending review as required. Its
+failure was traced to the asynchronous replay snapshot boundary, fixed by
+converting the three exact contract roots to fresh `to_primitive()` trees, and
+covered by an actual asynchronous complete-bundle regression. The focused
+replay/runner review passed 225 tests with four expected skips, the canonical
+VQ2 suite passed 1,480 tests, and a second fresh exact candidate passed the
+isolated 1,480-test gate. Independent review then explicitly unblocked the
+remaining passive attempts. The rejected private evidence remains preserved;
+it was neither deleted nor relabeled as accepted.
+
+Accepted sessions 02–04 total 8,439 replay records, 544 decoded/processed/
+timed camera frames, 2,110 exact HIGHRES_IMU arrivals, and 4,077 ordered
+decoded MAVLink message-boundary arrivals. Every required analyzer acceptance
+flag is true in all three
+sessions. All capture, ingress, vision, and timing drop/error counters are
+zero; command records and disallowed outbound sends are zero; the five-second
+healthy dwell, build/process identity, full frame verification, lease release,
+and post-probe release of UDP 14550/5600 are proved separately for each
+session. No poison marker was created.
+
+The exact per-session distributions, rates, queue/load/window context, private
+artifact hashes, and explicit unmeasured claims are recorded in
+`docs/aigp/vq2_runtime_timing.md`. This result accepts only the Package 2A /
+Package 3B passive capture-ingress tranche. Package 2 and M1 remain incomplete,
+and no powered work is authorized by this record.
+
+Promotion-boundary verification completed on 2026-07-20:
+
+- directly affected replay/runner verification: 225 passed, 4 skipped;
+- canonical `test-vq2`: 1,480 passed;
+- isolated hash-pinned VQ2 from fresh candidate
+  `a50f4ea0e18b2f5a295fdb1cc94e183734616601`: 1,480 passed;
+- `test-fast`: 2,578 passed, 20 skipped, 42 deselected;
+- `test-unit`: 2,578 passed, 20 skipped, 42 deselected; and
+- `test-full-non-live`: 2,619 passed, 21 skipped.
+
+A final independent artifact audit recomputed every tracked private artifact
+hash for sessions 02–04, rechecked every acceptance flag and Git binding,
+confirmed totals of 544 camera observations, 2,110 exact IMU arrivals, and
+8,439 replay records, and re-proved no poison marker and free UDP 14550/5600.
