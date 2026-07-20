@@ -147,8 +147,21 @@ the mapping for `tests/test_aigp_vq1_runner.py` may change from
 `af3612764af47f7e645893c90e2f8688a02f74662fa5c7713dc712a42a32ccb8`.
 The tested replacement file SHA-256 is
 `977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07`.
-No path may be added or removed. The new manifest file and canonical JSON
-identities must be recorded after independent `129/129` rehash verification.
+No path may be added or removed.
+
+The canonical builder first published to an external review path and then to
+the tracked path. Independent strict audits of both outputs matched all
+`129/129` direct regular files and found exactly the one frozen digest change,
+with no addition or removal. The tracked manifest identities are:
+
+- file SHA-256:
+  `3855243e7b3675ebff14731bbd073b7850bb87fb9d9d35267b7ca0fa2982d08f`;
+  and
+- canonical JSON SHA-256:
+  `ac2700e5cfed1c9aece92446d7aef665ddfff923d790e62628c35cbbbf4978a2`.
+
+These identities freeze the candidate trust metadata but do not replace the
+fresh full non-live and isolated hash-pinned promotion runs.
 
 ## Lifecycle evidence
 
