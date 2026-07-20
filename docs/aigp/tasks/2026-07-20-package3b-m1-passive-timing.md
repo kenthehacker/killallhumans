@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package3b-m1-passive-timing`
 - Parent: `2026-07-20-vq2-development-continuation-handoff`
-- State: `complete — passive tranche accepted`
+- State: `post_merge_verified — passive tranche accepted`
 - Objective: preserve and summarize real build-3385 camera receiver,
   reassembly, decode, publication, passive detection, and tracker timing from
   bounded Training-mode preflights, without sending an arm request, reset, or
@@ -282,10 +282,25 @@ Promotion-boundary verification completed on 2026-07-20:
 - isolated hash-pinned VQ2 from fresh candidate
   `a50f4ea0e18b2f5a295fdb1cc94e183734616601`: 1,480 passed;
 - `test-fast`: 2,578 passed, 20 skipped, 42 deselected;
-- `test-unit`: 2,578 passed, 20 skipped, 42 deselected; and
-- `test-full-non-live`: 2,619 passed, 21 skipped.
+- `test-unit`: 2,578 passed, 20 skipped, 42 deselected;
+- `test-full-non-live`: 2,619 passed, 21 skipped; and
+- fresh exact-commit promotion-worktree `test-full-non-live` at
+  `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`: 2,619 passed, 21 skipped.
 
 A final independent artifact audit recomputed every tracked private artifact
 hash for sessions 02–04, rechecked every acceptance flag and Git binding,
 confirmed totals of 544 camera observations, 2,110 exact IMU arrivals, and
 8,439 replay records, and re-proved no poison marker and free UDP 14550/5600.
+
+Integration owner `/root` fast-forwarded clean local `main` from
+`b7935b4e2d9b685a70ac59b944631a0d48a1d919` through the exact accepted
+candidate and evidence documentation at
+`cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`. A separate fresh worktree at that
+exact commit passed the isolated hash-pinned 1,480-test VQ2 gate. Another
+separate fresh worktree passed `test-full-non-live`; its only physical
+worktree side effect was `.pytest_cache/`, with no source-adjacent bytecode,
+tracked change, or non-ignored untracked artifact. Post-merge `test-vq2` on
+`main` passed 1,480 tests, trusted-manifest rehashing matched all 142 files,
+and tracked `main` status was empty. The documented six-file ignored
+source-bytecode baseline on `main` remained exactly six files; no new
+source-adjacent bytecode was attributed to this integration.

@@ -4,13 +4,16 @@ This is the operational starting point for development after Wave 3E. It does
 not authorize simulator access, private capture creation, replay-corpus use,
 production wiring, transport selection, or powered flight.
 
-The strongest current conclusion is deliberately narrow: the existing offline
-stack is integrated and green, but no new high-value VQ2 behavior tranche is
-unblocked without real calibration, approved replay, or separately authorized
-simulator evidence. The one bounded test-artifact hygiene task is integrated
-and post-merge verified at `ef92041bb3f05b1d8f3ef69182db8d51184c9cce`.
-Do not repeat it or create another detached proof-only state-estimation wave
-merely to keep coding.
+The strongest current conclusion is deliberately narrow: the Package 2A /
+Package 3B passive capture-ingress tranche is integrated and post-merge
+verified at `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`. Three accepted private
+build-3385 Training preflights now establish exact camera receiver, passive
+perception, and decoded MAVLink message-boundary timing on
+`host-perf-counter`. This advances only the passive receiver portion needed by
+Package 2 and M1. It does not complete either package, establish a calibrated
+camera/IMU offset, measure production no-capture latency, or authorize powered
+work. Do not repeat the completed tranche or create another detached
+proof-only state-estimation wave merely to keep coding.
 
 ## Precedence and required reading
 
@@ -52,8 +55,16 @@ inform a design, but it cannot replace empirical build-specific evidence.
 ## Current integrated baseline
 
 - Target: FlightSim build 3385 in Training mode.
-- Current reviewed implementation baseline before this documentation closeout:
-  `ef92041bb3f05b1d8f3ef69182db8d51184c9cce`.
+- Current reviewed implementation/evidence baseline:
+  `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`.
+- `cb2b1de` is the Package 2A / Package 3B passive capture-ingress evidence
+  closeout.
+- Accepted behavior and live-evidence candidate:
+  `a50f4ea0e18b2f5a295fdb1cc94e183734616601`.
+- Passive timing task record:
+  `docs/aigp/tasks/2026-07-20-package3b-m1-passive-timing.md`.
+- Exact distributions, artifact identities, and remaining unmeasured claims:
+  `docs/aigp/vq2_runtime_timing.md`.
 - `ef92041` is the bounded non-live telemetry-artifact isolation and trust
   integration.
 - Continuation-handoff introduction:
@@ -84,9 +95,11 @@ Earlier integrated milestones remain recorded in the execution-plan handoff:
 - Wave 3D stable reference: `46df0adee76070e10509fa5e807b986a9469c68e`.
 
 M0 and Wave 1A are complete. Waves 1 through 3E are integrated and
-post-merge verified offline, and the bounded promotion-hygiene maintenance is
-complete. M1, M2, and M4 runtime acceptance remain incomplete. No FlightSim
-evidence newer than the authoritative 2026-07-18 live record is claimed.
+post-merge verified offline, the bounded promotion-hygiene maintenance is
+complete, and the passive capture-ingress tranche has accepted 2026-07-20
+FlightSim evidence. M1, M2, and M4 runtime acceptance remain incomplete. The
+new evidence is capture-loaded and passive only; the authoritative 2026-07-18
+handoff still governs live flight state and every powered safety rule.
 
 The system is not race-ready. Gate 0 has one credited collision-free pass and
 Gate 1 has three-frame post-credit reacquisition evidence, but no control
@@ -137,10 +150,25 @@ transport without the later reviewed contracts below.
 
 ## Verification and trust baseline
 
-The hash-pinned trusted code state is maintenance integration commit
-`ef92041`. Relative to reviewed task base `8472869`, it changes only the
-bounded slow test, its trusted-manifest mapping, and task documentation;
-production code and the VQ2 policy are byte-identical. Accepted evidence is:
+The current hash-pinned trusted state is passive-tranche integration commit
+`cb2b1de`. Accepted tranche verification is:
+
+| Evidence | Observed result |
+|---|---|
+| Direct replay/runner review | `225` passed, `4` skipped |
+| Canonical candidate VQ2 | `1,480` passed |
+| Fresh isolated hash-pinned VQ2 at `a50f4ea` | `1,480` passed |
+| `test-fast` | `2,578` passed, `20` skipped, `42` deselected |
+| `test-unit` | `2,578` passed, `20` skipped, `42` deselected |
+| Development promotion `test-full-non-live` | `2,619` passed, `21` skipped |
+| Fresh exact-commit promotion `test-full-non-live` at `cb2b1de` | `2,619` passed, `21` skipped |
+| Fresh isolated hash-pinned VQ2 at `cb2b1de` | `1,480` passed |
+| Post-merge VQ2 at `cb2b1de` | `1,480` passed |
+
+The exact-commit promotion worktree gained only ignored `.pytest_cache/` and
+no source-adjacent bytecode, tracked change, or non-ignored untracked artifact.
+The separate isolated VQ2 worktree remained physically clean. The previous Wave
+3E/maintenance evidence remains historical context:
 
 | Evidence | Observed result |
 |---|---|
@@ -168,22 +196,20 @@ Current trust identities are:
 
 | Item | Identity |
 |---|---|
-| Policy file SHA-256 | `7daa46ec4dfd025c18f12076add06d70b6463f07d6320b20487a63bd78d0851e` |
-| Policy canonical JSON SHA-256 | `b8bc5228b12eafc75c10b3d2aa658cfe57a0d1ed820b3fefa6e0317d7c5cdc90` |
-| Trusted manifest file SHA-256 | `3855243e7b3675ebff14731bbd073b7850bb87fb9d9d35267b7ca0fa2982d08f` |
-| Trusted manifest canonical JSON SHA-256 | `ac2700e5cfed1c9aece92446d7aef665ddfff923d790e62628c35cbbbf4978a2` |
+| Policy file SHA-256 | `d513a88faddf2050d3f41d69cc425173d2fcc491e0f41df98bdafc1a7b326e0e` |
+| Policy canonical JSON SHA-256 | `e3cc46056c16d3e7b09dc2e02fa13ff615f0884614ab671c4db1cbad38d92161` |
+| Trusted manifest file SHA-256 | `ce662e46c460bf4930e8a1a22e38e893adf877efc0553a17dd01ed21c406afa7` |
+| Trusted manifest canonical JSON SHA-256 | `c1de0131b4ecb6f5563835098c66d29888b06c163ea78006315b7a2ea226220c` |
 | Wave 3E test SHA-256 | `683aa081103e6e9ae22281b1e1f573bc821218f57df75cdfa688587b0ad84382` |
 | VQ1 runner test SHA-256 | `977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07` |
 
-The policy contains `31` sorted, unique test files plus `2` discovery inputs
-and expects `1,325` passes. The trusted manifest contains `129` sorted, unique
-paths; independent review matched all `129/129` regular on-disk files. Its
-maintenance delta from Wave 3E is exactly the one changed
-`tests/test_aigp_vq1_runner.py` digest, with no path addition/removal and no
-policy change. Canonical JSON identities are SHA-256 over parsed JSON
-serialized with sorted keys and compact separators.
+The policy contains `36` sorted, unique test files plus `2` discovery inputs
+and expects `1,480` passes. The trusted manifest contains `142` sorted,
+case-unique paths; independent rehash matched all `142/142` regular on-disk
+files. Canonical JSON identities are SHA-256 over parsed JSON serialized with
+sorted keys and compact separators.
 
-The `1,325`-test result is not operational T1 replay. The checked-in promotion
+The `1,480`-test result is not operational T1 replay. The checked-in promotion
 command and ladder identity files are examples with placeholders or zero
 hashes. The required production command, identities, and candidate documents
 are absent. The ignored schema-v2 `.aigp-loop/trials.sqlite3` ledger is
@@ -192,11 +218,12 @@ imports. Preserve it, but there is no operational T0-T4 run to resume.
 
 ## Repository, worktrees, and physical hygiene
 
-At handoff drafting, Git tracked status on `main` was empty. Fifteen historical
-non-main worktrees remain registered. Their branches have no branch-only
-commits and are ancestors of `main`; they are inactive historical evidence,
-not current leases or candidate bases. Do not resume or remove them
-automatically. Inspect with:
+Immediately before the closeout documentation edits, Git tracked status on
+`main` was empty. Twenty-four non-main worktrees remain registered: fifteen
+pre-maintenance historical worktrees, four maintenance worktrees, and five
+passive-timing tranche worktrees. Their commits are ancestors of `main`; they
+are inactive historical or promotion evidence, not current leases or candidate
+bases. Do not resume or remove them automatically. Inspect with:
 
 ```powershell
 git worktree list --porcelain
@@ -204,7 +231,9 @@ git status --short --branch
 ```
 
 The completed maintenance added one development, one full-suite, one isolated
-VQ2, and one documentation-closeout worktree. They are inactive evidence after
+VQ2, and one documentation-closeout worktree. The passive tranche added one
+development worktree plus the `candidate`, `candidate2`, `final`, and
+`promotion-final` evidence worktrees. All nine are inactive evidence after
 this closeout, not reusable candidate bases; do not remove them automatically.
 
 Git-clean is not promotion-pristine. Current `main` has six ignored
@@ -224,10 +253,9 @@ ordinal relative-path order, with no trailing newline.
 Do not delete, relabel, or infer provenance for those files automatically.
 
 Use the current deliberately reviewed local `main` containing this handoff as
-the base. `ef92041` is the latest implementation/trust integration reference,
-not a reason to discard this later documentation-only closeout commit. A
-future task starts as follows only after one entry gate is actually satisfied,
-using unique names confirmed not to exist:
+the base. `cb2b1de` is the passive implementation/trust/evidence integration
+reference. A future task starts as follows only after one entry gate is
+actually satisfied, using unique names confirmed not to exist:
 
 ```powershell
 $vq2TaskBase = (git rev-parse main).Trim()
@@ -335,9 +363,10 @@ post-merge VQ2 gates all passed with the counts recorded above.
 The promotion full suite left the fresh candidate's five tracked captures
 byte-identical and produced only an inventoried `.pytest_cache`. A separate
 fresh exact candidate retained an identical physical inventory across the
-hash-pinned VQ2 run. The manifest remains 129 entries and changes only the VQ1
-runner-test digest; the VQ2 policy remains byte-identical at 1,325 expected
-passes.
+hash-pinned VQ2 run. At maintenance commit `ef92041`, the manifest contained
+129 entries and changed only the VQ1 runner-test digest; the then-current VQ2
+policy remained byte-identical at 1,325 expected passes. Those counts are
+historical, not the current passive-tranche trust identities recorded above.
 
 This maintenance improves promotion hygiene only. It advances neither M1, M2,
 nor M4 and unlocks no replay, calibration, producer, estimator, runtime,
@@ -347,14 +376,24 @@ prerequisite honestly.
 
 ## Current resume decision
 
-No approved replay corpus, final processor, calibrated policy, or pinned OS
-isolation boundary was supplied. No build-3385 calibration/timing dossier or
-producer evidence was supplied. No new simulator authority or exclusive lease
-was supplied. Therefore no consequential roadmap entry gate is currently
-satisfied. Human/operator provision of one of those prerequisites is the next
-step; absent it, create no new implementation worktree and stop. Do not
-reinterpret this maintenance, canonical tests, or Wave 3D/E synthetic evidence
-as replay, calibration, runtime, simulator, or powered evidence.
+The user supplied private full-frame storage/use authority and passive
+build-3385 simulator authority for the bounded Package 3B timing tranche. The
+accepted implementation now provides a durable exclusive live lease and three
+accepted passive timing captures with exact ingress/receive timestamps,
+queue/drop/high-water evidence, outbound audit, cleanup proof, and the timing
+dossier identified above. That bounded entry gate was satisfied and the
+tranche is integrated; it must not be described as still blocked or repeated.
+
+M1 itself is not complete. Consequential follow-on work still requires the
+specific entry gate for that package: full Package 2 calibration inputs
+(including the required camera/IMU calibration and timing/measurement model),
+the no-send 50 Hz shadow scheduler and production handoff/deadline/skip
+evidence, and—before operational replay—the approved labeled corpus, final
+processor, calibrated policy, and pinned OS isolation wrapper. Any powered
+FlightSim stage also requires fresh explicit powered authorization. Absent one
+of those remaining prerequisites, do not reinterpret the passive tranche,
+canonical tests, or Wave 3D/E synthetic evidence as calibration, operational
+replay, completed runtime, or powered evidence.
 
 ## Consequential development roadmap
 
