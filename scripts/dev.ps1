@@ -100,6 +100,9 @@ machine's script execution policy blocks direct .ps1 invocation.
                 'estimation/tests',
                 'gate_detection/tests',
                 'planning/tests/test_vq2_guidance.py',
+                'tests/test_aigp_live_lease.py',
+                'tests/test_aigp_vq2_passive_probe.py',
+                'tests/test_aigp_vq2_passive_timing_script.py',
                 'tests/test_aigp_vq2_runner.py',
                 'tests/test_vision_udp.py',
                 'tests/test_vision_udp_listener.py'
