@@ -28,6 +28,9 @@ from competition.vq2_controller import (
     ControllerTickInput,
     PredictiveControllerConfig,
     VQ2ControlPhase,
+    _VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY,
+    _propose_vq2_first_observation_dropout_command,
+    _propose_vq2_command_impl,
     propose_vq2_command,
 )
 
@@ -302,6 +305,41 @@ def _propose(
     )
 
 
+def _first_dropout_state(
+    *,
+    gate_index: int = 0,
+    bearing: tuple[float, float] = (0.2, -0.1),
+) -> RelativeGateStateV1:
+    return dataclasses.replace(
+        _state(
+            gate_index=gate_index,
+            bearing=bearing,
+            health=RelativeStateHealth.COASTING,
+        ),
+        health_reason="observation_dropout",
+    )
+
+
+def _propose_first_dropout(
+    state: RelativeGateStateV1,
+    *,
+    phase: ControllerPhaseInput,
+    capability: object,
+) -> CommandProposalV1:
+    tick = _tick(
+        state,
+        expected_phase_started_ns=phase.phase_started_monotonic_ns,
+        minimum_phase_evaluation_ns=phase.evaluation_monotonic_ns,
+    )
+    return _propose_vq2_first_observation_dropout_command(
+        state,
+        attitude=_attitude(),
+        tick=tick,
+        phase=phase,
+        capability=capability,
+    )
+
+
 def _legacy_vertical_thrust(control_y: float, control_y_rate: float) -> float:
     proportional = 0.040 * max(-1.0, min(1.0, (180.0 - control_y) / 90.0))
     damping = -0.00070 * max(-300.0, min(300.0, control_y_rate))
@@ -436,6 +474,87 @@ def test_shadow_and_nonhealthy_states_are_withheld_source_less(state):
     assert proposal.source_frame is None
     assert proposal.source_tracker_id is None
     assert proposal.reason.startswith("withheld:")
+
+
+def test_public_controller_rejects_even_an_exact_first_dropout_profile():
+    state = _first_dropout_state()
+
+    proposal = _propose(state)
+
+    assert proposal.is_exact_zero
+    assert proposal.source_frame is None
+    assert proposal.reason == "withheld:state_dropout"
+    assert proposal.uncertainty.limited
+
+
+def test_private_first_dropout_controller_rejects_an_unowned_capability():
+    state = _first_dropout_state()
+    phase = _phase()
+
+    with pytest.raises(TypeError, match="invalid first-dropout controller capability"):
+        _propose_first_dropout(state, phase=phase, capability=object())
+
+
+def test_controller_impl_rejects_a_raw_first_dropout_boolean():
+    state = _first_dropout_state()
+    phase = _phase()
+
+    with pytest.raises(TypeError, match="invalid internal first-dropout capability"):
+        _propose_vq2_command_impl(
+            state,
+            attitude=_attitude(),
+            tick=_tick(state),
+            phase=phase,
+            config=PredictiveControllerConfig(),
+            first_dropout_capability=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("gate_index", "phase", "bearing", "expected_reason"),
+    (
+        (
+            0,
+            VQ2ControlPhase.GATE0_APPROACH,
+            (0.2, -0.1),
+            "legacy_gate0_pixel_pd",
+        ),
+        (
+            1,
+            VQ2ControlPhase.GATE1_RECENTER,
+            (0.8, -0.8),
+            "bounded_gate1_recenter",
+        ),
+    ),
+    ids=("gate0", "gate1"),
+)
+def test_private_first_dropout_controller_is_source_bound_and_uncertainty_limited(
+    gate_index: int,
+    phase: VQ2ControlPhase,
+    bearing: tuple[float, float],
+    expected_reason: str,
+):
+    state = _first_dropout_state(gate_index=gate_index, bearing=bearing)
+    phase_input = _phase(
+        mode=phase,
+        phase_started_ns=(
+            _PROPOSAL_NS - 200_000_000
+            if phase is VQ2ControlPhase.GATE1_RECENTER
+            else _DEFAULT_PHASE_START_NS
+        ),
+    )
+
+    proposal = _propose_first_dropout(
+        state,
+        phase=phase_input,
+        capability=_VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY,
+    )
+
+    assert not proposal.is_exact_zero
+    assert proposal.reason == expected_reason
+    assert proposal.uncertainty.limited
+    assert proposal.uncertainty.reason == "first_observation_dropout_coast"
+    validate_command_proposal_source(proposal, state)
 
 
 def test_authority_host_phase_and_objective_mismatches_fail_closed():

@@ -24,6 +24,7 @@ from competition.vq2_contracts import (
     ObservationHealth,
     PredictionBasis,
     RelativeGateStateV1,
+    RelativeStateHealth,
     TrackRole,
     validate_command_proposal_source,
     validate_relative_gate_state_source,
@@ -36,8 +37,10 @@ from competition.vq2_wave3_imu_adapter import (
     HARD_MAX_CONTROLLER_ATTITUDE_UNCERTAINTY_RAD,
     VQ2Gate0PitchProvenance,
     VQ2PropagatedAttitudeProvenance,
+    VQ2Wave3CoastLease,
     VQ2Wave3ImuAdapterMemory,
     VQ2Wave3ImuAdapterTransition,
+    consume_vq2_wave3_coast_lease,
     step_vq2_wave3_imu_adapter,
 )
 from estimation.imu_attitude import ImuAttitudeConfig
@@ -58,6 +61,7 @@ from estimation.vq2_relative_estimator import (
     RelativeEstimatorConfig,
     RelativeEstimatorUpdate,
     RelativePredictionTarget,
+    VQ2ImuCorrelatedEstimatorCoast,
     VQ2ImuCorrelatedEstimatorUpdate,
     VQ2RelativeGateEstimator,
 )
@@ -311,9 +315,14 @@ def _attitude_input(
 def _prediction_target(
     observation: GateObservationV1,
     *,
+    decision_monotonic_ns: int | None = None,
     prediction_monotonic_ns: int | None = None,
 ) -> RelativePredictionTarget:
-    decision_ns = observation.frame_timing.publish_monotonic_ns
+    decision_ns = (
+        observation.frame_timing.publish_monotonic_ns
+        if decision_monotonic_ns is None
+        else decision_monotonic_ns
+    )
     prediction_ns = (
         decision_ns
         if prediction_monotonic_ns is None
@@ -339,6 +348,7 @@ def _derotation_evidence(
     *,
     capture_attitude: VQ2TimestampedAttitude,
     target_attitude: VQ2TimestampedAttitude,
+    decision_monotonic_ns: int | None = None,
     prediction_monotonic_ns: int | None = None,
     capture_orientation_uncertainty_rad: float = 0.001,
     target_orientation_uncertainty_rad: float = 0.001,
@@ -348,6 +358,7 @@ def _derotation_evidence(
 ):
     target = _prediction_target(
         observation,
+        decision_monotonic_ns=decision_monotonic_ns,
         prediction_monotonic_ns=prediction_monotonic_ns,
     )
     return derotate_gate_observation(
@@ -387,13 +398,18 @@ class _UpdateStream:
         *,
         frame_id: int,
         imu_sequence: int,
+        minimum_accepted_updates_for_healthy: int = 1,
+        dropout_variance_per_s: float = 0.25,
     ) -> None:
         self.estimator = VQ2RelativeGateEstimator(
             tracker_id,
             config=RelativeEstimatorConfig(
-                minimum_accepted_updates_for_healthy=1,
+                minimum_accepted_updates_for_healthy=(
+                    minimum_accepted_updates_for_healthy
+                ),
                 initial_bearing_rate_std_norm_s=0.01,
                 initial_expansion_rate_std_s=0.01,
+                dropout_variance_per_s=dropout_variance_per_s,
             ),
         )
         self.frame_id = frame_id
@@ -408,6 +424,7 @@ class _UpdateStream:
         pitch_rad: float = -0.2,
         attitude_source: VQ2ImuSource | None = None,
         exact_attitude: VQ2TimestampedAttitude | None = None,
+        decision_monotonic_ns: int | None = None,
         prediction_monotonic_ns: int | None = None,
         body_rates_rad_s: tuple[float, float, float] = (0.0, 0.0, 0.0),
         target_orientation_uncertainty_rad: float = 0.001,
@@ -433,7 +450,11 @@ class _UpdateStream:
                 body_rates_rad_s=body_rates_rad_s,
             )
             target_time = (
-                observation.frame_timing.publish_monotonic_ns
+                (
+                    observation.frame_timing.publish_monotonic_ns
+                    if decision_monotonic_ns is None
+                    else decision_monotonic_ns
+                )
                 if prediction_monotonic_ns is None
                 else prediction_monotonic_ns
             )
@@ -452,6 +473,7 @@ class _UpdateStream:
             observation,
             capture_attitude=capture,
             target_attitude=target_attitude,
+            decision_monotonic_ns=decision_monotonic_ns,
             prediction_monotonic_ns=prediction_monotonic_ns,
             target_orientation_uncertainty_rad=(
                 target_orientation_uncertainty_rad
@@ -507,13 +529,94 @@ def _step(
     safety: VQ2SafetyGuidanceInput,
     *,
     update: VQ2ImuCorrelatedEstimatorUpdate | None = None,
+    coast: VQ2ImuCorrelatedEstimatorCoast | None = None,
     tick: ControllerTickInput | None = None,
+    enable_correlated_coast: bool = False,
 ):
     return step_vq2_wave3_imu_adapter(
         memory,
         safety,
         active_update=update,
+        correlated_coast=coast,
         tick=_tick(safety, update) if tick is None else tick,
+        enable_correlated_coast=enable_correlated_coast,
+    )
+
+
+def _successor_safety(
+    source_safety: VQ2SafetyGuidanceInput,
+) -> VQ2SafetyGuidanceInput:
+    return replace(
+        source_safety,
+        evaluation_monotonic_ns=(
+            source_safety.evaluation_monotonic_ns + 20_000_000
+        ),
+    )
+
+
+def _make_coast(
+    stream: _UpdateStream,
+    prior_update: VQ2ImuCorrelatedEstimatorUpdate,
+    safety: VQ2SafetyGuidanceInput,
+    *,
+    target_attitude: VQ2TimestampedAttitude | None = None,
+) -> VQ2ImuCorrelatedEstimatorCoast:
+    target = RelativePredictionTarget.at_decision(
+        safety.evaluation_host_clock_id,
+        safety.evaluation_monotonic_ns,
+    )
+    state = stream.estimator.coast(target)
+    prior_evidence = prior_update.evidence
+    prior_attitude_input = prior_evidence.target_attitude
+    prior_attitude = prior_attitude_input.attitude
+    if target_attitude is None:
+        target_attitude = _timestamped_attitude(
+            prior_attitude.source,
+            sequence=prior_attitude.sample_sequence + 1,
+            source_time_us=prior_attitude.source_time_us + 10_000,
+            receive_monotonic_ns=safety.evaluation_monotonic_ns,
+            pitch_rad=prior_attitude.pitch_rad,
+            body_rates_rad_s=prior_attitude.body_rates_rad_s,
+        )
+    evidence = derotate_gate_observation(
+        prior_evidence.observation,
+        target,
+        capture_attitude=prior_evidence.capture_attitude,
+        target_attitude=VQ2AttitudeDerotationInput(
+            attitude=target_attitude,
+            orientation_uncertainty_rad=(
+                prior_attitude_input.orientation_uncertainty_rad
+            ),
+            host_time_uncertainty_ns=(
+                prior_attitude_input.host_time_uncertainty_ns
+            ),
+        ),
+        calibration=prior_evidence.calibration,
+        model=prior_evidence.model,
+    )
+    return VQ2ImuCorrelatedEstimatorCoast(prior_update, state, evidence)
+
+
+def _coast_tick(
+    safety: VQ2SafetyGuidanceInput,
+    coast: VQ2ImuCorrelatedEstimatorCoast,
+    lease: VQ2Wave3CoastLease,
+) -> ControllerTickInput:
+    return ControllerTickInput(
+        proposal_id=lease.eligible_control_tick_id,
+        control_tick_id=lease.eligible_control_tick_id,
+        host_clock_id=safety.evaluation_host_clock_id,
+        proposal_monotonic_ns=safety.evaluation_monotonic_ns + 5_000_000,
+        control_tick_deadline_monotonic_ns=(
+            lease.eligible_deadline_monotonic_ns
+        ),
+        minimum_state_decision_monotonic_ns=(
+            coast.state.timing.decision_time_monotonic_ns
+        ),
+        minimum_state_sequence=coast.state.state_sequence,
+        expected_phase_started_monotonic_ns=safety.phase_started_monotonic_ns,
+        minimum_phase_evaluation_monotonic_ns=safety.evaluation_monotonic_ns,
+        expected_authority=safety.authority,
     )
 
 
@@ -585,15 +688,38 @@ def _gate0_context():
     return transition.memory, approach
 
 
-def _enter_gate0(*, pitch_rad: float = -0.2):
+def _enter_gate0(
+    *,
+    pitch_rad: float = -0.2,
+    enable_correlated_coast: bool = False,
+    dropout_variance_per_s: float = 0.25,
+):
     memory, safety = _gate0_context()
-    stream = _UpdateStream("active-gate-0", frame_id=300, imu_sequence=100)
-    update = stream.make(safety, pitch_rad=pitch_rad)
-    transition = _step(memory, safety, update=update)
+    stream = _UpdateStream(
+        "active-gate-0",
+        frame_id=300,
+        imu_sequence=100,
+        dropout_variance_per_s=dropout_variance_per_s,
+    )
+    update = stream.make(
+        safety,
+        pitch_rad=pitch_rad,
+        decision_monotonic_ns=(
+            safety.evaluation_monotonic_ns
+            if enable_correlated_coast
+            else None
+        ),
+    )
+    transition = _step(
+        memory,
+        safety,
+        update=update,
+        enable_correlated_coast=enable_correlated_coast,
+    )
     return transition, safety, update, stream
 
 
-def _enter_gate1():
+def _enter_gate1(*, enable_correlated_coast: bool = False):
     transition, _, _, _ = _enter_gate0()
     commit = _safety(
         4,
@@ -631,9 +757,48 @@ def _enter_gate1():
         gate_index=1,
     )
     stream = _UpdateStream("active-gate-1", frame_id=400, imu_sequence=200)
-    update = stream.make(align, center=(0.40, -0.30), pitch_rad=0.05)
-    transition = _step(transition.memory, align, update=update)
+    update = stream.make(
+        align,
+        center=(0.40, -0.30),
+        pitch_rad=0.05,
+        decision_monotonic_ns=(
+            align.evaluation_monotonic_ns
+            if enable_correlated_coast
+            else None
+        ),
+    )
+    transition = _step(
+        transition.memory,
+        align,
+        update=update,
+        enable_correlated_coast=enable_correlated_coast,
+    )
     return transition, align, update, stream
+
+
+def _armed_gate0_coast():
+    source, source_safety, update, stream = _enter_gate0(
+        enable_correlated_coast=True,
+        dropout_variance_per_s=0.05,
+    )
+    lease = source.memory.coast_lease
+    assert lease is not None
+    safety = _successor_safety(source_safety)
+    coast = _make_coast(stream, update, safety)
+    tick = _coast_tick(safety, coast, lease)
+    return source, safety, coast, tick
+
+
+def _armed_gate1_coast():
+    source, source_safety, update, stream = _enter_gate1(
+        enable_correlated_coast=True
+    )
+    lease = source.memory.coast_lease
+    assert lease is not None
+    safety = _successor_safety(source_safety)
+    coast = _make_coast(stream, update, safety)
+    tick = _coast_tick(safety, coast, lease)
+    return source, safety, coast, tick
 
 
 def _unapplied(
@@ -805,6 +970,758 @@ def test_gate1_align_is_sourced_without_retaining_gate0_pitch_latch():
     assert transition.memory.inner_memory.gate0_pitch_latch is None
     assert transition.memory.gate0_pitch_provenance is None
     validate_command_proposal_source(transition.proposal, update.state)
+
+
+def test_coast_lease_is_default_off_and_arms_only_for_healthy_sourced_update():
+    ordinary, _, _, _ = _enter_gate0(enable_correlated_coast=False)
+    enabled, safety, update, _ = _enter_gate0(enable_correlated_coast=True)
+
+    assert ordinary.memory.coast_lease is None
+    lease = enabled.memory.coast_lease
+    assert lease is not None
+    assert lease.source_update is update
+    assert lease.source_proposal == enabled.proposal
+    assert lease.source_safety == safety
+    assert lease.source_control_tick_id == enabled.proposal.control_tick_id
+    assert lease.eligible_control_tick_id == lease.source_control_tick_id + 1
+    assert lease.eligible_due_monotonic_ns == (
+        lease.source_control_tick_deadline_monotonic_ns
+    )
+    assert lease.eligible_deadline_monotonic_ns == (
+        lease.eligible_due_monotonic_ns + 20_000_000
+    )
+    assert update.current_observation_accepted
+    assert update.state.health is RelativeStateHealth.HEALTHY
+    assert not enabled.proposal.is_exact_zero
+
+    initializing_memory, initializing_safety = _gate0_context()
+    initializing_update = _UpdateStream(
+        "initializing-lease-source",
+        frame_id=420,
+        imu_sequence=240,
+        minimum_accepted_updates_for_healthy=2,
+    ).make(
+        initializing_safety,
+        decision_monotonic_ns=initializing_safety.evaluation_monotonic_ns,
+    )
+    withheld = _step(
+        initializing_memory,
+        initializing_safety,
+        update=initializing_update,
+        enable_correlated_coast=True,
+    )
+    assert initializing_update.state.health is RelativeStateHealth.INITIALIZING
+    assert withheld.proposal.is_exact_zero
+    assert withheld.memory.coast_lease is None
+
+    unsourced_memory, unsourced_safety = _gate0_context()
+    healthy_outside_corridor = _UpdateStream(
+        "healthy-unsourced-lease-source",
+        frame_id=421,
+        imu_sequence=250,
+    ).make(
+        unsourced_safety,
+        center=(0.70, 0.0),
+        decision_monotonic_ns=unsourced_safety.evaluation_monotonic_ns,
+    )
+    unsourced = _step(
+        unsourced_memory,
+        unsourced_safety,
+        update=healthy_outside_corridor,
+        enable_correlated_coast=True,
+    )
+    assert healthy_outside_corridor.state.health is RelativeStateHealth.HEALTHY
+    assert unsourced.proposal.is_exact_zero
+    assert unsourced.memory.coast_lease is None
+
+
+def test_coast_lease_binds_the_exact_source_safety_phase_mapping():
+    source, _safety, _coast, _tick = _armed_gate0_coast()
+    lease = source.memory.coast_lease
+    assert lease is not None
+
+    with pytest.raises(ValueError, match="source tick or safety binding differs"):
+        replace(
+            lease,
+            source_proposal=replace(
+                lease.source_proposal,
+                phase="gate1_recenter",
+            ),
+        )
+
+
+@pytest.mark.parametrize("gate", [0, 1])
+def test_valid_gate0_and_gate1_coast_is_sourced_once_with_exact_limitation(gate):
+    source, safety, coast, tick = (
+        _armed_gate0_coast() if gate == 0 else _armed_gate1_coast()
+    )
+
+    result = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason is None
+    assert result.active_update is None
+    assert result.correlated_coast is coast
+    assert result.consumed_coast_lease == source.memory.coast_lease
+    assert result.accepted_attitude is coast.evidence.target_attitude.attitude
+    assert result.memory.last_attitude is result.accepted_attitude
+    assert result.memory.coast_lease is None
+    assert not result.proposal.is_exact_zero
+    assert result.proposal.uncertainty.limited
+    assert result.proposal.uncertainty.reason == (
+        "first_observation_dropout_coast"
+    )
+    validate_command_proposal_source(result.proposal, coast.state)
+    assert coast.state.health is RelativeStateHealth.COASTING
+    assert coast.state.dropout_count == 1
+    assert coast.state.health_reason == "observation_dropout"
+    assert coast.state.measurement_update_sequence == (
+        coast.prior_update.state.measurement_update_sequence
+    )
+    assert coast.state.state_sequence == (
+        coast.prior_update.state.state_sequence + 1
+    )
+    if gate == 0:
+        assert result.memory.gate0_pitch_provenance == (
+            source.memory.gate0_pitch_provenance
+        )
+        assert result.memory.inner_memory.gate0_pitch_latch == (
+            source.memory.inner_memory.gate0_pitch_latch
+        )
+    else:
+        assert result.memory.gate0_pitch_provenance is None
+        assert result.memory.inner_memory.gate0_pitch_latch is None
+
+
+def test_successful_coast_consumes_lease_and_second_attempt_is_exact_zero():
+    source, safety, coast, tick = _armed_gate0_coast()
+    first = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+    later_safety = replace(
+        safety,
+        evaluation_monotonic_ns=safety.evaluation_monotonic_ns + 20_000_000,
+    )
+    later_tick = replace(
+        tick,
+        proposal_id=tick.proposal_id + 1,
+        control_tick_id=tick.control_tick_id + 1,
+        proposal_monotonic_ns=tick.proposal_monotonic_ns + 20_000_000,
+        control_tick_deadline_monotonic_ns=(
+            tick.control_tick_deadline_monotonic_ns + 20_000_000
+        ),
+        minimum_phase_evaluation_monotonic_ns=(
+            later_safety.evaluation_monotonic_ns
+        ),
+    )
+
+    second = _step(
+        first.memory,
+        later_safety,
+        coast=coast,
+        tick=later_tick,
+        enable_correlated_coast=True,
+    )
+
+    assert second.outer_withholding_reason == (
+        "imu_correlated_coast_lease_missing"
+    )
+    _assert_exact_source_less_zero(second)
+    assert second.memory.coast_lease is None
+
+
+def test_skipped_tick_consumption_helper_is_idempotent_and_cannot_rearm():
+    source, safety, coast, tick = _armed_gate0_coast()
+
+    consumed = consume_vq2_wave3_coast_lease(source.memory)
+    assert consumed is not None
+    assert consumed.coast_lease is None
+    assert consume_vq2_wave3_coast_lease(consumed) is consumed
+    assert consume_vq2_wave3_coast_lease(None) is None
+
+    result = _step(
+        consumed,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+    assert result.outer_withholding_reason == (
+        "imu_correlated_coast_lease_missing"
+    )
+    _assert_exact_source_less_zero(result)
+
+
+def test_coast_is_exact_zero_when_feature_is_not_explicitly_enabled():
+    source, safety, coast, tick = _armed_gate0_coast()
+
+    result = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=False,
+    )
+
+    assert result.outer_withholding_reason == "imu_correlated_coast_disabled"
+    _assert_exact_source_less_zero(result)
+    assert result.accepted_attitude is None
+    assert result.controller_attitude_provenance is None
+    assert result.memory.coast_lease is None
+    assert result.correlated_coast is coast
+    assert result.consumed_coast_lease == source.memory.coast_lease
+
+    with pytest.raises(ValueError, match="exact consumed lease"):
+        replace(result, consumed_coast_lease=None)
+    with pytest.raises(
+        ValueError,
+        match="supported source-less transition requires its outer failure reason",
+    ):
+        replace(
+            result,
+            outer_withholding_reason=None,
+            correlated_coast=None,
+            consumed_coast_lease=None,
+        )
+
+
+def test_missing_coast_lease_is_exact_zero_even_when_feature_is_enabled():
+    source, safety, coast, tick = _armed_gate0_coast()
+    memory = consume_vq2_wave3_coast_lease(source.memory)
+
+    result = _step(
+        memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == (
+        "imu_correlated_coast_lease_missing"
+    )
+    _assert_exact_source_less_zero(result)
+
+
+@pytest.mark.parametrize(
+    ("tick_corruption", "expected_reason"),
+    (
+        ("identity", "imu_correlated_coast_not_immediate_successor"),
+        ("deadline", "imu_correlated_coast_tick_period_invalid"),
+    ),
+)
+def test_coast_requires_exact_successor_tick_and_deadline(
+    tick_corruption,
+    expected_reason,
+):
+    source, safety, coast, tick = _armed_gate0_coast()
+    if tick_corruption == "identity":
+        bad_tick = replace(
+            tick,
+            proposal_id=tick.proposal_id + 1,
+            control_tick_id=tick.control_tick_id + 1,
+        )
+    else:
+        bad_tick = replace(
+            tick,
+            control_tick_deadline_monotonic_ns=(
+                tick.control_tick_deadline_monotonic_ns + 1
+            ),
+        )
+
+    result = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=bad_tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == expected_reason
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+
+
+def test_coast_cannot_run_before_the_successor_due_window():
+    source, source_safety, update, stream = _enter_gate0(
+        enable_correlated_coast=True,
+        dropout_variance_per_s=0.05,
+    )
+    lease = source.memory.coast_lease
+    assert lease is not None
+    early_safety = replace(
+        source_safety,
+        evaluation_monotonic_ns=(
+            source_safety.evaluation_monotonic_ns + 1_000_000
+        ),
+    )
+    coast = _make_coast(stream, update, early_safety)
+    early_tick = ControllerTickInput(
+        proposal_id=lease.eligible_control_tick_id,
+        control_tick_id=lease.eligible_control_tick_id,
+        host_clock_id=early_safety.evaluation_host_clock_id,
+        proposal_monotonic_ns=(
+            early_safety.evaluation_monotonic_ns + 500_000
+        ),
+        control_tick_deadline_monotonic_ns=(
+            lease.eligible_deadline_monotonic_ns
+        ),
+        minimum_state_decision_monotonic_ns=(
+            coast.state.timing.decision_time_monotonic_ns
+        ),
+        minimum_state_sequence=coast.state.state_sequence,
+        expected_phase_started_monotonic_ns=(
+            early_safety.phase_started_monotonic_ns
+        ),
+        minimum_phase_evaluation_monotonic_ns=(
+            early_safety.evaluation_monotonic_ns
+        ),
+        expected_authority=early_safety.authority,
+    )
+    assert early_tick.proposal_monotonic_ns < lease.eligible_due_monotonic_ns
+
+    result = _step(
+        source.memory,
+        early_safety,
+        coast=coast,
+        tick=early_tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == (
+        "imu_correlated_coast_outside_successor_window"
+    )
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+
+
+@pytest.mark.parametrize(
+    "safety_corruption",
+    ("phase", "race", "authority", "phase_start"),
+)
+def test_coast_rejects_phase_race_authority_and_phase_start_changes(
+    safety_corruption,
+):
+    source, safety, coast, tick = _armed_gate0_coast()
+    if safety_corruption == "phase":
+        bad_safety = replace(safety, phase=VQ2GuidancePhase.ALIGN)
+    elif safety_corruption == "race":
+        bad_safety = replace(safety, race_state=VQ2GuidanceRaceState.FINISHED)
+    elif safety_corruption == "authority":
+        bad_safety = replace(
+            safety,
+            authority=replace(
+                safety.authority,
+                race_status_sequence=safety.authority.race_status_sequence + 1,
+            ),
+        )
+    else:
+        bad_safety = replace(
+            safety,
+            phase_started_monotonic_ns=(
+                safety.phase_started_monotonic_ns + 1
+            ),
+        )
+
+    result = _step(
+        source.memory,
+        bad_safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == (
+        "imu_correlated_coast_safety_transition"
+    )
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+
+
+def test_coast_from_another_accepted_source_cannot_spend_the_lease():
+    source, safety, _, tick = _armed_gate0_coast()
+    _, _, unrelated_coast, _ = _armed_gate1_coast()
+
+    result = _step(
+        source.memory,
+        safety,
+        coast=unrelated_coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == (
+        "imu_correlated_coast_source_mismatch"
+    )
+    _assert_exact_source_less_zero(result)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ("dropout_count", "health_reason", "attitude_sequence", "uncertainty"),
+)
+def test_malformed_coast_envelope_is_revalidated_and_exact_zero(corruption):
+    source, safety, coast, tick = _armed_gate0_coast()
+    forged = copy.deepcopy(coast)
+    if corruption == "dropout_count":
+        object.__setattr__(forged.state, "dropout_count", 2)
+    elif corruption == "health_reason":
+        object.__setattr__(forged.state, "health_reason", "forged_dropout")
+    elif corruption == "attitude_sequence":
+        object.__setattr__(
+            forged.evidence.target_attitude,
+            "attitude",
+            forged.prior_update.evidence.target_attitude.attitude,
+        )
+    else:
+        object.__setattr__(
+            forged.evidence.target_attitude,
+            "orientation_uncertainty_rad",
+            (
+                forged.evidence.target_attitude.orientation_uncertainty_rad
+                + 0.001
+            ),
+        )
+
+    result = _step(
+        source.memory,
+        safety,
+        coast=forged,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == "imu_correlated_coast_malformed"
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+
+
+def test_coast_attitude_uncertainty_has_exact_outer_reason_and_zero_output():
+    source, safety, coast, tick = _armed_gate0_coast()
+    high_rate_attitude = replace(
+        coast.evidence.target_attitude.attitude,
+        body_rates_rad_s=(1_000.0, 0.0, 0.0),
+    )
+    high_rate_evidence = derotate_gate_observation(
+        coast.evidence.observation,
+        coast.evidence.prediction_target,
+        capture_attitude=coast.evidence.capture_attitude,
+        target_attitude=VQ2AttitudeDerotationInput(
+            attitude=high_rate_attitude,
+            orientation_uncertainty_rad=(
+                coast.evidence.target_attitude.orientation_uncertainty_rad
+            ),
+            host_time_uncertainty_ns=(
+                coast.evidence.target_attitude.host_time_uncertainty_ns
+            ),
+        ),
+        calibration=coast.evidence.calibration,
+        model=coast.evidence.model,
+    )
+    uncertain = VQ2ImuCorrelatedEstimatorCoast(
+        coast.prior_update,
+        coast.state,
+        high_rate_evidence,
+    )
+
+    result = _step(
+        source.memory,
+        safety,
+        coast=uncertain,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == "attitude_uncertainty_exceeded"
+    _assert_exact_source_less_zero(result)
+    assert result.accepted_attitude is None
+    assert result.controller_attitude_provenance is None
+
+
+@pytest.mark.parametrize("bad_coast", [object(), "not-a-coast-envelope"])
+def test_wrong_coast_type_is_rejected_before_composition(bad_coast):
+    source, safety, _, tick = _armed_gate0_coast()
+
+    with pytest.raises(TypeError, match="VQ2ImuCorrelatedEstimatorCoast"):
+        step_vq2_wave3_imu_adapter(
+            source.memory,
+            safety,
+            active_update=None,
+            correlated_coast=bad_coast,
+            tick=tick,
+            enable_correlated_coast=True,
+        )
+
+
+def test_active_update_and_coast_are_mutually_exclusive():
+    source, safety, coast, tick = _armed_gate0_coast()
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        step_vq2_wave3_imu_adapter(
+            source.memory,
+            safety,
+            active_update=coast.prior_update,
+            correlated_coast=coast,
+            tick=tick,
+            enable_correlated_coast=True,
+        )
+
+
+@pytest.mark.parametrize("bad_enable", [1, "true", None])
+def test_coast_enable_switch_requires_an_exact_bool(bad_enable):
+    source, safety, coast, tick = _armed_gate0_coast()
+
+    with pytest.raises(TypeError, match="exact bool"):
+        step_vq2_wave3_imu_adapter(
+            source.memory,
+            safety,
+            active_update=None,
+            correlated_coast=coast,
+            tick=tick,
+            enable_correlated_coast=bad_enable,
+        )
+
+
+@pytest.mark.parametrize("bad_memory", [object(), "not-wave3-memory"])
+def test_lease_consumption_helper_requires_exact_memory_type(bad_memory):
+    with pytest.raises(TypeError, match="VQ2Wave3ImuAdapterMemory"):
+        consume_vq2_wave3_coast_lease(bad_memory)
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "eligible_tick",
+        "eligible_deadline",
+        "source_safety",
+        "source_update",
+    ),
+)
+def test_forged_coast_lease_identity_is_quarantined(forgery):
+    source, safety, coast, tick = _armed_gate0_coast()
+    forged_memory = copy.deepcopy(source.memory)
+    lease = forged_memory.coast_lease
+    assert lease is not None
+    attacker_attitude = None
+    if forgery == "eligible_tick":
+        object.__setattr__(
+            lease,
+            "eligible_control_tick_id",
+            lease.eligible_control_tick_id + 1,
+        )
+    elif forgery == "eligible_deadline":
+        object.__setattr__(
+            lease,
+            "eligible_deadline_monotonic_ns",
+            lease.eligible_deadline_monotonic_ns + 1,
+        )
+    elif forgery == "source_safety":
+        object.__setattr__(
+            lease,
+            "source_safety",
+            replace(
+                lease.source_safety,
+                evaluation_monotonic_ns=(
+                    lease.source_safety.evaluation_monotonic_ns + 1
+                ),
+            ),
+        )
+    else:
+        _, _, unrelated_coast, _ = _armed_gate1_coast()
+        attacker_attitude = (
+            unrelated_coast.prior_update.evidence.target_attitude.attitude
+        )
+        object.__setattr__(
+            lease,
+            "source_update",
+            unrelated_coast.prior_update,
+        )
+
+    result = _step(
+        forged_memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == "outer_memory_malformed"
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+    if attacker_attitude is not None:
+        assert result.memory.last_attitude != attacker_attitude
+        assert source.memory.gate0_pitch_provenance is not None
+        assert result.memory.last_attitude == (
+            source.memory.gate0_pitch_provenance.attitude
+        )
+
+
+def test_forged_lease_source_proposal_cannot_authorize_a_coast():
+    source, safety, coast, tick = _armed_gate0_coast()
+    forged_memory = copy.deepcopy(source.memory)
+    lease = forged_memory.coast_lease
+    assert lease is not None
+    initial = _safety(
+        0,
+        VQ2GuidancePhase.ACQUIRE,
+        VQ2GuidanceRaceState.NOT_UNDERWAY,
+    )
+    unrelated_zero = _step(None, initial).proposal
+    object.__setattr__(lease, "source_proposal", unrelated_zero)
+
+    result = _step(
+        forged_memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == "outer_memory_malformed"
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+
+
+def test_forged_retained_attitude_cannot_bypass_coast_chronology():
+    source, safety, coast, tick = _armed_gate0_coast()
+    forged_memory = copy.deepcopy(source.memory)
+    object.__setattr__(
+        forged_memory,
+        "last_attitude",
+        coast.evidence.target_attitude.attitude,
+    )
+
+    result = _step(
+        forged_memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.outer_withholding_reason == "outer_memory_malformed"
+    _assert_exact_source_less_zero(result)
+    assert result.memory.coast_lease is None
+
+
+def test_gate0_coast_retains_pitch_and_no_valid_memory_can_ask_it_to_open_one():
+    source, safety, coast, tick = _armed_gate0_coast()
+    result = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.memory.gate0_pitch_provenance == (
+        source.memory.gate0_pitch_provenance
+    )
+    assert result.memory.inner_memory.gate0_pitch_latch == (
+        source.memory.inner_memory.gate0_pitch_latch
+    )
+    without_latch = replace(
+        source.memory.inner_memory,
+        gate0_pitch_latch=None,
+    )
+    with pytest.raises(ValueError, match="must retain its latch"):
+        VQ2Wave3ImuAdapterMemory(
+            inner_memory=without_latch,
+            last_attitude=source.memory.last_attitude,
+            gate0_pitch_provenance=None,
+            coast_lease=source.memory.coast_lease,
+        )
+
+
+def test_exported_sourced_coast_transition_requires_its_exact_consumed_lease():
+    source, safety, coast, tick = _armed_gate0_coast()
+    result = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+
+    assert result.consumed_coast_lease == source.memory.coast_lease
+    with pytest.raises(ValueError, match="exact consumed lease"):
+        replace(result, consumed_coast_lease=None)
+
+    unrelated_source = _enter_gate1(enable_correlated_coast=True)[0]
+    assert unrelated_source.memory.coast_lease is not None
+    with pytest.raises(ValueError, match="differs from its consumed lease"):
+        replace(
+            result,
+            consumed_coast_lease=unrelated_source.memory.coast_lease,
+        )
+
+
+def test_transition_integrity_reconstructs_nested_wave2_diagnostics():
+    source, safety, coast, tick = _armed_gate0_coast()
+    result = _step(
+        source.memory,
+        safety,
+        coast=coast,
+        tick=tick,
+        enable_correlated_coast=True,
+    )
+    forged = copy.deepcopy(result)
+    object.__setattr__(
+        forged.inner_transition.proposal.saturation,
+        "body_rate_axes",
+        (1, False, False),
+    )
+
+    with pytest.raises(TypeError, match=r"body_rate_axes\[0\]"):
+        forged.validate_integrity()
+
+
+def test_outer_memory_integrity_reconstructs_guidance_history():
+    source, safety, coast, tick = _armed_gate0_coast()
+    forged = copy.deepcopy(source.memory)
+    history = forged.inner_memory.guidance_memory.track_histories[0]
+    object.__setattr__(history, "seen_measurements", ())
+
+    with pytest.raises(TypeError, match="seen_measurements"):
+        forged.validate_integrity()
+    with pytest.raises(ValueError, match="unrecoverable outer memory corruption"):
+        _step(
+            forged,
+            safety,
+            coast=coast,
+            tick=tick,
+            enable_correlated_coast=True,
+        )
+
+
+def test_unrecoverable_pitch_proof_corruption_is_classified():
+    source, safety, coast, tick = _armed_gate0_coast()
+    forged = copy.deepcopy(source.memory)
+    pitch = forged.gate0_pitch_provenance
+    assert pitch is not None
+    object.__setattr__(
+        pitch.attitude_provenance.evidence.model,
+        "model_id",
+        "",
+    )
+
+    with pytest.raises(ValueError, match="unrecoverable outer memory corruption"):
+        _step(
+            forged,
+            safety,
+            coast=coast,
+            tick=tick,
+            enable_correlated_coast=True,
+        )
 
 
 @pytest.mark.parametrize("bad_active", [object(), "relative-state-not-envelope"])
@@ -1856,4 +2773,50 @@ def test_adapter_module_static_imports_exclude_every_authority_surface():
         imported
         for imported in imports
         if any(token in imported.lower() for token in forbidden)
+    }
+
+
+def test_first_dropout_lower_callsite_is_private_and_owned_only_by_wave3():
+    competition_dir = Path(__file__).parents[1]
+    wave2_tree = ast.parse(
+        (competition_dir / "vq2_wave2_adapter.py").read_text(encoding="utf-8")
+    )
+    functions = {
+        node.name: node
+        for node in wave2_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    public_step = functions["step_vq2_wave2_adapter"]
+    public_names = {
+        argument.arg
+        for argument in (
+            *public_step.args.args,
+            *public_step.args.kwonlyargs,
+        )
+    }
+    assert "allow_first_observation_dropout" not in public_names
+
+    private_name = "_step_vq2_wave2_first_observation_dropout"
+    private_step = functions[private_name]
+    assert private_name.startswith("_")
+    assert "capability" in {
+        argument.arg for argument in private_step.args.kwonlyargs
+    }
+
+    wave3_tree = ast.parse(
+        (competition_dir / "vq2_wave3_imu_adapter.py").read_text(
+            encoding="utf-8"
+        )
+    )
+    wave2_private_imports = {
+        alias.name
+        for node in ast.walk(wave3_tree)
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "competition.vq2_wave2_adapter"
+        for alias in node.names
+        if alias.name.startswith("_")
+    }
+    assert wave2_private_imports == {
+        "_VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY",
+        private_name,
     }

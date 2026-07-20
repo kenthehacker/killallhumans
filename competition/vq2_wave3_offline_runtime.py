@@ -18,7 +18,7 @@ from __future__ import annotations
 import copy
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import numpy as np
@@ -31,6 +31,7 @@ from competition.vq2_contracts import (
     FrameTimingV1,
     LatencyEventKind,
     LatencyEventV1,
+    RelativeGateStateV1,
     validate_latency_event_sequence,
 )
 from competition.vq2_controller import ControllerTickInput
@@ -43,8 +44,10 @@ from competition.vq2_runtime import (
 )
 from competition.vq2_vision import VQ2VisionSnapshot
 from competition.vq2_wave3_imu_adapter import (
+    VQ2Wave3CoastLease,
     VQ2Wave3ImuAdapterMemory,
     VQ2Wave3ImuAdapterTransition,
+    consume_vq2_wave3_coast_lease,
     step_vq2_wave3_imu_adapter,
 )
 from estimation.imu_attitude import ImuAttitudeConfig
@@ -65,6 +68,7 @@ from estimation.vq2_relative_estimator import (
     RelativeEstimatorConfig,
     RelativeEstimatorError,
     RelativePredictionTarget,
+    VQ2ImuCorrelatedEstimatorCoast,
     VQ2ImuCorrelatedEstimatorUpdate,
     VQ2RelativeGateEstimator,
 )
@@ -101,6 +105,8 @@ _COMPLETED_TICK_KINDS = frozenset(
         LatencyEventKind.CONTROL_TICK_START,
         LatencyEventKind.PREDICTION_START,
         LatencyEventKind.PREDICTION_END,
+        LatencyEventKind.ESTIMATOR_UPDATE_START,
+        LatencyEventKind.ESTIMATOR_UPDATE_END,
         LatencyEventKind.CONTROLLER_START,
         LatencyEventKind.CONTROLLER_END,
         LatencyEventKind.CONTROL_TICK_END,
@@ -115,6 +121,14 @@ _SKIPPED_TICK_KINDS = frozenset(
 )
 _OFFLINE_SKIP_REASONS = frozenset(
     {"tick_deadline_elapsed", "planned_work_exceeds_deadline"}
+)
+_COAST_LEASE_DISPOSITIONS = frozenset(
+    {
+        "coast_accepted",
+        "coast_rejected",
+        "distinct_frame_selected",
+        "tick_skipped",
+    }
 )
 _PERCEPTION_STAGE_KINDS = (
     LatencyEventKind.DETECTION_START,
@@ -255,6 +269,24 @@ class VQ2OfflinePerceptionTiming:
 
 
 @dataclass(frozen=True, slots=True)
+class VQ2OfflineCoastTiming:
+    """Occurrence times for one retained-frame coast attempt."""
+
+    prediction_start_monotonic_ns: int
+    prediction_end_monotonic_ns: int
+    estimator_start_monotonic_ns: int
+    estimator_end_monotonic_ns: int
+
+    def __post_init__(self) -> None:
+        values = tuple(
+            _exact_nonnegative_int(getattr(self, name), name)
+            for name in self.__dataclass_fields__
+        )
+        if any(later < earlier for earlier, later in zip(values, values[1:])):
+            raise ValueError("coast timing stages must be monotonic")
+
+
+@dataclass(frozen=True, slots=True)
 class VQ2OfflineTickTiming:
     """One immutable generated timing plan for a scheduler poll."""
 
@@ -263,6 +295,7 @@ class VQ2OfflineTickTiming:
     controller_end_monotonic_ns: int
     tick_finish_monotonic_ns: int
     perception: Optional[VQ2OfflinePerceptionTiming]
+    coast: Optional[VQ2OfflineCoastTiming] = None
 
     def __post_init__(self) -> None:
         start = _exact_nonnegative_int(
@@ -286,11 +319,20 @@ class VQ2OfflineTickTiming:
             raise TypeError(
                 "perception must be VQ2OfflinePerceptionTiming or None"
             )
+        if type(self.coast) not in {VQ2OfflineCoastTiming, type(None)}:
+            raise TypeError("coast must be VQ2OfflineCoastTiming or None")
+        if self.perception is not None and self.coast is not None:
+            raise ValueError("perception and coast timing are mutually exclusive")
         ordered = [start]
         if self.perception is not None:
             ordered.extend(
                 getattr(self.perception, name)
                 for name in self.perception.__dataclass_fields__
+            )
+        if self.coast is not None:
+            ordered.extend(
+                getattr(self.coast, name)
+                for name in self.coast.__dataclass_fields__
             )
         ordered.extend((controller_start, controller_end, finish))
         if any(later < earlier for earlier, later in zip(ordered, ordered[1:])):
@@ -341,6 +383,7 @@ class VQ2Wave3OfflineConfig:
     first_control_tick_id: int = 0
     first_proposal_id: int = 0
     imu_history_limit: int = 256
+    enable_single_tick_correlated_coast: bool = False
     tracker_id: str = "wave3b-active-gate"
     candidate_id_prefix: str = "wave3b"
     imu_attitude_config: ImuAttitudeConfig = ImuAttitudeConfig()
@@ -375,6 +418,17 @@ class VQ2Wave3OfflineConfig:
         period = _positive_int(self.control_period_ns, "control_period_ns")
         if period < MINIMUM_CONTROL_PERIOD_NS:
             raise ValueError("control_period_ns cannot exceed the reviewed 50 Hz cap")
+        if type(self.enable_single_tick_correlated_coast) is not bool:
+            raise TypeError(
+                "enable_single_tick_correlated_coast must be an exact bool"
+            )
+        if (
+            self.enable_single_tick_correlated_coast
+            and period != MINIMUM_CONTROL_PERIOD_NS
+        ):
+            raise ValueError(
+                "single-tick correlated coast requires the reviewed 20 ms period"
+            )
         _exact_nonnegative_int(self.first_control_tick_id, "first_control_tick_id")
         _exact_nonnegative_int(self.first_proposal_id, "first_proposal_id")
         if _positive_int(self.imu_history_limit, "imu_history_limit") < 2:
@@ -438,15 +492,33 @@ class VQ2OfflineTickResult:
     skipped: bool
     reason: Optional[str]
     trace: tuple[LatencyEventV1, ...]
+    coast_attempted: bool = False
+    coast_timing: Optional[VQ2OfflineCoastTiming] = None
+    consumed_coast_lease: Optional[VQ2Wave3CoastLease] = None
+    consumed_coast_source_transition: Optional[
+        VQ2Wave3ImuAdapterTransition
+    ] = None
+    coast_lease_disposition: Optional[str] = None
 
     def __post_init__(self) -> None:
         _exact_nonnegative_int(self.control_tick_id, "control_tick_id")
         if type(self.lease) not in {ControlTickLeaseV1, type(None)}:
             raise TypeError("lease must be ControlTickLeaseV1 or None")
+        if self.lease is not None:
+            lease_frame = self.lease.frame
+            if lease_frame is not None:
+                lease_frame = replace(lease_frame)
+            replace(self.lease, frame=lease_frame)
         if type(self.selection) not in {LatestFrameSelectionV1, type(None)}:
             raise TypeError(
                 "selection must be LatestFrameSelectionV1 or None"
             )
+        if self.selection is not None:
+            selection_timing = replace(
+                self.selection.timing,
+                identity=replace(self.selection.timing.identity),
+            )
+            replace(self.selection, timing=selection_timing)
         if type(self.transition) not in {
             VQ2Wave3ImuAdapterTransition,
             type(None),
@@ -454,17 +526,82 @@ class VQ2OfflineTickResult:
             raise TypeError(
                 "transition must be VQ2Wave3ImuAdapterTransition or None"
             )
-        if type(self.perception_ran) is not bool or type(self.skipped) is not bool:
-            raise TypeError("perception_ran and skipped must be exact bools")
+        if self.transition is not None:
+            self.transition.validate_integrity()
+        if (
+            type(self.perception_ran) is not bool
+            or type(self.coast_attempted) is not bool
+            or type(self.skipped) is not bool
+        ):
+            raise TypeError(
+                "perception_ran, coast_attempted, and skipped must be exact bools"
+            )
+        if type(self.coast_timing) not in {VQ2OfflineCoastTiming, type(None)}:
+            raise TypeError("coast_timing must be VQ2OfflineCoastTiming or None")
+        if self.coast_timing is not None:
+            replace(self.coast_timing)
+        if type(self.consumed_coast_lease) not in {
+            VQ2Wave3CoastLease,
+            type(None),
+        }:
+            raise TypeError(
+                "consumed_coast_lease must be VQ2Wave3CoastLease or None"
+            )
+        if self.consumed_coast_lease is not None:
+            self.consumed_coast_lease.validate_integrity()
+        if type(self.consumed_coast_source_transition) not in {
+            VQ2Wave3ImuAdapterTransition,
+            type(None),
+        }:
+            raise TypeError(
+                "consumed_coast_source_transition must be "
+                "VQ2Wave3ImuAdapterTransition or None"
+            )
+        if self.consumed_coast_source_transition is not None:
+            self.consumed_coast_source_transition.validate_integrity()
+        if (self.consumed_coast_lease is None) != (
+            self.consumed_coast_source_transition is None
+        ):
+            raise ValueError(
+                "consumed coast lease and source transition are all-or-none"
+            )
+        if self.coast_lease_disposition is not None and (
+            type(self.coast_lease_disposition) is not str
+            or self.coast_lease_disposition not in _COAST_LEASE_DISPOSITIONS
+        ):
+            raise ValueError("coast_lease_disposition is not a reviewed value")
+        if (self.consumed_coast_lease is None) != (
+            self.coast_lease_disposition is None
+        ):
+            raise ValueError("consumed coast lease and disposition are all-or-none")
+        if (self.coast_timing is not None) != self.coast_attempted:
+            raise ValueError("coast attempt and timing must be all-or-none")
+        if self.perception_ran and self.coast_attempted:
+            raise ValueError("perception and coast work are mutually exclusive")
         if self.reason is not None and (
             type(self.reason) is not str or not self.reason
         ):
             raise TypeError("reason must be a non-empty string or None")
         if type(self.trace) is not tuple:
             raise TypeError("trace must be an exact tuple")
-        validate_latency_event_sequence(self.trace)
+        if any(type(event) is not LatencyEventV1 for event in self.trace):
+            raise TypeError("trace must contain exact LatencyEventV1 values")
+        reconstructed_trace = tuple(
+            replace(
+                event,
+                frame=(None if event.frame is None else replace(event.frame)),
+            )
+            for event in self.trace
+        )
+        validate_latency_event_sequence(reconstructed_trace)
         if not self.trace:
             raise ValueError("offline result trace must be non-empty")
+        if any(
+            event.control_tick_id is not None
+            and event.control_tick_id > self.control_tick_id
+            for event in self.trace
+        ):
+            raise ValueError("offline result trace cannot contain a future tick")
         if len({event.host_clock_id for event in self.trace}) != 1:
             raise ValueError("offline result trace must use one host clock")
         if any(
@@ -494,7 +631,11 @@ class VQ2OfflineTickResult:
                 raise ValueError("skipped result has an unknown offline reason")
             if self.lease is not None or self.selection is not None:
                 raise ValueError("skipped tick cannot carry a lease or selection")
-            if self.transition is not None or self.perception_ran:
+            if (
+                self.transition is not None
+                or self.perception_ran
+                or self.coast_attempted
+            ):
                 raise ValueError("skipped tick cannot claim pipeline work")
             if self.reason is None:
                 raise ValueError("skipped tick requires a reason")
@@ -509,6 +650,8 @@ class VQ2OfflineTickResult:
                 raise ValueError(
                     "perception and distinct frame selection must be all-or-none"
                 )
+            if self.coast_attempted and self.selection is not None:
+                raise ValueError("coast attempt cannot carry a distinct selection")
             proposal = self.transition.proposal
             if proposal.control_tick_id != self.control_tick_id:
                 raise ValueError("proposal differs from the completed control tick")
@@ -518,10 +661,28 @@ class VQ2OfflineTickResult:
             else:
                 if self.transition.active_update is not None:
                     raise ValueError("repeated frame cannot carry a correlated update")
-                if proposal.source_frame is not None or not proposal.is_exact_zero:
+                if (
+                    not self.coast_attempted
+                    and (
+                        proposal.source_frame is not None
+                        or not proposal.is_exact_zero
+                    )
+                ):
                     raise ValueError(
                         "repeated frame must remain source-less exact zero"
                     )
+                if not self.coast_attempted and (
+                    self.transition.correlated_coast is not None
+                    or self.transition.consumed_coast_lease is not None
+                ):
+                    raise ValueError(
+                        "ordinary repeated frame cannot retain coast evidence"
+                    )
+                if (
+                    self.coast_attempted
+                    and self.consumed_coast_lease is None
+                ):
+                    raise ValueError("coast attempt requires its consumed lease")
             active_update = self.transition.active_update
             if active_update is not None:
                 if self.selection is None or (
@@ -531,6 +692,105 @@ class VQ2OfflineTickResult:
                     raise ValueError(
                         "correlated update differs from its distinct frame selection"
                     )
+        consumed = self.consumed_coast_lease
+        if consumed is not None:
+            source_transition = self.consumed_coast_source_transition
+            if source_transition is None:
+                raise AssertionError("consumed lease lacks its source transition")
+            if (
+                source_transition.memory.coast_lease != consumed
+                or source_transition.active_update != consumed.source_update
+                or source_transition.correlated_coast is not None
+                or source_transition.proposal != consumed.source_proposal
+                or source_transition.memory.inner_memory.guidance_memory.safety
+                != consumed.source_safety
+            ):
+                raise ValueError(
+                    "consumed coast lease differs from its source transition"
+                )
+            if consumed.eligible_control_tick_id != self.control_tick_id:
+                raise ValueError("consumed coast lease differs from result tick")
+            if self.skipped:
+                if self.coast_lease_disposition != "tick_skipped":
+                    raise ValueError("skipped tick has the wrong coast disposition")
+                current_due = self._one_event(
+                    tuple(
+                        event
+                        for event in self.trace
+                        if event.control_tick_id == self.control_tick_id
+                    ),
+                    LatencyEventKind.CONTROL_TICK_DUE,
+                    "current consumed-lease due event",
+                )
+                if self.reason == "tick_deadline_elapsed":
+                    if (
+                        current_due.monotonic_ns
+                        <= consumed.eligible_deadline_monotonic_ns
+                    ):
+                        raise ValueError(
+                            "deadline-elapsed skip did not occur after lease expiry"
+                        )
+                elif self.reason == "planned_work_exceeds_deadline" and not (
+                    consumed.eligible_due_monotonic_ns
+                    <= current_due.monotonic_ns
+                    <= consumed.eligible_deadline_monotonic_ns
+                ):
+                    raise ValueError(
+                        "planned skip occurred outside the consumed lease window"
+                    )
+            elif self.coast_attempted:
+                transition = self.transition
+                if transition is None:
+                    raise AssertionError("coast result lacks its transition")
+                if transition.memory.coast_lease is not None:
+                    raise ValueError("coast result retained its consumed lease")
+                if (
+                    transition.correlated_coast is not None
+                    and transition.consumed_coast_lease != consumed
+                ):
+                    raise ValueError("coast transition changed its consumed lease")
+                if (
+                    transition.correlated_coast is not None
+                    and transition.correlated_coast.prior_update
+                    != consumed.source_update
+                ):
+                    raise ValueError("coast result changed its leased source update")
+                coast_accepted = bool(
+                    transition.correlated_coast is not None
+                    and transition.outer_withholding_reason is None
+                    and transition.accepted_attitude is not None
+                    and transition.controller_attitude_provenance is not None
+                )
+                expected = "coast_accepted" if coast_accepted else "coast_rejected"
+                if self.coast_lease_disposition != expected:
+                    raise ValueError("coast result has the wrong lease disposition")
+                lease = self.lease
+                if lease is None or (
+                    lease.due_monotonic_ns != consumed.eligible_due_monotonic_ns
+                    or lease.deadline_monotonic_ns
+                    != consumed.eligible_deadline_monotonic_ns
+                    or lease.frame != consumed.source_proposal.source_frame
+                ):
+                    raise ValueError("coast result differs from eligible lease identity")
+            elif self.selection is not None:
+                if self.coast_lease_disposition != "distinct_frame_selected":
+                    raise ValueError("distinct frame has the wrong coast disposition")
+            else:
+                raise ValueError("consumed lease lacks a consuming tick action")
+        if self.transition is not None and (
+            self.transition.consumed_coast_lease
+            != self.consumed_coast_lease
+        ):
+            if self.coast_attempted:
+                raise ValueError("coast transition changed its consumed lease")
+            raise ValueError(
+                "completed result changed its transition's consumed coast lease"
+            )
+        if consumed is not None:
+            self._validate_consumed_lease_source_trace(
+                consumed,
+                self.consumed_coast_source_transition,
+            )
         self._validate_trace_binding()
 
     @staticmethod
@@ -566,6 +826,13 @@ class VQ2OfflineTickResult:
                 LatencyEventKind.CONTROL_TICK_SKIPPED,
                 "current skipped-tick event",
             )
+            if any(
+                event.monotonic_ns > skipped.monotonic_ns
+                for event in self.trace
+            ):
+                raise ValueError(
+                    "skipped result trace contains facts after its terminal event"
+                )
             if (
                 due.outcome is not EventOutcome.OK
                 or skipped.host_clock_id != due.host_clock_id
@@ -619,6 +886,13 @@ class VQ2OfflineTickResult:
             LatencyEventKind.CONTROL_TICK_END,
             "current control-tick end event",
         )
+        if any(
+            event.monotonic_ns > tick_end.monotonic_ns
+            for event in self.trace
+        ):
+            raise ValueError(
+                "completed result trace contains facts after its tick end"
+            )
         core = (due, start, controller_start, controller_end, tick_end)
         proposal = transition.proposal
         if any(
@@ -650,7 +924,23 @@ class VQ2OfflineTickResult:
 
         selection = self.selection
         if selection is None:
-            self._validate_transition_reason(transition)
+            if self.coast_attempted:
+                self._validate_coast_trace(lease.frame)
+            else:
+                if any(
+                    event.kind
+                    in {
+                        LatencyEventKind.PREDICTION_START,
+                        LatencyEventKind.PREDICTION_END,
+                        LatencyEventKind.ESTIMATOR_UPDATE_START,
+                        LatencyEventKind.ESTIMATOR_UPDATE_END,
+                    }
+                    for event in tick_events
+                ):
+                    raise ValueError(
+                        "ordinary repeated trace cannot carry coast stages"
+                    )
+                self._validate_transition_reason(transition)
             return
         frame = selection.timing.identity
         for kind, field in _CAMERA_STAGES:
@@ -727,6 +1017,327 @@ class VQ2OfflineTickResult:
                 or matching[0].outcome is not EventOutcome.OK
             ):
                 raise ValueError("correlated attitude lacks its exact IMU trace fact")
+
+    def _validate_consumed_lease_source_trace(
+        self,
+        consumed: VQ2Wave3CoastLease,
+        source_transition: Optional[VQ2Wave3ImuAdapterTransition],
+    ) -> None:
+        """Bind every consumed lease to its independently retained source tick."""
+
+        if source_transition is None:
+            raise AssertionError("consumed lease trace lacks its source transition")
+        frame = consumed.source_proposal.source_frame
+        if frame is None:
+            raise AssertionError("validated consumed lease lacks a source frame")
+        source_tick_id = consumed.source_control_tick_id
+        source_tick_events = tuple(
+            event
+            for event in self.trace
+            if event.control_tick_id == source_tick_id
+        )
+        source_tick_kinds = (
+            LatencyEventKind.CONTROL_TICK_DUE,
+            LatencyEventKind.CONTROL_TICK_START,
+            LatencyEventKind.PREDICTION_START,
+            LatencyEventKind.PREDICTION_END,
+            LatencyEventKind.CONTROLLER_START,
+            LatencyEventKind.CONTROLLER_END,
+            LatencyEventKind.CONTROL_TICK_END,
+        )
+        if (
+            len(source_tick_events) != len(source_tick_kinds)
+            or any(
+                sum(event.kind is kind for event in source_tick_events) != 1
+                for kind in source_tick_kinds
+            )
+        ):
+            raise ValueError(
+                "coast trace lacks the exact leased source-tick lifecycle"
+            )
+        source_stages = {
+            kind: next(
+                event for event in source_tick_events if event.kind is kind
+            )
+            for kind in source_tick_kinds
+        }
+        source_proposal = consumed.source_proposal
+        source_due_ns = (
+            consumed.source_control_tick_deadline_monotonic_ns
+            - MINIMUM_CONTROL_PERIOD_NS
+        )
+        source_core = tuple(source_stages.values())
+        if any(
+            event.frame != frame
+            or event.host_clock_id != source_proposal.host_clock_id
+            or event.outcome is not EventOutcome.OK
+            or event.reason_code is not None
+            for event in source_core
+        ):
+            raise ValueError(
+                "coast trace changed its leased source-tick correlations"
+            )
+        source_due = source_stages[LatencyEventKind.CONTROL_TICK_DUE]
+        source_start = source_stages[LatencyEventKind.CONTROL_TICK_START]
+        source_prediction_start = source_stages[
+            LatencyEventKind.PREDICTION_START
+        ]
+        source_prediction_end = source_stages[LatencyEventKind.PREDICTION_END]
+        source_controller_start = source_stages[
+            LatencyEventKind.CONTROLLER_START
+        ]
+        source_controller_end = source_stages[LatencyEventKind.CONTROLLER_END]
+        source_end = source_stages[LatencyEventKind.CONTROL_TICK_END]
+        if (
+            source_due.monotonic_ns != source_due_ns
+            or source_start.monotonic_ns != source_due_ns
+            or not (
+                source_start.monotonic_ns
+                <= source_prediction_start.monotonic_ns
+                <= source_prediction_end.monotonic_ns
+                <= source_controller_start.monotonic_ns
+                <= source_controller_end.monotonic_ns
+                <= source_end.monotonic_ns
+                <= consumed.source_control_tick_deadline_monotonic_ns
+            )
+            or source_controller_end.monotonic_ns
+            != source_proposal.proposal_monotonic_ns
+        ):
+            raise ValueError(
+                "coast trace changed its leased source-tick timing"
+            )
+        source_prediction_target = (
+            consumed.source_update.evidence.prediction_target
+        )
+        if (
+            source_stages[LatencyEventKind.PREDICTION_END].monotonic_ns
+            != source_prediction_target.prediction_time_monotonic_ns
+        ):
+            raise ValueError(
+                "coast trace changed its leased source prediction target"
+            )
+        prior_estimator_stages = {
+            kind: tuple(
+                event
+                for event in self.trace
+                if event.kind is kind
+                and event.frame == frame
+                and event.control_tick_id is None
+            )
+            for kind in (
+                LatencyEventKind.ESTIMATOR_UPDATE_START,
+                LatencyEventKind.ESTIMATOR_UPDATE_END,
+            )
+        }
+        if any(len(events) != 1 for events in prior_estimator_stages.values()) or any(
+            event.outcome is not EventOutcome.OK or event.reason_code is not None
+            for events in prior_estimator_stages.values()
+            for event in events
+        ):
+            raise ValueError(
+                "coast trace lacks the exact leased source estimator lifecycle"
+            )
+        prediction_ticks = {source_tick_id}
+        estimator_ticks = {None}
+        if self.coast_attempted:
+            prediction_ticks.add(self.control_tick_id)
+            estimator_ticks.add(self.control_tick_id)
+        expected_work_correlations = {
+            LatencyEventKind.PREDICTION_START: prediction_ticks,
+            LatencyEventKind.PREDICTION_END: prediction_ticks,
+            LatencyEventKind.ESTIMATOR_UPDATE_START: estimator_ticks,
+            LatencyEventKind.ESTIMATOR_UPDATE_END: estimator_ticks,
+        }
+        for kind, expected_ticks in expected_work_correlations.items():
+            matching = tuple(
+                event
+                for event in self.trace
+                if event.kind is kind and event.frame == frame
+            )
+            if (
+                len(matching) != len(expected_ticks)
+                or {event.control_tick_id for event in matching}
+                != expected_ticks
+            ):
+                raise ValueError(
+                    "coast trace changed its source/current work lifecycles"
+                )
+        source_timing = (
+            consumed.source_update.evidence.observation.frame_timing
+        )
+        for kind, field in _CAMERA_STAGES:
+            matching = tuple(
+                event
+                for event in self.trace
+                if event.kind is kind and event.frame == frame
+            )
+            if len(matching) != 1 or (
+                matching[0].control_tick_id is not None
+                or matching[0].monotonic_ns != getattr(source_timing, field)
+                or matching[0].outcome is not EventOutcome.OK
+            ):
+                raise ValueError(
+                    "coast trace changed its retained source-frame camera facts"
+                )
+        for kind in (
+            LatencyEventKind.DETECTION_START,
+            LatencyEventKind.DETECTION_END,
+            LatencyEventKind.TRACKING_START,
+            LatencyEventKind.TRACKING_END,
+        ):
+            matching = tuple(
+                event
+                for event in self.trace
+                if event.kind is kind and event.frame == frame
+            )
+            if len(matching) != 1 or (
+                matching[0].control_tick_id is not None
+                or matching[0].outcome is not EventOutcome.OK
+            ):
+                raise ValueError(
+                    "coast trace changed its retained source perception facts"
+                )
+        if any(
+            event.kind is LatencyEventKind.FRAME_DROPPED
+            and event.frame == frame
+            for event in self.trace
+        ):
+            raise ValueError("coast trace relabeled its accepted source as dropped")
+        for attitude_input in (
+            consumed.source_update.evidence.capture_attitude,
+            consumed.source_update.evidence.target_attitude,
+        ):
+            attitude = attitude_input.attitude
+            matching = tuple(
+                event
+                for event in self.trace
+                if event.kind is LatencyEventKind.GYRO_SAMPLE
+                and event.sensor_sample_id == attitude.sample_sequence
+                and event.sensor_source_time_ns == attitude.source_time_us * 1_000
+                and event.monotonic_ns == attitude.receive_monotonic_ns
+            )
+            if len(matching) != 1 or (
+                matching[0].host_clock_id != attitude.source.host_clock_id
+                or matching[0].frame is not None
+                or matching[0].control_tick_id is not None
+                or matching[0].outcome is not EventOutcome.OK
+            ):
+                raise ValueError(
+                    "consumed lease source attitude lacks its exact IMU trace fact"
+                )
+
+    def _validate_coast_trace(self, frame: FrameIdentityV1) -> None:
+        timing = self.coast_timing
+        transition = self.transition
+        if timing is None or transition is None:
+            raise AssertionError("coast trace lacks its validated result structure")
+        consumed = self.consumed_coast_lease
+        if consumed is None:
+            raise AssertionError("coast trace lacks its consumed source lease")
+        if frame != consumed.source_proposal.source_frame:
+            raise ValueError("coast trace changed its consumed source frame")
+        current = tuple(
+            event
+            for event in self.trace
+            if event.control_tick_id == self.control_tick_id
+        )
+        if any(
+            event.kind
+            in {
+                LatencyEventKind.CAMERA_FIRST_PACKET,
+                LatencyEventKind.CAMERA_FINAL_PACKET,
+                LatencyEventKind.FRAME_REASSEMBLED,
+                LatencyEventKind.DECODE_START,
+                LatencyEventKind.DECODE_END,
+                LatencyEventKind.FRAME_PUBLISHED,
+                LatencyEventKind.DETECTION_START,
+                LatencyEventKind.DETECTION_END,
+                LatencyEventKind.TRACKING_START,
+                LatencyEventKind.TRACKING_END,
+                LatencyEventKind.FRAME_DROPPED,
+            }
+            for event in current
+        ):
+            raise ValueError("coast trace re-emitted retained-frame perception facts")
+        stages = {
+            kind: self._one_event(current, kind, kind.value)
+            for kind in (
+                LatencyEventKind.PREDICTION_START,
+                LatencyEventKind.PREDICTION_END,
+                LatencyEventKind.ESTIMATOR_UPDATE_START,
+                LatencyEventKind.ESTIMATOR_UPDATE_END,
+            )
+        }
+        expected_times = {
+            LatencyEventKind.PREDICTION_START: (
+                timing.prediction_start_monotonic_ns
+            ),
+            LatencyEventKind.PREDICTION_END: timing.prediction_end_monotonic_ns,
+            LatencyEventKind.ESTIMATOR_UPDATE_START: (
+                timing.estimator_start_monotonic_ns
+            ),
+            LatencyEventKind.ESTIMATOR_UPDATE_END: (
+                timing.estimator_end_monotonic_ns
+            ),
+        }
+        if any(
+            event.frame != frame
+            or event.monotonic_ns != expected_times[kind]
+            for kind, event in stages.items()
+        ):
+            raise ValueError("coast stages differ from their timing plan")
+        coast = transition.correlated_coast
+        if coast is None:
+            if self.reason != "imu_correlated_coast_unavailable":
+                raise ValueError("failed coast has an unknown reason")
+            if any(
+                stages[kind].outcome is not EventOutcome.OK
+                or stages[kind].reason_code is not None
+                for kind in (
+                    LatencyEventKind.PREDICTION_START,
+                    LatencyEventKind.PREDICTION_END,
+                    LatencyEventKind.ESTIMATOR_UPDATE_START,
+                )
+            ):
+                raise ValueError("failed coast has invalid preterminal stages")
+            terminal = stages[LatencyEventKind.ESTIMATOR_UPDATE_END]
+            if (
+                terminal.outcome is not EventOutcome.ERROR
+                or terminal.reason_code != self.reason
+            ):
+                raise ValueError("failed coast lacks its terminal error evidence")
+            self._validate_transition_reason(transition)
+            return
+
+        if any(
+            event.outcome is not EventOutcome.OK or event.reason_code is not None
+            for event in stages.values()
+        ):
+            raise ValueError("completed coast requires exact-OK stage evidence")
+        self._validate_transition_reason(transition)
+        target = coast.evidence.prediction_target
+        if (
+            target.decision_time_monotonic_ns
+            != target.prediction_time_monotonic_ns
+            or target.prediction_time_monotonic_ns
+            != stages[LatencyEventKind.PREDICTION_END].monotonic_ns
+        ):
+            raise ValueError("coast prediction trace differs from its target")
+        for attitude_input in (
+            coast.evidence.capture_attitude,
+            coast.evidence.target_attitude,
+        ):
+            attitude = attitude_input.attitude
+            matching = tuple(
+                event
+                for event in self.trace
+                if event.kind is LatencyEventKind.GYRO_SAMPLE
+                and event.sensor_sample_id == attitude.sample_sequence
+                and event.sensor_source_time_ns == attitude.source_time_us * 1_000
+                and event.monotonic_ns == attitude.receive_monotonic_ns
+            )
+            if len(matching) != 1:
+                raise ValueError("coast attitude lacks its exact IMU trace fact")
 
     def _validate_transition_reason(
         self,
@@ -909,6 +1520,23 @@ class VQ2Wave3OfflineRuntime:
     def processed_frame_timing(self) -> Optional[FrameTimingV1]:
         return self._cursor.previous_timing
 
+    def _source_transition_for_pending_lease(
+        self,
+        lease: Optional[VQ2Wave3CoastLease],
+    ) -> Optional[VQ2Wave3ImuAdapterTransition]:
+        if lease is None:
+            return None
+        prior = self._last_result
+        if (
+            prior is None
+            or prior.transition is None
+            or prior.transition.memory.coast_lease != lease
+        ):
+            raise AssertionError(
+                "pending coast lease lacks its exact prior source transition"
+            )
+        return prior.transition
+
     def ingest_imu(
         self,
         sample: VQ2TimedImuSample,
@@ -974,15 +1602,50 @@ class VQ2Wave3OfflineRuntime:
 
         candidate_cursor = copy.deepcopy(self._cursor)
         selection = candidate_cursor.select(snapshot)
-        if (selection is not None) != (timing.perception is not None):
+        pending_coast_lease = (
+            None
+            if self._adapter_memory is None
+            else self._adapter_memory.coast_lease
+        )
+        pending_coast_source_transition = (
+            self._source_transition_for_pending_lease(pending_coast_lease)
+        )
+        coast_eligible = bool(
+            self.config.enable_single_tick_correlated_coast
+            and selection is None
+            and pending_coast_lease is not None
+            and tick_id == pending_coast_lease.eligible_control_tick_id
+            and due == pending_coast_lease.eligible_due_monotonic_ns
+            and deadline == pending_coast_lease.eligible_deadline_monotonic_ns
+            and frame == pending_coast_lease.source_proposal.source_frame
+        )
+        if selection is not None:
+            if timing.perception is None or timing.coast is not None:
+                raise ValueError(
+                    "distinct frame requires only perception timing"
+                )
+        elif timing.perception is not None or (
+            (timing.coast is not None) != coast_eligible
+        ):
             raise ValueError(
-                "perception timing must be present exactly for a distinct frame"
+                "retained frame requires coast timing exactly when lease-eligible"
             )
 
-        candidate_estimator = copy.deepcopy(self._estimator)
+        expected_tracker_id = self._tracker_id_for_safety(safety)
+        tracker_scope_changed = self._estimator.tracker_id != expected_tracker_id
+        candidate_estimator = (
+            copy.deepcopy(self._estimator)
+            if not tracker_scope_changed
+            else VQ2RelativeGateEstimator(
+                expected_tracker_id,
+                config=self.config.relative_estimator_config,
+            )
+        )
         candidate_facts: list[LatencyEventV1] = []
         active_update: Optional[VQ2ImuCorrelatedEstimatorUpdate] = None
+        correlated_coast: Optional[VQ2ImuCorrelatedEstimatorCoast] = None
         perception_reason: Optional[str] = None
+        coast_reason: Optional[str] = None
         if selection is not None:
             (
                 active_update,
@@ -996,13 +1659,33 @@ class VQ2Wave3OfflineRuntime:
                 tick_id,
             )
             candidate_facts.extend(pipeline_facts)
+        elif coast_eligible:
+            assert pending_coast_lease is not None
+            (
+                correlated_coast,
+                coast_reason,
+                coast_facts,
+            ) = self._process_correlated_coast(
+                pending_coast_lease,
+                safety,
+                timing,
+                candidate_estimator,
+                tick_id,
+            )
+            candidate_facts.extend(coast_facts)
 
         controller_tick = self._controller_tick(
             safety,
             timing,
             tick_id=tick_id,
             deadline_monotonic_ns=deadline,
-            active_update=active_update,
+            active_state=(
+                active_update.state
+                if active_update is not None
+                else (
+                    None if correlated_coast is None else correlated_coast.state
+                )
+            ),
         )
         candidate_facts.append(
             self._event(
@@ -1017,8 +1700,20 @@ class VQ2Wave3OfflineRuntime:
             self._adapter_memory,
             safety,
             active_update=active_update,
+            correlated_coast=correlated_coast,
             tick=controller_tick,
+            enable_correlated_coast=(
+                self.config.enable_single_tick_correlated_coast
+                and (active_update is None or now == due)
+            ),
         )
+        if coast_eligible and correlated_coast is None:
+            if coast_reason != "imu_correlated_coast_unavailable":
+                raise AssertionError("failed coast lacks its stable reason")
+            transition = replace(
+                transition,
+                outer_withholding_reason=coast_reason,
+            )
         candidate_facts.append(
             self._event(
                 LatencyEventKind.CONTROLLER_END,
@@ -1045,7 +1740,11 @@ class VQ2Wave3OfflineRuntime:
             start_monotonic_ns=now,
             frame=frame,
         )
-        reason = perception_reason or transition.outer_withholding_reason
+        reason = (
+            perception_reason
+            or coast_reason
+            or transition.outer_withholding_reason
+        )
         if reason is None and transition.proposal.is_exact_zero:
             reason = transition.proposal.reason
         result = VQ2OfflineTickResult(
@@ -1057,6 +1756,37 @@ class VQ2Wave3OfflineRuntime:
             skipped=False,
             reason=reason,
             trace=preview_trace,
+            coast_attempted=coast_eligible,
+            coast_timing=timing.coast if coast_eligible else None,
+            consumed_coast_lease=(
+                pending_coast_lease
+                if selection is not None or coast_eligible
+                else None
+            ),
+            consumed_coast_source_transition=(
+                pending_coast_source_transition
+                if selection is not None or coast_eligible
+                else None
+            ),
+            coast_lease_disposition=(
+                (
+                    "distinct_frame_selected"
+                    if selection is not None
+                    else (
+                        "coast_accepted"
+                        if (
+                            correlated_coast is not None
+                            and transition.outer_withholding_reason is None
+                            and transition.accepted_attitude is not None
+                            and transition.controller_attitude_provenance is not None
+                        )
+                        else "coast_rejected"
+                    )
+                )
+                if pending_coast_lease is not None
+                and (selection is not None or coast_eligible)
+                else None
+            ),
         )
 
         lease = self._scheduler.begin_due(now, frame=frame, queue_depth=0)
@@ -1076,7 +1806,22 @@ class VQ2Wave3OfflineRuntime:
         )
 
         self._cursor = candidate_cursor
-        self._estimator = candidate_estimator
+        coast_accepted = bool(
+            coast_eligible
+            and correlated_coast is not None
+            and transition.outer_withholding_reason is None
+            and transition.accepted_attitude is not None
+            and transition.controller_attitude_provenance is not None
+        )
+        tracker_transition_accepted = bool(
+            transition.memory.inner_memory.guidance_memory.safety == safety
+        )
+        distinct_estimator_commit_allowed = bool(
+            selection is not None
+            and (not tracker_scope_changed or tracker_transition_accepted)
+        )
+        if distinct_estimator_commit_allowed or coast_accepted:
+            self._estimator = candidate_estimator
         self._adapter_memory = transition.memory
         self._facts = (*self._facts, *candidate_facts)
         self._next_fact_sequence += len(candidate_facts)
@@ -1096,6 +1841,14 @@ class VQ2Wave3OfflineRuntime:
         reason: str,
         deadline_missed: bool,
     ) -> VQ2OfflineTickResult:
+        consumed_coast_lease = (
+            None
+            if self._adapter_memory is None
+            else self._adapter_memory.coast_lease
+        )
+        consumed_coast_source_transition = (
+            self._source_transition_for_pending_lease(consumed_coast_lease)
+        )
         scheduler_facts = [
             self._event(
                 LatencyEventKind.CONTROL_TICK_DUE,
@@ -1138,6 +1891,15 @@ class VQ2Wave3OfflineRuntime:
             skipped=True,
             reason=reason,
             trace=preview_trace,
+            coast_attempted=False,
+            coast_timing=None,
+            consumed_coast_lease=consumed_coast_lease,
+            consumed_coast_source_transition=(
+                consumed_coast_source_transition
+            ),
+            coast_lease_disposition=(
+                "tick_skipped" if consumed_coast_lease is not None else None
+            ),
         )
 
         if deadline_missed:
@@ -1159,6 +1921,9 @@ class VQ2Wave3OfflineRuntime:
                 raise AssertionError("prevalidated due tick was not skipped")
         if self.trace != preview_trace:
             raise AssertionError("scheduler skip trace differs from prevalidated trace")
+        self._adapter_memory = consume_vq2_wave3_coast_lease(
+            self._adapter_memory
+        )
         self._last_result = result
         return result
 
@@ -1265,6 +2030,21 @@ class VQ2Wave3OfflineRuntime:
         ):
             raise ValueError("safety evaluation must occur inside the tick plan")
         return frame
+
+    def _tracker_id_for_safety(
+        self,
+        safety: VQ2SafetyGuidanceInput,
+    ) -> str:
+        authority = safety.authority
+        if authority.gate_epoch == 0 and authority.expected_gate_index == 0:
+            return self.config.tracker_id
+        suffix = (
+            f"-gate-{authority.gate_epoch}-{authority.expected_gate_index}"
+        )
+        prefix_length = 128 - len(suffix)
+        if prefix_length <= 0:
+            raise ValueError("gate-scoped tracker suffix exceeds token bound")
+        return f"{self.config.tracker_id[:prefix_length]}{suffix}"
 
     def _process_distinct_frame(
         self,
@@ -1520,6 +2300,150 @@ class VQ2Wave3OfflineRuntime:
             return None
         return capture, selected_target
 
+    def _process_correlated_coast(
+        self,
+        lease: VQ2Wave3CoastLease,
+        safety: VQ2SafetyGuidanceInput,
+        timing: VQ2OfflineTickTiming,
+        estimator: VQ2RelativeGateEstimator,
+        tick_id: int,
+    ) -> tuple[
+        Optional[VQ2ImuCorrelatedEstimatorCoast],
+        Optional[str],
+        tuple[LatencyEventV1, ...],
+    ]:
+        coast_timing = timing.coast
+        if coast_timing is None:
+            raise AssertionError("eligible coast lacks prevalidated timing")
+        if (
+            safety.evaluation_monotonic_ns
+            != coast_timing.prediction_end_monotonic_ns
+        ):
+            raise ValueError("coast safety evaluation must equal prediction end")
+        frame = lease.source_proposal.source_frame
+        if frame is None:
+            raise AssertionError("validated coast lease lacks a source frame")
+        facts = [
+            self._event(
+                LatencyEventKind.PREDICTION_START,
+                coast_timing.prediction_start_monotonic_ns,
+                frame=frame,
+                control_tick_id=tick_id,
+                sequence_offset=0,
+            ),
+            self._event(
+                LatencyEventKind.PREDICTION_END,
+                coast_timing.prediction_end_monotonic_ns,
+                frame=frame,
+                control_tick_id=tick_id,
+                sequence_offset=1,
+            ),
+            self._event(
+                LatencyEventKind.ESTIMATOR_UPDATE_START,
+                coast_timing.estimator_start_monotonic_ns,
+                frame=frame,
+                control_tick_id=tick_id,
+                sequence_offset=2,
+            ),
+        ]
+        reason = "imu_correlated_coast_unavailable"
+        try:
+            prior = lease.source_update
+            if estimator.last_state != prior.state:
+                raise RelativeEstimatorError(
+                    "runtime estimator differs from coast lease source"
+                )
+            target = RelativePredictionTarget.at_decision(
+                self.config.host_clock_id,
+                safety.evaluation_monotonic_ns,
+            )
+            target_attitude = self._select_coast_target_attitude(prior, target)
+            if target_attitude is None:
+                raise VQ2ImuDerotationError(
+                    "strictly newer coast target attitude is unavailable"
+                )
+            prior_target_input = prior.evidence.target_attitude
+            target_input = VQ2AttitudeDerotationInput(
+                target_attitude,
+                prior_target_input.orientation_uncertainty_rad,
+                prior_target_input.host_time_uncertainty_ns,
+            )
+            evidence = derotate_gate_observation(
+                prior.evidence.observation,
+                target,
+                capture_attitude=prior.evidence.capture_attitude,
+                target_attitude=target_input,
+                calibration=prior.evidence.calibration,
+                model=prior.evidence.model,
+            )
+            state = estimator.coast(target)
+            coast = VQ2ImuCorrelatedEstimatorCoast(
+                prior_update=prior,
+                state=state,
+                evidence=evidence,
+            )
+        except (
+            RelativeEstimatorError,
+            VQ2ImuDerotationError,
+            TypeError,
+            ValueError,
+        ):
+            facts.append(
+                self._event(
+                    LatencyEventKind.ESTIMATOR_UPDATE_END,
+                    coast_timing.estimator_end_monotonic_ns,
+                    frame=frame,
+                    control_tick_id=tick_id,
+                    outcome=EventOutcome.ERROR,
+                    reason_code=reason,
+                    sequence_offset=3,
+                )
+            )
+            return None, reason, tuple(facts)
+        facts.append(
+            self._event(
+                LatencyEventKind.ESTIMATOR_UPDATE_END,
+                coast_timing.estimator_end_monotonic_ns,
+                frame=frame,
+                control_tick_id=tick_id,
+                sequence_offset=3,
+            )
+        )
+        return coast, None, tuple(facts)
+
+    def _select_coast_target_attitude(
+        self,
+        prior: VQ2ImuCorrelatedEstimatorUpdate,
+        target: RelativePredictionTarget,
+    ) -> Optional[VQ2TimestampedAttitude]:
+        previous = prior.evidence.target_attitude.attitude
+        candidates = tuple(
+            attitude
+            for attitude in self._attitudes
+            if attitude.source == previous.source
+            and attitude.sample_sequence > previous.sample_sequence
+            and attitude.source_time_us > previous.source_time_us
+            and attitude.receive_monotonic_ns > previous.receive_monotonic_ns
+            and attitude.receive_monotonic_ns
+            <= target.prediction_time_monotonic_ns
+        )
+        if not candidates:
+            return None
+        selected = max(
+            candidates,
+            key=lambda attitude: (
+                attitude.receive_monotonic_ns,
+                attitude.sample_sequence,
+            ),
+        )
+        if (
+            target.prediction_time_monotonic_ns
+            - selected.receive_monotonic_ns
+            > prior.evidence.model.max_target_extrapolation_ns
+        ):
+            return None
+        return selected
+
     def _controller_tick(
         self,
         safety: VQ2SafetyGuidanceInput,
@@ -1527,9 +2451,9 @@ class VQ2Wave3OfflineRuntime:
         *,
         tick_id: int,
         deadline_monotonic_ns: int,
-        active_update: Optional[VQ2ImuCorrelatedEstimatorUpdate],
+        active_state: Optional[RelativeGateStateV1],
     ) -> ControllerTickInput:
-        state = None if active_update is None else active_update.state
+        state = active_state
         return ControllerTickInput(
             proposal_id=self._next_proposal_id,
             control_tick_id=tick_id,
@@ -1669,6 +2593,7 @@ class VQ2Wave3OfflineRuntime:
 
 
 __all__ = [
+    "VQ2OfflineCoastTiming",
     "VQ2OfflinePerceptionTiming",
     "VQ2OfflineTickInput",
     "VQ2OfflineTickResult",

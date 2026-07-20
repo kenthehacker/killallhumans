@@ -647,6 +647,7 @@ def _eligibility_failure(
     tick: ControllerTickInput,
     phase: ControllerPhaseInput,
     config: PredictiveControllerConfig,
+    allow_first_observation_dropout: bool,
 ) -> tuple[Optional[str], bool]:
     expected_gate_index = (
         0 if phase.mode is VQ2ControlPhase.GATE0_APPROACH else 1
@@ -686,6 +687,17 @@ def _eligibility_failure(
         return "inactive_source_track", False
     if not phase.objective_permitted:
         return f"objective_withheld:{phase.withholding_reason}", False
+    first_dropout_allowed = bool(
+        allow_first_observation_dropout
+        and state.dropout_count == 1
+        and state.health is RelativeStateHealth.COASTING
+        and state.health_reason == "observation_dropout"
+        and state.normalized_innovation_squared is None
+        and state.innovation_gate_threshold is None
+        and state.innovation_accepted is None
+    )
+    if state.dropout_count != 0 and not first_dropout_allowed:
+        return "state_dropout", True
     if state.innovation_accepted is False:
         return "state_innovation_rejected", True
     allowed_health = (
@@ -693,6 +705,8 @@ def _eligibility_failure(
         if phase.mode is VQ2ControlPhase.GATE0_APPROACH
         else {RelativeStateHealth.HEALTHY, RelativeStateHealth.DEGRADED}
     )
+    if first_dropout_allowed:
+        allowed_health.add(RelativeStateHealth.COASTING)
     if state.health not in allowed_health:
         return f"state_health_{state.health.value}", True
     decision_time = state.timing.decision_time_monotonic_ns
@@ -763,6 +777,9 @@ def _eligibility_failure(
     return None, False
 
 
+_VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY = object()
+
+
 def propose_vq2_command(
     state: RelativeGateStateV1,
     *,
@@ -770,6 +787,50 @@ def propose_vq2_command(
     tick: ControllerTickInput,
     phase: ControllerPhaseInput,
     config: PredictiveControllerConfig = DEFAULT_PREDICTIVE_CONTROLLER_CONFIG,
+) -> CommandProposalV1:
+    """Return ordinary controller intent or an exact-zero fail-closed value."""
+
+    return _propose_vq2_command_impl(
+        state,
+        attitude=attitude,
+        tick=tick,
+        phase=phase,
+        config=config,
+        first_dropout_capability=None,
+    )
+
+
+def _propose_vq2_first_observation_dropout_command(
+    state: RelativeGateStateV1,
+    *,
+    attitude: ControllerAttitudeInput,
+    tick: ControllerTickInput,
+    phase: ControllerPhaseInput,
+    config: PredictiveControllerConfig = DEFAULT_PREDICTIVE_CONTROLLER_CONFIG,
+    capability: object,
+) -> CommandProposalV1:
+    """Private Wave3-only seam for an already-proved first dropout."""
+
+    if capability is not _VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY:
+        raise TypeError("invalid first-dropout controller capability")
+    return _propose_vq2_command_impl(
+        state,
+        attitude=attitude,
+        tick=tick,
+        phase=phase,
+        config=config,
+        first_dropout_capability=_VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY,
+    )
+
+
+def _propose_vq2_command_impl(
+    state: RelativeGateStateV1,
+    *,
+    attitude: ControllerAttitudeInput,
+    tick: ControllerTickInput,
+    phase: ControllerPhaseInput,
+    config: PredictiveControllerConfig,
+    first_dropout_capability: Optional[object],
 ) -> CommandProposalV1:
     """Return one deterministic proposal, or an exact-zero fail-closed value.
 
@@ -789,9 +850,21 @@ def propose_vq2_command(
         raise TypeError("phase must be exact ControllerPhaseInput")
     if type(config) is not PredictiveControllerConfig:
         raise TypeError("config must be exact PredictiveControllerConfig")
+    if (
+        first_dropout_capability is not None
+        and first_dropout_capability is not _VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY
+    ):
+        raise TypeError("invalid internal first-dropout capability")
+    allow_first_observation_dropout = bool(
+        first_dropout_capability is _VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY
+    )
 
     failure, uncertainty_limited = _eligibility_failure(
-        state, tick, phase, config
+        state,
+        tick,
+        phase,
+        config,
+        allow_first_observation_dropout,
     )
     if failure is not None:
         return _failsafe_proposal(
@@ -893,6 +966,10 @@ def propose_vq2_command(
         reason = "legacy_gate0_pixel_pd"
         uncertainty_limited = False
         uncertainty_reason = None
+
+    if allow_first_observation_dropout:
+        uncertainty_limited = True
+        uncertainty_reason = "first_observation_dropout_coast"
 
     rates, rate_saturation = _attitude_body_rates(
         attitude,

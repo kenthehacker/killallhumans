@@ -31,6 +31,9 @@ from competition.vq2_vision import VQ2VisionSnapshot
 from competition.vq2_wave2_adapter import (
     VQ2Wave2AdapterMemory,
     VQ2Wave2AdapterTransition,
+    _VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY,
+    _step_vq2_wave2_first_observation_dropout,
+    _step_vq2_wave2_adapter_impl,
     step_vq2_wave2_adapter,
 )
 from estimation.vq2_relative_estimator import (
@@ -246,6 +249,46 @@ def _step(
     )
 
 
+def _first_dropout_from(state: RelativeGateStateV1) -> RelativeGateStateV1:
+    timing = replace(
+        state.timing,
+        decision_time_monotonic_ns=(
+            state.timing.decision_time_monotonic_ns + 1_000_000
+        ),
+        prediction_time_monotonic_ns=(
+            state.timing.prediction_time_monotonic_ns + 1_000_000
+        ),
+    )
+    return replace(
+        state,
+        timing=timing,
+        state_sequence=state.state_sequence + 1,
+        normalized_innovation_squared=None,
+        innovation_gate_threshold=None,
+        innovation_accepted=None,
+        dropout_count=1,
+        health=RelativeStateHealth.COASTING,
+        health_reason="observation_dropout",
+    )
+
+
+def _step_first_dropout(
+    memory: VQ2Wave2AdapterMemory,
+    safety: VQ2SafetyGuidanceInput,
+    state: RelativeGateStateV1,
+    *,
+    capability: object,
+):
+    return _step_vq2_wave2_first_observation_dropout(
+        memory,
+        safety,
+        active_state=state,
+        attitude=_attitude(),
+        tick=_tick(safety, state),
+        capability=capability,
+    )
+
+
 def _enter_gate0_approach(*, with_state: bool, pitch: float | None = -0.1):
     initial = _safety(
         0,
@@ -452,6 +495,83 @@ def test_gate1_recenter_requires_legal_credit_and_a_distinct_tracker() -> None:
     assert transition.memory.gate0_pitch_latch is None
     assert state is not None
     validate_command_proposal_source(transition.proposal, state)
+
+
+def test_public_wave2_adapter_rejects_even_an_exact_first_dropout_profile() -> None:
+    previous, safety, prior = _enter_gate0_approach(with_state=True)
+    assert prior is not None
+    coast = _first_dropout_from(prior)
+
+    rejected = _step(
+        previous.memory,
+        safety,
+        state=coast,
+        attitude=_attitude(),
+    )
+
+    assert not rejected.decision.objective_permitted
+    assert rejected.proposal.is_exact_zero
+    assert _all_source_fields_are_none(rejected.proposal)
+    assert "active_state_dropout" in rejected.proposal.reason
+
+
+def test_private_first_dropout_wave2_adapter_rejects_an_unowned_capability() -> None:
+    previous, safety, prior = _enter_gate0_approach(with_state=True)
+    assert prior is not None
+
+    with pytest.raises(TypeError, match="invalid first-dropout Wave2 capability"):
+        _step_first_dropout(
+            previous.memory,
+            safety,
+            _first_dropout_from(prior),
+            capability=object(),
+        )
+
+
+def test_wave2_adapter_impl_rejects_a_raw_first_dropout_boolean() -> None:
+    previous, safety, prior = _enter_gate0_approach(with_state=True)
+    assert prior is not None
+    coast = _first_dropout_from(prior)
+
+    with pytest.raises(TypeError, match="invalid internal first-dropout capability"):
+        _step_vq2_wave2_adapter_impl(
+            previous.memory,
+            safety,
+            active_state=coast,
+            shadow_states=(),
+            attitude=_attitude(),
+            tick=_tick(safety, coast),
+            gate0_initial_pitch_rad=None,
+            first_dropout_capability=True,
+        )
+
+
+@pytest.mark.parametrize("gate", (0, 1), ids=("gate0", "gate1"))
+def test_private_first_dropout_wave2_path_is_source_bound_and_uncertainty_limited(
+    gate: int,
+) -> None:
+    if gate == 0:
+        previous, safety, prior = _enter_gate0_approach(with_state=True)
+    else:
+        previous, safety, prior = _enter_gate1_align()
+    assert prior is not None
+    coast = _first_dropout_from(prior)
+
+    accepted = _step_first_dropout(
+        previous.memory,
+        safety,
+        coast,
+        capability=_VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY,
+    )
+
+    assert accepted.decision.objective_permitted
+    assert not accepted.proposal.is_exact_zero
+    assert accepted.proposal.uncertainty.limited
+    assert (
+        accepted.proposal.uncertainty.reason
+        == "first_observation_dropout_coast"
+    )
+    validate_command_proposal_source(accepted.proposal, coast)
 
 
 @pytest.mark.parametrize("phase", ["gate0", "gate1"])
@@ -1298,3 +1418,21 @@ def test_adapter_module_has_no_runtime_authority_or_system_id_imports() -> None:
         assert token not in source
     assert "ControllerAttitudeInput" in source
     assert "ineligible for\nshadow, runtime, or powered wiring" in source
+
+
+def test_private_first_dropout_wave2_capability_has_one_production_owner() -> None:
+    competition_dir = Path(__file__).parents[1]
+    defining_path = competition_dir / "vq2_wave2_adapter.py"
+    private_names = (
+        "_VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY",
+        "_step_vq2_wave2_first_observation_dropout",
+    )
+    owners = []
+    for path in competition_dir.glob("*.py"):
+        if path == defining_path:
+            continue
+        source = path.read_text(encoding="utf-8")
+        if any(name in source for name in private_names):
+            owners.append(path.name)
+
+    assert owners == ["vq2_wave3_imu_adapter.py"]

@@ -595,6 +595,9 @@ class VQ2GuidanceTransition:
             raise TypeError("decision must be an exact VQ2GuidanceDecision")
 
 
+_VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY = object()
+
+
 def step_vq2_guidance(
     memory: Optional[VQ2GuidanceMemory],
     safety: VQ2SafetyGuidanceInput,
@@ -602,6 +605,50 @@ def step_vq2_guidance(
     active_state: Optional[RelativeGateStateV1],
     shadow_states: tuple[RelativeGateStateV1, ...] = (),
     config: Optional[VQ2GuidanceConfig] = None,
+) -> VQ2GuidanceTransition:
+    """Apply the ordinary fail-closed guidance transition."""
+
+    return _step_vq2_guidance_impl(
+        memory,
+        safety,
+        active_state=active_state,
+        shadow_states=shadow_states,
+        config=config,
+        first_dropout_capability=None,
+    )
+
+
+def _step_vq2_guidance_first_observation_dropout(
+    memory: Optional[VQ2GuidanceMemory],
+    safety: VQ2SafetyGuidanceInput,
+    *,
+    active_state: RelativeGateStateV1,
+    shadow_states: tuple[RelativeGateStateV1, ...] = (),
+    config: Optional[VQ2GuidanceConfig] = None,
+    capability: object,
+) -> VQ2GuidanceTransition:
+    """Private Wave3-only seam for an already-proved first dropout."""
+
+    if capability is not _VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY:
+        raise TypeError("invalid first-dropout guidance capability")
+    return _step_vq2_guidance_impl(
+        memory,
+        safety,
+        active_state=active_state,
+        shadow_states=shadow_states,
+        config=config,
+        first_dropout_capability=_VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY,
+    )
+
+
+def _step_vq2_guidance_impl(
+    memory: Optional[VQ2GuidanceMemory],
+    safety: VQ2SafetyGuidanceInput,
+    *,
+    active_state: Optional[RelativeGateStateV1],
+    shadow_states: tuple[RelativeGateStateV1, ...],
+    config: Optional[VQ2GuidanceConfig],
+    first_dropout_capability: Optional[object],
 ) -> VQ2GuidanceTransition:
     """Apply one deterministic, authority-gated mapless guidance transition.
 
@@ -623,6 +670,14 @@ def step_vq2_guidance(
         raise TypeError("shadow_states must be an exact tuple")
     if any(type(state) is not RelativeGateStateV1 for state in shadow_states):
         raise TypeError("shadow_states must contain exact RelativeGateStateV1 values")
+    if (
+        first_dropout_capability is not None
+        and first_dropout_capability is not _VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY
+    ):
+        raise TypeError("invalid internal first-dropout capability")
+    allow_first_observation_dropout = bool(
+        first_dropout_capability is _VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY
+    )
     if config is None:
         config = DEFAULT_VQ2_GUIDANCE_CONFIG
     elif type(config) is not VQ2GuidanceConfig:
@@ -739,6 +794,7 @@ def step_vq2_guidance(
         active_rejection=active_rejection,
         shadow_track_count=len(shadow_states),
         config=config,
+        allow_first_observation_dropout=allow_first_observation_dropout,
     )
     return VQ2GuidanceTransition(memory=accepted_memory, decision=decision)
 
@@ -1202,6 +1258,7 @@ def _evaluate_decision(
     active_rejection: Optional[VQ2GuidanceWithholdingReason],
     shadow_track_count: int,
     config: VQ2GuidanceConfig,
+    allow_first_observation_dropout: bool,
 ) -> VQ2GuidanceDecision:
     objective_kind = _OBJECTIVE_BY_PHASE[safety.phase]
     corridor = _corridor_for_phase(safety.phase, config)
@@ -1213,6 +1270,26 @@ def _evaluate_decision(
     rate_eligible = False
     scale_eligible = False
     expansion_eligible = False
+    first_dropout_allowed = bool(
+        state is not None
+        and allow_first_observation_dropout
+        and (
+            (
+                safety.authority.expected_gate_index == 0
+                and safety.phase is VQ2GuidancePhase.APPROACH
+            )
+            or (
+                safety.authority.expected_gate_index == 1
+                and safety.phase is VQ2GuidancePhase.ALIGN
+            )
+        )
+        and state.dropout_count == 1
+        and state.health is RelativeStateHealth.COASTING
+        and state.health_reason == "observation_dropout"
+        and state.normalized_innovation_squared is None
+        and state.innovation_gate_threshold is None
+        and state.innovation_accepted is None
+    )
     if state is not None:
         sigma = config.uncertainty_sigma_multiplier
         covariance = state.covariance.matrix
@@ -1261,23 +1338,26 @@ def _evaluate_decision(
         reason = active_rejection
     elif state is None or source is None:
         reason = VQ2GuidanceWithholdingReason.ACTIVE_STATE_REQUIRED
-    elif state.dropout_count != 0:
+    elif state.dropout_count != 0 and not first_dropout_allowed:
         reason = VQ2GuidanceWithholdingReason.ACTIVE_STATE_DROPOUT
     elif state.innovation_accepted is False:
         reason = VQ2GuidanceWithholdingReason.ACTIVE_INNOVATION_REJECTED
-    elif (
-        safety.phase is VQ2GuidancePhase.ALIGN
-        and (
-            state.health
-            not in {RelativeStateHealth.HEALTHY, RelativeStateHealth.DEGRADED}
-            or (
-                state.health is RelativeStateHealth.DEGRADED
-                and state.last_clipping == FrameEdge.NONE
+    elif not first_dropout_allowed and (
+        (
+            safety.phase is VQ2GuidancePhase.ALIGN
+            and (
+                state.health
+                not in {RelativeStateHealth.HEALTHY, RelativeStateHealth.DEGRADED}
+                or (
+                    state.health is RelativeStateHealth.DEGRADED
+                    and state.last_clipping == FrameEdge.NONE
+                )
             )
         )
-    ) or (
-        safety.phase in {VQ2GuidancePhase.APPROACH, VQ2GuidancePhase.COMMIT}
-        and state.health is not RelativeStateHealth.HEALTHY
+        or (
+            safety.phase in {VQ2GuidancePhase.APPROACH, VQ2GuidancePhase.COMMIT}
+            and state.health is not RelativeStateHealth.HEALTHY
+        )
     ):
         reason = VQ2GuidanceWithholdingReason.ACTIVE_STATE_HEALTH
     elif not corridor_eligible:

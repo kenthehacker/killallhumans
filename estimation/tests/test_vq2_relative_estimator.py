@@ -20,6 +20,7 @@ from competition.vq2_contracts import (
     ObservationHealth,
     PredictionBasis,
     RelativeStateHealth,
+    TrackRole,
 )
 from estimation.vq2_relative_estimator import (
     EstimatorUnavailableError,
@@ -29,6 +30,7 @@ from estimation.vq2_relative_estimator import (
     RelativeEstimatorError,
     RelativePredictionTarget,
     StaleObservationError,
+    VQ2ImuCorrelatedEstimatorCoast,
     VQ2ImuCorrelatedEstimatorUpdate,
     VQ2RelativeGateEstimator,
 )
@@ -361,6 +363,50 @@ def _derotation_evidence(
             angular_rate_uncertainty_rad_s=0.01,
         ),
     )
+
+
+def _first_imu_correlated_coast():
+    first_observation = _observation(
+        frame_id=0,
+        measurement_offset_ns=0,
+        center=(0.20, -0.10),
+    )
+    estimator = VQ2RelativeGateEstimator("correlated-coast-filter")
+    estimator.update_with_imu_correlation(
+        _derotation_evidence(first_observation, target_yaw_rad=0.0)
+    )
+    observation = _observation(
+        frame_id=1,
+        measurement_offset_ns=30_000_000,
+        center=(0.20, -0.10),
+    )
+    prior = estimator.update_with_imu_correlation(
+        _derotation_evidence(observation, target_yaw_rad=0.0)
+    )
+    target = RelativePredictionTarget.at_decision(
+        observation.host_clock_id,
+        prior.state.timing.prediction_time_monotonic_ns + 20_000_000,
+    )
+    evidence = derotate_gate_observation(
+        observation,
+        target,
+        capture_attitude=prior.evidence.capture_attitude,
+        target_attitude=_derotation_attitude(
+            observation,
+            sequence=12,
+            receive_monotonic_ns=target.prediction_time_monotonic_ns,
+            yaw_rad=0.02,
+        ),
+        calibration=prior.evidence.calibration,
+        model=prior.evidence.model,
+    )
+    state = estimator.coast(target)
+    coast = VQ2ImuCorrelatedEstimatorCoast(
+        prior_update=prior,
+        state=state,
+        evidence=evidence,
+    )
+    return coast, estimator
 
 
 def _assert_psd(state) -> None:
@@ -911,3 +957,210 @@ def test_imu_correlated_update_requires_exact_evidence_before_mutating_estimator
         estimator.update_with_imu_correlation(object())
     assert estimator.last_state is None
     assert not estimator.is_initialized
+
+
+def test_first_imu_correlated_coast_retains_source_and_advances_only_prediction():
+    coast, estimator = _first_imu_correlated_coast()
+    prior = coast.prior_update
+
+    assert estimator.last_state is coast.state
+    assert coast.evidence.observation is prior.evidence.observation
+    assert coast.evidence.capture_attitude is prior.evidence.capture_attitude
+    assert coast.state.timing.source_frame == prior.state.timing.source_frame
+    assert coast.state.source_candidate_id == prior.state.source_candidate_id
+    assert coast.state.tracker_id == prior.state.tracker_id
+    assert coast.state.track_role is prior.state.track_role
+    assert coast.state.authority == prior.state.authority
+    assert coast.state.state_sequence == prior.state.state_sequence + 1
+    assert (
+        coast.state.measurement_update_sequence
+        == prior.state.measurement_update_sequence
+    )
+    assert coast.state.dropout_count == 1
+    assert coast.state.health is RelativeStateHealth.COASTING
+    assert coast.state.health_reason == "observation_dropout"
+    assert coast.state.normalized_innovation_squared is None
+    assert coast.state.innovation_gate_threshold is None
+    assert coast.state.innovation_accepted is None
+    assert coast.state.covariance != prior.state.covariance
+    assert not coast.derotation_applied_to_state
+    coast.validate_integrity()
+
+
+def test_first_imu_correlated_coast_requires_an_active_prior_state():
+    coast, _estimator = _first_imu_correlated_coast()
+    shadow_prior_state = dataclasses.replace(
+        coast.prior_update.state,
+        track_role=TrackRole.SHADOW,
+    )
+    shadow_prior = dataclasses.replace(
+        coast.prior_update,
+        estimator_update=dataclasses.replace(
+            coast.prior_update.estimator_update,
+            state=shadow_prior_state,
+        ),
+    )
+    shadow_coast_state = dataclasses.replace(
+        coast.state,
+        track_role=TrackRole.SHADOW,
+    )
+
+    with pytest.raises(ValueError, match="healthy active non-dropout"):
+        VQ2ImuCorrelatedEstimatorCoast(
+            prior_update=shadow_prior,
+            state=shadow_coast_state,
+            evidence=coast.evidence,
+        )
+
+
+@pytest.mark.parametrize(
+    "forgery",
+    (
+        "tracker",
+        "role",
+        "camera_source",
+        "unchanged_covariance",
+        "state_sequence",
+        "measurement_sequence",
+        "dropout_count",
+        "health",
+        "health_reason",
+    ),
+)
+def test_first_imu_correlated_coast_rejects_state_envelope_forgery(forgery: str):
+    coast, _estimator = _first_imu_correlated_coast()
+    state = coast.state
+    changes = {
+        "tracker": {"tracker_id": "forged-tracker"},
+        "role": {"track_role": TrackRole.SHADOW},
+        "camera_source": {"source_candidate_id": "forged-candidate"},
+        "unchanged_covariance": {"covariance": coast.prior_update.state.covariance},
+        "state_sequence": {"state_sequence": state.state_sequence + 1},
+        "measurement_sequence": {
+            "measurement_update_sequence": state.measurement_update_sequence + 1
+        },
+        "dropout_count": {"dropout_count": 2},
+        "health": {"health": RelativeStateHealth.LOST},
+        "health_reason": {"health_reason": "forged_dropout_reason"},
+    }[forgery]
+    forged = dataclasses.replace(state, **changes)
+
+    with pytest.raises(ValueError):
+        VQ2ImuCorrelatedEstimatorCoast(
+            prior_update=coast.prior_update,
+            state=forged,
+            evidence=coast.evidence,
+        )
+
+
+def test_first_imu_correlated_coast_rejects_compensated_variance_underreporting():
+    coast, _estimator = _first_imu_correlated_coast()
+    prior_diagonal = tuple(
+        coast.prior_update.state.covariance.matrix[index][index]
+        for index in range(6)
+    )
+    coast_diagonal = tuple(
+        coast.state.covariance.matrix[index][index] for index in range(6)
+    )
+    forged_diagonal = (
+        prior_diagonal[0] * 0.5,
+        prior_diagonal[1] * 0.5,
+        prior_diagonal[2] * 0.5,
+        coast_diagonal[3] + 1.0,
+        coast_diagonal[4] + 1.0,
+        coast_diagonal[5] + 1.0,
+    )
+    covariance = dataclasses.replace(
+        coast.state.covariance,
+        matrix=tuple(
+            tuple(
+                forged_diagonal[row] if row == column else 0.0
+                for column in range(6)
+            )
+            for row in range(6)
+        ),
+    )
+    forged = dataclasses.replace(coast.state, covariance=covariance)
+
+    with pytest.raises(ValueError, match="grow conservatively"):
+        VQ2ImuCorrelatedEstimatorCoast(
+            prior_update=coast.prior_update,
+            state=forged,
+            evidence=coast.evidence,
+        )
+
+
+def test_first_imu_correlated_coast_rejects_metric_state_injection():
+    coast, _estimator = _first_imu_correlated_coast()
+    metric_covariance = FeatureCovarianceV1(
+        model_id="forged-coast-metric-v1",
+        feature_order=(
+            "position_x_body_frd_m",
+            "position_y_body_frd_m",
+            "position_z_body_frd_m",
+            "velocity_x_body_frd_m_s",
+            "velocity_y_body_frd_m_s",
+            "velocity_z_body_frd_m_s",
+            "orientation_error_x_rad",
+            "orientation_error_y_rad",
+            "orientation_error_z_rad",
+        ),
+        matrix=tuple(
+            tuple(1.0 if row == column else 0.0 for column in range(9))
+            for row in range(9)
+        ),
+    )
+    forged = dataclasses.replace(
+        coast.state,
+        metric_position_body_frd_m=(1.0, 2.0, 3.0),
+        metric_velocity_body_frd_m_s=(4.0, 5.0, 6.0),
+        metric_gate_orientation_body_frd_xyzw=(0.0, 0.0, 0.0, 1.0),
+        metric_covariance=metric_covariance,
+    )
+
+    with pytest.raises(ValueError, match="unsupported metric state"):
+        VQ2ImuCorrelatedEstimatorCoast(
+            prior_update=coast.prior_update,
+            state=forged,
+            evidence=coast.evidence,
+        )
+
+
+def test_first_imu_correlated_coast_rejects_changed_attitude_uncertainty_model():
+    coast, _estimator = _first_imu_correlated_coast()
+    target_attitude = dataclasses.replace(
+        coast.evidence.target_attitude,
+        orientation_uncertainty_rad=(
+            coast.evidence.target_attitude.orientation_uncertainty_rad * 2.0
+        ),
+    )
+    changed_evidence = derotate_gate_observation(
+        coast.evidence.observation,
+        coast.evidence.prediction_target,
+        capture_attitude=coast.evidence.capture_attitude,
+        target_attitude=target_attitude,
+        calibration=coast.evidence.calibration,
+        model=coast.evidence.model,
+    )
+
+    with pytest.raises(ValueError, match="uncertainty model"):
+        VQ2ImuCorrelatedEstimatorCoast(
+            prior_update=coast.prior_update,
+            state=coast.state,
+            evidence=changed_evidence,
+        )
+
+
+def test_first_imu_correlated_coast_revalidates_nested_covariance_integrity():
+    coast, _estimator = _first_imu_correlated_coast()
+    matrix = [list(row) for row in coast.state.covariance.matrix]
+    matrix[0][1] = float("nan")
+    matrix[1][0] = float("nan")
+    object.__setattr__(
+        coast.state.covariance,
+        "matrix",
+        tuple(tuple(row) for row in matrix),
+    )
+
+    with pytest.raises(ValueError):
+        coast.validate_integrity()

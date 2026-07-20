@@ -38,6 +38,8 @@ from competition.vq2_controller import (
     ControllerPhaseInput,
     ControllerTickInput,
     VQ2ControlPhase,
+    _VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY,
+    _propose_vq2_first_observation_dropout_command,
     propose_vq2_command,
 )
 from planning.vq2_guidance import (
@@ -48,6 +50,8 @@ from planning.vq2_guidance import (
     VQ2GuidanceRaceState,
     VQ2GuidanceSource,
     VQ2SafetyGuidanceInput,
+    _VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY,
+    _step_vq2_guidance_first_observation_dropout,
     step_vq2_guidance,
 )
 
@@ -190,6 +194,9 @@ _SUPPORTED_MAPPINGS = (
 )
 
 
+_VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY = object()
+
+
 def step_vq2_wave2_adapter(
     memory: Optional[VQ2Wave2AdapterMemory],
     safety: VQ2SafetyGuidanceInput,
@@ -199,6 +206,58 @@ def step_vq2_wave2_adapter(
     attitude: Optional[ControllerAttitudeInput],
     tick: ControllerTickInput,
     gate0_initial_pitch_rad: Optional[float] = None,
+) -> VQ2Wave2AdapterTransition:
+    """Advance the ordinary fail-closed Wave2 composition."""
+
+    return _step_vq2_wave2_adapter_impl(
+        memory,
+        safety,
+        active_state=active_state,
+        shadow_states=shadow_states,
+        attitude=attitude,
+        tick=tick,
+        gate0_initial_pitch_rad=gate0_initial_pitch_rad,
+        first_dropout_capability=None,
+    )
+
+
+def _step_vq2_wave2_first_observation_dropout(
+    memory: VQ2Wave2AdapterMemory,
+    safety: VQ2SafetyGuidanceInput,
+    *,
+    active_state: RelativeGateStateV1,
+    shadow_states: tuple[RelativeGateStateV1, ...] = (),
+    attitude: ControllerAttitudeInput,
+    tick: ControllerTickInput,
+    gate0_initial_pitch_rad: Optional[float] = None,
+    capability: object,
+) -> VQ2Wave2AdapterTransition:
+    """Private Wave3-only composition for an already-proved first dropout."""
+
+    if capability is not _VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY:
+        raise TypeError("invalid first-dropout Wave2 capability")
+    return _step_vq2_wave2_adapter_impl(
+        memory,
+        safety,
+        active_state=active_state,
+        shadow_states=shadow_states,
+        attitude=attitude,
+        tick=tick,
+        gate0_initial_pitch_rad=gate0_initial_pitch_rad,
+        first_dropout_capability=_VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY,
+    )
+
+
+def _step_vq2_wave2_adapter_impl(
+    memory: Optional[VQ2Wave2AdapterMemory],
+    safety: VQ2SafetyGuidanceInput,
+    *,
+    active_state: Optional[RelativeGateStateV1],
+    shadow_states: tuple[RelativeGateStateV1, ...],
+    attitude: Optional[ControllerAttitudeInput],
+    tick: ControllerTickInput,
+    gate0_initial_pitch_rad: Optional[float],
+    first_dropout_capability: Optional[object],
 ) -> VQ2Wave2AdapterTransition:
     """Advance guidance and return one bounded proposal or exact-zero hold.
 
@@ -222,18 +281,37 @@ def step_vq2_wave2_adapter(
         raise TypeError("attitude must be ControllerAttitudeInput or None")
     if type(tick) is not ControllerTickInput:
         raise TypeError("tick must be exact ControllerTickInput")
+    if (
+        first_dropout_capability is not None
+        and first_dropout_capability is not _VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY
+    ):
+        raise TypeError("invalid internal first-dropout capability")
+    allow_first_observation_dropout = bool(
+        first_dropout_capability is _VQ2_WAVE3_FIRST_DROPOUT_CAPABILITY
+    )
     if gate0_initial_pitch_rad is not None:
         if type(gate0_initial_pitch_rad) is not float:
             raise TypeError("gate0_initial_pitch_rad must be an exact float or None")
         if not math.isfinite(gate0_initial_pitch_rad):
             raise ValueError("gate0_initial_pitch_rad must be finite")
 
-    guidance_transition = step_vq2_guidance(
-        None if memory is None else memory.guidance_memory,
-        safety,
-        active_state=active_state,
-        shadow_states=shadow_states,
-    )
+    if allow_first_observation_dropout:
+        if memory is None or active_state is None or attitude is None:
+            raise AssertionError("first-dropout Wave2 path lacks retained evidence")
+        guidance_transition = _step_vq2_guidance_first_observation_dropout(
+            memory.guidance_memory,
+            safety,
+            active_state=active_state,
+            shadow_states=shadow_states,
+            capability=_VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY,
+        )
+    else:
+        guidance_transition = step_vq2_guidance(
+            None if memory is None else memory.guidance_memory,
+            safety,
+            active_state=active_state,
+            shadow_states=shadow_states,
+        )
     next_memory, pitch_failure = _advance_adapter_memory(
         memory,
         guidance_transition.memory,
@@ -272,12 +350,21 @@ def step_vq2_wave2_adapter(
         objective_permitted=True,
         withholding_reason=None,
     )
-    proposal = propose_vq2_command(
-        active_state,
-        attitude=attitude,
-        tick=tick,
-        phase=phase,
-    )
+    if allow_first_observation_dropout:
+        proposal = _propose_vq2_first_observation_dropout_command(
+            active_state,
+            attitude=attitude,
+            tick=tick,
+            phase=phase,
+            capability=_VQ2_CONTROLLER_FIRST_DROPOUT_CAPABILITY,
+        )
+    else:
+        proposal = propose_vq2_command(
+            active_state,
+            attitude=attitude,
+            tick=tick,
+            phase=phase,
+        )
     if proposal.source_frame is None:
         if not proposal.is_exact_zero:
             raise AssertionError("a source-less controller proposal must be exact zero")

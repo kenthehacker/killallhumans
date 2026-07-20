@@ -107,6 +107,33 @@ def _bounded_token(value: object, label: str) -> str:
     return value
 
 
+def _revalidate_relative_gate_state(
+    state: RelativeGateStateV1,
+) -> RelativeGateStateV1:
+    """Reconstruct a state and every nested contract value."""
+
+    source_frame = state.timing.source_frame
+    if source_frame is None:
+        raise ValueError("relative estimator state requires a source frame")
+    timing = replace(
+        state.timing,
+        source_frame=replace(source_frame),
+    )
+    covariance = replace(state.covariance)
+    metric_covariance = (
+        None
+        if state.metric_covariance is None
+        else replace(state.metric_covariance)
+    )
+    return replace(
+        state,
+        timing=timing,
+        authority=replace(state.authority),
+        covariance=covariance,
+        metric_covariance=metric_covariance,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RelativeEstimatorConfig:
     """Reviewed tuning surface for the small constant-velocity filter."""
@@ -274,7 +301,7 @@ class VQ2ImuCorrelatedEstimatorUpdate:
     def validate_integrity(self) -> None:
         """Revalidate nested state/evidence and their exact correlation."""
 
-        state = replace(self.estimator_update.state)
+        state = _revalidate_relative_gate_state(self.estimator_update.state)
         estimator_update = replace(self.estimator_update, state=state)
         self.evidence.validate_integrity()
         replace(self, estimator_update=estimator_update)
@@ -291,6 +318,190 @@ class VQ2ImuCorrelatedEstimatorUpdate:
     def derotation_applied_to_state(self) -> bool:
         """The frozen ``/1`` state never claims the target-basis correction."""
 
+        return False
+
+
+@dataclass(frozen=True, slots=True)
+class VQ2ImuCorrelatedEstimatorCoast:
+    """One first-dropout coast bound to its accepted camera/IMU source.
+
+    The coast retains the prior accepted raw-camera observation and advances
+    only its prediction target, state sequence, covariance, and target IMU
+    attitude.  The new derotation evidence remains standalone and is not
+    applied to the frozen ``/1`` state.
+    """
+
+    prior_update: VQ2ImuCorrelatedEstimatorUpdate
+    state: RelativeGateStateV1
+    evidence: "VQ2DerotationEvidence"
+
+    def __post_init__(self) -> None:
+        from estimation.vq2_imu_derotation import VQ2DerotationEvidence
+
+        if type(self.prior_update) is not VQ2ImuCorrelatedEstimatorUpdate:
+            raise TypeError(
+                "prior_update must be exact VQ2ImuCorrelatedEstimatorUpdate"
+            )
+        if type(self.state) is not RelativeGateStateV1:
+            raise TypeError("state must be exact RelativeGateStateV1")
+        if type(self.evidence) is not VQ2DerotationEvidence:
+            raise TypeError("evidence must be exact VQ2DerotationEvidence")
+        self.prior_update.validate_integrity()
+        self.evidence.validate_integrity()
+        _revalidate_relative_gate_state(self.state)
+
+        prior = self.prior_update
+        prior_state = prior.state
+        observation = prior.evidence.observation
+        if not prior.current_observation_accepted:
+            raise ValueError("coast requires an accepted prior observation")
+        if (
+            prior_state.health is not RelativeStateHealth.HEALTHY
+            or prior_state.dropout_count != 0
+            or prior_state.track_role is not TrackRole.ACTIVE
+        ):
+            raise ValueError(
+                "coast requires a healthy active non-dropout prior state"
+            )
+        if self.evidence.observation != observation:
+            raise ValueError("coast evidence changed the accepted observation")
+        if self.evidence.capture_attitude != prior.evidence.capture_attitude:
+            raise ValueError("coast evidence changed the capture attitude")
+        if (
+            self.evidence.calibration != prior.evidence.calibration
+            or self.evidence.model != prior.evidence.model
+        ):
+            raise ValueError("coast evidence changed calibration or model identity")
+
+        target = self.evidence.prediction_target
+        prior_target = prior.evidence.prediction_target
+        if (
+            target.prediction_basis is not PredictionBasis.DECISION_TIME
+            or target.decision_time_monotonic_ns
+            != target.prediction_time_monotonic_ns
+            or target.prediction_time_monotonic_ns
+            <= prior_target.prediction_time_monotonic_ns
+        ):
+            raise ValueError("coast requires a strictly newer at-decision target")
+        timing = self.state.timing
+        if (
+            timing.host_clock_id != target.host_clock_id
+            or timing.decision_time_monotonic_ns
+            != target.decision_time_monotonic_ns
+            or timing.prediction_time_monotonic_ns
+            != target.prediction_time_monotonic_ns
+            or timing.prediction_basis is not target.prediction_basis
+            or timing.delay_model_id != target.delay_model_id
+            or timing.delay_uncertainty_ns != target.delay_uncertainty_ns
+        ):
+            raise ValueError("coast state differs from its prediction target")
+        validate_relative_gate_state_source(self.state, observation)
+        validate_relative_gate_state_sequence((prior_state, self.state))
+        if (
+            self.state.tracker_id != prior_state.tracker_id
+            or self.state.track_role is not prior_state.track_role
+            or self.state.authority != prior_state.authority
+            or self.state.source_candidate_id != prior_state.source_candidate_id
+            or self.state.state_sequence != prior_state.state_sequence + 1
+            or self.state.measurement_update_sequence
+            != prior_state.measurement_update_sequence
+            or self.state.dropout_count != 1
+            or self.state.health is not RelativeStateHealth.COASTING
+            or self.state.health_reason != "observation_dropout"
+            or self.state.normalized_innovation_squared is not None
+            or self.state.innovation_gate_threshold is not None
+            or self.state.innovation_accepted is not None
+        ):
+            raise ValueError("coast state is not the exact first-dropout profile")
+        metric_fields = (
+            "metric_position_body_frd_m",
+            "metric_velocity_body_frd_m_s",
+            "metric_gate_orientation_body_frd_xyzw",
+            "metric_covariance",
+        )
+        if any(
+            getattr(prior_state, name) is not None
+            or getattr(self.state, name) != getattr(prior_state, name)
+            for name in metric_fields
+        ):
+            raise ValueError("coast injected unsupported metric state")
+        if self.state.covariance == prior_state.covariance:
+            raise ValueError("coast covariance must grow from the accepted state")
+        if (
+            self.state.covariance.model_id != prior_state.covariance.model_id
+            or self.state.covariance.feature_order
+            != prior_state.covariance.feature_order
+        ):
+            raise ValueError("coast changed the estimator covariance model")
+        prior_diagonal = tuple(
+            prior_state.covariance.matrix[index][index] for index in range(6)
+        )
+        coast_diagonal = tuple(
+            self.state.covariance.matrix[index][index] for index in range(6)
+        )
+        if sum(coast_diagonal) <= sum(prior_diagonal) or any(
+            coast_value <= prior_value
+            for prior_value, coast_value in zip(
+                prior_diagonal,
+                coast_diagonal,
+            )
+        ):
+            raise ValueError("coast covariance did not grow conservatively")
+        elapsed_s = (
+            target.prediction_time_monotonic_ns
+            - prior_target.prediction_time_monotonic_ns
+        ) / 1_000_000_000
+        expected_features = (
+            prior_state.bearing_norm[0]
+            + prior_state.bearing_rate_norm_s[0] * elapsed_s,
+            prior_state.bearing_norm[1]
+            + prior_state.bearing_rate_norm_s[1] * elapsed_s,
+            prior_state.log_scale + prior_state.expansion_rate_s * elapsed_s,
+        )
+        actual_features = (*self.state.bearing_norm, self.state.log_scale)
+        if self.state.bearing_rate_norm_s != prior_state.bearing_rate_norm_s or (
+            self.state.expansion_rate_s != prior_state.expansion_rate_s
+        ):
+            raise ValueError("coast changed the constant-velocity rate state")
+        if any(
+            not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12)
+            for actual, expected in zip(actual_features, expected_features)
+        ):
+            raise ValueError("coast state is not the constant-velocity successor")
+
+        prior_attitude = prior.evidence.target_attitude.attitude
+        target_attitude = self.evidence.target_attitude.attitude
+        if (
+            self.evidence.target_attitude.orientation_uncertainty_rad
+            != prior.evidence.target_attitude.orientation_uncertainty_rad
+            or self.evidence.target_attitude.host_time_uncertainty_ns
+            != prior.evidence.target_attitude.host_time_uncertainty_ns
+        ):
+            raise ValueError("coast target attitude changed uncertainty model")
+        if target_attitude.source != prior_attitude.source:
+            raise ValueError("coast target attitude changed IMU source")
+        if (
+            target_attitude.sample_sequence <= prior_attitude.sample_sequence
+            or target_attitude.source_time_us <= prior_attitude.source_time_us
+            or target_attitude.receive_monotonic_ns
+            <= prior_attitude.receive_monotonic_ns
+        ):
+            raise ValueError("coast target attitude did not advance strictly")
+
+    def validate_integrity(self) -> None:
+        """Revalidate nested source, state, and derotation evidence."""
+
+        self.prior_update.validate_integrity()
+        self.evidence.validate_integrity()
+        state = _revalidate_relative_gate_state(self.state)
+        replace(
+            self,
+            prior_update=replace(self.prior_update),
+            state=state,
+        )
+
+    @property
+    def derotation_applied_to_state(self) -> bool:
         return False
 
 
@@ -1018,5 +1229,6 @@ __all__ = [
     "RelativePredictionTarget",
     "StaleObservationError",
     "VQ2ImuCorrelatedEstimatorUpdate",
+    "VQ2ImuCorrelatedEstimatorCoast",
     "VQ2RelativeGateEstimator",
 ]

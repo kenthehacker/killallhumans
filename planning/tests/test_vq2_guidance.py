@@ -24,6 +24,9 @@ from planning.vq2_guidance import (
     VQ2GuidanceRaceState,
     VQ2GuidanceWithholdingReason,
     VQ2SafetyGuidanceInput,
+    _VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY,
+    _step_vq2_guidance_first_observation_dropout,
+    _step_vq2_guidance_impl,
     step_vq2_guidance,
 )
 from planning.vq2_guidance_scenarios import (
@@ -307,6 +310,46 @@ def _with_active(phase: VQ2GuidancePhase, **state_kwargs):
         safety,
         active_state=_state(safety, **state_kwargs),
     )
+
+
+def _first_dropout_from(state: RelativeGateStateV1) -> RelativeGateStateV1:
+    timing = replace(
+        state.timing,
+        decision_time_monotonic_ns=(
+            state.timing.decision_time_monotonic_ns + 1_000_000
+        ),
+        prediction_time_monotonic_ns=(
+            state.timing.prediction_time_monotonic_ns + 1_000_000
+        ),
+    )
+    return replace(
+        state,
+        timing=timing,
+        state_sequence=state.state_sequence + 1,
+        normalized_innovation_squared=None,
+        innovation_gate_threshold=None,
+        innovation_accepted=None,
+        dropout_count=1,
+        health=RelativeStateHealth.COASTING,
+        health_reason="observation_dropout",
+    )
+
+
+def _guidance_memory_with_first_dropout(phase: VQ2GuidancePhase):
+    if phase is VQ2GuidancePhase.ALIGN:
+        transition, safety, _next_sequence = _ready_gate1_align()
+        tracker_id = "active-gate-1"
+    else:
+        transition, safety, _next_sequence = _ready_phase(phase)
+        tracker_id = "active-gate-0"
+    prior = _state(safety, tracker_id=tracker_id)
+    accepted = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=prior,
+    )
+    assert accepted.decision.objective_permitted
+    return accepted.memory, safety, _first_dropout_from(prior)
 
 
 @pytest.mark.parametrize(
@@ -2096,6 +2139,105 @@ def test_dropout_and_rejected_innovation_withhold(changes, reason) -> None:
 
     assert not result.decision.objective_permitted
     assert result.decision.withholding_reason is reason
+
+
+def test_public_guidance_rejects_even_an_exact_first_dropout_profile() -> None:
+    memory, safety, coast = _guidance_memory_with_first_dropout(
+        VQ2GuidancePhase.APPROACH
+    )
+
+    rejected = step_vq2_guidance(
+        memory,
+        safety,
+        active_state=coast,
+    )
+
+    assert not rejected.decision.objective_permitted
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.ACTIVE_STATE_DROPOUT
+    )
+
+
+def test_private_first_dropout_guidance_rejects_an_unowned_capability() -> None:
+    memory, safety, coast = _guidance_memory_with_first_dropout(
+        VQ2GuidancePhase.APPROACH
+    )
+
+    with pytest.raises(TypeError, match="invalid first-dropout guidance capability"):
+        _step_vq2_guidance_first_observation_dropout(
+            memory,
+            safety,
+            active_state=coast,
+            capability=object(),
+        )
+
+
+def test_guidance_impl_rejects_a_raw_first_dropout_boolean() -> None:
+    memory, safety, coast = _guidance_memory_with_first_dropout(
+        VQ2GuidancePhase.APPROACH
+    )
+
+    with pytest.raises(TypeError, match="invalid internal first-dropout capability"):
+        _step_vq2_guidance_impl(
+            memory,
+            safety,
+            active_state=coast,
+            shadow_states=(),
+            config=None,
+            first_dropout_capability=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (VQ2GuidancePhase.APPROACH, VQ2GuidancePhase.ALIGN),
+    ids=("gate0", "gate1"),
+)
+def test_private_first_dropout_guidance_permits_only_the_owned_motion_phases(
+    phase: VQ2GuidancePhase,
+) -> None:
+    memory, safety, coast = _guidance_memory_with_first_dropout(phase)
+
+    accepted = _step_vq2_guidance_first_observation_dropout(
+        memory,
+        safety,
+        active_state=coast,
+        capability=_VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY,
+    )
+
+    assert accepted.decision.objective_permitted
+    assert accepted.decision.withholding_reason is None
+    assert accepted.decision.source is not None
+    assert accepted.decision.source.state_sequence == coast.state_sequence
+    assert (
+        accepted.decision.source.measurement_update_sequence
+        == coast.measurement_update_sequence
+    )
+
+
+def test_private_first_dropout_guidance_rejects_gate0_align() -> None:
+    transition, safety, _next_sequence = _ready_phase(VQ2GuidancePhase.ALIGN)
+    prior = _state(safety, tracker_id="active-gate-0")
+    accepted = step_vq2_guidance(
+        transition.memory,
+        safety,
+        active_state=prior,
+    )
+    assert accepted.decision.objective_permitted
+
+    rejected = _step_vq2_guidance_first_observation_dropout(
+        accepted.memory,
+        safety,
+        active_state=_first_dropout_from(prior),
+        capability=_VQ2_GUIDANCE_FIRST_DROPOUT_CAPABILITY,
+    )
+
+    assert not rejected.decision.objective_permitted
+    assert (
+        rejected.decision.withholding_reason
+        is VQ2GuidanceWithholdingReason.ACTIVE_STATE_DROPOUT
+    )
 
 
 def test_race_finish_and_abort_are_forward_terminal_holds() -> None:
