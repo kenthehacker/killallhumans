@@ -6,20 +6,19 @@ powered authority. The exact Package 2 task contract records only the
 conditional simulator/private-capture authority and single powered pilot; it
 grants no replay, production, or transport authority.
 
-The current integrated local-main baseline is
-`5000ecedbe2de06b4847ce6e79483f65db79d32b`. It contains the promoted Package 2
-production-module correction. The append-only recovery-01 five-file L0 set was
-then independently reviewed and published create-new with the freeze last.
-Production admission again failed closed before `F00-A01`: a `cmd.exe` parent
-first injected hidden environment entry `=C:`, and the exact-environment
-invocation then exposed that this Windows target requires an exact 48-byte
-`SystemTimeOfDayInformation` buffer rather than the implemented 64 bytes.
-Recovery-02 behavior/trust commits `3a641c8` / `a1f55a1` pin that exact ABI and
-move only the accepted freeze ID/path to append-only `recovery-02`; they are
-under fresh exact-candidate promotion. The original and recovery-01 freezes
-remain immutable and inactive. No A01, simulator/port contact, frame capture,
-PAK access, reset, arm/disarm, target, or powered command occurred. The earlier
-Package 2A / Package 3B passive tranche at
+The current integrated local-main implementation baseline is
+`e58b428629529c9c8bac6963edd51bb115008b57`. It contains the promoted Package 2
+recovery-02 host-boot ABI correction and its documented gate. The independently
+reviewed append-only recovery-02 L0 set was published create-new with the freeze
+last. The sole authorized `F00-A01` was then consumed and failed closed during
+`launcher_return`: ordered import revalidation loaded `scripts.aigp_vq2_run`,
+whose pinned OpenCV loader prepended its DLL directory to native `PATH` after
+the frozen environment comparison. The later exact spawn-environment check
+rejected that drift before task query, simulator enumeration, launcher spawn,
+fixed ports, transport, child creation, frame capture, reset, arm/disarm,
+target, or powered-command contact. The immutable attempt-invalid and poison
+records require a new reviewed task and prohibit clearing or retrying A01. No
+PAK was read. The earlier Package 2A / Package 3B passive tranche at
 `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0` remains accepted historical
 evidence and must not be repeated.
 
@@ -65,8 +64,8 @@ inform a design, but it cannot replace empirical build-specific evidence.
 ## Current integrated baseline
 
 - Target: FlightSim build 3385 in Training mode.
-- Current reviewed implementation/evidence baseline:
-  `5000ecedbe2de06b4847ce6e79483f65db79d32b`.
+- Current reviewed implementation baseline:
+  `e58b428629529c9c8bac6963edd51bb115008b57`.
 - Package 2 behavior commit:
   `508d43d49c4f2b6704b3d6d51e071157de4ce2a3`.
 - Environment/import freeze-readiness behavior/trust commits:
@@ -80,8 +79,9 @@ inform a design, but it cannot replace empirical build-specific evidence.
 - Exact production-module binding and append-only recovery behavior/trust
   commits: `9028150` / `2e919ee`; promoted and integrated through `5000ece`.
 - Exact host-boot ABI and append-only recovery-02 behavior/trust commits:
-  `3a641c8dd8fb21fd3112143464d15a2feaef07d7` / `a1f55a1`; fresh
-  exact-candidate promotion is the active successor gate.
+  `3a641c8dd8fb21fd3112143464d15a2feaef07d7` /
+  `a1f55a12910b9b660111c2d71637ef161e23b111`; promoted and documented through
+  `e58b428629529c9c8bac6963edd51bb115008b57`.
 - `cb2b1de` is the Package 2A / Package 3B passive capture-ingress evidence
   closeout and remains a historical passive reference.
 - Accepted behavior and live-evidence candidate:
@@ -446,38 +446,66 @@ prerequisite honestly.
 
 ## Current resume decision
 
-The Package 2 separately authorized-collection entry gate is satisfied for
-exactly one bounded build-3385 Training `calibration-excite` pilot after all
-offline promotion and L0 freeze checks pass. The user approved routine
-in-contract work without repeated permission prompts, no cooked-PAK
-extraction, configurable and changeable nominal gate facts, simulator-observed
-camera/IMU/timing/stream facts, and private decoded capture for this simulation
-task only. That authority does not transfer to physical/HIL/submission/public
-use, a second attempt, another powered stage, or Gate 0/Gate 1 work.
+The Package 2 separately authorized `calibration-excite` pilot has reached its
+failure exit. The one allowed attempt, `F00-A01`, is consumed and poisoned; no
+Package 2 powered entry gate is currently satisfied. Routine offline work
+remains approved without repeated prompts, with no cooked-PAK extraction,
+configurable nominal gate facts, simulator-observed stream facts, and private
+simulation-only capture scope. Those decisions do not authorize poison
+clearing, an alternate attempt identity, a retry, another powered stage,
+Gate 0/Gate 1, or physical/HIL/submission/public use.
 
-The first Package 2 implementation and its environment/import, PowerShell, and
-production-module corrections were promoted and integrated through `5000ece`.
-The original and recovery-01 L0 sets were independently reviewed and published
-append-only, each with its freeze last. The recovery-01 root now contains
-exactly eleven immutable support files, but neither `F00-A01` nor poison exists.
+Recovery-02 final candidate `e58b428629529c9c8bac6963edd51bb115008b57`
+passed `246` affected tests, `2225` VQ2 tests with one skip, `3325` fast and
+unit tests with 21 skips and 42 deselections each, `3366` full non-live tests
+with 22 skips, the separate exact `2142`-test hash-pinned gate, and detached
+post-integration VQ2 at `2225` passes with one skip. The strict worktree remained
+physically pristine.
 
-The first recovery-01 console parent added hidden native environment entry
-`=C:` and was rejected against the exact 52-variable freeze. An
-exact-environment console then refused with `host boot FILETIME query failed`:
-class-3 `NtQuerySystemInformation` on this target accepts exactly 48 bytes and
-rejects the prior 64-byte request with `STATUS_INFO_LENGTH_MISMATCH`. Both
-refusals occurred before lease, launcher, simulator, fixed ports, frame,
-reset, arm/disarm, target, or powered-command contact.
+External preparer
+`C:\Users\John\aigp-review\2026-07-21-package2-live-freeze-recovery-02\l0_prepare_recovery_02.py`
+has SHA-256
+`44e6784248cf5282bf6964d6be6c75a115e7dd2a86a1dfe645fd40f11a1bb0ac`.
+Its independently reviewed bundles 5 and 6 were byte-identical, 228424 bytes,
+with SHA-256
+`b91690126d8619b85dcc63389586cfb4b1e11f7c621e4bc77d96ac161b81ea66`.
+It exact-admitted all eleven predecessor files, including their effective ACL,
+owner, final-path, reparse, volume, and one-link identities, then published the
+five recovery-02 files create-new with the freeze last. The resulting freeze
+SHA-256 is
+`d3b1517777d73a6aa358411f33d4d598bd29ef58b865be1aa4e9f4b91a2f2655`;
+the pre-attempt root contained exactly sixteen support files and no A01/poison.
 
-Behavior `3a641c8` pins that exact fail-closed ABI and moves only the accepted
-freeze ID/path to `recovery-02`; trust commit `a1f55a1` refreshes the same four
-affected hashes. The remaining gate sequence is fresh fast/unit,
-exact-candidate full non-live and separate hash-pinned VQ2, exact integration,
-and detached post-merge VQ2. Only then may a new external preparer be pinned and
-reviewed. It must exact-hash the predecessor eleven-file root, publish five
-uniquely named `recovery-02` L0 files create-new with the replacement freeze
-last, require exactly sixteen final files, and leave the same F00-A01/poison
-latch in force. This is still the one unconsumed authorized attempt.
+At `2026-07-21T13:23:00Z`, the exact wrapper published A01 and acquired the
+live lease, then failed `launcher_return` with reason
+`build_or_candidate_changed`: `child environment drifted from the freeze`.
+No scheduled task, simulator process, fixed port, transport, child, frame,
+reset, arm/disarm, target, or powered command was created or contacted. The
+validated terminal identities are attempt
+`8550ed1a1966607c49295db0729161a30f7f71b0ba523b8ee2d171c1d7651e0c`,
+wrapper lifecycle
+`faf07bc2f6b31163123ec4203369e6ca50a3fb0a8de2faf1364788d4e3a783ab`,
+poison `a725abc8f89696f398b73d97a949a817efdda195447bb46fee358788137b8fd0`,
+and attempt-invalid
+`c9dbd9e60a940279deeb3052b5e1d763809a8815d54d9e04b2b1e18d6eec47e6`.
+The immutable lease ledger has acquisition and heartbeats but no proved
+release, so formal cleanup remains failed and cannot be repaired by later OS
+absence. Repeated current OS snapshots nevertheless show the wrapper, console,
+FlightSim/payload, fixed-port owners, and scheduled task absent.
+
+Offline reproduction proved the exact ordering defect. Environment comparison
+froze `PATH` at SHA-256
+`39744aa75e82bc746b4a95893992f89cf68707c136df6b70aaf21330818efda1`;
+subsequent frozen-seed import of `scripts.aigp_vq2_run` reached the pinned
+OpenCV loader through `gate_detection.src.gate_detector` and prepended
+`C:\Users\John\killallhumans\.venv\Lib\site-packages\cv2\../../x64/vc17/bin`,
+changing only `PATH` to SHA-256
+`946f8b21b7abe870f2a87261714e512bd08a3f28f2e285432e416411f8b3288c`.
+The later spawn check correctly rejected it. A successor must be a new reviewed
+offline recovery task that isolates import revalidation (or freezes the exact
+post-import environment), adds a final native-environment gate before attempt
+consumption, and seals the checked spawn map. It must not whitelist the drift,
+clear poison, reuse A01, or claim authority for another powered attempt.
 
 The earlier Package 3B timing tranche remains integrated historical evidence
 with three accepted passive captures. It must not be described as blocked or

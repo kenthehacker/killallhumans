@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `recovery-01 promoted and integrated at 5000ece and its append-only L0 published; exact production admission then failed closed before F00-A01 on the target host's exact SystemTimeOfDayInformation ABI; recovery-02 behavior/trust committed at 3a641c8/a1f55a1 with fresh promotion pending`
+- State: `recovery-02 promoted and integrated at e58b428 and its append-only L0 published; the sole F00-A01 was consumed and failed closed before launcher/simulator contact on deterministic OpenCV PATH mutation; immutable invalid/poison evidence requires a new reviewed task and forbids retry`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -13,19 +13,18 @@
 - Active correction branch: `package2-live-freeze-readiness`.
 - Active correction worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-live-freeze-readiness`.
-- Designated integration-owner-controlled detached live worktree, rebuilt at
-  `5000ece` for recovery-01 L0 publication and pre-attempt production
-  admission. It has no attempt or poison and must be rebuilt at the final exact
-  recovery-02 commit before replacement L0 publication:
+- Designated integration-owner-controlled detached live worktree, rebuilt and
+  retained clean at exact recovery-02 commit
+  `e58b428629529c9c8bac6963edd51bb115008b57`:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration-live`.
 - Owner and integration owner: `/root`.
 - Heartbeat date: `2026-07-21`.
 - Simulator target: FlightSim build 3385, Training mode.
-- Private root, containing the immutable original and recovery-01 L0 support
-  sets but no attempt directory or poison:
+- Private root, containing the immutable original, recovery-01, and recovery-02
+  L0 support sets plus consumed `F00-A01` and required poison:
   `C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot`.
-- Maximum live scope after every entry gate passes: one accepted powered
-  discovery session; the first failed live attempt ends live work.
+- Maximum live scope is exhausted: the first failed live attempt ended live
+  work, and neither A01 nor poison may be cleared or reinterpreted.
 
 ## Authority and non-transferable boundary
 
@@ -2822,12 +2821,12 @@ port, PAK, or private evidence was contacted. This state/evidence-only update
 does not alter the reviewed executable contract. Its exact resulting hash is
 confirmed before the freeze commit.
 
-## Current entry audit and I0 release
+## Pre-attempt entry audit and I0 release
 
 P0 records the user's four scope decisions. The cooked-PAK route is inactive
-and no organizer PAK clearance is an active prerequisite. The separately
-authorized-collection disjunct in the parent Package 2 entry gate is satisfied
-only for this one bounded build-3385 Training simulation discovery pilot.
+and no organizer PAK clearance was an active prerequisite. The separately
+authorized-collection disjunct in the parent Package 2 entry gate was satisfied
+only for the one now-consumed build-3385 Training simulation discovery pilot.
 
 The actual runtime boundary supplies UDP JPEG frame/generation identities and
 opaque `sim_time_ns`, decoded image contents and dimensions, `HIGHRES_IMU` raw
@@ -3054,9 +3053,99 @@ The 42-test policy remains byte-identical at `2142` expected passes. Fresh
 fast, unit, exact-candidate full non-live, separate strict, integration, and
 detached post-merge VQ2 remain mandatory before recovery-02 L0 publication.
 
-The recovery-02 preparer must exact-admit the immutable eleven-file root,
-publish the five uniquely named recovery-02 files create-new with the freeze
-last, and require exactly sixteen final files while `F00-A01` and poison remain
-absent. This is not a second attempt: the sole attempt latch has never been
-consumed. No PAK was read, and the completed passive timing tranche was not
+The recovery-02 preparer was required to exact-admit the immutable eleven-file
+root, publish the five uniquely named recovery-02 files create-new with the
+freeze last, and require exactly sixteen final files while `F00-A01` and poison
+remained absent. At publication this was not a second attempt: the sole attempt
+latch had never been consumed. No PAK was read, and the completed passive timing
+tranche was not repeated.
+
+### Recovery-02 publication and terminal A01 outcome
+
+Recovery-02 final candidate
+`e58b428629529c9c8bac6963edd51bb115008b57` passed `246` directly affected
+tests, canonical VQ2 at `2225` passes with one skip, fast and unit at `3325`
+passes with 21 skips and 42 deselections each, fresh full non-live at `3366`
+passes with 22 skips, a separate physically pristine hash-pinned gate at exact
+`2142` passes, and detached post-integration VQ2 at `2225` passes with one skip.
+
+The final external preparer at
+`C:\Users\John\aigp-review\2026-07-21-package2-live-freeze-recovery-02\l0_prepare_recovery_02.py`
+has SHA-256
+`44e6784248cf5282bf6964d6be6c75a115e7dd2a86a1dfe645fd40f11a1bb0ac`.
+Independent review required it to prove each predecessor's current-user-only
+effective ACL as well as its owner, final path, volume, non-reparse and
+one-hardlink identity. It pins the inherited capture-authorization ACE flags at
+`0x10` and every protected predecessor/new-file ACE flags at zero. Bundles 5
+and 6 are byte-identical canonical 228424-byte files with SHA-256
+`b91690126d8619b85dcc63389586cfb4b1e11f7c621e4bc77d96ac161b81ea66`.
+Both independent reviewers returned `CLEAR`.
+
+The preparer published, create-new and in order, plan
+`ecaf1912a495cb91ed96fed8b61fc2ff8caa7828534fe2b7c142acf0984e500d`,
+implementation
+`d27e5dfe776ca72e907891dcbdef7b0b7fabdb8d40203df1cb5bb640162c932f`,
+environment
+`cdf96a096365b2d191e19349c7cf7086ee8694817f4dee2174260e1404ac7f40`,
+imports `9389f5c0b4a616c53f66684a56ee012cbefab23d8147d7daa559c295ad4ce957`,
+and freeze
+`d3b1517777d73a6aa358411f33d4d598bd29ef58b865be1aa4e9f4b91a2f2655`
+last. Postpublication revalidation proved the exact sixteen-file root, all
+support-file identities and ACLs, clean detached worktree, exact 52-variable
+environment, and absent A01/poison.
+
+The sole authorized production wrapper process was created at
+`2026-07-21T13:22:58.3707479Z`; its attempt context was created at
+`2026-07-21T13:23:00.358723Z` and consumed `F00-A01`. It published the attempt
+and lease acquisition/heartbeat records, then failed closed during
+`launcher_return` at approximately `2026-07-21T13:23:00Z` with
+`build_or_candidate_changed` and detail
+`child environment drifted from the freeze`. It never queried/created the
+scheduled task, enumerated/launched FlightSim, opened UDP 14550/5600, created a
+powered child or fallback, opened transport, captured a frame, reset, armed,
+disarmed, or sent a target/powered command.
+
+The canonical offline evidence validates with these identities:
+
+- attempt envelope:
+  `8550ed1a1966607c49295db0729161a30f7f71b0ba523b8ee2d171c1d7651e0c`;
+- wrapper lifecycle (11 exact events):
+  `faf07bc2f6b31163123ec4203369e6ca50a3fb0a8de2faf1364788d4e3a783ab`;
+- final lifecycle event:
+  `bbf61bbca471c19c9321859ec6b0f8324c67d1d06052a2086d576b50e979e631`;
+- live poison:
+  `a725abc8f89696f398b73d97a949a817efdda195447bb46fee358788137b8fd0`;
+- attempt-invalid:
+  `c9dbd9e60a940279deeb3052b5e1d763809a8815d54d9e04b2b1e18d6eec47e6`.
+
+The reason-code set is exact
+`build_or_candidate_changed,cleanup_unconfirmed,lease_release_unconfirmed,
+topology_failed`. The four lease records contain acquisition and heartbeats but
+no `release_intent`, `released`, or final index. Formal cleanup is therefore
+failed and poison is mandatory even though repeated post-exit OS snapshots
+show the wrapper and console absent, FlightSim and payload absent, UDP
+14550/5600 ownerless, and `AIGP-P2-F00-A01-Launch` absent. Later absence cannot
+retroactively create the missing ledgered proof.
+
+Offline reproduction isolated the deterministic cause. Environment admission
+froze `PATH` at SHA-256
+`39744aa75e82bc746b4a95893992f89cf68707c136df6b70aaf21330818efda1`,
+then import-graph revalidation loaded the frozen seed `scripts.aigp_vq2_run`.
+That module imports `gate_detection.src.gate_detector`, which imports the pinned
+OpenCV loader. On Windows the loader prepends
+`C:\Users\John\killallhumans\.venv\Lib\site-packages\cv2\../../x64/vc17/bin`
+to `PATH`, changing only that variable to SHA-256
+`946f8b21b7abe870f2a87261714e512bd08a3f28f2e285432e416411f8b3288c`.
+The later exact spawn-environment check correctly rejected the mutation before
+any launcher contact.
+
+No automatic recovery is permitted. A future offline-only recovery design
+should isolate import-graph revalidation from the wrapper environment (or
+freeze the exact post-import environment), add a final native-environment check
+immediately before attempt consumption, seal that mapping for every spawn, and
+retain the later strict equality check. It must add hash-only drift diagnostics
+and non-live tests proving unexpected import mutation leaves attempt, lease,
+and poison absent. It must not ignore `PATH`, clear poison, reuse `F00-A01`, or
+claim another powered attempt without a new reviewed task and fresh explicit
+powered authority. No PAK was read, and the completed passive tranche was not
 repeated.
