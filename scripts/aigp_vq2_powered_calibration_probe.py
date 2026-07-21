@@ -22,6 +22,8 @@ from scripts import aigp_vq2_powered_attempt as attempt_contract
 
 
 PROBE_MODULE = "scripts.aigp_vq2_powered_calibration_probe"
+IMPORT_AUDIT_MODULE = "scripts.aigp_vq2_powered_import_audit"
+POWERED_IMPORT_SEED_MODULES = attempt_contract.IMPORT_INVENTORY_SEEDS
 
 # Modules reached only through the child's deliberately lazy capture/transport
 # loaders.  L0 imports these after the six frozen seed modules and inventories
@@ -37,6 +39,11 @@ if POWERED_EAGER_IMPORT_MODULES != tuple(
     sorted(set(POWERED_EAGER_IMPORT_MODULES), key=lambda item: item.encode("utf-8"))
 ):  # pragma: no cover - import-time code-owned invariant
     raise RuntimeError("POWERED_EAGER_IMPORT_MODULES must be unique and ordinal-sorted")
+
+if POWERED_IMPORT_SEED_MODULES != tuple(
+    sorted(set(POWERED_IMPORT_SEED_MODULES), key=lambda item: item.encode("utf-8"))
+):  # pragma: no cover - import-time shared-contract invariant
+    raise RuntimeError("POWERED_IMPORT_SEED_MODULES must be unique and ordinal-sorted")
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -67,6 +74,31 @@ _POSTRELEASE_PHASES = frozenset(
         "invalid_ready",
     }
 )
+_POWERED_RUNTIME_IMPORT_PROVIDERS = MappingProxyType(
+    {
+        "cv2.utils.fs": ("cv2", ("_native",), ("_native", "utils", "fs"), "venv"),
+        "cv2.utils.logging": (
+            "cv2",
+            ("_native",),
+            ("_native", "utils", "logging"),
+            "venv",
+        ),
+        "cv2.utils.nested": (
+            "cv2",
+            ("_native",),
+            ("_native", "utils", "nested"),
+            "venv",
+        ),
+        "typing.io": ("typing", (), ("io",), "stdlib"),
+        "typing.re": ("typing", (), ("re",), "stdlib"),
+    }
+)
+if tuple(_POWERED_RUNTIME_IMPORT_PROVIDERS) != tuple(
+    sorted(_POWERED_RUNTIME_IMPORT_PROVIDERS, key=lambda item: item.encode("utf-8"))
+):  # pragma: no cover - import-time code-owned invariant
+    raise RuntimeError("runtime import provider map must be ordinal-sorted")
+if tuple(_POWERED_RUNTIME_IMPORT_PROVIDERS) != attempt_contract.RUNTIME_IMPORT_MODULES:
+    raise RuntimeError("runtime import provider map drifted from the schema allowlist")
 
 
 class PoweredCalibrationProbeError(RuntimeError):
@@ -1129,7 +1161,10 @@ def _admit_offline_body(
         )
         frozen_imports = attempt_contract.validate_import_inventory(import_value)
         attempt_contract.validate_live_freeze(
-            freeze, implementation_inventory=implementation
+            freeze,
+            implementation_inventory=implementation,
+            environment_inventory=frozen_environment,
+            import_inventory=frozen_imports,
         )
     except attempt_contract.PoweredAttemptContractError as exc:
         raise OfflineAdmissionError(str(exc)) from exc
@@ -5208,6 +5243,314 @@ class _WindowsProductionOfflineAdmissionBase:
             )
         return roots, classes
 
+    @staticmethod
+    def _loader_lookup_name(module_name: str, spec: Any) -> str:
+        spec_name = getattr(spec, "name", None)
+        if module_name == "__main__":
+            if spec_name != PROBE_MODULE:
+                raise OfflineAdmissionError(
+                    "import-audit __main__ is not the powered probe module"
+                )
+            return PROBE_MODULE
+        if type(spec_name) is str and spec_name:
+            return spec_name
+        return module_name
+
+    @staticmethod
+    def _runtime_attribute(root: Any, path: Sequence[str], label: str) -> Any:
+        current = root
+        for component in path:
+            try:
+                current = getattr(current, component)
+            except AttributeError as exc:
+                raise OfflineAdmissionError(
+                    f"runtime import provider lacks {label}"
+                ) from exc
+        return current
+
+    def _runtime_import_provider_identity(
+        self,
+        module_name: str,
+        module: Any,
+        *,
+        candidate_root: str,
+        venv_root: str,
+        stdlib_root: str,
+    ) -> tuple[str, FileIdentityProof]:
+        provider = _POWERED_RUNTIME_IMPORT_PROVIDERS.get(module_name)
+        if provider is None:
+            raise OfflineAdmissionError(
+                f"spec-less runtime import is not allowlisted: {module_name!r}"
+            )
+        if (
+            getattr(module, "__spec__", None) is not None
+            or getattr(module, "__file__", None) is not None
+            or getattr(module, "__path__", None) is not None
+            or getattr(module, "__name__", None) != module_name
+        ):
+            raise OfflineAdmissionError(
+                f"spec-less runtime import shape changed: {module_name!r}"
+            )
+        provider_module_name, provider_path, value_path, expected_root_class = provider
+        provider_module = sys.modules.get(provider_module_name)
+        if provider_module is None:
+            raise OfflineAdmissionError(
+                f"runtime import provider is absent: {provider_module_name!r}"
+            )
+        if self._runtime_attribute(
+            provider_module, value_path, f"value path for {module_name!r}"
+        ) is not module:
+            raise OfflineAdmissionError(
+                f"runtime import is not owned by its provider: {module_name!r}"
+            )
+        provider_value = self._runtime_attribute(
+            provider_module, provider_path, f"file path for {module_name!r}"
+        )
+        provider_spec = getattr(provider_value, "__spec__", None)
+        origin = getattr(provider_spec, "origin", None)
+        if type(origin) is not str:
+            raise OfflineAdmissionError(
+                f"runtime import provider has no file origin: {module_name!r}"
+            )
+        actual = self._lexical(self._os.path.abspath(origin))
+        if actual != origin or getattr(provider_value, "__file__", None) != actual:
+            raise OfflineAdmissionError(
+                f"runtime import provider origin is noncanonical: {module_name!r}"
+            )
+        root_class = self._classify_root(
+            actual,
+            candidate_root=candidate_root,
+            venv_root=venv_root,
+            stdlib_root=stdlib_root,
+        )
+        if root_class != expected_root_class:
+            raise OfflineAdmissionError(
+                f"runtime import provider root changed: {module_name!r}"
+            )
+        loader_filename = getattr(
+            getattr(provider_spec, "loader", None), "get_filename", None
+        )
+        provider_spec_name = getattr(provider_spec, "name", None)
+        if callable(loader_filename):
+            try:
+                loader_origin = self._lexical(
+                    self._os.path.abspath(loader_filename(provider_spec_name))
+                )
+            except (ImportError, AttributeError, OSError, TypeError) as exc:
+                raise OfflineAdmissionError(
+                    f"runtime import provider loader is invalid: {module_name!r}"
+                ) from exc
+            if loader_origin != actual:
+                raise OfflineAdmissionError(
+                    f"runtime import provider loader drifted: {module_name!r}"
+                )
+        return actual, self.observe_file_identity(actual, hash_kind="file_bytes")
+
+    def _initial_import_entry(
+        self,
+        module_name: str,
+        module: Any,
+        *,
+        candidate_root: str,
+        venv_root: str,
+        stdlib_root: str,
+    ) -> dict[str, Any]:
+        self._checkpoint()
+        spec = getattr(module, "__spec__", None)
+        if spec is None:
+            origin, identity = self._runtime_import_provider_identity(
+                module_name,
+                module,
+                candidate_root=candidate_root,
+                venv_root=venv_root,
+                stdlib_root=stdlib_root,
+            )
+            return {
+                "module": module_name,
+                "origin": origin,
+                "size_bytes": identity.size_bytes,
+                "sha256": identity.sha256,
+                "root_class": "runtime",
+                "namespace_roots": [],
+            }
+
+        origin = getattr(spec, "origin", None)
+        if origin in {"built-in", "frozen"}:
+            return {
+                "module": module_name,
+                "origin": None,
+                "size_bytes": None,
+                "sha256": None,
+                "root_class": "builtin" if origin == "built-in" else "frozen",
+                "namespace_roots": [],
+            }
+
+        locations = getattr(spec, "submodule_search_locations", None)
+        if origin is None and locations is not None:
+            roots, classes = self._namespace_roots(
+                locations,
+                candidate_root=candidate_root,
+                venv_root=venv_root,
+                stdlib_root=stdlib_root,
+            )
+            if not roots or len(classes) != 1 or None in classes:
+                raise OfflineAdmissionError(
+                    f"namespace import roots are mixed or unclassified: {module_name!r}"
+                )
+            return {
+                "module": module_name,
+                "origin": None,
+                "size_bytes": None,
+                "sha256": None,
+                "root_class": "namespace",
+                "namespace_roots": roots,
+            }
+        if type(origin) is not str:
+            raise OfflineAdmissionError(
+                f"import origin is not classifiable: {module_name!r}"
+            )
+
+        actual = self._lexical(self._os.path.abspath(origin))
+        if actual != origin:
+            raise OfflineAdmissionError(
+                f"import origin is not canonical absolute: {module_name!r}"
+            )
+        root_class = self._classify_root(
+            actual,
+            candidate_root=candidate_root,
+            venv_root=venv_root,
+            stdlib_root=stdlib_root,
+        )
+        if root_class is None:
+            raise OfflineAdmissionError(
+                f"import origin is outside every frozen root: {module_name!r}"
+            )
+        module_file = getattr(module, "__file__", None)
+        if type(module_file) is not str or self._os.path.abspath(module_file) != actual:
+            raise OfflineAdmissionError(
+                f"module file does not equal its import origin: {module_name!r}"
+            )
+        loader_filename = getattr(getattr(spec, "loader", None), "get_filename", None)
+        if callable(loader_filename):
+            lookup_name = self._loader_lookup_name(module_name, spec)
+            try:
+                loader_origin = self._lexical(
+                    self._os.path.abspath(loader_filename(lookup_name))
+                )
+            except (ImportError, AttributeError, OSError) as exc:
+                raise OfflineAdmissionError(
+                    f"loader origin could not be verified: {module_name!r}"
+                ) from exc
+            if loader_origin != actual:
+                raise OfflineAdmissionError(
+                    f"loader origin does not equal module origin: {module_name!r}"
+                )
+        identity = self.observe_file_identity(actual, hash_kind="file_bytes")
+        return {
+            "module": module_name,
+            "origin": actual,
+            "size_bytes": identity.size_bytes,
+            "sha256": identity.sha256,
+            "root_class": root_class,
+            "namespace_roots": [],
+        }
+
+    def derive_initial_import_inventory(
+        self,
+        seed_modules: Sequence[str],
+        eager_modules: Sequence[str],
+        *,
+        audit_module: str,
+    ) -> Mapping[str, Any]:
+        """Derive the complete graph in one isolated, bounded L0 interpreter."""
+
+        import importlib
+
+        if tuple(seed_modules) != POWERED_IMPORT_SEED_MODULES:
+            raise OfflineAdmissionError("powered import seed inventory changed")
+        if tuple(eager_modules) != POWERED_EAGER_IMPORT_MODULES:
+            raise OfflineAdmissionError("powered eager-import inventory changed")
+        if audit_module != IMPORT_AUDIT_MODULE:
+            raise OfflineAdmissionError("initial import audit module changed")
+        for name in seed_modules:
+            module = sys.modules.get(name)
+            if module is None or getattr(getattr(module, "__spec__", None), "name", None) != name:
+                raise OfflineAdmissionError(
+                    f"powered import seed was not loaded in audit order: {name!r}"
+                )
+        for name in eager_modules:
+            self._bounded_import(importlib, name)
+
+        audit_main = sys.modules.get("__main__")
+        audit_spec = getattr(audit_main, "__spec__", None)
+        if getattr(audit_spec, "name", None) != audit_module:
+            raise OfflineAdmissionError(
+                "initial import inventory did not use the exact audit module"
+            )
+        production_main = sys.modules.get(PROBE_MODULE)
+        if production_main is None:
+            raise OfflineAdmissionError("powered probe seed module is absent")
+        production_spec = getattr(production_main, "__spec__", None)
+        if getattr(production_spec, "name", None) != PROBE_MODULE:
+            raise OfflineAdmissionError("powered probe seed identity is invalid")
+        # The live process executes PROBE_MODULE with -m.  Normalize the audit
+        # interpreter's sole execution-module alias to that exact future
+        # identity before taking the complete sys.modules snapshot.
+        sys.modules["__main__"] = production_main
+
+        sysconfig = self._bounded_import(importlib, "sysconfig")
+        candidate_root = self.current_working_directory().path
+        venv_root, stdlib_root = self._runtime_roots(candidate_root, sysconfig)
+        module_snapshot = sorted(
+            (
+                (name, module)
+                for name, module in tuple(sys.modules.items())
+                if module is not None
+            ),
+            key=lambda item: item[0].encode("utf-8"),
+        )
+        module_names = [name for name, _module in module_snapshot]
+        if len(module_names) != len(set(module_names)):
+            raise OfflineAdmissionError("sys.modules contains duplicate names")
+        entries = [
+            self._initial_import_entry(
+                name,
+                module,
+                candidate_root=candidate_root,
+                venv_root=venv_root,
+                stdlib_root=stdlib_root,
+            )
+            for name, module in module_snapshot
+        ]
+        final_snapshot = sorted(
+            (
+                (name, module)
+                for name, module in tuple(sys.modules.items())
+                if module is not None
+            ),
+            key=lambda item: item[0].encode("utf-8"),
+        )
+        if len(final_snapshot) != len(module_snapshot) or any(
+            final_name != initial_name or final_module is not initial_module
+            for (initial_name, initial_module), (final_name, final_module) in zip(
+                module_snapshot, final_snapshot, strict=True
+            )
+        ):
+            raise OfflineAdmissionError(
+                "sys.modules changed while the initial inventory was derived"
+            )
+        python_identity = self.observe_file_identity(
+            self._os.path.abspath(sys.executable), hash_kind="file_bytes"
+        )
+        return attempt_contract.validate_import_inventory(
+            {
+                "schema": "aigp-vq2-powered-import-inventory/1",
+                "python_sha256": python_identity.sha256,
+                "seeds": list(seed_modules),
+                "entries": entries,
+            }
+        )
+
     def _rederive_import_inventory_hardened(
         self,
         frozen_inventory: Mapping[str, Any],
@@ -5243,6 +5586,24 @@ class _WindowsProductionOfflineAdmissionBase:
                 expected_origin = "built-in" if root_class == "builtin" else "frozen"
                 if origin != expected_origin:
                     origins_reverified = False
+            elif root_class == "runtime":
+                try:
+                    runtime_origin, runtime_identity = (
+                        self._runtime_import_provider_identity(
+                            name,
+                            module,
+                            candidate_root=candidate_root,
+                            venv_root=venv_root,
+                            stdlib_root=stdlib_root,
+                        )
+                    )
+                except OfflineAdmissionError:
+                    origins_reverified = False
+                else:
+                    if runtime_origin != entry["origin"]:
+                        origins_reverified = False
+                    candidate["size_bytes"] = runtime_identity.size_bytes
+                    candidate["sha256"] = runtime_identity.sha256
             elif root_class == "namespace":
                 roots, classes = self._namespace_roots(
                     getattr(spec, "submodule_search_locations", None),
@@ -5278,7 +5639,8 @@ class _WindowsProductionOfflineAdmissionBase:
                     loader_filename = getattr(getattr(spec, "loader", None), "get_filename", None)
                     if callable(loader_filename):
                         try:
-                            if self._os.path.abspath(loader_filename(name)) != actual:
+                            lookup_name = self._loader_lookup_name(name, spec)
+                            if self._os.path.abspath(loader_filename(lookup_name)) != actual:
                                 origins_reverified = False
                         except (ImportError, AttributeError, OSError):
                             origins_reverified = False
@@ -5313,6 +5675,8 @@ class _WindowsProductionOfflineAdmissionBase:
                     unexpected.append(name)
                 continue
             if origin is None:
+                if name not in frozen_names:
+                    unclassified.append(f"runtime:{name}")
                 continue
             actual = self._lexical(self._os.path.abspath(str(origin)))
             root_class = self._classify_root(
@@ -7504,6 +7868,47 @@ class WindowsProductionLiveBoundary:
             )
         return values
 
+    @staticmethod
+    def _spawn_environment_sha256(environment: Mapping[str, str]) -> str:
+        """Derive the canonical inventory-variable digest for one spawn map."""
+
+        if type(environment) is not dict:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "native spawn environment is not an exact mapping",
+            )
+        variables: list[dict[str, Any]] = []
+        for name, value in environment.items():
+            if type(name) is not str or type(value) is not str:
+                raise OrchestrationPhaseError(
+                    "build_or_candidate_changed",
+                    "native spawn environment contains a non-string entry",
+                )
+            variables.append(
+                {
+                    "name": name,
+                    "defined": True,
+                    "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                }
+            )
+        variables.sort(
+            key=lambda item: (item["name"].casefold(), item["name"].encode("utf-8"))
+        )
+        semantic_inventory = {
+            "schema": "aigp-vq2-powered-environment-inventory/1",
+            # Provenance is excluded from the semantic digest.  This fixed valid
+            # value lets the shared inventory validator check the derived rows.
+            "created_at_utc": "1970-01-01T00:00:00.000000Z",
+            "variables": variables,
+        }
+        try:
+            return attempt_contract.environment_variables_sha256(semantic_inventory)
+        except attempt_contract.PoweredAttemptContractError as exc:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "native spawn environment is not canonical",
+            ) from exc
+
     def _attempt_directory_receipt(self) -> SecureDirectoryReceipt:
         receipt = self.secure.open_private_directory(
             self.freeze["paths"]["attempt_dir"],
@@ -7874,11 +8279,18 @@ class WindowsProductionLiveBoundary:
         deadline_monotonic_ns: int,
         heartbeat: HeartbeatPump,
     ) -> Any:
-        import os
         import subprocess
 
         if attempt_contract.validate_live_freeze(freeze) != self.freeze:
             raise OrchestrationPhaseError("launch_failed", "live freeze changed")
+        environment = self._native_environment_for_spawn()
+        if self._spawn_environment_sha256(environment) != self.freeze["execution"][
+            "launcher_environment_sha256"
+        ]:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "launcher environment drifted from the freeze",
+            )
         before_task = self._query_task_absent(
             "before_launch",
             deadline_monotonic_ns=deadline_monotonic_ns,
@@ -7893,7 +8305,7 @@ class WindowsProductionLiveBoundary:
         process = subprocess.Popen(
             argv,
             cwd=self.freeze["execution"]["launcher_cwd"],
-            env=dict(os.environ),
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -10415,6 +10827,76 @@ class _ProductionFactories:
                 raise TypeError(f"production {name} factory must be callable")
 
 
+def run_initial_import_inventory_audit(
+    *,
+    audit_module: str,
+    seed_modules: Sequence[str],
+) -> int:
+    """Emit one non-live L0 import inventory to an inherited stdout pipe.
+
+    This entry point constructs only the QPC and read-only offline identity
+    boundaries.  It has no private-root, simulator, process-launch, mutex,
+    socket, fixed-port, or publication provider.
+    """
+
+    if audit_module != IMPORT_AUDIT_MODULE:
+        raise OfflineAdmissionError("initial import audit module changed")
+    if tuple(seed_modules) != POWERED_IMPORT_SEED_MODULES:
+        raise OfflineAdmissionError("powered import seed inventory changed")
+    expected_tail = ["-E", "-s", "-B", "-m", audit_module]
+    WindowsProductionOfflineAdmission._validate_invocation_values(
+        implementation=sys.implementation.name,
+        version=tuple(sys.version_info[:3]),
+        ignore_environment=sys.flags.ignore_environment,
+        no_user_site=sys.flags.no_user_site,
+        dont_write_bytecode=sys.flags.dont_write_bytecode,
+        observed_argv=list(getattr(sys, "orig_argv", ())),
+        expected_tail=expected_tail,
+    )
+    if len(sys.argv) != 1:
+        raise OfflineAdmissionError("initial import audit accepts no arguments")
+    output = getattr(sys.stdout, "buffer", None)
+    if output is None or sys.stdout.isatty():
+        raise OfflineAdmissionError(
+            "initial import audit stdout must be an inherited binary pipe"
+        )
+
+    from scripts import aigp_vq2_powered_runtime as powered_runtime
+
+    clock = powered_runtime.WindowsQpcProvider()
+    service = WindowsProductionOfflineAdmission()
+    begun = False
+    succeeded = False
+    try:
+        started = clock.now_ns()
+        service.begin_bounded_admission(
+            deadline_monotonic_ns=(
+                started + attempt_contract.DEADLINE_DURATIONS_NS["offline_precheck"]
+            ),
+            monotonic_ns=clock.now_ns,
+            heartbeat=None,
+        )
+        begun = True
+        inventory = service.derive_initial_import_inventory(
+            seed_modules,
+            POWERED_EAGER_IMPORT_MODULES,
+            audit_module=audit_module,
+        )
+        succeeded = True
+    finally:
+        try:
+            if begun:
+                service.end_bounded_admission(succeeded=succeeded)
+        finally:
+            service.close()
+    payload = attempt_contract.canonical_json_file_bytes(inventory)
+    if len(payload) > WindowsProductionOfflineAdmission._MAX_JSON_BYTES:
+        raise OfflineAdmissionError("initial import inventory exceeds its size bound")
+    output.write(payload)
+    output.flush()
+    return 0
+
+
 def _new_production_clock() -> Any:
     from scripts import aigp_vq2_powered_runtime as powered_runtime
 
@@ -10617,8 +11099,32 @@ def main(
     return 0
 
 
+def _validate_production_main_module_identity() -> None:
+    module = sys.modules.get("__main__")
+    spec = getattr(module, "__spec__", None)
+    if (
+        module is None
+        or getattr(spec, "name", None) != PROBE_MODULE
+        or type(getattr(spec, "origin", None)) is not str
+    ):
+        raise OfflineAdmissionError(
+            "powered probe must execute as the exact -m production module"
+        )
+    loader_filename = getattr(getattr(spec, "loader", None), "get_filename", None)
+    if not callable(loader_filename):
+        raise OfflineAdmissionError("powered probe execution loader is not file-backed")
+    try:
+        loader_origin = ntpath.normpath(loader_filename(PROBE_MODULE))
+    except (ImportError, AttributeError, OSError, TypeError) as exc:
+        raise OfflineAdmissionError("powered probe execution loader is invalid") from exc
+    if loader_origin != ntpath.normpath(spec.origin):
+        raise OfflineAdmissionError("powered probe execution origin is inconsistent")
+
+
 __all__ = [
+    "IMPORT_AUDIT_MODULE",
     "POWERED_EAGER_IMPORT_MODULES",
+    "POWERED_IMPORT_SEED_MODULES",
     "TRANCHE2_INTEGRATION_METHODS",
     "AttemptGateError",
     "AttemptHandleSet",
@@ -10692,10 +11198,12 @@ __all__ = [
     "generate_capability_secrets",
     "main",
     "parse_arguments",
+    "run_initial_import_inventory_audit",
     "validate_attempt_gate",
     "validate_live_orchestration_services",
 ]
 
 
 if __name__ == "__main__":  # pragma: no cover - production entry point
+    _validate_production_main_module_identity()
     raise SystemExit(main())

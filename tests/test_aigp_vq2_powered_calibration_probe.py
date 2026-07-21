@@ -219,7 +219,9 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
                 "-StartupTimeoutSeconds",
                 "25",
             ],
-            "launcher_environment_sha256": H,
+            "launcher_environment_sha256": contract.environment_variables_sha256(
+                environment
+            ),
             "child_cwd": LIVE_WORKTREE,
             "cleanup_cwd": LIVE_WORKTREE,
         },
@@ -1063,6 +1065,25 @@ def test_import_is_inert_and_cli_is_exact(monkeypatch):
         probe.parse_arguments(abbreviated)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="powered production module is Win32-only")
+def test_real_dash_m_probe_has_production_main_identity_before_cli_refusal():
+    result = subprocess.run(
+        [sys.executable, "-E", "-s", "-B", "-m", probe.PROBE_MODULE],
+        cwd=Path.cwd(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    stderr = result.stderr.decode(errors="replace")
+    assert result.returncode == 2
+    assert "--live-freeze" in stderr
+    assert "--live-freeze-sha256" in stderr
+    assert "--expected-commit" in stderr
+    assert "exact -m production module" not in stderr
+
+
 def test_offline_admission_revalidates_every_semantic_and_origin(tmp_path):
     freeze, service, admission = _admission(tmp_path)
     assert admission.live_freeze == freeze
@@ -1072,6 +1093,22 @@ def test_offline_admission_revalidates_every_semantic_and_origin(tmp_path):
     assert service.calls.index("cwd") < service.calls.index("import-rederive")
     expected_module = LIVE_WORKTREE + r"\scripts\aigp_vq2_powered_calibration_probe.py"
     assert f"identity:{expected_module}" in service.calls
+
+
+def test_offline_admission_cross_binds_frozen_environment_to_launcher(tmp_path):
+    freeze, documents = _freeze()
+    freeze["execution"]["launcher_environment_sha256"] = H
+    service = FakeOffline(tmp_path, freeze=freeze, documents=documents)
+    arguments = probe.ProbeArguments(
+        freeze["paths"]["live_freeze"],
+        contract.canonical_file_sha256(freeze),
+        COMMIT,
+    )
+    with pytest.raises(
+        probe.OfflineAdmissionError,
+        match=r"execution\.launcher_environment_sha256",
+    ):
+        probe.admit_offline(arguments, service)
 
 
 @pytest.mark.parametrize("fault", ["dirty", "environment", "imports", "canonical"])
@@ -2408,6 +2445,230 @@ class TestWindowsProductionOfflineAdmission:
         assert observed == size - 1
         return buffer.value
 
+    def test_isolated_initial_import_audit_is_complete_and_deterministic(self):
+        assert tuple(probe._POWERED_RUNTIME_IMPORT_PROVIDERS) == (
+            contract.RUNTIME_IMPORT_MODULES
+        )
+        command = [
+            sys.executable,
+            "-E",
+            "-s",
+            "-B",
+            "-m",
+            probe.IMPORT_AUDIT_MODULE,
+        ]
+        observed = [
+            subprocess.run(
+                command,
+                cwd=Path.cwd(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+            for _index in range(2)
+        ]
+        for result in observed:
+            assert result.returncode == 0, result.stderr.decode(errors="replace")
+            assert result.stderr == b""
+        assert observed[0].stdout == observed[1].stdout
+        inventory = contract.parse_and_validate_powered_record(observed[0].stdout)
+        assert inventory["seeds"] == list(probe.POWERED_IMPORT_SEED_MODULES)
+        entries = {entry["module"]: entry for entry in inventory["entries"]}
+        assert len(entries) == len(inventory["entries"])
+        assert probe.IMPORT_AUDIT_MODULE not in entries
+        assert entries["__main__"]["root_class"] == "candidate"
+        assert entries["__main__"]["origin"] == str(
+            (Path.cwd() / "scripts" / "aigp_vq2_powered_calibration_probe.py").resolve()
+        )
+        assert entries[probe.PROBE_MODULE]["origin"] == entries["__main__"]["origin"]
+        for name in (
+            "typing.io",
+            "typing.re",
+            "cv2.utils.fs",
+            "cv2.utils.logging",
+            "cv2.utils.nested",
+        ):
+            assert entries[name]["root_class"] == "runtime"
+            assert entries[name]["sha256"] is not None
+            assert entries[name]["origin"] is not None
+            assert entries[name]["size_bytes"] > 0
+        assert entries["typing.io"]["origin"].endswith(r"\Lib\typing.py")
+        assert entries["typing.re"]["origin"] == entries["typing.io"]["origin"]
+        assert entries["cv2.utils.fs"]["origin"].endswith(r"\cv2\cv2.pyd")
+        assert entries["cv2.utils.logging"]["origin"] == entries["cv2.utils.fs"][
+            "origin"
+        ]
+        assert entries["cv2.utils.nested"]["origin"] == entries["cv2.utils.fs"][
+            "origin"
+        ]
+        assert {
+            "builtin",
+            "candidate",
+            "frozen",
+            "namespace",
+            "runtime",
+            "stdlib",
+            "venv",
+        }.issubset({entry["root_class"] for entry in inventory["entries"]})
+
+    def test_initial_import_snapshot_rejects_same_name_object_replacement(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        service = probe.WindowsProductionOfflineAdmission()
+        self._begin(service)
+        replacement_name = "aigp_snapshot_replacement_probe"
+        initial_value = SimpleNamespace()
+        monkeypatch.setitem(sys.modules, replacement_name, initial_value)
+        monkeypatch.setitem(
+            sys.modules,
+            "__main__",
+            SimpleNamespace(__spec__=SimpleNamespace(name=probe.IMPORT_AUDIT_MODULE)),
+        )
+        for name in probe.POWERED_IMPORT_SEED_MODULES:
+            current = sys.modules.get(name)
+            if current is None or getattr(getattr(current, "__spec__", None), "name", None) != name:
+                monkeypatch.setitem(
+                    sys.modules,
+                    name,
+                    SimpleNamespace(__spec__=SimpleNamespace(name=name)),
+                )
+        monkeypatch.setattr(
+            service,
+            "_bounded_import",
+            lambda _importlib, name: SimpleNamespace(name=name),
+        )
+        monkeypatch.setattr(
+            service,
+            "current_working_directory",
+            lambda: probe.PathProof(
+                LIVE_WORKTREE,
+                LIVE_WORKTREE,
+                "directory",
+                "test-volume",
+            ),
+        )
+        monkeypatch.setattr(
+            service,
+            "_runtime_roots",
+            lambda _candidate, _sysconfig: (r"C:\venv", r"C:\stdlib"),
+        )
+        replaced = False
+
+        def entry(module_name, _module, **_roots):
+            nonlocal replaced
+            if not replaced:
+                sys.modules[replacement_name] = SimpleNamespace()
+                replaced = True
+            return {
+                "module": module_name,
+                "origin": None,
+                "size_bytes": None,
+                "sha256": None,
+                "root_class": "builtin",
+                "namespace_roots": [],
+            }
+
+        monkeypatch.setattr(service, "_initial_import_entry", entry)
+        try:
+            with pytest.raises(probe.OfflineAdmissionError, match="sys.modules changed"):
+                service.derive_initial_import_inventory(
+                    probe.POWERED_IMPORT_SEED_MODULES,
+                    probe.POWERED_EAGER_IMPORT_MODULES,
+                    audit_module=probe.IMPORT_AUDIT_MODULE,
+                )
+        finally:
+            service.end_bounded_admission(succeeded=False)
+
+    def test_isolated_import_audit_revalidates_in_the_live_main_shape(self):
+        inventory_process = subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                "-s",
+                "-B",
+                "-m",
+                probe.IMPORT_AUDIT_MODULE,
+            ],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert inventory_process.returncode == 0, inventory_process.stderr.decode(
+            errors="replace"
+        )
+        child_code = """
+import os
+import runpy
+import sys
+from scripts import aigp_vq2_powered_attempt as contract
+from scripts import aigp_vq2_powered_calibration_probe as probe
+from scripts import aigp_vq2_powered_runtime as runtime
+inventory = contract.parse_canonical_json_bytes(sys.stdin.buffer.read(), file_form=True)
+sys.path[0] = os.getcwd()
+sys.modules['__main__'] = sys.modules[probe.PROBE_MODULE]
+clock = runtime.WindowsQpcProvider()
+service = probe.WindowsProductionOfflineAdmission()
+service.begin_bounded_admission(
+    deadline_monotonic_ns=clock.now_ns() + 10_000_000_000,
+    monotonic_ns=clock.now_ns,
+    heartbeat=None,
+)
+succeeded = False
+try:
+    audit = service.rederive_import_inventory(
+        inventory, probe.POWERED_EAGER_IMPORT_MODULES
+    )
+    succeeded = True
+finally:
+    try:
+        service.end_bounded_admission(succeeded=succeeded)
+    finally:
+        service.close()
+result = {
+    'semantic_equal': {
+        key: audit.inventory[key] for key in ('python_sha256', 'seeds', 'entries')
+    } == {
+        key: inventory[key] for key in ('python_sha256', 'seeds', 'entries')
+    },
+    'origins_reverified': audit.origins_reverified,
+    'user_site_on_sys_path': audit.user_site_on_sys_path,
+    'unexpected': list(audit.unexpected_candidate_or_venv_modules),
+    'unclassified': list(audit.unclassified_origins),
+    'missing': [
+        entry['module'] for entry in inventory['entries']
+        if sys.modules.get(entry['module']) is None
+    ],
+}
+sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
+"""
+        revalidation = subprocess.run(
+            [sys.executable, "-E", "-s", "-B", "-c", child_code],
+            cwd=Path.cwd(),
+            input=inventory_process.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert revalidation.returncode == 0, revalidation.stderr.decode(
+            errors="replace"
+        )
+        assert contract.parse_canonical_json_bytes(
+            revalidation.stdout, file_form=True
+        ) == {
+            "semantic_equal": True,
+            "origins_reverified": True,
+            "user_site_on_sys_path": False,
+            "unexpected": [],
+            "unclassified": [],
+            "missing": [],
+        }
+
     def test_native_environment_snapshot_detects_non_python_drift(self):
         import ctypes
 
@@ -2833,6 +3094,98 @@ def _bare_production_boundary(freeze, *, clock=None):
     boundary._lease_release_attempted = False
     boundary._closed = False
     return boundary
+
+
+def test_production_launcher_passes_exact_native_environment_not_os_environ(
+    monkeypatch,
+):
+    freeze, _documents = _freeze()
+    native_environment = {"NATIVE_ONLY": "native-value"}
+    freeze["execution"]["launcher_environment_sha256"] = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            native_environment
+        )
+    )
+    boundary = _bare_production_boundary(freeze)
+    monkeypatch.setenv("NATIVE_ONLY", "os-environ-value")
+    monkeypatch.setenv("OS_ONLY", "must-not-be-forwarded")
+    monkeypatch.setattr(
+        boundary,
+        "_native_environment_for_spawn",
+        lambda: native_environment,
+    )
+    monkeypatch.setattr(
+        boundary,
+        "_query_task_absent",
+        lambda phase, **_kwargs: {
+            "phase": phase,
+            "observed_monotonic_ns": 1,
+            "query_exit_code": 1,
+            "absent": True,
+        },
+    )
+    monkeypatch.setattr(
+        boundary,
+        "_enumerate_simulator",
+        lambda: {"launcher": None, "payload": None},
+    )
+    monkeypatch.setattr(boundary, "_wait_subprocess", lambda *_args, **_kwargs: 0)
+    captured: dict[str, Any] = {}
+
+    def popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    result = boundary.launch_and_wait(
+        freeze=freeze,
+        deadline_monotonic_ns=1_000_000,
+        heartbeat=probe.HeartbeatPump("launcher_return", 1_000_000, 1_000, lambda: None),
+    )
+    assert result["launch"]["disposition"] == "absent_before_launcher_current_after"
+    assert captured["env"] is native_environment
+    assert captured["env"] == {"NATIVE_ONLY": "native-value"}
+    assert "OS_ONLY" not in captured["env"]
+
+
+def test_production_launcher_refuses_native_only_environment_drift_before_popen(
+    monkeypatch,
+):
+    freeze, _documents = _freeze()
+    frozen_environment = {"NATIVE_ONLY": "frozen-value"}
+    freeze["execution"]["launcher_environment_sha256"] = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            frozen_environment
+        )
+    )
+    boundary = _bare_production_boundary(freeze)
+    monkeypatch.setenv("NATIVE_ONLY", "frozen-value")
+    monkeypatch.setattr(
+        boundary,
+        "_native_environment_for_spawn",
+        lambda: {"NATIVE_ONLY": "native-drift"},
+    )
+    popen_called = False
+
+    def popen(*_args, **_kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("launcher Popen must not run after environment drift")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    with pytest.raises(
+        probe.OrchestrationPhaseError,
+        match="launcher environment drifted",
+    ):
+        boundary.launch_and_wait(
+            freeze=freeze,
+            deadline_monotonic_ns=1_000_000,
+            heartbeat=probe.HeartbeatPump(
+                "launcher_return", 1_000_000, 1_000, lambda: None
+            ),
+        )
+    assert popen_called is False
 
 
 class _ProductionRetained:

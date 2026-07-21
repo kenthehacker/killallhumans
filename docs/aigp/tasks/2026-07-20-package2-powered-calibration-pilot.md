@@ -846,7 +846,10 @@ as exact `{path,size_bytes,sha256}`. Candidate `code_sha256` hashes the canonica
 `schema,created_at_utc,variables`; variables is every Windows environment entry
 as exact `{name,defined,value_sha256}`, with uppercase name, literal
 `defined=true`, and SHA-256 of its UTF-8 value, sorted case-insensitively with
-duplicate-name rejection. The import inventory is
+duplicate-name rejection. Its timestamp-independent semantic identity is
+`SHA256(canonical_object({"variables":variables}))`; the runtime identity ref
+separately hashes the complete canonical inventory file including its one LF.
+The import inventory is
 `aigp-vq2-powered-import-inventory/1` with exact
 `schema,python_sha256,seeds,entries`; `seeds` is the exact sorted array
 `scripts.aigp_vq2_powered_attempt,scripts.aigp_vq2_powered_calibration_analysis,
@@ -859,20 +862,52 @@ return;
 each entry is exact `{module,origin,size_bytes,sha256,root_class,
 namespace_roots}` and is sorted uniquely by module. Origin and byte SHA/size are
 nonnull for file-backed modules and null only for built-in, frozen, or namespace
-packages; root class is `candidate|venv|stdlib|builtin|frozen|namespace`.
+packages; root class is
+`candidate|venv|stdlib|builtin|frozen|namespace|runtime`.
 Namespace packages alone carry a nonempty sorted exact absolute
 `namespace_roots` array; every root must classify wholly under one frozen
 candidate/venv/stdlib root, with mixed or unclassified roots rejected. Every
-other entry carries the empty array. L0 runs the isolated probe twice and
-requires byte-semantic equality of `{python_sha256,seeds,entries}` before
-freezing it.
+other entry carries the empty array. `runtime` is not a generic escape hatch:
+it is allowed only for exact spec-less/file-less entries `typing.io`,
+`typing.re`, `cv2.utils.fs`, `cv2.utils.logging`, and `cv2.utils.nested`. The
+typing entries must be the exact children of the inventoried `typing` provider
+and bind the absolute path, byte size, and SHA-256 of `typing.py`. The OpenCV
+entries must be the exact children of `cv2._native.utils` and bind the absolute
+path, byte size, and SHA-256 of the native provider `cv2._native.__spec__.origin`
+(`cv2.pyd` in the admitted environment). Any other spec-less entry, provider
+relationship, provider root, loader origin, or provider byte identity is
+rejected.
+
+The isolated builder has one non-live, no-argument audit invocation:
+
+```text
+<python> -E -s -B -m scripts.aigp_vq2_powered_import_audit
+```
+
+Its stdout must be an inherited binary pipe. It has no private-root,
+publication, simulator, process-launch, mutex, socket, or fixed-port provider.
+The audit module imports the six seeds and then the eager list in their exact
+array orders exactly once; the builder asserts seed presence instead of
+re-importing them. After proving its own execution-module spec and the canonical
+probe seed, it normalizes only the `sys.modules["__main__"]` alias to the probe
+module identity that the later sole powered `-m` invocation will have, then
+enumerates every nonnull entry. Both the sorted names and the identity of every
+value object must remain unchanged through origin hashing. This prevents an
+audit-driver `__main__` from being frozen in place of the powered probe or a
+same-name replacement from escaping the snapshot. L0 runs this isolated process
+twice and requires byte-semantic equality of `{python_sha256,seeds,entries}`
+before freezing it.
 
 The wrapper never regenerates an inventory file or its timestamp. Before
 attempt and again before child release it re-derives and compares only the
 deterministic semantic payloads: implementation `{commit,tree,entries}`,
 environment `variables`, and imports `{python_sha256,seeds,entries}`. The original
 environment `created_at_utc` remains file provenance and is excluded from that
-semantic comparison. Import comparison also re-resolves every inventoried
+semantic comparison. Freeze validation, when supplied all three inventories, binds
+each complete canonical inventory-file hash, binds `candidate.code_sha256` to
+the implementation semantics, binds the launcher environment hash to the
+environment semantics, and binds import `python_sha256` to the frozen runtime
+Python byte hash. Import comparison also re-resolves every inventoried
 origin/hash and rejects any loaded candidate- or venv-root module absent from
 entries; additional standard-library bootstrap modules are allowed only from
 the frozen stdlib root. Any payload or frozen file-byte hash drift invalidates.
@@ -964,7 +999,13 @@ L0 creates, independently reviews, and byte-hash pins exactly one private
   `security_environment` is exact `PYTHONNOUSERSITE=1`,
   `PYTHONDONTWRITEBYTECODE=1`, and sorted forbidden-defined array
   `PYTHONHOME,PYTHONPATH,PYTHONSTARTUP`; the complete environment must hash to
-  the runtime inventory. Launcher argv is the exact string array
+  the runtime inventory. `runtime.environment_inventory.sha256` is the complete
+  canonical inventory-file hash, while `launcher_environment_sha256` is the
+  timestamp-independent canonical `{"variables":variables}` object hash
+  defined above. The wrapper captures the native `GetEnvironmentStringsW`
+  mapping, re-derives both bindings, and passes that exact mapping object to the
+  launcher and child; `os.environ` cannot mask a native-only change. Launcher
+  argv is the exact string array
   `<absolute-powershell>,-NoLogo,-NoProfile,-NonInteractive,-ExecutionPolicy,Bypass,-File,<absolute-launch_sim.ps1>,-SimulatorPath,C:\Users\John\AIGP\AIGP_3385\FlightSim.exe,-TaskName,AIGP-P2-F00-A01-Launch,-StartupTimeoutSeconds,25`.
   It contains no `RunAsUser`, environment-derived simulator path, or extra
   option. The wrapper proves the exact task name absent before launch, after
@@ -2611,8 +2652,11 @@ Direct tests must cover at least:
   or exclusion, `uncomputed` structural fields, and no calibration-acceptance
   claim or pre-model singular-value inspection;
 - absolute interpreter/hash, environment rejection, import-origin/bytecode,
-  detached-clean-worktree, canonical-launch, exclusive lease, process/build,
-  port ordering, deadlines, and atomic invalidation;
+  deterministic double-run initial import audit, exact `__main__` `-m` parity,
+  spec-less provider-byte anchoring, same-name module replacement rejection,
+  native-only environment drift, detached-clean-worktree, canonical-launch,
+  exclusive lease, process/build, port ordering, deadlines, and atomic
+  invalidation;
 - `SO_EXCLUSIVEADDRUSE` before bind with no reuse, bind-conflict and partial-
   construction close, one-peer freeze, second-source rejection, actual child
   PID/port mapping, fallback never binding 5600, and stuck-worker disconnect;
@@ -2776,10 +2820,39 @@ interfaces while leaving excitation and safety bounds unchanged. I0 now
 implements the immutable wire schemas, pure powered contracts, OS/runtime
 primitives, replay/analysis service, cleanup certificate, isolated probe, and
 production entry composition. Directly affected tests and the canonical VQ2,
-fast, and unit non-live suites are green. T0 remains open for the separate
-trusted-policy/manifest commit and fresh exact-commit `test-full-non-live` and
-hash-pinned VQ2 promotion gates. This releases no integration, live-freeze, or
-powered gate.
+fast, and unit non-live suites are green.
+
+The first T0/T1 promotion completed on behavior commit
+`508d43d49c4f2b6704b3d6d51e071157de4ce2a3` and trusted-metadata commit
+`f33e4361fd98c558d046879e5762b94600a9a3bb`. Fresh isolated evidence was
+`3357 passed, 22 skipped` for `test-full-non-live`, `2133 passed` for the
+hash-pinned trusted VQ2 policy, and `2216 passed, 1 skipped` for post-merge VQ2
+from a detached exact-main worktree. Main was fast-forwarded unchanged to
+`f33e4361fd98c558d046879e5762b94600a9a3bb`.
+
+L0 then stopped before freeze publication, attempt creation, simulator contact,
+or fixed-port contact because review found two pre-live integrity gaps: the
+launcher environment digest was not cross-bound to the frozen native environment
+and the launcher used `os.environ`, while no production initial import-inventory
+builder existed. The live-freeze-readiness correction now binds the canonical
+environment file and semantic variable digest, uses the exact native Windows
+mapping for launcher and child spawn, cross-binds import inventory and runtime
+Python identities, and adds the isolated complete import audit described above.
+Because this changes executable code and the trusted manifest, the corrected
+exact commit must repeat T0/T1 full promotion and detached post-merge VQ2 before
+L0 can resume. This record does not claim that correction promotion, L0, a
+live-freeze, or a powered gate is complete.
+
+The correction's directly affected attempt/probe suite passed `246` tests.
+The canonical VQ2 suite passed `2225` tests with `1` skip, and both `test-fast`
+and `test-unit` passed `3325` tests with `21` skips and `42` deselections.
+Two fresh invocations of the isolated import-audit command were byte-identical
+and each froze a complete `385`-entry graph, including exactly the five
+provider-bound spec-less runtime aliases named by the contract. Independent
+import-graph and environment/freeze-binding reviews both returned `CLEAR`.
+These results are local correction evidence only; the exact-commit full
+non-live, hash-pinned VQ2, integration, and detached post-merge gates remain
+required.
 
 No FlightSim process, port, frame capture, reset, arm/disarm, target, or powered
 command has occurred. No PAK is read, and the completed passive timing tranche

@@ -2161,6 +2161,14 @@ def test_environment_and_import_inventories_are_exact_sorted_and_dispatched():
                 "namespace_roots": [],
             },
             {
+                "module": "cv2.utils.fs",
+                "origin": PYTHON,
+                "size_bytes": 1,
+                "sha256": H3,
+                "root_class": "runtime",
+                "namespace_roots": [],
+            },
+            {
                 "module": "scripts",
                 "origin": None,
                 "size_bytes": None,
@@ -2186,10 +2194,125 @@ def test_environment_and_import_inventories_are_exact_sorted_and_dispatched():
     mixed_shape["entries"][0]["origin"] = PYTHON
     with pytest.raises(contract.PoweredAttemptContractError, match="must be null"):
         contract.validate_import_inventory(mixed_shape)
+    missing_runtime_descriptor = copy.deepcopy(imports)
+    missing_runtime_descriptor["entries"][1]["sha256"] = None
+    with pytest.raises(contract.PoweredAttemptContractError, match="exact string"):
+        contract.validate_import_inventory(missing_runtime_descriptor)
+    unapproved_runtime = copy.deepcopy(imports)
+    unapproved_runtime["entries"][1]["module"] = "cv2.utils.unknown"
+    with pytest.raises(contract.PoweredAttemptContractError, match="not an allowed"):
+        contract.validate_import_inventory(unapproved_runtime)
     duplicate = copy.deepcopy(imports)
     duplicate["entries"].append(copy.deepcopy(duplicate["entries"][-1]))
     with pytest.raises(contract.PoweredAttemptContractError, match="unique"):
         contract.validate_import_inventory(duplicate)
+
+
+def test_environment_inventory_semantics_can_be_cross_bound_into_live_freeze():
+    environment = {
+        "schema": "aigp-vq2-powered-environment-inventory/1",
+        "created_at_utc": UTC,
+        "variables": [
+            {"name": "PATH", "defined": True, "value_sha256": H},
+            {"name": "TEMP", "defined": True, "value_sha256": H2},
+        ],
+    }
+    expected_semantic_sha256 = contract.canonical_object_sha256(
+        {"variables": environment["variables"]}
+    )
+    assert contract.environment_variables_sha256(environment) == expected_semantic_sha256
+
+    provenance_only_change = copy.deepcopy(environment)
+    provenance_only_change["created_at_utc"] = "2026-07-20T12:34:57.123456Z"
+    assert (
+        contract.environment_variables_sha256(provenance_only_change)
+        == expected_semantic_sha256
+    )
+    assert contract.canonical_file_sha256(provenance_only_change) != contract.canonical_file_sha256(
+        environment
+    )
+
+    freeze = live_freeze()
+    freeze["runtime"]["environment_inventory"]["sha256"] = (
+        contract.canonical_file_sha256(environment)
+    )
+    freeze["execution"]["launcher_environment_sha256"] = expected_semantic_sha256
+    assert (
+        contract.validate_live_freeze(
+            freeze,
+            environment_inventory=environment,
+        )
+        == freeze
+    )
+
+    wrong_file_binding = copy.deepcopy(freeze)
+    wrong_file_binding["runtime"]["environment_inventory"]["sha256"] = H3
+    with pytest.raises(
+        contract.PoweredAttemptContractError,
+        match=r"runtime\.environment_inventory\.sha256",
+    ):
+        contract.validate_live_freeze(
+            wrong_file_binding,
+            environment_inventory=environment,
+        )
+
+    wrong_semantic_binding = copy.deepcopy(freeze)
+    wrong_semantic_binding["execution"]["launcher_environment_sha256"] = H3
+    with pytest.raises(
+        contract.PoweredAttemptContractError,
+        match=r"execution\.launcher_environment_sha256",
+    ):
+        contract.validate_live_freeze(
+            wrong_semantic_binding,
+            environment_inventory=environment,
+        )
+
+
+def test_import_inventory_file_and_python_are_cross_bound_into_live_freeze():
+    imports = {
+        "schema": "aigp-vq2-powered-import-inventory/1",
+        "python_sha256": H,
+        "seeds": [
+            "scripts.aigp_vq2_powered_attempt",
+            "scripts.aigp_vq2_powered_calibration_analysis",
+            "scripts.aigp_vq2_powered_calibration_probe",
+            "scripts.aigp_vq2_powered_cleanup",
+            "scripts.aigp_vq2_powered_runtime",
+            "scripts.aigp_vq2_run",
+        ],
+        "entries": [],
+    }
+    freeze = live_freeze()
+    freeze["runtime"]["import_inventory"]["sha256"] = (
+        contract.canonical_file_sha256(imports)
+    )
+    assert contract.validate_live_freeze(freeze, import_inventory=imports) == freeze
+
+    wrong_file_binding = copy.deepcopy(freeze)
+    wrong_file_binding["runtime"]["import_inventory"]["sha256"] = H2
+    with pytest.raises(
+        contract.PoweredAttemptContractError,
+        match=r"runtime\.import_inventory\.sha256",
+    ):
+        contract.validate_live_freeze(
+            wrong_file_binding,
+            import_inventory=imports,
+        )
+
+    wrong_python_binding = copy.deepcopy(imports)
+    wrong_python_binding["python_sha256"] = H2
+    wrong_python_freeze = copy.deepcopy(freeze)
+    wrong_python_freeze["runtime"]["import_inventory"]["sha256"] = (
+        contract.canonical_file_sha256(wrong_python_binding)
+    )
+    with pytest.raises(
+        contract.PoweredAttemptContractError,
+        match="inventory Python",
+    ):
+        contract.validate_live_freeze(
+            wrong_python_freeze,
+            import_inventory=wrong_python_binding,
+        )
 
 
 def test_implementation_inventory_can_be_cross_bound_into_live_freeze():

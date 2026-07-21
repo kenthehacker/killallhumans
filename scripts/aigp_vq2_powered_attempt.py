@@ -779,6 +779,8 @@ def validate_live_freeze(
     value: Any,
     *,
     implementation_inventory: Any | None = None,
+    environment_inventory: Any | None = None,
+    import_inventory: Any | None = None,
 ) -> dict[str, Any]:
     path = "$live_freeze"
     row = _object(
@@ -878,6 +880,36 @@ def validate_live_freeze(
     if launcher_argv != expected_argv:
         _fail(f"{path}.execution.launcher_argv", "must equal the sole frozen launcher argv")
     _sha256(execution["launcher_environment_sha256"], f"{path}.execution.launcher_environment_sha256")
+    if environment_inventory is not None:
+        inventory = validate_environment_inventory(environment_inventory)
+        if runtime["environment_inventory"]["sha256"] != canonical_file_sha256(
+            inventory
+        ):
+            _fail(
+                f"{path}.runtime.environment_inventory.sha256",
+                "does not bind supplied environment inventory file",
+            )
+        if execution["launcher_environment_sha256"] != environment_variables_sha256(
+            inventory
+        ):
+            _fail(
+                f"{path}.execution.launcher_environment_sha256",
+                "does not bind supplied environment inventory variables",
+            )
+    if import_inventory is not None:
+        inventory = validate_import_inventory(import_inventory)
+        if runtime["import_inventory"]["sha256"] != canonical_file_sha256(
+            inventory
+        ):
+            _fail(
+                f"{path}.runtime.import_inventory.sha256",
+                "does not bind supplied import inventory file",
+            )
+        if inventory["python_sha256"] != runtime["python"]["sha256"]:
+            _fail(
+                f"{path}.runtime.import_inventory.sha256",
+                "inventory Python does not bind the frozen runtime",
+            )
     validate_frozen_paths(row["paths"], f"{path}.paths")
     validate_deadline_durations(row["deadline_durations_ns"], f"{path}.deadline_durations_ns")
     return defensive_copy(row)
@@ -942,17 +974,39 @@ def validate_environment_inventory(value: Any) -> dict[str, Any]:
     return defensive_copy(row)
 
 
-_IMPORT_INVENTORY_SEEDS = [
+def environment_variables_sha256(value: Any) -> str:
+    """Hash the validated, timestamp-independent environment semantics."""
+
+    inventory = validate_environment_inventory(value)
+    return canonical_object_sha256({"variables": inventory["variables"]})
+
+
+IMPORT_INVENTORY_SEEDS = (
     "scripts.aigp_vq2_powered_attempt",
     "scripts.aigp_vq2_powered_calibration_analysis",
     "scripts.aigp_vq2_powered_calibration_probe",
     "scripts.aigp_vq2_powered_cleanup",
     "scripts.aigp_vq2_powered_runtime",
     "scripts.aigp_vq2_run",
-]
+)
+if IMPORT_INVENTORY_SEEDS != tuple(
+    sorted(set(IMPORT_INVENTORY_SEEDS), key=lambda item: item.encode("utf-8"))
+):  # pragma: no cover - import-time code-owned invariant
+    raise RuntimeError("IMPORT_INVENTORY_SEEDS must be unique and ordinal-sorted")
 _MODULE_NAME_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
 )
+RUNTIME_IMPORT_MODULES = (
+    "cv2.utils.fs",
+    "cv2.utils.logging",
+    "cv2.utils.nested",
+    "typing.io",
+    "typing.re",
+)
+if RUNTIME_IMPORT_MODULES != tuple(
+    sorted(set(RUNTIME_IMPORT_MODULES), key=lambda item: item.encode("utf-8"))
+):  # pragma: no cover - import-time code-owned invariant
+    raise RuntimeError("RUNTIME_IMPORT_MODULES must be unique and ordinal-sorted")
 
 
 def validate_import_inventory(value: Any) -> dict[str, Any]:
@@ -969,7 +1023,7 @@ def validate_import_inventory(value: Any) -> dict[str, Any]:
     )
     _sha256(row["python_sha256"], f"{path}.python_sha256")
     seeds = _sorted_unique_strings(row["seeds"], f"{path}.seeds")
-    if seeds != _IMPORT_INVENTORY_SEEDS:
+    if seeds != list(IMPORT_INVENTORY_SEEDS):
         _fail(f"{path}.seeds", "must equal the frozen import seed array")
     entries = _array(row["entries"], f"{path}.entries")
     module_names: list[str] = []
@@ -992,7 +1046,15 @@ def validate_import_inventory(value: Any) -> dict[str, Any]:
             _fail(f"{item_path}.module", "must be a canonical Python module name")
         root_class = _enum(
             item["root_class"],
-            {"candidate", "venv", "stdlib", "builtin", "frozen", "namespace"},
+            {
+                "candidate",
+                "venv",
+                "stdlib",
+                "builtin",
+                "frozen",
+                "namespace",
+                "runtime",
+            },
             f"{item_path}.root_class",
         )
         namespace_roots = _array(
@@ -1008,6 +1070,22 @@ def validate_import_inventory(value: Any) -> dict[str, Any]:
                 _fail(
                     f"{item_path}.namespace_roots",
                     "must be empty for a file-backed module",
+                )
+        elif root_class == "runtime":
+            if module not in RUNTIME_IMPORT_MODULES:
+                _fail(
+                    f"{item_path}.module",
+                    "is not an allowed spec-less runtime entry",
+                )
+            validate_absolute_windows_path(
+                item["origin"], path=f"{item_path}.origin"
+            )
+            _int(item["size_bytes"], f"{item_path}.size_bytes")
+            _sha256(item["sha256"], f"{item_path}.sha256")
+            if namespace_roots:
+                _fail(
+                    f"{item_path}.namespace_roots",
+                    "must be empty for a spec-less runtime entry",
                 )
         else:
             for name in ("origin", "size_bytes", "sha256"):
@@ -4008,8 +4086,10 @@ __all__ = [
     "EXCITATION_PLAN_SHA256",
     "FROZEN_EXCITATION_PLAN",
     "HOST_CLOCK_ID",
+    "IMPORT_INVENTORY_SEEDS",
     "INVALIDATION_REASON_CODES",
     "PoweredAttemptContractError",
+    "RUNTIME_IMPORT_MODULES",
     "SESSION_ID",
     "TASK_ID",
     "WRAPPER_PHASES",
@@ -4024,6 +4104,7 @@ __all__ = [
     "derive_excitation_plan",
     "derive_poison_required",
     "encode_capability_frame",
+    "environment_variables_sha256",
     "excitation_command_for_tick",
     "excitation_tick",
     "frozen_excitation_plan",
