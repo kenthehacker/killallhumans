@@ -13,9 +13,9 @@
 - Active correction branch: `package2-live-freeze-readiness`.
 - Active correction worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-live-freeze-readiness`.
-- Future integration-owner-controlled detached live worktree, created only from
-  the exact T1-integrated local-main commit and designated as the sole powered
-  integration worktree for this task:
+- Designated integration-owner-controlled detached live worktree, created from
+  the first T1-integrated local-main commit, still unused, and to be rebuilt at
+  the final exact integrated commit before L0:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration-live`.
 - Owner and integration owner: `/root`.
 - Heartbeat date: `2026-07-20`.

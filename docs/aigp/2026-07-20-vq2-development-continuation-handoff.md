@@ -2,8 +2,9 @@
 
 This is the operational starting point for development after Wave 3E. This
 document alone grants no simulator, capture, replay, production, transport, or
-powered authority; the exact Package 2 task contract records the current
-user-approved exception.
+powered authority. The exact Package 2 task contract records only the
+conditional simulator/private-capture authority and single powered pilot; it
+grants no replay, production, or transport authority.
 
 The current integrated local-main baseline is
 `f33e4361fd98c558d046879e5762b94600a9a3bb`. It contains the first promoted
@@ -393,7 +394,8 @@ fresh exact candidate retained an identical physical inventory across the
 hash-pinned VQ2 run. At maintenance commit `ef92041`, the manifest contained
 129 entries and changed only the VQ1 runner-test digest; the then-current VQ2
 policy remained byte-identical at 1,325 expected passes. Those counts are
-historical, not the current passive-tranche trust identities recorded above.
+historical, not the later passive-tranche historical identities or current
+Package 2 identities recorded above.
 
 This maintenance improves promotion hygiene only. It advances neither M1, M2,
 nor M4 and unlocks no replay, calibration, producer, estimator, runtime,
@@ -416,10 +418,11 @@ The first Package 2 implementation was promoted and integrated at `f33e436`.
 L0 then stopped before freeze publication, A01 creation, simulator/port
 contact, or capture because the launcher environment was not cross-bound to
 the native frozen environment and no production initial import-inventory
-builder existed. Correction behavior `e87c5e6` fixes those gaps. Its next gate
-is trusted-metadata regeneration, fresh full non-live and hash-pinned VQ2
-promotion, exact integration, and detached post-merge VQ2. Only then may L0
-derive and independently review the live freeze. No attempt has been consumed.
+builder existed. Correction behavior `e87c5e6` fixes those gaps, and its
+trusted metadata is regenerated and independently reviewed. The remaining
+gate sequence is fresh exact-candidate full non-live and hash-pinned VQ2,
+exact integration, and detached post-merge VQ2. Only then may L0 derive and
+independently review the live freeze. No attempt has been consumed.
 
 The earlier Package 3B timing tranche remains integrated historical evidence
 with three accepted passive captures. It must not be described as blocked or
@@ -439,13 +442,15 @@ operational replay, completed runtime, or powered evidence.
 
 The current continuation selected Package 2 because its entry gate permits
 separately authorized collection, then froze and independently reviewed the
-algorithm-independent readiness contract at `d526524`. No calibration
-implementation or new collection followed. Accepted passive sessions 02
-through 04 contain `182`/`181`/`181` frames but only `6`/`5`/`5` unique decoded
-hashes, one exact target box `(282, 134, 80, 80)`, and `2,110` exact-zero gyro
-vectors. They contain no independent known-geometry label. They therefore
-provide no across-image intrinsic support, hand-eye rotation, or temporal-
-offset excitation and cannot be upgraded into Package 2 calibration.
+algorithm-independent readiness contract at `d526524`. That checkpoint was
+subsequently followed by implementation at `508d43`/`f33e436` and correction
+behavior at `e87c5e6`, but no new collection followed. Accepted passive
+sessions 02 through 04 contain `182`/`181`/`181` frames but only `6`/`5`/`5`
+unique decoded hashes, one exact target box `(282, 134, 80, 80)`, and `2,110`
+exact-zero gyro vectors. They contain no independent known-geometry label.
+They therefore provide no across-image intrinsic support, hand-eye rotation,
+or temporal-offset excitation and cannot be upgraded into Package 2
+calibration.
 
 Package 2 remains incomplete. Do not repeat the static passive collection or
 implement a detached fitter against it. The exact separately frozen powered
