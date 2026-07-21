@@ -254,6 +254,69 @@ def test_bundle_additively_preserves_exact_camera_and_imu_ingress(tmp_path):
     assert records[4]["event"] == "mavlink_ingress"
 
 
+def test_replay_v1_additively_preserves_powered_calibration_rich_events(tmp_path):
+    from scripts.aigp_vq2_powered_attempt import (
+        ATTEMPT_ID,
+        DEADLINE_DURATIONS_NS,
+        validate_phase_deadline_event,
+    )
+
+    duration_ns = DEADLINE_DURATIONS_NS["child_connect"]
+    observation = {
+        "schema": "aigp-vq2-phase-deadline/1",
+        "attempt_id": ATTEMPT_ID,
+        "producer_role": "powered_child",
+        "phase": "connect",
+        "event_sequence": 0,
+        "started_monotonic_ns": 100,
+        "duration_ns": duration_ns,
+        "parent_deadline_monotonic_ns": 100 + duration_ns + 1,
+        "deadline_monotonic_ns": 100 + duration_ns,
+    }
+    validate_phase_deadline_event(observation)
+
+    bundle = tmp_path / "powered-rich-event.vq2replay"
+    writer = ReplayBundleWriter(bundle, require_private=False)
+    writer.record_event(
+        "calibration_phase_deadline",
+        observation=observation,
+    )
+    writer.close()
+
+    summary, records = ReplayBundleReader(bundle).verify_and_read()
+    assert summary["records"] == 1
+    assert records[0]["schema"] == "aigp-vq2-replay-record/1"
+    assert records[0]["type"] == "event"
+    assert records[0]["event"] == "calibration_phase_deadline"
+    assert records[0]["observation"] == observation
+    validate_phase_deadline_event(records[0]["observation"])
+
+
+def test_replay_v1_rejects_powered_rich_fields_inserted_into_frozen_core_rows(
+    tmp_path,
+):
+    bundle = tmp_path / "powered-rich-field-in-core-row.vq2replay"
+    writer = ReplayBundleWriter(bundle, require_private=False)
+    writer.capture_decoded_frame(
+        _image(),
+        generation=0,
+        frame_id=1,
+        sim_time_ns=10,
+        received_monotonic_s=1.0,
+    )
+    writer.close()
+
+    def insert_rich_field(rows):
+        decoded = next(row for row in rows if row["type"] == "decoded_frame")
+        decoded["calibration_tick_disposition"] = {
+            "schema": "aigp-vq2-calibration-tick-disposition/1"
+        }
+
+    _rewrite_records_and_reseal(bundle, insert_rich_field)
+    with pytest.raises(ValueError, match="missing/unknown"):
+        ReplayBundleReader(bundle).verify_and_read()
+
+
 def test_bundle_rejects_mismatched_exact_timing_bindings(tmp_path):
     writer = ReplayBundleWriter(
         tmp_path / "mismatch.vq2replay", require_private=False

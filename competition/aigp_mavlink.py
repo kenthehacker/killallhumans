@@ -12,15 +12,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import hashlib
 import json
 import logging
 import math
+import re
+import socket
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Deque, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Deque, Dict, Optional
 
 from competition.adapter import (
     AttitudeCommand,
@@ -52,7 +55,15 @@ from competition.vq2_runtime import VQ2_HOST_CLOCK_ID
 from competition.vision_udp import VisionUdpListener
 
 if TYPE_CHECKING:
-    from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
+    from competition.vq2_capture import (
+        AttitudeTargetOutboundV1,
+        MavlinkIngressV1,
+        NonAttitudeOutboundV1,
+        ReceivedActuatorOutputStatusV1,
+        ReceivedHeartbeatV1,
+        ReceivedIMUSampleV1,
+        ReceivedRaceStatusV1,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +77,17 @@ MAV_FRAME_LOCAL_NED = 1
 
 VQ2_MAVLINK_STREAM_ID = "vq2-mavlink-udp-14550"
 DEFAULT_INGRESS_BUFFER_CAPACITY = 4096
+DEFAULT_OUTBOUND_RECEIPT_CAPACITY = 4096
+DEFAULT_COLLISION_BUFFER_CAPACITY = 128
+DEFAULT_RESET_PERSISTENCE_FAILURE_CAPACITY = 16
+POWERED_MAX_DATAGRAM_BYTES = 65_535
+POWERED_WORKER_POLL_NS = 50_000_000
+POWERED_OUTBOUND_CALL_NS = 250_000_000
+POWERED_RECEIVE_MODE_WORKER = "worker"
+POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP = "external_cleanup"
+POWERED_RECEIVE_OWNER_WORKER = "adapter_worker"
+POWERED_RECEIVE_OWNER_EXTERNAL_CLEANUP = "external_cleanup"
+_OUTBOUND_ERROR_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -115,6 +137,710 @@ class MavlinkOutboundAudit:
         )
 
 
+@dataclass(frozen=True)
+class MavlinkOutboundReceiptStats:
+    """Bounded attempt-global local-call receipt diagnostics.
+
+    ``generation`` identifies the reset generation used by the next receipt;
+    sequence and queue counters never restart at an in-attempt reset.
+    """
+
+    generation: int
+    next_sequence: int
+    returned: int
+    raised: int
+    dropped: int
+    high_watermark: int
+    capacity: int
+    buffered: int
+
+
+@dataclass(frozen=True)
+class PoweredMavlinkTransportState:
+    """Public immutable endpoint/worker state for powered close evidence."""
+
+    requested_host: str
+    requested_port: int
+    actual_host: str
+    actual_port: int
+    frozen_peer: Optional[tuple[str, int]]
+    rejected_source_count: int
+    endpoint_closed: bool
+    receiver_joined: bool
+    announcer_joined: bool
+    connection_closed: bool
+
+    def __post_init__(self) -> None:
+        for name in ("requested_host", "actual_host"):
+            if type(getattr(self, name)) is not str or not getattr(self, name):
+                raise ValueError(f"{name} must be a nonempty exact string")
+        for name in ("requested_port", "actual_port"):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value <= 65_535:
+                raise ValueError(f"{name} must be an exact UDP port")
+        if self.actual_port == 0:
+            raise ValueError("actual_port must be a bound UDP port")
+        if self.frozen_peer is not None:
+            if (
+                type(self.frozen_peer) is not tuple
+                or len(self.frozen_peer) != 2
+                or type(self.frozen_peer[0]) is not str
+                or not self.frozen_peer[0]
+                or type(self.frozen_peer[1]) is not int
+                or not 1 <= self.frozen_peer[1] <= 65_535
+            ):
+                raise ValueError("frozen_peer must be an exact host/port tuple")
+        if (
+            type(self.rejected_source_count) is not int
+            or self.rejected_source_count < 0
+        ):
+            raise ValueError("rejected_source_count must be nonnegative")
+        for name in (
+            "endpoint_closed",
+            "receiver_joined",
+            "announcer_joined",
+            "connection_closed",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be an exact boolean")
+
+    @property
+    def endpoint_state(self) -> str:
+        if self.endpoint_closed:
+            return (
+                "closed_with_peer"
+                if self.frozen_peer is not None
+                else "closed_without_peer"
+            )
+        return "peer_frozen" if self.frozen_peer is not None else "bound"
+
+    @property
+    def owned_handles_closed(self) -> bool:
+        return bool(
+            self.endpoint_closed
+            and self.receiver_joined
+            and self.announcer_joined
+            and self.connection_closed
+        )
+
+    def bind_proof(self) -> dict[str, Any]:
+        return {
+            "family": "AF_INET",
+            "requested": {
+                "host": self.requested_host,
+                "port": self.requested_port,
+            },
+            "actual": {"host": self.actual_host, "port": self.actual_port},
+            "socket_policy": "ipv4-exclusive-address-use",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PoweredDatagramDispatch:
+    """One source-gated raw datagram dispatch, without scratch-parser state."""
+
+    source_accepted: bool
+    peer_frozen_now: bool
+    rejected_source: bool
+    malformed: bool
+    production_dispatched: bool
+    source_promoted: bool
+    peer: tuple[str, int] | None
+    admitted_message_type: str | None
+    failure_reason: str | None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "source_accepted",
+            "peer_frozen_now",
+            "rejected_source",
+            "malformed",
+            "production_dispatched",
+            "source_promoted",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be an exact boolean")
+        source_outcomes = sum(
+            (self.source_accepted, self.rejected_source, self.malformed)
+        )
+        if source_outcomes not in {0, 1} or (
+            source_outcomes == 0 and self.failure_reason is None
+        ):
+            raise ValueError(
+                "powered datagram dispatch must have one source outcome or fail"
+            )
+        if self.production_dispatched and not self.source_accepted:
+            raise ValueError("only an accepted source may reach production parsing")
+        if self.peer_frozen_now and not self.source_accepted:
+            raise ValueError("only an accepted source may freeze a peer")
+        if self.peer is not None and (
+            type(self.peer) is not tuple
+            or len(self.peer) != 2
+            or type(self.peer[0]) is not str
+            or type(self.peer[1]) is not int
+        ):
+            raise ValueError("powered datagram peer is invalid")
+        if self.admitted_message_type is not None and (
+            type(self.admitted_message_type) is not str
+            or not self.admitted_message_type
+        ):
+            raise ValueError("admitted message type is invalid")
+        if self.failure_reason is not None and (
+            type(self.failure_reason) is not str or not self.failure_reason
+        ):
+            raise ValueError("powered datagram failure reason is invalid")
+
+
+@dataclass(frozen=True)
+class MavlinkCollisionStats:
+    """Calibration-only collision-buffer diagnostics for one generation."""
+
+    generation: int
+    handled: int
+    dropped: int
+    high_watermark: int
+    capacity: int
+    buffered: int
+
+    def to_primitive(self) -> dict[str, int]:
+        return {
+            "generation": self.generation,
+            "handled": self.handled,
+            "dropped": self.dropped,
+            "high_watermark": self.high_watermark,
+            "capacity": self.capacity,
+            "buffered": self.buffered,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationCollisionV1:
+    """Immutable copy of one legacy collision item at the reset boundary."""
+
+    id: int
+    threat_level: int
+    impulse: float
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not int or not 0 <= self.id <= 0xFFFFFFFF:
+            raise ValueError("collision id must be a uint32 exact integer")
+        if (
+            type(self.threat_level) is not int
+            or not 0 <= self.threat_level <= 0xFF
+        ):
+            raise ValueError("collision threat_level must be a uint8 exact integer")
+        if isinstance(self.impulse, bool) or not isinstance(self.impulse, (int, float)):
+            raise TypeError("collision impulse must be a real number")
+        if not math.isfinite(float(self.impulse)):
+            raise ValueError("collision impulse must be finite")
+        object.__setattr__(self, "impulse", float(self.impulse))
+
+    def to_primitive(self) -> dict[str, int | float]:
+        return {
+            "id": self.id,
+            "threat_level": self.threat_level,
+            "impulse": self.impulse,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationResetBoundaryV1:
+    """Atomic old-generation capture returned before a calibration reset send."""
+
+    SCHEMA: ClassVar[str] = "aigp-vq2-calibration-reset-boundary/1"
+
+    old_generation: int
+    new_generation: int
+    boundary_monotonic_ns: int
+    observations: tuple[Any, ...]
+    collisions: tuple[CalibrationCollisionV1, ...]
+    ingress_stats: MavlinkIngressStats
+    collision_stats: MavlinkCollisionStats
+
+    def __post_init__(self) -> None:
+        if type(self.old_generation) is not int or self.old_generation < 0:
+            raise ValueError("old_generation must be a non-negative exact integer")
+        if self.new_generation != self.old_generation + 1:
+            raise ValueError("new_generation must equal old_generation + 1")
+        if (
+            type(self.boundary_monotonic_ns) is not int
+            or self.boundary_monotonic_ns < 0
+        ):
+            raise ValueError(
+                "boundary_monotonic_ns must be a non-negative exact integer"
+            )
+        if self.ingress_stats.generation != self.old_generation:
+            raise ValueError("ingress_stats must describe old_generation")
+        if self.collision_stats.generation != self.old_generation:
+            raise ValueError("collision_stats must describe old_generation")
+        prior_sequence = -1
+        for observation in self.observations:
+            ingress = observation.ingress
+            observation.validate_integrity()
+            if ingress.generation != self.old_generation:
+                raise ValueError("boundary observation generation mismatch")
+            if ingress.sequence <= prior_sequence:
+                raise ValueError("boundary observations must be in ingress order")
+            prior_sequence = ingress.sequence
+
+    def to_primitive(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "old_generation": self.old_generation,
+            "new_generation": self.new_generation,
+            "boundary_monotonic_ns": self.boundary_monotonic_ns,
+            "observations": [item.to_primitive() for item in self.observations],
+            "collisions": [item.to_primitive() for item in self.collisions],
+            "ingress_stats": {
+                name: getattr(self.ingress_stats, name)
+                for name in self.ingress_stats.__dataclass_fields__
+            },
+            "collision_stats": self.collision_stats.to_primitive(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationResetPersistenceFailureV1:
+    """Redacted in-memory proof that cleanup boundary persistence failed."""
+
+    SCHEMA: ClassVar[str] = "aigp-vq2-reset-persistence-failure/1"
+
+    old_generation: int
+    new_generation: int
+    boundary_monotonic_ns: int
+    error_type: str
+
+    def __post_init__(self) -> None:
+        if type(self.old_generation) is not int or self.old_generation < 0:
+            raise ValueError("old_generation must be a non-negative exact integer")
+        if self.new_generation != self.old_generation + 1:
+            raise ValueError("new_generation must equal old_generation + 1")
+        if (
+            type(self.boundary_monotonic_ns) is not int
+            or self.boundary_monotonic_ns < 0
+        ):
+            raise ValueError(
+                "boundary_monotonic_ns must be a non-negative exact integer"
+            )
+        if (
+            type(self.error_type) is not str
+            or _OUTBOUND_ERROR_TOKEN_RE.fullmatch(self.error_type) is None
+        ):
+            raise ValueError("error_type must be a bounded redacted token")
+
+    def to_primitive(self) -> dict[str, Any]:
+        return {
+            "schema": self.SCHEMA,
+            "old_generation": self.old_generation,
+            "new_generation": self.new_generation,
+            "boundary_monotonic_ns": self.boundary_monotonic_ns,
+            "error_type": self.error_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationResetPersistenceState:
+    """Bounded attempt-global snapshot of cleanup persistence failures."""
+
+    failures: tuple[CalibrationResetPersistenceFailureV1, ...]
+    dropped: int
+
+    def __post_init__(self) -> None:
+        if type(self.failures) is not tuple:
+            raise TypeError("failures must be an exact tuple")
+        if any(
+            type(item) is not CalibrationResetPersistenceFailureV1
+            for item in self.failures
+        ):
+            raise TypeError("failures contain an invalid persistence proof")
+        if type(self.dropped) is not int or self.dropped < 0:
+            raise ValueError("dropped must be a non-negative exact integer")
+
+    @property
+    def failure_latched(self) -> bool:
+        return bool(self.failures or self.dropped)
+
+    def to_primitive(self) -> dict[str, Any]:
+        return {
+            "failures": [item.to_primitive() for item in self.failures],
+            "dropped": self.dropped,
+            "failure_latched": self.failure_latched,
+        }
+
+
+def _admitted_outbound_error_type(exc: BaseException) -> str:
+    """Return a deterministic capture-token without exposing exception text."""
+
+    name = type(exc).__name__
+    if _OUTBOUND_ERROR_TOKEN_RE.fullmatch(name) is not None:
+        return name
+    digest = hashlib.sha256(
+        name.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:20]
+    return f"ExceptionType-{digest}"
+
+
+class _FrozenPeerDatagramWriter:
+    """Pymavlink file seam that can write only to the source-frozen peer."""
+
+    def __init__(self, endpoint, source_gate, authority_error_type) -> None:
+        self._endpoint = endpoint
+        self._source_gate = source_gate
+        self._authority_error_type = authority_error_type
+        self._lock = threading.Lock()
+        self._authorized_thread: Optional[int] = None
+        self._writes_remaining = 0
+
+    def begin_authorized_call(self) -> None:
+        with self._lock:
+            if self._authorized_thread is not None:
+                raise self._authority_error_type(
+                    "powered MAVLink writer authorization is already active"
+                )
+            self._authorized_thread = threading.get_ident()
+            self._writes_remaining = 1
+
+    def finish_authorized_call(self, *, require_write: bool) -> None:
+        with self._lock:
+            if self._authorized_thread != threading.get_ident():
+                raise self._authority_error_type(
+                    "powered MAVLink writer authorization thread changed"
+                )
+            remaining = self._writes_remaining
+            self._authorized_thread = None
+            self._writes_remaining = 0
+        if require_write and remaining != 0:
+            raise self._authority_error_type(
+                "powered MAVLink call returned without one datagram write"
+            )
+
+    def cancel_authorized_call(self) -> None:
+        with self._lock:
+            if self._authorized_thread == threading.get_ident():
+                self._authorized_thread = None
+                self._writes_remaining = 0
+
+    def write(self, payload) -> int:
+        if not isinstance(payload, (bytes, bytearray, memoryview)):
+            raise TypeError("encoded MAVLink payload must be bytes-like")
+        raw = bytes(payload)
+        if not raw:
+            raise ValueError("encoded MAVLink payload must not be empty")
+        peer = self._source_gate.peer
+        if peer is None:
+            raise self._authority_error_type("MAVLink peer is not frozen")
+        if self._endpoint.closed:
+            raise self._authority_error_type("powered UDP endpoint is closed")
+        with self._lock:
+            if self._authorized_thread != threading.get_ident():
+                raise self._authority_error_type(
+                    "powered MAVLink write lacks adapter authorization"
+                )
+            if self._writes_remaining != 1:
+                raise self._authority_error_type(
+                    "powered MAVLink call attempted multiple datagram writes"
+                )
+        sent = self._endpoint.socket.sendto(raw, peer)
+        if type(sent) is not int or sent != len(raw):
+            raise OSError("powered UDP datagram send was incomplete")
+        with self._lock:
+            self._writes_remaining = 0
+        return sent
+
+
+class _PoweredConnection:
+    """Minimal connection projection consumed by the established adapter."""
+
+    def __init__(self, transport: "PoweredMavlinkTransport") -> None:
+        self._transport = transport
+        self.mav = transport.mavlink
+        self.target_system = 1
+        self.target_component = 1
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+class PoweredMavlinkTransport:
+    """Opt-in raw UDP transport backed by a caller-bound exclusive endpoint.
+
+    Construction takes ownership of ``endpoint``. Any partial construction
+    failure closes it. Scratch validation and the production pymavlink object
+    are deliberately distinct; only raw bytes accepted by ``source_gate`` are
+    passed to ``mavlink.parse_buffer``.
+    """
+
+    def __init__(
+        self,
+        endpoint,
+        *,
+        scratch_parser_factory: Callable[[], Any],
+        mavlink_factory: Callable[[Any], Any],
+        outbound_guards,
+        role_valid: Callable[[], bool],
+        parent_alive: Callable[[], bool],
+        lease_valid: Callable[[], bool],
+        external_cleanup_authorize: Optional[Callable[..., int]] = None,
+    ) -> None:
+        from scripts.aigp_vq2_powered_runtime import (
+            ExclusiveUdpEndpoint,
+            MavlinkSourceFreeze,
+            OutboundAuthorityError,
+            PoweredOutboundGuards,
+            normalize_ipv4_loopback_peer,
+        )
+
+        if type(endpoint) is not ExclusiveUdpEndpoint:
+            raise TypeError("endpoint must be exact ExclusiveUdpEndpoint")
+        try:
+            if endpoint.closed is not False:
+                raise ValueError("powered UDP endpoint must be open")
+            if getattr(endpoint.socket, "family", None) != socket.AF_INET:
+                raise ValueError("powered UDP socket must be IPv4")
+            socket_type = getattr(endpoint.socket, "type", None)
+            if (
+                isinstance(socket_type, bool)
+                or not isinstance(socket_type, int)
+                or socket_type & socket.SOCK_DGRAM == 0
+            ):
+                raise ValueError("powered UDP socket must be datagram")
+            normalize_ipv4_loopback_peer(
+                (endpoint.actual_host, endpoint.actual_port)
+            )
+            actual = endpoint.socket.getsockname()
+            if type(actual) is not tuple or len(actual) < 2:
+                raise ValueError("powered UDP socket address is invalid")
+            if (actual[0], actual[1]) != (
+                endpoint.actual_host,
+                endpoint.actual_port,
+            ):
+                raise ValueError("powered UDP endpoint bind proof changed")
+            for name in ("recvfrom", "sendto", "close"):
+                if not callable(getattr(endpoint.socket, name, None)):
+                    raise TypeError(f"powered UDP socket lacks {name}()")
+            if not callable(getattr(endpoint.socket, "getsockopt", None)):
+                raise TypeError("powered UDP socket lacks getsockopt()")
+            if type(endpoint.exclusive_option) is not int:
+                raise ValueError("powered UDP exclusive option is invalid")
+            if endpoint.socket.getsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_REUSEADDR,
+            ) != 0:
+                raise ValueError("powered UDP socket unexpectedly permits reuse")
+            if endpoint.socket.getsockopt(
+                socket.SOL_SOCKET,
+                endpoint.exclusive_option,
+            ) != 1:
+                raise ValueError("powered UDP socket exclusive-use proof changed")
+            if not callable(scratch_parser_factory):
+                raise TypeError("scratch_parser_factory must be callable")
+            if not callable(mavlink_factory):
+                raise TypeError("mavlink_factory must be callable")
+            if type(outbound_guards) is not PoweredOutboundGuards:
+                raise TypeError(
+                    "outbound_guards must be exact PoweredOutboundGuards"
+                )
+            for callback, name in (
+                (role_valid, "role_valid"),
+                (parent_alive, "parent_alive"),
+                (lease_valid, "lease_valid"),
+            ):
+                if not callable(callback):
+                    raise TypeError(f"{name} must be callable")
+            if (
+                external_cleanup_authorize is not None
+                and not callable(external_cleanup_authorize)
+            ):
+                raise TypeError(
+                    "external_cleanup_authorize must be callable or None"
+                )
+
+            source_gate = MavlinkSourceFreeze(scratch_parser_factory)
+            writer = _FrozenPeerDatagramWriter(
+                endpoint,
+                source_gate,
+                OutboundAuthorityError,
+            )
+            mavlink = mavlink_factory(writer)
+            if not callable(getattr(mavlink, "parse_buffer", None)):
+                raise TypeError("production MAVLink object lacks parse_buffer()")
+            for name in (
+                "set_attitude_target_send",
+                "command_long_send",
+                "heartbeat_send",
+                "timesync_send",
+            ):
+                if not callable(getattr(mavlink, name, None)):
+                    raise TypeError(f"production MAVLink object lacks {name}()")
+            if getattr(mavlink, "file", None) is not writer:
+                raise ValueError("production MAVLink sender did not retain frozen writer")
+            mavlink.robust_parsing = False
+            if mavlink.robust_parsing is not False:
+                raise ValueError("production MAVLink robust parsing stayed enabled")
+        except BaseException:
+            try:
+                endpoint.close()
+            except BaseException as close_exc:
+                raise RuntimeError(
+                    "partial powered transport construction could not close endpoint"
+                ) from close_exc
+            raise
+
+        self.endpoint = endpoint
+        self.source_gate = source_gate
+        self._writer = writer
+        self.mavlink = mavlink
+        self.outbound_guards = outbound_guards
+        self.role_valid = role_valid
+        self.parent_alive = parent_alive
+        self.lease_valid = lease_valid
+        self.external_cleanup_authorize = external_cleanup_authorize
+        self._receive_owner: Optional[str] = None
+        self._receive_owner_lock = threading.Lock()
+        self._receive_call_lock = threading.Lock()
+        self.connection = _PoweredConnection(self)
+
+    @classmethod
+    def from_pymavlink(
+        cls,
+        endpoint,
+        *,
+        outbound_guards,
+        role_valid: Callable[[], bool],
+        parent_alive: Callable[[], bool],
+        lease_valid: Callable[[], bool],
+        external_cleanup_authorize: Optional[Callable[..., int]] = None,
+    ) -> "PoweredMavlinkTransport":
+        """Build distinct scratch/production pymavlink parsers lazily."""
+
+        try:
+            from pymavlink import mavutil
+        except ImportError as exc:  # pragma: no cover - env-dependent
+            try:
+                endpoint.close()
+            except BaseException as close_exc:
+                raise RuntimeError(
+                    "missing pymavlink and powered endpoint close failed"
+                ) from close_exc
+            raise RuntimeError(
+                "pymavlink is required for powered AIGP transport"
+            ) from exc
+
+        return cls(
+            endpoint,
+            scratch_parser_factory=lambda: mavutil.mavlink.MAVLink(None),
+            mavlink_factory=lambda writer: mavutil.mavlink.MAVLink(
+                writer,
+                srcSystem=255,
+                srcComponent=190,
+            ),
+            outbound_guards=outbound_guards,
+            role_valid=role_valid,
+            parent_alive=parent_alive,
+            lease_valid=lease_valid,
+            external_cleanup_authorize=external_cleanup_authorize,
+        )
+
+    @property
+    def peer(self) -> tuple[str, int] | None:
+        return self.source_gate.peer
+
+    @property
+    def promoted(self) -> bool:
+        return self.source_gate.promoted
+
+    @property
+    def receive_owner(self) -> Optional[str]:
+        with self._receive_owner_lock:
+            return self._receive_owner
+
+    def claim_receive_owner(self, owner: str) -> None:
+        if owner not in {
+            POWERED_RECEIVE_OWNER_WORKER,
+            POWERED_RECEIVE_OWNER_EXTERNAL_CLEANUP,
+        }:
+            raise ValueError("powered receive owner is invalid")
+        with self._receive_owner_lock:
+            if self._receive_owner is not None:
+                raise RuntimeError("powered UDP receiver already has an owner")
+            if self.endpoint.closed:
+                raise RuntimeError("powered UDP endpoint is closed")
+            self._receive_owner = owner
+
+    def recvfrom(
+        self,
+        *,
+        owner: str,
+        max_wait_ns: Optional[int] = None,
+    ) -> Optional[tuple[bytes, Any]]:
+        with self._receive_owner_lock:
+            if owner != self._receive_owner:
+                raise RuntimeError("powered UDP receive ownership is invalid")
+        if max_wait_ns is not None and (
+            type(max_wait_ns) is not int
+            or not 1 <= max_wait_ns <= POWERED_WORKER_POLL_NS
+        ):
+            raise ValueError(
+                "bounded powered receive wait must be 1..50,000,000 ns"
+            )
+        if not self._receive_call_lock.acquire(blocking=False):
+            raise RuntimeError("powered UDP receive call is already active")
+        try:
+            if max_wait_ns is None:
+                received = self.endpoint.socket.recvfrom(
+                    POWERED_MAX_DATAGRAM_BYTES
+                )
+            else:
+                gettimeout = getattr(self.endpoint.socket, "gettimeout", None)
+                settimeout = getattr(self.endpoint.socket, "settimeout", None)
+                if not callable(gettimeout) or not callable(settimeout):
+                    raise TypeError(
+                        "bounded powered receive requires socket timeout APIs"
+                    )
+                previous_timeout = gettimeout()
+                settimeout(max_wait_ns / 1_000_000_000.0)
+                try:
+                    received = self.endpoint.socket.recvfrom(
+                        POWERED_MAX_DATAGRAM_BYTES
+                    )
+                except (socket.timeout, TimeoutError):
+                    return None
+                finally:
+                    if not self.endpoint.closed:
+                        settimeout(previous_timeout)
+            raw, source = received
+            if not isinstance(raw, (bytes, bytearray, memoryview)):
+                raise TypeError("powered UDP recvfrom payload must be bytes-like")
+            return bytes(raw), source
+        finally:
+            self._receive_call_lock.release()
+
+    def parse_production(self, raw: bytes) -> Any:
+        parsed = self.mavlink.parse_buffer(raw)
+        if type(parsed) is not list or len(parsed) != 1:
+            raise ValueError(
+                "production MAVLink parser did not return exactly one message"
+            )
+        message = parsed[0]
+        if message.get_type() == "BAD_DATA":
+            raise ValueError("production MAVLink parser returned BAD_DATA")
+        if bytes(message.get_msgbuf()) != raw:
+            raise ValueError("production MAVLink parser did not preserve datagram")
+        return message
+
+    def begin_authorized_write(self) -> None:
+        self._writer.begin_authorized_call()
+
+    def finish_authorized_write(self) -> None:
+        self._writer.finish_authorized_call(require_write=True)
+
+    def cancel_authorized_write(self) -> None:
+        self._writer.cancel_authorized_call()
+
+    def close(self) -> None:
+        self.endpoint.close()
+
+
 class AIGPMavlinkAdapter(CompetitionInterface):
     """CompetitionInterface implementation for the official AIGP sim."""
 
@@ -128,11 +854,33 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         telemetry_mode: str = "pose",
         fetch_track_on_connect: bool = True,
         ingress_buffer_capacity: int = DEFAULT_INGRESS_BUFFER_CAPACITY,
+        outbound_receipt_capacity: int = DEFAULT_OUTBOUND_RECEIPT_CAPACITY,
         host_clock_id: str = VQ2_HOST_CLOCK_ID,
         monotonic_ns: Optional[Callable[[], int]] = None,
+        powered_transport: Optional[PoweredMavlinkTransport] = None,
+        powered_receive_mode: str = POWERED_RECEIVE_MODE_WORKER,
     ) -> None:
+        if (
+            powered_transport is not None
+            and type(powered_transport) is not PoweredMavlinkTransport
+        ):
+            raise TypeError(
+                "powered_transport must be exact PoweredMavlinkTransport or None"
+            )
         if telemetry_mode not in {"pose", "imu"}:
             raise ValueError("telemetry_mode must be 'pose' or 'imu'")
+        if powered_receive_mode not in {
+            POWERED_RECEIVE_MODE_WORKER,
+            POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP,
+        }:
+            raise ValueError("powered_receive_mode is invalid")
+        if (
+            powered_transport is None
+            and powered_receive_mode != POWERED_RECEIVE_MODE_WORKER
+        ):
+            raise ValueError(
+                "external cleanup receive mode requires powered transport"
+            )
         if require_track and not fetch_track_on_connect:
             raise ValueError(
                 "require_track=True is incompatible with "
@@ -143,40 +891,95 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             or ingress_buffer_capacity < 1
         ):
             raise ValueError("ingress_buffer_capacity must be a positive exact integer")
+        if (
+            type(outbound_receipt_capacity) is not int
+            or outbound_receipt_capacity < 1
+        ):
+            raise ValueError(
+                "outbound_receipt_capacity must be a positive exact integer"
+            )
         if host_clock_id != VQ2_HOST_CLOCK_ID:
             raise ValueError(
                 f"host_clock_id must be exact {VQ2_HOST_CLOCK_ID!r}"
             )
         if monotonic_ns is not None and not callable(monotonic_ns):
             raise TypeError("monotonic_ns must be callable or None")
+        if powered_transport is not None and (
+            telemetry_mode != "imu"
+            or require_track
+            or fetch_track_on_connect
+            or powered_transport.endpoint.closed
+        ):
+            try:
+                powered_transport.close()
+            except BaseException as close_exc:
+                raise RuntimeError(
+                    "invalid powered adapter configuration could not close transport"
+                ) from close_exc
+            raise ValueError(
+                "powered transport requires open endpoint, telemetry_mode='imu', "
+                "require_track=False, and fetch_track_on_connect=False"
+            )
         self.enable_vision = enable_vision
         self.require_track = require_track
         self.track_retries = int(track_retries)
         self.telemetry_mode = telemetry_mode
         self.fetch_track_on_connect = bool(fetch_track_on_connect)
         self.ingress_buffer_capacity = ingress_buffer_capacity
+        self.outbound_receipt_capacity = outbound_receipt_capacity
         self.host_clock_id = host_clock_id
         self._monotonic_ns = monotonic_ns or time.perf_counter_ns
+        self._powered_transport = powered_transport
+        self.powered_receive_mode = powered_receive_mode
         from competition.vq2_capture import (
+            ActuatorOutputStatusPayloadV1,
+            AttitudeTargetOutboundV1,
+            AttitudeTargetWireV1,
+            CommandLongWireV1,
+            GCSHeartbeatWireV1,
+            HeartbeatPayloadV1,
             MavlinkIngressV1,
+            NonAttitudeOutboundV1,
+            RaceStatusPayloadV1,
+            ReceivedActuatorOutputStatusV1,
+            ReceivedHeartbeatV1,
             ReceivedIMUSampleV1,
+            ReceivedRaceStatusV1,
+            TimesyncWireV1,
         )
 
+        self._actuator_payload_type = ActuatorOutputStatusPayloadV1
+        self._attitude_outbound_type = AttitudeTargetOutboundV1
+        self._attitude_wire_type = AttitudeTargetWireV1
+        self._command_long_wire_type = CommandLongWireV1
+        self._gcs_heartbeat_wire_type = GCSHeartbeatWireV1
+        self._heartbeat_payload_type = HeartbeatPayloadV1
         self._mavlink_ingress_type = MavlinkIngressV1
+        self._nonattitude_outbound_type = NonAttitudeOutboundV1
+        self._race_status_payload_type = RaceStatusPayloadV1
+        self._received_actuator_type = ReceivedActuatorOutputStatusV1
+        self._received_heartbeat_type = ReceivedHeartbeatV1
         self._received_imu_type = ReceivedIMUSampleV1
+        self._received_race_status_type = ReceivedRaceStatusV1
+        self._timesync_wire_type = TimesyncWireV1
 
         self._conn = None
         self._target_system = 1
         self._target_component = 1
         self._send_lock = threading.Lock()
+        self._ingress_dispatch_lock = threading.Lock()
         self._audit_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._heartbeat_event = threading.Event()
         self._telemetry_ready_event = threading.Event()
         self._track_event = threading.Event()
+        self._powered_promotion_event = threading.Event()
+        self._powered_failure_event = threading.Event()
         self._rx_thread: Optional[threading.Thread] = None
         self._announce_thread: Optional[threading.Thread] = None
+        self._powered_connect_deadline_monotonic_ns: Optional[int] = None
+        self._powered_failure_reason: Optional[str] = None
         self._vision: Optional[VisionUdpListener] = (
             VisionUdpListener(port=vision_port) if enable_vision else None
         )
@@ -187,10 +990,28 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._imu_samples: Deque[ReceivedIMUSampleV1] = deque(
             maxlen=ingress_buffer_capacity
         )
-        self._mavlink_arrivals: Deque[MavlinkIngressV1] = deque(
+        self._mavlink_arrivals: Deque[
+            ReceivedHeartbeatV1
+            | ReceivedRaceStatusV1
+            | ReceivedActuatorOutputStatusV1
+        ] = deque(
             maxlen=ingress_buffer_capacity
         )
-        self._collisions: Deque[Dict] = deque(maxlen=128)
+        self._latest_received_heartbeat: Optional[ReceivedHeartbeatV1] = None
+        self._latest_received_race_status: Optional[ReceivedRaceStatusV1] = None
+        self._latest_received_actuator_output_status: Optional[
+            ReceivedActuatorOutputStatusV1
+        ] = None
+        self._collisions: Deque[Dict] = deque(
+            maxlen=DEFAULT_COLLISION_BUFFER_CAPACITY
+        )
+        self._reset_persistence_failures: Deque[
+            CalibrationResetPersistenceFailureV1
+        ] = deque(maxlen=DEFAULT_RESET_PERSISTENCE_FAILURE_CAPACITY)
+        self._reset_persistence_failures_dropped = 0
+        self._collision_handled = 0
+        self._collision_dropped = 0
+        self._collision_high_watermark = 0
         self._actuator_outputs: Optional[Dict] = None
         self._indi_debug: Optional[Dict] = None
         self._reassembler = TrackInfoReassembler()
@@ -231,6 +1052,15 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             "position_target": 0,
             "other_command": 0,
         }
+        self._outbound_receipts: Deque[
+            AttitudeTargetOutboundV1 | NonAttitudeOutboundV1
+        ] = deque(maxlen=outbound_receipt_capacity)
+        self._outbound_generation = 0
+        self._outbound_next_sequence = 0
+        self._outbound_returned = 0
+        self._outbound_raised = 0
+        self._outbound_dropped = 0
+        self._outbound_high_watermark = 0
         self._armed = False
         self._have_attitude = False
         self._have_lpn = False
@@ -351,7 +1181,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             self._indi = IndiInnerLoop(cfg)
         return self._indi
 
-    async def connect(self, address: str = DEFAULT_MAVLINK_URL) -> None:
+    async def connect(
+        self,
+        address: str = DEFAULT_MAVLINK_URL,
+        *,
+        deadline_monotonic_ns: Optional[int] = None,
+    ) -> None:
         """Open the UDP MAVLink socket, announce as GCS, then fetch track data.
 
         The RX thread starts before any heartbeat wait so a connect-time
@@ -364,6 +1199,32 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         """
         if self._conn is not None:
             return
+        if self._powered_transport is None:
+            if deadline_monotonic_ns is not None:
+                raise ValueError(
+                    "deadline_monotonic_ns is supported only by powered transport"
+                )
+        else:
+            try:
+                if address != DEFAULT_MAVLINK_URL:
+                    raise ValueError(
+                        "powered transport uses its caller-bound endpoint, not address"
+                    )
+                self._validate_powered_deadline(
+                    deadline_monotonic_ns,
+                    "connect",
+                )
+            except BaseException:
+                self._powered_transport.outbound_guards.latch_production(
+                    "powered_connect_contract_invalid"
+                )
+                try:
+                    self._powered_transport.close()
+                except BaseException as close_exc:
+                    raise RuntimeError(
+                        "invalid powered connect could not close endpoint"
+                    ) from close_exc
+                raise
 
         # A new socket is a new simulator epoch.  Never let reconnect reuse
         # readiness events, pose/IMU snapshots, race status, or decoded vision
@@ -386,13 +1247,27 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             self._race_status = None
             self._track_data = None
             self._actuator_outputs = None
+            self._latest_received_heartbeat = None
+            self._latest_received_race_status = None
+            self._latest_received_actuator_output_status = None
             self._begin_ingress_generation_locked()
-            self._collisions.clear()
+            self._reset_collision_generation_locked()
+            self._reset_persistence_failures.clear()
+            self._reset_persistence_failures_dropped = 0
+            generation = self._ingress_generation
         with self._audit_lock:
             for name in self._outbound_counts:
                 self._outbound_counts[name] = 0
+            self._begin_outbound_generation_locked(
+                generation,
+                initialize_attempt=True,
+            )
         if self._vision is not None:
             self._vision.reset()
+
+        if self._powered_transport is not None:
+            await self._connect_powered(deadline_monotonic_ns)
+            return
 
         try:
             from pymavlink import mavutil
@@ -435,7 +1310,79 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             if self._track_data is None:
                 logger.warning("AIGP track data not received after SIM_RESET")
 
-    async def disconnect(self) -> None:
+    async def disconnect(
+        self,
+        *,
+        deadline_monotonic_ns: Optional[int] = None,
+        powered_progress: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if self._powered_transport is not None:
+            deadline = self._validate_powered_deadline(
+                deadline_monotonic_ns,
+                "disconnect",
+                allow_reached=True,
+            )
+            if powered_progress is not None and not callable(powered_progress):
+                progress_contract_error: Optional[BaseException] = TypeError(
+                    "powered_progress must be callable or None"
+                )
+                self._powered_transport.outbound_guards.latch_production(
+                    "powered_progress_invalid"
+                )
+                powered_progress = None
+            else:
+                progress_contract_error = None
+            failures, progress_error = self._close_powered_transport_and_join(
+                deadline,
+                powered_progress=powered_progress,
+            )
+            if progress_error is None:
+                progress_error = progress_contract_error
+            if self._vision is not None:
+                if progress_error is None and powered_progress is not None:
+                    try:
+                        powered_progress()
+                    except BaseException as exc:
+                        self._powered_transport.outbound_guards.latch_production(
+                            "powered_progress_failed"
+                        )
+                        progress_error = exc
+                try:
+                    now = self._read_monotonic_ns()
+                    remaining = max(0.0, (deadline - now) / 1_000_000_000.0)
+                    if remaining <= 0.0:
+                        raise TimeoutError("disconnect deadline reached before vision stop")
+                    await asyncio.wait_for(self._vision.stop(), timeout=remaining)
+                except BaseException as exc:
+                    failures.append(
+                        "powered vision termination failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                if progress_error is None and powered_progress is not None:
+                    try:
+                        powered_progress()
+                    except BaseException as exc:
+                        self._powered_transport.outbound_guards.latch_production(
+                            "powered_progress_failed"
+                        )
+                        progress_error = exc
+            if progress_error is not None:
+                if failures:
+                    add_note = getattr(progress_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "powered disconnect also reported: "
+                            + "; ".join(failures)
+                        )
+                raise progress_error
+            if failures:
+                raise RuntimeError("; ".join(failures))
+            return
+
+        if deadline_monotonic_ns is not None or powered_progress is not None:
+            raise ValueError(
+                "powered disconnect options require powered transport"
+            )
         self._stop_event.set()
         threads = tuple(
             thread
@@ -484,46 +1431,358 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         if failures:
             raise RuntimeError("; ".join(failures))
 
-    async def arm(self) -> None:
+    def _validate_powered_deadline(
+        self,
+        value: Optional[int],
+        phase: str,
+        *,
+        allow_reached: bool = False,
+    ) -> int:
+        from scripts.aigp_vq2_powered_runtime import PoweredDeadlineExpired
+
+        if type(value) is not int or value < 1:
+            raise ValueError(
+                f"powered {phase} deadline must be a positive exact integer"
+            )
+        now = self._read_monotonic_ns()
+        if now >= value and not allow_reached:
+            raise PoweredDeadlineExpired(
+                f"powered {phase} absolute deadline was already reached"
+            )
+        return value
+
+    def _powered_callback_bool(self, callback: Callable[[], bool], label: str) -> bool:
+        from scripts.aigp_vq2_powered_runtime import OutboundAuthorityError
+
+        try:
+            value = callback()
+        except BaseException as exc:
+            self._powered_transport.outbound_guards.latch_production(
+                f"{label}_callback_raised"
+            )
+            raise OutboundAuthorityError(f"{label} callback raised") from exc
+        if type(value) is not bool:
+            self._powered_transport.outbound_guards.latch_production(
+                f"{label}_callback_invalid"
+            )
+            raise OutboundAuthorityError(
+                f"{label} callback must return an exact boolean"
+            )
+        return value
+
+    async def _connect_powered(
+        self,
+        deadline_monotonic_ns: Optional[int],
+    ) -> None:
+        from scripts.aigp_vq2_powered_runtime import (
+            OutboundAuthorityError,
+            PoweredRuntimeError,
+        )
+
+        transport = self._powered_transport
+        assert deadline_monotonic_ns is not None
+        deadline = deadline_monotonic_ns
+        self._powered_promotion_event.clear()
+        self._powered_failure_event.clear()
+        self._powered_failure_reason = None
+        self._powered_connect_deadline_monotonic_ns = deadline
+        try:
+            if self._read_monotonic_ns() >= deadline:
+                from scripts.aigp_vq2_powered_runtime import PoweredDeadlineExpired
+
+                raise PoweredDeadlineExpired(
+                    "powered connect deadline reached before worker start"
+                )
+            if transport.endpoint.closed or transport.peer is not None:
+                raise PoweredRuntimeError(
+                    "powered transport is single-use and unavailable"
+                )
+            if self.powered_receive_mode == POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP:
+                if not transport.outbound_guards.production_latched:
+                    raise OutboundAuthorityError(
+                        "external cleanup requires production to be latched"
+                    )
+                if not callable(transport.external_cleanup_authorize):
+                    raise OutboundAuthorityError(
+                        "external cleanup announcement authority is unavailable"
+                    )
+                cleanup_parent_alive = self._powered_callback_bool(
+                    transport.parent_alive,
+                    "parent_alive",
+                )
+                if (
+                    not cleanup_parent_alive
+                    and transport.outbound_guards.cleanup_state
+                    != "takeover_pending"
+                ):
+                    transport.outbound_guards.note_parent_death()
+                    raise OutboundAuthorityError(
+                        "wrapper parent is not live at cleanup connect"
+                    )
+                if not self._powered_callback_bool(
+                    transport.lease_valid,
+                    "lease_valid",
+                ):
+                    raise OutboundAuthorityError(
+                        "cleanup lease lineage is invalid"
+                    )
+                transport.claim_receive_owner(
+                    POWERED_RECEIVE_OWNER_EXTERNAL_CLEANUP
+                )
+                self._conn = transport.connection
+                self._target_system = 1
+                self._target_component = 1
+                self._stop_event.clear()
+                return
+
+            transport.outbound_guards.enable_production()
+            if not self._powered_callback_bool(transport.role_valid, "role_valid"):
+                transport.outbound_guards.latch_production("production_role_invalid")
+                raise OutboundAuthorityError("production role is invalid")
+            if not self._powered_callback_bool(transport.parent_alive, "parent_alive"):
+                transport.outbound_guards.note_parent_death()
+                raise OutboundAuthorityError("wrapper parent is not live")
+            if not self._powered_callback_bool(transport.lease_valid, "lease_valid"):
+                transport.outbound_guards.latch_production("production_lease_invalid")
+                raise OutboundAuthorityError("production lease lineage is invalid")
+
+            self._conn = transport.connection
+            self._target_system = 1
+            self._target_component = 1
+            self._stop_event.clear()
+            transport.claim_receive_owner(POWERED_RECEIVE_OWNER_WORKER)
+            self._rx_thread = threading.Thread(
+                target=self._powered_rx_loop,
+                name="aigp-powered-mavlink-rx",
+                daemon=True,
+            )
+            self._announce_thread = threading.Thread(
+                target=self._announce_loop,
+                name="aigp-powered-mavlink-announce",
+                daemon=True,
+            )
+            self._rx_thread.start()
+            self._announce_thread.start()
+            await asyncio.to_thread(self._wait_for_powered_promotion, deadline)
+
+            announce = self._announce_thread
+            if announce is not None:
+                now = self._read_monotonic_ns()
+                announce.join(timeout=max(0.0, (deadline - now) / 1_000_000_000.0))
+                if announce.is_alive():
+                    transport.outbound_guards.latch_production(
+                        "announcement_worker_unproved"
+                    )
+                    raise PoweredRuntimeError(
+                        "announcement worker did not stop before connect deadline"
+                    )
+                self._announce_thread = None
+
+            if self._vision is not None:
+                now = self._read_monotonic_ns()
+                remaining = max(0.0, (deadline - now) / 1_000_000_000.0)
+                if remaining <= 0.0:
+                    raise PoweredRuntimeError(
+                        "connect deadline reached before vision start"
+                    )
+                await asyncio.wait_for(self._vision.start(), timeout=remaining)
+        except BaseException as exc:
+            transport.outbound_guards.latch_production("powered_connect_failed")
+            failures, _progress_error = self._close_powered_transport_and_join(
+                deadline
+            )
+            if failures:
+                raise RuntimeError(
+                    f"powered connect failed and cleanup was unproved: {'; '.join(failures)}"
+                ) from exc
+            raise
+
+    def _wait_for_powered_promotion(self, deadline_monotonic_ns: int) -> None:
+        from scripts.aigp_vq2_powered_runtime import (
+            OutboundAuthorityError,
+            PoweredDeadlineExpired,
+            PoweredRuntimeError,
+        )
+
+        transport = self._powered_transport
+        while True:
+            if transport.promoted:
+                return
+            if self._powered_failure_event.is_set():
+                raise PoweredRuntimeError(
+                    self._powered_failure_reason or "powered receiver failed"
+                )
+            if not self._powered_callback_bool(transport.parent_alive, "parent_alive"):
+                transport.outbound_guards.note_parent_death()
+                raise OutboundAuthorityError("wrapper parent died before promotion")
+            now = self._read_monotonic_ns()
+            if now >= deadline_monotonic_ns:
+                transport.outbound_guards.latch_production(
+                    "source_promotion_deadline_reached"
+                )
+                raise PoweredDeadlineExpired(
+                    "MAVLink source promotion deadline was reached"
+                )
+            wait_ns = min(
+                POWERED_WORKER_POLL_NS,
+                deadline_monotonic_ns - now,
+            )
+            self._powered_promotion_event.wait(wait_ns / 1_000_000_000.0)
+
+    def _close_powered_transport_and_join(
+        self,
+        deadline_monotonic_ns: int,
+        *,
+        powered_progress: Optional[Callable[[], None]] = None,
+    ) -> tuple[list[str], Optional[BaseException]]:
+        self._stop_event.set()
+        failures: list[str] = []
+        progress_error: Optional[BaseException] = None
+        try:
+            self._powered_transport.close()
+        except BaseException as exc:
+            failures.append(
+                "powered UDP close failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        threads = tuple(
+            thread
+            for thread in (self._rx_thread, self._announce_thread)
+            if thread is not None
+        )
+        accounted_now: Optional[int] = None
+        for thread in threads:
+            while thread.is_alive():
+                observed_now = self._read_monotonic_ns()
+                now = (
+                    observed_now
+                    if accounted_now is None
+                    else max(accounted_now, observed_now)
+                )
+                if now >= deadline_monotonic_ns:
+                    break
+                if powered_progress is not None and progress_error is None:
+                    try:
+                        powered_progress()
+                    except BaseException as exc:
+                        self._powered_transport.outbound_guards.latch_production(
+                            "powered_progress_failed"
+                        )
+                        progress_error = exc
+                    observed_now = self._read_monotonic_ns()
+                    now = (
+                        observed_now
+                        if accounted_now is None
+                        else max(accounted_now, observed_now)
+                    )
+                    if now >= deadline_monotonic_ns:
+                        break
+                wait_ns = min(
+                    POWERED_WORKER_POLL_NS,
+                    deadline_monotonic_ns - now,
+                )
+                thread.join(timeout=wait_ns / 1_000_000_000.0)
+                after_join = self._read_monotonic_ns()
+                elapsed_ns = max(0, after_join - now)
+                if thread.is_alive() and elapsed_ns < wait_ns:
+                    # ``Thread.join`` is specified to wait until timeout, but
+                    # injected/foreign handle seams may return spuriously.
+                    # Avoid a CPU spin while preserving the same fixed slice.
+                    threading.Event().wait(
+                        (wait_ns - elapsed_ns) / 1_000_000_000.0
+                    )
+                    accounted_now = now + wait_ns
+                else:
+                    accounted_now = (
+                        after_join
+                        if accounted_now is None
+                        else max(accounted_now, after_join)
+                    )
+        if powered_progress is not None and progress_error is None:
+            try:
+                powered_progress()
+            except BaseException as exc:
+                self._powered_transport.outbound_guards.latch_production(
+                    "powered_progress_failed"
+                )
+                progress_error = exc
+        alive = [thread.name for thread in threads if thread.is_alive()]
+        if alive:
+            failures.append(
+                "powered MAVLink worker termination unproved: " + ", ".join(alive)
+            )
+        else:
+            self._rx_thread = None
+            self._announce_thread = None
+            self._conn = None
+        return failures, progress_error
+
+    async def arm(
+        self,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
         if self._armed:
             return
         self._require_conn()
+        wire = self._command_long_wire_type(
+            target_system=self._target_system,
+            target_component=self._target_component,
+            command=MAV_CMD_COMPONENT_ARM_DISARM,
+            confirmation=0,
+            params=(1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
         with self._send_lock:
-            self._audit_outbound("arm")
-            self._conn.mav.command_long_send(
-                self._target_system,
-                self._target_component,
-                MAV_CMD_COMPONENT_ARM_DISARM,
-                0,
-                1,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+            self._call_nonattitude_locked(
+                category="arm",
+                api="command_long_send",
+                audit_name="arm",
+                wire=wire,
+                call=lambda: self._conn.mav.command_long_send(
+                    wire.target_system,
+                    wire.target_component,
+                    wire.command,
+                    wire.confirmation,
+                    *wire.params,
+                ),
+                powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                powered_cleanup=powered_cleanup,
             )
         if not self._armed:
             logger.warning("Arm command sent but vehicle still reports disarmed")
 
-    async def disarm(self) -> None:
+    async def disarm(
+        self,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
         """Disarm the simulated vehicle as an emergency reset fallback."""
 
         self._require_conn()
+        wire = self._command_long_wire_type(
+            target_system=self._target_system,
+            target_component=self._target_component,
+            command=MAV_CMD_COMPONENT_ARM_DISARM,
+            confirmation=0,
+            params=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
         with self._send_lock:
-            self._audit_outbound("disarm")
-            self._conn.mav.command_long_send(
-                self._target_system,
-                self._target_component,
-                MAV_CMD_COMPONENT_ARM_DISARM,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+            self._call_nonattitude_locked(
+                category="disarm",
+                api="command_long_send",
+                audit_name="disarm",
+                wire=wire,
+                call=lambda: self._conn.mav.command_long_send(
+                    wire.target_system,
+                    wire.target_component,
+                    wire.command,
+                    wire.confirmation,
+                    *wire.params,
+                ),
+                powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                powered_cleanup=powered_cleanup,
             )
 
     async def start_offboard(self) -> None:
@@ -541,7 +1800,13 @@ class AIGPMavlinkAdapter(CompetitionInterface):
     async def get_camera_frame(self) -> Optional[CameraFrame]:
         return self._vision.latest_frame() if self._vision is not None else None
 
-    async def send_attitude(self, cmd: AttitudeCommand) -> None:
+    async def send_attitude(
+        self,
+        cmd: AttitudeCommand,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
         if self.telemetry_mode == "imu":
             raise RuntimeError(
                 "send_attitude() requires pose telemetry; VQ2 IMU mode must "
@@ -587,34 +1852,50 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                     kd=self._att_rate_kd, max_rate=self._att_rate_max,
                 )
             sx, sy, sz = self._rate_sign  # sim applies rates with opposite sign
+            wire = self._attitude_wire_type(
+                time_boot_ms=self._time_boot_ms(),
+                target_system=self._target_system,
+                target_component=self._target_component,
+                type_mask=SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
+                q_wxyz=(1.0, 0.0, 0.0, 0.0),
+                body_rates_rad_s=(sx * rr, sy * pr, sz * yr),
+                thrust=thrust,
+            )
             with self._send_lock:
-                self._audit_outbound("attitude_target")
-                self._conn.mav.set_attitude_target_send(
-                    self._time_boot_ms(),
-                    self._target_system,
-                    self._target_component,
-                    SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
-                    [1.0, 0.0, 0.0, 0.0],
-                    sx * rr, sy * pr, sz * yr,
-                    thrust,
+                self._call_attitude_target_locked(
+                    api="send_attitude_rate_from_attitude",
+                    wire=wire,
+                    powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                    powered_cleanup=powered_cleanup,
+                    powered_exact_zero=False if powered_cleanup else None,
                 )
             return
 
+        wire = self._attitude_wire_type(
+            time_boot_ms=self._time_boot_ms(),
+            target_system=self._target_system,
+            target_component=self._target_component,
+            type_mask=SET_ATTITUDE_TARGET_MASK_ATTITUDE_THRUST,
+            q_wxyz=(q.w, q.x, q.y, q.z),
+            body_rates_rad_s=(0.0, 0.0, 0.0),
+            thrust=thrust,
+        )
         with self._send_lock:
-            self._audit_outbound("attitude_target")
-            self._conn.mav.set_attitude_target_send(
-                self._time_boot_ms(),
-                self._target_system,
-                self._target_component,
-                SET_ATTITUDE_TARGET_MASK_ATTITUDE_THRUST,
-                [q.w, q.x, q.y, q.z],
-                0.0,
-                0.0,
-                0.0,
-                thrust,
+            self._call_attitude_target_locked(
+                api="send_attitude_quaternion",
+                wire=wire,
+                powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                powered_cleanup=powered_cleanup,
+                powered_exact_zero=False if powered_cleanup else None,
             )
 
-    async def send_attitude_rate(self, cmd: AttitudeRateCommand) -> None:
+    async def send_attitude_rate(
+        self,
+        cmd: AttitudeRateCommand,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
         self._require_conn()
         if not all(math.isfinite(value) for value in (
             cmd.roll_rate,
@@ -624,21 +1905,47 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             raise ValueError("body rates must be finite")
         thrust = _clamp_thrust(cmd.thrust)
         sx, sy, sz = self._rate_sign  # sim applies body rates with opposite sign
-        with self._send_lock:
-            self._audit_outbound("attitude_target")
-            self._conn.mav.set_attitude_target_send(
-                self._time_boot_ms(),
-                self._target_system,
-                self._target_component,
-                SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
-                [1.0, 0.0, 0.0, 0.0],
+        wire = self._attitude_wire_type(
+            time_boot_ms=self._time_boot_ms(),
+            target_system=self._target_system,
+            target_component=self._target_component,
+            type_mask=SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
+            q_wxyz=(1.0, 0.0, 0.0, 0.0),
+            body_rates_rad_s=(
                 sx * cmd.roll_rate,
                 sy * cmd.pitch_rate,
                 sz * cmd.yaw_rate,
-                thrust,
+            ),
+            thrust=thrust,
+        )
+        powered_exact_zero = None
+        if self._powered_transport is not None and powered_cleanup:
+            from scripts.aigp_vq2_powered_runtime import exact_zero_rate_thrust
+
+            powered_exact_zero = exact_zero_rate_thrust(
+                {
+                    "roll_rate_rad_s": cmd.roll_rate,
+                    "pitch_rate_rad_s": cmd.pitch_rate,
+                    "yaw_rate_rad_s": cmd.yaw_rate,
+                    "thrust": cmd.thrust,
+                }
+            )
+        with self._send_lock:
+            self._call_attitude_target_locked(
+                api="send_attitude_rate",
+                wire=wire,
+                powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                powered_cleanup=powered_cleanup,
+                powered_exact_zero=powered_exact_zero,
             )
 
-    async def send_position(self, cmd: PositionCommand) -> None:
+    async def send_position(
+        self,
+        cmd: PositionCommand,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
         """Send SET_POSITION_TARGET_LOCAL_NED for parity only.
 
         First-contact live testing showed this path does not track velocity
@@ -649,6 +1956,14 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         vn, ve, vd = cmd.velocity_ned
         with self._send_lock:
             self._audit_outbound("position_target")
+            call_start = self._read_monotonic_ns()
+            self._authorize_powered_outbound_locked(
+                "position_target",
+                call_start=call_start,
+                deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                cleanup=powered_cleanup,
+                exact_zero=None,
+            )
             self._conn.mav.set_position_target_local_ned_send(
                 self._time_boot_ms(),
                 self._target_system,
@@ -668,7 +1983,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 0.0,
             )
 
-    async def reset(self) -> Optional[TrackData]:
+    async def reset(
+        self,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> Optional[TrackData]:
         if not self.fetch_track_on_connect:
             # VQ2 has no track-transfer acknowledgement.  Clear the local
             # epoch before sending and require the runner to prove an IMU/race
@@ -682,13 +2002,166 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 self._latest_telem = None
                 self._race_status = None
                 self._actuator_outputs = None
+                self._latest_received_race_status = None
+                self._latest_received_actuator_output_status = None
                 self._begin_ingress_generation_locked()
-                self._collisions.clear()
-        await self._send_sim_reset(clear_track_event=True)
+                self._reset_collision_generation_locked()
+                generation = self._ingress_generation
+            with self._audit_lock:
+                self._begin_outbound_generation_locked(generation)
+        await self._send_sim_reset(
+            clear_track_event=True,
+            powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+            powered_cleanup=powered_cleanup,
+        )
         if not self.fetch_track_on_connect:
             return None
         await asyncio.to_thread(self._track_event.wait, 5.0)
         return self.track_data
+
+    async def reset_calibration_with_boundary(
+        self,
+        persist_boundary: Callable[[CalibrationResetBoundaryV1], None],
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+        powered_progress: Optional[Callable[[], None]] = None,
+    ) -> CalibrationResetBoundaryV1:
+        """Persist an atomic old-generation capture before sending SIM_RESET.
+
+        This calibration-only API leaves the legacy ``reset()`` contract
+        intact.  The callback runs synchronously after the receiver/collision
+        queues have moved to exactly one new generation and before any reset
+        packet is attempted.  A prepower persistence failure sends nothing.
+        Once powered cleanup is mandatory, a persistence failure is instead
+        redacted and latched in :meth:`calibration_reset_persistence_state`,
+        and cannot suppress the guarded reset attempt.  The callback must not
+        re-enter an adapter send API.  ``powered_progress``, when supplied for
+        powered cleanup, runs under the same atomic locks after persistence and
+        immediately before the final reset authorization/send so parent-death
+        takeover can complete without creating a second generation boundary.
+
+        Collision rows here are immutable copies of the adapter's legacy raw
+        collision facts.  The powered dispatcher, which knows phase and
+        disposition, owns conversion to runner collision observations.
+        """
+
+        if not callable(persist_boundary):
+            raise TypeError("persist_boundary must be callable")
+        if powered_progress is not None:
+            if not callable(powered_progress):
+                raise TypeError("powered_progress must be callable or None")
+            if self._powered_transport is None or powered_cleanup is not True:
+                raise ValueError(
+                    "powered_progress requires powered cleanup reset authority"
+                )
+        self._require_conn()
+
+        # Exclude the announce thread and every command API from the boundary
+        # transition through persistence and the reset call itself.  Excluding
+        # receiver dispatch also prevents a receive timestamp captured before
+        # this boundary from being appended later as a new-generation item.
+        with self._send_lock:
+            with self._ingress_dispatch_lock:
+                with self._state_lock:
+                    old_generation = self._ingress_generation
+                    ingress_stats = self._ingress_stats_locked()
+                    collision_stats = self._collision_stats_locked()
+                    observations = self._snapshot_received_observations_locked()
+                    collisions = tuple(
+                        CalibrationCollisionV1(
+                            id=item["id"],
+                            threat_level=item["threat_level"],
+                            impulse=item["impulse"],
+                        )
+                        for item in self._collisions
+                    )
+                    boundary_monotonic_ns = self._read_monotonic_ns()
+
+                    self._telemetry_ready_event.clear()
+                    self._have_attitude = False
+                    self._have_lpn = False
+                    self._have_odometry = False
+                    self._have_imu = False
+                    self._last_imu_monotonic = 0.0
+                    self._last_race_status_monotonic = 0.0
+                    self._last_actuator_monotonic = 0.0
+                    self._latest_telem = None
+                    self._race_status = None
+                    self._actuator_outputs = None
+                    self._indi_debug = None
+                    self._indi_last_t_us = None
+                    self._latest_received_race_status = None
+                    self._latest_received_actuator_output_status = None
+                    # Heartbeat state is intentionally retained so reset proof
+                    # can demand a strictly newer post-reset heartbeat.
+                    self._begin_ingress_generation_locked()
+                    self._reset_collision_generation_locked()
+                    new_generation = self._ingress_generation
+                    boundary = CalibrationResetBoundaryV1(
+                        old_generation=old_generation,
+                        new_generation=new_generation,
+                        boundary_monotonic_ns=boundary_monotonic_ns,
+                        observations=observations,
+                        collisions=collisions,
+                        ingress_stats=ingress_stats,
+                        collision_stats=collision_stats,
+                    )
+                    with self._audit_lock:
+                        self._begin_outbound_generation_locked(new_generation)
+
+                try:
+                    persist_boundary(boundary)
+                except BaseException as exc:
+                    if (
+                        self._powered_transport is None
+                        or powered_cleanup is not True
+                    ):
+                        raise
+                    self._powered_transport.outbound_guards.latch_production(
+                        "reset_boundary_persistence_failed"
+                    )
+                    failure = CalibrationResetPersistenceFailureV1(
+                        old_generation=boundary.old_generation,
+                        new_generation=boundary.new_generation,
+                        boundary_monotonic_ns=boundary.boundary_monotonic_ns,
+                        error_type=_admitted_outbound_error_type(exc),
+                    )
+                    with self._state_lock:
+                        if (
+                            len(self._reset_persistence_failures)
+                            >= DEFAULT_RESET_PERSISTENCE_FAILURE_CAPACITY
+                        ):
+                            self._reset_persistence_failures_dropped += 1
+                        self._reset_persistence_failures.append(failure)
+                self._track_event.clear()
+                if self._vision is not None:
+                    self._vision.reset()
+                wire = self._command_long_wire_type(
+                    target_system=self._target_system,
+                    target_component=self._target_component,
+                    command=SIM_RESET_COMMAND,
+                    confirmation=0,
+                    params=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                )
+                if powered_progress is not None:
+                    powered_progress()
+                self._call_nonattitude_locked(
+                    category="sim_reset",
+                    api="command_long_send",
+                    audit_name="sim_reset",
+                    wire=wire,
+                    call=lambda: self._conn.mav.command_long_send(
+                        wire.target_system,
+                        wire.target_component,
+                        wire.command,
+                        wire.confirmation,
+                        *wire.params,
+                    ),
+                    powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                    powered_cleanup=powered_cleanup,
+                )
+        return boundary
 
     async def wait_for_track_data(self, timeout_s: float = 10.0) -> Optional[TrackData]:
         await asyncio.to_thread(self._track_event.wait, timeout_s)
@@ -755,12 +2228,34 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             return samples
 
     def drain_mavlink_arrivals(self) -> list[MavlinkIngressV1]:
-        """Return non-IMU passive stream arrivals in strict receive order."""
+        """Project non-IMU envelopes to legacy ingress rows, then clear them."""
 
         with self._state_lock:
-            arrivals = list(self._mavlink_arrivals)
+            arrivals = [received.ingress for received in self._mavlink_arrivals]
             self._mavlink_arrivals.clear()
             return arrivals
+
+    def drain_received_observations(
+        self,
+    ) -> list[
+        ReceivedHeartbeatV1
+        | ReceivedIMUSampleV1
+        | ReceivedRaceStatusV1
+        | ReceivedActuatorOutputStatusV1
+    ]:
+        """Atomically drain every exact received envelope in ingress order.
+
+        The legacy drains are projections of these same two bounded queues;
+        the adapter never stores a second copy of an occurrence.
+        """
+
+        with self._state_lock:
+            values = list(self._mavlink_arrivals)
+            values.extend(self._imu_samples)
+            self._mavlink_arrivals.clear()
+            self._imu_samples.clear()
+        values.sort(key=lambda item: item.ingress.sequence)
+        return values
 
     def drain_received_ingress(
         self,
@@ -768,7 +2263,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         """Atomically drain both exact ingress queues in global receive order."""
 
         with self._state_lock:
-            values = list(self._mavlink_arrivals)
+            values = [received.ingress for received in self._mavlink_arrivals]
             values.extend(self._imu_samples)
             self._mavlink_arrivals.clear()
             self._imu_samples.clear()
@@ -783,35 +2278,209 @@ class AIGPMavlinkAdapter(CompetitionInterface):
 
     def ingress_stats(self) -> MavlinkIngressStats:
         with self._state_lock:
-            return MavlinkIngressStats(
-                generation=self._ingress_generation,
-                next_sequence=self._ingress_next_sequence,
-                highres_imu_received=self._ingress_counts["HIGHRES_IMU"],
-                heartbeat_received=self._ingress_counts["HEARTBEAT"],
-                race_status_received=self._ingress_counts["RACE_STATUS"],
-                actuator_received=self._ingress_counts[
-                    "ACTUATOR_OUTPUT_STATUS"
-                ],
-                dropped=self._ingress_dropped,
-                high_watermark=self._ingress_high_watermark,
-                imu_capacity=self.ingress_buffer_capacity,
-                other_capacity=self.ingress_buffer_capacity,
-                imu_dropped=self._imu_ingress_dropped,
-                other_dropped=self._other_ingress_dropped,
-                imu_high_watermark=self._imu_ingress_high_watermark,
-                other_high_watermark=self._other_ingress_high_watermark,
-                buffered_imu=len(self._imu_samples),
-                buffered_other=len(self._mavlink_arrivals),
-            )
+            return self._ingress_stats_locked()
 
     def outbound_audit(self) -> MavlinkOutboundAudit:
         with self._audit_lock:
             return MavlinkOutboundAudit(**self._outbound_counts)
 
     @property
+    def powered_peer(self) -> Optional[tuple[str, int]]:
+        if self._powered_transport is None:
+            return None
+        return self._powered_transport.peer
+
+    @property
+    def powered_source_promoted(self) -> bool:
+        return bool(
+            self._powered_transport is not None
+            and self._powered_transport.promoted
+        )
+
+    @property
+    def powered_source_rejected(self) -> bool:
+        return bool(
+            self._powered_transport is not None
+            and self._powered_transport.source_gate.source_rejected_latched
+        )
+
+    @property
+    def powered_source_authority(self):
+        """Return the one transport-owned source freeze used by production."""
+
+        if self._powered_transport is None:
+            return None
+        return self._powered_transport.source_gate
+
+    @property
+    def powered_receive_owner(self) -> Optional[str]:
+        if self._powered_transport is None:
+            return None
+        return self._powered_transport.receive_owner
+
+    def powered_transport_state(self) -> Optional[PoweredMavlinkTransportState]:
+        """Snapshot caller-visible powered endpoint and worker closure facts."""
+
+        transport = self._powered_transport
+        if transport is None:
+            return None
+        endpoint = transport.endpoint
+        receiver = self._rx_thread
+        announcer = self._announce_thread
+        peer = transport.peer
+        return PoweredMavlinkTransportState(
+            requested_host=endpoint.requested_host,
+            requested_port=endpoint.requested_port,
+            actual_host=endpoint.actual_host,
+            actual_port=endpoint.actual_port,
+            frozen_peer=None if peer is None else tuple(peer),
+            rejected_source_count=transport.source_gate.rejected_source_count,
+            endpoint_closed=endpoint.closed is True,
+            receiver_joined=receiver is None or not receiver.is_alive(),
+            announcer_joined=announcer is None or not announcer.is_alive(),
+            connection_closed=self._conn is None,
+        )
+
+    def calibration_reset_persistence_state(
+        self,
+    ) -> CalibrationResetPersistenceState:
+        """Return redacted, bounded proof of cleanup persistence failures."""
+
+        with self._state_lock:
+            return CalibrationResetPersistenceState(
+                failures=tuple(self._reset_persistence_failures),
+                dropped=self._reset_persistence_failures_dropped,
+            )
+
+    def receive_powered_external(
+        self,
+        max_wait_ns: int,
+    ) -> Optional[PoweredDatagramDispatch]:
+        """Boundedly read and dispatch one cleanup-owned powered datagram.
+
+        This API is unavailable in normal worker mode. It is the sole receive
+        call used by cleanup integration, so the transport source freeze and
+        the production parser see the same datagram under one receive owner.
+        """
+
+        if (
+            self._powered_transport is None
+            or self.powered_receive_mode
+            != POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP
+        ):
+            raise RuntimeError("external powered receive mode is not active")
+        if self._conn is None:
+            raise RuntimeError("external powered receive is not connected")
+        received = self._powered_transport.recvfrom(
+            owner=POWERED_RECEIVE_OWNER_EXTERNAL_CLEANUP,
+            max_wait_ns=max_wait_ns,
+        )
+        if received is None:
+            return None
+        raw, source = received
+        return self._handle_powered_datagram(raw, source)
+
+    def announce_powered_external_cleanup(self) -> None:
+        """Synchronously send one dispatcher-authorized TIMESYNC/GCS pair."""
+
+        if (
+            self._powered_transport is None
+            or self.powered_receive_mode
+            != POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP
+        ):
+            raise RuntimeError("external powered cleanup mode is not active")
+        self._require_conn()
+        timesync_wire = self._timesync_wire_type(tc1=0, ts1=time.time_ns())
+        heartbeat_wire = self._gcs_heartbeat_wire_type(
+            type=6,
+            autopilot=8,
+            base_mode=0,
+            custom_mode=0,
+            system_status=4,
+        )
+        with self._send_lock:
+            self._call_nonattitude_locked(
+                category="timesync",
+                api="timesync_send",
+                audit_name="timesync",
+                wire=timesync_wire,
+                call=lambda: self._conn.mav.timesync_send(
+                    timesync_wire.tc1,
+                    timesync_wire.ts1,
+                ),
+                powered_cleanup=True,
+            )
+            self._call_nonattitude_locked(
+                category="gcs_heartbeat",
+                api="heartbeat_send",
+                audit_name="gcs_heartbeat",
+                wire=heartbeat_wire,
+                call=lambda: self._conn.mav.heartbeat_send(
+                    heartbeat_wire.type,
+                    heartbeat_wire.autopilot,
+                    heartbeat_wire.base_mode,
+                    heartbeat_wire.custom_mode,
+                    heartbeat_wire.system_status,
+                ),
+                powered_cleanup=True,
+            )
+
+    @property
+    def powered_outbound_guards(self):
+        if self._powered_transport is None:
+            return None
+        return self._powered_transport.outbound_guards
+
+    def outbound_receipt_stats(self) -> MavlinkOutboundReceiptStats:
+        with self._audit_lock:
+            return MavlinkOutboundReceiptStats(
+                generation=self._outbound_generation,
+                next_sequence=self._outbound_next_sequence,
+                returned=self._outbound_returned,
+                raised=self._outbound_raised,
+                dropped=self._outbound_dropped,
+                high_watermark=self._outbound_high_watermark,
+                capacity=self.outbound_receipt_capacity,
+                buffered=len(self._outbound_receipts),
+            )
+
+    def drain_outbound_receipts(
+        self,
+    ) -> list[AttitudeTargetOutboundV1 | NonAttitudeOutboundV1]:
+        """Return bounded exact local-call receipts and clear their queue."""
+
+        with self._audit_lock:
+            receipts = list(self._outbound_receipts)
+            self._outbound_receipts.clear()
+            return receipts
+
+    def collision_stats(self) -> MavlinkCollisionStats:
+        """Return calibration-only collision-buffer diagnostics."""
+
+        with self._state_lock:
+            return self._collision_stats_locked()
+
+    @property
     def race_status(self) -> Optional[RaceStatus]:
         with self._state_lock:
             return self._race_status
+
+    @property
+    def latest_received_heartbeat(self) -> Optional[ReceivedHeartbeatV1]:
+        with self._state_lock:
+            return self._latest_received_heartbeat
+
+    @property
+    def latest_received_race_status(self) -> Optional[ReceivedRaceStatusV1]:
+        with self._state_lock:
+            return self._latest_received_race_status
+
+    @property
+    def latest_received_actuator_output_status(
+        self,
+    ) -> Optional[ReceivedActuatorOutputStatusV1]:
+        with self._state_lock:
+            return self._latest_received_actuator_output_status
 
     @property
     def track_data(self) -> Optional[TrackData]:
@@ -839,26 +2508,40 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             self._collisions.clear()
             return out
 
-    async def _send_sim_reset(self, clear_track_event: bool = False) -> None:
+    async def _send_sim_reset(
+        self,
+        clear_track_event: bool = False,
+        *,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
         self._require_conn()
         if clear_track_event:
             self._track_event.clear()
         if self._vision is not None:
             self._vision.reset()
+        wire = self._command_long_wire_type(
+            target_system=self._target_system,
+            target_component=self._target_component,
+            command=SIM_RESET_COMMAND,
+            confirmation=0,
+            params=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        )
         with self._send_lock:
-            self._audit_outbound("sim_reset")
-            self._conn.mav.command_long_send(
-                self._target_system,
-                self._target_component,
-                SIM_RESET_COMMAND,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
+            self._call_nonattitude_locked(
+                category="sim_reset",
+                api="command_long_send",
+                audit_name="sim_reset",
+                wire=wire,
+                call=lambda: self._conn.mav.command_long_send(
+                    wire.target_system,
+                    wire.target_component,
+                    wire.command,
+                    wire.confirmation,
+                    *wire.params,
+                ),
+                powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
+                powered_cleanup=powered_cleanup,
             )
 
     def _begin_ingress_generation_locked(self) -> None:
@@ -874,6 +2557,60 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         self._other_ingress_high_watermark = 0
         self._imu_samples.clear()
         self._mavlink_arrivals.clear()
+
+    def _snapshot_received_observations_locked(self) -> tuple[Any, ...]:
+        values = list(self._mavlink_arrivals)
+        values.extend(self._imu_samples)
+        values.sort(key=lambda item: item.ingress.sequence)
+        return tuple(
+            type(item).from_primitive(item.to_primitive()) for item in values
+        )
+
+    def _ingress_stats_locked(self) -> MavlinkIngressStats:
+        return MavlinkIngressStats(
+            generation=self._ingress_generation,
+            next_sequence=self._ingress_next_sequence,
+            highres_imu_received=self._ingress_counts["HIGHRES_IMU"],
+            heartbeat_received=self._ingress_counts["HEARTBEAT"],
+            race_status_received=self._ingress_counts["RACE_STATUS"],
+            actuator_received=self._ingress_counts["ACTUATOR_OUTPUT_STATUS"],
+            dropped=self._ingress_dropped,
+            high_watermark=self._ingress_high_watermark,
+            imu_capacity=self.ingress_buffer_capacity,
+            other_capacity=self.ingress_buffer_capacity,
+            imu_dropped=self._imu_ingress_dropped,
+            other_dropped=self._other_ingress_dropped,
+            imu_high_watermark=self._imu_ingress_high_watermark,
+            other_high_watermark=self._other_ingress_high_watermark,
+            buffered_imu=len(self._imu_samples),
+            buffered_other=len(self._mavlink_arrivals),
+        )
+
+    def _collision_stats_locked(self) -> MavlinkCollisionStats:
+        return MavlinkCollisionStats(
+            generation=self._ingress_generation,
+            handled=self._collision_handled,
+            dropped=self._collision_dropped,
+            high_watermark=self._collision_high_watermark,
+            capacity=DEFAULT_COLLISION_BUFFER_CAPACITY,
+            buffered=len(self._collisions),
+        )
+
+    def _reset_collision_generation_locked(self) -> None:
+        self._collisions.clear()
+        self._collision_handled = 0
+        self._collision_dropped = 0
+        self._collision_high_watermark = 0
+
+    def _append_collision_locked(self, collision: dict[str, int | float]) -> None:
+        self._collision_handled += 1
+        if len(self._collisions) >= DEFAULT_COLLISION_BUFFER_CAPACITY:
+            self._collision_dropped += 1
+        self._collisions.append(dict(collision))
+        self._collision_high_watermark = max(
+            self._collision_high_watermark,
+            len(self._collisions),
+        )
 
     def _new_ingress_locked(
         self,
@@ -893,9 +2630,19 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             source_time_value=source_time_value,
             source_time_unit=source_time_unit,
         )
-        self._ingress_next_sequence += 1
-        self._ingress_counts[message_type] += 1
         return ingress
+
+    def _commit_ingress_locked(self, ingress: MavlinkIngressV1) -> None:
+        """Commit one fully constructed receive envelope to exact counters."""
+
+        if (
+            ingress.generation != self._ingress_generation
+            or ingress.sequence != self._ingress_next_sequence
+            or ingress.message_type not in self._ingress_counts
+        ):
+            raise RuntimeError("MAVLink ingress commit does not match current state")
+        self._ingress_next_sequence += 1
+        self._ingress_counts[ingress.message_type] += 1
 
     def _append_ingress_locked(self, queue: Deque, value) -> None:
         is_imu_queue = queue is self._imu_samples
@@ -929,7 +2676,378 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         with self._audit_lock:
             self._outbound_counts[name] += 1
 
+    def _call_attitude_target_locked(
+        self,
+        *,
+        api: str,
+        wire,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+        powered_exact_zero: Optional[bool] = None,
+    ) -> None:
+        """Call SET_ATTITUDE_TARGET and emit one exact return/raise receipt."""
+
+        call_start = self._read_monotonic_ns()
+        self._authorize_powered_outbound_locked(
+            "attitude_target",
+            call_start=call_start,
+            deadline_monotonic_ns=powered_deadline_monotonic_ns,
+            cleanup=powered_cleanup,
+            exact_zero=powered_exact_zero,
+        )
+        if self._powered_transport is not None:
+            self._powered_transport.begin_authorized_write()
+        self._audit_outbound("attitude_target")
+        try:
+            self._conn.mav.set_attitude_target_send(
+                wire.time_boot_ms,
+                wire.target_system,
+                wire.target_component,
+                wire.type_mask,
+                list(wire.q_wxyz),
+                *wire.body_rates_rad_s,
+                wire.thrust,
+            )
+            if self._powered_transport is not None:
+                self._powered_transport.finish_authorized_write()
+        except BaseException as exc:
+            if self._powered_transport is not None:
+                self._powered_transport.cancel_authorized_write()
+            call_end = self._read_monotonic_ns()
+            self._append_attitude_receipt(
+                api=api,
+                wire=wire,
+                call_start=call_start,
+                call_end=call_end,
+                outcome="raised",
+                error_type=_admitted_outbound_error_type(exc),
+            )
+            raise
+        call_end = self._read_monotonic_ns()
+        self._append_attitude_receipt(
+            api=api,
+            wire=wire,
+            call_start=call_start,
+            call_end=call_end,
+            outcome="returned",
+            error_type=None,
+        )
+
+    def _call_nonattitude_locked(
+        self,
+        *,
+        category: str,
+        api: str,
+        audit_name: str,
+        wire,
+        call: Callable[[], None],
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+    ) -> None:
+        """Call an admitted nonattitude API and receipt return or raise."""
+
+        call_start = self._read_monotonic_ns()
+        call_deadline = self._authorize_powered_outbound_locked(
+            category,
+            call_start=call_start,
+            deadline_monotonic_ns=powered_deadline_monotonic_ns,
+            cleanup=powered_cleanup,
+            exact_zero=None,
+        )
+        if self._powered_transport is not None:
+            self._powered_transport.begin_authorized_write()
+        self._audit_outbound(audit_name)
+        try:
+            call()
+            if self._powered_transport is not None:
+                self._powered_transport.finish_authorized_write()
+        except BaseException as exc:
+            if self._powered_transport is not None:
+                self._powered_transport.cancel_authorized_write()
+            call_end = self._read_monotonic_ns()
+            self._append_nonattitude_receipt(
+                category=category,
+                api=api,
+                wire=wire,
+                call_start=call_start,
+                call_end=call_end,
+                outcome="raised",
+                error_type=_admitted_outbound_error_type(exc),
+            )
+            if call_deadline is not None and call_end >= call_deadline:
+                self._latch_late_powered_nonattitude_call(
+                    cleanup=powered_cleanup
+                )
+            raise
+        call_end = self._read_monotonic_ns()
+        self._append_nonattitude_receipt(
+            category=category,
+            api=api,
+            wire=wire,
+            call_start=call_start,
+            call_end=call_end,
+            outcome="returned",
+            error_type=None,
+        )
+        if call_deadline is not None and call_end >= call_deadline:
+            from scripts.aigp_vq2_powered_runtime import OutboundAuthorityError
+
+            self._latch_late_powered_nonattitude_call(
+                cleanup=powered_cleanup
+            )
+            raise OutboundAuthorityError(
+                "powered nonattitude call completed after its clipped deadline"
+            )
+
+    def _latch_late_powered_nonattitude_call(self, *, cleanup: bool) -> None:
+        guards = self._powered_transport.outbound_guards
+        if cleanup is True:
+            guards.close_cleanup()
+        else:
+            guards.latch_production("powered_nonattitude_call_deadline_reached")
+
+    def _authorize_powered_outbound_locked(
+        self,
+        category: str,
+        *,
+        call_start: int,
+        deadline_monotonic_ns: Optional[int],
+        cleanup: bool,
+        exact_zero: Optional[bool],
+    ) -> Optional[int]:
+        if self._powered_transport is None:
+            if deadline_monotonic_ns is not None or cleanup:
+                raise ValueError(
+                    "powered outbound options require powered transport"
+                )
+            return None
+
+        from scripts.aigp_vq2_powered_runtime import OutboundAuthorityError
+
+        transport = self._powered_transport
+        if type(cleanup) is not bool:
+            transport.outbound_guards.latch_production(
+                "powered_cleanup_flag_invalid"
+            )
+            raise OutboundAuthorityError(
+                "powered_cleanup must be an exact boolean"
+            )
+        external_cleanup_announcement = bool(
+            cleanup
+            and self.powered_receive_mode
+            == POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP
+            and category in {"timesync", "gcs_heartbeat"}
+        )
+        if external_cleanup_announcement:
+            if deadline_monotonic_ns is not None:
+                raise OutboundAuthorityError(
+                    "external cleanup announcement deadline is dispatcher-owned"
+                )
+            if transport.outbound_guards.cleanup_state == "closed":
+                raise OutboundAuthorityError("cleanup guard is closed")
+            if not transport.source_gate.outbound_permitted(category):
+                raise OutboundAuthorityError(
+                    "cleanup announcement source authority is unavailable"
+                )
+            authorize = transport.external_cleanup_authorize
+            if not callable(authorize):
+                raise OutboundAuthorityError(
+                    "cleanup announcement dispatcher is unavailable"
+                )
+            self._powered_callback_bool(
+                transport.parent_alive,
+                "parent_alive",
+            )
+            try:
+                dispatch_deadline = authorize(category)
+            except BaseException as exc:
+                raise OutboundAuthorityError(
+                    "cleanup announcement dispatcher rejected the call"
+                ) from exc
+            if type(dispatch_deadline) is not int or dispatch_deadline < 1:
+                raise OutboundAuthorityError(
+                    "cleanup announcement dispatcher returned an invalid deadline"
+                )
+            if call_start >= dispatch_deadline:
+                raise OutboundAuthorityError(
+                    "cleanup announcement deadline was reached"
+                )
+            if not self._powered_callback_bool(
+                transport.lease_valid,
+                "lease_valid",
+            ):
+                raise OutboundAuthorityError(
+                    "cleanup announcement lease lineage is invalid"
+                )
+            parent_alive = self._powered_callback_bool(
+                transport.parent_alive,
+                "parent_alive",
+            )
+            cleanup_state = transport.outbound_guards.cleanup_state
+            if parent_alive and cleanup_state in {
+                "takeover_pending",
+                "enabled_takeover",
+            }:
+                raise OutboundAuthorityError(
+                    "cleanup announcement parent state conflicts with takeover"
+                )
+            if not parent_alive and cleanup_state not in {
+                "takeover_pending",
+                "enabled_takeover",
+            }:
+                transport.outbound_guards.note_parent_death()
+                raise OutboundAuthorityError(
+                    "cleanup announcement requires abandoned takeover"
+                )
+            return min(
+                dispatch_deadline,
+                call_start + POWERED_OUTBOUND_CALL_NS,
+            )
+        if type(deadline_monotonic_ns) is not int or deadline_monotonic_ns < 1:
+            transport.outbound_guards.latch_production(
+                "powered_call_deadline_missing"
+            )
+            raise OutboundAuthorityError(
+                "powered outbound call requires an exact absolute deadline"
+            )
+        call_deadline = min(
+            deadline_monotonic_ns,
+            call_start + POWERED_OUTBOUND_CALL_NS,
+        )
+        parent_alive = self._powered_callback_bool(
+            transport.parent_alive,
+            "parent_alive",
+        )
+        if not cleanup and not parent_alive:
+            transport.outbound_guards.note_parent_death()
+            raise OutboundAuthorityError("wrapper parent is not live")
+        lease_valid = self._powered_callback_bool(
+            transport.lease_valid,
+            "lease_valid",
+        )
+        if cleanup:
+            transport.outbound_guards.authorize_cleanup(
+                category,
+                now_monotonic_ns=call_start,
+                deadline_monotonic_ns=call_deadline,
+                parent_alive=parent_alive,
+                lease_valid=lease_valid,
+                source_promoted=transport.promoted,
+                exact_zero=exact_zero,
+            )
+            return call_deadline
+        role_valid = self._powered_callback_bool(
+            transport.role_valid,
+            "role_valid",
+        )
+        transport.outbound_guards.authorize_production(
+            category,
+            now_monotonic_ns=call_start,
+            deadline_monotonic_ns=call_deadline,
+            role_valid=role_valid,
+            parent_alive=parent_alive,
+            lease_valid=lease_valid,
+            peer_frozen=transport.peer is not None,
+            source_valid=not transport.source_gate.source_rejected_latched,
+            source_promoted=transport.promoted,
+        )
+        return call_deadline
+
+    def _append_attitude_receipt(
+        self,
+        *,
+        api: str,
+        wire,
+        call_start: int,
+        call_end: int,
+        outcome: str,
+        error_type: Optional[str],
+    ) -> None:
+        with self._audit_lock:
+            receipt = self._attitude_outbound_type(
+                stream_id=VQ2_MAVLINK_STREAM_ID,
+                reset_generation=self._outbound_generation,
+                outbound_sequence=self._outbound_next_sequence,
+                host_clock_id=self.host_clock_id,
+                call_start_monotonic_ns=call_start,
+                call_end_monotonic_ns=call_end,
+                api=api,
+                outcome=outcome,
+                error_type=error_type,
+                wire=wire,
+            )
+            self._append_outbound_receipt_locked(receipt, outcome=outcome)
+
+    def _append_nonattitude_receipt(
+        self,
+        *,
+        category: str,
+        api: str,
+        wire,
+        call_start: int,
+        call_end: int,
+        outcome: str,
+        error_type: Optional[str],
+    ) -> None:
+        with self._audit_lock:
+            receipt = self._nonattitude_outbound_type(
+                stream_id=VQ2_MAVLINK_STREAM_ID,
+                reset_generation=self._outbound_generation,
+                outbound_sequence=self._outbound_next_sequence,
+                host_clock_id=self.host_clock_id,
+                call_start_monotonic_ns=call_start,
+                call_end_monotonic_ns=call_end,
+                category=category,
+                api=api,
+                outcome=outcome,
+                error_type=error_type,
+                wire=wire,
+            )
+            self._append_outbound_receipt_locked(receipt, outcome=outcome)
+
+    def _append_outbound_receipt_locked(self, receipt, *, outcome: str) -> None:
+        if len(self._outbound_receipts) >= self.outbound_receipt_capacity:
+            self._outbound_dropped += 1
+        self._outbound_receipts.append(receipt)
+        self._outbound_next_sequence += 1
+        if outcome == "returned":
+            self._outbound_returned += 1
+        else:
+            self._outbound_raised += 1
+        self._outbound_high_watermark = max(
+            self._outbound_high_watermark,
+            len(self._outbound_receipts),
+        )
+
+    def _begin_outbound_generation_locked(
+        self,
+        generation: int,
+        *,
+        initialize_attempt: bool = False,
+    ) -> None:
+        self._outbound_generation = generation
+        if initialize_attempt:
+            self._outbound_next_sequence = 0
+            self._outbound_returned = 0
+            self._outbound_raised = 0
+            self._outbound_dropped = 0
+            self._outbound_high_watermark = 0
+            self._outbound_receipts.clear()
+
     def _handle_message(self, msg, *, received_monotonic_ns: Optional[int] = None) -> None:
+        with self._ingress_dispatch_lock:
+            self._handle_message_locked(
+                msg,
+                received_monotonic_ns=received_monotonic_ns,
+            )
+
+    def _handle_message_locked(
+        self,
+        msg,
+        *,
+        received_monotonic_ns: Optional[int] = None,
+        raise_handler_errors: bool = False,
+    ) -> None:
         try:
             received_ns = (
                 self._read_monotonic_ns()
@@ -973,6 +3091,8 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                                 msg_type, msg.to_dict() if hasattr(msg, "to_dict") else msg)
         except Exception:
             logger.exception("AIGP MAVLink message handler failed")
+            if raise_handler_errors:
+                raise
 
     def _handle_statustext(self, msg) -> None:
         """Capture + log STATUSTEXT. The DSQ verdict (if the sim sends one over
@@ -992,14 +3112,24 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         logger.warning("AIGP STATUSTEXT (sev=%s): %s", severity, text)
 
     def _handle_heartbeat(self, msg, received_monotonic_ns: int) -> None:
+        payload = self._heartbeat_payload_type(
+            base_mode=msg.base_mode,
+            custom_mode=msg.custom_mode,
+        )
         with self._state_lock:
             ingress = self._new_ingress_locked(
                 "HEARTBEAT", received_monotonic_ns
             )
-            self._append_ingress_locked(self._mavlink_arrivals, ingress)
+            received = self._received_heartbeat_type(
+                ingress=ingress,
+                heartbeat=payload,
+            )
+            self._commit_ingress_locked(ingress)
+            self._append_ingress_locked(self._mavlink_arrivals, received)
+            self._latest_received_heartbeat = received
             self._last_heartbeat_monotonic = time.monotonic()
             self._heartbeat_sequence += 1
-            self._armed = bool(msg.base_mode & 0x80)
+            self._armed = bool(payload.base_mode & 0x80)
             if self._conn is not None:
                 self._target_system = getattr(self._conn, "target_system", self._target_system) or self._target_system
                 self._target_component = getattr(self._conn, "target_component", self._target_component) or self._target_component
@@ -1062,6 +3192,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 source_time_unit="us",
             )
             received = self._received_imu_type(ingress=ingress, imu=imu)
+            self._commit_ingress_locked(ingress)
             self._last_imu_monotonic = time.monotonic()
             self._append_ingress_locked(self._imu_samples, received)
             self._latest_telem = _telem_with(self._latest_telem, imu=imu)
@@ -1069,31 +3200,40 @@ class AIGPMavlinkAdapter(CompetitionInterface):
             self._maybe_ready()
 
     def _handle_actuator(self, msg, received_monotonic_ns: int) -> None:
+        payload = self._actuator_payload_type(
+            time_usec=msg.time_usec,
+            active=msg.active,
+            actuator=tuple(msg.actuator),
+        )
         with self._state_lock:
-            source_time = getattr(msg, "time_usec", None)
-            if type(source_time) is not int or source_time < 0:
-                source_time = None
             ingress = self._new_ingress_locked(
                 "ACTUATOR_OUTPUT_STATUS",
                 received_monotonic_ns,
-                source_time_value=source_time,
-                source_time_unit="us" if source_time is not None else None,
+                source_time_value=payload.time_usec,
+                source_time_unit="us",
             )
-            self._append_ingress_locked(self._mavlink_arrivals, ingress)
+            received = self._received_actuator_type(
+                ingress=ingress,
+                actuator_output_status=payload,
+            )
+            self._commit_ingress_locked(ingress)
+            self._append_ingress_locked(self._mavlink_arrivals, received)
+            self._latest_received_actuator_output_status = received
             self._last_actuator_monotonic = time.monotonic()
             self._actuator_outputs = {
-                "time_usec": getattr(msg, "time_usec", None),
-                "active": getattr(msg, "active", None),
-                "actuator": list(getattr(msg, "actuator", [])),
+                "time_usec": payload.time_usec,
+                "active": payload.active,
+                "actuator": list(payload.actuator),
             }
 
     def _handle_collision(self, msg) -> None:
+        collision = CalibrationCollisionV1(
+            id=msg.id,
+            threat_level=msg.threat_level,
+            impulse=msg.horizontal_minimum_delta,
+        ).to_primitive()
         with self._state_lock:
-            self._collisions.append({
-                "id": msg.id,
-                "threat_level": msg.threat_level,
-                "impulse": msg.horizontal_minimum_delta,
-            })
+            self._append_collision_locked(collision)
 
     def _handle_encapsulated(self, msg, received_monotonic_ns: int) -> None:
         payload = bytes(msg.data)
@@ -1102,14 +3242,27 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         data_type = payload[0]
         if data_type == ENCAPSULATED_RACE_STATUS_MSG_ID:
             race_status = parse_race_status(payload)
+            race_payload = self._race_status_payload_type(
+                sim_boot_time_ms=race_status.sim_boot_time_ms,
+                race_start_boot_time_ms=race_status.race_start_boot_time_ms,
+                race_finish_time_ns=race_status.race_finish_time_ns,
+                active_gate_index=race_status.active_gate_index,
+                last_gate_race_time=race_status.last_gate_race_time,
+            )
             with self._state_lock:
                 ingress = self._new_ingress_locked(
                     "RACE_STATUS",
                     received_monotonic_ns,
-                    source_time_value=race_status.sim_boot_time_ms,
+                    source_time_value=race_payload.sim_boot_time_ms,
                     source_time_unit="ms",
                 )
-                self._append_ingress_locked(self._mavlink_arrivals, ingress)
+                received = self._received_race_status_type(
+                    ingress=ingress,
+                    race_status=race_payload,
+                )
+                self._commit_ingress_locked(ingress)
+                self._append_ingress_locked(self._mavlink_arrivals, received)
+                self._latest_received_race_status = received
                 self._last_race_status_monotonic = time.monotonic()
                 self._race_status = race_status
             return
@@ -1139,23 +3292,307 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 logger.exception("AIGP MAVLink recv failed")
                 continue
             if msg is not None:
-                received_monotonic_ns = self._read_monotonic_ns()
-                self._handle_message(
-                    msg, received_monotonic_ns=received_monotonic_ns
+                self._handle_message(msg)
+
+    def _powered_rx_loop(self) -> None:  # pragma: no cover - live socket loop
+        transport = self._powered_transport
+        while not self._stop_event.is_set():
+            try:
+                received = transport.recvfrom(
+                    owner=POWERED_RECEIVE_OWNER_WORKER,
+                    max_wait_ns=POWERED_WORKER_POLL_NS,
+                )
+                if received is None:
+                    continue
+                raw, source = received
+            except BaseException:
+                if self._stop_event.is_set() or transport.endpoint.closed:
+                    return
+                self._latch_powered_receiver_failure("powered_udp_receive_failed")
+                return
+            self._handle_powered_datagram(raw, source)
+
+    def _handle_powered_datagram(
+        self,
+        raw: bytes,
+        source: Any,
+    ) -> PoweredDatagramDispatch:
+        """Gate raw source, then forward accepted bytes to production parsing."""
+
+        transport = self._powered_transport
+        admitted_type: Optional[str] = None
+        admitted_generation: Optional[int] = None
+        message = None
+        with self._ingress_dispatch_lock:
+            received_monotonic_ns = self._read_monotonic_ns()
+            decision = transport.source_gate.ingest(raw, source)
+            if decision.rejected_source:
+                transport.outbound_guards.latch_production(
+                    "mavlink_source_rejected"
+                )
+                if not transport.promoted:
+                    self._powered_failure_reason = "MAVLink source was rejected"
+                    self._powered_failure_event.set()
+                    self._powered_promotion_event.set()
+                return PoweredDatagramDispatch(
+                    source_accepted=False,
+                    peer_frozen_now=False,
+                    rejected_source=True,
+                    malformed=False,
+                    production_dispatched=False,
+                    source_promoted=transport.promoted,
+                    peer=transport.peer,
+                    admitted_message_type=None,
+                    failure_reason=None,
+                )
+            if decision.malformed:
+                return PoweredDatagramDispatch(
+                    source_accepted=False,
+                    peer_frozen_now=False,
+                    rejected_source=False,
+                    malformed=True,
+                    production_dispatched=False,
+                    source_promoted=transport.promoted,
+                    peer=transport.peer,
+                    admitted_message_type=None,
+                    failure_reason=None,
+                )
+            if not decision.accepted:
+                self._latch_powered_receiver_failure(
+                    "mavlink_source_decision_invalid"
+                )
+                return PoweredDatagramDispatch(
+                    source_accepted=False,
+                    peer_frozen_now=False,
+                    rejected_source=False,
+                    malformed=False,
+                    production_dispatched=False,
+                    source_promoted=transport.promoted,
+                    peer=transport.peer,
+                    admitted_message_type=None,
+                    failure_reason="mavlink_source_decision_invalid",
                 )
 
+            # Deliberately ignore decision.message: it came from the scratch
+            # validator. Production state receives only the accepted raw bytes
+            # parsed again by the established production pymavlink object.
+            try:
+                message = transport.parse_production(raw)
+            except BaseException:
+                self._latch_powered_receiver_failure(
+                    "production_mavlink_parse_failed"
+                )
+                return PoweredDatagramDispatch(
+                    source_accepted=True,
+                    peer_frozen_now=decision.peer_frozen_now,
+                    rejected_source=False,
+                    malformed=False,
+                    production_dispatched=False,
+                    source_promoted=transport.promoted,
+                    peer=transport.peer,
+                    admitted_message_type=None,
+                    failure_reason="production_mavlink_parse_failed",
+                )
+
+            with self._state_lock:
+                generation_before = self._ingress_generation
+                counts_before = dict(self._ingress_counts)
+            try:
+                self._handle_message_locked(
+                    message,
+                    received_monotonic_ns=received_monotonic_ns,
+                    raise_handler_errors=True,
+                )
+            except BaseException:
+                self._latch_powered_receiver_failure(
+                    "production_mavlink_handler_failed"
+                )
+                return PoweredDatagramDispatch(
+                    source_accepted=True,
+                    peer_frozen_now=decision.peer_frozen_now,
+                    rejected_source=False,
+                    malformed=False,
+                    production_dispatched=True,
+                    source_promoted=transport.promoted,
+                    peer=transport.peer,
+                    admitted_message_type=None,
+                    failure_reason="production_mavlink_handler_failed",
+                )
+            with self._state_lock:
+                generation_after = self._ingress_generation
+                changed = [
+                    name
+                    for name, count in self._ingress_counts.items()
+                    if count == counts_before[name] + 1
+                ]
+                no_other_changes = all(
+                    self._ingress_counts[name] == counts_before[name]
+                    for name in self._ingress_counts
+                    if name not in changed
+                )
+            if generation_after != generation_before:
+                self._latch_powered_receiver_failure(
+                    "ingress_generation_changed_during_datagram"
+                )
+                return PoweredDatagramDispatch(
+                    source_accepted=True,
+                    peer_frozen_now=decision.peer_frozen_now,
+                    rejected_source=False,
+                    malformed=False,
+                    production_dispatched=True,
+                    source_promoted=transport.promoted,
+                    peer=transport.peer,
+                    admitted_message_type=None,
+                    failure_reason="ingress_generation_changed_during_datagram",
+                )
+            if len(changed) == 1 and no_other_changes:
+                admitted_type = changed[0]
+                admitted_generation = generation_after
+
+        # Promotion shares the outbound send lock. Thus an announcement is
+        # linearly either wholly before promotion or denied after promotion.
+        if admitted_type in {"HEARTBEAT", "RACE_STATUS", "HIGHRES_IMU"}:
+            with self._send_lock:
+                with self._state_lock:
+                    generation_still_current = (
+                        self._ingress_generation == admitted_generation
+                    )
+                if (
+                    generation_still_current
+                    and transport.source_gate.observe_fresh_stream(admitted_type)
+                ):
+                    self._powered_promotion_event.set()
+
+        source_system = getattr(message, "get_srcSystem", None)
+        source_component = getattr(message, "get_srcComponent", None)
+        if callable(source_system) and callable(source_component):
+            system = source_system()
+            component = source_component()
+            if type(system) is int and 1 <= system <= 255:
+                self._target_system = system
+                transport.connection.target_system = system
+            if type(component) is int and 1 <= component <= 255:
+                self._target_component = component
+                transport.connection.target_component = component
+
+        return PoweredDatagramDispatch(
+            source_accepted=True,
+            peer_frozen_now=decision.peer_frozen_now,
+            rejected_source=False,
+            malformed=False,
+            production_dispatched=True,
+            source_promoted=transport.promoted,
+            peer=transport.peer,
+            admitted_message_type=admitted_type,
+            failure_reason=None,
+        )
+
+    def _latch_powered_receiver_failure(self, reason: str) -> None:
+        transport = self._powered_transport
+        transport.outbound_guards.latch_production(reason)
+        if self._powered_failure_reason is None:
+            self._powered_failure_reason = reason
+        self._powered_failure_event.set()
+        self._powered_promotion_event.set()
+
     def _announce_loop(self) -> None:  # pragma: no cover - live socket loop
+        if self._powered_transport is not None:
+            self._powered_announce_loop()
+            return
         while not self._stop_event.is_set():
             try:
                 now_ns = time.time_ns()
+                timesync_wire = self._timesync_wire_type(tc1=0, ts1=now_ns)
+                heartbeat_wire = self._gcs_heartbeat_wire_type(
+                    type=6,
+                    autopilot=8,
+                    base_mode=0,
+                    custom_mode=0,
+                    system_status=4,
+                )
                 with self._send_lock:
-                    self._conn.mav.timesync_send(0, now_ns)
-                    self._audit_outbound("timesync")
-                    self._conn.mav.heartbeat_send(6, 8, 0, 0, 4)
-                    self._audit_outbound("gcs_heartbeat")
+                    self._call_nonattitude_locked(
+                        category="timesync",
+                        api="timesync_send",
+                        audit_name="timesync",
+                        wire=timesync_wire,
+                        call=lambda: self._conn.mav.timesync_send(
+                            timesync_wire.tc1,
+                            timesync_wire.ts1,
+                        ),
+                    )
+                    self._call_nonattitude_locked(
+                        category="gcs_heartbeat",
+                        api="heartbeat_send",
+                        audit_name="gcs_heartbeat",
+                        wire=heartbeat_wire,
+                        call=lambda: self._conn.mav.heartbeat_send(
+                            heartbeat_wire.type,
+                            heartbeat_wire.autopilot,
+                            heartbeat_wire.base_mode,
+                            heartbeat_wire.custom_mode,
+                            heartbeat_wire.system_status,
+                        ),
+                    )
             except Exception:
                 logger.exception("AIGP MAVLink announce failed")
             self._stop_event.wait(0.1)
+
+    def _powered_announce_loop(self) -> None:
+        transport = self._powered_transport
+        while not self._stop_event.is_set():
+            if transport.promoted:
+                return
+            if transport.peer is None:
+                self._stop_event.wait(POWERED_WORKER_POLL_NS / 1_000_000_000.0)
+                continue
+            try:
+                now_ns = time.time_ns()
+                timesync_wire = self._timesync_wire_type(tc1=0, ts1=now_ns)
+                heartbeat_wire = self._gcs_heartbeat_wire_type(
+                    type=6,
+                    autopilot=8,
+                    base_mode=0,
+                    custom_mode=0,
+                    system_status=4,
+                )
+                with self._send_lock:
+                    # Promotion can race the outer check. Make the final check
+                    # under the same lock that brackets authorization and send.
+                    if transport.promoted:
+                        return
+                    deadline = self._powered_connect_deadline_monotonic_ns
+                    self._call_nonattitude_locked(
+                        category="timesync",
+                        api="timesync_send",
+                        audit_name="timesync",
+                        wire=timesync_wire,
+                        call=lambda: self._conn.mav.timesync_send(
+                            timesync_wire.tc1,
+                            timesync_wire.ts1,
+                        ),
+                        powered_deadline_monotonic_ns=deadline,
+                    )
+                    self._call_nonattitude_locked(
+                        category="gcs_heartbeat",
+                        api="heartbeat_send",
+                        audit_name="gcs_heartbeat",
+                        wire=heartbeat_wire,
+                        call=lambda: self._conn.mav.heartbeat_send(
+                            heartbeat_wire.type,
+                            heartbeat_wire.autopilot,
+                            heartbeat_wire.base_mode,
+                            heartbeat_wire.custom_mode,
+                            heartbeat_wire.system_status,
+                        ),
+                        powered_deadline_monotonic_ns=deadline,
+                    )
+            except BaseException:
+                self._latch_powered_receiver_failure(
+                    "powered_announcement_failed"
+                )
+                return
+            self._stop_event.wait(POWERED_WORKER_POLL_NS / 1_000_000_000.0)
 
     def _time_boot_ms(self) -> int:
         return int(time.monotonic() * 1000) & 0xFFFFFFFF

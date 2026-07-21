@@ -29,23 +29,36 @@ from __future__ import annotations
 import argparse
 import asyncio
 import gzip
+import hashlib
+import inspect
 import json
 import logging
 import math
 import statistics
+import sys
+import threading
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 
 from competition.adapter import AttitudeRateCommand, Quaternion
-from competition.aigp_mavlink import (
-    DEFAULT_MAVLINK_URL,
-    AIGPMavlinkAdapter,
-    _attitude_error_body_rates,
-)
+from competition.aigp_messages import RaceStatus
 from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
-from competition.vq2_vision import VQ2VisionThread
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from estimation.imu_attitude import (
     AttitudeEstimate,
@@ -57,6 +70,37 @@ from gate_detection.src.vq2_detector import VQ2GateDetector
 
 if TYPE_CHECKING:
     from aigp_loop.replay import AsyncReplayRecorder
+    from competition.aigp_mavlink import AIGPMavlinkAdapter
+    from competition.vq2_vision import VQ2VisionThread
+
+
+# Importing this module is part of the powered-child bootstrap path.  Keep the
+# two modules that can construct live transports out of the import graph until
+# immutable process/capability admission has succeeded.  Legacy callers load
+# them on first use through ``_load_live_transport_dependencies``.
+DEFAULT_MAVLINK_URL = "udpin:127.0.0.1:14550"
+AIGPMavlinkAdapter: Any = None
+VQ2VisionThread: Any = None
+_attitude_error_body_rates: Any = None
+
+
+def _load_live_transport_dependencies() -> Tuple[Any, Any, Any]:
+    global AIGPMavlinkAdapter, VQ2VisionThread, _attitude_error_body_rates
+    if AIGPMavlinkAdapter is None or _attitude_error_body_rates is None:
+        from competition.aigp_mavlink import (
+            AIGPMavlinkAdapter as adapter_type,
+            _attitude_error_body_rates as attitude_error_body_rates,
+        )
+
+        if AIGPMavlinkAdapter is None:
+            AIGPMavlinkAdapter = adapter_type
+        if _attitude_error_body_rates is None:
+            _attitude_error_body_rates = attitude_error_body_rates
+    if VQ2VisionThread is None:
+        from competition.vq2_vision import VQ2VisionThread as vision_type
+
+        VQ2VisionThread = vision_type
+    return AIGPMavlinkAdapter, VQ2VisionThread, _attitude_error_body_rates
 
 
 logger = logging.getLogger("aigp.vq2")
@@ -115,6 +159,5643 @@ def _replay_capture_dependencies():
 
 class SafetyAbort(RuntimeError):
     """A latched no-recovery flight watchdog failure."""
+
+
+class CalibrationBootstrapError(RuntimeError):
+    """The wrapper-owned powered-child admission could not be proved."""
+
+
+class CalibrationEvidenceError(RuntimeError):
+    """Required calibration evidence could not be validated or enqueued."""
+
+
+class CalibrationLifecycleError(RuntimeError):
+    """The admitted powered-child lifecycle could not complete exactly."""
+
+
+CALIBRATION_STAGE = "calibration-excite"
+CALIBRATION_CHILD_ROLE = "powered_child"
+CALIBRATION_CAPABILITY_DOMAIN = "aigp-vq2-powered-child/1"
+CALIBRATION_CAPABILITY_RELEASE_NS = 3_000_000_000
+CALIBRATION_OWNED_HANDLE_CLOSE_NS = 2_000_000_000
+
+
+@dataclass(frozen=True)
+class CalibrationArguments:
+    stage: str
+    powered_attempt_envelope: str
+    wrapper_process: str
+    powered_process_authority: str
+    attempt_capability_handle: str
+    parent_liveness_handle: str
+    record: str
+    replay_bundle: str
+    cleanup_certificate: str
+    recording_approved: bool
+
+
+def build_calibration_argument_parser() -> argparse.ArgumentParser:
+    """Build the exact, wrapper-only powered-child parser.
+
+    There is deliberately no address, waveform, duration, amplitude, thrust,
+    geometry, or safety override on this surface.
+    """
+
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.aigp_vq2_run",
+        allow_abbrev=False,
+    )
+    parser.add_argument("--stage", required=True, choices=(CALIBRATION_STAGE,))
+    parser.add_argument("--powered-attempt-envelope", required=True)
+    parser.add_argument("--wrapper-process", required=True)
+    parser.add_argument("--powered-process-authority", required=True)
+    parser.add_argument("--attempt-capability-handle", required=True)
+    parser.add_argument("--parent-liveness-handle", required=True)
+    parser.add_argument("--record", required=True)
+    parser.add_argument("--replay-bundle", required=True)
+    parser.add_argument("--cleanup-certificate", required=True)
+    parser.add_argument("--recording-approved", required=True, action="store_true")
+    return parser
+
+
+def parse_calibration_arguments(argv: Sequence[str]) -> CalibrationArguments:
+    if type(argv) not in {list, tuple} or any(type(item) is not str for item in argv):
+        raise TypeError("calibration argv must be an exact string list or tuple")
+    namespace = build_calibration_argument_parser().parse_args(list(argv))
+    return CalibrationArguments(
+        stage=namespace.stage,
+        powered_attempt_envelope=namespace.powered_attempt_envelope,
+        wrapper_process=namespace.wrapper_process,
+        powered_process_authority=namespace.powered_process_authority,
+        attempt_capability_handle=namespace.attempt_capability_handle,
+        parent_liveness_handle=namespace.parent_liveness_handle,
+        record=namespace.record,
+        replay_bundle=namespace.replay_bundle,
+        cleanup_certificate=namespace.cleanup_certificate,
+        recording_approved=namespace.recording_approved,
+    )
+
+
+class CalibrationProcessBoundary(Protocol):
+    """Retained Windows process/handle proof supplied by the wrapper runtime."""
+
+    def current_argv(self) -> Sequence[str]: ...
+
+    def current_process_identity(self) -> Mapping[str, Any]: ...
+
+    def retained_process_identity(self, handle: int) -> Mapping[str, Any]: ...
+
+    def prove_inherited_handle_policy(
+        self,
+        *,
+        capability_handle: int,
+        parent_handle: int,
+        process_authority: Mapping[str, Any],
+    ) -> bool: ...
+
+    def parent_signaled(self, handle: int) -> bool: ...
+
+    def close_owned_handles(
+        self,
+        *,
+        deadline_monotonic_ns: int,
+        monotonic_ns: Callable[[], int],
+    ) -> Any: ...
+
+
+@dataclass
+class CalibrationAdmissionServices:
+    """Injected bootstrap services; none may construct or open a live transport."""
+
+    process_boundary: CalibrationProcessBoundary
+    capability_operations: Any
+    monotonic_ns: Callable[[], int]
+    contract: Any = None
+    runtime: Any = None
+    load_record: Optional[Callable[[str, Any], Mapping[str, Any]]] = None
+    run_admitted: Optional[Callable[["CalibrationAdmission"], Any]] = None
+    child_services: Optional["CalibrationChildServices"] = None
+    owned_process_boundary: Optional[CalibrationProcessBoundary] = None
+    close_unconsumed_capability: Optional[Callable[[], bool]] = None
+
+
+@dataclass
+class CalibrationAdmission:
+    arguments: CalibrationArguments
+    attempt: Dict[str, Any]
+    live_freeze: Dict[str, Any]
+    process_authority: Dict[str, Any]
+    current_process: Dict[str, Any]
+    wrapper_process: Dict[str, Any]
+    process_argv: Tuple[str, ...]
+    capability_handle: int
+    parent_handle: int
+    role_secret: bytearray = field(repr=False)
+    admitted_monotonic_ns: int = 0
+    total_deadline_monotonic_ns: int = 0
+    prepower_deadline_monotonic_ns: int = 0
+    powered_deadline_monotonic_ns: int = 0
+    cleanup_deadline_monotonic_ns: int = 0
+    replay_close_deadline_monotonic_ns: int = 0
+    exit_deadline_monotonic_ns: int = 0
+    attempt_envelope_sha256: str = ""
+    process_authority_sha256: str = ""
+
+    def erase_role_secret(self) -> None:
+        for index in range(len(self.role_secret)):
+            self.role_secret[index] = 0
+
+
+def _powered_contract_modules(services: CalibrationAdmissionServices) -> Tuple[Any, Any]:
+    contract = services.contract
+    runtime = services.runtime
+    if contract is None:
+        from scripts import aigp_vq2_powered_attempt as contract_module
+
+        contract = contract_module
+    if runtime is None:
+        from scripts import aigp_vq2_powered_runtime as runtime_module
+
+        runtime = runtime_module
+    return contract, runtime
+
+
+def _stable_calibration_record(path: str, contract: Any, runtime: Any) -> Mapping[str, Any]:
+    before = runtime.stable_file_identity(path)
+    try:
+        payload = Path(path).read_bytes()
+    except OSError as exc:
+        raise CalibrationBootstrapError("immutable bootstrap record could not be read") from exc
+    after = runtime.stable_file_identity(path)
+    if before != after or hashlib.sha256(payload).hexdigest() != before.sha256:
+        raise CalibrationBootstrapError("immutable bootstrap record changed while reading")
+    try:
+        return contract.parse_canonical_json_bytes(payload, file_form=True)
+    except BaseException as exc:
+        raise CalibrationBootstrapError("bootstrap record is not canonical JSON") from exc
+
+
+def _load_calibration_record(
+    path: str,
+    services: CalibrationAdmissionServices,
+    contract: Any,
+    runtime: Any,
+) -> Mapping[str, Any]:
+    if services.load_record is not None:
+        return services.load_record(path, contract)
+    return _stable_calibration_record(path, contract, runtime)
+
+
+def _calibration_require_equal(actual: Any, expected: Any, label: str) -> None:
+    if actual != expected:
+        raise CalibrationBootstrapError(
+            f"{label} does not match immutable wrapper authority"
+        )
+
+
+def admit_calibration_child(
+    arguments: CalibrationArguments,
+    services: CalibrationAdmissionServices,
+) -> CalibrationAdmission:
+    """Consume the exact child capability before any live import or contact."""
+
+    if not isinstance(arguments, CalibrationArguments):
+        raise TypeError("arguments must be CalibrationArguments")
+    if not isinstance(services, CalibrationAdmissionServices):
+        raise TypeError("services must be CalibrationAdmissionServices")
+    contract, runtime = _powered_contract_modules(services)
+    try:
+        capability_handle = runtime.parse_decimal_handle(
+            arguments.attempt_capability_handle
+        )
+        parent_handle = runtime.parse_decimal_handle(
+            arguments.parent_liveness_handle
+        )
+        wrapper_token = runtime.parse_process_identity_token(
+            arguments.wrapper_process
+        )
+    except BaseException as exc:
+        raise CalibrationBootstrapError("child handle or wrapper token is invalid") from exc
+    if capability_handle == parent_handle:
+        raise CalibrationBootstrapError("capability and parent handles must be distinct")
+
+    try:
+        attempt_initial = contract.validate_attempt(
+            _load_calibration_record(
+                arguments.powered_attempt_envelope,
+                services,
+                contract,
+                runtime,
+            )
+        )
+        live_freeze = contract.validate_live_freeze(
+            _load_calibration_record(
+                attempt_initial["context"]["live_freeze"]["path"],
+                services,
+                contract,
+                runtime,
+            )
+        )
+        attempt = contract.validate_attempt(
+            attempt_initial,
+            live_freeze=live_freeze,
+        )
+        process_argv = tuple(services.process_boundary.current_argv())
+        if not process_argv or any(type(item) is not str for item in process_argv):
+            raise CalibrationBootstrapError("current process argv proof is invalid")
+        authority = contract.validate_process_authority(
+            _load_calibration_record(
+                arguments.powered_process_authority,
+                services,
+                contract,
+                runtime,
+            ),
+            attempt=attempt,
+            argv=process_argv,
+        )
+    except CalibrationBootstrapError:
+        raise
+    except BaseException as exc:
+        raise CalibrationBootstrapError(
+            "attempt or powered-child authority validation failed"
+        ) from exc
+
+    if authority["role"] != CALIBRATION_CHILD_ROLE:
+        raise CalibrationBootstrapError("process authority role is not powered child")
+    context = attempt["context"]
+    paths = context["paths"]
+    exact_values = (
+        (
+            arguments.powered_attempt_envelope,
+            paths["attempt_envelope"],
+            "attempt-envelope path",
+        ),
+        (
+            arguments.powered_process_authority,
+            paths["child_authority"],
+            "process-authority path",
+        ),
+        (arguments.record, paths["legacy_record"], "legacy-record path"),
+        (arguments.replay_bundle, paths["replay_bundle"], "replay-bundle path"),
+        (
+            arguments.cleanup_certificate,
+            paths["child_cleanup_certificate"],
+            "cleanup-certificate path",
+        ),
+        (process_argv, tuple(context["child_argv"]), "powered-child argv"),
+        (
+            parent_handle,
+            authority["parent_handle"]["value"],
+            "parent-liveness handle",
+        ),
+    )
+    for actual, expected, label in exact_values:
+        _calibration_require_equal(actual, expected, label)
+    if arguments.stage != CALIBRATION_STAGE or arguments.recording_approved is not True:
+        raise CalibrationBootstrapError("powered child stage/recording approval changed")
+
+    wrapper_expected = context["wrapper_process"]
+    if type(wrapper_expected) is not dict:
+        raise CalibrationBootstrapError("wrapper process authority is invalid")
+    if (
+        wrapper_token.pid != wrapper_expected["pid"]
+        or wrapper_token.creation_filetime_100ns
+        != wrapper_expected["creation_filetime_100ns"]
+    ):
+        raise CalibrationBootstrapError("wrapper identity token does not match attempt")
+    try:
+        current_process = runtime.validate_process_identity(
+            services.process_boundary.current_process_identity()
+        )
+        retained_parent = runtime.validate_process_identity(
+            services.process_boundary.retained_process_identity(parent_handle)
+        )
+    except BaseException as exc:
+        raise CalibrationBootstrapError("retained process identity proof failed") from exc
+    _calibration_require_equal(
+        current_process,
+        authority["process"],
+        "current process identity",
+    )
+    _calibration_require_equal(
+        retained_parent,
+        wrapper_expected,
+        "retained wrapper identity",
+    )
+    if services.process_boundary.prove_inherited_handle_policy(
+        capability_handle=capability_handle,
+        parent_handle=parent_handle,
+        process_authority=authority,
+    ) is not True:
+        raise CalibrationBootstrapError("inherited handle policy is unproved")
+
+    deadlines = authority["absolute_deadlines"]
+    capability_deadline = min(
+        deadlines["anchor"] + CALIBRATION_CAPABILITY_RELEASE_NS,
+        deadlines["total"],
+    )
+    try:
+        secret = runtime.read_bound_capability(
+            capability_handle,
+            parent_handle,
+            domain=CALIBRATION_CAPABILITY_DOMAIN,
+            context_sha256=attempt["context_sha256"],
+            expected_capability_sha256=authority["capability_sha256"],
+            deadline_monotonic_ns=capability_deadline,
+            operations=services.capability_operations,
+            monotonic_ns=services.monotonic_ns,
+        )
+    except BaseException as exc:
+        raise CalibrationBootstrapError("powered-child capability admission failed") from exc
+    admitted = runtime.read_qpc_ns(services.monotonic_ns)
+    if admitted >= deadlines["total"]:
+        erased = bytearray(secret)
+        for index in range(len(erased)):
+            erased[index] = 0
+        raise CalibrationBootstrapError("powered-child total deadline expired at admission")
+    return CalibrationAdmission(
+        arguments=arguments,
+        attempt=dict(attempt),
+        live_freeze=dict(live_freeze),
+        process_authority=dict(authority),
+        current_process=dict(current_process),
+        wrapper_process=dict(retained_parent),
+        process_argv=process_argv,
+        capability_handle=capability_handle,
+        parent_handle=parent_handle,
+        role_secret=bytearray(secret),
+        admitted_monotonic_ns=admitted,
+        total_deadline_monotonic_ns=deadlines["total"],
+        prepower_deadline_monotonic_ns=deadlines["prepower"],
+        powered_deadline_monotonic_ns=deadlines["powered"],
+        cleanup_deadline_monotonic_ns=deadlines["cleanup"],
+        replay_close_deadline_monotonic_ns=deadlines["replay_close"],
+        exit_deadline_monotonic_ns=deadlines["exit"],
+        attempt_envelope_sha256=contract.canonical_file_sha256(attempt),
+        process_authority_sha256=contract.canonical_file_sha256(authority),
+    )
+
+
+CALIBRATION_COMMAND_FAILURE_CODES = frozenset(
+    {
+        "slot_missed",
+        "deadline_expired",
+        "stream_stale",
+        "imu_not_advancing",
+        "race_not_advancing",
+        "estimator_unhealthy",
+        "target_missing",
+        "target_unstable",
+        "target_out_of_corridor",
+        "target_too_large",
+        "attitude_excursion",
+        "collision_observed",
+        "gate_changed",
+        "capture_failed",
+        "parent_dead",
+        "lease_invalid",
+        "send_raised",
+        "internal_error",
+    }
+)
+
+
+class CalibrationCheckFailure(SafetyAbort):
+    """A typed pre-send refusal with one frozen evidence reason code."""
+
+    def __init__(self, reason_code: str, detail: str) -> None:
+        if reason_code not in CALIBRATION_COMMAND_FAILURE_CODES:
+            raise ValueError("unsupported calibration command failure code")
+        if type(detail) is not str or not detail:
+            raise ValueError("calibration failure detail must be nonempty")
+        self.reason_code = reason_code
+        self.detail = detail.encode("utf-8", "replace")[:512].decode(
+            "utf-8", "ignore"
+        )
+        super().__init__(self.detail)
+
+
+@dataclass(frozen=True)
+class CalibrationSafetyFacts:
+    """Primitive, same-occurrence facts consumed by one excitation check."""
+
+    checked_monotonic_ns: int
+    reset_epoch: Mapping[str, Any]
+    frame: Mapping[str, Any]
+    imu: Mapping[str, Any]
+    race: Mapping[str, Any]
+    heartbeat: Mapping[str, Any]
+    actuator: Mapping[str, Any]
+    imu_advance_monotonic_ns: int
+    race_advance_monotonic_ns: int
+    estimator_healthy: bool
+    target_consecutive: int
+    target_center_px: Tuple[float, float]
+    target_bbox_px: Tuple[float, float, float, float]
+    initial_target_bbox_area_px: float
+    start_roll_rad: float
+    start_pitch_rad: float
+    current_roll_rad: float
+    current_pitch_rad: float
+    collision_count: int
+    capture_healthy: bool
+    parent_alive: bool
+    lease_valid: bool
+
+
+@dataclass(frozen=True)
+class CalibrationSafetyAuthorization:
+    reset_epoch: Dict[str, Any]
+    source: Dict[str, Any]
+    watchdogs: Dict[str, Any]
+
+
+def _calibration_exact_nonnegative_int(value: Any, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise CalibrationCheckFailure("internal_error", f"{label} is invalid")
+    return value
+
+
+def _calibration_finite(value: Any, label: str) -> float:
+    if type(value) not in {int, float} or not math.isfinite(float(value)):
+        raise CalibrationCheckFailure("internal_error", f"{label} is invalid")
+    return float(value)
+
+
+def _calibration_age_ns(now_ns: int, occurrence_ns: Any, label: str) -> int:
+    occurrence = _calibration_exact_nonnegative_int(occurrence_ns, label)
+    if occurrence > now_ns:
+        raise CalibrationCheckFailure(
+            "stream_stale", f"{label} follows the safety-check occurrence"
+        )
+    return now_ns - occurrence
+
+
+def evaluate_calibration_safety(
+    facts: CalibrationSafetyFacts,
+    *,
+    contract: Any = None,
+) -> CalibrationSafetyAuthorization:
+    """Validate the exact gate-0 corridor and source/watchdog lineage.
+
+    This is intentionally independent of adapter mutable side state.  The
+    caller supplies defensive-copy receiver envelopes from one drain pass.
+    """
+
+    if not isinstance(facts, CalibrationSafetyFacts):
+        raise TypeError("facts must be CalibrationSafetyFacts")
+    if contract is None:
+        from scripts import aigp_vq2_powered_attempt as contract_module
+
+        contract = contract_module
+    now_ns = _calibration_exact_nonnegative_int(
+        facts.checked_monotonic_ns, "checked_monotonic_ns"
+    )
+    try:
+        reset_epoch = {
+            "ingress_generation": facts.reset_epoch["ingress_generation"],
+            "race_anchor_boot_ms": facts.reset_epoch["race_anchor_boot_ms"],
+            "imu_anchor_usec": facts.reset_epoch["imu_anchor_usec"],
+        }
+        frame = dict(facts.frame)
+        imu = contract.validate_received_imu(dict(facts.imu))
+        race = contract.validate_received_race_status(dict(facts.race))
+        heartbeat = contract.validate_received_heartbeat(dict(facts.heartbeat))
+        actuator = contract.validate_received_actuator_output_status(
+            dict(facts.actuator)
+        )
+    except CalibrationCheckFailure:
+        raise
+    except BaseException as exc:
+        raise CalibrationCheckFailure(
+            "stream_stale", "receiver or frame lineage is invalid"
+        ) from exc
+
+    generation = _calibration_exact_nonnegative_int(
+        reset_epoch["ingress_generation"], "reset ingress generation"
+    )
+    race_anchor = _calibration_exact_nonnegative_int(
+        reset_epoch["race_anchor_boot_ms"], "reset race anchor"
+    )
+    imu_anchor = _calibration_exact_nonnegative_int(
+        reset_epoch["imu_anchor_usec"], "reset IMU anchor"
+    )
+    for label, observation in (
+        ("IMU", imu),
+        ("race", race),
+        ("heartbeat", heartbeat),
+        ("actuator", actuator),
+    ):
+        if observation["ingress"]["generation"] != generation:
+            raise CalibrationCheckFailure(
+                "stream_stale", f"{label} is outside the proved reset generation"
+            )
+    frame_keys = {
+        "stream_id",
+        "generation",
+        "frame_id",
+        "sim_time_ns",
+        "timing",
+        "width",
+        "height",
+    }
+    if type(facts.frame) is not dict or set(frame) != frame_keys:
+        raise CalibrationCheckFailure("capture_failed", "frame source shape is invalid")
+    if frame["generation"] != generation:
+        raise CalibrationCheckFailure(
+            "capture_failed", "frame is outside the proved reset generation"
+        )
+    if frame["width"] != 640 or frame["height"] != 360:
+        raise CalibrationCheckFailure(
+            "capture_failed", "decoded dimensions are not stable 640x360"
+        )
+    timing = frame.get("timing")
+    if type(timing) is not dict:
+        raise CalibrationCheckFailure("capture_failed", "frame timing is absent")
+    identity = timing.get("identity")
+    if type(identity) is not dict or any(
+        frame[name] != identity.get(name)
+        for name in ("stream_id", "generation", "frame_id")
+    ):
+        raise CalibrationCheckFailure(
+            "capture_failed", "frame identity does not match its timing record"
+        )
+    if frame["sim_time_ns"] != timing.get("camera_source_time_ns"):
+        raise CalibrationCheckFailure(
+            "capture_failed", "frame source token does not match timing"
+        )
+    if imu["imu"]["timestamp_us"] <= imu_anchor:
+        raise CalibrationCheckFailure(
+            "imu_not_advancing", "IMU did not advance beyond reset anchor"
+        )
+    if race["race_status"]["sim_boot_time_ms"] <= race_anchor:
+        raise CalibrationCheckFailure(
+            "race_not_advancing", "race clock did not advance beyond reset anchor"
+        )
+
+    heartbeat_age = _calibration_age_ns(
+        now_ns,
+        heartbeat["ingress"]["received_monotonic_ns"],
+        "heartbeat receipt",
+    )
+    imu_age = _calibration_age_ns(
+        now_ns, imu["ingress"]["received_monotonic_ns"], "IMU receipt"
+    )
+    race_age = _calibration_age_ns(
+        now_ns, race["ingress"]["received_monotonic_ns"], "race receipt"
+    )
+    actuator_age = _calibration_age_ns(
+        now_ns,
+        actuator["ingress"]["received_monotonic_ns"],
+        "actuator receipt",
+    )
+    vision_age = _calibration_age_ns(
+        now_ns,
+        timing.get("final_unique_packet_monotonic_ns"),
+        "camera final-packet receipt",
+    )
+    imu_advance_age = _calibration_age_ns(
+        now_ns, facts.imu_advance_monotonic_ns, "IMU advance"
+    )
+    race_advance_age = _calibration_age_ns(
+        now_ns, facts.race_advance_monotonic_ns, "race advance"
+    )
+    age_limits = (
+        (heartbeat_age, 1_500_000_000, "stream_stale", "heartbeat is stale"),
+        (imu_age, 50_000_000, "stream_stale", "IMU receipt is stale"),
+        (imu_advance_age, 50_000_000, "imu_not_advancing", "IMU is not advancing"),
+        (race_age, 400_000_000, "stream_stale", "race status is stale"),
+        (
+            race_advance_age,
+            400_000_000,
+            "race_not_advancing",
+            "race clock is not advancing",
+        ),
+        (actuator_age, 100_000_000, "stream_stale", "actuator status is stale"),
+        (vision_age, 100_000_000, "stream_stale", "camera frame is stale"),
+    )
+    for age, maximum, reason, detail in age_limits:
+        if age > maximum:
+            raise CalibrationCheckFailure(reason, detail)
+    if facts.capture_healthy is not True:
+        raise CalibrationCheckFailure("capture_failed", "capture callback is unhealthy")
+    if facts.parent_alive is not True:
+        raise CalibrationCheckFailure("parent_dead", "wrapper parent is no longer live")
+    if facts.lease_valid is not True:
+        raise CalibrationCheckFailure("lease_invalid", "powered lease lineage is invalid")
+    if facts.estimator_healthy is not True:
+        raise CalibrationCheckFailure(
+            "estimator_unhealthy", "attitude estimator is unhealthy"
+        )
+    if type(facts.target_consecutive) is not int or facts.target_consecutive < 3:
+        raise CalibrationCheckFailure(
+            "target_unstable", "gate target lacks three-frame confirmation"
+        )
+    if type(facts.collision_count) is not int or facts.collision_count < 0:
+        raise CalibrationCheckFailure("internal_error", "collision count is invalid")
+    if facts.collision_count:
+        raise CalibrationCheckFailure(
+            "collision_observed", "every calibration collision aborts"
+        )
+    if race["race_status"]["active_gate_index"] != 0:
+        raise CalibrationCheckFailure("gate_changed", "active gate is not gate zero")
+
+    if type(facts.target_center_px) is not tuple or len(facts.target_center_px) != 2:
+        raise CalibrationCheckFailure("target_missing", "target center is unavailable")
+    if type(facts.target_bbox_px) is not tuple or len(facts.target_bbox_px) != 4:
+        raise CalibrationCheckFailure("target_missing", "target bbox is unavailable")
+    center_x, center_y = (
+        _calibration_finite(value, "target center")
+        for value in facts.target_center_px
+    )
+    bbox = tuple(
+        _calibration_finite(value, "target bbox") for value in facts.target_bbox_px
+    )
+    if bbox[2] <= 0.0 or bbox[3] <= 0.0:
+        raise CalibrationCheckFailure("target_missing", "target bbox is empty")
+    initial_area = _calibration_finite(
+        facts.initial_target_bbox_area_px, "initial target area"
+    )
+    if initial_area <= 0.0:
+        raise CalibrationCheckFailure("target_missing", "initial target area is invalid")
+    area = bbox[2] * bbox[3]
+    if not 64.0 <= center_x <= 576.0 or not 36.0 <= center_y <= 324.0:
+        raise CalibrationCheckFailure(
+            "target_out_of_corridor", "target center left the closed safety corridor"
+        )
+    if bbox[2] > 160.0 or bbox[3] > 160.0 or area > 2.0 * initial_area:
+        raise CalibrationCheckFailure(
+            "target_too_large", "target bbox exceeded the calibration safety limit"
+        )
+    roll_excursion = abs(
+        _calibration_finite(facts.current_roll_rad, "current roll")
+        - _calibration_finite(facts.start_roll_rad, "start roll")
+    )
+    pitch_excursion = abs(
+        _calibration_finite(facts.current_pitch_rad, "current pitch")
+        - _calibration_finite(facts.start_pitch_rad, "start pitch")
+    )
+    if roll_excursion > 0.05 or pitch_excursion > 0.05:
+        raise CalibrationCheckFailure(
+            "attitude_excursion", "roll or pitch excursion exceeded 0.05 rad"
+        )
+
+    source = {
+        "frame": frame,
+        "imu": imu,
+        "race": race,
+        "heartbeat": heartbeat,
+        "actuator": actuator,
+    }
+    watchdogs = {
+        "checked_monotonic_ns": now_ns,
+        "heartbeat_age_ns": heartbeat_age,
+        "imu_age_ns": imu_age,
+        "imu_advance_age_ns": imu_advance_age,
+        "race_age_ns": race_age,
+        "race_advance_age_ns": race_advance_age,
+        "actuator_age_ns": actuator_age,
+        "vision_age_ns": vision_age,
+        "estimator_healthy": True,
+        "target_consecutive": facts.target_consecutive,
+        "target_center_px": [center_x, center_y],
+        "target_bbox_px": list(bbox),
+        "target_bbox_area_px": area,
+        "initial_target_bbox_area_px": initial_area,
+        "roll_excursion_rad": roll_excursion,
+        "pitch_excursion_rad": pitch_excursion,
+        "collision_count": 0,
+        "gate_index": 0,
+        "result": "pass",
+        "failure_codes": [],
+    }
+    return CalibrationSafetyAuthorization(
+        reset_epoch=reset_epoch,
+        source=source,
+        watchdogs=watchdogs,
+    )
+
+
+class CalibrationSnapshotCapture:
+    """Thread-safe dimension admission that precedes every replay frame copy."""
+
+    EXPECTED_WIDTH = 640
+    EXPECTED_HEIGHT = 360
+
+    def __init__(
+        self,
+        *,
+        recorder: "JsonlRecorder",
+        config_sha256: str,
+        monotonic_ns: Callable[[], int] = time.perf_counter_ns,
+        contract: Any = None,
+    ) -> None:
+        if not isinstance(recorder, JsonlRecorder) or recorder.replay is None:
+            raise ValueError("calibration capture requires an active replay recorder")
+        if (
+            type(config_sha256) is not str
+            or len(config_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in config_sha256)
+        ):
+            raise ValueError("config_sha256 must be 64 lowercase hexadecimal characters")
+        if not callable(monotonic_ns):
+            raise TypeError("monotonic_ns must be callable")
+        if contract is None:
+            from scripts import aigp_vq2_powered_attempt as contract_module
+
+            contract = contract_module
+        self.recorder = recorder
+        self.config_sha256 = config_sha256
+        self.monotonic_ns = monotonic_ns
+        self.contract = contract
+        # Serialize the complete admission -> replay-forward sequence.  The
+        # production receiver is single-threaded today, but callback ordering
+        # must remain true if that implementation changes.
+        self._lock = threading.RLock()
+        self._dimensions: Optional[Tuple[int, int]] = None
+        self._admission: Optional[Dict[str, Any]] = None
+        self._failure: Optional[str] = None
+        self._observed_frames = 0
+
+    @property
+    def admitted(self) -> bool:
+        with self._lock:
+            return self._admission is not None and self._failure is None
+
+    @property
+    def observed_frames(self) -> int:
+        with self._lock:
+            return self._observed_frames
+
+    @property
+    def failure(self) -> Optional[str]:
+        with self._lock:
+            return self._failure
+
+    @property
+    def admission(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return None if self._admission is None else dict(self._admission)
+
+    def _latch(self, reason: str) -> None:
+        with self._lock:
+            if self._failure is None:
+                self._failure = reason
+        try:
+            self.recorder.replay.fail(f"calibration decoded-frame capture failed: {reason}")
+        except BaseException:
+            pass
+
+    def raise_if_failed(self) -> None:
+        failure = self.failure
+        if failure is not None:
+            raise CalibrationCheckFailure("capture_failed", failure)
+
+    def _snapshot_facts(self, snapshot: Any) -> Tuple[int, int, Dict[str, Any]]:
+        image = getattr(getattr(snapshot, "camera_frame", None), "image", None)
+        shape = getattr(image, "shape", None)
+        if type(shape) is not tuple or len(shape) != 3 or shape[2] != 3:
+            raise ValueError("decoded image must have exact HxWx3 shape")
+        if str(getattr(image, "dtype", "")) != "uint8":
+            raise ValueError("decoded image must have uint8 dtype")
+        height = int(shape[0])
+        width = int(shape[1])
+        camera_frame = snapshot.camera_frame
+        if (
+            type(getattr(camera_frame, "width", None)) is not int
+            or type(getattr(camera_frame, "height", None)) is not int
+            or camera_frame.width != width
+            or camera_frame.height != height
+        ):
+            raise ValueError("CameraFrame dimensions do not match decoded image")
+        timing = getattr(snapshot, "timing", None)
+        to_primitive = getattr(timing, "to_primitive", None)
+        if not callable(to_primitive):
+            raise ValueError("decoded snapshot lacks exact frame timing")
+        timing_row = to_primitive()
+        identity = timing_row.get("identity") if type(timing_row) is dict else None
+        if type(identity) is not dict or (
+            identity.get("generation") != getattr(snapshot, "generation", None)
+            or identity.get("frame_id") != getattr(snapshot, "frame_id", None)
+            or timing_row.get("camera_source_time_ns")
+            != getattr(snapshot, "sim_time_ns", None)
+        ):
+            raise ValueError("snapshot identity does not match frame timing")
+        return width, height, timing_row
+
+    def __call__(self, snapshot: Any) -> bool:
+        """Validate dimensions, then and only then forward to replay capture."""
+
+        try:
+            with self._lock:
+                width, height, timing = self._snapshot_facts(snapshot)
+                if self._failure is not None:
+                    raise ValueError(self._failure)
+                dimensions = (width, height)
+                if self._dimensions is not None and dimensions != self._dimensions:
+                    raise ValueError("decoded dimensions drifted within the session")
+                if dimensions != (self.EXPECTED_WIDTH, self.EXPECTED_HEIGHT):
+                    raise ValueError("decoded dimensions are not exact 640x360")
+                first = self._dimensions is None
+                if first:
+                    self._dimensions = dimensions
+                self._observed_frames += 1
+                if first:
+                    admitted_ns = self.monotonic_ns()
+                    if type(admitted_ns) is not int or admitted_ns < 0:
+                        raise ValueError("dimension admission clock is invalid")
+                    row = {
+                        "schema": "aigp-vq2-decoded-dimensions-admission/1",
+                        "config_sha256": self.config_sha256,
+                        "expected": {
+                            "width": self.EXPECTED_WIDTH,
+                            "height": self.EXPECTED_HEIGHT,
+                        },
+                        "observed": {"width": width, "height": height},
+                        "first_frame_timing": timing,
+                        "admitted_monotonic_ns": admitted_ns,
+                        "status": "admitted",
+                    }
+                    checked = self.contract.validate_decoded_dimensions_admission(row)
+                    if self.recorder.emit_powered(
+                        "decoded_dimensions_admission", observation=checked
+                    ) is not True:
+                        raise CalibrationEvidenceError(
+                            "decoded-dimensions admission enqueue failed"
+                        )
+                    self._admission = dict(checked)
+                accepted = self.recorder.replay.capture_decoded_snapshot(snapshot)
+                if accepted is not True:
+                    raise CalibrationEvidenceError(
+                        "decoded snapshot enqueue returned false"
+                    )
+            return True
+        except BaseException as exc:
+            self._latch(f"{type(exc).__name__}: {exc}")
+            raise
+
+
+def calibration_vision_options(
+    capture: CalibrationSnapshotCapture,
+    *,
+    exclusive_socket_factory: Callable[[str, int], Any],
+) -> Dict[str, Any]:
+    """Return the non-overridable powered vision construction options."""
+
+    if not isinstance(capture, CalibrationSnapshotCapture):
+        raise TypeError("capture must be CalibrationSnapshotCapture")
+    if not callable(exclusive_socket_factory):
+        raise TypeError("exclusive_socket_factory must be callable")
+    return {
+        "on_snapshot": capture,
+        "capture_snapshot_queue_enabled": True,
+        "powered_exclusive": True,
+        "exclusive_socket_factory": exclusive_socket_factory,
+    }
+
+
+@dataclass(frozen=True)
+class CalibrationDispatchResult:
+    audit_count_before: int
+    audit_count_after: int
+    receipt: Optional[Mapping[str, Any]]
+    call_started_monotonic_ns: Optional[int]
+    call_ended_monotonic_ns: Optional[int]
+    error: Optional[BaseException] = field(default=None, compare=False, repr=False)
+
+
+@dataclass(frozen=True)
+class CalibrationScheduleResult:
+    anchor_monotonic_ns: int
+    powered_expiry_monotonic_ns: int
+    sent_ticks: Tuple[int, ...]
+    skipped_before_generation: Tuple[int, ...]
+    skipped_after_generation: Tuple[int, ...]
+    completed: bool
+    abort_reason_code: Optional[str]
+
+
+@dataclass(frozen=True)
+class CalibrationNonattitudeDispatch:
+    category: str
+    request_monotonic_ns: int
+    receipt: Optional[Mapping[str, Any]]
+    audit_count_before: int
+    audit_count_after: int
+    call_started_monotonic_ns: Optional[int]
+    call_ended_monotonic_ns: Optional[int]
+    boundary: Optional[Any] = field(default=None, compare=False, repr=False)
+    error: Optional[BaseException] = field(default=None, compare=False, repr=False)
+
+
+class CalibrationCommandEvidence:
+    """Validator-backed rich command/tick evidence with one event sequence."""
+
+    _EVENT_NAMES = {
+        "generated": "calibration_command_generated",
+        "sent": "calibration_command_sent",
+        "not_sent": "calibration_command_not_sent",
+        "tick": "calibration_tick_disposition",
+        "phase": "calibration_phase_deadline",
+    }
+
+    def __init__(
+        self,
+        *,
+        attempt: Mapping[str, Any],
+        recorder: Any = None,
+        contract: Any = None,
+        initial_event_sequence: int = 0,
+    ) -> None:
+        if contract is None:
+            from scripts import aigp_vq2_powered_attempt as contract_module
+
+            contract = contract_module
+        self.contract = contract
+        self.attempt = contract.validate_attempt(dict(attempt))
+        if type(initial_event_sequence) is not int or initial_event_sequence < 0:
+            raise ValueError("initial_event_sequence must be nonnegative")
+        self.recorder = recorder
+        self._next_event_sequence = initial_event_sequence
+        self.observations: List[Tuple[str, Dict[str, Any]]] = []
+
+    @property
+    def next_event_sequence(self) -> int:
+        return self._next_event_sequence
+
+    def _sequence(self) -> int:
+        value = self._next_event_sequence
+        self._next_event_sequence += 1
+        return value
+
+    def _emit(self, event: str, observation: Dict[str, Any]) -> Dict[str, Any]:
+        if self.recorder is not None:
+            emit_powered = getattr(self.recorder, "emit_powered", None)
+            if not callable(emit_powered):
+                raise CalibrationEvidenceError(
+                    "calibration recorder lacks strict powered-event support"
+                )
+            if emit_powered(event, observation=observation) is not True:
+                raise CalibrationEvidenceError(
+                    f"replay enqueue failed for {event}"
+                )
+        copied = json.loads(json.dumps(observation, allow_nan=False))
+        self.observations.append((event, copied))
+        return copied
+
+    def record_phase_deadline(self, value: Mapping[str, Any]) -> Dict[str, Any]:
+        row = {
+            "schema": "aigp-vq2-phase-deadline/1",
+            "attempt_id": self.contract.ATTEMPT_ID,
+            "producer_role": CALIBRATION_CHILD_ROLE,
+            "phase": value["phase"],
+            "event_sequence": self._sequence(),
+            "started_monotonic_ns": value["started_monotonic_ns"],
+            "duration_ns": value["duration_ns"],
+            "parent_deadline_monotonic_ns": value[
+                "parent_deadline_monotonic_ns"
+            ],
+            "deadline_monotonic_ns": value["deadline_monotonic_ns"],
+        }
+        checked = self.contract.validate_phase_deadline_event(row)
+        return self._emit(self._EVENT_NAMES["phase"], checked)
+
+    def _common(
+        self,
+        tick: Mapping[str, Any],
+        authorization: CalibrationSafetyAuthorization,
+    ) -> Dict[str, Any]:
+        context = self.attempt["context"]
+        absolute_tick = tick["absolute_tick"]
+        return {
+            "attempt_id": self.contract.ATTEMPT_ID,
+            "session_id": self.contract.SESSION_ID,
+            "candidate_commit": context["candidate_commit"],
+            "attempt_context_sha256": self.attempt["context_sha256"],
+            "host_clock_id": self.contract.HOST_CLOCK_ID,
+            "reset_epoch": dict(authorization.reset_epoch),
+            "plan": {
+                "plan_id": self.contract.EXCITATION_PLAN_ID,
+                "sha256": self.contract.EXCITATION_PLAN_SHA256,
+            },
+            "scope": "excitation",
+            "command_id": f"excitation/{absolute_tick:03d}",
+            "absolute_tick": absolute_tick,
+            "segment_id": tick["segment_id"],
+            "slot": {
+                "release_monotonic_ns": tick["release_monotonic_ns"],
+                "end_monotonic_ns": tick["end_monotonic_ns"],
+                "powered_expiry_monotonic_ns": tick[
+                    "powered_expiry_monotonic_ns"
+                ],
+            },
+            "command": dict(tick["command"]),
+            "source": dict(authorization.source),
+            "watchdogs": dict(authorization.watchdogs),
+        }
+
+    def _cleanup_common(self, checked_monotonic_ns: int) -> Dict[str, Any]:
+        if type(checked_monotonic_ns) is not int or checked_monotonic_ns < 0:
+            raise ValueError("cleanup authorization time must be nonnegative")
+        context = self.attempt["context"]
+        return {
+            "attempt_id": self.contract.ATTEMPT_ID,
+            "session_id": self.contract.SESSION_ID,
+            "candidate_commit": context["candidate_commit"],
+            "attempt_context_sha256": self.attempt["context_sha256"],
+            "host_clock_id": self.contract.HOST_CLOCK_ID,
+            "reset_epoch": None,
+            "plan": None,
+            "scope": "cleanup_zero",
+            "command_id": "cleanup/zero/0",
+            "absolute_tick": None,
+            "segment_id": None,
+            "slot": None,
+            "command": {
+                "roll_rate_rad_s": 0.0,
+                "pitch_rate_rad_s": 0.0,
+                "yaw_rate_rad_s": 0.0,
+                "thrust": 0.0,
+            },
+            "source": {
+                "frame": None,
+                "imu": None,
+                "race": None,
+                "heartbeat": None,
+                "actuator": None,
+            },
+            "watchdogs": {
+                "checked_monotonic_ns": checked_monotonic_ns,
+                "heartbeat_age_ns": None,
+                "imu_age_ns": None,
+                "imu_advance_age_ns": None,
+                "race_age_ns": None,
+                "race_advance_age_ns": None,
+                "actuator_age_ns": None,
+                "vision_age_ns": None,
+                "estimator_healthy": None,
+                "target_consecutive": None,
+                "target_center_px": None,
+                "target_bbox_px": None,
+                "target_bbox_area_px": None,
+                "initial_target_bbox_area_px": None,
+                "roll_excursion_rad": None,
+                "pitch_excursion_rad": None,
+                "collision_count": None,
+                "gate_index": None,
+                "result": "cleanup_authorized",
+                "failure_codes": [],
+            },
+        }
+
+    def record_generated(
+        self,
+        tick: Mapping[str, Any],
+        authorization: CalibrationSafetyAuthorization,
+        generated_monotonic_ns: int,
+    ) -> Dict[str, Any]:
+        row = {
+            "schema": "aigp-vq2-calibration-command-generated/1",
+            **self._common(tick, authorization),
+            "event_sequence": self._sequence(),
+            "generated_monotonic_ns": generated_monotonic_ns,
+        }
+        checked = self.contract.validate_calibration_command_generated(row)
+        if self.recorder is not None:
+            command = checked["command"]
+            core = getattr(self.recorder, "record_command", None)
+            if not callable(core) or core(
+                "generated",
+                AttitudeRateCommand(
+                    command["roll_rate_rad_s"],
+                    command["pitch_rate_rad_s"],
+                    command["yaw_rate_rad_s"],
+                    command["thrust"],
+                ),
+                monotonic_s=generated_monotonic_ns / 1_000_000_000.0,
+                frame_token=(
+                    checked["source"]["frame"]["generation"],
+                    checked["source"]["frame"]["frame_id"],
+                    checked["source"]["frame"]["sim_time_ns"],
+                ),
+            ) is not True:
+                raise CalibrationEvidenceError("generated core command enqueue failed")
+        return self._emit(self._EVENT_NAMES["generated"], checked)
+
+    def record_cleanup_generated(
+        self,
+        *,
+        checked_monotonic_ns: int,
+        generated_monotonic_ns: int,
+    ) -> Dict[str, Any]:
+        """Record the sole exact-zero cleanup command before its API call."""
+
+        row = {
+            "schema": "aigp-vq2-calibration-command-generated/1",
+            **self._cleanup_common(checked_monotonic_ns),
+            "event_sequence": self._sequence(),
+            "generated_monotonic_ns": generated_monotonic_ns,
+        }
+        checked = self.contract.validate_calibration_command_generated(row)
+        if self.recorder is not None:
+            core = getattr(self.recorder, "record_command", None)
+            if not callable(core) or core(
+                "generated",
+                AttitudeRateCommand(0.0, 0.0, 0.0, 0.0),
+                monotonic_s=generated_monotonic_ns / 1_000_000_000.0,
+                frame_token=None,
+            ) is not True:
+                raise CalibrationEvidenceError(
+                    "cleanup generated core command enqueue failed"
+                )
+        return self._emit(self._EVENT_NAMES["generated"], checked)
+
+    def record_sent(
+        self,
+        generated: Mapping[str, Any],
+        *,
+        sent_monotonic_ns: int,
+        dispatch: CalibrationDispatchResult,
+    ) -> Dict[str, Any]:
+        row = {
+            key: value
+            for key, value in generated.items()
+            if key not in {"schema", "event_sequence", "generated_monotonic_ns"}
+        }
+        row.update(
+            {
+                "schema": "aigp-vq2-calibration-command-sent/1",
+                "event_sequence": self._sequence(),
+                "sent_monotonic_ns": sent_monotonic_ns,
+                "generated_event_sequence": generated["event_sequence"],
+                "generation_sha256": self.contract.canonical_object_sha256(
+                    dict(generated)
+                ),
+                "transport": {
+                    "receipt": dict(dispatch.receipt or {}),
+                    "audit_count_before": dispatch.audit_count_before,
+                    "audit_count_after": dispatch.audit_count_after,
+                },
+            }
+        )
+        checked = self.contract.validate_calibration_command_sent(
+            row, generated=dict(generated)
+        )
+        if self.recorder is not None:
+            command = checked["command"]
+            source_frame = checked["source"]["frame"]
+            core = getattr(self.recorder, "record_command", None)
+            if not callable(core) or core(
+                "sent",
+                AttitudeRateCommand(
+                    command["roll_rate_rad_s"],
+                    command["pitch_rate_rad_s"],
+                    command["yaw_rate_rad_s"],
+                    command["thrust"],
+                ),
+                monotonic_s=sent_monotonic_ns / 1_000_000_000.0,
+                frame_token=(
+                    None
+                    if source_frame is None
+                    else (
+                        source_frame["generation"],
+                        source_frame["frame_id"],
+                        source_frame["sim_time_ns"],
+                    )
+                ),
+            ) is not True:
+                raise CalibrationEvidenceError("sent core command enqueue failed")
+        return self._emit(self._EVENT_NAMES["sent"], checked)
+
+    def record_not_sent(
+        self,
+        generated: Mapping[str, Any],
+        *,
+        recorded_monotonic_ns: int,
+        reason_code: str,
+        detail: str,
+        dispatch: Optional[CalibrationDispatchResult] = None,
+    ) -> Dict[str, Any]:
+        before = 0 if dispatch is None else dispatch.audit_count_before
+        after = before if dispatch is None else dispatch.audit_count_after
+        kind = "skipped_after_generation" if dispatch is None else "send_failed_or_uncertain"
+        row = {
+            key: value
+            for key, value in generated.items()
+            if key not in {"schema", "event_sequence", "generated_monotonic_ns"}
+        }
+        row.update(
+            {
+                "schema": "aigp-vq2-calibration-command-not-sent/1",
+                "event_sequence": self._sequence(),
+                "recorded_monotonic_ns": recorded_monotonic_ns,
+                "generated_event_sequence": generated["event_sequence"],
+                "generation_sha256": self.contract.canonical_object_sha256(
+                    dict(generated)
+                ),
+                "outcome": {
+                    "kind": kind,
+                    "reason_code": reason_code,
+                    "detail": detail,
+                    "audit_count_before": before,
+                    "audit_count_after": after,
+                    "call_started_monotonic_ns": (
+                        None if dispatch is None else dispatch.call_started_monotonic_ns
+                    ),
+                    "call_ended_monotonic_ns": (
+                        None if dispatch is None else dispatch.call_ended_monotonic_ns
+                    ),
+                },
+            }
+        )
+        checked = self.contract.validate_calibration_command_not_sent(
+            row, generated=dict(generated)
+        )
+        return self._emit(self._EVENT_NAMES["not_sent"], checked)
+
+    def record_tick_disposition(
+        self,
+        tick: Mapping[str, Any],
+        *,
+        recorded_monotonic_ns: int,
+        disposition: str,
+        generated_event_sequence: Optional[int],
+        terminal_event_sequence: Optional[int],
+        reason_code: Optional[str],
+    ) -> Dict[str, Any]:
+        row = {
+            "schema": "aigp-vq2-calibration-tick-disposition/1",
+            "attempt_id": self.contract.ATTEMPT_ID,
+            "session_id": self.contract.SESSION_ID,
+            "attempt_context_sha256": self.attempt["context_sha256"],
+            "plan_id": self.contract.EXCITATION_PLAN_ID,
+            "plan_sha256": self.contract.EXCITATION_PLAN_SHA256,
+            "event_sequence": self._sequence(),
+            "host_clock_id": self.contract.HOST_CLOCK_ID,
+            "recorded_monotonic_ns": recorded_monotonic_ns,
+            "absolute_tick": tick["absolute_tick"],
+            "segment_id": tick["segment_id"],
+            "slot": {
+                "release_monotonic_ns": tick["release_monotonic_ns"],
+                "end_monotonic_ns": tick["end_monotonic_ns"],
+                "powered_expiry_monotonic_ns": tick[
+                    "powered_expiry_monotonic_ns"
+                ],
+            },
+            "disposition": disposition,
+            "generated_event_sequence": generated_event_sequence,
+            "terminal_event_sequence": terminal_event_sequence,
+            "reason_code": reason_code,
+        }
+        checked = self.contract.validate_calibration_tick_disposition(row)
+        return self._emit(self._EVENT_NAMES["tick"], checked)
+
+
+class CalibrationLineageRecorder:
+    """Sole strict recorder for receiver, reset, collision, and outbound facts."""
+
+    _RECEIVED_EVENTS = {
+        "aigp-vq2-received-heartbeat/1": (
+            "received_heartbeat",
+            "validate_received_heartbeat",
+        ),
+        "aigp-vq2-received-race-status/1": (
+            "received_race_status",
+            "validate_received_race_status",
+        ),
+        "aigp-vq2-received-actuator-output-status/1": (
+            "received_actuator_output_status",
+            "validate_received_actuator_output_status",
+        ),
+        "aigp-vq2-received-imu/1": ("received_imu", "validate_received_imu"),
+    }
+
+    def __init__(self, recorder: "JsonlRecorder", *, contract: Any = None) -> None:
+        if not isinstance(recorder, JsonlRecorder) or recorder.replay is None:
+            raise ValueError("calibration lineage requires an active replay recorder")
+        if contract is None:
+            from scripts import aigp_vq2_powered_attempt as contract_module
+
+            contract = contract_module
+        self.recorder = recorder
+        self.contract = contract
+        self.received: List[Dict[str, Any]] = []
+        self.collisions: List[Dict[str, Any]] = []
+        self.outbound_receipts: List[Dict[str, Any]] = []
+        self.reset_boundaries: List[Dict[str, Any]] = []
+        self._collision_generation: Optional[int] = None
+        self._next_collision_sequence = 0
+
+    @staticmethod
+    def _primitive(value: Any, label: str) -> Dict[str, Any]:
+        to_primitive = getattr(value, "to_primitive", None)
+        if not callable(to_primitive):
+            raise CalibrationEvidenceError(f"{label} lacks to_primitive()")
+        primitive = to_primitive()
+        if type(primitive) is not dict:
+            raise CalibrationEvidenceError(f"{label} primitive is not an exact object")
+        return primitive
+
+    @staticmethod
+    def _require_enqueue(result: Any, label: str) -> None:
+        if result is not True:
+            raise CalibrationEvidenceError(f"{label} replay enqueue failed")
+
+    def record_received(
+        self,
+        observation: Any,
+        *,
+        estimator: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        primitive = self._primitive(observation, "received observation")
+        schema = primitive.get("schema")
+        route = self._RECEIVED_EVENTS.get(schema)
+        if route is None:
+            raise CalibrationEvidenceError("unsupported received-observation schema")
+        event, validator_name = route
+        validator = getattr(self.contract, validator_name)
+        checked = validator(primitive)
+        ingress = getattr(observation, "ingress", None)
+        self._require_enqueue(
+            self.recorder.record_mavlink_ingress(ingress),
+            "legacy MAVLink ingress",
+        )
+        received_s = checked["ingress"]["received_monotonic_ns"] / 1_000_000_000.0
+        if schema == "aigp-vq2-received-imu/1":
+            # AsyncReplayRecorder emits the linked strict received_imu event in
+            # the same operation as its core IMU row.
+            self._require_enqueue(
+                self.recorder.record_imu(
+                    observation.imu,
+                    None if estimator is None else dict(estimator),
+                    received_s,
+                    received_sample=observation,
+                ),
+                "received IMU",
+            )
+        else:
+            if schema == "aigp-vq2-received-race-status/1":
+                payload = checked["race_status"]
+                race = RaceStatus(
+                    sim_boot_time_ms=payload["sim_boot_time_ms"],
+                    race_start_boot_time_ms=payload["race_start_boot_time_ms"],
+                    race_finish_time_ns=payload["race_finish_time_ns"],
+                    active_gate_index=payload["active_gate_index"],
+                    last_gate_race_time=payload["last_gate_race_time"],
+                )
+                self._require_enqueue(
+                    self.recorder.record_race(race, received_s),
+                    "core race status",
+                )
+            self._require_enqueue(
+                self.recorder.emit_powered(event, observation=checked),
+                event,
+            )
+        self.received.append(dict(checked))
+        return dict(checked)
+
+    def record_collision(
+        self,
+        collision: Mapping[str, Any],
+        *,
+        reset_generation: int,
+        observed_monotonic_ns: int,
+        phase: str,
+        disposition: str,
+    ) -> Dict[str, Any]:
+        if self._collision_generation != reset_generation:
+            self._collision_generation = reset_generation
+            self._next_collision_sequence = 0
+        row = {
+            "schema": "aigp-vq2-runner-collision-observation/1",
+            "reset_generation": reset_generation,
+            "observation_sequence": self._next_collision_sequence,
+            "host_clock_id": self.contract.HOST_CLOCK_ID,
+            "observed_monotonic_ns": observed_monotonic_ns,
+            "phase": phase,
+            "disposition": disposition,
+            "boundary": "runner_drain_not_receiver_receipt",
+            "collision": dict(collision),
+        }
+        checked = self.contract.validate_collision_observation(row)
+        self._require_enqueue(
+            self.recorder.emit_powered(
+                "runner_collision_observation", observation=checked
+            ),
+            "runner collision observation",
+        )
+        self._next_collision_sequence += 1
+        self.collisions.append(dict(checked))
+        return dict(checked)
+
+    def retain_reset_boundary_without_replay(
+        self,
+        boundary: Any,
+        *,
+        phase: str,
+    ) -> Dict[str, Any]:
+        """Retain cleanup evidence after replay persistence has failed.
+
+        This path deliberately performs no recorder calls. It reconciles any
+        rows that were committed before the failure, fills only the missing
+        local certificate evidence, and leaves replay capture invalidated.
+        """
+
+        primitive = self._primitive(boundary, "calibration reset boundary")
+        observations: List[Dict[str, Any]] = []
+        received_by_token = {
+            (
+                item["ingress"]["stream_id"],
+                item["ingress"]["generation"],
+                item["ingress"]["sequence"],
+            ): item
+            for item in self.received
+        }
+        for observation in boundary.observations:
+            raw = self._primitive(observation, "boundary observation")
+            route = self._RECEIVED_EVENTS.get(raw.get("schema"))
+            if route is None:
+                raise CalibrationEvidenceError(
+                    "unsupported received-observation schema"
+                )
+            checked = getattr(self.contract, route[1])(raw)
+            ingress = checked["ingress"]
+            token = (
+                ingress["stream_id"],
+                ingress["generation"],
+                ingress["sequence"],
+            )
+            existing = received_by_token.get(token)
+            if existing is not None and existing != checked:
+                raise CalibrationEvidenceError(
+                    "boundary ingress token conflicts with retained evidence"
+                )
+            if existing is None:
+                existing = dict(checked)
+                self.received.append(existing)
+                received_by_token[token] = existing
+            observations.append(dict(existing))
+
+        old_generation = boundary.old_generation
+        boundary_time = boundary.boundary_monotonic_ns
+        available = [
+            item
+            for item in self.collisions
+            if item["reset_generation"] == old_generation
+            and item["observed_monotonic_ns"] == boundary_time
+            and item["phase"] == phase
+            and item["disposition"] == "reset_boundary_discard"
+        ]
+        used_tokens: set[tuple[int, int]] = set()
+        collisions: List[Dict[str, Any]] = []
+        if self._collision_generation != old_generation:
+            self._collision_generation = old_generation
+            prior_sequences = [
+                item["observation_sequence"]
+                for item in self.collisions
+                if item["reset_generation"] == old_generation
+            ]
+            self._next_collision_sequence = (
+                0 if not prior_sequences else max(prior_sequences) + 1
+            )
+        for collision in boundary.collisions:
+            payload = collision.to_primitive()
+            existing = next(
+                (
+                    item
+                    for item in available
+                    if item["collision"] == payload
+                    and (
+                        item["reset_generation"],
+                        item["observation_sequence"],
+                    )
+                    not in used_tokens
+                ),
+                None,
+            )
+            if existing is None:
+                row = {
+                    "schema": "aigp-vq2-runner-collision-observation/1",
+                    "reset_generation": old_generation,
+                    "observation_sequence": self._next_collision_sequence,
+                    "host_clock_id": self.contract.HOST_CLOCK_ID,
+                    "observed_monotonic_ns": boundary_time,
+                    "phase": phase,
+                    "disposition": "reset_boundary_discard",
+                    "boundary": "runner_drain_not_receiver_receipt",
+                    "collision": payload,
+                }
+                existing = self.contract.validate_collision_observation(row)
+                self._next_collision_sequence += 1
+                self.collisions.append(dict(existing))
+            token = (
+                existing["reset_generation"],
+                existing["observation_sequence"],
+            )
+            used_tokens.add(token)
+            collisions.append(dict(existing))
+
+        primitive["observations"] = observations
+        primitive["collisions"] = collisions
+        checked_boundary = self.contract.validate_reset_boundary(primitive)
+        if checked_boundary not in self.reset_boundaries:
+            self.reset_boundaries.append(dict(checked_boundary))
+        self._collision_generation = boundary.new_generation
+        self._next_collision_sequence = 0
+        return dict(checked_boundary)
+
+    def record_reset_boundary(
+        self,
+        boundary: Any,
+        *,
+        phase: str,
+    ) -> Dict[str, Any]:
+        primitive = self._primitive(boundary, "calibration reset boundary")
+        observations = []
+        for observation in boundary.observations:
+            observations.append(self.record_received(observation))
+        collisions = []
+        for collision in boundary.collisions:
+            collisions.append(
+                self.record_collision(
+                    collision.to_primitive(),
+                    reset_generation=boundary.old_generation,
+                    observed_monotonic_ns=boundary.boundary_monotonic_ns,
+                    phase=phase,
+                    disposition="reset_boundary_discard",
+                )
+            )
+        primitive["observations"] = observations
+        primitive["collisions"] = collisions
+        checked = self.contract.validate_reset_boundary(primitive)
+        self._require_enqueue(
+            self.recorder.emit_powered(
+                "calibration_reset_boundary", observation=checked
+            ),
+            "calibration reset boundary",
+        )
+        self.reset_boundaries.append(dict(checked))
+        self._collision_generation = boundary.new_generation
+        self._next_collision_sequence = 0
+        return dict(checked)
+
+    def record_outbound(self, receipt: Any) -> Dict[str, Any]:
+        primitive = self._primitive(receipt, "outbound receipt")
+        schema = primitive.get("schema")
+        if schema == "aigp-vq2-attitude-target-outbound/1":
+            checked = self.contract.validate_attitude_target_outbound(primitive)
+            event = "attitude_target_outbound"
+        elif schema == "aigp-vq2-nonattitude-outbound/1":
+            checked = self.contract.validate_nonattitude_outbound(primitive)
+            event = "nonattitude_outbound"
+        else:
+            raise CalibrationEvidenceError("unsupported outbound receipt schema")
+        self._require_enqueue(
+            self.recorder.emit_powered(event, observation=checked), event
+        )
+        self.outbound_receipts.append(dict(checked))
+        return dict(checked)
+
+
+class CalibrationAdapterDispatcher:
+    """Bridge the pure scheduler to one powered adapter and its receipts."""
+
+    def __init__(
+        self,
+        adapter: Any,
+        lineage: CalibrationLineageRecorder,
+        *,
+        monotonic_ns: Callable[[], int] = time.perf_counter_ns,
+        parent_alive: Callable[[], bool],
+        lease_valid: Callable[[], bool],
+    ) -> None:
+        if not isinstance(lineage, CalibrationLineageRecorder):
+            raise TypeError("lineage must be CalibrationLineageRecorder")
+        for callback, label in (
+            (monotonic_ns, "monotonic_ns"),
+            (parent_alive, "parent_alive"),
+            (lease_valid, "lease_valid"),
+        ):
+            if not callable(callback):
+                raise TypeError(f"{label} must be callable")
+        self.adapter = adapter
+        self.lineage = lineage
+        self.monotonic_ns = monotonic_ns
+        self.parent_alive = parent_alive
+        self.lease_valid = lease_valid
+
+    def _now(self) -> int:
+        value = self.monotonic_ns()
+        if type(value) is not int or value < 0:
+            raise CalibrationEvidenceError(
+                "adapter dispatcher clock must return a nonnegative exact integer"
+            )
+        return value
+
+    def _attitude_audit_count(self) -> int:
+        return self._audit_count("attitude_target")
+
+    def _audit_count(self, category: str) -> int:
+        audit = self.adapter.outbound_audit()
+        value = (
+            audit.get(category)
+            if isinstance(audit, Mapping)
+            else getattr(audit, category, None)
+        )
+        if type(value) is not int or value < 0:
+            raise CalibrationEvidenceError(
+                f"adapter {category} audit is invalid"
+            )
+        return value
+
+    def drain_outbound(self) -> List[Dict[str, Any]]:
+        drain = getattr(self.adapter, "drain_outbound_receipts", None)
+        if not callable(drain):
+            raise CalibrationEvidenceError("adapter lacks outbound receipt drain")
+        return [self.lineage.record_outbound(value) for value in drain()]
+
+    async def dispatch(
+        self,
+        command: AttitudeRateCommand,
+        deadline_monotonic_ns: int,
+    ) -> CalibrationDispatchResult:
+        if self.parent_alive() is not True:
+            raise CalibrationCheckFailure("parent_dead", "wrapper parent is not live")
+        if self.lease_valid() is not True:
+            raise CalibrationCheckFailure("lease_invalid", "powered lease is invalid")
+        if type(deadline_monotonic_ns) is not int or self._now() >= deadline_monotonic_ns:
+            raise CalibrationCheckFailure(
+                "deadline_expired", "adapter call deadline was reached"
+            )
+        self.drain_outbound()
+        before = self._attitude_audit_count()
+        call_started = self._now()
+        error: Optional[BaseException] = None
+        try:
+            await self.adapter.send_attitude_rate(
+                command,
+                powered_deadline_monotonic_ns=deadline_monotonic_ns,
+                powered_cleanup=False,
+            )
+        except BaseException as exc:
+            error = exc
+        call_ended = self._now()
+        receipts = self.drain_outbound()
+        after = self._attitude_audit_count()
+        attitude_receipts = [
+            value
+            for value in receipts
+            if value.get("schema") == "aigp-vq2-attitude-target-outbound/1"
+        ]
+        receipt = attitude_receipts[-1] if attitude_receipts else None
+        if receipt is not None:
+            call_started = receipt["call_start_monotonic_ns"]
+            call_ended = receipt["call_end_monotonic_ns"]
+            if receipt["outcome"] != "returned" and error is None:
+                error = RuntimeError("adapter recorded a raised attitude call")
+        if after != before + 1 and error is None:
+            error = CalibrationEvidenceError(
+                "attitude-target audit did not increment exactly once"
+            )
+        return CalibrationDispatchResult(
+            audit_count_before=before,
+            audit_count_after=after,
+            receipt=receipt,
+            call_started_monotonic_ns=call_started,
+            call_ended_monotonic_ns=call_ended,
+            error=error,
+        )
+
+    async def dispatch_cleanup_zero(
+        self,
+        deadline_monotonic_ns: int,
+    ) -> CalibrationDispatchResult:
+        """Call the one cleanup-authorized exact-zero rate API once."""
+
+        if type(deadline_monotonic_ns) is not int or self._now() >= deadline_monotonic_ns:
+            raise CalibrationCheckFailure(
+                "deadline_expired", "cleanup-zero deadline was reached"
+            )
+        self.drain_outbound()
+        before = self._attitude_audit_count()
+        call_started = self._now()
+        error: Optional[BaseException] = None
+        try:
+            await self.adapter.send_attitude_rate(
+                AttitudeRateCommand(0.0, 0.0, 0.0, 0.0),
+                powered_deadline_monotonic_ns=deadline_monotonic_ns,
+                powered_cleanup=True,
+            )
+        except BaseException as exc:
+            error = exc
+        call_ended = self._now()
+        receipts = self.drain_outbound()
+        after = self._attitude_audit_count()
+        candidates = [
+            item
+            for item in receipts
+            if item.get("schema") == "aigp-vq2-attitude-target-outbound/1"
+        ]
+        receipt = candidates[-1] if candidates else None
+        if receipt is not None:
+            call_started = receipt["call_start_monotonic_ns"]
+            call_ended = receipt["call_end_monotonic_ns"]
+            if receipt["outcome"] != "returned" and error is None:
+                error = RuntimeError("adapter recorded a raised cleanup-zero call")
+        if after != before + 1 and error is None:
+            error = CalibrationEvidenceError(
+                "cleanup-zero attitude audit did not increment exactly once"
+            )
+        return CalibrationDispatchResult(
+            audit_count_before=before,
+            audit_count_after=after,
+            receipt=receipt,
+            call_started_monotonic_ns=call_started,
+            call_ended_monotonic_ns=call_ended,
+            error=error,
+        )
+
+    async def dispatch_nonattitude(
+        self,
+        category: str,
+        deadline_monotonic_ns: int,
+        *,
+        cleanup: bool,
+        persist_boundary: Optional[Callable[[Any], None]] = None,
+        progress: Optional[Callable[[], None]] = None,
+    ) -> CalibrationNonattitudeDispatch:
+        """Dispatch one arm/disarm/reset and bind it to its exact receipt."""
+
+        if category not in {"arm", "disarm", "sim_reset"}:
+            raise ValueError("unsupported calibration nonattitude category")
+        if type(cleanup) is not bool:
+            raise TypeError("cleanup must be an exact boolean")
+        if not cleanup:
+            if self.parent_alive() is not True:
+                raise CalibrationCheckFailure("parent_dead", "wrapper parent is not live")
+            if self.lease_valid() is not True:
+                raise CalibrationCheckFailure("lease_invalid", "powered lease is invalid")
+        if type(deadline_monotonic_ns) is not int or self._now() >= deadline_monotonic_ns:
+            raise CalibrationCheckFailure(
+                "deadline_expired", f"{category} deadline was reached"
+            )
+        if category == "sim_reset" and not callable(persist_boundary):
+            raise TypeError("sim_reset requires a boundary persistence callback")
+        if category != "sim_reset" and persist_boundary is not None:
+            raise TypeError("boundary persistence is valid only for sim_reset")
+        if progress is not None and (
+            not callable(progress) or category != "sim_reset" or not cleanup
+        ):
+            raise TypeError(
+                "cooperative progress is valid only for cleanup sim_reset"
+            )
+
+        self.drain_outbound()
+        before = self._audit_count(category)
+        request_ns = self._now()
+        call_started: Optional[int] = request_ns
+        call_ended: Optional[int] = None
+        boundary: Optional[Any] = None
+        error: Optional[BaseException] = None
+        try:
+            if category == "sim_reset":
+                reset_kwargs: Dict[str, Any] = {
+                    "powered_deadline_monotonic_ns": deadline_monotonic_ns,
+                    "powered_cleanup": cleanup,
+                }
+                if progress is not None:
+                    parameters = inspect.signature(
+                        self.adapter.reset_calibration_with_boundary
+                    ).parameters
+                    if "powered_progress" not in parameters:
+                        raise CalibrationEvidenceError(
+                            "cleanup reset lacks same-call parent supervision"
+                        )
+                    reset_kwargs["powered_progress"] = progress
+                boundary = await self.adapter.reset_calibration_with_boundary(
+                    persist_boundary,
+                    **reset_kwargs,
+                )
+            else:
+                method = getattr(self.adapter, category)
+                await method(
+                    powered_deadline_monotonic_ns=deadline_monotonic_ns,
+                    powered_cleanup=cleanup,
+                )
+        except BaseException as exc:
+            error = exc
+        call_ended = self._now()
+        receipts = self.drain_outbound()
+        after = self._audit_count(category)
+        candidates = [
+            item
+            for item in receipts
+            if item.get("schema") == "aigp-vq2-nonattitude-outbound/1"
+            and item.get("category") == category
+        ]
+        receipt = candidates[-1] if candidates else None
+        if receipt is not None:
+            call_started = receipt["call_start_monotonic_ns"]
+            call_ended = receipt["call_end_monotonic_ns"]
+            if receipt["outcome"] != "returned" and error is None:
+                error = RuntimeError(
+                    f"adapter recorded a raised {category} call"
+                )
+        if after != before + 1 and error is None:
+            error = CalibrationEvidenceError(
+                f"{category} audit did not increment exactly once"
+            )
+        return CalibrationNonattitudeDispatch(
+            category=category,
+            request_monotonic_ns=request_ns,
+            receipt=receipt,
+            audit_count_before=before,
+            audit_count_after=after,
+            call_started_monotonic_ns=call_started,
+            call_ended_monotonic_ns=call_ended,
+            boundary=boundary,
+            error=error,
+        )
+
+    def begin_live_cleanup(self) -> None:
+        """Permanently latch production and consume the one live cleanup epoch."""
+
+        guards = getattr(self.adapter, "powered_outbound_guards", None)
+        if guards is None:
+            raise CalibrationEvidenceError("powered outbound guards are unavailable")
+        parent_alive = self.parent_alive()
+        lease_valid = self.lease_valid()
+        source_promoted = getattr(self.adapter, "powered_source_promoted", None)
+        if type(parent_alive) is not bool or type(lease_valid) is not bool:
+            raise CalibrationEvidenceError("cleanup lineage callbacks are not exact booleans")
+        if type(source_promoted) is not bool:
+            raise CalibrationEvidenceError("source-promotion state is not an exact boolean")
+        guards.enable_cleanup_live(
+            parent_alive=parent_alive,
+            lease_valid=lease_valid,
+            source_promoted=source_promoted,
+        )
+
+    def begin_takeover_cleanup(self) -> None:
+        """Enable the same single cleanup epoch after proved parent death."""
+
+        guards = getattr(self.adapter, "powered_outbound_guards", None)
+        if guards is None:
+            raise CalibrationEvidenceError("powered outbound guards are unavailable")
+        parent_alive = self.parent_alive()
+        lease_valid = self.lease_valid()
+        source_promoted = getattr(self.adapter, "powered_source_promoted", None)
+        if type(parent_alive) is not bool or type(lease_valid) is not bool:
+            raise CalibrationEvidenceError("takeover lineage callbacks are not exact booleans")
+        if type(source_promoted) is not bool:
+            raise CalibrationEvidenceError("source-promotion state is not an exact boolean")
+        guards.note_parent_death()
+        guards.enable_cleanup_takeover(
+            parent_signaled=not parent_alive,
+            abandoned_lease_owned=lease_valid,
+            authority_valid=lease_valid,
+            source_promoted=source_promoted,
+        )
+
+    async def disconnect(
+        self,
+        deadline_monotonic_ns: int,
+        *,
+        progress: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if type(deadline_monotonic_ns) is not int:
+            raise TypeError("disconnect deadline must be an exact integer")
+        kwargs: Dict[str, Any] = {
+            "deadline_monotonic_ns": deadline_monotonic_ns,
+        }
+        parameters = inspect.signature(self.adapter.disconnect).parameters
+        if "powered_progress" in parameters:
+            kwargs["powered_progress"] = progress
+        await self.adapter.disconnect(**kwargs)
+
+
+class CalibrationExcitationScheduler:
+    """Exact 245-slot, no-catch-up calibration excitation scheduler."""
+
+    def __init__(
+        self,
+        *,
+        evidence: CalibrationCommandEvidence,
+        safety_check: Callable[[int], CalibrationSafetyAuthorization],
+        dispatch: Callable[
+            [AttitudeRateCommand, int], Awaitable[CalibrationDispatchResult]
+        ],
+        monotonic_ns: Callable[[], int] = time.perf_counter_ns,
+        wait_until_ns: Optional[Callable[[int], Awaitable[None]]] = None,
+        powered_parent_deadline_monotonic_ns: Optional[int] = None,
+        contract: Any = None,
+    ) -> None:
+        if not isinstance(evidence, CalibrationCommandEvidence):
+            raise TypeError("evidence must be CalibrationCommandEvidence")
+        if not callable(safety_check) or not callable(dispatch):
+            raise TypeError("scheduler safety_check and dispatch must be callable")
+        if not callable(monotonic_ns):
+            raise TypeError("monotonic_ns must be callable")
+        if wait_until_ns is not None and not callable(wait_until_ns):
+            raise TypeError("wait_until_ns must be callable or None")
+        if contract is None:
+            contract = evidence.contract
+        self.contract = contract
+        self.evidence = evidence
+        self.safety_check = safety_check
+        self.dispatch = dispatch
+        self.monotonic_ns = monotonic_ns
+        self.wait_until_ns = wait_until_ns or self._default_wait_until
+        if powered_parent_deadline_monotonic_ns is not None and (
+            type(powered_parent_deadline_monotonic_ns) is not int
+            or powered_parent_deadline_monotonic_ns < 1
+        ):
+            raise ValueError("powered parent deadline must be a positive exact integer")
+        self.powered_parent_deadline_monotonic_ns = (
+            powered_parent_deadline_monotonic_ns
+        )
+
+    async def _default_wait_until(self, deadline_ns: int) -> None:
+        now = self._now()
+        if now < deadline_ns:
+            await asyncio.sleep((deadline_ns - now) / 1_000_000_000.0)
+
+    def _now(self) -> int:
+        value = self.monotonic_ns()
+        if type(value) is not int or value < 0:
+            raise CalibrationEvidenceError(
+                "scheduler monotonic clock must return a nonnegative exact integer"
+            )
+        return value
+
+    def _tick(self, index: int, anchor_ns: int) -> Dict[str, Any]:
+        return self.contract.excitation_tick(
+            index, anchor_monotonic_ns=anchor_ns
+        )
+
+    def _skip_before(
+        self,
+        tick: Mapping[str, Any],
+        reason_code: str,
+        recorded_ns: int,
+    ) -> None:
+        self.evidence.record_tick_disposition(
+            tick,
+            recorded_monotonic_ns=recorded_ns,
+            disposition="skipped_before_generation",
+            generated_event_sequence=None,
+            terminal_event_sequence=None,
+            reason_code=reason_code,
+        )
+
+    def _skip_remaining(
+        self,
+        start: int,
+        anchor_ns: int,
+        reason_code: str,
+        recorded_ns: int,
+        skipped_before: List[int],
+    ) -> None:
+        for index in range(start, self.contract.frozen_excitation_plan()["tick_count"]):
+            self._skip_before(self._tick(index, anchor_ns), reason_code, recorded_ns)
+            skipped_before.append(index)
+
+    async def run(self) -> CalibrationScheduleResult:
+        plan = self.contract.frozen_excitation_plan()
+        tick_count = plan["tick_count"]
+        period_ns = plan["control_period_ns"]
+
+        # No powered clock anchor exists until a complete initial gate passes.
+        self.safety_check(0)
+        anchor_ns = self._now()
+        hard_expiry_ns = anchor_ns + plan["powered_hard_expiry_offset_ns"]
+        authority_expiry_ns = (
+            hard_expiry_ns
+            if self.powered_parent_deadline_monotonic_ns is None
+            else min(hard_expiry_ns, self.powered_parent_deadline_monotonic_ns)
+        )
+        sent: List[int] = []
+        skipped_before: List[int] = []
+        skipped_after: List[int] = []
+        cursor = 0
+
+        while cursor < tick_count:
+            now_ns = self._now()
+            if now_ns >= authority_expiry_ns:
+                self._skip_remaining(
+                    cursor,
+                    anchor_ns,
+                    "deadline_expired",
+                    now_ns,
+                    skipped_before,
+                )
+                return CalibrationScheduleResult(
+                    anchor_ns,
+                    hard_expiry_ns,
+                    tuple(sent),
+                    tuple(skipped_before),
+                    tuple(skipped_after),
+                    False,
+                    "deadline_expired",
+                )
+            current = (now_ns - anchor_ns) // period_ns
+            if current < 0:
+                await self.wait_until_ns(anchor_ns)
+                continue
+            if current >= tick_count:
+                self._skip_remaining(
+                    cursor,
+                    anchor_ns,
+                    "slot_missed",
+                    now_ns,
+                    skipped_before,
+                )
+                break
+            while cursor < current:
+                self._skip_before(
+                    self._tick(cursor, anchor_ns), "slot_missed", now_ns
+                )
+                skipped_before.append(cursor)
+                cursor += 1
+            if cursor >= tick_count:
+                break
+            tick = self._tick(cursor, anchor_ns)
+            if now_ns < tick["release_monotonic_ns"]:
+                await self.wait_until_ns(tick["release_monotonic_ns"])
+                continue
+            if now_ns >= tick["end_monotonic_ns"]:
+                self._skip_before(tick, "slot_missed", now_ns)
+                skipped_before.append(cursor)
+                cursor += 1
+                continue
+
+            try:
+                authorization = self.safety_check(cursor)
+            except CalibrationCheckFailure as exc:
+                failed_ns = self._now()
+                self._skip_before(tick, exc.reason_code, failed_ns)
+                skipped_before.append(cursor)
+                self._skip_remaining(
+                    cursor + 1,
+                    anchor_ns,
+                    exc.reason_code,
+                    failed_ns,
+                    skipped_before,
+                )
+                return CalibrationScheduleResult(
+                    anchor_ns,
+                    hard_expiry_ns,
+                    tuple(sent),
+                    tuple(skipped_before),
+                    tuple(skipped_after),
+                    False,
+                    exc.reason_code,
+                )
+            checked_ns = self._now()
+            if checked_ns >= authority_expiry_ns:
+                self._skip_before(tick, "deadline_expired", checked_ns)
+                skipped_before.append(cursor)
+                self._skip_remaining(
+                    cursor + 1,
+                    anchor_ns,
+                    "deadline_expired",
+                    checked_ns,
+                    skipped_before,
+                )
+                return CalibrationScheduleResult(
+                    anchor_ns,
+                    hard_expiry_ns,
+                    tuple(sent),
+                    tuple(skipped_before),
+                    tuple(skipped_after),
+                    False,
+                    "deadline_expired",
+                )
+            recomputed = (checked_ns - anchor_ns) // period_ns
+            if recomputed != cursor or checked_ns >= tick["end_monotonic_ns"]:
+                self._skip_before(tick, "slot_missed", checked_ns)
+                skipped_before.append(cursor)
+                cursor += 1
+                continue
+
+            generated_ns = self._now()
+            if generated_ns >= tick["end_monotonic_ns"]:
+                self._skip_before(tick, "slot_missed", generated_ns)
+                skipped_before.append(cursor)
+                cursor += 1
+                continue
+            generated = self.evidence.record_generated(
+                tick, authorization, generated_ns
+            )
+
+            # Re-run every safety predicate after evidence enqueue and directly
+            # before dispatch.  The sent/not-sent event must still copy the
+            # first generated observation byte-for-byte.
+            try:
+                self.safety_check(cursor)
+                presend_ns = self._now()
+                if presend_ns >= authority_expiry_ns:
+                    raise CalibrationCheckFailure(
+                        "deadline_expired", "powered deadline reached before send"
+                    )
+                if (
+                    (presend_ns - anchor_ns) // period_ns != cursor
+                    or presend_ns >= tick["end_monotonic_ns"]
+                ):
+                    raise CalibrationCheckFailure(
+                        "slot_missed", "generated tick crossed its half-open slot"
+                    )
+            except CalibrationCheckFailure as exc:
+                terminal_ns = self._now()
+                terminal = self.evidence.record_not_sent(
+                    generated,
+                    recorded_monotonic_ns=terminal_ns,
+                    reason_code=exc.reason_code,
+                    detail=exc.detail,
+                )
+                self.evidence.record_tick_disposition(
+                    tick,
+                    recorded_monotonic_ns=self._now(),
+                    disposition="skipped_after_generation",
+                    generated_event_sequence=generated["event_sequence"],
+                    terminal_event_sequence=terminal["event_sequence"],
+                    reason_code=exc.reason_code,
+                )
+                skipped_after.append(cursor)
+                if exc.reason_code != "slot_missed":
+                    self._skip_remaining(
+                        cursor + 1,
+                        anchor_ns,
+                        exc.reason_code,
+                        terminal_ns,
+                        skipped_before,
+                    )
+                    return CalibrationScheduleResult(
+                        anchor_ns,
+                        hard_expiry_ns,
+                        tuple(sent),
+                        tuple(skipped_before),
+                        tuple(skipped_after),
+                        False,
+                        exc.reason_code,
+                    )
+                cursor += 1
+                continue
+
+            command_value = tick["command"]
+            command = AttitudeRateCommand(
+                command_value["roll_rate_rad_s"],
+                command_value["pitch_rate_rad_s"],
+                command_value["yaw_rate_rad_s"],
+                command_value["thrust"],
+            )
+            validate_command(command)
+            try:
+                dispatch_result = await self.dispatch(
+                    command,
+                    min(
+                        tick["end_monotonic_ns"],
+                        authority_expiry_ns,
+                    ),
+                )
+                if not isinstance(dispatch_result, CalibrationDispatchResult):
+                    raise TypeError("dispatch returned an invalid result")
+            except BaseException as exc:
+                # A dispatcher that raises cannot prove whether its adapter call
+                # began.  Preserve the conservative no-call uncertainty shape.
+                dispatch_result = CalibrationDispatchResult(
+                    audit_count_before=0,
+                    audit_count_after=0,
+                    receipt=None,
+                    call_started_monotonic_ns=None,
+                    call_ended_monotonic_ns=None,
+                    error=exc,
+                )
+            receipt_returned = bool(
+                dispatch_result.receipt is not None
+                and dispatch_result.receipt.get("outcome") == "returned"
+            )
+            if dispatch_result.error is not None or not receipt_returned:
+                terminal_ns = self._now()
+                if isinstance(dispatch_result.error, CalibrationCheckFailure):
+                    reason = dispatch_result.error.reason_code
+                    if reason not in {
+                        "deadline_expired",
+                        "parent_dead",
+                        "lease_invalid",
+                        "internal_error",
+                    }:
+                        reason = "internal_error"
+                else:
+                    reason = (
+                        "send_raised"
+                        if dispatch_result.call_started_monotonic_ns is not None
+                        else "internal_error"
+                    )
+                terminal = self.evidence.record_not_sent(
+                    generated,
+                    recorded_monotonic_ns=terminal_ns,
+                    reason_code=reason,
+                    detail="attitude-target dispatch failed or is uncertain",
+                    dispatch=dispatch_result,
+                )
+                self.evidence.record_tick_disposition(
+                    tick,
+                    recorded_monotonic_ns=self._now(),
+                    disposition="skipped_after_generation",
+                    generated_event_sequence=generated["event_sequence"],
+                    terminal_event_sequence=terminal["event_sequence"],
+                    reason_code=reason,
+                )
+                skipped_after.append(cursor)
+                self._skip_remaining(
+                    cursor + 1,
+                    anchor_ns,
+                    reason,
+                    terminal_ns,
+                    skipped_before,
+                )
+                return CalibrationScheduleResult(
+                    anchor_ns,
+                    hard_expiry_ns,
+                    tuple(sent),
+                    tuple(skipped_before),
+                    tuple(skipped_after),
+                    False,
+                    reason,
+                )
+            receipt_start = dispatch_result.receipt.get(
+                "call_start_monotonic_ns"
+            )
+            receipt_started_in_slot = bool(
+                type(receipt_start) is int
+                and tick["release_monotonic_ns"] <= receipt_start
+                < tick["end_monotonic_ns"]
+                and receipt_start < authority_expiry_ns
+            )
+            sent_ns = self._now()
+            terminal = self.evidence.record_sent(
+                generated,
+                sent_monotonic_ns=sent_ns,
+                dispatch=dispatch_result,
+            )
+            self.evidence.record_tick_disposition(
+                tick,
+                recorded_monotonic_ns=self._now(),
+                disposition="sent",
+                generated_event_sequence=generated["event_sequence"],
+                terminal_event_sequence=terminal["event_sequence"],
+                reason_code=None,
+            )
+            sent.append(cursor)
+            cursor += 1
+            if not receipt_started_in_slot:
+                # The returned receipt proves a call happened, so retain the
+                # truthful sent pair.  Its out-of-slot start invalidates the
+                # stage and no later tick may be dispatched.
+                self._skip_remaining(
+                    cursor,
+                    anchor_ns,
+                    "slot_missed",
+                    sent_ns,
+                    skipped_before,
+                )
+                return CalibrationScheduleResult(
+                    anchor_ns,
+                    hard_expiry_ns,
+                    tuple(sent),
+                    tuple(skipped_before),
+                    tuple(skipped_after),
+                    False,
+                    "slot_missed",
+                )
+
+        return CalibrationScheduleResult(
+            anchor_ns,
+            hard_expiry_ns,
+            tuple(sent),
+            tuple(skipped_before),
+            tuple(skipped_after),
+            True,
+            None,
+        )
+
+
+@dataclass(frozen=True)
+class CalibrationLeaseProof:
+    """One wrapper delegation or powered-child abandoned-lease proof."""
+
+    owner_role: str
+    generation: int
+    record_sha256: str
+    authority_valid: bool
+    takeover_completed_monotonic_ns: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.owner_role not in {"wrapper", "powered-child-parent-death"}:
+            raise ValueError("calibration lease owner role is invalid")
+        if type(self.generation) is not int or self.generation < 0:
+            raise ValueError("calibration lease generation must be nonnegative")
+        if (
+            type(self.record_sha256) is not str
+            or len(self.record_sha256) != 64
+            or any(value not in "0123456789abcdef" for value in self.record_sha256)
+        ):
+            raise ValueError("calibration lease record hash is invalid")
+        if type(self.authority_valid) is not bool:
+            raise TypeError("calibration lease authority must be an exact boolean")
+        if self.takeover_completed_monotonic_ns is not None and (
+            type(self.takeover_completed_monotonic_ns) is not int
+            or self.takeover_completed_monotonic_ns < 0
+        ):
+            raise ValueError("calibration takeover completion is invalid")
+
+
+class CalibrationLeaseBoundary(Protocol):
+    def prove_live_delegation(
+        self,
+        *,
+        attempt: Mapping[str, Any],
+        process_authority: Mapping[str, Any],
+    ) -> Any: ...
+
+    def take_over_abandoned(
+        self,
+        *,
+        role_secret: memoryview,
+        attempt: Mapping[str, Any],
+        process_authority: Mapping[str, Any],
+        deadline_monotonic_ns: int,
+    ) -> Any: ...
+
+    def heartbeat_takeover(
+        self,
+        proof: Any,
+        *,
+        phase: str,
+        deadline_monotonic_ns: int,
+    ) -> Any: ...
+
+    def release_takeover(
+        self,
+        proof: Any,
+        *,
+        deadline_monotonic_ns: int,
+    ) -> bool: ...
+
+
+class CalibrationCertificatePublisher(Protocol):
+    def publish_create_new(
+        self,
+        path: str,
+        value: Mapping[str, Any],
+        *,
+        deadline_monotonic_ns: int,
+        progress_callback: Callable[[], None],
+    ) -> str: ...
+
+
+@dataclass(frozen=True)
+class CalibrationClosedArtifacts:
+    legacy_record: Mapping[str, Any]
+    replay_bundle: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class CalibrationChildRunOutput:
+    certificate: Optional[Dict[str, Any]]
+    certificate_sha256: Optional[str]
+    process_result: Dict[str, Any]
+    exit_code: int
+
+
+@dataclass
+class CalibrationChildServices:
+    """Post-admission construction and proof seams for the powered child.
+
+    Both factories are called only after capability/identity admission and a
+    live lease proof.  The adapter factory owns the exclusive MAVLink bind;
+    the vision factory receives the non-overridable exclusive camera options.
+    """
+
+    process_boundary: CalibrationProcessBoundary
+    lease_boundary: CalibrationLeaseBoundary
+    recorder_factory: Callable[[CalibrationAdmission], "JsonlRecorder"]
+    adapter_factory: Callable[..., Any]
+    vision_factory: Callable[..., Any]
+    camera_socket_factory: Callable[[str, int], Any]
+    publisher: CalibrationCertificatePublisher
+    monotonic_ns: Callable[[], int]
+    wait_until_ns: Optional[Callable[[int], Awaitable[None]]] = None
+    detector_factory: Callable[[], Any] = VQ2GateDetector
+    endpoint_evidence: Optional[
+        Callable[[Any, Any, CalibrationAdmission], Mapping[str, Any]]
+    ] = None
+    transport_evidence: Optional[
+        Callable[[Any, Any, Any], Mapping[str, Any]]
+    ] = None
+    artifact_closer: Optional[
+        Callable[
+            ["JsonlRecorder", CalibrationAdmission, Mapping[str, Any], int],
+            Any,
+        ]
+    ] = None
+    contract: Any = None
+    runtime: Any = None
+
+
+@dataclass
+class _CalibrationObservationState:
+    heartbeat: Optional[Dict[str, Any]] = None
+    race: Optional[Dict[str, Any]] = None
+    imu: Optional[Dict[str, Any]] = None
+    actuator: Optional[Dict[str, Any]] = None
+    heartbeat_object: Any = None
+    race_object: Any = None
+    imu_object: Any = None
+    actuator_object: Any = None
+    generation: Optional[int] = None
+    sequence: Optional[int] = None
+    imu_advance_monotonic_ns: int = 0
+    race_advance_monotonic_ns: int = 0
+    last_imu_timestamp_us: Optional[int] = None
+    last_race_boot_ms: Optional[int] = None
+    imu_regressed: bool = False
+    race_regressed: bool = False
+
+    def begin_generation(self, generation: int) -> None:
+        if type(generation) is not int or generation < 0:
+            raise CalibrationEvidenceError("reset generation is invalid")
+        self.heartbeat = None
+        self.race = None
+        self.imu = None
+        self.actuator = None
+        self.heartbeat_object = None
+        self.race_object = None
+        self.imu_object = None
+        self.actuator_object = None
+        self.generation = generation
+        self.sequence = None
+        self.imu_advance_monotonic_ns = 0
+        self.race_advance_monotonic_ns = 0
+        self.last_imu_timestamp_us = None
+        self.last_race_boot_ms = None
+        self.imu_regressed = False
+        self.race_regressed = False
+
+    def accept(
+        self,
+        checked: Mapping[str, Any],
+        original: Any,
+        *,
+        allow_clock_rollback: bool,
+    ) -> str:
+        ingress = checked["ingress"]
+        generation = ingress["generation"]
+        sequence = ingress["sequence"]
+        if self.generation is None:
+            self.generation = generation
+        if generation != self.generation:
+            raise CalibrationEvidenceError(
+                "received envelope escaped the active reset generation"
+            )
+        if self.sequence is not None and sequence <= self.sequence:
+            raise CalibrationEvidenceError(
+                "received envelope sequence is not strictly increasing"
+            )
+        self.sequence = sequence
+        schema = checked["schema"]
+        if schema == "aigp-vq2-received-heartbeat/1":
+            self.heartbeat = dict(checked)
+            self.heartbeat_object = original
+            return "heartbeat"
+        if schema == "aigp-vq2-received-race-status/1":
+            boot = checked["race_status"]["sim_boot_time_ms"]
+            if self.last_race_boot_ms is None or boot > self.last_race_boot_ms:
+                self.last_race_boot_ms = boot
+                self.race_advance_monotonic_ns = ingress["received_monotonic_ns"]
+            elif boot < self.last_race_boot_ms and not allow_clock_rollback:
+                self.race_regressed = True
+            self.race = dict(checked)
+            self.race_object = original
+            return "race"
+        if schema == "aigp-vq2-received-imu/1":
+            timestamp = checked["imu"]["timestamp_us"]
+            if self.last_imu_timestamp_us is None or timestamp > self.last_imu_timestamp_us:
+                self.last_imu_timestamp_us = timestamp
+                self.imu_advance_monotonic_ns = ingress["received_monotonic_ns"]
+            elif timestamp < self.last_imu_timestamp_us and not allow_clock_rollback:
+                self.imu_regressed = True
+            self.imu = dict(checked)
+            self.imu_object = original
+            return "imu"
+        if schema == "aigp-vq2-received-actuator-output-status/1":
+            self.actuator = dict(checked)
+            self.actuator_object = original
+            return "actuator"
+        raise CalibrationEvidenceError("unsupported received observation")
+
+
+class CalibrationChildLifecycle:
+    """One admitted, bounded, fail-closed powered-child state machine."""
+
+    _PHASE_DURATION_KEYS = {
+        "connect": "child_connect",
+        "preflight": "child_preflight",
+        "reset_epoch": "child_reset_epoch",
+        "normalize_disarmed": "child_normalize_disarmed",
+        "countdown_go": "child_countdown_go",
+        "arm": "child_arm",
+        "powered_stage": "powered_stage",
+        "cleanup": "child_cleanup",
+        "replay_close": "child_replay_close",
+        "finalize": "child_finalize",
+        "parent_death_lease_takeover": "parent_death_lease_takeover",
+    }
+    _PHASE_PARENT = {
+        "connect": "prepower",
+        "preflight": "prepower",
+        "reset_epoch": "prepower",
+        "normalize_disarmed": "prepower",
+        "countdown_go": "prepower",
+        "arm": "prepower",
+        "powered_stage": "powered",
+        "cleanup": "cleanup",
+        "parent_death_lease_takeover": "cleanup",
+        "replay_close": "replay_close",
+        "finalize": "exit",
+    }
+    _ZERO_COMMAND = {
+        "roll_rate_rad_s": 0.0,
+        "pitch_rate_rad_s": 0.0,
+        "yaw_rate_rad_s": 0.0,
+        "thrust": 0.0,
+    }
+
+    def __init__(
+        self,
+        admission: CalibrationAdmission,
+        services: CalibrationChildServices,
+    ) -> None:
+        if not isinstance(admission, CalibrationAdmission):
+            raise TypeError("admission must be CalibrationAdmission")
+        if not isinstance(services, CalibrationChildServices):
+            raise TypeError("services must be CalibrationChildServices")
+        if not callable(services.monotonic_ns):
+            raise TypeError("calibration lifecycle clock must be callable")
+        self.admission = admission
+        self.services = services
+        if services.contract is None:
+            from scripts import aigp_vq2_powered_attempt as contract_module
+
+            self.contract = contract_module
+        else:
+            self.contract = services.contract
+        if services.runtime is None:
+            from scripts import aigp_vq2_powered_runtime as runtime_module
+
+            self.runtime = runtime_module
+        else:
+            self.runtime = services.runtime
+        self.durations = admission.attempt["context"]["deadline_durations_ns"]
+        self.phase_deadlines: List[Dict[str, Any]] = []
+        self.evidence = CalibrationCommandEvidence(
+            attempt=admission.attempt,
+            recorder=None,
+            contract=self.contract,
+        )
+        self.recorder: Optional[JsonlRecorder] = None
+        self.lineage: Optional[CalibrationLineageRecorder] = None
+        self.capture: Optional[CalibrationSnapshotCapture] = None
+        self.guards: Any = None
+        self.adapter: Any = None
+        self.vision: Any = None
+        self._vision_start_attempted = False
+        self.dispatcher: Optional[CalibrationAdapterDispatcher] = None
+        self.detector: Any = None
+        self.tracker = GateTargetTracker()
+        self.estimator = self._new_estimator()
+        self.estimate: Optional[AttitudeEstimate] = None
+        self.state = _CalibrationObservationState()
+        self.frame: Optional[Dict[str, Any]] = None
+        self.target: Optional[GateTarget] = None
+        self._last_frame_identity: Optional[Tuple[int, int]] = None
+        self._countdown_observed = False
+        self._reset_epoch: Optional[Dict[str, Any]] = None
+        self._start_roll_rad: Optional[float] = None
+        self._start_pitch_rad: Optional[float] = None
+        self._initial_target_area: Optional[float] = None
+        self._epoch_collision_count = 0
+        self._collision_recorded_by_generation: Dict[int, int] = {}
+        self._adapter_capture_failure: Optional[str] = None
+        self._lease_proof: Optional[CalibrationLeaseProof] = None
+        self._lease_boundary_proof: Any = None
+        self._parent_mode = "live_delegation"
+        self._parent_observed_ns = admission.admitted_monotonic_ns
+        self._parent_death_observed = False
+        self._takeover_completed_ns: Optional[int] = None
+        self._takeover_record_sha256: Optional[str] = None
+        self._takeover_last_heartbeat_ns: Optional[int] = None
+        self._pending_takeover_phase: Optional[Dict[str, Any]] = None
+        self._takeover_attempted = False
+        self._takeover_release_attempted = False
+        self._takeover_released = True
+        self._cleanup_started = False
+        self._cleanup_phase: Optional[Dict[str, Any]] = None
+        self._certificate_published = False
+        self._replay_closed = False
+        self._stage_completed = False
+        self._trigger = "stage_abort"
+        self._reason_codes: set[str] = set()
+        self._cleanup_failures: set[str] = set()
+        self._collection_codes: set[str] = set()
+        self._zero_command = self._zero_state(required=False)
+        self._disarm = self._disarm_state("not_required")
+        self._reset = self._reset_state("not_required")
+        self._final_state = self._unobserved_final_state()
+        self._certificate: Optional[Dict[str, Any]] = None
+        self._certificate_sha256: Optional[str] = None
+        self._certificate_reference_state = "absent"
+        self._certificate_reference_sha256: Optional[str] = None
+        self._artifacts = self._partial_artifacts("absent")
+
+    @staticmethod
+    def _new_estimator() -> ImuAttitudeEstimator:
+        config = ImuAttitudeConfig(
+            gravity_correction_kp=0.0,
+            gyro_bias_ki=0.0,
+        )
+        return ImuAttitudeEstimator(config)
+
+    @classmethod
+    def _zero_state(cls, *, required: bool) -> Dict[str, Any]:
+        return {
+            "state": "not_attempted" if required else "not_required",
+            "required": required,
+            "requested": dict(cls._ZERO_COMMAND) if required else None,
+            "generated": None,
+            "terminal": None,
+            "outbound_receipt": None,
+        }
+
+    @staticmethod
+    def _disarm_state(state: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "request_monotonic_ns": None,
+            "receipt": None,
+            "heartbeat_before": None,
+            "heartbeat_after": None,
+            "newer_confirmed": False,
+        }
+
+    @staticmethod
+    def _reset_state(state: str) -> Dict[str, Any]:
+        return {
+            "state": state,
+            "request_monotonic_ns": None,
+            "receipt": None,
+            "boundary": None,
+            "baseline": None,
+            "clean_epoch": None,
+            "advancing_race": [],
+            "advancing_imu": [],
+            "rollback_and_advance_confirmed": False,
+        }
+
+    @staticmethod
+    def _unobserved_final_state() -> Dict[str, Any]:
+        return {
+            "state": "unobserved",
+            "heartbeat": None,
+            "disarmed": None,
+            "reset_epoch": None,
+            "last_race": None,
+            "last_imu": None,
+        }
+
+    def _partial_artifacts(self, state: str) -> Dict[str, Any]:
+        return {
+            "legacy_record": {
+                "path": self.admission.arguments.record,
+                "state": state,
+                "sha256": None,
+            },
+            "replay_bundle": {
+                "path": self.admission.arguments.replay_bundle,
+                "state": state,
+                "dataset_hash": None,
+                "manifest_sha256": None,
+                "records_sha256": None,
+            },
+        }
+
+    def _now(self) -> int:
+        value = self.services.monotonic_ns()
+        if type(value) is not int or value < 0:
+            raise CalibrationEvidenceError(
+                "calibration lifecycle clock must return a nonnegative exact integer"
+            )
+        return value
+
+    def _poll_interval_ns(self) -> int:
+        value = getattr(self.runtime, "MAX_POLL_INTERVAL_NS", 50_000_000)
+        if type(value) is not int or value < 1:
+            raise CalibrationEvidenceError(
+                "calibration poll interval must be a positive exact integer"
+            )
+        return min(value, 50_000_000)
+
+    def _parent_deadline(self, phase: str) -> int:
+        name = self._PHASE_PARENT[phase]
+        return {
+            "prepower": self.admission.prepower_deadline_monotonic_ns,
+            "powered": self.admission.powered_deadline_monotonic_ns,
+            "cleanup": self.admission.cleanup_deadline_monotonic_ns,
+            "replay_close": self.admission.replay_close_deadline_monotonic_ns,
+            "exit": self.admission.exit_deadline_monotonic_ns,
+        }[name]
+
+    def _phase(
+        self,
+        phase: str,
+        *,
+        emit: bool = True,
+        parent_deadline_monotonic_ns: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        duration_key = self._PHASE_DURATION_KEYS.get(phase)
+        if duration_key is None or duration_key not in self.durations:
+            raise CalibrationEvidenceError("calibration phase duration is unavailable")
+        frozen = self.runtime.freeze_phase_deadline(
+            phase,
+            self.durations[duration_key],
+            (
+                self._parent_deadline(phase)
+                if parent_deadline_monotonic_ns is None
+                else parent_deadline_monotonic_ns
+            ),
+            monotonic_ns=self.services.monotonic_ns,
+        )
+        row = frozen.to_primitive()
+        self.contract.validate_phase_deadline(row, expected_phase=phase)
+        self.phase_deadlines.append(dict(row))
+        if emit:
+            self.evidence.record_phase_deadline(row)
+        return dict(row)
+
+    def _parent_alive(self) -> bool:
+        signaled = self.services.process_boundary.parent_signaled(
+            self.admission.parent_handle
+        )
+        if type(signaled) is not bool:
+            raise CalibrationEvidenceError("parent liveness is not an exact boolean")
+        return not signaled
+
+    def _note_parent_death(self) -> None:
+        """Latch one permanent wrapper-death invalidation occurrence."""
+
+        first_observation = not self._parent_death_observed
+        if first_observation:
+            self._parent_death_observed = True
+            self._parent_observed_ns = self._now()
+        self._trigger = "parent_death"
+        self._reason_codes.add("wrapper_death")
+        if (
+            first_observation
+            and self.guards is not None
+            and self._parent_mode == "live_delegation"
+        ):
+            self.guards.note_parent_death()
+
+    def _service_takeover_heartbeat(self, deadline_ns: int) -> None:
+        """Publish each due takeover heartbeat from the mutex-owning thread."""
+
+        if self._parent_mode != "signaled_takeover" or self._takeover_released:
+            return
+        proof = self._lease_proof
+        boundary_proof = self._lease_boundary_proof
+        last = self._takeover_last_heartbeat_ns
+        if proof is None or boundary_proof is None or last is None:
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("takeover heartbeat state is unavailable")
+        now = self._now()
+        period = self.durations["lease_heartbeat_period"]
+        maximum_gap = self.durations["lease_heartbeat_max_gap"]
+        if now - last > maximum_gap:
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("takeover heartbeat maximum gap was exceeded")
+        if now < last + period:
+            return
+        deadline = min(deadline_ns, self.admission.exit_deadline_monotonic_ns)
+        if now >= deadline:
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("takeover heartbeat deadline expired")
+        heartbeat = getattr(self.services.lease_boundary, "heartbeat_takeover", None)
+        if not callable(heartbeat):
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("takeover heartbeat boundary is unavailable")
+        try:
+            refreshed_boundary_proof = heartbeat(
+                boundary_proof,
+                phase="child_cleanup",
+                deadline_monotonic_ns=deadline,
+            )
+            refreshed = self._coerce_lease_proof(refreshed_boundary_proof)
+        except BaseException as exc:
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("takeover heartbeat failed") from exc
+        if (
+            refreshed.owner_role != "powered-child-parent-death"
+            or refreshed.authority_valid is not True
+            or refreshed.takeover_completed_monotonic_ns
+            != proof.takeover_completed_monotonic_ns
+            or refreshed.generation <= proof.generation
+        ):
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("takeover heartbeat proof is invalid")
+        self._lease_proof = refreshed
+        self._lease_boundary_proof = refreshed_boundary_proof
+        self._takeover_record_sha256 = refreshed.record_sha256
+        completed = self._now()
+        if completed >= deadline or completed - last > maximum_gap:
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError(
+                "takeover heartbeat completed outside its bounded cadence"
+            )
+        self._takeover_last_heartbeat_ns = completed
+
+    def _supervise_parent(self, deadline_ns: int, *, cleanup: bool) -> None:
+        """Observe the wrapper at every bounded poll boundary."""
+
+        if self._parent_mode == "signaled_takeover":
+            self._service_takeover_heartbeat(deadline_ns)
+            return
+        if self._parent_alive():
+            return
+        self._note_parent_death()
+        if not cleanup:
+            raise CalibrationCheckFailure("parent_dead", "wrapper parent is not live")
+        self._takeover_if_parent_dead(
+            parent_deadline_ns=deadline_ns,
+            enable_cleanup=bool(
+                self.guards is not None
+                and self.adapter is not None
+                and getattr(self.adapter, "powered_source_promoted", None) is True
+                and getattr(self.guards, "cleanup_state", None) != "closed"
+            ),
+            emit=self.recorder is not None and not self._replay_closed,
+        )
+
+    def _lease_valid(self) -> bool:
+        proof = self._lease_proof
+        if proof is None or proof.authority_valid is not True:
+            return False
+        if self._parent_mode == "live_delegation":
+            return proof.owner_role == "wrapper"
+        return proof.owner_role == "powered-child-parent-death"
+
+    @staticmethod
+    def _coerce_lease_proof(value: Any) -> CalibrationLeaseProof:
+        if isinstance(value, CalibrationLeaseProof):
+            return value
+        try:
+            return CalibrationLeaseProof(
+                owner_role=value.owner_role,
+                generation=value.generation,
+                record_sha256=value.record_sha256,
+                authority_valid=value.authority_valid,
+                takeover_completed_monotonic_ns=value.takeover_completed_monotonic_ns,
+            )
+        except BaseException as exc:
+            raise CalibrationEvidenceError("calibration lease proof is invalid") from exc
+
+    async def _wait_until(self, deadline_ns: int) -> None:
+        callback = self.services.wait_until_ns
+        if callback is None:
+            now = self._now()
+            if now < deadline_ns:
+                await asyncio.sleep((deadline_ns - now) / 1_000_000_000.0)
+            return
+        result = callback(deadline_ns)
+        if inspect.isawaitable(result):
+            await result
+        elif result is not None:
+            raise CalibrationEvidenceError("wait_until_ns returned an invalid value")
+
+    async def _poll_pause(self, deadline_ns: int) -> None:
+        self._supervise_parent(deadline_ns, cleanup=self._cleanup_started)
+        now = self._now()
+        if now >= deadline_ns:
+            raise CalibrationCheckFailure("deadline_expired", "phase deadline expired")
+        interval = self._poll_interval_ns()
+        await self._wait_until(min(deadline_ns, now + interval))
+        self._supervise_parent(deadline_ns, cleanup=self._cleanup_started)
+
+    async def _run_supervised_callable(
+        self,
+        callback: Callable[[], Any],
+        *,
+        deadline_ns: int,
+        cleanup: bool,
+        replay_close: bool = False,
+    ) -> Any:
+        """Run one bounded blocking seam while the owner thread supervises death."""
+
+        async def invoke() -> Any:
+            result = (
+                callback()
+                if inspect.iscoroutinefunction(callback)
+                else await asyncio.to_thread(callback)
+            )
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        task = asyncio.create_task(invoke())
+        supervision_error: Optional[BaseException] = None
+        interval_ns = self._poll_interval_ns()
+        while not task.done():
+            try:
+                if replay_close:
+                    if self._parent_mode == "live_delegation" and not self._parent_alive():
+                        self._freeze_pending_takeover(
+                            parent_deadline_ns=self.admission.exit_deadline_monotonic_ns,
+                            emit=False,
+                        )
+                elif supervision_error is None:
+                    self._supervise_parent(deadline_ns, cleanup=cleanup)
+            except BaseException as exc:
+                supervision_error = supervision_error or exc
+            now = self._now()
+            if now >= deadline_ns:
+                supervision_error = supervision_error or CalibrationCheckFailure(
+                    "deadline_expired", "supervised operation deadline expired"
+                )
+            remaining_ns = deadline_ns - now
+            wait_ns = (
+                interval_ns
+                if remaining_ns <= 0
+                else min(interval_ns, remaining_ns)
+            )
+            try:
+                await asyncio.wait(
+                    {task},
+                    timeout=wait_ns / 1_000_000_000.0,
+                )
+            except asyncio.CancelledError as exc:
+                supervision_error = supervision_error or exc
+                current = asyncio.current_task()
+                if current is not None and callable(getattr(current, "uncancel", None)):
+                    current.uncancel()
+        try:
+            result = task.result()
+        except BaseException as exc:
+            if supervision_error is not None:
+                exc.add_note(
+                    "supervision also failed: "
+                    f"{type(supervision_error).__name__}: {supervision_error}"
+                )
+            raise
+        if supervision_error is not None:
+            raise supervision_error
+        if replay_close:
+            if self._parent_mode == "live_delegation" and not self._parent_alive():
+                self._freeze_pending_takeover(
+                    parent_deadline_ns=self.admission.exit_deadline_monotonic_ns,
+                    emit=False,
+                )
+        else:
+            self._supervise_parent(deadline_ns, cleanup=cleanup)
+        return result
+
+    def _replay_estimator_fields(self) -> Optional[Dict[str, Any]]:
+        estimate = self.estimate
+        if estimate is None:
+            return None
+        return {
+            "timestamp_us": int(estimate.timestamp_us),
+            "rpy_rad": list(estimate.orientation.to_euler()),
+            "orientation_wxyz": [
+                estimate.orientation.w,
+                estimate.orientation.x,
+                estimate.orientation.y,
+                estimate.orientation.z,
+            ],
+            "body_rates": list(estimate.body_rates),
+            "gyro_bias": list(estimate.gyro_bias),
+            "healthy": bool(estimate.healthy),
+            "reason": estimate.reason,
+            "propagated": bool(estimate.propagated),
+        }
+
+    def _drain_received(
+        self,
+        *,
+        update_estimator: bool,
+        allow_clock_rollback: bool,
+    ) -> List[Dict[str, Any]]:
+        if self.adapter is None or self.lineage is None:
+            return []
+        drain = getattr(self.adapter, "drain_received_observations", None)
+        if not callable(drain):
+            raise CalibrationEvidenceError(
+                "powered adapter lacks the strict received-envelope drain"
+            )
+        recorded: List[Dict[str, Any]] = []
+        for observation in drain():
+            primitive = CalibrationLineageRecorder._primitive(
+                observation, "received observation"
+            )
+            schema = primitive.get("schema")
+            validator_name = {
+                "aigp-vq2-received-heartbeat/1": "validate_received_heartbeat",
+                "aigp-vq2-received-race-status/1": "validate_received_race_status",
+                "aigp-vq2-received-actuator-output-status/1": (
+                    "validate_received_actuator_output_status"
+                ),
+                "aigp-vq2-received-imu/1": "validate_received_imu",
+            }.get(schema)
+            if validator_name is None:
+                raise CalibrationEvidenceError("unsupported received-envelope schema")
+            checked = getattr(self.contract, validator_name)(primitive)
+            if self.state.generation is not None and (
+                checked["ingress"]["generation"] != self.state.generation
+            ):
+                raise CalibrationEvidenceError(
+                    "received envelope changed generation outside reset boundary"
+                )
+            if schema == "aigp-vq2-received-imu/1" and update_estimator:
+                estimate = self.estimator.update_imu(observation.imu)
+                if estimate is not None:
+                    self.estimate = estimate
+            recorded_row = self.lineage.record_received(
+                observation,
+                estimator=(
+                    self._replay_estimator_fields()
+                    if schema == "aigp-vq2-received-imu/1" and update_estimator
+                    else None
+                ),
+            )
+            self.state.accept(
+                recorded_row,
+                observation,
+                allow_clock_rollback=allow_clock_rollback,
+            )
+            recorded.append(recorded_row)
+        return recorded
+
+    def _drain_collisions(self, *, phase: str, abort: bool) -> List[Dict[str, Any]]:
+        if self.adapter is None or self.lineage is None:
+            return []
+        drain = getattr(self.adapter, "drain_collisions", None)
+        if not callable(drain):
+            raise CalibrationEvidenceError("powered adapter lacks collision drain")
+        generation = 0 if self.state.generation is None else self.state.generation
+        rows = [
+            self.lineage.record_collision(
+                value,
+                reset_generation=generation,
+                observed_monotonic_ns=self._now(),
+                phase=phase,
+                disposition="cleanup_continue" if not abort else "abort",
+            )
+            for value in drain()
+        ]
+        if rows:
+            self._collision_recorded_by_generation[generation] = (
+                self._collision_recorded_by_generation.get(generation, 0)
+                + len(rows)
+            )
+        if rows:
+            self._epoch_collision_count += len(rows)
+            self._collection_codes.add("collision_observed")
+            if abort:
+                raise CalibrationCheckFailure(
+                    "collision_observed", "every post-boundary collision aborts"
+                )
+        return rows
+
+    def _latch_adapter_capture_failure(self, detail: str, *, abort: bool) -> None:
+        if self._adapter_capture_failure is None:
+            self._adapter_capture_failure = detail
+        self._reason_codes.add("capture_incomplete")
+        if abort:
+            raise CalibrationCheckFailure("capture_failed", detail)
+
+    def _verify_adapter_queues(self, *, abort: bool) -> None:
+        if self.adapter is None:
+            return
+        ingress_method = getattr(self.adapter, "ingress_stats", None)
+        collision_method = getattr(self.adapter, "collision_stats", None)
+        if not callable(ingress_method) or not callable(collision_method):
+            raise CalibrationEvidenceError(
+                "powered adapter lacks ingress/collision diagnostics"
+            )
+        ingress = ingress_method()
+        collision = collision_method()
+        required_ingress = (
+            "generation",
+            "next_sequence",
+            "dropped",
+            "imu_dropped",
+            "other_dropped",
+            "buffered_imu",
+            "buffered_other",
+        )
+        required_collision = ("generation", "handled", "dropped", "buffered")
+        if any(type(getattr(ingress, name, None)) is not int for name in required_ingress):
+            raise CalibrationEvidenceError("powered ingress diagnostics are invalid")
+        if any(
+            type(getattr(collision, name, None)) is not int
+            for name in required_collision
+        ):
+            raise CalibrationEvidenceError("powered collision diagnostics are invalid")
+        generation = self.state.generation
+        problems: List[str] = []
+        if generation is not None and (
+            ingress.generation != generation or collision.generation != generation
+        ):
+            problems.append("diagnostic generation mismatched receiver state")
+        if ingress.dropped or ingress.imu_dropped or ingress.other_dropped:
+            problems.append("receiver ingress dropped observations")
+        if ingress.buffered_imu or ingress.buffered_other:
+            problems.append("receiver ingress remained buffered after strict drain")
+        if (
+            generation is not None
+            and self.state.sequence is not None
+            and ingress.next_sequence != self.state.sequence + 1
+        ):
+            problems.append("receiver ingress sequence accounting mismatched")
+        if collision.dropped:
+            problems.append("collision receiver dropped observations")
+        if collision.buffered:
+            problems.append("collision observations remained buffered after strict drain")
+        if generation is not None and collision.handled != (
+            self._collision_recorded_by_generation.get(generation, 0)
+        ):
+            problems.append("collision handled/recorded accounting mismatched")
+        if problems:
+            self._latch_adapter_capture_failure("; ".join(problems), abort=abort)
+
+    def _drain_frames(self) -> int:
+        if self.vision is None:
+            return 0
+        pop = getattr(self.vision, "pop_capture_snapshot", None)
+        if not callable(pop):
+            raise CalibrationEvidenceError("powered vision lacks capture FIFO drain")
+        count = 0
+        while True:
+            snapshot = pop()
+            if snapshot is None:
+                break
+            identity = (int(snapshot.generation), int(snapshot.frame_id))
+            if identity == self._last_frame_identity:
+                raise CalibrationEvidenceError("capture FIFO repeated a frame identity")
+            image = snapshot.camera_frame.image
+            height, width = image.shape[:2]
+            timing = snapshot.timing.to_primitive()
+            self.frame = {
+                "stream_id": timing["identity"]["stream_id"],
+                "generation": int(snapshot.generation),
+                "frame_id": int(snapshot.frame_id),
+                "sim_time_ns": int(snapshot.sim_time_ns),
+                "timing": timing,
+                "width": int(width),
+                "height": int(height),
+            }
+            if self.state.generation is not None and (
+                self.frame["generation"] != self.state.generation
+            ):
+                raise CalibrationCheckFailure(
+                    "capture_failed", "camera frame is outside reset generation"
+                )
+            detections = list(self.detector.detect(image))
+            self.target = self.tracker.update(
+                detections,
+                frame_id=snapshot.frame_id,
+                sim_time_ns=snapshot.sim_time_ns,
+                received_monotonic_s=snapshot.received_monotonic_s,
+            )
+            self._last_frame_identity = identity
+            count += 1
+        return count
+
+    def _drain_all(
+        self,
+        *,
+        phase: str,
+        update_estimator: bool,
+        collision_abort: bool,
+        allow_clock_rollback: bool = False,
+        frames: bool = True,
+    ) -> None:
+        self._drain_received(
+            update_estimator=update_estimator,
+            allow_clock_rollback=allow_clock_rollback,
+        )
+        if self.dispatcher is not None:
+            self.dispatcher.drain_outbound()
+        self._drain_collisions(phase=phase, abort=collision_abort)
+        if frames:
+            self._drain_frames()
+        self._verify_adapter_queues(abort=collision_abort)
+
+    def _prepare_recorder(self) -> None:
+        recorder = self.services.recorder_factory(self.admission)
+        if not isinstance(recorder, JsonlRecorder) or recorder.replay is None:
+            raise CalibrationEvidenceError(
+                "powered recorder factory must return active JsonlRecorder"
+            )
+        if recorder.capture_fifo_enabled is not True:
+            raise CalibrationEvidenceError(
+                "powered recorder must enable the decoded-frame FIFO"
+            )
+        self.recorder = recorder
+        self.evidence.recorder = recorder
+        self.lineage = CalibrationLineageRecorder(
+            recorder,
+            contract=self.contract,
+        )
+        target_config = self.admission.attempt["context"]["target_config"]
+        config_sha256 = target_config["sha256"]
+        self.capture = CalibrationSnapshotCapture(
+            recorder=recorder,
+            config_sha256=config_sha256,
+            monotonic_ns=self.services.monotonic_ns,
+            contract=self.contract,
+        )
+        self.detector = self.services.detector_factory()
+        if not callable(getattr(self.detector, "detect", None)):
+            raise CalibrationEvidenceError("detector factory returned an invalid detector")
+
+    def _prove_live_delegation(self) -> None:
+        if self._parent_alive() is not True:
+            raise CalibrationCheckFailure("parent_dead", "wrapper parent is already dead")
+        boundary_proof = self.services.lease_boundary.prove_live_delegation(
+            attempt=self.admission.attempt,
+            process_authority=self.admission.process_authority,
+        )
+        proof = self._coerce_lease_proof(boundary_proof)
+        if (
+            proof.owner_role != "wrapper"
+            or proof.authority_valid is not True
+        ):
+            raise CalibrationCheckFailure(
+                "lease_invalid", "wrapper lease delegation is invalid"
+            )
+        self._lease_proof = proof
+        self._lease_boundary_proof = boundary_proof
+
+    def _construct_transports(self) -> None:
+        if self.capture is None or self.lineage is None:
+            raise CalibrationEvidenceError("capture/lineage was not prepared")
+        transport = self.admission.live_freeze.get("transport")
+        if type(transport) is not dict:
+            raise CalibrationEvidenceError("live-freeze transport is unavailable")
+
+        def frozen_bind(name: str) -> Dict[str, Any]:
+            value = transport.get(name)
+            if type(value) is not dict or set(value) != {
+                "host",
+                "port",
+                "socket_policy",
+            }:
+                raise CalibrationEvidenceError(
+                    f"live-freeze {name} must be an exact bind object"
+                )
+            if (
+                type(value["host"]) is not str
+                or not value["host"]
+                or type(value["port"]) is not int
+                or not 1 <= value["port"] <= 65_535
+                or value["socket_policy"] != "ipv4-exclusive-address-use"
+            ):
+                raise CalibrationEvidenceError(f"live-freeze {name} is invalid")
+            return dict(value)
+
+        mavlink_bind = frozen_bind("mavlink_bind")
+        camera_bind = frozen_bind("camera_bind")
+        self.guards = self.runtime.PoweredOutboundGuards()
+        self.adapter = self.services.adapter_factory(
+            admission=self.admission,
+            bind=mavlink_bind,
+            outbound_guards=self.guards,
+            role_valid=lambda: True,
+            parent_alive=self._parent_alive,
+            lease_valid=self._lease_valid,
+        )
+        # Establish the close path immediately after adapter ownership begins.
+        # Any later validation, camera construction, or reset failure then
+        # still reaches the adapter's bounded disconnect path during cleanup.
+        self.dispatcher = CalibrationAdapterDispatcher(
+            self.adapter,
+            self.lineage,
+            monotonic_ns=self.services.monotonic_ns,
+            parent_alive=self._parent_alive,
+            lease_valid=self._lease_valid,
+        )
+        if getattr(self.adapter, "powered_outbound_guards", None) is not self.guards:
+            raise CalibrationEvidenceError(
+                "powered adapter did not retain the injected outbound guards"
+            )
+        for name, expected in (
+            ("enable_vision", False),
+            ("telemetry_mode", "imu"),
+            ("fetch_track_on_connect", False),
+        ):
+            if hasattr(self.adapter, name) and getattr(self.adapter, name) != expected:
+                raise CalibrationEvidenceError(
+                    f"powered adapter {name} construction option changed"
+                )
+        options = calibration_vision_options(
+            self.capture,
+            exclusive_socket_factory=self.services.camera_socket_factory,
+        )
+        self.vision = self.services.vision_factory(
+            admission=self.admission,
+            bind=camera_bind,
+            **options,
+        )
+        # Adapter connect starts MAVLink generation one.  Advance the
+        # independently owned camera receiver once so every later reset keeps
+        # their generation tokens equal without synthesizing a mapping.
+        reset = getattr(self.vision, "reset", None)
+        if not callable(reset):
+            raise CalibrationEvidenceError("powered vision lacks reset()")
+        reset()
+
+    async def _start_vision(self, deadline_ns: int) -> None:
+        if self.vision is None:
+            raise CalibrationEvidenceError("powered vision was not constructed")
+        if self._now() >= deadline_ns:
+            raise CalibrationCheckFailure("deadline_expired", "vision start deadline expired")
+        self._vision_start_attempted = True
+        await self._run_supervised_callable(
+            self.vision.start,
+            deadline_ns=deadline_ns,
+            cleanup=False,
+        )
+        if self._now() >= deadline_ns:
+            raise CalibrationCheckFailure("deadline_expired", "vision start completed late")
+
+    async def _stop_vision(self, deadline_ns: int, *, cleanup: bool = False) -> None:
+        if self.vision is None:
+            return
+        now = self._now()
+        if now >= deadline_ns:
+            raise CalibrationCheckFailure("deadline_expired", "vision stop deadline expired")
+        timeout_s = (deadline_ns - now) / 1_000_000_000.0
+        parameters = inspect.signature(self.vision.stop).parameters
+        callback = (
+            partial(self.vision.stop, timeout_s=timeout_s)
+            if "timeout_s" in parameters or any(
+                value.kind == inspect.Parameter.VAR_KEYWORD
+                for value in parameters.values()
+            )
+            else self.vision.stop
+        )
+        await self._run_supervised_callable(
+            callback,
+            deadline_ns=deadline_ns,
+            cleanup=cleanup,
+        )
+        if self._now() >= deadline_ns:
+            raise CalibrationCheckFailure("deadline_expired", "vision stop completed late")
+
+    async def _connect(self, phase: Mapping[str, Any]) -> None:
+        self._prove_live_delegation()
+        self._construct_transports()
+        await self._start_vision(phase["deadline_monotonic_ns"])
+        await self.adapter.connect(
+            DEFAULT_MAVLINK_URL,
+            deadline_monotonic_ns=phase["deadline_monotonic_ns"],
+        )
+        self._drain_all(
+            phase="connect",
+            update_estimator=True,
+            collision_abort=True,
+        )
+        if getattr(self.adapter, "powered_source_promoted", None) is not True:
+            raise CalibrationCheckFailure(
+                "stream_stale", "MAVLink source did not promote"
+            )
+
+    def _capture_healthy(self) -> bool:
+        if self.capture is None or self.capture.failure is not None:
+            return False
+        if self._adapter_capture_failure is not None:
+            return False
+        if self.adapter is not None and (
+            getattr(self.adapter, "powered_source_rejected", False) is True
+        ):
+            self._collection_codes.add("source_rejected")
+            return False
+        if self.vision is not None:
+            diagnostics = getattr(self.vision, "source_diagnostics", None)
+            if callable(diagnostics):
+                source = diagnostics()
+                if getattr(source, "source_rejected_latched", False) is True:
+                    self._collection_codes.add("source_rejected")
+                    return False
+            stats_method = getattr(self.vision, "stats", None)
+            if callable(stats_method):
+                stats = stats_method()
+                for name in (
+                    "capture_snapshot_queue_dropped",
+                    "receiver_dropped_partial_frames",
+                    "snapshot_callback_errors",
+                    "timing_overflow_latched",
+                ):
+                    value = getattr(stats, name, 0)
+                    if value not in {0, False}:
+                        return False
+        return True
+
+    def _required_sources_present(self) -> bool:
+        return all(
+            item is not None
+            for item in (
+                self.state.heartbeat,
+                self.state.race,
+                self.state.imu,
+                self.state.actuator,
+            )
+        )
+
+    async def _preflight(self, phase: Mapping[str, Any]) -> None:
+        deadline = phase["deadline_monotonic_ns"]
+        while self._now() < deadline:
+            self._drain_all(
+                phase="preflight",
+                update_estimator=True,
+                collision_abort=True,
+            )
+            if (
+                self._required_sources_present()
+                and self.estimate is not None
+                and self.estimate.healthy
+                and self.capture is not None
+                and self.capture.admitted
+                and self.target is not None
+                and self._capture_healthy()
+            ):
+                await self._stop_vision(deadline)
+                return
+            await self._poll_pause(deadline)
+        raise CalibrationCheckFailure("stream_stale", "powered preflight timed out")
+
+    async def _wait_reset_baseline(
+        self,
+        deadline_ns: int,
+        *,
+        phase: str,
+        cleanup: bool,
+    ) -> Dict[str, Any]:
+        last_race = (
+            None
+            if self.state.race is None
+            else self.state.race["race_status"]["sim_boot_time_ms"]
+        )
+        last_imu = (
+            None if self.state.imu is None else self.state.imu["imu"]["timestamp_us"]
+        )
+        race_advances = 0
+        imu_advances = 0
+        while self._now() < deadline_ns:
+            rows = self._drain_received(
+                update_estimator=False,
+                allow_clock_rollback=False,
+            )
+            if self.dispatcher is not None:
+                self.dispatcher.drain_outbound()
+            self._drain_collisions(phase=phase, abort=not cleanup)
+            self._verify_adapter_queues(abort=not cleanup)
+            for row in rows:
+                if row["schema"] == "aigp-vq2-received-race-status/1":
+                    value = row["race_status"]["sim_boot_time_ms"]
+                    if last_race is not None and value > last_race:
+                        race_advances += 1
+                    last_race = value
+                elif row["schema"] == "aigp-vq2-received-imu/1":
+                    value = row["imu"]["timestamp_us"]
+                    if last_imu is not None and value > last_imu:
+                        imu_advances += 1
+                    last_imu = value
+            if (
+                race_advances >= 2
+                and imu_advances >= 2
+                and self.state.race is not None
+                and self.state.imu is not None
+                and self.state.race["race_status"]["sim_boot_time_ms"] >= 800
+                and self.state.imu["imu"]["timestamp_us"] >= 200_000
+            ):
+                return {
+                    "race": dict(self.state.race),
+                    "imu": dict(self.state.imu),
+                }
+            await self._poll_pause(deadline_ns)
+        raise CalibrationCheckFailure(
+            "stream_stale", "fresh advancing reset baseline was not observed"
+        )
+
+    def _clear_for_reset_generation(self, generation: int) -> None:
+        self.state.begin_generation(generation)
+        self.estimator = self._new_estimator()
+        self.estimate = None
+        self.tracker.reset()
+        self.target = None
+        self.frame = None
+        self._last_frame_identity = None
+        self._epoch_collision_count = 0
+
+    async def _observe_reset_epoch(
+        self,
+        *,
+        baseline: Mapping[str, Any],
+        boundary: Mapping[str, Any],
+        deadline_ns: int,
+        phase: str,
+        cleanup: bool,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        pre_race = baseline["race"]["race_status"]["sim_boot_time_ms"]
+        pre_imu = baseline["imu"]["imu"]["timestamp_us"]
+        race_anchor: Optional[int] = None
+        imu_anchor: Optional[int] = None
+        race_last: Optional[int] = None
+        imu_last: Optional[int] = None
+        races: List[Dict[str, Any]] = []
+        imus: List[Dict[str, Any]] = []
+        while self._now() < deadline_ns:
+            rows = self._drain_received(
+                update_estimator=False,
+                allow_clock_rollback=True,
+            )
+            if self.dispatcher is not None:
+                self.dispatcher.drain_outbound()
+            self._drain_collisions(phase=phase, abort=not cleanup)
+            self._verify_adapter_queues(abort=not cleanup)
+            for row in rows:
+                if row["schema"] == "aigp-vq2-received-race-status/1":
+                    value = row["race_status"]["sim_boot_time_ms"]
+                    if race_anchor is None:
+                        if clock_rolled_back(pre_race, value, RESET_RACE_DROP_MS):
+                            race_anchor = value
+                            race_last = value
+                            self.state.last_race_boot_ms = value
+                            self.state.race_advance_monotonic_ns = row["ingress"][
+                                "received_monotonic_ns"
+                            ]
+                    elif value > race_last:
+                        races.append(dict(row))
+                        race_last = value
+                        self.state.last_race_boot_ms = value
+                        self.state.race_advance_monotonic_ns = row["ingress"][
+                            "received_monotonic_ns"
+                        ]
+                    start = row["race_status"]["race_start_boot_time_ms"]
+                    if start < 0 or value < start:
+                        self._countdown_observed = True
+                elif row["schema"] == "aigp-vq2-received-imu/1":
+                    value = row["imu"]["timestamp_us"]
+                    if imu_anchor is None:
+                        if clock_rolled_back(pre_imu, value, RESET_IMU_DROP_US):
+                            imu_anchor = value
+                            imu_last = value
+                            self.state.last_imu_timestamp_us = value
+                            self.state.imu_advance_monotonic_ns = row["ingress"][
+                                "received_monotonic_ns"
+                            ]
+                    elif value > imu_last:
+                        imus.append(dict(row))
+                        imu_last = value
+                        self.state.last_imu_timestamp_us = value
+                        self.state.imu_advance_monotonic_ns = row["ingress"][
+                            "received_monotonic_ns"
+                        ]
+            if (
+                race_anchor is not None
+                and imu_anchor is not None
+                and len(races) >= 2
+                and len(imus) >= 2
+            ):
+                epoch = {
+                    "ingress_generation": boundary["new_generation"],
+                    "race_anchor_boot_ms": race_anchor,
+                    "imu_anchor_usec": imu_anchor,
+                }
+                return epoch, races, imus
+            await self._poll_pause(deadline_ns)
+        raise CalibrationCheckFailure(
+            "race_not_advancing", "reset rollback/advance proof timed out"
+        )
+
+    async def _execute_reset(
+        self,
+        *,
+        deadline_ns: int,
+        phase: str,
+        cleanup: bool,
+    ) -> Dict[str, Any]:
+        if self.dispatcher is None or self.lineage is None:
+            raise CalibrationEvidenceError("reset dispatcher is unavailable")
+        baseline = await self._wait_reset_baseline(
+            deadline_ns,
+            phase=phase,
+            cleanup=cleanup,
+        )
+        if cleanup:
+            self._ensure_cleanup_send_authority(deadline_ns)
+        captured: Dict[str, Any] = {}
+        def persist(boundary: Any) -> None:
+            try:
+                checked = self.lineage.record_reset_boundary(boundary, phase=phase)
+                captured["boundary"] = checked
+                if checked["collisions"]:
+                    generation = checked["old_generation"]
+                    self._collision_recorded_by_generation[generation] = (
+                        self._collision_recorded_by_generation.get(generation, 0)
+                        + len(checked["collisions"])
+                    )
+                    self._epoch_collision_count += len(checked["collisions"])
+                    self._collection_codes.add("collision_observed")
+                    if not cleanup:
+                        raise CalibrationCheckFailure(
+                            "collision_observed",
+                            "reset boundary contained a collision observation",
+                        )
+                ingress_stats = checked["ingress_stats"]
+                collision_stats = checked["collision_stats"]
+                boundary_problems: List[str] = []
+                if (
+                    ingress_stats["dropped"]
+                    or ingress_stats["imu_dropped"]
+                    or ingress_stats["other_dropped"]
+                ):
+                    boundary_problems.append(
+                        "reset boundary reported dropped ingress observations"
+                    )
+                if (
+                    ingress_stats["buffered_imu"]
+                    + ingress_stats["buffered_other"]
+                    != len(checked["observations"])
+                ):
+                    boundary_problems.append(
+                        "reset boundary ingress buffering did not match preserved rows"
+                    )
+                if collision_stats["dropped"]:
+                    boundary_problems.append(
+                        "reset boundary reported dropped collision observations"
+                    )
+                if collision_stats["buffered"] != len(checked["collisions"]):
+                    boundary_problems.append(
+                        "reset boundary collision buffering did not match preserved rows"
+                    )
+                if collision_stats["handled"] != (
+                    self._collision_recorded_by_generation.get(
+                        checked["old_generation"], 0
+                    )
+                ):
+                    boundary_problems.append(
+                        "reset boundary collision handled/recorded accounting mismatched"
+                    )
+                if boundary_problems:
+                    self._latch_adapter_capture_failure(
+                        "; ".join(boundary_problems), abort=not cleanup
+                    )
+            except BaseException as exc:
+                if not cleanup:
+                    raise
+                # Cleanup authority must not be suppressed by failed replay
+                # enqueue. Preserve the exact batch for the certificate and
+                # let the adapter continue its guarded reset send.
+                checked = self.lineage.retain_reset_boundary_without_replay(
+                    boundary,
+                    phase=phase,
+                )
+                captured["boundary"] = checked
+                if checked["collisions"]:
+                    generation = checked["old_generation"]
+                    self._collision_recorded_by_generation[generation] = (
+                        self._collision_recorded_by_generation.get(generation, 0)
+                        + len(checked["collisions"])
+                    )
+                    self._epoch_collision_count += len(checked["collisions"])
+                    self._collection_codes.add("collision_observed")
+                self._reason_codes.add("capture_incomplete")
+
+        dispatch = await self.dispatcher.dispatch_nonattitude(
+            "sim_reset",
+            deadline_ns,
+            cleanup=cleanup,
+            persist_boundary=persist,
+            progress=(
+                (lambda: self._ensure_cleanup_send_authority(deadline_ns))
+                if cleanup
+                else None
+            ),
+        )
+        boundary = captured.get("boundary")
+        if cleanup:
+            persistence_state = getattr(
+                self.adapter,
+                "calibration_reset_persistence_state",
+                None,
+            )
+            if callable(persistence_state):
+                state = persistence_state()
+                if getattr(state, "failure_latched", None) is True:
+                    self._reason_codes.add("capture_incomplete")
+            if boundary is None and dispatch.boundary is not None:
+                boundary = self.lineage.retain_reset_boundary_without_replay(
+                    dispatch.boundary,
+                    phase=phase,
+                )
+                captured["boundary"] = boundary
+                if boundary["collisions"]:
+                    generation = boundary["old_generation"]
+                    self._collision_recorded_by_generation[generation] = (
+                        self._collision_recorded_by_generation.get(generation, 0)
+                        + len(boundary["collisions"])
+                    )
+                    self._epoch_collision_count += len(boundary["collisions"])
+                    self._collection_codes.add("collision_observed")
+                self._reason_codes.add("capture_incomplete")
+        result = self._reset_state("request_failed")
+        result.update(
+            {
+                "request_monotonic_ns": dispatch.request_monotonic_ns,
+                "receipt": (
+                    dict(dispatch.receipt)
+                    if dispatch.receipt is not None
+                    and dispatch.receipt.get("outcome") == "raised"
+                    else None
+                ),
+                "boundary": boundary,
+                "baseline": dict(baseline),
+            }
+        )
+        if boundary is None:
+            raise CalibrationEvidenceError("reset boundary was not preserved")
+        self._clear_for_reset_generation(boundary["new_generation"])
+        if dispatch.error is not None or dispatch.receipt is None:
+            if (
+                dispatch.receipt is not None
+                and dispatch.receipt.get("outcome") == "returned"
+            ):
+                result["state"] = "unconfirmed"
+                result["receipt"] = dict(dispatch.receipt)
+            if cleanup:
+                self._reset = result
+            raise CalibrationLifecycleError("reset request failed or was uncertain")
+        if dispatch.receipt.get("outcome") != "returned":
+            if cleanup:
+                self._reset = result
+            raise CalibrationLifecycleError("reset request raised")
+        result["state"] = "unconfirmed"
+        result["receipt"] = dict(dispatch.receipt)
+        try:
+            epoch, races, imus = await self._observe_reset_epoch(
+                baseline=baseline,
+                boundary=boundary,
+                deadline_ns=deadline_ns,
+                phase=phase,
+                cleanup=cleanup,
+            )
+        except BaseException:
+            result["advancing_race"] = []
+            result["advancing_imu"] = []
+            if cleanup:
+                self._reset = result
+            raise
+        result.update(
+            {
+                "state": "confirmed",
+                "clean_epoch": epoch,
+                "advancing_race": races,
+                "advancing_imu": imus,
+                "rollback_and_advance_confirmed": True,
+            }
+        )
+        self._reset_epoch = dict(epoch)
+        self.state.imu_regressed = False
+        self.state.race_regressed = False
+        if cleanup:
+            self._reset = result
+        return result
+
+    async def _reset_epoch_phase(self, phase: Mapping[str, Any]) -> None:
+        deadline = phase["deadline_monotonic_ns"]
+        await self._stop_vision(deadline)
+        await self._execute_reset(
+            deadline_ns=deadline,
+            phase="reset_epoch",
+            cleanup=False,
+        )
+        self.vision.reset()
+        await self._start_vision(deadline)
+
+    async def _wait_for_heartbeat(
+        self,
+        deadline_ns: int,
+        *,
+        phase: str,
+        update_estimator: bool,
+        cleanup: bool,
+    ) -> Dict[str, Any]:
+        while self._now() < deadline_ns:
+            self._drain_received(
+                update_estimator=update_estimator,
+                allow_clock_rollback=False,
+            )
+            if self.dispatcher is not None:
+                self.dispatcher.drain_outbound()
+            self._drain_collisions(phase=phase, abort=not cleanup)
+            self._verify_adapter_queues(abort=not cleanup)
+            heartbeat = self.state.heartbeat
+            if heartbeat is not None and (
+                self.state.generation is None
+                or heartbeat["ingress"]["generation"] == self.state.generation
+            ):
+                return dict(heartbeat)
+            await self._poll_pause(deadline_ns)
+        raise CalibrationCheckFailure("stream_stale", "fresh heartbeat was not observed")
+
+    async def _disarm_confirmed(
+        self,
+        deadline_ns: int,
+        *,
+        phase: str,
+        cleanup: bool,
+    ) -> Dict[str, Any]:
+        if self.dispatcher is None:
+            raise CalibrationEvidenceError("disarm dispatcher is unavailable")
+        before = await self._wait_for_heartbeat(
+            deadline_ns,
+            phase=phase,
+            update_estimator=not cleanup,
+            cleanup=cleanup,
+        )
+        if cleanup:
+            self._ensure_cleanup_send_authority(deadline_ns)
+        dispatch_deadline = (
+            min(
+                deadline_ns,
+                self._now() + self.durations["outbound_call"],
+            )
+            if cleanup
+            else deadline_ns
+        )
+        dispatch = await self.dispatcher.dispatch_nonattitude(
+            "disarm",
+            dispatch_deadline,
+            cleanup=cleanup,
+        )
+        if cleanup and self._resume_unsent_cleanup_after_takeover(
+            dispatch,
+            deadline_ns=deadline_ns,
+        ):
+            dispatch = await self.dispatcher.dispatch_nonattitude(
+                "disarm",
+                dispatch_deadline,
+                cleanup=True,
+            )
+        result = {
+            "state": "request_failed",
+            "request_monotonic_ns": dispatch.request_monotonic_ns,
+            "receipt": (
+                None if dispatch.receipt is None else dict(dispatch.receipt)
+            ),
+            "heartbeat_before": before,
+            "heartbeat_after": None,
+            "newer_confirmed": False,
+        }
+        if dispatch.error is not None or dispatch.receipt is None:
+            if result["receipt"] is not None and result["receipt"]["outcome"] == "returned":
+                result["state"] = "unconfirmed"
+            if cleanup:
+                self._disarm = result
+            raise CalibrationLifecycleError("disarm request failed or was uncertain")
+        if dispatch.receipt["outcome"] != "returned":
+            if cleanup:
+                self._disarm = result
+            raise CalibrationLifecycleError("disarm request raised")
+        result["state"] = "unconfirmed"
+        before_sequence = before["ingress"]["sequence"]
+        last_after: Optional[Dict[str, Any]] = None
+        while self._now() < deadline_ns:
+            self._drain_received(
+                update_estimator=not cleanup,
+                allow_clock_rollback=False,
+            )
+            self.dispatcher.drain_outbound()
+            self._drain_collisions(phase=phase, abort=not cleanup)
+            self._verify_adapter_queues(abort=not cleanup)
+            after = self.state.heartbeat
+            if (
+                after is not None
+                and after["ingress"]["sequence"] > before_sequence
+                and after["ingress"]["received_monotonic_ns"]
+                > dispatch.request_monotonic_ns
+            ):
+                last_after = dict(after)
+                if after["heartbeat"]["base_mode"] & 128 == 0:
+                    result.update(
+                        {
+                            "state": "confirmed",
+                            "heartbeat_after": last_after,
+                            "newer_confirmed": True,
+                        }
+                    )
+                    if cleanup:
+                        self._disarm = result
+                    return result
+            await self._poll_pause(deadline_ns)
+        result["heartbeat_after"] = last_after
+        if cleanup:
+            self._disarm = result
+        raise CalibrationCheckFailure(
+            "stream_stale", "disarm was not confirmed by a newer heartbeat"
+        )
+
+    async def _normalize_disarmed(self, phase: Mapping[str, Any]) -> None:
+        result = await self._disarm_confirmed(
+            phase["deadline_monotonic_ns"],
+            phase="normalize_disarmed",
+            cleanup=False,
+        )
+        if result["heartbeat_after"]["heartbeat"]["base_mode"] & 128:
+            raise CalibrationLifecycleError("vehicle remained armed after normalization")
+
+    def _current_attitude(self) -> Tuple[float, float]:
+        if self.estimate is None or self.estimate.healthy is not True:
+            raise CalibrationCheckFailure(
+                "estimator_unhealthy", "attitude estimate is unavailable"
+            )
+        roll, pitch, _yaw = self.estimate.orientation.to_euler()
+        return float(roll), float(pitch)
+
+    def _safety_authorization(self, _tick: int) -> CalibrationSafetyAuthorization:
+        self._drain_all(
+            phase="powered_stage",
+            update_estimator=True,
+            collision_abort=True,
+        )
+        if self.capture is not None:
+            self.capture.raise_if_failed()
+        if self.state.imu_regressed or self.state.race_regressed:
+            raise CalibrationCheckFailure(
+                "stream_stale", "source clock regressed inside the accepted epoch"
+            )
+        if (
+            self._reset_epoch is None
+            or self.frame is None
+            or self.state.imu is None
+            or self.state.race is None
+            or self.state.heartbeat is None
+            or self.state.actuator is None
+            or self.target is None
+            or self._initial_target_area is None
+            or self._start_roll_rad is None
+            or self._start_pitch_rad is None
+        ):
+            raise CalibrationCheckFailure(
+                "stream_stale", "complete powered safety sources are unavailable"
+            )
+        roll, pitch = self._current_attitude()
+        facts = CalibrationSafetyFacts(
+            checked_monotonic_ns=self._now(),
+            reset_epoch=self._reset_epoch,
+            frame=self.frame,
+            imu=self.state.imu,
+            race=self.state.race,
+            heartbeat=self.state.heartbeat,
+            actuator=self.state.actuator,
+            imu_advance_monotonic_ns=self.state.imu_advance_monotonic_ns,
+            race_advance_monotonic_ns=self.state.race_advance_monotonic_ns,
+            estimator_healthy=(
+                self.estimate is not None
+                and self.estimate.healthy is True
+                and self.estimator.is_ready
+            ),
+            target_consecutive=self.tracker.consecutive,
+            target_center_px=(self.target.center_x, self.target.center_y),
+            target_bbox_px=tuple(self.target.bbox),
+            initial_target_bbox_area_px=self._initial_target_area,
+            start_roll_rad=self._start_roll_rad,
+            start_pitch_rad=self._start_pitch_rad,
+            current_roll_rad=roll,
+            current_pitch_rad=pitch,
+            collision_count=self._epoch_collision_count,
+            capture_healthy=self._capture_healthy(),
+            parent_alive=self._parent_alive(),
+            lease_valid=self._lease_valid(),
+        )
+        return evaluate_calibration_safety(facts, contract=self.contract)
+
+    async def _countdown_go(self, phase: Mapping[str, Any]) -> None:
+        deadline = phase["deadline_monotonic_ns"]
+        go_observed_ns: Optional[int] = None
+        while self._now() < deadline:
+            self._drain_all(
+                phase="countdown_go",
+                update_estimator=True,
+                collision_abort=True,
+            )
+            if self.capture is not None:
+                self.capture.raise_if_failed()
+            race = self.state.race
+            heartbeat = self.state.heartbeat
+            if heartbeat is not None and heartbeat["heartbeat"]["base_mode"] & 128:
+                raise CalibrationCheckFailure(
+                    "internal_error", "vehicle armed before the explicit arm phase"
+                )
+            if race is not None:
+                status = race["race_status"]
+                boot = status["sim_boot_time_ms"]
+                start = status["race_start_boot_time_ms"]
+                if start < 0 or boot < start:
+                    self._countdown_observed = True
+                if (
+                    self._countdown_observed
+                    and start >= 0
+                    and boot >= start + 150
+                ):
+                    if go_observed_ns is None:
+                        go_observed_ns = self._now()
+                    if (
+                        self.target is not None
+                        and self.tracker.consecutive >= 3
+                        and self.capture is not None
+                        and self.capture.admitted
+                        and self.estimate is not None
+                        and self.estimator.is_ready
+                        and self._capture_healthy()
+                    ):
+                        roll, pitch = self._current_attitude()
+                        self._start_roll_rad = roll
+                        self._start_pitch_rad = pitch
+                        self._initial_target_area = float(self.target.bbox_area)
+                        self._safety_authorization(0)
+                        return
+                    if self._now() - go_observed_ns > 1_000_000_000:
+                        raise CalibrationCheckFailure(
+                            "target_unstable", "GO passed without complete readiness"
+                        )
+            await self._poll_pause(deadline)
+        raise CalibrationCheckFailure(
+            "stream_stale", "fresh countdown and GO+150ms were not observed"
+        )
+
+    async def _arm_confirmed(self, phase: Mapping[str, Any]) -> None:
+        if self.dispatcher is None:
+            raise CalibrationEvidenceError("arm dispatcher is unavailable")
+        deadline = phase["deadline_monotonic_ns"]
+        self._safety_authorization(0)
+        before = await self._wait_for_heartbeat(
+            deadline,
+            phase="arm",
+            update_estimator=True,
+            cleanup=False,
+        )
+        # The heartbeat wait drains fresh receiver state.  Re-authorize from
+        # that same-occurrence state, then perform one final immediately
+        # pre-dispatch check so no stale pre-wait decision can authorize arm.
+        self._safety_authorization(0)
+        if before["heartbeat"]["base_mode"] & 128:
+            raise CalibrationLifecycleError("vehicle was armed before arm request")
+        self._safety_authorization(0)
+        dispatch = await self.dispatcher.dispatch_nonattitude(
+            "arm", deadline, cleanup=False
+        )
+        if (
+            dispatch.error is not None
+            or dispatch.receipt is None
+            or dispatch.receipt.get("outcome") != "returned"
+        ):
+            raise CalibrationLifecycleError("arm request failed or was uncertain")
+        before_sequence = before["ingress"]["sequence"]
+        while self._now() < deadline:
+            self._drain_all(
+                phase="arm",
+                update_estimator=True,
+                collision_abort=True,
+            )
+            after = self.state.heartbeat
+            if (
+                after is not None
+                and after["ingress"]["sequence"] > before_sequence
+                and after["ingress"]["received_monotonic_ns"]
+                > dispatch.request_monotonic_ns
+                and after["heartbeat"]["base_mode"] & 128
+            ):
+                self._safety_authorization(0)
+                return
+            await self._poll_pause(deadline)
+        raise CalibrationCheckFailure(
+            "stream_stale", "arm was not confirmed by a newer heartbeat"
+        )
+
+    async def _powered_stage(self, phase: Mapping[str, Any]) -> None:
+        if self.dispatcher is None:
+            raise CalibrationEvidenceError("powered dispatcher is unavailable")
+        scheduler = CalibrationExcitationScheduler(
+            evidence=self.evidence,
+            safety_check=self._safety_authorization,
+            dispatch=self.dispatcher.dispatch,
+            monotonic_ns=self.services.monotonic_ns,
+            wait_until_ns=self.services.wait_until_ns,
+            powered_parent_deadline_monotonic_ns=phase["deadline_monotonic_ns"],
+            contract=self.contract,
+        )
+        result = await scheduler.run()
+        if not result.completed:
+            raise CalibrationCheckFailure(
+                result.abort_reason_code or "internal_error",
+                "powered excitation did not complete every frozen slot",
+            )
+
+    def _takeover_if_parent_dead(
+        self,
+        *,
+        parent_deadline_ns: int,
+        enable_cleanup: bool,
+        emit: bool,
+        phase_override: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
+        if self._parent_mode == "signaled_takeover":
+            return True
+        if self._parent_alive():
+            return False
+        self._note_parent_death()
+        if self._takeover_attempted:
+            self._cleanup_failures.update({"parent_dead", "lease_invalid"})
+            raise CalibrationLifecycleError("parent-death takeover was exhausted")
+        self._takeover_attempted = True
+        phase = (
+            dict(phase_override)
+            if phase_override is not None
+            else self._phase(
+                "parent_death_lease_takeover",
+                emit=emit,
+                parent_deadline_monotonic_ns=parent_deadline_ns,
+            )
+        )
+        self._pending_takeover_phase = None
+        try:
+            boundary_proof = self.services.lease_boundary.take_over_abandoned(
+                role_secret=memoryview(self.admission.role_secret),
+                attempt=self.admission.attempt,
+                process_authority=self.admission.process_authority,
+                deadline_monotonic_ns=phase["deadline_monotonic_ns"],
+            )
+            proof = self._coerce_lease_proof(boundary_proof)
+        except BaseException as exc:
+            self._cleanup_failures.update({"parent_dead", "lease_invalid"})
+            raise CalibrationLifecycleError("abandoned live lease takeover failed") from exc
+        if (
+            proof.owner_role != "powered-child-parent-death"
+            or proof.authority_valid is not True
+            or proof.takeover_completed_monotonic_ns is None
+            or proof.takeover_completed_monotonic_ns <= self._parent_observed_ns
+            or proof.takeover_completed_monotonic_ns
+            >= phase["deadline_monotonic_ns"]
+        ):
+            self._cleanup_failures.update({"parent_dead", "lease_invalid"})
+            raise CalibrationLifecycleError("parent-death lease proof is invalid")
+        self._lease_proof = proof
+        self._lease_boundary_proof = boundary_proof
+        self._parent_mode = "signaled_takeover"
+        self._takeover_completed_ns = proof.takeover_completed_monotonic_ns
+        self._takeover_record_sha256 = proof.record_sha256
+        self._takeover_last_heartbeat_ns = proof.takeover_completed_monotonic_ns
+        self._takeover_released = False
+        if enable_cleanup:
+            if self.guards is None or self.adapter is None:
+                raise CalibrationEvidenceError("cleanup takeover transport is unavailable")
+            self.guards.enable_cleanup_takeover(
+                parent_signaled=True,
+                abandoned_lease_owned=True,
+                authority_valid=True,
+                source_promoted=(
+                    getattr(self.adapter, "powered_source_promoted", None) is True
+                ),
+            )
+        return True
+
+    def _freeze_pending_takeover(
+        self,
+        *,
+        parent_deadline_ns: int,
+        emit: bool,
+    ) -> None:
+        """Freeze the one-second takeover wall without acquiring during replay close."""
+
+        if self._parent_mode == "signaled_takeover" or self._pending_takeover_phase is not None:
+            return
+        self._note_parent_death()
+        self._pending_takeover_phase = self._phase(
+            "parent_death_lease_takeover",
+            emit=emit,
+            parent_deadline_monotonic_ns=parent_deadline_ns,
+        )
+
+    def _post_cleanup_parent_check(
+        self,
+        *,
+        parent_deadline_ns: int,
+        emit: bool,
+    ) -> bool:
+        """Take over/release-capable authority after simulator sends are finished."""
+
+        if self._parent_mode == "signaled_takeover":
+            self._service_takeover_heartbeat(parent_deadline_ns)
+            return True
+        if self._parent_alive():
+            return False
+        self._note_parent_death()
+        return self._takeover_if_parent_dead(
+            parent_deadline_ns=parent_deadline_ns,
+            enable_cleanup=False,
+            emit=emit,
+            phase_override=self._pending_takeover_phase,
+        )
+
+    def _enable_cleanup_authority(self, deadline_ns: int) -> None:
+        if self.dispatcher is None or self.guards is None or self.adapter is None:
+            raise CalibrationEvidenceError("cleanup transport authority is unavailable")
+        if self._parent_mode == "signaled_takeover":
+            self._service_takeover_heartbeat(deadline_ns)
+            if self.guards.cleanup_state == "takeover_pending":
+                self.guards.enable_cleanup_takeover(
+                    parent_signaled=True,
+                    abandoned_lease_owned=True,
+                    authority_valid=True,
+                    source_promoted=(
+                        getattr(self.adapter, "powered_source_promoted", None) is True
+                    ),
+                )
+            return
+        if self._parent_alive():
+            self._parent_observed_ns = self._now()
+            boundary_proof = self.services.lease_boundary.prove_live_delegation(
+                attempt=self.admission.attempt,
+                process_authority=self.admission.process_authority,
+            )
+            proof = self._coerce_lease_proof(boundary_proof)
+            if proof.owner_role != "wrapper" or proof.authority_valid is not True:
+                self._cleanup_failures.add("lease_invalid")
+                raise CalibrationLifecycleError("live cleanup lease is invalid")
+            self._lease_proof = proof
+            self._lease_boundary_proof = boundary_proof
+            if not self._parent_alive():
+                self._note_parent_death()
+            else:
+                try:
+                    self.dispatcher.begin_live_cleanup()
+                    return
+                except BaseException:
+                    if self._parent_alive():
+                        raise
+                    self._note_parent_death()
+        self._takeover_if_parent_dead(
+            parent_deadline_ns=deadline_ns,
+            enable_cleanup=True,
+            emit=True,
+        )
+
+    def _ensure_cleanup_send_authority(self, deadline_ns: int) -> None:
+        self._supervise_parent(deadline_ns, cleanup=True)
+        if not self._lease_valid():
+            self._cleanup_failures.add("lease_invalid")
+            raise CalibrationLifecycleError("cleanup lease authority is invalid")
+
+    def _resume_unsent_cleanup_after_takeover(
+        self,
+        dispatch: Any,
+        *,
+        deadline_ns: int,
+    ) -> bool:
+        """Permit one retry only when the first local call provably never began."""
+
+        if (
+            self._parent_mode != "live_delegation"
+            or getattr(dispatch, "receipt", None) is not None
+            or getattr(dispatch, "audit_count_after", None)
+            != getattr(dispatch, "audit_count_before", None)
+            or self._parent_alive()
+        ):
+            return False
+        self._note_parent_death()
+        self._takeover_if_parent_dead(
+            parent_deadline_ns=deadline_ns,
+            enable_cleanup=True,
+            emit=True,
+        )
+        self._ensure_cleanup_send_authority(deadline_ns)
+        return True
+
+    def _zero_required(self) -> bool:
+        peer = None if self.adapter is None else getattr(self.adapter, "powered_peer", None)
+        receipts = [] if self.lineage is None else self.lineage.outbound_receipts
+        return bool(
+            peer is not None
+            or any(
+                row.get("schema") == "aigp-vq2-attitude-target-outbound/1"
+                or row.get("category") == "arm"
+                for row in receipts
+            )
+        )
+
+    async def _cleanup_zero(self, deadline_ns: int) -> None:
+        required = self._zero_required()
+        self._zero_command = self._zero_state(required=required)
+        if not required:
+            return
+        if self.dispatcher is None:
+            self._cleanup_failures.add("zero_failed")
+            return
+        self._ensure_cleanup_send_authority(deadline_ns)
+        checked_ns = self._now()
+        generated = self.evidence.record_cleanup_generated(
+            checked_monotonic_ns=checked_ns,
+            generated_monotonic_ns=self._now(),
+        )
+        self._zero_command["generated"] = generated
+        try:
+            self._ensure_cleanup_send_authority(deadline_ns)
+            dispatch_deadline = min(
+                deadline_ns,
+                self._now() + self.durations["outbound_call"],
+            )
+            dispatch = await self.dispatcher.dispatch_cleanup_zero(
+                dispatch_deadline
+            )
+            if self._resume_unsent_cleanup_after_takeover(
+                dispatch,
+                deadline_ns=deadline_ns,
+            ):
+                dispatch = await self.dispatcher.dispatch_cleanup_zero(
+                    dispatch_deadline
+                )
+        except BaseException as exc:
+            before = self.dispatcher._attitude_audit_count()
+            dispatch = CalibrationDispatchResult(
+                audit_count_before=before,
+                audit_count_after=before,
+                receipt=None,
+                call_started_monotonic_ns=None,
+                call_ended_monotonic_ns=None,
+                error=exc,
+            )
+        if dispatch.receipt is not None and dispatch.receipt.get("outcome") == "returned":
+            terminal = self.evidence.record_sent(
+                generated,
+                sent_monotonic_ns=self._now(),
+                dispatch=dispatch,
+            )
+            self._zero_command.update(
+                {
+                    "state": "returned",
+                    "terminal": terminal,
+                    "outbound_receipt": dict(dispatch.receipt),
+                }
+            )
+            if dispatch.error is not None:
+                self._cleanup_failures.add("receipt_incomplete")
+            return
+        reason = "send_raised" if dispatch.call_started_monotonic_ns is not None else "internal_error"
+        terminal = self.evidence.record_not_sent(
+            generated,
+            recorded_monotonic_ns=self._now(),
+            reason_code=reason,
+            detail="cleanup exact-zero dispatch failed or was uncertain",
+            dispatch=dispatch,
+        )
+        self._zero_command.update(
+            {
+                "state": "failed",
+                "terminal": terminal,
+                "outbound_receipt": (
+                    dict(dispatch.receipt)
+                    if dispatch.receipt is not None
+                    and dispatch.receipt.get("outcome") == "raised"
+                    else None
+                ),
+            }
+        )
+        self._cleanup_failures.add("zero_failed")
+
+    async def _wait_final_state(self, deadline_ns: int) -> None:
+        while self._now() < deadline_ns:
+            self._drain_received(
+                update_estimator=False,
+                allow_clock_rollback=False,
+            )
+            if self.dispatcher is not None:
+                self.dispatcher.drain_outbound()
+            self._drain_collisions(phase="cleanup", abort=False)
+            self._verify_adapter_queues(abort=False)
+            heartbeat = self.state.heartbeat
+            race = self.state.race
+            imu = self.state.imu
+            if (
+                self._reset_epoch is not None
+                and heartbeat is not None
+                and race is not None
+                and imu is not None
+                and heartbeat["ingress"]["generation"]
+                == self._reset_epoch["ingress_generation"]
+                and race["race_status"]["sim_boot_time_ms"]
+                > self._reset_epoch["race_anchor_boot_ms"]
+                and imu["imu"]["timestamp_us"]
+                > self._reset_epoch["imu_anchor_usec"]
+                and heartbeat["heartbeat"]["base_mode"] & 128 == 0
+            ):
+                self._final_state = {
+                    "state": "confirmed",
+                    "heartbeat": dict(heartbeat),
+                    "disarmed": True,
+                    "reset_epoch": dict(self._reset_epoch),
+                    "last_race": dict(race),
+                    "last_imu": dict(imu),
+                }
+                return
+            await self._poll_pause(deadline_ns)
+        if all(
+            value is not None
+            for value in (
+                self.state.heartbeat,
+                self.state.race,
+                self.state.imu,
+                self._reset_epoch,
+            )
+        ):
+            self._final_state = {
+                "state": "partial",
+                "heartbeat": dict(self.state.heartbeat),
+                "disarmed": bool(
+                    self.state.heartbeat["heartbeat"]["base_mode"] & 128 == 0
+                ),
+                "reset_epoch": dict(self._reset_epoch),
+                "last_race": dict(self.state.race),
+                "last_imu": dict(self.state.imu),
+            }
+        raise CalibrationLifecycleError("final disarmed reset epoch was not proved")
+
+    async def _close_transports(self, deadline_ns: int) -> None:
+        try:
+            await self._stop_vision(deadline_ns, cleanup=True)
+        except BaseException:
+            self._cleanup_failures.add("transport_unclosed")
+        try:
+            if self.guards is not None:
+                self.guards.close_cleanup()
+        except BaseException:
+            self._cleanup_failures.add("transport_unclosed")
+        try:
+            if self.dispatcher is not None:
+                await self.dispatcher.disconnect(
+                    deadline_ns,
+                    progress=lambda: self._supervise_parent(
+                        deadline_ns,
+                        cleanup=True,
+                    ),
+                )
+        except BaseException:
+            self._cleanup_failures.add("transport_unclosed")
+        try:
+            # Both producer threads are now stopped.  Drain every retained
+            # application queue once more before taking the immutable
+            # pre-close resource snapshot that is sealed into the manifest.
+            self._drain_received(
+                update_estimator=False,
+                allow_clock_rollback=False,
+            )
+            if self.dispatcher is not None:
+                self.dispatcher.drain_outbound()
+            self._drain_collisions(phase="cleanup", abort=False)
+            self._drain_frames()
+            self._verify_adapter_queues(abort=False)
+        except BaseException:
+            self._cleanup_failures.update(
+                {"receipt_incomplete", "transport_unclosed"}
+            )
+
+    async def _cleanup(self, phase: Mapping[str, Any]) -> None:
+        self._cleanup_started = True
+        self._cleanup_phase = dict(phase)
+        deadline = phase["deadline_monotonic_ns"]
+        try:
+            if self.adapter is None or getattr(
+                self.adapter, "powered_source_promoted", None
+            ) is not True:
+                self._zero_command = self._zero_state(required=self._zero_required())
+                self._disarm = self._disarm_state("not_required")
+                self._reset = self._reset_state("not_required")
+                self._cleanup_failures.add("connect_failed")
+                if not self._lease_valid():
+                    self._cleanup_failures.update({"authority_invalid", "lease_invalid"})
+                if not self._parent_alive():
+                    try:
+                        self._takeover_if_parent_dead(
+                            parent_deadline_ns=deadline,
+                            enable_cleanup=False,
+                            emit=True,
+                        )
+                    except BaseException:
+                        self._cleanup_failures.update({"parent_dead", "lease_invalid"})
+                return
+            self._enable_cleanup_authority(deadline)
+            self._disarm = self._disarm_state("not_attempted")
+            self._reset = self._reset_state("not_attempted")
+            try:
+                await self._cleanup_zero(deadline)
+            except BaseException:
+                self._cleanup_failures.add("zero_failed")
+            try:
+                self._ensure_cleanup_send_authority(deadline)
+                await self._disarm_confirmed(
+                    deadline,
+                    phase="cleanup",
+                    cleanup=True,
+                )
+            except BaseException:
+                self._cleanup_failures.add("disarm_failed")
+            try:
+                # No cleanup operation consumes camera data. Stop its producer
+                # and drain the old-generation FIFO before SIM_RESET advances
+                # the independently owned MAVLink generation.
+                await self._stop_vision(deadline, cleanup=True)
+                self._drain_frames()
+                self._ensure_cleanup_send_authority(deadline)
+                await self._execute_reset(
+                    deadline_ns=deadline,
+                    phase="cleanup",
+                    cleanup=True,
+                )
+            except BaseException:
+                self._cleanup_failures.add("reset_failed")
+            try:
+                await self._wait_final_state(deadline)
+            except BaseException:
+                self._cleanup_failures.add("final_state_unproved")
+            try:
+                if self._parent_mode == "live_delegation" and not self._parent_alive():
+                    self._takeover_if_parent_dead(
+                        parent_deadline_ns=deadline,
+                        enable_cleanup=True,
+                        emit=True,
+                    )
+            except BaseException:
+                self._cleanup_failures.update({"parent_dead", "lease_invalid"})
+        finally:
+            await self._close_transports(deadline)
+
+    def _default_endpoint_evidence(self) -> Dict[str, Any]:
+        mavlink = {
+            "state": "not_opened",
+            "bind": None,
+            "frozen_peer": None,
+            "rejected_source_count": 0,
+        }
+        if self.adapter is not None:
+            state_method = getattr(self.adapter, "powered_transport_state", None)
+            if not callable(state_method):
+                raise CalibrationEvidenceError(
+                    "powered adapter lacks public transport-state evidence"
+                )
+            state = state_method()
+            if state is None:
+                raise CalibrationEvidenceError(
+                    "constructed powered adapter has no transport-state evidence"
+                )
+            bind_method = getattr(state, "bind_proof", None)
+            if not callable(bind_method):
+                raise CalibrationEvidenceError(
+                    "powered transport state lacks public bind proof"
+                )
+            bind = bind_method()
+            if type(bind) is not dict:
+                raise CalibrationEvidenceError(
+                    "powered transport bind proof must be an exact object"
+                )
+            bind = json.loads(json.dumps(bind, allow_nan=False))
+            bind["role"] = "mavlink"
+            bind["owner_process"] = self.admission.current_process
+            peer = getattr(state, "frozen_peer", None)
+            mavlink = {
+                "state": getattr(state, "endpoint_state", None),
+                "bind": bind,
+                "frozen_peer": (
+                    None
+                    if peer is None
+                    else {"host": peer[0], "port": peer[1]}
+                ),
+                "rejected_source_count": getattr(
+                    state, "rejected_source_count", None
+                ),
+            }
+        camera = {
+            "state": "not_opened",
+            "bind": None,
+            "frozen_peer": None,
+            "rejected_source_count": 0,
+        }
+        if self.vision is not None:
+            diagnostics_method = getattr(self.vision, "source_diagnostics", None)
+            if callable(diagnostics_method):
+                diagnostics = diagnostics_method()
+                state = getattr(diagnostics, "state", "not_opened")
+                if state != "not_opened":
+                    peer = getattr(diagnostics, "frozen_peer", None)
+                    camera = {
+                        "state": state,
+                        "bind": {
+                            "role": "camera",
+                            "family": "AF_INET",
+                            "requested": {
+                                "host": diagnostics.requested_host,
+                                "port": diagnostics.requested_port,
+                            },
+                            "actual": {
+                                "host": diagnostics.actual_host,
+                                "port": diagnostics.actual_port,
+                            },
+                            "socket_policy": diagnostics.socket_policy,
+                            "owner_process": self.admission.current_process,
+                        },
+                        "frozen_peer": (
+                            None
+                            if peer is None
+                            else {"host": peer[0], "port": peer[1]}
+                        ),
+                        "rejected_source_count": diagnostics.rejected_source_count,
+                    }
+        return {"mavlink": mavlink, "camera": camera}
+
+    def _endpoints(self) -> Dict[str, Any]:
+        callback = self.services.endpoint_evidence
+        value = (
+            self._default_endpoint_evidence()
+            if callback is None
+            else callback(self.adapter, self.vision, self.admission)
+        )
+        if type(value) is not dict:
+            raise CalibrationEvidenceError("endpoint proof must be an exact object")
+        result = json.loads(json.dumps(value, allow_nan=False))
+        for endpoint in result.values():
+            if isinstance(endpoint, dict) and endpoint.get("rejected_source_count", 0):
+                self._collection_codes.add("source_rejected")
+        camera = result.get("camera")
+        if isinstance(camera, dict) and camera.get("state") in {
+            "not_opened",
+            "closed_without_peer",
+        }:
+            self._collection_codes.add("camera_missing")
+        return result
+
+    def _default_transport_evidence(self) -> Dict[str, Any]:
+        guard_latched = bool(
+            self.guards is not None
+            and getattr(self.guards, "production_latched", False) is True
+        )
+        cleanup_closed = bool(
+            self.guards is not None
+            and getattr(self.guards, "cleanup_state", None) == "closed"
+        )
+        if self.vision is None:
+            vision_closed = True
+        else:
+            diagnostics_method = getattr(self.vision, "source_diagnostics", None)
+            if callable(diagnostics_method):
+                diagnostics = diagnostics_method()
+                endpoint_state = getattr(diagnostics, "state", None)
+            else:
+                endpoint_state = None
+            vision_closed = bool(
+                getattr(self.vision, "is_running", None) is False
+                and endpoint_state
+                in (
+                    {"closed_with_peer", "closed_without_peer"}
+                    if self._vision_start_attempted
+                    else {"not_opened", "closed_with_peer", "closed_without_peer"}
+                )
+            )
+        state = None
+        if self.adapter is not None:
+            state_method = getattr(self.adapter, "powered_transport_state", None)
+            if not callable(state_method):
+                raise CalibrationEvidenceError(
+                    "powered adapter lacks public transport-state evidence"
+                )
+            state = state_method()
+            if state is None:
+                raise CalibrationEvidenceError(
+                    "constructed powered adapter has no transport-state evidence"
+                )
+        socket_closed = bool(
+            state is None or getattr(state, "endpoint_closed", None) is True
+        )
+        receiver_joined = bool(
+            state is None or getattr(state, "receiver_joined", None) is True
+        )
+        announcer_joined = bool(
+            state is None or getattr(state, "announcer_joined", None) is True
+        )
+        owned_handles_closed = bool(
+            state is None or getattr(state, "owned_handles_closed", None) is True
+        )
+        return {
+            "production_guard_latched": guard_latched,
+            "cleanup_guard_closed": cleanup_closed,
+            "vision_closed": vision_closed,
+            "mavlink_socket_closed": socket_closed,
+            "receiver_joined": receiver_joined,
+            "announcer_joined": announcer_joined,
+            "owned_handles_closed": bool(owned_handles_closed and vision_closed),
+        }
+
+    def _transport(self) -> Dict[str, Any]:
+        callback = self.services.transport_evidence
+        value = (
+            self._default_transport_evidence()
+            if callback is None
+            else callback(self.adapter, self.vision, self.guards)
+        )
+        if type(value) is not dict:
+            raise CalibrationEvidenceError("transport proof must be an exact object")
+        expected = {
+            "production_guard_latched",
+            "cleanup_guard_closed",
+            "vision_closed",
+            "mavlink_socket_closed",
+            "receiver_joined",
+            "announcer_joined",
+            "owned_handles_closed",
+        }
+        if set(value) != expected or any(type(item) is not bool for item in value.values()):
+            raise CalibrationEvidenceError("transport proof shape is invalid")
+        return dict(value)
+
+    def _outbound_audit(self) -> Dict[str, int]:
+        receipts = [] if self.lineage is None else self.lineage.outbound_receipts
+        categories = (
+            "timesync",
+            "gcs_heartbeat",
+            "sim_reset",
+            "arm",
+            "disarm",
+            "attitude_target",
+            "position_target",
+            "other_command",
+        )
+        audit = {
+            "timesync": 0,
+            "gcs_heartbeat": 0,
+            "sim_reset": 0,
+            "arm": 0,
+            "disarm": 0,
+            "attitude_target": 0,
+            "position_target": 0,
+            "other_command": 0,
+            "receipt_count": len(receipts),
+            "receipt_returned": 0,
+            "receipt_raised": 0,
+            "receipt_dropped": 0,
+            "receipt_buffered": 0,
+        }
+        prior = -1
+        for receipt in receipts:
+            sequence = receipt["outbound_sequence"]
+            if sequence <= prior:
+                self._cleanup_failures.add("receipt_incomplete")
+            prior = sequence
+            if receipt["schema"] == "aigp-vq2-attitude-target-outbound/1":
+                audit["attitude_target"] += 1
+            else:
+                audit[receipt["category"]] += 1
+            audit[f"receipt_{receipt['outcome']}"] += 1
+        retained_category_counts = {
+            name: audit[name]
+            for name in categories
+        }
+        stats_method = (
+            None if self.adapter is None else getattr(self.adapter, "outbound_receipt_stats", None)
+        )
+        reported_dropped = 0
+        if callable(stats_method):
+            stats = stats_method()
+            dropped = getattr(stats, "dropped", 0)
+            buffered = getattr(stats, "buffered", 0)
+            if type(dropped) is not int or dropped < 0:
+                raise CalibrationEvidenceError("outbound dropped count is invalid")
+            if type(buffered) is not int or buffered < 0:
+                raise CalibrationEvidenceError("outbound buffered count is invalid")
+            reported_dropped = dropped
+            if dropped > 0:
+                self._cleanup_failures.add("receipt_incomplete")
+                self._collection_codes.add("unexpected_outbound")
+            if buffered > 0:
+                audit["receipt_buffered"] = buffered
+                self._cleanup_failures.add("receipt_incomplete")
+        raw_method = None if self.adapter is None else getattr(self.adapter, "outbound_audit", None)
+        if callable(raw_method):
+            raw = raw_method()
+            for name in categories:
+                value = (
+                    raw.get(name, 0)
+                    if isinstance(raw, Mapping)
+                    else getattr(raw, name, 0)
+                )
+                if type(value) is not int or value < 0:
+                    raise CalibrationEvidenceError(
+                        f"outbound attempted count {name} is invalid"
+                    )
+                if value < retained_category_counts[name]:
+                    raise CalibrationEvidenceError(
+                        f"outbound attempted count {name} is below retained receipts"
+                    )
+                audit[name] = value
+        elif reported_dropped:
+            # A receipt drop cannot truthfully be assigned to a category when
+            # the adapter omitted its exact attempted-category audit.
+            raise CalibrationEvidenceError(
+                "dropped outbound receipts lack attempted-category evidence"
+            )
+        attempted = sum(audit[name] for name in categories)
+        if attempted < audit["receipt_count"]:
+            raise CalibrationEvidenceError(
+                "outbound attempted count is below retained receipt count"
+            )
+        audit["receipt_dropped"] = attempted - audit["receipt_count"]
+        if audit["receipt_dropped"]:
+            self._cleanup_failures.add("receipt_incomplete")
+            self._collection_codes.add("unexpected_outbound")
+        if reported_dropped != audit["receipt_dropped"]:
+            self._cleanup_failures.add("receipt_incomplete")
+            self._collection_codes.add("unexpected_outbound")
+        return self.contract.validate_outbound_audit(audit)
+
+    def _cleanup_proved(
+        self,
+        endpoints: Mapping[str, Any],
+        transport: Mapping[str, Any],
+    ) -> bool:
+        return bool(
+            not self._cleanup_failures
+            and self._lease_valid()
+            and endpoints["mavlink"]["state"] == "closed_with_peer"
+            and self._zero_command["state"] in {"not_required", "returned"}
+            and self._disarm["state"] == "confirmed"
+            and self._reset["state"] == "confirmed"
+            and self._final_state["state"] == "confirmed"
+            and all(transport.values())
+        )
+
+    def _build_cleanup_certificate(self) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        if self._cleanup_phase is None:
+            raise CalibrationEvidenceError("cleanup phase was not frozen")
+        endpoints = self._endpoints()
+        transport = self._transport()
+        audit = self._outbound_audit()
+        if self.lineage is not None and self.lineage.collisions:
+            self._collection_codes.add("collision_observed")
+        if not all(transport.values()):
+            self._cleanup_failures.add("transport_unclosed")
+        proof = self._lease_proof
+        if proof is None:
+            proof = CalibrationLeaseProof(
+                owner_role="wrapper",
+                generation=0,
+                record_sha256=self.admission.process_authority["lease_record_sha256"],
+                authority_valid=False,
+            )
+        completed = self._now()
+        deadline = self._cleanup_phase["deadline_monotonic_ns"]
+        if completed >= deadline:
+            self._cleanup_failures.add("deadline_expired")
+            raise CalibrationEvidenceError("cleanup certificate deadline expired")
+        proved = self._cleanup_proved(endpoints, transport)
+        if not proved and not self._cleanup_failures:
+            self._cleanup_failures.add("internal_error")
+        trigger = self._trigger
+        if trigger != "parent_death":
+            trigger = "normal_completion" if self._stage_completed else "stage_abort"
+        certificate = {
+            "schema": "aigp-vq2-powered-cleanup-certificate/1",
+            "task_id": self.contract.TASK_ID,
+            "session_id": self.contract.SESSION_ID,
+            "attempt_id": self.contract.ATTEMPT_ID,
+            "producer_role": CALIBRATION_CHILD_ROLE,
+            "cleanup_epoch": "child-cleanup-0",
+            "authority": {
+                "process_authority": {
+                    "path": self.admission.arguments.powered_process_authority,
+                    "sha256": self.admission.process_authority_sha256,
+                },
+                "attempt_context_sha256": self.admission.attempt["context_sha256"],
+                "attempt_envelope_sha256": self.admission.attempt_envelope_sha256,
+                "producer": self.admission.current_process,
+            },
+            "trigger": trigger,
+            "started_monotonic_ns": self._cleanup_phase["started_monotonic_ns"],
+            "deadline_monotonic_ns": deadline,
+            "completed_monotonic_ns": completed,
+            "parent_state": {
+                "mode": self._parent_mode,
+                "wrapper_process": self.admission.wrapper_process,
+                "observed_monotonic_ns": self._parent_observed_ns,
+                "takeover_completed_monotonic_ns": self._takeover_completed_ns,
+                "takeover_lease_record_sha256": self._takeover_record_sha256,
+            },
+            "lease": {
+                "owner_role": proof.owner_role,
+                "generation": proof.generation,
+                "record_sha256": proof.record_sha256,
+                "authority_valid": proof.authority_valid,
+            },
+            "phase_deadlines": list(self.phase_deadlines),
+            "endpoints": endpoints,
+            "outbound_receipts": (
+                [] if self.lineage is None else list(self.lineage.outbound_receipts)
+            ),
+            "zero_command": self._zero_command,
+            "disarm": self._disarm,
+            "reset": self._reset,
+            "collisions": {
+                "observations": (
+                    [] if self.lineage is None else list(self.lineage.collisions)
+                ),
+                "invalidating_occurrence_count": (
+                    0 if self.lineage is None else len(self.lineage.collisions)
+                ),
+            },
+            "final_state": self._final_state,
+            "transport": transport,
+            "outcome": "proved" if proved else "failed",
+            "failure_codes": [] if proved else sorted(self._cleanup_failures),
+            "collection_invalidating_codes": sorted(self._collection_codes),
+        }
+        return self.contract.validate_cleanup_certificate(certificate), audit
+
+    def _publish_certificate(
+        self,
+        certificate: Mapping[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        if self._certificate_published:
+            raise CalibrationEvidenceError("cleanup certificate publication repeated")
+        self._certificate_published = True
+        deadline = self._cleanup_phase["deadline_monotonic_ns"]
+        def progress() -> None:
+            self._post_cleanup_parent_check(
+                parent_deadline_ns=deadline,
+                emit=self.recorder is not None and not self._replay_closed,
+            )
+
+        progress()
+        publish = self.services.publisher.publish_create_new
+        parameters = inspect.signature(publish).parameters
+        publish_kwargs: Dict[str, Any] = {
+            "deadline_monotonic_ns": deadline,
+        }
+        if "progress" in parameters:
+            publish_kwargs["progress"] = progress
+        elif "progress_callback" in parameters:
+            publish_kwargs["progress_callback"] = progress
+        elif any(
+            value.kind == inspect.Parameter.VAR_KEYWORD
+            for value in parameters.values()
+        ):
+            publish_kwargs["progress"] = progress
+        else:
+            raise CalibrationEvidenceError(
+                "cleanup certificate publisher lacks cooperative progress"
+            )
+        digest = publish(
+            self.admission.arguments.cleanup_certificate,
+            certificate,
+            **publish_kwargs,
+        )
+        if self._now() >= deadline:
+            raise CalibrationEvidenceError(
+                "cleanup certificate publication completed too late"
+            )
+        expected = self.contract.canonical_file_sha256(certificate)
+        if digest != expected:
+            raise CalibrationEvidenceError("cleanup certificate readback hash mismatched")
+        if certificate["parent_state"]["mode"] != self._parent_mode:
+            raise CalibrationEvidenceError(
+                "cleanup certificate parent state changed during publication"
+            )
+        self._certificate_reference_state = "published"
+        self._certificate_reference_sha256 = digest
+        return dict(certificate), digest
+
+    def _preserve_failed_certificate_reference(self) -> None:
+        """Classify one failed create-new target without overwriting forensic bytes."""
+
+        target = Path(self.admission.arguments.cleanup_certificate)
+        try:
+            if not target.is_file():
+                self._certificate_reference_state = "absent"
+                self._certificate_reference_sha256 = None
+                return
+            self._certificate_reference_sha256 = self._file_sha256(target)
+            self._certificate_reference_state = "invalid"
+        except BaseException:
+            self._certificate_reference_state = "absent"
+            self._certificate_reference_sha256 = None
+            self._reason_codes.add("capture_incomplete")
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            while True:
+                payload = stream.read(1024 * 1024)
+                if not payload:
+                    break
+                digest.update(payload)
+        return digest.hexdigest()
+
+    def _default_close_artifacts(
+        self,
+        outcome: Mapping[str, Any],
+        deadline_ns: int,
+    ) -> CalibrationClosedArtifacts:
+        if self.recorder is None:
+            partial = self._partial_artifacts("absent")
+            return CalibrationClosedArtifacts(
+                legacy_record=partial["legacy_record"],
+                replay_bundle=partial["replay_bundle"],
+            )
+        now = self._now()
+        if now >= deadline_ns:
+            raise CalibrationEvidenceError("replay close deadline expired")
+        stats = self.recorder.close(
+            outcome=dict(outcome),
+            timeout_s=(deadline_ns - now) / 1_000_000_000.0,
+        )
+        if self._now() >= deadline_ns:
+            raise CalibrationEvidenceError("replay close completed too late")
+        record_path = Path(self.admission.arguments.record)
+        legacy = {
+            "path": self.admission.arguments.record,
+            "state": "partial",
+            "sha256": None,
+        }
+        if record_path.is_file():
+            legacy = {
+                "path": self.admission.arguments.record,
+                "state": "closed",
+                "sha256": self._file_sha256(record_path),
+            }
+        replay = {
+            "path": self.admission.arguments.replay_bundle,
+            "state": "partial",
+            "dataset_hash": None,
+            "manifest_sha256": None,
+            "records_sha256": None,
+        }
+        complete = getattr(stats, "complete", False) is True
+        dataset_hash = getattr(stats, "dataset_hash", None)
+        bundle_path = Path(self.admission.arguments.replay_bundle)
+        manifest_path = bundle_path / "manifest.json"
+        records_path = bundle_path / "records.jsonl"
+        if (
+            complete
+            and type(dataset_hash) is str
+            and manifest_path.is_file()
+            and records_path.is_file()
+        ):
+            replay = {
+                "path": self.admission.arguments.replay_bundle,
+                "state": "closed",
+                "dataset_hash": dataset_hash,
+                "manifest_sha256": self._file_sha256(manifest_path),
+                "records_sha256": self._file_sha256(records_path),
+            }
+        return CalibrationClosedArtifacts(
+            legacy_record=legacy,
+            replay_bundle=replay,
+        )
+
+    @staticmethod
+    def _resource_counter_object(
+        source: Any,
+        names: Sequence[str],
+        *,
+        constructed: bool,
+        boolean_names: Sequence[str] = (),
+    ) -> Dict[str, Any]:
+        if type(constructed) is not bool:
+            raise CalibrationEvidenceError(
+                "capture resource construction state is invalid"
+            )
+        booleans = frozenset(boolean_names)
+        result: Dict[str, Any] = {"constructed": constructed}
+        for name in names:
+            value = 0 if not constructed else getattr(source, name, None)
+            if name in booleans:
+                if not constructed:
+                    value = False
+                if type(value) is not bool:
+                    raise CalibrationEvidenceError(
+                        f"capture resource boolean {name} is invalid"
+                    )
+            elif type(value) is not int or value < 0:
+                raise CalibrationEvidenceError(
+                    f"capture resource counter {name} is invalid"
+                )
+            result[name] = value
+        return result
+
+    def _powered_capture_resource_stats(self) -> Dict[str, Any]:
+        """Take the sole raw, post-transport/pre-writer-close stats snapshot."""
+
+        recorder_names = (
+            "enqueued",
+            "written",
+            "dropped",
+            "duplicate_frame_tokens",
+            "writer_errors",
+            "queue_high_watermark",
+            "decoded_frames_enqueued",
+            "decoded_frames_written",
+            "decoded_frames_dropped",
+            "complete",
+        )
+        vision_names = (
+            "datagrams_received",
+            "unique_datagrams",
+            "duplicate_datagrams",
+            "malformed_datagrams",
+            "frames_reassembled",
+            "frames_decoded",
+            "decode_failures",
+            "out_of_order_frame_drops",
+            "reset_generation_drops",
+            "processing_errors",
+            "socket_errors",
+            "snapshot_callback_errors",
+            "resets",
+            "remembered_chunk_keys",
+            "timing_ledger_entries",
+            "timing_ledger_high_watermark",
+            "timing_ledger_capacity",
+            "timing_overflow_latched",
+            "receiver_buffered_partial_frames",
+            "receiver_buffer_high_watermark",
+            "receiver_buffer_capacity",
+            "capture_snapshot_queue_entries",
+            "capture_snapshot_queue_high_watermark",
+            "capture_snapshot_queue_capacity",
+            "capture_snapshot_queue_dropped",
+            "capture_snapshot_queue_enabled",
+            "receiver_dropped_partial_frames",
+            "receiver_duplicate_chunks",
+            "receiver_dropped_late_packets",
+        )
+        ingress_names = (
+            "generation",
+            "next_sequence",
+            "highres_imu_received",
+            "heartbeat_received",
+            "race_status_received",
+            "actuator_received",
+            "dropped",
+            "high_watermark",
+            "imu_capacity",
+            "other_capacity",
+            "imu_dropped",
+            "other_dropped",
+            "imu_high_watermark",
+            "other_high_watermark",
+            "buffered_imu",
+            "buffered_other",
+        )
+        collision_names = (
+            "generation",
+            "handled",
+            "dropped",
+            "high_watermark",
+            "capacity",
+            "buffered",
+        )
+        outbound_names = (
+            "generation",
+            "next_sequence",
+            "returned",
+            "raised",
+            "dropped",
+            "high_watermark",
+            "capacity",
+            "buffered",
+        )
+
+        replay = None if self.recorder is None else self.recorder.replay
+        recorder_stats_method = None if replay is None else getattr(replay, "stats", None)
+        if replay is not None and not callable(recorder_stats_method):
+            raise CalibrationEvidenceError(
+                "powered replay recorder lacks pre-close stats"
+            )
+        recorder_stats = None if replay is None else recorder_stats_method()
+
+        vision_stats_method = None if self.vision is None else getattr(self.vision, "stats", None)
+        if self.vision is not None and not callable(vision_stats_method):
+            raise CalibrationEvidenceError("powered vision lacks final stats")
+        vision_stats = None if self.vision is None else vision_stats_method()
+
+        ingress_method = None if self.adapter is None else getattr(self.adapter, "ingress_stats", None)
+        collision_method = None if self.adapter is None else getattr(self.adapter, "collision_stats", None)
+        outbound_method = None if self.adapter is None else getattr(
+            self.adapter, "outbound_receipt_stats", None
+        )
+        if self.adapter is not None and not all(
+            callable(value)
+            for value in (ingress_method, collision_method, outbound_method)
+        ):
+            raise CalibrationEvidenceError(
+                "powered adapter lacks final capture resource stats"
+            )
+        ingress_stats = None if self.adapter is None else ingress_method()
+        collision_stats = None if self.adapter is None else collision_method()
+        outbound_stats = None if self.adapter is None else outbound_method()
+
+        snapshot = {
+            "constructed": self.capture is not None,
+            "observed_frames": (
+                0 if self.capture is None else self.capture.observed_frames
+            ),
+            "dimensions_admitted": bool(
+                self.capture is not None and self.capture.admitted
+            ),
+            "failure_latched": bool(
+                self.capture is not None and self.capture.failure is not None
+            ),
+        }
+        if type(snapshot["observed_frames"]) is not int or snapshot[
+            "observed_frames"
+        ] < 0:
+            raise CalibrationEvidenceError(
+                "snapshot capture observed-frame count is invalid"
+            )
+        return {
+            "schema": "aigp-vq2-powered-capture-resource-stats/1",
+            "recorder": {
+                **self._resource_counter_object(
+                    recorder_stats,
+                    recorder_names,
+                    constructed=replay is not None,
+                    boolean_names=("complete",),
+                ),
+                "failure_latched": bool(
+                    recorder_stats is not None
+                    and getattr(recorder_stats, "failure_reason", None) is not None
+                ),
+            },
+            "vision": self._resource_counter_object(
+                vision_stats,
+                vision_names,
+                constructed=self.vision is not None,
+                boolean_names=(
+                    "timing_overflow_latched",
+                    "capture_snapshot_queue_enabled",
+                ),
+            ),
+            "ingress": self._resource_counter_object(
+                ingress_stats,
+                ingress_names,
+                constructed=self.adapter is not None,
+            ),
+            "collision": self._resource_counter_object(
+                collision_stats,
+                collision_names,
+                constructed=self.adapter is not None,
+            ),
+            "outbound_receipts": self._resource_counter_object(
+                outbound_stats,
+                outbound_names,
+                constructed=self.adapter is not None,
+            ),
+            "snapshot_capture": snapshot,
+        }
+
+    async def _close_artifacts(self, phase: Mapping[str, Any]) -> None:
+        deadline = phase["deadline_monotonic_ns"]
+        resource_stats = self._powered_capture_resource_stats()
+        outcome = {
+            "powered_stage_completed": self._stage_completed,
+            "cleanup_certificate_outcome": (
+                None if self._certificate is None else self._certificate["outcome"]
+            ),
+            "reason_codes": sorted(self._reason_codes),
+            "vision_capture_stats": (
+                {}
+                if self.vision is None or not callable(getattr(self.vision, "stats", None))
+                else {
+                    name: getattr(self.vision.stats(), name)
+                    for name in getattr(self.vision.stats(), "__dataclass_fields__", {})
+                }
+            ),
+            "powered_capture_resource_stats": resource_stats,
+        }
+        closer = self.services.artifact_closer
+        if closer is None:
+            callback = partial(self._default_close_artifacts, outcome, deadline)
+        else:
+            callback = partial(
+                closer,
+                self.recorder,
+                self.admission,
+                outcome,
+                deadline,
+            )
+        closed: Any = await self._run_supervised_callable(
+            callback,
+            deadline_ns=deadline,
+            cleanup=False,
+            replay_close=True,
+        )
+        if self._now() >= deadline:
+            raise CalibrationEvidenceError("replay close completed too late")
+        if isinstance(closed, CalibrationClosedArtifacts):
+            artifacts = {
+                "legacy_record": dict(closed.legacy_record),
+                "replay_bundle": dict(closed.replay_bundle),
+            }
+        elif type(closed) is dict and set(closed) == {"legacy_record", "replay_bundle"}:
+            artifacts = json.loads(json.dumps(closed, allow_nan=False))
+        else:
+            raise CalibrationEvidenceError("artifact closer returned an invalid proof")
+        self._artifacts = artifacts
+        self._replay_closed = True
+
+    def _release_takeover(self) -> bool:
+        if self._parent_mode != "signaled_takeover":
+            return True
+        if self._takeover_release_attempted:
+            return self._takeover_released
+        self._takeover_release_attempted = True
+        self._takeover_released = False
+        if self._lease_proof is None or self._lease_boundary_proof is None:
+            return False
+        now = self._now()
+        deadline = min(
+            self.admission.exit_deadline_monotonic_ns,
+            now + self.durations["lease_release_and_verify"],
+        )
+        if now >= deadline:
+            return False
+        try:
+            self._service_takeover_heartbeat(deadline)
+            result = self.services.lease_boundary.release_takeover(
+                self._lease_boundary_proof,
+                deadline_monotonic_ns=deadline,
+            )
+        except BaseException:
+            return False
+        self._takeover_released = result is True and self._now() < deadline
+        return self._takeover_released
+
+    def _reason_for_exception(self, exc: BaseException) -> str:
+        if isinstance(exc, asyncio.CancelledError):
+            return "child_failed"
+        if isinstance(exc, CalibrationCheckFailure):
+            if exc.reason_code == "deadline_expired":
+                return "deadline_expired"
+            if exc.reason_code == "parent_dead":
+                return "wrapper_death"
+            if exc.reason_code == "capture_failed":
+                return "capture_incomplete"
+            if exc.reason_code in {"send_raised", "internal_error"}:
+                return "command_reconciliation_failed"
+            return "watchdog_failed"
+        if isinstance(exc, CalibrationEvidenceError):
+            return "capture_incomplete"
+        return "internal_error"
+
+    def _build_process_result(self, audit: Mapping[str, Any]) -> Dict[str, Any]:
+        completed_monotonic_ns = self._now()
+        if completed_monotonic_ns >= self.admission.exit_deadline_monotonic_ns:
+            self._reason_codes.add("deadline_expired")
+        if self._certificate_reference_state == "invalid":
+            certificate_ref = {
+                "path": self.admission.arguments.cleanup_certificate,
+                "state": "invalid",
+                "sha256": self._certificate_reference_sha256,
+            }
+            self._reason_codes.add("cleanup_unconfirmed")
+        elif self._certificate is None or self._certificate_sha256 is None:
+            certificate_ref = {
+                "path": self.admission.arguments.cleanup_certificate,
+                "state": "absent",
+                "sha256": None,
+            }
+            self._reason_codes.add("cleanup_unconfirmed")
+        else:
+            certificate_ref = {
+                "path": self.admission.arguments.cleanup_certificate,
+                "state": "published",
+                "sha256": self._certificate_sha256,
+            }
+            if self._certificate["outcome"] != "proved":
+                self._reason_codes.add("cleanup_unconfirmed")
+        if (
+            self._artifacts["legacy_record"]["state"] != "closed"
+            or self._artifacts["replay_bundle"]["state"] != "closed"
+        ):
+            self._reason_codes.add("capture_incomplete")
+        if not self._stage_completed:
+            self._reason_codes.add("child_failed")
+        if not self._takeover_released:
+            self._reason_codes.add("cleanup_unconfirmed")
+        if "unexpected_outbound" in self._collection_codes:
+            self._reason_codes.add("unexpected_outbound")
+        if "collision_observed" in self._collection_codes:
+            self._reason_codes.add("watchdog_failed")
+        if "camera_missing" in self._collection_codes:
+            self._reason_codes.add("capture_incomplete")
+        reasons = sorted(self._reason_codes)
+        result = {
+            "schema": "aigp-vq2-powered-process-result/1",
+            "task_id": self.contract.TASK_ID,
+            "session_id": self.contract.SESSION_ID,
+            "attempt_id": self.contract.ATTEMPT_ID,
+            "producer_role": CALIBRATION_CHILD_ROLE,
+            "process_authority_sha256": self.admission.process_authority_sha256,
+            "started_monotonic_ns": self.admission.process_authority[
+                "absolute_deadlines"
+            ]["anchor"],
+            "completed_monotonic_ns": completed_monotonic_ns,
+            "outcome": "completed" if not reasons else "failed",
+            "reason_codes": reasons,
+            "phase_deadlines": list(self.phase_deadlines),
+            "cleanup_certificate": certificate_ref,
+            "outbound_audit": dict(audit),
+            "artifacts": self._artifacts,
+        }
+        return self.contract.validate_process_result(
+            result,
+            cleanup_certificate=self._certificate,
+        )
+
+    async def run(self) -> CalibrationChildRunOutput:
+        """Run every reached phase once and always enter cleanup after admission."""
+
+        audit: Dict[str, Any] = {
+            name: 0
+            for name in (
+                "timesync",
+                "gcs_heartbeat",
+                "sim_reset",
+                "arm",
+                "disarm",
+                "attitude_target",
+                "position_target",
+                "other_command",
+                "receipt_count",
+                "receipt_returned",
+                "receipt_raised",
+                "receipt_dropped",
+                "receipt_buffered",
+            )
+        }
+        try:
+            try:
+                self._prepare_recorder()
+                connect = self._phase("connect")
+                await self._connect(connect)
+                await self._preflight(self._phase("preflight"))
+                await self._reset_epoch_phase(self._phase("reset_epoch"))
+                await self._normalize_disarmed(self._phase("normalize_disarmed"))
+                await self._countdown_go(self._phase("countdown_go"))
+                await self._arm_confirmed(self._phase("arm"))
+                await self._powered_stage(self._phase("powered_stage"))
+                self._stage_completed = True
+                self._trigger = "normal_completion"
+            except BaseException as exc:
+                self._reason_codes.add(self._reason_for_exception(exc))
+                try:
+                    if not self._parent_alive():
+                        self._note_parent_death()
+                except BaseException:
+                    self._reason_codes.add("internal_error")
+                if self.guards is not None:
+                    try:
+                        self.guards.latch_production("powered_stage_terminal")
+                    except BaseException:
+                        pass
+
+            try:
+                cleanup_phase = self._phase("cleanup")
+                await self._cleanup(cleanup_phase)
+            except BaseException as exc:
+                self._reason_codes.add(self._reason_for_exception(exc))
+                if not self._cleanup_failures:
+                    self._cleanup_failures.add("internal_error")
+                try:
+                    await self._close_transports(
+                        self.admission.cleanup_deadline_monotonic_ns
+                    )
+                except BaseException:
+                    self._cleanup_failures.add("transport_unclosed")
+
+            try:
+                self._post_cleanup_parent_check(
+                    parent_deadline_ns=self.admission.cleanup_deadline_monotonic_ns,
+                    emit=self.recorder is not None and not self._replay_closed,
+                )
+                certificate, audit = self._build_cleanup_certificate()
+                self._certificate, self._certificate_sha256 = self._publish_certificate(
+                    certificate
+                )
+            except BaseException as exc:
+                self._reason_codes.add(self._reason_for_exception(exc))
+                self._reason_codes.add("cleanup_unconfirmed")
+                self._preserve_failed_certificate_reference()
+                try:
+                    audit = self._outbound_audit()
+                except BaseException:
+                    self._reason_codes.add("command_reconciliation_failed")
+
+            # A takeover observed during cleanup or through certificate
+            # publication must be released before replay.close().  The lease
+            # publisher owns release-intent publication, release, proof, and
+            # final lease-index publication as one bounded operation.
+            try:
+                self._post_cleanup_parent_check(
+                    parent_deadline_ns=self.admission.exit_deadline_monotonic_ns,
+                    emit=self.recorder is not None and not self._replay_closed,
+                )
+            except BaseException:
+                self._reason_codes.add("cleanup_unconfirmed")
+            self._takeover_released = self._release_takeover()
+            if not self._takeover_released:
+                self._reason_codes.add("cleanup_unconfirmed")
+
+            try:
+                replay_phase = self._phase("replay_close")
+                await self._close_artifacts(replay_phase)
+            except BaseException as exc:
+                self._reason_codes.add(self._reason_for_exception(exc))
+                self._reason_codes.add("capture_incomplete")
+                self._artifacts = self._partial_artifacts("partial")
+                self._replay_closed = True
+
+            # A parent that dies only after replay closure still requires a
+            # bounded takeover/release, but cleanup commands are never replayed.
+            try:
+                took_over = self._post_cleanup_parent_check(
+                    parent_deadline_ns=self.admission.exit_deadline_monotonic_ns,
+                    emit=False,
+                )
+                if took_over:
+                    self._takeover_released = self._release_takeover()
+            except BaseException:
+                self._reason_codes.add("cleanup_unconfirmed")
+            if not self._takeover_released:
+                self._reason_codes.add("cleanup_unconfirmed")
+            try:
+                self._phase("finalize", emit=False)
+            except BaseException:
+                self._reason_codes.add("deadline_expired")
+            try:
+                took_over = self._post_cleanup_parent_check(
+                    parent_deadline_ns=self.admission.exit_deadline_monotonic_ns,
+                    emit=False,
+                )
+                if took_over and not self._takeover_released:
+                    self._takeover_released = self._release_takeover()
+            except BaseException:
+                self._reason_codes.add("cleanup_unconfirmed")
+            process_result = self._build_process_result(audit)
+            try:
+                took_over = self._post_cleanup_parent_check(
+                    parent_deadline_ns=self.admission.exit_deadline_monotonic_ns,
+                    emit=False,
+                )
+                if took_over and not self._takeover_released:
+                    self._takeover_released = self._release_takeover()
+                    process_result = self._build_process_result(audit)
+            except BaseException:
+                self._reason_codes.add("cleanup_unconfirmed")
+                process_result = self._build_process_result(audit)
+            return CalibrationChildRunOutput(
+                certificate=self._certificate,
+                certificate_sha256=self._certificate_sha256,
+                process_result=process_result,
+                exit_code=0 if process_result["outcome"] == "completed" else 1,
+            )
+        finally:
+            self.admission.erase_role_secret()
+
+
+async def run_powered_calibration_child(
+    admission: CalibrationAdmission,
+    services: CalibrationChildServices,
+) -> CalibrationChildRunOutput:
+    return await CalibrationChildLifecycle(admission, services).run()
 
 
 def next_control_deadline(
@@ -605,6 +6286,9 @@ def attitude_rate_command(
 ) -> AttitudeRateCommand:
     """Conservative roll/pitch attitude loop with yaw deliberately disabled."""
 
+    if _attitude_error_body_rates is None:
+        _load_live_transport_dependencies()
+
     desired = Quaternion.from_euler(
         float(target_roll_rad),
         float(target_pitch_rad),
@@ -665,9 +6349,12 @@ class JsonlRecorder:
         *,
         replay: Optional[AsyncReplayRecorder] = None,
         capture_fifo_enabled: bool = False,
+        create_new: bool = False,
     ) -> None:
         if type(capture_fifo_enabled) is not bool:
             raise TypeError("capture_fifo_enabled must be an exact bool")
+        if type(create_new) is not bool:
+            raise TypeError("create_new must be an exact bool")
         if capture_fifo_enabled and replay is None:
             raise ValueError("capture FIFO requires a replay recorder")
         self.path = Path(path).resolve() if path else None
@@ -677,20 +6364,67 @@ class JsonlRecorder:
         if self.path is not None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if str(self.path).endswith(".gz"):
-                self._handle = gzip.open(self.path, "wt", encoding="utf-8")
+                self._handle = gzip.open(
+                    self.path,
+                    "xt" if create_new else "wt",
+                    encoding="utf-8",
+                )
             else:
-                self._handle = self.path.open("w", encoding="utf-8")
+                self._handle = self.path.open(
+                    "x" if create_new else "w",
+                    encoding="utf-8",
+                )
 
     @property
     def capture_enabled(self) -> bool:
         return self.replay is not None
 
-    def emit(self, event: str, **fields: Any) -> None:
+    def emit(self, event: str, **fields: Any) -> bool:
         if self._handle is not None:
             row = {"event": event, "wall_time_ns": time.time_ns(), **fields}
             self._handle.write(json.dumps(row, separators=(",", ":")) + "\n")
         if self.replay is not None:
             self.replay.record_event(event, **fields)
+        return True
+
+    def emit_powered(self, event: str, *, observation: Mapping[str, Any]) -> bool:
+        """Enqueue one exact nested powered observation and fail on backpressure."""
+
+        if type(event) is not str or not event:
+            raise TypeError("powered event name must be a nonempty exact string")
+        if type(observation) is not dict:
+            raise TypeError("powered observation must be an exact object")
+        if self._handle is not None:
+            row = {
+                "event": event,
+                "wall_time_ns": time.time_ns(),
+                "observation": observation,
+            }
+            self._handle.write(
+                json.dumps(
+                    row,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            )
+        if self.replay is None:
+            return False
+        try:
+            accepted = self.replay.record_event(event, observation=observation)
+        except BaseException as exc:
+            try:
+                self.replay.fail(
+                    f"powered replay enqueue raised for {event}: "
+                    f"{type(exc).__name__}"
+                )
+            finally:
+                raise
+        if accepted is not True:
+            self.replay.fail(f"powered replay enqueue returned false for {event}")
+            return False
+        return True
 
     def record_imu(
         self,
@@ -699,18 +6433,20 @@ class JsonlRecorder:
         now_s: float,
         *,
         received_sample: Optional[Any] = None,
-    ) -> None:
+    ) -> bool:
         if self.replay is not None:
-            self.replay.record_imu(
+            return self.replay.record_imu(
                 imu,
                 estimator=estimator,
                 received_monotonic_s=now_s,
                 received_sample=received_sample,
             )
+        return True
 
-    def record_mavlink_ingress(self, ingress: Any) -> None:
+    def record_mavlink_ingress(self, ingress: Any) -> bool:
         if self.replay is not None:
-            self.replay.record_mavlink_ingress(ingress)
+            return self.replay.record_mavlink_ingress(ingress)
+        return True
 
     def record_camera_timing(
         self, observation: CameraFrameTimingObservationV1
@@ -721,9 +6457,10 @@ class JsonlRecorder:
                 observation=observation.to_primitive(),
             )
 
-    def record_race(self, race: Any, now_s: float) -> None:
+    def record_race(self, race: Any, now_s: float) -> bool:
         if self.replay is not None:
-            self.replay.record_race(race, received_monotonic_s=now_s)
+            return self.replay.record_race(race, received_monotonic_s=now_s)
+        return True
 
     def record_command(
         self,
@@ -732,14 +6469,15 @@ class JsonlRecorder:
         *,
         monotonic_s: float,
         frame_token: Optional[Tuple[int, int, int]],
-    ) -> None:
+    ) -> bool:
         if self.replay is not None:
-            self.replay.record_command(
+            return self.replay.record_command(
                 kind,
                 command,
                 monotonic_s=monotonic_s,
                 frame_token=frame_token,
             )
+        return True
 
     def capture_frame(self, image: Any, **fields: Any) -> None:
         if self.replay is not None:
@@ -766,7 +6504,18 @@ class JsonlRecorder:
             raise OSError(f"OpenCV could not write diagnostic image {output}")
         return str(output.resolve())
 
-    def close(self, *, outcome: Optional[Dict[str, Any]] = None) -> Any:
+    def close(
+        self,
+        *,
+        outcome: Optional[Dict[str, Any]] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Any:
+        if timeout_s is not None and (
+            type(timeout_s) not in {int, float}
+            or not math.isfinite(float(timeout_s))
+            or timeout_s <= 0
+        ):
+            raise ValueError("recorder close timeout must be finite and positive")
         handle_error: Optional[BaseException] = None
         handle_traceback = None
         if self._handle is not None:
@@ -794,10 +6543,13 @@ class JsonlRecorder:
                 except BaseException as exc:
                     replay_error = exc
             try:
-                replay_result = self.replay.close(
-                    outcome=outcome,
-                    expected_decoded_frames=expected,
-                )
+                kwargs = {
+                    "outcome": outcome,
+                    "expected_decoded_frames": expected,
+                }
+                if timeout_s is not None:
+                    kwargs["timeout_s"] = float(timeout_s)
+                replay_result = self.replay.close(**kwargs)
             except BaseException as exc:
                 replay_error = replay_error or exc
         if handle_error is not None:
@@ -2801,6 +8553,7 @@ async def run_live(
     recording_approved: bool = False,
     preflight_healthy_dwell_s: float = 0.0,
 ) -> StageResult:
+    _load_live_transport_dependencies()
     if type(recording_approved) is not bool:
         raise TypeError("recording_approved must be an exact bool")
     if replay_bundle is not None and recording_approved is not True:
@@ -3113,8 +8866,620 @@ def _default_replay_path(stage: str) -> str:
     return str(Path("captures") / "replays" / f"vq2_{stage}_{stamp}.vq2replay")
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Bounded AIGP VQ2 training runner")
+def _calibration_cli_requested(argv: Sequence[str]) -> bool:
+    return CALIBRATION_STAGE in argv or any(
+        item
+        in {
+            "--powered-attempt-envelope",
+            "--powered-process-authority",
+            "--attempt-capability-handle",
+            "--parent-liveness-handle",
+            "--cleanup-certificate",
+        }
+        for item in argv
+    )
+
+
+def _write_calibration_stderr(stream: Any, message: bytes) -> None:
+    try:
+        stream.write(message)
+    except TypeError:
+        stream.write(message.decode("utf-8"))
+    if hasattr(stream, "flush"):
+        stream.flush()
+
+
+class _OwnedCalibrationCapabilityOperations:
+    """Track the inherited one-shot reader without ever closing it twice."""
+
+    def __init__(self, operations: Any, capability_handle: int) -> None:
+        if operations is None:
+            raise TypeError("capability operations are required")
+        if type(capability_handle) is not int or capability_handle < 1:
+            raise ValueError("capability handle must be a positive exact integer")
+        self._operations = operations
+        self._capability_handle = capability_handle
+        self._lock = threading.Lock()
+        self._close_attempted = False
+        self._closed = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._operations, name)
+
+    def close_handle(self, handle: int) -> None:
+        if type(handle) is not int or handle != self._capability_handle:
+            raise CalibrationBootstrapError(
+                "capability operations attempted to close an unexpected handle"
+            )
+        with self._lock:
+            if self._close_attempted:
+                raise CalibrationBootstrapError(
+                    "capability reader close was attempted more than once"
+                )
+            self._close_attempted = True
+            self._operations.close_handle(handle)
+            self._closed = True
+
+    def close_unconsumed(self) -> bool:
+        with self._lock:
+            if self._close_attempted:
+                return self._closed
+            self._close_attempted = True
+            try:
+                self._operations.close_handle(self._capability_handle)
+            except BaseException:
+                return False
+            self._closed = True
+            return True
+
+
+def _close_default_calibration_process_boundary(
+    process_boundary: Any,
+    monotonic_ns: Callable[[], int],
+) -> bool:
+    """Close one default bootstrap boundary under one immutable local deadline."""
+
+    try:
+        started = monotonic_ns()
+        if type(started) is not int or started < 0:
+            return False
+        deadline = started + CALIBRATION_OWNED_HANDLE_CLOSE_NS
+        proof = process_boundary.close_owned_handles(
+            deadline_monotonic_ns=deadline,
+            monotonic_ns=monotonic_ns,
+        )
+    except BaseException:
+        return False
+    return getattr(proof, "proved", None) is True
+
+
+def _create_default_calibration_delegated_lease(
+    admission: CalibrationAdmission,
+    process_boundary: CalibrationProcessBoundary,
+    qpc_provider: Any,
+) -> CalibrationLeaseBoundary:
+    """Construct the production delegated lease only after capability admission."""
+
+    from scripts import aigp_live_lease
+
+    context = admission.attempt["context"]
+    frequency = qpc_provider.query_performance_frequency_hz()
+    if frequency != context["host"]["qpc_frequency_hz"]:
+        raise CalibrationBootstrapError(
+            "runtime QPC frequency changed from powered-child admission"
+        )
+    paths = context["paths"]
+    store = aigp_live_lease.PoweredLeaseLedgerStore(
+        paths["lease_directory"],
+        paths["lease_final"],
+        task_id=context["task_id"],
+        session_id=context["session_id"],
+        attempt_id=context["attempt_id"],
+        attempt_envelope_sha256=admission.attempt_envelope_sha256,
+        attempt_context_sha256=admission.attempt["context_sha256"],
+        wrapper_process=admission.wrapper_process,
+        qpc_frequency_hz=frequency,
+        _clock_ns=qpc_provider.now_ns,
+    )
+    return aigp_live_lease.DelegatedPoweredLeaseBoundary(
+        store,
+        admission.arguments.powered_attempt_envelope,
+        parent_signaled=process_boundary.parent_signaled,
+        _clock_ns=qpc_provider.now_ns,
+    )
+
+
+def _create_default_calibration_recorder(
+    admission: CalibrationAdmission,
+    *,
+    monotonic_ns: Callable[[], int],
+) -> JsonlRecorder:
+    """Create both create-new capture artifacts after child admission."""
+
+    AsyncRecorder, ReplayWriter, _environment, _git = _replay_capture_dependencies()
+    context = admission.attempt["context"]
+    metadata = {
+        "capture_kind": "powered_calibration",
+        "producer_role": CALIBRATION_CHILD_ROLE,
+        "task_id": context["task_id"],
+        "session_id": context["session_id"],
+        "attempt_id": context["attempt_id"],
+        "candidate_commit": context["candidate_commit"],
+        "attempt_context_sha256": admission.attempt["context_sha256"],
+        "attempt_envelope_sha256": admission.attempt_envelope_sha256,
+        "process_authority_sha256": admission.process_authority_sha256,
+    }
+    writer: Any = None
+    replay: Any = None
+    try:
+        writer = ReplayWriter(
+            admission.arguments.replay_bundle,
+            session_id=context["session_id"],
+            metadata=metadata,
+            require_private=True,
+        )
+        replay = AsyncRecorder(writer)
+        return JsonlRecorder(
+            admission.arguments.record,
+            replay=replay,
+            capture_fifo_enabled=True,
+            create_new=True,
+        )
+    except BaseException as exc:
+        if replay is not None:
+            try:
+                replay.fail(
+                    "powered calibration recorder construction failed: "
+                    f"{type(exc).__name__}"
+                )
+                now = monotonic_ns()
+                remaining = max(
+                    1,
+                    admission.replay_close_deadline_monotonic_ns - now,
+                )
+                replay.close(
+                    outcome={"powered_calibration_recorder_constructed": False},
+                    timeout_s=remaining / 1_000_000_000.0,
+                )
+            except BaseException as cleanup_exc:
+                exc.add_note(
+                    "Replay construction cleanup also failed: "
+                    f"{type(cleanup_exc).__name__}"
+                )
+        elif writer is not None:
+            try:
+                writer.abort(
+                    "powered calibration async recorder construction failed: "
+                    f"{type(exc).__name__}"
+                )
+            except BaseException as cleanup_exc:
+                exc.add_note(
+                    "Replay writer abort also failed: "
+                    f"{type(cleanup_exc).__name__}"
+                )
+        raise
+
+
+def _create_default_calibration_adapter(
+    *,
+    admission: CalibrationAdmission,
+    bind: Mapping[str, Any],
+    outbound_guards: Any,
+    role_valid: Callable[[], bool],
+    parent_alive: Callable[[], bool],
+    lease_valid: Callable[[], bool],
+    runtime: Any,
+    monotonic_ns: Callable[[], int],
+) -> Any:
+    """Bind and transfer the exclusive MAVLink endpoint after lease proof."""
+
+    del admission
+    from competition.aigp_mavlink import (
+        AIGPMavlinkAdapter as PoweredAdapter,
+        POWERED_RECEIVE_MODE_WORKER,
+        PoweredMavlinkTransport,
+    )
+
+    endpoint = runtime.create_exclusive_udp_endpoint(bind["host"], bind["port"])
+    transport: Any = None
+    try:
+        transport = PoweredMavlinkTransport.from_pymavlink(
+            endpoint,
+            outbound_guards=outbound_guards,
+            role_valid=role_valid,
+            parent_alive=parent_alive,
+            lease_valid=lease_valid,
+        )
+        return PoweredAdapter(
+            enable_vision=False,
+            require_track=False,
+            telemetry_mode="imu",
+            fetch_track_on_connect=False,
+            monotonic_ns=monotonic_ns,
+            powered_transport=transport,
+            powered_receive_mode=POWERED_RECEIVE_MODE_WORKER,
+        )
+    except BaseException:
+        owner = transport if transport is not None else endpoint
+        try:
+            owner.close()
+        except BaseException as close_exc:
+            raise CalibrationLifecycleError(
+                "partial powered MAVLink construction could not close its endpoint"
+            ) from close_exc
+        raise
+
+
+def _create_default_calibration_vision(
+    *,
+    admission: CalibrationAdmission,
+    bind: Mapping[str, Any],
+    monotonic_ns: Callable[[], int],
+    **options: Any,
+) -> Any:
+    """Construct the production receiver; its exclusive bind occurs at start()."""
+
+    del admission
+    from competition.vq2_vision import VQ2VisionThread as PoweredVision
+
+    return PoweredVision(
+        bind_host=bind["host"],
+        port=bind["port"],
+        monotonic_ns=monotonic_ns,
+        **options,
+    )
+
+
+def _create_default_calibration_camera_socket(
+    host: str,
+    port: int,
+    *,
+    runtime: Any,
+) -> Any:
+    """Transfer one exclusively bound raw socket to VQ2VisionThread."""
+
+    endpoint = runtime.create_exclusive_udp_endpoint(host, port)
+    if type(endpoint) is not runtime.ExclusiveUdpEndpoint:
+        try:
+            endpoint.close()
+        except BaseException as close_exc:
+            raise CalibrationLifecycleError(
+                "invalid camera endpoint could not close its socket"
+            ) from close_exc
+        raise CalibrationLifecycleError(
+            "camera endpoint factory did not return exact ExclusiveUdpEndpoint"
+        )
+    try:
+        return endpoint.transfer_socket()
+    except BaseException:
+        try:
+            endpoint.close()
+        except BaseException as close_exc:
+            raise CalibrationLifecycleError(
+                "partial powered camera construction could not close its endpoint"
+            ) from close_exc
+        raise
+
+
+def build_default_calibration_services(
+    arguments: CalibrationArguments,
+    *,
+    qpc_provider_factory: Optional[Callable[[], Any]] = None,
+    process_boundary_factory: Optional[Callable[..., CalibrationProcessBoundary]] = None,
+    capability_operations_factory: Optional[Callable[[], Any]] = None,
+    delegated_lease_factory: Optional[
+        Callable[[CalibrationAdmission, CalibrationProcessBoundary, Any], CalibrationLeaseBoundary]
+    ] = None,
+    recorder_builder: Optional[Callable[[CalibrationAdmission], JsonlRecorder]] = None,
+    adapter_builder: Optional[Callable[..., Any]] = None,
+    vision_builder: Optional[Callable[..., Any]] = None,
+    camera_socket_builder: Optional[Callable[[str, int], Any]] = None,
+    publisher_factory: Optional[Callable[..., CalibrationCertificatePublisher]] = None,
+    child_runner: Optional[
+        Callable[[CalibrationAdmission, CalibrationChildServices], Any]
+    ] = None,
+) -> CalibrationAdmissionServices:
+    """Build inert admission services and defer every output/live effect."""
+
+    if not isinstance(arguments, CalibrationArguments):
+        raise TypeError("arguments must be CalibrationArguments")
+    from scripts import aigp_vq2_powered_attempt as attempt_contract
+    from scripts import aigp_vq2_powered_runtime as powered_runtime
+
+    capability_handle = powered_runtime.parse_decimal_handle(
+        arguments.attempt_capability_handle
+    )
+    parent_handle = powered_runtime.parse_decimal_handle(
+        arguments.parent_liveness_handle
+    )
+    if capability_handle == parent_handle:
+        raise CalibrationBootstrapError(
+            "capability and parent handles must be distinct"
+        )
+    make_capability = (
+        capability_operations_factory
+        or powered_runtime.Win32CapabilityPipeOperations
+    )
+    make_qpc = qpc_provider_factory or powered_runtime.WindowsQpcProvider
+    make_process = (
+        process_boundary_factory
+        or powered_runtime.RetainedChildBootstrapProcessBoundary
+    )
+    make_lease = (
+        delegated_lease_factory
+        or _create_default_calibration_delegated_lease
+    )
+    run_child = child_runner or run_powered_calibration_child
+    capability_owner: Optional[_OwnedCalibrationCapabilityOperations] = None
+    qpc: Any = None
+    process_boundary: Optional[CalibrationProcessBoundary] = None
+    try:
+        capability_owner = _OwnedCalibrationCapabilityOperations(
+            make_capability(), capability_handle
+        )
+        qpc = make_qpc()
+        process_boundary = make_process(capability_handle, parent_handle)
+        post_admission_lock = threading.Lock()
+        post_admission_started = False
+
+        def run_admitted(admission: CalibrationAdmission) -> Any:
+            nonlocal post_admission_started
+            with post_admission_lock:
+                if post_admission_started:
+                    raise CalibrationLifecycleError(
+                        "post-admission calibration services are one-shot"
+                    )
+                post_admission_started = True
+            lease = make_lease(admission, process_boundary, qpc)
+            if publisher_factory is None:
+                from scripts.aigp_vq2_powered_cleanup import (
+                    CanonicalCreateNewPublisher,
+                )
+
+                publisher = CanonicalCreateNewPublisher(
+                    contract=attempt_contract,
+                    monotonic_ns=qpc.now_ns,
+                )
+            else:
+                publisher = publisher_factory(
+                    contract=attempt_contract,
+                    monotonic_ns=qpc.now_ns,
+                )
+            child_services = CalibrationChildServices(
+                process_boundary=process_boundary,
+                lease_boundary=lease,
+                recorder_factory=(
+                    recorder_builder
+                    if recorder_builder is not None
+                    else partial(
+                        _create_default_calibration_recorder,
+                        monotonic_ns=qpc.now_ns,
+                    )
+                ),
+                adapter_factory=(
+                    adapter_builder
+                    if adapter_builder is not None
+                    else partial(
+                        _create_default_calibration_adapter,
+                        runtime=powered_runtime,
+                        monotonic_ns=qpc.now_ns,
+                    )
+                ),
+                vision_factory=(
+                    vision_builder
+                    if vision_builder is not None
+                    else partial(
+                        _create_default_calibration_vision,
+                        monotonic_ns=qpc.now_ns,
+                    )
+                ),
+                camera_socket_factory=(
+                    camera_socket_builder
+                    if camera_socket_builder is not None
+                    else partial(
+                        _create_default_calibration_camera_socket,
+                        runtime=powered_runtime,
+                    )
+                ),
+                publisher=publisher,
+                monotonic_ns=qpc.now_ns,
+                contract=attempt_contract,
+                runtime=powered_runtime,
+            )
+            return run_child(admission, child_services)
+
+        return CalibrationAdmissionServices(
+            process_boundary=process_boundary,
+            capability_operations=capability_owner,
+            monotonic_ns=qpc.now_ns,
+            contract=attempt_contract,
+            runtime=powered_runtime,
+            run_admitted=run_admitted,
+            owned_process_boundary=process_boundary,
+            close_unconsumed_capability=capability_owner.close_unconsumed,
+        )
+    except BaseException:
+        if capability_owner is not None:
+            capability_owner.close_unconsumed()
+        if process_boundary is not None and qpc is not None:
+            _close_default_calibration_process_boundary(
+                process_boundary,
+                qpc.now_ns,
+            )
+        raise
+
+
+def _run_calibration_cli(
+    argv: Sequence[str],
+    *,
+    services: Optional[CalibrationAdmissionServices],
+    stdout: Any,
+    stderr: Any,
+) -> int:
+    arguments = parse_calibration_arguments(argv)
+    active_services = services
+    if active_services is None:
+        try:
+            active_services = build_default_calibration_services(arguments)
+        except BaseException:
+            _write_calibration_stderr(
+                stderr, b"powered calibration failed before admission\n"
+            )
+            return 2
+    admission: Optional[CalibrationAdmission] = None
+    try:
+        admission = admit_calibration_child(arguments, active_services)
+    except BaseException:
+        close_failed = False
+        if active_services.close_unconsumed_capability is not None:
+            try:
+                if active_services.close_unconsumed_capability() is not True:
+                    close_failed = True
+            except BaseException:
+                close_failed = True
+        if active_services.owned_process_boundary is not None:
+            if (
+                active_services.owned_process_boundary
+                is not active_services.process_boundary
+                or not _close_default_calibration_process_boundary(
+                    active_services.owned_process_boundary,
+                    active_services.monotonic_ns,
+                )
+            ):
+                close_failed = True
+        _write_calibration_stderr(
+            stderr, b"powered calibration failed before admission\n"
+        )
+        if close_failed:
+            _write_calibration_stderr(
+                stderr,
+                b"powered calibration bootstrap handle closure failed\n",
+            )
+            return 1
+        return 2
+    try:
+        # This is the first point at which the child may import a module able
+        # to construct the simulator transports.
+        _load_live_transport_dependencies()
+        if (
+            active_services.run_admitted is None
+            and active_services.child_services is None
+        ):
+            _write_calibration_stderr(
+                stderr, b"powered calibration execution integration is unavailable\n"
+            )
+            return 2
+        if (
+            active_services.child_services is not None
+            and active_services.child_services.process_boundary
+            is not active_services.process_boundary
+        ):
+            raise CalibrationEvidenceError(
+                "admission and child lifecycle must share one process boundary"
+            )
+        result = (
+            active_services.run_admitted(admission)
+            if active_services.run_admitted is not None
+            else run_powered_calibration_child(
+                admission, active_services.child_services
+            )
+        )
+        if inspect.isawaitable(result):
+            result = asyncio.run(result)
+        if isinstance(result, CalibrationChildRunOutput):
+            if active_services.process_boundary.parent_signaled(
+                admission.parent_handle
+            ):
+                raise CalibrationLifecycleError(
+                    "wrapper parent died before process-result serialization"
+                )
+            contract, _runtime = _powered_contract_modules(active_services)
+            payload = contract.canonical_json_file_bytes(result.process_result)
+            if active_services.process_boundary.parent_signaled(
+                admission.parent_handle
+            ):
+                raise CalibrationLifecycleError(
+                    "wrapper parent died before process-result publication"
+                )
+            try:
+                stdout.write(payload)
+            except TypeError:
+                stdout.write(payload.decode("utf-8"))
+            if hasattr(stdout, "flush"):
+                stdout.flush()
+            if active_services.process_boundary.parent_signaled(
+                admission.parent_handle
+            ):
+                raise CalibrationLifecycleError(
+                    "wrapper parent died during process-result publication"
+                )
+            return result.exit_code
+        if type(result) is not int or result not in {0, 1, 2}:
+            raise CalibrationEvidenceError(
+                "admitted runner returned an invalid exit code"
+            )
+        if active_services.process_boundary.parent_signaled(
+            admission.parent_handle
+        ):
+            raise CalibrationLifecycleError(
+                "wrapper parent died before powered-child exit"
+            )
+        return result
+    except BaseException:
+        _write_calibration_stderr(
+            stderr, b"powered calibration failed after admission\n"
+        )
+        return 1
+    finally:
+        close_failed = False
+        if active_services.close_unconsumed_capability is not None:
+            try:
+                if active_services.close_unconsumed_capability() is not True:
+                    close_failed = True
+            except BaseException:
+                close_failed = True
+        try:
+            proof = active_services.process_boundary.close_owned_handles(
+                deadline_monotonic_ns=admission.exit_deadline_monotonic_ns,
+                monotonic_ns=active_services.monotonic_ns,
+            )
+            if getattr(proof, "proved", None) is not True:
+                raise CalibrationLifecycleError(
+                    "bootstrap owned-handle closure was not proved"
+                )
+        except BaseException:
+            close_failed = True
+        admission.erase_role_secret()
+        if close_failed:
+            _write_calibration_stderr(
+                stderr,
+                b"powered calibration bootstrap handle closure failed\n",
+            )
+            return 1
+
+
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    calibration_services: Optional[CalibrationAdmissionServices] = None,
+    stdout: Any = None,
+    stderr: Any = None,
+) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    error_stream = sys.stderr.buffer if stderr is None else stderr
+    output_stream = sys.stdout.buffer if stdout is None else stdout
+    if _calibration_cli_requested(args):
+        return _run_calibration_cli(
+            args,
+            services=calibration_services,
+            stdout=output_stream,
+            stderr=error_stream,
+        )
+
+    parser = argparse.ArgumentParser(
+        description="Bounded AIGP VQ2 training runner",
+        allow_abbrev=False,
+    )
     parser.add_argument(
         "--stage",
         choices=("preflight", "sign-id", "hover", "gate0", "gate0-observe"),
@@ -3150,29 +9515,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="continue an already-healthy passive preflight for up to 8 seconds",
     )
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args(argv)
-    if args.replay_bundle is not None and not args.recording_approved:
+    parsed = parser.parse_args(args)
+    if parsed.replay_bundle is not None and not parsed.recording_approved:
         parser.error("--replay-bundle requires explicit --recording-approved")
-    if args.stage != "preflight" and args.preflight_healthy_dwell_s != 0.0:
+    if parsed.stage != "preflight" and parsed.preflight_healthy_dwell_s != 0.0:
         parser.error("--preflight-healthy-dwell-s requires --stage preflight")
-    record = _default_record_path(args.stage) if args.record == "auto" else args.record
+    record = (
+        _default_record_path(parsed.stage)
+        if parsed.record == "auto"
+        else parsed.record
+    )
     replay_bundle = (
-        _default_replay_path(args.stage)
-        if args.replay_bundle == "auto"
-        else args.replay_bundle
+        _default_replay_path(parsed.stage)
+        if parsed.replay_bundle == "auto"
+        else parsed.replay_bundle
     )
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if parsed.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     result = asyncio.run(
         run_live(
-            args.stage,
-            args.address,
+            parsed.stage,
+            parsed.address,
             record,
             replay_bundle=replay_bundle,
-            recording_approved=args.recording_approved,
-            preflight_healthy_dwell_s=args.preflight_healthy_dwell_s,
+            recording_approved=parsed.recording_approved,
+            preflight_healthy_dwell_s=parsed.preflight_healthy_dwell_s,
         )
     )
     print(json.dumps(asdict(result), indent=2, sort_keys=True))

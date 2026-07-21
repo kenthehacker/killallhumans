@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `I0 contract frozen and independently cleared - implementation not started; no simulator contact`
+- State: `I0 implementation complete; local T0 gates green; exact-candidate promotion pending; no simulator contact`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -881,7 +881,10 @@ the frozen stdlib root. Any payload or frozen file-byte hash drift invalidates.
 
 The runner and evidence validator use this exact value. It is code-owned, not
 configurable and not CLI-overridable. Its canonical compact/sorted JSON SHA-256
-is `6ca6900c1977ba789920fad87aee67dca36f0911de255aa4cf29c30bc8809bce`:
+is `6ca6900c1977ba789920fad87aee67dca36f0911de255aa4cf29c30bc8809bce`.
+This is the canonical object SHA-256 defined above, over bytes without a
+trailing LF; a newline-terminated file-byte SHA-256 is not the excitation-plan
+identity. The exact object is:
 
 ```json
 {
@@ -1892,9 +1895,11 @@ Shared exact shapes are:
   with release < end <= expiry.
 - `command={roll_rate_rad_s,pitch_rate_rad_s,yaw_rate_rad_s,thrust}`, all finite.
 - `source` has exact keys `frame`, `imu`, `race`, `heartbeat`, and `actuator`.
-  `frame` is exact camera `stream_id,generation,frame_id,sim_time_ns` plus the
-  complete `FrameTimingV1` primitive and admitted decoded width/height. The
-  other four are the complete immutable received-envelope primitives above.
+  `frame` has the exact literal key set
+  `{stream_id,generation,frame_id,sim_time_ns,timing,width,height}`: `timing` is
+  the complete `FrameTimingV1` primitive and `width`/`height` are the admitted
+  decoded dimensions. The other four are the complete immutable received-
+  envelope primitives above.
   Every generated excitation requires all five nonnull, including an actual
   fresh actuator occurrence; null is allowed only by the separately frozen
   cleanup scope, where all five are exactly null, never as fabricated values.
@@ -2766,12 +2771,14 @@ The read-only I0 audit found that the earlier draft exceeded its owned receiver
 surface, relied on unsupported abandoned takeover and nonexclusive pymavlink
 bind behavior, paired mutable payload side state with ingress, starved cleanup
 under its process wall, and left attempt/command/poison/report/split interfaces
-underspecified. The authoritative correction above now owns and freezes those
-interfaces while leaving excitation and safety bounds unchanged. Independent
-authority/lifecycle, evidence-schema, and compatibility review now clears the
-correction. The next admitted work is I0 implementation in the dependency order
-recorded above, beginning with immutable wire schemas, pure powered contracts,
-and OS/runtime primitives. This releases no T0, integration, live-freeze, or
+underspecified. The authoritative correction above owns and freezes those
+interfaces while leaving excitation and safety bounds unchanged. I0 now
+implements the immutable wire schemas, pure powered contracts, OS/runtime
+primitives, replay/analysis service, cleanup certificate, isolated probe, and
+production entry composition. Directly affected tests and the canonical VQ2,
+fast, and unit non-live suites are green. T0 remains open for the separate
+trusted-policy/manifest commit and fresh exact-commit `test-full-non-live` and
+hash-pinned VQ2 promotion gates. This releases no integration, live-freeze, or
 powered gate.
 
 No FlightSim process, port, frame capture, reset, arm/disarm, target, or powered

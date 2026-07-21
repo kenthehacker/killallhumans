@@ -461,6 +461,54 @@ class _FakeSocket:
         self.incoming.put(packet)
 
 
+class _FakePoweredSocket(_FakeSocket):
+    def __init__(
+        self,
+        *,
+        actual=("0.0.0.0", 49_152),
+        family=socket.AF_INET,
+        close_error=False,
+    ):
+        super().__init__()
+        self.family = family
+        self.actual = actual
+        self.bind_calls = []
+        self.close_error = close_error
+
+    def getsockname(self):
+        return self.actual
+
+    def bind(self, address):
+        self.bind_calls.append(address)
+        raise AssertionError(
+            "exclusive socket factory must return an already-bound socket"
+        )
+
+    def close(self):
+        if self.close_error:
+            raise OSError("injected powered socket close failure")
+        super().close()
+
+    def recvfrom(self, _size):
+        try:
+            item = self.incoming.get(timeout=0.02)
+        except queue.Empty as exc:
+            raise socket.timeout() from exc
+        if item is self._CLOSED:
+            raise OSError("fake socket closed")
+        return item
+
+    def push_from(self, packet, addr):
+        self.incoming.put((packet, addr))
+
+
+def _wait_until(predicate, timeout_s=1.0):
+    deadline = time.monotonic() + timeout_s
+    while not predicate() and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert predicate()
+
+
 def test_start_stop_are_idempotent_and_fake_socket_thread_publishes_frame():
     fake = _FakeSocket()
     receiver = VQ2VisionThread(
@@ -487,6 +535,141 @@ def test_start_stop_are_idempotent_and_fake_socket_thread_publishes_frame():
     receiver.stop()
     assert not receiver.is_running
     assert fake.closed
+
+
+def test_powered_vision_requires_one_unambiguous_exclusive_factory():
+    with pytest.raises(ValueError, match="requires an exclusive_socket_factory"):
+        VQ2VisionThread(powered_exclusive=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        VQ2VisionThread(
+            powered_exclusive=True,
+            socket_factory=_FakeSocket,
+            exclusive_socket_factory=lambda _host, _port: _FakePoweredSocket(),
+        )
+    with pytest.raises(ValueError, match="only in powered mode"):
+        VQ2VisionThread(
+            exclusive_socket_factory=lambda _host, _port: _FakePoweredSocket()
+        )
+
+
+@pytest.mark.parametrize(
+    ("fake", "message"),
+    [
+        (_FakePoweredSocket(family=socket.AF_INET6), "must be AF_INET"),
+        (_FakePoweredSocket(actual=("127.0.0.1", 49_152)), "bind host changed"),
+        (_FakePoweredSocket(actual=("0.0.0.0", 0)), "ephemeral port is invalid"),
+    ],
+)
+def test_powered_vision_closes_socket_when_bind_proof_fails(fake, message):
+    receiver = VQ2VisionThread(
+        port=0,
+        powered_exclusive=True,
+        exclusive_socket_factory=lambda _host, _port: fake,
+    )
+    with pytest.raises(OSError, match=message):
+        receiver.start()
+    assert fake.closed
+    assert receiver.source_diagnostics().state == "not_opened"
+
+
+def test_powered_vision_freezes_valid_loopback_peer_and_rejects_before_feed():
+    fake = _FakePoweredSocket()
+    factory_calls = []
+
+    def exclusive_factory(host, port):
+        factory_calls.append((host, port))
+        return fake
+
+    receiver = VQ2VisionThread(
+        port=0,
+        powered_exclusive=True,
+        exclusive_socket_factory=exclusive_factory,
+    )
+    with pytest.raises(RuntimeError, match="socket source gate"):
+        receiver.feed_datagram(_jpeg_packets(total_chunks=1)[0])
+    initial = receiver.source_diagnostics()
+    assert initial.state == "not_opened"
+    assert initial.actual_host is None
+    assert initial.frozen_peer is None
+    assert initial.socket_policy == "ipv4-exclusive-address-use"
+
+    receiver.start()
+    assert factory_calls == [("0.0.0.0", 0)]
+    assert fake.bind_calls == []
+    bound = receiver.source_diagnostics()
+    assert (bound.actual_host, bound.actual_port) == ("0.0.0.0", 49_152)
+    assert bound.state == "bound"
+
+    # A malformed packet cannot choose the peer or reach production
+    # reassembly, but remains visible in cumulative malformed diagnostics.
+    fake.push_from(b"not-a-frame-chunk", ("127.0.0.1", 50_001))
+    _wait_until(lambda: receiver.stats().malformed_datagrams == 1)
+    assert receiver.source_diagnostics().frozen_peer is None
+    assert receiver.stats().datagrams_received == 1
+
+    # Non-loopback input is rejected and latched before production mutation.
+    first_packet = _jpeg_packets(frame_id=41, total_chunks=1)[0]
+    fake.push_from(first_packet, ("192.0.2.10", 50_001))
+    _wait_until(lambda: receiver.source_diagnostics().rejected_source_count == 1)
+    rejected = receiver.source_diagnostics()
+    assert rejected.source_rejected_latched is True
+    assert rejected.frozen_peer is None
+    assert receiver.stats().datagrams_received == 1
+
+    # The first syntactically valid loopback chunk freezes before normal feed.
+    fake.push_from(first_packet, ("127.0.0.1", 50_001))
+    _wait_until(lambda: receiver.snapshot() is not None)
+    frozen = receiver.source_diagnostics()
+    assert frozen.state == "peer_frozen"
+    assert frozen.frozen_peer == ("127.0.0.1", 50_001)
+    assert receiver.snapshot().frame_id == 41
+    received_before_second_source = receiver.stats().datagrams_received
+
+    # A second endpoint is rejected before it can publish frame 42.
+    fake.push_from(
+        _jpeg_packets(frame_id=42, total_chunks=1)[0],
+        ("127.0.0.1", 50_002),
+    )
+    _wait_until(lambda: receiver.source_diagnostics().rejected_source_count == 2)
+    assert receiver.snapshot().frame_id == 41
+    assert receiver.stats().datagrams_received == received_before_second_source
+
+    # The latch is diagnostic, not a cleanup denial: the frozen peer remains
+    # usable, and reset must not erase attempt-lifetime peer/count evidence.
+    fake.push_from(
+        _jpeg_packets(
+            frame_id=43,
+            sim_time_ns=2_000_000_000,
+            total_chunks=1,
+        )[0],
+        ("127.0.0.1", 50_001),
+    )
+    _wait_until(lambda: receiver.snapshot().frame_id == 43)
+    receiver.reset()
+    after_reset = receiver.source_diagnostics()
+    assert after_reset.frozen_peer == ("127.0.0.1", 50_001)
+    assert after_reset.rejected_source_count == 2
+    assert after_reset.source_rejected_latched is True
+
+    receiver.stop()
+    stopped = receiver.source_diagnostics()
+    assert stopped.state == "closed_with_peer"
+    assert stopped.frozen_peer == ("127.0.0.1", 50_001)
+
+
+def test_powered_vision_close_failure_is_cleanup_failure_not_closed_state():
+    fake = _FakePoweredSocket(close_error=True)
+    receiver = VQ2VisionThread(
+        port=0,
+        powered_exclusive=True,
+        exclusive_socket_factory=lambda _host, _port: fake,
+    )
+    receiver.start()
+    with pytest.raises(RuntimeError, match="close was not proved"):
+        receiver.stop()
+    diagnostics = receiver.source_diagnostics()
+    assert diagnostics.state == "bound"
+    assert receiver.stats().socket_errors >= 1
 
 
 @pytest.mark.parametrize("max_age", [-1.0, float("nan"), float("inf")])

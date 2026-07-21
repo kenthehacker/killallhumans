@@ -17,6 +17,7 @@ publish after the boundary.
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import socket
 import struct
@@ -118,6 +119,22 @@ class VQ2VisionStats:
     receiver_dropped_late_packets: int
 
 
+@dataclass(frozen=True)
+class VQ2VisionSourceDiagnostics:
+    """Powered-only exclusive bind and source-freeze diagnostics."""
+
+    powered_exclusive: bool
+    state: str
+    requested_host: str
+    requested_port: int
+    actual_host: Optional[str]
+    actual_port: Optional[int]
+    socket_policy: str
+    frozen_peer: Optional[Tuple[str, int]]
+    rejected_source_count: int
+    source_rejected_latched: bool
+
+
 class VQ2VisionThread:
     """Drain and decode the VQ2 JPEG stream outside the control-loop thread.
 
@@ -144,6 +161,10 @@ class VQ2VisionThread:
         stream_id: str = "vq2-camera-udp-5600",
         host_clock_id: str = VQ2_HOST_CLOCK_ID,
         monotonic_ns: Optional[Callable[[], int]] = None,
+        powered_exclusive: bool = False,
+        exclusive_socket_factory: Optional[
+            Callable[[str, int], socket.socket]
+        ] = None,
     ) -> None:
         if not 0 <= int(port) <= 65_535:
             raise ValueError("port must be in [0, 65535]")
@@ -168,6 +189,20 @@ class VQ2VisionThread:
             raise ValueError("socket_timeout_s must be finite and > 0")
         if monotonic_ns is not None and not callable(monotonic_ns):
             raise TypeError("monotonic_ns must be callable or None")
+        if type(powered_exclusive) is not bool:
+            raise TypeError("powered_exclusive must be an exact bool")
+        if powered_exclusive and not callable(exclusive_socket_factory):
+            raise ValueError(
+                "powered_exclusive requires an exclusive_socket_factory"
+            )
+        if powered_exclusive and socket_factory is not None:
+            raise ValueError(
+                "socket_factory cannot be combined with powered_exclusive"
+            )
+        if not powered_exclusive and exclusive_socket_factory is not None:
+            raise ValueError(
+                "exclusive_socket_factory is available only in powered mode"
+            )
 
         self.port = int(port)
         self.bind_host = str(bind_host)
@@ -177,6 +212,8 @@ class VQ2VisionThread:
         self.receive_buffer_bytes = int(receive_buffer_bytes)
         self.socket_timeout_s = float(socket_timeout_s)
         self._socket_factory = socket_factory or self._new_udp_socket
+        self._powered_exclusive = powered_exclusive
+        self._exclusive_socket_factory = exclusive_socket_factory
         self._on_snapshot = on_snapshot
         self._capture_snapshot_queue_enabled = capture_snapshot_queue_enabled
         self.capture_snapshot_queue_capacity = int(
@@ -210,6 +247,12 @@ class VQ2VisionThread:
         self._stop_event = threading.Event()
         self._socket: Optional[socket.socket] = None
         self._thread: Optional[threading.Thread] = None
+        self._endpoint_state = "not_opened"
+        self._actual_bind: Optional[Tuple[str, int]] = None
+        self._frozen_peer: Optional[Tuple[str, int]] = None
+        self._rejected_source_count = 0
+        self._source_rejected_latched = False
+        self._socket_close_proved = False
 
         self._receiver = self._new_receiver()
         self._seen_keys: set[Tuple[int, int]] = set()
@@ -263,11 +306,54 @@ class VQ2VisionThread:
             if self._thread is not None and self._thread.is_alive():
                 return
 
-            sock = self._socket_factory()
+            if self._powered_exclusive:
+                assert self._exclusive_socket_factory is not None
+                sock = self._exclusive_socket_factory(self.bind_host, self.port)
+            else:
+                sock = self._socket_factory()
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.receive_buffer_bytes)
+                if self._powered_exclusive:
+                    if getattr(sock, "family", None) != socket.AF_INET:
+                        raise OSError("powered vision socket must be AF_INET")
+                    getsockname = getattr(sock, "getsockname", None)
+                    if not callable(getsockname):
+                        raise OSError(
+                            "powered vision socket cannot prove bind identity"
+                        )
+                    actual = getsockname()
+                    if (
+                        type(actual) is not tuple
+                        or len(actual) < 2
+                        or type(actual[0]) is not str
+                        or type(actual[1]) is not int
+                    ):
+                        raise OSError("powered vision socket has invalid bind identity")
+                    actual_host = str(actual[0])
+                    actual_port = int(actual[1])
+                    if actual_host != self.bind_host:
+                        raise OSError("powered vision socket bind host changed")
+                    if self.port == 0:
+                        if not 1 <= actual_port <= 65_535:
+                            raise OSError("powered vision ephemeral port is invalid")
+                    elif actual_port != self.port:
+                        raise OSError("powered vision socket bind port changed")
+                else:
+                    actual_host = self.bind_host
+                    actual_port = self.port
+                sock.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_RCVBUF,
+                    self.receive_buffer_bytes,
+                )
                 sock.settimeout(self.socket_timeout_s)
-                sock.bind((self.bind_host, self.port))
+                if not self._powered_exclusive:
+                    sock.bind((self.bind_host, self.port))
+                    getsockname = getattr(sock, "getsockname", None)
+                    if callable(getsockname):
+                        actual = getsockname()
+                        if type(actual) is tuple and len(actual) >= 2:
+                            actual_host = str(actual[0])
+                            actual_port = int(actual[1])
             except Exception:
                 try:
                     sock.close()
@@ -283,7 +369,32 @@ class VQ2VisionThread:
             )
             self._socket = sock
             self._thread = thread
-            thread.start()
+            with self._data_lock:
+                self._socket_close_proved = False
+                self._actual_bind = (actual_host, actual_port)
+                self._endpoint_state = (
+                    "peer_frozen" if self._frozen_peer is not None else "bound"
+                )
+            try:
+                thread.start()
+            except Exception:
+                self._socket = None
+                self._thread = None
+                try:
+                    sock.close()
+                except OSError:
+                    with self._data_lock:
+                        self._socket_errors += 1
+                    raise
+                else:
+                    with self._data_lock:
+                        self._socket_close_proved = True
+                        self._endpoint_state = (
+                            "closed_with_peer"
+                            if self._frozen_peer is not None
+                            else "closed_without_peer"
+                        )
+                raise
 
     def stop(self, timeout_s: float = 2.0) -> None:
         """Stop the worker and close its socket.  Safe before/after ``start``."""
@@ -300,7 +411,11 @@ class VQ2VisionThread:
             try:
                 sock.close()
             except OSError:
-                pass
+                with self._data_lock:
+                    self._socket_errors += 1
+            else:
+                with self._data_lock:
+                    self._socket_close_proved = True
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=float(timeout_s))
 
@@ -319,11 +434,44 @@ class VQ2VisionThread:
                 thread is None or not thread.is_alive()
             ):
                 self._thread = None
+        with self._data_lock:
+            close_proved = self._socket_close_proved
+            if self._actual_bind is not None and close_proved:
+                self._endpoint_state = (
+                    "closed_with_peer"
+                    if self._frozen_peer is not None
+                    else "closed_without_peer"
+                )
+        if self._powered_exclusive and sock is not None and not close_proved:
+            raise RuntimeError("powered vision socket close was not proved")
 
     @property
     def is_running(self) -> bool:
         with self._lifecycle_lock:
             return self._thread is not None and self._thread.is_alive()
+
+    def source_diagnostics(self) -> VQ2VisionSourceDiagnostics:
+        """Return immutable bind/source state without weakening source gates."""
+
+        with self._data_lock:
+            actual = self._actual_bind
+            peer = self._frozen_peer
+            return VQ2VisionSourceDiagnostics(
+                powered_exclusive=self._powered_exclusive,
+                state=self._endpoint_state,
+                requested_host=self.bind_host,
+                requested_port=self.port,
+                actual_host=None if actual is None else actual[0],
+                actual_port=None if actual is None else actual[1],
+                socket_policy=(
+                    "ipv4-exclusive-address-use"
+                    if self._powered_exclusive
+                    else "legacy-default"
+                ),
+                frozen_peer=None if peer is None else (peer[0], peer[1]),
+                rejected_source_count=self._rejected_source_count,
+                source_rejected_latched=self._source_rejected_latched,
+            )
 
     def reset(self) -> None:
         """Clear all frame/dedup state at a ``SIM_RESET`` boundary.
@@ -346,6 +494,25 @@ class VQ2VisionThread:
             self._resets += 1
 
     def feed_datagram(
+        self,
+        raw: bytes,
+        *,
+        received_monotonic_s: Optional[float] = None,
+        received_monotonic_ns: Optional[int] = None,
+    ) -> Optional[VQ2VisionSnapshot]:
+        """Feed replay/test traffic when the powered source gate is disabled."""
+
+        if self._powered_exclusive:
+            raise RuntimeError(
+                "powered vision datagrams must pass the socket source gate"
+            )
+        return self._feed_admitted_datagram(
+            raw,
+            received_monotonic_s=received_monotonic_s,
+            received_monotonic_ns=received_monotonic_ns,
+        )
+
+    def _feed_admitted_datagram(
         self,
         raw: bytes,
         *,
@@ -664,11 +831,71 @@ class VQ2VisionThread:
     def _read_monotonic_ns(self) -> int:
         return _validate_monotonic_ns(self._monotonic_ns(), "monotonic_ns clock")
 
+    @staticmethod
+    def _normalize_loopback_peer(addr: object) -> Optional[Tuple[str, int]]:
+        if type(addr) is not tuple or len(addr) != 2:
+            return None
+        host, port = addr
+        if type(host) is not str or type(port) is not int:
+            return None
+        if not 1 <= port <= 65_535:
+            return None
+        try:
+            parsed_host = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        if parsed_host.version != 4 or not parsed_host.is_loopback:
+            return None
+        return str(parsed_host), port
+
+    def _reject_powered_source_locked(self) -> None:
+        self._rejected_source_count += 1
+        self._source_rejected_latched = True
+
+    def _accept_powered_source(self, raw: bytes, addr: object) -> bool:
+        """Freeze one valid loopback source before production receiver use."""
+
+        if not self._powered_exclusive:
+            return True
+
+        peer = self._normalize_loopback_peer(addr)
+        with self._data_lock:
+            frozen_peer = self._frozen_peer
+            if peer is None or (
+                frozen_peer is not None and peer != frozen_peer
+            ):
+                self._reject_powered_source_locked()
+                return False
+            if frozen_peer is not None:
+                return True
+
+        # This parse is intentionally scratch-only.  No duplicate, reassembly,
+        # publication, or production receiver state is touched before a source
+        # has proved one syntactically valid build-3385 frame chunk.
+        try:
+            parse_packet(raw)
+        except (ValueError, struct.error):
+            with self._data_lock:
+                self._datagrams_received += 1
+                self._malformed_datagrams += 1
+            return False
+
+        with self._data_lock:
+            if self._frozen_peer is None:
+                assert peer is not None
+                self._frozen_peer = peer
+                self._endpoint_state = "peer_frozen"
+                return True
+            if self._frozen_peer != peer:
+                self._reject_powered_source_locked()
+                return False
+            return True
+
     def _receive_loop(self, sock: socket.socket) -> None:
         try:
             while not self._stop_event.is_set():
                 try:
-                    raw, _addr = sock.recvfrom(_MAX_UDP_DATAGRAM_BYTES)
+                    raw, addr = sock.recvfrom(_MAX_UDP_DATAGRAM_BYTES)
                 except socket.timeout:
                     continue
                 except OSError:
@@ -677,7 +904,8 @@ class VQ2VisionThread:
                             self._socket_errors += 1
                     break
                 try:
-                    self.feed_datagram(raw)
+                    if self._accept_powered_source(raw, addr):
+                        self._feed_admitted_datagram(raw)
                 except Exception:
                     # Keep draining after an unexpected per-datagram failure.
                     # Deliberately do not catch BaseException/SystemExit.
@@ -687,7 +915,20 @@ class VQ2VisionThread:
             try:
                 sock.close()
             except OSError:
-                pass
+                with self._data_lock:
+                    self._socket_errors += 1
+                    close_proved = self._socket_close_proved
+            else:
+                with self._data_lock:
+                    self._socket_close_proved = True
+                    close_proved = True
+            with self._data_lock:
+                if self._actual_bind is not None and close_proved:
+                    self._endpoint_state = (
+                        "closed_with_peer"
+                        if self._frozen_peer is not None
+                        else "closed_without_peer"
+                    )
 
 
 def _validate_max_age(max_age_s: float) -> float:
