@@ -7,15 +7,17 @@ conditional simulator/private-capture authority and single powered pilot; it
 grants no replay, production, or transport authority.
 
 The current integrated local-main baseline is
-`0ac02a043b569d712ed74131d1ee659833f1320f`. It contains the promoted Package 2
-environment/import-freeze correction. L0 then failed closed before writing a
-review bundle or private support file because the exact System32 PowerShell
-binary has its normal two-name NTFS component-store identity while production
-offline admission required one link for every file. Behavior commit
-`298535969a0f49dd078ed5a4da99ed2e585f6282` and trusted-metadata commit
-`f4152c072330836939c00fc342f90d6d3d07bc91` narrowly correct that boundary and
-are under fresh exact-candidate promotion. No A01, simulator/port contact, or
-frame capture occurred. The earlier Package 2A / Package 3B passive tranche at
+`c4e2a2691af543b63607034bf79f43c7dd67471a`. It contains the promoted Package 2
+PowerShell component-store correction. The original five-file L0 set was then
+published create-new with the freeze last, but the exact production `-m`
+command failed closed before `F00-A01` because offline admission could not
+resolve the running probe under its canonical module key. Recovery
+behavior/trust commits
+`9028150` / `2e919ee` bind the validated `__main__` execution object under that
+canonical name and move only the accepted freeze ID/path to append-only
+`recovery-01`; they are under fresh exact-candidate promotion. The original
+freeze remains immutable and inactive. No A01, simulator/port contact, or frame
+capture occurred. The earlier Package 2A / Package 3B passive tranche at
 `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0` remains accepted historical
 evidence and must not be repeated.
 
@@ -62,7 +64,7 @@ inform a design, but it cannot replace empirical build-specific evidence.
 
 - Target: FlightSim build 3385 in Training mode.
 - Current reviewed implementation/evidence baseline:
-  `0ac02a043b569d712ed74131d1ee659833f1320f`.
+  `c4e2a2691af543b63607034bf79f43c7dd67471a`.
 - Package 2 behavior commit:
   `508d43d49c4f2b6704b3d6d51e071157de4ce2a3`.
 - Environment/import freeze-readiness behavior/trust commits:
@@ -71,8 +73,11 @@ inform a design, but it cannot replace empirical build-specific evidence.
   `0ac02a043b569d712ed74131d1ee659833f1320f`.
 - Exact System32 PowerShell component-store admission behavior/trust commits:
   `298535969a0f49dd078ed5a4da99ed2e585f6282` /
-  `f4152c072330836939c00fc342f90d6d3d07bc91`; fresh exact-candidate promotion
-  is the active successor gate.
+  `f4152c072330836939c00fc342f90d6d3d07bc91`; promoted and integrated through
+  `c4e2a2691af543b63607034bf79f43c7dd67471a`.
+- Exact production-module binding and append-only recovery behavior/trust
+  commits: `9028150` / `2e919ee`; fresh exact-candidate promotion is the active
+  successor gate.
 - `cb2b1de` is the Package 2A / Package 3B passive capture-ingress evidence
   closeout and remains a historical passive reference.
 - Accepted behavior and live-evidence candidate:
@@ -174,29 +179,31 @@ transport without the later reviewed contracts below.
 ## Verification and trust baseline
 
 The current integrated hash-pinned trusted state is Package 2 commit
-`0ac02a043b569d712ed74131d1ee659833f1320f`. Its accepted exact-candidate
+`c4e2a2691af543b63607034bf79f43c7dd67471a`. Its accepted exact-candidate
 evidence is:
 
 | Evidence | Observed result |
 |---|---|
-| Freeze-readiness behavior commit | `e87c5e636aafe3f4d7155dd2e446b7043dca599f` |
-| Trusted-metadata commit | `aafc5408f27f6855005ccbb825bca16f3d74e38a` |
-| Documentation/final integrated commit | `0ac02a043b569d712ed74131d1ee659833f1320f` |
+| PowerShell admission behavior commit | `298535969a0f49dd078ed5a4da99ed2e585f6282` |
+| Trusted-metadata commit | `f4152c072330836939c00fc342f90d6d3d07bc91` |
+| Documentation/final integrated commit | `c4e2a2691af543b63607034bf79f43c7dd67471a` |
 | Fresh exact-commit `test-full-non-live` | `3,366` passed, `22` skipped |
 | Fresh isolated hash-pinned VQ2 | `2,142` passed |
 | Detached post-merge VQ2 | `2,225` passed, `1` skipped |
 
-The PowerShell component-store correction at `2985359` has `81` direct probe
-passes, `2,225` canonical VQ2 passes with `1` skip, and `3,325` fast/unit passes
-with `21` skips and `42` deselections. Its independently reviewed `157`-path
-manifest changes only the probe and existing probe-test digests and has
-raw/canonical SHA-256
-`566063b69699e4a5932cb310966ec2b8722c15a20d88664074099da7b9710a50` /
-`c13d52df37859eb353c578d78515d7d78bb5507cae07593fe2712eb4af08d8f5`.
-The 42-test policy remains byte-identical at `2,142` expected passes, which a
-local isolated run achieved. These are pre-promotion correction results; fresh
-exact-candidate full-suite and separate hash-pinned runs, integration, and the
-post-merge gate remain mandatory.
+The production-module/recovery correction at `9028150` has `246` directly
+affected attempt/probe passes and `2,225` canonical VQ2 passes with `1` skip.
+It binds exact `-m` execution under the canonical reviewed module name and
+changes only the accepted live-freeze ID/path to append-only `recovery-01`;
+the root, F00-A01 latch, attempt limit, powered plan, and safety boundaries are
+unchanged. Trusted commit `2e919ee` changes exactly four existing manifest
+digests. The `157`-path manifest has raw/canonical SHA-256
+`fe50b3e909d03f6427a58431882d5ced35d3036bfd58298e78cc1368f388b27c` /
+`587b5a8e7cef0ed11f0a09ac4087468027ec1ae05341ab3728c90a1fffed52f3`.
+The 42-test policy remains byte-identical at `2,142` expected passes. These are
+pre-promotion recovery results; fresh fast, unit, exact-candidate full-suite,
+separate hash-pinned, integration, and detached post-merge gates remain
+mandatory.
 
 The following table is historical accepted passive-tranche evidence at
 `cb2b1de`, not the current trust identity:
@@ -270,10 +277,11 @@ Git tracked status on `main` was empty at Package 2 correction entry. Multiple
 historical, readiness, development, and promotion worktrees remain registered;
 their count is not a durable identity. The active correction worktree is
 `wt-package2-live-freeze-readiness`. The designated
-`wt-package2-powered-calibration-live` worktree was used only for the failed
-pre-publication offline L0 derivation: it has no live freeze and no consumed
-attempt. Do not resume or remove another worktree automatically. Inspect the
-current facts with:
+`wt-package2-powered-calibration-live` worktree is detached at integrated
+`c4e2a26` and was used for the reviewed predecessor L0 publication and the
+pre-attempt wrapper refusal. It has no consumed attempt or poison and must be
+rebuilt at the final recovery commit before replacement L0. Do not resume or
+remove another worktree automatically. Inspect the current facts with:
 
 ```powershell
 git worktree list --porcelain
@@ -297,7 +305,7 @@ ordinal relative-path order, with no trailing newline.
 Do not delete, relabel, or infer provenance for those files automatically.
 
 Use the current deliberately reviewed local `main` containing this handoff as
-the base. `0ac02a0` is the current Package 2 integrated baseline; `f33e436` is
+the base. `c4e2a26` is the current Package 2 integrated baseline; `f33e436` is
 the historical first Package 2 promotion, and `cb2b1de` remains the passive
 historical reference. A future task starts as follows only after one entry gate
 is actually satisfied, using unique names confirmed not to exist:
@@ -433,23 +441,25 @@ use, a second attempt, another powered stage, or Gate 0/Gate 1 work.
 
 The first Package 2 implementation was promoted and integrated at `f33e436`.
 The environment/import correction was then promoted and integrated unchanged
-through `0ac02a0`, with fresh full non-live, strict hash-pinned, and detached
-post-merge evidence recorded above. L0 resumed using a separately reviewed,
-hash-pinned offline preparer, but its first derivation failed before either
-review bundle or any private support publication: the exact System32
-PowerShell executable reported the expected System32/WinSxS two-link identity,
-and the production reader rejected every link count other than one. Production
-wrapper admission uses the same reader, so bypassing L0 was not viable.
+through `0ac02a0`. The PowerShell boundary correction was then promoted and
+integrated through `c4e2a26`, with fresh full non-live, strict hash-pinned, and
+detached post-merge evidence recorded above. A separately reviewed preparer
+published the original five-file L0 set create-new, with the freeze last.
+The exact production wrapper then failed closed before attempt creation with
+`module has no file-backed origin`: pinned CPython `-m` execution populated
+`__main__`, while admission required the canonical probe key. The private root
+therefore contains the immutable predecessor six-file root, but neither
+`F00-A01` nor poison exists; the launcher, simulator, and fixed ports were not
+reached.
 
-Behavior `2985359` admits exactly two links only for the exact case-sensitive
-System32 PowerShell path. Every other file still requires one link; the WinSxS
-name and case variants remain forbidden; link count joins retained state; and
-private/live evidence boundaries are unchanged. Its trust commit is `f4152c0`.
-The remaining gate sequence is fresh exact-candidate full non-live and separate
-hash-pinned VQ2, exact integration, and detached post-merge VQ2. Only then may
-the external L0 preparer be re-pinned, re-reviewed, and used to derive the live
-freeze. The private root still contains only `capture-authorization.json`; no
-attempt or poison has been created.
+Behavior `9028150` fixes only that exact execution alias and moves the accepted
+freeze ID/path to `recovery-01`; trust commit `2e919ee` refreshes the four
+affected hashes. The remaining gate sequence is fresh fast/unit, exact-candidate
+full non-live and separate hash-pinned VQ2, exact integration, and detached
+post-merge VQ2. Only then may a new external preparer be pinned and reviewed.
+It must exact-hash the predecessor six-file root, publish five uniquely named
+`recovery-01` L0 files create-new with the replacement freeze last, and
+leave the same F00-A01/poison latch in force.
 
 The earlier Package 3B timing tranche remains integrated historical evidence
 with three accepted passive captures. It must not be described as blocked or
@@ -471,8 +481,10 @@ The current continuation selected Package 2 because its entry gate permits
 separately authorized collection, then froze and independently reviewed the
 algorithm-independent readiness contract at `d526524`. That checkpoint was
 subsequently followed by implementation at `508d43`/`f33e436`, freeze-readiness
-correction at `e87c5e6`/`0ac02a0`, and the current PowerShell boundary
-correction at `2985359`/`f4152c0`, but no new collection followed. Accepted
+correction at `e87c5e6`/`0ac02a0`, and the PowerShell boundary
+correction at `2985359`/`f4152c0` integrated through `c4e2a26`, followed by the
+pre-attempt module-binding recovery at `9028150`/`2e919ee`; no new collection
+followed. Accepted
 passive
 sessions 02 through 04 contain `182`/`181`/`181` frames but only `6`/`5`/`5`
 unique decoded hashes, one exact target box `(282, 134, 80, 80)`, and `2,110`

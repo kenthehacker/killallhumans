@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `environment/import correction integrated at 0ac02a0; PowerShell component-store behavior/trust committed at 2985359/f4152c0 with fresh promotion pending; failed offline L0 derive wrote nothing and made no simulator contact`
+- State: `PowerShell correction promoted and integrated at c4e2a26; predecessor L0 freeze published; exact production -m invocation then failed closed before F00-A01 because its canonical module alias was absent; recovery behavior/trust committed at 9028150/2e919ee with fresh promotion pending`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -14,14 +14,15 @@
 - Active correction worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-live-freeze-readiness`.
 - Designated integration-owner-controlled detached live worktree, rebuilt at
-  `0ac02a0` and used only for the failed pre-publication offline L0 derive; it
-  has no freeze or attempt and must be rebuilt at the next final exact
-  integrated commit before L0 retries:
+  `c4e2a26` for the predecessor L0 publication and pre-attempt production
+  admission. It has no attempt or poison and must be rebuilt at the final exact
+  recovery commit before replacement L0 publication:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration-live`.
 - Owner and integration owner: `/root`.
-- Heartbeat date: `2026-07-20`.
+- Heartbeat date: `2026-07-21`.
 - Simulator target: FlightSim build 3385, Training mode.
-- Private root, not created by the contract freeze:
+- Private root, containing the immutable predecessor L0 support set but no
+  attempt directory or poison:
   `C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot`.
 - Maximum live scope after every entry gate passes: one accepted powered
   discovery session; the first failed live attempt ends live work.
@@ -972,13 +973,20 @@ cleanup scope intentionally carries null plan identity.
 
 ### Live freeze, sole operator command, and paths
 
-L0 creates, independently reviews, and byte-hash pins exactly one private
-`aigp-vq2-powered-calibration-live-freeze/1`. Its exact top-level keys are
+The predecessor L0 created and independently reviewed one immutable
+`aigp-vq2-powered-calibration-live-freeze/1` at
+`<root>\live-freeze-F00-A01.json`. Exact production admission later refused
+before attempt creation, so that file remains historical and inactive. The
+append-only recovery L0 must stable-hash all six predecessor root files, prove
+`F00-A01` and poison absent, and create exactly one replacement executable
+freeze at `<root>\live-freeze-F00-A01-recovery-01.json`; it may not overwrite,
+rename, delete, or reinterpret the predecessor. The replacement keeps schema
+`/1` because its shape and powered semantics are unchanged. Its exact top-level keys are
 `schema`, `task_id`, `freeze_id`, `candidate`, `session`, `inputs`, `runtime`,
 `simulator`, `transport`, `execution`, `paths`, and `deadline_durations_ns`:
 
 - `task_id` is `vq2-package2-powered-calibration-pilot`; `freeze_id` is
-  `vq2-package2-powered-calibration-f00-a01-live-freeze`.
+  `vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01`.
 - `candidate` has exact keys `commit`, `code_sha256`, `live_worktree`,
   `detached_head_required`, `clean_tracked_untracked_ignored_required`, and
   `implementation_inventory`. The two booleans are true; the inventory has
@@ -1043,7 +1051,8 @@ L0 creates, independently reviews, and byte-hash pins exactly one private
 `split_registry`, `attempt_complete`, `attempt_invalid`, `cleanup_stdout`,
 `cleanup_stderr`, and `live_poison`. The root is
 `C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot`;
-the freeze is `<root>\live-freeze-F00-A01.json`; the attempt directory is
+the sole executable freeze is
+`<root>\live-freeze-F00-A01-recovery-01.json`; the attempt directory is
 `<root>\F00-A01`; the registry is
 `<root>\split-registry\registry-000001.json`; and poison is
 `<root>\live-poison.json`. Attempt basenames respectively are `attempt.json`,
@@ -1056,6 +1065,15 @@ the freeze is `<root>\live-freeze-F00-A01.json`; the attempt directory is
 `analysis.json`, `split-claim.json`,
 `attempt-complete.json`, `attempt-invalid.json`, `cleanup-stdout.json`, and
 `cleanup-stderr.txt`.
+
+The recovery preparer publishes these five unique recovery L0 files create-new
+in the existing root, in this order, with the freeze last:
+`plan-recovery-01.json`, `implementation-inventory-recovery-01.json`,
+`environment-inventory-recovery-01.json`,
+`import-inventory-recovery-01.json`, and
+`live-freeze-F00-A01-recovery-01.json`. The predecessor six-file set remains
+byte-identical beside them. Neither freeze filename is attempt-like; the one
+unchanged `<root>\F00-A01` directory remains the sole consumption latch.
 
 From `candidate.live_worktree` as the exact current directory, the only
 operator argv is:
@@ -2923,3 +2941,56 @@ integration, and detached post-merge VQ2 remain mandatory before L0 retries.
 No FlightSim process, port, frame capture, reset, arm/disarm, target, or powered
 command has occurred. No PAK is read, and the completed passive timing tranche
 is not repeated.
+
+The PowerShell correction was subsequently promoted and integrated unchanged
+through `c4e2a2691af543b63607034bf79f43c7dd67471a`. Its fresh exact-candidate
+evidence was `3366` passed with `22` skipped for full non-live, `2142` passed
+for the separate strict hash-pinned suite, and `2225` passed with `1` skipped
+for detached post-merge VQ2. The detached live worktree was rebuilt clean at
+that exact commit. Separately reviewed L0 bundles then published the original
+five-file L0 set create-new, with the original freeze last. The original
+freeze file SHA-256 is
+`ded4ebd1b07e2644749703df15ce9d3400aafddc7df247e052997cf98b6d5b29`.
+
+The exact production command was then started from the frozen live worktree in
+an attached local console. It failed before the attempt directory existed. A
+second still-unconsumed offline invocation retained its console and exposed the
+exact refusal: `module has no file-backed origin`. CPython 3.12.2 exact `-m`
+execution had correctly installed the running probe only as `__main__`, while
+offline admission looked up the already-reviewed canonical module name. The
+attempt directory and poison remained absent. Because attempt creation precedes
+lease, launcher, simulator, and port contact, neither invocation reached any
+live boundary.
+
+Recovery behavior commit `9028150` validates that the `__main__` object owns
+the currently executing globals, has the exact canonical spec/origin/loader,
+and has no pre-populated canonical key; it then binds that same object under
+the reviewed canonical name and rechecks identity. This matches the frozen
+two-name import inventory without relaxing `module_origin`. The same commit
+changes only the accepted freeze ID/path to the append-only `recovery-01`
+literals while preserving the root, F00, F00-A01, attempt limit, poison,
+launcher, transport, powered plan, and cleanup contract. Existing tests now
+accept only the recovery ID/path and explicitly reject the predecessor values.
+Independent code and recovery-contract reviews returned `CLEAR`; the affected
+attempt/probe suites passed `246`, and canonical VQ2 passed `2225` with `1`
+skip.
+
+Trusted-metadata commit `2e919ee` changes exactly the attempt source, probe
+source, and their two existing test digests. The `157`-path manifest remains
+count-identical and has raw/canonical SHA-256
+`fe50b3e909d03f6427a58431882d5ced35d3036bfd58298e78cc1368f388b27c` /
+`587b5a8e7cef0ed11f0a09ac4087468027ec1ae05341ab3728c90a1fffed52f3`.
+The 42-test policy remains byte-identical at `2142` expected passes. Fresh fast,
+unit, full non-live, separate strict, integration, detached post-merge VQ2, and
+independently reviewed replacement L0 publication remain mandatory before the
+single powered child may be created.
+
+The recovery preparer must preserve and exact-hash all six predecessor root
+files, publish the five `recovery-01` L0 files create-new with the freeze
+last, and require the final root to contain exactly those eleven files before
+attempt consumption. The original capture authorization and target config
+remain byte-identical because the private root, simulator-only data scope,
+nominal geometry, and observed-stream contract did not change. This correction
+does not authorize a second attempt: `<root>\F00-A01` remains the one and only
+consumption latch. No PAK was read, and the completed passive timing tranche
+was not repeated.
