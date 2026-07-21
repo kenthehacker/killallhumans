@@ -680,13 +680,13 @@ if canonical_object_sha256(_PLAN_LITERAL) != EXCITATION_PLAN_SHA256:  # import-t
 EVIDENCE_ROOT = r"C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot"
 _ATTEMPT_ROOT = EVIDENCE_ROOT + r"\F00-A01"
 _LIVE_FREEZE_ID = (
-    "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01"
+    "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-02"
 )
 _FROZEN_PATHS = MappingProxyType(
     {
         "evidence_root": EVIDENCE_ROOT,
         "live_freeze": (
-            EVIDENCE_ROOT + r"\live-freeze-F00-A01-recovery-01.json"
+            EVIDENCE_ROOT + r"\live-freeze-F00-A01-recovery-02.json"
         ),
         "attempt_dir": _ATTEMPT_ROOT,
         "attempt_envelope": _ATTEMPT_ROOT + r"\attempt.json",

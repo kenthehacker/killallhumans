@@ -7444,6 +7444,9 @@ class WindowsProductionLiveBoundary:
     _HEARTBEAT_EMIT_NS = 900_000_000
     _MAX_STDOUT_BYTES = 16 * 1024 * 1024
     _MAX_STDERR_BYTES = 1 * 1024 * 1024
+    # Class 3 rejects oversized buffers on the target host; pin its full ABI.
+    _SYSTEM_TIME_OF_DAY_INFORMATION_CLASS = 3
+    _SYSTEM_TIME_OF_DAY_INFORMATION_SIZE = 48
 
     def __init__(
         self,
@@ -7549,14 +7552,19 @@ class WindowsProductionLiveBoundary:
             ctypes.POINTER(wintypes.ULONG),
         ]
         ntdll.NtQuerySystemInformation.restype = ctypes.c_long
-        buffer = ctypes.create_string_buffer(64)
+        buffer = ctypes.create_string_buffer(
+            self._SYSTEM_TIME_OF_DAY_INFORMATION_SIZE
+        )
         returned = wintypes.ULONG(0)
         status = int(
             ntdll.NtQuerySystemInformation(
-                3, buffer, len(buffer), ctypes.byref(returned)
+                self._SYSTEM_TIME_OF_DAY_INFORMATION_CLASS,
+                buffer,
+                len(buffer),
+                ctypes.byref(returned),
             )
         )
-        if status < 0 or returned.value < 8:
+        if status != 0 or returned.value != len(buffer):
             raise OrchestrationPhaseError(
                 "internal_error", "host boot FILETIME query failed"
             )

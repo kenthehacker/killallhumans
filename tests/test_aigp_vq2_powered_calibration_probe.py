@@ -110,7 +110,7 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
         "schema": "aigp-vq2-powered-calibration-live-freeze/1",
         "task_id": contract.TASK_ID,
         "freeze_id": (
-            "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01"
+            "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-02"
         ),
         "candidate": {
             "commit": COMMIT,
@@ -1071,6 +1071,10 @@ def test_import_is_inert_and_cli_is_exact(monkeypatch):
 def test_real_dash_m_probe_has_production_main_identity_before_cli_refusal(
     monkeypatch,
 ):
+    import ctypes
+    import struct
+    import winreg
+
     result = subprocess.run(
         [sys.executable, "-E", "-s", "-B", "-m", probe.PROBE_MODULE],
         cwd=Path.cwd(),
@@ -1120,6 +1124,83 @@ def test_real_dash_m_probe_has_production_main_identity_before_cli_refusal(
         check=False,
     )
     assert alias_check.returncode == 0, alias_check.stderr.decode(errors="replace")
+
+    boundary = object.__new__(probe.WindowsProductionLiveBoundary)
+    native_boot_id = boundary.host_boot_id_sha256()
+    assert native_boot_id == boundary.host_boot_id_sha256()
+    assert len(native_boot_id) == 64
+    assert set(native_boot_id) <= set("0123456789abcdef")
+
+    with winreg.OpenKey(
+        winreg.HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Cryptography",
+        0,
+        winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+    ) as key:
+        machine_guid, _value_type = winreg.QueryValueEx(key, "MachineGuid")
+
+    class FakeNtQuery:
+        argtypes = None
+        restype = None
+
+        def __init__(self):
+            self.status = 0
+            self.returned_length = 48
+            self.boot_filetime = 0x123456789ABCDEF
+            self.calls = []
+
+        def __call__(self, information_class, buffer, length, returned):
+            self.calls.append((information_class, length))
+            ctypes.memmove(
+                buffer,
+                struct.pack("<Q", self.boot_filetime),
+                ctypes.sizeof(ctypes.c_uint64),
+            )
+            returned._obj.value = self.returned_length
+            return self.status
+
+    query = FakeNtQuery()
+    fake_ntdll = type("FakeNtdll", (), {"NtQuerySystemInformation": query})()
+    monkeypatch.setattr(
+        ctypes,
+        "WinDLL",
+        lambda name, **_kwargs: fake_ntdll
+        if name == "ntdll"
+        else pytest.fail(f"unexpected WinDLL request: {name}"),
+    )
+    expected_boot_id = hashlib.sha256(
+        machine_guid.upper().encode("utf-8")
+        + b"\x00"
+        + struct.pack("<Q", query.boot_filetime)
+    ).hexdigest()
+    assert boundary.host_boot_id_sha256() == expected_boot_id
+    assert query.calls == [(3, 48)]
+    assert boundary._SYSTEM_TIME_OF_DAY_INFORMATION_CLASS == 3
+    assert boundary._SYSTEM_TIME_OF_DAY_INFORMATION_SIZE == 48
+
+    for status, returned_length in (
+        (1, 48),
+        (-1073741820, 48),
+        (0, 8),
+        (0, 47),
+        (0, 49),
+        (0, 64),
+    ):
+        query.status = status
+        query.returned_length = returned_length
+        with pytest.raises(
+            probe.OrchestrationPhaseError, match="host boot FILETIME query failed"
+        ) as exc_info:
+            boundary.host_boot_id_sha256()
+        assert exc_info.value.reason_code == "internal_error"
+
+    query.status = 0
+    query.returned_length = 48
+    query.boot_filetime = 0
+    with pytest.raises(
+        probe.OrchestrationPhaseError, match="host boot FILETIME is invalid"
+    ):
+        boundary.host_boot_id_sha256()
 
     monkeypatch.setitem(sys.modules, "__main__", probe)
     monkeypatch.setitem(sys.modules, probe.PROBE_MODULE, probe)
