@@ -2725,6 +2725,46 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
         assert destination.read_bytes() == b"{}\n"
 
     def test_path_proof_rejects_hard_link_alias(self, tmp_path):
+        system_service = probe.WindowsProductionOfflineAdmission()
+        assert system_service._expected_file_link_count(POWERSHELL) == 2
+        assert system_service._expected_file_link_count(POWERSHELL.upper()) == 1
+        assert system_service._expected_file_link_count(
+            r"C:\Windows\WinSxS\powershell.exe"
+        ) == 1
+        self._begin(system_service)
+        system_succeeded = False
+        try:
+            system_proof = system_service.observe_file_identity(
+                POWERSHELL, hash_kind="file_bytes"
+            )
+            assert system_proof.path.final_path == POWERSHELL
+            assert system_proof.path.retained_handle is True
+            assert system_proof.size_bytes > 0
+            assert len(system_proof.sha256) == 64
+            assert int(
+                system_service._retained[POWERSHELL][1].nNumberOfLinks
+            ) == 2
+            launch = subprocess.run(
+                [
+                    POWERSHELL,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "exit 0",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+                check=False,
+            )
+            assert launch.returncode == 0, launch.stderr.decode(errors="replace")
+            system_succeeded = True
+        finally:
+            system_service.end_bounded_admission(succeeded=system_succeeded)
+            system_service.close()
+
         source = tmp_path / "identity.bin"
         alias = tmp_path / "identity-alias.bin"
         source.write_bytes(b"same bytes")
@@ -2741,6 +2781,7 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
                 )
         finally:
             service.end_bounded_admission(succeeded=False)
+            service.close()
 
     def test_base_interpreter_dll_is_stdlib_and_mixed_namespace_is_detected(
         self, monkeypatch

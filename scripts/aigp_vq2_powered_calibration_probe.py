@@ -5875,6 +5875,10 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
     _MAX_GIT_INPUT_BYTES = 4 * 1024 * 1024
     _MAX_GIT_STDOUT_BYTES = 128 * 1024 * 1024
     _MAX_GIT_STDERR_BYTES = 1024 * 1024
+    _SYSTEM_POWERSHELL_PATH = (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    _SYSTEM_POWERSHELL_LINK_COUNT = 2
 
     def __init__(self) -> None:
         import ctypes
@@ -6111,7 +6115,13 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
             value = value[4:]
         return self._lexical(value)
 
-    def _file_info(self, handle: int, *, directory: bool) -> Any:
+    @classmethod
+    def _expected_file_link_count(cls, path: str) -> int:
+        if path == cls._SYSTEM_POWERSHELL_PATH:
+            return cls._SYSTEM_POWERSHELL_LINK_COUNT
+        return 1
+
+    def _file_info(self, handle: int, *, path: str, directory: bool) -> Any:
         info = self._BY_HANDLE_FILE_INFORMATION()
         if not self._kernel.GetFileInformationByHandle(
             handle, self._ctypes.byref(info)
@@ -6122,8 +6132,16 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
             raise OfflineAdmissionError("offline identity has the wrong object kind")
         if attributes & self._FILE_ATTRIBUTE_REPARSE_POINT:
             raise OfflineAdmissionError("offline identity is a reparse point")
-        if not directory and int(info.nNumberOfLinks) != 1:
-            raise OfflineAdmissionError("offline file has an aliased hard-link identity")
+        if not directory:
+            expected_links = self._expected_file_link_count(path)
+            if int(info.nNumberOfLinks) != expected_links:
+                if expected_links != 1:
+                    raise OfflineAdmissionError(
+                        "offline system PowerShell component-store identity changed"
+                    )
+                raise OfflineAdmissionError(
+                    "offline file has an aliased hard-link identity"
+                )
         return info
 
     @staticmethod
@@ -6140,6 +6158,7 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
     def _file_state_tuple(cls, info: Any) -> tuple[int, ...]:
         return (
             *cls._identity_tuple(info),
+            int(info.nNumberOfLinks),
             int(info.nFileSizeHigh),
             int(info.nFileSizeLow),
             int(info.ftLastWriteTime.dwHighDateTime),
@@ -6160,9 +6179,14 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
             handle, initial, initial_directory = prior
             if initial_directory is not directory:
                 raise OfflineAdmissionError("retained path kind changed")
-            current = self._file_info(handle, directory=directory)
+            current = self._file_info(handle, path=path, directory=directory)
             if (
                 self._identity_tuple(current) != self._identity_tuple(initial)
+                or (
+                    not directory
+                    and int(current.nNumberOfLinks)
+                    != int(initial.nNumberOfLinks)
+                )
                 or self._final_path(handle) != path
             ):
                 raise OfflineAdmissionError("retained path identity changed")
@@ -6189,7 +6213,7 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
             raise self._winerror("CreateFileW(open offline identity)")
         value = int(handle)
         try:
-            info = self._file_info(value, directory=directory)
+            info = self._file_info(value, path=path, directory=directory)
             final = self._final_path(value)
             if final != path:
                 raise OfflineAdmissionError(
@@ -6272,7 +6296,7 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
             if collected is not None:
                 collected.extend(chunk)
             total += count
-        after = self._file_info(handle, directory=False)
+        after = self._file_info(handle, path=path, directory=False)
         if (
             total != size
             or self._file_state_tuple(after) != self._file_state_tuple(before)
