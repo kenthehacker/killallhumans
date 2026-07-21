@@ -11123,11 +11123,12 @@ def main(
     return 0
 
 
-def _validate_production_main_module_identity() -> None:
+def _validate_production_main_module_identity() -> Any:
     module = sys.modules.get("__main__")
     spec = getattr(module, "__spec__", None)
     if (
         module is None
+        or getattr(module, "__dict__", None) is not globals()
         or getattr(spec, "name", None) != PROBE_MODULE
         or type(getattr(spec, "origin", None)) is not str
     ):
@@ -11143,6 +11144,22 @@ def _validate_production_main_module_identity() -> None:
         raise OfflineAdmissionError("powered probe execution loader is invalid") from exc
     if loader_origin != ntpath.normpath(spec.origin):
         raise OfflineAdmissionError("powered probe execution origin is inconsistent")
+    return module
+
+
+def _bind_production_main_module_alias() -> None:
+    """Bind exact ``-m`` execution to the canonical reviewed module name."""
+
+    module = _validate_production_main_module_identity()
+    if sys.modules.get("__main__") is not module:
+        raise OfflineAdmissionError("powered probe execution module identity changed")
+    if PROBE_MODULE in sys.modules:
+        raise OfflineAdmissionError(
+            "powered probe canonical module alias was populated before binding"
+        )
+    sys.modules[PROBE_MODULE] = module
+    if sys.modules.get(PROBE_MODULE) is not module:
+        raise OfflineAdmissionError("powered probe canonical module alias changed")
 
 
 __all__ = [
@@ -11229,5 +11246,5 @@ __all__ = [
 
 
 if __name__ == "__main__":  # pragma: no cover - production entry point
-    _validate_production_main_module_identity()
+    _bind_production_main_module_alias()
     raise SystemExit(main())

@@ -109,7 +109,9 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     value = {
         "schema": "aigp-vq2-powered-calibration-live-freeze/1",
         "task_id": contract.TASK_ID,
-        "freeze_id": "vq2-package2-powered-calibration-f00-a01-live-freeze",
+        "freeze_id": (
+            "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01"
+        ),
         "candidate": {
             "commit": COMMIT,
             "code_sha256": contract.canonical_object_sha256(semantic),
@@ -1066,7 +1068,9 @@ def test_import_is_inert_and_cli_is_exact(monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="powered production module is Win32-only")
-def test_real_dash_m_probe_has_production_main_identity_before_cli_refusal():
+def test_real_dash_m_probe_has_production_main_identity_before_cli_refusal(
+    monkeypatch,
+):
     result = subprocess.run(
         [sys.executable, "-E", "-s", "-B", "-m", probe.PROBE_MODULE],
         cwd=Path.cwd(),
@@ -1082,6 +1086,45 @@ def test_real_dash_m_probe_has_production_main_identity_before_cli_refusal():
     assert "--live-freeze-sha256" in stderr
     assert "--expected-commit" in stderr
     assert "exact -m production module" not in stderr
+
+    alias_check = subprocess.run(
+        [
+            sys.executable,
+            "-E",
+            "-s",
+            "-B",
+            "-c",
+            (
+                "import ntpath,runpy,sys\n"
+                f"name={probe.PROBE_MODULE!r}\n"
+                "try:\n"
+                "    runpy.run_module(name,run_name='__main__',alter_sys=True)\n"
+                "except SystemExit as exc:\n"
+                "    assert exc.code == 2\n"
+                "else:\n"
+                "    raise AssertionError('production module did not stop at CLI')\n"
+                "execution=sys.modules[name]\n"
+                "spec=execution.__spec__\n"
+                "assert execution.__name__ == '__main__'\n"
+                "assert spec.name == name\n"
+                "assert execution.__file__ == spec.origin\n"
+                "assert ntpath.normpath(spec.loader.get_filename(name)) == "
+                "ntpath.normpath(spec.origin)\n"
+            ),
+        ],
+        cwd=Path.cwd(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    assert alias_check.returncode == 0, alias_check.stderr.decode(errors="replace")
+
+    monkeypatch.setitem(sys.modules, "__main__", probe)
+    monkeypatch.setitem(sys.modules, probe.PROBE_MODULE, probe)
+    with pytest.raises(probe.OfflineAdmissionError, match="populated before binding"):
+        probe._bind_production_main_module_alias()
 
 
 def test_offline_admission_revalidates_every_semantic_and_origin(tmp_path):

@@ -679,10 +679,15 @@ if canonical_object_sha256(_PLAN_LITERAL) != EXCITATION_PLAN_SHA256:  # import-t
 
 EVIDENCE_ROOT = r"C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot"
 _ATTEMPT_ROOT = EVIDENCE_ROOT + r"\F00-A01"
+_LIVE_FREEZE_ID = (
+    "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01"
+)
 _FROZEN_PATHS = MappingProxyType(
     {
         "evidence_root": EVIDENCE_ROOT,
-        "live_freeze": EVIDENCE_ROOT + r"\live-freeze-F00-A01.json",
+        "live_freeze": (
+            EVIDENCE_ROOT + r"\live-freeze-F00-A01-recovery-01.json"
+        ),
         "attempt_dir": _ATTEMPT_ROOT,
         "attempt_envelope": _ATTEMPT_ROOT + r"\attempt.json",
         "training_attestation": _ATTEMPT_ROOT + r"\training-attestation.json",
@@ -790,7 +795,7 @@ def validate_live_freeze(
     )
     _literal(row["schema"], "aigp-vq2-powered-calibration-live-freeze/1", f"{path}.schema")
     _literal(row["task_id"], TASK_ID, f"{path}.task_id")
-    _literal(row["freeze_id"], "vq2-package2-powered-calibration-f00-a01-live-freeze", f"{path}.freeze_id")
+    _literal(row["freeze_id"], _LIVE_FREEZE_ID, f"{path}.freeze_id")
 
     candidate = _object(
         row["candidate"],

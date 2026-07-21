@@ -89,7 +89,9 @@ def live_freeze() -> dict[str, object]:
     return {
         "schema": "aigp-vq2-powered-calibration-live-freeze/1",
         "task_id": contract.TASK_ID,
-        "freeze_id": "vq2-package2-powered-calibration-f00-a01-live-freeze",
+        "freeze_id": (
+            "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01"
+        ),
         "candidate": {
             "commit": COMMIT,
             "code_sha256": contract.canonical_object_sha256(implementation),
@@ -1393,7 +1395,31 @@ def test_paths_deadlines_and_capability_frames_fail_closed():
 
 def test_live_freeze_attempt_and_process_authority_cross_bind():
     freeze = live_freeze()
+    assert freeze["freeze_id"] == (
+        "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01"
+    )
+    assert freeze["paths"]["live_freeze"] == (
+        contract.EVIDENCE_ROOT + r"\live-freeze-F00-A01-recovery-01.json"
+    )
     assert contract.validate_live_freeze(freeze) == freeze
+
+    predecessor_id = copy.deepcopy(freeze)
+    predecessor_id["freeze_id"] = (
+        "vq2-package2-powered-calibration-f00-a01-live-freeze"
+    )
+    with pytest.raises(contract.PoweredAttemptContractError, match="freeze_id"):
+        contract.validate_live_freeze(predecessor_id)
+
+    predecessor_path = copy.deepcopy(freeze)
+    predecessor_path["paths"]["live_freeze"] = (
+        contract.EVIDENCE_ROOT + r"\live-freeze-F00-A01.json"
+    )
+    with pytest.raises(
+        contract.PoweredAttemptContractError,
+        match=r"paths\.live_freeze",
+    ):
+        contract.validate_live_freeze(predecessor_path)
+
     envelope = attempt()
     assert contract.validate_attempt(envelope, live_freeze=freeze) == envelope
     anchor = 1000
