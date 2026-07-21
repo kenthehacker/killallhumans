@@ -1,19 +1,19 @@
 # AIGP VQ2 development continuation handoff — 2026-07-20
 
-This is the operational starting point for development after Wave 3E. It does
-not authorize simulator access, private capture creation, replay-corpus use,
-production wiring, transport selection, or powered flight.
+This is the operational starting point for development after Wave 3E. This
+document alone grants no simulator, capture, replay, production, transport, or
+powered authority; the exact Package 2 task contract records the current
+user-approved exception.
 
-The strongest current conclusion is deliberately narrow: the Package 2A /
-Package 3B passive capture-ingress tranche is integrated and post-merge
-verified at `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`. Three accepted private
-build-3385 Training preflights now establish exact camera receiver, passive
-perception, and decoded MAVLink message-boundary timing on
-`host-perf-counter`. This advances only the passive receiver portion needed by
-Package 2 and M1. It does not complete either package, establish a calibrated
-camera/IMU offset, measure production no-capture latency, or authorize powered
-work. Do not repeat the completed tranche or create another detached
-proof-only state-estimation wave merely to keep coding.
+The current integrated local-main baseline is
+`f33e4361fd98c558d046879e5762b94600a9a3bb`. It contains the first promoted
+Package 2 powered-calibration implementation. L0 stopped before publishing a
+live freeze, creating attempt A01, contacting FlightSim or fixed ports, or
+capturing a frame because two pre-live integrity gaps remained. Correction
+behavior commit `e87c5e6` closes those environment/import-freeze gaps and is
+under exact-candidate promotion in this successor. The earlier Package 2A /
+Package 3B passive tranche at `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`
+remains accepted historical evidence and must not be repeated.
 
 ## Precedence and required reading
 
@@ -23,12 +23,14 @@ Use this order when resuming:
 2. `docs/aigp/2026-07-18-vq2-handoff.md` for build-3385 live state, the
    verified interface, and the safety contract.
 3. This handoff for current development sequencing and resume gates.
-4. `docs/aigp/2026-07-18-vq2-execution-plan-handoff.md` for program history,
+4. `docs/aigp/tasks/2026-07-20-package2-powered-calibration-pilot.md` for the
+   exact approved scope, executable contract, evidence, and stop conditions.
+5. `docs/aigp/2026-07-18-vq2-execution-plan-handoff.md` for program history,
    ownership, milestones, and orchestration.
-5. `docs/aigp/vq2_local_differential_measurement.md` and
+6. `docs/aigp/vq2_local_differential_measurement.md` and
    `docs/aigp/tasks/2026-07-19-wave3e-local-differential-measurement.md` for
    the Wave 3E contract and accepted evidence.
-6. `docs/aigp/durable_improvement_loop.md` for T0-T5 trust, replay, promotion,
+7. `docs/aigp/durable_improvement_loop.md` for T0-T5 trust, replay, promotion,
    isolation, and campaign semantics.
 
 Stop for human review if these sources conflict. Verified build-3385 VQ2
@@ -56,9 +58,13 @@ inform a design, but it cannot replace empirical build-specific evidence.
 
 - Target: FlightSim build 3385 in Training mode.
 - Current reviewed implementation/evidence baseline:
-  `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0`.
+  `f33e4361fd98c558d046879e5762b94600a9a3bb`.
+- Package 2 behavior commit:
+  `508d43d49c4f2b6704b3d6d51e071157de4ce2a3`.
+- Live-freeze-readiness correction behavior commit: `e87c5e6`; its trusted
+  metadata and exact-candidate promotion are the active successor gate.
 - `cb2b1de` is the Package 2A / Package 3B passive capture-ingress evidence
-  closeout.
+  closeout and remains a historical passive reference.
 - Accepted behavior and live-evidence candidate:
   `a50f4ea0e18b2f5a295fdb1cc94e183734616601`.
 - Passive timing task record:
@@ -103,10 +109,10 @@ M0 and Wave 1A are complete. Waves 1 through 3E are integrated and
 post-merge verified offline, the bounded promotion-hygiene maintenance is
 complete, and the passive capture-ingress tranche has accepted 2026-07-20
 FlightSim evidence. M1, M2, and M4 runtime acceptance remain incomplete. The
-new receiver evidence is capture-loaded and passive only. The later Package 2
-readiness freeze adds no simulator or behavioral evidence. The authoritative
-2026-07-18 handoff still governs live flight state and every powered safety
-rule.
+passive receiver evidence is capture-loaded and passive only. Package 2's
+current implementation and correction add no live simulator evidence. The
+authoritative 2026-07-18 handoff still governs live flight state and every
+powered safety rule.
 
 The system is not race-ready. Gate 0 has one credited collision-free pass and
 Gate 1 has three-frame post-credit reacquisition evidence, but no control
@@ -157,8 +163,26 @@ transport without the later reviewed contracts below.
 
 ## Verification and trust baseline
 
-The current hash-pinned trusted state is passive-tranche integration commit
-`cb2b1de`. Accepted tranche verification is:
+The current integrated hash-pinned trusted state is Package 2 commit
+`f33e436`. Its accepted exact-candidate evidence is:
+
+| Evidence | Observed result |
+|---|---|
+| Package 2 behavior commit | `508d43d49c4f2b6704b3d6d51e071157de4ce2a3` |
+| Trusted-metadata/integration commit | `f33e4361fd98c558d046879e5762b94600a9a3bb` |
+| Fresh exact-commit `test-full-non-live` | `3,357` passed, `22` skipped |
+| Fresh isolated hash-pinned VQ2 | `2,133` passed |
+| Detached post-merge VQ2 | `2,216` passed, `1` skipped |
+
+The live-freeze correction at `e87c5e6` has `246` directly affected passes,
+`2,225` canonical VQ2 passes with `1` skip, and `3,325` fast/unit passes with
+`21` skips and `42` deselections. Its reviewed 42-test trusted policy expects
+`2,142` passes, which a local strict validation achieved. Those are
+pre-promotion correction results; the fresh exact-candidate full-suite and
+hash-pinned runs, integration, and post-merge gate remain mandatory.
+
+The following table is historical accepted passive-tranche evidence at
+`cb2b1de`, not the current trust identity:
 
 | Evidence | Observed result |
 |---|---|
@@ -199,7 +223,7 @@ one-ULP boundaries, dense covariance scales from `1e-250` through `1e6`, and
 tolerated versus material negative modes. This remains synthetic T0 evidence,
 not covariance calibration or replay acceptance.
 
-Current trust identities are:
+Historical passive-tranche trust identities were:
 
 | Item | Identity |
 |---|---|
@@ -210,47 +234,40 @@ Current trust identities are:
 | Wave 3E test SHA-256 | `683aa081103e6e9ae22281b1e1f573bc821218f57df75cdfa688587b0ad84382` |
 | VQ1 runner test SHA-256 | `977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07` |
 
-The policy contains `36` sorted, unique test files plus `2` discovery inputs
+That historical policy contains `36` sorted, unique test files plus `2` discovery inputs
 and expects `1,480` passes. The trusted manifest contains `142` sorted,
 case-unique paths; independent rehash matched all `142/142` regular on-disk
 files. Canonical JSON identities are SHA-256 over parsed JSON serialized with
 sorted keys and compact separators.
 
-The `1,480`-test result is not operational T1 replay. The checked-in promotion
-command and ladder identity files are examples with placeholders or zero
-hashes. The required production command, identities, and candidate documents
-are absent. The ignored schema-v2 `.aigp-loop/trials.sqlite3` ledger is
-operationally empty: zero trials, checkpoints, leases, promotion rounds, and
-imports. Preserve it, but there is no operational T0-T4 run to resume.
+That `1,480`-test result is not operational T1 replay. The checked-in promotion
+command and ladder identity files were examples with placeholders or zero
+hashes. At that passive checkpoint, the required production command,
+identities, and candidate documents were absent, and the ignored schema-v2
+`.aigp-loop/trials.sqlite3` ledger was operationally empty. Those are
+historical facts, not a current Package 2 gate assessment.
 
 ## Repository, worktrees, and physical hygiene
 
-Immediately before the Package 2 closeout documentation edits, Git tracked
-status on `main` was empty. Twenty-five non-main worktrees remain registered:
-fifteen pre-maintenance historical worktrees, four maintenance worktrees, five
-passive-timing tranche worktrees, and the Package 2 readiness worktree. Their
-commits are ancestors of `main`; they are inactive historical, readiness, or
-promotion evidence, not current leases or candidate bases. Do not resume or
-remove them automatically. Inspect with:
+Git tracked status on `main` was empty at Package 2 correction entry. Multiple
+historical, readiness, development, and promotion worktrees remain registered;
+their count is not a durable identity. The active correction worktree is
+`wt-package2-live-freeze-readiness`. The designated
+`wt-package2-powered-calibration-live` worktree remains unused: it has no live
+freeze and no consumed attempt. Do not resume or remove another worktree
+automatically. Inspect the current facts with:
 
 ```powershell
 git worktree list --porcelain
 git status --short --branch
 ```
 
-The completed maintenance added one development, one full-suite, one isolated
-VQ2, and one documentation-closeout worktree. The passive tranche added one
-development worktree plus the `candidate`, `candidate2`, `final`, and
-`promotion-final` evidence worktrees. Package 2 added one documentation-only
-readiness worktree. All ten are inactive evidence after this closeout, not
-reusable candidate bases; do not remove them automatically.
-
-Git-clean is not promotion-pristine. Current `main` has six ignored
-source-adjacent `.pyc` files under `__pycache__/`, `aigp_loop/__pycache__/`,
-and `scripts/__pycache__/`. Do not delete unexplained ignored state merely to
-make a report clean, and do not use `main` as a strict promotion candidate.
-Create a fresh exact worktree for every new task and another fresh exact
-candidate for the final hash-pinned promotion run.
+Historical worktrees are evidence, not reusable candidate bases. Git-clean is
+also not promotion-pristine: inventory ignored executable/cache state at each
+gate and do not rely on a stale exact count. Do not delete unexplained ignored
+state merely to make a report clean, and do not use `main` as a strict
+promotion candidate. Create fresh exact worktrees for full-suite and
+hash-pinned promotion.
 
 At maintenance entry, the main worktree also contained 40 ignored capture
 files alongside five tracked historical captures. They were preserved as
@@ -262,9 +279,10 @@ ordinal relative-path order, with no trailing newline.
 Do not delete, relabel, or infer provenance for those files automatically.
 
 Use the current deliberately reviewed local `main` containing this handoff as
-the base. `cb2b1de` is the passive implementation/trust/evidence integration
-reference. A future task starts as follows only after one entry gate is
-actually satisfied, using unique names confirmed not to exist:
+the base. `f33e436` is the Package 2 implementation/trust integration baseline;
+`cb2b1de` remains the passive historical reference. A future task starts as
+follows only after one entry gate is actually satisfied, using unique names
+confirmed not to exist:
 
 ```powershell
 $vq2TaskBase = (git rev-parse main).Trim()
@@ -340,8 +358,8 @@ $env:AIGP_PYTHON = 'C:\Users\John\killallhumans\.venv\Scripts\python.exe'
 targeted slow or benchmark test. Run affected tests after each edit. Run
 `test-vq2` for each accepted candidate. Use `test-slow` and `test-benchmark`
 only for their explicit tiers. Use `test-full-non-live` only at a promotion
-boundary; the current full suite takes about eight minutes, so the calling
-shell needs an outer ceiling longer than the suite.
+boundary; the current full suite has taken about thirteen minutes, so the
+calling shell needs an outer ceiling longer than the suite.
 
 For the final strict candidate only, after verifying a fresh exact worktree:
 
@@ -385,24 +403,39 @@ prerequisite honestly.
 
 ## Current resume decision
 
-The user supplied private full-frame storage/use authority and passive
-build-3385 simulator authority for the bounded Package 3B timing tranche. The
-accepted implementation now provides a durable exclusive live lease and three
-accepted passive timing captures with exact ingress/receive timestamps,
-queue/drop/high-water evidence, outbound audit, cleanup proof, and the timing
-dossier identified above. That bounded entry gate was satisfied and the
-tranche is integrated; it must not be described as still blocked or repeated.
+The Package 2 separately authorized-collection entry gate is satisfied for
+exactly one bounded build-3385 Training `calibration-excite` pilot after all
+offline promotion and L0 freeze checks pass. The user approved routine
+in-contract work without repeated permission prompts, no cooked-PAK
+extraction, configurable and changeable nominal gate facts, simulator-observed
+camera/IMU/timing/stream facts, and private decoded capture for this simulation
+task only. That authority does not transfer to physical/HIL/submission/public
+use, a second attempt, another powered stage, or Gate 0/Gate 1 work.
+
+The first Package 2 implementation was promoted and integrated at `f33e436`.
+L0 then stopped before freeze publication, A01 creation, simulator/port
+contact, or capture because the launcher environment was not cross-bound to
+the native frozen environment and no production initial import-inventory
+builder existed. Correction behavior `e87c5e6` fixes those gaps. Its next gate
+is trusted-metadata regeneration, fresh full non-live and hash-pinned VQ2
+promotion, exact integration, and detached post-merge VQ2. Only then may L0
+derive and independently review the live freeze. No attempt has been consumed.
+
+The earlier Package 3B timing tranche remains integrated historical evidence
+with three accepted passive captures. It must not be described as blocked or
+repeated.
 
 M1 itself is not complete. Consequential follow-on work still requires the
 specific entry gate for that package: full Package 2 calibration inputs
 (including the required camera/IMU calibration and timing/measurement model),
 the no-send 50 Hz shadow scheduler and production handoff/deadline/skip
 evidence, and—before operational replay—the approved labeled corpus, final
-processor, calibrated policy, and pinned OS isolation wrapper. Any powered
-FlightSim stage also requires fresh explicit powered authorization. Absent one
-of those remaining prerequisites, do not reinterpret the passive tranche,
-canonical tests, or Wave 3D/E synthetic evidence as calibration, operational
-replay, completed runtime, or powered evidence.
+processor, calibrated policy, and pinned OS isolation wrapper. The exact
+Package 2 pilot already has conditional task-specific authorization; any other
+powered FlightSim stage requires its own frozen contract and authorization.
+Absent one of those remaining prerequisites, do not reinterpret the passive
+tranche, canonical tests, or Wave 3D/E synthetic evidence as calibration,
+operational replay, completed runtime, or powered evidence.
 
 The current continuation selected Package 2 because its entry gate permits
 separately authorized collection, then froze and independently reviewed the
@@ -415,12 +448,10 @@ provide no across-image intrinsic support, hand-eye rotation, or temporal-
 offset excitation and cannot be upgraded into Package 2 calibration.
 
 Package 2 remains incomplete. Do not repeat the static passive collection or
-implement a detached fitter against it. Resume Package 2 only after an approved
-build-3385 render/mount/time oracle or non-flight reference protocol satisfies
-the frozen readiness conditions, or after the user freshly authorizes a
-separately frozen powered calibration stage. The previous collection authority
-does not transfer through this handoff into new simulator contact or private
-capture creation.
+implement a detached fitter against it. The exact separately frozen powered
+pilot is now the active path, subject to correction promotion and independent
+L0 freeze review. The earlier passive authority does not transfer; simulator
+and private-capture authority comes only from the exact Package 2 task contract.
 
 ## Consequential development roadmap
 
@@ -656,11 +687,13 @@ reviewed proof carrier required by its authority owner.
 
 ## Separate bounded live path
 
-The first live change remains the independently reviewed bounded Gate 1
-recenter stage. Wave 3E is neither a prerequisite nor an excuse to broaden it.
-Entry requires M1 timing/simulator evidence, M2 replay/tracker-isolation
-acceptance, a frozen stage plan, the exclusive simulator lease, and fresh
-explicit powered authorization.
+The Package 2 `calibration-excite` pilot is the active separate bounded live
+path. It is discovery-only and grants no Gate 0/Gate 1 approach or passage
+authority. The independently reviewed Gate 1 recenter stage remains a later,
+separate path: Wave 3E is neither a prerequisite nor an excuse to broaden it,
+and its entry still requires M1 timing/simulator evidence, M2
+replay/tracker-isolation acceptance, a frozen stage plan, the exclusive
+simulator lease, and its own authorization.
 
 The stage moves the captured high-right Gate 1 target toward a conservative
 image corridor, then stops on corridor or timeout and proves cleanup. It does
@@ -668,10 +701,10 @@ not attempt passage and aborts on any unexpected gate-index transition.
 
 `preflight` is passive and sends no arm or flight target, but it still contacts
 the simulator and binds live ports, so it requires lease coordination. Every
-`sign-id`, `hover`, `gate0`, `gate0-observe`, Gate 1, system-ID, or other
-powered stage requires fresh explicit authorization and must run only from the
-integration worktree. This handoff makes no claim that FlightSim is currently
-running or responsive.
+`sign-id`, `hover`, `gate0`, `gate0-observe`, Gate 1, system-ID, or powered
+stage other than the exact Package 2 pilot requires its own contract and
+authorization and must run only from its designated integration worktree. This
+handoff makes no claim that FlightSim is currently running or responsive.
 
 The authoritative live safety contract remains unchanged:
 
@@ -746,8 +779,8 @@ generated traces, or open-loop replay as FlightSim or closed-loop evidence.
 
 Stop rather than manufacture progress when:
 
-- no real calibration, producer, replay, isolation, or simulator-authority
-  prerequisite has arrived;
+- the selected task's concrete calibration, producer, replay, isolation, or
+  simulator-authority prerequisite is not actually satisfied;
 - proposed work adds only more detached synthetic scaffolding without advancing
   M1, M2, M4, or promotion hygiene;
 - anyone proposes deriving Wave 3E input from `/1`, fitted corners,
@@ -756,9 +789,8 @@ Stop rather than manufacture progress when:
 - anyone proposes a downstream rate/state built from zero-rate placeholders or
   naive finite differences without a reviewed sequential model;
 - a candidate differs from its declared base, a candidate contains ignored
-  executable source state, tracked `main` is unexpectedly dirty, or `main`
-  gains new/unattributed ignored executable state beyond the documented
-  six-file bytecode baseline;
+  executable source state, tracked `main` is unexpectedly dirty, or any
+  new/unattributed ignored executable state appears;
 - a policy count, trusted digest, discovery input, dependency, or required test
   result drifts;
 - work would wire Wave 3D/E, corrected-ray evidence, scheduler output, or a

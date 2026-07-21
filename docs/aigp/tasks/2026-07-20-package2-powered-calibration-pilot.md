@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `I0 implementation complete; local T0 gates green; exact-candidate promotion pending; no simulator contact`
+- State: `first T0/T1 integrated at f33e436; live-freeze-readiness correction behavior committed at e87c5e6 and trusted promotion pending; no simulator contact`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -10,6 +10,9 @@
 - Branch: `package2-powered-calibration`.
 - Worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration`.
+- Active correction branch: `package2-live-freeze-readiness`.
+- Active correction worktree:
+  `C:\Users\John\aigp-worktrees\wt-package2-live-freeze-readiness`.
 - Future integration-owner-controlled detached live worktree, created only from
   the exact T1-integrated local-main commit and designated as the sole powered
   integration worktree for this task:
@@ -2853,6 +2856,19 @@ import-graph and environment/freeze-binding reviews both returned `CLEAR`.
 These results are local correction evidence only; the exact-commit full
 non-live, hash-pinned VQ2, integration, and detached post-merge gates remain
 required.
+
+Integration-owner metadata review added only
+`scripts/aigp_vq2_powered_import_audit.py` to the prior `156`-path trusted set
+and changed exactly the six expected digests. The resulting `157`-path
+manifest has raw/canonical SHA-256
+`3663febcb537eac7c07f363cd5ab501b47728bb14bf9603d8f93fb484551aa37` /
+`da95db55b2e1172b8bc7d854d9790557085535b8729ec95aa32b0f90344ed0f0`.
+The 42-test policy now expects `2142` passes and has raw/canonical SHA-256
+`5f02c6d18b5ab9216af3ae21f79a48538d263db0aa79437b26e59a61603ea5e7` /
+`0b858ab81249cd5c7fe19a32aaf314ca8135eea6a411bd8487e31eaff806dd25`.
+Independent path/digest/closure review returned `CLEAR`, and a local strict
+hash-pinned validation passed all `2142` tests. This is metadata validation,
+not the required fresh exact-candidate promotion run.
 
 No FlightSim process, port, frame capture, reset, arm/disarm, target, or powered
 command has occurred. No PAK is read, and the completed passive timing tranche
