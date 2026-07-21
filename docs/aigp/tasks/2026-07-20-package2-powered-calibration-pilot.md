@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `PowerShell correction promoted and integrated at c4e2a26; predecessor L0 freeze published; exact production -m invocation then failed closed before F00-A01 because its canonical module alias was absent; recovery behavior/trust committed at 9028150/2e919ee with fresh promotion pending`
+- State: `recovery-01 promoted and integrated at 5000ece and its append-only L0 published; exact production admission then failed closed before F00-A01 on the target host's exact SystemTimeOfDayInformation ABI; recovery-02 behavior/trust committed at 3a641c8/a1f55a1 with fresh promotion pending`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -14,15 +14,15 @@
 - Active correction worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-live-freeze-readiness`.
 - Designated integration-owner-controlled detached live worktree, rebuilt at
-  `c4e2a26` for the predecessor L0 publication and pre-attempt production
+  `5000ece` for recovery-01 L0 publication and pre-attempt production
   admission. It has no attempt or poison and must be rebuilt at the final exact
-  recovery commit before replacement L0 publication:
+  recovery-02 commit before replacement L0 publication:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration-live`.
 - Owner and integration owner: `/root`.
 - Heartbeat date: `2026-07-21`.
 - Simulator target: FlightSim build 3385, Training mode.
-- Private root, containing the immutable predecessor L0 support set but no
-  attempt directory or poison:
+- Private root, containing the immutable original and recovery-01 L0 support
+  sets but no attempt directory or poison:
   `C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot`.
 - Maximum live scope after every entry gate passes: one accepted powered
   discovery session; the first failed live attempt ends live work.
@@ -973,20 +973,22 @@ cleanup scope intentionally carries null plan identity.
 
 ### Live freeze, sole operator command, and paths
 
-The predecessor L0 created and independently reviewed one immutable
+The original L0 created and independently reviewed one immutable
 `aigp-vq2-powered-calibration-live-freeze/1` at
-`<root>\live-freeze-F00-A01.json`. Exact production admission later refused
-before attempt creation, so that file remains historical and inactive. The
-append-only recovery L0 must stable-hash all six predecessor root files, prove
-`F00-A01` and poison absent, and create exactly one replacement executable
-freeze at `<root>\live-freeze-F00-A01-recovery-01.json`; it may not overwrite,
-rename, delete, or reinterpret the predecessor. The replacement keeps schema
+`<root>\live-freeze-F00-A01.json`. Recovery-01 later created a second immutable
+freeze at `<root>\live-freeze-F00-A01-recovery-01.json`. Exact production
+admission refused before attempt creation under each accepted predecessor, so
+both files remain historical and inactive. The append-only recovery-02 L0 must
+stable-hash all eleven predecessor root files, prove `F00-A01` and poison
+absent, and create exactly one replacement executable freeze at
+`<root>\live-freeze-F00-A01-recovery-02.json`; it may not overwrite, rename,
+delete, or reinterpret either predecessor set. The replacement keeps schema
 `/1` because its shape and powered semantics are unchanged. Its exact top-level keys are
 `schema`, `task_id`, `freeze_id`, `candidate`, `session`, `inputs`, `runtime`,
 `simulator`, `transport`, `execution`, `paths`, and `deadline_durations_ns`:
 
 - `task_id` is `vq2-package2-powered-calibration-pilot`; `freeze_id` is
-  `vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-01`.
+  `vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-02`.
 - `candidate` has exact keys `commit`, `code_sha256`, `live_worktree`,
   `detached_head_required`, `clean_tracked_untracked_ignored_required`, and
   `implementation_inventory`. The two booleans are true; the inventory has
@@ -1052,7 +1054,7 @@ rename, delete, or reinterpret the predecessor. The replacement keeps schema
 `cleanup_stderr`, and `live_poison`. The root is
 `C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot`;
 the sole executable freeze is
-`<root>\live-freeze-F00-A01-recovery-01.json`; the attempt directory is
+`<root>\live-freeze-F00-A01-recovery-02.json`; the attempt directory is
 `<root>\F00-A01`; the registry is
 `<root>\split-registry\registry-000001.json`; and poison is
 `<root>\live-poison.json`. Attempt basenames respectively are `attempt.json`,
@@ -1066,14 +1068,15 @@ the sole executable freeze is
 `attempt-complete.json`, `attempt-invalid.json`, `cleanup-stdout.json`, and
 `cleanup-stderr.txt`.
 
-The recovery preparer publishes these five unique recovery L0 files create-new
-in the existing root, in this order, with the freeze last:
-`plan-recovery-01.json`, `implementation-inventory-recovery-01.json`,
-`environment-inventory-recovery-01.json`,
-`import-inventory-recovery-01.json`, and
-`live-freeze-F00-A01-recovery-01.json`. The predecessor six-file set remains
-byte-identical beside them. Neither freeze filename is attempt-like; the one
-unchanged `<root>\F00-A01` directory remains the sole consumption latch.
+The recovery-02 preparer publishes these five unique L0 files create-new in the
+existing root, in this order, with the freeze last:
+`plan-recovery-02.json`, `implementation-inventory-recovery-02.json`,
+`environment-inventory-recovery-02.json`,
+`import-inventory-recovery-02.json`, and
+`live-freeze-F00-A01-recovery-02.json`. The predecessor eleven-file set remains
+byte-identical beside them, and the final pre-attempt root has exactly sixteen
+files. None of the freeze filenames is attempt-like; creation of the one
+protected `<root>\F00-A01` directory remains the sole consumption latch.
 
 From `candidate.live_worktree` as the exact current directory, the only
 operator argv is:
@@ -2969,8 +2972,9 @@ the reviewed canonical name and rechecks identity. This matches the frozen
 two-name import inventory without relaxing `module_origin`. The same commit
 changes only the accepted freeze ID/path to the append-only `recovery-01`
 literals while preserving the root, F00, F00-A01, attempt limit, poison,
-launcher, transport, powered plan, and cleanup contract. Existing tests now
-accept only the recovery ID/path and explicitly reject the predecessor values.
+launcher, transport, powered plan, and cleanup contract. Tests for that
+historical candidate accepted only the recovery-01 ID/path and explicitly
+rejected the original predecessor values.
 Independent code and recovery-contract reviews returned `CLEAR`; the affected
 attempt/probe suites passed `246`, and canonical VQ2 passed `2225` with `1`
 skip.
@@ -2980,17 +2984,79 @@ source, and their two existing test digests. The `157`-path manifest remains
 count-identical and has raw/canonical SHA-256
 `fe50b3e909d03f6427a58431882d5ced35d3036bfd58298e78cc1368f388b27c` /
 `587b5a8e7cef0ed11f0a09ac4087468027ec1ae05341ab3728c90a1fffed52f3`.
-The 42-test policy remains byte-identical at `2142` expected passes. Fresh fast,
-unit, full non-live, separate strict, integration, detached post-merge VQ2, and
-independently reviewed replacement L0 publication remain mandatory before the
-single powered child may be created.
+The 42-test policy remained byte-identical at `2142` expected passes. At that
+point fresh fast, unit, full non-live, separate strict, integration, detached
+post-merge VQ2, and independently reviewed replacement L0 publication were
+still mandatory; they subsequently passed or completed as recorded below.
 
-The recovery preparer must preserve and exact-hash all six predecessor root
-files, publish the five `recovery-01` L0 files create-new with the freeze
-last, and require the final root to contain exactly those eleven files before
-attempt consumption. The original capture authorization and target config
-remain byte-identical because the private root, simulator-only data scope,
-nominal geometry, and observed-stream contract did not change. This correction
-does not authorize a second attempt: `<root>\F00-A01` remains the one and only
-consumption latch. No PAK was read, and the completed passive timing tranche
-was not repeated.
+The recovery-01 preparer was required to preserve and exact-hash all six
+predecessor root files, publish the five `recovery-01` L0 files create-new with
+the freeze last, and require the final root to contain exactly those eleven
+files before attempt consumption. The original capture authorization and
+target config remained byte-identical because the private root,
+simulator-only data scope, nominal geometry, and observed-stream contract did
+not change. That correction did not authorize a second attempt:
+`<root>\F00-A01` remained the one and only consumption latch. No PAK was read,
+and the completed passive timing tranche was not repeated.
+
+### Recovery-01 publication and recovery-02 pre-attempt correction
+
+The production-module correction was promoted unchanged through exact final
+candidate `5000ecedbe2de06b4847ce6e79483f65db79d32b`. Its accepted evidence was
+`246` directly affected passes, `2225` canonical VQ2 passes with `1` skip,
+`3325` fast and unit passes each, with `21` skips and `42` deselections per
+suite, `3366` fresh
+full-non-live passes with `22` skips, `2142` separate strict hash-pinned passes,
+and `2225` detached post-merge VQ2 passes with `1` skip. The designated live
+worktree was then rebuilt detached and clean at that exact commit.
+
+An independently reviewed recovery-01 preparer with SHA-256
+`e2da295adbf63f31552a89ba80fa3376f5f6f1b1321aaeb3f771cca8caa98015`
+derived two byte-identical canonical bundles with SHA-256
+`43d4bed3a23fb593ce8c2d54415b130300718d1b9acc19042ed46a67f3d39cb6`.
+It exact-admitted the six immutable predecessor files, then published the five
+recovery-01 files create-new with the freeze last. The recovery-01 file hashes
+are plan `ecaf1912a495cb91ed96fed8b61fc2ff8caa7828534fe2b7c142acf0984e500d`,
+implementation `f9e1d3da9a0128657439e82b1af7489dcf4bb77c5b8a7a0b2d4093e6f79f9589`,
+environment `3df4d94643b5fe5c5807c7f72859f02e6f0c23e3fcfa302cb3f10bf8cb416dd0`,
+imports `01a8b07a07950de5cb644367898a72b8ca6ab386dfd02fa1c9b3c25318b817be`,
+and freeze `7e40953814bea81515f2a630680998f71c4603b28dd59764c131529fb8db3821`.
+The root audit proved exactly eleven one-link, non-reparse, current-user-only
+effective-ACL files, with `F00-A01` and poison absent.
+
+The first recovery-01 console wrapper failed offline because `cmd.exe` injected
+the hidden drive-current-directory environment entry `=C:`. The frozen
+environment correctly rejected 53 variables against its exact 52-variable
+semantic payload; production does not filter or relax that payload. An
+exact-environment PowerShell console then reached the next offline fact and
+refused with `host boot FILETIME query failed`. On this target,
+`NtQuerySystemInformation(SystemTimeOfDayInformation)` accepts the exact
+48-byte structure (`status=0`, `ReturnLength=48`) and rejects 64 or 128 bytes
+with `STATUS_INFO_LENGTH_MISMATCH` while reporting required length 48. Every
+invocation stopped before `F00-A01`, lease, launcher, simulator, fixed ports,
+frame, reset, arm/disarm, target, powered command, or poison.
+
+Recovery-02 behavior commit
+`3a641c8dd8fb21fd3112143464d15a2feaef07d7` pins class 3 and the full 48-byte
+ABI, accepts only exact zero status and exact returned length 48, and retains
+the positive first-QWORD boot-FILETIME check and existing boot-ID formula. It
+also moves only the accepted freeze ID/path to append-only `recovery-02`; tests
+explicitly reject both original and recovery-01 values. Native and fake-query
+regressions are count-preserving, independent review returned `CLEAR`, and the
+detached affected suite passed `246`.
+
+Trusted-metadata commit `a1f55a1` changes exactly the attempt source, probe
+source, and their two existing test digests. The `157`-path manifest remains
+count-identical and has raw/canonical SHA-256
+`b27d354ecb6747fdf3f1b5421b4fdfcc3cd373c1f2b0115118875c870e169d99` /
+`44a27d2188a83a252208fbdaec2bfb6a98c0dd3a2f5ac7561652ea6ab8b6ba0c`.
+The 42-test policy remains byte-identical at `2142` expected passes. Fresh
+fast, unit, exact-candidate full non-live, separate strict, integration, and
+detached post-merge VQ2 remain mandatory before recovery-02 L0 publication.
+
+The recovery-02 preparer must exact-admit the immutable eleven-file root,
+publish the five uniquely named recovery-02 files create-new with the freeze
+last, and require exactly sixteen final files while `F00-A01` and poison remain
+absent. This is not a second attempt: the sole attempt latch has never been
+consumed. No PAK was read, and the completed passive timing tranche was not
+repeated.

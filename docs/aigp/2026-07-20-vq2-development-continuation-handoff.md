@@ -7,17 +7,19 @@ conditional simulator/private-capture authority and single powered pilot; it
 grants no replay, production, or transport authority.
 
 The current integrated local-main baseline is
-`c4e2a2691af543b63607034bf79f43c7dd67471a`. It contains the promoted Package 2
-PowerShell component-store correction. The original five-file L0 set was then
-published create-new with the freeze last, but the exact production `-m`
-command failed closed before `F00-A01` because offline admission could not
-resolve the running probe under its canonical module key. Recovery
-behavior/trust commits
-`9028150` / `2e919ee` bind the validated `__main__` execution object under that
-canonical name and move only the accepted freeze ID/path to append-only
-`recovery-01`; they are under fresh exact-candidate promotion. The original
-freeze remains immutable and inactive. No A01, simulator/port contact, or frame
-capture occurred. The earlier Package 2A / Package 3B passive tranche at
+`5000ecedbe2de06b4847ce6e79483f65db79d32b`. It contains the promoted Package 2
+production-module correction. The append-only recovery-01 five-file L0 set was
+then independently reviewed and published create-new with the freeze last.
+Production admission again failed closed before `F00-A01`: a `cmd.exe` parent
+first injected hidden environment entry `=C:`, and the exact-environment
+invocation then exposed that this Windows target requires an exact 48-byte
+`SystemTimeOfDayInformation` buffer rather than the implemented 64 bytes.
+Recovery-02 behavior/trust commits `3a641c8` / `a1f55a1` pin that exact ABI and
+move only the accepted freeze ID/path to append-only `recovery-02`; they are
+under fresh exact-candidate promotion. The original and recovery-01 freezes
+remain immutable and inactive. No A01, simulator/port contact, frame capture,
+PAK access, reset, arm/disarm, target, or powered command occurred. The earlier
+Package 2A / Package 3B passive tranche at
 `cb2b1decdfe7d2fd82de803fc1510ee569cc4ef0` remains accepted historical
 evidence and must not be repeated.
 
@@ -64,7 +66,7 @@ inform a design, but it cannot replace empirical build-specific evidence.
 
 - Target: FlightSim build 3385 in Training mode.
 - Current reviewed implementation/evidence baseline:
-  `c4e2a2691af543b63607034bf79f43c7dd67471a`.
+  `5000ecedbe2de06b4847ce6e79483f65db79d32b`.
 - Package 2 behavior commit:
   `508d43d49c4f2b6704b3d6d51e071157de4ce2a3`.
 - Environment/import freeze-readiness behavior/trust commits:
@@ -76,8 +78,10 @@ inform a design, but it cannot replace empirical build-specific evidence.
   `f4152c072330836939c00fc342f90d6d3d07bc91`; promoted and integrated through
   `c4e2a2691af543b63607034bf79f43c7dd67471a`.
 - Exact production-module binding and append-only recovery behavior/trust
-  commits: `9028150` / `2e919ee`; fresh exact-candidate promotion is the active
-  successor gate.
+  commits: `9028150` / `2e919ee`; promoted and integrated through `5000ece`.
+- Exact host-boot ABI and append-only recovery-02 behavior/trust commits:
+  `3a641c8dd8fb21fd3112143464d15a2feaef07d7` / `a1f55a1`; fresh
+  exact-candidate promotion is the active successor gate.
 - `cb2b1de` is the Package 2A / Package 3B passive capture-ingress evidence
   closeout and remains a historical passive reference.
 - Accepted behavior and live-evidence candidate:
@@ -179,31 +183,43 @@ transport without the later reviewed contracts below.
 ## Verification and trust baseline
 
 The current integrated hash-pinned trusted state is Package 2 commit
-`c4e2a2691af543b63607034bf79f43c7dd67471a`. Its accepted exact-candidate
+`5000ecedbe2de06b4847ce6e79483f65db79d32b`. Its accepted exact-candidate
 evidence is:
 
 | Evidence | Observed result |
 |---|---|
-| PowerShell admission behavior commit | `298535969a0f49dd078ed5a4da99ed2e585f6282` |
-| Trusted-metadata commit | `f4152c072330836939c00fc342f90d6d3d07bc91` |
-| Documentation/final integrated commit | `c4e2a2691af543b63607034bf79f43c7dd67471a` |
+| Production-module/recovery-01 behavior commit | `9028150` |
+| Trusted-metadata commit | `2e919ee` |
+| Documentation/final integrated commit | `5000ecedbe2de06b4847ce6e79483f65db79d32b` |
 | Fresh exact-commit `test-full-non-live` | `3,366` passed, `22` skipped |
 | Fresh isolated hash-pinned VQ2 | `2,142` passed |
 | Detached post-merge VQ2 | `2,225` passed, `1` skipped |
 
-The production-module/recovery correction at `9028150` has `246` directly
-affected attempt/probe passes and `2,225` canonical VQ2 passes with `1` skip.
-It binds exact `-m` execution under the canonical reviewed module name and
-changes only the accepted live-freeze ID/path to append-only `recovery-01`;
-the root, F00-A01 latch, attempt limit, powered plan, and safety boundaries are
-unchanged. Trusted commit `2e919ee` changes exactly four existing manifest
-digests. The `157`-path manifest has raw/canonical SHA-256
-`fe50b3e909d03f6427a58431882d5ced35d3036bfd58298e78cc1368f388b27c` /
-`587b5a8e7cef0ed11f0a09ac4087468027ec1ae05341ab3728c90a1fffed52f3`.
-The 42-test policy remains byte-identical at `2,142` expected passes. These are
-pre-promotion recovery results; fresh fast, unit, exact-candidate full-suite,
-separate hash-pinned, integration, and detached post-merge gates remain
-mandatory.
+The integrated production-module/recovery-01 correction has `246` directly
+affected attempt/probe passes, `2,225` canonical VQ2 passes with `1` skip,
+`3,325` fast and unit passes each, with `21` skips and `42` deselections per
+suite, `3,366`
+fresh full-non-live passes with `22` skips, and `2,142` separate strict passes.
+Its recovery-01 preparer/bundle/freeze SHA-256 values are respectively
+`e2da295adbf63f31552a89ba80fa3376f5f6f1b1321aaeb3f771cca8caa98015`,
+`43d4bed3a23fb593ce8c2d54415b130300718d1b9acc19042ed46a67f3d39cb6`,
+and `7e40953814bea81515f2a630680998f71c4603b28dd59764c131529fb8db3821`.
+Publication left an exact eleven-file private root with both `F00-A01` and
+poison absent; the unchanged `F00-A01` path remains the sole future consumption
+latch.
+
+Recovery-02 behavior `3a641c8` requires class 3, exact buffer and returned
+length 48, exact zero NTSTATUS, and a positive first-QWORD boot FILETIME. It
+changes only the accepted freeze ID/path to append-only `recovery-02`; the root,
+F00-A01 latch, attempt limit, powered plan, and safety boundaries are unchanged.
+Its detached directly affected suite passes `246`, and independent ABI/code
+review is `CLEAR`. Trusted commit `a1f55a1` changes exactly four existing
+manifest digests. The `157`-path manifest has raw/canonical SHA-256
+`b27d354ecb6747fdf3f1b5421b4fdfcc3cd373c1f2b0115118875c870e169d99` /
+`44a27d2188a83a252208fbdaec2bfb6a98c0dd3a2f5ac7561652ea6ab8b6ba0c`.
+The 42-test policy remains byte-identical at `2,142` expected passes. Fresh
+fast, unit, exact-candidate full-suite, separate hash-pinned, integration, and
+detached post-merge gates remain mandatory.
 
 The following table is historical accepted passive-tranche evidence at
 `cb2b1de`, not the current trust identity:
@@ -439,27 +455,29 @@ camera/IMU/timing/stream facts, and private decoded capture for this simulation
 task only. That authority does not transfer to physical/HIL/submission/public
 use, a second attempt, another powered stage, or Gate 0/Gate 1 work.
 
-The first Package 2 implementation was promoted and integrated at `f33e436`.
-The environment/import correction was then promoted and integrated unchanged
-through `0ac02a0`. The PowerShell boundary correction was then promoted and
-integrated through `c4e2a26`, with fresh full non-live, strict hash-pinned, and
-detached post-merge evidence recorded above. A separately reviewed preparer
-published the original five-file L0 set create-new, with the freeze last.
-The exact production wrapper then failed closed before attempt creation with
-`module has no file-backed origin`: pinned CPython `-m` execution populated
-`__main__`, while admission required the canonical probe key. The private root
-therefore contains the immutable predecessor six-file root, but neither
-`F00-A01` nor poison exists; the launcher, simulator, and fixed ports were not
-reached.
+The first Package 2 implementation and its environment/import, PowerShell, and
+production-module corrections were promoted and integrated through `5000ece`.
+The original and recovery-01 L0 sets were independently reviewed and published
+append-only, each with its freeze last. The recovery-01 root now contains
+exactly eleven immutable support files, but neither `F00-A01` nor poison exists.
 
-Behavior `9028150` fixes only that exact execution alias and moves the accepted
-freeze ID/path to `recovery-01`; trust commit `2e919ee` refreshes the four
-affected hashes. The remaining gate sequence is fresh fast/unit, exact-candidate
-full non-live and separate hash-pinned VQ2, exact integration, and detached
-post-merge VQ2. Only then may a new external preparer be pinned and reviewed.
-It must exact-hash the predecessor six-file root, publish five uniquely named
-`recovery-01` L0 files create-new with the replacement freeze last, and
-leave the same F00-A01/poison latch in force.
+The first recovery-01 console parent added hidden native environment entry
+`=C:` and was rejected against the exact 52-variable freeze. An
+exact-environment console then refused with `host boot FILETIME query failed`:
+class-3 `NtQuerySystemInformation` on this target accepts exactly 48 bytes and
+rejects the prior 64-byte request with `STATUS_INFO_LENGTH_MISMATCH`. Both
+refusals occurred before lease, launcher, simulator, fixed ports, frame,
+reset, arm/disarm, target, or powered-command contact.
+
+Behavior `3a641c8` pins that exact fail-closed ABI and moves only the accepted
+freeze ID/path to `recovery-02`; trust commit `a1f55a1` refreshes the same four
+affected hashes. The remaining gate sequence is fresh fast/unit,
+exact-candidate full non-live and separate hash-pinned VQ2, exact integration,
+and detached post-merge VQ2. Only then may a new external preparer be pinned and
+reviewed. It must exact-hash the predecessor eleven-file root, publish five
+uniquely named `recovery-02` L0 files create-new with the replacement freeze
+last, require exactly sixteen final files, and leave the same F00-A01/poison
+latch in force. This is still the one unconsumed authorized attempt.
 
 The earlier Package 3B timing tranche remains integrated historical evidence
 with three accepted passive captures. It must not be described as blocked or
