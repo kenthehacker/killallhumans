@@ -2,7 +2,7 @@
 
 - Task ID: `vq2-package2-powered-calibration-pilot`
 - Parent: `vq2-package2-production-calibration`
-- State: `first T0/T1 integrated at f33e436; live-freeze-readiness correction behavior committed at e87c5e6 and trusted promotion pending; no simulator contact`
+- State: `environment/import correction integrated at 0ac02a0; PowerShell component-store behavior/trust committed at 2985359/f4152c0 with fresh promotion pending; failed offline L0 derive wrote nothing and made no simulator contact`
 - Starting main commit:
   `ccbea8ac9fa9b53c3f86324662f616041693277b`.
 - R0 contract commit: `49b331f`.
@@ -13,9 +13,10 @@
 - Active correction branch: `package2-live-freeze-readiness`.
 - Active correction worktree:
   `C:\Users\John\aigp-worktrees\wt-package2-live-freeze-readiness`.
-- Designated integration-owner-controlled detached live worktree, created from
-  the first T1-integrated local-main commit, still unused, and to be rebuilt at
-  the final exact integrated commit before L0:
+- Designated integration-owner-controlled detached live worktree, rebuilt at
+  `0ac02a0` and used only for the failed pre-publication offline L0 derive; it
+  has no freeze or attempt and must be rebuilt at the next final exact
+  integrated commit before L0 retries:
   `C:\Users\John\aigp-worktrees\wt-package2-powered-calibration-live`.
 - Owner and integration owner: `/root`.
 - Heartbeat date: `2026-07-20`.
@@ -806,6 +807,17 @@ and a SHA-256 is 64 lowercase hex. Exact integers reject `bool`.
 In every hash formula, `00` between concatenation operators denotes one binary
 octet `0x00`, never the two ASCII characters `"00"`.
 
+There is one narrow read-only offline-identity exception to the generic
+single-name rule. The exact case-sensitive path
+`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` must report exactly
+two NTFS links because the active Windows component store supplies its second
+name. Only the System32 name is admissible; the WinSxS name, a case variant,
+one or three links at the System32 name, and every other multi-link file are
+rejected. The retained handle still uses read plus file-attribute access with
+read sharing only, proves the exact final System32 path, and rechecks link
+count, state, and bytes before and after hashing. Candidate, configuration,
+private-root, publication, and live-evidence files remain exactly one link.
+
 Named nested shapes are also exact. `IdentityRefV1` is `{path,sha256}`.
 `ProcessIdentityV1` is `{pid,creation_filetime_100ns,windows_session_id,image_path,image_sha256,argv_sha256}`.
 `ArtifactRefV1` is `{name,path,size_bytes,sha256}`. `PhaseDeadlineV1` is
@@ -982,8 +994,11 @@ L0 creates, independently reviews, and byte-hash pins exactly one private
   environment_inventory,import_inventory`. Python is exact
   `{path,implementation,version,sha256}` with `implementation=CPython` and
   `version=3.12.2`; PowerShell is exact `{path,product_version,sha256}` with a
-  nonempty version; and the other three are exact `IdentityRefV1`. No user site,
-  alternate import root, or mutable candidate-local executable is accepted.
+  nonempty version. It is the exact System32 invocation name and the sole
+  two-link component-store exception defined above; its file bytes remain
+  freeze-hash-bound through the retained handle. The other three are exact
+  `IdentityRefV1`. No user site, alternate import root, or mutable
+  candidate-local executable is accepted.
 - `simulator` contains exact `build=3385`, `mode=Training`, identity objects for
   `launcher_script`, `launcher`, and `payload`; each is exact `IdentityRefV1`.
   It also contains topology literal
@@ -2869,6 +2884,41 @@ The 42-test policy now expects `2142` passes and has raw/canonical SHA-256
 Independent path/digest/closure review returned `CLEAR`, and a local strict
 hash-pinned validation passed all `2142` tests. This is metadata validation,
 not the required fresh exact-candidate promotion run.
+
+That correction was subsequently promoted unchanged. Behavior commit
+`e87c5e636aafe3f4d7155dd2e446b7043dca599f`, trusted-metadata commit
+`aafc5408f27f6855005ccbb825bca16f3d74e38a`, and documentation reconciliation
+commit `0ac02a043b569d712ed74131d1ee659833f1320f` passed a fresh exact-candidate
+full non-live suite (`3366` passed, `22` skipped), a separate fresh isolated
+hash-pinned suite (`2142` passed), exact fast-forward integration, and detached
+post-merge VQ2 (`2225` passed, `1` skipped). Main and the designated detached
+live worktree were exact and clean at `0ac02a0` before L0 resumed.
+
+The first resumed L0 derivation then failed closed before creating either
+review bundle or any private support file. The exact System32 PowerShell binary
+has two NTFS names (System32 and its Windows component-store WinSxS name), while
+the production offline reader still required one link for every file. The same
+reader is used by the production wrapper, so bypassing the preparer would have
+failed identically before A01. The private root still contained only
+`capture-authorization.json`; neither `F00-A01` nor live poison existed, and no
+simulator, fixed port, PAK, frame, reset, arm/disarm, target, or powered command
+was touched.
+
+The count-preserving correction is behavior commit
+`298535969a0f49dd078ed5a4da99ed2e585f6282`. It changes only the production
+offline identity reader and its existing hardlink test: the exact System32
+name requires exactly two links, every other file still requires one, link
+count is part of retained state, and private/live evidence boundaries are
+unchanged. Independent boundary and trust reviews returned `CLEAR`; the probe
+suite passed `81`, canonical VQ2 passed `2225` with `1` skip, and both fast and
+unit passed `3325` with `21` skips and `42` deselections. Trusted-metadata
+commit `f4152c072330836939c00fc342f90d6d3d07bc91` changes exactly the probe and
+probe-test digests. Its `157`-path manifest has raw/canonical SHA-256
+`566063b69699e4a5932cb310966ec2b8722c15a20d88664074099da7b9710a50` /
+`c13d52df37859eb353c578d78515d7d78bb5507cae07593fe2712eb4af08d8f5`;
+the policy remains byte-identical at `2142` expected passes, which a local
+strict run achieved. Fresh exact-candidate full non-live, separate strict,
+integration, and detached post-merge VQ2 remain mandatory before L0 retries.
 
 No FlightSim process, port, frame capture, reset, arm/disarm, target, or powered
 command has occurred. No PAK is read, and the completed passive timing tranche
