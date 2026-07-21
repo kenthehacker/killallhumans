@@ -1,6 +1,6 @@
 {
   "schema": "aigp-t1-pytest-policy/1",
-  "expected_passed": 1480,
+  "expected_passed": 2133,
   "pytest_version": "9.1.1",
   "pytest_timeout_version": "2.4.0",
   "test_files": [
@@ -35,8 +35,14 @@
     "gate_detection/tests/test_vq2_detector.py",
     "planning/tests/test_vq2_guidance.py",
     "tests/test_aigp_live_lease.py",
+    "tests/test_aigp_vq2_calibration_target.py",
     "tests/test_aigp_vq2_passive_probe.py",
     "tests/test_aigp_vq2_passive_timing_script.py",
+    "tests/test_aigp_vq2_powered_attempt.py",
+    "tests/test_aigp_vq2_powered_calibration_analysis.py",
+    "tests/test_aigp_vq2_powered_calibration_probe.py",
+    "tests/test_aigp_vq2_powered_cleanup.py",
+    "tests/test_aigp_vq2_powered_runtime.py",
     "tests/test_aigp_vq2_runner.py",
     "tests/test_vision_udp.py",
     "tests/test_vision_udp_listener.py"
