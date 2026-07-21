@@ -24,14 +24,14 @@ def _authorization_value():
         "schema": "aigp-vq2-simulation-capture-authorization/1",
         "authority": {
             "kind": "user_operator",
-            "authority_id": "conversation-2026-07-20-package2-sim-capture",
-            "authorized_on": "2026-07-20",
+            "authority_id": "conversation-2026-07-21-package2-f01-sim-capture",
+            "authorized_on": "2026-07-21",
             "source": "direct_user_instruction",
         },
-        "task_id": "vq2-package2-powered-calibration-pilot",
+        "task_id": "vq2-package2-import-environment-recovery",
         "domain": "simulator_only",
         "simulator": {"build": 3385, "mode": "Training"},
-        "session_ids": ["F00"],
+        "session_ids": ["F01"],
         "allowed_purposes": [
             "calibration_discovery",
             "independent_review",
@@ -53,7 +53,7 @@ def _authorization_value():
         "storage": {
             "private_root": (
                 r"C:\Users\John\aigp-evidence"
-                r"\2026-07-20-package2-powered-calibration-pilot"
+                r"\2026-07-21-package2-import-environment-recovery"
             ),
             "git": False,
             "public_release": False,
@@ -121,7 +121,7 @@ def test_valid_authorization_and_cross_document_scope(tmp_path):
 
     target.validate_collection_protocol(config, authorization)
 
-    assert authorization.value["session_ids"] == ("F00",)
+    assert authorization.value["session_ids"] == ("F01",)
     assert authorization.value["domain"] == "simulator_only"
     assert config.value["data_scope"]["private_simulation_capture"] is True
 
@@ -322,16 +322,27 @@ def test_authorization_rejects_every_missing_top_level_key(key):
 @pytest.mark.parametrize(
     ("path", "replacement"),
     [
+        (
+            ("authority", "authority_id"),
+            "conversation-2026-07-20-package2-sim-capture",
+        ),
+        (("authority", "authorized_on"), "2026-07-20"),
+        (("task_id",), "vq2-package2-powered-calibration-pilot"),
         (("domain",), "physical"),
         (("simulator", "build"), 3384),
         (("simulator", "mode"), "Race"),
-        (("session_ids",), ["F01"]),
+        (("session_ids",), ["F00"]),
         (("organizer_media_credential",), True),
         (("publication_permitted",), True),
         (("storage", "git"), True),
         (("storage", "public_release"), True),
         (("storage", "network_export"), True),
         (("storage", "external_service_upload"), True),
+        (
+            ("storage", "private_root"),
+            r"C:\Users\John\aigp-evidence"
+            r"\2026-07-20-package2-powered-calibration-pilot",
+        ),
         (("transfer", "successor_task"), True),
         (("transfer", "new_session"), True),
         (("transfer", "new_build_or_mode"), True),

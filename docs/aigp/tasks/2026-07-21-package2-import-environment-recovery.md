@@ -15,7 +15,7 @@
   `powered` for one `calibration-excite` attempt only after this exact
   correction/identity rollover is integrated, its new private root and freeze
   are independently reviewed, and every L0/L1 entry gate below passes.
-- Contract-freeze commit: pending this pre-freeze review.
+- Contract-freeze commit: `ea728904c4a4761b677d7d118265a595d5b0d5ac`.
 
 ## Failure provenance and authority
 

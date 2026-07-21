@@ -3030,7 +3030,7 @@ def build_prospective_publications(
         "claimed_at_utc": claimed_at_utc,
         "claimed_monotonic_ns": claimed_monotonic_ns,
         "timing": claim_timing,
-        "run_id": "F00-A01/reset-epoch-1/excitation-1",
+        "run_id": "F01-A01/reset-epoch-1/excitation-1",
         "assigned_split": "discovery_fit",
         "identity": {
             "attempt_context_sha256": seal_identity["attempt_context_sha256"],
@@ -3044,7 +3044,7 @@ def build_prospective_publications(
         "decoded_content_sha256": _clone(summary["decoded_content_sha256"]),
         "derivative_sha256": [],
         "collision_policy": (
-            "f00_fixed_future_whole_run_discovery_fit_or_global_exclusion"
+            "f01_fixed_future_whole_run_discovery_fit_or_global_exclusion"
         ),
     }
     claim = _validated(
@@ -3069,7 +3069,7 @@ def build_prospective_publications(
                 "claim_sha256": claim_sha256,
                 "session_id": attempt_contract.SESSION_ID,
                 "attempt_id": attempt_contract.ATTEMPT_ID,
-                "run_id": "F00-A01/reset-epoch-1/excitation-1",
+                "run_id": "F01-A01/reset-epoch-1/excitation-1",
                 "assigned_split": "discovery_fit",
                 "activation": "requires_matching_attempt_complete",
             }
@@ -3077,7 +3077,7 @@ def build_prospective_publications(
         "content_groups": [
             {
                 "decoded_sha256": digest,
-                "run_ids": ["F00-A01/reset-epoch-1/excitation-1"],
+                "run_ids": ["F01-A01/reset-epoch-1/excitation-1"],
                 "assigned_split": "discovery_fit",
                 "disposition": "assigned",
                 "activation": "requires_matching_attempt_complete",
@@ -3314,10 +3314,10 @@ def _validate_collision_runs(value: Any, *, anchor_run_id: str) -> list[dict[str
         _fail("$anchor_run_id", "must identify one supplied run")
     anchor = checked[run_ids.index(anchor_run_id)]
     if (
-        anchor_run_id == "F00-A01/reset-epoch-1/excitation-1"
+        anchor_run_id == "F01-A01/reset-epoch-1/excitation-1"
         and anchor["assigned_split"] != "discovery_fit"
     ):
-        _fail("$anchor_run_id", "F00 is immutable discovery_fit")
+        _fail("$anchor_run_id", "F01 is immutable discovery_fit")
     return checked
 
 
@@ -3329,7 +3329,7 @@ def plan_global_content_assignment(
 ) -> dict[str, Any]:
     """Resolve global decoded/derivative collisions at whole-run granularity.
 
-    Cross-split components containing the immutable F00 anchor either join its
+    Cross-split components containing the immutable F01 anchor either join its
     split as complete runs or are globally excluded.  Cross-split components
     without that anchor are conservatively excluded because this function has
     no reviewed authority to choose between their splits.  No frame, crop,
@@ -3761,7 +3761,7 @@ _TREE_EXIT_KEYS = {
 
 
 class ProductionPostReleaseService:
-    """Ordered pure/offline verifier and record builder for the sole F00/A01 run.
+    """Ordered pure/offline verifier and record builder for the sole F01/A01 run.
 
     The constructor is deliberately inert.  Every read occurs in a protocol
     method that the wrapper invokes only after the lease-release occurrence.

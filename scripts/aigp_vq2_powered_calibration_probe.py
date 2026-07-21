@@ -568,6 +568,8 @@ class OfflineAdmissionService(Protocol):
         self,
         frozen_inventory: Mapping[str, Any],
         eager_modules: Sequence[str],
+        *,
+        environment_inventory: Mapping[str, Any],
     ) -> ImportRevalidation: ...
 
 
@@ -719,6 +721,8 @@ class LeaseService(Protocol):
 
 
 class SpawnService(Protocol):
+    def seal_spawn_environment(self, *, deadline_monotonic_ns: int) -> None: ...
+
     def allocate_attempt_handles(self, wrapper_process: Mapping[str, Any]) -> AttemptHandleSet: ...
 
     def spawn_powered_child_blocked(
@@ -846,6 +850,7 @@ TRANCHE2_INTEGRATION_METHODS = MappingProxyType(
         ),
         "lease": ("acquire", "heartbeat", "release_and_verify"),
         "spawn": (
+            "seal_spawn_environment",
             "allocate_attempt_handles",
             "spawn_powered_child_blocked",
             "release_child_capability",
@@ -1047,6 +1052,84 @@ def _semantic_subset(value: Mapping[str, Any], names: Sequence[str]) -> dict[str
     return {name: value[name] for name in names}
 
 
+def _environment_inventory_from_mapping(
+    environment: Mapping[str, str], *, created_at_utc: str
+) -> dict[str, Any]:
+    """Build canonical hash-only semantics for one exact Windows spawn map."""
+
+    if type(environment) is not dict:
+        raise ValueError("environment must be an exact dictionary")
+    variables: list[dict[str, Any]] = []
+    for name, value in environment.items():
+        if (
+            type(name) is not str
+            or type(value) is not str
+            or not name
+            or name != name.upper()
+            or "=" in name
+            or "\x00" in name
+            or "\x00" in value
+        ):
+            raise ValueError("environment contains a noncanonical spawn entry")
+        variables.append(
+            {
+                "name": name,
+                "defined": True,
+                "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            }
+        )
+    variables.sort(
+        key=lambda item: (item["name"].casefold(), item["name"].encode("utf-8"))
+    )
+    return attempt_contract.validate_environment_inventory(
+        {
+            "schema": "aigp-vq2-powered-environment-inventory/1",
+            "created_at_utc": created_at_utc,
+            "variables": variables,
+        }
+    )
+
+
+def _append_native_environment_entry(
+    environment: dict[str, str],
+    raw: str,
+    *,
+    allow_drive_state: bool = False,
+) -> None:
+    """Append one complete native-block entry or reject it as non-spawn-safe."""
+
+    if type(environment) is not dict or type(raw) is not str or not raw:
+        raise ValueError("native environment entry is malformed")
+    separator = raw.find("=", 1 if raw.startswith("=") else 0)
+    if separator <= 0:
+        raise ValueError("native environment entry is malformed")
+    name = raw[:separator].upper()
+    value = raw[separator + 1 :]
+    drive_state = (
+        len(name) == 3
+        and name[0] == "="
+        and "A" <= name[1] <= "Z"
+        and name[2] == ":"
+    )
+    if (
+        not name
+        or ("=" in name and not (allow_drive_state and drive_state))
+        or "\x00" in name
+        or "\x00" in value
+        or name in environment
+    ):
+        raise ValueError("native environment entry is not spawn-safe and unique")
+    environment[name] = value
+
+
+def _environment_mapping_sha256(environment: Mapping[str, str]) -> str:
+    inventory = _environment_inventory_from_mapping(
+        environment,
+        created_at_utc="1970-01-01T00:00:00.000000Z",
+    )
+    return attempt_contract.environment_variables_sha256(inventory)
+
+
 def _identity_refs(
     freeze: Mapping[str, Any],
 ) -> tuple[tuple[str, Mapping[str, Any], str], ...]:
@@ -1175,19 +1258,51 @@ def _admit_offline_body(
     implementation_now = attempt_contract.validate_implementation_inventory(
         service.rederive_implementation_inventory(implementation)
     )
-    environment_now = attempt_contract.validate_environment_inventory(
-        service.rederive_environment_inventory(frozen_environment)
-    )
-    import_audit = service.rederive_import_inventory(
-        frozen_imports, POWERED_EAGER_IMPORT_MODULES
-    )
-    imports_now = attempt_contract.validate_import_inventory(import_audit.inventory)
     if _semantic_subset(implementation_now, ("commit", "tree", "entries")) != _semantic_subset(
         implementation, ("commit", "tree", "entries")
     ):
         raise OfflineAdmissionError("implementation inventory semantic payload drifted")
+
+    entries_by_path = {entry["path"]: entry for entry in implementation["entries"]}
+    for relative, absolute, label in (
+        (
+            "scripts/aigp_vq2_powered_calibration_probe.py",
+            expected_module,
+            "probe module",
+        ),
+        (
+            "scripts/aigp_vq2_powered_import_audit.py",
+            worktree + r"\scripts\aigp_vq2_powered_import_audit.py",
+            "import-audit module",
+        ),
+    ):
+        entry = entries_by_path.get(relative)
+        if entry is None:
+            raise OfflineAdmissionError(
+                f"implementation inventory omits the {label}"
+            )
+        _validate_file_identity(
+            service.observe_file_identity(absolute, hash_kind="file_bytes"),
+            absolute,
+            entry["sha256"],
+        )
+
+    environment_now = attempt_contract.validate_environment_inventory(
+        service.rederive_environment_inventory(frozen_environment)
+    )
     if environment_now["variables"] != frozen_environment["variables"]:
-        raise OfflineAdmissionError("environment inventory semantic payload drifted")
+        raise OfflineAdmissionError(
+            "environment inventory semantic payload drifted; "
+            f"expected_sha256={attempt_contract.environment_variables_sha256(frozen_environment)}; "
+            f"observed_sha256={attempt_contract.environment_variables_sha256(environment_now)}"
+        )
+
+    import_audit = service.rederive_import_inventory(
+        frozen_imports,
+        POWERED_EAGER_IMPORT_MODULES,
+        environment_inventory=frozen_environment,
+    )
+    imports_now = attempt_contract.validate_import_inventory(import_audit.inventory)
     if _semantic_subset(imports_now, ("python_sha256", "seeds", "entries")) != _semantic_subset(
         frozen_imports, ("python_sha256", "seeds", "entries")
     ):
@@ -1202,15 +1317,6 @@ def _admit_offline_body(
     if imports_now["python_sha256"] != freeze["runtime"]["python"]["sha256"]:
         raise OfflineAdmissionError("import inventory Python hash does not match runtime")
 
-    entries_by_path = {entry["path"]: entry for entry in implementation["entries"]}
-    probe_entry = entries_by_path.get("scripts/aigp_vq2_powered_calibration_probe.py")
-    if probe_entry is None:
-        raise OfflineAdmissionError("implementation inventory omits the probe module")
-    _validate_file_identity(
-        service.observe_file_identity(expected_module, hash_kind="file_bytes"),
-        expected_module,
-        probe_entry["sha256"],
-    )
     for _label, reference, hash_kind in _identity_refs(freeze):
         proof = service.observe_file_identity(
             reference["path"], hash_kind=hash_kind
@@ -1292,7 +1398,7 @@ def validate_attempt_gate(
     if snapshot.live_poison_present:
         raise AttemptGateError("root poison exists and has no automatic clear")
     if snapshot.target_attempt_directory_present or snapshot.target_attempt_envelope_present:
-        raise AttemptGateError("F00-A01 already exists; retry/replacement is forbidden")
+        raise AttemptGateError("F01-A01 already exists; retry/replacement is forbidden")
     if snapshot.unknown_attempt_entries:
         raise AttemptGateError("unknown attempt-like root entries make consumption ambiguous")
     for prior in snapshot.prior_attempts:
@@ -2678,6 +2784,11 @@ class _SingleAttemptExecution:
             attempt_publish_started_monotonic_ns=attempt_started,
             random_bytes=self.services.csprng.token_bytes,
         )
+        self.services.spawn.seal_spawn_environment(
+            deadline_monotonic_ns=self.material.attempt_publish_deadline[
+                "deadline_monotonic_ns"
+            ]
+        )
         self.workspace = AttemptWorkspace.consume(self.secure, self.freeze)
         self.ledger_directory = self.workspace.create_subdirectory(
             "wrapper_ledger_directory"
@@ -3029,7 +3140,7 @@ class _SingleAttemptExecution:
         assert self.material is not None and self.handles is not None
         self.fallback_used = True
         self._add_failure(
-            "cleanup_unconfirmed", "cleanup fallback use invalidates F00"
+            "cleanup_unconfirmed", "cleanup fallback use invalidates F01"
         )
 
         def spawn_fallback(
@@ -3378,7 +3489,7 @@ class _SingleAttemptExecution:
         self.fallback_used = True
         self.cleanup_state["fallback"] = "failed"
         self._add_failure(
-            "cleanup_unconfirmed", "cleanup fallback use invalidates F00"
+            "cleanup_unconfirmed", "cleanup fallback use invalidates F01"
         )
         window = self._unledgered_safety_window("fallback_spawn")
         if window is None:
@@ -4794,21 +4905,79 @@ class _WindowsProductionOfflineAdmissionBase:
         )
         return values
 
-    def _abort_process(self, process: Any) -> None:
+    @staticmethod
+    def _close_process_streams(process: Any) -> None:
+        failure: BaseException | None = None
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                if stream is not None and not stream.closed:
+                    stream.close()
+            except (OSError, ValueError) as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise OfflineAdmissionError(
+                "bounded identity process pipe close was not proved"
+            ) from failure
+
+    def _abort_process(
+        self, process: Any, *, workers: Sequence[Any] = ()
+    ) -> None:
+        failure: BaseException | None = None
         try:
             if process.poll() is None:
                 process.kill()
-        except OSError:
-            pass
+        except OSError as exc:
+            failure = exc
+        cleanup_deadline_ns = self._cleanup_clock_ns() + 1_000_000_000
+
+        def remaining_seconds() -> float:
+            return max(
+                0.0,
+                (
+                    cleanup_deadline_ns - self._cleanup_clock_ns()
+                )
+                / 1_000_000_000.0,
+            )
+
         try:
-            process.communicate(timeout=0.05)
-        except (OSError, self._subprocess.SubprocessError):
-            for stream in (process.stdin, process.stdout, process.stderr):
-                try:
-                    if stream is not None:
-                        stream.close()
-                except OSError:
-                    pass
+            process.wait(timeout=remaining_seconds())
+        except self._subprocess.TimeoutExpired as exc:
+            failure = failure or exc
+            try:
+                process.kill()
+            except OSError as kill_exc:
+                failure = failure or kill_exc
+            try:
+                process.wait(timeout=remaining_seconds())
+            except (OSError, self._subprocess.SubprocessError) as wait_exc:
+                failure = failure or wait_exc
+        except (OSError, self._subprocess.SubprocessError) as exc:
+            failure = failure or exc
+        workers_stopped = True
+        for worker in workers:
+            worker.join(timeout=remaining_seconds())
+            if worker.is_alive():
+                workers_stopped = False
+                failure = failure or RuntimeError(
+                    "bounded identity process pipe worker did not stop"
+                )
+        try:
+            reaped = process.poll() is not None
+        except OSError as exc:
+            failure = failure or exc
+            reaped = False
+        streams_closed = False
+        if reaped and workers_stopped:
+            try:
+                self._close_process_streams(process)
+                streams_closed = True
+            except BaseException as exc:
+                failure = failure or exc
+        if not reaped or not workers_stopped or not streams_closed:
+            raise OfflineAdmissionError(
+                "bounded identity process termination/reap and pipe-worker stop "
+                "were not proved"
+            ) from failure
 
     def _run_process(
         self,
@@ -4821,6 +4990,8 @@ class _WindowsProductionOfflineAdmissionBase:
     ) -> Any:
         if not argv or any(type(item) is not str or not item for item in argv):
             raise OfflineAdmissionError("bounded process argv is invalid")
+        if type(stdout_limit) is not int or stdout_limit < 0:
+            raise OfflineAdmissionError("bounded process stdout limit is invalid")
         if input_bytes is not None and len(input_bytes) > self._MAX_GIT_INPUT_BYTES:
             raise OfflineAdmissionError("bounded process input exceeds its limit")
         self._checkpoint()
@@ -4837,45 +5008,166 @@ class _WindowsProductionOfflineAdmissionBase:
                 stdout=self._subprocess.PIPE,
                 stderr=self._subprocess.PIPE,
                 shell=False,
+                bufsize=0,
+                close_fds=True,
             )
         except OSError as exc:
             raise OfflineAdmissionError("bounded identity process failed to start") from exc
-        pending_input = input_bytes
+        workers: list[Any] = []
         try:
+            activity = self._threading.Event()
+            reader_state: dict[
+                str, tuple[bytes, bool, BaseException | None]
+            ] = {}
+            output_overflow: list[str] = []
+
+            def read_bounded(name: str, stream: Any, limit: int) -> None:
+                payload = bytearray()
+                overflow = False
+                failure: BaseException | None = None
+                try:
+                    while True:
+                        remaining = max(0, limit - len(payload))
+                        chunk = stream.read(min(64 * 1024, remaining + 1))
+                        if not chunk:
+                            break
+                        if len(chunk) > remaining:
+                            if not overflow:
+                                output_overflow.append(name)
+                            overflow = True
+                            activity.set()
+                            break
+                        payload.extend(chunk)
+                except BaseException as exc:  # returned to the supervising thread
+                    failure = exc
+                    activity.set()
+                finally:
+                    reader_state[name] = (bytes(payload), overflow, failure)
+                    activity.set()
+
+            for name, stream, limit in (
+                ("stdout", process.stdout, stdout_limit),
+                ("stderr", process.stderr, self._MAX_GIT_STDERR_BYTES),
+            ):
+                if stream is None:
+                    raise OfflineAdmissionError(
+                        "bounded identity process pipe was not created"
+                    )
+                worker = self._threading.Thread(
+                    target=read_bounded,
+                    args=(name, stream, limit),
+                    name=f"aigp-offline-{name}",
+                    daemon=True,
+                )
+                worker.start()
+                workers.append(worker)
+
+            writer_state: list[BaseException] = []
+            writer_done = self._threading.Event()
+
+            def write_input() -> None:
+                try:
+                    assert process.stdin is not None
+                    view = memoryview(input_bytes if input_bytes is not None else b"")
+                    offset = 0
+                    while offset < len(view):
+                        written = process.stdin.write(
+                            view[offset : offset + 64 * 1024]
+                        )
+                        if type(written) is not int or written <= 0:
+                            raise OSError(
+                                "bounded identity process stdin made no progress"
+                            )
+                        offset += written
+                    process.stdin.close()
+                except BrokenPipeError:
+                    pass
+                except BaseException as exc:  # returned to the supervising thread
+                    writer_state.append(exc)
+                finally:
+                    writer_done.set()
+                    activity.set()
+
+            if input_bytes is None:
+                writer_done.set()
+            else:
+                if process.stdin is None:
+                    raise OfflineAdmissionError(
+                        "bounded identity process stdin pipe was not created"
+                    )
+                writer = self._threading.Thread(
+                    target=write_input,
+                    name="aigp-offline-stdin",
+                    daemon=True,
+                )
+                writer.start()
+                workers.append(writer)
+
+            def validate_io_state() -> None:
+                if output_overflow:
+                    raise OfflineAdmissionError(
+                        "bounded identity process output exceeded its limit"
+                    )
+                for name in ("stdout", "stderr"):
+                    state = reader_state.get(name)
+                    if state is not None:
+                        _payload, overflow, failure = state
+                        if overflow:
+                            raise OfflineAdmissionError(
+                                "bounded identity process output exceeded its limit"
+                            )
+                        if failure is not None:
+                            raise OfflineAdmissionError(
+                                "bounded identity process pipe read failed"
+                            ) from failure
+                if writer_state:
+                    raise OfflineAdmissionError(
+                        "bounded identity process stdin write failed"
+                    ) from writer_state[0]
+
             while True:
                 now = self._checkpoint()
                 assert self._deadline_monotonic_ns is not None
                 remaining = self._deadline_monotonic_ns - now
-                timeout = min(self._POLL_INTERVAL_NS, remaining) / 1_000_000_000.0
-                try:
-                    stdout, stderr = process.communicate(
-                        input=pending_input, timeout=timeout
-                    )
+                validate_io_state()
+                code = process.poll()
+                if (
+                    code is not None
+                    and writer_done.is_set()
+                    and "stdout" in reader_state
+                    and "stderr" in reader_state
+                ):
                     break
-                except self._subprocess.TimeoutExpired as exc:
-                    pending_input = None
-                    partial_stdout = exc.output or b""
-                    partial_stderr = exc.stderr or b""
-                    if (
-                        len(partial_stdout) > stdout_limit
-                        or len(partial_stderr) > self._MAX_GIT_STDERR_BYTES
-                    ):
-                        raise OfflineAdmissionError(
-                            "bounded identity process output exceeded its limit"
-                        )
-            if (
-                len(stdout) > stdout_limit
-                or len(stderr) > self._MAX_GIT_STDERR_BYTES
-            ):
-                raise OfflineAdmissionError(
-                    "bounded identity process output exceeded its limit"
+                activity.wait(
+                    min(self._POLL_INTERVAL_NS, remaining) / 1_000_000_000.0
                 )
+                activity.clear()
+            for worker in workers:
+                while worker.is_alive():
+                    now = self._checkpoint()
+                    assert self._deadline_monotonic_ns is not None
+                    worker.join(
+                        timeout=min(
+                            self._POLL_INTERVAL_NS,
+                            self._deadline_monotonic_ns - now,
+                        )
+                        / 1_000_000_000.0
+                    )
+            validate_io_state()
+            stdout = reader_state["stdout"][0]
+            stderr = reader_state["stderr"][0]
+            self._close_process_streams(process)
             self._checkpoint()
             return self._subprocess.CompletedProcess(
-                list(argv), process.returncode, stdout, stderr
+                list(argv), code, stdout, stderr
             )
         except BaseException:
-            self._abort_process(process)
+            try:
+                self._abort_process(process, workers=workers)
+            except BaseException as abort_exc:
+                raise OfflineAdmissionError(
+                    "bounded identity process failed and was not cleanly reaped"
+                ) from abort_exc
             raise
 
     def _run_git(
@@ -5725,8 +6017,11 @@ class _WindowsProductionOfflineAdmissionBase:
         self,
         frozen_inventory: Mapping[str, Any],
         eager_modules: Sequence[str],
+        *,
+        environment_inventory: Mapping[str, Any],
     ) -> ImportRevalidation:
         frozen = attempt_contract.validate_import_inventory(frozen_inventory)
+        attempt_contract.validate_environment_inventory(environment_inventory)
         import importlib
         import os
         import site
@@ -5885,6 +6180,7 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
         import os
         import subprocess
         import threading
+        import time
         from ctypes import wintypes
 
         if os.name != "nt":
@@ -5893,6 +6189,7 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
         self._wintypes = wintypes
         self._subprocess = subprocess
         self._threading = threading
+        self._cleanup_clock_ns = time.perf_counter_ns
         self._os = os
         self._kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -6417,8 +6714,9 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
         ):
             raise OfflineAdmissionError("wrapper invocation is not the sole frozen argv")
 
-    def _native_environment(self) -> dict[str, str]:
-        self._checkpoint()
+    def _read_native_environment_block(self) -> dict[str, str]:
+        """Read the native block, including during fail-closed deadline cleanup."""
+
         block = self._kernel.GetEnvironmentStringsW()
         if not block:
             raise self._winerror("GetEnvironmentStringsW")
@@ -6431,19 +6729,24 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
                 if not raw:
                     break
                 offset += len(raw) + 1
-                separator = raw.find("=", 1 if raw.startswith("=") else 0)
-                if separator <= 0:
-                    raise OfflineAdmissionError("Windows environment entry is malformed")
-                name = raw[:separator].upper()
-                value = raw[separator + 1 :]
-                if name in values:
-                    raise OfflineAdmissionError(
-                        "Windows environment names collide case-insensitively"
+                try:
+                    _append_native_environment_entry(
+                        values,
+                        raw,
+                        allow_drive_state=True,
                     )
-                values[name] = value
+                except ValueError as exc:
+                    raise OfflineAdmissionError(
+                        "Windows environment entry is not spawn-safe and unique"
+                    ) from exc
         finally:
             if not self._kernel.FreeEnvironmentStringsW(block):
                 raise self._winerror("FreeEnvironmentStringsW")
+        return values
+
+    def _native_environment(self) -> dict[str, str]:
+        self._checkpoint()
+        values = self._read_native_environment_block()
         self._checkpoint()
         return values
 
@@ -6461,24 +6764,15 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
         self, frozen_inventory: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         checked = attempt_contract.validate_environment_inventory(frozen_inventory)
-        variables = [
-            {
-                "name": name,
-                "defined": True,
-                "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-            }
-            for name, value in self._native_environment().items()
-        ]
-        variables.sort(
-            key=lambda item: (item["name"].casefold(), item["name"].encode("utf-8"))
-        )
-        return attempt_contract.validate_environment_inventory(
-            {
-                "schema": "aigp-vq2-powered-environment-inventory/1",
-                "created_at_utc": checked["created_at_utc"],
-                "variables": variables,
-            }
-        )
+        try:
+            return _environment_inventory_from_mapping(
+                self._native_environment(),
+                created_at_utc=checked["created_at_utc"],
+            )
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise OfflineAdmissionError(
+                "native environment is not a canonical spawn mapping"
+            ) from exc
 
     @staticmethod
     def _under(path: str, root: str) -> bool:
@@ -6488,13 +6782,184 @@ class WindowsProductionOfflineAdmission(_WindowsProductionOfflineAdmissionBase):
             return False
         return ntpath.normcase(common) == ntpath.normcase(root)
 
+    @staticmethod
+    def _module_identity_snapshot() -> tuple[tuple[str, Any], ...]:
+        snapshot = tuple(sys.modules.items())
+        if any(type(name) is not str for name, _module in snapshot):
+            raise OfflineAdmissionError("sys.modules contains a non-string key")
+        return tuple(
+            sorted(snapshot, key=lambda item: item[0].encode("utf-8"))
+        )
+
+    @staticmethod
+    def _module_identity_snapshots_equal(
+        before: Sequence[tuple[str, Any]],
+        after: Sequence[tuple[str, Any]],
+    ) -> bool:
+        return len(before) == len(after) and all(
+            before_name == after_name and before_module is after_module
+            for (before_name, before_module), (after_name, after_module) in zip(
+                before, after, strict=True
+            )
+        )
+
+    def _retain_frozen_import_origins(
+        self, inventory: Mapping[str, Any]
+    ) -> None:
+        checked = attempt_contract.validate_import_inventory(inventory)
+        for entry in checked["entries"]:
+            origin = entry["origin"]
+            if origin is not None:
+                proof = self.observe_file_identity(origin, hash_kind="file_bytes")
+                _validate_file_identity(
+                    proof,
+                    origin,
+                    entry["sha256"],
+                )
+                if proof.size_bytes != entry["size_bytes"]:
+                    raise OfflineAdmissionError(
+                        "frozen import-origin size changed"
+                    )
+            for namespace_root in entry["namespace_roots"]:
+                _validate_path_proof(
+                    self._path_proof(namespace_root, directory=True),
+                    namespace_root,
+                    kind="directory",
+                )
+
     def rederive_import_inventory(
         self,
         frozen_inventory: Mapping[str, Any],
         eager_modules: Sequence[str],
+        *,
+        environment_inventory: Mapping[str, Any],
     ) -> ImportRevalidation:
-        return self._rederive_import_inventory_hardened(
-            frozen_inventory, eager_modules
+        frozen = attempt_contract.validate_import_inventory(frozen_inventory)
+        frozen_environment = attempt_contract.validate_environment_inventory(
+            environment_inventory
+        )
+        if tuple(eager_modules) != POWERED_EAGER_IMPORT_MODULES:
+            raise OfflineAdmissionError("powered eager-import inventory changed")
+
+        python_path = self._lexical(self._os.path.abspath(sys.executable))
+        python_identity = self.observe_file_identity(
+            python_path, hash_kind="file_bytes"
+        )
+        if python_identity.sha256 != frozen["python_sha256"]:
+            raise OfflineAdmissionError("isolated import-audit Python hash drifted")
+
+        parent_environment = self._native_environment()
+        try:
+            parent_environment_inventory = _environment_inventory_from_mapping(
+                parent_environment,
+                created_at_utc=frozen_environment["created_at_utc"],
+            )
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise OfflineAdmissionError(
+                "isolated import-audit environment is not spawn-safe"
+            ) from exc
+        if (
+            parent_environment_inventory["variables"]
+            != frozen_environment["variables"]
+        ):
+            raise OfflineAdmissionError(
+                "isolated import-audit environment drifted; "
+                f"expected_sha256={attempt_contract.environment_variables_sha256(frozen_environment)}; "
+                f"observed_sha256={attempt_contract.environment_variables_sha256(parent_environment_inventory)}"
+            )
+
+        expected_payload = attempt_contract.canonical_json_file_bytes(frozen)
+        if len(expected_payload) > self._MAX_JSON_BYTES:
+            raise OfflineAdmissionError("frozen import inventory exceeds its size bound")
+        candidate_root = self.current_working_directory().path
+        command = [
+            python_path,
+            "-E",
+            "-s",
+            "-B",
+            "-m",
+            IMPORT_AUDIT_MODULE,
+        ]
+        before_modules = self._module_identity_snapshot()
+        audit_failure: BaseException | None = None
+        result: Any = None
+        try:
+            result = self._run_process(
+                command,
+                cwd=candidate_root,
+                input_bytes=None,
+                environment=dict(parent_environment),
+                stdout_limit=len(expected_payload),
+            )
+        except BaseException as exc:
+            audit_failure = exc
+
+        state_failure: BaseException | None = None
+        try:
+            after_environment = self._read_native_environment_block()
+            if after_environment != parent_environment:
+                try:
+                    expected_sha256 = _environment_mapping_sha256(
+                        parent_environment
+                    )
+                    observed_sha256 = _environment_mapping_sha256(after_environment)
+                    detail = (
+                        "parent native environment changed across isolated import audit; "
+                        f"expected_sha256={expected_sha256}; "
+                        f"observed_sha256={observed_sha256}"
+                    )
+                except (TypeError, ValueError, UnicodeError):
+                    detail = (
+                        "parent native environment became noncanonical across "
+                        "isolated import audit"
+                    )
+                raise OfflineAdmissionError(detail)
+            after_modules = self._module_identity_snapshot()
+            if not self._module_identity_snapshots_equal(
+                before_modules, after_modules
+            ):
+                raise OfflineAdmissionError(
+                    "parent import graph changed across isolated import audit"
+                )
+        except BaseException as exc:
+            state_failure = exc
+
+        if state_failure is not None:
+            if audit_failure is not None:
+                state_failure.add_note(
+                    "isolated import audit also failed: "
+                    f"{type(audit_failure).__name__}"
+                )
+            raise state_failure
+        if audit_failure is not None:
+            raise audit_failure
+        if result is None:
+            raise OfflineAdmissionError("isolated import audit returned no result")
+        if result.returncode != 0:
+            raise OfflineAdmissionError("isolated import audit child refused")
+        if result.stderr:
+            raise OfflineAdmissionError("isolated import audit emitted stderr")
+        if result.stdout != expected_payload:
+            raise OfflineAdmissionError(
+                "isolated import audit differed from the frozen complete graph"
+            )
+        try:
+            observed = attempt_contract.validate_import_inventory(
+                attempt_contract.parse_canonical_json_bytes(
+                    result.stdout, file_form=True
+                )
+            )
+        except attempt_contract.PoweredAttemptContractError as exc:
+            raise OfflineAdmissionError(
+                "isolated import audit result is not canonical"
+            ) from exc
+        self._retain_frozen_import_origins(observed)
+        return ImportRevalidation(
+            inventory=observed,
+            origins_reverified=True,
+            user_site_on_sys_path=False,
+            unexpected_candidate_or_venv_modules=(),
+            unclassified_origins=(),
         )
 
 
@@ -7439,7 +7904,7 @@ class WindowsProductionLiveBoundary:
     invoked after offline admission and attempt consumption.
     """
 
-    _TASK_NAME = "AIGP-P2-F00-A01-Launch"
+    _TASK_NAME = "AIGP-P2-F01-A01-Launch"
     _POLL_NS = 50_000_000
     _HEARTBEAT_EMIT_NS = 900_000_000
     _MAX_STDOUT_BYTES = 16 * 1024 * 1024
@@ -7495,6 +7960,9 @@ class WindowsProductionLiveBoundary:
         self._stable_file_handles: dict[str, int] = {}
         self._stable_file_payloads: dict[str, bytes] = {}
         self._closed_process_ids: set[int] = set()
+        self._spawn_environment_seal_attempted = False
+        self._sealed_spawn_environment: Mapping[str, str] | None = None
+        self._sealed_spawn_environment_sha256: str | None = None
         self._lease_release_attempted = False
         self._closed = False
 
@@ -7833,7 +8301,7 @@ class WindowsProductionLiveBoundary:
                 self.secure._close_handle(handle)
 
     def _native_environment_for_spawn(self) -> dict[str, str]:
-        """Read the native Windows block used for the exact child environment."""
+        """Read and validate the native Windows block once for sealing."""
 
         import ctypes
 
@@ -7856,19 +8324,13 @@ class WindowsProductionLiveBoundary:
                 if not raw:
                     break
                 offset += len(raw) + 1
-                separator = raw.find("=", 1 if raw.startswith("=") else 0)
-                if separator <= 0:
-                    raise OrchestrationPhaseError(
-                        "build_or_candidate_changed",
-                        "native environment contains a malformed entry",
-                    )
-                name = raw[:separator].upper()
-                if "=" in name or name in values:
+                try:
+                    _append_native_environment_entry(values, raw)
+                except ValueError as exc:
                     raise OrchestrationPhaseError(
                         "build_or_candidate_changed",
                         "native environment names are not spawn-safe and unique",
-                    )
-                values[name] = raw[separator + 1 :]
+                    ) from exc
         finally:
             if not kernel.FreeEnvironmentStringsW(block):
                 raise OrchestrationPhaseError(
@@ -7883,20 +8345,34 @@ class WindowsProductionLiveBoundary:
             validator=attempt_contract.validate_environment_inventory,
             label="environment inventory",
         )
-        observed = [
-            {
-                "name": name,
-                "defined": True,
-                "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-            }
-            for name, value in values.items()
-        ]
-        observed.sort(
-            key=lambda item: (item["name"].casefold(), item["name"].encode("utf-8"))
-        )
-        if observed != inventory["variables"]:
+        try:
+            observed_inventory = _environment_inventory_from_mapping(
+                values,
+                created_at_utc=inventory["created_at_utc"],
+            )
+            observed_sha256 = attempt_contract.environment_variables_sha256(
+                observed_inventory
+            )
+        except (
+            TypeError,
+            ValueError,
+            UnicodeError,
+            attempt_contract.PoweredAttemptContractError,
+        ) as exc:
             raise OrchestrationPhaseError(
-                "build_or_candidate_changed", "child environment drifted from the freeze"
+                "build_or_candidate_changed",
+                "native environment is not a canonical spawn mapping",
+            ) from exc
+        expected_sha256 = self.freeze["execution"]["launcher_environment_sha256"]
+        if (
+            observed_inventory["variables"] != inventory["variables"]
+            or observed_sha256 != expected_sha256
+        ):
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "native environment drifted from the freeze; "
+                f"expected_sha256={expected_sha256}; "
+                f"observed_sha256={observed_sha256}",
             )
         return values
 
@@ -7904,42 +8380,83 @@ class WindowsProductionLiveBoundary:
     def _spawn_environment_sha256(environment: Mapping[str, str]) -> str:
         """Derive the canonical inventory-variable digest for one spawn map."""
 
-        if type(environment) is not dict:
-            raise OrchestrationPhaseError(
-                "build_or_candidate_changed",
-                "native spawn environment is not an exact mapping",
-            )
-        variables: list[dict[str, Any]] = []
-        for name, value in environment.items():
-            if type(name) is not str or type(value) is not str:
-                raise OrchestrationPhaseError(
-                    "build_or_candidate_changed",
-                    "native spawn environment contains a non-string entry",
-                )
-            variables.append(
-                {
-                    "name": name,
-                    "defined": True,
-                    "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-                }
-            )
-        variables.sort(
-            key=lambda item: (item["name"].casefold(), item["name"].encode("utf-8"))
-        )
-        semantic_inventory = {
-            "schema": "aigp-vq2-powered-environment-inventory/1",
-            # Provenance is excluded from the semantic digest.  This fixed valid
-            # value lets the shared inventory validator check the derived rows.
-            "created_at_utc": "1970-01-01T00:00:00.000000Z",
-            "variables": variables,
-        }
         try:
-            return attempt_contract.environment_variables_sha256(semantic_inventory)
-        except attempt_contract.PoweredAttemptContractError as exc:
+            return _environment_mapping_sha256(environment)
+        except (
+            TypeError,
+            ValueError,
+            UnicodeError,
+            attempt_contract.PoweredAttemptContractError,
+        ) as exc:
             raise OrchestrationPhaseError(
                 "build_or_candidate_changed",
                 "native spawn environment is not canonical",
             ) from exc
+
+    @staticmethod
+    def _systemroot_from_spawn_environment(
+        environment: Mapping[str, str],
+    ) -> str:
+        system_root = environment.get("SYSTEMROOT")
+        try:
+            return attempt_contract.validate_absolute_windows_path(
+                system_root,
+                path="$sealed_spawn_environment.SYSTEMROOT",
+            )
+        except attempt_contract.PoweredAttemptContractError as exc:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "sealed spawn environment lacks a canonical SYSTEMROOT",
+            ) from exc
+
+    def seal_spawn_environment(self, *, deadline_monotonic_ns: int) -> None:
+        """Seal the sole frozen mapping immediately before attempt consumption."""
+
+        self._require_before_deadline(
+            deadline_monotonic_ns, "spawn-environment seal"
+        )
+        if getattr(self, "_spawn_environment_seal_attempted", False):
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "spawn environment seal is single-use",
+            )
+        self._spawn_environment_seal_attempted = True
+        environment = self._native_environment_for_spawn()
+        observed_sha256 = self._spawn_environment_sha256(environment)
+        expected_sha256 = self.freeze["execution"]["launcher_environment_sha256"]
+        if observed_sha256 != expected_sha256:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "spawn environment seal drifted; "
+                f"expected_sha256={expected_sha256}; "
+                f"observed_sha256={observed_sha256}",
+            )
+        self._systemroot_from_spawn_environment(environment)
+        self._require_before_deadline(
+            deadline_monotonic_ns, "spawn-environment seal"
+        )
+        self._sealed_spawn_environment = MappingProxyType(dict(environment))
+        self._sealed_spawn_environment_sha256 = observed_sha256
+
+    def _sealed_spawn_environment_copy(self) -> dict[str, str]:
+        sealed = getattr(self, "_sealed_spawn_environment", None)
+        sealed_sha256 = getattr(self, "_sealed_spawn_environment_sha256", None)
+        if sealed is None or sealed_sha256 is None:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "spawn environment was not sealed before process creation",
+            )
+        environment = dict(sealed)
+        observed_sha256 = self._spawn_environment_sha256(environment)
+        expected_sha256 = self.freeze["execution"]["launcher_environment_sha256"]
+        if observed_sha256 != sealed_sha256 or observed_sha256 != expected_sha256:
+            raise OrchestrationPhaseError(
+                "build_or_candidate_changed",
+                "sealed spawn environment identity changed; "
+                f"expected_sha256={expected_sha256}; "
+                f"observed_sha256={observed_sha256}",
+            )
+        return environment
 
     def _attempt_directory_receipt(self) -> SecureDirectoryReceipt:
         receipt = self.secure.open_private_directory(
@@ -8032,21 +8549,18 @@ class WindowsProductionLiveBoundary:
         deadline_monotonic_ns: int,
         heartbeat: HeartbeatPump,
     ) -> dict[str, Any]:
-        import os
         import subprocess
 
-        executable = os.path.join(
-            os.environ.get("SystemRoot", r"C:\Windows"),
-            "System32",
-            "schtasks.exe",
-        )
+        environment = self._sealed_spawn_environment_copy()
+        system_root = self._systemroot_from_spawn_environment(environment)
+        executable = ntpath.join(system_root, "System32", "schtasks.exe")
         process = subprocess.Popen(
             [executable, "/Query", "/TN", self._TASK_NAME],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             cwd=self.freeze["execution"]["wrapper_cwd"],
-            env=dict(os.environ),
+            env=environment,
             shell=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -8315,14 +8829,7 @@ class WindowsProductionLiveBoundary:
 
         if attempt_contract.validate_live_freeze(freeze) != self.freeze:
             raise OrchestrationPhaseError("launch_failed", "live freeze changed")
-        environment = self._native_environment_for_spawn()
-        if self._spawn_environment_sha256(environment) != self.freeze["execution"][
-            "launcher_environment_sha256"
-        ]:
-            raise OrchestrationPhaseError(
-                "build_or_candidate_changed",
-                "launcher environment drifted from the freeze",
-            )
+        environment = self._sealed_spawn_environment_copy()
         before_task = self._query_task_absent(
             "before_launch",
             deadline_monotonic_ns=deadline_monotonic_ns,
@@ -9240,7 +9747,7 @@ class WindowsProductionLiveBoundary:
                 "child_spawn_failed", "spawn inheritance handles are unavailable"
             )
 
-        environment = self._native_environment_for_spawn()
+        environment = self._sealed_spawn_environment_copy()
         directory = self._attempt_directory_receipt()
         stdout_handle: int | None = None
         stderr_handle: int | None = None
@@ -10721,6 +11228,8 @@ class WindowsProductionLiveBoundary:
 
         if self.secure is not None:
             close_one("secure_boundary", self.secure.close)
+        self._sealed_spawn_environment = None
+        self._sealed_spawn_environment_sha256 = None
         self._closed = True
         if failures:
             raise SecureBoundaryError(

@@ -20,10 +20,13 @@ H = "a" * 64
 H2 = "b" * 64
 H3 = "c" * 64
 PROBE_HASH = "e" * 64
+IMPORT_AUDIT_HASH = "1" * 64
 COMMIT = "d" * 40
 TREE = "f" * 40
 UTC = "2026-07-20T12:34:56.123456Z"
-LIVE_WORKTREE = r"C:\Users\John\aigp-worktrees\wt-package2-powered-calibration-live"
+LIVE_WORKTREE = (
+    r"C:\Users\John\aigp-worktrees\wt-package2-import-environment-recovery-live"
+)
 PYTHON = r"C:\Users\John\killallhumans\.venv\Scripts\python.exe"
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
@@ -42,7 +45,12 @@ def _implementation_inventory() -> dict[str, object]:
                 "path": "scripts/aigp_vq2_powered_calibration_probe.py",
                 "size_bytes": 123,
                 "sha256": PROBE_HASH,
-            }
+            },
+            {
+                "path": "scripts/aigp_vq2_powered_import_audit.py",
+                "size_bytes": 456,
+                "sha256": IMPORT_AUDIT_HASH,
+            },
         ],
     }
 
@@ -109,9 +117,7 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     value = {
         "schema": "aigp-vq2-powered-calibration-live-freeze/1",
         "task_id": contract.TASK_ID,
-        "freeze_id": (
-            "vq2-package2-powered-calibration-f00-a01-live-freeze-recovery-02"
-        ),
+        "freeze_id": "vq2-package2-import-environment-recovery-f01-a01-live-freeze",
         "candidate": {
             "commit": COMMIT,
             "code_sha256": contract.canonical_object_sha256(semantic),
@@ -217,7 +223,7 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
                 "-SimulatorPath",
                 launcher,
                 "-TaskName",
-                "AIGP-P2-F00-A01-Launch",
+                "AIGP-P2-F01-A01-Launch",
                 "-StartupTimeoutSeconds",
                 "25",
             ],
@@ -266,6 +272,9 @@ class FakeOffline:
         self.identity_hashes[
             LIVE_WORKTREE + r"\scripts\aigp_vq2_powered_calibration_probe.py"
         ] = PROBE_HASH
+        self.identity_hashes[
+            LIVE_WORKTREE + r"\scripts\aigp_vq2_powered_import_audit.py"
+        ] = IMPORT_AUDIT_HASH
 
     def read_stable_json(self, path: str) -> probe.StableJsonProof:
         self.calls.append(f"json:{path}")
@@ -339,9 +348,14 @@ class FakeOffline:
         value["created_at_utc"] = "2026-07-20T12:35:00.000000Z"
         return value
 
-    def rederive_import_inventory(self, frozen_inventory, eager_modules):
+    def rederive_import_inventory(
+        self, frozen_inventory, eager_modules, *, environment_inventory
+    ):
         self.calls.append("import-rederive")
         assert tuple(eager_modules) == probe.POWERED_EAGER_IMPORT_MODULES
+        assert environment_inventory["variables"] == _environment_inventory()[
+            "variables"
+        ]
         return probe.ImportRevalidation(
             inventory=copy.deepcopy(frozen_inventory),
             origins_reverified=True,
@@ -359,6 +373,30 @@ def _admission(tmp_path: Path):
         expected_commit=COMMIT,
     )
     return freeze, service, probe.admit_offline(arguments, service)
+
+
+def test_native_environment_entry_parser_rejects_hidden_drive_state():
+    environment: dict[str, str] = {}
+    with pytest.raises(ValueError, match="not spawn-safe"):
+        probe._append_native_environment_entry(
+            environment,
+            r"=C:=C:\hidden-drive-state",
+        )
+    assert environment == {}
+    probe._append_native_environment_entry(
+        environment,
+        r"=C:=C:\hidden-drive-state",
+        allow_drive_state=True,
+    )
+    assert environment == {"=C:": r"C:\hidden-drive-state"}
+
+    probe._append_native_environment_entry(environment, r"Path=C:\Windows")
+    assert environment == {
+        "=C:": r"C:\hidden-drive-state",
+        "PATH": r"C:\Windows",
+    }
+    with pytest.raises(ValueError, match="not spawn-safe"):
+        probe._append_native_environment_entry(environment, r"PATH=C:\Other")
 
 
 class FakeSecure:
@@ -679,6 +717,11 @@ class FakeLive:
         self._call("spawn.allocate_handles")
         assert wrapper_process == _process()
         return probe.AttemptHandleSet(41, 42, 43, 44)
+
+    def seal_spawn_environment(self, *, deadline_monotonic_ns):
+        self._call("spawn.seal_environment")
+        assert self.clock is not None
+        assert self.clock.value < deadline_monotonic_ns
 
     def launch_and_wait(
         self, *, freeze, deadline_monotonic_ns, heartbeat
@@ -1215,6 +1258,9 @@ def test_offline_admission_revalidates_every_semantic_and_origin(tmp_path):
     assert "environment-rederive" in service.calls
     assert "import-rederive" in service.calls
     assert service.calls.index("cwd") < service.calls.index("import-rederive")
+    assert service.calls.index("environment-rederive") < service.calls.index(
+        "import-rederive"
+    )
     expected_module = LIVE_WORKTREE + r"\scripts\aigp_vq2_powered_calibration_probe.py"
     assert f"identity:{expected_module}" in service.calls
 
@@ -1258,8 +1304,12 @@ def test_offline_admission_fails_closed_on_identity_drift(tmp_path, fault):
     elif fault == "imports":
         original_import = service.rederive_import_inventory
 
-        def bad_import(frozen, eager):
-            value = original_import(frozen, eager)
+        def bad_import(frozen, eager, *, environment_inventory):
+            value = original_import(
+                frozen,
+                eager,
+                environment_inventory=environment_inventory,
+            )
             return probe.ImportRevalidation(
                 value.inventory, True, False, ("unexpected.module",), ()
             )
@@ -1315,7 +1365,7 @@ def test_attempt_gate_rejects_poison_existing_and_any_prior_attempt():
                 False,
                 False,
                 False,
-                (probe.PriorAttemptObservation("F00-A00", 1, 1),),
+                (probe.PriorAttemptObservation("F01-A00", 1, 1),),
             ),
         )
     with pytest.raises(probe.AttemptGateError, match="sole terminal"):
@@ -1326,7 +1376,7 @@ def test_attempt_gate_rejects_poison_existing_and_any_prior_attempt():
                 False,
                 False,
                 False,
-                (probe.PriorAttemptObservation("F00-A00", 2, 1),),
+                (probe.PriorAttemptObservation("F01-A00", 2, 1),),
             ),
         )
 
@@ -1406,7 +1456,7 @@ def test_windows_secure_create_new_applies_private_acl_at_creation(tmp_path):
         root_receipt = service.open_private_directory(
             root, parent_path=str(tmp_path)
         )
-        attempt_path = root + r"\F00-A01"
+        attempt_path = root + "\\" + contract.ATTEMPT_ID
         attempt_receipt = service.create_private_directory_create_new(
             attempt_path, parent_path=root
         )
@@ -2062,6 +2112,10 @@ def test_single_attempt_wrapper_completes_exact_sequence_and_goes_offline(tmp_pa
 
     assert secure.directory_calls.count(freeze["paths"]["attempt_dir"]) == 1
     assert secure.file_calls.count(freeze["paths"]["attempt_envelope"]) == 1
+    assert live.events.count("spawn.seal_environment") == 1
+    assert live.events.index("spawn.seal_environment") + 1 == live.events.index(
+        f"secure.mkdir:{contract.ATTEMPT_ID}"
+    )
     assert offline.calls.count("git") == 2
     assert live.acquired_qpc_frequency_hz == 10_000_000
     assert live.owner_secret_reference is not None
@@ -2492,6 +2546,117 @@ def test_prepublication_failure_zeroizes_all_secrets_and_closes_handles(
     assert live.events.count("process.close_retained_wrapper") == 1
 
 
+def test_final_environment_seal_failure_is_unconsumed_and_leaves_no_poison(
+    tmp_path, monkeypatch
+):
+    captured: list[probe.CapabilitySecrets] = []
+    original = probe.generate_capability_secrets
+
+    def capture(random_bytes):
+        secrets = original(random_bytes)
+        captured.append(secrets)
+        return secrets
+
+    monkeypatch.setattr(probe, "generate_capability_secrets", capture)
+    freeze, documents = _freeze()
+    offline = FakeOffline(tmp_path, freeze=freeze, documents=documents)
+    secure = FakeSecure(tmp_path, freeze)
+    live = FakeLive()
+    clock = StepClock()
+    live.clock = clock
+    secure.clock = clock
+    offline.events = live.events
+    secure.events = live.events
+    live.failures["spawn.seal_environment"] = probe.OrchestrationPhaseError(
+        "build_or_candidate_changed",
+        f"native environment drifted expected_sha256={H} observed_sha256={H2}",
+    )
+    orchestrator = probe.ProbeOrchestrator(
+        offline=offline,
+        secure=secure,
+        clock=clock,
+        live=_live_services(live),
+        validators=RecordingValidators(),
+    )
+
+    with pytest.raises(
+        probe.OrchestrationPhaseError,
+        match="expected_sha256=[a-f0-9]{64} observed_sha256=[a-f0-9]{64}",
+    ):
+        orchestrator.run(
+            probe.ProbeArguments(
+                freeze["paths"]["live_freeze"],
+                contract.canonical_file_sha256(freeze),
+                COMMIT,
+            )
+        )
+
+    assert len(captured) == 1
+    assert all(
+        captured[0].is_zeroized(role)
+        for role in ("lease_owner", "child", "cleanup")
+    )
+    assert secure.directory_calls == []
+    assert secure.file_calls == []
+    assert not secure.physical(freeze["paths"]["attempt_dir"]).exists()
+    assert not secure.physical(freeze["paths"]["live_poison"]).exists()
+    assert live.events.count("spawn.seal_environment") == 1
+    assert live.events.count("spawn.close_attempt_handles") == 1
+    assert live.events.count("process.close_retained_wrapper") == 1
+    assert not any(
+        event.startswith(("lease.", "launcher.", "ports.", "spawn.child", "spawn.fallback"))
+        for event in live.events
+    )
+
+
+def test_import_audit_environment_mutation_fails_before_attempt_or_live_contact(
+    tmp_path,
+):
+    freeze, documents = _freeze()
+    offline = FakeOffline(tmp_path, freeze=freeze, documents=documents)
+
+    def reject_mutation(_frozen, _eager, *, environment_inventory):
+        assert environment_inventory["variables"] == _environment_inventory()[
+            "variables"
+        ]
+        raise probe.OfflineAdmissionError(
+            f"parent native environment changed; expected_sha256={H}; "
+            f"observed_sha256={H2}"
+        )
+
+    offline.rederive_import_inventory = reject_mutation
+    secure = FakeSecure(tmp_path, freeze)
+    live = FakeLive()
+    offline.events = live.events
+    secure.events = live.events
+    orchestrator = probe.ProbeOrchestrator(
+        offline=offline,
+        secure=secure,
+        clock=StepClock(),
+        live=_live_services(live),
+        validators=RecordingValidators(),
+    )
+
+    with pytest.raises(
+        probe.OfflineAdmissionError,
+        match="parent native environment changed",
+    ):
+        orchestrator.run(
+            probe.ProbeArguments(
+                freeze["paths"]["live_freeze"],
+                contract.canonical_file_sha256(freeze),
+                COMMIT,
+            )
+        )
+
+    assert secure.inspect_calls == 0
+    assert secure.directory_calls == []
+    assert secure.file_calls == []
+    assert not secure.physical(freeze["paths"]["attempt_dir"]).exists()
+    assert not secure.physical(freeze["paths"]["live_poison"]).exists()
+    assert live.events == ["offline.admit"]
+
+
 def test_spawn_failure_closes_prepared_owners_before_invalid_terminal(tmp_path):
     def configure(live, secure, freeze):
         live.failures["spawn.child_blocked"] = probe.OrchestrationPhaseError(
@@ -2737,6 +2902,8 @@ sys.path[0] = os.getcwd()
 sys.modules['__main__'] = sys.modules[probe.PROBE_MODULE]
 clock = runtime.WindowsQpcProvider()
 service = probe.WindowsProductionOfflineAdmission()
+native_environment = {name.upper(): value for name, value in os.environ.items()}
+service._read_native_environment_block = lambda: dict(native_environment)
 service.begin_bounded_admission(
     deadline_monotonic_ns=clock.now_ns() + 10_000_000_000,
     monotonic_ns=clock.now_ns,
@@ -2744,8 +2911,19 @@ service.begin_bounded_admission(
 )
 succeeded = False
 try:
+    environment = service.rederive_environment_inventory({
+        'schema': 'aigp-vq2-powered-environment-inventory/1',
+        'created_at_utc': '2026-07-21T00:00:00.000000Z',
+        'variables': [],
+    })
+    missing_before = [
+        entry['module'] for entry in inventory['entries']
+        if sys.modules.get(entry['module']) is None
+    ]
     audit = service.rederive_import_inventory(
-        inventory, probe.POWERED_EAGER_IMPORT_MODULES
+        inventory,
+        probe.POWERED_EAGER_IMPORT_MODULES,
+        environment_inventory=environment,
     )
     succeeded = True
 finally:
@@ -2763,10 +2941,10 @@ result = {
     'user_site_on_sys_path': audit.user_site_on_sys_path,
     'unexpected': list(audit.unexpected_candidate_or_venv_modules),
     'unclassified': list(audit.unclassified_origins),
-    'missing': [
+    'parent_missing_preserved': [
         entry['module'] for entry in inventory['entries']
         if sys.modules.get(entry['module']) is None
-    ],
+    ] == missing_before,
 }
 sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
 """
@@ -2790,10 +2968,220 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
             "user_site_on_sys_path": False,
             "unexpected": [],
             "unclassified": [],
-            "missing": [],
+            "parent_missing_preserved": True,
         }
 
-    def test_native_environment_snapshot_detects_non_python_drift(self):
+    def test_production_revalidation_isolated_from_parent_modules_and_path(
+        self, monkeypatch
+    ):
+        inventory_process = subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                "-s",
+                "-B",
+                "-m",
+                probe.IMPORT_AUDIT_MODULE,
+            ],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert inventory_process.returncode == 0, inventory_process.stderr.decode(
+            errors="replace"
+        )
+        inventory = contract.parse_canonical_json_bytes(
+            inventory_process.stdout, file_form=True
+        )
+        service = probe.WindowsProductionOfflineAdmission()
+        native_environment = {
+            name.upper(): value for name, value in os.environ.items()
+        }
+        monkeypatch.setattr(
+            service,
+            "_read_native_environment_block",
+            lambda: dict(native_environment),
+        )
+        self._begin(service, seconds=15.0)
+        succeeded = False
+        try:
+            environment = service.rederive_environment_inventory(
+                {
+                    "schema": "aigp-vq2-powered-environment-inventory/1",
+                    "created_at_utc": UTC,
+                    "variables": [],
+                }
+            )
+            native_before = service._native_environment()
+            modules_before = tuple(sys.modules.items())
+            audit = service.rederive_import_inventory(
+                inventory,
+                probe.POWERED_EAGER_IMPORT_MODULES,
+                environment_inventory=environment,
+            )
+            assert audit.inventory == inventory
+            assert audit.origins_reverified is True
+            assert audit.user_site_on_sys_path is False
+            assert audit.unexpected_candidate_or_venv_modules == ()
+            assert audit.unclassified_origins == ()
+            assert service._native_environment() == native_before
+            modules_after = tuple(sys.modules.items())
+            assert len(modules_after) == len(modules_before)
+            assert all(
+                after_name == before_name and after_module is before_module
+                for (before_name, before_module), (after_name, after_module) in zip(
+                    modules_before, modules_after, strict=True
+                )
+            )
+            succeeded = True
+        finally:
+            service.end_bounded_admission(succeeded=succeeded)
+            service.close()
+
+    def test_production_import_audit_rejects_parent_native_environment_mutation(
+        self, monkeypatch
+    ):
+        inventory_process = subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                "-s",
+                "-B",
+                "-m",
+                probe.IMPORT_AUDIT_MODULE,
+            ],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert inventory_process.returncode == 0, inventory_process.stderr.decode(
+            errors="replace"
+        )
+        inventory = contract.parse_canonical_json_bytes(
+            inventory_process.stdout, file_form=True
+        )
+        service = probe.WindowsProductionOfflineAdmission()
+        native_environment = {
+            name.upper(): value for name, value in os.environ.items()
+        }
+        monkeypatch.setattr(
+            service,
+            "_read_native_environment_block",
+            lambda: dict(native_environment),
+        )
+        sentinel_name = "AIGP_NATIVE_MUTATION_SENTINEL"
+        sentinel_value = "must-not-leak-from-diagnostic"
+
+        def mutate_parent_environment(argv, **_kwargs):
+            native_environment[sentinel_name] = sentinel_value
+            return subprocess.CompletedProcess(
+                list(argv),
+                0,
+                contract.canonical_json_file_bytes(inventory),
+                b"",
+            )
+
+        monkeypatch.setattr(service, "_run_process", mutate_parent_environment)
+        self._begin(service)
+        try:
+            environment = service.rederive_environment_inventory(
+                {
+                    "schema": "aigp-vq2-powered-environment-inventory/1",
+                    "created_at_utc": UTC,
+                    "variables": [],
+                }
+            )
+            with pytest.raises(
+                probe.OfflineAdmissionError,
+                match=(
+                    "parent native environment changed across isolated import audit; "
+                    "expected_sha256=[a-f0-9]{64}; observed_sha256=[a-f0-9]{64}"
+                ),
+            ) as failure:
+                service.rederive_import_inventory(
+                    inventory,
+                    probe.POWERED_EAGER_IMPORT_MODULES,
+                    environment_inventory=environment,
+                )
+            assert sentinel_name not in str(failure.value)
+            assert sentinel_value not in str(failure.value)
+        finally:
+            service.end_bounded_admission(succeeded=False)
+
+    def test_production_import_audit_rejects_parent_module_graph_mutation(
+        self, monkeypatch
+    ):
+        inventory_process = subprocess.run(
+            [
+                sys.executable,
+                "-E",
+                "-s",
+                "-B",
+                "-m",
+                probe.IMPORT_AUDIT_MODULE,
+            ],
+            cwd=Path.cwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+        assert inventory_process.returncode == 0, inventory_process.stderr.decode(
+            errors="replace"
+        )
+        inventory = contract.parse_canonical_json_bytes(
+            inventory_process.stdout, file_form=True
+        )
+        service = probe.WindowsProductionOfflineAdmission()
+        native_environment = {
+            name.upper(): value for name, value in os.environ.items()
+        }
+        monkeypatch.setattr(
+            service,
+            "_read_native_environment_block",
+            lambda: dict(native_environment),
+        )
+        sentinel_name = "aigp_parent_module_mutation_sentinel"
+
+        def mutate_parent_modules(argv, **_kwargs):
+            sys.modules[sentinel_name] = object()
+            return subprocess.CompletedProcess(
+                list(argv),
+                0,
+                contract.canonical_json_file_bytes(inventory),
+                b"",
+            )
+
+        monkeypatch.setattr(service, "_run_process", mutate_parent_modules)
+        self._begin(service)
+        try:
+            environment = service.rederive_environment_inventory(
+                {
+                    "schema": "aigp-vq2-powered-environment-inventory/1",
+                    "created_at_utc": UTC,
+                    "variables": [],
+                }
+            )
+            with pytest.raises(
+                probe.OfflineAdmissionError,
+                match="parent import graph changed across isolated import audit",
+            ):
+                service.rederive_import_inventory(
+                    inventory,
+                    probe.POWERED_EAGER_IMPORT_MODULES,
+                    environment_inventory=environment,
+                )
+        finally:
+            sys.modules.pop(sentinel_name, None)
+            service.end_bounded_admission(succeeded=False)
+
+    def test_native_environment_snapshot_detects_non_python_drift(
+        self, monkeypatch
+    ):
         import ctypes
 
         service = probe.WindowsProductionOfflineAdmission()
@@ -2812,18 +3200,29 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
         self._begin(service)
         try:
             assert os.environ.get(name) != "native-only-review"
-            assert service.security_environment()[name] == "native-only-review"
-            inventory = service.rederive_environment_inventory(
-                {
-                    "schema": "aigp-vq2-powered-environment-inventory/1",
-                    "created_at_utc": UTC,
-                    "variables": [],
-                }
+            assert self._native_environment_value(kernel, name) == "native-only-review"
+            complete_with_drive_state = {
+                key.upper(): value for key, value in os.environ.items()
+            }
+            complete_with_drive_state[name] = "native-only-review"
+            complete_with_drive_state["=C:"] = r"C:\native-drive-state"
+            monkeypatch.setattr(
+                service,
+                "_read_native_environment_block",
+                lambda: dict(complete_with_drive_state),
             )
-            by_name = {item["name"]: item for item in inventory["variables"]}
-            assert by_name[name]["value_sha256"] == hashlib.sha256(
-                b"native-only-review"
-            ).hexdigest()
+            assert service.security_environment()[name] == "native-only-review"
+            with pytest.raises(
+                probe.OfflineAdmissionError,
+                match="not a canonical spawn mapping",
+            ):
+                service.rederive_environment_inventory(
+                    {
+                        "schema": "aigp-vq2-powered-environment-inventory/1",
+                        "created_at_utc": UTC,
+                        "variables": [],
+                    }
+                )
         finally:
             service.end_bounded_admission(succeeded=True)
             service.close()
@@ -3067,7 +3466,9 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
             service.end_bounded_admission(succeeded=True)
             service.close()
 
-    def test_bounded_process_polls_heartbeats_and_hard_expires(self):
+    def test_bounded_process_polls_heartbeats_and_hard_expires(
+        self, monkeypatch
+    ):
         service = probe.WindowsProductionOfflineAdmission()
         heartbeats = []
         self._begin(service, seconds=2.5, heartbeat=lambda: heartbeats.append(time.perf_counter_ns()))
@@ -3089,6 +3490,15 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
         service.close()
 
         expired = probe.WindowsProductionOfflineAdmission()
+        spawned = []
+        real_popen = expired._subprocess.Popen
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(expired._subprocess, "Popen", capture_popen)
         started = time.perf_counter()
         self._begin(expired, seconds=0.15)
         try:
@@ -3096,13 +3506,140 @@ sys.stdout.buffer.write(contract.canonical_json_file_bytes(result))
                 expired._run_process(
                     [sys.executable, "-c", "import time; time.sleep(5)"],
                     cwd=str(Path.cwd().resolve()),
-                    input_bytes=None,
+                    input_bytes=b"x" * expired._MAX_GIT_INPUT_BYTES,
                     environment=environment,
                     stdout_limit=1024,
                 )
         finally:
             expired.end_bounded_admission(succeeded=False)
         assert time.perf_counter() - started < 1.0
+        assert len(spawned) == 1 and spawned[0].poll() is not None
+        assert not any(
+            thread.name.startswith("aigp-offline-") and thread.is_alive()
+            for thread in __import__("threading").enumerate()
+        )
+
+    @pytest.mark.parametrize(
+        ("stream_name", "payload_size", "stdout_limit"),
+        [
+            ("stdout", 2_000_000, 1_024),
+            ("stderr", 2_000_000, 1_024),
+        ],
+    )
+    def test_bounded_process_hard_caps_running_child_output(
+        self,
+        monkeypatch,
+        stream_name,
+        payload_size,
+        stdout_limit,
+    ):
+        service = probe.WindowsProductionOfflineAdmission()
+        environment = {
+            name.upper(): value for name, value in os.environ.items()
+        }
+        spawned = []
+        real_popen = service._subprocess.Popen
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(service._subprocess, "Popen", capture_popen)
+        child_code = (
+            "import sys,time; "
+            f"stream=sys.{stream_name}.buffer; "
+            f"stream.write(b'x'*{payload_size}); stream.flush(); time.sleep(5)"
+        )
+        started = time.perf_counter()
+        self._begin(service, seconds=3.0)
+        try:
+            with pytest.raises(
+                probe.OfflineAdmissionError,
+                match="output exceeded its limit",
+            ) as failure:
+                service._run_process(
+                    [sys.executable, "-c", child_code],
+                    cwd=str(Path.cwd().resolve()),
+                    input_bytes=None,
+                    environment=environment,
+                    stdout_limit=stdout_limit,
+                )
+        finally:
+            service.end_bounded_admission(succeeded=False)
+        assert time.perf_counter() - started < 1.5
+        assert len(spawned) == 1 and spawned[0].poll() is not None
+        assert str(failure.value) == (
+            "bounded identity process output exceeded its limit"
+        )
+        assert not any(
+            thread.name.startswith("aigp-offline-") and thread.is_alive()
+            for thread in __import__("threading").enumerate()
+        )
+
+    def test_bounded_process_accepts_output_exactly_at_stdout_limit(self):
+        service = probe.WindowsProductionOfflineAdmission()
+        environment = {
+            name.upper(): value for name, value in os.environ.items()
+        }
+        payload = b"exact-limit"
+        self._begin(service)
+        try:
+            result = service._run_process(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.buffer.write(b'exact-limit')",
+                ],
+                cwd=str(Path.cwd().resolve()),
+                input_bytes=None,
+                environment=environment,
+                stdout_limit=len(payload),
+            )
+            assert result.returncode == 0
+            assert result.stdout == payload
+            assert result.stderr == b""
+        finally:
+            service.end_bounded_admission(succeeded=True)
+            service.close()
+
+    def test_bounded_process_thread_start_failure_reaps_child(
+        self, monkeypatch
+    ):
+        service = probe.WindowsProductionOfflineAdmission()
+        environment = {
+            name.upper(): value for name, value in os.environ.items()
+        }
+        spawned = []
+        real_popen = service._subprocess.Popen
+
+        def capture_popen(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        class RefusedThread:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("injected thread-start refusal")
+
+        monkeypatch.setattr(service._subprocess, "Popen", capture_popen)
+        monkeypatch.setattr(service._threading, "Thread", RefusedThread)
+        self._begin(service)
+        try:
+            with pytest.raises(RuntimeError, match="thread-start refusal"):
+                service._run_process(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    cwd=str(Path.cwd().resolve()),
+                    input_bytes=None,
+                    environment=environment,
+                    stdout_limit=1_024,
+                )
+        finally:
+            service.end_bounded_admission(succeeded=False)
+        assert len(spawned) == 1 and spawned[0].poll() is not None
 
     def test_production_provider_construction_and_import_are_inert(self, monkeypatch):
         def unexpected_spawn(*_args, **_kwargs):
@@ -3177,7 +3714,7 @@ def _production_prechild_proof() -> dict[str, object]:
         "build": 3385,
         "topology": "one_launcher_parent_retained_one_payload_child",
         "scheduled_task": {
-            "name": "AIGP-P2-F00-A01-Launch",
+            "name": "AIGP-P2-F01-A01-Launch",
             "observations": [
                 {
                     "phase": phase,
@@ -3255,10 +3792,210 @@ def _bare_production_boundary(freeze, *, clock=None):
     boundary.stable_file_proofs = {}
     boundary._stable_file_handles = {}
     boundary._stable_file_payloads = {}
+    boundary._sealed_spawn_environment = None
+    boundary._sealed_spawn_environment_sha256 = None
     boundary._closed_process_ids = set()
     boundary._lease_release_attempted = False
     boundary._closed = False
     return boundary
+
+
+def test_production_spawn_environment_seal_is_single_use_and_defensive(
+    monkeypatch,
+):
+    freeze, _documents = _freeze()
+    native_environment = {
+        "SYSTEMROOT": r"C:\Windows",
+        "NATIVE_ONLY": "native-value",
+    }
+    freeze["execution"]["launcher_environment_sha256"] = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            native_environment
+        )
+    )
+    boundary = _bare_production_boundary(freeze)
+    native_reads = 0
+
+    def read_native():
+        nonlocal native_reads
+        native_reads += 1
+        return native_environment
+
+    monkeypatch.setattr(boundary, "_native_environment_for_spawn", read_native)
+    boundary.seal_spawn_environment(deadline_monotonic_ns=1_000_000)
+    assert native_reads == 1
+    first = boundary._sealed_spawn_environment_copy()
+    second = boundary._sealed_spawn_environment_copy()
+    assert first == second == native_environment
+    assert first is not second and first is not native_environment
+    first["NATIVE_ONLY"] = "caller-mutation"
+    assert boundary._sealed_spawn_environment_copy() == native_environment
+    with pytest.raises(probe.OrchestrationPhaseError, match="single-use"):
+        boundary.seal_spawn_environment(deadline_monotonic_ns=1_000_000)
+    assert native_reads == 1
+
+
+def test_production_spawn_environment_drift_diagnostic_is_hash_only(monkeypatch):
+    freeze, _documents = _freeze()
+    boundary = _bare_production_boundary(freeze)
+    observed = {"SECRET_ENVIRONMENT_VALUE": "must-not-leak"}
+    observed_sha256 = probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+        observed
+    )
+    expected_sha256 = freeze["execution"]["launcher_environment_sha256"]
+    monkeypatch.setattr(
+        boundary,
+        "_native_environment_for_spawn",
+        lambda: observed,
+    )
+
+    with pytest.raises(probe.OrchestrationPhaseError) as failure:
+        boundary.seal_spawn_environment(deadline_monotonic_ns=1_000_000)
+
+    detail = str(failure.value)
+    assert f"expected_sha256={expected_sha256}" in detail
+    assert f"observed_sha256={observed_sha256}" in detail
+    assert "SECRET_ENVIRONMENT_VALUE" not in detail
+    assert "must-not-leak" not in detail
+    assert boundary._sealed_spawn_environment is None
+
+
+def test_production_spawn_environment_seal_rejects_hidden_drive_state(monkeypatch):
+    freeze, _documents = _freeze()
+    boundary = _bare_production_boundary(freeze)
+    monkeypatch.setattr(
+        boundary,
+        "_native_environment_for_spawn",
+        lambda: {"=C:": r"C:\hidden-drive-state", "SYSTEMROOT": r"C:\Windows"},
+    )
+
+    with pytest.raises(
+        probe.OrchestrationPhaseError,
+        match="native spawn environment is not canonical",
+    ):
+        boundary.seal_spawn_environment(deadline_monotonic_ns=1_000_000)
+
+    assert boundary._sealed_spawn_environment is None
+    assert boundary._spawn_environment_seal_attempted is True
+
+
+@pytest.mark.parametrize(
+    "system_root",
+    [None, "", r"relative\Windows", r"\Windows", r"C:\Windows\..\evil"],
+)
+def test_production_spawn_environment_seal_requires_canonical_systemroot(
+    monkeypatch, system_root
+):
+    freeze, _documents = _freeze()
+    native_environment = {"NATIVE_ONLY": "native-value"}
+    if system_root is not None:
+        native_environment["SYSTEMROOT"] = system_root
+    freeze["execution"]["launcher_environment_sha256"] = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            native_environment
+        )
+    )
+    boundary = _bare_production_boundary(freeze)
+    monkeypatch.setattr(
+        boundary,
+        "_native_environment_for_spawn",
+        lambda: dict(native_environment),
+    )
+
+    with pytest.raises(
+        probe.OrchestrationPhaseError,
+        match="lacks a canonical SYSTEMROOT",
+    ):
+        boundary.seal_spawn_environment(deadline_monotonic_ns=1_000_000)
+
+    assert boundary._sealed_spawn_environment is None
+    assert boundary._spawn_environment_seal_attempted is True
+
+
+def test_scheduled_task_query_uses_only_the_sealed_environment(monkeypatch):
+    freeze, _documents = _freeze()
+    sealed = {
+        "SYSTEMROOT": r"C:\FrozenWindows",
+        "NATIVE_ONLY": "sealed-value",
+    }
+    freeze["execution"]["launcher_environment_sha256"] = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(sealed)
+    )
+    boundary = _bare_production_boundary(freeze)
+    boundary._sealed_spawn_environment = sealed
+    boundary._sealed_spawn_environment_sha256 = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(sealed)
+    )
+    monkeypatch.setenv("SYSTEMROOT", r"C:\MutableWindows")
+    monkeypatch.setenv("OS_ONLY", "must-not-be-forwarded")
+    captured: dict[str, Any] = {}
+
+    def popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(boundary, "_wait_subprocess", lambda *_args, **_kwargs: 1)
+    observation = boundary._query_task_absent(
+        "before_launch",
+        deadline_monotonic_ns=1_000_000,
+        heartbeat=probe.HeartbeatPump(
+            "launcher_return", 1_000_000, 1_000, lambda: None
+        ),
+    )
+
+    assert observation["absent"] is True
+    assert captured["argv"] == [
+        r"C:\FrozenWindows\System32\schtasks.exe",
+        "/Query",
+        "/TN",
+        "AIGP-P2-F01-A01-Launch",
+    ]
+    assert captured["env"] == sealed
+    assert captured["env"] is not sealed
+    assert "OS_ONLY" not in captured["env"]
+
+
+@pytest.mark.parametrize(
+    "system_root",
+    [None, "", r"relative\Windows", r"\Windows", r"C:\Windows\..\evil"],
+)
+def test_scheduled_task_query_requires_canonical_sealed_systemroot(
+    monkeypatch, system_root
+):
+    freeze, _documents = _freeze()
+    sealed = {"NATIVE_ONLY": "sealed-value"}
+    if system_root is not None:
+        sealed["SYSTEMROOT"] = system_root
+    freeze["execution"]["launcher_environment_sha256"] = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(sealed)
+    )
+    boundary = _bare_production_boundary(freeze)
+    boundary._sealed_spawn_environment = sealed
+    boundary._sealed_spawn_environment_sha256 = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(sealed)
+    )
+    popen_called = False
+
+    def popen(*_args, **_kwargs):
+        nonlocal popen_called
+        popen_called = True
+        raise AssertionError("scheduled-task query must not spawn")
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    with pytest.raises(
+        probe.OrchestrationPhaseError,
+        match="lacks a canonical SYSTEMROOT",
+    ):
+        boundary._query_task_absent(
+            "before_launch",
+            deadline_monotonic_ns=1_000_000,
+            heartbeat=probe.HeartbeatPump(
+                "launcher_return", 1_000_000, 1_000, lambda: None
+            ),
+        )
+    assert popen_called is False
 
 
 def test_production_launcher_passes_exact_native_environment_not_os_environ(
@@ -3272,13 +4009,14 @@ def test_production_launcher_passes_exact_native_environment_not_os_environ(
         )
     )
     boundary = _bare_production_boundary(freeze)
+    boundary._sealed_spawn_environment = native_environment
+    boundary._sealed_spawn_environment_sha256 = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            native_environment
+        )
+    )
     monkeypatch.setenv("NATIVE_ONLY", "os-environ-value")
     monkeypatch.setenv("OS_ONLY", "must-not-be-forwarded")
-    monkeypatch.setattr(
-        boundary,
-        "_native_environment_for_spawn",
-        lambda: native_environment,
-    )
     monkeypatch.setattr(
         boundary,
         "_query_task_absent",
@@ -3309,7 +4047,7 @@ def test_production_launcher_passes_exact_native_environment_not_os_environ(
         heartbeat=probe.HeartbeatPump("launcher_return", 1_000_000, 1_000, lambda: None),
     )
     assert result["launch"]["disposition"] == "absent_before_launcher_current_after"
-    assert captured["env"] is native_environment
+    assert captured["env"] is not native_environment
     assert captured["env"] == {"NATIVE_ONLY": "native-value"}
     assert "OS_ONLY" not in captured["env"]
 
@@ -3325,12 +4063,13 @@ def test_production_launcher_refuses_native_only_environment_drift_before_popen(
         )
     )
     boundary = _bare_production_boundary(freeze)
-    monkeypatch.setenv("NATIVE_ONLY", "frozen-value")
-    monkeypatch.setattr(
-        boundary,
-        "_native_environment_for_spawn",
-        lambda: {"NATIVE_ONLY": "native-drift"},
+    boundary._sealed_spawn_environment = {"NATIVE_ONLY": "native-drift"}
+    boundary._sealed_spawn_environment_sha256 = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            boundary._sealed_spawn_environment
+        )
     )
+    monkeypatch.setenv("NATIVE_ONLY", "frozen-value")
     popen_called = False
 
     def popen(*_args, **_kwargs):
@@ -3341,7 +4080,7 @@ def test_production_launcher_refuses_native_only_environment_drift_before_popen(
     monkeypatch.setattr(subprocess, "Popen", popen)
     with pytest.raises(
         probe.OrchestrationPhaseError,
-        match="launcher environment drifted",
+        match="sealed spawn environment identity changed",
     ):
         boundary.launch_and_wait(
             freeze=freeze,
@@ -3629,7 +4368,17 @@ def test_production_spawn_binds_lease_row_and_releases_only_secret(
     monkeypatch.setattr(
         boundary, "_load_attempt_envelope", lambda: copy.deepcopy(material.envelope)
     )
-    monkeypatch.setattr(boundary, "_native_environment_for_spawn", lambda: {"A": "B"})
+    sealed_environment = {"A": "B"}
+    freeze_environment_sha256 = (
+        probe.WindowsProductionLiveBoundary._spawn_environment_sha256(
+            sealed_environment
+        )
+    )
+    boundary.freeze["execution"]["launcher_environment_sha256"] = (
+        freeze_environment_sha256
+    )
+    boundary._sealed_spawn_environment = sealed_environment
+    boundary._sealed_spawn_environment_sha256 = freeze_environment_sha256
     parent = probe.SecureDirectoryReceipt(
         freeze["paths"]["attempt_dir"],
         freeze["paths"]["attempt_dir"],
@@ -3671,6 +4420,8 @@ def test_production_spawn_binds_lease_row_and_releases_only_secret(
         @staticmethod
         def spawn_blocked_child(argv, **kwargs):
             calls.append(("spawn", tuple(kwargs["inherited_handles"]) if "inherited_handles" in kwargs else None))
+            assert kwargs["environment"] == sealed_environment
+            assert kwargs["environment"] is not sealed_environment
             assert kwargs["capability_pipe"] is boundary.child_pipe
             assert kwargs["parent_process"] is boundary.child_parent
             assert kwargs["stdin_handle"] == 53
