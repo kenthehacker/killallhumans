@@ -155,7 +155,7 @@
     "tests/test_vision_udp.py": "0b92d4da17a8fe7b45fd995744ad031a4f3a7dcd4a4d86711dda037e37459174",
     "tests/test_vision_udp_listener.py": "640addb01e874cb66c319290a63169f2e68130c0f8c2e7919829164e92d18266",
     "tests/test_visualize_matrix.py": "a087f60f490b5dc20985dbf315d0dab743f50376db2af03fd4c7596407d49cf6",
-    "tests/test_windows_tooling.py": "7d18656476b5344e3fe33c0daf22b534c98886df8a33e5ed76834ff553dbaaa1",
+    "tests/test_windows_tooling.py": "6da7595328df39ae87e1d5f6fac56d8d2123864b67657db29b9ff41896e73355",
     "tests/test_yolo_experiment_audit.py": "5bf7c92dfc99a5a3a70697ed7c75864d74bf55f74bd11365c652682abed9aae7"
   },
   "schema": "aigp-trusted-evaluator-files/1"
