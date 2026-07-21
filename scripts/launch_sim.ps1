@@ -11,6 +11,61 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+function Select-AigpInteractiveSession {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$SessionLines,
+        [Parameter(Mandatory = $true)]
+        [int]$QueryExitCode
+    )
+
+    # On the verified build-3385 host, the trusted System32 query.exe emits a
+    # complete session table but returns 1. Admit only the two observed success
+    # statuses, then require the expected header and a parsed Active row. The
+    # output proof, not status 1 alone, is what makes that host behavior usable.
+    if ($QueryExitCode -ne 0 -and $QueryExitCode -ne 1) {
+        throw 'Unable to query Windows sessions; cannot safely target a GUI desktop.'
+    }
+    if (
+        $SessionLines.Count -gt 256 -or
+        @($SessionLines | Where-Object { $_.Length -gt 4096 }).Count -ne 0
+    ) {
+        throw 'Windows session query output exceeded its bounded shape.'
+    }
+    $headerCount = @(
+        $SessionLines | Where-Object {
+            $_ -match '^\s*SESSIONNAME\s+USERNAME\s+ID\s+STATE\s+TYPE\s+DEVICE\s*$'
+        }
+    ).Count
+    if ($headerCount -ne 1) {
+        throw 'Windows session query did not emit exactly one expected header.'
+    }
+
+    $activeSessions = @(
+        foreach ($line in $SessionLines) {
+            if ($line -match '^\s*(?<current>>)?\s*(?<session>\S+)\s+(?<user>\S+)\s+(?<id>\d+)\s+Active\b') {
+                [pscustomobject]@{
+                    Current = [bool]$Matches.current
+                    Session = $Matches.session
+                    User = $Matches.user
+                    Id = [int]$Matches.id
+                }
+            }
+        }
+    )
+    if ($activeSessions.Count -eq 0) {
+        throw 'No active interactive Windows session; log in before launching FlightSim.'
+    }
+    return $activeSessions |
+        Sort-Object -Property @(
+            @{ Expression = 'Current'; Descending = $true },
+            @{ Expression = { $_.Session -eq 'console' }; Descending = $true },
+            @{ Expression = 'Id'; Descending = $false }
+        ) |
+        Select-Object -First 1
+}
+
 # Serialize the process check and launch lifecycle across shells/sessions. A
 # plain Get-Process check has a TOCTOU window in which two concurrent launchers
 # can both observe no simulator and create different randomly named tasks.
@@ -56,31 +111,10 @@ $SimulatorDirectory = Split-Path -Parent $SimulatorPath
 # attached to this shell, then console, then another active RDP desktop.
 $querySession = Join-Path $env:SystemRoot 'System32\query.exe'
 $sessionLines = & $querySession session 2>$null
-if ($LASTEXITCODE -ne 0) {
-    throw 'Unable to query Windows sessions; cannot safely target a GUI desktop.'
-}
-$activeSessions = @(
-    foreach ($line in $sessionLines) {
-        if ($line -match '^\s*(?<current>>)?\s*(?<session>\S+)\s+(?<user>\S+)\s+(?<id>\d+)\s+Active\b') {
-            [pscustomobject]@{
-                Current = [bool]$Matches.current
-                Session = $Matches.session
-                User = $Matches.user
-                Id = [int]$Matches.id
-            }
-        }
-    }
-)
-if ($activeSessions.Count -eq 0) {
-    throw 'No active interactive Windows session; log in before launching FlightSim.'
-}
-$interactive = $activeSessions |
-    Sort-Object -Property @(
-        @{ Expression = 'Current'; Descending = $true },
-        @{ Expression = { $_.Session -eq 'console' }; Descending = $true },
-        @{ Expression = 'Id'; Descending = $false }
-    ) |
-    Select-Object -First 1
+$querySessionExitCode = $LASTEXITCODE
+$interactive = Select-AigpInteractiveSession `
+    -SessionLines @($sessionLines) `
+    -QueryExitCode $querySessionExitCode
 $InteractiveSessionId = $interactive.Id
 
 if (-not $RunAsUser) {

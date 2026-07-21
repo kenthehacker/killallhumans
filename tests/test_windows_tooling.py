@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -21,6 +22,63 @@ _P2_ENTRYPOINTS = tuple(
         "aigp_trials.py",
     )
 )
+
+
+def _run_launcher_session_selector(
+    session_lines: list[str], query_exit_code: int
+) -> subprocess.CompletedProcess[str]:
+    command = r"""
+$ErrorActionPreference = 'Stop'
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile(
+    $env:AIGP_PS_PARSE_PATH,
+    [ref]$tokens,
+    [ref]$errors
+)
+if ($errors.Count) { throw 'launch_sim.ps1 did not parse' }
+$functions = @(
+    $ast.FindAll(
+        {
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -eq 'Select-AigpInteractiveSession'
+        },
+        $true
+    )
+)
+if ($functions.Count -ne 1) { throw 'session selector is not unique' }
+Invoke-Expression $functions[0].Extent.Text
+$lines = [string[]]($env:AIGP_SESSION_LINES_JSON | ConvertFrom-Json)
+try {
+    $selected = Select-AigpInteractiveSession `
+        -SessionLines $lines `
+        -QueryExitCode ([int]$env:AIGP_QUERY_EXIT_CODE)
+    $selected | ConvertTo-Json -Compress
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 7
+}
+"""
+    return subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={
+            **os.environ,
+            "AIGP_PS_PARSE_PATH": str(_LAUNCHER),
+            "AIGP_SESSION_LINES_JSON": json.dumps(session_lines),
+            "AIGP_QUERY_EXIT_CODE": str(query_exit_code),
+        },
+    )
 
 
 def test_windows_command_surface_contains_all_passive_development_tasks():
@@ -120,10 +178,112 @@ def test_launcher_is_parameterized_and_has_no_stale_host_or_session_id():
     assert "/RL HIGHEST /F" not in source
     assert "Could not delete temporary launcher task" in source
     assert "[Guid]::NewGuid()" in source
-    assert source.index("Get-Process") < source.index("query.exe")
+    assert source.index("Get-Process") < source.index("$querySession = Join-Path")
     assert "Kenichi" not in source
     assert "3364" not in source
     assert "SessionId -contains 1" not in source
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell test is Windows-only")
+@pytest.mark.parametrize("query_exit_code", [0, 1])
+def test_launcher_accepts_bounded_active_session_table_for_observed_exit_codes(
+    query_exit_code,
+):
+    result = _run_launcher_session_selector(
+        [
+            " SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE ",
+            " services                                    0  Disc                        ",
+            ">console           John                      1  Active                      ",
+        ],
+        query_exit_code,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {
+        "Current": True,
+        "Session": "console",
+        "User": "John",
+        "Id": 1,
+    }
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell test is Windows-only")
+@pytest.mark.parametrize(
+    "active_rows, expected",
+    [
+        (
+            [
+                " console           John                      1  Active",
+                ">rdp-tcp#4         John                      9  Active",
+            ],
+            {"Current": True, "Session": "rdp-tcp#4", "User": "John", "Id": 9},
+        ),
+        (
+            [
+                " rdp-tcp#2         Other                     2  Active",
+                " console           John                      8  Active",
+            ],
+            {"Current": False, "Session": "console", "User": "John", "Id": 8},
+        ),
+        (
+            [
+                " rdp-tcp#7         Other                     7  Active",
+                " rdp-tcp#3         John                      3  Active",
+            ],
+            {"Current": False, "Session": "rdp-tcp#3", "User": "John", "Id": 3},
+        ),
+    ],
+)
+def test_launcher_preserves_current_console_then_lowest_id_priority(
+    active_rows, expected
+):
+    result = _run_launcher_session_selector(
+        [
+            " SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE ",
+            *active_rows,
+        ],
+        1,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == expected
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell test is Windows-only")
+def test_launcher_rejects_unexpected_query_status_even_with_active_row():
+    result = _run_launcher_session_selector(
+        [
+            " SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE ",
+            ">console           John                      1  Active                      ",
+        ],
+        2,
+    )
+
+    assert result.returncode == 7
+    assert "Unable to query Windows sessions" in result.stderr
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell test is Windows-only")
+@pytest.mark.parametrize(
+    "session_lines, expected_error",
+    [
+        (["query failed"], "exactly one expected header"),
+        (
+            [
+                " SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE ",
+                " services                                    0  Disc                        ",
+            ],
+            "No active interactive Windows session",
+        ),
+    ],
+)
+def test_launcher_requires_header_and_active_session_proof(
+    session_lines, expected_error
+):
+    result = _run_launcher_session_selector(session_lines, 1)
+
+    assert result.returncode == 7
+    assert expected_error in result.stderr
 
 
 @pytest.mark.parametrize("script", _P2_ENTRYPOINTS, ids=lambda path: path.name)
