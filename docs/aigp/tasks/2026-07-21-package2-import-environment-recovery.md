@@ -2,7 +2,8 @@
 
 - Task ID: `vq2-package2-import-environment-recovery`
 - Parent: `vq2-package2-powered-calibration-pilot`
-- State: `active`
+- State: `F01-A01 consumed and terminal-invalid before simulator launch; immutable
+  poison requires a new reviewed recovery task and forbids retry or clearing`
 - Starting main commit:
   `e8d1f339c949ea4ab83721746a7a42eda43a1c2e`.
 - Branch: `package2-import-environment-recovery`.
@@ -310,3 +311,36 @@ freeze, any spawn can bypass the seal, a pre-consumption failure creates
 attempt/lease/poison state, trusted counts or hashes drift unexpectedly, the
 candidate is not physically pristine, L0 would reuse predecessor state, the
 simulator is not exact build 3385 Training, or any safety/cleanup gate fails.
+
+## F01-A01 terminal result
+
+The import/environment correction was promoted at
+`0970f4b74c8529fb6fcd72d37c765d7d18025c3a`. Its fresh L0 publication and
+pre-L1 recovery succeeded; the final pre-L1 attestation is 3,962 bytes with
+SHA-256 `92cf96b9a0947df648c9c8abd6888be928841fda1aabd3d8aae17f4eca3a1137`.
+The sole authorized F01-A01 wrapper was then consumed once.
+
+F01-A01 failed `launcher_return` in about 0.278 seconds because the frozen
+`launch_sim.ps1` rejected `query.exe session` exit code `1`. On this exact host,
+that command emitted a complete table with one current row proving
+`console / John / session 1 / Active`, despite the status. The launcher failed
+before task creation and before its first mandatory 500 ms post-run wait.
+
+No powered child or fallback, transport, capture, replay, reset, arm/disarm,
+target, or flight command exists. Passive post-exit observation found the
+wrapper, FlightSim/payload, exact scheduled task, and UDP 14550/5600 owners
+absent. That later cleanliness cannot replace the missing contemporaneous
+post-launch topology and lease-release proof. The immutable terminal identities
+are:
+
+- attempt `e939c1f35e5a41ff350a7319f3f7f8c22b4a733c9104b428682e1ac38d12eab5`;
+- lifecycle `218fe368f6971ab309be4c09c7a87e4d86b9d49624590641fe7d4a5083bc880f`;
+- attempt-invalid `edf2424bbf60fb305fc805a28b561fa37982c77e9f8321ed35c91305e3dbaeb0`;
+- poison `009edcb1b7f48d120c1f46b393a9094073e378ed122d3ac75c2a565a65fae91d`;
+- last lease generation `9e69def312f13f7b90b5a265851e0f83f91ec8419780f5df37836c41286fb898`.
+
+The lease chain has acquisition and heartbeats but no release intent, released
+generation, or final lease record. Cleanup therefore failed under the VQ2
+safety contract. F01-A01 and its poison are permanent evidence. A successor
+must use a new task, attempt, private root, freeze, review, and explicit powered
+checkpoint.
