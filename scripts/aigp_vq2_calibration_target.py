@@ -145,7 +145,7 @@ _DATA_SCOPE = {
 
 _AUTHORITY = {
     "kind": "user_operator",
-    "authority_id": "conversation-2026-07-21-package2-f01-sim-capture",
+    "authority_id": "conversation-2026-07-21-package2-f02-sim-capture",
     "authorized_on": "2026-07-21",
     "source": "direct_user_instruction",
 }
@@ -170,7 +170,7 @@ _ALLOWED_CLASSES = [
 _STORAGE = {
     "private_root": (
         r"C:\Users\John\aigp-evidence"
-        r"\2026-07-21-package2-import-environment-recovery"
+        r"\2026-07-21-package2-f02-powered-calibration-attempt"
     ),
     "git": False,
     "public_release": False,
@@ -514,7 +514,7 @@ def validate_target_config(value: Any) -> None:
 
 
 def validate_capture_authorization(value: Any) -> None:
-    """Validate the exact, non-transferable F01 simulation authority."""
+    """Validate the exact, non-transferable F02 simulation authority."""
 
     obj = _require_object(value, label="capture_authorization")
     _require_keys(
@@ -544,7 +544,7 @@ def validate_capture_authorization(value: Any) -> None:
     _require_exact(obj["authority"], _AUTHORITY, label="capture_authorization.authority")
     _require_exact(
         obj["task_id"],
-        "vq2-package2-import-environment-recovery",
+        "vq2-package2-f02-powered-calibration-attempt",
         label="capture_authorization.task_id",
     )
     _require_exact(
@@ -552,7 +552,7 @@ def validate_capture_authorization(value: Any) -> None:
     )
     _require_exact(obj["simulator"], _SIMULATOR, label="capture_authorization.simulator")
     _require_exact(
-        obj["session_ids"], ["F01"], label="capture_authorization.session_ids"
+        obj["session_ids"], ["F02"], label="capture_authorization.session_ids"
     )
     _require_exact(
         obj["allowed_purposes"],

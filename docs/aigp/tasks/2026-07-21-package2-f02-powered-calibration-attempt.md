@@ -71,7 +71,7 @@ absence never repairs F01 and must not be used to release or rewrite it.
   `C:\Users\John\aigp-evidence\2026-07-21-package2-f02-powered-calibration-attempt`;
 - attempt directory: `<private-root>\F02-A01`;
 - detached live worktree:
-  `C:\Users\John\aigp-worktrees\wt-package2-f02-powered-calibration-live`;
+  `C:\Users\John\aigp-worktrees\wt-package2-f02-powered-calibration-attempt-live`;
 - independent review root:
   `C:\Users\John\aigp-review\2026-07-21-package2-f02-powered-calibration-attempt`;
 - freeze ID:
