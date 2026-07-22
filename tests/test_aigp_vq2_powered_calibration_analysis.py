@@ -1469,7 +1469,7 @@ def _collision_run(run_id: str, split: str, decoded: list[str], derivative=None)
 
 def test_global_collision_is_transitive_and_never_moves_individual_frames():
     f00 = "F00-A01/reset-epoch-1/excitation-1"
-    f03 = "F03-A01/reset-epoch-1/excitation-1"
+    f04 = "F04-A01/reset-epoch-1/excitation-1"
     h1, h2, h3, d1 = (character * 64 for character in "abcd")
     runs = [
         _collision_run(f00, "discovery_fit", [h1], [d1]),
@@ -1510,11 +1510,11 @@ def test_global_collision_is_transitive_and_never_moves_individual_frames():
         )
     with pytest.raises(
         analysis.PoweredCalibrationAnalysisError,
-        match="F03 is immutable discovery_fit",
+        match="F04 is immutable discovery_fit",
     ):
         analysis.plan_global_content_assignment(
-            [_collision_run(f03, "held_out", [h1])],
-            anchor_run_id=f03,
+            [_collision_run(f04, "held_out", [h1])],
+            anchor_run_id=f04,
             allow_anchor_whole_run_join=True,
         )
 
@@ -1791,7 +1791,7 @@ def _process_proof(fixtures, *, phase: str) -> dict[str, object]:
         "build": 3385,
         "topology": "one_launcher_parent_retained_one_payload_child",
         "scheduled_task": {
-            "name": "AIGP-P2-F03-A01-Launch",
+            "name": "AIGP-P2-F04-A01-Launch",
             "observations": [
                 {
                     "phase": name,

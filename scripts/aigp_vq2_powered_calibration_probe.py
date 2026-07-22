@@ -1398,7 +1398,7 @@ def validate_attempt_gate(
     if snapshot.live_poison_present:
         raise AttemptGateError("root poison exists and has no automatic clear")
     if snapshot.target_attempt_directory_present or snapshot.target_attempt_envelope_present:
-        raise AttemptGateError("F03-A01 already exists; retry/replacement is forbidden")
+        raise AttemptGateError("F04-A01 already exists; retry/replacement is forbidden")
     if snapshot.unknown_attempt_entries:
         raise AttemptGateError("unknown attempt-like root entries make consumption ambiguous")
     for prior in snapshot.prior_attempts:
@@ -3140,7 +3140,7 @@ class _SingleAttemptExecution:
         assert self.material is not None and self.handles is not None
         self.fallback_used = True
         self._add_failure(
-            "cleanup_unconfirmed", "cleanup fallback use invalidates F03"
+            "cleanup_unconfirmed", "cleanup fallback use invalidates F04"
         )
 
         def spawn_fallback(
@@ -3489,7 +3489,7 @@ class _SingleAttemptExecution:
         self.fallback_used = True
         self.cleanup_state["fallback"] = "failed"
         self._add_failure(
-            "cleanup_unconfirmed", "cleanup fallback use invalidates F03"
+            "cleanup_unconfirmed", "cleanup fallback use invalidates F04"
         )
         window = self._unledgered_safety_window("fallback_spawn")
         if window is None:
@@ -7904,7 +7904,7 @@ class WindowsProductionLiveBoundary:
     invoked after offline admission and attempt consumption.
     """
 
-    _TASK_NAME = "AIGP-P2-F03-A01-Launch"
+    _TASK_NAME = "AIGP-P2-F04-A01-Launch"
     _POLL_NS = 50_000_000
     _HEARTBEAT_EMIT_NS = 900_000_000
     _MAX_STDOUT_BYTES = 16 * 1024 * 1024

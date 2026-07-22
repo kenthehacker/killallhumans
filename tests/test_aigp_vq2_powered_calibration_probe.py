@@ -26,7 +26,7 @@ TREE = "f" * 40
 UTC = "2026-07-20T12:34:56.123456Z"
 LIVE_WORKTREE = (
     r"C:\Users\John\aigp-worktrees"
-    r"\wt-package2-f03-powered-calibration-attempt-live"
+    r"\wt-package2-f04-powered-calibration-attempt-live"
 )
 PYTHON = r"C:\Users\John\killallhumans\.venv\Scripts\python.exe"
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -118,7 +118,7 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     value = {
         "schema": "aigp-vq2-powered-calibration-live-freeze/1",
         "task_id": contract.TASK_ID,
-        "freeze_id": "vq2-package2-f03-powered-calibration-attempt-f03-a01-live-freeze",
+        "freeze_id": "vq2-package2-f04-powered-calibration-attempt-f04-a01-live-freeze",
         "candidate": {
             "commit": COMMIT,
             "code_sha256": contract.canonical_object_sha256(semantic),
@@ -224,7 +224,7 @@ def _freeze() -> tuple[dict[str, object], dict[str, dict[str, object]]]:
                 "-SimulatorPath",
                 launcher,
                 "-TaskName",
-                "AIGP-P2-F03-A01-Launch",
+                "AIGP-P2-F04-A01-Launch",
                 "-StartupTimeoutSeconds",
                 "25",
             ],
@@ -1366,7 +1366,7 @@ def test_attempt_gate_rejects_poison_existing_and_any_prior_attempt():
                 False,
                 False,
                 False,
-                (probe.PriorAttemptObservation("F03-A00", 1, 1),),
+                (probe.PriorAttemptObservation("F04-A00", 1, 1),),
             ),
         )
     with pytest.raises(probe.AttemptGateError, match="sole terminal"):
@@ -1377,7 +1377,7 @@ def test_attempt_gate_rejects_poison_existing_and_any_prior_attempt():
                 False,
                 False,
                 False,
-                (probe.PriorAttemptObservation("F03-A00", 2, 1),),
+                (probe.PriorAttemptObservation("F04-A00", 2, 1),),
             ),
         )
 
@@ -3715,7 +3715,7 @@ def _production_prechild_proof() -> dict[str, object]:
         "build": 3385,
         "topology": "one_launcher_parent_retained_one_payload_child",
         "scheduled_task": {
-            "name": "AIGP-P2-F03-A01-Launch",
+            "name": "AIGP-P2-F04-A01-Launch",
             "observations": [
                 {
                     "phase": phase,
@@ -3951,7 +3951,7 @@ def test_scheduled_task_query_uses_only_the_sealed_environment(monkeypatch):
         r"C:\FrozenWindows\System32\schtasks.exe",
         "/Query",
         "/TN",
-        "AIGP-P2-F03-A01-Launch",
+        "AIGP-P2-F04-A01-Launch",
     ]
     assert captured["env"] == sealed
     assert captured["env"] is not sealed

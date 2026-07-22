@@ -14,13 +14,13 @@ COMMIT = "d" * 40
 UTC = "2026-07-20T12:34:56.123456Z"
 LIVE_WORKTREE = (
     r"C:\Users\John\aigp-worktrees"
-    r"\wt-package2-f03-powered-calibration-attempt-live"
+    r"\wt-package2-f04-powered-calibration-attempt-live"
 )
 PREDECESSOR_EVIDENCE_ROOT = (
-    r"C:\Users\John\aigp-evidence\2026-07-21-package2-f02-powered-calibration-attempt"
+    r"C:\Users\John\aigp-evidence\2026-07-22-package2-f03-powered-calibration-attempt"
 )
 PREDECESSOR_LIVE_WORKTREE = (
-    r"C:\Users\John\aigp-worktrees\wt-package2-f02-powered-calibration-attempt-live"
+    r"C:\Users\John\aigp-worktrees\wt-package2-f03-powered-calibration-attempt-live"
 )
 HISTORICAL_EVIDENCE_ROOT = (
     r"C:\Users\John\aigp-evidence\2026-07-20-package2-powered-calibration-pilot"
@@ -102,7 +102,7 @@ def live_freeze() -> dict[str, object]:
         "schema": "aigp-vq2-powered-calibration-live-freeze/1",
         "task_id": contract.TASK_ID,
         "freeze_id": (
-            "vq2-package2-f03-powered-calibration-attempt-f03-a01-live-freeze"
+            "vq2-package2-f04-powered-calibration-attempt-f04-a01-live-freeze"
         ),
         "candidate": {
             "commit": COMMIT,
@@ -201,7 +201,7 @@ def live_freeze() -> dict[str, object]:
                 "-SimulatorPath",
                 launcher["path"],
                 "-TaskName",
-                "AIGP-P2-F03-A01-Launch",
+                "AIGP-P2-F04-A01-Launch",
                 "-StartupTimeoutSeconds",
                 "25",
             ],
@@ -1360,10 +1360,10 @@ def test_canonical_json_contract_rejects_duplicates_bom_nonfinite_and_noncanonic
 
 def test_plan_hash_derivation_tick_lookup_and_immutability_are_exact():
     plan = contract.frozen_excitation_plan()
-    assert contract.EXCITATION_PLAN_ID == "vq2-build3385-training-f03-excite-v1"
+    assert contract.EXCITATION_PLAN_ID == "vq2-build3385-training-f04-excite-v1"
     assert contract.canonical_object_sha256(plan) == contract.EXCITATION_PLAN_SHA256
     assert contract.canonical_file_sha256(plan) == (
-        "d69ea76c6f3d4d44b8ec17c70e813eb79fe8530e995ced4e65a91a77333c221a"
+        "52daf4306d8daba477464fbcd6292f2108509516c5ca0199b1895761b24c9f90"
     )
     assert contract.canonical_file_sha256(plan) != contract.EXCITATION_PLAN_SHA256
     with pytest.raises(contract.PoweredAttemptContractError):
@@ -1409,14 +1409,15 @@ def test_paths_deadlines_and_capability_frames_fail_closed():
 def test_live_freeze_attempt_and_process_authority_cross_bind():
     freeze = live_freeze()
     assert freeze["freeze_id"] == (
-        "vq2-package2-f03-powered-calibration-attempt-f03-a01-live-freeze"
+        "vq2-package2-f04-powered-calibration-attempt-f04-a01-live-freeze"
     )
     assert freeze["paths"]["live_freeze"] == (
-        contract.EVIDENCE_ROOT + r"\live-freeze-F03-A01.json"
+        contract.EVIDENCE_ROOT + r"\live-freeze-F04-A01.json"
     )
     assert contract.validate_live_freeze(freeze) == freeze
 
     for stale_id in (
+        "vq2-package2-f03-powered-calibration-attempt-f03-a01-live-freeze",
         "vq2-package2-f02-powered-calibration-attempt-f02-a01-live-freeze",
         "vq2-package2-import-environment-recovery-f01-a01-live-freeze",
         "vq2-package2-powered-calibration-f00-a01-live-freeze",
@@ -1429,8 +1430,8 @@ def test_live_freeze_attempt_and_process_authority_cross_bind():
             contract.validate_live_freeze(predecessor_id)
 
     for stale_path in (
-        contract.EVIDENCE_ROOT + r"\live-freeze-F02-A01.json",
-        PREDECESSOR_EVIDENCE_ROOT + r"\live-freeze-F02-A01.json",
+        contract.EVIDENCE_ROOT + r"\live-freeze-F03-A01.json",
+        PREDECESSOR_EVIDENCE_ROOT + r"\live-freeze-F03-A01.json",
         contract.EVIDENCE_ROOT + r"\live-freeze-F00-A01.json",
         contract.EVIDENCE_ROOT + r"\live-freeze-F00-A01-recovery-01.json",
         contract.EVIDENCE_ROOT + r"\live-freeze-F00-A01-recovery-02.json",
@@ -1453,9 +1454,9 @@ def test_live_freeze_attempt_and_process_authority_cross_bind():
         contract.validate_live_freeze(predecessor_worktree)
 
     for key_path, stale_value in (
-        (("task_id",), "vq2-package2-f02-powered-calibration-attempt"),
-        (("session", "session_id"), "F02"),
-        (("session", "attempt_id"), "F02-A01"),
+        (("task_id",), "vq2-package2-f03-powered-calibration-attempt"),
+        (("session", "session_id"), "F03"),
+        (("session", "attempt_id"), "F03-A01"),
     ):
         predecessor_identity = copy.deepcopy(freeze)
         cursor = predecessor_identity
@@ -2091,7 +2092,7 @@ def test_bundle_verification_split_and_complete_terminal_shapes():
         "claimed_at_utc": UTC,
         "claimed_monotonic_ns": 20,
         "timing": timing("split_publish", prepared=20),
-        "run_id": "F03-A01/reset-epoch-1/excitation-1",
+        "run_id": "F04-A01/reset-epoch-1/excitation-1",
         "assigned_split": "discovery_fit",
         "identity": {
             "attempt_context_sha256": H,
@@ -2111,7 +2112,7 @@ def test_bundle_verification_split_and_complete_terminal_shapes():
         ),
         "decoded_content_sha256": [H],
         "derivative_sha256": [],
-        "collision_policy": "f03_fixed_future_whole_run_discovery_fit_or_global_exclusion",
+        "collision_policy": "f04_fixed_future_whole_run_discovery_fit_or_global_exclusion",
     }
     assert contract.validate_split_claim(claim) == claim
     registry = {
@@ -2130,13 +2131,13 @@ def test_bundle_verification_split_and_complete_terminal_shapes():
             "claim_sha256": contract.canonical_file_sha256(claim),
             "session_id": contract.SESSION_ID,
             "attempt_id": contract.ATTEMPT_ID,
-            "run_id": "F03-A01/reset-epoch-1/excitation-1",
+            "run_id": "F04-A01/reset-epoch-1/excitation-1",
             "assigned_split": "discovery_fit",
             "activation": "requires_matching_attempt_complete",
         }],
         "content_groups": [{
             "decoded_sha256": H,
-            "run_ids": ["F03-A01/reset-epoch-1/excitation-1"],
+            "run_ids": ["F04-A01/reset-epoch-1/excitation-1"],
             "assigned_split": "discovery_fit",
             "disposition": "assigned",
             "activation": "requires_matching_attempt_complete",
@@ -2450,7 +2451,7 @@ def test_simulator_process_proof_and_training_attestation_bind():
         "build": 3385,
         "topology": "one_launcher_parent_retained_one_payload_child",
         "scheduled_task": {
-            "name": "AIGP-P2-F03-A01-Launch",
+            "name": "AIGP-P2-F04-A01-Launch",
             "observations": [
                 {"phase": phase, "observed_monotonic_ns": index + 3, "query_exit_code": 1, "absent": True}
                 for index, phase in enumerate(("before_launch", "after_launcher_return", "before_child"))

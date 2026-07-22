@@ -24,15 +24,15 @@ class PoweredAttemptContractError(ValueError):
     """Raised when a powered-attempt value is outside the frozen contract."""
 
 
-TASK_ID = "vq2-package2-f03-powered-calibration-attempt"
-SESSION_ID = "F03"
-ATTEMPT_ID = "F03-A01"
+TASK_ID = "vq2-package2-f04-powered-calibration-attempt"
+SESSION_ID = "F04"
+ATTEMPT_ID = "F04-A01"
 HOST_CLOCK_ID = "host-perf-counter"
 
 EXCITATION_PLAN_SCHEMA = "aigp-vq2-calibration-excitation-plan/1"
-EXCITATION_PLAN_ID = "vq2-build3385-training-f03-excite-v1"
+EXCITATION_PLAN_ID = "vq2-build3385-training-f04-excite-v1"
 EXCITATION_PLAN_SHA256 = (
-    "73a1134906edeb6480e189cdf9df1d9d30eac697537d3da44d5d0de075237e7b"
+    "fae9d932e269e7de6513589d6f7bfd19862696d7222f1edad6eb3226292de773"
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -677,16 +677,16 @@ if canonical_object_sha256(_PLAN_LITERAL) != EXCITATION_PLAN_SHA256:  # import-t
     raise RuntimeError("frozen excitation plan literal/hash mismatch")
 
 
-EVIDENCE_ROOT = r"C:\Users\John\aigp-evidence\2026-07-22-package2-f03-powered-calibration-attempt"
-_ATTEMPT_ROOT = EVIDENCE_ROOT + r"\F03-A01"
+EVIDENCE_ROOT = r"C:\Users\John\aigp-evidence\2026-07-22-package2-f04-powered-calibration-attempt"
+_ATTEMPT_ROOT = EVIDENCE_ROOT + r"\F04-A01"
 _LIVE_FREEZE_ID = (
-    "vq2-package2-f03-powered-calibration-attempt-f03-a01-live-freeze"
+    "vq2-package2-f04-powered-calibration-attempt-f04-a01-live-freeze"
 )
 _FROZEN_PATHS = MappingProxyType(
     {
         "evidence_root": EVIDENCE_ROOT,
         "live_freeze": (
-            EVIDENCE_ROOT + r"\live-freeze-F03-A01.json"
+            EVIDENCE_ROOT + r"\live-freeze-F04-A01.json"
         ),
         "attempt_dir": _ATTEMPT_ROOT,
         "attempt_envelope": _ATTEMPT_ROOT + r"\attempt.json",
@@ -807,7 +807,7 @@ def validate_live_freeze(
     validate_absolute_windows_path(candidate["live_worktree"], path=f"{path}.candidate.live_worktree")
     _literal(
         candidate["live_worktree"],
-        r"C:\Users\John\aigp-worktrees\wt-package2-f03-powered-calibration-attempt-live",
+        r"C:\Users\John\aigp-worktrees\wt-package2-f04-powered-calibration-attempt-live",
         f"{path}.candidate.live_worktree",
     )
     _literal(candidate["detached_head_required"], True, f"{path}.candidate.detached_head_required")
@@ -885,7 +885,7 @@ def validate_live_freeze(
     expected_argv = [
         powershell["path"], "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
         simulator["launcher_script"]["path"], "-SimulatorPath", expected_launcher,
-        "-TaskName", "AIGP-P2-F03-A01-Launch", "-StartupTimeoutSeconds", "25",
+        "-TaskName", "AIGP-P2-F04-A01-Launch", "-StartupTimeoutSeconds", "25",
     ]
     if launcher_argv != expected_argv:
         _fail(f"{path}.execution.launcher_argv", "must equal the sole frozen launcher argv")
@@ -3238,7 +3238,7 @@ def _validate_simulator_launch(value: Any, path: str) -> dict[str, Any]:
 
 def _validate_scheduled_task(value: Any, path: str, *, phase: str) -> dict[str, Any]:
     row = _object(value, {"name", "observations"}, path)
-    _literal(row["name"], "AIGP-P2-F03-A01-Launch", f"{path}.name")
+    _literal(row["name"], "AIGP-P2-F04-A01-Launch", f"{path}.name")
     observations = _array(row["observations"], f"{path}.observations")
     expected = ["before_launch", "after_launcher_return", "before_child"]
     if phase == "postchild":
@@ -3843,7 +3843,7 @@ def validate_split_claim(value: Any) -> dict[str, Any]:
     timing = validate_artifact_timing(row["timing"], f"{path}.timing", expected_phase="split_publish")
     if timing["prepared_monotonic_ns"] != claimed:
         _fail(f"{path}.timing.prepared_monotonic_ns", "must equal claimed_monotonic_ns")
-    _literal(row["run_id"], "F03-A01/reset-epoch-1/excitation-1", f"{path}.run_id")
+    _literal(row["run_id"], "F04-A01/reset-epoch-1/excitation-1", f"{path}.run_id")
     _literal(row["assigned_split"], "discovery_fit", f"{path}.assigned_split")
     identity = _object(row["identity"], {"attempt_context_sha256", "attempt_envelope_sha256", "capture_seal_sha256", "excitation_plan_id", "excitation_plan_sha256"}, f"{path}.identity")
     for name in ("attempt_context_sha256", "attempt_envelope_sha256", "capture_seal_sha256"):
@@ -3869,7 +3869,7 @@ def validate_split_claim(value: Any) -> dict[str, Any]:
     if frame_hashes != decoded:
         _fail(f"{path}.run_artifacts", "replay-frame names must exactly cover decoded_content_sha256")
     _array(row["derivative_sha256"], f"{path}.derivative_sha256", length=0)
-    _literal(row["collision_policy"], "f03_fixed_future_whole_run_discovery_fit_or_global_exclusion", f"{path}.collision_policy")
+    _literal(row["collision_policy"], "f04_fixed_future_whole_run_discovery_fit_or_global_exclusion", f"{path}.collision_policy")
     return defensive_copy(row)
 
 
@@ -3896,7 +3896,7 @@ def validate_split_registry(value: Any, *, split_claim: Any | None = None) -> di
     _sha256(claim["claim_sha256"], f"{path}.claims[0].claim_sha256")
     _literal(claim["session_id"], SESSION_ID, f"{path}.claims[0].session_id")
     _literal(claim["attempt_id"], ATTEMPT_ID, f"{path}.claims[0].attempt_id")
-    _literal(claim["run_id"], "F03-A01/reset-epoch-1/excitation-1", f"{path}.claims[0].run_id")
+    _literal(claim["run_id"], "F04-A01/reset-epoch-1/excitation-1", f"{path}.claims[0].run_id")
     _literal(claim["assigned_split"], "discovery_fit", f"{path}.claims[0].assigned_split")
     _literal(claim["activation"], "requires_matching_attempt_complete", f"{path}.claims[0].activation")
     groups = _array(row["content_groups"], f"{path}.content_groups")
@@ -3906,7 +3906,7 @@ def validate_split_registry(value: Any, *, split_claim: Any | None = None) -> di
         item = _object(group, {"decoded_sha256", "run_ids", "assigned_split", "disposition", "activation"}, item_path)
         hashes.append(_sha256(item["decoded_sha256"], f"{item_path}.decoded_sha256"))
         run_ids = _sorted_unique_strings(item["run_ids"], f"{item_path}.run_ids")
-        if run_ids != ["F03-A01/reset-epoch-1/excitation-1"]:
+        if run_ids != ["F04-A01/reset-epoch-1/excitation-1"]:
             _fail(f"{item_path}.run_ids", "initial registry group must name the sole run")
         _literal(item["assigned_split"], "discovery_fit", f"{item_path}.assigned_split")
         _literal(item["disposition"], "assigned", f"{item_path}.disposition")
