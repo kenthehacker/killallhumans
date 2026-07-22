@@ -4,6 +4,10 @@
 - Parent: `vq2-package2-launcher-session-recovery`.
 - Starting main commit:
   `7be5111199161adbf545fd4e58034a31bd2f3a0a`.
+- Contract-freeze commit:
+  `602dddcede9d094e114087786131b0656f909da1`.
+- Identity-rollover behavior commit:
+  `cd5c43f8a0631a18a8f2889d2747628f125e95ba`.
 - Simulator target: FlightSim build 3385, Training mode.
 - State: `offline preparation, promotion, publication, and review only`.
 - Simulator access before the final checkpoint: passive host/process/task/port
