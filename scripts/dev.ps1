@@ -83,7 +83,8 @@ try {
             if ($TaskArgs.Count -ne 0) { throw 'help takes no arguments.' }
             Write-Output @"
 Available tasks: test-target, test-fast, test-unit, test-vq2, test-slow,
-test-benchmark, test-promotion, test-full-non-live, preflight, launch-sim, sbom.
+test-benchmark, test-promotion, test-full-non-live, preflight, flight-cycle,
+launch-sim, sbom.
 Use scripts\dev.cmd on Windows so the repository command works even when the
 machine's script execution policy blocks direct .ps1 invocation.
 
@@ -94,6 +95,11 @@ The supervisor enforces a hard 15-minute aggregate ceiling.
 test-full-non-live remains a compatibility alias.
 Both names require an exact pristine commit checkout (including no ignored
 files) and may reuse its durable result.
+
+flight-cycle is a dedicated powered command, not a test task. It requires an
+existing scoped user authorization and never prompts or reconfirms it. It
+performs no separate passive preflight, screenshot, console challenge, or
+interactive confirmation.
 "@
         }
         'test-target' {
@@ -124,6 +130,7 @@ files) and may reuse its durable result.
                 'tests/test_aigp_live_lease.py',
                 'tests/test_aigp_vq2_build_reference.py',
                 'tests/test_aigp_vq2_calibration_target.py',
+                'tests/test_aigp_vq2_fast_cycle.py',
                 'tests/test_aigp_vq2_passive_probe.py',
                 'tests/test_aigp_vq2_passive_timing_script.py',
                 'tests/test_aigp_vq2_powered_attempt.py',
@@ -157,7 +164,36 @@ files) and may reuse its durable result.
         'preflight' {
             if ($TaskArgs.Count -ne 0) { throw 'preflight takes no arguments.' }
             Write-Output 'Running passive VQ2 preflight (no arm or flight targets).'
-            Invoke-Python @('-m', 'scripts.aigp_vq2_run', '--stage', 'preflight', '--record')
+            Invoke-Python @(
+                '-m', 'scripts.aigp_vq2_run',
+                '--stage', 'preflight',
+                '--preflight-timeout-s', '3'
+            )
+        }
+        'flight-cycle' {
+            if ($TaskArgs.Count -gt 1) {
+                throw 'flight-cycle accepts at most one powered stage.'
+            }
+            $stage = if ($TaskArgs.Count -eq 1) {
+                $TaskArgs[0]
+            } else {
+                'calibration-excite'
+            }
+            $allowed = @(
+                'sign-id', 'hover', 'gate0', 'gate0-observe',
+                'calibration-excite'
+            )
+            if ($stage -notin $allowed) {
+                throw "Unsupported flight-cycle stage '$stage'."
+            }
+            Write-Output (
+                "Running one POWERED '$stage' cycle with compact evidence " +
+                'and no interactive preflight ceremony.'
+            )
+            Invoke-Python @(
+                '-E', '-s', '-B',
+                '-m', 'scripts.aigp_vq2_fast_cycle', $stage
+            )
         }
         'launch-sim' {
             if ($TaskArgs.Count -gt 1) { throw 'launch-sim accepts at most one FlightSim.exe path.' }
@@ -189,7 +225,8 @@ Unknown task '$Task'. Available tasks:
   test-benchmark       Explicit deterministic benchmark tier (always excludes live)
   test-promotion       Durable promotion-only full non-live suite (typically 10-13m)
   test-full-non-live   Compatibility alias for test-promotion
-  preflight            Passive build-3385 stream/target health check
+  preflight            Fast passive stream/target health check; no capture
+  flight-cycle [stage] Dedicated powered cycle (default: calibration-excite)
   launch-sim [path]    Launch FlightSim in the active interactive session
   sbom [path]          Generate a local CycloneDX dependency inventory
 "@

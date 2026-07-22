@@ -69,6 +69,32 @@ generic test command. Powered work must preserve the proved reset epoch,
 countdown/GO, fresh-stream checks, watchdogs, command bounds, disarm/reset, and
 cleanup confirmation in the VQ2 handoff. A cleanup failure is a failed stage.
 
+For rapid simulator iteration, a direct user instruction to run or continually
+iterate a specific powered stage is the authorization for that scoped work. Do
+not ask for another confirmation on every attempt while that instruction still
+applies. Use the dedicated, noninteractive command (default stage is the
+calibration excitation):
+
+```powershell
+.\scripts\dev.cmd flight-cycle [sign-id|hover|gate0|gate0-observe|calibration-excite]
+```
+
+`flight-cycle` is not a test task. It automatically writes one compact run
+manifest, one JSONL trace, one result, and the small canonical live-lease record
+under the private external evidence root. It does not run a separate passive
+preflight, take screenshots, request a console challenge, wait for manual
+approval, derive duplicate freezes, inventory the full
+repository/environment/import graph, or synchronously review/analyze the
+capture before returning. Do not add those gates back unless the user asks for
+a forensic or promotion workflow. A failure before simulator contact does not
+require a new F-number or poisoned attempt.
+
+The fast path still must retain the same reset/GO/freshness/watchdog/bounds and
+cleanup invariants above. Training mode is not machine-readable in build 3385;
+record it as configured session state without claiming a fresh visual proof.
+The command takes the existing nonblocking host-wide FlightSim live lease and
+refuses immediately if any legacy or fast live workflow owns it.
+
 The parameterized Windows launcher is:
 
 ```powershell

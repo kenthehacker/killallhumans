@@ -6623,7 +6623,10 @@ class VQ2Runner:
         self._vision_diagnostic_logging = False
         self._post_gate_reacquisition = False
         self._last_flight_command: Optional[AttitudeRateCommand] = None
+        self._last_flight_command_started_ns: Optional[int] = None
         self._last_flight_command_sent_s: Optional[float] = None
+        self._epoch_vision_started_s: Optional[float] = None
+        self._epoch_vision_initial_frames: Optional[int] = None
         self._gate0_transition_proof: Optional[GateTransitionProof] = None
         self._deferred_pngs: List[Tuple[str, Any]] = []
 
@@ -6693,7 +6696,10 @@ class VQ2Runner:
         self._vision_diagnostic_logging = False
         self._post_gate_reacquisition = False
         self._last_flight_command = None
+        self._last_flight_command_started_ns = None
         self._last_flight_command_sent_s = None
+        self._epoch_vision_started_s = None
+        self._epoch_vision_initial_frames = None
         self._gate0_transition_proof = None
         self.tracker.reset()
 
@@ -7071,6 +7077,58 @@ class VQ2Runner:
                     reason=self._detection_error,
                 )
 
+    def _powered_vision_readiness(
+        self,
+        now: Optional[float] = None,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        """Return post-reset frame-rate and exact-dimension readiness facts."""
+
+        checked = time.monotonic() if now is None else float(now)
+        failures: List[str] = []
+        started = self._epoch_vision_started_s
+        initial_frames = self._epoch_vision_initial_frames
+        elapsed = None if started is None else max(0.0, checked - started)
+        frames: Optional[int] = None
+        fps: Optional[float] = None
+        try:
+            stats = self.vision.stats()
+            observed_frames = getattr(stats, "frames_decoded", None)
+            if type(observed_frames) is not int or observed_frames < 0:
+                raise ValueError("decoded frame count is invalid")
+            frames = observed_frames
+        except Exception:
+            failures.append("vision frame-rate statistics are unavailable")
+        if started is None or initial_frames is None:
+            failures.append("post-reset vision rate baseline is unavailable")
+        elif elapsed is None or elapsed < 1.0:
+            failures.append("post-reset vision rate has less than 1.0s evidence")
+        elif frames is not None:
+            decoded = frames - initial_frames
+            if decoded < 0:
+                failures.append("post-reset decoded frame count regressed")
+            else:
+                fps = decoded / max(elapsed, 1e-6)
+                if fps < 20.0:
+                    failures.append(f"post-reset vision rate is below 20fps ({fps:.1f})")
+
+        image = self._latest_detection_image
+        shape = getattr(image, "shape", None)
+        dimensions = None
+        if shape is not None and len(shape) >= 2:
+            dimensions = [int(shape[1]), int(shape[0])]
+        if dimensions != [640, 360]:
+            failures.append("decoded dimensions are not stable 640x360")
+        return failures, {
+            "observation_s": elapsed,
+            "frames_decoded": (
+                None
+                if frames is None or initial_frames is None
+                else frames - initial_frames
+            ),
+            "fps": fps,
+            "dimensions_px": dimensions,
+        }
+
     def _stream_failures(
         self,
         *,
@@ -7212,8 +7270,59 @@ class VQ2Runner:
             command=(asdict(command) if command else None),
         )
 
-    async def _send_flight_command(self, command: AttitudeRateCommand) -> None:
-        """Send one validated setpoint and remember its completion time."""
+    @staticmethod
+    def _outbound_receipt_primitive(receipt: Any) -> Dict[str, Any]:
+        if isinstance(receipt, Mapping):
+            return dict(receipt)
+        convert = getattr(receipt, "to_primitive", None)
+        if callable(convert):
+            value = convert()
+            if isinstance(value, Mapping):
+                return dict(value)
+        try:
+            value = asdict(receipt)
+        except (TypeError, ValueError) as exc:
+            raise SafetyAbort("adapter returned an invalid outbound receipt") from exc
+        if not isinstance(value, Mapping):
+            raise SafetyAbort("adapter returned an invalid outbound receipt")
+        return dict(value)
+
+    async def _send_flight_command(
+        self,
+        command: AttitudeRateCommand,
+        *,
+        require_wire_receipt: bool = False,
+        wire_start_not_before_ns: Optional[int] = None,
+        wire_start_deadline_ns: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Send one validated setpoint and optionally prove wire-call timing."""
+
+        if type(require_wire_receipt) is not bool:
+            raise TypeError("require_wire_receipt must be an exact bool")
+        for label, value in (
+            ("wire_start_not_before_ns", wire_start_not_before_ns),
+            ("wire_start_deadline_ns", wire_start_deadline_ns),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{label} must be a non-negative exact integer")
+        if (
+            (wire_start_not_before_ns is not None or wire_start_deadline_ns is not None)
+            and not require_wire_receipt
+        ):
+            raise ValueError("wire timing guards require an exact outbound receipt")
+        drain_receipts = getattr(self.adapter, "drain_outbound_receipts", None)
+        if require_wire_receipt:
+            if not callable(drain_receipts):
+                raise SafetyAbort("adapter lacks exact outbound receipt timing")
+            stale = [
+                self._outbound_receipt_primitive(value)
+                for value in drain_receipts()
+            ]
+            if any(
+                value.get("schema") == "aigp-vq2-attitude-target-outbound/1"
+                for value in stale
+            ):
+                raise SafetyAbort("unexpected queued attitude-target receipt")
 
         generated_at = time.monotonic()
         frame_token = self._latest_frame_token()
@@ -7226,9 +7335,48 @@ class VQ2Runner:
                 frame_token=frame_token,
             )
         validate_command(command)
-        await self.adapter.send_attitude_rate(command)
+        send_options: Dict[str, Any] = {}
+        if wire_start_not_before_ns is not None:
+            send_options["call_start_not_before_monotonic_ns"] = (
+                wire_start_not_before_ns
+            )
+        if wire_start_deadline_ns is not None:
+            send_options["call_start_deadline_monotonic_ns"] = wire_start_deadline_ns
+        await self.adapter.send_attitude_rate(command, **send_options)
         self._last_flight_command = command
         self._last_flight_command_sent_s = time.monotonic()
+        wire_receipt: Optional[Dict[str, Any]] = None
+        if require_wire_receipt:
+            assert callable(drain_receipts)
+            receipts = [
+                self._outbound_receipt_primitive(value)
+                for value in drain_receipts()
+            ]
+            attitude_receipts = [
+                value
+                for value in receipts
+                if value.get("schema")
+                == "aigp-vq2-attitude-target-outbound/1"
+            ]
+            if len(attitude_receipts) != 1:
+                raise SafetyAbort(
+                    "adapter did not return exactly one attitude-target receipt"
+                )
+            wire_receipt = attitude_receipts[0]
+            call_start = wire_receipt.get("call_start_monotonic_ns")
+            call_end = wire_receipt.get("call_end_monotonic_ns")
+            if (
+                wire_receipt.get("host_clock_id") != "host-perf-counter"
+                or wire_receipt.get("api") != "send_attitude_rate"
+                or wire_receipt.get("outcome") != "returned"
+                or type(call_start) is not int
+                or type(call_end) is not int
+                or call_start < 0
+                or call_end < call_start
+            ):
+                raise SafetyAbort("adapter outbound receipt is invalid")
+            self._last_flight_command_started_ns = call_start
+            self.recorder.emit("attitude_target_outbound", receipt=wire_receipt)
         if callable(record_command):
             record_command(
                 "sent",
@@ -7236,6 +7384,7 @@ class VQ2Runner:
                 monotonic_s=self._last_flight_command_sent_s,
                 frame_token=frame_token,
             )
+        return wire_receipt
 
     @staticmethod
     def _is_exact_zero_command(command: Optional[AttitudeRateCommand]) -> bool:
@@ -7492,6 +7641,11 @@ class VQ2Runner:
         if restart_vision:
             self.vision.reset()
             self.vision.start()
+            self._epoch_vision_started_s = time.monotonic()
+            frames_decoded = getattr(self.vision.stats(), "frames_decoded", None)
+            if type(frames_decoded) is not int or frames_decoded < 0:
+                raise SafetyAbort("vision did not expose a valid post-reset frame count")
+            self._epoch_vision_initial_frames = frames_decoded
         self.recorder.emit("reset_proved", **asdict(proof))
         logger.info(
             "Reset epoch proved on attempt %d: race %d->%dms, IMU %d->%dus",
@@ -7604,6 +7758,10 @@ class VQ2Runner:
                     require_target=True,
                     require_armed=False,
                 )
+                vision_failures, vision_readiness = (
+                    self._powered_vision_readiness(time.monotonic())
+                )
+                failures.extend(vision_failures)
                 if self.tracker.consecutive < 3:
                     failures.append("gate target lacks three-frame confirmation")
                 if not self._countdown_observed:
@@ -7622,6 +7780,10 @@ class VQ2Runner:
                         initial_gate_y=self.tracker.target.center_y,
                         initial_gate_area=self.tracker.target.bbox_area,
                         go_boot_ms=int(race.sim_boot_time_ms),
+                    )
+                    self.recorder.emit(
+                        "powered_vision_ready",
+                        **vision_readiness,
                     )
                     self.recorder.emit("go_ready", **asdict(context))
                     return context
@@ -7831,6 +7993,212 @@ class VQ2Runner:
             "baseline_rates_rad_s": baseline,
             "final_attitude_excursion_rad": excursion,
             "max_attitude_excursion_rad": max_excursion,
+        }
+
+    def _check_calibration_envelope(
+        self,
+        context: StartContext,
+    ) -> Tuple[float, float, float]:
+        """Enforce the calibration-specific corridor on top of the watchdog."""
+
+        race = self.adapter.race_status
+        if race is None or int(race.active_gate_index) != 0:
+            raise SafetyAbort("calibration active gate changed from gate 0")
+        target = self.tracker.target
+        if target is None or self.tracker.consecutive < 3:
+            raise SafetyAbort("calibration target lacks three-frame confirmation")
+        image_shape = getattr(self._latest_detection_image, "shape", None)
+        if (
+            image_shape is None
+            or len(image_shape) < 2
+            or int(image_shape[0]) != 360
+            or int(image_shape[1]) != 640
+        ):
+            raise SafetyAbort("calibration decoded dimensions changed from 640x360")
+        center_x = float(target.center_x)
+        center_y = float(target.center_y)
+        _x, _y, width, height = (float(value) for value in target.bbox)
+        area = width * height
+        if not 64.0 <= center_x <= 576.0 or not 36.0 <= center_y <= 324.0:
+            raise SafetyAbort("calibration target left the closed safety corridor")
+        if (
+            width > 160.0
+            or height > 160.0
+            or area > 2.0 * float(context.initial_gate_area)
+        ):
+            raise SafetyAbort("calibration target exceeded the size safety limit")
+        if self.estimate is None:
+            raise SafetyAbort("calibration attitude estimate is unavailable")
+        roll, pitch, _yaw = self.estimate.orientation.to_euler()
+        roll_excursion = abs(float(roll) - float(context.spawn_roll_rad))
+        pitch_excursion = abs(float(pitch) - float(context.spawn_pitch_rad))
+        if roll_excursion > 0.05 or pitch_excursion > 0.05:
+            raise SafetyAbort("calibration attitude excursion exceeded 0.05 rad")
+        return roll_excursion, pitch_excursion, area
+
+    async def _run_calibration_excite(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Run the reviewed 4.9 s waveform without the task-local freeze ceremony.
+
+        This is intentionally only an execution shortcut. It retains the same
+        gate-zero corridor, attitude-excursion limit, zero yaw, exact 50 Hz
+        half-open slots, per-tick watchdog, and fail-closed cleanup owned by
+        ``run_powered_stage``. A missed slot aborts instead of being replayed.
+        """
+
+        from scripts import aigp_vq2_powered_attempt as calibration_contract
+
+        plan = calibration_contract.validate_excitation_plan(
+            calibration_contract.frozen_excitation_plan()
+        )
+        period_ns = int(plan["control_period_ns"])
+        if period_ns != int(CONTROL_PERIOD_S * 1_000_000_000):
+            raise SafetyAbort("calibration plan is not exactly 50 Hz")
+        if plan["stage"] != CALIBRATION_STAGE:
+            raise SafetyAbort("calibration plan stage changed")
+        plan_sha256 = calibration_contract.canonical_object_sha256(plan)
+        flight_start_ns = time.perf_counter_ns()
+        hard_deadline_ns = flight_start_ns + int(
+            plan["powered_hard_expiry_offset_ns"]
+        )
+        sent = 0
+        max_roll_excursion = 0.0
+        max_pitch_excursion = 0.0
+        max_target_area = float(context.initial_gate_area)
+        self.recorder.emit(
+            "calibration_plan_start",
+            plan_id=plan["plan_id"],
+            plan_sha256=plan_sha256,
+            tick_count=plan["tick_count"],
+            control_period_ns=period_ns,
+        )
+        for tick_index in range(int(plan["tick_count"])):
+            nominal_release_ns = flight_start_ns + tick_index * period_ns
+            slot_end_ns = nominal_release_ns + period_ns
+            now_ns = time.perf_counter_ns()
+            if now_ns < nominal_release_ns:
+                await asyncio.sleep(
+                    (nominal_release_ns - now_ns) / 1_000_000_000.0
+                )
+            now_ns = time.perf_counter_ns()
+            if now_ns >= slot_end_ns or now_ns >= hard_deadline_ns:
+                self.recorder.emit(
+                    "calibration_slot_missed",
+                    absolute_tick=tick_index,
+                    observed_monotonic_ns=now_ns,
+                )
+                raise SafetyAbort(
+                    f"calibration slot {tick_index} was missed; no catch-up send"
+                )
+
+            self._sample()
+            # Unlike gate-flight launch handling, the calibration contract
+            # treats every collision as terminal.
+            self._watchdog(allow_benign_pad_contact=False)
+            roll_excursion, pitch_excursion, target_area = (
+                self._check_calibration_envelope(context)
+            )
+            max_roll_excursion = max(max_roll_excursion, roll_excursion)
+            max_pitch_excursion = max(max_pitch_excursion, pitch_excursion)
+            max_target_area = max(max_target_area, target_area)
+
+            tick = calibration_contract.excitation_tick(tick_index)
+            command_value = tick["command"]
+            command = AttitudeRateCommand(
+                float(command_value["roll_rate_rad_s"]),
+                float(command_value["pitch_rate_rad_s"]),
+                float(command_value["yaw_rate_rad_s"]),
+                float(command_value["thrust"]),
+            )
+            validate_command(command)
+
+            # Keep fixed plan slots while spacing the adapter's exact wire-call
+            # starts. If variable safety work finishes early, wait out only the
+            # remaining pacing gap; the adapter rechecks both edges of the
+            # window inside its send lock before any wire mutation.
+            earliest_send_ns = nominal_release_ns
+            if self._last_flight_command_started_ns is not None:
+                earliest_send_ns = max(
+                    earliest_send_ns,
+                    self._last_flight_command_started_ns + period_ns,
+                )
+            checked_ns = time.perf_counter_ns()
+            if checked_ns < earliest_send_ns:
+                await asyncio.sleep(
+                    (earliest_send_ns - checked_ns) / 1_000_000_000.0
+                )
+                checked_ns = time.perf_counter_ns()
+                if checked_ns >= slot_end_ns or checked_ns >= hard_deadline_ns:
+                    self.recorder.emit(
+                        "calibration_slot_missed",
+                        absolute_tick=tick_index,
+                        observed_monotonic_ns=checked_ns,
+                    )
+                    raise SafetyAbort(
+                        f"calibration slot {tick_index} was missed while pacing"
+                    )
+            checked_ns = time.perf_counter_ns()
+            if checked_ns >= slot_end_ns or checked_ns >= hard_deadline_ns:
+                self.recorder.emit(
+                    "calibration_slot_missed",
+                    absolute_tick=tick_index,
+                    observed_monotonic_ns=checked_ns,
+                )
+                raise SafetyAbort(
+                    f"calibration slot {tick_index} expired before send"
+                )
+            previous_wire_start_ns = self._last_flight_command_started_ns
+            receipt = await self._send_flight_command(
+                command,
+                require_wire_receipt=True,
+                wire_start_not_before_ns=earliest_send_ns,
+                wire_start_deadline_ns=min(slot_end_ns, hard_deadline_ns),
+            )
+            assert receipt is not None
+            sent += 1
+            call_start_ns = int(receipt["call_start_monotonic_ns"])
+            call_end_ns = int(receipt["call_end_monotonic_ns"])
+            self._record_tick(
+                f"calibration-excite/{tick['segment_id']}",
+                (call_start_ns - flight_start_ns) / 1_000_000_000.0,
+                command,
+            )
+            if not (
+                nominal_release_ns <= call_start_ns < slot_end_ns
+                and call_start_ns < hard_deadline_ns
+            ):
+                self.recorder.emit(
+                    "calibration_slot_missed",
+                    absolute_tick=tick_index,
+                    observed_monotonic_ns=call_start_ns,
+                )
+                raise SafetyAbort(
+                    f"calibration slot {tick_index} wire dispatch started out of slot"
+                )
+            if (
+                previous_wire_start_ns is not None
+                and call_start_ns - previous_wire_start_ns < period_ns
+            ):
+                raise SafetyAbort("calibration wire dispatch exceeded 50 Hz")
+            if call_end_ns >= hard_deadline_ns:
+                raise SafetyAbort("calibration wire dispatch crossed the hard deadline")
+
+        self.recorder.emit(
+            "calibration_plan_complete",
+            plan_id=plan["plan_id"],
+            plan_sha256=plan_sha256,
+            ticks_sent=sent,
+        )
+        return {
+            "plan_id": plan["plan_id"],
+            "plan_sha256": plan_sha256,
+            "ticks_sent": sent,
+            "ticks_expected": int(plan["tick_count"]),
+            "max_roll_excursion_rad": max_roll_excursion,
+            "max_pitch_excursion_rad": max_pitch_excursion,
+            "max_target_area_px": max_target_area,
         }
 
     async def _run_hover(self, context: StartContext) -> Dict[str, Any]:
@@ -8422,8 +8790,21 @@ class VQ2Runner:
         finally:
             self._post_gate_reacquisition = False
 
-    async def run_powered_stage(self, stage: str) -> StageResult:
-        if stage not in {"sign-id", "hover", "gate0", "gate0-observe"}:
+    async def run_powered_stage(
+        self,
+        stage: str,
+        *,
+        write_diagnostic_pngs: bool = True,
+    ) -> StageResult:
+        if type(write_diagnostic_pngs) is not bool:
+            raise TypeError("write_diagnostic_pngs must be an exact bool")
+        if stage not in {
+            "sign-id",
+            "hover",
+            "gate0",
+            "gate0-observe",
+            CALIBRATION_STAGE,
+        }:
             raise ValueError(f"unsupported powered stage: {stage}")
         started = time.monotonic()
         reason = "unknown"
@@ -8446,12 +8827,14 @@ class VQ2Runner:
                 details = await self._run_sign_id()
             elif stage == "hover":
                 details = await self._run_hover(context)
+            elif stage == CALIBRATION_STAGE:
+                details = await self._run_calibration_excite(context)
             elif stage == "gate0":
                 details = await self._run_gate0(context)
             else:
                 gate0_details = await self._run_gate0(
                     context,
-                    capture_transition=True,
+                    capture_transition=write_diagnostic_pngs,
                 )
                 details = {"gate0": gate0_details}
                 try:
@@ -8481,7 +8864,11 @@ class VQ2Runner:
             race = self.adapter.race_status
             gate_after = race.active_gate_index if race else None
             post_cleanup_diagnostic_errors: List[str] = []
-            if cleanup_confirmed and self._post_gate_last_frame is not None:
+            if (
+                write_diagnostic_pngs
+                and cleanup_confirmed
+                and self._post_gate_last_frame is not None
+            ):
                 token, image = self._post_gate_last_frame
                 observation = details.get("gate1_observation", {})
                 if observation.get("gate1_observed"):
@@ -8500,17 +8887,21 @@ class VQ2Runner:
                     self._deferred_pngs.append(
                         ("gate1_observation_terminal", image)
                     )
-            if cleanup_confirmed:
+            if cleanup_confirmed and write_diagnostic_pngs:
                 diagnostic_paths, diagnostic_errors = self._flush_deferred_snapshots()
                 diagnostic_errors = (
                     post_cleanup_diagnostic_errors + diagnostic_errors
                 )
-            else:
+            elif not cleanup_confirmed and write_diagnostic_pngs:
                 self._deferred_pngs = []
                 diagnostic_paths = []
                 diagnostic_errors = [
                     "diagnostic images not encoded because cleanup was unconfirmed"
                 ]
+            else:
+                self._deferred_pngs = []
+                diagnostic_paths = []
+                diagnostic_errors = []
             if diagnostic_paths:
                 details["diagnostic_pngs"] = diagnostic_paths
             if diagnostic_errors:
@@ -8552,10 +8943,24 @@ async def run_live(
     replay_bundle: Optional[str] = None,
     recording_approved: bool = False,
     preflight_healthy_dwell_s: float = 0.0,
+    preflight_timeout_s: float = 10.0,
+    preflight_before_powered_stage: bool = True,
+    write_diagnostic_pngs: bool = True,
+    run_manifest_sha256: Optional[str] = None,
 ) -> StageResult:
     _load_live_transport_dependencies()
     if type(recording_approved) is not bool:
         raise TypeError("recording_approved must be an exact bool")
+    if type(preflight_before_powered_stage) is not bool:
+        raise TypeError("preflight_before_powered_stage must be an exact bool")
+    if type(write_diagnostic_pngs) is not bool:
+        raise TypeError("write_diagnostic_pngs must be an exact bool")
+    if run_manifest_sha256 is not None and (
+        type(run_manifest_sha256) is not str
+        or len(run_manifest_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in run_manifest_sha256)
+    ):
+        raise ValueError("run_manifest_sha256 must be 64 lowercase hexadecimal characters")
     if replay_bundle is not None and recording_approved is not True:
         raise PermissionError(
             "programmatic replay capture requires explicit recording_approved=True"
@@ -8570,6 +8975,12 @@ async def run_live(
         )
     if stage != "preflight" and float(preflight_healthy_dwell_s) != 0.0:
         raise ValueError("preflight dwell is valid only for the preflight stage")
+    if (
+        type(preflight_timeout_s) not in {int, float}
+        or not math.isfinite(preflight_timeout_s)
+        or not 1.0 <= float(preflight_timeout_s) <= 10.0
+    ):
+        raise ValueError("preflight_timeout_s must be finite and in [1, 10]")
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
         require_track=False,
@@ -8596,6 +9007,12 @@ async def run_live(
                     "preflight_healthy_dwell_s": float(
                         preflight_healthy_dwell_s
                     ),
+                    "preflight_timeout_s": float(preflight_timeout_s),
+                    "preflight_before_powered_stage": (
+                        preflight_before_powered_stage
+                    ),
+                    "write_diagnostic_pngs": write_diagnostic_pngs,
+                    "run_manifest_sha256": run_manifest_sha256,
                     "mavlink_address": address,
                     "capture_kind": "private-development-session",
                     "commit_hash": commit_hash,
@@ -8671,12 +9088,21 @@ async def run_live(
             replay=replay,
             capture_fifo_enabled=(replay is not None and stage == "preflight"),
         )
+        if run_manifest_sha256 is not None:
+            recorder.emit(
+                "fast_cycle_binding",
+                run_manifest_sha256=run_manifest_sha256,
+            )
         runner = VQ2Runner(adapter, vision, recorder=recorder)
         await adapter.connect(address)
-        preflight = await runner.preflight(
-            healthy_dwell_s=float(preflight_healthy_dwell_s)
-        )
+        preflight = None
+        if stage == "preflight" or preflight_before_powered_stage:
+            preflight = await runner.preflight(
+                timeout_s=float(preflight_timeout_s),
+                healthy_dwell_s=float(preflight_healthy_dwell_s),
+            )
         if stage == "preflight":
+            assert preflight is not None
             result = StageResult(
                 stage=stage,
                 success=True,
@@ -8688,7 +9114,10 @@ async def run_live(
                 details=preflight,
             )
         else:
-            result = await runner.run_powered_stage(stage)
+            result = await runner.run_powered_stage(
+                stage,
+                write_diagnostic_pngs=write_diagnostic_pngs,
+            )
     except BaseException as exc:
         failure = f"{type(exc).__name__}: {exc}"
         primary_exception = exc
@@ -9514,6 +9943,12 @@ def main(
         default=0.0,
         help="continue an already-healthy passive preflight for up to 8 seconds",
     )
+    parser.add_argument(
+        "--preflight-timeout-s",
+        type=float,
+        default=10.0,
+        help="fail passive stream readiness after 1-10 seconds",
+    )
     parser.add_argument("--verbose", action="store_true")
     parsed = parser.parse_args(args)
     if parsed.replay_bundle is not None and not parsed.recording_approved:
@@ -9542,6 +9977,7 @@ def main(
             replay_bundle=replay_bundle,
             recording_approved=parsed.recording_approved,
             preflight_healthy_dwell_s=parsed.preflight_healthy_dwell_s,
+            preflight_timeout_s=parsed.preflight_timeout_s,
         )
     )
     print(json.dumps(asdict(result), indent=2, sort_keys=True))
