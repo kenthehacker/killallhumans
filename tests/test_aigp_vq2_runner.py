@@ -1272,6 +1272,7 @@ def test_fast_calibration_waveform_is_exact_50hz_zero_yaw_and_complete(
     runner, adapter, context = _fast_calibration_runner()
     clock = [0.0]
     send_times = []
+    watchdog_calls = []
 
     async def advance(seconds):
         clock[0] += max(0.0, float(seconds))
@@ -1304,30 +1305,53 @@ def test_fast_calibration_waveform_is_exact_50hz_zero_yaw_and_complete(
         "perf_counter_ns",
         lambda: int(round(clock[0] * 1_000_000_000)),
     )
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_calibration_release",
+        lambda deadline_ns: clock.__setitem__(
+            0, max(clock[0], deadline_ns / 1_000_000_000.0)
+        ),
+    )
     monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
     monkeypatch.setattr(runner, "_sample", sample)
-    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner, "_watchdog", lambda **kwargs: watchdog_calls.append(kwargs)
+    )
     monkeypatch.setattr(adapter, "send_attitude_rate", send)
 
     details = asyncio.run(runner._run_calibration_excite(context))
 
-    plan = powered_contract.frozen_excitation_plan()
-    assert details["ticks_sent"] == details["ticks_expected"] == 245
-    assert details["plan_sha256"] == powered_contract.EXCITATION_PLAN_SHA256
-    assert len(adapter.commands) == plan["tick_count"]
+    fast_plan = powered_contract.fast_excitation_plan()
+    assert (
+        details["ticks_sent"]
+        == details["ticks_expected"]
+        == fast_plan["tick_count"]
+    )
+    assert details["plan_sha256"] == powered_contract.canonical_object_sha256(
+        fast_plan
+    )
+    assert len(adapter.commands) == fast_plan["tick_count"]
     assert all(command.yaw_rate == 0.0 for command in adapter.commands)
-    assert all(abs(command.roll_rate) <= 0.08 for command in adapter.commands)
-    assert all(abs(command.pitch_rate) <= 0.08 for command in adapter.commands)
+    assert all(abs(command.roll_rate) <= 0.02 for command in adapter.commands)
+    assert all(abs(command.pitch_rate) <= 0.02 for command in adapter.commands)
     assert all(command.thrust == 0.235 for command in adapter.commands)
+    assert all(
+        call == {
+            "allow_benign_pad_contact": True,
+            "enforce_benign_pad_budget": False,
+            "benign_pad_max_impulse": 0.02,
+        }
+        for call in watchdog_calls
+    )
     assert all(
         later - earlier == pytest.approx(vq2_module.CONTROL_PERIOD_S)
         for earlier, later in zip(send_times, send_times[1:])
     )
     assert send_times[-1] - send_times[0] == pytest.approx(
-        (plan["tick_count"] - 1) * vq2_module.CONTROL_PERIOD_S
+        (fast_plan["tick_count"] - 1) * vq2_module.CONTROL_PERIOD_S
     )
     for index, command in enumerate(adapter.commands):
-        expected = powered_contract.excitation_command_for_tick(index)
+        expected = powered_contract.fast_excitation_tick(index)["command"]
         assert command.roll_rate == expected["roll_rate_rad_s"]
         assert command.pitch_rate == expected["pitch_rate_rad_s"]
         assert command.yaw_rate == expected["yaw_rate_rad_s"]
@@ -1375,6 +1399,13 @@ def test_fast_calibration_variable_safety_cost_does_not_creep_phase(monkeypatch)
         "perf_counter_ns",
         lambda: int(round(clock[0] * 1_000_000_000)),
     )
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_calibration_release",
+        lambda deadline_ns: clock.__setitem__(
+            0, max(clock[0], deadline_ns / 1_000_000_000.0)
+        ),
+    )
     monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
     monkeypatch.setattr(runner, "_sample", sample)
     monkeypatch.setattr(runner, "_watchdog", watchdog)
@@ -1382,8 +1413,9 @@ def test_fast_calibration_variable_safety_cost_does_not_creep_phase(monkeypatch)
 
     details = asyncio.run(runner._run_calibration_excite(context))
 
-    assert details["ticks_sent"] == 245
-    assert len(send_times) == 245
+    fast_plan = powered_contract.fast_excitation_plan()
+    assert details["ticks_sent"] == fast_plan["tick_count"]
+    assert len(send_times) == fast_plan["tick_count"]
     assert all(
         later - earlier >= vq2_module.CONTROL_PERIOD_S - 1e-9
         for earlier, later in zip(send_times, send_times[1:])
@@ -1461,6 +1493,19 @@ def test_fast_calibration_rejects_changed_decoded_dimensions():
     runner._latest_detection_image = SimpleNamespace(shape=(180, 320, 3))
 
     with pytest.raises(SafetyAbort, match="dimensions changed"):
+        runner._check_calibration_envelope(context)
+
+
+def test_fast_calibration_excursion_matches_the_complete_waveform_envelope():
+    runner, _adapter, context = _fast_calibration_runner()
+    runner.estimate = _estimate(roll=0.024, pitch=-0.31)
+    roll_excursion, _pitch_excursion, _area = (
+        runner._check_calibration_envelope(context)
+    )
+    assert roll_excursion == pytest.approx(0.024)
+
+    runner.estimate = _estimate(roll=0.026, pitch=-0.31)
+    with pytest.raises(SafetyAbort, match="exceeded 0.025 rad"):
         runner._check_calibration_envelope(context)
 
 
@@ -1543,6 +1588,10 @@ def test_only_tiny_spawn_pad_contact_is_classified_benign():
     )
     assert not is_benign_pad_contact(
         {"id": 1002, "threat_level": 1, "impulse": 0.02}
+    )
+    assert is_benign_pad_contact(
+        {"id": 1002, "threat_level": 1, "impulse": 0.0159},
+        max_impulse=0.02,
     )
 
 

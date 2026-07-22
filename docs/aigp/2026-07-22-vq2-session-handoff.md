@@ -114,3 +114,16 @@ F04 live-poison SHA-256: `ea3b9da4010d38498a23215d5c12157425fb5206783bb444eacf84
 F04 attempt envelope SHA-256: `9772f0c2e6ee6c082e2798a52bf92cdff69bea7d01fe5084afe2d6ba4fd499d2`.
 The exact reviewed supervisor SHA-256 was
 `99fe53d13e9d39df1788ac6f1fa8fba2218f3dd9a4363286a580c6cb101c3849`.
+
+## Compact powered-cycle success
+
+The streamlined local-main path completed a real `calibration-excite` run at
+`2026-07-22T18:34:39Z`. Run ID
+`20260722T183431Z-calibration-excite-755a8fb2` sent all 45 balanced 50 Hz slots,
+kept gate index 0, reported zero ingress drops, and confirmed disarm/reset
+cleanup. Manifest SHA-256 is
+`9a3b308bd35e703b0d3577d10fffc3c64165fa380bd0a2526ce85a7bd940c697`;
+trace SHA-256 is
+`638670dcd6a0aa251e8d72e1240aba7614b19ff2e0b4c29fc32499f5d9d574b4`.
+The executed plan SHA-256 was
+`fcfac170756771e32ae5afa8f6f2abad3bef61737ddce111b9dfd0c1512e4dea`.

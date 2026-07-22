@@ -558,6 +558,50 @@ def frozen_excitation_plan() -> dict[str, Any]:
     return defensive_copy(_PLAN_LITERAL)
 
 
+def fast_excitation_plan() -> dict[str, Any]:
+    """Return the compact-cycle balanced waveform for pad-safe identification."""
+
+    plan = validate_excitation_plan(frozen_excitation_plan())
+    plan["plan_id"] = "vq2-build3385-training-fast-excite-v5"
+    plan["tick_count"] = 45
+    plan["nominal_end_offset_ns"] = 900_000_000
+    plan["powered_hard_expiry_offset_ns"] = 1_000_000_000
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+
+    def add(name: str, count: int, roll: float, pitch: float) -> None:
+        nonlocal cursor
+        segments.append(
+            {
+                "segment_id": name,
+                "first_tick": cursor,
+                "last_tick": cursor + count - 1,
+                "roll_rate_rad_s": roll,
+                "pitch_rate_rad_s": pitch,
+            }
+        )
+        cursor += count
+
+    add("dwell-0", 10, 0.0, 0.0)
+    add("roll-positive", 4, 0.02, 0.0)
+    add("roll-negative", 4, -0.02, 0.0)
+    add("pitch-positive", 4, 0.0, 0.0175)
+    add("pitch-negative", 4, 0.0, -0.0175)
+    coupled = (
+        (0.015, 0.0125),
+        (-0.015, -0.0125),
+        (0.015, -0.0125),
+        (-0.015, 0.0125),
+    )
+    for phase, (roll, pitch) in enumerate(coupled):
+        add(f"coupled-{phase}", 3, roll, pitch)
+    add("dwell-final", 7, 0.0, 0.0)
+    if cursor != plan["tick_count"]:
+        raise AssertionError("fast excitation segments do not cover 45 ticks")
+    plan["segments"] = segments
+    return plan
+
+
 def derive_excitation_plan(value: Any) -> dict[str, Any]:
     row = _object(
         value,
@@ -655,6 +699,51 @@ def excitation_tick(tick: Any, *, anchor_monotonic_ns: int | None = None) -> dic
         "end_monotonic_ns": anchor + (absolute_tick + 1) * period,
         "powered_expiry_monotonic_ns": anchor + _PLAN_LITERAL["powered_hard_expiry_offset_ns"],
         "command": excitation_command_for_tick(absolute_tick),
+    }
+    if anchor_monotonic_ns is None:
+        result = {
+            "absolute_tick": result["absolute_tick"],
+            "segment_id": result["segment_id"],
+            "release_offset_ns": result["release_monotonic_ns"],
+            "end_offset_ns": result["end_monotonic_ns"],
+            "powered_expiry_offset_ns": result["powered_expiry_monotonic_ns"],
+            "command": result["command"],
+        }
+    return result
+
+
+def fast_excitation_tick(
+    tick: Any,
+    *,
+    anchor_monotonic_ns: int | None = None,
+) -> dict[str, Any]:
+    plan = fast_excitation_plan()
+    absolute_tick = _int(tick, "$tick", maximum=plan["tick_count"] - 1)
+    anchor = (
+        0
+        if anchor_monotonic_ns is None
+        else _int(anchor_monotonic_ns, "$anchor_monotonic_ns")
+    )
+    period = plan["control_period_ns"]
+    segment = next(
+        item
+        for item in plan["segments"]
+        if item["first_tick"] <= absolute_tick <= item["last_tick"]
+    )
+    result = {
+        "absolute_tick": absolute_tick,
+        "segment_id": segment["segment_id"],
+        "release_monotonic_ns": anchor + absolute_tick * period,
+        "end_monotonic_ns": anchor + (absolute_tick + 1) * period,
+        "powered_expiry_monotonic_ns": (
+            anchor + plan["powered_hard_expiry_offset_ns"]
+        ),
+        "command": {
+            "roll_rate_rad_s": segment["roll_rate_rad_s"],
+            "pitch_rate_rad_s": segment["pitch_rate_rad_s"],
+            "yaw_rate_rad_s": plan["command"]["yaw_rate_rad_s"],
+            "thrust": plan["command"]["thrust"],
+        },
     }
     if anchor_monotonic_ns is None:
         result = {

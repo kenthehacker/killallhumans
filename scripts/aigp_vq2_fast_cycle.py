@@ -203,7 +203,7 @@ def _excitation_plan_identity(stage: str) -> Mapping[str, Any] | None:
         return None
     from scripts import aigp_vq2_powered_attempt as contract
 
-    plan = contract.validate_excitation_plan(contract.frozen_excitation_plan())
+    plan = contract.fast_excitation_plan()
     return {
         "plan_id": plan["plan_id"],
         "sha256": contract.canonical_object_sha256(plan),

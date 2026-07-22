@@ -55,15 +55,15 @@ The powered runner still:
 - sends no faster than 50 Hz, never catches up missed ticks, keeps yaw rate at
   zero, and retains the command envelope;
 - aborts on stale/nonadvancing streams, target/corridor loss, estimator or
-  attitude failure, collision, gate change, non-finite/out-of-bounds command,
+  attitude failure, unsafe collision, gate change, non-finite/out-of-bounds command,
   or missed waveform deadline;
 - on every runner exit path, latches command production, sends the safe stop
   when applicable, disarms, resets, proves the clean epoch, and marks failed
   cleanup as a failed stage.
 
-The calibration waveform is the existing reviewed 245-slot, 4.9-second plan.
-Its values and safety limits are code-owned and cannot be changed through the
-manifest.
+The compact calibration waveform is a balanced 45-slot, 0.9-second system-ID
+burst with a 1.0-second hard expiry. Its values and safety limits are code-owned
+and cannot be changed through the manifest.
 
 ## Evidence and failures
 

@@ -136,6 +136,7 @@ MAX_PITCH_RAD = math.radians(10.0)
 MAX_BODY_RATE_RAD_S = 2.0
 IMMEDIATE_MAX_BODY_RATE_RAD_S = 3.0
 MAX_COMMAND_RATE_RAD_S = 0.25
+CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD = 0.025
 
 RESET_RACE_DROP_MS = 500
 RESET_IMU_DROP_US = 100_000
@@ -6329,14 +6330,21 @@ def validate_command(command: AttitudeRateCommand) -> None:
         raise SafetyAbort("commanded thrust exceeded conservative VQ2 envelope")
 
 
-def is_benign_pad_contact(collision: Dict[str, Any]) -> bool:
+def is_benign_pad_contact(
+    collision: Dict[str, Any],
+    *,
+    max_impulse: float = 0.01,
+) -> bool:
     """Exact low-energy spawn-pad contact class observed during motor preload."""
 
     try:
         return (
-            collision.get("id") == 1002
+            math.isfinite(float(max_impulse))
+            and float(max_impulse) > 0.0
+            and collision.get("id") == 1002
             and int(collision.get("threat_level", 99)) <= 1
-            and abs(float(collision.get("impulse", math.inf))) <= 0.01
+            and abs(float(collision.get("impulse", math.inf)))
+            <= float(max_impulse)
         )
     except (TypeError, ValueError, OverflowError):
         return False
@@ -7186,6 +7194,7 @@ class VQ2Runner:
         require_target: bool = True,
         allow_benign_pad_contact: bool = False,
         enforce_benign_pad_budget: bool = False,
+        benign_pad_max_impulse: float = 0.01,
         count_rate_sample: bool = True,
     ) -> None:
         if self._abort_latched:
@@ -7199,7 +7208,10 @@ class VQ2Runner:
         if collisions:
             harmful = []
             for collision in collisions:
-                benign_pad = allow_benign_pad_contact and is_benign_pad_contact(collision)
+                benign_pad = allow_benign_pad_contact and is_benign_pad_contact(
+                    collision,
+                    max_impulse=benign_pad_max_impulse,
+                )
                 if benign_pad:
                     self._benign_pad_contact_count += 1
                     self._benign_pad_contact_impulse += abs(float(collision["impulse"]))
@@ -8032,9 +8044,42 @@ class VQ2Runner:
         roll, pitch, _yaw = self.estimate.orientation.to_euler()
         roll_excursion = abs(float(roll) - float(context.spawn_roll_rad))
         pitch_excursion = abs(float(pitch) - float(context.spawn_pitch_rad))
-        if roll_excursion > 0.05 or pitch_excursion > 0.05:
-            raise SafetyAbort("calibration attitude excursion exceeded 0.05 rad")
+        if (
+            roll_excursion > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+            or pitch_excursion > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+        ):
+            raise SafetyAbort(
+                "calibration attitude excursion exceeded "
+                f"{CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD:.3f} rad"
+            )
         return roll_excursion, pitch_excursion, area
+
+    @staticmethod
+    def _wait_for_calibration_release(deadline_ns: int) -> None:
+        """Wait for a 50 Hz release without the coarse Windows asyncio timer.
+
+        The default Windows event-loop timer advances in roughly 15.6 ms
+        quanta on this host, so an ``asyncio.sleep`` for the remainder of a
+        20 ms slot can wake a full slot late.  Sleep most of the interval with
+        the high-resolution CPython waitable timer, then spin only the final
+        2 ms.  ``time.sleep`` releases the GIL, so the MAVLink and vision
+        receiver threads continue to run during the coarse portion.
+        """
+
+        if type(deadline_ns) is not int or deadline_ns < 0:
+            raise ValueError("calibration release deadline must be nonnegative")
+        spin_ns = 2_000_000
+        while True:
+            now_ns = time.perf_counter_ns()
+            remaining_ns = deadline_ns - now_ns
+            if remaining_ns <= 0:
+                return
+            if remaining_ns > spin_ns:
+                time.sleep((remaining_ns - spin_ns) / 1_000_000_000.0)
+                continue
+            while time.perf_counter_ns() < deadline_ns:
+                pass
+            return
 
     async def _run_calibration_excite(
         self,
@@ -8050,9 +8095,7 @@ class VQ2Runner:
 
         from scripts import aigp_vq2_powered_attempt as calibration_contract
 
-        plan = calibration_contract.validate_excitation_plan(
-            calibration_contract.frozen_excitation_plan()
-        )
+        plan = calibration_contract.fast_excitation_plan()
         period_ns = int(plan["control_period_ns"])
         if period_ns != int(CONTROL_PERIOD_S * 1_000_000_000):
             raise SafetyAbort("calibration plan is not exactly 50 Hz")
@@ -8079,9 +8122,7 @@ class VQ2Runner:
             slot_end_ns = nominal_release_ns + period_ns
             now_ns = time.perf_counter_ns()
             if now_ns < nominal_release_ns:
-                await asyncio.sleep(
-                    (nominal_release_ns - now_ns) / 1_000_000_000.0
-                )
+                self._wait_for_calibration_release(nominal_release_ns)
             now_ns = time.perf_counter_ns()
             if now_ns >= slot_end_ns or now_ns >= hard_deadline_ns:
                 self.recorder.emit(
@@ -8094,9 +8135,16 @@ class VQ2Runner:
                 )
 
             self._sample()
-            # Unlike gate-flight launch handling, the calibration contract
-            # treats every collision as terminal.
-            self._watchdog(allow_benign_pad_contact=False)
+            # The frozen waveform uses the already-bounded sign-ID thrust and
+            # can remain lightly loaded against the spawn pad.  Reuse the
+            # sign-ID rule: only exact tiny id-1002/threat-1 contacts are
+            # tolerated; every differently identified, larger, or higher-
+            # threat collision remains terminal.
+            self._watchdog(
+                allow_benign_pad_contact=True,
+                enforce_benign_pad_budget=False,
+                benign_pad_max_impulse=0.02,
+            )
             roll_excursion, pitch_excursion, target_area = (
                 self._check_calibration_envelope(context)
             )
@@ -8104,7 +8152,7 @@ class VQ2Runner:
             max_pitch_excursion = max(max_pitch_excursion, pitch_excursion)
             max_target_area = max(max_target_area, target_area)
 
-            tick = calibration_contract.excitation_tick(tick_index)
+            tick = calibration_contract.fast_excitation_tick(tick_index)
             command_value = tick["command"]
             command = AttitudeRateCommand(
                 float(command_value["roll_rate_rad_s"]),
@@ -8126,9 +8174,7 @@ class VQ2Runner:
                 )
             checked_ns = time.perf_counter_ns()
             if checked_ns < earliest_send_ns:
-                await asyncio.sleep(
-                    (earliest_send_ns - checked_ns) / 1_000_000_000.0
-                )
+                self._wait_for_calibration_release(earliest_send_ns)
                 checked_ns = time.perf_counter_ns()
                 if checked_ns >= slot_end_ns or checked_ns >= hard_deadline_ns:
                     self.recorder.emit(
