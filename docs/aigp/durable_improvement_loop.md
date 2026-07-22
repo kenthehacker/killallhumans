@@ -68,7 +68,18 @@ change:
   aigp_loop\ledger.py `
   aigp_loop\campaign.py aigp_loop\nonlive.py aigp_loop\promotion.py `
   aigp_loop\replay.py aigp_loop\scheduler.py `
-  scripts\aigp_nonlive.py scripts\aigp_pytest.py scripts\aigp_replay.py `
+  competition\aigp_mavlink.py competition\vq2_capture.py `
+  competition\vq2_passive_timing.py competition\vq2_vision.py `
+  config\aigp_vq2_calibration_target_build3385.json `
+  scripts\aigp_live_lease.py `
+  scripts\aigp_nonlive.py scripts\aigp_promotion_runner.py `
+  scripts\aigp_pytest.py scripts\aigp_pytest_progress.py scripts\aigp_replay.py `
+  scripts\aigp_vq2_calibration_target.py scripts\aigp_vq2_passive_probe.py `
+  scripts\aigp_vq2_passive_timing.py scripts\aigp_vq2_powered_attempt.py `
+  scripts\aigp_vq2_powered_calibration_analysis.py `
+  scripts\aigp_vq2_powered_calibration_probe.py `
+  scripts\aigp_vq2_powered_cleanup.py scripts\aigp_vq2_powered_import_audit.py `
+  scripts\aigp_vq2_powered_runtime.py scripts\aigp_vq2_run.py `
   scripts\benchmark.py `
   scripts\benchmark_matrix.py planning\__init__.py `
   planning\artifact_cache.py `

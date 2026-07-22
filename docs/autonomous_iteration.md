@@ -16,13 +16,19 @@ Work from the cheapest valid evidence upward:
 | T1 | Every accepted candidate | `.\scripts\dev.cmd test-vq2` plus the configured private golden-replay policy gate |
 | T2 | Relevant control/planning candidate | One warm prepared synthetic simulation |
 | T3 | Promising simulation candidate | Changed-domain track subset |
-| T4 | Pre-merge/nightly | `test-benchmark` and `test-full-non-live` outside the inner loop |
+| T4 | Pre-merge/nightly | Durable `test-promotion` outside the inner loop |
 | T5 | Explicit human promotion | One bounded, authorized official-simulator trial |
 
 The default `pytest`/`test-fast` selection excludes `slow`, `benchmark`, and
 `live`, uses strict marker registration, and has a hard timeout. The VQ2 suite
 is deliberately fast; use the current `test-vq2` result rather than a copied
 test-count baseline, because safety coverage is expected to grow.
+`test-promotion` includes all non-live slow and benchmark tests and normally
+takes 10-13 minutes. Its external commit-keyed state coordinates attachment
+and result recovery; the isolated trusted-manifest run remains the promotion
+evidence. A lost caller wait is not permission to rerun it.
+Use `test-benchmark` separately only when the benchmark matrix itself is the
+specific evidence needed; do not run it immediately before `test-promotion`.
 
 Completion and safety are lexicographic gates:
 

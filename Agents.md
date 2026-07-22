@@ -38,10 +38,17 @@ a hard wall timeout.
 
 Synthetic and PyBullet matrices are module-specific or pre-merge evidence, not
 the universal optimization objective. Invoke them explicitly with
-`test-benchmark`; use `test-full-non-live` only at a promotion boundary. Do not
-append to `benchmark_history.jsonl`, whose historical records are multiline
-objects and whose skipped PyBullet tier made old `overall_passed` values
-misleading.
+`test-benchmark`; use `test-promotion` only at a promotion boundary. The
+promotion suite normally takes 10-13 minutes because it includes the slow and
+benchmark tiers. Its external, commit-keyed state lets a later caller attach
+to an active run or reuse its terminal result; never launch a duplicate merely
+because a console or API wait expired. Use `--fresh` only after reviewing an
+incomplete or terminal attempt. `test-full-non-live` remains a compatibility
+alias. Promotion runs require a fresh exact-commit worktree with no ignored
+files, so ignored model/data inputs cannot bypass the durable key. Do not
+append to `benchmark_history.jsonl`, whose historical records
+are multiline objects and whose skipped PyBullet tier made old
+`overall_passed` values misleading.
 
 The explicit isolated and bounded legacy tiers are
 `.\scripts\dev.cmd test-unit` and `.\scripts\dev.cmd test-slow`. A `live` marker is

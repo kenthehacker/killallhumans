@@ -28,12 +28,23 @@ Use one command surface from the repository root:
 .\scripts\dev.cmd test-vq2
 .\scripts\dev.cmd test-slow
 .\scripts\dev.cmd test-benchmark
-.\scripts\dev.cmd test-full-non-live
+.\scripts\dev.cmd test-promotion
 ```
 
 Normal pytest selection excludes `slow`, `benchmark`, and `live`, rejects
 unknown markers, and enforces a hard per-test wall timeout. The benchmark and
 full non-live tiers are explicit promotion gates, not the per-edit loop.
+`test-promotion` typically takes 10-13 minutes, streams per-test progress, and
+uses external commit-keyed state so another caller attaches to the same run
+instead of repeating it after an output-channel timeout. The historical
+`test-full-non-live` spelling is a command-name-only compatibility alias; both
+names require a clean exact commit and may reuse its result. State defaults to
+`%LOCALAPPDATA%\AIGP\promotion-tests\v1\<repository-scope>` and can be moved to
+another external local directory with `AIGP_PROMOTION_STATE_ROOT`. A hard
+15-minute supervisor ceiling prevents an unexpectedly wedged suite from
+running indefinitely. Run it from a fresh exact-commit worktree: ignored files
+are rejected because they could otherwise change behavior without changing the
+durable key.
 Tests marked `live` are invoked directly with `python -m pytest -m live` only
 after explicit authorization; there is intentionally no generic powered task.
 

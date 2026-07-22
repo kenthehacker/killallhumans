@@ -78,7 +78,9 @@
     "pyproject.toml": "6fba84e0fecdc16b4121f8521ae2e6b4fa666851042109b93394d79adf0f3d4b",
     "scripts/aigp_live_lease.py": "a1441c92500cb545f65a4743d5d2ab395e11cec9fc4ed84190df623711f73740",
     "scripts/aigp_nonlive.py": "ac9c263309a4c88b6a0afecdfc6802cfd7bec2b72e97f73b3725d8544687913f",
+    "scripts/aigp_promotion_runner.py": "b5e12c674790562707827c15e3906a361fb4fc78ac88550acc10181e99f6fe53",
     "scripts/aigp_pytest.py": "9031b77f327c046b646159e8b45fd3ce93bccb57eb4dbbf246ece7e4af2c13b7",
+    "scripts/aigp_pytest_progress.py": "99c642bc69def1d1532a1ce70a1671d91ce98d9866db55161173aa21ecd5b8bb",
     "scripts/aigp_replay.py": "a2c56f4f820c3b971e28dd059d447074c5da470c50cddf02fec0a886042b2ad5",
     "scripts/aigp_vq2_calibration_target.py": "d427cf71cef7e0e26afcb19c466c52efe0c00bbe8a3abf3d3480ccdfb74cbb50",
     "scripts/aigp_vq2_passive_probe.py": "3545e8d9e4dade8ec657cd7af755669c7c05c0e0a94580782996f635737e8466",
@@ -119,6 +121,7 @@
     "tests/test_aigp_loop_replay.py": "97559bdd3c69d9f157a8af30f7fbae4c5473b84a85c8224cb0d5cdc0ca74fb75",
     "tests/test_aigp_loop_scheduler.py": "88fda3419e6c3dbbfc1b688d8762560342ef22bcbce153f8ec04932525086a9f",
     "tests/test_aigp_loop_util.py": "87a8726dea26d2b20825f8ded8db49ba992ee14989f143a7b3712bf127c147b2",
+    "tests/test_aigp_promotion_runner.py": "94ed125e7d7dd7c210b18fba042689e527d71b9ed67e43b1dab4e7c45e5cdf75",
     "tests/test_aigp_vq1_runner.py": "977f2431aaa07b762eab7888451f0b6aa82dc5aa6f387d940d3862d3ecb9cf07",
     "tests/test_aigp_vq2_build_reference.py": "82991ae67e91871fd126f016d3a117a1b305ccd5c82c1e956ca9f017cb401cc7",
     "tests/test_aigp_vq2_calibration_target.py": "41902a26cbb7363b2735ee701a03450718126b309a6c3f1ffb2047a07b667df6",
@@ -155,7 +158,7 @@
     "tests/test_vision_udp.py": "0b92d4da17a8fe7b45fd995744ad031a4f3a7dcd4a4d86711dda037e37459174",
     "tests/test_vision_udp_listener.py": "640addb01e874cb66c319290a63169f2e68130c0f8c2e7919829164e92d18266",
     "tests/test_visualize_matrix.py": "a087f60f490b5dc20985dbf315d0dab743f50376db2af03fd4c7596407d49cf6",
-    "tests/test_windows_tooling.py": "6da7595328df39ae87e1d5f6fac56d8d2123864b67657db29b9ff41896e73355",
+    "tests/test_windows_tooling.py": "e9b6b7457a07fb2af29901981cb66b71600a0a3728163b4b574ec0ace8490f8a",
     "tests/test_yolo_experiment_audit.py": "5bf7c92dfc99a5a3a70697ed7c75864d74bf55f74bd11365c652682abed9aae7"
   },
   "schema": "aigp-trusted-evaluator-files/1"

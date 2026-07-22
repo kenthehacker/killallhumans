@@ -36,9 +36,13 @@ Race status/collisions/watchdogs -------+-> body rates + thrust
 .\scripts\dev.cmd test-vq2
 .\scripts\dev.cmd test-slow
 .\scripts\dev.cmd test-benchmark
-.\scripts\dev.cmd test-full-non-live
+.\scripts\dev.cmd test-promotion
 .\scripts\dev.cmd preflight
 ```
+
+`test-promotion` is the durable 10-13 minute full non-live boundary. Reinvoke
+it to attach to or reuse the exact commit-keyed run; do not start a duplicate
+when a console wait expires. `test-full-non-live` is a compatibility alias.
 
 `preflight` is passive. Powered stages are never routine tests and require
 explicit user authorization. They must retain fresh reset proof,

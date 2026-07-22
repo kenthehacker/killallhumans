@@ -15,8 +15,10 @@ Run `.\scripts\dev.cmd test-target <paths>` after each edit. The pure-Python
 synthetic evaluator is available in the development profile. Actual PyBullet
 and visualization runs require the separate
 `requirements\legacy-simulation.txt` profile. Benchmark tests run only via the
-explicit `test-benchmark` or `test-full-non-live` promotion tasks; they are not
-the universal VQ2 objective.
+explicit `test-benchmark` or `test-promotion` tasks; they are not the universal
+VQ2 objective. The durable promotion task normally takes 10-13 minutes and
+reattaches to an existing exact-candidate run rather than starting a duplicate.
+`test-full-non-live` remains a compatibility alias.
 
 `.\scripts\dev.cmd preflight` is passive. Powered FlightSim stages require
 explicit user authorization and are never part of a generic test task. Read

@@ -399,9 +399,11 @@ $env:AIGP_PYTHON = 'C:\Users\John\killallhumans\.venv\Scripts\python.exe'
 `test-target` always excludes `live` but deliberately permits an explicitly
 targeted slow or benchmark test. Run affected tests after each edit. Run
 `test-vq2` for each accepted candidate. Use `test-slow` and `test-benchmark`
-only for their explicit tiers. Use `test-full-non-live` only at a promotion
-boundary; the current full suite has taken about thirteen minutes, so the
-calling shell needs an outer ceiling longer than the suite.
+only for their explicit tiers. Use durable `test-promotion` only at a promotion
+boundary; the current full suite has taken about thirteen minutes. Reinvoking
+the command attaches to the active exact-candidate run or reuses its terminal
+result, so a lost shell/API wait must not trigger a duplicate. The historical
+`test-full-non-live` command remains a compatibility alias.
 
 For the final strict candidate only, after verifying a fresh exact worktree:
 
@@ -856,7 +858,7 @@ For each accepted candidate:
    identities.
 10. Commit the complete promotion candidate and prove its tracked status empty.
 11. Create a fresh promotion-test worktree at that exact commit, run
-    `test-full-non-live`, and inventory every physical side effect of the run.
+    `test-promotion`, and inventory every physical side effect of the run.
 12. Create a separate fresh exact worktree at the same unchanged commit, audit
     its physical contents, and run the isolated hash-pinned VQ2 suite there.
 13. Fast-forward or merge that exact commit through one integration owner.

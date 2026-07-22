@@ -63,6 +63,19 @@ function Invoke-Python {
     }
 }
 
+function Invoke-PromotionTests {
+    param([string[]]$PromotionArgs)
+    if (
+        $PromotionArgs.Count -gt 1 -or
+        ($PromotionArgs.Count -eq 1 -and $PromotionArgs[0] -ne '--fresh')
+    ) {
+        throw 'test-promotion accepts only the optional --fresh recovery flag.'
+    }
+    Invoke-Python (
+        @('-u', '-m', 'scripts.aigp_promotion_runner') + $PromotionArgs
+    )
+}
+
 Push-Location $RepoRoot
 try {
     switch ($Task.ToLowerInvariant()) {
@@ -70,9 +83,17 @@ try {
             if ($TaskArgs.Count -ne 0) { throw 'help takes no arguments.' }
             Write-Output @"
 Available tasks: test-target, test-fast, test-unit, test-vq2, test-slow,
-test-benchmark, test-full-non-live, preflight, launch-sim, sbom.
+test-benchmark, test-promotion, test-full-non-live, preflight, launch-sim, sbom.
 Use scripts\dev.cmd on Windows so the repository command works even when the
 machine's script execution policy blocks direct .ps1 invocation.
+
+test-promotion is the durable 10-13 minute promotion boundary. It includes
+slow and benchmark tests, reports live per-test progress, and reuses or
+attaches to the exact same commit-keyed run instead of launching a duplicate.
+The supervisor enforces a hard 15-minute aggregate ceiling.
+test-full-non-live remains a compatibility alias.
+Both names require an exact pristine commit checkout (including no ignored
+files) and may reuse its durable result.
 "@
         }
         'test-target' {
@@ -123,9 +144,15 @@ machine's script execution policy blocks direct .ps1 invocation.
             if ($TaskArgs.Count -ne 0) { throw 'test-benchmark takes no arguments.' }
             Invoke-Python @('-m', 'pytest', '-q', '-m', 'benchmark and not live', '--timeout=300')
         }
+        'test-promotion' {
+            Invoke-PromotionTests $TaskArgs
+        }
         'test-full-non-live' {
-            if ($TaskArgs.Count -ne 0) { throw 'test-full-non-live takes no arguments.' }
-            Invoke-Python @('-m', 'pytest', '-q', '-m', 'not live', '--timeout=300')
+            Write-Warning (
+                'test-full-non-live is a compatibility alias; ' +
+                'use test-promotion for the explicit promotion boundary.'
+            )
+            Invoke-PromotionTests $TaskArgs
         }
         'preflight' {
             if ($TaskArgs.Count -ne 0) { throw 'preflight takes no arguments.' }
@@ -160,7 +187,8 @@ Unknown task '$Task'. Available tasks:
   test-vq2             Canonical build-3385 VQ2 candidate suite
   test-slow            Explicit bounded slow-test tier (always excludes live)
   test-benchmark       Explicit deterministic benchmark tier (always excludes live)
-  test-full-non-live   All tests except live FlightSim tests
+  test-promotion       Durable promotion-only full non-live suite (typically 10-13m)
+  test-full-non-live   Compatibility alias for test-promotion
   preflight            Passive build-3385 stream/target health check
   launch-sim [path]    Launch FlightSim in the active interactive session
   sbom [path]          Generate a local CycloneDX dependency inventory

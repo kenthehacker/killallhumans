@@ -90,6 +90,7 @@ def test_windows_command_surface_contains_all_passive_development_tasks():
         "test-vq2",
         "test-slow",
         "test-benchmark",
+        "test-promotion",
         "test-full-non-live",
         "preflight",
         "launch-sim",
@@ -101,6 +102,12 @@ def test_windows_command_surface_contains_all_passive_development_tasks():
     assert "'unit and not live'" in source
     assert "'slow and not live'" in source
     assert "'benchmark and not live'" in source
+    assert "scripts.aigp_promotion_runner" in source
+    assert "10-13 minute promotion boundary" in source
+    assert "test-full-non-live is a compatibility alias" in source
+    assert source.count("Invoke-PromotionTests $TaskArgs") == 2
+    assert "accepts only the optional --fresh recovery flag" in source
+    assert "'-m', 'pytest', '-q', '-m', 'not live', '--timeout=300'" not in source
 
 
 def test_windows_python_tasks_use_external_process_scoped_bytecode_cache():
@@ -127,6 +134,24 @@ def test_windows_cmd_bootstrap_bypasses_machine_execution_policy():
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Available tasks" in result.stdout
+    assert "test-promotion" in result.stdout
+    assert "test-full-non-live" in result.stdout
+    assert "10-13 minute promotion boundary" in result.stdout
+
+
+@pytest.mark.parametrize("task", ["test-promotion", "test-full-non-live"])
+def test_promotion_task_names_reject_unreviewed_arguments(task):
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", str(_DEV_CMD), task, "--unreviewed"],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert "accepts only the optional --fresh recovery flag" in (
+        result.stdout + result.stderr
+    )
 
 
 def test_target_executes_explicit_benchmark_but_still_excludes_live(tmp_path):
