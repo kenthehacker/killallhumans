@@ -9,7 +9,7 @@
 - Identity-rollover behavior commit:
   `cd5c43f8a0631a18a8f2889d2747628f125e95ba`.
 - Simulator target: FlightSim build 3385, Training mode.
-- State: `offline preparation, promotion, publication, and review only`.
+- State: `terminal-invalid and poisoned; do not retry or recover`.
 - Simulator access before the final checkpoint: passive host/process/task/port
   absence proofs only. No launch, fixed-port contact, preflight stream contact,
   reset, arm/disarm, target, or powered command is authorized by this record.
@@ -209,3 +209,30 @@ split identities and obtain independent acquisition-integrity review. All F02
 data stays sealed quarantine. Fitting, rank/identifiability claims, limit or
 calibration acceptance, held-out design, successor access, Gate 1 work, or data
 disposition requires a separate new hash-bound task and authority.
+
+## F02-A01 terminal result
+
+`F02-A01` entered the production wrapper but failed during `launcher_return`
+before simulator launch/contact, fixed-port binding, reset, arm, target, or any
+powered command. `Win32ProcessOperations.query_process_identity()` attempted to
+hash the 91,968,000-byte payload through the generic 64 MiB stable-file ceiling.
+The resulting `StableFileError` made cleanup unconfirmed, so the attempt is
+terminal-invalid and the F02 root is permanently poisoned.
+
+The immutable terminal identities are:
+
+- attempt envelope: size `9927`, SHA-256
+  `f8e7071dc35f6d336d6127c6164c87194313c4e88723adb9435531b15b7df8b3`;
+- attempt-invalid: size `2809`, SHA-256
+  `d64b943184796c10bc91cdc257f57e5cfab16765de8d92a9e6889319604c481b`;
+- wrapper lifecycle: size `4751`, SHA-256
+  `c82528d2ed4bd766823b74694b9ba04e8c57a413f0b765a48c30593dc0a6d71a`;
+- live poison: size `1891`, SHA-256
+  `63a215a250bedde84cfdd2714745e7762b2b97e27ed0a2782e4283592e9c2005`;
+  and
+- last lease generation: size `1493`, SHA-256
+  `faec921e6ef7518a7c91364e031cfbec9ba99d32aef887cf210ebe503267661e`.
+
+Later verified simulator topology does not repair F02. A successor must use a
+new task, session, attempt, private root, worktree, freeze, and exact powered
+authority.

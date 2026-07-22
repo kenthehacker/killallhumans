@@ -41,6 +41,7 @@ HANDLE_FLAG_INHERIT = 0x00000001
 JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x00001000
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+MAX_PROCESS_IMAGE_BYTES = 128 * 1024 * 1024
 
 CAPABILITY_DOMAINS = frozenset(
     {
@@ -3436,7 +3437,10 @@ class Win32ProcessOperations:
         before = facts()
         if before[4] != argv:
             raise ProcessIdentityError("retained process argv mismatched")
-        image = stable_file_identity(before[3])
+        image = stable_file_identity(
+            before[3],
+            max_bytes=MAX_PROCESS_IMAGE_BYTES,
+        )
         after = facts()
         if before != after or image.path != before[3]:
             raise ProcessIdentityError("process identity changed while proving image")

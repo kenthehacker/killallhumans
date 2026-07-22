@@ -576,6 +576,49 @@ def test_process_identity_primitive_and_argv_hash_are_exact():
         runtime.argv_sha256(["python", 1])  # type: ignore[list-item]
 
 
+def test_win32_process_identity_uses_bounded_large_image_hash(monkeypatch):
+    image_path = r"C:\AIGP_3385\DCGame-Win64-Shipping.exe"
+    argv = (image_path, "FlightSim")
+    stable_calls = []
+
+    class FakeProcessOperations:
+        def _process_pid(self, handle):
+            assert handle == 123
+            return 456
+
+        def _creation_filetime(self, handle):
+            assert handle == 123
+            return 789
+
+        def _session_id(self, pid):
+            assert pid == 456
+            return 1
+
+        def _image_path(self, handle):
+            assert handle == 123
+            return image_path
+
+        def query_process_argv(self, handle):
+            assert handle == 123
+            return argv
+
+    def stable_image(path, *, max_bytes):
+        stable_calls.append((path, max_bytes))
+        return runtime.StableFileIdentity(path, 91_968_000, "a" * 64)
+
+    monkeypatch.setattr(runtime, "stable_file_identity", stable_image)
+    identity = runtime.Win32ProcessOperations.query_process_identity(
+        FakeProcessOperations(), 123, argv
+    )
+
+    assert runtime.MAX_PROCESS_IMAGE_BYTES == 128 * 1024 * 1024
+    assert 91_968_000 <= runtime.MAX_PROCESS_IMAGE_BYTES
+    assert stable_calls == [(image_path, runtime.MAX_PROCESS_IMAGE_BYTES)]
+    assert identity["image_path"] == image_path
+    assert identity["image_sha256"] == "a" * 64
+    assert identity["argv_sha256"] == runtime.argv_sha256(argv)
+
+
 def test_new_win32_boundaries_are_lazy_off_windows(monkeypatch):
     monkeypatch.setattr(runtime.os, "name", "posix")
     with pytest.raises(runtime.Win32RuntimeUnavailable, match="Windows"):

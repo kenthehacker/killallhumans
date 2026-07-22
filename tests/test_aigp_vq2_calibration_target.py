@@ -24,14 +24,14 @@ def _authorization_value():
         "schema": "aigp-vq2-simulation-capture-authorization/1",
         "authority": {
             "kind": "user_operator",
-            "authority_id": "conversation-2026-07-21-package2-f02-sim-capture",
-            "authorized_on": "2026-07-21",
+            "authority_id": "conversation-2026-07-22-package2-f03-sim-capture",
+            "authorized_on": "2026-07-22",
             "source": "direct_user_instruction",
         },
-        "task_id": "vq2-package2-f02-powered-calibration-attempt",
+        "task_id": "vq2-package2-f03-powered-calibration-attempt",
         "domain": "simulator_only",
         "simulator": {"build": 3385, "mode": "Training"},
-        "session_ids": ["F02"],
+        "session_ids": ["F03"],
         "allowed_purposes": [
             "calibration_discovery",
             "independent_review",
@@ -53,7 +53,7 @@ def _authorization_value():
         "storage": {
             "private_root": (
                 r"C:\Users\John\aigp-evidence"
-                r"\2026-07-21-package2-f02-powered-calibration-attempt"
+                r"\2026-07-22-package2-f03-powered-calibration-attempt"
             ),
             "git": False,
             "public_release": False,
@@ -121,7 +121,7 @@ def test_valid_authorization_and_cross_document_scope(tmp_path):
 
     target.validate_collection_protocol(config, authorization)
 
-    assert authorization.value["session_ids"] == ("F02",)
+    assert authorization.value["session_ids"] == ("F03",)
     assert authorization.value["domain"] == "simulator_only"
     assert config.value["data_scope"]["private_simulation_capture"] is True
 
@@ -324,14 +324,14 @@ def test_authorization_rejects_every_missing_top_level_key(key):
     [
         (
             ("authority", "authority_id"),
-            "conversation-2026-07-21-package2-f01-sim-capture",
+            "conversation-2026-07-21-package2-f02-sim-capture",
         ),
-        (("authority", "authorized_on"), "2026-07-20"),
-        (("task_id",), "vq2-package2-import-environment-recovery"),
+        (("authority", "authorized_on"), "2026-07-21"),
+        (("task_id",), "vq2-package2-f02-powered-calibration-attempt"),
         (("domain",), "physical"),
         (("simulator", "build"), 3384),
         (("simulator", "mode"), "Race"),
-        (("session_ids",), ["F01"]),
+        (("session_ids",), ["F02"]),
         (("organizer_media_credential",), True),
         (("publication_permitted",), True),
         (("storage", "git"), True),
@@ -341,7 +341,7 @@ def test_authorization_rejects_every_missing_top_level_key(key):
         (
             ("storage", "private_root"),
             r"C:\Users\John\aigp-evidence"
-            r"\2026-07-21-package2-import-environment-recovery",
+            r"\2026-07-21-package2-f02-powered-calibration-attempt",
         ),
         (("transfer", "successor_task"), True),
         (("transfer", "new_session"), True),
