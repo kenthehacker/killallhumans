@@ -74,7 +74,8 @@ change:
   scripts\aigp_live_lease.py `
   scripts\aigp_nonlive.py scripts\aigp_promotion_runner.py `
   scripts\aigp_pytest.py scripts\aigp_pytest_progress.py scripts\aigp_replay.py `
-  scripts\aigp_vq2_calibration_target.py scripts\aigp_vq2_passive_probe.py `
+  scripts\aigp_vq2_calibration_target.py scripts\aigp_vq2_fast_cycle.py `
+  scripts\aigp_vq2_passive_probe.py `
   scripts\aigp_vq2_passive_timing.py scripts\aigp_vq2_powered_attempt.py `
   scripts\aigp_vq2_powered_calibration_analysis.py `
   scripts\aigp_vq2_powered_calibration_probe.py `

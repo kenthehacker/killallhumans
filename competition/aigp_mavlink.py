@@ -1895,6 +1895,8 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         *,
         powered_deadline_monotonic_ns: Optional[int] = None,
         powered_cleanup: bool = False,
+        call_start_not_before_monotonic_ns: Optional[int] = None,
+        call_start_deadline_monotonic_ns: Optional[int] = None,
     ) -> None:
         self._require_conn()
         if not all(math.isfinite(value) for value in (
@@ -1937,6 +1939,12 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
                 powered_cleanup=powered_cleanup,
                 powered_exact_zero=powered_exact_zero,
+                call_start_not_before_monotonic_ns=(
+                    call_start_not_before_monotonic_ns
+                ),
+                call_start_deadline_monotonic_ns=(
+                    call_start_deadline_monotonic_ns
+                ),
             )
 
     async def send_position(
@@ -2684,10 +2692,35 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         powered_deadline_monotonic_ns: Optional[int] = None,
         powered_cleanup: bool = False,
         powered_exact_zero: Optional[bool] = None,
+        call_start_not_before_monotonic_ns: Optional[int] = None,
+        call_start_deadline_monotonic_ns: Optional[int] = None,
     ) -> None:
         """Call SET_ATTITUDE_TARGET and emit one exact return/raise receipt."""
 
         call_start = self._read_monotonic_ns()
+        for label, value in (
+            ("call-start not-before", call_start_not_before_monotonic_ns),
+            ("call-start deadline", call_start_deadline_monotonic_ns),
+        ):
+            if value is not None and (type(value) is not int or value < 0):
+                raise ValueError(f"{label} must be a non-negative exact integer")
+        if (
+            call_start_not_before_monotonic_ns is not None
+            and call_start_deadline_monotonic_ns is not None
+            and call_start_not_before_monotonic_ns
+            >= call_start_deadline_monotonic_ns
+        ):
+            raise ValueError("call-start pacing window is empty")
+        if (
+            call_start_not_before_monotonic_ns is not None
+            and call_start < call_start_not_before_monotonic_ns
+        ):
+            raise TimeoutError("attitude-target call began before its pacing window")
+        if (
+            call_start_deadline_monotonic_ns is not None
+            and call_start >= call_start_deadline_monotonic_ns
+        ):
+            raise TimeoutError("attitude-target call-start deadline was reached")
         self._authorize_powered_outbound_locked(
             "attitude_target",
             call_start=call_start,

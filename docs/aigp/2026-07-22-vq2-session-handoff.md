@@ -1,5 +1,14 @@
 # VQ2 session handoff — 2026-07-22
 
+> **Process update:** The F00-F04 freeze, screenshot, attached-console
+> challenge, duplicate-inventory, and attempt-rollover workflow described below
+> is retained as historical evidence but is no longer the default iteration
+> path. Use `docs/aigp/fast-flight-cycle.md` and
+> `.\scripts\dev.cmd flight-cycle`. The compact path preserves the authoritative
+> July 18 runtime safety contract and removes the pre-contact ceremony. Do not
+> create a new F-number or poison an attempt for a failure before simulator
+> contact.
+
 Start here. Do not recover, clear, or rerun `F02-A01` or `F03-A01`.
 
 ## What completed

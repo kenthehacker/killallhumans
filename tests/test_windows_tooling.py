@@ -81,7 +81,7 @@ try {
     )
 
 
-def test_windows_command_surface_contains_all_passive_development_tasks():
+def test_windows_command_surface_separates_tests_from_dedicated_powered_cycle():
     source = _DEV.read_text(encoding="utf-8")
     for task in (
         "test-target",
@@ -93,12 +93,17 @@ def test_windows_command_surface_contains_all_passive_development_tasks():
         "test-promotion",
         "test-full-non-live",
         "preflight",
+        "flight-cycle",
         "launch-sim",
         "sbom",
     ):
         assert f"'{task}'" in source
     assert "--stage', 'preflight'" in source
-    assert "--stage', 'gate0'" not in source
+    assert "scripts.aigp_vq2_fast_cycle" in source
+    assert "'-E', '-s', '-B'" in source
+    assert "dedicated powered command, not a test task" in source
+    assert "interactive confirmation" in source
+    assert "'--stage', 'preflight', '--record'" not in source
     assert "'unit and not live'" in source
     assert "'slow and not live'" in source
     assert "'benchmark and not live'" in source
@@ -136,6 +141,7 @@ def test_windows_cmd_bootstrap_bypasses_machine_execution_policy():
     assert "Available tasks" in result.stdout
     assert "test-promotion" in result.stdout
     assert "test-full-non-live" in result.stdout
+    assert "flight-cycle" in result.stdout
     assert "10-13 minute promotion boundary" in result.stdout
 
 

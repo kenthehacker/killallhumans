@@ -2350,3 +2350,21 @@ def test_raised_receipt_sanitizes_arbitrary_exception_class_name_without_masking
     assert len(receipts[0].error_type) <= 128
     assert "secret" not in receipts[0].error_type
     assert adapter.outbound_audit().attitude_target == 1
+
+
+def test_attitude_call_start_deadline_is_checked_inside_send_lock_before_wire():
+    adapter = _adapter_with_fake_conn()
+    adapter._monotonic_ns = lambda: 20_000_000
+
+    with pytest.raises(TimeoutError, match="call-start deadline"):
+        asyncio.run(
+            adapter.send_attitude_rate(
+                AttitudeRateCommand(0.1, 0.0, 0.0, 0.2),
+                call_start_not_before_monotonic_ns=0,
+                call_start_deadline_monotonic_ns=20_000_000,
+            )
+        )
+
+    assert adapter._conn.mav.calls == []
+    assert adapter.outbound_audit().attitude_target == 0
+    assert adapter.drain_outbound_receipts() == []

@@ -448,6 +448,7 @@ class _FakeVision:
         self.is_running = False
         self.current_snapshot = None
         self.reset_calls = 0
+        self.frames_decoded = 0
 
     def stop(self):
         self.is_running = False
@@ -460,6 +461,12 @@ class _FakeVision:
 
     def snapshot(self, **_kwargs):
         return self.current_snapshot
+
+    def stats(self):
+        return SimpleNamespace(
+            frames_decoded=self.frames_decoded,
+            duplicate_datagrams=0,
+        )
 
 
 class _FakeAdapter:
@@ -481,6 +488,7 @@ class _FakeAdapter:
         self.imu_samples = []
         self.collisions = []
         self.commands = []
+        self.outbound_receipts = []
 
     async def reset(self):
         self.reset_calls += 1
@@ -491,8 +499,40 @@ class _FakeAdapter:
     async def disarm(self):
         pass
 
-    async def send_attitude_rate(self, command):
+    async def send_attitude_rate(
+        self,
+        command,
+        *,
+        call_start_not_before_monotonic_ns=None,
+        call_start_deadline_monotonic_ns=None,
+    ):
+        call_start = vq2_module.time.perf_counter_ns()
+        if (
+            call_start_not_before_monotonic_ns is not None
+            and call_start < call_start_not_before_monotonic_ns
+        ):
+            raise TimeoutError("fake send began before its pacing window")
+        if (
+            call_start_deadline_monotonic_ns is not None
+            and call_start >= call_start_deadline_monotonic_ns
+        ):
+            raise TimeoutError("fake send reached its call-start deadline")
         self.commands.append(command)
+        self.outbound_receipts.append(
+            {
+                "schema": "aigp-vq2-attitude-target-outbound/1",
+                "host_clock_id": "host-perf-counter",
+                "call_start_monotonic_ns": call_start,
+                "call_end_monotonic_ns": vq2_module.time.perf_counter_ns(),
+                "api": "send_attitude_rate",
+                "outcome": "returned",
+            }
+        )
+
+    def drain_outbound_receipts(self):
+        values = self.outbound_receipts
+        self.outbound_receipts = []
+        return values
 
     def drain_imu_samples(self):
         samples = self.imu_samples
@@ -1179,6 +1219,318 @@ def test_unproved_reset_path_never_calls_arm(monkeypatch):
     assert adapter.arm_calls == 0
 
 
+def _fast_calibration_runner():
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(
+        sim_boot_time_ms=1_000,
+        race_start_boot_time_ms=0,
+        race_finish_time_ns=-1,
+        active_gate_index=0,
+        last_gate_race_time=-1,
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=0.0, pitch=-0.31)
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=10,
+        sim_time_ns=10,
+        received_monotonic_s=0.0,
+        center_x=322,
+        center_y=174,
+        bbox=(282, 134, 80, 80),
+        confidence=0.8,
+    )
+    runner.tracker.consecutive = 3
+    runner._latest_detection_image = SimpleNamespace(shape=(360, 640, 3))
+    context = vq2_module.StartContext(
+        spawn_roll_rad=0.0,
+        spawn_pitch_rad=-0.31,
+        initial_gate_x=322,
+        initial_gate_y=174,
+        initial_gate_area=6_400,
+        go_boot_ms=1_000,
+    )
+    return runner, adapter, context
+
+
+def _append_fake_attitude_receipt(adapter, call_start_ns, call_end_ns):
+    adapter.outbound_receipts.append(
+        {
+            "schema": "aigp-vq2-attitude-target-outbound/1",
+            "host_clock_id": "host-perf-counter",
+            "call_start_monotonic_ns": call_start_ns,
+            "call_end_monotonic_ns": call_end_ns,
+            "api": "send_attitude_rate",
+            "outcome": "returned",
+        }
+    )
+
+
+def test_fast_calibration_waveform_is_exact_50hz_zero_yaw_and_complete(
+    monkeypatch,
+):
+    runner, adapter, context = _fast_calibration_runner()
+    clock = [0.0]
+    send_times = []
+
+    async def advance(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def sample():
+        clock[0] += 0.001
+
+    async def send(
+        command,
+        *,
+        call_start_not_before_monotonic_ns,
+        call_start_deadline_monotonic_ns,
+    ):
+        call_start_ns = int(round(clock[0] * 1_000_000_000))
+        assert call_start_ns >= call_start_not_before_monotonic_ns
+        assert call_start_ns < call_start_deadline_monotonic_ns
+        adapter.commands.append(command)
+        send_times.append(clock[0])
+        # Transport completion latency must not be added to every 20 ms slot.
+        clock[0] += 0.001
+        _append_fake_attitude_receipt(
+            adapter,
+            call_start_ns,
+            int(round(clock[0] * 1_000_000_000)),
+        )
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        lambda: int(round(clock[0] * 1_000_000_000)),
+    )
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(adapter, "send_attitude_rate", send)
+
+    details = asyncio.run(runner._run_calibration_excite(context))
+
+    plan = powered_contract.frozen_excitation_plan()
+    assert details["ticks_sent"] == details["ticks_expected"] == 245
+    assert details["plan_sha256"] == powered_contract.EXCITATION_PLAN_SHA256
+    assert len(adapter.commands) == plan["tick_count"]
+    assert all(command.yaw_rate == 0.0 for command in adapter.commands)
+    assert all(abs(command.roll_rate) <= 0.08 for command in adapter.commands)
+    assert all(abs(command.pitch_rate) <= 0.08 for command in adapter.commands)
+    assert all(command.thrust == 0.235 for command in adapter.commands)
+    assert all(
+        later - earlier == pytest.approx(vq2_module.CONTROL_PERIOD_S)
+        for earlier, later in zip(send_times, send_times[1:])
+    )
+    assert send_times[-1] - send_times[0] == pytest.approx(
+        (plan["tick_count"] - 1) * vq2_module.CONTROL_PERIOD_S
+    )
+    for index, command in enumerate(adapter.commands):
+        expected = powered_contract.excitation_command_for_tick(index)
+        assert command.roll_rate == expected["roll_rate_rad_s"]
+        assert command.pitch_rate == expected["pitch_rate_rad_s"]
+        assert command.yaw_rate == expected["yaw_rate_rad_s"]
+        assert command.thrust == expected["thrust"]
+
+
+def test_fast_calibration_variable_safety_cost_does_not_creep_phase(monkeypatch):
+    runner, adapter, context = _fast_calibration_runner()
+    clock = [0.0]
+    sample_count = [0]
+    send_times = []
+
+    async def advance(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def sample():
+        if sample_count[0] == 0:
+            clock[0] += 0.005
+        sample_count[0] += 1
+
+    def watchdog(**_kwargs):
+        clock[0] += 0.0001
+
+    async def send(
+        command,
+        *,
+        call_start_not_before_monotonic_ns,
+        call_start_deadline_monotonic_ns,
+    ):
+        call_start_ns = int(round(clock[0] * 1_000_000_000))
+        assert call_start_ns >= call_start_not_before_monotonic_ns
+        assert call_start_ns < call_start_deadline_monotonic_ns
+        send_times.append(clock[0])
+        adapter.commands.append(command)
+        clock[0] += 0.001
+        _append_fake_attitude_receipt(
+            adapter,
+            call_start_ns,
+            int(round(clock[0] * 1_000_000_000)),
+        )
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        lambda: int(round(clock[0] * 1_000_000_000)),
+    )
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", watchdog)
+    monkeypatch.setattr(adapter, "send_attitude_rate", send)
+
+    details = asyncio.run(runner._run_calibration_excite(context))
+
+    assert details["ticks_sent"] == 245
+    assert len(send_times) == 245
+    assert all(
+        later - earlier >= vq2_module.CONTROL_PERIOD_S - 1e-9
+        for earlier, later in zip(send_times, send_times[1:])
+    )
+    assert send_times[-1] < 4.9
+
+
+def test_fast_calibration_transport_deadline_blocks_late_wire_send(monkeypatch):
+    runner, adapter, context = _fast_calibration_runner()
+    clock = [0.0]
+
+    async def advance(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    async def delayed_send(
+        command,
+        *,
+        call_start_not_before_monotonic_ns,
+        call_start_deadline_monotonic_ns,
+    ):
+        del command, call_start_not_before_monotonic_ns
+        # Model waiting on the adapter's private send lock. The concrete
+        # adapter checks the deadline only after that lock is acquired.
+        clock[0] += 0.020
+        call_start_ns = int(round(clock[0] * 1_000_000_000))
+        if call_start_ns >= call_start_deadline_monotonic_ns:
+            raise TimeoutError("attitude-target call-start deadline was reached")
+        raise AssertionError("late command must not reach the wire")
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        lambda: int(round(clock[0] * 1_000_000_000)),
+    )
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(adapter, "send_attitude_rate", delayed_send)
+
+    with pytest.raises(TimeoutError, match="call-start deadline"):
+        asyncio.run(runner._run_calibration_excite(context))
+
+    assert adapter.commands == []
+
+
+def test_fast_calibration_missed_slot_aborts_without_catchup_send(monkeypatch):
+    runner, adapter, context = _fast_calibration_runner()
+    clock = [0.0]
+
+    def stalled_sample():
+        clock[0] += 0.021
+
+    async def advance(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        lambda: int(round(clock[0] * 1_000_000_000)),
+    )
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(runner, "_sample", stalled_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+
+    with pytest.raises(SafetyAbort, match="expired before send"):
+        asyncio.run(runner._run_calibration_excite(context))
+
+    assert adapter.commands == []
+
+
+def test_fast_calibration_rejects_changed_decoded_dimensions():
+    runner, _adapter, context = _fast_calibration_runner()
+    runner._latest_detection_image = SimpleNamespace(shape=(180, 320, 3))
+
+    with pytest.raises(SafetyAbort, match="dimensions changed"):
+        runner._check_calibration_envelope(context)
+
+
+def test_powered_readiness_requires_20fps_and_exact_dimensions():
+    runner, _adapter, _context = _fast_calibration_runner()
+    runner._epoch_vision_started_s = 0.0
+    runner._epoch_vision_initial_frames = 0
+    runner.vision.frames_decoded = 31
+
+    failures, facts = runner._powered_vision_readiness(1.0)
+
+    assert failures == []
+    assert facts["fps"] == pytest.approx(31.0)
+    assert facts["dimensions_px"] == [640, 360]
+
+    runner.vision.frames_decoded = 19
+    runner._latest_detection_image = SimpleNamespace(shape=(180, 320, 3))
+    failures, _facts = runner._powered_vision_readiness(1.0)
+    assert any("below 20fps" in failure for failure in failures)
+    assert any("640x360" in failure for failure in failures)
+
+
+def test_fast_calibration_stage_retains_reset_go_arm_and_cleanup(monkeypatch):
+    runner, adapter, context = _fast_calibration_runner()
+    calls = []
+
+    async def reset_epoch(*, restart_vision):
+        calls.append(("reset_epoch", restart_vision))
+
+    async def normalize_disarmed():
+        calls.append("normalize_disarmed")
+
+    async def wait_for_go():
+        calls.append("wait_for_go")
+        return context
+
+    async def arm_confirmed():
+        calls.append("arm_confirmed")
+
+    async def excite(value):
+        assert value == context
+        calls.append("calibration-excite")
+        return {"ticks_sent": 245}
+
+    async def cleanup():
+        calls.append("cleanup")
+        adapter.is_armed = False
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", reset_epoch)
+    monkeypatch.setattr(runner, "normalize_disarmed", normalize_disarmed)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", arm_confirmed)
+    monkeypatch.setattr(runner, "_run_calibration_excite", excite)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(runner.run_powered_stage("calibration-excite"))
+
+    assert result.success is True
+    assert result.cleanup_confirmed is True
+    assert calls == [
+        ("reset_epoch", True),
+        "normalize_disarmed",
+        "wait_for_go",
+        "arm_confirmed",
+        "calibration-excite",
+        "cleanup",
+    ]
+
+
 def test_only_tiny_spawn_pad_contact_is_classified_benign():
     assert is_benign_pad_contact(
         {"id": 1002, "threat_level": 1, "impulse": 0.0025}
@@ -1782,8 +2134,10 @@ def test_gate0_early_gate1_status_requires_strictly_newer_packet(monkeypatch):
     assert adapter.commands == []
 
 
-def test_gate0_observe_dispatch_preserves_credited_gate0_on_observation_abort(
+@pytest.mark.parametrize("write_diagnostic_pngs", [True, False])
+def test_gate0_observe_dispatch_preserves_credit_with_optional_pngs(
     monkeypatch,
+    write_diagnostic_pngs,
 ):
     adapter = _FakeAdapter()
     adapter.race_status = RaceStatus(
@@ -1834,8 +2188,19 @@ def test_gate0_observe_dispatch_preserves_credited_gate0_on_observation_abort(
     monkeypatch.setattr(runner, "_run_gate0", gate0)
     monkeypatch.setattr(runner, "_observe_gate1", observe)
     monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+    flush_calls = []
+    monkeypatch.setattr(
+        runner,
+        "_flush_deferred_snapshots",
+        lambda: (flush_calls.append(True) or ([], [])),
+    )
 
-    result = asyncio.run(runner.run_powered_stage("gate0-observe"))
+    result = asyncio.run(
+        runner.run_powered_stage(
+            "gate0-observe",
+            write_diagnostic_pngs=write_diagnostic_pngs,
+        )
+    )
 
     assert not result.success
     assert result.cleanup_confirmed
@@ -1844,12 +2209,13 @@ def test_gate0_observe_dispatch_preserves_credited_gate0_on_observation_abort(
         "gate1_observed": False,
         "reason": "diagnostic observation timeout",
     }
+    assert flush_calls == ([True] if write_diagnostic_pngs else [])
     assert calls == [
         "reset",
         "normalize",
         "go",
         "arm",
-        ("gate0", True),
+        ("gate0", write_diagnostic_pngs),
         ("observe", True),
         "cleanup",
     ]
