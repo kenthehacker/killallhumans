@@ -5,7 +5,7 @@
 - Starting local-main commit:
   `1479a85827bca72613b63bfecc81a395136cb36a`.
 - Simulator target: FlightSim build 3385, Training mode.
-- State: `one exact F03-A01 production attempt authorized after freeze`.
+- State: `terminal-invalid and poisoned; no retry or automatic clear`.
 - Contract date: `2026-07-22`.
 
 ## Authority and stop boundary
@@ -99,3 +99,44 @@ suite:
 .\scripts\dev.cmd test-target tests/test_aigp_vq2_calibration_target.py tests/test_aigp_vq2_powered_attempt.py tests/test_aigp_vq2_powered_calibration_analysis.py tests/test_aigp_vq2_powered_calibration_probe.py tests/test_aigp_vq2_powered_runtime.py
 .\scripts\dev.cmd test-vq2
 ```
+
+## Terminal result
+
+Candidate commit `bdbd45649c7d9baab7d5025434205930bcb84561` was
+validated in a detached pristine worktree. The five directly affected test
+files passed `471` tests, and `test-vq2` passed `2254` tests with one skip. A
+passive preflight also passed before publication.
+
+The reviewed six-file L0 bundle was published create-new with live-freeze
+SHA-256
+`ca7a5d7dc08aaf6a7fecd3d38675918090a08fafa75121349a19ceac114ea2e9`.
+The first external launcher invocation refused before wrapper creation because
+its review-only `sys.orig_argv[0]` gate expected the venv path instead of
+CPython's base-executable path. The launcher was narrowly corrected and
+independently re-reviewed; no candidate or frozen-evidence byte changed.
+
+The sole authorized wrapper consumption then reached
+`topology_and_training_attestation`, but no matching operator attestation was
+received within the 30-second deadline. `F03-A01` failed before the powered
+child was created, so there was no transport connection, reset, arm, attitude
+target, thrust command, capture, or powered cleanup child. The wrapper proved
+the lease released, ports free, transport closed, scheduled task absent,
+simulator responsive, and the original launcher/payload topology unchanged.
+
+Preserve the terminal evidence exactly:
+
+- attempt envelope SHA-256:
+  `4082339925ad6da687161b05ade3bdbc3c1f7ce39c045a4e119acaf552193e4a`;
+- attempt-invalid SHA-256:
+  `b8df4b33b30f9a5b267b4650e6db91a55c6e9236b0f5c46651eb87f36e3a820f`;
+- live-poison SHA-256:
+  `185bdb4a3b970ab323e9a40f4fcbfb805134aca32ad9c463d973a78e298f1fb3`;
+- process-final-proof SHA-256:
+  `732ccdabf97283ee62cffb9b767e802fa349d8f90c608cc0d23eb2c8fcf72a88`;
+  and
+- live-lease SHA-256:
+  `8908f04433eab6ae0794a0cf357e0364a7e1f9075cd9c56ed755beb792824f4b`.
+
+The poison requires `new_reviewed_recovery_task_no_automatic_clear`. Do not
+recover, clear, or rerun `F03-A01`; another powered attempt requires a new task,
+new identities and freeze, and fresh explicit user authorization.
