@@ -91,3 +91,17 @@ worktrees were removed after proving them clean apart from disposable pytest
 caches. Their commits and source states are fully recreatable; the deleted
 caches are not. Do not remove the live F03 worktree or either poisoned evidence
 root.
+
+## F04-A01 terminal result
+
+F04 was executed once through the reviewed external supervisor after autonomous
+console attestation. The wrapper released the powered child, but the child
+failed before admission and the supervisor failed closed on `artifact_mismatch`
+and `process_residue`. Preserve the F04 evidence root and do not retry or clear
+its poison. Simulator topology remained unchanged, ports were free, transport
+closed, lease released, and the simulator remained responsive.
+
+F04 live-poison SHA-256: `ea3b9da4010d38498a23215d5c12157425fb5206783bb444eacf84942a95b40d`.
+F04 attempt envelope SHA-256: `9772f0c2e6ee6c082e2798a52bf92cdff69bea7d01fe5084afe2d6ba4fd499d2`.
+The exact reviewed supervisor SHA-256 was
+`99fe53d13e9d39df1788ac6f1fa8fba2218f3dd9a4363286a580c6cb101c3849`.
