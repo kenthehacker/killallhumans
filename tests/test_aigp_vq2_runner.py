@@ -2204,6 +2204,13 @@ def test_gate1_yaw_envelope_soft_stops_then_aborts_strictly_over_bound():
     assert excursion == pytest.approx(0.046)
     assert soft_stopped is True
 
+    runner.estimate = _estimate(yaw=0.01)
+    excursion, soft_stopped = runner._gate1_yaw_envelope_state(
+        phase="test",
+    )
+    assert excursion == pytest.approx(0.01)
+    assert soft_stopped is True
+
     runner.estimate = _estimate(
         yaw=0.051
     )
@@ -3405,7 +3412,7 @@ def test_configured_gate0_early_turn_combines_roll_negative_yaw_and_braking(
         pass
 
     document = controller_config_module.default_controller_config_mapping()
-    document["phase_timing"]["gate0_yaw_brake_duration_s"] = 0.21
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = 0.21
     document["turn_cue"]["exit_counterroll_enabled"] = False
     document["yaw_control"]["gate0_turn_score_gain"] = -0.80
     document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.08
@@ -3521,6 +3528,159 @@ def test_configured_gate0_early_turn_combines_roll_negative_yaw_and_braking(
     assert runner._gate0_early_turn_summary is not None
     assert runner._gate0_early_turn_summary["command_count"] >= len(active)
     assert runner._gate1_max_abs_yaw_excursion_rad == 0.0
+
+
+def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
+    monkeypatch,
+):
+    class CommandsCaptured(Exception):
+        pass
+
+    document = controller_config_module.default_controller_config_mapping()
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = 0.40
+    document["turn_cue"]["sustained_preshape_enabled"] = True
+    document["turn_cue"]["exit_counterroll_enabled"] = False
+    document["turn_cue"]["preturn_roll_cap_rad"] = 0.10
+    document["turn_cue"]["preshape_end_gate_area_scale"] = 20.0
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.40
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.02
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.275
+    config = controller_config_module.validate_controller_config(document)
+    clock = [0.0]
+    sample_count = [0]
+    line_count = [0]
+    objectives = []
+    commands = []
+    events = []
+    scores = [0.05, 0.10, 0.20, 0.40, None, None, None, None, None]
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(
+        adapter,
+        _FakeVision(),
+        controller_config=config,
+    )
+    runner.estimate = _estimate(roll=0.0, pitch=0.0, yaw=0.0)
+    runner._latest_detection_image = object()
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6400,
+        1000,
+    )
+
+    def sample():
+        sample_count[0] += 1
+        runner._latest_detection_generation = 7
+        bbox = (
+            (240, 130, 160, 100)
+            if sample_count[0] <= 3
+            else (200, 80, 240, 240)
+        )
+        runner.tracker.target = vq2_module.GateTarget(
+            frame_id=sample_count[0],
+            sim_time_ns=sample_count[0],
+            received_monotonic_s=clock[0],
+            center_x=320,
+            center_y=180,
+            bbox=bbox,
+            confidence=0.8,
+        )
+        runner.tracker.consecutive = 3
+
+    def observe_line(_image):
+        index = line_count[0]
+        line_count[0] += 1
+        score = scores[min(index, len(scores) - 1)]
+        if score is None:
+            return None
+        return vq2_module.CourseLineObservation(
+            turn_score=score,
+            upper_center_x=384.0,
+            lower_center_x=320.0,
+            upper_pixel_count=136,
+            lower_pixel_count=136,
+        )
+
+    def capture_objective(
+        _estimate_value,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        objectives.append((target_roll_rad, target_pitch_rad, thrust))
+        return AttitudeRateCommand(0.0, 0.0, 0.0, thrust)
+
+    async def capture_command(command, **_kwargs):
+        commands.append(command)
+        if len(commands) == 10:
+            raise CommandsCaptured
+
+    async def advance_clock(_seconds):
+        clock[0] += 0.10
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+    monkeypatch.setattr(runner.recorder, "emit", lambda e, **p: events.append((e, p)))
+    monkeypatch.setattr(vq2_module, "attitude_rate_command", capture_objective)
+    monkeypatch.setattr(vq2_module, "cyan_course_line_observation", observe_line)
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance_clock),
+        )
+        with pytest.raises(CommandsCaptured):
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=False,
+                )
+            )
+
+    latch_events = [payload for event, payload in events if event == "gate0_preshape_latched"]
+    applied = [
+        payload
+        for event, payload in events
+        if event == "course_line_sustained_preshape_applied"
+    ]
+    end_events = [payload for event, payload in events if event == "gate0_preshape_ended"]
+    assert len(latch_events) == 1
+    assert applied
+    assert any(payload["gate_area_px"] > 8 * context.initial_gate_area for payload in applied)
+    assert max(payload["max_abs_proved_score"] for payload in applied) > 0.20
+    assert len(end_events) == 1
+    assert end_events[0]["reason"] == "duration"
+    assert any(command.yaw_rate < 0.0 for command in commands)
+    ended_index = next(
+        index
+        for index, (event, _payload) in enumerate(events)
+        if event == "gate0_preshape_ended"
+    )
+    assert all(
+        command.yaw_rate == 0.0
+        for command in commands[
+            sum(event == "tick" for event, _payload in events[:ended_index]) :
+        ]
+    )
+    assert runner._gate0_early_turn_summary is not None
+    assert (
+        runner._gate0_early_turn_summary["preshape_end_reason"]
+        == "duration"
+    )
 
 
 def _capture_first_gate0_thrust(

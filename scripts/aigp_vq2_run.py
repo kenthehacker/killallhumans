@@ -181,6 +181,13 @@ COURSE_LINE_EXIT_COUNTERROLL_RAD = 0.08
 COURSE_LINE_PRETURN_TAPER_AREA_SCALE = 8.0
 COURSE_LINE_PRETURN_REQUIRED_FRAMES = 3
 COURSE_LINE_PRETURN_MAX_AGE_S = 0.25
+GATE0_PRESHAPE_HARD_MAX_DURATION_S = 1.20
+GATE0_PRESHAPE_HARD_MAX_AREA_SCALE = 20.0
+GATE0_PRESHAPE_MAX_ABS_ROLL_RAD = 0.15
+GATE0_PRESHAPE_MIN_PITCH_RAD = -0.20
+GATE0_PRESHAPE_MAX_PITCH_RAD = 0.10
+GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD = 0.12
+GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S = 0.50
 COURSE_EDGE_CONTINUATION_MARGIN_PX = 2
 COURSE_EDGE_CONTINUATION_MAX_ASPECT_RATIO = 2.60
 COURSE_FRAGMENT_UNION_MAX_ASPECT_RATIO = 1.45
@@ -7758,6 +7765,7 @@ class VQ2Runner:
         self._gate0_early_turn_summary: Optional[Dict[str, Any]] = None
         self._gate1_recenter_summary: Optional[Dict[str, Any]] = None
         self._gate1_yaw_reference_rad: Optional[float] = None
+        self._gate1_yaw_authority_exhausted = False
         self._gate1_max_abs_yaw_excursion_rad = 0.0
         self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
         self._deferred_pngs: List[Tuple[str, Any]] = []
@@ -7798,10 +7806,9 @@ class VQ2Runner:
                 "Gate-1 calibrated yaw excursion exceeded its fixed bound "
                 f"during {phase}"
             )
-        return (
-            excursion,
-            abs(excursion) >= GATE1_CONTROLLER_YAW_SOFT_STOP_RAD,
-        )
+        if abs(excursion) >= GATE1_CONTROLLER_YAW_SOFT_STOP_RAD:
+            self._gate1_yaw_authority_exhausted = True
+        return excursion, self._gate1_yaw_authority_exhausted
 
     def _replay_estimator_fields(self) -> Optional[Dict[str, Any]]:
         estimate = self.estimate
@@ -10125,6 +10132,14 @@ class VQ2Runner:
             raise ValueError("gate-0 course-line exit-counterroll flag must be bool")
         if course_line_exit_counterroll_enabled and not course_line_preturn:
             raise ValueError("gate-0 course-line exit counter-roll requires preturn")
+        if turn_cue.sustained_preshape_enabled and (
+            not course_line_preturn
+            or course_line_exit_counterroll_enabled
+        ):
+            raise ValueError(
+                "Gate-0 sustained preshape requires preturn without "
+                "exit counter-roll"
+            )
         if (
             type(crossing_hold_thrust) not in {int, float}
             or not math.isfinite(float(crossing_hold_thrust))
@@ -10155,6 +10170,13 @@ class VQ2Runner:
         course_line_exit_started = False
         early_turn_started_s: Optional[float] = None
         early_turn_command_count = 0
+        preshape_latched_sign: Optional[float] = None
+        preshape_max_abs_proved_score = 0.0
+        preshape_entry_generation: Optional[int] = None
+        preshape_entry_roll_rad: Optional[float] = None
+        preshape_entry_pitch_rad: Optional[float] = None
+        preshape_ended = False
+        preshape_end_reason: Optional[str] = None
         while True:
             now = time.monotonic()
             elapsed = now - flight_start
@@ -10356,6 +10378,21 @@ class VQ2Runner:
             )
             if stable_course_line and early_turn_started_s is None:
                 early_turn_started_s = now
+                preshape_latched_sign = math.copysign(
+                    1.0,
+                    filtered_course_turn,
+                )
+                preshape_max_abs_proved_score = abs(
+                    filtered_course_turn
+                )
+                preshape_entry_generation = (
+                    self._latest_detection_generation
+                )
+                (
+                    preshape_entry_roll_rad,
+                    preshape_entry_pitch_rad,
+                    _preshape_entry_yaw_rad,
+                ) = self.estimate.orientation.to_euler()
                 self._gate0_early_turn_summary = {
                     "started": True,
                     "started_elapsed_s": elapsed,
@@ -10367,13 +10404,137 @@ class VQ2Runner:
                     "command_count": 0,
                     "max_abs_yaw_excursion_rad": 0.0,
                     "max_abs_measured_yaw_rate_rad_s": 0.0,
+                    "sustained_preshape_enabled": (
+                        turn_cue.sustained_preshape_enabled
+                    ),
+                    "preshape_end_reason": None,
                 }
-            early_turn_active = bool(
-                stable_course_line
+                self.recorder.emit(
+                    "gate0_preshape_latched",
+                    elapsed_s=elapsed,
+                    frame_id=target.frame_id,
+                    gate_area_scale=(
+                        float(target.bbox_area)
+                        / float(context.initial_gate_area)
+                    ),
+                    filtered_turn_score=filtered_course_turn,
+                    latched_turn_sign=preshape_latched_sign,
+                    vision_generation=preshape_entry_generation,
+                    sustained=turn_cue.sustained_preshape_enabled,
+                )
+            elif (
+                turn_cue.sustained_preshape_enabled
                 and early_turn_started_s is not None
-                and now - early_turn_started_s
-                < phase_timing.gate0_yaw_brake_duration_s
-            )
+                and stable_course_line
+                and preshape_latched_sign is not None
+                and filtered_course_turn * preshape_latched_sign > 0.0
+            ):
+                preshape_max_abs_proved_score = max(
+                    preshape_max_abs_proved_score,
+                    abs(filtered_course_turn),
+                )
+
+            preshape_control_score = filtered_course_turn
+            if (
+                turn_cue.sustained_preshape_enabled
+                and preshape_latched_sign is not None
+            ):
+                preshape_control_score = (
+                    preshape_latched_sign
+                    * preshape_max_abs_proved_score
+                )
+
+            if turn_cue.sustained_preshape_enabled:
+                if early_turn_started_s is not None and not preshape_ended:
+                    elapsed_preshape_s = now - early_turn_started_s
+                    effective_duration_s = min(
+                        phase_timing.gate0_preshape_max_duration_s,
+                        GATE0_PRESHAPE_HARD_MAX_DURATION_S,
+                    )
+                    effective_end_area_scale = min(
+                        turn_cue.preshape_end_gate_area_scale,
+                        GATE0_PRESHAPE_HARD_MAX_AREA_SCALE,
+                    )
+                    current_area_scale = (
+                        float(target.bbox_area)
+                        / float(context.initial_gate_area)
+                    )
+                    if crossing_armed:
+                        preshape_end_reason = "crossing_armed"
+                    elif elapsed_preshape_s >= effective_duration_s:
+                        preshape_end_reason = "duration"
+                    elif current_area_scale >= effective_end_area_scale:
+                        preshape_end_reason = "gate_area"
+                    if preshape_end_reason is not None:
+                        preshape_ended = True
+                        assert self._gate0_early_turn_summary is not None
+                        self._gate0_early_turn_summary.update(
+                            {
+                                "preshape_end_reason": preshape_end_reason,
+                                "ended_elapsed_s": elapsed,
+                                "end_gate_area_scale": current_area_scale,
+                            }
+                        )
+                        self.recorder.emit(
+                            "gate0_preshape_ended",
+                            elapsed_s=elapsed,
+                            frame_id=target.frame_id,
+                            gate_area_scale=current_area_scale,
+                            reason=preshape_end_reason,
+                        )
+                early_turn_active = bool(
+                    early_turn_started_s is not None
+                    and not preshape_ended
+                )
+                if early_turn_active:
+                    if (
+                        preshape_entry_generation is None
+                        or self._latest_detection_generation
+                        != preshape_entry_generation
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 sustained preshape escaped its "
+                            "fresh vision generation"
+                        )
+                    if target.composite:
+                        raise SafetyAbort(
+                            "Gate-0 sustained preshape received a "
+                            "composite target"
+                        )
+                    roll, pitch, _yaw = (
+                        self.estimate.orientation.to_euler()
+                    )
+                    assert preshape_entry_roll_rad is not None
+                    assert preshape_entry_pitch_rad is not None
+                    peak_rate = max(
+                        abs(float(value))
+                        for value in self.estimate.body_rates
+                    )
+                    if (
+                        abs(float(roll))
+                        > GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
+                        or not GATE0_PRESHAPE_MIN_PITCH_RAD
+                        <= float(pitch)
+                        <= GATE0_PRESHAPE_MAX_PITCH_RAD
+                        or max(
+                            abs(float(roll) - preshape_entry_roll_rad),
+                            abs(float(pitch) - preshape_entry_pitch_rad),
+                        )
+                        > GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
+                        or peak_rate
+                        > GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 sustained preshape exceeded its "
+                            "fixed attitude envelope"
+                        )
+            else:
+                early_turn_active = bool(
+                    stable_course_line
+                    and early_turn_started_s is not None
+                    and now - early_turn_started_s
+                    < phase_timing.gate0_preshape_max_duration_s
+                )
             if (
                 course_line_exit_counterroll_enabled
                 and stable_course_line
@@ -10393,7 +10554,36 @@ class VQ2Runner:
                 * context.initial_gate_area
             ):
                 course_line_exit_started = True
-            if course_line_exit_started:
+            if (
+                turn_cue.sustained_preshape_enabled
+                and early_turn_active
+            ):
+                preturn_bias = course_line_preturn_roll(
+                    preshape_control_score,
+                    gain=turn_cue.preturn_gain,
+                    cap_rad=turn_cue.preturn_roll_cap_rad,
+                    min_abs_score=turn_cue.min_abs_score,
+                )
+                target_roll = max(
+                    -turn_cue.preturn_roll_cap_rad,
+                    min(
+                        turn_cue.preturn_roll_cap_rad,
+                        target_roll + preturn_bias,
+                    ),
+                )
+                self.recorder.emit(
+                    "course_line_sustained_preshape_applied",
+                    frame_id=target.frame_id,
+                    elapsed_s=elapsed,
+                    gate_area_px=target.bbox_area,
+                    latched_turn_sign=preshape_latched_sign,
+                    max_abs_proved_score=(
+                        preshape_max_abs_proved_score
+                    ),
+                    roll_bias_rad=preturn_bias,
+                    target_roll_rad=target_roll,
+                )
+            elif course_line_exit_started:
                 if (
                     proved_course_turn_score is not None
                     and proved_course_turn_score * normalized_x >= 0.0
@@ -10418,8 +10608,9 @@ class VQ2Runner:
                 course_line_preturn
                 and stable_course_line
                 and target.bbox_area
-                < turn_cue.preturn_taper_area_scale
+                < turn_cue.preshape_end_gate_area_scale
                 * context.initial_gate_area
+                and not turn_cue.sustained_preshape_enabled
             ):
                 preturn_bias = course_line_preturn_roll(
                     filtered_course_turn,
@@ -10502,7 +10693,7 @@ class VQ2Runner:
                 )
                 if not yaw_soft_stopped:
                     local_yaw_rate = course_line_turn_yaw_rate(
-                        filtered_course_turn,
+                        preshape_control_score,
                         gain=yaw_control.gate0_turn_score_gain,
                         cap_rad_s=(
                             yaw_control.gate0_command_rate_cap_rad_s
@@ -10547,6 +10738,7 @@ class VQ2Runner:
                     "gate0_early_turn_command",
                     elapsed_s=elapsed,
                     filtered_turn_score=filtered_course_turn,
+                    preshape_control_score=preshape_control_score,
                     target_roll_rad=target_roll,
                     target_pitch_rad=target_pitch,
                     thrust=thrust,
@@ -12839,6 +13031,7 @@ class VQ2Runner:
             self._post_gate_last_frame = None
             self._abort_latched = False
             self._gate1_yaw_reference_rad = None
+            self._gate1_yaw_authority_exhausted = False
             self._gate1_max_abs_yaw_excursion_rad = 0.0
             self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
             await self.establish_reset_epoch(restart_vision=True)

@@ -19,6 +19,20 @@ def _set_path(document, path, value):
     return document
 
 
+def _sustained_preshape():
+    document = _default()
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = 1.20
+    document["turn_cue"]["sustained_preshape_enabled"] = True
+    document["turn_cue"]["exit_counterroll_enabled"] = False
+    document["turn_cue"]["preshape_end_gate_area_scale"] = 20.0
+    document["turn_cue"]["preturn_roll_cap_rad"] = 0.12
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.20
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.04
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.24
+    return document
+
+
 def test_default_config_is_deeply_immutable_and_returns_fresh_copies():
     with pytest.raises(TypeError):
         config_module.DEFAULT_CONTROLLER_CONFIG["schema"] = "changed"
@@ -40,12 +54,12 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["schema"] == "aigp-vq2-controller-config/1"
     assert (
         mapping["controller_family"]
-        == "aigp-vq2-gate0-gate1-recenter/1"
+        == "aigp-vq2-gate0-gate1-recenter/2"
     )
     assert mapping["phase_timing"] == {
         "gate0_boost_until_s": 0.45,
         "gate0_pitch_blend_s": runner.GATE0_PITCH_BLEND_S,
-        "gate0_yaw_brake_duration_s": runner.SIGN_ID_YAW_PULSE_DURATION_S,
+        "gate0_preshape_max_duration_s": runner.SIGN_ID_YAW_PULSE_DURATION_S,
         "post_gate_observation_duration_s": (
             runner.POST_GATE_OBSERVATION_TIMEOUT_S
         ),
@@ -54,11 +68,12 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["turn_cue"] == {
         "preturn_enabled": True,
         "exit_counterroll_enabled": True,
+        "sustained_preshape_enabled": False,
         "min_gate_area_scale": runner.COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE,
         "min_abs_score": runner.COURSE_LINE_PRETURN_MIN_SCORE,
         "preturn_gain": runner.COURSE_LINE_PRETURN_GAIN,
         "preturn_roll_cap_rad": runner.COURSE_LINE_PRETURN_LIMIT_RAD,
-        "preturn_taper_area_scale": (
+        "preshape_end_gate_area_scale": (
             runner.COURSE_LINE_PRETURN_TAPER_AREA_SCALE
         ),
         "exit_counterroll_onset_area_scale": (
@@ -101,6 +116,11 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     (
         ("schema", "aigp-vq2-controller-config/2", "must equal"),
         ("schema", 1, "must equal"),
+        (
+            "controller_family",
+            "aigp-vq2-gate0-gate1-recenter/1",
+            "must equal",
+        ),
         ("controller_family", "other", "must equal"),
         ("controller_family", True, "must equal"),
     ),
@@ -157,6 +177,35 @@ def test_unknown_fields_are_rejected_at_every_level(group):
 
 
 @pytest.mark.parametrize(
+    ("group", "new_field", "retired_field"),
+    (
+        (
+            "phase_timing",
+            "gate0_preshape_max_duration_s",
+            "gate0_yaw_brake_duration_s",
+        ),
+        (
+            "turn_cue",
+            "preshape_end_gate_area_scale",
+            "preturn_taper_area_scale",
+        ),
+    ),
+)
+def test_retired_family_one_field_names_are_rejected(
+    group,
+    new_field,
+    retired_field,
+):
+    document = _default()
+    document[group][retired_field] = document[group].pop(new_field)
+    with pytest.raises(
+        config_module.ControllerConfigError,
+        match="missing=.*unknown=",
+    ):
+        config_module.validate_controller_config(document)
+
+
+@pytest.mark.parametrize(
     "lifecycle_field",
     (
         "control_hz",
@@ -187,6 +236,7 @@ def test_lifecycle_safety_invariants_are_not_configurable(lifecycle_field):
         ("forward_braking.gate1_forward_thrust", -math.inf, "finite number"),
         ("turn_cue.preturn_enabled", 1, "exact bool"),
         ("turn_cue.exit_counterroll_enabled", "true", "exact bool"),
+        ("turn_cue.sustained_preshape_enabled", 1, "exact bool"),
     ),
 )
 def test_malformed_field_values_are_rejected(path, value, match):
@@ -201,15 +251,16 @@ def test_malformed_field_values_are_rejected(path, value, match):
         ("phase_timing.gate0_boost_until_s", 0.449),
         ("phase_timing.gate0_boost_until_s", 1.001),
         ("phase_timing.gate0_pitch_blend_s", 0.799),
-        ("phase_timing.gate0_yaw_brake_duration_s", 0.039),
-        ("phase_timing.gate0_yaw_brake_duration_s", 0.211),
+        ("phase_timing.gate0_preshape_max_duration_s", 0.039),
+        ("phase_timing.gate0_preshape_max_duration_s", 1.201),
         ("phase_timing.post_gate_observation_duration_s", 0.099),
         ("phase_timing.gate1_recenter_duration_s", 0.601),
         ("turn_cue.min_gate_area_scale", 1.299),
         ("turn_cue.min_abs_score", 0.251),
         ("turn_cue.preturn_gain", 0.801),
         ("turn_cue.preturn_roll_cap_rad", 0.131),
-        ("turn_cue.preturn_taper_area_scale", 8.001),
+        ("turn_cue.preshape_end_gate_area_scale", 7.999),
+        ("turn_cue.preshape_end_gate_area_scale", 20.001),
         ("turn_cue.exit_counterroll_onset_area_scale", 3.499),
         ("turn_cue.exit_counterroll_cap_rad", 0.081),
         ("roll_control.gate0_centering_gain", 0.151),
@@ -260,19 +311,86 @@ def test_exit_counterroll_requires_preturn():
         config_module.validate_controller_config(document)
 
 
+def test_turn_cue_area_phase_boundary_is_admitted():
+    document = _default()
+    document["turn_cue"]["exit_counterroll_onset_area_scale"] = 8.0
+    document["turn_cue"]["preshape_end_gate_area_scale"] = 8.0
+    config_module.validate_controller_config(document)
+
+
 @pytest.mark.parametrize(
-    ("onset", "taper"),
+    ("field", "value"),
     (
-        (4.0, 3.5),
-        (7.0, 6.0),
+        ("gate0_preshape_max_duration_s", 0.22),
+        ("preshape_end_gate_area_scale", 9.0),
     ),
 )
-def test_turn_cue_area_phases_must_be_ordered(onset, taper):
+def test_disabled_sustained_preshape_requires_exact_legacy_shape(field, value):
     document = _default()
-    document["turn_cue"]["exit_counterroll_onset_area_scale"] = onset
-    document["turn_cue"]["preturn_taper_area_scale"] = taper
-    with pytest.raises(config_module.ControllerConfigError, match="area scales"):
+    group = (
+        "phase_timing"
+        if field == "gate0_preshape_max_duration_s"
+        else "turn_cue"
+    )
+    document[group][field] = value
+    with pytest.raises(config_module.ControllerConfigError, match="exact legacy"):
         config_module.validate_controller_config(document)
+
+
+@pytest.mark.parametrize(
+    ("preturn_enabled", "exit_counterroll_enabled"),
+    (
+        (False, False),
+        (True, True),
+    ),
+)
+def test_sustained_preshape_requires_preturn_without_exit_counterroll(
+    preturn_enabled,
+    exit_counterroll_enabled,
+):
+    document = _sustained_preshape()
+    document["turn_cue"]["preturn_enabled"] = preturn_enabled
+    document["turn_cue"]["exit_counterroll_enabled"] = (
+        exit_counterroll_enabled
+    )
+    with pytest.raises(
+        config_module.ControllerConfigError,
+        match="preturn enabled.*counterroll disabled",
+    ):
+        config_module.validate_controller_config(document)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        ("yaw_control.gate0_turn_score_gain", -0.401),
+        ("yaw_control.gate0_command_rate_cap_rad_s", 0.041),
+        ("forward_braking.gate0_turn_pitch_rad", 0.041),
+        ("forward_braking.gate0_turn_thrust_cap", 0.239),
+        ("turn_cue.preturn_roll_cap_rad", 0.121),
+    ),
+)
+def test_sustained_preshape_has_tighter_control_envelope(path, value):
+    document = _set_path(_sustained_preshape(), path, value)
+    with pytest.raises(
+        config_module.ControllerConfigError,
+        match="sustained preshape exceeds",
+    ):
+        config_module.validate_controller_config(document)
+
+
+def test_sustained_preshape_boundary_is_admitted():
+    document = _sustained_preshape()
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.40
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.04
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.24
+
+    effective = config_module.validate_controller_config(document)
+
+    assert effective.turn_cue.sustained_preshape_enabled is True
+    assert effective.phase_timing.gate0_preshape_max_duration_s == 1.20
+    assert effective.turn_cue.preshape_end_gate_area_scale == 20.0
 
 
 def test_requested_post_gate_phases_cannot_extend_combined_ceiling():
@@ -338,6 +456,17 @@ def test_calibrated_negative_yaw_tuning_is_inside_the_schema_envelope():
     effective = config_module.validate_controller_config(document)
     assert effective.yaw_control.gate1_error_gain == -0.08
     assert effective.yaw_control.command_rate_cap_rad_s == 0.08
+
+
+def test_gate0_and_gate1_calibrated_yaw_can_be_enabled_together():
+    document = _sustained_preshape()
+    document["yaw_control"]["gate1_error_gain"] = -0.08
+    document["yaw_control"]["command_rate_cap_rad_s"] = 0.08
+
+    effective = config_module.validate_controller_config(document)
+
+    assert effective.yaw_control.gate0_turn_score_gain == -0.20
+    assert effective.yaw_control.gate1_error_gain == -0.08
 
 
 def test_effective_config_hash_is_canonical_and_normalizes_numbers():

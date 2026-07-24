@@ -22,7 +22,7 @@ from typing import Any, Mapping
 
 
 CONTROLLER_CONFIG_SCHEMA = "aigp-vq2-controller-config/1"
-CONTROLLER_FAMILY = "aigp-vq2-gate0-gate1-recenter/1"
+CONTROLLER_FAMILY = "aigp-vq2-gate0-gate1-recenter/2"
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -40,7 +40,7 @@ _GROUP_FIELDS = {
         {
             "gate0_boost_until_s",
             "gate0_pitch_blend_s",
-            "gate0_yaw_brake_duration_s",
+            "gate0_preshape_max_duration_s",
             "post_gate_observation_duration_s",
             "gate1_recenter_duration_s",
         }
@@ -49,11 +49,12 @@ _GROUP_FIELDS = {
         {
             "preturn_enabled",
             "exit_counterroll_enabled",
+            "sustained_preshape_enabled",
             "min_gate_area_scale",
             "min_abs_score",
             "preturn_gain",
             "preturn_roll_cap_rad",
-            "preturn_taper_area_scale",
+            "preshape_end_gate_area_scale",
             "exit_counterroll_onset_area_scale",
             "exit_counterroll_cap_rad",
         }
@@ -101,14 +102,14 @@ NUMERIC_FIELD_BOUNDS = MappingProxyType(
     {
         "phase_timing.gate0_boost_until_s": (0.45, 1.0),
         "phase_timing.gate0_pitch_blend_s": (0.80, 1.0),
-        "phase_timing.gate0_yaw_brake_duration_s": (0.04, 0.21),
+        "phase_timing.gate0_preshape_max_duration_s": (0.04, 1.20),
         "phase_timing.post_gate_observation_duration_s": (0.10, 0.20),
         "phase_timing.gate1_recenter_duration_s": (0.10, 0.60),
         "turn_cue.min_gate_area_scale": (1.30, 3.50),
         "turn_cue.min_abs_score": (0.04, 0.25),
         "turn_cue.preturn_gain": (0.0, 0.80),
         "turn_cue.preturn_roll_cap_rad": (0.0, 0.13),
-        "turn_cue.preturn_taper_area_scale": (3.50, 8.0),
+        "turn_cue.preshape_end_gate_area_scale": (8.0, 20.0),
         "turn_cue.exit_counterroll_onset_area_scale": (3.50, 8.0),
         "turn_cue.exit_counterroll_cap_rad": (0.0, 0.08),
         "roll_control.gate0_centering_gain": (0.0, 0.15),
@@ -136,18 +137,19 @@ _DEFAULT_DOCUMENT: dict[str, Any] = {
     "phase_timing": {
         "gate0_boost_until_s": 0.45,
         "gate0_pitch_blend_s": 0.80,
-        "gate0_yaw_brake_duration_s": 0.21,
+        "gate0_preshape_max_duration_s": 0.21,
         "post_gate_observation_duration_s": 0.20,
         "gate1_recenter_duration_s": 0.60,
     },
     "turn_cue": {
         "preturn_enabled": True,
         "exit_counterroll_enabled": True,
+        "sustained_preshape_enabled": False,
         "min_gate_area_scale": 1.30,
         "min_abs_score": 0.04,
         "preturn_gain": 0.80,
         "preturn_roll_cap_rad": 0.13,
-        "preturn_taper_area_scale": 8.0,
+        "preshape_end_gate_area_scale": 8.0,
         "exit_counterroll_onset_area_scale": 3.5,
         "exit_counterroll_cap_rad": 0.08,
     },
@@ -184,7 +186,7 @@ class ControllerConfigError(ValueError):
 class PhaseTimingConfig:
     gate0_boost_until_s: float
     gate0_pitch_blend_s: float
-    gate0_yaw_brake_duration_s: float
+    gate0_preshape_max_duration_s: float
     post_gate_observation_duration_s: float
     gate1_recenter_duration_s: float
 
@@ -193,11 +195,12 @@ class PhaseTimingConfig:
 class TurnCueConfig:
     preturn_enabled: bool
     exit_counterroll_enabled: bool
+    sustained_preshape_enabled: bool
     min_gate_area_scale: float
     min_abs_score: float
     preturn_gain: float
     preturn_roll_cap_rad: float
-    preturn_taper_area_scale: float
+    preshape_end_gate_area_scale: float
     exit_counterroll_onset_area_scale: float
     exit_counterroll_cap_rad: float
 
@@ -382,6 +385,10 @@ def validate_controller_config(document: object) -> VQ2ControllerConfig:
             turn_value["exit_counterroll_enabled"],
             path="turn_cue.exit_counterroll_enabled",
         ),
+        sustained_preshape_enabled=_require_bool(
+            turn_value["sustained_preshape_enabled"],
+            path="turn_cue.sustained_preshape_enabled",
+        ),
         min_gate_area_scale=_require_number(
             turn_value["min_gate_area_scale"],
             path="turn_cue.min_gate_area_scale",
@@ -398,9 +405,9 @@ def validate_controller_config(document: object) -> VQ2ControllerConfig:
             turn_value["preturn_roll_cap_rad"],
             path="turn_cue.preturn_roll_cap_rad",
         ),
-        preturn_taper_area_scale=_require_number(
-            turn_value["preturn_taper_area_scale"],
-            path="turn_cue.preturn_taper_area_scale",
+        preshape_end_gate_area_scale=_require_number(
+            turn_value["preshape_end_gate_area_scale"],
+            path="turn_cue.preshape_end_gate_area_scale",
         ),
         exit_counterroll_onset_area_scale=_require_number(
             turn_value["exit_counterroll_onset_area_scale"],
@@ -452,13 +459,38 @@ def validate_controller_config(document: object) -> VQ2ControllerConfig:
     if not (
         turn.min_gate_area_scale
         <= turn.exit_counterroll_onset_area_scale
-        <= turn.preturn_taper_area_scale
+        <= turn.preshape_end_gate_area_scale
     ):
         raise ControllerConfigError(
             "turn-cue area scales must satisfy "
             "min_gate_area_scale <= exit_counterroll_onset_area_scale "
-            "<= preturn_taper_area_scale"
+            "<= preshape_end_gate_area_scale"
         )
+    if not turn.sustained_preshape_enabled and (
+        phase.gate0_preshape_max_duration_s != 0.21
+        or turn.preshape_end_gate_area_scale != 8.0
+    ):
+        raise ControllerConfigError(
+            "disabled sustained preshape requires the exact legacy "
+            "duration 0.21s and end-area scale 8.0"
+        )
+    if turn.sustained_preshape_enabled:
+        if not turn.preturn_enabled or turn.exit_counterroll_enabled:
+            raise ControllerConfigError(
+                "sustained preshape requires preturn enabled and exit "
+                "counterroll disabled"
+            )
+        if (
+            yaw.gate0_turn_score_gain < -0.40
+            or yaw.gate0_command_rate_cap_rad_s > 0.04
+            or braking.gate0_turn_pitch_rad > 0.04
+            or braking.gate0_turn_thrust_cap < 0.24
+            or turn.preturn_roll_cap_rad > 0.12
+        ):
+            raise ControllerConfigError(
+                "sustained preshape exceeds its conservative roll, yaw, "
+                "pitch, or thrust envelope"
+            )
     if (
         phase.post_gate_observation_duration_s
         + phase.gate1_recenter_duration_s
