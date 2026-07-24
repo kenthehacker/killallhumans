@@ -83,7 +83,12 @@ class VisualServoTuning:
     stable_rate_norm_s: float = 0.30
     stable_scale_rate_s: float = 1.10
     brake_scale_rate_s: float = 2.00
-    yaw_error_gain: float = 0.15
+    # The first two exact Gate-0 -> Gate-1 handoffs showed that a 0.15 gain
+    # behind a 0.25 bearing blend produced only about 0.012 rad/s of preview
+    # yaw and left the promoted track moving outward at 0.304-0.349 norm/s.
+    # Use the reviewed tuning ceiling so the generic servo can exploit the
+    # separately immutable 0.08 rad/s rate and 0.18 rad excursion envelopes.
+    yaw_error_gain: float = 0.30
     yaw_rate_gain: float = 0.035
     # Roll authority remains zero in schema /1.  Existing live evidence has a
     # sign conflict between Gate-0 centering and the later Gate-1 recovery

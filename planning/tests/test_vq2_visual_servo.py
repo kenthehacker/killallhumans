@@ -840,6 +840,74 @@ def test_output_distinguishes_raw_next_and_effective_blended_errors():
     assert output.effective_horizontal_error > output.horizontal_error
 
 
+def test_default_gain_uses_more_heading_authority_on_latest_live_prepass_frame():
+    """Regress the last safe frame from the 20260724T222751Z handoff."""
+
+    servo = ImageVisualServo()
+    for frame, y in ((1, -0.1500), (2, -0.1556), (3, -0.1667)):
+        step(
+            servo,
+            target(
+                frame,
+                x=-0.003125,
+                y=y,
+                x_rate=-0.004596953355714091,
+                y_rate=-0.2952764132559311,
+                log_scale=-1.8050598101266444,
+                scale_rate=-0.01868892118010406,
+                consecutive=109 + frame,
+            ),
+            next_target=target(
+                frame,
+                track_id="vq2-track-000002",
+                x=0.328125,
+                y=-0.2777777777777778,
+                x_rate=0.06166095463922315,
+                y_rate=-0.2953488580256311,
+                log_scale=-2.5112116249241483,
+                scale_rate=0.3596903616559018,
+                consecutive=109 + frame,
+            ),
+            requested_next_blend=0.25,
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
+
+    output = step(
+        servo,
+        target(
+            4,
+            x=-0.003125,
+            y=-0.1777777777777778,
+            x_rate=-0.004596953355714091,
+            y_rate=-0.2952764132559311,
+            log_scale=-1.8050598101266444,
+            scale_rate=-0.01868892118010406,
+            consecutive=112,
+        ),
+        next_target=target(
+            4,
+            track_id="vq2-track-000002",
+            x=0.328125,
+            y=-0.2777777777777778,
+            x_rate=0.06166095463922315,
+            y_rate=-0.2953488580256311,
+            log_scale=-2.5112116249241483,
+            scale_rate=0.3596903616559018,
+            consecutive=112,
+        ),
+        requested_next_blend=0.25,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert output.next_gate_blend == pytest.approx(0.25)
+    assert output.effective_horizontal_error == pytest.approx(0.0796875)
+    assert output.yaw_rate_rad_s == pytest.approx(-0.024325113327505703)
+    assert output.target_pitch_rad >= 0.0
+    assert output.advance_enabled is False
+
+
 def test_visual_track_adapter_preserves_image_down_axis_explicitly():
     adapted = VisualTarget.from_visual_track(
         tracker_track(),
