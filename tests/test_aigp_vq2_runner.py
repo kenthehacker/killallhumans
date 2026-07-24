@@ -3695,7 +3695,7 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
 
     async def capture_command(command, **_kwargs):
         commands.append(command)
-        if len(commands) == 10:
+        if len(commands) == 13:
             raise CommandsCaptured
 
     async def advance_clock(_seconds):
@@ -3733,6 +3733,11 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
         for event, payload in events
         if event == "gate0_longitudinal_brake_latched"
     ]
+    entry_proof_events = [
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    ]
     latch_events = [
         payload for event, payload in events if event == "gate0_preshape_latched"
     ]
@@ -3743,18 +3748,19 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     ]
     end_events = [payload for event, payload in events if event == "gate0_preshape_ended"]
     assert len(brake_latch_events) == 1
+    assert len(entry_proof_events) == 1
     assert len(latch_events) == 1
     assert (
         brake_latch_events[0]["elapsed_s"]
-        < latch_events[0]["elapsed_s"]
+        == latch_events[0]["elapsed_s"]
     )
-    assert brake_latch_events[0]["gate_area_scale"] == pytest.approx(
+    assert entry_proof_events[0]["gate_area_scale"] == pytest.approx(
         vq2_module.GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
     )
-    assert brake_latch_events[0]["frame_id"] == 6
+    assert entry_proof_events[0]["frame_id"] == 6
     assert (
         brake_latch_events[0]["area_proof_frame_count"]
-        == vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES
+        >= vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES
     )
     assert applied
     assert any(payload["gate_area_px"] > 8 * context.initial_gate_area for payload in applied)
@@ -3774,13 +3780,6 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
         preshape_entry_pitch
         + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
     )
-    assert objectives[5][0] == pytest.approx(0.0)
-    assert objectives[5][1] == pytest.approx(
-        preshape_entry_pitch
-        + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
-    )
-    assert objectives[5][2] == pytest.approx(0.275)
-    assert commands[5].yaw_rate == 0.0
     active_objectives = [
         objective
         for objective, command in zip(objectives, commands)
@@ -3814,7 +3813,7 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     )
     assert (
         end_events[0]["elapsed_s"] - latch_events[0]["elapsed_s"]
-        < 0.40
+        == pytest.approx(0.40)
     )
     assert (
         runner._gate0_early_turn_summary["preshape_end_reason"]
@@ -3960,7 +3959,7 @@ def test_sustained_gate0_brake_refuses_unproved_frame_and_never_falls_back(
         expected_abort = (
             "vision generation changed inside the powered stage"
             if authority_fault == "generation_restart"
-            else "cue lacked active early longitudinal-brake authority"
+            else "cue lacked proved safe entry authority"
         )
         with pytest.raises(SafetyAbort, match=expected_abort):
             asyncio.run(
@@ -4078,7 +4077,7 @@ def test_sustained_gate0_brake_enforces_attitude_guard_before_turn_cue(
         "cyan_course_line_observation",
         lambda _image: (
             None
-            if sample_count[0] <= 5
+                if sample_count[0] <= 3
             else vq2_module.CourseLineObservation(
                 turn_score=0.20,
                 upper_center_x=384.0,
@@ -4117,19 +4116,23 @@ def test_sustained_gate0_brake_enforces_attitude_guard_before_turn_cue(
         event == "gate0_longitudinal_brake_latched"
         for event, _payload in events
     )
-    assert not any(
+    assert any(
         event == "gate0_preshape_latched"
         for event, _payload in events
     )
 
 
-def _exercise_sustained_gate0_without_cue(
+def _exercise_sustained_gate0_with_cue(
     monkeypatch,
     *,
     post_latch_fault=None,
     entry_attitude_fault=False,
     authority_boundary_fault=None,
     pre_latch_rejection=False,
+    yaw_stop_roll=None,
+    yaw_stop_excursion=-0.046,
+    turn_score=0.20,
+    entry_roll=0.0,
 ):
     class CommandsCaptured(Exception):
         pass
@@ -4158,7 +4161,11 @@ def _exercise_sustained_gate0_without_cue(
         _FakeVision(),
         controller_config=config,
     )
-    runner.estimate = _estimate(roll=0.0, pitch=-0.176264, yaw=0.0)
+    runner.estimate = _estimate(
+        roll=float(entry_roll),
+        pitch=-0.176264,
+        yaw=0.0,
+    )
     runner._latest_detection_image = object()
     runner._latest_detection_generation = 7
     context = vq2_module.StartContext(
@@ -4192,6 +4199,12 @@ def _exercise_sustained_gate0_without_cue(
         elif entry_attitude_fault and sample_count[0] == 7:
             runner.estimate = _estimate(
                 roll=0.0,
+                pitch=-0.176264,
+                yaw=0.0,
+            )
+        if yaw_stop_roll is not None and sample_count[0] >= 7:
+            runner.estimate = _estimate(
+                roll=float(yaw_stop_roll),
                 pitch=-0.176264,
                 yaw=0.0,
             )
@@ -4270,8 +4283,27 @@ def _exercise_sustained_gate0_without_cue(
     monkeypatch.setattr(
         vq2_module,
         "cyan_course_line_observation",
-        lambda _image: None,
+        lambda _image: vq2_module.CourseLineObservation(
+            turn_score=float(turn_score),
+            upper_center_x=384.0,
+            lower_center_x=320.0,
+            upper_pixel_count=136,
+            lower_pixel_count=136,
+        ),
     )
+    if yaw_stop_roll is not None:
+        monkeypatch.setattr(
+            runner,
+            "_gate1_yaw_envelope_state",
+            lambda **_kwargs: (
+                (float(yaw_stop_excursion), True)
+                if sample_count[0] == 7
+                else (
+                    math.copysign(0.030, -float(turn_score)),
+                    False,
+                )
+            ),
+        )
 
     with monkeypatch.context() as clock_patch:
         clock_patch.setattr(
@@ -4289,6 +4321,21 @@ def _exercise_sustained_gate0_without_cue(
             if (
                 post_latch_fault is None
                 and authority_boundary_fault is None
+                and not entry_attitude_fault
+                and not pre_latch_rejection
+                and abs(float(entry_roll))
+                <= vq2_module.GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
+                and (
+                    yaw_stop_roll is None
+                    or (
+                        float(yaw_stop_roll)
+                        * float(turn_score)
+                        > 0.0
+                        and float(yaw_stop_excursion)
+                        * -float(turn_score)
+                        > 0.0
+                    )
+                )
             )
             else SafetyAbort
         )
@@ -4304,15 +4351,15 @@ def _exercise_sustained_gate0_without_cue(
     return runner, commands, events
 
 
-def test_sustained_gate0_brake_requires_three_safe_frames_after_rejection(
+def test_sustained_gate0_cue_fails_closed_after_attitude_rejection(
     monkeypatch,
 ):
-    runner, commands, events = _exercise_sustained_gate0_without_cue(
+    runner, commands, events = _exercise_sustained_gate0_with_cue(
         monkeypatch,
         entry_attitude_fault=True,
     )
 
-    assert len(commands) == 10
+    assert len(commands) == 5
     rejected = [
         payload
         for event, payload in events
@@ -4325,15 +4372,14 @@ def test_sustained_gate0_brake_requires_three_safe_frames_after_rejection(
     ]
     assert len(rejected) == 1
     assert rejected[0]["frame_id"] == 6
-    assert len(latches) == 1
-    assert latches[0]["frame_id"] == 9
-    assert runner._gate0_early_turn_summary is not None
+    assert latches == []
+    assert runner._gate0_early_turn_summary is None
 
 
-def test_sustained_gate0_brake_area_streak_resets_on_rejected_frame(
+def test_sustained_gate0_cue_fails_closed_after_authority_reset(
     monkeypatch,
 ):
-    _runner, _commands, events = _exercise_sustained_gate0_without_cue(
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
         monkeypatch,
         pre_latch_rejection=True,
     )
@@ -4343,18 +4389,13 @@ def test_sustained_gate0_brake_area_streak_resets_on_rejected_frame(
         if event == "gate0_longitudinal_brake_latched"
     ]
 
-    assert len(brake_latches) == 1
-    assert brake_latches[0]["frame_id"] == 8
-    assert (
-        brake_latches[0]["area_proof_frame_count"]
-        == vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES
-    )
+    assert brake_latches == []
 
 
-def test_sustained_gate0_brake_ends_at_shared_deadline_without_turn_cue(
+def test_sustained_gate0_brake_ends_at_shared_deadline_from_turn_cue(
     monkeypatch,
 ):
-    runner, commands, events = _exercise_sustained_gate0_without_cue(
+    runner, commands, events = _exercise_sustained_gate0_with_cue(
         monkeypatch,
     )
     brake_latches = [
@@ -4384,17 +4425,215 @@ def test_sustained_gate0_brake_ends_at_shared_deadline_without_turn_cue(
     assert max(
         payload["elapsed_s"] for payload in brake_objectives
     ) < brake_ends[0]["elapsed_s"]
-    assert not any(
+    assert any(
         event == "gate0_preshape_latched"
         for event, _payload in events
     )
-    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert any(command.yaw_rate < 0.0 for command in commands)
     assert runner._gate0_early_turn_summary is not None
     assert (
         runner._gate0_early_turn_summary[
             "longitudinal_brake_end_reason"
         ]
         == "duration"
+    )
+
+
+def test_sustained_gate0_yaw_stop_releases_roll_to_exact_level_once(
+    monkeypatch,
+):
+    runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_roll=0.02,
+        yaw_stop_roll=0.05,
+    )
+
+    level_latches = [
+        payload
+        for event, payload in events
+        if event == "gate0_yaw_stop_roll_level_latched"
+    ]
+    level_commands = [
+        payload
+        for event, payload in events
+        if event == "course_line_yaw_stop_roll_level_applied"
+    ]
+    assert len(level_latches) == 1
+    assert level_latches[0]["frame_id"] == 7
+    assert level_latches[0]["entry_roll_rad"] == pytest.approx(0.02)
+    assert level_latches[0]["trigger_roll_rad"] == pytest.approx(0.05)
+    assert level_latches[0]["target_roll_rad"] == pytest.approx(0.0)
+    assert len(level_commands) >= 2
+    assert all(
+        payload["target_roll_rad"] == pytest.approx(0.0)
+        for payload in level_commands
+    )
+    assert all(
+        command.yaw_rate == 0.0
+        for command in commands[6:]
+    )
+    assert any(command.yaw_rate < 0.0 for command in commands[:6])
+    assert commands[6].roll_rate < 0.0
+    latch_event_index = next(
+        index
+        for index, (event, _payload) in enumerate(events)
+        if event == "gate0_yaw_stop_roll_level_latched"
+    )
+    first_level_command_index = next(
+        index
+        for index, (event, _payload) in enumerate(events)
+        if event == "course_line_yaw_stop_roll_level_applied"
+    )
+    assert latch_event_index < first_level_command_index
+    assert runner._gate0_early_turn_summary is not None
+    assert runner._gate0_early_turn_summary["roll_level_started"] is True
+    assert (
+        runner._gate0_early_turn_summary["roll_level_command_count"]
+        == len(level_commands)
+    )
+    level_end_events = [
+        payload
+        for event, payload in events
+        if event == "gate0_yaw_stop_roll_level_ended"
+    ]
+    assert len(level_end_events) == 1
+    assert level_end_events[0]["reason"] == "duration"
+    assert level_end_events[0]["command_count"] == len(level_commands)
+    level_end_index = next(
+        index
+        for index, (event, _payload) in enumerate(events)
+        if event == "gate0_yaw_stop_roll_level_ended"
+    )
+    assert all(
+        index < level_end_index
+        for index, (event, _payload) in enumerate(events)
+        if event == "course_line_yaw_stop_roll_level_applied"
+    )
+
+
+def test_sustained_gate0_yaw_stop_rejects_wrong_sign_roll_excursion(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        yaw_stop_roll=-0.05,
+    )
+
+    assert len(commands) == 6
+    assert not any(
+        event == "gate0_yaw_stop_roll_level_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "course_line_yaw_stop_roll_level_applied"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_yaw_stop_rejects_wrong_sign_yaw_excursion(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        yaw_stop_roll=0.05,
+        yaw_stop_excursion=0.046,
+    )
+
+    assert len(commands) == 6
+    assert not any(
+        event == "gate0_yaw_stop_roll_level_latched"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_yaw_stop_rejects_unreachable_level_target(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_roll=0.13,
+        yaw_stop_roll=0.14,
+    )
+
+    assert len(commands) == 6
+    assert not any(
+        event == "gate0_yaw_stop_roll_level_latched"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_yaw_stop_leveling_mirrors_negative_turn(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        yaw_stop_roll=-0.05,
+        yaw_stop_excursion=0.046,
+        turn_score=-0.20,
+    )
+
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_yaw_stop_roll_level_latched"
+    )
+    assert latch["target_roll_rad"] == pytest.approx(0.0)
+    assert latch["trigger_roll_rad"] == pytest.approx(-0.05)
+    assert commands[6].roll_rate > 0.0
+    assert all(command.yaw_rate == 0.0 for command in commands[6:])
+
+
+def test_sustained_gate0_yaw_stop_changes_only_post_stop_roll_profile(
+    monkeypatch,
+):
+    _baseline_runner, _baseline_commands, baseline_events = (
+        _exercise_sustained_gate0_with_cue(monkeypatch)
+    )
+    _level_runner, _level_commands, level_events = (
+        _exercise_sustained_gate0_with_cue(
+            monkeypatch,
+            yaw_stop_roll=0.05,
+        )
+    )
+
+    def brake_profile(events):
+        return [
+            (
+                payload["elapsed_s"],
+                payload["target_pitch_rad"],
+                payload["thrust"],
+            )
+            for event, payload in events
+            if event == "gate0_longitudinal_brake_objective"
+        ]
+
+    def phase_boundary(events, event_name):
+        payload = next(
+            payload
+            for event, payload in events
+            if event == event_name
+        )
+        return (
+            payload["elapsed_s"],
+            payload.get("reason"),
+        )
+
+    assert brake_profile(level_events) == pytest.approx(
+        brake_profile(baseline_events)
+    )
+    assert phase_boundary(
+        level_events,
+        "gate0_longitudinal_brake_latched",
+    ) == phase_boundary(
+        baseline_events,
+        "gate0_longitudinal_brake_latched",
+    )
+    assert phase_boundary(
+        level_events,
+        "gate0_preshape_ended",
+    ) == phase_boundary(
+        baseline_events,
+        "gate0_preshape_ended",
     )
 
 
@@ -4407,7 +4646,7 @@ def test_sustained_gate0_guard_precedes_end_and_pass_boundaries(
     authority_boundary_fault,
     expected_commands,
 ):
-    _runner, commands, events = _exercise_sustained_gate0_without_cue(
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
         monkeypatch,
         authority_boundary_fault=authority_boundary_fault,
     )
@@ -4431,7 +4670,7 @@ def test_sustained_gate0_brake_aborts_on_post_latch_authority_loss(
     monkeypatch,
     post_latch_fault,
 ):
-    runner, commands, events = _exercise_sustained_gate0_without_cue(
+    runner, commands, events = _exercise_sustained_gate0_with_cue(
         monkeypatch,
         post_latch_fault=post_latch_fault,
     )
