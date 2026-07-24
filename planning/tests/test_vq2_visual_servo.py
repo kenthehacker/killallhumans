@@ -868,7 +868,7 @@ def test_default_gain_uses_more_heading_authority_on_latest_live_prepass_frame()
                 scale_rate=0.3596903616559018,
                 consecutive=109 + frame,
             ),
-            requested_next_blend=0.25,
+            requested_next_blend=0.35,
             allow_advance=False,
             allow_passage_safe_next_blend=True,
         )
@@ -896,14 +896,14 @@ def test_default_gain_uses_more_heading_authority_on_latest_live_prepass_frame()
             scale_rate=0.3596903616559018,
             consecutive=112,
         ),
-        requested_next_blend=0.25,
+        requested_next_blend=0.35,
         allow_advance=False,
         allow_passage_safe_next_blend=True,
     )
 
-    assert output.next_gate_blend == pytest.approx(0.25)
-    assert output.effective_horizontal_error == pytest.approx(0.0796875)
-    assert output.yaw_rate_rad_s == pytest.approx(-0.024325113327505703)
+    assert output.next_gate_blend == pytest.approx(0.35)
+    assert output.effective_horizontal_error == pytest.approx(0.1128125)
+    assert output.yaw_rate_rad_s == pytest.approx(-0.03449451600548799)
     assert output.target_pitch_rad >= 0.0
     assert output.advance_enabled is False
 

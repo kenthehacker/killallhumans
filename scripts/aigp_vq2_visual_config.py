@@ -49,7 +49,11 @@ class VisualConfigError(ValueError):
 
 @dataclass(frozen=True)
 class VisualLifecycleTuning:
-    next_gate_blend_max: float = 0.25
+    # The gain-only live candidate remained safely inside every yaw bound but
+    # left substantial unused preview authority.  Use the existing immutable
+    # blend ceiling while the current aperture remains inside its separate
+    # passage corridor.
+    next_gate_blend_max: float = 0.35
     next_gate_blend_start_log_scale: float = -1.80
     next_gate_blend_full_log_scale: float = -0.50
     restricted_alignment_duration_s: float = 0.90

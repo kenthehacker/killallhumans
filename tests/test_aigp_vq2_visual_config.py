@@ -37,9 +37,10 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
     assert mapping["servo"]["brake_thrust"] == MIN_VISUAL_THRUST
     assert mapping["servo"]["advance_thrust"] == 0.295
     assert mapping["servo"]["yaw_error_gain"] == 0.30
+    assert mapping["lifecycle"]["next_gate_blend_max"] == 0.35
     assert config.to_effective_mapping() == mapping
     assert config.effective_config_sha256 == (
-        "42ac7f1e42deea537d3633897771367ee6184ed4fbb05e18416363e617cb78cf"
+        "ca07ccf0b60840e77db43137e9c5e2f33449d23bb6f7933994695e62fbb93e11"
     )
     assert len(config.effective_config_sha256) == 64
     assert canonical_visual_config_sha256(mapping) == (

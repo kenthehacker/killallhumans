@@ -3369,7 +3369,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         ):
             assert expected_current_track_id == current_track_id
             assert gate_index == 0
-            assert next_gate_blend == pytest.approx(0.25)
+            assert next_gate_blend == pytest.approx(0.35)
             self.next_gate_blend = next_gate_blend
             self.calls = 0
 
