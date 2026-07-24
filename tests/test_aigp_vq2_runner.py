@@ -1685,21 +1685,21 @@ def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
 @pytest.mark.parametrize(
     ("normalized_x", "normalized_x_rate_s", "expected"),
     (
-        (0.25, 0.0, 0.0375),
-        (0.25, 0.40, 0.0375),
-        (-0.25, -0.40, -0.0375),
-        (1.0, 0.0, 0.08),
-        (-1.0, 0.0, -0.08),
+        (0.25, 0.0, -0.06),
+        (0.25, 0.40, -0.06),
+        (-0.25, -0.40, 0.06),
+        (1.0, 0.0, -0.12),
+        (-1.0, 0.0, 0.12),
     ),
 )
-def test_gate1_recenter_roll_target_reuses_live_proved_gate0_sign(
+def test_gate1_recenter_roll_target_uses_live_identified_negative_sign(
     normalized_x,
     normalized_x_rate_s,
     expected,
 ):
-    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.15
+    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == -0.24
     assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
-    assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.08
+    assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.12
     assert vq2_module.gate1_recenter_roll_target(
         normalized_x,
         normalized_x_rate_s,
@@ -1743,9 +1743,9 @@ def test_gate1_recenter_absolute_error_slope_uses_only_strict_fresh_times():
 
 def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_DURATION_S == 0.60
-    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.15
+    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == -0.24
     assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
-    assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.08
+    assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.12
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
