@@ -181,6 +181,8 @@ GATE1_RECENTER_ROLL_GAIN = -0.24
 GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
 GATE1_RECENTER_MAX_ROLL_RAD = 0.12
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
+GATE1_RECENTER_YAW_RATE_RAD_S = 0.12
+GATE1_RECENTER_MAX_YAW_EXCURSION_RAD = 0.12
 GATE1_RECENTER_THRUST = 0.275
 GATE1_RECENTER_TRANSITION_THRUST = GATE1_RECENTER_THRUST
 GATE1_RECENTER_TARGET_PITCH_RAD = 0.10
@@ -6126,6 +6128,21 @@ def gate1_recenter_roll_target(
     )
 
 
+def gate1_recenter_latched_yaw_rate(normalized_x: float) -> float:
+    """Latch a bounded heading-rate sign from the proved Gate-1 entry."""
+
+    if (
+        type(normalized_x) not in {int, float}
+        or not math.isfinite(float(normalized_x))
+        or abs(float(normalized_x)) > 1.0
+    ):
+        raise ValueError("gate-1 recenter yaw input is outside bounds")
+    value = float(normalized_x)
+    if abs(value) <= GATE1_RECENTER_CORRIDOR_NORMALIZED_X:
+        return 0.0
+    return math.copysign(GATE1_RECENTER_YAW_RATE_RAD_S, value)
+
+
 def gate1_recenter_absolute_error_slope_px_s(
     samples: Sequence[Tuple[float, float]],
 ) -> Optional[float]:
@@ -10131,6 +10148,15 @@ class VQ2Runner:
         ):
             raise SafetyAbort("gate-1 recenter requires a fresh primary target")
         entry_error_px = float(entry_target.center_x) - 320.0
+        entry_normalized_x = entry_error_px / 320.0
+        try:
+            latched_yaw_rate = gate1_recenter_latched_yaw_rate(
+                entry_normalized_x,
+            )
+        except ValueError as exc:
+            raise SafetyAbort(
+                "gate-1 recenter entry yaw control is outside bounds"
+            ) from exc
         self._gate1_recenter_summary = {
             "candidate_authority": "user_authorized_bounded_recenter_diagnostic",
             "success": False,
@@ -10141,6 +10167,8 @@ class VQ2Runner:
             "entry_abs_horizontal_error_px": abs(entry_error_px),
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": abs(entry_error_px),
+            "entry_normalized_x": entry_normalized_x,
+            "latched_command_yaw_rate_rad_s": latched_yaw_rate,
             "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
             "max_target_area_px": int(entry_target.bbox_area),
             "max_target_width_px": int(entry_target.bbox[2]),
@@ -10188,7 +10216,9 @@ class VQ2Runner:
         if self.estimate is None:
             raise SafetyAbort("gate-1 recenter attitude estimate is unavailable")
 
-        entry_roll, entry_pitch, _entry_yaw = self.estimate.orientation.to_euler()
+        entry_roll, entry_pitch, entry_yaw = (
+            self.estimate.orientation.to_euler()
+        )
         if (
             abs(float(entry_roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
             or not (
@@ -10206,6 +10236,10 @@ class VQ2Runner:
         ]
         min_roll = max_roll = float(entry_roll)
         min_pitch = max_pitch = float(entry_pitch)
+        max_abs_yaw_excursion = 0.0
+        max_abs_measured_yaw_rate = abs(
+            float(self.estimate.body_rates[2])
+        )
         min_command_roll_rate: Optional[float] = None
         max_command_roll_rate: Optional[float] = None
         min_command_pitch_rate: Optional[float] = None
@@ -10262,8 +10296,13 @@ class VQ2Runner:
             "corridor_accepted_elapsed_s": None,
             "entry_horizontal_error_px": entry_error_px,
             "entry_abs_horizontal_error_px": entry_abs_error_px,
+            "entry_normalized_x": entry_normalized_x,
+            "entry_yaw_rad": float(entry_yaw),
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": entry_abs_error_px,
+            "latched_command_yaw_rate_rad_s": latched_yaw_rate,
+            "max_abs_yaw_excursion_rad": max_abs_yaw_excursion,
+            "max_abs_measured_yaw_rate_rad_s": max_abs_measured_yaw_rate,
             "fresh_abs_horizontal_error_slope_px_s": None,
             "fresh_control_frame_count": 0,
             "corridor_hold_frame_count": 0,
@@ -10299,6 +10338,7 @@ class VQ2Runner:
             corridor_accepted_elapsed_s: Optional[float] = None,
         ) -> None:
             nonlocal min_roll, max_roll, min_pitch, max_pitch
+            nonlocal max_abs_yaw_excursion, max_abs_measured_yaw_rate
             nonlocal min_command_roll_rate, max_command_roll_rate
             nonlocal min_command_pitch_rate, max_command_pitch_rate
             nonlocal max_target_area, max_target_width, max_gate_index
@@ -10321,6 +10361,12 @@ class VQ2Runner:
                     ),
                     "final_horizontal_error_px": final_error_px,
                     "final_abs_horizontal_error_px": abs(final_error_px),
+                    "max_abs_yaw_excursion_rad": (
+                        max_abs_yaw_excursion
+                    ),
+                    "max_abs_measured_yaw_rate_rad_s": (
+                        max_abs_measured_yaw_rate
+                    ),
                     "fresh_abs_horizontal_error_slope_px_s": slope,
                     "fresh_control_frame_count": fresh_control_frames,
                     "corridor_hold_frame_count": corridor_hold_frames,
@@ -10392,6 +10438,10 @@ class VQ2Runner:
             entry_target=asdict(entry_target),
             entry_error_px=entry_error_px,
             entry_abs_error_px=entry_abs_error_px,
+            entry_normalized_x=entry_normalized_x,
+            entry_yaw_rad=float(entry_yaw),
+            latched_command_yaw_rate_rad_s=latched_yaw_rate,
+            yaw_sign_basis="latched_entry_horizontal_error",
             vision_generation=entry_generation,
             hard_deadline_monotonic_s=hard_deadline_s,
             last_recenter_wire_start_monotonic_ns=(
@@ -10404,6 +10454,10 @@ class VQ2Runner:
                 "max_roll_rad": GATE1_RECENTER_MAX_ROLL_RAD,
                 "max_command_rate_rad_s": (
                     GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+                ),
+                "yaw_rate_rad_s": GATE1_RECENTER_YAW_RATE_RAD_S,
+                "max_yaw_excursion_rad": (
+                    GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
                 ),
                 "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
                 "thrust": GATE1_RECENTER_THRUST,
@@ -10480,11 +10534,23 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter attitude estimate is unavailable"
                     )
-                roll, pitch, _yaw = self.estimate.orientation.to_euler()
+                roll, pitch, yaw = self.estimate.orientation.to_euler()
+                yaw_excursion = math.atan2(
+                    math.sin(float(yaw) - float(entry_yaw)),
+                    math.cos(float(yaw) - float(entry_yaw)),
+                )
                 min_roll = min(min_roll, float(roll))
                 max_roll = max(max_roll, float(roll))
                 min_pitch = min(min_pitch, float(pitch))
                 max_pitch = max(max_pitch, float(pitch))
+                max_abs_yaw_excursion = max(
+                    max_abs_yaw_excursion,
+                    abs(yaw_excursion),
+                )
+                max_abs_measured_yaw_rate = max(
+                    max_abs_measured_yaw_rate,
+                    abs(float(self.estimate.body_rates[2])),
+                )
                 if (
                     abs(float(roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
                     or not (
@@ -10496,6 +10562,8 @@ class VQ2Runner:
                     > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                     or abs(float(pitch) - entry_pitch)
                     > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                    or abs(yaw_excursion)
+                    > GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
                 ):
                     raise SafetyAbort(
                         "gate-1 recenter attitude excursion approached its bound"
@@ -10591,6 +10659,12 @@ class VQ2Runner:
                         normalized_x=current_error_px / 320.0,
                         normalized_x_rate_s=current_x_rate_norm_s,
                         corridor_hold_frames=corridor_hold_frames,
+                        yaw_rad=float(yaw),
+                        yaw_excursion_rad=yaw_excursion,
+                        measured_yaw_rate_rad_s=float(
+                            self.estimate.body_rates[2]
+                        ),
+                        command_yaw_rate_rad_s=latched_yaw_rate,
                     )
                     last_token = token
                     last_center_x = float(accepted.center_x)
@@ -10714,16 +10788,32 @@ class VQ2Runner:
                                 "gate-1 recenter attitude estimate changed "
                                 "before cleanup"
                             )
-                        cleanup_roll, cleanup_pitch, _cleanup_yaw = (
+                        cleanup_roll, cleanup_pitch, cleanup_yaw = (
                             self.estimate.orientation.to_euler()
+                        )
+                        cleanup_yaw_excursion = math.atan2(
+                            math.sin(
+                                float(cleanup_yaw) - float(entry_yaw)
+                            ),
+                            math.cos(
+                                float(cleanup_yaw) - float(entry_yaw)
+                            ),
                         )
                         min_roll = min(min_roll, float(cleanup_roll))
                         max_roll = max(max_roll, float(cleanup_roll))
                         min_pitch = min(min_pitch, float(cleanup_pitch))
                         max_pitch = max(max_pitch, float(cleanup_pitch))
+                        max_abs_yaw_excursion = max(
+                            max_abs_yaw_excursion,
+                            abs(cleanup_yaw_excursion),
+                        )
                         cleanup_peak_rate = max(
                             abs(float(value))
                             for value in self.estimate.body_rates
+                        )
+                        max_abs_measured_yaw_rate = max(
+                            max_abs_measured_yaw_rate,
+                            abs(float(self.estimate.body_rates[2])),
                         )
                         if (
                             abs(float(cleanup_roll))
@@ -10737,6 +10827,8 @@ class VQ2Runner:
                             > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                             or abs(float(cleanup_pitch) - entry_pitch)
                             > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                            or abs(cleanup_yaw_excursion)
+                            > GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
                             or cleanup_peak_rate
                             > GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S
                         ):
@@ -10856,8 +10948,17 @@ class VQ2Runner:
                     command,
                     GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S,
                 )
+                command = AttitudeRateCommand(
+                    roll_rate=command.roll_rate,
+                    pitch_rate=command.pitch_rate,
+                    yaw_rate=latched_yaw_rate,
+                    thrust=command.thrust,
+                )
+                validate_command(command)
                 if (
-                    command.yaw_rate != 0.0
+                    command.yaw_rate != latched_yaw_rate
+                    or abs(command.yaw_rate)
+                    > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
                     or abs(command.roll_rate)
                     > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
                     or abs(command.pitch_rate)

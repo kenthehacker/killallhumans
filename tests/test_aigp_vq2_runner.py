@@ -1728,6 +1728,44 @@ def test_gate1_recenter_roll_target_rejects_unbounded_inputs(
         )
 
 
+@pytest.mark.parametrize(
+    ("normalized_x", "expected"),
+    (
+        (1.0, 0.12),
+        (0.36, 0.12),
+        (0.35, 0.0),
+        (0.0, 0.0),
+        (-0.35, 0.0),
+        (-0.36, -0.12),
+        (-1.0, -0.12),
+    ),
+)
+def test_gate1_recenter_latched_yaw_rate_uses_entry_sign_only(
+    normalized_x,
+    expected,
+):
+    assert vq2_module.gate1_recenter_latched_yaw_rate(
+        normalized_x,
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "normalized_x",
+    (
+        True,
+        math.nan,
+        math.inf,
+        math.nextafter(1.0, math.inf),
+        math.nextafter(-1.0, -math.inf),
+    ),
+)
+def test_gate1_recenter_latched_yaw_rate_rejects_unbounded_input(
+    normalized_x,
+):
+    with pytest.raises(ValueError, match="yaw input"):
+        vq2_module.gate1_recenter_latched_yaw_rate(normalized_x)
+
+
 def test_gate1_recenter_absolute_error_slope_uses_only_strict_fresh_times():
     assert vq2_module.gate1_recenter_absolute_error_slope_px_s(
         [(1.0, 200.0)]
@@ -1747,6 +1785,8 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.12
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
+    assert vq2_module.GATE1_RECENTER_YAW_RATE_RAD_S == 0.12
+    assert vq2_module.GATE1_RECENTER_MAX_YAW_EXCURSION_RAD == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TARGET_PITCH_RAD == 0.10
@@ -2149,10 +2189,13 @@ def test_offline_gate1_recenter_requires_error_decrease_and_three_frame_hold(
         <= vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
         and abs(command.pitch_rate)
         <= vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
-        and command.yaw_rate == 0.0
+        and command.yaw_rate == vq2_module.GATE1_RECENTER_YAW_RATE_RAD_S
         and command.thrust == vq2_module.GATE1_RECENTER_THRUST
         for command in adapter.commands
     )
+    assert result["entry_normalized_x"] == pytest.approx(210.0 / 320.0)
+    assert result["latched_command_yaw_rate_rad_s"] == 0.12
+    assert result["max_abs_yaw_excursion_rad"] == 0.0
 
 
 def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
@@ -2630,6 +2673,34 @@ def test_offline_gate1_recenter_rejects_unsafe_entry_attitude(monkeypatch):
 
     with pytest.raises(SafetyAbort, match="entry attitude"):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+
+def test_offline_gate1_recenter_rejects_wrapped_yaw_excursion(monkeypatch):
+    runner, adapter, observation, _clock = (
+        _configure_gate1_recenter_candidate(monkeypatch)
+    )
+
+    def sample():
+        runner.estimate = _estimate(
+            roll=0.0,
+            pitch=-0.05,
+            yaw=math.nextafter(
+                vq2_module.GATE1_RECENTER_MAX_YAW_EXCURSION_RAD,
+                math.inf,
+            ),
+        )
+
+    monkeypatch.setattr(runner, "_sample", sample)
+
+    with pytest.raises(SafetyAbort, match="attitude excursion"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+    assert runner._gate1_recenter_summary is not None
+    assert (
+        runner._gate1_recenter_summary["max_abs_yaw_excursion_rad"]
+        > vq2_module.GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
+    )
 
 
 def test_offline_gate1_recenter_requires_same_accepted_entry_object(
