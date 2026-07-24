@@ -6241,19 +6241,19 @@ def gate0_course_line_intercept_offset_px(
 
 def gate0_spatial_intercept_roll_target(
     gate_center_x_px: int,
-    gate_width_px: int,
+    normalization_gate_width_px: int,
     intercept_offset_px: float,
     *,
     gain: float,
     cap_rad: float,
 ) -> Tuple[float, float, float]:
-    """Map a latched aperture offset through the bounded Gate-0 centering law."""
+    """Map a fixed intercept through its latched-aperture centering law."""
 
     if (
         type(gate_center_x_px) is not int
         or not 0 <= gate_center_x_px <= 640
-        or type(gate_width_px) is not int
-        or not 1 <= gate_width_px <= 640
+        or type(normalization_gate_width_px) is not int
+        or not 1 <= normalization_gate_width_px <= 640
         or type(intercept_offset_px) not in {int, float}
         or not math.isfinite(float(intercept_offset_px))
         or abs(float(intercept_offset_px))
@@ -6265,7 +6265,7 @@ def gate0_spatial_intercept_roll_target(
     desired_center_x_px = 320.0 + float(intercept_offset_px)
     aperture_error = (
         float(gate_center_x_px) - desired_center_x_px
-    ) / (0.5 * float(gate_width_px))
+    ) / (0.5 * float(normalization_gate_width_px))
     target_roll_rad = gate0_centering_roll_target(
         aperture_error,
         gain=gain,
@@ -11355,7 +11355,7 @@ class VQ2Runner:
                         "roll_brake_started": False,
                         "roll_brake_command_count": 0,
                         "roll_objective_mode": (
-                            "aperture_spatial_intercept"
+                            "latched_aperture_spatial_intercept"
                         ),
                         "course_line_displacement_px": (
                             latest_course_line_displacement_px
@@ -11453,7 +11453,9 @@ class VQ2Runner:
                         max_offset_px=(
                             GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX
                         ),
-                        objective_mode="aperture_spatial_intercept",
+                        objective_mode=(
+                            "latched_aperture_spatial_intercept"
+                        ),
                     )
                 self.recorder.emit(
                     "gate0_preshape_latched",
@@ -11842,7 +11844,7 @@ class VQ2Runner:
                             target_roll,
                         ) = gate0_spatial_intercept_roll_target(
                             target.center_x,
-                            target.bbox[2],
+                            preshape_intercept_latch_gate_width_px,
                             preshape_intercept_offset_px,
                             gain=roll_control.gate0_centering_gain,
                             cap_rad=roll_control.gate0_target_cap_rad,
@@ -11855,6 +11857,8 @@ class VQ2Runner:
                     if (
                         abs(target_roll)
                         > roll_control.gate0_target_cap_rad
+                        or abs(target_roll)
+                        > turn_cue.preturn_roll_cap_rad
                         or abs(target_roll)
                         > GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
                         or (
@@ -11875,7 +11879,7 @@ class VQ2Runner:
                         "spatial_intercept_command_count"
                     ] = preshape_intercept_command_count
                     self.recorder.emit(
-                        "course_line_spatial_intercept_applied",
+                        "course_line_latched_aperture_intercept_applied",
                         frame_id=target.frame_id,
                         elapsed_s=elapsed,
                         gate_area_px=target.bbox_area,
@@ -11891,12 +11895,17 @@ class VQ2Runner:
                         intercept_latch_gate_width_px=(
                             preshape_intercept_latch_gate_width_px
                         ),
+                        normalization_gate_width_px=(
+                            preshape_intercept_latch_gate_width_px
+                        ),
                         desired_center_x_px=(
                             intercept_desired_center_x_px
                         ),
                         aperture_error=intercept_aperture_error,
                         target_roll_rad=target_roll,
-                        objective_mode="aperture_spatial_intercept",
+                        objective_mode=(
+                            "latched_aperture_spatial_intercept"
+                        ),
                         command_count=(
                             preshape_intercept_command_count
                         ),
