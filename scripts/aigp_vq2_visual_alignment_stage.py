@@ -18,6 +18,7 @@ from planning.vq2_visual_alignment import (
     RestrictedAlignmentMonitor,
     VisualAlignmentRefusal,
     VisualAlignmentTrend,
+    require_visual_alignment_entry,
 )
 from planning.vq2_visual_servo import (
     ImageVisualServo,
@@ -84,6 +85,7 @@ class VisualAlignmentStageHost(Protocol):
         context: Any,
         *,
         capture_transition: bool = False,
+        visual_next_gate_blend: bool = False,
     ) -> Dict[str, Any]: ...
 
     async def _wait_for_next_flight_command_slot(self) -> float: ...
@@ -163,7 +165,32 @@ async def run_visual_alignment_stage(
             "visual alignment lacks a bound initial current gate"
         )
     initial_current_track_id = bound.current_track_id
-    gate0 = await host._run_gate0(context, capture_transition=False)
+    gate0 = await host._run_gate0(
+        context,
+        capture_transition=False,
+        visual_next_gate_blend=True,
+    )
+    gate0_blend = gate0.get("visual_next_gate_blend")
+    if (
+        type(gate0_blend) is not dict
+        or gate0_blend.get("enabled") is not True
+        or gate0_blend.get("started") is not True
+        or type(gate0_blend.get("fresh_blend_frame_count")) is not int
+        or int(gate0_blend["fresh_blend_frame_count"]) < 3
+        or type(gate0_blend.get("command_count")) is not int
+        or int(gate0_blend["command_count"]) < 3
+        or gate0_blend.get("current_track_id")
+        != initial_current_track_id
+        or type(gate0_blend.get("blended_next_track_id")) is not str
+        or not gate0_blend["blended_next_track_id"]
+        or gate0_blend.get("withdrawn_before_confirmation") is not True
+        or type(gate0_blend.get("yaw_reference_rad"))
+        not in {int, float}
+        or not math.isfinite(float(gate0_blend["yaw_reference_rad"]))
+    ):
+        raise abort_type(
+            "visual alignment lacks a proved corridor-safe pre-pass blend"
+        )
     transition = host._visual_transition
     if (
         transition is None
@@ -178,6 +205,14 @@ async def run_visual_alignment_stage(
     ):
         raise abort_type(
             "visual alignment lacks the proved pretracked 0->1 promotion"
+        )
+    if (
+        transition.promoted_track_id
+        != gate0_blend["blended_next_track_id"]
+    ):
+        raise abort_type(
+            "visual alignment pre-pass blended identity was not "
+            "authoritatively promoted"
         )
     promoted_track_id = transition.promoted_track_id
     proof = host._gate0_transition_proof
@@ -194,6 +229,15 @@ async def run_visual_alignment_stage(
         "reason": None,
         "authoritative_transition": [0, 1],
         "initial_current_track_id": initial_current_track_id,
+        "precredit_blended_next_track_id": (
+            gate0_blend.get("blended_next_track_id")
+        ),
+        "precredit_blend_frame_count": int(
+            gate0_blend["fresh_blend_frame_count"]
+        ),
+        "precredit_blend_command_count": int(
+            gate0_blend["command_count"]
+        ),
         "promoted_current_track_id": promoted_track_id,
         "current_track_id": promoted_track_id,
         "next_track_ids": [],
@@ -205,7 +249,9 @@ async def run_visual_alignment_stage(
         "post_credit_zero_command_count": 0,
         "fresh_control_frame_count": 0,
         "thrust_saturation_count": 0,
-        "max_abs_yaw_excursion_rad": 0.0,
+        "max_abs_yaw_excursion_rad": float(
+            gate0_blend.get("max_abs_yaw_excursion_rad", 0.0)
+        ),
         "max_abs_measured_yaw_rate_rad_s": 0.0,
         "max_peak_body_rate_rad_s": 0.0,
         "min_command_yaw_rate_rad_s": None,
@@ -344,7 +390,15 @@ async def run_visual_alignment_stage(
                 raise abort_type(
                     "visual alignment promoted identity was missed or "
                     "ambiguous on its first post-credit publication"
-            )
+                )
+            if (
+                current_publish_ns is not None
+                and int(current_publish_ns) > int(race_credit_ns)
+            ):
+                # Exact post-credit visual provenance is now available.  Do
+                # not spend another paced slot on zero before restricted
+                # alignment admission.
+                break
             command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
             dispatch_attempt_s = runtime.monotonic()
             try:
@@ -366,11 +420,6 @@ async def run_visual_alignment_stage(
                 now_s - proof.pass_confirmed_monotonic_s,
                 command,
             )
-            if (
-                current_publish_ns is not None
-                and int(current_publish_ns) > int(race_credit_ns)
-            ):
-                break
             next_tick = runtime.next_control_deadline(
                 next_tick,
                 runtime.monotonic(),
@@ -396,14 +445,41 @@ async def run_visual_alignment_stage(
             raise abort_type(
                 "visual alignment lacks an entry attitude estimate"
             )
-        entry_roll, entry_pitch, entry_yaw = (
+        entry_roll, entry_pitch, entry_measured_yaw = (
             float(value)
             for value in host.estimate.orientation.to_euler()
         )
+        yaw_reference = float(gate0_blend["yaw_reference_rad"])
         entry_state = host._assert_visual_alignment_attitude(
             entry_roll_rad=entry_roll,
             entry_pitch_rad=entry_pitch,
             phase="entry",
+        )
+        try:
+            entry_admission = require_visual_alignment_entry(
+                _entry_target,
+                measured_pitch_rad=entry_pitch,
+            )
+        except VisualAlignmentRefusal as exc:
+            raise abort_type(
+                f"visual alignment post-promotion entry refused: {exc}"
+            ) from exc
+        summary["entry_admission"] = asdict(entry_admission)
+        _entry_yaw_command, entry_yaw_excursion = (
+            runtime.visual_alignment_yaw_rate(
+                requested_rate_rad_s=0.0,
+                measured_yaw_rad=entry_measured_yaw,
+                reference_yaw_rad=yaw_reference,
+                measured_yaw_rate_rad_s=entry_state["yaw_rate_rad_s"],
+                horizontal_error_norm=_entry_target.normalized_x,
+                horizontal_corridor_norm=(
+                    host.visual_config.servo.horizontal_corridor
+                ),
+            )
+        )
+        summary["max_abs_yaw_excursion_rad"] = max(
+            float(summary["max_abs_yaw_excursion_rad"]),
+            abs(entry_yaw_excursion),
         )
         summary["max_peak_body_rate_rad_s"] = float(
             entry_state["peak_body_rate_rad_s"]
@@ -488,7 +564,7 @@ async def run_visual_alignment_stage(
                 runtime.visual_alignment_yaw_rate(
                     requested_rate_rad_s=0.0,
                     measured_yaw_rad=terminal_state["yaw_rad"],
-                    reference_yaw_rad=entry_yaw,
+                    reference_yaw_rad=yaw_reference,
                     measured_yaw_rate_rad_s=(
                         terminal_state["yaw_rate_rad_s"]
                     ),
@@ -630,7 +706,7 @@ async def run_visual_alignment_stage(
                 runtime.visual_alignment_yaw_rate(
                     requested_rate_rad_s=0.0,
                     measured_yaw_rad=state["yaw_rad"],
-                    reference_yaw_rad=entry_yaw,
+                    reference_yaw_rad=yaw_reference,
                     measured_yaw_rate_rad_s=state["yaw_rate_rad_s"],
                     horizontal_error_norm=target.normalized_x,
                     horizontal_corridor_norm=(
@@ -748,7 +824,7 @@ async def run_visual_alignment_stage(
                 runtime.visual_alignment_yaw_rate(
                     requested_rate_rad_s=latest_output.yaw_rate_rad_s,
                     measured_yaw_rad=state["yaw_rad"],
-                    reference_yaw_rad=entry_yaw,
+                    reference_yaw_rad=yaw_reference,
                     measured_yaw_rate_rad_s=state["yaw_rate_rad_s"],
                     horizontal_error_norm=(
                         latest_output.effective_horizontal_error
@@ -815,7 +891,7 @@ async def run_visual_alignment_stage(
                 runtime.visual_alignment_yaw_rate(
                     requested_rate_rad_s=command.yaw_rate,
                     measured_yaw_rad=send_state["yaw_rad"],
-                    reference_yaw_rad=entry_yaw,
+                    reference_yaw_rad=yaw_reference,
                     measured_yaw_rate_rad_s=send_state["yaw_rate_rad_s"],
                     horizontal_error_norm=(
                         latest_output.effective_horizontal_error

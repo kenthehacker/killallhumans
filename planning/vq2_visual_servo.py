@@ -77,9 +77,13 @@ class VisualServoTuning:
     collective_rate_gain: float = 0.080
     advance_pitch_rad: float = -0.105
     brake_pitch_rad: float = 0.035
-    align_thrust: float = 0.275
+    # No-advance modes start at the immutable minimum collective.  The
+    # image-space collective corrections below remain available for vertical
+    # alignment, but an uncorrected alignment/brake command must not retain
+    # the failed 0.275 forward-closure collective.
+    align_thrust: float = MIN_VISUAL_THRUST
     advance_thrust: float = 0.295
-    brake_thrust: float = 0.275
+    brake_thrust: float = MIN_VISUAL_THRUST
     required_corridor_frames: int = 3
 
     def __post_init__(self) -> None:
@@ -836,9 +840,12 @@ class ImageVisualServo:
             MIN_VISUAL_TARGET_PITCH_RAD,
             MAX_VISUAL_TARGET_PITCH_RAD,
         )
-        # This is the normalized form of the live-proved Gate-0 vertical
-        # pixel-space collective law: a gate high in the image requests more
-        # collective, while image motion toward the desired row damps it.
+        # This retains the live-proved Gate-0 vertical pixel-space collective
+        # law on top of the selected basis: a gate high in the image requests
+        # more collective, while image motion toward the desired row damps it.
+        # The default alignment and brake bases are MIN_VISUAL_THRUST, so a
+        # clipped/censored target with no safe vertical correction falls back
+        # to minimum collective rather than holding forward-closure thrust.
         thrust = _clamp(
             thrust_basis
             - self.tuning.collective_error_gain * vertical

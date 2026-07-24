@@ -61,6 +61,12 @@ from estimation.imu_attitude import (
     ImuAttitudeEstimator,
 )
 from gate_detection.src.gate_detector import GateDetection
+from planning.vq2_visual_servo import (
+    MAX_NEXT_GATE_BLEND,
+    ServoFrameToken,
+    VisualServoOutput,
+    VisualTarget,
+)
 from scripts.aigp_vq2_run import (
     CalibrationAdmission,
     CalibrationAdmissionServices,
@@ -2989,6 +2995,17 @@ def test_gate0_minimum_thrust_rejects_invalid_bounds_before_sampling(
     assert adapter.commands == []
 
 
+def test_runner_uses_bounded_real_frame_occlusion_association_horizon():
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+
+    assert (
+        runner.visual_tracker.config.max_association_gap_ns
+        == vq2_module.VISUAL_TRACKER_MAX_ASSOCIATION_GAP_NS
+        == 500_000_000
+    )
+    assert runner.visual_tracker.config.max_missed_frames == 12
+
+
 @pytest.mark.parametrize(
     "boost_until_s",
     (
@@ -3154,6 +3171,374 @@ def test_gate0_course_line_exit_counterroll_requires_preturn_before_sampling(
         )
 
     assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    "visual_next_gate_blend",
+    (None, 0, 1, 0.0, "true"),
+)
+def test_gate0_visual_next_gate_blend_rejects_non_bool_before_sampling(
+    monkeypatch,
+    visual_next_gate_blend,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid visual blend option reached sampling"),
+    )
+
+    with pytest.raises(ValueError, match="visual next-gate blend flag"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                visual_next_gate_blend=visual_next_gate_blend,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    "retired_course_line_option",
+    (
+        {"observe_course_line": True},
+        {"course_line_preturn": True},
+        {
+            "course_line_preturn": True,
+            "course_line_exit_counterroll_enabled": True,
+        },
+    ),
+)
+def test_gate0_visual_blend_rejects_retired_course_line_authority_before_sampling(
+    monkeypatch,
+    retired_course_line_option,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("mixed navigation authority reached sampling"),
+    )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                visual_next_gate_blend=True,
+                **retired_course_line_option,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+def test_gate0_visual_blend_requires_zero_crossing_hold_before_sampling(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("nonzero visual crossing hold reached sampling"),
+    )
+
+    with pytest.raises(ValueError, match="requires exact-zero crossing"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                visual_next_gate_blend=True,
+                crossing_hold_thrust=0.275,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossing(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    vision = _FakeVision()
+    vision.current_snapshot = _vision_snapshot(
+        frame_id=500,
+        received_monotonic_s=0.20,
+    )
+    runner = VQ2Runner(adapter, vision)
+    runner.estimate = _estimate(pitch=-0.05)
+    clock = [0.0]
+    sample_count = [0]
+    sent_commands = []
+    confirmation_commands = []
+    yaw_checks = []
+    current_track_id = "current-track"
+    next_track_id = "next-track"
+
+    graph = SimpleNamespace(
+        latest_snapshot=SimpleNamespace(
+            current_track_id=current_track_id,
+            current_gate_index=0,
+            authority_usable=True,
+            latest_camera_token=vq2_module.VisualCameraFrameToken(
+                generation=1,
+                frame_id=100,
+                publication_sequence=1,
+                stream_id="vq2-camera",
+            ),
+        )
+    )
+    runner.visual_gate_graph = graph
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=100,
+        sim_time_ns=100,
+        received_monotonic_s=0.0,
+        center_x=320,
+        center_y=180,
+        bbox=(240, 120, 160, 120),
+        confidence=0.9,
+    )
+    runner.tracker.consecutive = 3
+
+    class FakeApproach:
+        def __init__(self, expected_current_track_id, gate_index, _tuning):
+            assert expected_current_track_id == current_track_id
+            assert gate_index == 0
+            self.calls = 0
+
+        def observe(
+            self,
+            _snapshot,
+            _tracker,
+            *,
+            now_monotonic_s,
+            segment_elapsed_s,
+            segment_yaw_excursion_rad,
+        ):
+            assert segment_elapsed_s >= 0.0
+            assert abs(segment_yaw_excursion_rad) <= (
+                vq2_module.VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD
+            )
+            self.calls += 1
+            if self.calls == 4:
+                raise vq2_module.VisualApproachCurrentGeometryUnavailable(
+                    "authoritative current aperture is clipped or censored"
+                )
+            token = ServoFrameToken(
+                stream_id="vq2-camera",
+                generation=1,
+                frame_id=100 + self.calls,
+                publication_sequence=1 + self.calls,
+            )
+            current = VisualTarget(
+                track_id=current_track_id,
+                frame_token=token,
+                received_monotonic_s=now_monotonic_s,
+                normalized_x=0.02,
+                normalized_y_down=-0.04,
+                normalized_x_rate_s=0.0,
+                normalized_y_rate_down_s=0.0,
+                log_scale=-1.0,
+                log_scale_rate_s=0.2,
+                confidence=0.9,
+                association_confidence=0.9,
+                consecutive_frames=20,
+            )
+            next_target = VisualTarget(
+                track_id=next_track_id,
+                frame_token=token,
+                received_monotonic_s=now_monotonic_s,
+                normalized_x=0.30,
+                normalized_y_down=-0.20,
+                normalized_x_rate_s=0.0,
+                normalized_y_rate_down_s=0.0,
+                log_scale=-2.0,
+                log_scale_rate_s=0.1,
+                confidence=0.8,
+                association_confidence=0.8,
+                consecutive_frames=20,
+            )
+            output = VisualServoOutput(
+                target_roll_rad=0.0,
+                target_pitch_rad=0.03,
+                yaw_rate_rad_s=-0.02,
+                thrust=0.21,
+                corridor_frames=3,
+                advance_enabled=False,
+                next_gate_blend=MAX_NEXT_GATE_BLEND,
+                horizontal_error=0.02,
+                vertical_error_image_down=-0.04,
+                effective_horizontal_error=0.118,
+                effective_vertical_error_image_down=-0.096,
+                effective_horizontal_rate_s=0.0,
+                effective_vertical_rate_down_s=0.0,
+                next_horizontal_error=0.30,
+                next_vertical_error_image_down=-0.20,
+                horizontal_abs_error_delta=-0.01,
+                vertical_abs_error_delta=-0.01,
+                brake_reason="advance_not_authorized",
+                yaw_envelope_limited=False,
+            )
+            return vq2_module.VisualApproachProposal(
+                current_target=current,
+                next_target=next_target,
+                servo_output=output,
+                candidate_track_ids=(next_track_id,),
+                provisional_track_ids=(),
+                withholding_reason=None,
+                relationship_basis=None,
+                latched_next_track_id=next_track_id,
+            )
+
+    def sample():
+        sample_count[0] += 1
+        graph.latest_snapshot.latest_camera_token = (
+            vq2_module.VisualCameraFrameToken(
+                generation=1,
+                frame_id=100 + sample_count[0],
+                publication_sequence=1 + sample_count[0],
+                stream_id="vq2-camera",
+            )
+        )
+        if sample_count[0] == 5:
+            runner.tracker.target = vq2_module.GateTarget(
+                frame_id=200,
+                sim_time_ns=200,
+                received_monotonic_s=clock[0],
+                center_x=320,
+                center_y=180,
+                bbox=(60, 0, 520, 360),
+                confidence=0.9,
+            )
+            runner.tracker.consecutive = 3
+        if sample_count[0] == 12:
+            adapter.race_status = RaceStatus(1250, 0, -1, 1, 123)
+
+    async def send(command, **_kwargs):
+        sent_commands.append(command)
+        runner._last_flight_command_sent_s = clock[0]
+
+    async def sleep(seconds):
+        clock[0] += max(float(seconds), 0.02)
+
+    async def next_slot():
+        return clock[0]
+
+    original_yaw_rate = vq2_module.visual_alignment_yaw_rate
+
+    def checked_yaw_rate(**kwargs):
+        yaw_checks.append(
+            (
+                sample_count[0],
+                kwargs["requested_rate_rad_s"],
+                kwargs["reference_yaw_rad"],
+            )
+        )
+        return original_yaw_rate(**kwargs)
+
+    def record_tick(stage, _elapsed, command):
+        if stage == "gate0/confirm":
+            confirmation_commands.append(command)
+
+    monkeypatch.setattr(
+        vq2_module,
+        "RollingVisualApproachServo",
+        FakeApproach,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "visual_alignment_yaw_rate",
+        checked_yaw_rate,
+    )
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", send)
+    monkeypatch.setattr(runner, "_record_tick", record_tick)
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_next_flight_command_slot",
+        next_slot,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            perf_counter_ns=lambda: round(clock[0] * 1_000_000_000),
+        ),
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "asyncio",
+        SimpleNamespace(
+            sleep=sleep,
+            CancelledError=asyncio.CancelledError,
+        ),
+    )
+
+    result = asyncio.run(
+        runner._run_gate0(
+            vq2_module.StartContext(
+                spawn_roll_rad=0.0,
+                spawn_pitch_rad=-0.05,
+                initial_gate_x=320,
+                initial_gate_y=180,
+                initial_gate_area=6400,
+                go_boot_ms=1000,
+            ),
+            visual_next_gate_blend=True,
+        )
+    )
+
+    summary = result["visual_next_gate_blend"]
+    assert result["gate0_passed"] is True
+    assert summary["started"] is True
+    assert summary["blended_next_track_id"] == next_track_id
+    assert summary["fresh_blend_frame_count"] == 3
+    assert summary["command_count"] == 3
+    assert summary["withdrawn_before_confirmation"] is True
+    assert (
+        summary["withdrawal_reason"]
+        == "current_aperture_geometry_unavailable"
+    )
+    visual_commands = sent_commands[: summary["command_count"]]
+    assert visual_commands
+    assert all(
+        abs(command.roll_rate)
+        <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+        and abs(command.pitch_rate)
+        <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+        and abs(command.yaw_rate)
+        <= vq2_module.VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
+        and 0.21 <= command.thrust <= vq2_module.VISUAL_GATE0_BLEND_THRUST_CAP
+        for command in visual_commands
+    )
+    assert confirmation_commands
+    assert all(
+        command == AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+        for command in confirmation_commands
+    )
+    assert any(
+        sample >= 4 and requested == 0.0
+        for sample, requested, _reference in yaw_checks
+    )
+    assert any(
+        sample >= 10 and requested == 0.0
+        for sample, requested, _reference in yaw_checks
+    )
+    assert {reference for _sample, _requested, reference in yaw_checks} == {
+        0.0
+    }
 
 
 @pytest.mark.parametrize(

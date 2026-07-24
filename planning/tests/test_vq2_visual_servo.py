@@ -20,6 +20,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_SEGMENT_DURATION_S,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
+    MIN_VISUAL_THRUST,
     ServoFrameToken,
     VISUAL_SEGMENT_YAW_SOFT_STOP_RAD,
     VisualServoRefusal,
@@ -162,6 +163,9 @@ def test_aligns_before_enabling_forward_closure():
     servo = ImageVisualServo()
     first = step(servo, target(1, x=0.42, y=-0.36))
 
+    assert servo.tuning.align_thrust == MIN_VISUAL_THRUST
+    assert servo.tuning.brake_thrust == MIN_VISUAL_THRUST
+    assert servo.tuning.advance_thrust == 0.295
     assert first.advance_enabled is False
     assert first.brake_reason == "aligning"
     assert first.thrust > servo.tuning.align_thrust
@@ -203,7 +207,7 @@ def test_vertical_image_error_drives_pitch_in_both_directions():
     assert high.target_pitch_rad > 0.0
     assert low.target_pitch_rad == 0.0
     assert high.thrust > servo.tuning.align_thrust
-    assert low.thrust < servo.tuning.align_thrust
+    assert low.thrust == pytest.approx(MIN_VISUAL_THRUST)
 
 
 def test_scale_rate_brakes_even_after_corridor_dwell():
@@ -218,7 +222,7 @@ def test_scale_rate_brakes_even_after_corridor_dwell():
     assert accelerating.advance_enabled is False
     assert accelerating.brake_reason == "scale_rate"
     assert accelerating.target_pitch_rad > 0.0
-    assert accelerating.thrust < servo.tuning.brake_thrust
+    assert accelerating.thrust == pytest.approx(MIN_VISUAL_THRUST)
 
 
 def test_target_edge_brakes_instead_of_continuing_fixed_thrust():
@@ -695,15 +699,18 @@ def test_visual_track_adapter_requires_visible_race_labelled_current_authority()
     assert next_candidate.track_id == "vq2-track-000001"
 
 
-def test_top_clipping_suppresses_only_vertical_correction_and_brakes():
+def test_failed_top_clipped_geometry_brakes_at_minimum_collective():
     servo = ImageVisualServo()
     output = step(
         servo,
         target(
             1,
-            x=0.45,
-            y=-0.80,
-            y_rate=-0.4,
+            x=0.65625,
+            y=-0.7277777777777779,
+            x_rate=0.345412,
+            y_rate=-0.607664,
+            log_scale=-1.530552,
+            scale_rate=1.0593890808936899,
             clipped=True,
             center_censored=True,
             vertical_censored=True,
@@ -713,11 +720,14 @@ def test_top_clipping_suppresses_only_vertical_correction_and_brakes():
     assert output.advance_enabled is False
     assert output.brake_reason == "target_edge_or_clipping"
     assert output.yaw_rate_rad_s < 0.0
-    assert output.effective_horizontal_error == pytest.approx(0.45)
+    assert output.effective_horizontal_error == pytest.approx(0.65625)
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
-    assert output.target_pitch_rad == pytest.approx(servo.tuning.brake_pitch_rad)
-    assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
+    assert output.target_pitch_rad >= 0.0
+    assert output.target_pitch_rad == pytest.approx(
+        servo.tuning.brake_pitch_rad
+    )
+    assert output.thrust == pytest.approx(MIN_VISUAL_THRUST)
 
 
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():

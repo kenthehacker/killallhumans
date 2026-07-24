@@ -20,10 +20,140 @@ from planning.vq2_visual_servo import ServoFrameToken, VisualTarget
 MAX_ALIGNMENT_MONITOR_FRAMES = 64
 MAX_ALIGNMENT_DIVERGENCE_NORM = 0.08
 MAX_CONSECUTIVE_WORSENING_STEPS = 2
+MAX_CONSECUTIVE_GEOMETRY_CENSORED_RESPONSE_FRAMES = 2
+
+# Code-owned admission bounds for the first powered command after an
+# authoritative promotion.  These are safety policy, not controller tuning.
+POST_PROMOTION_ENTRY_MAX_ABS_X_NORM = 0.67
+POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM = 0.71
+POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S = 0.25
+POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S = 0.85
+POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD = -0.02
 
 
 class VisualAlignmentRefusal(ValueError):
     """The supplied observation cannot support a bounded alignment claim."""
+
+
+def _signed_outward_rate(error: float, rate: float) -> float:
+    """Return positive motion away from image center on one signed axis."""
+
+    if error > 0.0:
+        return rate
+    if error < 0.0:
+        return -rate
+    # At exact center either direction increases absolute error.
+    return abs(rate)
+
+
+@dataclass(frozen=True)
+class VisualAlignmentEntryAdmission:
+    """Exact bounded facts admitted for first post-promotion authority."""
+
+    track_id: str
+    frame_token: ServoFrameToken
+    horizontal_error: float
+    vertical_error_image_down: float
+    horizontal_outward_rate_s: float
+    vertical_outward_rate_down_s: float
+    log_scale_rate_s: float
+    measured_pitch_rad: float
+
+
+def require_visual_alignment_entry(
+    target: VisualTarget,
+    *,
+    measured_pitch_rad: float,
+) -> VisualAlignmentEntryAdmission:
+    """Fail closed unless a promoted target is safe for first command authority.
+
+    The check is deliberately image-relative and does not claim metric pose or
+    distance.  Its bounds are immutable module policy for the post-promotion
+    handoff; callers cannot loosen them through controller configuration.
+    """
+
+    if type(target) is not VisualTarget:
+        raise VisualAlignmentRefusal(
+            "post-promotion entry requires an exact VisualTarget"
+        )
+    if (
+        type(measured_pitch_rad) not in {int, float}
+        or not math.isfinite(float(measured_pitch_rad))
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion measured pitch must be finite"
+        )
+    if target.ambiguous:
+        raise VisualAlignmentRefusal(
+            "post-promotion entry target is ambiguous"
+        )
+    if (
+        target.clipped
+        or target.center_censored
+        or target.horizontal_geometry_censored
+        or target.vertical_geometry_censored
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion entry target geometry is clipped or censored"
+        )
+
+    horizontal = float(target.normalized_x)
+    vertical = float(target.normalized_y_down)
+    if abs(horizontal) > POST_PROMOTION_ENTRY_MAX_ABS_X_NORM:
+        raise VisualAlignmentRefusal(
+            "post-promotion horizontal error exceeds the entry bound"
+        )
+    if abs(vertical) > POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM:
+        raise VisualAlignmentRefusal(
+            "post-promotion vertical error exceeds the entry bound"
+        )
+
+    horizontal_outward_rate = _signed_outward_rate(
+        horizontal,
+        float(target.normalized_x_rate_s),
+    )
+    if (
+        horizontal_outward_rate
+        > POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion horizontal motion is outward above the entry bound"
+        )
+    vertical_outward_rate = _signed_outward_rate(
+        vertical,
+        float(target.normalized_y_rate_down_s),
+    )
+    if (
+        vertical_outward_rate
+        > POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion vertical motion is outward above the entry bound"
+        )
+    if (
+        float(target.log_scale_rate_s)
+        > POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion scale closure exceeds the entry bound"
+        )
+    if (
+        float(measured_pitch_rad)
+        < POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion measured pitch has not reached the entry brake bound"
+        )
+    return VisualAlignmentEntryAdmission(
+        track_id=target.track_id,
+        frame_token=target.frame_token,
+        horizontal_error=horizontal,
+        vertical_error_image_down=vertical,
+        horizontal_outward_rate_s=horizontal_outward_rate,
+        vertical_outward_rate_down_s=vertical_outward_rate,
+        log_scale_rate_s=float(target.log_scale_rate_s),
+        measured_pitch_rad=float(measured_pitch_rad),
+    )
 
 
 @dataclass(frozen=True)
@@ -84,9 +214,13 @@ class RestrictedAlignmentMonitor:
         self._required = required_improving_frames
         self._last_token: Optional[ServoFrameToken] = None
         self._processed = 0
+        self._response_evaluation_started = False
+        self._geometry_censored_response_streak = 0
         self._joint_streak = 0
         self._joint_frame_count = 0
         self._last_joint_errors: Optional[tuple[float, float]] = None
+        self._joint_horizontal_errors: list[float] = []
+        self._joint_vertical_errors: list[float] = []
         self._horizontal_errors: list[float] = []
         self._vertical_errors: list[float] = []
         self._horizontal_deltas: list[float] = []
@@ -94,9 +228,32 @@ class RestrictedAlignmentMonitor:
         self._scale_rates: list[float] = []
         self._horizontal_baseline: Optional[float] = None
         self._vertical_baseline: Optional[float] = None
+        self._last_horizontal_error: Optional[float] = None
+        self._last_vertical_error: Optional[float] = None
         self._horizontal_worsening_streak = 0
         self._vertical_worsening_streak = 0
         self._abort_reason: Optional[str] = None
+
+    def _reset_joint_evidence(self) -> None:
+        self._joint_streak = 0
+        self._joint_frame_count = 0
+        self._last_joint_errors = None
+        self._joint_horizontal_errors.clear()
+        self._joint_vertical_errors.clear()
+
+    def _reset_horizontal_evidence(self) -> None:
+        self._horizontal_errors.clear()
+        self._horizontal_deltas.clear()
+        self._horizontal_baseline = None
+        self._last_horizontal_error = None
+        self._horizontal_worsening_streak = 0
+
+    def _reset_vertical_evidence(self) -> None:
+        self._vertical_errors.clear()
+        self._vertical_deltas.clear()
+        self._vertical_baseline = None
+        self._last_vertical_error = None
+        self._vertical_worsening_streak = 0
 
     def observe(
         self,
@@ -142,83 +299,119 @@ class RestrictedAlignmentMonitor:
             raise VisualAlignmentRefusal("alignment scale rate is non-finite")
         self._scale_rates.append(scale_rate)
 
-        joint_usable = bool(
-            response_evaluation_enabled
-            and not target.horizontal_geometry_censored
-            and not target.vertical_geometry_censored
+        self._response_evaluation_started = bool(
+            self._response_evaluation_started
+            or response_evaluation_enabled
         )
-        if not joint_usable:
-            self._joint_streak = 0
-            self._joint_frame_count = 0
-            self._last_joint_errors = None
-            self._horizontal_worsening_streak = 0
-            self._vertical_worsening_streak = 0
-            self._horizontal_errors.clear()
-            self._vertical_errors.clear()
-            self._horizontal_deltas.clear()
-            self._vertical_deltas.clear()
-            self._horizontal_baseline = None
-            self._vertical_baseline = None
+        if not self._response_evaluation_started:
+            self._reset_joint_evidence()
             return self._snapshot(corridor_frames)
 
-        horizontal = abs(float(target.normalized_x))
-        vertical = abs(float(target.normalized_y_down))
-        if not math.isfinite(horizontal) or not math.isfinite(vertical):
-            raise VisualAlignmentRefusal("alignment errors are non-finite")
-        self._horizontal_errors.append(horizontal)
-        self._vertical_errors.append(vertical)
-        self._joint_frame_count += 1
-        if self._horizontal_baseline is None:
-            self._horizontal_baseline = horizontal
-        if self._vertical_baseline is None:
-            self._vertical_baseline = vertical
-
-        if horizontal > self._horizontal_baseline + MAX_ALIGNMENT_DIVERGENCE_NORM:
-            self._abort_reason = "horizontal_error_diverged"
-        if vertical > self._vertical_baseline + MAX_ALIGNMENT_DIVERGENCE_NORM:
+        horizontal_censored = target.horizontal_geometry_censored
+        vertical_censored = target.vertical_geometry_censored
+        geometry_censored = horizontal_censored or vertical_censored
+        self._geometry_censored_response_streak = (
+            self._geometry_censored_response_streak + 1
+            if geometry_censored
+            else 0
+        )
+        if (
+            self._geometry_censored_response_streak
+            >= MAX_CONSECUTIVE_GEOMETRY_CENSORED_RESPONSE_FRAMES
+        ):
             self._abort_reason = (
-                self._abort_reason or "vertical_error_diverged"
+                self._abort_reason or "geometry_censored_uninterrupted"
             )
 
+        horizontal: Optional[float] = None
+        if horizontal_censored:
+            self._reset_horizontal_evidence()
+        else:
+            horizontal = abs(float(target.normalized_x))
+            self._horizontal_errors.append(horizontal)
+            if self._horizontal_baseline is None:
+                self._horizontal_baseline = horizontal
+            if (
+                horizontal
+                > self._horizontal_baseline + MAX_ALIGNMENT_DIVERGENCE_NORM
+            ):
+                self._abort_reason = (
+                    self._abort_reason or "horizontal_error_diverged"
+                )
+            if self._last_horizontal_error is None:
+                self._horizontal_worsening_streak = 0
+            else:
+                horizontal_delta = (
+                    horizontal - self._last_horizontal_error
+                )
+                self._horizontal_deltas.append(horizontal_delta)
+                self._horizontal_worsening_streak = (
+                    self._horizontal_worsening_streak + 1
+                    if horizontal_delta > 0.0
+                    else 0
+                )
+                if (
+                    self._horizontal_worsening_streak
+                    >= MAX_CONSECUTIVE_WORSENING_STEPS
+                ):
+                    self._abort_reason = (
+                        self._abort_reason
+                        or "horizontal_error_worsening_uninterrupted"
+                    )
+            self._last_horizontal_error = horizontal
+
+        vertical: Optional[float] = None
+        if vertical_censored:
+            self._reset_vertical_evidence()
+        else:
+            vertical = abs(float(target.normalized_y_down))
+            self._vertical_errors.append(vertical)
+            if self._vertical_baseline is None:
+                self._vertical_baseline = vertical
+            if vertical > self._vertical_baseline + MAX_ALIGNMENT_DIVERGENCE_NORM:
+                self._abort_reason = (
+                    self._abort_reason or "vertical_error_diverged"
+                )
+            if self._last_vertical_error is None:
+                self._vertical_worsening_streak = 0
+            else:
+                vertical_delta = vertical - self._last_vertical_error
+                self._vertical_deltas.append(vertical_delta)
+                self._vertical_worsening_streak = (
+                    self._vertical_worsening_streak + 1
+                    if vertical_delta > 0.0
+                    else 0
+                )
+                if (
+                    self._vertical_worsening_streak
+                    >= MAX_CONSECUTIVE_WORSENING_STEPS
+                ):
+                    self._abort_reason = (
+                        self._abort_reason
+                        or "vertical_error_worsening_uninterrupted"
+                    )
+            self._last_vertical_error = vertical
+
+        if geometry_censored:
+            self._reset_joint_evidence()
+            return self._snapshot(corridor_frames)
+        assert horizontal is not None and vertical is not None
+
+        self._joint_horizontal_errors.append(horizontal)
+        self._joint_vertical_errors.append(vertical)
+        self._joint_frame_count += 1
         previous = self._last_joint_errors
         if previous is None:
             self._joint_streak = 1
-            self._horizontal_worsening_streak = 0
-            self._vertical_worsening_streak = 0
         else:
-            horizontal_delta = horizontal - previous[0]
-            vertical_delta = vertical - previous[1]
-            self._horizontal_deltas.append(horizontal_delta)
-            self._vertical_deltas.append(vertical_delta)
-            self._horizontal_worsening_streak = (
-                self._horizontal_worsening_streak + 1
-                if horizontal_delta > 0.0
-                else 0
-            )
-            self._vertical_worsening_streak = (
-                self._vertical_worsening_streak + 1
-                if vertical_delta > 0.0
-                else 0
-            )
-            if (
-                self._horizontal_worsening_streak
-                >= MAX_CONSECUTIVE_WORSENING_STEPS
-            ):
-                self._abort_reason = (
-                    self._abort_reason
-                    or "horizontal_error_worsening_uninterrupted"
-                )
-            if (
-                self._vertical_worsening_streak
-                >= MAX_CONSECUTIVE_WORSENING_STEPS
-            ):
-                self._abort_reason = (
-                    self._abort_reason
-                    or "vertical_error_worsening_uninterrupted"
-                )
+            horizontal_joint_delta = horizontal - previous[0]
+            vertical_joint_delta = vertical - previous[1]
             self._joint_streak = (
                 self._joint_streak + 1
-                if horizontal_delta < 0.0 and vertical_delta < 0.0
+                if (
+                    horizontal_joint_delta < 0.0
+                    and vertical_joint_delta < 0.0
+                )
                 else 1
             )
         self._last_joint_errors = (horizontal, vertical)
@@ -229,9 +422,13 @@ class RestrictedAlignmentMonitor:
             raise RuntimeError("alignment monitor has no exact frame")
         horizontal_values = tuple(self._horizontal_errors)
         vertical_values = tuple(self._vertical_errors)
+        joint_horizontal_values = tuple(self._joint_horizontal_errors)
+        joint_vertical_values = tuple(self._joint_vertical_errors)
         scale_rates = tuple(self._scale_rates)
         horizontal_trend = _signed_trend(horizontal_values)
         vertical_trend = _signed_trend(vertical_values)
+        joint_horizontal_trend = _signed_trend(joint_horizontal_values)
+        joint_vertical_trend = _signed_trend(joint_vertical_values)
         return VisualAlignmentTrend(
             track_id=self._track_id,
             latest_token=self._last_token,
@@ -252,6 +449,8 @@ class RestrictedAlignmentMonitor:
                 and self._joint_streak >= self._required
                 and horizontal_trend == "negative_uninterrupted"
                 and vertical_trend == "negative_uninterrupted"
+                and joint_horizontal_trend == "negative_uninterrupted"
+                and joint_vertical_trend == "negative_uninterrupted"
             ),
             abort_reason=self._abort_reason,
         )
@@ -260,8 +459,16 @@ class RestrictedAlignmentMonitor:
 __all__ = [
     "MAX_ALIGNMENT_DIVERGENCE_NORM",
     "MAX_ALIGNMENT_MONITOR_FRAMES",
+    "MAX_CONSECUTIVE_GEOMETRY_CENSORED_RESPONSE_FRAMES",
     "MAX_CONSECUTIVE_WORSENING_STEPS",
+    "POST_PROMOTION_ENTRY_MAX_ABS_X_NORM",
+    "POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM",
+    "POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S",
+    "POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S",
+    "POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD",
     "RestrictedAlignmentMonitor",
+    "VisualAlignmentEntryAdmission",
     "VisualAlignmentRefusal",
     "VisualAlignmentTrend",
+    "require_visual_alignment_entry",
 ]

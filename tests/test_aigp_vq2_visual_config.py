@@ -9,6 +9,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_SEGMENT_DURATION_S,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
+    MIN_VISUAL_THRUST,
 )
 from scripts.aigp_vq2_visual_config import (
     VISUAL_CONFIG_SCHEMA,
@@ -27,7 +28,13 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
 
     assert mapping["schema"] == VISUAL_CONFIG_SCHEMA
     assert mapping["controller_family"] == VISUAL_CONTROLLER_FAMILY
+    assert mapping["servo"]["align_thrust"] == MIN_VISUAL_THRUST
+    assert mapping["servo"]["brake_thrust"] == MIN_VISUAL_THRUST
+    assert mapping["servo"]["advance_thrust"] == 0.295
     assert config.to_effective_mapping() == mapping
+    assert config.effective_config_sha256 == (
+        "641309fd2fef6b51f8d4b43bb88893a7d9f2cd0f89d54a56a730733f1c6af138"
+    )
     assert len(config.effective_config_sha256) == 64
     assert canonical_visual_config_sha256(mapping) == (
         config.effective_config_sha256

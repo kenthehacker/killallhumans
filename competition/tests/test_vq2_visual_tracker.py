@@ -145,6 +145,58 @@ def test_tracks_every_detection_and_does_not_follow_largest_or_input_order() -> 
     assert {item.detection_source_index for item in second.associations} == {0, 1, 2}
 
 
+def test_bounded_aperture_occlusion_preserves_motion_consistent_identity() -> None:
+    """Mirror the 461.7 ms build-3385 Gate-0 occlusion without semantic labels."""
+
+    tracker = MultiTargetVisualTracker(
+        MultiTargetTrackerConfig(max_association_gap_ns=500_000_000)
+    )
+    track_id = ""
+    for sequence in range(1, 6):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _detection(
+                        0,
+                        0.435 + 0.006 * (sequence - 1),
+                        -0.443 - 0.006 * (sequence - 1),
+                        0.105,
+                        0.135,
+                    ),
+                ),
+            )
+        )
+        if sequence == 1:
+            track_id = update.visible_track_ids[0]
+    first_token = tracker.track(track_id).first_token
+
+    for sequence in range(6, 18):
+        tracker.update(_frame(sequence, ()))
+    assert tracker.track(track_id).missed_frame_count == 12
+    assert tracker.track(track_id).role is not VisualTrackRole.RETIRED
+
+    update = tracker.update(
+        _frame(
+            19,
+            (_detection(0, 0.553, -0.572, 0.140, 0.183),),
+        )
+    )
+
+    assert update.created_track_ids == ()
+    assert update.associated_track_ids == (track_id,)
+    assert update.visible_track_ids == (track_id,)
+    assert update.ambiguous_track_ids == ()
+    assert len(update.associations) == 1
+    assert update.associations[0].predicted_center_residual_norm < 0.08
+    assert update.associations[0].bbox_iou > 0.35
+    recovered = tracker.track(track_id)
+    assert recovered.first_token == first_token
+    assert recovered.total_observation_count == 6
+    assert recovered.consecutive_frame_count == 1
+    assert recovered.missed_frame_count == 0
+
+
 def test_nested_detections_retain_distinct_ids_through_contour_changes() -> None:
     tracker = MultiTargetVisualTracker()
     first = tracker.update(

@@ -72,6 +72,7 @@ from competition.vq2_contracts import FrameEdge
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from competition.vq2_visual_tracker import (
     CameraFrameToken as VisualCameraFrameToken,
+    MultiTargetTrackerConfig,
     MultiTargetVisualTracker,
     VisualDetectionFrame,
     VisualTrack,
@@ -90,6 +91,12 @@ from planning.vq2_gate_graph import (
     GateGraphError,
     GateGraphSnapshot,
     RollingVisualGateGraph,
+)
+from planning.vq2_visual_approach import (
+    RollingVisualApproachServo,
+    VisualApproachCurrentGeometryUnavailable,
+    VisualApproachProposal,
+    VisualApproachRefusal,
 )
 from planning.vq2_visual_alignment import VisualAlignmentTrend
 from planning.vq2_visual_servo import (
@@ -250,8 +257,8 @@ VISUAL_ALIGN_HARD_DURATION_S = 0.90
 VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S = 0.12
 VISUAL_ALIGN_RESPONSE_GRACE_S = 0.12
 VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.08
-VISUAL_ALIGN_YAW_SOFT_STOP_RAD = 0.060
-VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD = 0.075
+VISUAL_ALIGN_YAW_SOFT_STOP_RAD = 0.16
+VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD = 0.18
 VISUAL_ALIGN_YAW_HOLD_HORIZON_S = 0.12
 VISUAL_ALIGN_MAX_MEASURED_YAW_RATE_RAD_S = 0.35
 VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S = 0.12
@@ -262,6 +269,15 @@ VISUAL_ALIGN_MAX_ENTRY_ATTITUDE_DELTA_RAD = 0.08
 VISUAL_ALIGN_MAX_BODY_RATE_RAD_S = 0.50
 VISUAL_ALIGN_MIN_THRUST = 0.21
 VISUAL_ALIGN_MAX_THRUST = 0.30
+VISUAL_GATE0_BLEND_THRUST_CAP = 0.29
+# Real build-3385 replay proves the stable next gate is occluded by Gate 0 for
+# 461.7 ms, then reappears with 0.034 normalized prediction residual and 0.549
+# bbox IoU.  Preserve identity across that bounded aperture occlusion without
+# extending the existing 12-publication retirement lease.
+VISUAL_TRACKER_MAX_ASSOCIATION_GAP_NS = 500_000_000
+VISUAL_TRACKER_CONFIG = MultiTargetTrackerConfig(
+    max_association_gap_ns=VISUAL_TRACKER_MAX_ASSOCIATION_GAP_NS,
+)
 VISUAL_ALIGNMENT_STAGE_LIMITS = VisualAlignmentStageLimits(
     control_period_s=CONTROL_PERIOD_S,
     required_pretransition_frames=(
@@ -7213,7 +7229,7 @@ def visual_alignment_yaw_rate(
     The successful sign-ID calibration proves the command sign and the
     ``0.08 rad/s`` rate magnitude, but its ``0.05 rad`` experiment excursion
     was not a course-turn limit.  This stage owns a separately reviewed
-    ``0.060 rad`` soft stop and ``0.075 rad`` hard stop.  Inward recovery is
+    ``0.16 rad`` soft stop and ``0.18 rad`` hard stop.  Inward recovery is
     always retained; an outward command that has exhausted the soft envelope
     aborts while the target remains outside the horizontal corridor.
     """
@@ -7989,13 +8005,16 @@ class VQ2Runner:
         self._visual_tracking_enabled = False
         self._visual_diagnostic_logging = False
         self._visual_reset_epoch = 0
-        self.visual_tracker = MultiTargetVisualTracker()
+        self.visual_tracker = MultiTargetVisualTracker(
+            VISUAL_TRACKER_CONFIG
+        )
         self.visual_gate_graph = RollingVisualGateGraph()
         self._visual_latest_tracker_update: Any = None
         self._visual_latest_graph_snapshot: Optional[GateGraphSnapshot] = None
         self._visual_transition: Optional[ConfirmedGateTransition] = None
         self._visual_shadow_summary: Optional[Dict[str, Any]] = None
         self._visual_alignment_summary: Optional[Dict[str, Any]] = None
+        self._visual_gate0_blend_summary: Optional[Dict[str, Any]] = None
         self._visual_active_stage: Optional[str] = None
 
     def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
@@ -8243,7 +8262,9 @@ class VQ2Runner:
         self._gate1_recenter_summary = None
         self.tracker.reset()
         if self._visual_tracking_enabled:
-            self.visual_tracker = MultiTargetVisualTracker()
+            self.visual_tracker = MultiTargetVisualTracker(
+                VISUAL_TRACKER_CONFIG
+            )
             self.visual_gate_graph = RollingVisualGateGraph()
             self._visual_latest_tracker_update = None
             self._visual_latest_graph_snapshot = None
@@ -10759,6 +10780,11 @@ class VQ2Runner:
                     "max_abs_measured_yaw_rate_rad_s": 0.0,
                 }
             ),
+            "visual_next_gate_blend": (
+                None
+                if self._visual_gate0_blend_summary is None
+                else dict(self._visual_gate0_blend_summary)
+            ),
             "visual_transition": (
                 None
                 if visual_transition is None
@@ -10796,6 +10822,7 @@ class VQ2Runner:
         course_line_preturn: bool = False,
         course_line_exit_counterroll_enabled: bool = False,
         crossing_hold_thrust: float = 0.0,
+        visual_next_gate_blend: bool = False,
     ) -> Dict[str, Any]:
         controller = self.controller_config
         phase_timing = controller.phase_timing
@@ -10829,8 +10856,19 @@ class VQ2Runner:
             raise ValueError("gate-0 course-line preturn flag must be bool")
         if type(course_line_exit_counterroll_enabled) is not bool:
             raise ValueError("gate-0 course-line exit-counterroll flag must be bool")
+        if type(visual_next_gate_blend) is not bool:
+            raise ValueError("gate-0 visual next-gate blend flag must be bool")
         if course_line_exit_counterroll_enabled and not course_line_preturn:
             raise ValueError("gate-0 course-line exit counter-roll requires preturn")
+        if visual_next_gate_blend and (
+            observe_course_line
+            or course_line_preturn
+            or course_line_exit_counterroll_enabled
+        ):
+            raise ValueError(
+                "gate-0 visual next-gate blend is mutually exclusive with "
+                "retired course-line authority"
+            )
         if (
             type(crossing_hold_thrust) not in {int, float}
             or not math.isfinite(float(crossing_hold_thrust))
@@ -10841,9 +10879,18 @@ class VQ2Runner:
                 "gate-0 crossing hold thrust must be exact zero or the "
                 "Gate-1 continuation value"
             )
+        if (
+            visual_next_gate_blend
+            and float(crossing_hold_thrust) != 0.0
+        ):
+            raise ValueError(
+                "gate-0 visual next-gate blend requires exact-zero "
+                "crossing hold thrust"
+            )
 
         flight_start = await self._wait_for_next_flight_command_slot()
         self._gate0_early_turn_summary = None
+        self._visual_gate0_blend_summary = None
         next_tick = flight_start
         max_gate_area = context.initial_gate_area
         last_target_frame: Optional[int] = None
@@ -10861,6 +10908,46 @@ class VQ2Runner:
         course_line_exit_started = False
         early_turn_started_s: Optional[float] = None
         early_turn_command_count = 0
+        visual_approach: Optional[RollingVisualApproachServo] = None
+        latest_visual_proposal: Optional[VisualApproachProposal] = None
+        last_visual_approach_token: Optional[VisualCameraFrameToken] = None
+        visual_yaw_reference_rad: Optional[float] = None
+        visual_blend_withdrawn = False
+        if visual_next_gate_blend:
+            bound = self.visual_gate_graph.latest_snapshot
+            if (
+                bound is None
+                or bound.current_track_id is None
+                or bound.current_gate_index != 0
+                or not bound.authority_usable
+            ):
+                raise SafetyAbort(
+                    "gate-0 visual blend lacks a bound authoritative current gate"
+                )
+            visual_approach = RollingVisualApproachServo(
+                bound.current_track_id,
+                0,
+                self.visual_config.servo,
+            )
+            self._visual_gate0_blend_summary = {
+                "enabled": True,
+                "started": False,
+                "current_track_id": bound.current_track_id,
+                "blended_next_track_id": None,
+                "observed_next_track_ids": [],
+                "fresh_blend_frame_count": 0,
+                "command_count": 0,
+                "withdrawn_before_confirmation": False,
+                "withdrawal_reason": None,
+                "yaw_reference_rad": None,
+                "max_abs_yaw_excursion_rad": 0.0,
+                "max_abs_measured_yaw_rate_rad_s": 0.0,
+                "latest_horizontal_error": None,
+                "latest_vertical_error_image_down": None,
+                "latest_scale_rate_s": None,
+                "min_command_thrust": None,
+                "max_command_thrust": None,
+            }
         while True:
             now = time.monotonic()
             elapsed = now - flight_start
@@ -10916,6 +11003,190 @@ class VQ2Runner:
                     control_y=control_y,
                 )
 
+            if visual_approach is not None:
+                assert self._visual_gate0_blend_summary is not None
+                if crossing_armed and not visual_blend_withdrawn:
+                    visual_blend_withdrawn = True
+                    latest_visual_proposal = None
+                    self._visual_gate0_blend_summary.update(
+                        {
+                            "withdrawn_before_confirmation": True,
+                            "withdrawal_reason": "crossing_candidate_armed",
+                            "withdrawn_elapsed_s": elapsed,
+                        }
+                    )
+                    self.recorder.emit(
+                        "visual_next_gate_blend_withdrawn",
+                        elapsed_s=elapsed,
+                        reason="crossing_candidate_armed",
+                        current_track_id=(
+                            self._visual_gate0_blend_summary[
+                                "current_track_id"
+                            ]
+                        ),
+                        blended_next_track_id=(
+                            self._visual_gate0_blend_summary[
+                                "blended_next_track_id"
+                            ]
+                        ),
+                    )
+                elif not visual_blend_withdrawn:
+                    graph = self.visual_gate_graph.latest_snapshot
+                    if graph is None:
+                        raise SafetyAbort(
+                            "gate-0 visual blend lost its rolling graph"
+                        )
+                    if graph.latest_camera_token != last_visual_approach_token:
+                        _roll, _pitch, measured_yaw = (
+                            self.estimate.orientation.to_euler()
+                        )
+                        visual_yaw_excursion = (
+                            0.0
+                            if visual_yaw_reference_rad is None
+                            else math.atan2(
+                                math.sin(
+                                    float(measured_yaw)
+                                    - visual_yaw_reference_rad
+                                ),
+                                math.cos(
+                                    float(measured_yaw)
+                                    - visual_yaw_reference_rad
+                                ),
+                            )
+                        )
+                        try:
+                            proposal = visual_approach.observe(
+                                graph,
+                                self.visual_tracker,
+                                now_monotonic_s=(
+                                    time.perf_counter_ns()
+                                    / 1_000_000_000.0
+                                ),
+                                segment_elapsed_s=elapsed,
+                                segment_yaw_excursion_rad=(
+                                    visual_yaw_excursion
+                                ),
+                            )
+                        except VisualApproachCurrentGeometryUnavailable as exc:
+                            # The optional pre-pass blend owns no crossing
+                            # authority.  Withdraw it permanently when the
+                            # current aperture becomes censored and return to
+                            # the proved Gate-0 bootstrap controller.  All
+                            # identity/provenance refusals remain fatal below.
+                            visual_blend_withdrawn = True
+                            latest_visual_proposal = None
+                            self._visual_gate0_blend_summary.update(
+                                {
+                                    "withdrawn_before_confirmation": True,
+                                    "withdrawal_reason": (
+                                        "current_aperture_geometry_unavailable"
+                                    ),
+                                    "withdrawn_elapsed_s": elapsed,
+                                }
+                            )
+                            self.recorder.emit(
+                                "visual_next_gate_blend_withdrawn",
+                                elapsed_s=elapsed,
+                                reason=(
+                                    "current_aperture_geometry_unavailable"
+                                ),
+                                refusal=str(exc),
+                                current_track_id=(
+                                    self._visual_gate0_blend_summary[
+                                        "current_track_id"
+                                    ]
+                                ),
+                                blended_next_track_id=(
+                                    self._visual_gate0_blend_summary[
+                                        "blended_next_track_id"
+                                    ]
+                                ),
+                            )
+                        except VisualApproachRefusal as exc:
+                            raise SafetyAbort(
+                                f"gate-0 visual blend refused: {exc}"
+                            ) from exc
+                        else:
+                            last_visual_approach_token = (
+                                graph.latest_camera_token
+                            )
+                            observed_ids = list(
+                                self._visual_gate0_blend_summary[
+                                    "observed_next_track_ids"
+                                ]
+                            )
+                            for track_id in proposal.candidate_track_ids:
+                                if track_id not in observed_ids:
+                                    observed_ids.append(track_id)
+                            self._visual_gate0_blend_summary[
+                                "observed_next_track_ids"
+                            ] = observed_ids
+                            if proposal.servo_output.next_gate_blend > 0.0:
+                                if visual_yaw_reference_rad is None:
+                                    visual_yaw_reference_rad = float(
+                                        measured_yaw
+                                    )
+                                    self._visual_gate0_blend_summary.update(
+                                        {
+                                            "started": True,
+                                            "started_elapsed_s": elapsed,
+                                            "yaw_reference_rad": (
+                                                visual_yaw_reference_rad
+                                            ),
+                                        }
+                                    )
+                                latest_visual_proposal = proposal
+                                self._visual_gate0_blend_summary.update(
+                                    {
+                                        "blended_next_track_id": (
+                                            proposal.latched_next_track_id
+                                        ),
+                                        "fresh_blend_frame_count": (
+                                            int(
+                                                self._visual_gate0_blend_summary[
+                                                    "fresh_blend_frame_count"
+                                                ]
+                                            )
+                                            + 1
+                                        ),
+                                        "latest_horizontal_error": (
+                                            proposal.servo_output
+                                            .effective_horizontal_error
+                                        ),
+                                        "latest_vertical_error_image_down": (
+                                            proposal.servo_output
+                                            .effective_vertical_error_image_down
+                                        ),
+                                        "latest_scale_rate_s": (
+                                            proposal.current_target
+                                            .log_scale_rate_s
+                                        ),
+                                    }
+                                )
+                                self.recorder.emit(
+                                    "visual_next_gate_blend_frame",
+                                    elapsed_s=elapsed,
+                                    current_target=asdict(
+                                        proposal.current_target
+                                    ),
+                                    next_target=(
+                                        None
+                                        if proposal.next_target is None
+                                        else asdict(proposal.next_target)
+                                    ),
+                                    servo=asdict(proposal.servo_output),
+                                    candidate_track_ids=list(
+                                        proposal.candidate_track_ids
+                                    ),
+                                    relationship_basis=(
+                                        None
+                                        if proposal.relationship_basis is None
+                                        else proposal.relationship_basis.value
+                                    ),
+                                )
+                            else:
+                                latest_visual_proposal = None
+
             crossing_confirming = bool(
                 crossing_started_s is not None
                 or (
@@ -10934,6 +11205,51 @@ class VQ2Runner:
                 raise SafetyAbort(f"unexpected gate-index jump to {race.active_gate_index}")
             if self._gate1_yaw_reference_rad is not None:
                 self._gate1_yaw_envelope_state(phase="Gate-0 approach")
+            if visual_yaw_reference_rad is not None:
+                # Once the optional blend establishes its segment reference,
+                # its hard excursion/rate/momentum envelope remains latched
+                # through current-only frames, geometry withdrawal, exact-zero
+                # crossing confirmation, and the authoritative transition.
+                # Proposal availability controls command authority, not safety
+                # observation.
+                _roll, _pitch, measured_visual_yaw = (
+                    self.estimate.orientation.to_euler()
+                )
+                _zero_rate, latched_visual_yaw_excursion = (
+                    visual_alignment_yaw_rate(
+                        requested_rate_rad_s=0.0,
+                        measured_yaw_rad=float(measured_visual_yaw),
+                        reference_yaw_rad=visual_yaw_reference_rad,
+                        measured_yaw_rate_rad_s=float(
+                            self.estimate.body_rates[2]
+                        ),
+                        horizontal_error_norm=normalized_x,
+                        horizontal_corridor_norm=(
+                            self.visual_config.servo.horizontal_corridor
+                        ),
+                    )
+                )
+                assert self._visual_gate0_blend_summary is not None
+                self._visual_gate0_blend_summary.update(
+                    {
+                        "max_abs_yaw_excursion_rad": max(
+                            float(
+                                self._visual_gate0_blend_summary[
+                                    "max_abs_yaw_excursion_rad"
+                                ]
+                            ),
+                            abs(latched_visual_yaw_excursion),
+                        ),
+                        "max_abs_measured_yaw_rate_rad_s": max(
+                            float(
+                                self._visual_gate0_blend_summary[
+                                    "max_abs_measured_yaw_rate_rad_s"
+                                ]
+                            ),
+                            abs(float(self.estimate.body_rates[2])),
+                        ),
+                    }
+                )
             if not crossing_confirming and race.active_gate_index == 1:
                 if last_gate0_race_boot_ms is None:
                     raise SafetyAbort("gate 1 appeared without a recorded gate-0 packet")
@@ -11172,6 +11488,33 @@ class VQ2Runner:
                     thrust,
                     forward_braking.gate0_turn_thrust_cap,
                 )
+            visual_blend_active = latest_visual_proposal is not None
+            if visual_blend_active:
+                assert latest_visual_proposal is not None
+                visual_age_s = (
+                    time.perf_counter_ns() / 1_000_000_000.0
+                    - latest_visual_proposal.current_target.received_monotonic_s
+                )
+                if (
+                    visual_age_s < -1e-6
+                    or visual_age_s > MAX_VISUAL_OBSERVATION_AGE_S
+                    or latest_visual_proposal.next_target is None
+                    or latest_visual_proposal.servo_output.next_gate_blend
+                    <= 0.0
+                    or latest_visual_proposal.servo_output.advance_enabled
+                ):
+                    raise SafetyAbort(
+                        "gate-0 visual blend proposal lost fresh no-advance "
+                        "authority"
+                    )
+                target_pitch = max(
+                    target_pitch,
+                    min(
+                        VISUAL_ALIGN_MAX_PITCH_RAD,
+                        latest_visual_proposal.servo_output.target_pitch_rad,
+                    ),
+                )
+                thrust = min(thrust, VISUAL_GATE0_BLEND_THRUST_CAP)
 
             # At close range the uncorrected contour center becomes unsafe if
             # the lower gate edge is clipped.  Abort before impact when the
@@ -11189,10 +11532,46 @@ class VQ2Runner:
                 target_pitch_rad=target_pitch,
                 thrust=thrust,
             )
+            if visual_blend_active:
+                command = limit_command_rates(
+                    command,
+                    VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+                )
             local_yaw_rate = 0.0
             yaw_excursion = 0.0
             yaw_soft_stopped = False
-            if (
+            if visual_blend_active:
+                assert latest_visual_proposal is not None
+                assert visual_yaw_reference_rad is not None
+                _roll, _pitch, yaw = (
+                    self.estimate.orientation.to_euler()
+                )
+                local_yaw_rate, yaw_excursion = (
+                    visual_alignment_yaw_rate(
+                        requested_rate_rad_s=(
+                            latest_visual_proposal.servo_output
+                            .yaw_rate_rad_s
+                        ),
+                        measured_yaw_rad=float(yaw),
+                        reference_yaw_rad=visual_yaw_reference_rad,
+                        measured_yaw_rate_rad_s=float(
+                            self.estimate.body_rates[2]
+                        ),
+                        horizontal_error_norm=(
+                            latest_visual_proposal.servo_output
+                            .effective_horizontal_error
+                        ),
+                        horizontal_corridor_norm=(
+                            self.visual_config.servo.horizontal_corridor
+                        ),
+                    )
+                )
+                yaw_soft_stopped = bool(
+                    local_yaw_rate == 0.0
+                    and abs(yaw_excursion)
+                    >= VISUAL_ALIGN_YAW_SOFT_STOP_RAD
+                )
+            elif (
                 early_turn_active
                 and yaw_control.gate0_command_rate_cap_rad_s > 0.0
             ):
@@ -11225,12 +11604,102 @@ class VQ2Runner:
             if (
                 abs(command.yaw_rate) > SIGN_ID_RATE_RAD_S
                 or (
-                    not early_turn_active
+                    not (early_turn_active or visual_blend_active)
                     and command.yaw_rate != 0.0
                 )
             ):
                 raise SafetyAbort(
-                    "Gate-0 early-turn yaw escaped its fixed envelope"
+                    "Gate-0 bounded yaw escaped its fixed envelope"
+                )
+            if visual_blend_active:
+                assert self._visual_gate0_blend_summary is not None
+                command_count = (
+                    int(
+                        self._visual_gate0_blend_summary[
+                            "command_count"
+                        ]
+                    )
+                    + 1
+                )
+                self._visual_gate0_blend_summary.update(
+                    {
+                        "command_count": command_count,
+                        "last_command_yaw_rate_rad_s": local_yaw_rate,
+                        "last_target_pitch_rad": target_pitch,
+                        "last_yaw_excursion_rad": yaw_excursion,
+                        "yaw_soft_stopped": yaw_soft_stopped,
+                        "max_abs_yaw_excursion_rad": max(
+                            float(
+                                self._visual_gate0_blend_summary[
+                                    "max_abs_yaw_excursion_rad"
+                                ]
+                            ),
+                            abs(yaw_excursion),
+                        ),
+                        "max_abs_measured_yaw_rate_rad_s": max(
+                            float(
+                                self._visual_gate0_blend_summary[
+                                    "max_abs_measured_yaw_rate_rad_s"
+                                ]
+                            ),
+                            abs(float(self.estimate.body_rates[2])),
+                        ),
+                        "min_command_thrust": (
+                            command.thrust
+                            if self._visual_gate0_blend_summary[
+                                "min_command_thrust"
+                            ]
+                            is None
+                            else min(
+                                float(
+                                    self._visual_gate0_blend_summary[
+                                        "min_command_thrust"
+                                    ]
+                                ),
+                                command.thrust,
+                            )
+                        ),
+                        "max_command_thrust": (
+                            command.thrust
+                            if self._visual_gate0_blend_summary[
+                                "max_command_thrust"
+                            ]
+                            is None
+                            else max(
+                                float(
+                                    self._visual_gate0_blend_summary[
+                                        "max_command_thrust"
+                                    ]
+                                ),
+                                command.thrust,
+                            )
+                        ),
+                    }
+                )
+                self.recorder.emit(
+                    "visual_next_gate_blend_command",
+                    elapsed_s=elapsed,
+                    current_track_id=(
+                        latest_visual_proposal.current_target.track_id
+                    ),
+                    next_track_id=(
+                        latest_visual_proposal.next_target.track_id
+                        if latest_visual_proposal.next_target is not None
+                        else None
+                    ),
+                    effective_horizontal_error=(
+                        latest_visual_proposal.servo_output
+                        .effective_horizontal_error
+                    ),
+                    effective_vertical_error_image_down=(
+                        latest_visual_proposal.servo_output
+                        .effective_vertical_error_image_down
+                    ),
+                    target_pitch_rad=target_pitch,
+                    thrust=command.thrust,
+                    command_yaw_rate_rad_s=local_yaw_rate,
+                    yaw_excursion_rad=yaw_excursion,
+                    yaw_soft_stopped=yaw_soft_stopped,
                 )
             if early_turn_active:
                 early_turn_command_count += 1
@@ -14002,6 +14471,7 @@ class VQ2Runner:
             self._visual_reset_epoch = 0
             self._visual_shadow_summary = None
             self._visual_alignment_summary = None
+            self._visual_gate0_blend_summary = None
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
             context = await self.wait_for_go()

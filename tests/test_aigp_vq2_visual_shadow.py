@@ -590,7 +590,9 @@ class _Orientation:
 
 
 def _alignment_estimate():
-    orientation = _Orientation()
+    # Restricted alignment authority now requires an achieved neutral/braking
+    # pitch at entry, not merely a positive requested pitch.
+    orientation = _Orientation(pitch=0.0)
     return SimpleNamespace(
         orientation=orientation,
         body_rates=(0.0, 0.0, 0.0),
@@ -610,14 +612,17 @@ def _alignment_estimate():
     [
         (
             0.08,
-            0.059,
+            0.159,
             0.0,
             0.0,
             0.5,
-            (0.060 - 0.059)
+            (
+                vq2_module.VISUAL_ALIGN_YAW_SOFT_STOP_RAD
+                - 0.159
+            )
             / vq2_module.VISUAL_ALIGN_YAW_HOLD_HORIZON_S,
         ),
-        (-0.08, 0.061, 0.0, 0.0, 0.5, -0.08),
+        (-0.08, 0.161, 0.0, 0.0, 0.5, -0.08),
         (
             -0.08,
             -math.pi + 0.01,
@@ -656,7 +661,7 @@ def test_visual_alignment_yaw_envelope_aborts_exhausted_outward_authority():
     ):
         vq2_module.visual_alignment_yaw_rate(
             requested_rate_rad_s=0.08,
-            measured_yaw_rad=0.061,
+            measured_yaw_rad=0.161,
             reference_yaw_rad=0.0,
             measured_yaw_rate_rad_s=0.0,
             horizontal_error_norm=0.5,
@@ -671,7 +676,7 @@ def test_visual_alignment_yaw_envelope_aborts_outward_measured_momentum():
     ):
         vq2_module.visual_alignment_yaw_rate(
             requested_rate_rad_s=-0.08,
-            measured_yaw_rad=0.059,
+            measured_yaw_rad=0.159,
             reference_yaw_rad=0.0,
             measured_yaw_rate_rad_s=0.20,
             horizontal_error_norm=0.5,
@@ -909,9 +914,15 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
     clock = [0.320]
     commands = []
 
-    async def run_gate0(_context, *, capture_transition=False):
+    async def run_gate0(
+        _context,
+        *,
+        capture_transition=False,
+        visual_next_gate_blend=False,
+    ):
         assert _context is context
         assert capture_transition is False
+        assert visual_next_gate_blend is True
         _set_race(
             adapter,
             gate_index=1,
@@ -938,20 +949,33 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
             vision_received_monotonic_s=0.26,
             pass_rpy_rad=(0.0, -0.05, 0.0),
         )
-        return {"gate0_passed": True}
+        return {
+            "gate0_passed": True,
+            "visual_next_gate_blend": {
+                "enabled": True,
+                "started": True,
+                "current_track_id": initial_current_id,
+                "blended_next_track_id": promoted_id,
+                "fresh_blend_frame_count": 4,
+                "command_count": 4,
+                "withdrawn_before_confirmation": True,
+                "yaw_reference_rad": 0.0,
+                "max_abs_yaw_excursion_rad": 0.01,
+            },
+        }
 
     publications = [
-        (105, 465, 0, 0.320),
-        (106, 458, 12, 0.360),
-        (107, 451, 18, 0.380),
-        (108, 444, 24, 0.400),
-        (109, 437, 30, 0.420),
-        (110, 430, 36, 0.440),
-        (111, 423, 42, 0.460),
-        (112, 416, 48, 0.480),
-        (113, 409, 54, 0.500),
-        (114, 402, 60, 0.520),
-        (115, 395, 66, 0.540),
+        (105, 465, 65, 0.320),
+        (106, 458, 71, 0.360),
+        (107, 451, 77, 0.380),
+        (108, 444, 83, 0.400),
+        (109, 437, 89, 0.420),
+        (110, 430, 95, 0.440),
+        (111, 423, 101, 0.460),
+        (112, 416, 107, 0.480),
+        (113, 409, 113, 0.500),
+        (114, 402, 119, 0.520),
+        (115, 395, 125, 0.540),
     ]
     publication_index = [0]
 
@@ -967,7 +991,7 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
             runner,
             _frame(
                 frame_id,
-                [_detection(x, y, 50, 75)],
+                [_detection(x, y, 50, 60)],
                 final_packet_ns=round(
                     (perf_offset_s + observed_s) * 1_000_000_000
                 ),
@@ -1064,8 +1088,8 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         summary["eligible_joint_frame_count"]
     )
     assert summary["ambiguity"] is False
-    assert commands[0][1] == AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
-    navigation_commands = commands[1:]
+    assert summary["post_credit_zero_command_count"] == 0
+    navigation_commands = commands
     assert navigation_commands
     assert navigation_commands[0][1].yaw_rate < 0.0
     assert all(
@@ -1092,6 +1116,62 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
     )
 
 
+def test_visual_alignment_rejects_blended_identity_promotion_mismatch(
+    monkeypatch,
+):
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    context, initial_current_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+
+    async def run_gate0(
+        _context,
+        *,
+        capture_transition=False,
+        visual_next_gate_blend=False,
+    ):
+        assert _context is context
+        assert capture_transition is False
+        assert visual_next_gate_blend is True
+        _set_race(
+            adapter,
+            gate_index=1,
+            boot_ms=1_300,
+            sequence=11,
+            received_ns=300_000_000,
+        )
+        transition = runner._confirm_visual_transition(
+            from_gate_index=0,
+            to_gate_index=1,
+        )
+        assert transition.retired_track_id == initial_current_id
+        assert transition.promoted_track_id == promoted_id
+        return {
+            "gate0_passed": True,
+            "visual_next_gate_blend": {
+                "enabled": True,
+                "started": True,
+                "current_track_id": initial_current_id,
+                "blended_next_track_id": "different-prepass-track",
+                "fresh_blend_frame_count": 4,
+                "command_count": 4,
+                "withdrawn_before_confirmation": True,
+                "yaw_reference_rad": 0.0,
+                "max_abs_yaw_excursion_rad": 0.01,
+            },
+        }
+
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="blended identity was not authoritatively promoted",
+    ):
+        asyncio.run(runner._run_visual_alignment(context))
+
+
 def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
     monkeypatch,
 ):
@@ -1105,9 +1185,15 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
     clock = [0.320]
     failure_observed_s = []
 
-    async def run_gate0(_context, *, capture_transition=False):
+    async def run_gate0(
+        _context,
+        *,
+        capture_transition=False,
+        visual_next_gate_blend=False,
+    ):
         assert _context is context
         assert capture_transition is False
+        assert visual_next_gate_blend is True
         _set_race(
             adapter,
             gate_index=1,
@@ -1133,7 +1219,20 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
             vision_received_monotonic_s=0.26,
             pass_rpy_rad=(0.0, -0.05, 0.0),
         )
-        return {"gate0_passed": True}
+        return {
+            "gate0_passed": True,
+            "visual_next_gate_blend": {
+                "enabled": True,
+                "started": True,
+                "current_track_id": _initial_current_id,
+                "blended_next_track_id": promoted_id,
+                "fresh_blend_frame_count": 4,
+                "command_count": 4,
+                "withdrawn_before_confirmation": True,
+                "yaw_reference_rad": 0.0,
+                "max_abs_yaw_excursion_rad": 0.01,
+            },
+        }
 
     published = [False]
 
@@ -1143,7 +1242,7 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
                 runner,
                 _frame(
                     105,
-                    [_detection(465, 0, 50, 75)],
+                    [_detection(465, 65, 50, 60)],
                     final_packet_ns=320_000_000,
                 ),
             )
@@ -1166,6 +1265,18 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
         uncertain_send,
     )
     monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        lambda _estimate, *, target_roll_rad, target_pitch_rad, thrust: (
+            AttitudeRateCommand(
+                target_roll_rad,
+                target_pitch_rad,
+                0.0,
+                thrust,
+            )
+        ),
+    )
     with monkeypatch.context() as clock_patch:
         clock_patch.setattr(
             vq2_module,
@@ -1187,7 +1298,7 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
         )
         with pytest.raises(
             vq2_module.SafetyAbort,
-            match="post-credit zero dispatch failed closed",
+            match="visual alignment command dispatch failed closed",
         ):
             asyncio.run(runner._run_visual_alignment(context))
 
