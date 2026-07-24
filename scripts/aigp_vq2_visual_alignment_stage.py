@@ -290,6 +290,16 @@ async def run_visual_alignment_stage(
             observed = next_observed
             attempts += 1
 
+    def target_clock_s() -> float:
+        """Read the receiver/QPC clock used by exact visual sample times."""
+
+        value = runtime.perf_counter_ns()
+        if type(value) is not int or value < 0:
+            raise abort_type(
+                "visual alignment target clock is invalid"
+            )
+        return value / 1_000_000_000.0
+
     try:
         post_credit_deadline_s = runtime.post_gate_observation_deadline(
             pass_confirmed_s=proof.pass_confirmed_monotonic_s,
@@ -373,11 +383,10 @@ async def run_visual_alignment_stage(
                 )
             )
 
-        entry_now_s = runtime.monotonic()
         entry_track, _entry_target = host._require_visual_current_target(
             expected_gate_index=1,
             expected_track_id=promoted_track_id,
-            now_s=entry_now_s,
+            now_s=target_clock_s(),
         )
         host._assert_visual_alignment_no_passage(
             entry_track,
@@ -501,11 +510,12 @@ async def run_visual_alignment_stage(
                 float(summary["max_abs_measured_yaw_rate_rad_s"]),
                 abs(float(terminal_state["yaw_rate_rad_s"])),
             )
+            terminal_target_now_s = target_clock_s()
             terminal_track, terminal_target = (
                 host._require_visual_current_target(
                     expected_gate_index=1,
                     expected_track_id=promoted_track_id,
-                    now_s=terminal_now_s,
+                    now_s=terminal_target_now_s,
                 )
             )
             summary["latest_geometry"] = (
@@ -518,7 +528,7 @@ async def run_visual_alignment_stage(
                 try:
                     terminal_output = servo.step(
                         terminal_target,
-                        now_monotonic_s=terminal_now_s,
+                        now_monotonic_s=terminal_target_now_s,
                         segment_elapsed_s=(
                             terminal_now_s - segment_started_s
                         ),
@@ -604,10 +614,11 @@ async def run_visual_alignment_stage(
                 float(summary["max_peak_body_rate_rad_s"]),
                 float(state["peak_body_rate_rad_s"]),
             )
+            target_now_s = target_clock_s()
             track, target = host._require_visual_current_target(
                 expected_gate_index=1,
                 expected_track_id=promoted_track_id,
-                now_s=now_s,
+                now_s=target_now_s,
             )
             geometry = host._assert_visual_alignment_no_passage(
                 track,
@@ -641,7 +652,7 @@ async def run_visual_alignment_stage(
                 try:
                     latest_output = servo.step(
                         target,
-                        now_monotonic_s=now_s,
+                        now_monotonic_s=target_now_s,
                         segment_elapsed_s=elapsed_s,
                         segment_yaw_excursion_rad=yaw_excursion,
                         requested_next_blend=0.0,
@@ -789,7 +800,7 @@ async def run_visual_alignment_stage(
                 host._require_visual_current_target(
                     expected_gate_index=1,
                     expected_track_id=promoted_track_id,
-                    now_s=send_now_s,
+                    now_s=target_clock_s(),
                 )
             )
             host._assert_visual_alignment_no_passage(

@@ -174,7 +174,12 @@ def _update_visual(runner, frame):
     return update
 
 
-def _prime_bound_gate_graph(runner, adapter):
+def _prime_bound_gate_graph(
+    runner,
+    adapter,
+    *,
+    perf_clock_offset_ns=0,
+):
     """Create stable current/next identities and bind only Gate 0."""
 
     runner._visual_tracking_enabled = True
@@ -193,7 +198,11 @@ def _prime_bound_gate_graph(runner, adapter):
                         60,
                     ),
                 ],
-                final_packet_ns=100_000_000 + 40_000_000 * offset,
+                final_packet_ns=(
+                    perf_clock_offset_ns
+                    + 100_000_000
+                    + 40_000_000 * offset
+                ),
             ),
         )
     _set_race(
@@ -201,7 +210,7 @@ def _prime_bound_gate_graph(runner, adapter):
         gate_index=0,
         boot_ms=1_000,
         sequence=10,
-        received_ns=200_000_000,
+        received_ns=perf_clock_offset_ns + 200_000_000,
     )
     context = vq2_module.StartContext(0.0, -0.31, 320, 180, 6_400, 1_000)
     bound = runner._bind_initial_visual_gate(context)
@@ -222,7 +231,11 @@ def _prime_bound_gate_graph(runner, adapter):
                         60,
                     ),
                 ],
-                final_packet_ns=100_000_000 + 40_000_000 * offset,
+                final_packet_ns=(
+                    perf_clock_offset_ns
+                    + 100_000_000
+                    + 40_000_000 * offset
+                ),
             ),
         )
     next_ids = [
@@ -714,6 +727,62 @@ def test_visual_alignment_current_authority_rejects_a_fresh_track_miss():
         )
 
 
+def test_visual_alignment_current_authority_defaults_to_receiver_clock(
+    monkeypatch,
+):
+    perf_offset_s = 10.0
+    perf_offset_ns = round(perf_offset_s * 1_000_000_000)
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    _context, _initial_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+        perf_clock_offset_ns=perf_offset_ns,
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=perf_offset_ns + 300_000_000,
+    )
+    runner._confirm_visual_transition(
+        from_gate_index=0,
+        to_gate_index=1,
+    )
+    _update_visual(
+        runner,
+        _frame(
+            105,
+            [_detection(465, 15, 50, 75)],
+            final_packet_ns=perf_offset_ns + 320_000_000,
+        ),
+    )
+
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: 0.320,
+            perf_counter_ns=lambda: perf_offset_ns + 320_000_000,
+        ),
+    )
+    track, target = runner._require_visual_current_target(
+        expected_gate_index=1,
+        expected_track_id=promoted_id,
+    )
+    assert track.track_id == target.track_id == promoted_id
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="promoted visual current target is stale",
+    ):
+        runner._require_visual_current_target(
+            expected_gate_index=1,
+            expected_track_id=promoted_id,
+            now_s=perf_offset_s + 0.421,
+        )
+
+
 def test_visual_alignment_rejects_graph_or_race_ambiguity():
     adapter = _Adapter()
     runner = vq2_module.VQ2Runner(adapter, _Vision())
@@ -825,11 +894,16 @@ def test_visual_alignment_no_passage_bounds_fail_closed(
 def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
     monkeypatch,
 ):
+    # Windows build-3385 receiver timestamps use QPC while control pacing uses
+    # the coarser GetTickCount64 monotonic clock.  Keep their epochs distinct.
+    perf_offset_s = 10.0
+    perf_offset_ns = round(perf_offset_s * 1_000_000_000)
     adapter = _Adapter()
     runner = vq2_module.VQ2Runner(adapter, _Vision())
     context, initial_current_id, promoted_id = _prime_bound_gate_graph(
         runner,
         adapter,
+        perf_clock_offset_ns=perf_offset_ns,
     )
     runner.estimate = _alignment_estimate()
     clock = [0.320]
@@ -843,7 +917,7 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
             gate_index=1,
             boot_ms=1_300,
             sequence=11,
-            received_ns=300_000_000,
+            received_ns=perf_offset_ns + 300_000_000,
         )
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
@@ -894,13 +968,17 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
             _frame(
                 frame_id,
                 [_detection(x, y, 50, 75)],
-                final_packet_ns=round(observed_s * 1_000_000_000),
+                final_packet_ns=round(
+                    (perf_offset_s + observed_s) * 1_000_000_000
+                ),
             ),
         )
         publication_index[0] += 1
 
     async def send(command, **kwargs):
-        start_ns = round(clock[0] * 1_000_000_000)
+        start_ns = round(
+            (perf_offset_s + clock[0]) * 1_000_000_000
+        )
         not_before_ns = kwargs.get("wire_start_not_before_ns")
         deadline_ns = kwargs.get("wire_start_deadline_ns")
         if not_before_ns is not None:
@@ -955,7 +1033,7 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
             SimpleNamespace(
                 monotonic=lambda: clock[0],
                 perf_counter_ns=lambda: round(
-                    clock[0] * 1_000_000_000
+                    (perf_offset_s + clock[0]) * 1_000_000_000
                 ),
             ),
         )

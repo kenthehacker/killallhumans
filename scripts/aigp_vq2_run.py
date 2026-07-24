@@ -11509,7 +11509,11 @@ class VQ2Runner:
             raise SafetyAbort(
                 f"visual current-target adaptation refused: {exc}"
             ) from exc
-        observed_s = time.monotonic() if now_s is None else float(now_s)
+        observed_s = (
+            time.perf_counter_ns() / 1_000_000_000.0
+            if now_s is None
+            else float(now_s)
+        )
         age_s = observed_s - float(target.received_monotonic_s)
         if (
             not math.isfinite(age_s)
