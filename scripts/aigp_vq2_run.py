@@ -10263,6 +10263,29 @@ class VQ2Runner:
                 and current_target.age_s(checked_s) <= MAX_VISION_AGE_S
             )
 
+        def preshape_entry_attitude_state() -> Tuple[
+            bool, float, float, float
+        ]:
+            roll, pitch, _yaw = self.estimate.orientation.to_euler()
+            peak_rate = max(
+                abs(float(value))
+                for value in self.estimate.body_rates
+            )
+            admitted = bool(
+                abs(float(roll)) <= GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
+                and GATE0_PRESHAPE_MIN_PITCH_RAD
+                <= float(pitch)
+                <= GATE0_PRESHAPE_MAX_PITCH_RAD
+                and peak_rate
+                <= GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S
+            )
+            return (
+                admitted,
+                float(roll),
+                float(pitch),
+                float(peak_rate),
+            )
+
         def assert_sustained_authority_guard(
             current_target: GateTarget,
             checked_s: float,
@@ -10522,14 +10545,39 @@ class VQ2Runner:
                         )
                     longitudinal_brake_last_proof = current_proof
                     longitudinal_brake_proof_count += 1
-                    if (
-                        target.bbox_area
-                        >= GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
-                        * context.initial_gate_area
-                    ):
-                        longitudinal_brake_area_proof_count += 1
-                    else:
-                        longitudinal_brake_area_proof_count = 0
+                    if longitudinal_brake_started_s is None:
+                        if (
+                            target.bbox_area
+                            >= GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
+                            * context.initial_gate_area
+                        ):
+                            (
+                                entry_admitted,
+                                candidate_roll,
+                                candidate_pitch,
+                                candidate_peak_rate,
+                            ) = preshape_entry_attitude_state()
+                            if entry_admitted:
+                                longitudinal_brake_area_proof_count += 1
+                            else:
+                                longitudinal_brake_area_proof_count = 0
+                                self.recorder.emit(
+                                    "gate0_longitudinal_brake_entry_rejected",
+                                    elapsed_s=elapsed,
+                                    frame_id=target.frame_id,
+                                    gate_area_scale=(
+                                        float(target.bbox_area)
+                                        / float(context.initial_gate_area)
+                                    ),
+                                    reason="fixed_attitude_envelope",
+                                    roll_rad=candidate_roll,
+                                    pitch_rad=candidate_pitch,
+                                    peak_body_rate_rad_s=(
+                                        candidate_peak_rate
+                                    ),
+                                )
+                        else:
+                            longitudinal_brake_area_proof_count = 0
                 else:
                     longitudinal_brake_last_proof = None
                     longitudinal_brake_proof_count = 0
@@ -10545,24 +10593,15 @@ class VQ2Runner:
                     and longitudinal_brake_area_proof_count
                     >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
                 ):
-                    entry_roll, entry_pitch, _entry_yaw = (
-                        self.estimate.orientation.to_euler()
-                    )
-                    entry_peak_rate = max(
-                        abs(float(value))
-                        for value in self.estimate.body_rates
-                    )
-                    if not (
-                        abs(float(entry_roll))
-                        <= GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
-                        and GATE0_PRESHAPE_MIN_PITCH_RAD
-                        <= float(entry_pitch)
-                        <= GATE0_PRESHAPE_MAX_PITCH_RAD
-                        and entry_peak_rate
-                        <= GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S
-                    ):
+                    (
+                        entry_admitted,
+                        entry_roll,
+                        entry_pitch,
+                        entry_peak_rate,
+                    ) = preshape_entry_attitude_state()
+                    if not entry_admitted:
                         raise SafetyAbort(
-                            "Gate-0 longitudinal-brake latch exceeded its "
+                            "Gate-0 longitudinal-brake latch escaped its "
                             "fixed attitude envelope"
                         )
                     longitudinal_brake_started_s = now

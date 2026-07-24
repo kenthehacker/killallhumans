@@ -4189,6 +4189,12 @@ def _exercise_sustained_gate0_without_cue(
                 pitch=-0.176264,
                 yaw=0.0,
             )
+        elif entry_attitude_fault and sample_count[0] == 7:
+            runner.estimate = _estimate(
+                roll=0.0,
+                pitch=-0.176264,
+                yaw=0.0,
+            )
         if (
             authority_boundary_fault == "duration"
             and sample_count[0] == 10
@@ -4282,7 +4288,6 @@ def _exercise_sustained_gate0_without_cue(
             CommandsCaptured
             if (
                 post_latch_fault is None
-                and not entry_attitude_fault
                 and authority_boundary_fault is None
             )
             else SafetyAbort
@@ -4299,7 +4304,7 @@ def _exercise_sustained_gate0_without_cue(
     return runner, commands, events
 
 
-def test_sustained_gate0_brake_rejects_unsafe_eligible_entry(
+def test_sustained_gate0_brake_requires_three_safe_frames_after_rejection(
     monkeypatch,
 ):
     runner, commands, events = _exercise_sustained_gate0_without_cue(
@@ -4307,12 +4312,22 @@ def test_sustained_gate0_brake_rejects_unsafe_eligible_entry(
         entry_attitude_fault=True,
     )
 
-    assert len(commands) == 5
-    assert not any(
-        event == "gate0_longitudinal_brake_latched"
-        for event, _payload in events
-    )
-    assert runner._gate0_early_turn_summary is None
+    assert len(commands) == 10
+    rejected = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_entry_rejected"
+    ]
+    latches = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["frame_id"] == 6
+    assert len(latches) == 1
+    assert latches[0]["frame_id"] == 9
+    assert runner._gate0_early_turn_summary is not None
 
 
 def test_sustained_gate0_brake_area_streak_resets_on_rejected_frame(
