@@ -10237,6 +10237,10 @@ class VQ2Runner:
         longitudinal_brake_last_detection_token: Optional[
             Tuple[int, int, int, float]
         ] = None
+        longitudinal_brake_anchor_center_y_px: Optional[float] = None
+        longitudinal_brake_last_center_y_px: Optional[float] = None
+        longitudinal_brake_last_observed_center_y_px: Optional[float] = None
+        longitudinal_brake_vertical_ready_count = 0
         preshape_latched_sign: Optional[float] = None
         preshape_max_abs_proved_score = 0.0
         preshape_entry_generation: Optional[int] = None
@@ -10742,14 +10746,92 @@ class VQ2Runner:
                         candidate_peak_rate,
                     ) = preshape_entry_attitude_state()
                     if entry_admitted:
+                        current_center_y_px = float(target.center_y)
+                        if not math.isfinite(current_center_y_px):
+                            raise SafetyAbort(
+                                "Gate-0 sustained preshape vertical "
+                                "readiness was non-finite"
+                            )
+                        if course_turn_streak == 1:
+                            longitudinal_brake_last_center_y_px = None
+                            longitudinal_brake_last_observed_center_y_px = None
+                            longitudinal_brake_vertical_ready_count = 0
+                        if longitudinal_brake_anchor_center_y_px is None:
+                            longitudinal_brake_anchor_center_y_px = (
+                                current_center_y_px
+                            )
+                        previous_center_y_px = (
+                            longitudinal_brake_last_center_y_px
+                        )
+                        previous_observed_center_y_px = (
+                            longitudinal_brake_last_observed_center_y_px
+                        )
+                        longitudinal_brake_last_observed_center_y_px = (
+                            current_center_y_px
+                        )
+                        recovered_to_anchor = bool(
+                            current_center_y_px
+                            >= float(
+                                longitudinal_brake_anchor_center_y_px
+                            )
+                        )
+                        vertical_non_departing = bool(
+                            recovered_to_anchor
+                            and (
+                                previous_center_y_px is None
+                                or current_center_y_px
+                                >= float(previous_center_y_px)
+                            )
+                        )
+                        if vertical_non_departing:
+                            longitudinal_brake_vertical_ready_count += 1
+                            longitudinal_brake_last_center_y_px = (
+                                current_center_y_px
+                            )
+                        elif recovered_to_anchor:
+                            longitudinal_brake_vertical_ready_count = 1
+                            longitudinal_brake_last_center_y_px = (
+                                current_center_y_px
+                            )
+                        else:
+                            longitudinal_brake_vertical_ready_count = 0
+                            longitudinal_brake_last_center_y_px = None
+                        if not vertical_non_departing:
+                            self.recorder.emit(
+                                "gate0_preshape_vertical_readiness_reset",
+                                elapsed_s=elapsed,
+                                frame_id=target.frame_id,
+                                gate_area_scale=(
+                                    float(target.bbox_area)
+                                    / float(context.initial_gate_area)
+                                ),
+                                previous_center_y_px=(
+                                    None
+                                    if previous_observed_center_y_px is None
+                                    else float(
+                                        previous_observed_center_y_px
+                                    )
+                                ),
+                                comparison_center_y_px=float(
+                                    previous_center_y_px
+                                    if previous_center_y_px is not None
+                                    else longitudinal_brake_anchor_center_y_px
+                                ),
+                                anchor_center_y_px=float(
+                                    longitudinal_brake_anchor_center_y_px
+                                ),
+                                center_y_px=current_center_y_px,
+                            )
                         longitudinal_brake_last_proof = current_proof
                         longitudinal_brake_proof_count = min(
                             course_turn_streak,
                             longitudinal_brake_proof_count + 1,
+                            longitudinal_brake_vertical_ready_count,
                         )
                         longitudinal_brake_area_proof_count = min(
                             course_turn_streak,
                             longitudinal_brake_area_proof_count + 1,
+                            longitudinal_brake_vertical_ready_count,
                         )
                         if (
                             longitudinal_brake_proof_count
@@ -10777,6 +10859,13 @@ class VQ2Runner:
                                 area_proof_frame_count=(
                                     longitudinal_brake_area_proof_count
                                 ),
+                                center_y_px=current_center_y_px,
+                                anchor_center_y_px=float(
+                                    longitudinal_brake_anchor_center_y_px
+                                ),
+                                vertical_ready_frame_count=(
+                                    longitudinal_brake_vertical_ready_count
+                                ),
                                 roll_rad=float(candidate_roll),
                                 pitch_rad=float(candidate_pitch),
                                 peak_body_rate_rad_s=float(
@@ -10793,12 +10882,22 @@ class VQ2Runner:
                                     / float(context.initial_gate_area)
                                 ),
                                 pitch_rad=float(candidate_pitch),
+                                center_y_px=current_center_y_px,
+                                anchor_center_y_px=float(
+                                    longitudinal_brake_anchor_center_y_px
+                                ),
+                                vertical_ready_frame_count=(
+                                    longitudinal_brake_vertical_ready_count
+                                ),
                                 ready_frame_count=(
                                     longitudinal_brake_area_proof_count
                                 ),
                             )
                     else:
                         longitudinal_brake_last_proof = None
+                        longitudinal_brake_last_center_y_px = None
+                        longitudinal_brake_last_observed_center_y_px = None
+                        longitudinal_brake_vertical_ready_count = 0
                         longitudinal_brake_proof_count = 0
                         longitudinal_brake_area_proof_count = 0
                         sustained_preshape_entry_proved = False
@@ -10847,6 +10946,9 @@ class VQ2Runner:
                         )
                     )
                     longitudinal_brake_last_proof = None
+                    longitudinal_brake_last_center_y_px = None
+                    longitudinal_brake_last_observed_center_y_px = None
+                    longitudinal_brake_vertical_ready_count = 0
                     longitudinal_brake_proof_count = 0
                     longitudinal_brake_area_proof_count = 0
                     sustained_preshape_entry_proved = False

@@ -4252,6 +4252,7 @@ def _exercise_sustained_gate0_with_cue(
     entry_window_sample=None,
     entry_window_height_px=100,
     expected_abort_match=None,
+    center_y_by_sample=None,
 ):
     class CommandsCaptured(Exception):
         pass
@@ -4393,7 +4394,11 @@ def _exercise_sustained_gate0_with_cue(
             sim_time_ns=sample_count[0],
             received_monotonic_s=received_s,
             center_x=320,
-            center_y=180,
+            center_y=(
+                180
+                if center_y_by_sample is None
+                else center_y_by_sample.get(sample_count[0], 180)
+            ),
             bbox=(
                 (277, 132, 86, 96)
                 if sample_count[0] <= 3
@@ -4680,6 +4685,171 @@ def test_sustained_gate0_exact_pitch_readiness_boundary_admits(
     assert proof["frame_id"] == 6
     assert proof["pitch_rad"] == pytest.approx(
         vq2_module.GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD
+    )
+
+
+def test_sustained_gate0_vertical_departure_resets_joint_proof(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        center_y_by_sample={
+            4: 147,
+            5: 146,
+            6: 146,
+            7: 147,
+            8: 147,
+            9: 148,
+        },
+    )
+
+    resets = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_vertical_readiness_reset"
+    ]
+    deferred = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_admission_deferred"
+    ]
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    assert [payload["frame_id"] for payload in resets] == [5, 6]
+    assert all(
+        payload["anchor_center_y_px"] == 147.0
+        and payload["center_y_px"] == 146.0
+        for payload in resets
+    )
+    assert [
+        payload["previous_center_y_px"]
+        for payload in resets
+    ] == [147.0, 146.0]
+    assert [
+        payload["comparison_center_y_px"]
+        for payload in resets
+    ] == [147.0, 147.0]
+    assert [payload["ready_frame_count"] for payload in deferred] == [
+        1,
+        0,
+        0,
+        1,
+        2,
+    ]
+    assert proof["frame_id"] == 9
+    assert proof["center_y_px"] == 148.0
+    assert proof["anchor_center_y_px"] == 147.0
+    assert proof["vertical_ready_frame_count"] == 3
+    assert all(command.yaw_rate == 0.0 for command in commands[:8])
+    assert commands[8].yaw_rate < 0.0
+
+
+def test_sustained_gate0_lower_vertical_plateau_cannot_replace_anchor(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        center_y_by_sample={
+            4: 147,
+            5: 146,
+            6: 146,
+            7: 146,
+            8: 146,
+            9: 146,
+            10: 146,
+        },
+    )
+
+    assert len(commands) == 10
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert not any(
+        event == "gate0_sustained_preshape_entry_proved"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+
+
+@pytest.mark.parametrize("reset_kind", ("pitch", "cue", "cue_sign"))
+def test_sustained_gate0_vertical_anchor_survives_joint_reset(
+    monkeypatch,
+    reset_kind,
+):
+    kwargs = {
+        "center_y_by_sample": {
+            4: 147,
+            5: 146,
+            6: 146,
+            7: 146,
+            8: 146,
+            9: 146,
+            10: 146,
+        },
+    }
+    if reset_kind == "pitch":
+        kwargs["pitch_by_sample"] = {5: -0.17}
+    elif reset_kind == "cue":
+        kwargs["turn_score_by_sample"] = {5: None}
+    else:
+        kwargs["turn_score_by_sample"] = {5: -0.20}
+
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        **kwargs,
+    )
+
+    assert len(commands) == 10
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert not any(
+        event == "gate0_sustained_preshape_entry_proved"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    resets = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_vertical_readiness_reset"
+    ]
+    assert resets
+    assert all(
+        payload["anchor_center_y_px"] == 147.0
+        for payload in resets
+    )
+
+
+def test_sustained_gate0_continuing_vertical_departure_never_latches(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        center_y_by_sample={
+            4: 147,
+            5: 146,
+            6: 145,
+            7: 144,
+            8: 143,
+            9: 142,
+            10: 141,
+        },
+    )
+
+    assert len(commands) == 10
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert not any(
+        event == "gate0_sustained_preshape_entry_proved"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
     )
 
 
