@@ -1748,6 +1748,7 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
+    assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_MIN_THRUST == 0.21
     assert vq2_module.GATE1_RECENTER_MAX_THRUST == 0.30
     assert vq2_module.GATE1_RECENTER_CORRIDOR_NORMALIZED_X == 0.35
@@ -2882,8 +2883,16 @@ def test_offline_gate1_recenter_composition_uses_proved_default_stages(
     result = asyncio.run(runner._run_gate1_recenter_candidate(context))
 
     assert calls == [
-        ("gate0", context, {}),
-        ("observe", gate0, {}),
+        (
+            "gate0",
+            context,
+            {"crossing_hold_thrust": 0.275},
+        ),
+        (
+            "observe",
+            gate0,
+            {"hold_thrust": 0.275},
+        ),
         ("recenter", observation, {}),
     ]
     assert result == {
@@ -2945,6 +2954,35 @@ def test_gate0_boost_duration_rejects_invalid_bounds_before_sampling(
     with pytest.raises(ValueError, match="boost.*duration"):
         asyncio.run(
             runner._run_gate0(context, boost_until_s=boost_until_s)
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    "crossing_hold_thrust",
+    (True, math.nan, 0.20, 0.30),
+)
+def test_gate0_crossing_hold_thrust_rejects_unadmitted_values_before_sampling(
+    monkeypatch,
+    crossing_hold_thrust,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid crossing thrust reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="crossing hold thrust"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                crossing_hold_thrust=crossing_hold_thrust,
+            )
         )
 
     assert adapter.commands == []
@@ -4464,13 +4502,22 @@ def test_repeated_tiny_pad_contacts_exceed_cumulative_launch_budget(monkeypatch)
 
 
 @pytest.mark.parametrize(
-    ("post_cross_gate_index", "expected_reason"),
-    [(1, None), (0, "not credited")],
+    (
+        "post_cross_gate_index",
+        "expected_reason",
+        "crossing_hold_thrust",
+    ),
+    [
+        (1, None, 0.0),
+        (1, None, 0.275),
+        (0, "not credited", 0.0),
+    ],
 )
-def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
+def test_gate0_confirmation_uses_configured_hold_then_new_race_packet(
     monkeypatch,
     post_cross_gate_index,
     expected_reason,
+    crossing_hold_thrust,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = True
@@ -4503,6 +4550,7 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
     clock = [0.0]
     sample_count = [0]
     watchdog_target_requirements = []
+    confirmation_commands = []
 
     def fake_monotonic():
         return clock[0]
@@ -4543,10 +4591,15 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
     def fake_watchdog(**kwargs):
         watchdog_target_requirements.append(kwargs["require_target"])
 
+    def record_tick(stage, _elapsed, command):
+        if stage == "gate0/confirm":
+            confirmation_commands.append(command)
+
     monkeypatch.setattr(vq2_module.time, "monotonic", fake_monotonic)
     monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
     monkeypatch.setattr(runner, "_sample", fake_sample)
     monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
+    monkeypatch.setattr(runner, "_record_tick", record_tick)
 
     context = vq2_module.StartContext(
         spawn_roll_rad=0.0,
@@ -4561,6 +4614,7 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
             runner._run_gate0(
                 context,
                 boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+                crossing_hold_thrust=crossing_hold_thrust,
             )
         )
         assert result["gate0_passed"]
@@ -4571,20 +4625,20 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
                 runner._run_gate0(
                     context,
                     boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+                    crossing_hold_thrust=crossing_hold_thrust,
                 )
             )
 
-    first_zero = next(
-        index
-        for index, command in enumerate(adapter.commands)
-        if command.thrust == 0.0
-    )
+    assert confirmation_commands
     assert all(
-        command.thrust == 0.0
-        and command.roll_rate == 0.0
-        and command.pitch_rate == 0.0
-        and command.yaw_rate == 0.0
-        for command in adapter.commands[first_zero:]
+        command
+        == AttitudeRateCommand(
+            0.0,
+            0.0,
+            0.0,
+            crossing_hold_thrust,
+        )
+        for command in confirmation_commands
     )
     assert False in watchdog_target_requirements
 
@@ -4648,8 +4702,10 @@ def _publish_observation_frame(runner, *, frame_id, clock, detection):
     runner._latest_accepted_target = accepted
 
 
-def test_gate1_observation_requires_three_new_frames_and_sends_only_paced_zero(
+@pytest.mark.parametrize("hold_thrust", (0.0, 0.275))
+def test_gate1_observation_requires_three_new_frames_and_paced_zero_rates(
     monkeypatch,
+    hold_thrust,
 ):
     clock = [10.0]
     runner, adapter, vision, details = _configure_gate1_observer(clock=clock)
@@ -4686,14 +4742,17 @@ def test_gate1_observation_requires_three_new_frames_and_sends_only_paced_zero(
     monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
     monkeypatch.setattr(adapter, "send_attitude_rate", recorded_send)
 
-    result = asyncio.run(runner._observe_gate1(details))
+    result = asyncio.run(
+        runner._observe_gate1(details, hold_thrust=hold_thrust)
+    )
 
     assert result["gate1_observed"]
     assert result["frame_count"] == 3
     assert [frame["frame_id"] for frame in result["frames"]] == [101, 102, 103]
     assert len(adapter.commands) == 2
     assert all(
-        command.roll_rate == command.pitch_rate == command.yaw_rate == command.thrust == 0.0
+        command.roll_rate == command.pitch_rate == command.yaw_rate == 0.0
+        and command.thrust == hold_thrust
         for command in adapter.commands
     )
     assert all(
@@ -4703,6 +4762,56 @@ def test_gate1_observation_requires_three_new_frames_and_sends_only_paced_zero(
     assert watchdog_require_target == [False] * 6
     assert vision.reset_calls == 0
     assert vision.is_running is False
+
+
+@pytest.mark.parametrize("geometry_source", ("accepted", "raw"))
+def test_powered_gate1_observation_enforces_no_passage_geometry_before_send(
+    monkeypatch,
+    geometry_source,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+
+    def fake_monotonic():
+        return clock[0]
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        if geometry_source == "accepted":
+            target = vq2_module.GateTarget(
+                frame_id=101,
+                sim_time_ns=1_010,
+                received_monotonic_s=clock[0],
+                center_x=520,
+                center_y=50,
+                bbox=(440, 0, 160, 100),
+                confidence=0.8,
+            )
+            runner.tracker.target = target
+            runner.tracker.consecutive = 1
+            runner.tracker.last_selection_mode = "primary"
+            runner._latest_accepted_target = target
+        else:
+            runner._latest_raw_detections = [
+                _detection(440, 0, 160, 144)
+            ]
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+
+    with pytest.raises(SafetyAbort, match="no-passage geometry bound"):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
 
 
 def test_gate1_observation_resets_streak_after_missing_frame(monkeypatch):
@@ -5215,8 +5324,8 @@ def test_gate1_recenter_powered_lifecycle_requires_criteria_and_cleanup(
         calls.append(("gate0", observed_context, kwargs))
         return {"gate0_passed": True}
 
-    async def observe_gate1(gate0):
-        calls.append(("observe", gate0))
+    async def observe_gate1(gate0, **kwargs):
+        calls.append(("observe", gate0, kwargs))
         return {"gate1_observed": True}
 
     async def run_recenter(observation):
@@ -5278,6 +5387,8 @@ def test_gate1_recenter_powered_lifecycle_requires_criteria_and_cleanup(
         "recenter",
         "cleanup",
     ]
+    assert calls[0][2]["crossing_hold_thrust"] == 0.275
+    assert calls[1][2]["hold_thrust"] == 0.275
 
 
 def test_gate1_recenter_powered_lifecycle_persists_abort_summary(monkeypatch):
@@ -5295,7 +5406,7 @@ def test_gate1_recenter_powered_lifecycle_persists_abort_summary(monkeypatch):
     async def run_gate0(_context, **_kwargs):
         return {"gate0_passed": True}
 
-    async def observe_gate1(_gate0):
+    async def observe_gate1(_gate0, **_kwargs):
         return {"gate1_observed": True}
 
     async def abort_recenter(_observation):

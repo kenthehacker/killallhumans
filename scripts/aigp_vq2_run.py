@@ -182,6 +182,7 @@ GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
 GATE1_RECENTER_MAX_ROLL_RAD = 0.05
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
 GATE1_RECENTER_THRUST = 0.275
+GATE1_RECENTER_TRANSITION_THRUST = GATE1_RECENTER_THRUST
 GATE1_RECENTER_MIN_THRUST = 0.21
 GATE1_RECENTER_MAX_THRUST = 0.30
 GATE1_RECENTER_CORRIDOR_NORMALIZED_X = 0.35
@@ -9353,6 +9354,7 @@ class VQ2Runner:
         observe_course_line: bool = False,
         course_line_preturn: bool = False,
         course_line_exit_counterroll_enabled: bool = False,
+        crossing_hold_thrust: float = 0.0,
     ) -> Dict[str, Any]:
         gate0_target_pitch_rad(context.spawn_pitch_rad, exit_pitch_rad, 0.0)
         if (
@@ -9375,6 +9377,16 @@ class VQ2Runner:
             raise ValueError("gate-0 course-line exit-counterroll flag must be bool")
         if course_line_exit_counterroll_enabled and not course_line_preturn:
             raise ValueError("gate-0 course-line exit counter-roll requires preturn")
+        if (
+            type(crossing_hold_thrust) not in {int, float}
+            or not math.isfinite(float(crossing_hold_thrust))
+            or float(crossing_hold_thrust)
+            not in {0.0, GATE1_RECENTER_TRANSITION_THRUST}
+        ):
+            raise ValueError(
+                "gate-0 crossing hold thrust must be exact zero or the "
+                "Gate-1 continuation value"
+            )
 
         flight_start = await self._wait_for_next_flight_command_slot()
         next_tick = flight_start
@@ -9487,6 +9499,7 @@ class VQ2Runner:
                         elapsed_s=elapsed,
                         baseline_race_boot_ms=crossing_race_boot_ms,
                         target_age_s=target.age_s(now),
+                        hold_thrust=float(crossing_hold_thrust),
                     )
                 assert crossing_race_boot_ms is not None
                 decision = crossing_status_decision(
@@ -9514,7 +9527,12 @@ class VQ2Runner:
                             capture_transition=capture_transition,
                         )
                     raise SafetyAbort(f"gate-0 crossing {decision.replace('_', ' ')}")
-                command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+                command = AttitudeRateCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    float(crossing_hold_thrust),
+                )
                 await self._send_flight_command(command)
                 self._record_tick("gate0/confirm", elapsed, command)
                 next_tick = next_control_deadline(next_tick, time.monotonic())
@@ -9653,6 +9671,31 @@ class VQ2Runner:
             next_tick = next_control_deadline(next_tick, time.monotonic())
             await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
 
+    def _assert_gate1_no_passage_geometry(
+        self,
+        target: Optional[GateTarget],
+        *,
+        phase: str,
+    ) -> None:
+        if target is not None and (
+            int(target.bbox_area) >= GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX
+            or int(target.bbox[2])
+            >= GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX
+        ):
+            raise SafetyAbort(
+                "gate-1 recenter no-passage geometry bound reached "
+                f"during {phase}"
+            )
+        raw_contact_risk = select_untracked_contact_risk(
+            self._latest_raw_detections,
+            accepted_target=None,
+        )
+        if raw_contact_risk is not None:
+            raise SafetyAbort(
+                "gate-1 recenter raw no-passage geometry bound reached "
+                f"during {phase}"
+            )
+
     async def _observe_gate1(
         self,
         gate0_details: Dict[str, Any],
@@ -9661,16 +9704,21 @@ class VQ2Runner:
     ) -> Dict[str, Any]:
         """Collect a bounded view after a proved gate-0 pass.
 
-        Observation authority is exact-zero. It never supplies Gate 1 control
-        or passage authority.
+        Observation authority has exact-zero attitude rates. The powered
+        recenter stage may preserve its exact transition thrust so the motors
+        do not cut during handoff; no Gate 1 steering or passage is supplied.
         """
 
         if (
             type(hold_thrust) not in {int, float}
             or not math.isfinite(float(hold_thrust))
-            or float(hold_thrust) != 0.0
+            or float(hold_thrust)
+            not in {0.0, GATE1_RECENTER_TRANSITION_THRUST}
         ):
-            raise ValueError("post-gate observation requires exact-zero thrust")
+            raise ValueError(
+                "post-gate observation thrust must be exact zero or the "
+                "Gate-1 continuation value"
+            )
         proof = self._gate0_transition_proof
         if proof is None or not gate0_details.get("gate_transition_proved"):
             raise SafetyAbort("gate-1 observation lacks an authoritative transition proof")
@@ -9757,6 +9805,7 @@ class VQ2Runner:
             post_gate_race_boot_ms=proof.post_gate_race_boot_ms,
             hard_deadline_monotonic_s=hard_deadline,
             budget_s=hard_deadline - observation_started_s,
+            hold_thrust=float(hold_thrust),
             watermark={
                 "generation": watermark.generation,
                 "frame_id": watermark.frame_id,
@@ -9789,6 +9838,11 @@ class VQ2Runner:
                     )
                 if int(race.sim_boot_time_ms) < proof.post_gate_race_boot_ms:
                     raise SafetyAbort("race clock regressed below the gate-1 proof")
+                if float(hold_thrust) != 0.0:
+                    self._assert_gate1_no_passage_geometry(
+                        self._latest_accepted_target,
+                        phase="powered observation",
+                    )
                 assert self.estimate is not None
                 roll, pitch, _yaw = self.estimate.orientation.to_euler()
                 if (
@@ -9797,7 +9851,10 @@ class VQ2Runner:
                     or abs(pitch - proof.pass_rpy_rad[1])
                     > POST_GATE_MAX_ATTITUDE_DELTA_RAD
                 ):
-                    raise SafetyAbort("attitude changed over 5deg during zero-thrust observation")
+                    raise SafetyAbort(
+                        "attitude changed over 5deg during zero-rate "
+                        "transition observation"
+                    )
                 peak_rate = max(abs(value) for value in self.estimate.body_rates)
                 if peak_rate > POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S:
                     raise SafetyAbort(
@@ -9903,6 +9960,11 @@ class VQ2Runner:
                                 raise SafetyAbort(
                                     "race status changed at gate-1 observation acceptance"
                                 )
+                            if float(hold_thrust) != 0.0:
+                                self._assert_gate1_no_passage_geometry(
+                                    accepted,
+                                    phase="powered observation acceptance",
+                                )
                             result = {
                                 "gate1_observed": True,
                                 "observation_elapsed_s": (
@@ -9917,6 +9979,7 @@ class VQ2Runner:
                                 ],
                                 "race_boot_ms": int(final_race.sim_boot_time_ms),
                                 "gate_index": int(final_race.active_gate_index),
+                                "hold_thrust": float(hold_thrust),
                             }
                             return result
 
@@ -9942,6 +10005,11 @@ class VQ2Runner:
                 ):
                     raise SafetyAbort(
                         "race status changed before gate-1 observation setpoint"
+                    )
+                if float(hold_thrust) != 0.0:
+                    self._assert_gate1_no_passage_geometry(
+                        self._latest_accepted_target,
+                        phase="powered observation command send",
                     )
 
                 await self._send_flight_command(transition_command)
@@ -9969,30 +10037,6 @@ class VQ2Runner:
         proof = self._gate0_transition_proof
         frames = gate1_observation.get("frames")
 
-        def assert_no_passage_geometry(
-            target: GateTarget,
-            *,
-            phase: str,
-        ) -> None:
-            if (
-                int(target.bbox_area)
-                >= GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX
-                or int(target.bbox[2])
-                >= GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX
-            ):
-                raise SafetyAbort(
-                    "gate-1 recenter no-passage geometry bound reached "
-                    f"during {phase}"
-                )
-            raw_contact_risk = select_untracked_contact_risk(
-                self._latest_raw_detections,
-                accepted_target=None,
-            )
-            if raw_contact_risk is not None:
-                raise SafetyAbort(
-                    "gate-1 recenter raw no-passage geometry bound reached "
-                    f"during {phase}"
-                )
         if (
             proof is None
             or gate1_observation.get("gate1_observed") is not True
@@ -10085,7 +10129,10 @@ class VQ2Runner:
             "contact_safety_outcome": "clean_so_far",
             "cleanup_confirmed": False,
         }
-        assert_no_passage_geometry(entry_target, phase="entry")
+        self._assert_gate1_no_passage_geometry(
+            entry_target,
+            phase="entry",
+        )
         entry_generation = self._latest_detection_generation
         entry_frame_id = self._latest_detection_frame_id
         entry_sim_time_ns = self._latest_detection_frame_sim_ns
@@ -10399,7 +10446,10 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter target lost primary fresh-frame authority"
                     )
-                assert_no_passage_geometry(accepted, phase="control")
+                self._assert_gate1_no_passage_geometry(
+                    accepted,
+                    phase="control",
+                )
                 if self.estimate is None:
                     raise SafetyAbort(
                         "gate-1 recenter attitude estimate is unavailable"
@@ -10629,7 +10679,7 @@ class VQ2Runner:
                             raise SafetyAbort(
                                 "gate-1 recenter authority changed before cleanup"
                             )
-                        assert_no_passage_geometry(
+                        self._assert_gate1_no_passage_geometry(
                             cleanup_ready_target,
                             phase="cleanup readiness",
                         )
@@ -10839,7 +10889,10 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter authority changed before command send"
                     )
-                assert_no_passage_geometry(latest_target, phase="command send")
+                self._assert_gate1_no_passage_geometry(
+                    latest_target,
+                    phase="command send",
+                )
                 wire_not_before_ns = (
                     None
                     if self._last_flight_command_started_ns is None
@@ -10953,8 +11006,14 @@ class VQ2Runner:
     ) -> Dict[str, Any]:
         """Compose proved Gate 0, zero-authority acquisition, and the candidate."""
 
-        gate0 = await self._run_gate0(context)
-        observation = await self._observe_gate1(gate0)
+        gate0 = await self._run_gate0(
+            context,
+            crossing_hold_thrust=GATE1_RECENTER_TRANSITION_THRUST,
+        )
+        observation = await self._observe_gate1(
+            gate0,
+            hold_thrust=GATE1_RECENTER_TRANSITION_THRUST,
+        )
         recenter = await self._run_bounded_gate1_recenter(observation)
         return {
             "gate0": gate0,
@@ -11763,10 +11822,16 @@ class VQ2Runner:
                 gate0_details = await self._run_gate0(
                     context,
                     capture_transition=write_diagnostic_pngs,
+                    crossing_hold_thrust=(
+                        GATE1_RECENTER_TRANSITION_THRUST
+                    ),
                 )
                 details = {"gate0": gate0_details}
                 try:
-                    observation = await self._observe_gate1(gate0_details)
+                    observation = await self._observe_gate1(
+                        gate0_details,
+                        hold_thrust=GATE1_RECENTER_TRANSITION_THRUST,
+                    )
                 except SafetyAbort as exc:
                     details["gate1_observation"] = {
                         "gate1_observed": False,
