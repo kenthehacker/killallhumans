@@ -84,7 +84,7 @@ class VisualLifecycleTuning:
             < float(self.next_gate_blend_full_log_scale)
         ):
             raise VisualConfigError("next-gate blend scale interval is invalid")
-        if not 0.40 <= float(self.restricted_alignment_duration_s) <= 1.20:
+        if not 0.40 <= float(self.restricted_alignment_duration_s) <= 0.90:
             raise VisualConfigError("restricted alignment duration is outside bounds")
         if type(self.required_improving_frames) is not int or not (
             3 <= self.required_improving_frames <= 6

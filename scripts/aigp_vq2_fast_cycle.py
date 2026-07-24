@@ -50,7 +50,7 @@ SIMULATOR_BUILD = 3385
 SIMULATOR_MODE = "Training"
 DEFAULT_ADDRESS = "udpin:127.0.0.1:14550"
 ISOLATION_FLAGS = ("-E", "-s", "-B")
-VISUAL_POWERED_STAGES = ("visual-shadow",)
+VISUAL_POWERED_STAGES = ("visual-shadow", "visual-align")
 FAST_POWERED_STAGES = (
     "sign-id",
     "hover",
@@ -66,6 +66,7 @@ _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_live_lease.py",
     "scripts/aigp_vq2_controller_config.py",
     "scripts/aigp_vq2_visual_config.py",
+    "scripts/aigp_vq2_visual_alignment_stage.py",
     "scripts/aigp_vq2_fast_cycle.py",
     "scripts/aigp_vq2_run.py",
     "scripts/aigp_vq2_powered_attempt.py",
@@ -80,6 +81,7 @@ _RUNTIME_SOURCE_PATHS = (
     "gate_detection/src/gate_detector.py",
     "gate_detection/src/vq2_detector.py",
     "planning/vq2_gate_graph.py",
+    "planning/vq2_visual_alignment.py",
     "planning/vq2_visual_servo.py",
 )
 
@@ -88,6 +90,14 @@ ControllerConfigValue = VQ2ControllerConfig | VisualNavigationConfig
 
 class FastCycleError(RuntimeError):
     """The compact admission or execution boundary failed closed."""
+
+
+def _visual_replay_filename(stage: str) -> str | None:
+    if stage == "visual-shadow":
+        return "shadow.vq2replay"
+    if stage == "visual-align":
+        return "alignment.vq2replay"
+    return None
 
 
 class _CaptureLeaseRelease:
@@ -396,8 +406,8 @@ def build_manifest(
             "manifest": str(run_directory / "run-manifest.json"),
             "trace": str(run_directory / "session.jsonl.gz"),
             "replay_bundle": (
-                str(run_directory / "shadow.vq2replay")
-                if stage == "visual-shadow"
+                str(run_directory / replay_name)
+                if (replay_name := _visual_replay_filename(stage))
                 else None
             ),
             "result": str(run_directory / "result.json"),
@@ -588,11 +598,14 @@ def _execute_fast_cycle(
                         manifest["controller"]["config_sha256"]
                     ),
                     replay_bundle=(
-                        str(run_directory / "shadow.vq2replay")
-                        if stage == "visual-shadow"
+                        str(run_directory / replay_name)
+                        if (
+                            replay_name
+                            := _visual_replay_filename(stage)
+                        )
                         else None
                     ),
-                    recording_approved=(stage == "visual-shadow"),
+                    recording_approved=(stage in VISUAL_POWERED_STAGES),
                 )
             )
             result_value = {

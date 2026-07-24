@@ -114,9 +114,18 @@ def test_gate1_recenter_is_admitted_as_the_bounded_position_only_stage():
     assert arguments.stage == "gate1-recenter"
 
 
-def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
+@pytest.mark.parametrize(
+    ("requested_stage", "expected_replay_name"),
+    [
+        ("visual-shadow", "shadow.vq2replay"),
+        ("visual-align", "alignment.vq2replay"),
+    ],
+)
+def test_visual_stage_is_admitted_with_visual_config_and_replay_evidence(
     tmp_path,
     monkeypatch,
+    requested_stage,
+    expected_replay_name,
 ):
     git_snapshot = {
         "head_commit": "a" * 40,
@@ -134,7 +143,7 @@ def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
 
     async def run_live(stage, address, record, **kwargs):
         calls.append((stage, address, record, kwargs))
-        Path(record).write_bytes(b"visual shadow trace")
+        Path(record).write_bytes(b"visual navigation trace")
         effective = visual_config.validate_visual_config(
             kwargs["controller_config"]
         )
@@ -155,7 +164,7 @@ def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
         )
 
     code, result = fast_cycle._execute_fast_cycle(
-        "visual-shadow",
+        requested_stage,
         evidence_root=tmp_path,
         now=lambda: UTC,
         load_runner=lambda: SimpleNamespace(run_live=run_live),
@@ -166,7 +175,7 @@ def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
     assert result["success"] is True
     assert len(calls) == 1
     stage, address, record, kwargs = calls[0]
-    assert stage == "visual-shadow"
+    assert stage == requested_stage
     assert address == fast_cycle.DEFAULT_ADDRESS
     effective = visual_config.validate_visual_config(
         kwargs["controller_config"]
@@ -185,7 +194,7 @@ def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
     assert kwargs["write_diagnostic_pngs"] is False
     replay_path = Path(kwargs["replay_bundle"])
     assert replay_path.parent == Path(record).parent
-    assert replay_path.name == "shadow.vq2replay"
+    assert replay_path.name == expected_replay_name
     manifest = json.loads(
         (Path(record).parent / "run-manifest.json").read_text()
     )
@@ -193,9 +202,14 @@ def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
     assert manifest["candidate"]["worktree_state"] == "clean"
 
 
-def test_visual_shadow_refuses_dirty_candidate_before_live_contact(
+@pytest.mark.parametrize(
+    "requested_stage",
+    ["visual-shadow", "visual-align"],
+)
+def test_visual_stage_refuses_dirty_candidate_before_live_contact(
     tmp_path,
     monkeypatch,
+    requested_stage,
 ):
     monkeypatch.setattr(
         fast_cycle,
@@ -220,7 +234,7 @@ def test_visual_shadow_refuses_dirty_candidate_before_live_contact(
         match="require a clean exact commit",
     ):
         fast_cycle._execute_fast_cycle(
-            "visual-shadow",
+            requested_stage,
             evidence_root=tmp_path,
             now=lambda: UTC,
             load_runner=lambda: SimpleNamespace(run_live=run_live),

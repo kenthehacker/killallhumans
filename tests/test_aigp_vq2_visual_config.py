@@ -51,6 +51,7 @@ def test_config_hash_is_independent_of_json_key_order():
         (("servo", "yaw_error_gain"), float("nan")),
         (("lifecycle", "next_gate_blend_max"), 0.36),
         (("lifecycle", "required_improving_frames"), 2),
+        (("lifecycle", "restricted_alignment_duration_s"), 0.900001),
         (("lifecycle", "restricted_alignment_duration_s"), 2.0),
     ],
 )

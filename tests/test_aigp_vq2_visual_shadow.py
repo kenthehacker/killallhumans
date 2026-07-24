@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -60,6 +62,9 @@ class _Adapter:
         values = self.collisions
         self.collisions = []
         return values
+
+    def drain_outbound_receipts(self):
+        return []
 
     async def send_attitude_rate(self, command, **_kwargs):
         self.commands.append(command)
@@ -135,11 +140,12 @@ def _set_race(
     boot_ms,
     sequence,
     received_ns,
+    race_finish_time_ns=-1,
 ):
     adapter.race_status = RaceStatus(
         sim_boot_time_ms=boot_ms,
         race_start_boot_time_ms=900,
-        race_finish_time_ns=-1,
+        race_finish_time_ns=race_finish_time_ns,
         active_gate_index=gate_index,
         last_gate_race_time=-1,
     )
@@ -154,7 +160,7 @@ def _set_race(
         race_status=SimpleNamespace(
             sim_boot_time_ms=boot_ms,
             active_gate_index=gate_index,
-            race_finish_time_ns=-1,
+            race_finish_time_ns=race_finish_time_ns,
         ),
     )
 
@@ -299,8 +305,16 @@ def test_initial_gate_binding_rejects_two_plausible_visual_identities():
         )
 
 
-def test_visual_shadow_refuses_direct_run_without_fast_cycle_binding(
+@pytest.mark.parametrize(
+    "stage",
+    [
+        vq2_module.VISUAL_SHADOW_STAGE,
+        vq2_module.VISUAL_ALIGN_STAGE,
+    ],
+)
+def test_visual_stage_refuses_direct_run_without_fast_cycle_binding(
     monkeypatch,
+    stage,
 ):
     contacted_transport = False
 
@@ -321,7 +335,7 @@ def test_visual_shadow_refuses_direct_run_without_fast_cycle_binding(
     ):
         asyncio.run(
             vq2_module.run_live(
-                vq2_module.VISUAL_SHADOW_STAGE,
+                stage,
                 vq2_module.DEFAULT_MAVLINK_URL,
                 None,
             )
@@ -550,3 +564,668 @@ def test_powered_shadow_requires_authoritative_boundary_and_confirmed_cleanup(
         "race_finished": False,
         "transition": [0, 1],
     }
+
+
+class _Orientation:
+    def __init__(self, roll=0.0, pitch=-0.05, yaw=0.0):
+        self.roll = roll
+        self.pitch = pitch
+        self.yaw = yaw
+
+    def to_euler(self):
+        return self.roll, self.pitch, self.yaw
+
+
+def _alignment_estimate():
+    orientation = _Orientation()
+    return SimpleNamespace(
+        orientation=orientation,
+        body_rates=(0.0, 0.0, 0.0),
+        yaw=orientation.yaw,
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "requested",
+        "yaw",
+        "reference",
+        "yaw_rate",
+        "horizontal_error",
+        "expected",
+    ),
+    [
+        (
+            0.08,
+            0.059,
+            0.0,
+            0.0,
+            0.5,
+            (0.060 - 0.059)
+            / vq2_module.VISUAL_ALIGN_YAW_HOLD_HORIZON_S,
+        ),
+        (-0.08, 0.061, 0.0, 0.0, 0.5, -0.08),
+        (
+            -0.08,
+            -math.pi + 0.01,
+            math.pi - 0.01,
+            0.0,
+            -0.5,
+            -0.08,
+        ),
+    ],
+)
+def test_visual_alignment_yaw_envelope_caps_outward_and_retains_inward(
+    requested,
+    yaw,
+    reference,
+    yaw_rate,
+    horizontal_error,
+    expected,
+):
+    command, excursion = vq2_module.visual_alignment_yaw_rate(
+        requested_rate_rad_s=requested,
+        measured_yaw_rad=yaw,
+        reference_yaw_rad=reference,
+        measured_yaw_rate_rad_s=yaw_rate,
+        horizontal_error_norm=horizontal_error,
+        horizontal_corridor_norm=0.16,
+    )
+
+    assert command == pytest.approx(expected)
+    assert abs(excursion) <= vq2_module.VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD
+
+
+def test_visual_alignment_yaw_envelope_aborts_exhausted_outward_authority():
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="authority exhausted",
+    ):
+        vq2_module.visual_alignment_yaw_rate(
+            requested_rate_rad_s=0.08,
+            measured_yaw_rad=0.061,
+            reference_yaw_rad=0.0,
+            measured_yaw_rate_rad_s=0.0,
+            horizontal_error_norm=0.5,
+            horizontal_corridor_norm=0.16,
+        )
+
+
+def test_visual_alignment_yaw_envelope_aborts_outward_measured_momentum():
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="outward yaw momentum",
+    ):
+        vq2_module.visual_alignment_yaw_rate(
+            requested_rate_rad_s=-0.08,
+            measured_yaw_rad=0.059,
+            reference_yaw_rad=0.0,
+            measured_yaw_rate_rad_s=0.20,
+            horizontal_error_norm=0.5,
+            horizontal_corridor_norm=0.16,
+        )
+
+
+def test_visual_alignment_current_authority_rejects_a_fresh_track_miss():
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    _context, _initial_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=300_000_000,
+    )
+    runner._confirm_visual_transition(
+        from_gate_index=0,
+        to_gate_index=1,
+    )
+    _update_visual(
+        runner,
+        _frame(
+            105,
+            [_detection(465, 15, 50, 75)],
+            final_packet_ns=320_000_000,
+        ),
+    )
+    track, target = runner._require_visual_current_target(
+        expected_gate_index=1,
+        expected_track_id=promoted_id,
+        now_s=0.32,
+    )
+    assert track.track_id == target.track_id == promoted_id
+
+    _update_visual(
+        runner,
+        _frame(106, [], final_packet_ns=340_000_000),
+    )
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="withheld exact current-target authority",
+    ):
+        runner._require_visual_current_target(
+            expected_gate_index=1,
+            expected_track_id=promoted_id,
+            now_s=0.34,
+        )
+
+
+def test_visual_alignment_rejects_graph_or_race_ambiguity():
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    _context, _initial_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=300_000_000,
+    )
+    runner._confirm_visual_transition(
+        from_gate_index=0,
+        to_gate_index=1,
+    )
+    _update_visual(
+        runner,
+        _frame(
+            105,
+            [_detection(465, 15, 50, 75)],
+            final_packet_ns=320_000_000,
+        ),
+    )
+    graph = runner.visual_gate_graph.latest_snapshot
+    assert graph is not None
+    runner.visual_gate_graph._latest_snapshot = replace(
+        graph,
+        next_selection_ambiguous=True,
+    )
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="withheld exact current-target authority",
+    ):
+        runner._require_visual_current_target(
+            expected_gate_index=1,
+            expected_track_id=promoted_id,
+            now_s=0.32,
+        )
+
+    _set_race(
+        adapter,
+        gate_index=2,
+        boot_ms=1_400,
+        sequence=12,
+        received_ns=340_000_000,
+    )
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="no-passage Gate-1 boundary",
+    ):
+        runner._assert_visual_alignment_race_boundary()
+
+
+@pytest.mark.parametrize(
+    ("bbox_norm", "clipping"),
+    [
+        ((0.20, 0.20, 0.45, 0.40), vq2_module.FrameEdge.NONE),
+        (
+            (0.20, 0.20, 0.40, 0.20 + 1.0 / 3.0),
+            vq2_module.FrameEdge.NONE,
+        ),
+        (
+            (0.20, 0.20, 0.40, 0.40),
+            vq2_module.FrameEdge.LEFT | vq2_module.FrameEdge.RIGHT,
+        ),
+    ],
+)
+def test_visual_alignment_no_passage_bounds_fail_closed(
+    bbox_norm,
+    clipping,
+):
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    _context, _initial_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=300_000_000,
+    )
+    runner._confirm_visual_transition(
+        from_gate_index=0,
+        to_gate_index=1,
+    )
+    promoted = runner.visual_tracker.track(promoted_id)
+    unsafe = replace(
+        promoted,
+        bbox_norm=bbox_norm,
+        clipping=clipping,
+    )
+
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="no-passage geometry",
+    ):
+        runner._assert_visual_alignment_no_passage(
+            unsafe,
+            phase="test",
+        )
+
+
+def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
+    monkeypatch,
+):
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    context, initial_current_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    runner.estimate = _alignment_estimate()
+    clock = [0.320]
+    commands = []
+
+    async def run_gate0(_context, *, capture_transition=False):
+        assert _context is context
+        assert capture_transition is False
+        _set_race(
+            adapter,
+            gate_index=1,
+            boot_ms=1_300,
+            sequence=11,
+            received_ns=300_000_000,
+        )
+        transition = runner._confirm_visual_transition(
+            from_gate_index=0,
+            to_gate_index=1,
+        )
+        assert transition.retired_track_id == initial_current_id
+        assert transition.promoted_track_id == promoted_id
+        runner._gate0_transition_proof = vq2_module.GateTransitionProof(
+            pre_gate_race_boot_ms=1_000,
+            post_gate_race_boot_ms=1_300,
+            flight_started_monotonic_s=0.10,
+            crossing_started_monotonic_s=0.29,
+            pass_confirmed_monotonic_s=0.30,
+            next_control_deadline_s=0.30,
+            vision_generation=7,
+            vision_frame_id=104,
+            vision_sim_time_ns=104_000,
+            vision_received_monotonic_s=0.26,
+            pass_rpy_rad=(0.0, -0.05, 0.0),
+        )
+        return {"gate0_passed": True}
+
+    publications = [
+        (105, 465, 0, 0.320),
+        (106, 458, 12, 0.360),
+        (107, 451, 18, 0.380),
+        (108, 444, 24, 0.400),
+        (109, 437, 30, 0.420),
+        (110, 430, 36, 0.440),
+        (111, 423, 42, 0.460),
+        (112, 416, 48, 0.480),
+        (113, 409, 54, 0.500),
+        (114, 402, 60, 0.520),
+        (115, 395, 66, 0.540),
+    ]
+    publication_index = [0]
+
+    def sample():
+        if publication_index[0] >= len(publications):
+            return
+        frame_id, x, y, observed_s = publications[
+            publication_index[0]
+        ]
+        if clock[0] + 1e-9 < observed_s:
+            return
+        _update_visual(
+            runner,
+            _frame(
+                frame_id,
+                [_detection(x, y, 50, 75)],
+                final_packet_ns=round(observed_s * 1_000_000_000),
+            ),
+        )
+        publication_index[0] += 1
+
+    async def send(command, **kwargs):
+        start_ns = round(clock[0] * 1_000_000_000)
+        not_before_ns = kwargs.get("wire_start_not_before_ns")
+        deadline_ns = kwargs.get("wire_start_deadline_ns")
+        if not_before_ns is not None:
+            assert start_ns >= not_before_ns
+        if deadline_ns is not None:
+            assert start_ns < deadline_ns
+        commands.append((clock[0], command, dict(kwargs)))
+        runner._last_flight_command_sent_s = clock[0]
+        if kwargs.get("require_wire_receipt"):
+            runner._last_flight_command_started_ns = start_ns
+            return {
+                "schema": "aigp-vq2-attitude-target-outbound/1",
+                "host_clock_id": "host-perf-counter",
+                "api": "send_attitude_rate",
+                "outcome": "returned",
+                "call_start_monotonic_ns": start_ns,
+                "call_end_monotonic_ns": start_ns + 1,
+            }
+        return None
+
+    async def sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def attitude_command(
+        _estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        return AttitudeRateCommand(
+            roll_rate=target_roll_rad,
+            pitch_rate=target_pitch_rad,
+            yaw_rate=0.0,
+            thrust=thrust,
+        )
+
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", send)
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        attitude_command,
+    )
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock[0],
+                perf_counter_ns=lambda: round(
+                    clock[0] * 1_000_000_000
+                ),
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(
+                sleep=sleep,
+                CancelledError=asyncio.CancelledError,
+            ),
+        )
+        summary = asyncio.run(
+            runner._run_visual_alignment(context)
+        )
+
+    assert summary["success"] is True
+    assert summary["authoritative_transition"] == [0, 1]
+    assert summary["promoted_current_track_id"] == promoted_id
+    assert runner.visual_tracker.track(promoted_id).first_token.frame_id == 100
+    assert summary["horizontal_abs_error_trend"]["trend"] == (
+        "negative_uninterrupted"
+    )
+    assert summary["vertical_abs_error_trend"]["trend"] == (
+        "negative_uninterrupted"
+    )
+    assert summary["eligible_joint_frame_count"] >= 3
+    assert summary["fresh_control_frame_count"] > (
+        summary["eligible_joint_frame_count"]
+    )
+    assert summary["ambiguity"] is False
+    assert commands[0][1] == AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+    navigation_commands = commands[1:]
+    assert navigation_commands
+    assert navigation_commands[0][1].yaw_rate < 0.0
+    assert all(
+        later[0] - earlier[0]
+        >= vq2_module.CONTROL_PERIOD_S - 1e-9
+        for earlier, later in zip(commands, commands[1:])
+    )
+    assert all(
+        item[2].get("require_wire_receipt") is True
+        and item[2].get("wire_start_deadline_ns") is not None
+        for item in navigation_commands
+    )
+    assert all(
+        abs(command.roll_rate)
+        <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+        and abs(command.pitch_rate)
+        <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+        and abs(command.yaw_rate)
+        <= vq2_module.VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
+        and vq2_module.VISUAL_ALIGN_MIN_THRUST
+        <= command.thrust
+        <= vq2_module.VISUAL_ALIGN_MAX_THRUST
+        for _sent_s, command, _kwargs in navigation_commands
+    )
+
+
+def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
+    monkeypatch,
+):
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    context, _initial_current_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    runner.estimate = _alignment_estimate()
+    clock = [0.320]
+    failure_observed_s = []
+
+    async def run_gate0(_context, *, capture_transition=False):
+        assert _context is context
+        assert capture_transition is False
+        _set_race(
+            adapter,
+            gate_index=1,
+            boot_ms=1_300,
+            sequence=11,
+            received_ns=300_000_000,
+        )
+        transition = runner._confirm_visual_transition(
+            from_gate_index=0,
+            to_gate_index=1,
+        )
+        assert transition.promoted_track_id == promoted_id
+        runner._gate0_transition_proof = vq2_module.GateTransitionProof(
+            pre_gate_race_boot_ms=1_000,
+            post_gate_race_boot_ms=1_300,
+            flight_started_monotonic_s=0.10,
+            crossing_started_monotonic_s=0.29,
+            pass_confirmed_monotonic_s=0.30,
+            next_control_deadline_s=0.30,
+            vision_generation=7,
+            vision_frame_id=104,
+            vision_sim_time_ns=104_000,
+            vision_received_monotonic_s=0.26,
+            pass_rpy_rad=(0.0, -0.05, 0.0),
+        )
+        return {"gate0_passed": True}
+
+    published = [False]
+
+    def sample():
+        if not published[0]:
+            _update_visual(
+                runner,
+                _frame(
+                    105,
+                    [_detection(465, 0, 50, 75)],
+                    final_packet_ns=320_000_000,
+                ),
+            )
+            published[0] = True
+
+    async def uncertain_send(_command, **_kwargs):
+        clock[0] += 0.050
+        failure_observed_s.append(clock[0])
+        raise RuntimeError("uncertain adapter return")
+
+    async def sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_send_flight_command",
+        uncertain_send,
+    )
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock[0],
+                perf_counter_ns=lambda: round(
+                    clock[0] * 1_000_000_000
+                ),
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(
+                sleep=sleep,
+                CancelledError=asyncio.CancelledError,
+            ),
+        )
+        with pytest.raises(
+            vq2_module.SafetyAbort,
+            match="post-credit zero dispatch failed closed",
+        ):
+            asyncio.run(runner._run_visual_alignment(context))
+
+    assert failure_observed_s == [pytest.approx(0.370)]
+    assert clock[0] >= (
+        failure_observed_s[0] + vq2_module.CONTROL_PERIOD_S - 1e-9
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "cleanup_gate",
+        "cleanup_confirmed",
+        "criteria_met",
+        "reported_track_id",
+        "race_finished",
+        "expected_success",
+    ),
+    [
+        (1, True, True, "vq2-track-000004", False, True),
+        (1, False, True, "vq2-track-000004", False, False),
+        (2, True, True, "vq2-track-000004", False, False),
+        (1, True, False, "vq2-track-000004", False, False),
+        (1, True, True, "vq2-track-999999", False, False),
+        (1, True, True, "vq2-track-000004", True, False),
+    ],
+)
+def test_powered_visual_alignment_requires_gate1_and_confirmed_cleanup(
+    monkeypatch,
+    cleanup_gate,
+    cleanup_confirmed,
+    criteria_met,
+    reported_track_id,
+    race_finished,
+    expected_success,
+):
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6_400,
+        1_000,
+    )
+    promoted_id = "vq2-track-000004"
+
+    async def no_result(*_args, **_kwargs):
+        return None
+
+    async def wait_for_go():
+        _set_race(
+            adapter,
+            gate_index=0,
+            boot_ms=1_000,
+            sequence=1,
+            received_ns=10_000_000,
+        )
+        return context
+
+    async def run_alignment(_context):
+        assert _context is context
+        _set_race(
+            adapter,
+            gate_index=cleanup_gate,
+            boot_ms=1_300,
+            sequence=2,
+            received_ns=20_000_000,
+            race_finish_time_ns=(25_000_000 if race_finished else -1),
+        )
+        runner._visual_transition = SimpleNamespace(
+            from_gate_index=0,
+            to_gate_index=1,
+            promoted_track_id=promoted_id,
+        )
+        summary = {
+            "promoted_current_track_id": reported_track_id,
+            "alignment_criteria_met": criteria_met,
+            "outcome": "success",
+            "success": True,
+        }
+        runner._visual_alignment_summary = dict(summary)
+        return summary
+
+    async def cleanup():
+        return cleanup_confirmed
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", no_result)
+    monkeypatch.setattr(runner, "normalize_disarmed", no_result)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(
+        runner,
+        "_bind_initial_visual_gate",
+        lambda _context: None,
+    )
+    monkeypatch.setattr(runner, "arm_confirmed", no_result)
+    monkeypatch.setattr(
+        runner,
+        "_run_visual_alignment",
+        run_alignment,
+    )
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(
+        runner.run_powered_stage(
+            vq2_module.VISUAL_ALIGN_STAGE,
+            write_diagnostic_pngs=False,
+        )
+    )
+
+    assert result.success is expected_success
+    assert result.cleanup_confirmed is cleanup_confirmed
+    assert result.details["visual_alignment"]["cleanup_confirmed"] is (
+        cleanup_confirmed
+    )
+    assert result.details["visual_alignment"]["outcome"] == (
+        "success" if expected_success else "abort"
+    )

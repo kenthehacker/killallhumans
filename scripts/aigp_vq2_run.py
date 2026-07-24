@@ -21,6 +21,10 @@ map.  This runner therefore performs only bounded training stages:
     Keep the proved Gate-0 controller in sole command authority while the
     multi-target visual graph proves pre-credit Gate-1 tracking, promotion
     without history reset, and one fresh post-credit observation.
+``visual-align``
+    Reuse that proved promotion, then apply at most 0.90 seconds of
+    no-advance image servo authority to prove uninterrupted horizontal and
+    vertical Gate-1 alignment before cleanup.  Passage is forbidden.
 
 Every powered stage proves both the race and IMU clocks rolled back after
 ``SIM_RESET``, calibrates a gyro-only flight estimator during the countdown,
@@ -64,6 +68,7 @@ from typing import (
 from competition.adapter import AttitudeRateCommand, Quaternion
 from competition.aigp_messages import RaceStatus
 from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
+from competition.vq2_contracts import FrameEdge
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from competition.vq2_visual_tracker import (
     CameraFrameToken as VisualCameraFrameToken,
@@ -86,6 +91,14 @@ from planning.vq2_gate_graph import (
     GateGraphSnapshot,
     RollingVisualGateGraph,
 )
+from planning.vq2_visual_alignment import VisualAlignmentTrend
+from planning.vq2_visual_servo import (
+    MAX_VISUAL_OBSERVATION_AGE_S,
+    MAX_VISUAL_THRUST,
+    MAX_VISUAL_YAW_RATE_RAD_S,
+    VisualServoRefusal,
+    VisualTarget,
+)
 from scripts.aigp_vq2_controller_config import (
     ControllerConfigError,
     VQ2ControllerConfig,
@@ -97,6 +110,11 @@ from scripts.aigp_vq2_visual_config import (
     VisualNavigationConfig,
     default_visual_config,
     validate_visual_config,
+)
+from scripts.aigp_vq2_visual_alignment_stage import (
+    VisualAlignmentStageLimits,
+    VisualAlignmentStageRuntime,
+    run_visual_alignment_stage,
 )
 
 if TYPE_CHECKING:
@@ -224,8 +242,46 @@ POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 # the authoritative replay/tracker-isolation prerequisite is accepted.
 GATE1_RECENTER_STAGE = "gate1-recenter"
 VISUAL_SHADOW_STAGE = "visual-shadow"
+VISUAL_ALIGN_STAGE = "visual-align"
+VISUAL_POWERED_STAGES = (VISUAL_SHADOW_STAGE, VISUAL_ALIGN_STAGE)
 VISUAL_SHADOW_POST_CREDIT_TIMEOUT_S = 0.15
 VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
+VISUAL_ALIGN_HARD_DURATION_S = 0.90
+VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S = 0.12
+VISUAL_ALIGN_RESPONSE_GRACE_S = 0.12
+VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.08
+VISUAL_ALIGN_YAW_SOFT_STOP_RAD = 0.060
+VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD = 0.075
+VISUAL_ALIGN_YAW_HOLD_HORIZON_S = 0.12
+VISUAL_ALIGN_MAX_MEASURED_YAW_RATE_RAD_S = 0.35
+VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S = 0.12
+VISUAL_ALIGN_MAX_ABS_ROLL_RAD = 0.12
+VISUAL_ALIGN_MIN_PITCH_RAD = -0.20
+VISUAL_ALIGN_MAX_PITCH_RAD = 0.08
+VISUAL_ALIGN_MAX_ENTRY_ATTITUDE_DELTA_RAD = 0.08
+VISUAL_ALIGN_MAX_BODY_RATE_RAD_S = 0.50
+VISUAL_ALIGN_MIN_THRUST = 0.21
+VISUAL_ALIGN_MAX_THRUST = 0.30
+VISUAL_ALIGNMENT_STAGE_LIMITS = VisualAlignmentStageLimits(
+    control_period_s=CONTROL_PERIOD_S,
+    required_pretransition_frames=(
+        VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES
+    ),
+    hard_duration_s=VISUAL_ALIGN_HARD_DURATION_S,
+    post_credit_frame_timeout_s=(
+        VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S
+    ),
+    response_grace_s=VISUAL_ALIGN_RESPONSE_GRACE_S,
+    max_yaw_rate_rad_s=VISUAL_ALIGN_MAX_YAW_RATE_RAD_S,
+    max_command_rate_rad_s=VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+    max_pitch_rad=VISUAL_ALIGN_MAX_PITCH_RAD,
+    max_entry_attitude_delta_rad=(
+        VISUAL_ALIGN_MAX_ENTRY_ATTITUDE_DELTA_RAD
+    ),
+    min_thrust=VISUAL_ALIGN_MIN_THRUST,
+    max_thrust=VISUAL_ALIGN_MAX_THRUST,
+    max_visual_controller_thrust=MAX_VISUAL_THRUST,
+)
 GATE1_RECENTER_DURATION_S = 0.60
 GATE1_RECENTER_ROLL_GAIN = -0.24
 GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
@@ -305,7 +361,7 @@ LIVE_RUN_STAGES = (
     "gate0",
     "gate0-observe",
     GATE1_RECENTER_STAGE,
-    VISUAL_SHADOW_STAGE,
+    *VISUAL_POWERED_STAGES,
     CALIBRATION_STAGE,
 )
 CALIBRATION_CHILD_ROLE = "powered_child"
@@ -7143,6 +7199,103 @@ def limit_command_rates(
     return limited
 
 
+def visual_alignment_yaw_rate(
+    *,
+    requested_rate_rad_s: float,
+    measured_yaw_rad: float,
+    reference_yaw_rad: float,
+    measured_yaw_rate_rad_s: float,
+    horizontal_error_norm: float,
+    horizontal_corridor_norm: float,
+) -> Tuple[float, float]:
+    """Apply the immutable restricted-segment yaw envelope prospectively.
+
+    The successful sign-ID calibration proves the command sign and the
+    ``0.08 rad/s`` rate magnitude, but its ``0.05 rad`` experiment excursion
+    was not a course-turn limit.  This stage owns a separately reviewed
+    ``0.060 rad`` soft stop and ``0.075 rad`` hard stop.  Inward recovery is
+    always retained; an outward command that has exhausted the soft envelope
+    aborts while the target remains outside the horizontal corridor.
+    """
+
+    values = (
+        requested_rate_rad_s,
+        measured_yaw_rad,
+        reference_yaw_rad,
+        measured_yaw_rate_rad_s,
+        horizontal_error_norm,
+        horizontal_corridor_norm,
+    )
+    if not all(
+        type(value) in {int, float} and math.isfinite(float(value))
+        for value in values
+    ):
+        raise SafetyAbort("visual alignment yaw inputs are non-finite")
+    if (
+        float(horizontal_corridor_norm) <= 0.0
+        or float(horizontal_corridor_norm) > 1.0
+    ):
+        raise SafetyAbort("visual alignment horizontal corridor is invalid")
+    if abs(float(requested_rate_rad_s)) > (
+        VISUAL_ALIGN_MAX_YAW_RATE_RAD_S + 1e-12
+    ):
+        raise SafetyAbort("visual alignment requested yaw rate exceeded its bound")
+    if abs(float(measured_yaw_rate_rad_s)) > (
+        VISUAL_ALIGN_MAX_MEASURED_YAW_RATE_RAD_S
+    ):
+        raise SafetyAbort(
+            "visual alignment measured yaw rate exceeded its fixed bound"
+        )
+
+    excursion = math.atan2(
+        math.sin(float(measured_yaw_rad) - float(reference_yaw_rad)),
+        math.cos(float(measured_yaw_rad) - float(reference_yaw_rad)),
+    )
+    if abs(excursion) > VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD:
+        raise SafetyAbort(
+            "visual alignment yaw excursion exceeded its fixed hard bound"
+        )
+    measured_rate = float(measured_yaw_rate_rad_s)
+    projected_measured_excursion = (
+        excursion
+        + measured_rate * VISUAL_ALIGN_YAW_HOLD_HORIZON_S
+    )
+    if (
+        excursion * measured_rate > 0.0
+        and abs(projected_measured_excursion)
+        > VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD
+    ):
+        raise SafetyAbort(
+            "visual alignment outward yaw momentum projects beyond its "
+            "fixed hard bound"
+        )
+
+    requested = float(requested_rate_rad_s)
+    outward = excursion * requested > 0.0
+    if (
+        outward
+        and abs(excursion) >= VISUAL_ALIGN_YAW_SOFT_STOP_RAD
+    ):
+        if abs(float(horizontal_error_norm)) > float(
+            horizontal_corridor_norm
+        ):
+            raise SafetyAbort(
+                "visual alignment outward yaw authority exhausted outside "
+                "the horizontal corridor"
+            )
+        return 0.0, excursion
+
+    if outward:
+        direction = math.copysign(1.0, excursion)
+        soft_boundary = direction * VISUAL_ALIGN_YAW_SOFT_STOP_RAD
+        remaining_rate = (
+            soft_boundary - excursion
+        ) / VISUAL_ALIGN_YAW_HOLD_HORIZON_S
+        requested = direction * min(abs(requested), abs(remaining_rate))
+
+    return requested, excursion
+
+
 def course_recenter_rate_command(
     command: AttitudeRateCommand,
 ) -> AttitudeRateCommand:
@@ -7842,6 +7995,8 @@ class VQ2Runner:
         self._visual_latest_graph_snapshot: Optional[GateGraphSnapshot] = None
         self._visual_transition: Optional[ConfirmedGateTransition] = None
         self._visual_shadow_summary: Optional[Dict[str, Any]] = None
+        self._visual_alignment_summary: Optional[Dict[str, Any]] = None
+        self._visual_active_stage: Optional[str] = None
 
     def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
         """Enforce the code-owned calibrated yaw excursion envelope."""
@@ -8246,15 +8401,29 @@ class VQ2Runner:
                         detections,
                     )
                     visual_update = self.visual_tracker.update(visual_frame)
-                    self._visual_latest_tracker_update = visual_update
                     self._visual_latest_graph_snapshot = (
                         self.visual_gate_graph.observe(self.visual_tracker)
                     )
+                    # Graph observation can authoritatively update tracker
+                    # roles.  Retain the refreshed exact update rather than
+                    # the pre-graph immutable view that may still say NEXT.
+                    refreshed_update = self.visual_tracker.latest_update
+                    if (
+                        refreshed_update is None
+                        or refreshed_update.token != visual_update.token
+                    ):
+                        raise SafetyAbort(
+                            "visual graph role refresh lost exact frame identity"
+                        )
+                    self._visual_latest_tracker_update = refreshed_update
                     if self._visual_diagnostic_logging:
                         visual_race = self.adapter.race_status
                         self.recorder.emit(
                             "visual_gate_graph_frame",
-                            phase="visual_shadow",
+                            phase=(
+                                self._visual_active_stage
+                                or "visual_navigation"
+                            ),
                             frame_token=list(
                                 visual_update.token.live_identity_tuple
                                 or visual_update.token.exact_tuple
@@ -11232,6 +11401,267 @@ class VQ2Runner:
         self.recorder.emit("visual_shadow_complete", **summary)
         return summary
 
+    def _require_visual_current_target(
+        self,
+        *,
+        expected_gate_index: int,
+        expected_track_id: str,
+        now_s: Optional[float] = None,
+    ) -> Tuple[VisualTrack, VisualTarget]:
+        """Return only the exact graph-authorized current camera publication."""
+
+        if (
+            type(expected_gate_index) is not int
+            or expected_gate_index < 0
+            or type(expected_track_id) is not str
+            or not expected_track_id
+        ):
+            raise SafetyAbort("visual current-target expectation is invalid")
+        update = self.visual_tracker.latest_update
+        graph = self.visual_gate_graph.latest_snapshot
+        if update is None or graph is None:
+            raise SafetyAbort("visual current-target authority is unavailable")
+        if (
+            graph.latest_camera_token != update.token
+            or graph.tracker_frame_sequence != update.tracker_frame_sequence
+            or graph.current_track_id != expected_track_id
+            or graph.current_gate_index != expected_gate_index
+            or graph.current_track is None
+            or graph.current_track.track_id != expected_track_id
+            or not graph.authority_usable
+            or graph.next_selection_ambiguous
+            or graph.race_finished
+        ):
+            raise SafetyAbort(
+                "visual gate graph withheld exact current-target authority"
+            )
+        try:
+            track = self.visual_tracker.track(expected_track_id)
+        except KeyError as exc:
+            raise SafetyAbort(
+                "promoted visual current track disappeared"
+            ) from exc
+        if (
+            track != graph.current_track
+            or track.latest_token != update.token
+            or track.role is not VisualTrackRole.CURRENT
+            or track.authoritative_gate_index != expected_gate_index
+            or not track.visible
+            or track.missed_frame_count != 0
+            or track.ambiguous
+            or track.consecutive_frame_count < 1
+        ):
+            raise SafetyAbort(
+                "promoted visual current track lost exact authority"
+            )
+        try:
+            target = VisualTarget.from_visual_track(
+                track,
+                require_current_authority=True,
+                expected_gate_index=expected_gate_index,
+            )
+        except VisualServoRefusal as exc:
+            raise SafetyAbort(
+                f"visual current-target adaptation refused: {exc}"
+            ) from exc
+        observed_s = time.monotonic() if now_s is None else float(now_s)
+        age_s = observed_s - float(target.received_monotonic_s)
+        if (
+            not math.isfinite(age_s)
+            or age_s < -1e-6
+            or age_s > MAX_VISUAL_OBSERVATION_AGE_S
+        ):
+            raise SafetyAbort("promoted visual current target is stale")
+        return track, target
+
+    def _assert_visual_alignment_race_boundary(self) -> Any:
+        race = self.adapter.race_status
+        if (
+            race is None
+            or bool(race.race_finished)
+            or int(race.active_gate_index) != 1
+        ):
+            raise SafetyAbort(
+                "visual alignment lost its no-passage Gate-1 boundary"
+            )
+        return race
+
+    def _assert_visual_alignment_no_passage(
+        self,
+        track: VisualTrack,
+        *,
+        phase: str,
+    ) -> Dict[str, Any]:
+        """Abort before close or opposing-edge gate geometry can be crossed."""
+
+        if type(track) is not VisualTrack:
+            raise SafetyAbort("visual no-passage guard requires an exact track")
+        left, top, right, bottom = (
+            float(value) for value in track.bbox_norm
+        )
+        width_fraction = max(0.0, right - left)
+        height_fraction = max(0.0, bottom - top)
+        area_fraction = width_fraction * height_fraction
+        width_px = width_fraction * 640.0
+        height_px = height_fraction * 360.0
+        opposing_edges = bool(
+            (
+                track.clipping & FrameEdge.LEFT
+                and track.clipping & FrameEdge.RIGHT
+            )
+            or (
+                track.clipping & FrameEdge.TOP
+                and track.clipping & FrameEdge.BOTTOM
+            )
+        )
+        if (
+            area_fraction >= 0.10
+            or width_fraction >= 0.25
+            or height_fraction >= (1.0 / 3.0)
+            or opposing_edges
+        ):
+            raise SafetyAbort(
+                "visual alignment no-passage geometry bound reached "
+                f"during {phase}"
+            )
+        raw_contact_risk = select_untracked_contact_risk(
+            self._latest_raw_detections,
+            accepted_target=None,
+        )
+        if raw_contact_risk is not None:
+            raise SafetyAbort(
+                "visual alignment raw no-passage geometry bound reached "
+                f"during {phase}"
+            )
+        return {
+            "area_fraction": area_fraction,
+            "width_px": width_px,
+            "height_px": height_px,
+            "clipping_edges": int(track.clipping),
+            "opposing_edges": opposing_edges,
+        }
+
+    def _assert_visual_alignment_attitude(
+        self,
+        *,
+        entry_roll_rad: float,
+        entry_pitch_rad: float,
+        phase: str,
+    ) -> Dict[str, float]:
+        if self.estimate is None:
+            raise SafetyAbort(
+                f"visual alignment attitude is unavailable during {phase}"
+            )
+        roll, pitch, yaw = (
+            float(value) for value in self.estimate.orientation.to_euler()
+        )
+        rates = tuple(float(value) for value in self.estimate.body_rates)
+        peak_rate = max(abs(value) for value in rates)
+        if (
+            abs(roll) > VISUAL_ALIGN_MAX_ABS_ROLL_RAD
+            or pitch < VISUAL_ALIGN_MIN_PITCH_RAD
+            or pitch > VISUAL_ALIGN_MAX_PITCH_RAD
+            or abs(roll - float(entry_roll_rad))
+            > VISUAL_ALIGN_MAX_ENTRY_ATTITUDE_DELTA_RAD
+            or abs(pitch - float(entry_pitch_rad))
+            > VISUAL_ALIGN_MAX_ENTRY_ATTITUDE_DELTA_RAD
+            or peak_rate > VISUAL_ALIGN_MAX_BODY_RATE_RAD_S
+        ):
+            raise SafetyAbort(
+                "visual alignment attitude/rate envelope exceeded "
+                f"during {phase}"
+            )
+        return {
+            "roll_rad": roll,
+            "pitch_rad": pitch,
+            "yaw_rad": yaw,
+            "peak_body_rate_rad_s": peak_rate,
+            "yaw_rate_rad_s": rates[2],
+        }
+
+    @staticmethod
+    def _visual_alignment_trend_summary(
+        trend: Optional[VisualAlignmentTrend],
+    ) -> Dict[str, Any]:
+        if trend is None:
+            return {
+                "horizontal_abs_error_trend": {
+                    "values": [],
+                    "deltas": [],
+                    "trend": "insufficient",
+                },
+                "vertical_abs_error_trend": {
+                    "values": [],
+                    "deltas": [],
+                    "trend": "insufficient",
+                },
+                "log_scale_rate_trend": {
+                    "values": [],
+                    "trend": "insufficient",
+                },
+                "corridor_frames": 0,
+                "eligible_joint_frame_count": 0,
+                "improving_joint_frame_streak": 0,
+                "alignment_criteria_met": False,
+            }
+        return {
+            "horizontal_abs_error_trend": {
+                "values": list(trend.horizontal_abs_errors),
+                "deltas": list(trend.horizontal_deltas),
+                "trend": trend.horizontal_trend,
+            },
+            "vertical_abs_error_trend": {
+                "values": list(trend.vertical_abs_errors),
+                "deltas": list(trend.vertical_deltas),
+                "trend": trend.vertical_trend,
+            },
+            "log_scale_rate_trend": {
+                "values": list(trend.log_scale_rates_s),
+                "trend": trend.scale_rate_trend,
+            },
+            "corridor_frames": int(trend.corridor_frames),
+            "eligible_joint_frame_count": int(
+                trend.eligible_joint_frame_count
+            ),
+            "improving_joint_frame_streak": int(
+                trend.improving_joint_frame_streak
+            ),
+            "alignment_criteria_met": bool(trend.accepted),
+        }
+
+    async def _run_visual_alignment(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Delegate the bounded stage while retaining live runner authority."""
+
+        if MAX_VISUAL_YAW_RATE_RAD_S != VISUAL_ALIGN_MAX_YAW_RATE_RAD_S:
+            raise SafetyAbort(
+                "visual servo yaw bound differs from the fixed live bound"
+            )
+        return await run_visual_alignment_stage(
+            self,
+            context,
+            runtime=VisualAlignmentStageRuntime(
+                limits=VISUAL_ALIGNMENT_STAGE_LIMITS,
+                safety_abort_type=SafetyAbort,
+                cancelled_error_type=asyncio.CancelledError,
+                monotonic=time.monotonic,
+                perf_counter_ns=time.perf_counter_ns,
+                sleep=asyncio.sleep,
+                post_gate_observation_deadline=(
+                    post_gate_observation_deadline
+                ),
+                next_control_deadline=next_control_deadline,
+                visual_alignment_yaw_rate=(
+                    visual_alignment_yaw_rate
+                ),
+                attitude_rate_command=attitude_rate_command,
+                limit_command_rates=limit_command_rates,
+                validate_command=validate_command,
+            ),
+        )
+
     def _assert_gate1_no_passage_geometry(
         self,
         target: Optional[GateTarget],
@@ -13497,7 +13927,7 @@ class VQ2Runner:
             "gate0",
             "gate0-observe",
             GATE1_RECENTER_STAGE,
-            VISUAL_SHADOW_STAGE,
+            *VISUAL_POWERED_STAGES,
             CALIBRATION_STAGE,
         }:
             raise ValueError(f"unsupported powered stage: {stage}")
@@ -13515,16 +13945,20 @@ class VQ2Runner:
             self._gate1_yaw_reference_rad = None
             self._gate1_max_abs_yaw_excursion_rad = 0.0
             self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
-            self._visual_tracking_enabled = stage == VISUAL_SHADOW_STAGE
-            self._visual_diagnostic_logging = stage == VISUAL_SHADOW_STAGE
+            self._visual_tracking_enabled = stage in VISUAL_POWERED_STAGES
+            self._visual_diagnostic_logging = stage in VISUAL_POWERED_STAGES
+            self._visual_active_stage = (
+                stage if stage in VISUAL_POWERED_STAGES else None
+            )
             self._visual_reset_epoch = 0
             self._visual_shadow_summary = None
+            self._visual_alignment_summary = None
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
             context = await self.wait_for_go()
             race = self.adapter.race_status
             gate_before = race.active_gate_index if race else None
-            if stage == VISUAL_SHADOW_STAGE:
+            if stage in VISUAL_POWERED_STAGES:
                 self._bind_initial_visual_gate(context)
             await self.arm_confirmed()
             if stage == "sign-id":
@@ -13554,6 +13988,12 @@ class VQ2Runner:
             elif stage == VISUAL_SHADOW_STAGE:
                 details = {
                     "visual_shadow": await self._run_visual_shadow(context)
+                }
+            elif stage == VISUAL_ALIGN_STAGE:
+                details = {
+                    "visual_alignment": await self._run_visual_alignment(
+                        context
+                    )
                 }
             elif stage == GATE1_RECENTER_STAGE:
                 gate0_details = await self._run_gate0(
@@ -13638,6 +14078,13 @@ class VQ2Runner:
                 details["visual_shadow"] = dict(
                     self._visual_shadow_summary
                 )
+            if (
+                stage == VISUAL_ALIGN_STAGE
+                and self._visual_alignment_summary is not None
+            ):
+                details["visual_alignment"] = dict(
+                    self._visual_alignment_summary
+                )
             reason = str(exc) or type(exc).__name__
             logger.error("%s ABORT: %s", stage, reason)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
@@ -13658,6 +14105,13 @@ class VQ2Runner:
                 details["visual_shadow"] = dict(
                     self._visual_shadow_summary
                 )
+            if (
+                stage == VISUAL_ALIGN_STAGE
+                and self._visual_alignment_summary is not None
+            ):
+                details["visual_alignment"] = dict(
+                    self._visual_alignment_summary
+                )
             reason = f"unexpected {type(exc).__name__}: {exc}"
             logger.exception("%s failed unexpectedly", stage)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
@@ -13673,7 +14127,7 @@ class VQ2Runner:
                 if cleanup_entry_race is not None
                 else None
             )
-            if stage == VISUAL_SHADOW_STAGE:
+            if stage in VISUAL_POWERED_STAGES:
                 details["authoritative_cleanup_entry"] = {
                     "gate_index": cleanup_entry_gate_index,
                     "race_finished": cleanup_entry_race_finished,
@@ -13690,10 +14144,26 @@ class VQ2Runner:
                     cleanup_entry_gate_index != 1
                     or cleanup_entry_race_finished is not False
                     or self._visual_transition is None
+                    or self._visual_transition.from_gate_index != 0
+                    or self._visual_transition.to_gate_index != 1
+                    or (
+                        stage == VISUAL_ALIGN_STAGE
+                        and (
+                            self._visual_alignment_summary is None
+                            or self._visual_alignment_summary.get(
+                                "promoted_current_track_id"
+                            )
+                            != self._visual_transition.promoted_track_id
+                            or self._visual_alignment_summary.get(
+                                "alignment_criteria_met"
+                            )
+                            is not True
+                        )
+                    )
                 ):
                     success = False
                     boundary_reason = (
-                        "visual shadow cleanup boundary lacks proved 0->1 "
+                        f"{stage} cleanup boundary lacks proved 0->1 "
                         f"authority (gate_index={cleanup_entry_gate_index}, "
                         f"race_finished={cleanup_entry_race_finished})"
                     )
@@ -13707,6 +14177,22 @@ class VQ2Runner:
                         stage=stage,
                         reason=boundary_reason,
                     )
+                    if (
+                        stage == VISUAL_ALIGN_STAGE
+                        and self._visual_alignment_summary is not None
+                    ):
+                        alignment_boundary = dict(
+                            self._visual_alignment_summary
+                        )
+                        alignment_boundary["success"] = False
+                        alignment_boundary["outcome"] = "abort"
+                        alignment_boundary["reason"] = boundary_reason
+                        alignment_boundary["abort_outcome"] = (
+                            boundary_reason
+                        )
+                        self._visual_alignment_summary = (
+                            alignment_boundary
+                        )
             if (
                 stage == GATE1_RECENTER_STAGE
                 and success
@@ -13757,6 +14243,14 @@ class VQ2Runner:
                 )
                 else None
             )
+            alignment_summary_before_cleanup = (
+                dict(self._visual_alignment_summary)
+                if (
+                    stage == VISUAL_ALIGN_STAGE
+                    and self._visual_alignment_summary is not None
+                )
+                else None
+            )
             cleanup_confirmed = await self.safe_cleanup()
             if (
                 stage == GATE1_RECENTER_STAGE
@@ -13782,6 +14276,41 @@ class VQ2Runner:
                 self.recorder.emit(
                     "gate1_recenter_post_cleanup",
                     **recenter_summary,
+                )
+            if (
+                stage == VISUAL_ALIGN_STAGE
+                and alignment_summary_before_cleanup is not None
+            ):
+                alignment_summary = alignment_summary_before_cleanup
+                alignment_summary["cleanup_entry_gate_index"] = (
+                    cleanup_entry_gate_index
+                )
+                alignment_summary["cleanup_entry_race_finished"] = (
+                    cleanup_entry_race_finished
+                )
+                alignment_summary["cleanup_confirmed"] = bool(
+                    cleanup_confirmed
+                )
+                alignment_summary["success"] = bool(
+                    success
+                    and cleanup_confirmed
+                    and alignment_summary.get(
+                        "alignment_criteria_met"
+                    )
+                )
+                if not cleanup_confirmed:
+                    alignment_summary["outcome"] = "abort"
+                    alignment_summary["reason"] = (
+                        "visual alignment cleanup was unconfirmed"
+                    )
+                    alignment_summary["abort_outcome"] = (
+                        "cleanup_unconfirmed"
+                    )
+                self._visual_alignment_summary = alignment_summary
+                details["visual_alignment"] = alignment_summary
+                self.recorder.emit(
+                    "visual_alignment_post_cleanup",
+                    **alignment_summary,
                 )
             race = self.adapter.race_status
             gate_after = race.active_gate_index if race else None
@@ -13839,7 +14368,7 @@ class VQ2Runner:
             details=details,
             controller=dict(
                 self.visual_controller_evidence
-                if stage == VISUAL_SHADOW_STAGE
+                if stage in VISUAL_POWERED_STAGES
                 else self.controller_evidence
             ),
         )
@@ -13883,7 +14412,7 @@ async def run_live(
     if type(stage) is not str or stage not in LIVE_RUN_STAGES:
         raise ValueError(f"unsupported live stage: {stage}")
     try:
-        if stage == VISUAL_SHADOW_STAGE:
+        if stage in VISUAL_POWERED_STAGES:
             effective_visual_controller = (
                 default_visual_config()
                 if controller_config is None
@@ -13924,11 +14453,11 @@ async def run_live(
     )
     controller = (
         visual_controller
-        if stage == VISUAL_SHADOW_STAGE
+        if stage in VISUAL_POWERED_STAGES
         else legacy_controller
     )
     if (
-        stage not in {GATE1_RECENTER_STAGE, VISUAL_SHADOW_STAGE}
+        stage not in {GATE1_RECENTER_STAGE, *VISUAL_POWERED_STAGES}
         and effective_controller.effective_config_sha256
         != default_controller_config().effective_config_sha256
     ):
@@ -13941,7 +14470,7 @@ async def run_live(
         or expected_controller_config_sha256
         != (
             effective_visual_controller.effective_config_sha256
-            if stage == VISUAL_SHADOW_STAGE
+            if stage in VISUAL_POWERED_STAGES
             else effective_controller.effective_config_sha256
         )
     ):
@@ -13980,7 +14509,7 @@ async def run_live(
         or not 1.0 <= float(preflight_timeout_s) <= 10.0
     ):
         raise ValueError("preflight_timeout_s must be finite and in [1, 10]")
-    if stage == VISUAL_SHADOW_STAGE and (
+    if stage in VISUAL_POWERED_STAGES and (
         run_manifest_sha256 is None
         or candidate_commit is None
         or expected_controller_config_sha256 is None
@@ -13990,7 +14519,8 @@ async def run_live(
         or write_diagnostic_pngs is not False
     ):
         raise PermissionError(
-            "visual-shadow requires the clean, manifest-bound fast-cycle "
+            "visual-navigation powered stages require the clean, "
+            "manifest-bound fast-cycle "
             "wrapper with private replay capture"
         )
     _load_live_transport_dependencies()
@@ -14055,9 +14585,26 @@ async def run_live(
                     },
                     "controller_envelope": {
                         "control_hz": CONTROL_HZ,
-                        "max_roll_pitch_command_rate_rad_s": MAX_COMMAND_RATE_RAD_S,
-                        "yaw_rate_rad_s": 0.0,
-                        "max_thrust": 0.35,
+                        "max_roll_pitch_command_rate_rad_s": (
+                            VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+                            if stage == VISUAL_ALIGN_STAGE
+                            else MAX_COMMAND_RATE_RAD_S
+                        ),
+                        "yaw_rate_rad_s": (
+                            VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
+                            if stage == VISUAL_ALIGN_STAGE
+                            else 0.0
+                        ),
+                        "max_thrust": (
+                            VISUAL_ALIGN_MAX_THRUST
+                            if stage == VISUAL_ALIGN_STAGE
+                            else 0.35
+                        ),
+                        "hard_stage_duration_s": (
+                            VISUAL_ALIGN_HARD_DURATION_S
+                            if stage == VISUAL_ALIGN_STAGE
+                            else None
+                        ),
                     },
             },
             repo_root=repo_root,
