@@ -54,7 +54,7 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["schema"] == "aigp-vq2-controller-config/1"
     assert (
         mapping["controller_family"]
-        == "aigp-vq2-gate0-gate1-recenter/2"
+        == "aigp-vq2-gate0-gate1-recenter/3"
     )
     assert mapping["phase_timing"] == {
         "gate0_boost_until_s": 0.45,
@@ -119,6 +119,11 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
         (
             "controller_family",
             "aigp-vq2-gate0-gate1-recenter/1",
+            "must equal",
+        ),
+        (
+            "controller_family",
+            "aigp-vq2-gate0-gate1-recenter/2",
             "must equal",
         ),
         ("controller_family", "other", "must equal"),
@@ -213,6 +218,7 @@ def test_retired_family_one_field_names_are_rejected(
         "stream_freshness_s",
         "collision_impulse_limit",
         "max_measured_body_rate_rad_s",
+        "max_preshape_pitch_objective_delta_rad",
         "cleanup_timeout_s",
         "reset_retry_count",
         "no_passage_width_px",

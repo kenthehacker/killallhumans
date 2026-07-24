@@ -187,6 +187,7 @@ GATE0_PRESHAPE_MAX_ABS_ROLL_RAD = 0.15
 GATE0_PRESHAPE_MIN_PITCH_RAD = -0.20
 GATE0_PRESHAPE_MAX_PITCH_RAD = 0.10
 GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD = 0.12
+GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD = 0.10
 GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S = 0.50
 COURSE_EDGE_CONTINUATION_MARGIN_PX = 2
 COURSE_EDGE_CONTINUATION_MAX_ASPECT_RATIO = 2.60
@@ -6202,6 +6203,44 @@ def gate0_centering_roll_target(
     )
 
 
+def gate0_sustained_preshape_pitch_target(
+    base_target_pitch_rad: float,
+    configured_target_pitch_rad: float,
+    preshape_entry_pitch_rad: float,
+) -> float:
+    """Cap longitudinal braking inside the fixed latch-relative envelope."""
+
+    values = (
+        base_target_pitch_rad,
+        configured_target_pitch_rad,
+        preshape_entry_pitch_rad,
+    )
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or not MIN_PITCH_RAD
+        <= float(base_target_pitch_rad)
+        <= GATE0_PRESHAPE_MAX_PITCH_RAD
+        or not 0.0 <= float(configured_target_pitch_rad) <= 0.04
+        or not GATE0_PRESHAPE_MIN_PITCH_RAD
+        <= float(preshape_entry_pitch_rad)
+        <= GATE0_PRESHAPE_MAX_PITCH_RAD
+    ):
+        raise ValueError(
+            "Gate-0 sustained-preshape pitch inputs are outside bounds"
+        )
+    requested_target = max(
+        float(base_target_pitch_rad),
+        float(configured_target_pitch_rad),
+    )
+    relative_ceiling = min(
+        GATE0_PRESHAPE_MAX_PITCH_RAD,
+        float(preshape_entry_pitch_rad)
+        + GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD,
+    )
+    return min(requested_target, relative_ceiling)
+
+
 def gate1_recenter_roll_target(
     normalized_x: float,
     normalized_x_rate_s: float,
@@ -10636,10 +10675,18 @@ class VQ2Runner:
                     target_roll_rad=target_roll,
                 )
             if early_turn_active:
-                target_pitch = max(
-                    target_pitch,
-                    forward_braking.gate0_turn_pitch_rad,
-                )
+                if turn_cue.sustained_preshape_enabled:
+                    assert preshape_entry_pitch_rad is not None
+                    target_pitch = gate0_sustained_preshape_pitch_target(
+                        target_pitch,
+                        forward_braking.gate0_turn_pitch_rad,
+                        preshape_entry_pitch_rad,
+                    )
+                else:
+                    target_pitch = max(
+                        target_pitch,
+                        forward_braking.gate0_turn_pitch_rad,
+                    )
             if elapsed < 0.15:
                 thrust = 0.26
             elif elapsed < float(boost_until_s):

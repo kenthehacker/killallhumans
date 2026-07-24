@@ -378,6 +378,56 @@ def test_gate0_centering_roll_rejects_invalid_input(normalized_x):
         vq2_module.gate0_centering_roll_target(normalized_x)
 
 
+def test_sustained_preshape_pitch_target_uses_fixed_latch_relative_ceiling():
+    entry_pitch = -0.176264
+    target = vq2_module.gate0_sustained_preshape_pitch_target(
+        -0.14,
+        0.04,
+        entry_pitch,
+    )
+
+    assert (
+        vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
+        == 0.10
+    )
+    assert target == pytest.approx(entry_pitch + 0.10)
+    assert (
+        target - entry_pitch
+        < vq2_module.GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
+    )
+
+
+def test_sustained_preshape_pitch_target_caps_the_final_base_objective():
+    assert vq2_module.gate0_sustained_preshape_pitch_target(
+        -0.04,
+        0.04,
+        -0.176264,
+    ) == pytest.approx(-0.076264)
+
+
+@pytest.mark.parametrize(
+    ("base_target", "configured_target", "entry_pitch"),
+    (
+        (True, 0.04, -0.17),
+        (math.nan, 0.04, -0.17),
+        (-0.14, 0.041, -0.17),
+        (-0.14, 0.04, -0.201),
+        (-0.14, 0.04, math.inf),
+    ),
+)
+def test_sustained_preshape_pitch_target_rejects_invalid_inputs(
+    base_target,
+    configured_target,
+    entry_pitch,
+):
+    with pytest.raises(ValueError, match="pitch inputs"):
+        vq2_module.gate0_sustained_preshape_pitch_target(
+            base_target,
+            configured_target,
+            entry_pitch,
+        )
+
+
 def test_gate_tracker_requires_temporal_continuity():
     tracker = GateTargetTracker()
     for frame_id in range(1, 4):
@@ -3562,7 +3612,12 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
         _FakeVision(),
         controller_config=config,
     )
-    runner.estimate = _estimate(roll=0.0, pitch=0.0, yaw=0.0)
+    preshape_entry_pitch = -0.176264
+    runner.estimate = _estimate(
+        roll=0.0,
+        pitch=preshape_entry_pitch,
+        yaw=0.0,
+    )
     runner._latest_detection_image = object()
     context = vq2_module.StartContext(
         0.0,
@@ -3665,6 +3720,20 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     assert len(end_events) == 1
     assert end_events[0]["reason"] == "duration"
     assert any(command.yaw_rate < 0.0 for command in commands)
+    active_objectives = [
+        objective
+        for objective, command in zip(objectives, commands)
+        if command.yaw_rate < 0.0
+    ]
+    assert active_objectives
+    assert all(
+        target_pitch
+        == pytest.approx(
+            preshape_entry_pitch
+            + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
+        )
+        for _target_roll, target_pitch, _thrust in active_objectives
+    )
     ended_index = next(
         index
         for index, (event, _payload) in enumerate(events)
