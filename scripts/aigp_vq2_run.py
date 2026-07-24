@@ -183,6 +183,7 @@ GATE1_RECENTER_MAX_ROLL_RAD = 0.12
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
 GATE1_RECENTER_THRUST = 0.275
 GATE1_RECENTER_TRANSITION_THRUST = GATE1_RECENTER_THRUST
+GATE1_RECENTER_TARGET_PITCH_RAD = 0.10
 GATE1_RECENTER_MIN_THRUST = 0.21
 GATE1_RECENTER_MAX_THRUST = 0.30
 GATE1_RECENTER_CORRIDOR_NORMALIZED_X = 0.35
@@ -10029,7 +10030,7 @@ class VQ2Runner:
         self,
         gate1_observation: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """Run the user-authorized position-only, no-passage Gate 1 trial."""
+        """Run the user-authorized bounded, no-passage Gate 1 diagnostic."""
 
         self._gate1_recenter_summary = None
         if not isinstance(gate1_observation, Mapping):
@@ -10108,7 +10109,7 @@ class VQ2Runner:
             raise SafetyAbort("gate-1 recenter requires a fresh primary target")
         entry_error_px = float(entry_target.center_x) - 320.0
         self._gate1_recenter_summary = {
-            "candidate_authority": "user_authorized_position_only_live_trial",
+            "candidate_authority": "user_authorized_bounded_recenter_diagnostic",
             "success": False,
             "recenter_criteria_met": False,
             "outcome": "entry_validation",
@@ -10117,6 +10118,7 @@ class VQ2Runner:
             "entry_abs_horizontal_error_px": abs(entry_error_px),
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": abs(entry_error_px),
+            "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
             "max_target_area_px": int(entry_target.bbox_area),
             "max_target_width_px": int(entry_target.bbox[2]),
             "no_passage_max_area_px": (
@@ -10228,7 +10230,7 @@ class VQ2Runner:
         ]
 
         summary: Dict[str, Any] = {
-            "candidate_authority": "user_authorized_position_only_live_trial",
+            "candidate_authority": "user_authorized_bounded_recenter_diagnostic",
             "success": False,
             "recenter_criteria_met": False,
             "outcome": "running",
@@ -10251,6 +10253,7 @@ class VQ2Runner:
             "min_command_pitch_rate_rad_s": None,
             "max_command_pitch_rate_rad_s": None,
             "command_count": 0,
+            "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
             "max_target_area_px": max_target_area,
             "max_target_width_px": max_target_width,
             "no_passage_max_area_px": (
@@ -10379,7 +10382,7 @@ class VQ2Runner:
                 "max_command_rate_rad_s": (
                     GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
                 ),
-                "target_pitch_rad": 0.0,
+                "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
                 "thrust": GATE1_RECENTER_THRUST,
                 "duration_s": GATE1_RECENTER_DURATION_S,
             },
@@ -10823,7 +10826,7 @@ class VQ2Runner:
                 command = attitude_rate_command(
                     self.estimate,
                     target_roll_rad=target_roll,
-                    target_pitch_rad=0.0,
+                    target_pitch_rad=GATE1_RECENTER_TARGET_PITCH_RAD,
                     thrust=GATE1_RECENTER_THRUST,
                 )
                 command = limit_command_rates(

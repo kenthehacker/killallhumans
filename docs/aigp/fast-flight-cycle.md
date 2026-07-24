@@ -20,13 +20,14 @@ The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`,
 scaffolding remains offline-only and is not admitted by this powered entry
 point.
 
-`gate1-recenter` is a user-authorized, position-only no-passage trial. Its
-pixel-rate gain remains exactly zero pending M2 recorded-replay and
-tracker-isolation acceptance. It preserves exact `0.275` thrust with zero
-attitude rates during the visually armed Gate 0 crossing confirmation and
-authoritative Gate 1 acquisition so the motors do not cut during the
-continuation handoff. Once Gate 1 is authoritative, the accepted and raw
-no-passage geometry guards apply before every such powered observation
+`gate1-recenter` is a user-authorized bounded no-passage diagnostic. Its
+horizontal pixel-rate gain remains exactly zero pending M2 recorded-replay and
+tracker-isolation acceptance; the current diagnostic combines horizontal
+position error with a fixed bounded pitch brake. It preserves exact `0.275`
+thrust with zero attitude rates during the visually armed Gate 0 crossing
+confirmation and authoritative Gate 1 acquisition so the motors do not cut
+during the continuation handoff. Once Gate 1 is authoritative, the accepted
+and raw no-passage geometry guards apply before every such powered observation
 setpoint. It stops after 0.60 seconds, on any gate-index change, or before a
 primary target reaches 160 pixels wide or 23,040 square pixels; the existing
 raw large-geometry contact guard is enforced independently. Stage success

@@ -3,10 +3,10 @@
 ## User-authorized bounded live exception
 
 Later on 2026-07-23, the user explicitly authorized rapid powered simulator
-iteration. That instruction admits only the position-only, 0.60-second
-`gate1-recenter` trial with the frozen no-passage bounds and normal powered
-lifecycle. It does not accept M1/M2, pixel-rate authority, Gate 1 passage, or
-`full-lap`; those claims still require their own evidence.
+iteration. That instruction admits only the bounded 0.60-second
+`gate1-recenter` diagnostic with frozen no-passage bounds and the normal
+powered lifecycle. It does not accept M1/M2, pixel-rate authority, Gate 1
+passage, or `full-lap`; those claims still require their own evidence.
 
 ## Disposition
 

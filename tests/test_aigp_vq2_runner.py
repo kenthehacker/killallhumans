@@ -1749,6 +1749,7 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
+    assert vq2_module.GATE1_RECENTER_TARGET_PITCH_RAD == 0.10
     assert vq2_module.GATE1_RECENTER_MIN_THRUST == 0.21
     assert vq2_module.GATE1_RECENTER_MAX_THRUST == 0.30
     assert vq2_module.GATE1_RECENTER_CORRIDOR_NORMALIZED_X == 0.35
@@ -2154,7 +2155,7 @@ def test_offline_gate1_recenter_requires_error_decrease_and_three_frame_hold(
     )
 
 
-def test_offline_gate1_recenter_wires_zero_pitch_and_fixed_thrust(
+def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
     monkeypatch,
 ):
     runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
@@ -2184,7 +2185,7 @@ def test_offline_gate1_recenter_wires_zero_pitch_and_fixed_thrust(
 
     assert observed
     assert all(
-        objective["target_pitch_rad"] == 0.0
+        objective["target_pitch_rad"] == 0.10
         and objective["thrust"] == 0.275
         for objective in observed
     )
