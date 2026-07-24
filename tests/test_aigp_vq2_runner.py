@@ -3718,8 +3718,6 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     commands = []
     events = []
     scores = [
-        None,
-        None,
         0.05,
         0.10,
         0.20,
@@ -3736,7 +3734,7 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
         _FakeVision(),
         controller_config=config,
     )
-    preshape_entry_pitch = -0.176264
+    preshape_entry_pitch = -0.15
     runner.estimate = _estimate(
         roll=0.0,
         pitch=preshape_entry_pitch,
@@ -4120,7 +4118,7 @@ def test_sustained_gate0_brake_enforces_attitude_guard_before_turn_cue(
         _FakeVision(),
         controller_config=config,
     )
-    entry_pitch = -0.176264
+    entry_pitch = -0.15
     runner.estimate = _estimate(roll=0.0, pitch=entry_pitch, yaw=0.0)
     runner._latest_detection_image = object()
     runner._latest_detection_generation = 7
@@ -4247,6 +4245,13 @@ def _exercise_sustained_gate0_with_cue(
     area_boundary_sample=None,
     turn_score=0.20,
     entry_roll=0.0,
+    entry_pitch=-0.15,
+    pitch_by_sample=None,
+    turn_score_by_sample=None,
+    duplicate_sample=None,
+    entry_window_sample=None,
+    entry_window_height_px=100,
+    expected_abort_match=None,
 ):
     class CommandsCaptured(Exception):
         pass
@@ -4279,7 +4284,7 @@ def _exercise_sustained_gate0_with_cue(
     )
     runner.estimate = _estimate(
         roll=float(entry_roll),
-        pitch=-0.176264,
+        pitch=float(entry_pitch),
         yaw=0.0,
     )
     runner._latest_detection_image = object()
@@ -4295,6 +4300,32 @@ def _exercise_sustained_gate0_with_cue(
 
     def sample():
         sample_count[0] += 1
+        if pitch_by_sample is not None:
+            runner.estimate = _estimate(
+                roll=float(entry_roll),
+                pitch=float(
+                    pitch_by_sample.get(
+                        sample_count[0],
+                        entry_pitch,
+                    )
+                ),
+                yaw=0.0,
+            )
+        if sample_count[0] == duplicate_sample:
+            assert last_target[0] is not None
+            runner.tracker.target = last_target[0]
+            runner.tracker.consecutive = 3
+            runner.tracker.last_selection_mode = "primary"
+            runner._latest_accepted_target = last_target[0]
+            runner._latest_detection_generation = 7
+            runner._latest_detection_frame_id = last_target[0].frame_id
+            runner._latest_detection_frame_sim_ns = (
+                last_target[0].sim_time_ns
+            )
+            runner._latest_detection_received_s = (
+                last_target[0].received_monotonic_s
+            )
+            return
         if pre_latch_rejection and sample_count[0] == 5:
             assert last_target[0] is not None
             runner.tracker.target = last_target[0]
@@ -4309,13 +4340,13 @@ def _exercise_sustained_gate0_with_cue(
         if entry_attitude_fault and sample_count[0] == 6:
             runner.estimate = _estimate(
                 roll=vq2_module.GATE0_PRESHAPE_MAX_ABS_ROLL_RAD + 0.001,
-                pitch=-0.176264,
+                pitch=float(entry_pitch),
                 yaw=0.0,
             )
         elif entry_attitude_fault and sample_count[0] == 7:
             runner.estimate = _estimate(
                 roll=0.0,
-                pitch=-0.176264,
+                pitch=float(entry_pitch),
                 yaw=0.0,
             )
         if (
@@ -4331,7 +4362,7 @@ def _exercise_sustained_gate0_with_cue(
                     )
                     else float(yaw_stop_roll)
                 ),
-                pitch=-0.176264,
+                pitch=float(entry_pitch),
                 yaw=0.0,
             )
         if (
@@ -4346,7 +4377,7 @@ def _exercise_sustained_gate0_with_cue(
                     vq2_module.GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
                     + 0.001
                 ),
-                pitch=-0.176264,
+                pitch=float(entry_pitch),
                 yaw=0.0,
             )
         if authority_boundary_fault == "pass" and sample_count[0] == 7:
@@ -4367,9 +4398,18 @@ def _exercise_sustained_gate0_with_cue(
                 (277, 132, 86, 96)
                 if sample_count[0] <= 3
                 else (
-                    (200, 70, 240, 220)
-                    if sample_count[0] == area_boundary_sample
-                    else (280, 128, 80, 104)
+                    (
+                        200,
+                        100,
+                        160,
+                        int(entry_window_height_px),
+                    )
+                    if sample_count[0] == entry_window_sample
+                    else (
+                        (200, 70, 240, 220)
+                        if sample_count[0] == area_boundary_sample
+                        else (280, 128, 80, 104)
+                    )
                 )
             ),
             confidence=0.8,
@@ -4418,16 +4458,26 @@ def _exercise_sustained_gate0_with_cue(
         "emit",
         lambda event, **payload: events.append((event, payload)),
     )
-    monkeypatch.setattr(
-        vq2_module,
-        "cyan_course_line_observation",
-        lambda _image: vq2_module.CourseLineObservation(
-            turn_score=float(turn_score),
+    def observe_line(_image):
+        score = (
+            turn_score
+            if turn_score_by_sample is None
+            else turn_score_by_sample.get(sample_count[0], turn_score)
+        )
+        if score is None:
+            return None
+        return vq2_module.CourseLineObservation(
+            turn_score=float(score),
             upper_center_x=384.0,
             lower_center_x=320.0,
             upper_pixel_count=136,
             lower_pixel_count=136,
-        ),
+        )
+
+    monkeypatch.setattr(
+        vq2_module,
+        "cyan_course_line_observation",
+        observe_line,
     )
     if yaw_stop_roll is not None:
         monkeypatch.setattr(
@@ -4461,6 +4511,10 @@ def _exercise_sustained_gate0_with_cue(
                 and authority_boundary_fault is None
                 and not entry_attitude_fault
                 and not pre_latch_rejection
+                and not (
+                    entry_window_sample is not None
+                    and int(entry_window_height_px) >= 100
+                )
                 and abs(float(entry_roll))
                 <= vq2_module.GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
                 and (
@@ -4497,7 +4551,10 @@ def _exercise_sustained_gate0_with_cue(
             )
             assert result["gate0_passed"] is True
         else:
-            with pytest.raises(expected_exception):
+            with pytest.raises(
+                expected_exception,
+                match=expected_abort_match,
+            ):
                 asyncio.run(
                     runner._run_gate0(
                         context,
@@ -4548,6 +4605,301 @@ def test_sustained_gate0_cue_fails_closed_after_authority_reset(
     ]
 
     assert brake_latches == []
+
+
+def test_sustained_gate0_defers_authority_until_three_pitch_ready_frames(
+    monkeypatch,
+):
+    pitch_by_sample = {
+        1: -0.175,
+        2: -0.175,
+        3: -0.175,
+        4: -0.175,
+        5: -0.175,
+        6: -0.159,
+        7: -0.158,
+        8: -0.157,
+        9: -0.157,
+        10: -0.157,
+    }
+    runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_pitch=-0.175,
+        pitch_by_sample=pitch_by_sample,
+    )
+
+    rejected = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_entry_rejected"
+    ]
+    deferred = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_admission_deferred"
+    ]
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    )
+
+    assert [payload["frame_id"] for payload in rejected] == [4, 5]
+    assert all(
+        payload["reason"] == "pitch_readiness"
+        for payload in rejected
+    )
+    assert [payload["ready_frame_count"] for payload in deferred] == [1, 2]
+    assert proof["frame_id"] == 8
+    assert proof["pitch_rad"] == pytest.approx(-0.157)
+    assert latch["frame_id"] == 8
+    assert latch["entry_pitch_rad"] == pytest.approx(-0.157)
+    assert all(command.yaw_rate == 0.0 for command in commands[:7])
+    assert commands[7].yaw_rate < 0.0
+    assert runner._gate0_early_turn_summary is not None
+
+
+def test_sustained_gate0_exact_pitch_readiness_boundary_admits(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_pitch=vq2_module.GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD,
+    )
+
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    assert proof["frame_id"] == 6
+    assert proof["pitch_rad"] == pytest.approx(
+        vq2_module.GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD
+    )
+
+
+def test_sustained_gate0_below_pitch_readiness_boundary_never_latches(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_pitch=(
+            vq2_module.GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD
+            - 0.000001
+        ),
+    )
+
+    assert len(commands) == 10
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert not any(
+        event == "gate0_sustained_preshape_entry_proved"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    assert all(
+        payload["reason"] == "pitch_readiness"
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_entry_rejected"
+    )
+
+
+def test_sustained_gate0_duplicate_poll_does_not_advance_joint_proof(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        duplicate_sample=5,
+    )
+
+    deferred = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_admission_deferred"
+    ]
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    assert [payload["ready_frame_count"] for payload in deferred] == [1, 2]
+    assert proof["frame_id"] == 7
+
+
+def test_sustained_gate0_pitch_dip_resets_joint_proof(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        pitch_by_sample={6: -0.17},
+    )
+
+    rejected = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_entry_rejected"
+    ]
+    deferred = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_admission_deferred"
+    ]
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    assert [payload["frame_id"] for payload in rejected] == [6]
+    assert rejected[0]["reason"] == "pitch_readiness"
+    assert [payload["ready_frame_count"] for payload in deferred] == [
+        1,
+        2,
+        1,
+        2,
+    ]
+    assert proof["frame_id"] == 9
+
+
+def test_sustained_gate0_cue_sign_loss_resets_joint_proof(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        turn_score_by_sample={6: -0.20},
+    )
+
+    deferred = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_admission_deferred"
+    ]
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    assert [payload["ready_frame_count"] for payload in deferred] == [
+        1,
+        2,
+        1,
+        1,
+        2,
+    ]
+    assert proof["frame_id"] == 9
+
+
+@pytest.mark.parametrize("lost_score", (None, 0.01))
+def test_sustained_gate0_cue_loss_resets_joint_proof(
+    monkeypatch,
+    lost_score,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        turn_score_by_sample={6: lost_score},
+    )
+
+    deferred = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_admission_deferred"
+    ]
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    assert [payload["ready_frame_count"] for payload in deferred] == [
+        1,
+        2,
+        1,
+        2,
+    ]
+    assert proof["frame_id"] == 9
+
+
+def test_sustained_gate0_entry_window_boundary_precedes_ready_latch(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_window_sample=6,
+        entry_window_height_px=100,
+        expected_abort_match="missed its fixed pitch-ready entry window",
+    )
+
+    assert len(commands) == 5
+    assert not any(
+        event == "gate0_sustained_preshape_entry_proved"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "course_line_sustained_preshape_applied"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_entry_just_below_window_admits(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_window_sample=6,
+        entry_window_height_px=99,
+    )
+
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    )
+    assert proof["frame_id"] == 6
+    assert proof["gate_area_scale"] == pytest.approx(2.475)
+    assert latch["frame_id"] == 6
+
+
+def test_sustained_gate0_readiness_floor_is_admission_only(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        pitch_by_sample={
+            7: -0.17,
+            8: -0.17,
+            9: -0.17,
+            10: -0.17,
+        },
+    )
+
+    proof = next(
+        payload
+        for event, payload in events
+        if event == "gate0_sustained_preshape_entry_proved"
+    )
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    )
+    assert proof["frame_id"] == 6
+    assert latch["frame_id"] == 6
+    assert len(commands) == 10
+    assert any(command.yaw_rate < 0.0 for command in commands[6:])
 
 
 def test_sustained_gate0_brake_ends_at_shared_deadline_from_turn_cue(

@@ -186,8 +186,10 @@ GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE = (
 )
 GATE0_PRESHAPE_HARD_MAX_DURATION_S = 1.20
 GATE0_PRESHAPE_HARD_MAX_AREA_SCALE = 20.0
+GATE0_PRESHAPE_HARD_MAX_ENTRY_AREA_SCALE = 2.5
 GATE0_PRESHAPE_MAX_ABS_ROLL_RAD = 0.15
 GATE0_PRESHAPE_MIN_PITCH_RAD = -0.20
+GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD = -0.16
 GATE0_PRESHAPE_MAX_PITCH_RAD = 0.10
 GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD = 0.12
 GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD = 0.10
@@ -10228,6 +10230,7 @@ class VQ2Runner:
         longitudinal_brake_proof_count = 0
         longitudinal_brake_area_proof_count = 0
         sustained_preshape_entry_proved = False
+        sustained_preshape_entry_authority_failed = False
         longitudinal_brake_last_proof: Optional[
             Tuple[int, int, float]
         ] = None
@@ -10280,7 +10283,7 @@ class VQ2Runner:
             )
             admitted = bool(
                 abs(float(roll)) <= GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
-                and GATE0_PRESHAPE_MIN_PITCH_RAD
+                and GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD
                 <= float(pitch)
                 <= GATE0_PRESHAPE_MAX_PITCH_RAD
                 and peak_rate
@@ -10616,129 +10619,7 @@ class VQ2Runner:
                     int(self._latest_detection_frame_sim_ns),
                     float(self._latest_detection_received_s),
                 )
-            if (
-                turn_cue.sustained_preshape_enabled
-                and current_detection_token
-                != longitudinal_brake_last_detection_token
-            ):
-                longitudinal_brake_last_detection_token = (
-                    current_detection_token
-                )
-                exact_primary_authority = bool(
-                    int(race.active_gate_index) == 0
-                    and not crossing_armed
-                    and target.received_monotonic_s >= flight_start
-                    and has_exact_primary_authority(target, now)
-                )
-                if exact_primary_authority:
-                    current_proof = (
-                        int(target.frame_id),
-                        int(target.sim_time_ns),
-                        float(target.received_monotonic_s),
-                    )
-                    if (
-                        longitudinal_brake_last_proof is not None
-                        and (
-                            current_proof[0]
-                            <= longitudinal_brake_last_proof[0]
-                            or current_proof[1]
-                            <= longitudinal_brake_last_proof[1]
-                            or current_proof[2]
-                            <= longitudinal_brake_last_proof[2]
-                        )
-                    ):
-                        raise SafetyAbort(
-                            "Gate-0 longitudinal-brake fresh-frame "
-                            "proof did not advance strictly"
-                        )
-                    longitudinal_brake_last_proof = current_proof
-                    longitudinal_brake_proof_count += 1
-                    if longitudinal_brake_started_s is None:
-                        if (
-                            target.bbox_area
-                            >= GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
-                            * context.initial_gate_area
-                        ):
-                            (
-                                entry_admitted,
-                                candidate_roll,
-                                candidate_pitch,
-                                candidate_peak_rate,
-                            ) = preshape_entry_attitude_state()
-                            if entry_admitted:
-                                longitudinal_brake_area_proof_count += 1
-                            else:
-                                longitudinal_brake_area_proof_count = 0
-                                sustained_preshape_entry_proved = False
-                                self.recorder.emit(
-                                    "gate0_longitudinal_brake_entry_rejected",
-                                    elapsed_s=elapsed,
-                                    frame_id=target.frame_id,
-                                    gate_area_scale=(
-                                        float(target.bbox_area)
-                                        / float(context.initial_gate_area)
-                                    ),
-                                    reason="fixed_attitude_envelope",
-                                    roll_rad=candidate_roll,
-                                    pitch_rad=candidate_pitch,
-                                    peak_body_rate_rad_s=(
-                                        candidate_peak_rate
-                                    ),
-                                )
-                        else:
-                            longitudinal_brake_area_proof_count = 0
-                            sustained_preshape_entry_proved = False
-                else:
-                    longitudinal_brake_last_proof = None
-                    longitudinal_brake_proof_count = 0
-                    longitudinal_brake_area_proof_count = 0
-                    sustained_preshape_entry_proved = False
-                if (
-                    longitudinal_brake_started_s is None
-                    and not sustained_preshape_entry_proved
-                    and target.bbox_area
-                    >= GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
-                    * context.initial_gate_area
-                    and exact_primary_authority
-                    and longitudinal_brake_proof_count
-                    >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
-                    and longitudinal_brake_area_proof_count
-                    >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
-                ):
-                    (
-                        entry_admitted,
-                        entry_roll,
-                        entry_pitch,
-                        entry_peak_rate,
-                    ) = preshape_entry_attitude_state()
-                    if not entry_admitted:
-                        raise SafetyAbort(
-                            "Gate-0 longitudinal-brake latch escaped its "
-                            "fixed attitude envelope"
-                        )
-                    sustained_preshape_entry_proved = True
-                    start_area_scale = (
-                        float(target.bbox_area)
-                        / float(context.initial_gate_area)
-                    )
-                    self.recorder.emit(
-                        "gate0_sustained_preshape_entry_proved",
-                        elapsed_s=elapsed,
-                        vision_generation=self._latest_detection_generation,
-                        frame_id=target.frame_id,
-                        sim_time_ns=target.sim_time_ns,
-                        received_monotonic_s=(
-                            target.received_monotonic_s
-                        ),
-                        gate_area_scale=start_area_scale,
-                        area_proof_frame_count=(
-                            longitudinal_brake_area_proof_count
-                        ),
-                        roll_rad=float(entry_roll),
-                        pitch_rad=float(entry_pitch),
-                        peak_body_rate_rad_s=float(entry_peak_rate),
-                    )
-
+            current_course_line_proved = False
             new_target_frame = target.frame_id != last_target_frame
             if new_target_frame:
                 if last_control_y is not None and last_target_time is not None:
@@ -10763,6 +10644,7 @@ class VQ2Runner:
                         line is not None
                         and abs(line.turn_score) >= turn_cue.min_abs_score
                     ):
+                        current_course_line_proved = True
                         if (
                             course_turn_streak == 0
                             or filtered_course_turn * line.turn_score > 0.0
@@ -10797,7 +10679,193 @@ class VQ2Runner:
             stable_course_line = (
                 course_turn_streak >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
             )
-            if stable_course_line and early_turn_started_s is None:
+            if (
+                turn_cue.sustained_preshape_enabled
+                and early_turn_started_s is None
+                and (
+                    float(target.bbox_area)
+                    / float(context.initial_gate_area)
+                )
+                >= GATE0_PRESHAPE_HARD_MAX_ENTRY_AREA_SCALE
+            ):
+                raise SafetyAbort(
+                    "Gate-0 sustained preshape missed its fixed "
+                    "pitch-ready entry window"
+                )
+            if (
+                turn_cue.sustained_preshape_enabled
+                and early_turn_started_s is None
+                and current_detection_token
+                != longitudinal_brake_last_detection_token
+            ):
+                longitudinal_brake_last_detection_token = (
+                    current_detection_token
+                )
+                exact_primary_authority = bool(
+                    int(race.active_gate_index) == 0
+                    and not crossing_armed
+                    and target.received_monotonic_s >= flight_start
+                    and has_exact_primary_authority(target, now)
+                )
+                joint_entry_candidate = bool(
+                    exact_primary_authority
+                    and current_course_line_proved
+                    and target.bbox_area
+                    >= GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
+                    * context.initial_gate_area
+                )
+                if joint_entry_candidate:
+                    current_proof = (
+                        int(target.frame_id),
+                        int(target.sim_time_ns),
+                        float(target.received_monotonic_s),
+                    )
+                    if (
+                        longitudinal_brake_last_proof is not None
+                        and (
+                            current_proof[0]
+                            <= longitudinal_brake_last_proof[0]
+                            or current_proof[1]
+                            <= longitudinal_brake_last_proof[1]
+                            or current_proof[2]
+                            <= longitudinal_brake_last_proof[2]
+                        )
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 longitudinal-brake fresh-frame "
+                            "proof did not advance strictly"
+                        )
+                    (
+                        entry_admitted,
+                        candidate_roll,
+                        candidate_pitch,
+                        candidate_peak_rate,
+                    ) = preshape_entry_attitude_state()
+                    if entry_admitted:
+                        longitudinal_brake_last_proof = current_proof
+                        longitudinal_brake_proof_count = min(
+                            course_turn_streak,
+                            longitudinal_brake_proof_count + 1,
+                        )
+                        longitudinal_brake_area_proof_count = min(
+                            course_turn_streak,
+                            longitudinal_brake_area_proof_count + 1,
+                        )
+                        if (
+                            longitudinal_brake_proof_count
+                            >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
+                            and longitudinal_brake_area_proof_count
+                            >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
+                        ):
+                            sustained_preshape_entry_proved = True
+                            start_area_scale = (
+                                float(target.bbox_area)
+                                / float(context.initial_gate_area)
+                            )
+                            self.recorder.emit(
+                                "gate0_sustained_preshape_entry_proved",
+                                elapsed_s=elapsed,
+                                vision_generation=(
+                                    self._latest_detection_generation
+                                ),
+                                frame_id=target.frame_id,
+                                sim_time_ns=target.sim_time_ns,
+                                received_monotonic_s=(
+                                    target.received_monotonic_s
+                                ),
+                                gate_area_scale=start_area_scale,
+                                area_proof_frame_count=(
+                                    longitudinal_brake_area_proof_count
+                                ),
+                                roll_rad=float(candidate_roll),
+                                pitch_rad=float(candidate_pitch),
+                                peak_body_rate_rad_s=float(
+                                    candidate_peak_rate
+                                ),
+                            )
+                        else:
+                            self.recorder.emit(
+                                "gate0_preshape_admission_deferred",
+                                elapsed_s=elapsed,
+                                frame_id=target.frame_id,
+                                gate_area_scale=(
+                                    float(target.bbox_area)
+                                    / float(context.initial_gate_area)
+                                ),
+                                pitch_rad=float(candidate_pitch),
+                                ready_frame_count=(
+                                    longitudinal_brake_area_proof_count
+                                ),
+                            )
+                    else:
+                        longitudinal_brake_last_proof = None
+                        longitudinal_brake_proof_count = 0
+                        longitudinal_brake_area_proof_count = 0
+                        sustained_preshape_entry_proved = False
+                        pitch_readiness_only = bool(
+                            abs(float(candidate_roll))
+                            <= GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
+                            and GATE0_PRESHAPE_MIN_PITCH_RAD
+                            <= float(candidate_pitch)
+                            < GATE0_PRESHAPE_MIN_ENTRY_PITCH_RAD
+                            and candidate_peak_rate
+                            <= GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S
+                        )
+                        self.recorder.emit(
+                            "gate0_longitudinal_brake_entry_rejected",
+                            elapsed_s=elapsed,
+                            frame_id=target.frame_id,
+                            gate_area_scale=(
+                                float(target.bbox_area)
+                                / float(context.initial_gate_area)
+                            ),
+                            reason=(
+                                "pitch_readiness"
+                                if pitch_readiness_only
+                                else "fixed_attitude_envelope"
+                            ),
+                            roll_rad=candidate_roll,
+                            pitch_rad=candidate_pitch,
+                            peak_body_rate_rad_s=candidate_peak_rate,
+                        )
+                        if (
+                            stable_course_line
+                            and not pitch_readiness_only
+                        ):
+                            raise SafetyAbort(
+                                "Gate-0 sustained preshape cue escaped "
+                                "its fixed attitude envelope"
+                            )
+                else:
+                    sustained_preshape_entry_authority_failed = bool(
+                        sustained_preshape_entry_authority_failed
+                        or (
+                            not exact_primary_authority
+                            and target.bbox_area
+                            >= GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
+                            * context.initial_gate_area
+                        )
+                    )
+                    longitudinal_brake_last_proof = None
+                    longitudinal_brake_proof_count = 0
+                    longitudinal_brake_area_proof_count = 0
+                    sustained_preshape_entry_proved = False
+            if (
+                stable_course_line
+                and sustained_preshape_entry_authority_failed
+            ):
+                raise SafetyAbort(
+                    "Gate-0 sustained preshape cue lacked proved "
+                    "safe entry authority"
+                )
+            if (
+                stable_course_line
+                and early_turn_started_s is None
+                and (
+                    not turn_cue.sustained_preshape_enabled
+                    or sustained_preshape_entry_proved
+                )
+            ):
                 if turn_cue.sustained_preshape_enabled:
                     exact_primary_authority = bool(
                         int(race.active_gate_index) == 0
