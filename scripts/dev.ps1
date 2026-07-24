@@ -180,7 +180,7 @@ interactive confirmation.
                 'calibration-excite'
             }
             $allowed = @(
-                'sign-id', 'hover', 'gate0', 'gate0-observe',
+                'sign-id', 'hover', 'gate0', 'gate0-observe', 'gate1-recenter',
                 'calibration-excite'
             )
             if ($stage -notin $allowed) {

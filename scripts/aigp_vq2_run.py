@@ -173,13 +173,12 @@ POST_GATE_MAX_ATTITUDE_DELTA_RAD = math.radians(5.0)
 POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S = 1.0
 POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 
-# Offline candidate only until the authoritative recorded-replay and
-# tracker-isolation prerequisite is accepted. No live dispatcher admits this
-# stage identity.
+# User-authorized bounded live trial. Pixel-rate damping stays disabled until
+# the authoritative replay/tracker-isolation prerequisite is accepted.
 GATE1_RECENTER_STAGE = "gate1-recenter"
 GATE1_RECENTER_DURATION_S = 0.60
 GATE1_RECENTER_ROLL_GAIN = 0.12
-GATE1_RECENTER_ROLL_RATE_GAIN = 0.025
+GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
 GATE1_RECENTER_MAX_ROLL_RAD = 0.05
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
 GATE1_RECENTER_THRUST = 0.275
@@ -194,6 +193,8 @@ GATE1_RECENTER_MIN_PITCH_RAD = -0.20
 GATE1_RECENTER_MAX_PITCH_RAD = 0.10
 GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD = 0.12
 GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S = 0.50
+GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX = COURSE_UNTRACKED_CONTACT_MIN_AREA_PX
+GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX = COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX
 
 MAX_BENIGN_PAD_CONTACTS = 12
 MAX_BENIGN_PAD_IMPULSE = 0.05
@@ -249,6 +250,7 @@ LIVE_RUN_STAGES = (
     "hover",
     "gate0",
     "gate0-observe",
+    GATE1_RECENTER_STAGE,
     CALIBRATION_STAGE,
 )
 CALIBRATION_CHILD_ROLE = "powered_child"
@@ -6102,11 +6104,7 @@ def gate1_recenter_roll_target(
     normalized_x: float,
     normalized_x_rate_s: float,
 ) -> float:
-    """Return the reviewed positive-sign Gate 1 recenter roll target.
-
-    This is pure candidate math. The powered runner does not admit the stage
-    until the recorded-replay/tracker-isolation prerequisite is resolved.
-    """
+    """Return the bounded positive-sign Gate 1 recenter roll target."""
 
     values = (normalized_x, normalized_x_rate_s)
     if (
@@ -9963,19 +9961,38 @@ class VQ2Runner:
         self,
         gate1_observation: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """Run the no-passage Gate 1 candidate behind an offline-only seam.
-
-        The method contains the intended supervisor behavior and is directly
-        testable, but no live stage list or dispatcher can reach it while the
-        authoritative recorded-replay/tracker-isolation prerequisite remains
-        unresolved.
-        """
+        """Run the user-authorized position-only, no-passage Gate 1 trial."""
 
         self._gate1_recenter_summary = None
         if not isinstance(gate1_observation, Mapping):
             raise SafetyAbort("gate-1 recenter lacks a valid observation")
         proof = self._gate0_transition_proof
         frames = gate1_observation.get("frames")
+
+        def assert_no_passage_geometry(
+            target: GateTarget,
+            *,
+            phase: str,
+        ) -> None:
+            if (
+                int(target.bbox_area)
+                >= GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX
+                or int(target.bbox[2])
+                >= GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX
+            ):
+                raise SafetyAbort(
+                    "gate-1 recenter no-passage geometry bound reached "
+                    f"during {phase}"
+                )
+            raw_contact_risk = select_untracked_contact_risk(
+                self._latest_raw_detections,
+                accepted_target=None,
+            )
+            if raw_contact_risk is not None:
+                raise SafetyAbort(
+                    "gate-1 recenter raw no-passage geometry bound reached "
+                    f"during {phase}"
+                )
         if (
             proof is None
             or gate1_observation.get("gate1_observed") is not True
@@ -10045,6 +10062,30 @@ class VQ2Runner:
             or self.tracker.consecutive < POST_GATE_REQUIRED_FRAMES
         ):
             raise SafetyAbort("gate-1 recenter requires a fresh primary target")
+        entry_error_px = float(entry_target.center_x) - 320.0
+        self._gate1_recenter_summary = {
+            "candidate_authority": "user_authorized_position_only_live_trial",
+            "success": False,
+            "recenter_criteria_met": False,
+            "outcome": "entry_validation",
+            "reason": None,
+            "entry_horizontal_error_px": entry_error_px,
+            "entry_abs_horizontal_error_px": abs(entry_error_px),
+            "final_horizontal_error_px": entry_error_px,
+            "final_abs_horizontal_error_px": abs(entry_error_px),
+            "max_target_area_px": int(entry_target.bbox_area),
+            "max_target_width_px": int(entry_target.bbox[2]),
+            "no_passage_max_area_px": (
+                GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX
+            ),
+            "no_passage_max_width_px": (
+                GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX
+            ),
+            "authoritative_max_gate_index": 1,
+            "contact_safety_outcome": "clean_so_far",
+            "cleanup_confirmed": False,
+        }
+        assert_no_passage_geometry(entry_target, phase="entry")
         entry_generation = self._latest_detection_generation
         entry_frame_id = self._latest_detection_frame_id
         entry_sim_time_ns = self._latest_detection_frame_sim_ns
@@ -10087,7 +10128,6 @@ class VQ2Runner:
             raise SafetyAbort(
                 "gate-1 recenter entry attitude approached its bound"
             )
-        entry_error_px = float(entry_target.center_x) - 320.0
         entry_abs_error_px = abs(entry_error_px)
         fresh_error_samples: List[Tuple[float, float]] = [
             (float(entry_target.received_monotonic_s), entry_abs_error_px)
@@ -10141,7 +10181,7 @@ class VQ2Runner:
         ]
 
         summary: Dict[str, Any] = {
-            "candidate_authority": "offline_only_pending_replay_review",
+            "candidate_authority": "user_authorized_position_only_live_trial",
             "success": False,
             "recenter_criteria_met": False,
             "outcome": "running",
@@ -10166,6 +10206,12 @@ class VQ2Runner:
             "command_count": 0,
             "max_target_area_px": max_target_area,
             "max_target_width_px": max_target_width,
+            "no_passage_max_area_px": (
+                GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX
+            ),
+            "no_passage_max_width_px": (
+                GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX
+            ),
             "authoritative_max_gate_index": max_gate_index,
             "contact_safety_outcome": "clean_so_far",
             "cleanup_confirmed": False,
@@ -10353,6 +10399,7 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter target lost primary fresh-frame authority"
                     )
+                assert_no_passage_geometry(accepted, phase="control")
                 if self.estimate is None:
                     raise SafetyAbort(
                         "gate-1 recenter attitude estimate is unavailable"
@@ -10582,6 +10629,10 @@ class VQ2Runner:
                             raise SafetyAbort(
                                 "gate-1 recenter authority changed before cleanup"
                             )
+                        assert_no_passage_geometry(
+                            cleanup_ready_target,
+                            phase="cleanup readiness",
+                        )
                         if self.estimate is None:
                             raise SafetyAbort(
                                 "gate-1 recenter attitude estimate changed "
@@ -10788,6 +10839,7 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter authority changed before command send"
                     )
+                assert_no_passage_geometry(latest_target, phase="command send")
                 wire_not_before_ns = (
                     None
                     if self._last_flight_command_started_ns is None
@@ -11662,6 +11714,7 @@ class VQ2Runner:
             "hover",
             "gate0",
             "gate0-observe",
+            GATE1_RECENTER_STAGE,
             CALIBRATION_STAGE,
         }:
             raise ValueError(f"unsupported powered stage: {stage}")
@@ -11706,22 +11759,165 @@ class VQ2Runner:
                         "reason": str(exc),
                     }
                     raise
+            elif stage == GATE1_RECENTER_STAGE:
+                gate0_details = await self._run_gate0(
+                    context,
+                    capture_transition=write_diagnostic_pngs,
+                )
+                details = {"gate0": gate0_details}
+                try:
+                    observation = await self._observe_gate1(gate0_details)
+                except SafetyAbort as exc:
+                    details["gate1_observation"] = {
+                        "gate1_observed": False,
+                        "reason": str(exc),
+                    }
+                    raise
+                details["gate1_observation"] = observation
+                try:
+                    recenter_result = (
+                        await self._run_bounded_gate1_recenter(observation)
+                    )
+                    if not isinstance(recenter_result, Mapping):
+                        raise SafetyAbort(
+                            "gate-1 recenter returned an invalid result"
+                        )
+                    details["gate1_recenter"] = dict(recenter_result)
+                    if (
+                        recenter_result.get("recenter_criteria_met")
+                        is not True
+                    ):
+                        if self._gate1_recenter_summary is None:
+                            self._gate1_recenter_summary = dict(
+                                recenter_result
+                            )
+                        raise SafetyAbort(
+                            "gate-1 recenter returned without satisfying "
+                            "its criteria"
+                        )
+                except BaseException as exc:
+                    if self._gate1_recenter_summary is not None:
+                        abort_summary = dict(self._gate1_recenter_summary)
+                        if (
+                            abort_summary.get("recenter_criteria_met")
+                            is not True
+                        ):
+                            abort_summary["success"] = False
+                            abort_summary["outcome"] = "abort"
+                            abort_summary["reason"] = (
+                                str(exc) or type(exc).__name__
+                            )
+                        self._gate1_recenter_summary = abort_summary
+                        details["gate1_recenter"] = abort_summary
+                    raise
             else:
                 raise AssertionError("powered stage dispatch was not exhaustive")
             success = True
             reason = "stage completed"
         except (SafetyAbort, asyncio.CancelledError) as exc:
+            if (
+                stage == GATE1_RECENTER_STAGE
+                and self._gate1_recenter_summary is not None
+            ):
+                details["gate1_recenter"] = dict(
+                    self._gate1_recenter_summary
+                )
             reason = str(exc) or type(exc).__name__
             logger.error("%s ABORT: %s", stage, reason)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
             if isinstance(exc, asyncio.CancelledError):
                 raise
         except Exception as exc:
+            if (
+                stage == GATE1_RECENTER_STAGE
+                and self._gate1_recenter_summary is not None
+            ):
+                details["gate1_recenter"] = dict(
+                    self._gate1_recenter_summary
+                )
             reason = f"unexpected {type(exc).__name__}: {exc}"
             logger.exception("%s failed unexpectedly", stage)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
         finally:
+            cleanup_entry_race = self.adapter.race_status
+            cleanup_entry_gate_index = (
+                int(cleanup_entry_race.active_gate_index)
+                if cleanup_entry_race is not None
+                else None
+            )
+            cleanup_entry_race_finished = (
+                bool(cleanup_entry_race.race_finished)
+                if cleanup_entry_race is not None
+                else None
+            )
+            if (
+                stage == GATE1_RECENTER_STAGE
+                and success
+                and (
+                cleanup_entry_gate_index != 1
+                or cleanup_entry_race_finished is not False
+                )
+            ):
+                success = False
+                boundary_reason = (
+                    "gate-1 recenter cleanup boundary lost gate 1 authority "
+                    f"(gate_index={cleanup_entry_gate_index}, "
+                    f"race_finished={cleanup_entry_race_finished})"
+                )
+                reason = (
+                    boundary_reason
+                    if reason in {"unknown", "stage completed"}
+                    else f"{reason}; {boundary_reason}"
+                )
+                if self._gate1_recenter_summary is not None:
+                    boundary_summary = dict(self._gate1_recenter_summary)
+                    prior_max_gate = boundary_summary.get(
+                        "authoritative_max_gate_index"
+                    )
+                    if cleanup_entry_gate_index is not None:
+                        boundary_summary["authoritative_max_gate_index"] = max(
+                            int(prior_max_gate)
+                            if type(prior_max_gate) is int
+                            else cleanup_entry_gate_index,
+                            cleanup_entry_gate_index,
+                        )
+                    boundary_summary["outcome"] = "abort"
+                    boundary_summary["reason"] = boundary_reason
+                    boundary_summary["contact_safety_outcome"] = (
+                        "cleanup_boundary_authority_violation"
+                    )
+                    self._gate1_recenter_summary = boundary_summary
+                self.recorder.emit(
+                    "stage_abort",
+                    stage=stage,
+                    reason=boundary_reason,
+                )
             cleanup_confirmed = await self.safe_cleanup()
+            if (
+                stage == GATE1_RECENTER_STAGE
+                and self._gate1_recenter_summary is not None
+            ):
+                recenter_summary = dict(self._gate1_recenter_summary)
+                recenter_summary["cleanup_entry_gate_index"] = (
+                    cleanup_entry_gate_index
+                )
+                recenter_summary["cleanup_entry_race_finished"] = (
+                    cleanup_entry_race_finished
+                )
+                recenter_summary["cleanup_confirmed"] = bool(
+                    cleanup_confirmed
+                )
+                recenter_summary["success"] = bool(
+                    success
+                    and cleanup_confirmed
+                    and recenter_summary.get("recenter_criteria_met")
+                )
+                self._gate1_recenter_summary = recenter_summary
+                details["gate1_recenter"] = recenter_summary
+                self.recorder.emit(
+                    "gate1_recenter_post_cleanup",
+                    **recenter_summary,
+                )
             race = self.adapter.race_status
             gate_after = race.active_gate_index if race else None
             post_cleanup_diagnostic_errors: List[str] = []
@@ -12780,6 +12976,7 @@ def main(
             "hover",
             "gate0",
             "gate0-observe",
+            GATE1_RECENTER_STAGE,
         ),
         default="preflight",
     )

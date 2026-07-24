@@ -1686,8 +1686,8 @@ def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
     ("normalized_x", "normalized_x_rate_s", "expected"),
     (
         (0.25, 0.0, 0.03),
-        (0.25, 0.40, 0.04),
-        (-0.25, -0.40, -0.04),
+        (0.25, 0.40, 0.03),
+        (-0.25, -0.40, -0.03),
         (1.0, 0.0, 0.05),
         (-1.0, 0.0, -0.05),
     ),
@@ -1698,7 +1698,7 @@ def test_gate1_recenter_roll_target_uses_positive_position_and_rate_sign(
     expected,
 ):
     assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.12
-    assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.025
+    assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
     assert vq2_module.gate1_recenter_roll_target(
         normalized_x,
@@ -1744,7 +1744,7 @@ def test_gate1_recenter_absolute_error_slope_uses_only_strict_fresh_times():
 def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_DURATION_S == 0.60
     assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.12
-    assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.025
+    assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
@@ -1757,6 +1757,8 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_ABS_ROLL_RAD == 0.15
     assert vq2_module.GATE1_RECENTER_MIN_PITCH_RAD == -0.20
     assert vq2_module.GATE1_RECENTER_MAX_PITCH_RAD == 0.10
+    assert vq2_module.GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX == 23_040
+    assert vq2_module.GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX == 160
 
 
 def test_official_lap_time_uses_finish_ns_minus_start_ms():
@@ -2048,6 +2050,69 @@ def _install_gate1_frame_sequence(
         runner._latest_detection_received_s = target.received_monotonic_s
 
     monkeypatch.setattr(runner, "_sample", sample)
+
+
+@pytest.mark.parametrize(
+    "bbox",
+    (
+        (370, 0, 160, 100),
+        (370, 0, 144, 160),
+    ),
+    ids=("width-equality", "area-equality"),
+)
+def test_bounded_gate1_recenter_rejects_no_passage_entry_geometry(
+    monkeypatch,
+    bbox,
+):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    entry = runner.tracker.target
+    assert entry is not None
+    bounded = replace(entry, bbox=bbox)
+    runner.tracker.target = bounded
+    runner._latest_accepted_target = bounded
+    observation["frames"][-1]["bbox_xywh_px"] = list(bbox)
+
+    with pytest.raises(SafetyAbort, match="no-passage geometry bound"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    summary = runner._gate1_recenter_summary
+    assert summary is not None
+    assert summary["max_target_area_px"] == bbox[2] * bbox[3]
+    assert summary["max_target_width_px"] == bbox[2]
+    assert summary["no_passage_max_area_px"] == 23_040
+    assert summary["no_passage_max_width_px"] == 160
+
+
+def test_bounded_gate1_recenter_rejects_hidden_large_raw_geometry(monkeypatch):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    runner._latest_raw_detections = [_detection(470, 0, 160, 144)]
+
+    with pytest.raises(SafetyAbort, match="raw no-passage geometry bound"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+
+def test_bounded_gate1_recenter_allows_geometry_just_below_bounds(monkeypatch):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    entry = runner.tracker.target
+    assert entry is not None
+    below = replace(entry, bbox=(370, 0, 159, 144))
+    runner.tracker.target = below
+    runner._latest_accepted_target = below
+    observation["frames"][-1]["bbox_xywh_px"] = list(below.bbox)
+
+    def change_generation():
+        runner._latest_detection_generation = 2
+
+    monkeypatch.setattr(runner, "_sample", change_generation)
+
+    with pytest.raises(SafetyAbort, match="vision generation changed"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
 
 def test_offline_gate1_recenter_requires_error_decrease_and_three_frame_hold(
@@ -2704,6 +2769,65 @@ def test_offline_gate1_recenter_reports_and_rechecks_final_cleanup_frame(
     assert summary["recenter_criteria_met"] is False
     assert summary["final_abs_horizontal_error_px"] == 130.0
     assert summary["max_target_width_px"] == 140
+
+
+def test_bounded_gate1_recenter_rechecks_raw_geometry_before_send(monkeypatch):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    watchdog_calls = [0]
+
+    def expose_large_raw_geometry(**_kwargs):
+        watchdog_calls[0] += 1
+        if watchdog_calls[0] == 2:
+            runner._latest_raw_detections = [
+                _detection(470, 0, 160, 144)
+            ]
+
+    monkeypatch.setattr(runner, "_watchdog", expose_large_raw_geometry)
+
+    with pytest.raises(SafetyAbort, match="raw no-passage geometry bound"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+
+
+def test_bounded_gate1_recenter_rechecks_geometry_before_cleanup(monkeypatch):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [430, 420, 410, 405],
+    )
+    advance_frame = runner._sample
+    sample_calls = [0]
+
+    def sample_with_close_cleanup_target():
+        sample_calls[0] += 1
+        advance_frame()
+        if sample_calls[0] == 4:
+            current = runner._latest_accepted_target
+            assert current is not None
+            close = replace(current, bbox=(320, 0, 160, 100))
+            runner.tracker.target = close
+            runner._latest_accepted_target = close
+
+    monkeypatch.setattr(runner, "_sample", sample_with_close_cleanup_target)
+
+    with pytest.raises(SafetyAbort, match="no-passage geometry bound"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert runner._gate1_recenter_summary is not None
+    assert runner._gate1_recenter_summary["recenter_criteria_met"] is False
 
 
 def test_offline_gate1_recenter_classifies_stream_watchdog_as_safety_abort(
@@ -5010,7 +5134,7 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
     assert result.details == {"gate0_passed": True}
 
 
-@pytest.mark.parametrize("stage", ["full-lap", "gate1-recenter"])
+@pytest.mark.parametrize("stage", ["full-lap"])
 def test_unaccepted_course_stages_are_rejected_before_powered_lifecycle(
     monkeypatch,
     stage,
@@ -5030,7 +5154,7 @@ def test_unaccepted_course_stages_are_rejected_before_powered_lifecycle(
         )
 
 
-@pytest.mark.parametrize("stage", ["full-lap", "gate1-recenter"])
+@pytest.mark.parametrize("stage", ["full-lap"])
 def test_unaccepted_course_stages_are_rejected_before_live_import_or_contact(
     monkeypatch,
     stage,
@@ -5052,6 +5176,164 @@ def test_unaccepted_course_stages_are_rejected_before_live_import_or_contact(
         )
 
     assert live_imports == []
+
+
+@pytest.mark.parametrize(
+    (
+        "cleanup_confirmed",
+        "criteria_met",
+        "cleanup_entry_gate_index",
+        "expected_success",
+    ),
+    (
+        (True, True, 1, True),
+        (False, True, 1, False),
+        (True, False, 1, False),
+        (True, True, 2, False),
+    ),
+)
+def test_gate1_recenter_powered_lifecycle_requires_criteria_and_cleanup(
+    monkeypatch,
+    cleanup_confirmed,
+    criteria_met,
+    cleanup_entry_gate_index,
+    expected_success,
+):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+    calls = []
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def wait_for_go():
+        return context
+
+    async def run_gate0(observed_context, **kwargs):
+        calls.append(("gate0", observed_context, kwargs))
+        return {"gate0_passed": True}
+
+    async def observe_gate1(gate0):
+        calls.append(("observe", gate0))
+        return {"gate1_observed": True}
+
+    async def run_recenter(observation):
+        calls.append(("recenter", observation))
+        adapter.race_status = RaceStatus(
+            sim_boot_time_ms=1100,
+            race_start_boot_time_ms=0,
+            race_finish_time_ns=-1,
+            active_gate_index=cleanup_entry_gate_index,
+            last_gate_race_time=-1,
+        )
+        summary = {
+            "success": False,
+            "recenter_criteria_met": criteria_met,
+            "cleanup_confirmed": False,
+            "outcome": "corridor_hold",
+        }
+        runner._gate1_recenter_summary = dict(summary)
+        return dict(summary)
+
+    async def cleanup():
+        calls.append(("cleanup",))
+        return cleanup_confirmed
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", no_op)
+    monkeypatch.setattr(runner, "normalize_disarmed", no_op)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", no_op)
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_observe_gate1", observe_gate1)
+    monkeypatch.setattr(runner, "_run_bounded_gate1_recenter", run_recenter)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(
+        runner.run_powered_stage(
+            "gate1-recenter",
+            write_diagnostic_pngs=False,
+        )
+    )
+
+    assert result.success is expected_success
+    assert result.cleanup_confirmed is cleanup_confirmed
+    assert result.details["gate1_recenter"]["cleanup_confirmed"] is (
+        cleanup_confirmed
+    )
+    assert result.details["gate1_recenter"]["success"] is expected_success
+    if not criteria_met:
+        assert "without satisfying its criteria" in result.reason
+    if cleanup_entry_gate_index != 1:
+        assert "cleanup boundary lost gate 1 authority" in result.reason
+        assert (
+            result.details["gate1_recenter"]["authoritative_max_gate_index"]
+            == cleanup_entry_gate_index
+        )
+    assert [call[0] for call in calls] == [
+        "gate0",
+        "observe",
+        "recenter",
+        "cleanup",
+    ]
+
+
+def test_gate1_recenter_powered_lifecycle_persists_abort_summary(monkeypatch):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def wait_for_go():
+        return context
+
+    async def run_gate0(_context, **_kwargs):
+        return {"gate0_passed": True}
+
+    async def observe_gate1(_gate0):
+        return {"gate1_observed": True}
+
+    async def abort_recenter(_observation):
+        runner._gate1_recenter_summary = {
+            "success": False,
+            "recenter_criteria_met": False,
+            "cleanup_confirmed": False,
+            "outcome": "abort",
+            "reason": "injected bounded abort",
+        }
+        raise SafetyAbort("injected bounded abort")
+
+    async def cleanup():
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", no_op)
+    monkeypatch.setattr(runner, "normalize_disarmed", no_op)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", no_op)
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_observe_gate1", observe_gate1)
+    monkeypatch.setattr(runner, "_run_bounded_gate1_recenter", abort_recenter)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(
+        runner.run_powered_stage(
+            "gate1-recenter",
+            write_diagnostic_pngs=False,
+        )
+    )
+
+    assert result.success is False
+    assert result.cleanup_confirmed is True
+    summary = result.details["gate1_recenter"]
+    assert summary["success"] is False
+    assert summary["recenter_criteria_met"] is False
+    assert summary["cleanup_confirmed"] is True
+    assert summary["outcome"] == "abort"
+    assert summary["reason"] == "injected bounded abort"
 
 
 def test_offline_full_lap_scaffold_disables_unaccepted_gate0_overrides(

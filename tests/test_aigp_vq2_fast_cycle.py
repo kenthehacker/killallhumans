@@ -103,10 +103,12 @@ def test_full_lap_is_quarantined_from_fast_powered_stages():
         fast_cycle.build_argument_parser().parse_args(["full-lap"])
 
 
-def test_gate1_recenter_remains_offline_until_replay_prerequisite_is_accepted():
-    assert "gate1-recenter" not in fast_cycle.FAST_POWERED_STAGES
-    with pytest.raises(SystemExit):
-        fast_cycle.build_argument_parser().parse_args(["gate1-recenter"])
+def test_gate1_recenter_is_admitted_as_the_bounded_position_only_stage():
+    assert "gate1-recenter" in fast_cycle.FAST_POWERED_STAGES
+    arguments = fast_cycle.build_argument_parser().parse_args(
+        ["gate1-recenter"]
+    )
+    assert arguments.stage == "gate1-recenter"
 
 
 @pytest.mark.parametrize("requested_stage", ["calibration-excite"])

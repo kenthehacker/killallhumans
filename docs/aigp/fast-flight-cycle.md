@@ -15,18 +15,17 @@ asserts that an existing direct user instruction authorizes that powered stage
 or a continuing scoped iteration; the command itself is not proof of
 authorization.
 
-The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`, and
-`calibration-excite`. Experimental course and full-lap scaffolding is offline
-only and is not admitted by this powered entry point.
+The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`,
+`gate1-recenter`, and `calibration-excite`. Experimental course and full-lap
+scaffolding remains offline-only and is not admitted by this powered entry
+point.
 
-The bounded `gate1-recenter` candidate is also offline-only for now. Its
-position-plus-rate law is implemented behind a non-dispatched test seam, but
-the authoritative M1 timing/simulator evidence and M2 recorded-replay and
-tracker-isolation entry gates have not been satisfied by the available Gate 1
-artifacts. No reviewed close-geometry threshold yet proves the separate
-no-passage requirement, either. Neither this wrapper nor the runner CLI
-accepts that stage until those conflicts are reviewed and the prerequisites
-are accepted.
+`gate1-recenter` is a user-authorized, position-only no-passage trial. Its
+pixel-rate gain remains exactly zero pending M2 recorded-replay and
+tracker-isolation acceptance. It stops after 0.60 seconds, on any gate-index
+change, or before a primary target reaches 160 pixels wide or 23,040 square
+pixels; the existing raw large-geometry contact guard is enforced
+independently. Stage success still requires cleanup confirmation.
 
 ## What happens before flight
 
