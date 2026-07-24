@@ -19,6 +19,15 @@ The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`, and
 `calibration-excite`. Experimental course and full-lap scaffolding is offline
 only and is not admitted by this powered entry point.
 
+The bounded `gate1-recenter` candidate is also offline-only for now. Its
+position-plus-rate law is implemented behind a non-dispatched test seam, but
+the authoritative M1 timing/simulator evidence and M2 recorded-replay and
+tracker-isolation entry gates have not been satisfied by the available Gate 1
+artifacts. No reviewed close-geometry threshold yet proves the separate
+no-passage requirement, either. Neither this wrapper nor the runner CLI
+accepts that stage until those conflicts are reviewed and the prerequisites
+are accepted.
+
 ## What happens before flight
 
 The command does only the following pre-contact work:

@@ -173,6 +173,28 @@ POST_GATE_MAX_ATTITUDE_DELTA_RAD = math.radians(5.0)
 POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S = 1.0
 POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 
+# Offline candidate only until the authoritative recorded-replay and
+# tracker-isolation prerequisite is accepted. No live dispatcher admits this
+# stage identity.
+GATE1_RECENTER_STAGE = "gate1-recenter"
+GATE1_RECENTER_DURATION_S = 0.60
+GATE1_RECENTER_ROLL_GAIN = 0.12
+GATE1_RECENTER_ROLL_RATE_GAIN = 0.025
+GATE1_RECENTER_MAX_ROLL_RAD = 0.05
+GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
+GATE1_RECENTER_THRUST = 0.275
+GATE1_RECENTER_MIN_THRUST = 0.21
+GATE1_RECENTER_MAX_THRUST = 0.30
+GATE1_RECENTER_CORRIDOR_NORMALIZED_X = 0.35
+GATE1_RECENTER_REQUIRED_CORRIDOR_FRAMES = 3
+GATE1_RECENTER_DIVERGENCE_PX = 24.0
+GATE1_RECENTER_MAX_ABS_X_RATE_NORM_S = 4.0
+GATE1_RECENTER_MAX_ABS_ROLL_RAD = 0.15
+GATE1_RECENTER_MIN_PITCH_RAD = -0.20
+GATE1_RECENTER_MAX_PITCH_RAD = 0.10
+GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD = 0.12
+GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S = 0.50
+
 MAX_BENIGN_PAD_CONTACTS = 12
 MAX_BENIGN_PAD_IMPULSE = 0.05
 
@@ -221,6 +243,14 @@ class CalibrationLifecycleError(RuntimeError):
 
 
 CALIBRATION_STAGE = "calibration-excite"
+LIVE_RUN_STAGES = (
+    "preflight",
+    "sign-id",
+    "hover",
+    "gate0",
+    "gate0-observe",
+    CALIBRATION_STAGE,
+)
 CALIBRATION_CHILD_ROLE = "powered_child"
 CALIBRATION_CAPABILITY_DOMAIN = "aigp-vq2-powered-child/1"
 CALIBRATION_CAPABILITY_RELEASE_NS = 3_000_000_000
@@ -6068,6 +6098,71 @@ def gate0_centering_roll_target(normalized_x: float) -> float:
     return max(-0.08, min(0.08, 0.15 * float(normalized_x)))
 
 
+def gate1_recenter_roll_target(
+    normalized_x: float,
+    normalized_x_rate_s: float,
+) -> float:
+    """Return the reviewed positive-sign Gate 1 recenter roll target.
+
+    This is pure candidate math. The powered runner does not admit the stage
+    until the recorded-replay/tracker-isolation prerequisite is resolved.
+    """
+
+    values = (normalized_x, normalized_x_rate_s)
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or abs(float(normalized_x_rate_s))
+        > GATE1_RECENTER_MAX_ABS_X_RATE_NORM_S
+    ):
+        raise ValueError("gate-1 recenter horizontal inputs are outside bounds")
+    target = (
+        GATE1_RECENTER_ROLL_GAIN * float(normalized_x)
+        + GATE1_RECENTER_ROLL_RATE_GAIN * float(normalized_x_rate_s)
+    )
+    return max(
+        -GATE1_RECENTER_MAX_ROLL_RAD,
+        min(GATE1_RECENTER_MAX_ROLL_RAD, target),
+    )
+
+
+def gate1_recenter_absolute_error_slope_px_s(
+    samples: Sequence[Tuple[float, float]],
+) -> Optional[float]:
+    """Least-squares slope of fresh-frame absolute horizontal error."""
+
+    if not isinstance(samples, Sequence):
+        raise TypeError("gate-1 error samples must be a sequence")
+    if len(samples) < 2:
+        return None
+    normalized: List[Tuple[float, float]] = []
+    for sample in samples:
+        if (
+            not isinstance(sample, Sequence)
+            or len(sample) != 2
+            or any(type(value) not in {int, float} for value in sample)
+            or not all(math.isfinite(float(value)) for value in sample)
+        ):
+            raise ValueError("gate-1 error samples must contain finite pairs")
+        normalized.append((float(sample[0]), float(sample[1])))
+    if any(
+        normalized[index][0] <= normalized[index - 1][0]
+        for index in range(1, len(normalized))
+    ):
+        raise ValueError("gate-1 error sample times must increase strictly")
+    mean_time = statistics.fmean(sample[0] for sample in normalized)
+    mean_error = statistics.fmean(sample[1] for sample in normalized)
+    denominator = sum(
+        (sample[0] - mean_time) ** 2 for sample in normalized
+    )
+    if denominator <= 0.0:
+        raise ValueError("gate-1 error sample times have no span")
+    return sum(
+        (sample[0] - mean_time) * (sample[1] - mean_error)
+        for sample in normalized
+    ) / denominator
+
+
 def select_primary_gate(
     detections: Iterable[GateDetection],
 ) -> Optional[GateDetection]:
@@ -7448,6 +7543,7 @@ class VQ2Runner:
         self._epoch_vision_started_s: Optional[float] = None
         self._epoch_vision_initial_frames: Optional[int] = None
         self._gate0_transition_proof: Optional[GateTransitionProof] = None
+        self._gate1_recenter_summary: Optional[Dict[str, Any]] = None
         self._deferred_pngs: List[Tuple[str, Any]] = []
 
     def _replay_estimator_fields(self) -> Optional[Dict[str, Any]]:
@@ -7522,6 +7618,7 @@ class VQ2Runner:
         self._epoch_vision_started_s = None
         self._epoch_vision_initial_frames = None
         self._gate0_transition_proof = None
+        self._gate1_recenter_summary = None
         self.tracker.reset()
 
     def _consume_imu_sample(
@@ -9862,6 +9959,957 @@ class VQ2Runner:
         finally:
             self._post_gate_reacquisition = False
 
+    async def _run_bounded_gate1_recenter(
+        self,
+        gate1_observation: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Run the no-passage Gate 1 candidate behind an offline-only seam.
+
+        The method contains the intended supervisor behavior and is directly
+        testable, but no live stage list or dispatcher can reach it while the
+        authoritative recorded-replay/tracker-isolation prerequisite remains
+        unresolved.
+        """
+
+        self._gate1_recenter_summary = None
+        if not isinstance(gate1_observation, Mapping):
+            raise SafetyAbort("gate-1 recenter lacks a valid observation")
+        proof = self._gate0_transition_proof
+        frames = gate1_observation.get("frames")
+        if (
+            proof is None
+            or gate1_observation.get("gate1_observed") is not True
+            or int(gate1_observation.get("gate_index", -1)) != 1
+            or int(gate1_observation.get("frame_count", -1))
+            != POST_GATE_REQUIRED_FRAMES
+            or not isinstance(frames, Sequence)
+            or len(frames) < POST_GATE_REQUIRED_FRAMES
+        ):
+            raise SafetyAbort("gate-1 recenter lacks the proved three-frame handoff")
+        handoff_frames = list(frames[-POST_GATE_REQUIRED_FRAMES:])
+        handoff_tokens: List[Tuple[int, int, float]] = []
+        for frame in handoff_frames:
+            if not isinstance(frame, Mapping):
+                raise SafetyAbort(
+                    "gate-1 recenter handoff contains an invalid frame"
+                )
+            frame_id = frame.get("frame_id")
+            sim_time_ns = frame.get("sim_time_ns")
+            received_s = frame.get("received_monotonic_s")
+            if (
+                type(frame_id) is not int
+                or type(sim_time_ns) is not int
+                or type(received_s) not in {int, float}
+                or frame_id < 0
+                or sim_time_ns < 0
+                or not math.isfinite(float(received_s))
+            ):
+                raise SafetyAbort(
+                    "gate-1 recenter handoff frame provenance is invalid"
+                )
+            handoff_tokens.append(
+                (frame_id, sim_time_ns, float(received_s))
+            )
+        if any(
+            handoff_tokens[index][0] <= handoff_tokens[index - 1][0]
+            or handoff_tokens[index][1] <= handoff_tokens[index - 1][1]
+            or handoff_tokens[index][2] <= handoff_tokens[index - 1][2]
+            for index in range(1, len(handoff_tokens))
+        ):
+            raise SafetyAbort(
+                "gate-1 recenter handoff frames did not advance strictly"
+            )
+        first_handoff_token = handoff_tokens[0]
+        if (
+            first_handoff_token[0] <= proof.vision_frame_id
+            or first_handoff_token[1] <= proof.vision_sim_time_ns
+            or first_handoff_token[2] <= proof.vision_received_monotonic_s
+        ):
+            raise SafetyAbort(
+                "gate-1 recenter handoff did not begin after the proved transition"
+            )
+        race = self.adapter.race_status
+        if (
+            race is None
+            or bool(race.race_finished)
+            or int(race.active_gate_index) != 1
+            or int(race.sim_boot_time_ms) < proof.post_gate_race_boot_ms
+        ):
+            raise SafetyAbort("gate-1 recenter race authority is invalid")
+        entry_target = self.tracker.target
+        if (
+            entry_target is None
+            or entry_target.composite
+            or self._latest_accepted_target is not entry_target
+            or self.tracker.last_selection_mode != "primary"
+            or self.tracker.consecutive < POST_GATE_REQUIRED_FRAMES
+        ):
+            raise SafetyAbort("gate-1 recenter requires a fresh primary target")
+        entry_generation = self._latest_detection_generation
+        entry_frame_id = self._latest_detection_frame_id
+        entry_sim_time_ns = self._latest_detection_frame_sim_ns
+        entry_received_s = self._latest_detection_received_s
+        if (
+            entry_generation != proof.vision_generation
+            or entry_frame_id != entry_target.frame_id
+            or entry_sim_time_ns != entry_target.sim_time_ns
+            or entry_received_s != entry_target.received_monotonic_s
+        ):
+            raise SafetyAbort("gate-1 recenter entry frame provenance is invalid")
+        final_observation = frames[-1]
+        if (
+            not isinstance(final_observation, Mapping)
+            or int(final_observation.get("frame_id", -1)) != entry_target.frame_id
+            or int(final_observation.get("sim_time_ns", -1))
+            != entry_target.sim_time_ns
+            or float(final_observation.get("received_monotonic_s", math.nan))
+            != entry_target.received_monotonic_s
+            or list(final_observation.get("center_px", ()))
+            != [entry_target.center_x, entry_target.center_y]
+            or list(final_observation.get("bbox_xywh_px", ()))
+            != list(entry_target.bbox)
+        ):
+            raise SafetyAbort("gate-1 recenter entry does not match observation")
+        if entry_target.age_s() > MAX_VISION_AGE_S:
+            raise SafetyAbort("gate-1 recenter entry target is stale")
+        if self.estimate is None:
+            raise SafetyAbort("gate-1 recenter attitude estimate is unavailable")
+
+        entry_roll, entry_pitch, _entry_yaw = self.estimate.orientation.to_euler()
+        if (
+            abs(float(entry_roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
+            or not (
+                GATE1_RECENTER_MIN_PITCH_RAD
+                <= float(entry_pitch)
+                <= GATE1_RECENTER_MAX_PITCH_RAD
+            )
+        ):
+            raise SafetyAbort(
+                "gate-1 recenter entry attitude approached its bound"
+            )
+        entry_error_px = float(entry_target.center_x) - 320.0
+        entry_abs_error_px = abs(entry_error_px)
+        fresh_error_samples: List[Tuple[float, float]] = [
+            (float(entry_target.received_monotonic_s), entry_abs_error_px)
+        ]
+        min_roll = max_roll = float(entry_roll)
+        min_pitch = max_pitch = float(entry_pitch)
+        min_command_roll_rate: Optional[float] = None
+        max_command_roll_rate: Optional[float] = None
+        min_command_pitch_rate: Optional[float] = None
+        max_command_pitch_rate: Optional[float] = None
+        max_target_area = int(entry_target.bbox_area)
+        max_target_width = int(entry_target.bbox[2])
+        max_gate_index = 1
+        fresh_control_frames = 0
+        corridor_hold_frames = 0
+        command_count = 0
+        current_x_rate_norm_s = 0.0
+        last_token = (
+            int(entry_generation),
+            int(entry_target.frame_id),
+            int(entry_target.sim_time_ns),
+        )
+        last_center_x = float(entry_target.center_x)
+        last_received_s = float(entry_target.received_monotonic_s)
+        latest_target = entry_target
+        recenter_started_s = await self._wait_for_next_flight_command_slot()
+        hard_deadline_s = recenter_started_s + GATE1_RECENTER_DURATION_S
+        wire_clock_anchor_ns = time.perf_counter_ns()
+        wire_clock_anchor_s = time.monotonic()
+        remaining_wire_budget_s = max(
+            0.0,
+            hard_deadline_s - wire_clock_anchor_s - CONTROL_PERIOD_S,
+        )
+        last_recenter_wire_start_ns = wire_clock_anchor_ns + math.floor(
+            remaining_wire_budget_s * 1_000_000_000
+        )
+        next_tick = recenter_started_s
+        last_dispatch_attempt_s: Optional[float] = None
+        drain_outbound_receipts = getattr(
+            self.adapter,
+            "drain_outbound_receipts",
+            None,
+        )
+        if not callable(drain_outbound_receipts):
+            raise SafetyAbort(
+                "gate-1 recenter requires exact outbound wire receipts"
+            )
+        prior_receipts = [
+            self._outbound_receipt_primitive(value)
+            for value in drain_outbound_receipts()
+        ]
+
+        summary: Dict[str, Any] = {
+            "candidate_authority": "offline_only_pending_replay_review",
+            "success": False,
+            "recenter_criteria_met": False,
+            "outcome": "running",
+            "reason": None,
+            "duration_s": 0.0,
+            "corridor_accepted_elapsed_s": None,
+            "entry_horizontal_error_px": entry_error_px,
+            "entry_abs_horizontal_error_px": entry_abs_error_px,
+            "final_horizontal_error_px": entry_error_px,
+            "final_abs_horizontal_error_px": entry_abs_error_px,
+            "fresh_abs_horizontal_error_slope_px_s": None,
+            "fresh_control_frame_count": 0,
+            "corridor_hold_frame_count": 0,
+            "min_roll_rad": min_roll,
+            "max_roll_rad": max_roll,
+            "min_pitch_rad": min_pitch,
+            "max_pitch_rad": max_pitch,
+            "min_command_roll_rate_rad_s": None,
+            "max_command_roll_rate_rad_s": None,
+            "min_command_pitch_rate_rad_s": None,
+            "max_command_pitch_rate_rad_s": None,
+            "command_count": 0,
+            "max_target_area_px": max_target_area,
+            "max_target_width_px": max_target_width,
+            "authoritative_max_gate_index": max_gate_index,
+            "contact_safety_outcome": "clean_so_far",
+            "cleanup_confirmed": False,
+        }
+        self._gate1_recenter_summary = summary
+
+        def refresh_summary(
+            *,
+            outcome: str,
+            reason: Optional[str],
+            criteria_met: bool = False,
+            corridor_accepted_elapsed_s: Optional[float] = None,
+        ) -> None:
+            nonlocal min_roll, max_roll, min_pitch, max_pitch
+            nonlocal min_command_roll_rate, max_command_roll_rate
+            nonlocal min_command_pitch_rate, max_command_pitch_rate
+            nonlocal max_target_area, max_target_width, max_gate_index
+            elapsed = max(0.0, time.monotonic() - recenter_started_s)
+            slope = gate1_recenter_absolute_error_slope_px_s(
+                fresh_error_samples
+            )
+            final_error_px = float(latest_target.center_x) - 320.0
+            summary.update(
+                {
+                    "success": bool(
+                        criteria_met and summary["cleanup_confirmed"]
+                    ),
+                    "recenter_criteria_met": bool(criteria_met),
+                    "outcome": str(outcome),
+                    "reason": reason,
+                    "duration_s": elapsed,
+                    "corridor_accepted_elapsed_s": (
+                        corridor_accepted_elapsed_s
+                    ),
+                    "final_horizontal_error_px": final_error_px,
+                    "final_abs_horizontal_error_px": abs(final_error_px),
+                    "fresh_abs_horizontal_error_slope_px_s": slope,
+                    "fresh_control_frame_count": fresh_control_frames,
+                    "corridor_hold_frame_count": corridor_hold_frames,
+                    "min_roll_rad": min_roll,
+                    "max_roll_rad": max_roll,
+                    "min_pitch_rad": min_pitch,
+                    "max_pitch_rad": max_pitch,
+                    "min_command_roll_rate_rad_s": min_command_roll_rate,
+                    "max_command_roll_rate_rad_s": max_command_roll_rate,
+                    "min_command_pitch_rate_rad_s": min_command_pitch_rate,
+                    "max_command_pitch_rate_rad_s": max_command_pitch_rate,
+                    "command_count": command_count,
+                    "max_target_area_px": max_target_area,
+                    "max_target_width_px": max_target_width,
+                    "authoritative_max_gate_index": max_gate_index,
+                    "contact_safety_outcome": (
+                        "clean"
+                        if reason is None
+                        else (
+                            (
+                                "contact_abort"
+                                if "collision" in reason or "contact" in reason
+                                else "safety_abort"
+                            )
+                            if outcome == "abort"
+                            else (
+                                "interrupted"
+                                if outcome == "interrupted"
+                                else "infrastructure_error"
+                            )
+                        )
+                    ),
+                }
+            )
+
+        async def reserve_terminal_cleanup_slot(
+            *,
+            uncertain_dispatch_observed_s: Optional[float] = None,
+        ) -> None:
+            """Leave one command period after any completed or uncertain send."""
+
+            if self._last_flight_command_sent_s is not None:
+                await self._wait_for_next_flight_command_slot()
+            if uncertain_dispatch_observed_s is None:
+                return
+            not_before_s = uncertain_dispatch_observed_s + CONTROL_PERIOD_S
+            observed_s = time.monotonic()
+            wait_attempts = 0
+            while observed_s < not_before_s:
+                if wait_attempts >= 8:
+                    raise SafetyAbort(
+                        "gate-1 recenter cleanup pacing wait returned early"
+                    )
+                await asyncio.sleep(not_before_s - observed_s)
+                next_observed_s = time.monotonic()
+                if (
+                    type(next_observed_s) not in {int, float}
+                    or not math.isfinite(float(next_observed_s))
+                    or float(next_observed_s) < observed_s
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter cleanup pacing clock is invalid"
+                    )
+                observed_s = float(next_observed_s)
+                wait_attempts += 1
+
+        self.recorder.emit(
+            "gate1_recenter_started",
+            entry_target=asdict(entry_target),
+            entry_error_px=entry_error_px,
+            entry_abs_error_px=entry_abs_error_px,
+            vision_generation=entry_generation,
+            hard_deadline_monotonic_s=hard_deadline_s,
+            last_recenter_wire_start_monotonic_ns=(
+                last_recenter_wire_start_ns
+            ),
+            drained_prior_outbound_receipt_count=len(prior_receipts),
+            control_law={
+                "roll_gain": GATE1_RECENTER_ROLL_GAIN,
+                "roll_rate_gain": GATE1_RECENTER_ROLL_RATE_GAIN,
+                "max_roll_rad": GATE1_RECENTER_MAX_ROLL_RAD,
+                "max_command_rate_rad_s": (
+                    GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+                ),
+                "target_pitch_rad": 0.0,
+                "thrust": GATE1_RECENTER_THRUST,
+                "duration_s": GATE1_RECENTER_DURATION_S,
+            },
+        )
+
+        try:
+            while True:
+                now = time.monotonic()
+                if now >= hard_deadline_s:
+                    raise SafetyAbort(
+                        "gate-1 recenter hard 0.60s window expired"
+                    )
+                self._sample()
+                now = time.monotonic()
+                if now >= hard_deadline_s:
+                    raise SafetyAbort(
+                        "gate-1 recenter hard 0.60s window expired"
+                    )
+                self._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=False,
+                    enforce_benign_pad_budget=False,
+                )
+                race = self.adapter.race_status
+                if race is None:
+                    raise SafetyAbort("gate-1 recenter race status is unavailable")
+                max_gate_index = max(max_gate_index, int(race.active_gate_index))
+                if bool(race.race_finished) or int(race.active_gate_index) != 1:
+                    raise SafetyAbort(
+                        "gate index changed during gate-1 recenter "
+                        f"({race.active_gate_index})"
+                    )
+                if int(race.sim_boot_time_ms) < proof.post_gate_race_boot_ms:
+                    raise SafetyAbort(
+                        "race clock regressed below the gate-1 transition proof"
+                    )
+                if self._latest_detection_generation != entry_generation:
+                    raise SafetyAbort(
+                        "vision generation changed during gate-1 recenter"
+                    )
+                accepted = self._latest_accepted_target
+                if accepted is None:
+                    contact_risk = select_untracked_contact_risk(
+                        self._latest_raw_detections,
+                        accepted_target=None,
+                    )
+                    if contact_risk is not None:
+                        raise SafetyAbort(
+                            "untracked contact risk during gate-1 recenter"
+                        )
+                    raise SafetyAbort(
+                        "primary gate target lost during gate-1 recenter"
+                    )
+                if (
+                    accepted.composite
+                    or self.tracker.last_selection_mode != "primary"
+                    or self.tracker.consecutive < POST_GATE_REQUIRED_FRAMES
+                    or accepted.frame_id != self._latest_detection_frame_id
+                    or accepted.sim_time_ns != self._latest_detection_frame_sim_ns
+                    or accepted.received_monotonic_s
+                    != self._latest_detection_received_s
+                    or accepted.age_s(now) > MAX_VISION_AGE_S
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter target lost primary fresh-frame authority"
+                    )
+                if self.estimate is None:
+                    raise SafetyAbort(
+                        "gate-1 recenter attitude estimate is unavailable"
+                    )
+                roll, pitch, _yaw = self.estimate.orientation.to_euler()
+                min_roll = min(min_roll, float(roll))
+                max_roll = max(max_roll, float(roll))
+                min_pitch = min(min_pitch, float(pitch))
+                max_pitch = max(max_pitch, float(pitch))
+                if (
+                    abs(float(roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
+                    or not (
+                        GATE1_RECENTER_MIN_PITCH_RAD
+                        <= float(pitch)
+                        <= GATE1_RECENTER_MAX_PITCH_RAD
+                    )
+                    or abs(float(roll) - entry_roll)
+                    > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                    or abs(float(pitch) - entry_pitch)
+                    > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter attitude excursion approached its bound"
+                    )
+                measured_peak_rate = max(
+                    abs(float(value)) for value in self.estimate.body_rates
+                )
+                if (
+                    measured_peak_rate
+                    > GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter measured body rate approached its bound"
+                    )
+
+                token = (
+                    int(entry_generation),
+                    int(accepted.frame_id),
+                    int(accepted.sim_time_ns),
+                )
+                latest_target = accepted
+                if token != last_token:
+                    if (
+                        token[1] <= last_token[1]
+                        or token[2] <= last_token[2]
+                        or float(accepted.received_monotonic_s)
+                        <= last_received_s
+                    ):
+                        raise SafetyAbort(
+                            "gate-1 recenter frame did not advance strictly"
+                        )
+                    dt_target = (
+                        float(accepted.received_monotonic_s) - last_received_s
+                    )
+                    if dt_target <= 1e-3:
+                        raise SafetyAbort(
+                            "gate-1 recenter frame interval is too small"
+                        )
+                    current_x_rate_norm_s = (
+                        (float(accepted.center_x) - last_center_x)
+                        / 320.0
+                        / dt_target
+                    )
+                    try:
+                        gate1_recenter_roll_target(
+                            (float(accepted.center_x) - 320.0) / 320.0,
+                            current_x_rate_norm_s,
+                        )
+                    except ValueError as exc:
+                        raise SafetyAbort(
+                            "gate-1 recenter horizontal rate is outside bounds"
+                        ) from exc
+                    fresh_control_frames += 1
+                    current_error_px = float(accepted.center_x) - 320.0
+                    current_abs_error_px = abs(current_error_px)
+                    fresh_error_samples.append(
+                        (
+                            float(accepted.received_monotonic_s),
+                            current_abs_error_px,
+                        )
+                    )
+                    max_target_area = max(
+                        max_target_area,
+                        int(accepted.bbox_area),
+                    )
+                    max_target_width = max(
+                        max_target_width,
+                        int(accepted.bbox[2]),
+                    )
+                    if (
+                        fresh_control_frames >= 3
+                        and current_abs_error_px
+                        > entry_abs_error_px + GATE1_RECENTER_DIVERGENCE_PX
+                    ):
+                        raise SafetyAbort(
+                            "gate-1 recenter horizontal error diverged by more "
+                            "than 24px"
+                        )
+                    if (
+                        abs(current_error_px / 320.0)
+                        <= GATE1_RECENTER_CORRIDOR_NORMALIZED_X
+                    ):
+                        corridor_hold_frames += 1
+                    else:
+                        corridor_hold_frames = 0
+                    self.recorder.emit(
+                        "gate1_recenter_fresh_frame",
+                        fresh_control_frame=fresh_control_frames,
+                        frame_id=accepted.frame_id,
+                        sim_time_ns=accepted.sim_time_ns,
+                        center_x=accepted.center_x,
+                        horizontal_error_px=current_error_px,
+                        normalized_x=current_error_px / 320.0,
+                        normalized_x_rate_s=current_x_rate_norm_s,
+                        corridor_hold_frames=corridor_hold_frames,
+                    )
+                    last_token = token
+                    last_center_x = float(accepted.center_x)
+                    last_received_s = float(accepted.received_monotonic_s)
+
+                    error_slope = gate1_recenter_absolute_error_slope_px_s(
+                        fresh_error_samples
+                    )
+                    error_decreased = bool(
+                        current_abs_error_px < entry_abs_error_px
+                        and error_slope is not None
+                        and error_slope < 0.0
+                    )
+                    if (
+                        error_decreased
+                        and corridor_hold_frames
+                        >= GATE1_RECENTER_REQUIRED_CORRIDOR_FRAMES
+                    ):
+                        self._watchdog(
+                            require_target=False,
+                            allow_benign_pad_contact=False,
+                            enforce_benign_pad_budget=False,
+                            count_rate_sample=False,
+                        )
+                        accepted_s = time.monotonic()
+                        final_race = self.adapter.race_status
+                        if final_race is not None:
+                            max_gate_index = max(
+                                max_gate_index,
+                                int(final_race.active_gate_index),
+                            )
+                        if accepted_s >= hard_deadline_s:
+                            raise SafetyAbort(
+                                "gate-1 recenter hard 0.60s window expired"
+                            )
+                        if (
+                            final_race is None
+                            or bool(final_race.race_finished)
+                            or int(final_race.active_gate_index) != 1
+                            or int(final_race.sim_boot_time_ms)
+                            < proof.post_gate_race_boot_ms
+                            or self._latest_detection_generation
+                            != entry_generation
+                        ):
+                            raise SafetyAbort(
+                                "gate-1 recenter authority changed at acceptance"
+                            )
+                        await self._wait_for_next_flight_command_slot()
+                        self._sample()
+                        self._watchdog(
+                            require_target=False,
+                            allow_benign_pad_contact=False,
+                            enforce_benign_pad_budget=False,
+                            count_rate_sample=False,
+                        )
+                        cleanup_ready_race = self.adapter.race_status
+                        cleanup_ready_target = self._latest_accepted_target
+                        cleanup_ready_s = time.monotonic()
+                        cleanup_ready_token_is_valid = False
+                        if cleanup_ready_target is not None:
+                            cleanup_ready_token = (
+                                int(entry_generation),
+                                int(cleanup_ready_target.frame_id),
+                                int(cleanup_ready_target.sim_time_ns),
+                            )
+                            cleanup_ready_token_is_valid = bool(
+                                (
+                                    cleanup_ready_token == last_token
+                                    and float(
+                                        cleanup_ready_target.received_monotonic_s
+                                    )
+                                    == last_received_s
+                                )
+                                or (
+                                    cleanup_ready_token[1] > last_token[1]
+                                    and cleanup_ready_token[2] > last_token[2]
+                                    and float(
+                                        cleanup_ready_target.received_monotonic_s
+                                    )
+                                    > last_received_s
+                                )
+                            )
+                        if cleanup_ready_race is not None:
+                            max_gate_index = max(
+                                max_gate_index,
+                                int(cleanup_ready_race.active_gate_index),
+                            )
+                        if (
+                            cleanup_ready_race is None
+                            or bool(cleanup_ready_race.race_finished)
+                            or int(cleanup_ready_race.active_gate_index) != 1
+                            or int(cleanup_ready_race.sim_boot_time_ms)
+                            < proof.post_gate_race_boot_ms
+                            or self._latest_detection_generation
+                            != entry_generation
+                            or cleanup_ready_target is None
+                            or not cleanup_ready_token_is_valid
+                            or cleanup_ready_target.composite
+                            or self.tracker.target is not cleanup_ready_target
+                            or self.tracker.last_selection_mode != "primary"
+                            or self.tracker.consecutive
+                            < POST_GATE_REQUIRED_FRAMES
+                            or cleanup_ready_target.frame_id
+                            != self._latest_detection_frame_id
+                            or cleanup_ready_target.sim_time_ns
+                            != self._latest_detection_frame_sim_ns
+                            or cleanup_ready_target.received_monotonic_s
+                            != self._latest_detection_received_s
+                            or cleanup_ready_target.age_s(cleanup_ready_s)
+                            > MAX_VISION_AGE_S
+                        ):
+                            raise SafetyAbort(
+                                "gate-1 recenter authority changed before cleanup"
+                            )
+                        if self.estimate is None:
+                            raise SafetyAbort(
+                                "gate-1 recenter attitude estimate changed "
+                                "before cleanup"
+                            )
+                        cleanup_roll, cleanup_pitch, _cleanup_yaw = (
+                            self.estimate.orientation.to_euler()
+                        )
+                        min_roll = min(min_roll, float(cleanup_roll))
+                        max_roll = max(max_roll, float(cleanup_roll))
+                        min_pitch = min(min_pitch, float(cleanup_pitch))
+                        max_pitch = max(max_pitch, float(cleanup_pitch))
+                        cleanup_peak_rate = max(
+                            abs(float(value))
+                            for value in self.estimate.body_rates
+                        )
+                        if (
+                            abs(float(cleanup_roll))
+                            > GATE1_RECENTER_MAX_ABS_ROLL_RAD
+                            or not (
+                                GATE1_RECENTER_MIN_PITCH_RAD
+                                <= float(cleanup_pitch)
+                                <= GATE1_RECENTER_MAX_PITCH_RAD
+                            )
+                            or abs(float(cleanup_roll) - entry_roll)
+                            > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                            or abs(float(cleanup_pitch) - entry_pitch)
+                            > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                            or cleanup_peak_rate
+                            > GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S
+                        ):
+                            raise SafetyAbort(
+                                "gate-1 recenter state approached its bound "
+                                "before cleanup"
+                            )
+                        assert cleanup_ready_target is not None
+                        assert cleanup_ready_token_is_valid
+                        cleanup_target_advanced = cleanup_ready_token != last_token
+                        latest_target = cleanup_ready_target
+                        max_target_area = max(
+                            max_target_area,
+                            int(cleanup_ready_target.bbox_area),
+                        )
+                        max_target_width = max(
+                            max_target_width,
+                            int(cleanup_ready_target.bbox[2]),
+                        )
+                        if cleanup_target_advanced:
+                            cleanup_dt_s = (
+                                float(
+                                    cleanup_ready_target.received_monotonic_s
+                                )
+                                - last_received_s
+                            )
+                            cleanup_x_rate_norm_s = (
+                                (
+                                    float(cleanup_ready_target.center_x)
+                                    - last_center_x
+                                )
+                                / 320.0
+                                / cleanup_dt_s
+                            )
+                            try:
+                                gate1_recenter_roll_target(
+                                    (
+                                        float(cleanup_ready_target.center_x)
+                                        - 320.0
+                                    )
+                                    / 320.0,
+                                    cleanup_x_rate_norm_s,
+                                )
+                            except ValueError as rate_exc:
+                                raise SafetyAbort(
+                                    "gate-1 recenter final horizontal rate is "
+                                    "outside bounds"
+                                ) from rate_exc
+                            fresh_error_samples.append(
+                                (
+                                    float(
+                                        cleanup_ready_target.received_monotonic_s
+                                    ),
+                                    abs(
+                                        float(cleanup_ready_target.center_x)
+                                        - 320.0
+                                    ),
+                                )
+                            )
+                        cleanup_abs_error_px = abs(
+                            float(cleanup_ready_target.center_x) - 320.0
+                        )
+                        cleanup_error_slope = (
+                            gate1_recenter_absolute_error_slope_px_s(
+                                fresh_error_samples
+                            )
+                        )
+                        if (
+                            cleanup_abs_error_px >= entry_abs_error_px
+                            or cleanup_error_slope is None
+                            or cleanup_error_slope >= 0.0
+                            or abs(
+                                (
+                                    float(cleanup_ready_target.center_x)
+                                    - 320.0
+                                )
+                                / 320.0
+                            )
+                            > GATE1_RECENTER_CORRIDOR_NORMALIZED_X
+                        ):
+                            raise SafetyAbort(
+                                "gate-1 recenter criteria changed before cleanup"
+                            )
+                        refresh_summary(
+                            outcome="corridor_hold",
+                            reason=None,
+                            criteria_met=True,
+                            corridor_accepted_elapsed_s=(
+                                accepted_s - recenter_started_s
+                            ),
+                        )
+                        self.recorder.emit(
+                            "gate1_recenter_terminal",
+                            **summary,
+                        )
+                        return dict(summary)
+
+                normalized_x = (
+                    float(latest_target.center_x) - 320.0
+                ) / 320.0
+                try:
+                    target_roll = gate1_recenter_roll_target(
+                        normalized_x,
+                        current_x_rate_norm_s,
+                    )
+                except ValueError as exc:
+                    raise SafetyAbort(
+                        "gate-1 recenter horizontal control is outside bounds"
+                    ) from exc
+                command = attitude_rate_command(
+                    self.estimate,
+                    target_roll_rad=target_roll,
+                    target_pitch_rad=0.0,
+                    thrust=GATE1_RECENTER_THRUST,
+                )
+                command = limit_command_rates(
+                    command,
+                    GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S,
+                )
+                if (
+                    command.yaw_rate != 0.0
+                    or abs(command.roll_rate)
+                    > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+                    or abs(command.pitch_rate)
+                    > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+                    or not (
+                        GATE1_RECENTER_MIN_THRUST
+                        <= command.thrust
+                        <= GATE1_RECENTER_MAX_THRUST
+                    )
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter command escaped the bounded envelope"
+                    )
+
+                self._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=False,
+                    enforce_benign_pad_budget=False,
+                    count_rate_sample=False,
+                )
+                send_checked_s = time.monotonic()
+                send_race = self.adapter.race_status
+                if send_race is not None:
+                    max_gate_index = max(
+                        max_gate_index,
+                        int(send_race.active_gate_index),
+                    )
+                if (
+                    hard_deadline_s - send_checked_s
+                    <= CONTROL_PERIOD_S
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter hard 0.60s window expired"
+                    )
+                if (
+                    send_race is None
+                    or bool(send_race.race_finished)
+                    or int(send_race.active_gate_index) != 1
+                    or int(send_race.sim_boot_time_ms)
+                    < proof.post_gate_race_boot_ms
+                    or self._latest_detection_generation != entry_generation
+                    or self._latest_accepted_target is not latest_target
+                    or self.tracker.target is not latest_target
+                    or latest_target.composite
+                    or self.tracker.last_selection_mode != "primary"
+                    or self.tracker.consecutive < POST_GATE_REQUIRED_FRAMES
+                    or latest_target.frame_id
+                    != self._latest_detection_frame_id
+                    or latest_target.sim_time_ns
+                    != self._latest_detection_frame_sim_ns
+                    or latest_target.received_monotonic_s
+                    != self._latest_detection_received_s
+                    or latest_target.age_s(send_checked_s) > MAX_VISION_AGE_S
+                ):
+                    raise SafetyAbort(
+                        "gate-1 recenter authority changed before command send"
+                    )
+                wire_not_before_ns = (
+                    None
+                    if self._last_flight_command_started_ns is None
+                    else self._last_flight_command_started_ns
+                    + round(CONTROL_PERIOD_S * 1_000_000_000)
+                )
+                last_dispatch_attempt_s = time.monotonic()
+                try:
+                    await self._send_flight_command(
+                        command,
+                        require_wire_receipt=True,
+                        wire_start_not_before_ns=wire_not_before_ns,
+                        wire_start_deadline_ns=last_recenter_wire_start_ns,
+                    )
+                    last_dispatch_attempt_s = None
+                except Exception as exc:
+                    raise SafetyAbort(
+                        "gate-1 recenter command dispatch failed closed"
+                    ) from exc
+                command_count += 1
+                min_command_roll_rate = (
+                    command.roll_rate
+                    if min_command_roll_rate is None
+                    else min(min_command_roll_rate, command.roll_rate)
+                )
+                max_command_roll_rate = (
+                    command.roll_rate
+                    if max_command_roll_rate is None
+                    else max(max_command_roll_rate, command.roll_rate)
+                )
+                min_command_pitch_rate = (
+                    command.pitch_rate
+                    if min_command_pitch_rate is None
+                    else min(min_command_pitch_rate, command.pitch_rate)
+                )
+                max_command_pitch_rate = (
+                    command.pitch_rate
+                    if max_command_pitch_rate is None
+                    else max(max_command_pitch_rate, command.pitch_rate)
+                )
+                self._record_tick(
+                    "gate1-recenter/recenter",
+                    send_checked_s - recenter_started_s,
+                    command,
+                )
+                refresh_summary(outcome="running", reason=None)
+                next_tick = next_control_deadline(
+                    next_tick,
+                    time.monotonic(),
+                )
+                await asyncio.sleep(
+                    max(
+                        0.0,
+                        min(next_tick, hard_deadline_s) - time.monotonic(),
+                    )
+                )
+        except BaseException as exc:
+            pacing_failure: Optional[BaseException] = None
+            terminal_observed_s = time.monotonic()
+            if (
+                self._last_flight_command_sent_s is not None
+                or last_dispatch_attempt_s is not None
+            ):
+                try:
+                    await reserve_terminal_cleanup_slot(
+                        uncertain_dispatch_observed_s=(
+                            terminal_observed_s
+                            if last_dispatch_attempt_s is not None
+                            else None
+                        )
+                    )
+                except BaseException as reserve_exc:
+                    pacing_failure = reserve_exc
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            "gate-1 recenter terminal cleanup-slot reservation "
+                            f"also failed: {reserve_exc}"
+                        )
+            terminal_reason = str(exc) or type(exc).__name__
+            if pacing_failure is not None:
+                terminal_reason = (
+                    f"{terminal_reason}; cleanup-slot reservation failed: "
+                    f"{pacing_failure}"
+                )
+            refresh_summary(
+                outcome=(
+                    "abort"
+                    if isinstance(exc, SafetyAbort)
+                    else (
+                        "interrupted"
+                        if isinstance(exc, asyncio.CancelledError)
+                        else "unexpected_error"
+                    )
+                ),
+                reason=terminal_reason,
+                criteria_met=False,
+            )
+            try:
+                self.recorder.emit("gate1_recenter_terminal", **summary)
+            except BaseException as recorder_exc:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(
+                        "gate-1 recenter terminal evidence emission also "
+                        f"failed: {recorder_exc}"
+                    )
+            raise
+
+    async def _run_gate1_recenter_candidate(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Compose proved Gate 0, zero-authority acquisition, and the candidate."""
+
+        gate0 = await self._run_gate0(context)
+        observation = await self._observe_gate1(gate0)
+        recenter = await self._run_bounded_gate1_recenter(observation)
+        return {
+            "gate0": gate0,
+            "gate1_observation": observation,
+            "gate1_recenter": recenter,
+        }
+
     @staticmethod
     def _official_lap_time_s(race: Any) -> float:
         start_ms = int(race.race_start_boot_time_ms)
@@ -10761,6 +11809,8 @@ async def run_live(
     write_diagnostic_pngs: bool = True,
     run_manifest_sha256: Optional[str] = None,
 ) -> StageResult:
+    if type(stage) is not str or stage not in LIVE_RUN_STAGES:
+        raise ValueError(f"unsupported live stage: {stage}")
     _load_live_transport_dependencies()
     if type(recording_approved) is not bool:
         raise TypeError("recording_approved must be an exact bool")

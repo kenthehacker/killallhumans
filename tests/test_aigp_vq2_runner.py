@@ -788,7 +788,7 @@ def test_pitch_leveling_moves_expected_gate_reference_down():
     ("elapsed_s", "expected_pitch"),
     ((0.0, -0.31), (0.40, -0.155), (0.80, 0.0), (1.20, 0.0)),
 )
-def test_gate0_full_lap_pitch_schedule_reaches_bounded_exit_pitch(
+def test_offline_gate0_full_lap_pitch_schedule_reaches_bounded_exit_pitch(
     elapsed_s,
     expected_pitch,
 ):
@@ -1250,7 +1250,7 @@ def test_gate0_stage_waits_for_prior_flight_command_slot_before_sampling(
     assert events[1][1] == pytest.approx(1.01)
 
 
-def test_course_gate_stage_waits_for_prior_flight_command_slot_before_sampling(
+def test_offline_course_gate_waits_for_prior_command_slot_before_sampling(
     monkeypatch,
 ):
     class SampleReached(Exception):
@@ -1432,7 +1432,7 @@ def test_untracked_contact_guard_selects_the_live_collision_precursor_only():
         )
 
 
-def test_course_gate_aborts_large_current_raw_detection_rejected_by_tracker(
+def test_offline_course_gate_aborts_large_raw_detection_rejected_by_tracker(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -1473,7 +1473,7 @@ def test_course_gate_aborts_large_current_raw_detection_rejected_by_tracker(
     assert adapter.commands == []
 
 
-def test_course_gate_aborts_if_vision_generation_changes(monkeypatch):
+def test_offline_course_gate_aborts_if_vision_generation_changes(monkeypatch):
     clock = [1.0]
     samples = [0]
     commands = []
@@ -1550,7 +1550,7 @@ def test_course_gate_aborts_if_vision_generation_changes(monkeypatch):
         (0.0, 1),
     ),
 )
-def test_course_gate_roll_target_rejects_nonfinite_or_untyped_inputs(
+def test_offline_course_gate_roll_target_rejects_invalid_inputs(
     normalized_x,
     recenter,
 ):
@@ -1575,7 +1575,7 @@ def test_offline_course_gate_roll_target_uses_empirically_convergent_sign():
     ((True, 0.05), (False, 0.16)),
     ids=("recenter", "approach"),
 )
-def test_course_gate_roll_target_uses_phase_specific_symmetric_clamps(
+def test_offline_course_gate_roll_target_uses_phase_specific_clamps(
     recenter,
     limit,
 ):
@@ -1597,7 +1597,7 @@ def test_course_gate_roll_target_uses_phase_specific_symmetric_clamps(
     ("entry_pitch", "control_y"),
     ((-0.05, 180.0), (-0.05, 60.0), (-0.05, 300.0)),
 )
-def test_course_gate_recenter_pitch_is_exact_zero(entry_pitch, control_y):
+def test_offline_course_gate_recenter_pitch_is_exact_zero(entry_pitch, control_y):
     assert (
         vq2_module.course_gate_recenter_pitch_target(entry_pitch, control_y)
         == 0.0
@@ -1608,7 +1608,10 @@ def test_course_gate_recenter_pitch_is_exact_zero(entry_pitch, control_y):
     ("entry_pitch", "control_y"),
     ((True, 180.0), (math.nan, 180.0), (0.0, True), (0.0, math.inf)),
 )
-def test_course_gate_recenter_pitch_rejects_invalid_inputs(entry_pitch, control_y):
+def test_offline_course_gate_recenter_pitch_rejects_invalid_inputs(
+    entry_pitch,
+    control_y,
+):
     with pytest.raises(ValueError, match="recenter pitch inputs"):
         vq2_module.course_gate_recenter_pitch_target(entry_pitch, control_y)
 
@@ -1625,7 +1628,7 @@ def test_course_gate_recenter_pitch_rejects_invalid_inputs(entry_pitch, control_
         (0.0, 0.0, math.nan),
     ),
 )
-def test_course_gate_recenter_required_rejects_invalid_inputs(
+def test_offline_course_gate_recenter_required_rejects_invalid_inputs(
     elapsed_s,
     normalized_x,
     control_y,
@@ -1647,7 +1650,7 @@ def test_course_gate_recenter_required_rejects_invalid_inputs(
     ),
     ids=("inside-window", "exact-deadline", "past-deadline"),
 )
-def test_course_gate_recenter_window_is_hard_and_nonrenewable(
+def test_offline_course_gate_recenter_window_is_hard_and_nonrenewable(
     elapsed_s,
     expected,
 ):
@@ -1677,6 +1680,83 @@ def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
         AttitudeRateCommand(0.20, -0.11, 0.0, 0.275),
     )
     assert limited == AttitudeRateCommand(0.12, -0.11, 0.0, 0.275)
+
+
+@pytest.mark.parametrize(
+    ("normalized_x", "normalized_x_rate_s", "expected"),
+    (
+        (0.25, 0.0, 0.03),
+        (0.25, 0.40, 0.04),
+        (-0.25, -0.40, -0.04),
+        (1.0, 0.0, 0.05),
+        (-1.0, 0.0, -0.05),
+    ),
+)
+def test_gate1_recenter_roll_target_uses_positive_position_and_rate_sign(
+    normalized_x,
+    normalized_x_rate_s,
+    expected,
+):
+    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.12
+    assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.025
+    assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
+    assert vq2_module.gate1_recenter_roll_target(
+        normalized_x,
+        normalized_x_rate_s,
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("normalized_x", "normalized_x_rate_s"),
+    (
+        (True, 0.0),
+        (0.0, False),
+        (math.nan, 0.0),
+        (0.0, math.inf),
+        (0.0, math.nextafter(4.0, math.inf)),
+        (0.0, math.nextafter(-4.0, -math.inf)),
+    ),
+)
+def test_gate1_recenter_roll_target_rejects_unbounded_inputs(
+    normalized_x,
+    normalized_x_rate_s,
+):
+    with pytest.raises(ValueError, match="horizontal inputs"):
+        vq2_module.gate1_recenter_roll_target(
+            normalized_x,
+            normalized_x_rate_s,
+        )
+
+
+def test_gate1_recenter_absolute_error_slope_uses_only_strict_fresh_times():
+    assert vq2_module.gate1_recenter_absolute_error_slope_px_s(
+        [(1.0, 200.0)]
+    ) is None
+    assert vq2_module.gate1_recenter_absolute_error_slope_px_s(
+        [(1.0, 200.0), (1.1, 190.0), (1.2, 180.0)]
+    ) == pytest.approx(-100.0)
+    with pytest.raises(ValueError, match="increase strictly"):
+        vq2_module.gate1_recenter_absolute_error_slope_px_s(
+            [(1.0, 200.0), (1.0, 190.0)]
+        )
+
+
+def test_gate1_recenter_candidate_contract_constants_are_exact():
+    assert vq2_module.GATE1_RECENTER_DURATION_S == 0.60
+    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.12
+    assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.025
+    assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
+    assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
+    assert vq2_module.GATE1_RECENTER_THRUST == 0.275
+    assert vq2_module.GATE1_RECENTER_MIN_THRUST == 0.21
+    assert vq2_module.GATE1_RECENTER_MAX_THRUST == 0.30
+    assert vq2_module.GATE1_RECENTER_CORRIDOR_NORMALIZED_X == 0.35
+    assert vq2_module.GATE1_RECENTER_REQUIRED_CORRIDOR_FRAMES == 3
+    assert vq2_module.GATE1_RECENTER_DIVERGENCE_PX == 24.0
+    assert vq2_module.GATE1_RECENTER_MAX_ABS_X_RATE_NORM_S == 4.0
+    assert vq2_module.GATE1_RECENTER_MAX_ABS_ROLL_RAD == 0.15
+    assert vq2_module.GATE1_RECENTER_MIN_PITCH_RAD == -0.20
+    assert vq2_module.GATE1_RECENTER_MAX_PITCH_RAD == 0.10
 
 
 def test_official_lap_time_uses_finish_ns_minus_start_ms():
@@ -1842,6 +1922,851 @@ class _FakeAdapter:
         collisions = self.collisions
         self.collisions = []
         return collisions
+
+
+def _configure_gate1_recenter_candidate(monkeypatch, *, entry_center_x=530):
+    clock = [0.0]
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1250, 0, -1, 1, 123)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=0.0, pitch=-0.05)
+    runner._gate0_transition_proof = vq2_module.GateTransitionProof(
+        pre_gate_race_boot_ms=1000,
+        post_gate_race_boot_ms=1250,
+        flight_started_monotonic_s=-2.0,
+        crossing_started_monotonic_s=-0.4,
+        pass_confirmed_monotonic_s=-0.1,
+        next_control_deadline_s=0.0,
+        vision_generation=1,
+        vision_frame_id=100,
+        vision_sim_time_ns=1000,
+        vision_received_monotonic_s=-0.3,
+        pass_rpy_rad=(0.0, -0.05, 0.0),
+    )
+    entry = vq2_module.GateTarget(
+        frame_id=103,
+        sim_time_ns=1030,
+        received_monotonic_s=0.0,
+        center_x=entry_center_x,
+        center_y=50,
+        bbox=(entry_center_x - 50, 0, 100, 100),
+        confidence=0.8,
+    )
+    runner.tracker.target = entry
+    runner.tracker.consecutive = 3
+    runner.tracker.last_selection_mode = "primary"
+    runner._latest_accepted_target = entry
+    runner._latest_detection_generation = 1
+    runner._latest_detection_frame_id = entry.frame_id
+    runner._latest_detection_frame_sim_ns = entry.sim_time_ns
+    runner._latest_detection_received_s = entry.received_monotonic_s
+    runner._latest_raw_detections = []
+    observation = {
+        "gate1_observed": True,
+        "frame_count": 3,
+        "frames": [
+            {
+                "frame_id": 101,
+                "sim_time_ns": 1010,
+                "received_monotonic_s": -0.2,
+                "center_px": [524, 52],
+                "bbox_xywh_px": [474, 2, 100, 100],
+            },
+            {
+                "frame_id": 102,
+                "sim_time_ns": 1020,
+                "received_monotonic_s": -0.1,
+                "center_px": [527, 51],
+                "bbox_xywh_px": [477, 1, 100, 100],
+            },
+            {
+                "frame_id": 103,
+                "sim_time_ns": 1030,
+                "received_monotonic_s": 0.0,
+                "center_px": [entry_center_x, 50],
+                "bbox_xywh_px": [entry_center_x - 50, 0, 100, 100],
+            },
+        ],
+        "gate_index": 1,
+    }
+
+    async def advance(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0],
+            perf_counter_ns=lambda: round(clock[0] * 1_000_000_000),
+        ),
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "asyncio",
+        SimpleNamespace(sleep=advance, CancelledError=asyncio.CancelledError),
+    )
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    return runner, adapter, observation, clock
+
+
+def _install_gate1_frame_sequence(
+    monkeypatch,
+    runner,
+    clock,
+    centers,
+    *,
+    generation=1,
+    sample_step_s=0.10,
+):
+    queued = deque(int(value) for value in centers)
+
+    def sample():
+        if not queued:
+            return
+        clock[0] += float(sample_step_s)
+        center_x = queued.popleft()
+        previous = runner.tracker.target
+        assert previous is not None
+        target = vq2_module.GateTarget(
+            frame_id=previous.frame_id + 1,
+            sim_time_ns=previous.sim_time_ns + 10,
+            received_monotonic_s=clock[0],
+            center_x=center_x,
+            center_y=50,
+            bbox=(center_x - 50, 0, 100, 100),
+            confidence=0.8,
+        )
+        runner.tracker.target = target
+        runner.tracker.consecutive += 1
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = target
+        runner._latest_detection_generation = generation
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = target.received_monotonic_s
+
+    monkeypatch.setattr(runner, "_sample", sample)
+
+
+def test_offline_gate1_recenter_requires_error_decrease_and_three_frame_hold(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [430, 420, 410],
+    )
+
+    result = asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert result["success"] is False
+    assert result["recenter_criteria_met"] is True
+    assert result["cleanup_confirmed"] is False
+    assert result["outcome"] == "corridor_hold"
+    assert result["fresh_control_frame_count"] == 3
+    assert result["corridor_hold_frame_count"] == 3
+    assert result["entry_abs_horizontal_error_px"] == 210.0
+    assert result["final_abs_horizontal_error_px"] == 90.0
+    assert result["fresh_abs_horizontal_error_slope_px_s"] < 0.0
+    assert result["authoritative_max_gate_index"] == 1
+    assert result["contact_safety_outcome"] == "clean"
+    assert adapter.commands
+    assert all(
+        abs(command.roll_rate)
+        <= vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+        and abs(command.pitch_rate)
+        <= vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+        and command.yaw_rate == 0.0
+        and command.thrust == vq2_module.GATE1_RECENTER_THRUST
+        for command in adapter.commands
+    )
+
+
+def test_offline_gate1_recenter_wires_zero_pitch_and_fixed_thrust(
+    monkeypatch,
+):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [520],
+    )
+    observed = []
+    original = vq2_module.attitude_rate_command
+
+    def capture_objective(estimate, **kwargs):
+        observed.append(dict(kwargs))
+        return original(estimate, **kwargs)
+
+    monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        capture_objective,
+    )
+
+    with pytest.raises(SafetyAbort):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert observed
+    assert all(
+        objective["target_pitch_rad"] == 0.0
+        and objective["thrust"] == 0.275
+        for objective in observed
+    )
+
+
+def test_offline_gate1_recenter_duplicate_frames_do_not_count(monkeypatch):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    calls = [0]
+
+    def sample():
+        calls[0] += 1
+        if calls[0] in {2, 4, 6}:
+            clock[0] += 0.10
+            center_x = {2: 430, 4: 420, 6: 410}[calls[0]]
+            previous = runner.tracker.target
+            assert previous is not None
+            target = replace(
+                previous,
+                frame_id=previous.frame_id + 1,
+                sim_time_ns=previous.sim_time_ns + 10,
+                received_monotonic_s=clock[0],
+                center_x=center_x,
+                bbox=(center_x - 50, 0, 100, 100),
+            )
+            runner.tracker.target = target
+            runner.tracker.consecutive += 1
+            runner.tracker.last_selection_mode = "primary"
+            runner._latest_accepted_target = target
+            runner._latest_detection_frame_id = target.frame_id
+            runner._latest_detection_frame_sim_ns = target.sim_time_ns
+            runner._latest_detection_received_s = target.received_monotonic_s
+
+    monkeypatch.setattr(runner, "_sample", sample)
+
+    result = asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    # One commandless sample rechecks authority after the paced cleanup slot.
+    assert calls[0] == 7
+    assert result["fresh_control_frame_count"] == 3
+    assert result["corridor_hold_frame_count"] == 3
+
+
+def test_offline_gate1_recenter_rejects_transient_improvement_with_bad_finish(
+    monkeypatch,
+):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch,
+        entry_center_x=430,
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [400, 425, 432],
+    )
+
+    with pytest.raises(SafetyAbort):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    summary = runner._gate1_recenter_summary
+    assert summary is not None
+    assert summary["recenter_criteria_met"] is False
+    assert summary["final_abs_horizontal_error_px"] == 112.0
+    assert summary["entry_abs_horizontal_error_px"] == 110.0
+    assert summary["fresh_abs_horizontal_error_slope_px_s"] > 0.0
+
+
+@pytest.mark.parametrize(
+    ("third_center_x", "expected_reason"),
+    (
+        (445, "diverged by more than 24px"),
+        (444, "target lost primary fresh-frame authority"),
+    ),
+    ids=("strictly-over-bound", "exact-bound-allowed"),
+)
+def test_offline_gate1_recenter_divergence_boundary_is_strict(
+    monkeypatch,
+    third_center_x,
+    expected_reason,
+):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch,
+        entry_center_x=420,
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [430, 440, third_center_x],
+    )
+
+    with pytest.raises(SafetyAbort, match=expected_reason):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert runner._gate1_recenter_summary is not None
+    assert runner._gate1_recenter_summary["success"] is False
+    assert runner._gate1_recenter_summary["fresh_control_frame_count"] == 3
+
+
+def test_offline_gate1_recenter_never_sends_at_or_after_hard_deadline(
+    monkeypatch,
+):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+
+    def refresh_same_error():
+        clock[0] += 0.002
+        previous = runner.tracker.target
+        assert previous is not None
+        target = replace(
+            previous,
+            frame_id=previous.frame_id + 1,
+            sim_time_ns=previous.sim_time_ns + 10,
+            received_monotonic_s=clock[0],
+        )
+        runner.tracker.target = target
+        runner.tracker.consecutive += 1
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = target
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = target.received_monotonic_s
+
+    monkeypatch.setattr(runner, "_sample", refresh_same_error)
+    send_times = []
+    original_send = runner._send_flight_command
+
+    async def record_send(command, **kwargs):
+        send_times.append(clock[0])
+        return await original_send(command, **kwargs)
+
+    monkeypatch.setattr(runner, "_send_flight_command", record_send)
+
+    with pytest.raises(SafetyAbort, match="hard 0.60s window expired"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert send_times
+    assert all(
+        sent < vq2_module.GATE1_RECENTER_DURATION_S
+        for sent in send_times
+    )
+    assert all(
+        sent
+        < vq2_module.GATE1_RECENTER_DURATION_S
+        - vq2_module.CONTROL_PERIOD_S
+        for sent in send_times
+    )
+    assert clock[0] >= (
+        vq2_module.GATE1_RECENTER_DURATION_S
+        - vq2_module.CONTROL_PERIOD_S
+    )
+
+
+def test_offline_gate1_recenter_wire_deadline_rejects_delayed_send(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    entry = runner.tracker.target
+    assert entry is not None
+
+    def sample():
+        clock[0] = (
+            vq2_module.GATE1_RECENTER_DURATION_S
+            - vq2_module.CONTROL_PERIOD_S
+            - 0.006
+        )
+        refreshed = replace(
+            entry,
+            frame_id=entry.frame_id + 1,
+            sim_time_ns=entry.sim_time_ns + 10,
+            received_monotonic_s=clock[0],
+        )
+        runner.tracker.target = refreshed
+        runner.tracker.consecutive += 1
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = refreshed
+        runner._latest_detection_frame_id = refreshed.frame_id
+        runner._latest_detection_frame_sim_ns = refreshed.sim_time_ns
+        runner._latest_detection_received_s = refreshed.received_monotonic_s
+
+    original_send = runner._send_flight_command
+
+    async def delayed_send(command, **kwargs):
+        clock[0] += 0.030
+        return await original_send(command, **kwargs)
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_send_flight_command", delayed_send)
+
+    with pytest.raises(SafetyAbort, match="dispatch failed closed"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+
+
+def test_offline_gate1_recenter_wire_deadline_survives_start_clock_preemption(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    entry = runner.tracker.target
+    assert entry is not None
+    first_perf_sample = [True]
+
+    def preempted_perf_counter_ns():
+        sampled_ns = round(clock[0] * 1_000_000_000)
+        if first_perf_sample[0]:
+            first_perf_sample[0] = False
+            clock[0] += 0.030
+        return sampled_ns
+
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        preempted_perf_counter_ns,
+    )
+
+    def sample():
+        clock[0] = (
+            vq2_module.GATE1_RECENTER_DURATION_S
+            - vq2_module.CONTROL_PERIOD_S
+            - 0.006
+        )
+        refreshed = replace(
+            entry,
+            frame_id=entry.frame_id + 1,
+            sim_time_ns=entry.sim_time_ns + 10,
+            received_monotonic_s=clock[0],
+        )
+        runner.tracker.target = refreshed
+        runner.tracker.consecutive += 1
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = refreshed
+        runner._latest_detection_frame_id = refreshed.frame_id
+        runner._latest_detection_frame_sim_ns = refreshed.sim_time_ns
+        runner._latest_detection_received_s = refreshed.received_monotonic_s
+
+    original_send = runner._send_flight_command
+
+    async def delayed_send(command, **kwargs):
+        clock[0] += 0.030
+        return await original_send(command, **kwargs)
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_send_flight_command", delayed_send)
+
+    with pytest.raises(SafetyAbort, match="dispatch failed closed"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert clock[0] >= vq2_module.GATE1_RECENTER_DURATION_S
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize("failure_mode", ("missing_receipt", "send_raised"))
+def test_offline_gate1_recenter_reserves_cleanup_slot_after_uncertain_dispatch(
+    monkeypatch,
+    failure_mode,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    dispatch_times = []
+    dispatch_terminal_times = []
+
+    async def uncertain_send(
+        command,
+        *,
+        call_start_not_before_monotonic_ns=None,
+        call_start_deadline_monotonic_ns=None,
+    ):
+        del call_start_not_before_monotonic_ns, call_start_deadline_monotonic_ns
+        dispatch_times.append(clock[0])
+        clock[0] += 0.015
+        dispatch_terminal_times.append(clock[0])
+        if failure_mode == "send_raised":
+            raise TimeoutError("wire outcome is unknown")
+        adapter.commands.append(command)
+
+    monkeypatch.setattr(adapter, "send_attitude_rate", uncertain_send)
+
+    with pytest.raises(SafetyAbort, match="dispatch failed closed"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert dispatch_times
+    assert dispatch_terminal_times
+    assert clock[0] >= (
+        dispatch_terminal_times[-1] + vq2_module.CONTROL_PERIOD_S
+    )
+
+
+def test_offline_gate1_recenter_rechecks_target_freshness_at_send(monkeypatch):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    watchdog_calls = [0]
+
+    def delayed_watchdog(**_kwargs):
+        watchdog_calls[0] += 1
+        if watchdog_calls[0] == 2:
+            clock[0] += vq2_module.MAX_VISION_AGE_S + 0.001
+
+    monkeypatch.setattr(runner, "_watchdog", delayed_watchdog)
+
+    with pytest.raises(SafetyAbort, match="authority changed before command send"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+
+
+def test_offline_gate1_recenter_reserves_cleanup_slot_after_unexpected_error(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    error_times = []
+
+    def fail_after_send(*_args, **_kwargs):
+        error_times.append(clock[0])
+        raise RuntimeError("post-send recorder failed")
+
+    monkeypatch.setattr(runner, "_record_tick", fail_after_send)
+
+    with pytest.raises(RuntimeError, match="post-send recorder failed"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands
+    assert error_times
+    assert clock[0] >= error_times[-1] + vq2_module.CONTROL_PERIOD_S
+    assert runner._gate1_recenter_summary is not None
+    assert runner._gate1_recenter_summary["outcome"] == "unexpected_error"
+    assert (
+        runner._gate1_recenter_summary["contact_safety_outcome"]
+        == "infrastructure_error"
+    )
+
+
+def test_offline_gate1_recenter_does_not_delay_late_error_after_proved_send(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    error_times = []
+
+    def fail_well_after_send(*_args, **_kwargs):
+        clock[0] += 0.050
+        error_times.append(clock[0])
+        raise RuntimeError("late post-send failure")
+
+    monkeypatch.setattr(runner, "_record_tick", fail_well_after_send)
+
+    with pytest.raises(RuntimeError, match="late post-send failure"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands
+    assert error_times
+    assert clock[0] == pytest.approx(error_times[-1])
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    (
+        ("generation", "vision generation changed"),
+        ("race", "gate index changed"),
+        ("target", "primary gate target lost"),
+        ("composite", "primary fresh-frame authority"),
+    ),
+)
+def test_offline_gate1_recenter_aborts_on_authority_loss(
+    monkeypatch,
+    mutation,
+    expected_reason,
+):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+
+    def sample():
+        if mutation == "generation":
+            runner._latest_detection_generation = 2
+        elif mutation == "race":
+            runner.adapter.race_status = RaceStatus(1500, 0, -1, 2, 123)
+        elif mutation == "target":
+            runner._latest_accepted_target = None
+        else:
+            assert runner._latest_accepted_target is not None
+            composite = replace(
+                runner._latest_accepted_target,
+                composite=True,
+            )
+            runner._latest_accepted_target = composite
+            runner.tracker.target = composite
+
+    monkeypatch.setattr(runner, "_sample", sample)
+
+    with pytest.raises(SafetyAbort, match=expected_reason):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+
+def test_offline_gate1_recenter_rejects_unsafe_entry_attitude(monkeypatch):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    runner.estimate = _estimate(
+        roll=math.nextafter(
+            vq2_module.GATE1_RECENTER_MAX_ABS_ROLL_RAD,
+            math.inf,
+        ),
+        pitch=-0.05,
+    )
+
+    with pytest.raises(SafetyAbort, match="entry attitude"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+
+def test_offline_gate1_recenter_requires_same_accepted_entry_object(
+    monkeypatch,
+):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    assert runner._latest_accepted_target is not None
+    runner._latest_accepted_target = replace(runner._latest_accepted_target)
+
+    with pytest.raises(SafetyAbort, match="fresh primary target"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+
+def test_offline_gate1_recenter_binds_handoff_to_transition_watermark(
+    monkeypatch,
+):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    observation["frames"][0]["received_monotonic_s"] = -0.4
+
+    with pytest.raises(SafetyAbort, match="did not begin after the proved transition"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+
+@pytest.mark.parametrize("cleanup_change", ("target_lost", "gate_advanced"))
+def test_offline_gate1_recenter_rechecks_authority_before_cleanup(
+    monkeypatch,
+    cleanup_change,
+):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [430, 420, 410],
+    )
+    advance_frame = runner._sample
+    sample_calls = [0]
+
+    def sample_then_change_authority():
+        sample_calls[0] += 1
+        advance_frame()
+        if sample_calls[0] == 4:
+            if cleanup_change == "target_lost":
+                runner._latest_accepted_target = None
+            else:
+                runner.adapter.race_status = RaceStatus(1500, 0, -1, 2, 123)
+
+    monkeypatch.setattr(runner, "_sample", sample_then_change_authority)
+
+    with pytest.raises(SafetyAbort, match="authority changed before cleanup"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    summary = runner._gate1_recenter_summary
+    assert summary is not None
+    assert summary["recenter_criteria_met"] is False
+    assert summary["authoritative_max_gate_index"] == (
+        2 if cleanup_change == "gate_advanced" else 1
+    )
+
+
+def test_offline_gate1_recenter_rejects_regressed_cleanup_frame(monkeypatch):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [430, 420, 410],
+    )
+    advance_frame = runner._sample
+    sample_calls = [0]
+
+    def sample_then_regress():
+        sample_calls[0] += 1
+        advance_frame()
+        if sample_calls[0] == 4:
+            current = runner._latest_accepted_target
+            assert current is not None
+            regressed = replace(
+                current,
+                frame_id=50,
+                sim_time_ns=500,
+                received_monotonic_s=clock[0],
+            )
+            runner.tracker.target = regressed
+            runner._latest_accepted_target = regressed
+            runner._latest_detection_frame_id = regressed.frame_id
+            runner._latest_detection_frame_sim_ns = regressed.sim_time_ns
+            runner._latest_detection_received_s = regressed.received_monotonic_s
+
+    monkeypatch.setattr(runner, "_sample", sample_then_regress)
+
+    with pytest.raises(SafetyAbort, match="authority changed before cleanup"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert runner._gate1_recenter_summary is not None
+    assert runner._gate1_recenter_summary["recenter_criteria_met"] is False
+
+
+def test_offline_gate1_recenter_reports_and_rechecks_final_cleanup_frame(
+    monkeypatch,
+):
+    runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [430, 420, 410, 450],
+    )
+    advance_frame = runner._sample
+    sample_calls = [0]
+
+    def sample_with_larger_final_target():
+        sample_calls[0] += 1
+        advance_frame()
+        if sample_calls[0] == 4:
+            current = runner._latest_accepted_target
+            assert current is not None
+            larger = replace(current, bbox=(380, 0, 140, 110))
+            runner.tracker.target = larger
+            runner._latest_accepted_target = larger
+
+    monkeypatch.setattr(runner, "_sample", sample_with_larger_final_target)
+
+    with pytest.raises(SafetyAbort, match="criteria changed before cleanup"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    summary = runner._gate1_recenter_summary
+    assert summary is not None
+    assert summary["recenter_criteria_met"] is False
+    assert summary["final_abs_horizontal_error_px"] == 130.0
+    assert summary["max_target_width_px"] == 140
+
+
+def test_offline_gate1_recenter_classifies_stream_watchdog_as_safety_abort(
+    monkeypatch,
+):
+    runner, _adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+
+    def fail_watchdog(**_kwargs):
+        raise SafetyAbort("IMU timestamp not advancing")
+
+    monkeypatch.setattr(runner, "_watchdog", fail_watchdog)
+
+    with pytest.raises(SafetyAbort, match="IMU timestamp"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert runner._gate1_recenter_summary is not None
+    assert (
+        runner._gate1_recenter_summary["contact_safety_outcome"]
+        == "safety_abort"
+    )
+
+
+def test_offline_gate1_recenter_composition_uses_proved_default_stages(
+    monkeypatch,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+    calls = []
+    gate0 = {"gate0_passed": True}
+    observation = {"gate1_observed": True}
+    recenter = {"success": True}
+
+    async def run_gate0(observed_context, **kwargs):
+        calls.append(("gate0", observed_context, kwargs))
+        return gate0
+
+    async def observe_gate1(observed_gate0, **kwargs):
+        calls.append(("observe", observed_gate0, kwargs))
+        return observation
+
+    async def run_recenter(observed, **kwargs):
+        calls.append(("recenter", observed, kwargs))
+        return recenter
+
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_observe_gate1", observe_gate1)
+    monkeypatch.setattr(runner, "_run_bounded_gate1_recenter", run_recenter)
+
+    result = asyncio.run(runner._run_gate1_recenter_candidate(context))
+
+    assert calls == [
+        ("gate0", context, {}),
+        ("observe", gate0, {}),
+        ("recenter", observation, {}),
+    ]
+    assert result == {
+        "gate0": gate0,
+        "gate1_observation": observation,
+        "gate1_recenter": recenter,
+    }
 
 
 @pytest.mark.parametrize(
@@ -4085,20 +5010,48 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
     assert result.details == {"gate0_passed": True}
 
 
-def test_full_lap_is_rejected_before_any_powered_lifecycle(monkeypatch):
+@pytest.mark.parametrize("stage", ["full-lap", "gate1-recenter"])
+def test_unaccepted_course_stages_are_rejected_before_powered_lifecycle(
+    monkeypatch,
+    stage,
+):
     adapter = _FakeAdapter()
     adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
     runner = VQ2Runner(adapter, _FakeVision())
     monkeypatch.setattr(
         runner,
         "establish_reset_epoch",
-        lambda **_kwargs: pytest.fail("full-lap reached reset"),
+        lambda **_kwargs: pytest.fail(f"{stage} reached reset"),
     )
 
     with pytest.raises(ValueError, match="unsupported powered stage"):
         asyncio.run(
-            runner.run_powered_stage("full-lap", write_diagnostic_pngs=False)
+            runner.run_powered_stage(stage, write_diagnostic_pngs=False)
         )
+
+
+@pytest.mark.parametrize("stage", ["full-lap", "gate1-recenter"])
+def test_unaccepted_course_stages_are_rejected_before_live_import_or_contact(
+    monkeypatch,
+    stage,
+):
+    live_imports = []
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        lambda: live_imports.append(stage),
+    )
+
+    with pytest.raises(ValueError, match="unsupported live stage"):
+        asyncio.run(
+            vq2_module.run_live(
+                stage,
+                "udpin:127.0.0.1:14550",
+                None,
+            )
+        )
+
+    assert live_imports == []
 
 
 def test_offline_full_lap_scaffold_disables_unaccepted_gate0_overrides(
