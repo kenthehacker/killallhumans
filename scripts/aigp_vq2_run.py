@@ -17,6 +17,10 @@ map.  This runner therefore performs only bounded training stages:
 ``gate0-observe``
     Run the proved gate-0 stage, then hold zero thrust for at most 0.20 seconds
     while recording a three-frame observation of the next gate.
+``visual-shadow``
+    Keep the proved Gate-0 controller in sole command authority while the
+    multi-target visual graph proves pre-credit Gate-1 tracking, promotion
+    without history reset, and one fresh post-credit observation.
 
 Every powered stage proves both the race and IMU clocks rolled back after
 ``SIM_RESET``, calibrates a gyro-only flight estimator during the countdown,
@@ -61,6 +65,13 @@ from competition.adapter import AttitudeRateCommand, Quaternion
 from competition.aigp_messages import RaceStatus
 from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
+from competition.vq2_visual_tracker import (
+    CameraFrameToken as VisualCameraFrameToken,
+    MultiTargetVisualTracker,
+    VisualDetectionFrame,
+    VisualTrack,
+    VisualTrackRole,
+)
 from estimation.imu_attitude import (
     AttitudeEstimate,
     ImuAttitudeConfig,
@@ -68,11 +79,24 @@ from estimation.imu_attitude import (
 )
 from gate_detection.src.gate_detector import GateDetection
 from gate_detection.src.vq2_detector import VQ2GateDetector
+from planning.vq2_gate_graph import (
+    AuthoritativeRaceStatusRef,
+    ConfirmedGateTransition,
+    GateGraphError,
+    GateGraphSnapshot,
+    RollingVisualGateGraph,
+)
 from scripts.aigp_vq2_controller_config import (
     ControllerConfigError,
     VQ2ControllerConfig,
     default_controller_config,
     validate_controller_config,
+)
+from scripts.aigp_vq2_visual_config import (
+    VisualConfigError,
+    VisualNavigationConfig,
+    default_visual_config,
+    validate_visual_config,
 )
 
 if TYPE_CHECKING:
@@ -199,6 +223,9 @@ POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 # User-authorized bounded live trial. Pixel-rate damping stays disabled until
 # the authoritative replay/tracker-isolation prerequisite is accepted.
 GATE1_RECENTER_STAGE = "gate1-recenter"
+VISUAL_SHADOW_STAGE = "visual-shadow"
+VISUAL_SHADOW_POST_CREDIT_TIMEOUT_S = 0.15
+VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
 GATE1_RECENTER_DURATION_S = 0.60
 GATE1_RECENTER_ROLL_GAIN = -0.24
 GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
@@ -278,6 +305,7 @@ LIVE_RUN_STAGES = (
     "gate0",
     "gate0-observe",
     GATE1_RECENTER_STAGE,
+    VISUAL_SHADOW_STAGE,
     CALIBRATION_STAGE,
 )
 CALIBRATION_CHILD_ROLE = "powered_child"
@@ -6016,7 +6044,7 @@ class StageResult:
 
 
 def controller_config_evidence(
-    config: VQ2ControllerConfig,
+    config: VQ2ControllerConfig | VisualNavigationConfig,
     *,
     candidate_commit: Optional[str],
 ) -> Dict[str, Any]:
@@ -7670,6 +7698,11 @@ class VQ2Runner:
             Mapping[str, Any] | VQ2ControllerConfig
         ] = None,
         controller_evidence: Optional[Mapping[str, Any]] = None,
+        visual_config: Optional[
+            Mapping[str, Any] | VisualNavigationConfig
+        ] = None,
+        visual_controller_evidence: Optional[Mapping[str, Any]] = None,
+        visual_session_id: str = "direct-live-session",
     ) -> None:
         if adapter.enable_vision:
             raise ValueError("VQ2Runner requires adapter vision disabled")
@@ -7707,6 +7740,45 @@ class VQ2Runner:
         ):
             raise ValueError("controller evidence does not match effective config")
         self.controller_evidence = expected_controller
+        try:
+            self.visual_config = (
+                default_visual_config()
+                if visual_config is None
+                else (
+                    validate_visual_config(
+                        visual_config.to_effective_mapping()
+                    )
+                    if isinstance(visual_config, VisualNavigationConfig)
+                    else validate_visual_config(visual_config)
+                )
+            )
+        except VisualConfigError as exc:
+            raise ValueError(
+                f"visual navigation configuration refused: {exc}"
+            ) from exc
+        expected_visual_controller = controller_config_evidence(
+            self.visual_config,
+            candidate_commit=(
+                None
+                if visual_controller_evidence is None
+                else visual_controller_evidence.get("git_commit")
+            ),
+        )
+        if (
+            visual_controller_evidence is not None
+            and dict(visual_controller_evidence) != expected_visual_controller
+        ):
+            raise ValueError(
+                "visual controller evidence does not match effective config"
+            )
+        self.visual_controller_evidence = expected_visual_controller
+        if (
+            type(visual_session_id) is not str
+            or not visual_session_id
+            or len(visual_session_id) > 128
+        ):
+            raise ValueError("visual_session_id must be a bounded string")
+        self._visual_session_id = visual_session_id
 
         config = ImuAttitudeConfig(
             gravity_correction_kp=0.0,
@@ -7761,6 +7833,15 @@ class VQ2Runner:
         self._gate1_max_abs_yaw_excursion_rad = 0.0
         self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
         self._deferred_pngs: List[Tuple[str, Any]] = []
+        self._visual_tracking_enabled = False
+        self._visual_diagnostic_logging = False
+        self._visual_reset_epoch = 0
+        self.visual_tracker = MultiTargetVisualTracker()
+        self.visual_gate_graph = RollingVisualGateGraph()
+        self._visual_latest_tracker_update: Any = None
+        self._visual_latest_graph_snapshot: Optional[GateGraphSnapshot] = None
+        self._visual_transition: Optional[ConfirmedGateTransition] = None
+        self._visual_shadow_summary: Optional[Dict[str, Any]] = None
 
     def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
         """Enforce the code-owned calibrated yaw excursion envelope."""
@@ -7836,6 +7917,90 @@ class VQ2Runner:
             self._latest_detection_frame_sim_ns,
         )
 
+    @staticmethod
+    def _visual_track_summary(track: VisualTrack) -> Dict[str, Any]:
+        latest_token = track.latest_token
+        first_token = track.first_token
+        return {
+            "track_id": track.track_id,
+            "first_frame_token": (
+                list(first_token.live_identity_tuple)
+                if first_token.live_identity_tuple is not None
+                else list(first_token.exact_tuple)
+            ),
+            "latest_frame_token": (
+                list(latest_token.live_identity_tuple)
+                if latest_token.live_identity_tuple is not None
+                else list(latest_token.exact_tuple)
+            ),
+            "center_norm_image_down": list(track.center_norm),
+            "bbox_norm_ltrb": list(track.bbox_norm),
+            "apparent_scale": track.apparent_scale,
+            "center_velocity_norm_s_image_down": list(
+                track.center_velocity_norm_s
+            ),
+            "log_scale_rate_s": track.log_scale_rate_s,
+            "confidence": track.confidence,
+            "association_confidence": track.association_confidence,
+            "consecutive_frame_count": track.consecutive_frame_count,
+            "total_observation_count": track.total_observation_count,
+            "missed_frame_count": track.missed_frame_count,
+            "clipping_edges": int(track.clipping),
+            "center_censored": track.center_censored,
+            "role": track.role.value,
+            "authoritative_gate_index": track.authoritative_gate_index,
+            "ambiguous": track.ambiguous,
+            "visible": track.visible,
+        }
+
+    @staticmethod
+    def _visual_graph_summary(
+        snapshot: Optional[GateGraphSnapshot],
+    ) -> Optional[Dict[str, Any]]:
+        if snapshot is None:
+            return None
+        return {
+            "current_track_id": snapshot.current_track_id,
+            "current_gate_index": snapshot.current_gate_index,
+            "next_candidates": [
+                {
+                    "track_id": candidate.track_id,
+                    "score": candidate.score,
+                    "stable_frame_count": candidate.stable_frame_count,
+                    "first_frame_token": (
+                        list(candidate.first_token.live_identity_tuple)
+                        if candidate.first_token.live_identity_tuple is not None
+                        else list(candidate.first_token.exact_tuple)
+                    ),
+                    "latest_frame_token": (
+                        list(candidate.latest_token.live_identity_tuple)
+                        if candidate.latest_token.live_identity_tuple is not None
+                        else list(candidate.latest_token.exact_tuple)
+                    ),
+                    "bearing_norm": candidate.bearing_norm,
+                    "elevation_norm": candidate.elevation_norm,
+                    "bearing_rate_norm_s": candidate.bearing_rate_norm_s,
+                    "elevation_rate_norm_s": candidate.elevation_rate_norm_s,
+                    "apparent_scale": candidate.apparent_scale,
+                    "log_scale_rate_s": candidate.log_scale_rate_s,
+                    "confidence": candidate.confidence,
+                    "association_confidence": (
+                        candidate.association_confidence
+                    ),
+                    "center_censored": candidate.center_censored,
+                    "promotable": candidate.promotable,
+                }
+                for candidate in snapshot.next_candidates
+            ],
+            "next_selection_ambiguous": snapshot.next_selection_ambiguous,
+            "authority_usable": snapshot.authority_usable,
+            "withholding_reason": snapshot.withholding_reason,
+            "confirmed_transition_count": len(
+                snapshot.confirmed_transitions
+            ),
+            "race_finished": snapshot.race_finished,
+        }
+
     def _clear_epoch_state(self) -> None:
         self.estimator.reset()
         self.estimate = None
@@ -7877,6 +8042,12 @@ class VQ2Runner:
         self._gate0_transition_proof = None
         self._gate1_recenter_summary = None
         self.tracker.reset()
+        if self._visual_tracking_enabled:
+            self.visual_tracker = MultiTargetVisualTracker()
+            self.visual_gate_graph = RollingVisualGateGraph()
+            self._visual_latest_tracker_update = None
+            self._visual_latest_graph_snapshot = None
+            self._visual_transition = None
 
     def _consume_imu_sample(
         self,
@@ -8069,6 +8240,82 @@ class VQ2Runner:
                         detector_ended_ns - detector_started_ns
                     ) / 1_000_000.0
                 self._latest_raw_detections = detections
+                if self._visual_tracking_enabled:
+                    visual_frame = VisualDetectionFrame.from_vision_snapshot(
+                        snapshot,
+                        detections,
+                    )
+                    visual_update = self.visual_tracker.update(visual_frame)
+                    self._visual_latest_tracker_update = visual_update
+                    self._visual_latest_graph_snapshot = (
+                        self.visual_gate_graph.observe(self.visual_tracker)
+                    )
+                    if self._visual_diagnostic_logging:
+                        visual_race = self.adapter.race_status
+                        self.recorder.emit(
+                            "visual_gate_graph_frame",
+                            phase="visual_shadow",
+                            frame_token=list(
+                                visual_update.token.live_identity_tuple
+                                or visual_update.token.exact_tuple
+                            ),
+                            camera_source_time_ns=int(snapshot.sim_time_ns),
+                            final_unique_packet_monotonic_ns=(
+                                visual_frame.final_unique_packet_monotonic_ns
+                            ),
+                            publish_monotonic_ns=(
+                                visual_frame.publish_monotonic_ns
+                            ),
+                            received_monotonic_s=(
+                                snapshot.received_monotonic_s
+                            ),
+                            race_boot_ms=(
+                                int(visual_race.sim_boot_time_ms)
+                                if visual_race is not None
+                                else None
+                            ),
+                            gate_index=(
+                                int(visual_race.active_gate_index)
+                                if visual_race is not None
+                                else None
+                            ),
+                            tracks=[
+                                self._visual_track_summary(track)
+                                for track in visual_update.tracks
+                            ],
+                            associations=[
+                                {
+                                    "track_id": item.track_id,
+                                    "detection_source_index": (
+                                        item.detection_source_index
+                                    ),
+                                    "cost": item.cost,
+                                    "confidence": item.confidence,
+                                    "bbox_iou": item.bbox_iou,
+                                    "predicted_center_residual_norm": (
+                                        item.predicted_center_residual_norm
+                                    ),
+                                    "log_width_change": item.log_width_change,
+                                    "log_height_change": (
+                                        item.log_height_change
+                                    ),
+                                    "log_area_residual": (
+                                        item.log_area_residual
+                                    ),
+                                    "clipping_continuity": (
+                                        item.clipping_continuity
+                                    ),
+                                    "temporal_consistency": (
+                                        item.temporal_consistency
+                                    ),
+                                    "ambiguous": item.ambiguous,
+                                }
+                                for item in visual_update.associations
+                            ],
+                            graph=self._visual_graph_summary(
+                                self._visual_latest_graph_snapshot
+                            ),
+                        )
                 tracking_detections = detections
                 if self._post_gate_reacquisition:
                     tracking_detections = [
@@ -8233,6 +8480,28 @@ class VQ2Runner:
                         tracker={
                             "consecutive": self.tracker.consecutive,
                             "target": asdict(self.tracker.target) if self.tracker.target else None,
+                            **(
+                                {
+                                    "visual_gate_graph": (
+                                        self._visual_graph_summary(
+                                            self._visual_latest_graph_snapshot
+                                        )
+                                    ),
+                                    "visual_tracks": (
+                                        [
+                                            self._visual_track_summary(track)
+                                            for track in (
+                                                self._visual_latest_tracker_update.tracks
+                                            )
+                                        ]
+                                        if self._visual_latest_tracker_update
+                                        is not None
+                                        else []
+                                    ),
+                                }
+                                if self._visual_tracking_enabled
+                                else {}
+                            ),
                         },
                         imu=current_imu,
                         estimator=self._replay_estimator_fields(),
@@ -8881,6 +9150,8 @@ class VQ2Runner:
             # strictly after the accepted boundary.
             drain_imu()
         self._clear_epoch_state()
+        if self._visual_tracking_enabled:
+            self._visual_reset_epoch += 1
         self._epoch_race_anchor_ms = proof.post_race_boot_ms
         self._epoch_imu_anchor_us = proof.post_imu_us
         self._epoch_anchor_monotonic_s = time.monotonic()
@@ -9997,6 +10268,200 @@ class VQ2Runner:
             "final_rpy_rad": list(self.estimate.orientation.to_euler()),
         }
 
+    def _visual_race_status_ref(self) -> AuthoritativeRaceStatusRef:
+        received = getattr(
+            self.adapter,
+            "latest_received_race_status",
+            None,
+        )
+        if received is None:
+            raise SafetyAbort(
+                "visual gate graph lacks exact received race-status provenance"
+            )
+        validate_integrity = getattr(received, "validate_integrity", None)
+        if callable(validate_integrity):
+            validate_integrity()
+        ingress = received.ingress
+        payload = received.race_status
+        race = self.adapter.race_status
+        if (
+            race is None
+            or int(payload.sim_boot_time_ms) != int(race.sim_boot_time_ms)
+            or int(payload.active_gate_index) != int(race.active_gate_index)
+            or int(payload.race_finish_time_ns)
+            != int(race.race_finish_time_ns)
+        ):
+            raise SafetyAbort(
+                "visual gate graph race payload is not the active exact ingress"
+            )
+        return AuthoritativeRaceStatusRef.live(
+            session_id=self._visual_session_id,
+            reset_epoch=self._visual_reset_epoch,
+            race_generation=int(ingress.generation),
+            race_status_sequence=int(ingress.sequence),
+            race_status_boot_ms=int(payload.sim_boot_time_ms),
+            active_gate_index=int(payload.active_gate_index),
+            received_monotonic_ns=int(ingress.received_monotonic_ns),
+            host_clock_id=str(ingress.host_clock_id),
+            race_finished=bool(race.race_finished),
+        )
+
+    def _bind_initial_visual_gate(
+        self,
+        context: StartContext,
+    ) -> GateGraphSnapshot:
+        update = self._visual_latest_tracker_update
+        if update is None:
+            raise SafetyAbort("visual tracker has no fresh initial gate frames")
+        expected_center = (
+            2.0 * float(context.initial_gate_x) / 640.0 - 1.0,
+            2.0 * float(context.initial_gate_y) / 360.0 - 1.0,
+        )
+        expected_area = float(context.initial_gate_area) / (640.0 * 360.0)
+        candidates: List[VisualTrack] = []
+        for track in update.visible_tracks:
+            left, top, right, bottom = track.bbox_norm
+            area = max(0.0, right - left) * max(0.0, bottom - top)
+            area_ratio = area / max(expected_area, 1e-9)
+            center_error = math.hypot(
+                track.center_norm[0] - expected_center[0],
+                track.center_norm[1] - expected_center[1],
+            )
+            if (
+                not track.ambiguous
+                and track.consecutive_frame_count
+                >= VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES
+                and track.confidence >= 0.20
+                and track.association_confidence >= 0.10
+                and center_error <= 0.22
+                and 0.25 <= area_ratio <= 4.0
+            ):
+                candidates.append(track)
+        if len(candidates) != 1:
+            raise SafetyAbort(
+                "initial visual current-gate association is "
+                f"{'absent' if not candidates else 'ambiguous'} "
+                f"(candidate_count={len(candidates)})"
+            )
+        race_ref = self._visual_race_status_ref()
+        if race_ref.active_gate_index != 0 or race_ref.race_finished:
+            raise SafetyAbort(
+                "initial visual gate binding lacks authoritative gate 0"
+            )
+        snapshot = self.visual_gate_graph.bind_initial_current(
+            self.visual_tracker,
+            track_id=candidates[0].track_id,
+            race_status=race_ref,
+        )
+        self._visual_latest_graph_snapshot = snapshot
+        self.recorder.emit(
+            "visual_initial_gate_bound",
+            race_status=asdict(race_ref),
+            current_track=self._visual_track_summary(candidates[0]),
+            graph=self._visual_graph_summary(snapshot),
+        )
+        return snapshot
+
+    def _visual_camera_token_at_race_credit(
+        self,
+        race_status: AuthoritativeRaceStatusRef,
+    ) -> VisualCameraFrameToken:
+        received_ns = race_status.received_monotonic_ns
+        if received_ns is None:
+            raise SafetyAbort("live race credit lacks host receive time")
+        eligible: Dict[
+            Tuple[str, int, int, int],
+            Tuple[int, VisualCameraFrameToken],
+        ] = {}
+        for track in self.visual_tracker.tracks():
+            for sample in track.history:
+                token = sample.token
+                identity = token.live_identity_tuple
+                published = sample.publication_monotonic_ns
+                if (
+                    identity is not None
+                    and published is not None
+                    and int(published) <= int(received_ns)
+                ):
+                    eligible[identity] = (int(published), token)
+        if not eligible:
+            raise SafetyAbort(
+                "no exact camera publication precedes authoritative race credit"
+            )
+        return max(eligible.values(), key=lambda item: item[0])[1]
+
+    def _confirm_visual_transition(
+        self,
+        *,
+        from_gate_index: int,
+        to_gate_index: int,
+    ) -> ConfirmedGateTransition:
+        race_ref = self._visual_race_status_ref()
+        if (
+            race_ref.active_gate_index != to_gate_index
+            or to_gate_index != from_gate_index + 1
+            or race_ref.race_finished
+        ):
+            raise SafetyAbort(
+                "visual graph transition lacks exact sequential race authority"
+            )
+        camera_token = self._visual_camera_token_at_race_credit(race_ref)
+        try:
+            transition = self.visual_gate_graph.confirm_transition(
+                self.visual_tracker,
+                race_status=race_ref,
+                camera_token_at_credit=camera_token,
+            )
+        except GateGraphError as exc:
+            raise SafetyAbort(
+                f"visual gate promotion refused: {exc}"
+            ) from exc
+        if (
+            transition.from_gate_index != from_gate_index
+            or transition.to_gate_index != to_gate_index
+            or len(transition.pretransition_frame_tokens)
+            < VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES
+            or transition.history_length_before_promotion
+            != transition.history_length_after_promotion
+        ):
+            raise SafetyAbort(
+                "visual gate promotion proof is incomplete or reset history"
+            )
+        self._visual_transition = transition
+        self._visual_latest_graph_snapshot = (
+            self.visual_gate_graph.latest_snapshot
+        )
+        self.recorder.emit(
+            "visual_gate_transition_promoted",
+            from_gate_index=transition.from_gate_index,
+            to_gate_index=transition.to_gate_index,
+            retired_track_id=transition.retired_track_id,
+            promoted_track_id=transition.promoted_track_id,
+            race_status=asdict(transition.race_status),
+            camera_token_at_credit=list(
+                transition.camera_token_at_credit.live_identity_tuple
+                or transition.camera_token_at_credit.exact_tuple
+            ),
+            promoted_first_token=list(
+                transition.promoted_first_token.live_identity_tuple
+                or transition.promoted_first_token.exact_tuple
+            ),
+            pretransition_frame_tokens=[
+                list(token.live_identity_tuple or token.exact_tuple)
+                for token in transition.pretransition_frame_tokens
+            ],
+            history_length_before_promotion=(
+                transition.history_length_before_promotion
+            ),
+            history_length_after_promotion=(
+                transition.history_length_after_promotion
+            ),
+            graph=self._visual_graph_summary(
+                self._visual_latest_graph_snapshot
+            ),
+        )
+        return transition
+
     def _complete_gate0_pass(
         self,
         *,
@@ -10048,6 +10513,12 @@ class VQ2Runner:
             ),
         )
         self._gate0_transition_proof = proof
+        visual_transition: Optional[ConfirmedGateTransition] = None
+        if self._visual_tracking_enabled:
+            visual_transition = self._confirm_visual_transition(
+                from_gate_index=0,
+                to_gate_index=1,
+            )
         if capture_transition:
             self._defer_snapshot("gate1_race_credit")
         result = {
@@ -10072,6 +10543,27 @@ class VQ2Runner:
                     "command_count": 0,
                     "max_abs_yaw_excursion_rad": 0.0,
                     "max_abs_measured_yaw_rate_rad_s": 0.0,
+                }
+            ),
+            "visual_transition": (
+                None
+                if visual_transition is None
+                else {
+                    "retired_track_id": (
+                        visual_transition.retired_track_id
+                    ),
+                    "promoted_track_id": (
+                        visual_transition.promoted_track_id
+                    ),
+                    "pretransition_frame_count": len(
+                        visual_transition.pretransition_frame_tokens
+                    ),
+                    "history_length_before_promotion": (
+                        visual_transition.history_length_before_promotion
+                    ),
+                    "history_length_after_promotion": (
+                        visual_transition.history_length_after_promotion
+                    ),
                 }
             ),
         }
@@ -10558,6 +11050,187 @@ class VQ2Runner:
             self._record_tick("gate0", elapsed, command)
             next_tick = next_control_deadline(next_tick, time.monotonic())
             await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+
+    @staticmethod
+    def _signed_error_trend(values: Sequence[float]) -> Dict[str, Any]:
+        normalized = [float(value) for value in values]
+        deltas = [
+            normalized[index] - normalized[index - 1]
+            for index in range(1, len(normalized))
+        ]
+        if not deltas:
+            label = "insufficient"
+        elif all(delta < 0.0 for delta in deltas):
+            label = "negative_uninterrupted"
+        elif all(delta > 0.0 for delta in deltas):
+            label = "positive_uninterrupted"
+        elif all(delta == 0.0 for delta in deltas):
+            label = "flat"
+        else:
+            label = "mixed"
+        return {
+            "values": normalized,
+            "deltas": deltas,
+            "trend": label,
+        }
+
+    async def _run_visual_shadow(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Use proved Gate-0 authority while the new graph remains commandless."""
+
+        if not self._visual_tracking_enabled:
+            raise SafetyAbort("visual shadow tracker was not enabled before reset")
+        bound = self.visual_gate_graph.latest_snapshot
+        if (
+            bound is None
+            or bound.current_track_id is None
+            or bound.current_gate_index != 0
+        ):
+            raise SafetyAbort("visual shadow lacks a bound initial current gate")
+        initial_current_track_id = bound.current_track_id
+        gate0 = await self._run_gate0(context, capture_transition=False)
+        transition = self._visual_transition
+        if transition is None:
+            raise SafetyAbort("visual shadow lacks a promoted 0->1 transition")
+        if (
+            transition.retired_track_id != initial_current_track_id
+            or transition.promoted_track_id == initial_current_track_id
+        ):
+            raise SafetyAbort("visual shadow promotion changed identity incorrectly")
+
+        proof = self._gate0_transition_proof
+        if proof is None:
+            raise SafetyAbort("visual shadow lacks Gate-0 transition timing proof")
+        race_credit_ns = transition.race_status.received_monotonic_ns
+        if race_credit_ns is None:
+            raise SafetyAbort("visual shadow lacks exact race-credit receive time")
+        deadline_s = post_gate_observation_deadline(
+            pass_confirmed_s=proof.pass_confirmed_monotonic_s,
+            flight_started_s=proof.flight_started_monotonic_s,
+            crossing_started_s=proof.crossing_started_monotonic_s,
+            requested_duration_s=VISUAL_SHADOW_POST_CREDIT_TIMEOUT_S,
+        )
+        next_tick = max(
+            proof.next_control_deadline_s,
+            await self._wait_for_next_flight_command_slot(),
+        )
+        post_credit_tokens: List[VisualCameraFrameToken] = []
+        command_count = 0
+        while time.monotonic() < deadline_s and not post_credit_tokens:
+            self._sample()
+            self._watchdog(
+                require_target=False,
+                allow_benign_pad_contact=False,
+            )
+            race = self.adapter.race_status
+            if (
+                race is None
+                or int(race.active_gate_index) != 1
+                or bool(race.race_finished)
+            ):
+                raise SafetyAbort(
+                    "visual shadow lost authoritative Gate-1 boundary"
+                )
+            current = self.visual_tracker.track(
+                transition.promoted_track_id
+            )
+            if current.ambiguous or current.role is not VisualTrackRole.CURRENT:
+                raise SafetyAbort(
+                    "visual shadow promoted track became ambiguous or lost role"
+                )
+            post_credit_tokens = [
+                sample.token
+                for sample in current.history
+                if sample.publication_monotonic_ns is not None
+                and int(sample.publication_monotonic_ns)
+                > int(race_credit_ns)
+            ]
+            command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+            await self._send_flight_command(command)
+            self._record_tick("visual-shadow/post-credit", 0.0, command)
+            command_count += 1
+            next_tick = next_control_deadline(next_tick, time.monotonic())
+            await asyncio.sleep(
+                max(0.0, min(next_tick, deadline_s) - time.monotonic())
+            )
+        if not post_credit_tokens:
+            raise SafetyAbort(
+                "visual shadow promotion lacks a fresh post-credit frame"
+            )
+
+        promoted = self.visual_tracker.track(transition.promoted_track_id)
+        token_set = set(transition.pretransition_frame_tokens)
+        pretransition_samples = [
+            sample for sample in promoted.history if sample.token in token_set
+        ]
+        if len(pretransition_samples) < (
+            VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES
+        ):
+            raise SafetyAbort(
+                "visual shadow retained fewer than three pre-transition frames"
+            )
+        horizontal_errors = [
+            abs(sample.center_norm[0]) for sample in pretransition_samples
+        ]
+        vertical_errors = [
+            abs(sample.center_norm[1]) for sample in pretransition_samples
+        ]
+        corridor_frames = sum(
+            1
+            for sample in pretransition_samples
+            if abs(sample.center_norm[0])
+            <= self.visual_config.servo.horizontal_corridor
+            and abs(sample.center_norm[1])
+            <= self.visual_config.servo.vertical_corridor
+        )
+        latest_graph = self.visual_gate_graph.latest_snapshot
+        next_track_ids = (
+            [candidate.track_id for candidate in latest_graph.next_candidates]
+            if latest_graph is not None
+            else []
+        )
+        summary = {
+            "shadow_command_authority": "legacy_proved_gate0_only",
+            "visual_navigation_command_count": 0,
+            "post_credit_zero_command_count": command_count,
+            "authoritative_transition": [0, 1],
+            "initial_current_track_id": initial_current_track_id,
+            "promoted_current_track_id": transition.promoted_track_id,
+            "next_track_ids": next_track_ids,
+            "pretransition_frame_count": len(pretransition_samples),
+            "pretransition_frame_tokens": [
+                list(sample.token.live_identity_tuple or sample.token.exact_tuple)
+                for sample in pretransition_samples
+            ],
+            "post_credit_frame_tokens": [
+                list(token.live_identity_tuple or token.exact_tuple)
+                for token in post_credit_tokens
+            ],
+            "history_length_before_promotion": (
+                transition.history_length_before_promotion
+            ),
+            "history_length_after_promotion": (
+                transition.history_length_after_promotion
+            ),
+            "horizontal_abs_error_trend": self._signed_error_trend(
+                horizontal_errors
+            ),
+            "vertical_abs_error_trend": self._signed_error_trend(
+                vertical_errors
+            ),
+            "latest_scale": promoted.apparent_scale,
+            "latest_log_scale_rate_s": promoted.log_scale_rate_s,
+            "corridor_frames": corridor_frames,
+            "association_confidence": promoted.association_confidence,
+            "ambiguous": promoted.ambiguous,
+            "gate0": gate0,
+            "graph": self._visual_graph_summary(latest_graph),
+        }
+        self._visual_shadow_summary = summary
+        self.recorder.emit("visual_shadow_complete", **summary)
+        return summary
 
     def _assert_gate1_no_passage_geometry(
         self,
@@ -12824,6 +13497,7 @@ class VQ2Runner:
             "gate0",
             "gate0-observe",
             GATE1_RECENTER_STAGE,
+            VISUAL_SHADOW_STAGE,
             CALIBRATION_STAGE,
         }:
             raise ValueError(f"unsupported powered stage: {stage}")
@@ -12841,11 +13515,17 @@ class VQ2Runner:
             self._gate1_yaw_reference_rad = None
             self._gate1_max_abs_yaw_excursion_rad = 0.0
             self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
+            self._visual_tracking_enabled = stage == VISUAL_SHADOW_STAGE
+            self._visual_diagnostic_logging = stage == VISUAL_SHADOW_STAGE
+            self._visual_reset_epoch = 0
+            self._visual_shadow_summary = None
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
             context = await self.wait_for_go()
             race = self.adapter.race_status
             gate_before = race.active_gate_index if race else None
+            if stage == VISUAL_SHADOW_STAGE:
+                self._bind_initial_visual_gate(context)
             await self.arm_confirmed()
             if stage == "sign-id":
                 details = await self._run_sign_id()
@@ -12871,6 +13551,10 @@ class VQ2Runner:
                         "reason": str(exc),
                     }
                     raise
+            elif stage == VISUAL_SHADOW_STAGE:
+                details = {
+                    "visual_shadow": await self._run_visual_shadow(context)
+                }
             elif stage == GATE1_RECENTER_STAGE:
                 gate0_details = await self._run_gate0(
                     context,
@@ -12947,6 +13631,13 @@ class VQ2Runner:
                 details["gate1_recenter"] = dict(
                     self._gate1_recenter_summary
                 )
+            if (
+                stage == VISUAL_SHADOW_STAGE
+                and self._visual_shadow_summary is not None
+            ):
+                details["visual_shadow"] = dict(
+                    self._visual_shadow_summary
+                )
             reason = str(exc) or type(exc).__name__
             logger.error("%s ABORT: %s", stage, reason)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
@@ -12959,6 +13650,13 @@ class VQ2Runner:
             ):
                 details["gate1_recenter"] = dict(
                     self._gate1_recenter_summary
+                )
+            if (
+                stage == VISUAL_SHADOW_STAGE
+                and self._visual_shadow_summary is not None
+            ):
+                details["visual_shadow"] = dict(
+                    self._visual_shadow_summary
                 )
             reason = f"unexpected {type(exc).__name__}: {exc}"
             logger.exception("%s failed unexpectedly", stage)
@@ -12975,6 +13673,40 @@ class VQ2Runner:
                 if cleanup_entry_race is not None
                 else None
             )
+            if stage == VISUAL_SHADOW_STAGE:
+                details["authoritative_cleanup_entry"] = {
+                    "gate_index": cleanup_entry_gate_index,
+                    "race_finished": cleanup_entry_race_finished,
+                    "transition": (
+                        None
+                        if self._visual_transition is None
+                        else [
+                            self._visual_transition.from_gate_index,
+                            self._visual_transition.to_gate_index,
+                        ]
+                    ),
+                }
+                if success and (
+                    cleanup_entry_gate_index != 1
+                    or cleanup_entry_race_finished is not False
+                    or self._visual_transition is None
+                ):
+                    success = False
+                    boundary_reason = (
+                        "visual shadow cleanup boundary lacks proved 0->1 "
+                        f"authority (gate_index={cleanup_entry_gate_index}, "
+                        f"race_finished={cleanup_entry_race_finished})"
+                    )
+                    reason = (
+                        boundary_reason
+                        if reason in {"unknown", "stage completed"}
+                        else f"{reason}; {boundary_reason}"
+                    )
+                    self.recorder.emit(
+                        "stage_abort",
+                        stage=stage,
+                        reason=boundary_reason,
+                    )
             if (
                 stage == GATE1_RECENTER_STAGE
                 and success
@@ -13105,7 +13837,11 @@ class VQ2Runner:
             gate_index_after=gate_after,
             cleanup_confirmed=cleanup_confirmed,
             details=details,
-            controller=dict(self.controller_evidence),
+            controller=dict(
+                self.visual_controller_evidence
+                if stage == VISUAL_SHADOW_STAGE
+                else self.controller_evidence
+            ),
         )
 
 
@@ -13139,7 +13875,7 @@ async def run_live(
     write_diagnostic_pngs: bool = True,
     run_manifest_sha256: Optional[str] = None,
     controller_config: Optional[
-        Mapping[str, Any] | VQ2ControllerConfig
+        Mapping[str, Any] | VQ2ControllerConfig | VisualNavigationConfig
     ] = None,
     candidate_commit: Optional[str] = None,
     expected_controller_config_sha256: Optional[str] = None,
@@ -13147,25 +13883,52 @@ async def run_live(
     if type(stage) is not str or stage not in LIVE_RUN_STAGES:
         raise ValueError(f"unsupported live stage: {stage}")
     try:
-        effective_controller = (
-            default_controller_config()
-            if controller_config is None
-            else (
-                validate_controller_config(
-                    controller_config.to_effective_mapping()
+        if stage == VISUAL_SHADOW_STAGE:
+            effective_visual_controller = (
+                default_visual_config()
+                if controller_config is None
+                else (
+                    validate_visual_config(
+                        controller_config.to_effective_mapping()
+                    )
+                    if isinstance(
+                        controller_config,
+                        VisualNavigationConfig,
+                    )
+                    else validate_visual_config(controller_config)
                 )
-                if isinstance(controller_config, VQ2ControllerConfig)
-                else validate_controller_config(controller_config)
             )
-        )
-    except ControllerConfigError as exc:
+            effective_controller = default_controller_config()
+        else:
+            effective_controller = (
+                default_controller_config()
+                if controller_config is None
+                else (
+                    validate_controller_config(
+                        controller_config.to_effective_mapping()
+                    )
+                    if isinstance(controller_config, VQ2ControllerConfig)
+                    else validate_controller_config(controller_config)
+                )
+            )
+            effective_visual_controller = default_visual_config()
+    except (ControllerConfigError, VisualConfigError) as exc:
         raise ValueError(f"controller configuration refused: {exc}") from exc
-    controller = controller_config_evidence(
+    legacy_controller = controller_config_evidence(
         effective_controller,
         candidate_commit=candidate_commit,
     )
+    visual_controller = controller_config_evidence(
+        effective_visual_controller,
+        candidate_commit=candidate_commit,
+    )
+    controller = (
+        visual_controller
+        if stage == VISUAL_SHADOW_STAGE
+        else legacy_controller
+    )
     if (
-        stage != GATE1_RECENTER_STAGE
+        stage not in {GATE1_RECENTER_STAGE, VISUAL_SHADOW_STAGE}
         and effective_controller.effective_config_sha256
         != default_controller_config().effective_config_sha256
     ):
@@ -13176,7 +13939,11 @@ async def run_live(
     if expected_controller_config_sha256 is not None and (
         type(expected_controller_config_sha256) is not str
         or expected_controller_config_sha256
-        != effective_controller.effective_config_sha256
+        != (
+            effective_visual_controller.effective_config_sha256
+            if stage == VISUAL_SHADOW_STAGE
+            else effective_controller.effective_config_sha256
+        )
     ):
         raise ValueError(
             "expected controller config hash does not match effective config"
@@ -13213,6 +13980,19 @@ async def run_live(
         or not 1.0 <= float(preflight_timeout_s) <= 10.0
     ):
         raise ValueError("preflight_timeout_s must be finite and in [1, 10]")
+    if stage == VISUAL_SHADOW_STAGE and (
+        run_manifest_sha256 is None
+        or candidate_commit is None
+        or expected_controller_config_sha256 is None
+        or replay_bundle is None
+        or recording_approved is not True
+        or preflight_before_powered_stage is not False
+        or write_diagnostic_pngs is not False
+    ):
+        raise PermissionError(
+            "visual-shadow requires the clean, manifest-bound fast-cycle "
+            "wrapper with private replay capture"
+        )
     _load_live_transport_dependencies()
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
@@ -13337,7 +14117,14 @@ async def run_live(
             vision,
             recorder=recorder,
             controller_config=effective_controller,
-            controller_evidence=controller,
+            controller_evidence=legacy_controller,
+            visual_config=effective_visual_controller,
+            visual_controller_evidence=visual_controller,
+            visual_session_id=(
+                run_manifest_sha256
+                or candidate_commit
+                or "direct-live-session"
+            ),
         )
         await adapter.connect(address)
         preflight = None

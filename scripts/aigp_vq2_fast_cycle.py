@@ -36,6 +36,12 @@ from scripts.aigp_vq2_controller_config import (
     default_controller_config,
     validate_controller_config,
 )
+from scripts.aigp_vq2_visual_config import (
+    VisualConfigError,
+    VisualNavigationConfig,
+    default_visual_config,
+    validate_visual_config,
+)
 
 
 MANIFEST_SCHEMA = "aigp-vq2-fast-flight-cycle-manifest/2"
@@ -44,12 +50,14 @@ SIMULATOR_BUILD = 3385
 SIMULATOR_MODE = "Training"
 DEFAULT_ADDRESS = "udpin:127.0.0.1:14550"
 ISOLATION_FLAGS = ("-E", "-s", "-B")
+VISUAL_POWERED_STAGES = ("visual-shadow",)
 FAST_POWERED_STAGES = (
     "sign-id",
     "hover",
     "gate0",
     "gate0-observe",
     "gate1-recenter",
+    *VISUAL_POWERED_STAGES,
     "calibration-excite",
 )
 _HEX40_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -57,6 +65,7 @@ _HEX40_RE = re.compile(r"[0-9a-f]{40}\Z")
 _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_live_lease.py",
     "scripts/aigp_vq2_controller_config.py",
+    "scripts/aigp_vq2_visual_config.py",
     "scripts/aigp_vq2_fast_cycle.py",
     "scripts/aigp_vq2_run.py",
     "scripts/aigp_vq2_powered_attempt.py",
@@ -64,12 +73,17 @@ _RUNTIME_SOURCE_PATHS = (
     "competition/aigp_mavlink.py",
     "competition/aigp_messages.py",
     "competition/vq2_capture.py",
+    "competition/vq2_visual_tracker.py",
     "competition/vq2_vision.py",
     "competition/vision_udp.py",
     "estimation/imu_attitude.py",
     "gate_detection/src/gate_detector.py",
     "gate_detection/src/vq2_detector.py",
+    "planning/vq2_gate_graph.py",
+    "planning/vq2_visual_servo.py",
 )
+
+ControllerConfigValue = VQ2ControllerConfig | VisualNavigationConfig
 
 
 class FastCycleError(RuntimeError):
@@ -221,7 +235,7 @@ def _excitation_plan_identity(stage: str) -> Mapping[str, Any] | None:
 
 
 def _controller_evidence(
-    config: VQ2ControllerConfig,
+    config: ControllerConfigValue,
     *,
     candidate_commit: str,
 ) -> dict[str, Any]:
@@ -241,9 +255,28 @@ def _controller_evidence(
     }
 
 
-def _load_controller_config(path: Path | None) -> VQ2ControllerConfig:
+def _default_controller_config_for_stage(stage: str) -> ControllerConfigValue:
+    if stage in VISUAL_POWERED_STAGES:
+        return default_visual_config()
+    return default_controller_config()
+
+
+def _validate_controller_config_for_stage(
+    stage: str,
+    document: object,
+) -> ControllerConfigValue:
+    if stage in VISUAL_POWERED_STAGES:
+        return validate_visual_config(document)
+    return validate_controller_config(document)
+
+
+def _load_controller_config(
+    path: Path | None,
+    *,
+    stage: str = "gate1-recenter",
+) -> ControllerConfigValue:
     if path is None:
-        return default_controller_config()
+        return _default_controller_config_for_stage(stage)
     resolved = path.expanduser().resolve()
     try:
         payload = resolved.read_bytes()
@@ -276,7 +309,7 @@ def _load_controller_config(path: Path | None) -> VQ2ControllerConfig:
                 )
             ),
         )
-        return validate_controller_config(document)
+        return _validate_controller_config_for_stage(stage, document)
     except UnicodeDecodeError as exc:
         raise FastCycleError(
             "controller configuration must be UTF-8 JSON"
@@ -285,7 +318,7 @@ def _load_controller_config(path: Path | None) -> VQ2ControllerConfig:
         raise FastCycleError(
             f"controller configuration is malformed JSON: {exc.msg}"
         ) from exc
-    except ControllerConfigError as exc:
+    except (ControllerConfigError, VisualConfigError) as exc:
         raise FastCycleError(f"controller configuration refused: {exc}") from exc
 
 
@@ -301,13 +334,15 @@ def build_manifest(
     target_config: Mapping[str, Any],
     development_lock: Mapping[str, Any],
     excitation_plan: Mapping[str, Any] | None,
-    controller_config: VQ2ControllerConfig | None = None,
+    controller_config: ControllerConfigValue | None = None,
 ) -> dict[str, Any]:
     """Build the exact small manifest with one bounded controller identity."""
 
     if stage not in FAST_POWERED_STAGES:
         raise FastCycleError(f"unsupported fast powered stage: {stage}")
-    effective_controller = controller_config or default_controller_config()
+    effective_controller = (
+        controller_config or _default_controller_config_for_stage(stage)
+    )
     controller = _controller_evidence(
         effective_controller,
         candidate_commit=str(git_snapshot["head_commit"]),
@@ -360,6 +395,11 @@ def build_manifest(
             "directory": str(run_directory),
             "manifest": str(run_directory / "run-manifest.json"),
             "trace": str(run_directory / "session.jsonl.gz"),
+            "replay_bundle": (
+                str(run_directory / "shadow.vq2replay")
+                if stage == "visual-shadow"
+                else None
+            ),
             "result": str(run_directory / "result.json"),
             "live_lease": str(run_directory / "live-lease.json"),
         },
@@ -409,7 +449,7 @@ def _execute_fast_cycle(
     now: Callable[[], datetime] = _utc_now,
     load_runner: Callable[[], Any] | None = None,
     lease_factory: Callable[..., Any] = live_simulator_lease,
-    controller_config: Mapping[str, Any] | VQ2ControllerConfig | None = None,
+    controller_config: Mapping[str, Any] | ControllerConfigValue | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Injected implementation used by the production boundary and unit tests."""
 
@@ -419,20 +459,25 @@ def _execute_fast_cycle(
         raise FastCycleError("fast cycles use the fixed verified MAVLink address")
     try:
         effective_controller = (
-            default_controller_config()
+            _default_controller_config_for_stage(stage)
             if controller_config is None
-            else (
-                validate_controller_config(
+            else _validate_controller_config_for_stage(
+                stage,
+                (
                     controller_config.to_effective_mapping()
-                )
-                if isinstance(controller_config, VQ2ControllerConfig)
-                else validate_controller_config(controller_config)
+                    if isinstance(
+                        controller_config,
+                        (VQ2ControllerConfig, VisualNavigationConfig),
+                    )
+                    else controller_config
+                ),
             )
         )
-    except ControllerConfigError as exc:
+    except (ControllerConfigError, VisualConfigError) as exc:
         raise FastCycleError(f"controller configuration refused: {exc}") from exc
     if (
-        stage != "gate1-recenter"
+        stage not in VISUAL_POWERED_STAGES
+        and stage != "gate1-recenter"
         and effective_controller.effective_config_sha256
         != default_controller_config().effective_config_sha256
     ):
@@ -473,6 +518,13 @@ def _execute_fast_cycle(
             **_file_identity(lockfile_path),
         }
         git_snapshot = _git_snapshot(repo_root)
+        if (
+            stage in VISUAL_POWERED_STAGES
+            and git_snapshot["worktree_state"] != "clean"
+        ):
+            raise FastCycleError(
+                "visual-navigation powered stages require a clean exact commit"
+            )
         manifest = build_manifest(
             stage=stage,
             run_id=run_id,
@@ -535,6 +587,12 @@ def _execute_fast_cycle(
                     expected_controller_config_sha256=(
                         manifest["controller"]["config_sha256"]
                     ),
+                    replay_bundle=(
+                        str(run_directory / "shadow.vq2replay")
+                        if stage == "visual-shadow"
+                        else None
+                    ),
+                    recording_approved=(stage == "visual-shadow"),
                 )
             )
             result_value = {
@@ -601,7 +659,10 @@ def execute_fast_cycle(
         now=_utc_now,
         load_runner=None,
         lease_factory=live_simulator_lease,
-        controller_config=_load_controller_config(controller_config_path),
+        controller_config=_load_controller_config(
+            controller_config_path,
+            stage=stage,
+        ),
     )
 
 
@@ -619,8 +680,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--controller-config",
         type=Path,
         help=(
-            "complete strict-schema controller JSON; omitted uses the "
-            "current-behavior default"
+            "complete strict-schema controller JSON for the selected stage; "
+            "omitted uses that stage family's default"
         ),
     )
     parser.add_argument("--verbose", action="store_true")

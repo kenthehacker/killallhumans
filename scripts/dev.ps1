@@ -127,6 +127,8 @@ interactive confirmation.
                 'estimation/tests',
                 'gate_detection/tests',
                 'planning/tests/test_vq2_guidance.py',
+                'planning/tests/test_vq2_recorded_gate_promotion.py',
+                'planning/tests/test_vq2_visual_servo.py',
                 'tests/test_aigp_live_lease.py',
                 'tests/test_aigp_vq2_build_reference.py',
                 'tests/test_aigp_vq2_calibration_target.py',
@@ -139,6 +141,8 @@ interactive confirmation.
                 'tests/test_aigp_vq2_powered_calibration_analysis.py',
                 'tests/test_aigp_vq2_powered_cleanup.py',
                 'tests/test_aigp_vq2_runner.py',
+                'tests/test_aigp_vq2_visual_config.py',
+                'tests/test_aigp_vq2_visual_shadow.py',
                 'tests/test_vision_udp.py',
                 'tests/test_vision_udp_listener.py'
             )
@@ -190,7 +194,7 @@ interactive confirmation.
             }
             $allowed = @(
                 'sign-id', 'hover', 'gate0', 'gate0-observe', 'gate1-recenter',
-                'calibration-excite'
+                'visual-shadow', 'calibration-excite'
             )
             if ($stage -notin $allowed) {
                 throw "Unsupported flight-cycle stage '$stage'."

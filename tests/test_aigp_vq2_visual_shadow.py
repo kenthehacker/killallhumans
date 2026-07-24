@@ -299,6 +299,36 @@ def test_initial_gate_binding_rejects_two_plausible_visual_identities():
         )
 
 
+def test_visual_shadow_refuses_direct_run_without_fast_cycle_binding(
+    monkeypatch,
+):
+    contacted_transport = False
+
+    def load_transport():
+        nonlocal contacted_transport
+        contacted_transport = True
+        raise AssertionError("unbound visual stage must not load live transport")
+
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        load_transport,
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="manifest-bound fast-cycle wrapper",
+    ):
+        asyncio.run(
+            vq2_module.run_live(
+                vq2_module.VISUAL_SHADOW_STAGE,
+                vq2_module.DEFAULT_MAVLINK_URL,
+                None,
+            )
+        )
+    assert contacted_transport is False
+
+
 def test_shadow_promotes_precredit_track_without_reset_and_sends_only_zero(
     monkeypatch,
 ):

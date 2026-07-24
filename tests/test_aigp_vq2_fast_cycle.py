@@ -13,6 +13,7 @@ import pytest
 
 from scripts import aigp_vq2_fast_cycle as fast_cycle
 from scripts import aigp_vq2_controller_config as controller_config
+from scripts import aigp_vq2_visual_config as visual_config
 
 
 UTC = datetime(2026, 7, 22, 20, 0, tzinfo=timezone.utc)
@@ -111,6 +112,121 @@ def test_gate1_recenter_is_admitted_as_the_bounded_position_only_stage():
         ["gate1-recenter"]
     )
     assert arguments.stage == "gate1-recenter"
+
+
+def test_visual_shadow_is_admitted_with_visual_config_and_replay_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    git_snapshot = {
+        "head_commit": "a" * 40,
+        "head_tree": "b" * 40,
+        "worktree_state": "clean",
+        "status_sha256": "c" * 64,
+        "tracked_diff_sha256": "d" * 64,
+    }
+    monkeypatch.setattr(
+        fast_cycle,
+        "_git_snapshot",
+        lambda _root: dict(git_snapshot),
+    )
+    calls = []
+
+    async def run_live(stage, address, record, **kwargs):
+        calls.append((stage, address, record, kwargs))
+        Path(record).write_bytes(b"visual shadow trace")
+        effective = visual_config.validate_visual_config(
+            kwargs["controller_config"]
+        )
+        evidence = fast_cycle._controller_evidence(
+            effective,
+            candidate_commit=kwargs["candidate_commit"],
+        )
+        return _StageResult(
+            stage=stage,
+            success=True,
+            reason="stage completed",
+            duration_s=4.0,
+            gate_index_before=0,
+            gate_index_after=0,
+            cleanup_confirmed=True,
+            details={"authoritative_transition": [0, 1]},
+            controller=evidence,
+        )
+
+    code, result = fast_cycle._execute_fast_cycle(
+        "visual-shadow",
+        evidence_root=tmp_path,
+        now=lambda: UTC,
+        load_runner=lambda: SimpleNamespace(run_live=run_live),
+        lease_factory=_fake_lease,
+    )
+
+    assert code == 0
+    assert result["success"] is True
+    assert len(calls) == 1
+    stage, address, record, kwargs = calls[0]
+    assert stage == "visual-shadow"
+    assert address == fast_cycle.DEFAULT_ADDRESS
+    effective = visual_config.validate_visual_config(
+        kwargs["controller_config"]
+    )
+    assert result["controller"]["controller_family"] == (
+        visual_config.VISUAL_CONTROLLER_FAMILY
+    )
+    assert result["controller"]["config_sha256"] == (
+        effective.effective_config_sha256
+    )
+    assert kwargs["expected_controller_config_sha256"] == (
+        effective.effective_config_sha256
+    )
+    assert kwargs["recording_approved"] is True
+    assert kwargs["preflight_before_powered_stage"] is False
+    assert kwargs["write_diagnostic_pngs"] is False
+    replay_path = Path(kwargs["replay_bundle"])
+    assert replay_path.parent == Path(record).parent
+    assert replay_path.name == "shadow.vq2replay"
+    manifest = json.loads(
+        (Path(record).parent / "run-manifest.json").read_text()
+    )
+    assert manifest["evidence"]["replay_bundle"] == str(replay_path)
+    assert manifest["candidate"]["worktree_state"] == "clean"
+
+
+def test_visual_shadow_refuses_dirty_candidate_before_live_contact(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        fast_cycle,
+        "_git_snapshot",
+        lambda _root: {
+            "head_commit": "a" * 40,
+            "head_tree": "b" * 40,
+            "worktree_state": "dirty",
+            "status_sha256": "c" * 64,
+            "tracked_diff_sha256": "d" * 64,
+        },
+    )
+    called = False
+
+    async def run_live(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("dirty visual candidate must not contact live runner")
+
+    with pytest.raises(
+        fast_cycle.FastCycleError,
+        match="require a clean exact commit",
+    ):
+        fast_cycle._execute_fast_cycle(
+            "visual-shadow",
+            evidence_root=tmp_path,
+            now=lambda: UTC,
+            load_runner=lambda: SimpleNamespace(run_live=run_live),
+            lease_factory=_fake_lease,
+        )
+    assert called is False
 
 
 @pytest.mark.parametrize("requested_stage", ["calibration-excite"])
