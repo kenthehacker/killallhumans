@@ -20,25 +20,33 @@ The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`,
 scaffolding remains offline-only and is not admitted by this powered entry
 point.
 
+`sign-id` keeps the established below-hover roll/pitch check and adds isolated
+`+0.08` and `-0.08 rad/s` yaw pulses separated by zero-rate holds. It requires
+exact outbound wire receipts, bounded gyro-Z response, at least four strictly
+newer gyro samples and four distinct fresh primary-target frames per yaw or
+neutral window, opposite paired image effects, no attitude excursion beyond
+`0.05 rad`, no measured yaw rate beyond `0.50 rad/s`, and confirmed cleanup.
+The result records controller-to-body and controller-to-image signs plus paired
+gyro and image-rate gains. Gate-1 yaw remains exact zero until three identical
+fixed-hash `sign-id` repeats are reviewed and a separate calibrated candidate
+is committed.
+
 `gate1-recenter` is a user-authorized bounded no-passage diagnostic. Its
 horizontal pixel-rate gain remains exactly zero pending M2 recorded-replay and
 tracker-isolation acceptance; the current diagnostic combines horizontal
 position error with a fixed bounded pitch brake. Its single structural
 hypothesis enables the existing bounded Gate 0 cyan-course-line preturn while
 enabling its bounded late exit counterroll to align the Gate 1 handoff with the
-frozen recenter direction. Once the authoritative three-frame Gate 1 entry is
-accepted, it also latches one bounded heading-rate sign from that entry error;
-the rate and wrapped yaw excursion are each limited to `0.12` rad/s and `0.12`
-rad respectively. Applied preturn, exit-counterroll, and heading objectives
-are recorded in the trace. It preserves exact `0.275` thrust with zero
-attitude rates during the visually armed Gate 0 crossing confirmation and
-authoritative Gate 1 acquisition so the motors do not cut during the
-continuation handoff. Once Gate 1 is authoritative, the accepted and raw
-no-passage geometry guards apply before every such powered observation
-setpoint. It stops after 0.60 seconds, on any gate-index change, or before a
-primary target reaches 160 pixels wide or 23,040 square pixels; the existing
-raw large-geometry contact guard is enforced independently. Stage success
-still requires cleanup confirmation.
+frozen recenter direction. Applied preturn and exit-counterroll objectives are
+recorded in the trace. It preserves exact `0.275` thrust with zero attitude
+rates during the visually armed Gate 0 crossing confirmation and authoritative
+Gate 1 acquisition so the motors do not cut during the continuation handoff.
+Once Gate 1 is authoritative, the accepted and raw no-passage geometry guards
+apply before every such powered observation setpoint. It stops after 0.60
+seconds, on any gate-index change, or before a primary target reaches 160
+pixels wide or 23,040 square pixels; the existing raw large-geometry contact
+guard is enforced independently. Stage success still requires cleanup
+confirmation.
 
 ## What happens before flight
 

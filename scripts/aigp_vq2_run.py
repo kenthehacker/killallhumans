@@ -7,7 +7,8 @@ map.  This runner therefore performs only bounded training stages:
 ``preflight``
     Receive and validate every required stream.  Sends no arm or flight target.
 ``sign-id``
-    Apply two very small, below-hover roll/pitch rate pulses, then stop/reset.
+    Apply isolated, below-hover roll/pitch and paired yaw-rate pulses, then
+    stop/reset.
 ``hover``
     Level and hold for 2.5 seconds, then stop/reset.
 ``gate0``
@@ -108,6 +109,20 @@ logger = logging.getLogger("aigp.vq2")
 CONTROL_HZ = 50.0
 CONTROL_PERIOD_S = 1.0 / CONTROL_HZ
 
+SIGN_ID_RATE_RAD_S = 0.08
+SIGN_ID_THRUST = 0.235
+SIGN_ID_RESPONSE_SETTLE_S = 0.04
+SIGN_ID_YAW_PULSE_DURATION_S = 0.18
+SIGN_ID_YAW_NEUTRAL_DURATION_S = 0.18
+SIGN_ID_MIN_RESPONSE_RAD_S = 0.006
+SIGN_ID_MIN_GYRO_SAMPLES = 3
+SIGN_ID_MIN_YAW_GYRO_SAMPLES = 4
+SIGN_ID_MIN_FRESH_IMAGE_FRAMES = 4
+SIGN_ID_MIN_IMAGE_EFFECT_PX_S = 15.0
+SIGN_ID_MAX_POLARITY_GAIN_RATIO = 2.0
+SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD = 0.05
+SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S = 0.50
+
 MAX_HEARTBEAT_AGE_S = 1.5
 MAX_IMU_AGE_S = 0.050
 MAX_RACE_AGE_S = 0.40
@@ -181,8 +196,6 @@ GATE1_RECENTER_ROLL_GAIN = -0.24
 GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
 GATE1_RECENTER_MAX_ROLL_RAD = 0.12
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
-GATE1_RECENTER_YAW_RATE_RAD_S = 0.12
-GATE1_RECENTER_MAX_YAW_EXCURSION_RAD = 0.12
 GATE1_RECENTER_THRUST = 0.275
 GATE1_RECENTER_TRANSITION_THRUST = GATE1_RECENTER_THRUST
 GATE1_RECENTER_TARGET_PITCH_RAD = 0.10
@@ -6128,21 +6141,6 @@ def gate1_recenter_roll_target(
     )
 
 
-def gate1_recenter_latched_yaw_rate(normalized_x: float) -> float:
-    """Latch a bounded heading-rate sign from the proved Gate-1 entry."""
-
-    if (
-        type(normalized_x) not in {int, float}
-        or not math.isfinite(float(normalized_x))
-        or abs(float(normalized_x)) > 1.0
-    ):
-        raise ValueError("gate-1 recenter yaw input is outside bounds")
-    value = float(normalized_x)
-    if abs(value) <= GATE1_RECENTER_CORRIDOR_NORMALIZED_X:
-        return 0.0
-    return math.copysign(GATE1_RECENTER_YAW_RATE_RAD_S, value)
-
-
 def gate1_recenter_absolute_error_slope_px_s(
     samples: Sequence[Tuple[float, float]],
 ) -> Optional[float]:
@@ -8939,69 +8937,574 @@ class VQ2Runner:
         assert self.estimate is not None
         start_rpy = self.estimate.orientation.to_euler()
         max_excursion = 0.0
+        max_abs_measured_yaw_rate = abs(float(self.estimate.body_rates[2]))
         segments = [
             ("settle", 0.25, (0.0, 0.0, 0.0)),
-            ("roll", 0.10, (0.08, 0.0, 0.0)),
+            (
+                "neutral-pre-yaw",
+                SIGN_ID_YAW_NEUTRAL_DURATION_S,
+                (0.0, 0.0, 0.0),
+            ),
+            (
+                "yaw-positive",
+                SIGN_ID_YAW_PULSE_DURATION_S,
+                (0.0, 0.0, SIGN_ID_RATE_RAD_S),
+            ),
+            (
+                "neutral-between-yaw",
+                SIGN_ID_YAW_NEUTRAL_DURATION_S,
+                (0.0, 0.0, 0.0),
+            ),
+            (
+                "yaw-negative",
+                SIGN_ID_YAW_PULSE_DURATION_S,
+                (0.0, 0.0, -SIGN_ID_RATE_RAD_S),
+            ),
+            (
+                "neutral-post-yaw",
+                SIGN_ID_YAW_NEUTRAL_DURATION_S,
+                (0.0, 0.0, 0.0),
+            ),
+            ("roll", 0.10, (SIGN_ID_RATE_RAD_S, 0.0, 0.0)),
             ("neutral", 0.12, (0.0, 0.0, 0.0)),
-            ("pitch", 0.10, (0.0, 0.08, 0.0)),
+            ("pitch", 0.10, (0.0, SIGN_ID_RATE_RAD_S, 0.0)),
         ]
-        responses: Dict[str, List[float]] = {"roll": [], "pitch": []}
-        baseline_samples: List[Tuple[float, float]] = []
-        flight_start = await self._wait_for_next_flight_command_slot()
-        next_tick = flight_start
-        for name, duration, rates in segments:
-            segment_start = time.monotonic()
-            while time.monotonic() - segment_start < duration:
-                segment_elapsed = time.monotonic() - segment_start
-                self._sample()
-                self._watchdog(allow_benign_pad_contact=True)
-                assert self.estimate is not None
-                current_rpy = self.estimate.orientation.to_euler()
-                max_excursion = max(
-                    max_excursion,
-                    abs(current_rpy[0] - start_rpy[0]),
-                    abs(current_rpy[1] - start_rpy[1]),
+        responses: Dict[str, List[Tuple[int, float]]] = {
+            "roll": [],
+            "pitch": [],
+            "neutral-pre-yaw": [],
+            "yaw-positive": [],
+            "neutral-between-yaw": [],
+            "yaw-negative": [],
+        }
+        baseline_samples: List[Tuple[int, float, float, float]] = []
+        image_segment_names = {
+            "neutral-pre-yaw",
+            "yaw-positive",
+            "neutral-between-yaw",
+            "yaw-negative",
+        }
+        image_samples: Dict[str, List[Tuple[float, float]]] = {
+            name: [] for name in image_segment_names
+        }
+        wire_yaw_rates: Dict[str, List[float]] = {
+            "yaw-positive": [],
+            "yaw-negative": [],
+        }
+
+        def wrapped_yaw_excursion(yaw: float) -> float:
+            delta = float(yaw) - float(start_rpy[2])
+            return math.atan2(math.sin(delta), math.cos(delta))
+
+        def image_slope(name: str) -> float:
+            samples = image_samples[name]
+            if len(samples) < SIGN_ID_MIN_FRESH_IMAGE_FRAMES:
+                raise SafetyAbort(
+                    f"sign-ID {name} lacks four fresh image frames"
                 )
-                if max_excursion > 0.05:
-                    raise SafetyAbort(
-                        f"sign-ID attitude excursion too large ({max_excursion:.3f}rad)"
+            if any(
+                samples[index][0] <= samples[index - 1][0]
+                for index in range(1, len(samples))
+            ):
+                raise SafetyAbort(
+                    f"sign-ID {name} image times did not advance"
+                )
+            pairwise_slopes = [
+                (later[1] - earlier[1]) / (later[0] - earlier[0])
+                for index, earlier in enumerate(samples)
+                for later in samples[index + 1 :]
+            ]
+            if not pairwise_slopes or not all(
+                math.isfinite(value) for value in pairwise_slopes
+            ):
+                raise SafetyAbort(f"sign-ID {name} image slope is unavailable")
+            return float(statistics.median(pairwise_slopes))
+
+        def validate_wire_yaw(
+            receipt: Optional[Mapping[str, Any]],
+            command: AttitudeRateCommand,
+        ) -> float:
+            if not isinstance(receipt, Mapping):
+                raise SafetyAbort("sign-ID lacks an outbound wire receipt")
+            wire = receipt.get("wire")
+            if not isinstance(wire, Mapping):
+                raise SafetyAbort("sign-ID receipt lacks wire evidence")
+            body_rates = wire.get("body_rates_rad_s")
+            wire_thrust = wire.get("thrust")
+            if (
+                wire.get("type_mask") != 128
+                or not isinstance(body_rates, Sequence)
+                or len(body_rates) != 3
+                or any(
+                    type(value) not in {int, float}
+                    or not math.isfinite(float(value))
+                    for value in body_rates
+                )
+                or float(body_rates[2]) != -float(command.yaw_rate)
+                or type(wire_thrust) not in {int, float}
+                or not math.isfinite(float(wire_thrust))
+                or float(wire_thrust) != float(command.thrust)
+            ):
+                raise SafetyAbort("sign-ID yaw wire mapping is invalid")
+            return float(body_rates[2])
+
+        try:
+            flight_start = await self._wait_for_next_flight_command_slot()
+            next_tick = flight_start
+            for name, duration, rates in segments:
+                segment_start = time.monotonic()
+                segment_target = self.tracker.target
+                last_image_token = (
+                    None
+                    if (
+                        segment_target is None
+                        or type(self._latest_detection_generation) is not int
                     )
-                command = AttitudeRateCommand(rates[0], rates[1], 0.0, 0.235)
-                validate_command(command)
-                await self._send_flight_command(command)
-                elapsed = time.monotonic() - flight_start
-                self._record_tick(f"sign-id/{name}", elapsed, command)
-                if name == "settle" and segment_elapsed > 0.15:
-                    baseline_samples.append(
-                        (self.estimate.body_rates[0], self.estimate.body_rates[1])
+                    else (
+                        int(self._latest_detection_generation),
+                        int(segment_target.frame_id),
+                        int(segment_target.sim_time_ns),
                     )
-                if name in responses and segment_elapsed > 0.04:
-                    axis = 0 if name == "roll" else 1
-                    responses[name].append(self.estimate.body_rates[axis])
-                next_tick = next_control_deadline(next_tick, time.monotonic())
-                await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
-        assert self.estimate is not None
-        end_rpy = self.estimate.orientation.to_euler()
-        excursion = max(abs(end_rpy[i] - start_rpy[i]) for i in (0, 1))
-        raw_means = {
-            axis: (statistics.fmean(values) if values else 0.0)
-            for axis, values in responses.items()
-        }
-        baseline = {
-            "roll": statistics.fmean(sample[0] for sample in baseline_samples),
-            "pitch": statistics.fmean(sample[1] for sample in baseline_samples),
-        }
-        means = {axis: raw_means[axis] - baseline[axis] for axis in responses}
-        bad = [axis for axis, mean in means.items() if mean <= 0.006]
-        if bad:
-            raise SafetyAbort(f"sign-ID response inconclusive/wrong for {bad}: {means}")
-        return {
-            "mean_responses_rad_s": means,
-            "raw_mean_responses_rad_s": raw_means,
-            "baseline_rates_rad_s": baseline,
-            "final_attitude_excursion_rad": excursion,
-            "max_attitude_excursion_rad": max_excursion,
-        }
+                )
+                segment_wire_release_s: Optional[float] = None
+                while time.monotonic() - segment_start < duration:
+                    segment_elapsed = time.monotonic() - segment_start
+                    self._sample()
+                    self._watchdog(allow_benign_pad_contact=True)
+                    assert self.estimate is not None
+                    current_rpy = self.estimate.orientation.to_euler()
+                    yaw_excursion = wrapped_yaw_excursion(current_rpy[2])
+                    max_excursion = max(
+                        max_excursion,
+                        abs(current_rpy[0] - start_rpy[0]),
+                        abs(current_rpy[1] - start_rpy[1]),
+                        abs(yaw_excursion),
+                    )
+                    measured_yaw_rate = float(self.estimate.body_rates[2])
+                    max_abs_measured_yaw_rate = max(
+                        max_abs_measured_yaw_rate,
+                        abs(measured_yaw_rate),
+                    )
+                    if max_excursion > SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD:
+                        raise SafetyAbort(
+                            "sign-ID attitude excursion too large "
+                            f"({max_excursion:.3f}rad)"
+                        )
+                    if (
+                        abs(measured_yaw_rate)
+                        > SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S
+                    ):
+                        raise SafetyAbort(
+                            "sign-ID measured yaw rate exceeded "
+                            f"{SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S:.2f}rad/s"
+                        )
+
+                    target = self.tracker.target
+                    if name in image_segment_names:
+                        if (
+                            target is None
+                            or target.composite
+                            or self.tracker.last_selection_mode != "primary"
+                            or type(self._latest_detection_generation) is not int
+                        ):
+                            raise SafetyAbort(
+                                "sign-ID yaw image target lost primary authority"
+                            )
+                        image_token = (
+                            int(self._latest_detection_generation),
+                            int(target.frame_id),
+                            int(target.sim_time_ns),
+                        )
+                        if image_token != last_image_token:
+                            if (
+                                last_image_token is not None
+                                and (
+                                    image_token[0] != last_image_token[0]
+                                    or image_token[1] <= last_image_token[1]
+                                    or image_token[2] <= last_image_token[2]
+                                )
+                            ):
+                                raise SafetyAbort(
+                                    "sign-ID yaw image frame did not advance"
+                                )
+                            last_image_token = image_token
+                            if (
+                                segment_wire_release_s is not None
+                                and float(target.received_monotonic_s)
+                                >= segment_wire_release_s
+                                + SIGN_ID_RESPONSE_SETTLE_S
+                            ):
+                                image_samples[name].append(
+                                    (
+                                        float(target.received_monotonic_s),
+                                        float(target.center_x),
+                                    )
+                                )
+                                self.recorder.emit(
+                                    "sign_id_yaw_image_frame",
+                                    segment=name,
+                                    frame_id=target.frame_id,
+                                    sim_time_ns=target.sim_time_ns,
+                                    received_monotonic_s=(
+                                        target.received_monotonic_s
+                                    ),
+                                    center_x=target.center_x,
+                                )
+
+                    command = AttitudeRateCommand(
+                        rates[0],
+                        rates[1],
+                        rates[2],
+                        SIGN_ID_THRUST,
+                    )
+                    validate_command(command)
+                    receipt = await self._send_flight_command(
+                        command,
+                        require_wire_receipt=True,
+                    )
+                    wire_yaw = validate_wire_yaw(receipt, command)
+                    if segment_wire_release_s is None:
+                        assert receipt is not None
+                        call_end_ns = receipt.get(
+                            "call_end_monotonic_ns"
+                        )
+                        if type(call_end_ns) is not int or call_end_ns < 0:
+                            raise SafetyAbort(
+                                "sign-ID wire release timestamp is invalid"
+                            )
+                        segment_wire_release_s = (
+                            call_end_ns / 1_000_000_000.0
+                        )
+                    if name in wire_yaw_rates:
+                        wire_yaw_rates[name].append(wire_yaw)
+                    elapsed = time.monotonic() - flight_start
+                    self._record_tick(f"sign-id/{name}", elapsed, command)
+                    if name == "settle" and segment_elapsed > 0.15:
+                        timestamp_us = int(self.estimate.timestamp_us)
+                        if (
+                            not baseline_samples
+                            or timestamp_us > baseline_samples[-1][0]
+                        ):
+                            baseline_samples.append(
+                                (
+                                    timestamp_us,
+                                    *(
+                                        float(value)
+                                        for value in self.estimate.body_rates
+                                    ),
+                                )
+                            )
+                    if (
+                        name in responses
+                        and segment_wire_release_s is not None
+                        and time.monotonic()
+                        >= segment_wire_release_s
+                        + SIGN_ID_RESPONSE_SETTLE_S
+                    ):
+                        axis = (
+                            0
+                            if name == "roll"
+                            else (1 if name == "pitch" else 2)
+                        )
+                        timestamp_us = int(self.estimate.timestamp_us)
+                        if (
+                            not responses[name]
+                            or timestamp_us > responses[name][-1][0]
+                        ):
+                            responses[name].append(
+                                (
+                                    timestamp_us,
+                                    float(self.estimate.body_rates[axis]),
+                                )
+                            )
+                    next_tick = next_control_deadline(
+                        next_tick,
+                        time.monotonic(),
+                    )
+                    await asyncio.sleep(
+                        max(0.0, next_tick - time.monotonic())
+                    )
+
+            if len(baseline_samples) < SIGN_ID_MIN_GYRO_SAMPLES:
+                raise SafetyAbort(
+                    "sign-ID lacks three fresh body-rate baseline samples"
+                )
+            sparse_responses = [
+                name
+                for name, values in responses.items()
+                if len(values)
+                < (
+                    SIGN_ID_MIN_GYRO_SAMPLES
+                    if name in {"roll", "pitch"}
+                    else SIGN_ID_MIN_YAW_GYRO_SAMPLES
+                )
+            ]
+            if sparse_responses:
+                raise SafetyAbort(
+                    "sign-ID lacks required fresh body-rate samples for "
+                    f"{sparse_responses}"
+                )
+            assert self.estimate is not None
+            end_rpy = self.estimate.orientation.to_euler()
+            final_yaw_excursion = wrapped_yaw_excursion(end_rpy[2])
+            excursion = max(
+                abs(end_rpy[0] - start_rpy[0]),
+                abs(end_rpy[1] - start_rpy[1]),
+                abs(final_yaw_excursion),
+            )
+            raw_means = {
+                axis: (
+                    statistics.fmean(
+                        sample[1] for sample in values
+                    )
+                    if values
+                    else 0.0
+                )
+                for axis, values in responses.items()
+            }
+            yaw_medians = {
+                name: statistics.median(
+                    sample[1] for sample in responses[name]
+                )
+                for name in (
+                    "neutral-pre-yaw",
+                    "yaw-positive",
+                    "neutral-between-yaw",
+                    "yaw-negative",
+                )
+            }
+            baseline = {
+                "roll": statistics.fmean(
+                    sample[1] for sample in baseline_samples
+                ),
+                "pitch": statistics.fmean(
+                    sample[2] for sample in baseline_samples
+                ),
+                "yaw": statistics.fmean(
+                    sample[3] for sample in baseline_samples
+                ),
+            }
+            means = {
+                "roll": raw_means["roll"] - baseline["roll"],
+                "pitch": raw_means["pitch"] - baseline["pitch"],
+                "yaw-positive": (
+                    yaw_medians["yaw-positive"]
+                    - yaw_medians["neutral-pre-yaw"]
+                ),
+                "yaw-negative": (
+                    yaw_medians["yaw-negative"]
+                    - yaw_medians["neutral-between-yaw"]
+                ),
+            }
+            bad = [
+                axis
+                for axis in ("roll", "pitch")
+                if means[axis] <= SIGN_ID_MIN_RESPONSE_RAD_S
+            ]
+            if bad:
+                raise SafetyAbort(
+                    f"sign-ID response inconclusive/wrong for {bad}: {means}"
+                )
+            if (
+                abs(means["yaw-positive"])
+                <= SIGN_ID_MIN_RESPONSE_RAD_S
+                or abs(means["yaw-negative"])
+                <= SIGN_ID_MIN_RESPONSE_RAD_S
+                or means["yaw-positive"] * means["yaw-negative"] >= 0.0
+            ):
+                raise SafetyAbort(
+                    "sign-ID yaw gyro response is inconclusive/wrong: "
+                    f"{means}"
+                )
+
+            slopes = {
+                name: image_slope(name)
+                for name in image_segment_names
+            }
+            positive_effect = (
+                slopes["yaw-positive"] - slopes["neutral-pre-yaw"]
+            )
+            negative_effect = (
+                slopes["yaw-negative"]
+                - slopes["neutral-between-yaw"]
+            )
+            if (
+                abs(positive_effect) < SIGN_ID_MIN_IMAGE_EFFECT_PX_S
+                or abs(negative_effect) < SIGN_ID_MIN_IMAGE_EFFECT_PX_S
+                or positive_effect * negative_effect >= 0.0
+            ):
+                raise SafetyAbort(
+                    "sign-ID yaw image response is inconclusive/wrong: "
+                    f"positive={positive_effect:.6f}px/s, "
+                    f"negative={negative_effect:.6f}px/s"
+                )
+
+            gyro_gain = (
+                means["yaw-positive"] - means["yaw-negative"]
+            ) / (2.0 * SIGN_ID_RATE_RAD_S)
+            image_gain = (
+                positive_effect - negative_effect
+            ) / (2.0 * SIGN_ID_RATE_RAD_S)
+            positive_gyro_gain = (
+                means["yaw-positive"] / SIGN_ID_RATE_RAD_S
+            )
+            negative_gyro_gain = (
+                means["yaw-negative"] / -SIGN_ID_RATE_RAD_S
+            )
+            positive_image_gain = (
+                positive_effect / SIGN_ID_RATE_RAD_S
+            )
+            negative_image_gain = (
+                negative_effect / -SIGN_ID_RATE_RAD_S
+            )
+            gyro_gain_ratio = max(
+                abs(positive_gyro_gain),
+                abs(negative_gyro_gain),
+            ) / min(
+                abs(positive_gyro_gain),
+                abs(negative_gyro_gain),
+            )
+            image_gain_ratio = max(
+                abs(positive_image_gain),
+                abs(negative_image_gain),
+            ) / min(
+                abs(positive_image_gain),
+                abs(negative_image_gain),
+            )
+            if (
+                gyro_gain_ratio > SIGN_ID_MAX_POLARITY_GAIN_RATIO
+                or image_gain_ratio > SIGN_ID_MAX_POLARITY_GAIN_RATIO
+            ):
+                raise SafetyAbort(
+                    "sign-ID yaw polarity gains are inconsistent: "
+                    f"gyro_ratio={gyro_gain_ratio:.6f}, "
+                    f"image_ratio={image_gain_ratio:.6f}"
+                )
+            controller_to_body_sign = (
+                1 if gyro_gain > 0.0 else -1
+            )
+            controller_to_image_sign = (
+                1 if image_gain > 0.0 else -1
+            )
+            pulse_summaries = {
+                "positive": {
+                    "command_yaw_rate_rad_s": SIGN_ID_RATE_RAD_S,
+                    "wire_yaw_rate_rad_s": statistics.fmean(
+                        wire_yaw_rates["yaw-positive"]
+                    ),
+                    "corrected_median_yaw_rate_rad_s": (
+                        means["yaw-positive"]
+                    ),
+                    "gyro_rate_gain": positive_gyro_gain,
+                    "fresh_image_frame_count": len(
+                        image_samples["yaw-positive"]
+                    ),
+                    "image_start_x_px": image_samples[
+                        "yaw-positive"
+                    ][0][1],
+                    "image_end_x_px": image_samples[
+                        "yaw-positive"
+                    ][-1][1],
+                    "image_slope_px_s": slopes["yaw-positive"],
+                    "neutral_image_slope_px_s": slopes[
+                        "neutral-pre-yaw"
+                    ],
+                    "differential_image_effect_px_s": positive_effect,
+                    "image_rate_gain_px_per_command_rad": (
+                        positive_image_gain
+                    ),
+                },
+                "negative": {
+                    "command_yaw_rate_rad_s": -SIGN_ID_RATE_RAD_S,
+                    "wire_yaw_rate_rad_s": statistics.fmean(
+                        wire_yaw_rates["yaw-negative"]
+                    ),
+                    "corrected_median_yaw_rate_rad_s": (
+                        means["yaw-negative"]
+                    ),
+                    "gyro_rate_gain": negative_gyro_gain,
+                    "fresh_image_frame_count": len(
+                        image_samples["yaw-negative"]
+                    ),
+                    "image_start_x_px": image_samples[
+                        "yaw-negative"
+                    ][0][1],
+                    "image_end_x_px": image_samples[
+                        "yaw-negative"
+                    ][-1][1],
+                    "image_slope_px_s": slopes["yaw-negative"],
+                    "neutral_image_slope_px_s": slopes[
+                        "neutral-between-yaw"
+                    ],
+                    "differential_image_effect_px_s": negative_effect,
+                    "image_rate_gain_px_per_command_rad": (
+                        negative_image_gain
+                    ),
+                },
+            }
+            yaw_calibration = {
+                "yaw_identified": True,
+                "controller_to_body_sign": controller_to_body_sign,
+                "controller_to_image_sign": controller_to_image_sign,
+                "command_rate_abs_rad_s": SIGN_ID_RATE_RAD_S,
+                "baseline_yaw_rate_rad_s": baseline["yaw"],
+                "positive_local_yaw_baseline_rad_s": yaw_medians[
+                    "neutral-pre-yaw"
+                ],
+                "negative_local_yaw_baseline_rad_s": yaw_medians[
+                    "neutral-between-yaw"
+                ],
+                "gyro_rate_gain": abs(gyro_gain),
+                "signed_gyro_rate_gain": gyro_gain,
+                "gyro_polarity_gain_ratio": gyro_gain_ratio,
+                "image_rate_gain_px_per_command_rad": image_gain,
+                "image_polarity_gain_ratio": image_gain_ratio,
+                "positive": pulse_summaries["positive"],
+                "negative": pulse_summaries["negative"],
+                "final_yaw_excursion_rad": final_yaw_excursion,
+                "max_attitude_excursion_rad": max_excursion,
+                "max_abs_measured_yaw_rate_rad_s": (
+                    max_abs_measured_yaw_rate
+                ),
+            }
+            self.recorder.emit(
+                "sign_id_yaw_terminal",
+                success=True,
+                reason=None,
+                **yaw_calibration,
+            )
+            return {
+                "mean_responses_rad_s": {
+                    "roll": means["roll"],
+                    "pitch": means["pitch"],
+                },
+                "raw_mean_responses_rad_s": {
+                    "roll": raw_means["roll"],
+                    "pitch": raw_means["pitch"],
+                },
+                "baseline_rates_rad_s": baseline,
+                "final_attitude_excursion_rad": excursion,
+                "max_attitude_excursion_rad": max_excursion,
+                "yaw_calibration": yaw_calibration,
+            }
+        except BaseException as exc:
+            try:
+                self.recorder.emit(
+                    "sign_id_yaw_terminal",
+                    success=False,
+                    reason=str(exc) or type(exc).__name__,
+                    max_attitude_excursion_rad=max_excursion,
+                    max_abs_measured_yaw_rate_rad_s=(
+                        max_abs_measured_yaw_rate
+                    ),
+                )
+            except BaseException as recorder_exc:
+                if hasattr(exc, "add_note"):
+                    exc.add_note(
+                        "sign-ID yaw terminal evidence also failed: "
+                        f"{recorder_exc}"
+                    )
+            raise
 
     def _check_calibration_envelope(
         self,
@@ -10148,15 +10651,6 @@ class VQ2Runner:
         ):
             raise SafetyAbort("gate-1 recenter requires a fresh primary target")
         entry_error_px = float(entry_target.center_x) - 320.0
-        entry_normalized_x = entry_error_px / 320.0
-        try:
-            latched_yaw_rate = gate1_recenter_latched_yaw_rate(
-                entry_normalized_x,
-            )
-        except ValueError as exc:
-            raise SafetyAbort(
-                "gate-1 recenter entry yaw control is outside bounds"
-            ) from exc
         self._gate1_recenter_summary = {
             "candidate_authority": "user_authorized_bounded_recenter_diagnostic",
             "success": False,
@@ -10167,8 +10661,6 @@ class VQ2Runner:
             "entry_abs_horizontal_error_px": abs(entry_error_px),
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": abs(entry_error_px),
-            "entry_normalized_x": entry_normalized_x,
-            "latched_command_yaw_rate_rad_s": latched_yaw_rate,
             "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
             "max_target_area_px": int(entry_target.bbox_area),
             "max_target_width_px": int(entry_target.bbox[2]),
@@ -10216,9 +10708,7 @@ class VQ2Runner:
         if self.estimate is None:
             raise SafetyAbort("gate-1 recenter attitude estimate is unavailable")
 
-        entry_roll, entry_pitch, entry_yaw = (
-            self.estimate.orientation.to_euler()
-        )
+        entry_roll, entry_pitch, _entry_yaw = self.estimate.orientation.to_euler()
         if (
             abs(float(entry_roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
             or not (
@@ -10236,10 +10726,6 @@ class VQ2Runner:
         ]
         min_roll = max_roll = float(entry_roll)
         min_pitch = max_pitch = float(entry_pitch)
-        max_abs_yaw_excursion = 0.0
-        max_abs_measured_yaw_rate = abs(
-            float(self.estimate.body_rates[2])
-        )
         min_command_roll_rate: Optional[float] = None
         max_command_roll_rate: Optional[float] = None
         min_command_pitch_rate: Optional[float] = None
@@ -10296,13 +10782,8 @@ class VQ2Runner:
             "corridor_accepted_elapsed_s": None,
             "entry_horizontal_error_px": entry_error_px,
             "entry_abs_horizontal_error_px": entry_abs_error_px,
-            "entry_normalized_x": entry_normalized_x,
-            "entry_yaw_rad": float(entry_yaw),
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": entry_abs_error_px,
-            "latched_command_yaw_rate_rad_s": latched_yaw_rate,
-            "max_abs_yaw_excursion_rad": max_abs_yaw_excursion,
-            "max_abs_measured_yaw_rate_rad_s": max_abs_measured_yaw_rate,
             "fresh_abs_horizontal_error_slope_px_s": None,
             "fresh_control_frame_count": 0,
             "corridor_hold_frame_count": 0,
@@ -10338,7 +10819,6 @@ class VQ2Runner:
             corridor_accepted_elapsed_s: Optional[float] = None,
         ) -> None:
             nonlocal min_roll, max_roll, min_pitch, max_pitch
-            nonlocal max_abs_yaw_excursion, max_abs_measured_yaw_rate
             nonlocal min_command_roll_rate, max_command_roll_rate
             nonlocal min_command_pitch_rate, max_command_pitch_rate
             nonlocal max_target_area, max_target_width, max_gate_index
@@ -10361,12 +10841,6 @@ class VQ2Runner:
                     ),
                     "final_horizontal_error_px": final_error_px,
                     "final_abs_horizontal_error_px": abs(final_error_px),
-                    "max_abs_yaw_excursion_rad": (
-                        max_abs_yaw_excursion
-                    ),
-                    "max_abs_measured_yaw_rate_rad_s": (
-                        max_abs_measured_yaw_rate
-                    ),
                     "fresh_abs_horizontal_error_slope_px_s": slope,
                     "fresh_control_frame_count": fresh_control_frames,
                     "corridor_hold_frame_count": corridor_hold_frames,
@@ -10438,10 +10912,6 @@ class VQ2Runner:
             entry_target=asdict(entry_target),
             entry_error_px=entry_error_px,
             entry_abs_error_px=entry_abs_error_px,
-            entry_normalized_x=entry_normalized_x,
-            entry_yaw_rad=float(entry_yaw),
-            latched_command_yaw_rate_rad_s=latched_yaw_rate,
-            yaw_sign_basis="latched_entry_horizontal_error",
             vision_generation=entry_generation,
             hard_deadline_monotonic_s=hard_deadline_s,
             last_recenter_wire_start_monotonic_ns=(
@@ -10454,10 +10924,6 @@ class VQ2Runner:
                 "max_roll_rad": GATE1_RECENTER_MAX_ROLL_RAD,
                 "max_command_rate_rad_s": (
                     GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
-                ),
-                "yaw_rate_rad_s": GATE1_RECENTER_YAW_RATE_RAD_S,
-                "max_yaw_excursion_rad": (
-                    GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
                 ),
                 "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
                 "thrust": GATE1_RECENTER_THRUST,
@@ -10534,23 +11000,11 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter attitude estimate is unavailable"
                     )
-                roll, pitch, yaw = self.estimate.orientation.to_euler()
-                yaw_excursion = math.atan2(
-                    math.sin(float(yaw) - float(entry_yaw)),
-                    math.cos(float(yaw) - float(entry_yaw)),
-                )
+                roll, pitch, _yaw = self.estimate.orientation.to_euler()
                 min_roll = min(min_roll, float(roll))
                 max_roll = max(max_roll, float(roll))
                 min_pitch = min(min_pitch, float(pitch))
                 max_pitch = max(max_pitch, float(pitch))
-                max_abs_yaw_excursion = max(
-                    max_abs_yaw_excursion,
-                    abs(yaw_excursion),
-                )
-                max_abs_measured_yaw_rate = max(
-                    max_abs_measured_yaw_rate,
-                    abs(float(self.estimate.body_rates[2])),
-                )
                 if (
                     abs(float(roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
                     or not (
@@ -10562,8 +11016,6 @@ class VQ2Runner:
                     > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                     or abs(float(pitch) - entry_pitch)
                     > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
-                    or abs(yaw_excursion)
-                    > GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
                 ):
                     raise SafetyAbort(
                         "gate-1 recenter attitude excursion approached its bound"
@@ -10659,12 +11111,6 @@ class VQ2Runner:
                         normalized_x=current_error_px / 320.0,
                         normalized_x_rate_s=current_x_rate_norm_s,
                         corridor_hold_frames=corridor_hold_frames,
-                        yaw_rad=float(yaw),
-                        yaw_excursion_rad=yaw_excursion,
-                        measured_yaw_rate_rad_s=float(
-                            self.estimate.body_rates[2]
-                        ),
-                        command_yaw_rate_rad_s=latched_yaw_rate,
                     )
                     last_token = token
                     last_center_x = float(accepted.center_x)
@@ -10788,32 +11234,16 @@ class VQ2Runner:
                                 "gate-1 recenter attitude estimate changed "
                                 "before cleanup"
                             )
-                        cleanup_roll, cleanup_pitch, cleanup_yaw = (
+                        cleanup_roll, cleanup_pitch, _cleanup_yaw = (
                             self.estimate.orientation.to_euler()
-                        )
-                        cleanup_yaw_excursion = math.atan2(
-                            math.sin(
-                                float(cleanup_yaw) - float(entry_yaw)
-                            ),
-                            math.cos(
-                                float(cleanup_yaw) - float(entry_yaw)
-                            ),
                         )
                         min_roll = min(min_roll, float(cleanup_roll))
                         max_roll = max(max_roll, float(cleanup_roll))
                         min_pitch = min(min_pitch, float(cleanup_pitch))
                         max_pitch = max(max_pitch, float(cleanup_pitch))
-                        max_abs_yaw_excursion = max(
-                            max_abs_yaw_excursion,
-                            abs(cleanup_yaw_excursion),
-                        )
                         cleanup_peak_rate = max(
                             abs(float(value))
                             for value in self.estimate.body_rates
-                        )
-                        max_abs_measured_yaw_rate = max(
-                            max_abs_measured_yaw_rate,
-                            abs(float(self.estimate.body_rates[2])),
                         )
                         if (
                             abs(float(cleanup_roll))
@@ -10827,8 +11257,6 @@ class VQ2Runner:
                             > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                             or abs(float(cleanup_pitch) - entry_pitch)
                             > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
-                            or abs(cleanup_yaw_excursion)
-                            > GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
                             or cleanup_peak_rate
                             > GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S
                         ):
@@ -10948,17 +11376,8 @@ class VQ2Runner:
                     command,
                     GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S,
                 )
-                command = AttitudeRateCommand(
-                    roll_rate=command.roll_rate,
-                    pitch_rate=command.pitch_rate,
-                    yaw_rate=latched_yaw_rate,
-                    thrust=command.thrust,
-                )
-                validate_command(command)
                 if (
-                    command.yaw_rate != latched_yaw_rate
-                    or abs(command.yaw_rate)
-                    > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+                    command.yaw_rate != 0.0
                     or abs(command.roll_rate)
                     > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
                     or abs(command.pitch_rate)

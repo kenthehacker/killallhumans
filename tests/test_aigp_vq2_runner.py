@@ -1728,44 +1728,6 @@ def test_gate1_recenter_roll_target_rejects_unbounded_inputs(
         )
 
 
-@pytest.mark.parametrize(
-    ("normalized_x", "expected"),
-    (
-        (1.0, 0.12),
-        (0.36, 0.12),
-        (0.35, 0.0),
-        (0.0, 0.0),
-        (-0.35, 0.0),
-        (-0.36, -0.12),
-        (-1.0, -0.12),
-    ),
-)
-def test_gate1_recenter_latched_yaw_rate_uses_entry_sign_only(
-    normalized_x,
-    expected,
-):
-    assert vq2_module.gate1_recenter_latched_yaw_rate(
-        normalized_x,
-    ) == expected
-
-
-@pytest.mark.parametrize(
-    "normalized_x",
-    (
-        True,
-        math.nan,
-        math.inf,
-        math.nextafter(1.0, math.inf),
-        math.nextafter(-1.0, -math.inf),
-    ),
-)
-def test_gate1_recenter_latched_yaw_rate_rejects_unbounded_input(
-    normalized_x,
-):
-    with pytest.raises(ValueError, match="yaw input"):
-        vq2_module.gate1_recenter_latched_yaw_rate(normalized_x)
-
-
 def test_gate1_recenter_absolute_error_slope_uses_only_strict_fresh_times():
     assert vq2_module.gate1_recenter_absolute_error_slope_px_s(
         [(1.0, 200.0)]
@@ -1785,8 +1747,6 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.12
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
-    assert vq2_module.GATE1_RECENTER_YAW_RATE_RAD_S == 0.12
-    assert vq2_module.GATE1_RECENTER_MAX_YAW_EXCURSION_RAD == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TARGET_PITCH_RAD == 0.10
@@ -2189,13 +2149,10 @@ def test_offline_gate1_recenter_requires_error_decrease_and_three_frame_hold(
         <= vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
         and abs(command.pitch_rate)
         <= vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
-        and command.yaw_rate == vq2_module.GATE1_RECENTER_YAW_RATE_RAD_S
+        and command.yaw_rate == 0.0
         and command.thrust == vq2_module.GATE1_RECENTER_THRUST
         for command in adapter.commands
     )
-    assert result["entry_normalized_x"] == pytest.approx(210.0 / 320.0)
-    assert result["latched_command_yaw_rate_rad_s"] == 0.12
-    assert result["max_abs_yaw_excursion_rad"] == 0.0
 
 
 def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
@@ -2673,34 +2630,6 @@ def test_offline_gate1_recenter_rejects_unsafe_entry_attitude(monkeypatch):
 
     with pytest.raises(SafetyAbort, match="entry attitude"):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
-
-
-def test_offline_gate1_recenter_rejects_wrapped_yaw_excursion(monkeypatch):
-    runner, adapter, observation, _clock = (
-        _configure_gate1_recenter_candidate(monkeypatch)
-    )
-
-    def sample():
-        runner.estimate = _estimate(
-            roll=0.0,
-            pitch=-0.05,
-            yaw=math.nextafter(
-                vq2_module.GATE1_RECENTER_MAX_YAW_EXCURSION_RAD,
-                math.inf,
-            ),
-        )
-
-    monkeypatch.setattr(runner, "_sample", sample)
-
-    with pytest.raises(SafetyAbort, match="attitude excursion"):
-        asyncio.run(runner._run_bounded_gate1_recenter(observation))
-
-    assert adapter.commands == []
-    assert runner._gate1_recenter_summary is not None
-    assert (
-        runner._gate1_recenter_summary["max_abs_yaw_excursion_rad"]
-        > vq2_module.GATE1_RECENTER_MAX_YAW_EXCURSION_RAD
-    )
 
 
 def test_offline_gate1_recenter_requires_same_accepted_entry_object(
@@ -4132,6 +4061,224 @@ def test_sampling_records_mixed_receiver_ingress_in_global_sequence_order():
         ("other", 2),
         ("imu", 3),
     ]
+
+
+def _configured_yaw_sign_id(
+    monkeypatch,
+    *,
+    image_command_sign=1.0,
+    yaw_response_gain=2.0,
+):
+    clock = [0.0]
+    center_x = [322.0]
+    yaw = [0.0]
+    frame_id = [10]
+    events = []
+    send_options = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=0.0, pitch=-0.31)
+    target = vq2_module.GateTarget(
+        frame_id=frame_id[0],
+        sim_time_ns=frame_id[0] * 1_000,
+        received_monotonic_s=clock[0],
+        center_x=round(center_x[0]),
+        center_y=174,
+        bbox=(282, 134, 80, 80),
+        confidence=0.8,
+    )
+    runner.tracker.target = target
+    runner.tracker.consecutive = 3
+    runner.tracker.last_selection_mode = "primary"
+    runner._latest_detection_generation = 1
+    runner._latest_detection_frame_id = target.frame_id
+    runner._latest_detection_frame_sim_ns = target.sim_time_ns
+    runner._latest_detection_received_s = target.received_monotonic_s
+
+    def sample():
+        previous = (
+            adapter.commands[-1]
+            if adapter.commands
+            else AttitudeRateCommand(0.0, 0.0, 0.0, vq2_module.SIGN_ID_THRUST)
+        )
+        body_rates = (
+            1.1 * float(previous.roll_rate),
+            2.0 * float(previous.pitch_rate),
+            float(yaw_response_gain) * float(previous.yaw_rate),
+        )
+        yaw[0] += body_rates[2] * vq2_module.CONTROL_PERIOD_S
+        center_x[0] += (
+            float(image_command_sign)
+            * float(previous.yaw_rate)
+            * 400.0
+            * vq2_module.CONTROL_PERIOD_S
+        )
+        runner.estimate = replace(
+            _estimate(roll=0.0, pitch=-0.31, yaw=yaw[0]),
+            timestamp_us=frame_id[0] * 1_000,
+            body_rates=body_rates,
+        )
+        frame_id[0] += 1
+        current_x = round(center_x[0])
+        current = vq2_module.GateTarget(
+            frame_id=frame_id[0],
+            sim_time_ns=frame_id[0] * 1_000,
+            received_monotonic_s=clock[0],
+            center_x=current_x,
+            center_y=174,
+            bbox=(current_x - 40, 134, 80, 80),
+            confidence=0.8,
+        )
+        runner.tracker.target = current
+        runner.tracker.consecutive += 1
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_detection_frame_id = current.frame_id
+        runner._latest_detection_frame_sim_ns = current.sim_time_ns
+        runner._latest_detection_received_s = current.received_monotonic_s
+
+    async def send(command, **kwargs):
+        send_options.append(dict(kwargs))
+        adapter.commands.append(command)
+        return {
+            "schema": "aigp-vq2-attitude-target-outbound/1",
+            "host_clock_id": "host-perf-counter",
+            "call_start_monotonic_ns": round(clock[0] * 1_000_000_000),
+            "call_end_monotonic_ns": round(clock[0] * 1_000_000_000),
+            "api": "send_attitude_rate",
+            "outcome": "returned",
+            "wire": {
+                "type_mask": 128,
+                "body_rates_rad_s": [
+                    -command.roll_rate,
+                    -command.pitch_rate,
+                    -command.yaw_rate,
+                ],
+                "thrust": command.thrust,
+            },
+        }
+
+    async def advance(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        lambda: round(clock[0] * 1_000_000_000),
+    )
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", send)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    return runner, adapter, events, send_options
+
+
+@pytest.mark.parametrize(
+    ("image_command_sign", "expected_image_sign"),
+    ((1.0, 1), (-1.0, -1)),
+)
+def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
+    monkeypatch,
+    image_command_sign,
+    expected_image_sign,
+):
+    runner, adapter, events, send_options = _configured_yaw_sign_id(
+        monkeypatch,
+        image_command_sign=image_command_sign,
+        yaw_response_gain=2.0,
+    )
+
+    details = asyncio.run(runner._run_sign_id())
+    yaw = details["yaw_calibration"]
+
+    assert vq2_module.SIGN_ID_RATE_RAD_S == 0.08
+    assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 0.18
+    assert vq2_module.SIGN_ID_YAW_NEUTRAL_DURATION_S == 0.18
+    assert vq2_module.SIGN_ID_MIN_GYRO_SAMPLES == 3
+    assert vq2_module.SIGN_ID_MIN_YAW_GYRO_SAMPLES == 4
+    assert vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES == 4
+    assert vq2_module.SIGN_ID_MIN_IMAGE_EFFECT_PX_S == 15.0
+    assert vq2_module.SIGN_ID_MAX_POLARITY_GAIN_RATIO == 2.0
+    assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.05
+    assert vq2_module.SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S == 0.50
+    assert all(
+        option == {"require_wire_receipt": True}
+        for option in send_options
+    )
+    positive = [
+        command for command in adapter.commands
+        if command.yaw_rate == vq2_module.SIGN_ID_RATE_RAD_S
+    ]
+    negative = [
+        command for command in adapter.commands
+        if command.yaw_rate == -vq2_module.SIGN_ID_RATE_RAD_S
+    ]
+    assert positive and negative
+    assert all(
+        command.roll_rate == command.pitch_rate == 0.0
+        and command.thrust == vq2_module.SIGN_ID_THRUST
+        for command in (*positive, *negative)
+    )
+    assert yaw["yaw_identified"] is True
+    assert yaw["controller_to_body_sign"] == 1
+    assert yaw["controller_to_image_sign"] == expected_image_sign
+    assert yaw["gyro_rate_gain"] == pytest.approx(2.0)
+    assert math.copysign(
+        1.0,
+        yaw["image_rate_gain_px_per_command_rad"],
+    ) == expected_image_sign
+    assert yaw["positive"]["wire_yaw_rate_rad_s"] == -0.08
+    assert yaw["negative"]["wire_yaw_rate_rad_s"] == 0.08
+    assert (
+        yaw["positive"]["fresh_image_frame_count"]
+        >= vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES
+    )
+    assert (
+        yaw["negative"]["fresh_image_frame_count"]
+        >= vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES
+    )
+    terminals = [
+        payload
+        for event, payload in events
+        if event == "sign_id_yaw_terminal"
+    ]
+    assert terminals[-1]["success"] is True
+
+
+def test_sign_id_yaw_rejects_stationary_image_response(monkeypatch):
+    runner, _adapter, events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+        image_command_sign=0.0,
+        yaw_response_gain=2.0,
+    )
+
+    with pytest.raises(SafetyAbort, match="yaw image response"):
+        asyncio.run(runner._run_sign_id())
+
+    terminals = [
+        payload
+        for event, payload in events
+        if event == "sign_id_yaw_terminal"
+    ]
+    assert terminals[-1]["success"] is False
+
+
+def test_sign_id_yaw_reuses_attitude_excursion_guard(monkeypatch):
+    runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+        image_command_sign=1.0,
+        yaw_response_gain=4.5,
+    )
+
+    with pytest.raises(SafetyAbort, match="attitude excursion"):
+        asyncio.run(runner._run_sign_id())
 
 
 def test_delayed_pre_reset_clocks_cannot_unlock_go():
