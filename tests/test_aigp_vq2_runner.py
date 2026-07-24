@@ -428,6 +428,53 @@ def test_sustained_preshape_pitch_target_rejects_invalid_inputs(
         )
 
 
+def test_gate0_projected_area_uses_two_conservative_fresh_increments():
+    assert vq2_module.gate0_conservative_projected_area_scale(
+        [15.185625, 17.21125, 19.2365625]
+    ) == pytest.approx(21.261875)
+    assert vq2_module.gate0_conservative_projected_area_scale(
+        [12.146875, 13.4171875, 14.9428125]
+    ) == pytest.approx(16.213125)
+    clean_projection = vq2_module.gate0_conservative_projected_area_scale(
+        [13.4171875, 14.9428125, 16.1175]
+    )
+    assert clean_projection == pytest.approx(17.2921875)
+    assert clean_projection < 20.0
+    assert vq2_module.gate0_conservative_projected_area_scale(
+        [16.0, 18.0, 19.0]
+    ) == pytest.approx(20.0)
+    assert (
+        vq2_module.gate0_conservative_projected_area_scale(
+            [15.0, 15.0, 19.0]
+        )
+        is None
+    )
+    assert (
+        vq2_module.gate0_conservative_projected_area_scale(
+            [15.0, 17.0, 16.0]
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "samples",
+    (
+        None,
+        [1.0, 2.0],
+        [1.0, 2.0, 3.0, 4.0],
+        [1.0, True, 3.0],
+        [1.0, math.nan, 3.0],
+        [0.0, 1.0, 2.0],
+        [1.0e308, 1.4e308, 1.7e308],
+        [1, 2, 10**1000],
+    ),
+)
+def test_gate0_projected_area_rejects_unbounded_samples(samples):
+    with pytest.raises(ValueError, match="projected-area"):
+        vq2_module.gate0_conservative_projected_area_scale(samples)
+
+
 def test_gate_tracker_requires_temporal_continuity():
     tracker = GateTargetTracker()
     for frame_id in range(1, 4):
@@ -4354,12 +4401,20 @@ def _exercise_sustained_gate0_with_cue(
     entry_window_height_px=100,
     expected_abort_match=None,
     center_y_by_sample=None,
+    bbox_by_sample=None,
+    frame_id_by_sample=None,
+    sim_time_ns_by_sample=None,
+    received_s_by_sample=None,
+    generation_by_sample=None,
+    preshape_max_duration_s=0.20,
 ):
     class CommandsCaptured(Exception):
         pass
 
     document = controller_config_module.default_controller_config_mapping()
-    document["phase_timing"]["gate0_preshape_max_duration_s"] = 0.20
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = (
+        preshape_max_duration_s
+    )
     document["turn_cue"]["sustained_preshape_enabled"] = True
     document["turn_cue"]["exit_counterroll_enabled"] = False
     document["turn_cue"]["preturn_roll_cap_rad"] = 0.12
@@ -4484,23 +4539,43 @@ def _exercise_sustained_gate0_with_cue(
             )
         if authority_boundary_fault == "pass" and sample_count[0] == 7:
             adapter.race_status = RaceStatus(1100, 0, -1, 1, -1)
-        received_s = (
+        default_received_s = (
             clock[0] - vq2_module.MAX_VISION_AGE_S - 0.01
             if post_latch_fault == "stale"
             and sample_count[0] >= 7
             else clock[0]
         )
-        target = vq2_module.GateTarget(
-            frame_id=sample_count[0],
-            sim_time_ns=sample_count[0],
-            received_monotonic_s=received_s,
-            center_x=320,
-            center_y=(
-                180
-                if center_y_by_sample is None
-                else center_y_by_sample.get(sample_count[0], 180)
-            ),
-            bbox=(
+        received_s = (
+            default_received_s
+            if received_s_by_sample is None
+            else received_s_by_sample.get(
+                sample_count[0],
+                default_received_s,
+            )
+        )
+        frame_id = (
+            sample_count[0]
+            if frame_id_by_sample is None
+            else frame_id_by_sample.get(
+                sample_count[0],
+                sample_count[0],
+            )
+        )
+        sim_time_ns = (
+            sample_count[0]
+            if sim_time_ns_by_sample is None
+            else sim_time_ns_by_sample.get(
+                sample_count[0],
+                sample_count[0],
+            )
+        )
+        sample_bbox = (
+            bbox_by_sample[sample_count[0]]
+            if (
+                bbox_by_sample is not None
+                and sample_count[0] in bbox_by_sample
+            )
+            else (
                 (277, 132, 86, 96)
                 if sample_count[0] <= 3
                 else (
@@ -4517,7 +4592,19 @@ def _exercise_sustained_gate0_with_cue(
                         else (280, 128, 80, 104)
                     )
                 )
+            )
+        )
+        target = vq2_module.GateTarget(
+            frame_id=frame_id,
+            sim_time_ns=sim_time_ns,
+            received_monotonic_s=received_s,
+            center_x=320,
+            center_y=(
+                180
+                if center_y_by_sample is None
+                else center_y_by_sample.get(sample_count[0], 180)
             ),
+            bbox=sample_bbox,
             confidence=0.8,
         )
         runner.tracker.target = target
@@ -4535,7 +4622,11 @@ def _exercise_sustained_gate0_with_cue(
             and sample_count[0] >= 7
             else target
         )
-        runner._latest_detection_generation = 7
+        runner._latest_detection_generation = (
+            7
+            if generation_by_sample is None
+            else generation_by_sample.get(sample_count[0], 7)
+        )
         runner._latest_detection_frame_id = target.frame_id
         runner._latest_detection_frame_sim_ns = target.sim_time_ns
         runner._latest_detection_received_s = target.received_monotonic_s
@@ -4615,6 +4706,7 @@ def _exercise_sustained_gate0_with_cue(
             if (
                 post_latch_fault is None
                 and authority_boundary_fault is None
+                and expected_abort_match is None
                 and not entry_attitude_fault
                 and not pre_latch_rejection
                 and not (
@@ -5217,6 +5309,277 @@ def test_sustained_gate0_brake_ends_at_shared_deadline_from_turn_cue(
             "longitudinal_brake_end_reason"
         ]
         == "duration"
+    )
+
+
+def test_sustained_gate0_preshape_ends_on_conservative_fresh_area_projection(
+    monkeypatch,
+):
+    runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        bbox_by_sample={
+            7: (170, 20, 300, 320),
+            8: (148, 20, 344, 320),
+            9: (128, 20, 384, 320),
+        },
+    )
+
+    ends = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_ended"
+    ]
+    assert len(ends) == 1
+    end = ends[0]
+    assert end["reason"] == "projected_gate_area"
+    assert end["frame_id"] == 9
+    assert end["gate_area_scale"] == pytest.approx(19.2)
+    assert end["recent_gate_area_scales"] == pytest.approx(
+        [15.0, 17.2, 19.2]
+    )
+    recent_samples = end["recent_gate_area_samples"]
+    assert [sample["generation"] for sample in recent_samples] == [7, 7, 7]
+    assert [sample["frame_id"] for sample in recent_samples] == [7, 8, 9]
+    assert [sample["sim_time_ns"] for sample in recent_samples] == [7, 8, 9]
+    assert [
+        sample["gate_area_px"] for sample in recent_samples
+    ] == [96000, 110080, 122880]
+    assert [
+        sample["bbox_xywh_px"] for sample in recent_samples
+    ] == [
+        [170, 20, 300, 320],
+        [148, 20, 344, 320],
+        [128, 20, 384, 320],
+    ]
+    received_tokens = [
+        sample["received_monotonic_s"] for sample in recent_samples
+    ]
+    assert received_tokens[0] < received_tokens[1] < received_tokens[2]
+    assert end["projected_area_increments"] == pytest.approx([2.2, 2.0])
+    assert end["projected_next_gate_area_scale"] == pytest.approx(21.2)
+    assert end["effective_end_gate_area_scale"] == pytest.approx(20.0)
+    assert end["gate_area_scale"] < 20.0
+    assert runner._gate0_early_turn_summary is not None
+    assert (
+        runner._gate0_early_turn_summary["preshape_end_reason"]
+        == "projected_gate_area"
+    )
+    assert (
+        runner._gate0_early_turn_summary["recent_gate_area_samples"]
+        == recent_samples
+    )
+    end_event_index = next(
+        index
+        for index, (event, _payload) in enumerate(events)
+        if event == "gate0_preshape_ended"
+    )
+    exit_command_index = sum(
+        event == "tick"
+        for event, _payload in events[:end_event_index]
+    )
+    assert commands[exit_command_index].yaw_rate == 0.0
+    assert all(
+        command.yaw_rate == 0.0
+        for command in commands[exit_command_index:]
+    )
+    assert not any(
+        event == "course_line_sustained_preshape_applied"
+        and payload["frame_id"] == 9
+        for event, payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_objective"
+        and payload["frame_id"] == 9
+        for event, payload in events
+    )
+
+
+def test_sustained_gate0_projected_area_ignores_exact_duplicate_poll(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        duplicate_sample=8,
+        bbox_by_sample={
+            7: (170, 20, 300, 320),
+            9: (130, 20, 380, 320),
+        },
+        frame_id_by_sample={9: 8},
+        sim_time_ns_by_sample={9: 8},
+        preshape_max_duration_s=0.25,
+    )
+
+    ends = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_ended"
+    ]
+    assert len(ends) == 1
+    assert ends[0]["reason"] == "projected_gate_area"
+    assert ends[0]["frame_id"] == 8
+    assert [
+        sample["frame_id"]
+        for sample in ends[0]["recent_gate_area_samples"]
+    ] == [6, 7, 8]
+    assert ends[0]["recent_gate_area_scales"] == pytest.approx(
+        [1.3, 15.0, 19.0]
+    )
+
+
+def test_sustained_gate0_projected_area_resets_after_frame_gap(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        bbox_by_sample={
+            7: (170, 20, 300, 320),
+            8: (148, 20, 344, 320),
+            9: (128, 20, 384, 320),
+            10: (126, 20, 388, 320),
+        },
+        frame_id_by_sample={8: 9, 9: 10, 10: 11},
+    )
+
+    ends = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_ended"
+    ]
+    assert len(ends) == 1
+    assert ends[0]["reason"] == "duration"
+    assert [
+        sample["frame_id"]
+        for sample in ends[0]["recent_gate_area_samples"]
+    ] == [9, 10, 11]
+    assert ends[0]["recent_gate_area_scales"] == pytest.approx(
+        [17.2, 19.2, 19.4]
+    )
+    assert ends[0]["projected_next_gate_area_scale"] == pytest.approx(
+        19.6
+    )
+
+
+def test_sustained_gate0_projected_area_requires_two_later_positive_steps(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        bbox_by_sample={
+            7: (170, 20, 300, 320),
+            8: (180, 20, 280, 320),
+            9: (150, 20, 340, 320),
+            10: (135, 20, 370, 320),
+        },
+        preshape_max_duration_s=0.25,
+    )
+
+    ends = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_ended"
+    ]
+    assert len(ends) == 1
+    assert ends[0]["reason"] == "projected_gate_area"
+    assert ends[0]["frame_id"] == 10
+    assert ends[0]["recent_gate_area_scales"] == pytest.approx(
+        [14.0, 17.0, 18.5]
+    )
+    assert ends[0]["projected_area_increments"] == pytest.approx(
+        [3.0, 1.5]
+    )
+    assert ends[0]["projected_next_gate_area_scale"] == pytest.approx(
+        20.0
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "terminal_bbox",
+        "preshape_max_duration_s",
+        "expected_reason",
+        "expected_projection",
+    ),
+    (
+        ((128, 20, 384, 320), 0.15, "duration", 21.2),
+        ((120, 20, 400, 320), 0.25, "gate_area", 22.2),
+        ((0, 0, 512, 360), 0.25, "crossing_armed", 31.0),
+    ),
+)
+def test_sustained_gate0_projected_area_preserves_end_priority(
+    monkeypatch,
+    terminal_bbox,
+    preshape_max_duration_s,
+    expected_reason,
+    expected_projection,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        bbox_by_sample={
+            7: (170, 20, 300, 320),
+            8: (148, 20, 344, 320),
+            9: terminal_bbox,
+        },
+        preshape_max_duration_s=preshape_max_duration_s,
+    )
+
+    ends = [
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_ended"
+    ]
+    assert len(ends) == 1
+    assert ends[0]["reason"] == expected_reason
+    assert ends[0]["projected_next_gate_area_scale"] == pytest.approx(
+        expected_projection
+    )
+    assert ends[0]["effective_end_gate_area_scale"] == pytest.approx(
+        20.0
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "frame_id_by_sample",
+        "sim_time_ns_by_sample",
+        "received_s_by_sample",
+        "generation_by_sample",
+        "expected_abort_match",
+    ),
+    (
+        ({8: 6}, None, None, None, "proof token did not advance strictly"),
+        (None, {8: 6}, None, None, "proof token did not advance strictly"),
+        (None, None, {8: 0.25}, None, "proof token did not advance strictly"),
+        ({8: True}, None, None, None, "lacks an exact typed detection token"),
+        (
+            None,
+            None,
+            None,
+            {8: 8},
+            "vision generation changed inside the powered stage",
+        ),
+    ),
+)
+def test_sustained_gate0_projected_area_fails_closed_on_invalid_token(
+    monkeypatch,
+    frame_id_by_sample,
+    sim_time_ns_by_sample,
+    received_s_by_sample,
+    generation_by_sample,
+    expected_abort_match,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        frame_id_by_sample=frame_id_by_sample,
+        sim_time_ns_by_sample=sim_time_ns_by_sample,
+        received_s_by_sample=received_s_by_sample,
+        generation_by_sample=generation_by_sample,
+        expected_abort_match=expected_abort_match,
+    )
+
+    assert len(commands) == 7
+    assert not any(
+        event == "gate0_preshape_ended"
+        for event, _payload in events
     )
 
 

@@ -6249,6 +6249,48 @@ def gate0_sustained_preshape_pitch_target(
     return min(requested_target, relative_ceiling)
 
 
+def gate0_conservative_projected_area_scale(
+    area_scales: Sequence[float],
+) -> Optional[float]:
+    """Project one frame using only two consecutive proved area increments."""
+
+    if (
+        not isinstance(area_scales, Sequence)
+        or isinstance(area_scales, (str, bytes))
+        or len(area_scales) != 3
+        or any(type(value) not in {int, float} for value in area_scales)
+    ):
+        raise ValueError(
+            "Gate-0 projected-area samples must be three positive finite numbers"
+        )
+    try:
+        previous, latest, current = (
+            float(value) for value in area_scales
+        )
+    except (OverflowError, ValueError) as exc:
+        raise ValueError(
+            "Gate-0 projected-area samples must be three positive finite numbers"
+        ) from exc
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (previous, latest, current)
+        )
+        or any(value <= 0.0 for value in (previous, latest, current))
+    ):
+        raise ValueError(
+            "Gate-0 projected-area samples must be three positive finite numbers"
+        )
+    previous_increment = latest - previous
+    current_increment = current - latest
+    if previous_increment <= 0.0 or current_increment <= 0.0:
+        return None
+    projected = current + min(previous_increment, current_increment)
+    if not math.isfinite(projected):
+        raise ValueError("Gate-0 projected-area result must remain finite")
+    return projected
+
+
 def gate1_recenter_roll_target(
     normalized_x: float,
     normalized_x_rate_s: float,
@@ -10289,6 +10331,22 @@ class VQ2Runner:
         preshape_entry_pitch_rad: Optional[float] = None
         preshape_ended = False
         preshape_end_reason: Optional[str] = None
+        preshape_recent_area_samples: List[
+            Tuple[
+                int,
+                int,
+                int,
+                float,
+                int,
+                Tuple[int, int, int, int],
+                float,
+            ]
+        ] = []
+        preshape_projected_next_area_scale: Optional[float] = None
+        preshape_projected_area_increments: Optional[
+            Tuple[float, float]
+        ] = None
+        preshape_effective_end_area_scale: Optional[float] = None
         preshape_roll_brake_started_s: Optional[float] = None
         preshape_roll_brake_target_rad: Optional[float] = None
         preshape_roll_brake_command_count = 0
@@ -10421,6 +10479,33 @@ class VQ2Runner:
                     "end_gate_area_scale": current_area_scale,
                     "authority_elapsed_s": elapsed_preshape_s,
                     "longitudinal_brake_end_reason": reason,
+                    "recent_gate_area_scales": [
+                        sample[6]
+                        for sample in preshape_recent_area_samples
+                    ],
+                    "recent_gate_area_samples": [
+                        {
+                            "generation": sample[0],
+                            "frame_id": sample[1],
+                            "sim_time_ns": sample[2],
+                            "received_monotonic_s": sample[3],
+                            "gate_area_px": sample[4],
+                            "bbox_xywh_px": list(sample[5]),
+                            "gate_area_scale": sample[6],
+                        }
+                        for sample in preshape_recent_area_samples
+                    ],
+                    "projected_area_increments": (
+                        list(preshape_projected_area_increments)
+                        if preshape_projected_area_increments is not None
+                        else None
+                    ),
+                    "projected_next_gate_area_scale": (
+                        preshape_projected_next_area_scale
+                    ),
+                    "effective_end_gate_area_scale": (
+                        preshape_effective_end_area_scale
+                    ),
                 }
             )
             if preshape_roll_brake_started_s is not None:
@@ -10459,6 +10544,32 @@ class VQ2Runner:
                 elapsed_s=elapsed_s,
                 frame_id=current_target.frame_id,
                 gate_area_scale=current_area_scale,
+                recent_gate_area_scales=[
+                    sample[6] for sample in preshape_recent_area_samples
+                ],
+                recent_gate_area_samples=[
+                    {
+                        "generation": sample[0],
+                        "frame_id": sample[1],
+                        "sim_time_ns": sample[2],
+                        "received_monotonic_s": sample[3],
+                        "gate_area_px": sample[4],
+                        "bbox_xywh_px": list(sample[5]),
+                        "gate_area_scale": sample[6],
+                    }
+                    for sample in preshape_recent_area_samples
+                ],
+                projected_area_increments=(
+                    list(preshape_projected_area_increments)
+                    if preshape_projected_area_increments is not None
+                    else None
+                ),
+                projected_next_gate_area_scale=(
+                    preshape_projected_next_area_scale
+                ),
+                effective_end_gate_area_scale=(
+                    preshape_effective_end_area_scale
+                ),
                 reason=reason,
             )
             if longitudinal_brake_started_s is not None:
@@ -10655,14 +10766,14 @@ class VQ2Runner:
                 and type(self._latest_detection_received_s)
                 in {int, float}
                 and math.isfinite(
-                    float(self._latest_detection_received_s)
+                    self._latest_detection_received_s
                 )
             ):
                 current_detection_token = (
-                    int(self._latest_detection_generation),
-                    int(self._latest_detection_frame_id),
-                    int(self._latest_detection_frame_sim_ns),
-                    float(self._latest_detection_received_s),
+                    self._latest_detection_generation,
+                    self._latest_detection_frame_id,
+                    self._latest_detection_frame_sim_ns,
+                    self._latest_detection_received_s,
                 )
             current_course_line_proved = False
             new_target_frame = target.frame_id != last_target_frame
@@ -11180,10 +11291,94 @@ class VQ2Runner:
                         turn_cue.preshape_end_gate_area_scale,
                         GATE0_PRESHAPE_HARD_MAX_AREA_SCALE,
                     )
+                    preshape_effective_end_area_scale = (
+                        effective_end_area_scale
+                    )
                     current_area_scale = (
                         float(target.bbox_area)
                         / float(context.initial_gate_area)
                     )
+                    if current_detection_token is None:
+                        raise SafetyAbort(
+                            "Gate-0 projected-area proof lacks an exact "
+                            "typed detection token"
+                        )
+                    if (
+                        preshape_entry_generation is None
+                        or current_detection_token[0]
+                        != preshape_entry_generation
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 projected-area proof escaped its "
+                            "latched vision generation"
+                        )
+                    current_area_sample = (
+                        *current_detection_token,
+                        target.bbox_area,
+                        tuple(target.bbox),
+                        current_area_scale,
+                    )
+                    if not preshape_recent_area_samples:
+                        preshape_recent_area_samples = [
+                            current_area_sample
+                        ]
+                    elif (
+                        current_detection_token
+                        != preshape_recent_area_samples[-1][:4]
+                    ):
+                        previous_token = (
+                            preshape_recent_area_samples[-1][:4]
+                        )
+                        if (
+                            current_detection_token[0]
+                            != previous_token[0]
+                            or current_detection_token[1]
+                            <= previous_token[1]
+                            or current_detection_token[2]
+                            <= previous_token[2]
+                            or current_detection_token[3]
+                            <= previous_token[3]
+                        ):
+                            raise SafetyAbort(
+                                "Gate-0 projected-area proof token did "
+                                "not advance strictly"
+                            )
+                        if (
+                            current_detection_token[1]
+                            != previous_token[1] + 1
+                        ):
+                            preshape_recent_area_samples = [
+                                current_area_sample
+                            ]
+                        else:
+                            preshape_recent_area_samples.append(
+                                current_area_sample
+                            )
+                            preshape_recent_area_samples = (
+                                preshape_recent_area_samples[-3:]
+                            )
+                    preshape_projected_next_area_scale = None
+                    preshape_projected_area_increments = None
+                    if len(preshape_recent_area_samples) == 3:
+                        recent_scales = [
+                            sample[6]
+                            for sample in preshape_recent_area_samples
+                        ]
+                        preshape_projected_area_increments = (
+                            recent_scales[1] - recent_scales[0],
+                            recent_scales[2] - recent_scales[1],
+                        )
+                        try:
+                            preshape_projected_next_area_scale = (
+                                gate0_conservative_projected_area_scale(
+                                    recent_scales
+                                )
+                            )
+                        except ValueError as exc:
+                            raise SafetyAbort(
+                                "Gate-0 projected-area proof escaped "
+                                "its fixed numeric bounds"
+                            ) from exc
                     if crossing_armed:
                         preshape_end_reason = "crossing_armed"
                     elif (
@@ -11193,6 +11388,13 @@ class VQ2Runner:
                         preshape_end_reason = "duration"
                     elif current_area_scale >= effective_end_area_scale:
                         preshape_end_reason = "gate_area"
+                    elif (
+                        preshape_projected_next_area_scale is not None
+                        and current_area_scale
+                        < effective_end_area_scale
+                        <= preshape_projected_next_area_scale
+                    ):
+                        preshape_end_reason = "projected_gate_area"
                     if preshape_end_reason is not None:
                         finalize_sustained_preshape(
                             reason=preshape_end_reason,
