@@ -1682,54 +1682,6 @@ def test_course_recenter_rate_limit_preserves_zero_yaw_and_thrust():
     )
 
 
-@pytest.mark.parametrize(
-    ("elapsed_s", "bootstrap_thrust", "expected"),
-    (
-        (0.149, 0.26, 0.26),
-        (0.15, 0.32, 0.32),
-        (math.nextafter(0.45, 0.0), 0.32, 0.32),
-        (0.45, 0.29, 0.21),
-        (math.nextafter(0.45, math.inf), 0.29, 0.21),
-    ),
-)
-def test_visual_gate0_collective_preserves_launch_then_aligns(
-    elapsed_s,
-    bootstrap_thrust,
-    expected,
-):
-    assert vq2_module.visual_gate0_collective_thrust(
-        bootstrap_thrust=bootstrap_thrust,
-        visual_thrust=0.21,
-        elapsed_s=elapsed_s,
-        launch_hold_s=0.45,
-    ) == pytest.approx(expected)
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    (
-        ("bootstrap_thrust", True),
-        ("visual_thrust", 0.20),
-        ("elapsed_s", -1e-6),
-        ("launch_hold_s", math.nextafter(0.45, 0.0)),
-        ("launch_hold_s", 0.61),
-    ),
-)
-def test_visual_gate0_collective_rejects_unreviewed_inputs(
-    field,
-    value,
-):
-    kwargs = {
-        "bootstrap_thrust": 0.32,
-        "visual_thrust": 0.21,
-        "elapsed_s": 0.45,
-        "launch_hold_s": 0.45,
-    }
-    kwargs[field] = value
-    with pytest.raises(ValueError, match="collective"):
-        vq2_module.visual_gate0_collective_thrust(**kwargs)
-
-
 def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
     limited = vq2_module.course_recenter_rate_command(
         AttitudeRateCommand(0.20, -0.11, 0.0, 0.275),
@@ -3375,6 +3327,8 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     sample_count = [0]
     sent_commands = []
     confirmation_commands = []
+    bootstrap_attitude_targets = []
+    bootstrap_commands = []
     yaw_checks = []
     current_track_id = "current-track"
     next_track_id = "next-track"
@@ -3513,6 +3467,18 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
                 stream_id="vq2-camera",
             )
         )
+        if sample_count[0] in {2, 3}:
+            center_y = 170 if sample_count[0] == 2 else 150
+            runner.tracker.target = vq2_module.GateTarget(
+                frame_id=100 + sample_count[0],
+                sim_time_ns=100 + sample_count[0],
+                received_monotonic_s=clock[0],
+                center_x=320,
+                center_y=center_y,
+                bbox=(240, center_y - 60, 160, 120),
+                confidence=0.9,
+            )
+            runner.tracker.consecutive += 1
         if sample_count[0] == 5:
             runner.tracker.target = vq2_module.GateTarget(
                 frame_id=200,
@@ -3524,7 +3490,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
                 confidence=0.9,
             )
             runner.tracker.consecutive = 3
-        if sample_count[0] == 12:
+        if sample_count[0] == 7:
             adapter.race_status = RaceStatus(1250, 0, -1, 1, 123)
 
     async def send(command, **_kwargs):
@@ -3532,10 +3498,31 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         runner._last_flight_command_sent_s = clock[0]
 
     async def sleep(seconds):
-        clock[0] += max(float(seconds), 0.02)
+        minimum_step = 0.45 if clock[0] == 0.0 else 0.25
+        clock[0] += max(float(seconds), minimum_step)
 
     async def next_slot():
         return clock[0]
+
+    def checked_attitude_rate_command(
+        _estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        del target_roll_rad
+        bootstrap_attitude_targets.append(
+            (clock[0], target_pitch_rad, thrust)
+        )
+        command = AttitudeRateCommand(
+            roll_rate=0.18,
+            pitch_rate=-0.20,
+            yaw_rate=0.0,
+            thrust=thrust,
+        )
+        bootstrap_commands.append(command)
+        return command
 
     original_yaw_rate = vq2_module.visual_alignment_yaw_rate
 
@@ -3562,6 +3549,11 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         vq2_module,
         "visual_alignment_yaw_rate",
         checked_yaw_rate,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        checked_attitude_rate_command,
     )
     monkeypatch.setattr(runner, "_sample", sample)
     monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
@@ -3613,18 +3605,92 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     assert summary["withdrawal_reason"] == withdrawal_reason
     assert summary["launch_collective_hold_s"] == pytest.approx(0.45)
     assert summary["launch_boost_thrust"] == pytest.approx(0.32)
-    assert summary["collective_reduction_started_elapsed_s"] is None
+    assert summary["command_axis_authority"] == {
+        "yaw": "visual_next_track_blend",
+        "pitch": "bounded_visual_brake",
+        "roll_collective": "proved_gate0_bootstrap",
+    }
     visual_commands = sent_commands[: summary["command_count"]]
+    visual_attitude_targets = bootstrap_attitude_targets[
+        : summary["command_count"]
+    ]
     assert visual_commands
+    assert len(visual_attitude_targets) == len(visual_commands)
     assert all(
         abs(command.roll_rate)
-        <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+        <= vq2_module.MAX_COMMAND_RATE_RAD_S
         and abs(command.pitch_rate)
         <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
         and abs(command.yaw_rate)
         <= vq2_module.VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
-        and command.thrust == pytest.approx(0.26)
         for command in visual_commands
+    )
+    assert all(
+        command.roll_rate == bootstrap.roll_rate
+        and command.pitch_rate
+        == pytest.approx(
+            max(
+                -vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+                min(
+                    vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+                    bootstrap.pitch_rate,
+                ),
+            )
+        )
+        and command.thrust == bootstrap.thrust
+        for command, bootstrap in zip(
+            visual_commands,
+            bootstrap_commands[: summary["command_count"]],
+            strict=True,
+        )
+    )
+    assert all(
+        target_pitch
+        == pytest.approx(
+            max(
+                vq2_module.gate0_target_pitch_rad(
+                    -0.05,
+                    0.0,
+                    elapsed_s,
+                    blend_duration_s=0.80,
+                ),
+                0.03,
+            )
+        )
+        for elapsed_s, target_pitch, thrust in visual_attitude_targets
+    )
+    first_rate = 0.35 * ((170.0 - 180.0) / 0.45)
+    second_rate = (
+        0.65 * first_rate
+        + 0.35 * ((150.0 - 170.0) / 0.25)
+    )
+    assert [target[2] for target in visual_attitude_targets] == pytest.approx(
+        [
+            0.26,
+            vq2_module.gate_vertical_thrust(170.0, first_rate),
+            vq2_module.gate_vertical_thrust(150.0, second_rate),
+        ]
+    )
+    assert [command.thrust for command in visual_commands] == pytest.approx(
+        [target[2] for target in visual_attitude_targets]
+    )
+    boundary_and_later = [
+        (targets, command)
+        for targets, command in zip(
+            visual_attitude_targets,
+            visual_commands,
+            strict=True,
+        )
+        if targets[0] >= 0.45
+    ]
+    assert [targets[0] for targets, _command in boundary_and_later] == (
+        pytest.approx([0.45, 0.70])
+    )
+    assert all(
+        targets[1] == pytest.approx(0.03)
+        and targets[2] != pytest.approx(0.21)
+        and command.yaw_rate == pytest.approx(-0.02)
+        for targets, command in boundary_and_later
     )
     assert any(
         command.pitch_rate != 0.0 and command.yaw_rate != 0.0
@@ -3640,7 +3706,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         for sample, requested, _reference in yaw_checks
     )
     assert any(
-        sample >= 10 and requested == 0.0
+        sample >= 6 and requested == 0.0
         for sample, requested, _reference in yaw_checks
     )
     assert {reference for _sample, _requested, reference in yaw_checks} == {
@@ -6830,6 +6896,73 @@ def test_replay_writer_is_aborted_when_async_recorder_construction_fails(
     manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["complete"] is False
     assert "async replay recorder construction failed" in manifest["abort_reason"]
+
+
+def test_visual_alignment_replay_metadata_declares_phase_envelopes(
+    tmp_path,
+    monkeypatch,
+):
+    class ConstructorFailure:
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("vision constructor failed")
+
+    monkeypatch.setattr(
+        vq2_module,
+        "VQ2VisionThread",
+        ConstructorFailure,
+    )
+    bundle = tmp_path / "visual-alignment-envelope.vq2replay"
+    config = vq2_module.default_visual_config()
+
+    with pytest.raises(RuntimeError, match="vision constructor failed"):
+        asyncio.run(
+            vq2_module.run_live(
+                vq2_module.VISUAL_ALIGN_STAGE,
+                "udp://127.0.0.1:14550",
+                None,
+                replay_bundle=str(bundle),
+                recording_approved=True,
+                preflight_before_powered_stage=False,
+                write_diagnostic_pngs=False,
+                run_manifest_sha256="a" * 64,
+                candidate_commit="b" * 40,
+                expected_controller_config_sha256=(
+                    config.effective_config_sha256
+                ),
+            )
+        )
+
+    manifest = json.loads(
+        (bundle / "manifest.json").read_text(encoding="utf-8")
+    )
+    envelope = manifest["metadata"]["controller_envelope"]
+    assert envelope == vq2_module.replay_controller_envelope(
+        vq2_module.VISUAL_ALIGN_STAGE
+    )
+    assert envelope["max_roll_pitch_command_rate_rad_s"] == 0.25
+    assert envelope["max_thrust"] == 0.32
+    phases = envelope["phase_envelopes"]
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "axis_authority"
+    ] == {
+        "yaw": "visual_next_track_blend",
+        "pitch": "bounded_visual_brake",
+        "roll_collective": "proved_gate0_bootstrap",
+    }
+    assert phases["crossing_confirmation"] == {
+        "exact_zero_rate_zero_thrust": True,
+        "max_wait_s": 0.40,
+    }
+    assert phases["post_credit_fresh_frame_wait"] == {
+        "exact_zero_rate_zero_thrust": True,
+        "max_wait_s": 0.12,
+    }
+    assert phases["restricted_post_promotion_alignment"] == {
+        "max_roll_pitch_command_rate_rad_s": 0.12,
+        "yaw_rate_rad_s": 0.08,
+        "max_thrust": 0.30,
+        "hard_duration_s": 0.90,
+    }
 
 
 def test_jsonl_close_failure_still_invalidates_and_closes_replay():

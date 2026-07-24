@@ -104,7 +104,6 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_OBSERVATION_AGE_S,
     MAX_VISUAL_THRUST,
     MAX_VISUAL_YAW_RATE_RAD_S,
-    MIN_VISUAL_THRUST,
     VisualServoRefusal,
     VisualTarget,
 )
@@ -271,7 +270,6 @@ VISUAL_ALIGN_MAX_ENTRY_ATTITUDE_DELTA_RAD = 0.08
 VISUAL_ALIGN_MAX_BODY_RATE_RAD_S = 0.50
 VISUAL_ALIGN_MIN_THRUST = 0.21
 VISUAL_ALIGN_MAX_THRUST = 0.30
-VISUAL_GATE0_BLEND_THRUST_CAP = 0.29
 # Real build-3385 replay proves the stable next gate is occluded by Gate 0 for
 # 461.7 ms, then reappears with 0.034 normalized prediction residual and 0.549
 # bbox IoU.  Preserve identity across that bounded aperture occlusion without
@@ -6144,6 +6142,61 @@ def controller_config_evidence(
     }
 
 
+def replay_controller_envelope(stage: str) -> Dict[str, Any]:
+    """Return capture-level limits, with phase detail for visual alignment."""
+
+    if type(stage) is not str or stage not in LIVE_RUN_STAGES:
+        raise ValueError("replay controller envelope requires a live stage")
+    if stage == VISUAL_ALIGN_STAGE:
+        return {
+            "control_hz": CONTROL_HZ,
+            "max_roll_pitch_command_rate_rad_s": MAX_COMMAND_RATE_RAD_S,
+            "yaw_rate_rad_s": VISUAL_ALIGN_MAX_YAW_RATE_RAD_S,
+            "max_thrust": MAX_VISUAL_THRUST,
+            "hard_stage_duration_s": None,
+            "phase_envelopes": {
+                "gate0_visual_handoff_bootstrap": {
+                    "max_roll_pitch_command_rate_rad_s": (
+                        MAX_COMMAND_RATE_RAD_S
+                    ),
+                    "yaw_rate_rad_s": VISUAL_ALIGN_MAX_YAW_RATE_RAD_S,
+                    "max_thrust": MAX_VISUAL_THRUST,
+                    "hard_duration_s": GATE0_FLIGHT_TIMEOUT_S,
+                    "axis_authority": {
+                        "yaw": "visual_next_track_blend",
+                        "pitch": "bounded_visual_brake",
+                        "roll_collective": "proved_gate0_bootstrap",
+                    },
+                },
+                "crossing_confirmation": {
+                    "exact_zero_rate_zero_thrust": True,
+                    "max_wait_s": CROSSING_STATUS_TIMEOUT_S,
+                },
+                "post_credit_fresh_frame_wait": {
+                    "exact_zero_rate_zero_thrust": True,
+                    "max_wait_s": (
+                        VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S
+                    ),
+                },
+                "restricted_post_promotion_alignment": {
+                    "max_roll_pitch_command_rate_rad_s": (
+                        VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+                    ),
+                    "yaw_rate_rad_s": VISUAL_ALIGN_MAX_YAW_RATE_RAD_S,
+                    "max_thrust": VISUAL_ALIGN_MAX_THRUST,
+                    "hard_duration_s": VISUAL_ALIGN_HARD_DURATION_S,
+                },
+            },
+        }
+    return {
+        "control_hz": CONTROL_HZ,
+        "max_roll_pitch_command_rate_rad_s": MAX_COMMAND_RATE_RAD_S,
+        "yaw_rate_rad_s": 0.0,
+        "max_thrust": 0.35,
+        "hard_stage_duration_s": None,
+    }
+
+
 def clock_rolled_back(pre_value: int, current_value: int, margin: int) -> bool:
     """Whether a simulator clock is authoritatively below its prior epoch."""
 
@@ -7215,46 +7268,6 @@ def limit_command_rates(
     )
     validate_command(limited)
     return limited
-
-
-def visual_gate0_collective_thrust(
-    *,
-    bootstrap_thrust: float,
-    visual_thrust: float,
-    elapsed_s: float,
-    launch_hold_s: float,
-) -> float:
-    """Preserve proved launch collective, then admit visual reductions only."""
-
-    values = (
-        bootstrap_thrust,
-        visual_thrust,
-        elapsed_s,
-        launch_hold_s,
-    )
-    if not all(
-        type(value) in {int, float} and math.isfinite(float(value))
-        for value in values
-    ):
-        raise ValueError("visual Gate-0 collective inputs must be finite")
-    if (
-        not 0.21 <= float(bootstrap_thrust) <= 0.32
-        or not MIN_VISUAL_THRUST
-        <= float(visual_thrust)
-        <= MAX_VISUAL_THRUST
-        or float(elapsed_s) < 0.0
-        or not 0.45 <= float(launch_hold_s) <= 0.60
-    ):
-        raise ValueError(
-            "visual Gate-0 collective inputs are outside reviewed bounds"
-        )
-    if float(elapsed_s) < float(launch_hold_s):
-        return float(bootstrap_thrust)
-    return min(
-        float(bootstrap_thrust),
-        float(visual_thrust),
-        VISUAL_GATE0_BLEND_THRUST_CAP,
-    )
 
 
 def visual_alignment_yaw_rate(
@@ -11018,7 +11031,11 @@ class VQ2Runner:
                 "max_command_thrust": None,
                 "launch_collective_hold_s": float(boost_until_s),
                 "launch_boost_thrust": visual_launch_boost_thrust,
-                "collective_reduction_started_elapsed_s": None,
+                "command_axis_authority": {
+                    "yaw": "visual_next_track_blend",
+                    "pitch": "bounded_visual_brake",
+                    "roll_collective": "proved_gate0_bootstrap",
+                },
             }
         while True:
             now = time.monotonic()
@@ -11587,6 +11604,13 @@ class VQ2Runner:
                         "gate-0 visual blend proposal lost fresh no-advance "
                         "authority"
                     )
+                # The stable next identity supplies bounded heading and
+                # nonnegative braking-pitch authority.  Preserve the proved
+                # current-aperture roll and vertical collective: exact live
+                # evidence showed that replacing collective .319-.32 with
+                # .244-.262 exhausted Gate-1's top-edge margin, while the
+                # braking pitch reduced entry closure relative to the matched
+                # bootstrap trace.
                 target_pitch = max(
                     target_pitch,
                     min(
@@ -11594,32 +11618,6 @@ class VQ2Runner:
                         latest_visual_proposal.servo_output.target_pitch_rad,
                     ),
                 )
-                # Keep the proved launch collective intact while visual
-                # tracking, pitch, and yaw begin.  The first continuous-blend
-                # live trace showed that reducing .26/.32 to .213-.241 before
-                # this hashed boundary accumulated 18 pad contacts; a matched
-                # prior launch with the same visual pitch path and preserved
-                # collective had none.  After liftoff, the visual proposal
-                # owns only a reduction from the bootstrap collective.
-                thrust = visual_gate0_collective_thrust(
-                    bootstrap_thrust=thrust,
-                    visual_thrust=(
-                        latest_visual_proposal.servo_output.thrust
-                    ),
-                    elapsed_s=elapsed,
-                    launch_hold_s=float(boost_until_s),
-                )
-                if elapsed >= float(boost_until_s):
-                    assert self._visual_gate0_blend_summary is not None
-                    if (
-                        self._visual_gate0_blend_summary[
-                            "collective_reduction_started_elapsed_s"
-                        ]
-                        is None
-                    ):
-                        self._visual_gate0_blend_summary[
-                            "collective_reduction_started_elapsed_s"
-                        ] = elapsed
 
             # At close range the uncorrected contour center becomes unsafe if
             # the lower gate edge is clipped.  Abort before impact when the
@@ -11638,9 +11636,17 @@ class VQ2Runner:
                 thrust=thrust,
             )
             if visual_blend_active:
-                command = limit_command_rates(
-                    command,
-                    VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+                command = AttitudeRateCommand(
+                    roll_rate=command.roll_rate,
+                    pitch_rate=max(
+                        -VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+                        min(
+                            VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S,
+                            command.pitch_rate,
+                        ),
+                    ),
+                    yaw_rate=command.yaw_rate,
+                    thrust=command.thrust,
                 )
             local_yaw_rate = 0.0
             yaw_excursion = 0.0
@@ -15207,29 +15213,9 @@ async def run_live(
                             [[150, 50, 100], [180, 255, 255]],
                         ],
                     },
-                    "controller_envelope": {
-                        "control_hz": CONTROL_HZ,
-                        "max_roll_pitch_command_rate_rad_s": (
-                            VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
-                            if stage == VISUAL_ALIGN_STAGE
-                            else MAX_COMMAND_RATE_RAD_S
-                        ),
-                        "yaw_rate_rad_s": (
-                            VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
-                            if stage == VISUAL_ALIGN_STAGE
-                            else 0.0
-                        ),
-                        "max_thrust": (
-                            VISUAL_ALIGN_MAX_THRUST
-                            if stage == VISUAL_ALIGN_STAGE
-                            else 0.35
-                        ),
-                        "hard_stage_duration_s": (
-                            VISUAL_ALIGN_HARD_DURATION_S
-                            if stage == VISUAL_ALIGN_STAGE
-                            else None
-                        ),
-                    },
+                    "controller_envelope": replay_controller_envelope(
+                        stage
+                    ),
             },
             repo_root=repo_root,
         )

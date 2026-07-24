@@ -88,7 +88,7 @@ def test_post_promotion_entry_accepts_exact_code_owned_bounds():
     assert admission.horizontal_outward_rate_s == 0.25
     assert admission.vertical_outward_rate_down_s == 0.25
     assert admission.log_scale_rate_s == 0.85
-    assert admission.measured_pitch_rad == -0.02
+    assert admission.measured_pitch_rad == -0.06
     with pytest.raises(FrozenInstanceError):
         admission.horizontal_error = 0.0
 
@@ -154,7 +154,14 @@ def test_post_promotion_entry_accepts_exact_code_owned_bounds():
             "vertical motion",
         ),
         (_target(1, scale_rate=0.851), 0.0, "scale closure"),
-        (_target(1), -0.0201, "measured pitch"),
+        (
+            _target(1),
+            math.nextafter(
+                POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD,
+                -math.inf,
+            ),
+            "measured pitch",
+        ),
     ),
 )
 def test_post_promotion_entry_rejects_each_unsafe_bound(
@@ -217,6 +224,68 @@ def test_failed_live_trace_geometry_is_refused_before_first_authority():
         require_visual_alignment_entry(
             first_clipped_frame,
             measured_pitch_rad=-0.0514,
+        )
+
+
+@pytest.mark.parametrize(
+    "measured_pitch_rad",
+    (-0.0472571, -0.0447612),
+)
+def test_proved_gate0_handoff_pitch_is_admitted_when_geometry_is_safe(
+    measured_pitch_rad,
+):
+    admission = require_visual_alignment_entry(
+        _target(
+            180,
+            x=0.60,
+            y=-0.60,
+            x_rate=-0.10,
+            y_rate=0.10,
+            scale_rate=0.50,
+        ),
+        measured_pitch_rad=measured_pitch_rad,
+    )
+
+    assert admission.measured_pitch_rad == measured_pitch_rad
+
+
+def test_latest_live_entry_audits_every_admission_bound():
+    target = _target(
+        180,
+        x=0.64375,
+        y=-0.7333333333333333,
+        x_rate=0.349106,
+        y_rate=-0.293239,
+        vertical_censored=True,
+        scale_rate=0.542511,
+    )
+    measured_pitch_rad = -0.044761
+
+    assert abs(target.normalized_x) <= POST_PROMOTION_ENTRY_MAX_ABS_X_NORM
+    assert abs(target.normalized_y_down) > POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM
+    assert (
+        target.normalized_x_rate_s
+        > POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S
+    )
+    assert (
+        -target.normalized_y_rate_down_s
+        > POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S
+    )
+    assert (
+        target.log_scale_rate_s
+        <= POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S
+    )
+    assert (
+        measured_pitch_rad
+        >= POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD
+    )
+    with pytest.raises(
+        VisualAlignmentRefusal,
+        match="clipped or censored",
+    ):
+        require_visual_alignment_entry(
+            target,
+            measured_pitch_rad=measured_pitch_rad,
         )
 
 

@@ -28,7 +28,12 @@ POST_PROMOTION_ENTRY_MAX_ABS_X_NORM = 0.67
 POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM = 0.71
 POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S = 0.25
 POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S = 0.85
-POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD = -0.02
+# Two collision-free build-3385 Gate-0 passages reached post-credit zero
+# authority at -0.0473 and -0.0448 rad.  Admit that proved handoff with a
+# small fixed margin; the alignment stage still requires a nonnegative
+# braking target to be reachable inside its separate 0.08 rad entry-attitude
+# delta and 0.12 rad/s command-rate envelopes.
+POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD = -0.06
 
 
 class VisualAlignmentRefusal(ValueError):
