@@ -1685,19 +1685,19 @@ def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
 @pytest.mark.parametrize(
     ("normalized_x", "normalized_x_rate_s", "expected"),
     (
-        (0.25, 0.0, 0.03),
-        (0.25, 0.40, 0.03),
-        (-0.25, -0.40, -0.03),
-        (1.0, 0.0, 0.05),
-        (-1.0, 0.0, -0.05),
+        (0.25, 0.0, -0.03),
+        (0.25, 0.40, -0.03),
+        (-0.25, -0.40, 0.03),
+        (1.0, 0.0, -0.05),
+        (-1.0, 0.0, 0.05),
     ),
 )
-def test_gate1_recenter_roll_target_uses_positive_position_and_rate_sign(
+def test_gate1_recenter_roll_target_uses_live_corrected_position_sign(
     normalized_x,
     normalized_x_rate_s,
     expected,
 ):
-    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.12
+    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == -0.12
     assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
     assert vq2_module.gate1_recenter_roll_target(
@@ -1743,7 +1743,7 @@ def test_gate1_recenter_absolute_error_slope_uses_only_strict_fresh_times():
 
 def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_DURATION_S == 0.60
-    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == 0.12
+    assert vq2_module.GATE1_RECENTER_ROLL_GAIN == -0.12
     assert vq2_module.GATE1_RECENTER_ROLL_RATE_GAIN == 0.0
     assert vq2_module.GATE1_RECENTER_MAX_ROLL_RAD == 0.05
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
@@ -5239,6 +5239,7 @@ def test_gate1_recenter_powered_lifecycle_requires_criteria_and_cleanup(
 
     async def cleanup():
         calls.append(("cleanup",))
+        runner._gate1_recenter_summary = None
         return cleanup_confirmed
 
     monkeypatch.setattr(runner, "establish_reset_epoch", no_op)
@@ -5308,6 +5309,7 @@ def test_gate1_recenter_powered_lifecycle_persists_abort_summary(monkeypatch):
         raise SafetyAbort("injected bounded abort")
 
     async def cleanup():
+        runner._gate1_recenter_summary = None
         return True
 
     monkeypatch.setattr(runner, "establish_reset_epoch", no_op)

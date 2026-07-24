@@ -177,7 +177,7 @@ POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 # the authoritative replay/tracker-isolation prerequisite is accepted.
 GATE1_RECENTER_STAGE = "gate1-recenter"
 GATE1_RECENTER_DURATION_S = 0.60
-GATE1_RECENTER_ROLL_GAIN = 0.12
+GATE1_RECENTER_ROLL_GAIN = -0.12
 GATE1_RECENTER_ROLL_RATE_GAIN = 0.0
 GATE1_RECENTER_MAX_ROLL_RAD = 0.05
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
@@ -6104,7 +6104,7 @@ def gate1_recenter_roll_target(
     normalized_x: float,
     normalized_x_rate_s: float,
 ) -> float:
-    """Return the bounded positive-sign Gate 1 recenter roll target."""
+    """Return the live-corrected, bounded Gate 1 recenter roll target."""
 
     values = (normalized_x, normalized_x_rate_s)
     if (
@@ -11892,12 +11892,20 @@ class VQ2Runner:
                     stage=stage,
                     reason=boundary_reason,
                 )
+            recenter_summary_before_cleanup = (
+                dict(self._gate1_recenter_summary)
+                if (
+                    stage == GATE1_RECENTER_STAGE
+                    and self._gate1_recenter_summary is not None
+                )
+                else None
+            )
             cleanup_confirmed = await self.safe_cleanup()
             if (
                 stage == GATE1_RECENTER_STAGE
-                and self._gate1_recenter_summary is not None
+                and recenter_summary_before_cleanup is not None
             ):
-                recenter_summary = dict(self._gate1_recenter_summary)
+                recenter_summary = recenter_summary_before_cleanup
                 recenter_summary["cleanup_entry_gate_index"] = (
                     cleanup_entry_gate_index
                 )
