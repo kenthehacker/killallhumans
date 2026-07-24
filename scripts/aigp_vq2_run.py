@@ -104,6 +104,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_OBSERVATION_AGE_S,
     MAX_VISUAL_THRUST,
     MAX_VISUAL_YAW_RATE_RAD_S,
+    MIN_VISUAL_THRUST,
     VisualServoRefusal,
     VisualTarget,
 )
@@ -7216,6 +7217,46 @@ def limit_command_rates(
     return limited
 
 
+def visual_gate0_collective_thrust(
+    *,
+    bootstrap_thrust: float,
+    visual_thrust: float,
+    elapsed_s: float,
+    launch_hold_s: float,
+) -> float:
+    """Preserve proved launch collective, then admit visual reductions only."""
+
+    values = (
+        bootstrap_thrust,
+        visual_thrust,
+        elapsed_s,
+        launch_hold_s,
+    )
+    if not all(
+        type(value) in {int, float} and math.isfinite(float(value))
+        for value in values
+    ):
+        raise ValueError("visual Gate-0 collective inputs must be finite")
+    if (
+        not 0.21 <= float(bootstrap_thrust) <= 0.32
+        or not MIN_VISUAL_THRUST
+        <= float(visual_thrust)
+        <= MAX_VISUAL_THRUST
+        or float(elapsed_s) < 0.0
+        or not 0.45 <= float(launch_hold_s) <= 0.60
+    ):
+        raise ValueError(
+            "visual Gate-0 collective inputs are outside reviewed bounds"
+        )
+    if float(elapsed_s) < float(launch_hold_s):
+        return float(bootstrap_thrust)
+    return min(
+        float(bootstrap_thrust),
+        float(visual_thrust),
+        VISUAL_GATE0_BLEND_THRUST_CAP,
+    )
+
+
 def visual_alignment_yaw_rate(
     *,
     requested_rate_rad_s: float,
@@ -10831,13 +10872,30 @@ class VQ2Runner:
         roll_control = controller.roll_control
         yaw_control = controller.yaw_control
         forward_braking = controller.forward_braking
+        if type(visual_next_gate_blend) is not bool:
+            raise ValueError("gate-0 visual next-gate blend flag must be bool")
+        visual_lifecycle = self.visual_config.lifecycle
         if boost_until_s is None:
-            boost_until_s = phase_timing.gate0_boost_until_s
+            boost_until_s = (
+                visual_lifecycle.launch_boost_duration_s
+                if visual_next_gate_blend
+                else phase_timing.gate0_boost_until_s
+            )
+        visual_pitch_blend_s = (
+            visual_lifecycle.launch_pitch_blend_s
+            if visual_next_gate_blend
+            else phase_timing.gate0_pitch_blend_s
+        )
+        visual_launch_boost_thrust = (
+            float(visual_lifecycle.launch_boost_thrust)
+            if visual_next_gate_blend
+            else 0.32
+        )
         gate0_target_pitch_rad(
             context.spawn_pitch_rad,
             exit_pitch_rad,
             0.0,
-            blend_duration_s=phase_timing.gate0_pitch_blend_s,
+            blend_duration_s=visual_pitch_blend_s,
         )
         if (
             type(minimum_thrust) not in {int, float}
@@ -10851,14 +10909,21 @@ class VQ2Runner:
             or not 0.45 <= float(boost_until_s) <= 1.0
         ):
             raise ValueError("gate-0 boost duration is outside the validated envelope")
+        if (
+            visual_next_gate_blend
+            and float(boost_until_s)
+            != float(visual_lifecycle.launch_boost_duration_s)
+        ):
+            raise ValueError(
+                "visual gate-0 launch duration must match hashed lifecycle "
+                "configuration"
+            )
         if type(observe_course_line) is not bool:
             raise ValueError("gate-0 course-line observation flag must be bool")
         if type(course_line_preturn) is not bool:
             raise ValueError("gate-0 course-line preturn flag must be bool")
         if type(course_line_exit_counterroll_enabled) is not bool:
             raise ValueError("gate-0 course-line exit-counterroll flag must be bool")
-        if type(visual_next_gate_blend) is not bool:
-            raise ValueError("gate-0 visual next-gate blend flag must be bool")
         if course_line_exit_counterroll_enabled and not course_line_preturn:
             raise ValueError("gate-0 course-line exit counter-roll requires preturn")
         if visual_next_gate_blend and (
@@ -10951,6 +11016,9 @@ class VQ2Runner:
                 "latest_scale_rate_s": None,
                 "min_command_thrust": None,
                 "max_command_thrust": None,
+                "launch_collective_hold_s": float(boost_until_s),
+                "launch_boost_thrust": visual_launch_boost_thrust,
+                "collective_reduction_started_elapsed_s": None,
             }
         while True:
             now = time.monotonic()
@@ -10972,7 +11040,7 @@ class VQ2Runner:
                 context.spawn_pitch_rad,
                 exit_pitch_rad,
                 elapsed,
-                blend_duration_s=phase_timing.gate0_pitch_blend_s,
+                blend_duration_s=visual_pitch_blend_s,
             )
             normalized_x = (target.center_x - 320.0) / 320.0
             target_roll = gate0_centering_roll_target(
@@ -11486,7 +11554,7 @@ class VQ2Runner:
             if elapsed < 0.15:
                 thrust = 0.26
             elif elapsed < float(boost_until_s):
-                thrust = 0.32
+                thrust = visual_launch_boost_thrust
             else:
                 # Steer the camera ray through the opening center.  Image-rate
                 # damping brakes climb before positional error grows near the
@@ -11526,15 +11594,32 @@ class VQ2Runner:
                         latest_visual_proposal.servo_output.target_pitch_rad,
                     ),
                 )
-                # The visual proposal owns only a reduction from the proved
-                # Gate-0 bootstrap collective.  Honor its align/brake result
-                # so large or increasing current/next image error cannot keep
-                # the former fixed forward-closure thrust.
-                thrust = min(
-                    thrust,
-                    latest_visual_proposal.servo_output.thrust,
-                    VISUAL_GATE0_BLEND_THRUST_CAP,
+                # Keep the proved launch collective intact while visual
+                # tracking, pitch, and yaw begin.  The first continuous-blend
+                # live trace showed that reducing .26/.32 to .213-.241 before
+                # this hashed boundary accumulated 18 pad contacts; a matched
+                # prior launch with the same visual pitch path and preserved
+                # collective had none.  After liftoff, the visual proposal
+                # owns only a reduction from the bootstrap collective.
+                thrust = visual_gate0_collective_thrust(
+                    bootstrap_thrust=thrust,
+                    visual_thrust=(
+                        latest_visual_proposal.servo_output.thrust
+                    ),
+                    elapsed_s=elapsed,
+                    launch_hold_s=float(boost_until_s),
                 )
+                if elapsed >= float(boost_until_s):
+                    assert self._visual_gate0_blend_summary is not None
+                    if (
+                        self._visual_gate0_blend_summary[
+                            "collective_reduction_started_elapsed_s"
+                        ]
+                        is None
+                    ):
+                        self._visual_gate0_blend_summary[
+                            "collective_reduction_started_elapsed_s"
+                        ] = elapsed
 
             # At close range the uncorrected contour center becomes unsafe if
             # the lower gate edge is clipped.  Abort before impact when the

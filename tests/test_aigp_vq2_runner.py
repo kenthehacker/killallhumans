@@ -1682,6 +1682,54 @@ def test_course_recenter_rate_limit_preserves_zero_yaw_and_thrust():
     )
 
 
+@pytest.mark.parametrize(
+    ("elapsed_s", "bootstrap_thrust", "expected"),
+    (
+        (0.149, 0.26, 0.26),
+        (0.15, 0.32, 0.32),
+        (math.nextafter(0.45, 0.0), 0.32, 0.32),
+        (0.45, 0.29, 0.21),
+        (math.nextafter(0.45, math.inf), 0.29, 0.21),
+    ),
+)
+def test_visual_gate0_collective_preserves_launch_then_aligns(
+    elapsed_s,
+    bootstrap_thrust,
+    expected,
+):
+    assert vq2_module.visual_gate0_collective_thrust(
+        bootstrap_thrust=bootstrap_thrust,
+        visual_thrust=0.21,
+        elapsed_s=elapsed_s,
+        launch_hold_s=0.45,
+    ) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("bootstrap_thrust", True),
+        ("visual_thrust", 0.20),
+        ("elapsed_s", -1e-6),
+        ("launch_hold_s", math.nextafter(0.45, 0.0)),
+        ("launch_hold_s", 0.61),
+    ),
+)
+def test_visual_gate0_collective_rejects_unreviewed_inputs(
+    field,
+    value,
+):
+    kwargs = {
+        "bootstrap_thrust": 0.32,
+        "visual_thrust": 0.21,
+        "elapsed_s": 0.45,
+        "launch_hold_s": 0.45,
+    }
+    kwargs[field] = value
+    with pytest.raises(ValueError, match="collective"):
+        vq2_module.visual_gate0_collective_thrust(**kwargs)
+
+
 def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
     limited = vq2_module.course_recenter_rate_command(
         AttitudeRateCommand(0.20, -0.11, 0.0, 0.275),
@@ -3037,6 +3085,37 @@ def test_gate0_boost_duration_rejects_invalid_bounds_before_sampling(
     assert adapter.commands == []
 
 
+def test_visual_gate0_launch_duration_must_match_hashed_lifecycle(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        322,
+        174,
+        6400,
+        1000,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("launch-config drift reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="hashed lifecycle"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                boost_until_s=0.50,
+                visual_next_gate_blend=True,
+            )
+        )
+
+    assert adapter.commands == []
+
+
 @pytest.mark.parametrize(
     "crossing_hold_thrust",
     (True, math.nan, 0.20, 0.30),
@@ -3532,6 +3611,9 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     assert summary["command_count"] == 3
     assert summary["withdrawn_before_confirmation"] is True
     assert summary["withdrawal_reason"] == withdrawal_reason
+    assert summary["launch_collective_hold_s"] == pytest.approx(0.45)
+    assert summary["launch_boost_thrust"] == pytest.approx(0.32)
+    assert summary["collective_reduction_started_elapsed_s"] is None
     visual_commands = sent_commands[: summary["command_count"]]
     assert visual_commands
     assert all(
@@ -3541,7 +3623,11 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
         and abs(command.yaw_rate)
         <= vq2_module.VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
-        and command.thrust == pytest.approx(0.21)
+        and command.thrust == pytest.approx(0.26)
+        for command in visual_commands
+    )
+    assert any(
+        command.pitch_rate != 0.0 and command.yaw_rate != 0.0
         for command in visual_commands
     )
     assert confirmation_commands

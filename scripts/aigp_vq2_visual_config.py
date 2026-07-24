@@ -90,11 +90,11 @@ class VisualLifecycleTuning:
             3 <= self.required_improving_frames <= 6
         ):
             raise VisualConfigError("required improving frames are outside bounds")
-        if not 0.35 <= float(self.launch_boost_duration_s) <= 0.60:
+        if not 0.45 <= float(self.launch_boost_duration_s) <= 0.60:
             raise VisualConfigError("launch boost duration is outside bounds")
         if not 0.30 <= float(self.launch_boost_thrust) <= 0.32:
             raise VisualConfigError("launch boost thrust is outside bounds")
-        if not 0.70 <= float(self.launch_pitch_blend_s) <= 1.0:
+        if not 0.80 <= float(self.launch_pitch_blend_s) <= 1.0:
             raise VisualConfigError("launch pitch blend duration is outside bounds")
         if float(self.restricted_alignment_duration_s) >= (
             MAX_VISUAL_SEGMENT_DURATION_S

@@ -65,6 +65,8 @@ def test_config_hash_is_independent_of_json_key_order():
         (("lifecycle", "required_improving_frames"), 2),
         (("lifecycle", "restricted_alignment_duration_s"), 0.900001),
         (("lifecycle", "restricted_alignment_duration_s"), 2.0),
+        (("lifecycle", "launch_boost_duration_s"), 0.449999),
+        (("lifecycle", "launch_pitch_blend_s"), 0.799999),
     ],
 )
 def test_config_rejects_values_outside_reviewed_tuning_bounds(path, value):
