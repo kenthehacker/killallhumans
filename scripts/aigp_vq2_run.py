@@ -220,9 +220,7 @@ GATE1_RECENTER_MAX_ROLL_RAD = 0.12
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
 GATE1_RECENTER_THRUST = 0.275
 GATE1_RECENTER_TRANSITION_THRUST = GATE1_RECENTER_THRUST
-GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD = (
-    -POST_GATE_MAX_ATTITUDE_DELTA_RAD
-)
+GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD = 0.0
 GATE1_RECENTER_MIN_THRUST = 0.21
 GATE1_RECENTER_MAX_THRUST = 0.30
 GATE1_RECENTER_CORRIDOR_NORMALIZED_X = 0.35
@@ -6329,43 +6327,25 @@ def gate1_recenter_roll_target(
     )
 
 
-def gate1_vertical_recovery_pitch_target(
+def gate1_pass_pitch_hold_target(
     pass_pitch_basis_rad: float,
 ) -> float:
-    """Derive the frozen negative Gate-1 target from the proved pass pitch."""
+    """Hold the exact authoritative Gate-0 pass pitch during Gate-1 recenter."""
 
     if (
         type(pass_pitch_basis_rad) not in {int, float}
         or not math.isfinite(float(pass_pitch_basis_rad))
-    ):
-        raise ValueError(
-            "Gate-1 vertical-recovery pass pitch must be finite and numeric"
-        )
-    pass_pitch_basis_rad = float(pass_pitch_basis_rad)
-    target_pitch_rad = (
-        pass_pitch_basis_rad
-        + GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
-    )
-    if (
-        not (
-            GATE1_RECENTER_MIN_PITCH_RAD
-            <= target_pitch_rad
-            <= GATE1_RECENTER_MAX_PITCH_RAD
-        )
         or not (
             GATE1_RECENTER_MIN_PITCH_RAD
-            <= pass_pitch_basis_rad
+            <= float(pass_pitch_basis_rad)
             <= GATE1_RECENTER_MAX_PITCH_RAD
         )
-        or target_pitch_rad >= pass_pitch_basis_rad
-        or target_pitch_rad >= 0.0
-        or GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
-        != -POST_GATE_MAX_ATTITUDE_DELTA_RAD
+        or GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD != 0.0
     ):
         raise ValueError(
-            "Gate-1 vertical-recovery pitch target is outside frozen bounds"
+            "Gate-1 pass-pitch hold basis is outside frozen bounds"
         )
-    return target_pitch_rad
+    return float(pass_pitch_basis_rad)
 
 
 def course_line_turn_yaw_rate(
@@ -11907,8 +11887,8 @@ class VQ2Runner:
         """Collect a bounded view after a proved gate-0 pass.
 
         Passive observation has exact-zero attitude rates. The powered
-        recenter handoff preserves its exact transition thrust and advances
-        the existing bounded Gate-1 pitch objective. Once a fresh primary
+        recenter handoff preserves its exact transition thrust and holds the
+        authoritative Gate-0 pass pitch. Once a fresh primary
         Gate-1 target exists, it also advances the existing bounded recenter
         roll objective; yaw remains exact zero and no passage is supplied.
         """
@@ -11944,14 +11924,14 @@ class VQ2Runner:
         if powered_pitch_recovery:
             try:
                 pitch_recovery_target_pitch_rad = (
-                    gate1_vertical_recovery_pitch_target(
+                    gate1_pass_pitch_hold_target(
                         proof.pass_rpy_rad[1],
                     )
                 )
             except (IndexError, TypeError, ValueError) as exc:
                 raise SafetyAbort(
                     "gate-1 powered observation pitch target is outside "
-                    "its frozen negative envelope"
+                    "its exact pass-pitch hold envelope"
                 ) from exc
 
         race = self.adapter.race_status
@@ -12191,6 +12171,11 @@ class VQ2Runner:
             budget_s=hard_deadline - observation_started_s,
             hold_thrust=float(hold_thrust),
             pitch_recovery_enabled=powered_pitch_recovery,
+            pitch_objective_mode=(
+                "exact_pass_pitch_hold"
+                if powered_pitch_recovery
+                else "passive_zero_rates"
+            ),
             pitch_recovery_target_pitch_rad=(
                 pitch_recovery_target_pitch_rad
                 if powered_pitch_recovery
@@ -12291,6 +12276,15 @@ class VQ2Runner:
                     lateral_recovery_max_roll_rad,
                     float(roll),
                 )
+                if powered_pitch_recovery and not (
+                    GATE1_RECENTER_MIN_PITCH_RAD
+                    <= float(pitch)
+                    <= GATE1_RECENTER_MAX_PITCH_RAD
+                ):
+                    raise SafetyAbort(
+                        "powered observation pitch escaped its fixed "
+                        "Gate-1 envelope"
+                    )
                 if (
                     abs(roll - proof.pass_rpy_rad[0])
                     > POST_GATE_MAX_ATTITUDE_DELTA_RAD
@@ -12436,6 +12430,11 @@ class VQ2Runner:
                                 "hold_thrust": float(hold_thrust),
                                 "pitch_recovery_enabled": (
                                     powered_pitch_recovery
+                                ),
+                                "pitch_objective_mode": (
+                                    "exact_pass_pitch_hold"
+                                    if powered_pitch_recovery
+                                    else "passive_zero_rates"
                                 ),
                                 "pitch_recovery_target_pitch_rad": (
                                     pitch_recovery_target_pitch_rad
@@ -12588,6 +12587,15 @@ class VQ2Runner:
                         abs(float(value))
                         for value in self.estimate.body_rates
                     )
+                    if not (
+                        GATE1_RECENTER_MIN_PITCH_RAD
+                        <= float(send_pitch)
+                        <= GATE1_RECENTER_MAX_PITCH_RAD
+                    ):
+                        raise SafetyAbort(
+                            "powered observation pitch escaped its fixed "
+                            "Gate-1 envelope before send"
+                        )
                     if (
                         abs(float(send_roll) - proof.pass_rpy_rad[0])
                         > POST_GATE_MAX_ATTITUDE_DELTA_RAD
@@ -12657,10 +12665,11 @@ class VQ2Runner:
                 if powered_pitch_recovery:
                     pitch_recovery_command_count += 1
                     self.recorder.emit(
-                        "post_gate_pitch_recovery_command",
+                        "post_gate_pass_pitch_hold_command",
                         elapsed_s=(
                             send_checked_s - observation_started_s
                         ),
+                        pitch_objective_mode="exact_pass_pitch_hold",
                         target_pitch_rad=pitch_recovery_target_pitch_rad,
                         pass_pitch_basis_rad=float(
                             proof.pass_rpy_rad[1]
@@ -12753,13 +12762,13 @@ class VQ2Runner:
         ):
             raise SafetyAbort("gate-1 recenter lacks the proved three-frame handoff")
         try:
-            target_pitch_rad = gate1_vertical_recovery_pitch_target(
+            target_pitch_rad = gate1_pass_pitch_hold_target(
                 proof.pass_rpy_rad[1],
             )
         except (IndexError, TypeError, ValueError) as exc:
             raise SafetyAbort(
-                "gate-1 recenter pitch target is outside its frozen "
-                "negative envelope"
+                "gate-1 recenter pitch target is outside its exact "
+                "pass-pitch hold envelope"
             ) from exc
         handoff_frames = list(frames[-POST_GATE_REQUIRED_FRAMES:])
         handoff_tokens: List[Tuple[int, int, float]] = []
@@ -12855,6 +12864,7 @@ class VQ2Runner:
             "entry_normalized_x": entry_normalized_x,
             "target_pitch_rad": target_pitch_rad,
             "pass_pitch_basis_rad": float(proof.pass_rpy_rad[1]),
+            "pitch_objective_mode": "exact_pass_pitch_hold",
             "pass_to_target_pitch_delta_rad": (
                 GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
             ),
@@ -12937,13 +12947,13 @@ class VQ2Runner:
                 "gate-1 recenter entry attitude approached its bound"
             )
         if (
-            target_pitch_rad >= float(entry_pitch)
+            target_pitch_rad != pass_pitch_basis_rad
             or abs(target_pitch_rad - float(entry_pitch))
             > POST_GATE_MAX_ATTITUDE_DELTA_RAD
         ):
             raise SafetyAbort(
-                "gate-1 recenter entry cannot preserve the frozen "
-                "negative pitch objective"
+                "gate-1 recenter entry cannot preserve the exact "
+                "pass-pitch hold objective"
             )
         entry_abs_error_px = abs(entry_error_px)
         fresh_error_samples: List[Tuple[float, float]] = [
@@ -13050,6 +13060,7 @@ class VQ2Runner:
             "pass_to_target_pitch_delta_rad": (
                 GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
             ),
+            "pitch_objective_mode": "exact_pass_pitch_hold",
             "forward_thrust": forward_braking.gate1_forward_thrust,
             "requested_duration_s": (
                 phase_timing.gate1_recenter_duration_s
@@ -13204,6 +13215,7 @@ class VQ2Runner:
                 ),
                 "target_pitch_rad": target_pitch_rad,
                 "pass_pitch_basis_rad": pass_pitch_basis_rad,
+                "pitch_objective_mode": "exact_pass_pitch_hold",
                 "pass_to_target_pitch_delta_rad": (
                     GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
                 ),

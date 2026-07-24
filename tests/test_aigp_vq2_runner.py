@@ -1847,11 +1847,7 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
-    assert (
-        vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
-        == -vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD
-        == -math.radians(5.0)
-    )
+    assert vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD == 0.0
     assert vq2_module.GATE1_RECENTER_MIN_THRUST == 0.21
     assert vq2_module.GATE1_RECENTER_MAX_THRUST == 0.30
     assert vq2_module.GATE1_RECENTER_CORRIDOR_NORMALIZED_X == 0.35
@@ -1865,42 +1861,41 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX == 160
 
 
-def test_gate1_vertical_recovery_pitch_target_is_frozen_and_negative():
-    assert vq2_module.gate1_vertical_recovery_pitch_target(
-        -0.05,
-    ) == pytest.approx(-0.05 - math.radians(5.0))
-    assert vq2_module.gate1_vertical_recovery_pitch_target(
+@pytest.mark.parametrize(
+    "pass_pitch_basis_rad",
+    (
+        vq2_module.GATE1_RECENTER_MIN_PITCH_RAD,
         -0.07,
-    ) == pytest.approx(-0.07 - math.radians(5.0))
-    lower_boundary_basis = (
-        vq2_module.GATE1_RECENTER_MIN_PITCH_RAD
-        - vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+        0.0,
+        0.09,
+        vq2_module.GATE1_RECENTER_MAX_PITCH_RAD,
+    ),
+)
+def test_gate1_pass_pitch_hold_target_is_exact_and_frozen(
+    pass_pitch_basis_rad,
+):
+    assert (
+        vq2_module.gate1_pass_pitch_hold_target(pass_pitch_basis_rad)
+        == pass_pitch_basis_rad
     )
-    assert vq2_module.gate1_vertical_recovery_pitch_target(
-        lower_boundary_basis,
-    ) == pytest.approx(vq2_module.GATE1_RECENTER_MIN_PITCH_RAD)
 
 
 @pytest.mark.parametrize(
     "pass_pitch_basis_rad",
     (
-        (
-            vq2_module.GATE1_RECENTER_MIN_PITCH_RAD
-            - vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
-            - 1e-12
-        ),
-        -vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD,
-        0.09,
-        -0.20,
+        vq2_module.GATE1_RECENTER_MIN_PITCH_RAD - 1e-12,
+        vq2_module.GATE1_RECENTER_MAX_PITCH_RAD + 1e-12,
         math.nan,
+        math.inf,
         True,
+        "0",
     ),
 )
-def test_gate1_vertical_recovery_pitch_target_rejects_other_authority(
+def test_gate1_pass_pitch_hold_target_rejects_other_authority(
     pass_pitch_basis_rad,
 ):
     with pytest.raises(ValueError, match="pitch"):
-        vq2_module.gate1_vertical_recovery_pitch_target(
+        vq2_module.gate1_pass_pitch_hold_target(
             pass_pitch_basis_rad,
         )
 
@@ -2250,7 +2245,7 @@ def test_bounded_gate1_recenter_rejects_flat_top_edge_handoff_before_command(
     assert runner._gate1_recenter_summary is None
 
 
-def test_bounded_gate1_recenter_rejects_stacked_entry_pitch_authority(
+def test_bounded_gate1_recenter_rejects_out_of_bounds_pass_pitch(
     monkeypatch,
 ):
     runner, adapter, observation, _clock = _configure_gate1_recenter_candidate(
@@ -2260,12 +2255,16 @@ def test_bounded_gate1_recenter_rejects_stacked_entry_pitch_authority(
     assert proof is not None
     runner._gate0_transition_proof = replace(
         proof,
-        pass_rpy_rad=(0.0, -0.18, 0.0),
+        pass_rpy_rad=(
+            0.0,
+            vq2_module.GATE1_RECENTER_MIN_PITCH_RAD - 0.01,
+            0.0,
+        ),
     )
 
     with pytest.raises(
         SafetyAbort,
-        match="frozen negative envelope",
+        match="exact pass-pitch hold envelope",
     ):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
@@ -2469,7 +2468,7 @@ def test_gate1_yaw_envelope_soft_stops_then_aborts_strictly_over_bound():
         runner._gate1_yaw_envelope_state(phase="test")
 
 
-def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
+def test_offline_gate1_recenter_holds_pass_pitch_and_fixed_thrust(
     monkeypatch,
 ):
     runner, _adapter, observation, clock = _configure_gate1_recenter_candidate(
@@ -2503,23 +2502,25 @@ def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
     with pytest.raises(SafetyAbort):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
-    expected_target_pitch = (
-        -0.05
-        + vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
-    )
+    expected_target_pitch = -0.05
     assert observed
     assert all(
         objective["target_pitch_rad"] == expected_target_pitch
         and objective["thrust"] == 0.275
         for objective in observed
     )
-    assert all(command.pitch_rate < 0.0 for command in _adapter.commands)
+    assert all(
+        abs(command.pitch_rate)
+        <= runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
+        for command in _adapter.commands
+    )
     summary = runner._gate1_recenter_summary
     assert summary is not None
     assert summary["target_pitch_rad"] == pytest.approx(expected_target_pitch)
     assert summary["pass_pitch_basis_rad"] == pytest.approx(-0.05)
+    assert summary["pitch_objective_mode"] == "exact_pass_pitch_hold"
     assert summary["pass_to_target_pitch_delta_rad"] == pytest.approx(
-        -math.radians(5.0)
+        0.0
     )
     started = [
         fields for event, fields in events if event == "gate1_recenter_started"
@@ -2528,12 +2529,24 @@ def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
     assert started[0]["control_law"]["target_pitch_rad"] == pytest.approx(
         expected_target_pitch
     )
+    assert (
+        started[0]["control_law"]["pitch_objective_mode"]
+        == "exact_pass_pitch_hold"
+    )
     assert started[0]["control_law"][
         "pass_to_target_pitch_delta_rad"
-    ] == pytest.approx(-math.radians(5.0))
+    ] == pytest.approx(0.0)
 
 
-@pytest.mark.parametrize("pass_pitch_basis_rad", (0.09, False, "0"))
+@pytest.mark.parametrize(
+    "pass_pitch_basis_rad",
+    (
+        vq2_module.GATE1_RECENTER_MIN_PITCH_RAD - 1e-12,
+        vq2_module.GATE1_RECENTER_MAX_PITCH_RAD + 1e-12,
+        False,
+        "0",
+    ),
+)
 def test_bounded_gate1_recenter_rejects_invalid_derived_target_before_record_or_send(
     monkeypatch,
     pass_pitch_basis_rad,
@@ -2554,7 +2567,10 @@ def test_bounded_gate1_recenter_rejects_invalid_derived_target_before_record_or_
         lambda event, **fields: events.append((event, fields)),
     )
 
-    with pytest.raises(SafetyAbort, match="frozen negative envelope"):
+    with pytest.raises(
+        SafetyAbort,
+        match="exact pass-pitch hold envelope",
+    ):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
     assert adapter.commands == []
@@ -7772,7 +7788,7 @@ def _publish_observation_frame(runner, *, frame_id, clock, detection):
 
 
 @pytest.mark.parametrize("hold_thrust", (0.0, 0.275))
-def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
+def test_gate1_observation_requires_three_frames_and_bounded_powered_pass_hold(
     monkeypatch,
     hold_thrust,
 ):
@@ -7788,10 +7804,18 @@ def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
         clock=clock,
         controller_config=controller_config,
     )
+    if hold_thrust:
+        runner.estimate = _estimate(roll=0.01, pitch=-0.06)
     sample_count = [0]
     command_times = []
     watchdog_require_target = []
     events = []
+    pitch_objectives = []
+    original_attitude_rate_command = vq2_module.attitude_rate_command
+
+    def capture_attitude_objective(estimate, **kwargs):
+        pitch_objectives.append(dict(kwargs))
+        return original_attitude_rate_command(estimate, **kwargs)
 
     def fake_monotonic():
         return clock[0]
@@ -7822,6 +7846,11 @@ def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
     monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
     monkeypatch.setattr(adapter, "send_attitude_rate", recorded_send)
     monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        capture_attitude_objective,
+    )
+    monkeypatch.setattr(
         runner.recorder,
         "emit",
         lambda event, **fields: events.append((event, fields)),
@@ -7847,24 +7876,30 @@ def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
             for command in adapter.commands
         )
         assert result["pitch_recovery_enabled"] is False
+        assert result["pitch_objective_mode"] == "passive_zero_rates"
         assert result["pitch_recovery_command_count"] == 0
         assert result["lateral_recovery_enabled"] is False
         assert result["lateral_recovery_command_count"] == 0
+        assert pitch_objectives == []
     else:
         assert all(
             0.0 < command.roll_rate
             <= runner.controller_config.roll_control.command_rate_cap_rad_s
             and command.yaw_rate == 0.0
-            and -runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
-            <= command.pitch_rate
-            < 0.0
+            and 0.0 < command.pitch_rate
+            <= runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
             and command.thrust == hold_thrust
             for command in adapter.commands
         )
         assert result["pitch_recovery_enabled"] is True
-        expected_target_pitch = (
-            -0.05
-            + vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+        assert result["pitch_objective_mode"] == "exact_pass_pitch_hold"
+        proof = runner._gate0_transition_proof
+        assert proof is not None
+        expected_target_pitch = proof.pass_rpy_rad[1]
+        assert len(pitch_objectives) == 2
+        assert all(
+            objective["target_pitch_rad"] == expected_target_pitch
+            for objective in pitch_objectives
         )
         assert result["pitch_recovery_target_pitch_rad"] == pytest.approx(
             expected_target_pitch
@@ -7875,18 +7910,18 @@ def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
         assert result[
             "pitch_recovery_pass_to_target_pitch_delta_rad"
         ] == pytest.approx(
-            -math.radians(5.0)
+            0.0
         )
         assert result["pitch_recovery_command_count"] == 2
         assert result["pitch_recovery_min_pitch_rad"] == pytest.approx(
-            -0.05
+            -0.06
         )
         assert result["pitch_recovery_max_pitch_rad"] == pytest.approx(
             -0.05
         )
         assert result[
             "pitch_recovery_max_abs_pass_delta_rad"
-        ] == pytest.approx(0.0)
+        ] == pytest.approx(0.01)
         assert result["lateral_recovery_enabled"] is True
         assert result["lateral_recovery_command_count"] == 2
         assert result["lateral_recovery_error_gain"] == pytest.approx(
@@ -7911,16 +7946,18 @@ def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
     recovery_events = [
         fields
         for event, fields in events
-        if event == "post_gate_pitch_recovery_command"
+        if event == "post_gate_pass_pitch_hold_command"
     ]
     assert len(recovery_events) == (2 if hold_thrust else 0)
     assert all(
         event["target_pitch_rad"]
-        == pytest.approx(-0.05 - math.radians(5.0))
+        == pytest.approx(-0.05)
         and event["pass_pitch_basis_rad"] == pytest.approx(-0.05)
+        and event["pitch_objective_mode"] == "exact_pass_pitch_hold"
         and event["pass_to_target_pitch_delta_rad"]
-        == pytest.approx(-math.radians(5.0))
-        and event["command_pitch_rate_rad_s"] < 0.0
+        == pytest.approx(0.0)
+        and abs(event["command_pitch_rate_rad_s"])
+        <= runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
         and event["command_count"] == index
         for index, event in enumerate(recovery_events, start=1)
     )
@@ -8121,7 +8158,15 @@ def test_powered_gate1_observation_rejects_regressing_token_before_send(
     assert [event["frame_id"] for event in lateral_events] == [101, 102]
 
 
-@pytest.mark.parametrize("pass_pitch_basis_rad", (0.09, False, "0"))
+@pytest.mark.parametrize(
+    "pass_pitch_basis_rad",
+    (
+        vq2_module.GATE1_RECENTER_MIN_PITCH_RAD - 1e-12,
+        vq2_module.GATE1_RECENTER_MAX_PITCH_RAD + 1e-12,
+        False,
+        "0",
+    ),
+)
 def test_powered_gate1_observation_rejects_invalid_derived_target_before_record_or_send(
     monkeypatch,
     pass_pitch_basis_rad,
@@ -8141,7 +8186,10 @@ def test_powered_gate1_observation_rejects_invalid_derived_target_before_record_
         lambda event, **fields: events.append((event, fields)),
     )
 
-    with pytest.raises(SafetyAbort, match="frozen negative envelope"):
+    with pytest.raises(
+        SafetyAbort,
+        match="exact pass-pitch hold envelope",
+    ):
         asyncio.run(
             runner._observe_gate1(
                 details,
@@ -8206,6 +8254,70 @@ def test_powered_gate1_pitch_observation_checks_state_before_send(
         )
 
     assert adapter.commands == []
+
+
+@pytest.mark.parametrize("escape_phase", ("sample", "send"))
+def test_powered_gate1_observation_rejects_absolute_pitch_escape_at_each_guard(
+    monkeypatch,
+    escape_phase,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+    proof = runner._gate0_transition_proof
+    assert proof is not None
+    boundary_pitch = vq2_module.GATE1_RECENTER_MIN_PITCH_RAD
+    escaped_pitch = boundary_pitch - 0.001
+    runner._gate0_transition_proof = replace(
+        proof,
+        pass_rpy_rad=(0.01, boundary_pitch, 0.0),
+    )
+    runner.estimate = _estimate(roll=0.01, pitch=boundary_pitch)
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        _publish_observation_frame(
+            runner,
+            frame_id=101,
+            clock=clock,
+            detection=_detection(410, 138, 28, 45),
+        )
+        if escape_phase == "sample":
+            runner.estimate = _estimate(roll=0.01, pitch=escaped_pitch)
+
+    geometry_checks = [0]
+    original_geometry_check = runner._assert_gate1_no_passage_geometry
+
+    def checked_geometry(target, *, phase):
+        geometry_checks[0] += 1
+        original_geometry_check(target, phase=phase)
+        if escape_phase == "send" and geometry_checks[0] == 2:
+            runner.estimate = _estimate(roll=0.01, pitch=escaped_pitch)
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner,
+        "_assert_gate1_no_passage_geometry",
+        checked_geometry,
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="pitch escaped its fixed Gate-1 envelope",
+    ):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
+    assert geometry_checks[0] == (1 if escape_phase == "sample" else 2)
 
 
 @pytest.mark.parametrize(
