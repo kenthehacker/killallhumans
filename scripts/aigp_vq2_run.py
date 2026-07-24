@@ -205,6 +205,7 @@ COURSE_UNTRACKED_CONTACT_MIN_HEIGHT_PX = 120
 
 POST_GATE_OBSERVATION_TIMEOUT_S = 0.20
 POST_GATE_REQUIRED_FRAMES = 3
+POST_GATE_LATERAL_RECOVERY_MAX_COMMANDS = POST_GATE_REQUIRED_FRAMES - 1
 POST_GATE_MAX_ATTITUDE_DELTA_RAD = math.radians(5.0)
 POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S = 1.0
 POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
@@ -11907,8 +11908,9 @@ class VQ2Runner:
 
         Passive observation has exact-zero attitude rates. The powered
         recenter handoff preserves its exact transition thrust and advances
-        only the existing bounded Gate-1 pitch objective; roll and yaw remain
-        exact zero, and no target-dependent steering or passage is supplied.
+        the existing bounded Gate-1 pitch objective. Once a fresh primary
+        Gate-1 target exists, it also advances the existing bounded recenter
+        roll objective; yaw remains exact zero and no passage is supplied.
         """
 
         if (
@@ -11924,6 +11926,8 @@ class VQ2Runner:
         powered_pitch_recovery = bool(
             float(hold_thrust) == GATE1_RECENTER_TRANSITION_THRUST
         )
+        powered_lateral_recovery = powered_pitch_recovery
+        roll_control = self.controller_config.roll_control
         forward_braking = self.controller_config.forward_braking
         proof = self._gate0_transition_proof
         if proof is None or not gate0_details.get("gate_transition_proved"):
@@ -11960,27 +11964,185 @@ class VQ2Runner:
         watermark = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
         if watermark is None:
             raise SafetyAbort("camera unavailable at gate-1 observation handoff")
-        if int(watermark.generation) != proof.vision_generation:
+        if (
+            type(watermark.generation) is not int
+            or type(watermark.frame_id) is not int
+            or type(watermark.sim_time_ns) is not int
+            or type(watermark.received_monotonic_s)
+            not in {int, float}
+            or not math.isfinite(
+                float(watermark.received_monotonic_s)
+            )
+        ):
+            raise SafetyAbort(
+                "camera watermark lacks an exact typed frame token"
+            )
+        watermark_token = (
+            watermark.generation,
+            watermark.frame_id,
+            watermark.sim_time_ns,
+            watermark.received_monotonic_s,
+        )
+        if watermark.generation != proof.vision_generation:
             raise SafetyAbort("vision generation changed after gate-0 passage")
         if (
-            int(watermark.frame_id) < proof.vision_frame_id
-            or int(watermark.sim_time_ns) < proof.vision_sim_time_ns
-            or float(watermark.received_monotonic_s)
+            watermark.frame_id < proof.vision_frame_id
+            or watermark.sim_time_ns < proof.vision_sim_time_ns
+            or watermark.received_monotonic_s
             < proof.vision_received_monotonic_s
         ):
             raise SafetyAbort("camera snapshot regressed after gate-0 passage")
 
+        def powered_lateral_recovery_objective(
+            checked_s: float,
+        ) -> Optional[
+            Tuple[
+                GateTarget,
+                float,
+                float,
+                Tuple[int, int, int, float],
+            ]
+        ]:
+            current_target = self.tracker.target
+            if current_target is None:
+                return None
+            if (
+                lateral_recovery_command_count
+                >= POST_GATE_LATERAL_RECOVERY_MAX_COMMANDS
+            ):
+                return None
+            if (
+                current_target.composite
+                or self._latest_accepted_target is not current_target
+                or self.tracker.last_selection_mode != "primary"
+                or self.tracker.consecutive < 1
+            ):
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective lost "
+                    "exact primary tracker authority"
+                )
+            if (
+                type(self._latest_detection_generation) is not int
+                or type(self._latest_detection_frame_id) is not int
+                or type(self._latest_detection_frame_sim_ns) is not int
+                or type(self._latest_detection_received_s)
+                not in {int, float}
+                or type(current_target.frame_id) is not int
+                or type(current_target.sim_time_ns) is not int
+                or type(current_target.received_monotonic_s)
+                not in {int, float}
+                or type(current_target.center_x) is not int
+            ):
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective lacks "
+                    "an exact typed fresh-frame token"
+                )
+            if (
+                not math.isfinite(
+                    float(self._latest_detection_received_s)
+                )
+                or not math.isfinite(
+                    float(current_target.received_monotonic_s)
+                )
+            ):
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective has "
+                    "a non-finite fresh-frame token"
+                )
+            if (
+                self._latest_detection_generation
+                != int(watermark.generation)
+                or self._latest_detection_frame_id
+                != current_target.frame_id
+                or self._latest_detection_frame_sim_ns
+                != current_target.sim_time_ns
+                or self._latest_detection_received_s
+                != current_target.received_monotonic_s
+            ):
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective token "
+                    "does not match the primary target"
+                )
+            if current_target.age_s(checked_s) > MAX_VISION_AGE_S:
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective target "
+                    "is stale"
+                )
+            current_token = (
+                self._latest_detection_generation,
+                self._latest_detection_frame_id,
+                self._latest_detection_frame_sim_ns,
+                self._latest_detection_received_s,
+            )
+            if last_lateral_command_token is not None:
+                if current_token == last_lateral_command_token:
+                    return None
+                if (
+                    current_token[0] != last_lateral_command_token[0]
+                    or current_token[1] <= last_lateral_command_token[1]
+                    or current_token[2] <= last_lateral_command_token[2]
+                    or current_token[3] <= last_lateral_command_token[3]
+                ):
+                    raise SafetyAbort(
+                        "gate-1 powered observation lateral command token "
+                        "did not advance strictly"
+                    )
+            normalized_x = (
+                float(current_target.center_x) - 320.0
+            ) / 320.0
+            if abs(normalized_x) > 1.0:
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral error escaped "
+                    "the image envelope"
+                )
+            try:
+                target_roll_rad = gate1_recenter_roll_target(
+                    normalized_x,
+                    0.0,
+                    error_gain=roll_control.gate1_error_gain,
+                    error_rate_gain=roll_control.gate1_error_rate_gain,
+                    cap_rad=roll_control.gate1_target_cap_rad,
+                )
+            except ValueError as exc:
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective "
+                    "escaped its fixed envelope"
+                ) from exc
+            if (
+                not math.isfinite(target_roll_rad)
+                or abs(target_roll_rad)
+                > roll_control.gate1_target_cap_rad
+                or abs(target_roll_rad)
+                > GATE1_RECENTER_MAX_ROLL_RAD
+            ):
+                raise SafetyAbort(
+                    "gate-1 powered observation lateral objective "
+                    "escaped its fixed envelope"
+                )
+            self._assert_gate1_recenter_top_margin(
+                current_target,
+                phase="powered observation lateral command",
+            )
+            return (
+                current_target,
+                normalized_x,
+                target_roll_rad,
+                current_token,
+            )
+
         # Deliberately skip any frame that existed before the tracker reset.
         # The vision receiver and its generation remain untouched.
         self._last_frame_identity = (
-            int(watermark.generation),
-            int(watermark.frame_id),
+            watermark.generation,
+            watermark.frame_id,
         )
-        self._last_frame_sim_ns = int(watermark.sim_time_ns)
-        self._latest_detection_frame_id = int(watermark.frame_id)
-        self._latest_detection_frame_sim_ns = int(watermark.sim_time_ns)
-        self._latest_detection_generation = int(watermark.generation)
-        self._latest_detection_received_s = float(watermark.received_monotonic_s)
+        self._last_frame_sim_ns = watermark.sim_time_ns
+        self._latest_detection_frame_id = watermark.frame_id
+        self._latest_detection_frame_sim_ns = watermark.sim_time_ns
+        self._latest_detection_generation = watermark.generation
+        self._latest_detection_received_s = (
+            watermark.received_monotonic_s
+        )
         self._latest_raw_detections = []
         self.tracker.reset()
         self._latest_accepted_target = None
@@ -12009,16 +12171,18 @@ class VQ2Runner:
                 else observation_started_s
             ),
         )
-        last_processed_token = (
-            int(watermark.generation),
-            int(watermark.frame_id),
-            int(watermark.sim_time_ns),
-        )
+        last_processed_token = watermark_token
         qualifying_frames: List[Dict[str, Any]] = []
         strict_high_rate_samples = 0
         pitch_recovery_command_count = 0
         pitch_recovery_min_pitch_rad = float(proof.pass_rpy_rad[1])
         pitch_recovery_max_pitch_rad = float(proof.pass_rpy_rad[1])
+        lateral_recovery_command_count = 0
+        last_lateral_command_token: Optional[
+            Tuple[int, int, int, float]
+        ] = None
+        lateral_recovery_min_roll_rad = float(proof.pass_rpy_rad[0])
+        lateral_recovery_max_roll_rad = float(proof.pass_rpy_rad[0])
         self.recorder.emit(
             "post_gate_observation_started",
             pre_gate_race_boot_ms=proof.pre_gate_race_boot_ms,
@@ -12046,6 +12210,27 @@ class VQ2Runner:
                 forward_braking.pitch_command_rate_cap_rad_s
                 if powered_pitch_recovery
                 else 0.0
+            ),
+            lateral_recovery_enabled=powered_lateral_recovery,
+            lateral_recovery_error_gain=(
+                roll_control.gate1_error_gain
+                if powered_lateral_recovery
+                else 0.0
+            ),
+            lateral_recovery_target_cap_rad=(
+                roll_control.gate1_target_cap_rad
+                if powered_lateral_recovery
+                else 0.0
+            ),
+            lateral_recovery_rate_cap_rad_s=(
+                roll_control.command_rate_cap_rad_s
+                if powered_lateral_recovery
+                else 0.0
+            ),
+            lateral_recovery_max_command_count=(
+                POST_GATE_LATERAL_RECOVERY_MAX_COMMANDS
+                if powered_lateral_recovery
+                else 0
             ),
             watermark={
                 "generation": watermark.generation,
@@ -12098,6 +12283,14 @@ class VQ2Runner:
                     pitch_recovery_max_pitch_rad,
                     float(pitch),
                 )
+                lateral_recovery_min_roll_rad = min(
+                    lateral_recovery_min_roll_rad,
+                    float(roll),
+                )
+                lateral_recovery_max_roll_rad = max(
+                    lateral_recovery_max_roll_rad,
+                    float(roll),
+                )
                 if (
                     abs(roll - proof.pass_rpy_rad[0])
                     > POST_GATE_MAX_ATTITUDE_DELTA_RAD
@@ -12123,27 +12316,35 @@ class VQ2Runner:
                         "body rate exceeded 0.5rad/s for two gate-1 observation samples"
                     )
 
-                frame_token: Optional[Tuple[int, int, int]] = None
                 if (
-                    self._latest_detection_generation is not None
-                    and self._latest_detection_frame_id is not None
-                    and self._latest_detection_frame_sim_ns is not None
-                ):
-                    frame_token = (
-                        self._latest_detection_generation,
-                        self._latest_detection_frame_id,
-                        self._latest_detection_frame_sim_ns,
+                    type(self._latest_detection_generation) is not int
+                    or type(self._latest_detection_frame_id) is not int
+                    or type(self._latest_detection_frame_sim_ns) is not int
+                    or type(self._latest_detection_received_s)
+                    not in {int, float}
+                    or not math.isfinite(
+                        float(self._latest_detection_received_s)
                     )
-                if frame_token is not None and frame_token != last_processed_token:
-                    generation, frame_id, sim_time_ns = frame_token
-                    received_s = self._latest_detection_received_s
-                    if generation != int(watermark.generation):
+                ):
+                    raise SafetyAbort(
+                        "post-pass camera frame lacks an exact typed token"
+                    )
+                frame_token = (
+                    self._latest_detection_generation,
+                    self._latest_detection_frame_id,
+                    self._latest_detection_frame_sim_ns,
+                    self._latest_detection_received_s,
+                )
+                if frame_token != last_processed_token:
+                    generation, frame_id, sim_time_ns, received_s = (
+                        frame_token
+                    )
+                    if generation != watermark.generation:
                         raise SafetyAbort("vision generation changed during gate-1 observation")
                     if (
-                        frame_id <= int(watermark.frame_id)
-                        or sim_time_ns <= int(watermark.sim_time_ns)
-                        or received_s is None
-                        or received_s <= float(watermark.received_monotonic_s)
+                        frame_id <= last_processed_token[1]
+                        or sim_time_ns <= last_processed_token[2]
+                        or received_s <= last_processed_token[3]
                     ):
                         raise SafetyAbort("post-pass camera frame did not advance strictly")
                     last_processed_token = frame_token
@@ -12270,6 +12471,48 @@ class VQ2Runner:
                                         - float(proof.pass_rpy_rad[1])
                                     ),
                                 ),
+                                "lateral_recovery_enabled": (
+                                    powered_lateral_recovery
+                                ),
+                                "lateral_recovery_command_count": (
+                                    lateral_recovery_command_count
+                                ),
+                                "lateral_recovery_error_gain": (
+                                    roll_control.gate1_error_gain
+                                    if powered_lateral_recovery
+                                    else 0.0
+                                ),
+                                "lateral_recovery_target_cap_rad": (
+                                    roll_control.gate1_target_cap_rad
+                                    if powered_lateral_recovery
+                                    else 0.0
+                                ),
+                                "lateral_recovery_rate_cap_rad_s": (
+                                    roll_control.command_rate_cap_rad_s
+                                    if powered_lateral_recovery
+                                    else 0.0
+                                ),
+                                "lateral_recovery_max_command_count": (
+                                    POST_GATE_LATERAL_RECOVERY_MAX_COMMANDS
+                                    if powered_lateral_recovery
+                                    else 0
+                                ),
+                                "lateral_recovery_min_roll_rad": (
+                                    lateral_recovery_min_roll_rad
+                                ),
+                                "lateral_recovery_max_roll_rad": (
+                                    lateral_recovery_max_roll_rad
+                                ),
+                                "lateral_recovery_max_abs_pass_delta_rad": max(
+                                    abs(
+                                        lateral_recovery_min_roll_rad
+                                        - float(proof.pass_rpy_rad[0])
+                                    ),
+                                    abs(
+                                        lateral_recovery_max_roll_rad
+                                        - float(proof.pass_rpy_rad[0])
+                                    ),
+                                ),
                                 "handoff_center_y_delta_px": (
                                     int(
                                         qualifying_frames[-1][
@@ -12323,6 +12566,14 @@ class VQ2Runner:
                     0.0,
                     float(hold_thrust),
                 )
+                lateral_objective: Optional[
+                    Tuple[
+                        GateTarget,
+                        float,
+                        float,
+                        Tuple[int, int, int, float],
+                    ]
+                ] = None
                 if powered_pitch_recovery:
                     assert pitch_recovery_target_pitch_rad is not None
                     if self.estimate is None:
@@ -12347,30 +12598,53 @@ class VQ2Runner:
                     ):
                         raise SafetyAbort(
                             "powered observation state changed before "
-                            "pitch command"
+                            "pitch/lateral command"
                         )
-                    pitch_objective = attitude_rate_command(
+                    if powered_lateral_recovery:
+                        lateral_objective = (
+                            powered_lateral_recovery_objective(
+                                send_checked_s,
+                            )
+                        )
+                    target_roll_rad = float(send_roll)
+                    if lateral_objective is not None:
+                        target_roll_rad = lateral_objective[2]
+                    attitude_objective = attitude_rate_command(
                         self.estimate,
-                        target_roll_rad=float(send_roll),
+                        target_roll_rad=target_roll_rad,
                         target_pitch_rad=pitch_recovery_target_pitch_rad,
                         thrust=float(hold_thrust),
                     )
+                    roll_rate = 0.0
+                    if lateral_objective is not None:
+                        roll_rate = max(
+                            -roll_control.command_rate_cap_rad_s,
+                            min(
+                                roll_control.command_rate_cap_rad_s,
+                                attitude_objective.roll_rate,
+                            ),
+                        )
                     pitch_rate = max(
                         -forward_braking.pitch_command_rate_cap_rad_s,
                         min(
                             forward_braking.pitch_command_rate_cap_rad_s,
-                            pitch_objective.pitch_rate,
+                            attitude_objective.pitch_rate,
                         ),
                     )
                     transition_command = AttitudeRateCommand(
-                        0.0,
+                        roll_rate,
                         pitch_rate,
                         0.0,
                         float(hold_thrust),
                     )
                 validate_command(transition_command)
                 if (
-                    transition_command.roll_rate != 0.0
+                    abs(transition_command.roll_rate)
+                    > (
+                        roll_control.command_rate_cap_rad_s
+                        if powered_lateral_recovery
+                        else 0.0
+                    )
                     or transition_command.yaw_rate != 0.0
                     or abs(transition_command.pitch_rate)
                     > forward_braking.pitch_command_rate_cap_rad_s
@@ -12402,6 +12676,43 @@ class VQ2Runner:
                             transition_command.pitch_rate
                         ),
                         command_count=pitch_recovery_command_count,
+                    )
+                if lateral_objective is not None:
+                    (
+                        lateral_target,
+                        lateral_normalized_x,
+                        lateral_target_roll_rad,
+                        lateral_command_token,
+                    ) = lateral_objective
+                    last_lateral_command_token = lateral_command_token
+                    lateral_recovery_command_count += 1
+                    self.recorder.emit(
+                        "post_gate_lateral_recovery_command",
+                        elapsed_s=(
+                            send_checked_s - observation_started_s
+                        ),
+                        vision_generation=int(watermark.generation),
+                        frame_id=lateral_target.frame_id,
+                        sim_time_ns=lateral_target.sim_time_ns,
+                        received_monotonic_s=(
+                            lateral_target.received_monotonic_s
+                        ),
+                        normalized_x=lateral_normalized_x,
+                        target_roll_rad=lateral_target_roll_rad,
+                        target_roll_cap_rad=(
+                            roll_control.gate1_target_cap_rad
+                        ),
+                        measured_roll_rad=float(send_roll),
+                        measured_roll_rate_rad_s=float(
+                            self.estimate.body_rates[0]
+                        ),
+                        command_roll_rate_rad_s=(
+                            transition_command.roll_rate
+                        ),
+                        command_rate_cap_rad_s=(
+                            roll_control.command_rate_cap_rad_s
+                        ),
+                        command_count=lateral_recovery_command_count,
                     )
                 self._record_tick(
                     "gate0-observe/post-pass",

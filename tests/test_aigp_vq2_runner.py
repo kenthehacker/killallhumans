@@ -7703,7 +7703,12 @@ def test_gate0_confirmation_uses_configured_hold_then_new_race_packet(
     assert False in watchdog_target_requirements
 
 
-def _configure_gate1_observer(*, clock, crossing_started_s=9.70):
+def _configure_gate1_observer(
+    *,
+    clock,
+    crossing_started_s=9.70,
+    controller_config=None,
+):
     adapter = _FakeAdapter()
     adapter.is_armed = True
     adapter.race_status = RaceStatus(
@@ -7720,7 +7725,11 @@ def _configure_gate1_observer(*, clock, crossing_started_s=9.70):
         received_monotonic_s=9.99,
         generation=4,
     )
-    runner = VQ2Runner(adapter, vision)
+    runner = VQ2Runner(
+        adapter,
+        vision,
+        controller_config=controller_config,
+    )
     runner.estimate = _estimate(roll=0.01, pitch=-0.05)
     runner._last_flight_command = vq2_module.AttitudeRateCommand(
         0.0, 0.0, 0.0, 0.0
@@ -7763,12 +7772,22 @@ def _publish_observation_frame(runner, *, frame_id, clock, detection):
 
 
 @pytest.mark.parametrize("hold_thrust", (0.0, 0.275))
-def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
+def test_gate1_observation_requires_three_frames_and_bounded_powered_recovery(
     monkeypatch,
     hold_thrust,
 ):
     clock = [10.0]
-    runner, adapter, vision, details = _configure_gate1_observer(clock=clock)
+    document = controller_config_module.default_controller_config_mapping()
+    document["roll_control"]["gate1_error_gain"] = 0.12
+    document["roll_control"]["gate1_error_rate_gain"] = 0.025
+    document["roll_control"]["gate1_target_cap_rad"] = 0.05
+    controller_config = controller_config_module.validate_controller_config(
+        document
+    )
+    runner, adapter, vision, details = _configure_gate1_observer(
+        clock=clock,
+        controller_config=controller_config,
+    )
     sample_count = [0]
     command_times = []
     watchdog_require_target = []
@@ -7829,9 +7848,13 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
         )
         assert result["pitch_recovery_enabled"] is False
         assert result["pitch_recovery_command_count"] == 0
+        assert result["lateral_recovery_enabled"] is False
+        assert result["lateral_recovery_command_count"] == 0
     else:
         assert all(
-            command.roll_rate == command.yaw_rate == 0.0
+            0.0 < command.roll_rate
+            <= runner.controller_config.roll_control.command_rate_cap_rad_s
+            and command.yaw_rate == 0.0
             and -runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
             <= command.pitch_rate
             < 0.0
@@ -7864,6 +7887,27 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
         assert result[
             "pitch_recovery_max_abs_pass_delta_rad"
         ] == pytest.approx(0.0)
+        assert result["lateral_recovery_enabled"] is True
+        assert result["lateral_recovery_command_count"] == 2
+        assert result["lateral_recovery_error_gain"] == pytest.approx(
+            runner.controller_config.roll_control.gate1_error_gain
+        )
+        assert result["lateral_recovery_target_cap_rad"] == pytest.approx(
+            runner.controller_config.roll_control.gate1_target_cap_rad
+        )
+        assert result["lateral_recovery_rate_cap_rad_s"] == pytest.approx(
+            runner.controller_config.roll_control.command_rate_cap_rad_s
+        )
+        assert result["lateral_recovery_max_command_count"] == 2
+        assert result["lateral_recovery_min_roll_rad"] == pytest.approx(
+            0.01
+        )
+        assert result["lateral_recovery_max_roll_rad"] == pytest.approx(
+            0.01
+        )
+        assert result[
+            "lateral_recovery_max_abs_pass_delta_rad"
+        ] == pytest.approx(0.0)
     recovery_events = [
         fields
         for event, fields in events
@@ -7880,6 +7924,28 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
         and event["command_count"] == index
         for index, event in enumerate(recovery_events, start=1)
     )
+    lateral_events = [
+        fields
+        for event, fields in events
+        if event == "post_gate_lateral_recovery_command"
+    ]
+    assert len(lateral_events) == (2 if hold_thrust else 0)
+    assert all(
+        event["vision_generation"] == 4
+        and event["frame_id"] == 100 + index
+        and event["sim_time_ns"] == (100 + index) * 10
+        and event["normalized_x"] > 0.0
+        and 0.0 < event["target_roll_rad"]
+        <= runner.controller_config.roll_control.gate1_target_cap_rad
+        and event["target_roll_cap_rad"]
+        == runner.controller_config.roll_control.gate1_target_cap_rad
+        and event["measured_roll_rad"] == pytest.approx(0.01)
+        and event["command_roll_rate_rad_s"] > 0.0
+        and event["command_rate_cap_rad_s"]
+        == runner.controller_config.roll_control.command_rate_cap_rad_s
+        and event["command_count"] == index
+        for index, event in enumerate(lateral_events, start=1)
+    )
     assert all(
         later - earlier >= vq2_module.CONTROL_PERIOD_S - 1e-12
         for earlier, later in zip(command_times, command_times[1:])
@@ -7887,6 +7953,172 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     assert watchdog_require_target == [False] * 6
     assert vision.reset_calls == 0
     assert vision.is_running is False
+
+
+def test_powered_gate1_lateral_observation_uses_each_fresh_token_once(
+    monkeypatch,
+):
+    clock = [10.0]
+    document = controller_config_module.default_controller_config_mapping()
+    document["roll_control"]["gate1_error_gain"] = 0.12
+    document["roll_control"]["gate1_error_rate_gain"] = 0.025
+    document["roll_control"]["gate1_target_cap_rad"] = 0.05
+    config = controller_config_module.validate_controller_config(document)
+    runner, adapter, _vision, details = _configure_gate1_observer(
+        clock=clock,
+        controller_config=config,
+    )
+    sample_count = [0]
+    events = []
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        sample_count[0] += 1
+        if sample_count[0] == 2:
+            return
+        frame_id = (
+            101
+            if sample_count[0] == 1
+            else sample_count[0] + 99
+        )
+        _publish_observation_frame(
+            runner,
+            frame_id=frame_id,
+            clock=clock,
+            detection=_detection(409 + frame_id - 100, 138, 28, 45),
+        )
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    result = asyncio.run(
+        runner._observe_gate1(
+            details,
+            hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+        )
+    )
+
+    assert result["lateral_recovery_command_count"] == 2
+    assert (
+        result["lateral_recovery_max_command_count"]
+        == vq2_module.POST_GATE_LATERAL_RECOVERY_MAX_COMMANDS
+        == 2
+    )
+    assert len(adapter.commands) == 3
+    assert adapter.commands[0].roll_rate > 0.0
+    assert adapter.commands[1].roll_rate == 0.0
+    assert adapter.commands[2].roll_rate > 0.0
+    lateral_events = [
+        fields
+        for event, fields in events
+        if event == "post_gate_lateral_recovery_command"
+    ]
+    assert [event["frame_id"] for event in lateral_events] == [101, 102]
+    assert [event["command_count"] for event in lateral_events] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("token_fault", "expected_abort_match"),
+    (
+        ("frame", "did not advance strictly"),
+        ("sim_time", "did not advance strictly"),
+        ("receipt", "did not advance strictly"),
+        ("malformed", "lacks an exact typed token"),
+        ("generation", "vision generation changed"),
+    ),
+)
+def test_powered_gate1_observation_rejects_regressing_token_before_send(
+    monkeypatch,
+    token_fault,
+    expected_abort_match,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+    sample_count = [0]
+    second_target = [None]
+    events = []
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        sample_count[0] += 1
+        if sample_count[0] <= 2:
+            frame_id = 100 + sample_count[0]
+            _publish_observation_frame(
+                runner,
+                frame_id=frame_id,
+                clock=clock,
+                detection=_detection(409 + sample_count[0], 138, 28, 45),
+            )
+            if sample_count[0] == 2:
+                second_target[0] = runner.tracker.target
+            return
+        assert second_target[0] is not None
+        target = vq2_module.GateTarget(
+            frame_id=(True if token_fault == "malformed" else (
+                101 if token_fault == "frame" else 103
+            )),
+            sim_time_ns=(
+                1_015 if token_fault == "sim_time" else 1_030
+            ),
+            received_monotonic_s=(
+                second_target[0].received_monotonic_s
+                if token_fault == "receipt"
+                else clock[0]
+            ),
+            center_x=426,
+            center_y=160,
+            bbox=(412, 138, 28, 45),
+            confidence=0.8,
+        )
+        runner.tracker.target = target
+        runner.tracker.consecutive = 3
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = target
+        runner._latest_detection_generation = (
+            5 if token_fault == "generation" else 4
+        )
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = (
+            target.received_monotonic_s
+        )
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    with pytest.raises(SafetyAbort, match=expected_abort_match):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert len(adapter.commands) == 2
+    lateral_events = [
+        fields
+        for event, fields in events
+        if event == "post_gate_lateral_recovery_command"
+    ]
+    assert [event["frame_id"] for event in lateral_events] == [101, 102]
 
 
 @pytest.mark.parametrize("pass_pitch_basis_rad", (0.09, False, "0"))
@@ -7966,6 +8198,150 @@ def test_powered_gate1_pitch_observation_checks_state_before_send(
     monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
 
     with pytest.raises(SafetyAbort, match=match):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    ("authority_fault", "expected_abort_match"),
+    (
+        ("identity", "exact primary tracker authority"),
+        ("selection_mode", "exact primary tracker authority"),
+        ("frame_metadata", "token does not match"),
+        ("composite", "exact primary tracker authority"),
+    ),
+)
+def test_powered_gate1_lateral_observation_requires_exact_primary_authority(
+    monkeypatch,
+    authority_fault,
+    expected_abort_match,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        _publish_observation_frame(
+            runner,
+            frame_id=101,
+            clock=clock,
+            detection=_detection(410, 138, 28, 45),
+        )
+        target = runner.tracker.target
+        assert target is not None
+        if authority_fault == "identity":
+            runner._latest_accepted_target = replace(target)
+        elif authority_fault == "selection_mode":
+            runner.tracker.last_selection_mode = "tracked_edge_continuation"
+        elif authority_fault == "frame_metadata":
+            runner._latest_detection_frame_id = target.frame_id + 1
+        else:
+            composite = replace(target, composite=True)
+            runner.tracker.target = composite
+            runner._latest_accepted_target = composite
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+
+    with pytest.raises(
+        SafetyAbort,
+        match=expected_abort_match,
+    ):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+def test_powered_gate1_lateral_observation_rejects_stale_primary_authority(
+    monkeypatch,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(
+        clock=clock,
+        crossing_started_s=None,
+    )
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        clock[0] += 0.15
+        stale_received_s = clock[0] - vq2_module.MAX_VISION_AGE_S - 0.001
+        target = vq2_module.GateTarget(
+            frame_id=101,
+            sim_time_ns=1_010,
+            received_monotonic_s=stale_received_s,
+            center_x=424,
+            center_y=160,
+            bbox=(410, 138, 28, 45),
+            confidence=0.8,
+        )
+        runner.tracker.target = target
+        runner.tracker.consecutive = 1
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = target
+        runner._latest_detection_generation = 4
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = stale_received_s
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="lateral objective target is stale",
+    ):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+def test_powered_gate1_lateral_observation_checks_top_margin_before_send(
+    monkeypatch,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        _publish_observation_frame(
+            runner,
+            frame_id=101,
+            clock=clock,
+            detection=_detection(410, 0, 28, 45),
+        )
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+
+    with pytest.raises(SafetyAbort, match="top-edge safety margin"):
         asyncio.run(
             runner._observe_gate1(
                 details,
@@ -8108,6 +8484,10 @@ def test_gate1_observation_uses_fixed_nested_deadline_and_never_catches_up(
     assert command_times == [10.0]
     assert clock[0] == pytest.approx(10.065)
     assert all(command.thrust == hold_thrust for command in adapter.commands)
+    assert all(
+        command.roll_rate == command.yaw_rate == 0.0
+        for command in adapter.commands
+    )
 
 
 def test_gate1_observation_cannot_accept_third_frame_after_hard_deadline(
