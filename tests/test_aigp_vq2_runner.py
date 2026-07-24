@@ -1800,7 +1800,7 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
-    assert vq2_module.GATE1_RECENTER_TARGET_PITCH_RAD == 0.10
+    assert vq2_module.GATE1_RECENTER_TARGET_PITCH_RAD == -0.10
     assert vq2_module.GATE1_RECENTER_MIN_THRUST == 0.21
     assert vq2_module.GATE1_RECENTER_MAX_THRUST == 0.30
     assert vq2_module.GATE1_RECENTER_CORRIDOR_NORMALIZED_X == 0.35
@@ -1812,6 +1812,44 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_PITCH_RAD == 0.10
     assert vq2_module.GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX == 23_040
     assert vq2_module.GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX == 160
+
+
+def test_gate1_vertical_recovery_pitch_target_is_frozen_and_negative():
+    assert vq2_module.gate1_vertical_recovery_pitch_target(
+        -0.10,
+        -0.05,
+    ) == pytest.approx(-0.10)
+    assert vq2_module.gate1_vertical_recovery_pitch_target(
+        -0.10,
+        -0.10 + vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD,
+    ) == pytest.approx(-0.10)
+
+
+@pytest.mark.parametrize(
+    ("target_pitch_rad", "reference_pitch_rad"),
+    (
+        (0.10, -0.05),
+        (0.0, -0.05),
+        (-0.099, -0.05),
+        (-0.101, -0.05),
+        (-0.10, -0.10),
+        (
+            -0.10,
+            -0.10 + vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD + 1e-12,
+        ),
+        (-0.10, math.nan),
+        (-0.10, True),
+    ),
+)
+def test_gate1_vertical_recovery_pitch_target_rejects_other_authority(
+    target_pitch_rad,
+    reference_pitch_rad,
+):
+    with pytest.raises(ValueError, match="pitch"):
+        vq2_module.gate1_vertical_recovery_pitch_target(
+            target_pitch_rad,
+            reference_pitch_rad,
+        )
 
 
 def test_official_lap_time_uses_finish_ns_minus_start_ms():
@@ -2187,7 +2225,7 @@ def test_bounded_gate1_recenter_enforces_pass_anchored_pitch_excursion(
     runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
         monkeypatch
     )
-    runner.estimate = _estimate(pitch=0.06)
+    runner.estimate = _estimate(pitch=-0.04)
     _install_gate1_frame_sequence(
         monkeypatch,
         runner,
@@ -2391,6 +2429,7 @@ def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
         [520],
     )
     observed = []
+    events = []
     original = vq2_module.attitude_rate_command
 
     def capture_objective(estimate, **kwargs):
@@ -2402,16 +2441,58 @@ def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
         "attitude_rate_command",
         capture_objective,
     )
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
 
     with pytest.raises(SafetyAbort):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
     assert observed
     assert all(
-        objective["target_pitch_rad"] == 0.10
+        objective["target_pitch_rad"] == -0.10
         and objective["thrust"] == 0.275
         for objective in observed
     )
+    assert all(command.pitch_rate < 0.0 for command in _adapter.commands)
+    summary = runner._gate1_recenter_summary
+    assert summary is not None
+    assert summary["target_pitch_rad"] == pytest.approx(-0.10)
+    started = [
+        fields for event, fields in events if event == "gate1_recenter_started"
+    ]
+    assert len(started) == 1
+    assert started[0]["control_law"]["target_pitch_rad"] == pytest.approx(-0.10)
+
+
+def test_bounded_gate1_recenter_rejects_positive_pitch_config_before_record_or_send(
+    monkeypatch,
+):
+    runner, adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    runner.controller_config = replace(
+        runner.controller_config,
+        forward_braking=replace(
+            runner.controller_config.forward_braking,
+            gate1_target_pitch_rad=0.10,
+        ),
+    )
+    events = []
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    with pytest.raises(SafetyAbort, match="frozen negative envelope"):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+    assert events == []
+    assert runner._gate1_recenter_summary is None
 
 
 def test_offline_gate1_recenter_duplicate_frames_do_not_count(monkeypatch):
@@ -7368,15 +7449,15 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     else:
         assert all(
             command.roll_rate == command.yaw_rate == 0.0
-            and 0.0
-            < command.pitch_rate
-            <= runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
+            and -runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
+            <= command.pitch_rate
+            < 0.0
             and command.thrust == hold_thrust
             for command in adapter.commands
         )
         assert result["pitch_recovery_enabled"] is True
         assert result["pitch_recovery_target_pitch_rad"] == pytest.approx(
-            0.10
+            -0.10
         )
         assert result["pitch_recovery_command_count"] == 2
         assert result["pitch_recovery_min_pitch_rad"] == pytest.approx(
@@ -7395,8 +7476,8 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     ]
     assert len(recovery_events) == (2 if hold_thrust else 0)
     assert all(
-        event["target_pitch_rad"] == pytest.approx(0.10)
-        and event["command_pitch_rate_rad_s"] > 0.0
+        event["target_pitch_rad"] == pytest.approx(-0.10)
+        and event["command_pitch_rate_rad_s"] < 0.0
         and event["command_count"] == index
         for index, event in enumerate(recovery_events, start=1)
     )
@@ -7407,6 +7488,37 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     assert watchdog_require_target == [False] * 6
     assert vision.reset_calls == 0
     assert vision.is_running is False
+
+
+def test_powered_gate1_observation_rejects_positive_pitch_config_before_record_or_send(
+    monkeypatch,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+    runner.controller_config = replace(
+        runner.controller_config,
+        forward_braking=replace(
+            runner.controller_config.forward_braking,
+            gate1_target_pitch_rad=0.10,
+        ),
+    )
+    events = []
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    with pytest.raises(SafetyAbort, match="frozen negative envelope"):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
+    assert events == []
 
 
 @pytest.mark.parametrize(

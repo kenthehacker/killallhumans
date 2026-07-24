@@ -54,7 +54,7 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["schema"] == "aigp-vq2-controller-config/1"
     assert (
         mapping["controller_family"]
-        == "aigp-vq2-gate0-gate1-recenter/11"
+        == "aigp-vq2-gate0-gate1-recenter/12"
     )
     assert mapping["phase_timing"] == {
         "gate0_boost_until_s": 0.45,
@@ -164,6 +164,11 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
         (
             "controller_family",
             "aigp-vq2-gate0-gate1-recenter/10",
+            "must equal",
+        ),
+        (
+            "controller_family",
+            "aigp-vq2-gate0-gate1-recenter/11",
             "must equal",
         ),
         ("controller_family", "other", "must equal"),
@@ -326,7 +331,8 @@ def test_malformed_field_values_are_rejected(path, value, match):
         ("yaw_control.command_rate_cap_rad_s", 0.081),
         ("forward_braking.gate0_turn_pitch_rad", 0.081),
         ("forward_braking.gate0_turn_thrust_cap", 0.321),
-        ("forward_braking.gate1_target_pitch_rad", -0.001),
+        ("forward_braking.gate1_target_pitch_rad", -0.101),
+        ("forward_braking.gate1_target_pitch_rad", -0.099),
         ("forward_braking.pitch_command_rate_cap_rad_s", 0.121),
         ("forward_braking.gate1_forward_thrust", 0.301),
     ),
