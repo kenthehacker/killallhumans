@@ -14,15 +14,27 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import (
     CameraFrameToken,
     FrameProvenanceBasis,
     MultiTargetVisualTracker,
     VisualTrack,
     VisualTrackRole,
+    VisualTrackSample,
 )
 
 _MAX_PROMOTION_MISSED_CAMERA_PUBLICATIONS = 2
+_ADJACENT_HANDOFF_MAX_GAP_NS = 100_000_000
+_ADJACENT_HANDOFF_MAX_CREDIT_AGE_NS = 100_000_000
+_ADJACENT_HANDOFF_MAX_CONFIRMATION_PUBLICATIONS = 12
+_ADJACENT_HANDOFF_MIN_CURRENT_SCALE = 0.95
+_ADJACENT_HANDOFF_MAX_NEXT_SCALE_RATIO = 0.50
+_ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE = 0.01
+_ADJACENT_HANDOFF_CONFIDENCE_FACTOR = 0.50
+_ALL_FRAME_EDGES = (
+    FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
+)
 
 
 class RaceStatusProvenanceBasis(str, Enum):
@@ -38,6 +50,13 @@ class GateGraphError(ValueError):
 
 class AmbiguousGatePromotionError(GateGraphError):
     """Race credit cannot uniquely identify a pretracked next gate."""
+
+
+class GateRelationshipBasis(str, Enum):
+    """Exact observation basis for one rolling current-to-next relationship."""
+
+    SIMULTANEOUS_IMAGE = "simultaneous_image"
+    ADJACENT_PUBLICATION_HANDOFF = "adjacent_publication_handoff"
 
 
 @dataclass(frozen=True, slots=True)
@@ -188,10 +207,16 @@ class ObservedGateRelationship:
 
     current_track_id: str
     next_track_id: str
+    basis: GateRelationshipBasis
+    current_anchor_token: CameraFrameToken
+    next_anchor_token: CameraFrameToken
+    anchor_publication_delta: int
+    anchor_time_gap_ns: int
     first_token: CameraFrameToken
     latest_token: CameraFrameToken
     observation_count: int
     simultaneous_observation_count: int
+    sequential_observation_count: int
     latest_tracker_frame_sequence: int
     current_bearing_norm: float
     current_elevation_norm: float
@@ -207,10 +232,21 @@ class ObservedGateRelationship:
     current_center_censored: bool
     next_center_censored: bool
     fresh: bool
+    contended: bool
 
     @property
     def geometry_degraded(self) -> bool:
         return self.current_center_censored or self.next_center_censored
+
+    @property
+    def relative_geometry_usable(self) -> bool:
+        """Whether the relative image geometry came from an uncensored joint view."""
+
+        return (
+            self.basis is GateRelationshipBasis.SIMULTANEOUS_IMAGE
+            and self.simultaneous_observation_count > 0
+            and not self.geometry_degraded
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,10 +306,16 @@ class GateGraphSnapshot:
 
 @dataclass(slots=True)
 class _RelationshipState:
+    basis: GateRelationshipBasis
+    current_anchor_token: CameraFrameToken
+    next_anchor_token: CameraFrameToken
+    anchor_publication_delta: int
+    anchor_time_gap_ns: int
     first_token: CameraFrameToken
     latest_token: CameraFrameToken
     observation_count: int
     simultaneous_observation_count: int
+    sequential_observation_count: int
     latest_tracker_frame_sequence: int
     current_bearing_norm: float
     current_elevation_norm: float
@@ -287,6 +329,7 @@ class _RelationshipState:
     current_center_censored: bool
     next_center_censored: bool
     fresh: bool
+    contended: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,19 +443,60 @@ class RollingVisualGateGraph:
             and update.tracker_frame_sequence != self._last_relationship_frame_sequence
         ):
             current = tracks[self._current_track_id]
-            for track in tracks.values():
+            visible_noncurrent = tuple(
+                track
+                for track in tracks.values()
                 if (
-                    track.track_id == current.track_id
-                    or not track.visible
-                    or track.role is VisualTrackRole.RETIRED
-                ):
-                    continue
+                    track.track_id != current.track_id
+                    and track.visible
+                    and track.role is not VisualTrackRole.RETIRED
+                )
+            )
+            handoff_contenders = tuple(
+                track
+                for track in tracks.values()
+                if (
+                    track.track_id != current.track_id
+                    and track.role is not VisualTrackRole.RETIRED
+                    and (
+                        track.visible
+                        or _is_recent_handoff_contender(
+                            track,
+                            current_tracker_frame_sequence=(
+                                update.tracker_frame_sequence
+                            ),
+                        )
+                    )
+                )
+            )
+            sequential_seed_track_id: Optional[str] = None
+            if (
+                len(visible_noncurrent) == 1
+                and len(handoff_contenders) == 1
+                and handoff_contenders[0].track_id
+                == visible_noncurrent[0].track_id
+                and self._eligible_adjacent_handoff_seed(
+                    current,
+                    visible_noncurrent[0],
+                    update.tracker_frame_sequence,
+                    update.token,
+                )
+            ):
+                sequential_seed_track_id = visible_noncurrent[0].track_id
+            for track in visible_noncurrent:
                 self._update_relationship(
                     current,
                     track,
                     update.tracker_frame_sequence,
                     update.token,
+                    allow_adjacent_handoff_seed=(
+                        track.track_id == sequential_seed_track_id
+                    ),
                 )
+            self._mark_adjacent_handoff_contention(
+                current,
+                visible_noncurrent,
+            )
             self._last_relationship_frame_sequence = update.tracker_frame_sequence
 
         snapshot = self._snapshot(update.tracker_frame_sequence, update.token, tracks)
@@ -455,6 +539,10 @@ class RollingVisualGateGraph:
         promotable = tuple(
             candidate for candidate in snapshot.next_candidates if candidate.promotable
         )
+        if snapshot.next_selection_ambiguous:
+            raise AmbiguousGatePromotionError(
+                "multiple next-gate tracks have indistinguishable authority"
+            )
         if not promotable:
             raise GateGraphError("no stable pretracked next gate is promotable")
         selected: Optional[NextGateCandidate] = None
@@ -494,6 +582,11 @@ class RollingVisualGateGraph:
             raise GateGraphError(
                 "promotion lacks three consecutive fresh pre-transition frames"
             )
+        _validate_adjacent_handoff_credit_freshness(
+            selected,
+            pretransition_samples,
+            race_status,
+        )
         if any(sample.association_confidence < self.config.min_association_confidence
                for sample in pretransition_samples[-self.config.min_next_candidate_frames :]):
             raise GateGraphError("pre-transition association confidence is insufficient")
@@ -572,13 +665,40 @@ class RollingVisualGateGraph:
         candidate: VisualTrack,
         frame_sequence: int,
         token: CameraFrameToken,
+        *,
+        allow_adjacent_handoff_seed: bool,
     ) -> None:
         key = (current.track_id, candidate.track_id)
         previous = self._relationships.get(key)
-        if not current.visible and previous is None:
-            # No joint image observation exists from which to claim a
-            # current-to-next relationship.
+        adjacent_anchors = None
+        if (
+            previous is not None
+            and previous.basis
+            is GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+            and not current.visible
+            and not _adjacent_handoff_step_is_contiguous(
+                previous,
+                candidate,
+                frame_sequence=frame_sequence,
+                token=token,
+            )
+        ):
+            previous.contended = True
             return
+        if not current.visible and previous is None:
+            if not allow_adjacent_handoff_seed:
+                # No joint image observation or tightly bounded sequential
+                # crossing evidence exists from which to claim a relationship.
+                return
+            adjacent_anchors = _adjacent_handoff_anchors(
+                current,
+                candidate,
+                frame_sequence=frame_sequence,
+                token=token,
+                config=self.config,
+            )
+            if adjacent_anchors is None:
+                return
         count = 1 if previous is None else previous.observation_count + 1
         if current.visible:
             simultaneous_count = (
@@ -603,24 +723,92 @@ class RollingVisualGateGraph:
             current_scale = current.apparent_scale
             current_scale_rate = current.log_scale_rate_s
             current_censored = current.center_censored
+            basis = (
+                GateRelationshipBasis.SIMULTANEOUS_IMAGE
+                if previous is None
+                else previous.basis
+            )
+            current_anchor_token = (
+                token if previous is None else previous.current_anchor_token
+            )
+            next_anchor_token = (
+                token if previous is None else previous.next_anchor_token
+            )
+            anchor_publication_delta = (
+                0 if previous is None else previous.anchor_publication_delta
+            )
+            anchor_time_gap_ns = (
+                0 if previous is None else previous.anchor_time_gap_ns
+            )
+            sequential_count = (
+                0 if previous is None else previous.sequential_observation_count
+            )
+            contended = (
+                False
+                if previous is None
+                else (
+                    previous.contended
+                    or previous.basis
+                    is GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+                )
+            )
+        elif previous is None:
+            assert adjacent_anchors is not None
+            current_sample, candidate_sample, anchor_time_gap_ns = adjacent_anchors
+            simultaneous_count = 0
+            sequential_count = 1
+            confidence = _adjacent_handoff_confidence(
+                current_sample,
+                candidate_sample,
+            )
+            current_bearing = current_sample.bearing_norm
+            current_elevation = current_sample.elevation_norm
+            current_scale = current_sample.apparent_scale
+            current_scale_rate = current.log_scale_rate_s
+            current_censored = current_sample.center_censored
+            basis = GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+            current_anchor_token = current_sample.token
+            next_anchor_token = candidate_sample.token
+            anchor_publication_delta = 1
+            contended = False
         else:
-            assert previous is not None
             # The next track may keep accumulating exact pre-credit history
             # after the crossed/current contour disappears.  Retain the last
             # jointly observed relationship confidence and mark it non-fresh;
             # never synthesize new current geometry from the stale support.
             simultaneous_count = previous.simultaneous_observation_count
+            sequential_count = (
+                previous.sequential_observation_count
+                + (
+                    1
+                    if previous.basis
+                    is GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+                    else 0
+                )
+            )
             confidence = previous.observation_confidence
             current_bearing = previous.current_bearing_norm
             current_elevation = previous.current_elevation_norm
             current_scale = previous.current_apparent_scale
             current_scale_rate = previous.current_log_scale_rate_s
             current_censored = previous.current_center_censored
+            basis = previous.basis
+            current_anchor_token = previous.current_anchor_token
+            next_anchor_token = previous.next_anchor_token
+            anchor_publication_delta = previous.anchor_publication_delta
+            anchor_time_gap_ns = previous.anchor_time_gap_ns
+            contended = previous.contended or candidate.ambiguous
         state = _RelationshipState(
+            basis=basis,
+            current_anchor_token=current_anchor_token,
+            next_anchor_token=next_anchor_token,
+            anchor_publication_delta=anchor_publication_delta,
+            anchor_time_gap_ns=anchor_time_gap_ns,
             first_token=token if previous is None else previous.first_token,
             latest_token=token,
             observation_count=count,
             simultaneous_observation_count=simultaneous_count,
+            sequential_observation_count=sequential_count,
             latest_tracker_frame_sequence=frame_sequence,
             current_bearing_norm=current_bearing,
             current_elevation_norm=current_elevation,
@@ -634,6 +822,7 @@ class RollingVisualGateGraph:
             current_center_censored=current_censored,
             next_center_censored=candidate.center_censored,
             fresh=current.visible and candidate.visible,
+            contended=contended,
         )
         self._relationships[key] = state
         if len(self._relationships) > self.config.relationship_history_limit:
@@ -645,6 +834,44 @@ class RollingVisualGateGraph:
                 ),
             )
             del self._relationships[oldest_key]
+
+    def _eligible_adjacent_handoff_seed(
+        self,
+        current: VisualTrack,
+        candidate: VisualTrack,
+        frame_sequence: int,
+        token: CameraFrameToken,
+    ) -> bool:
+        return _adjacent_handoff_anchors(
+            current,
+            candidate,
+            frame_sequence=frame_sequence,
+            token=token,
+            config=self.config,
+        ) is not None
+
+    def _mark_adjacent_handoff_contention(
+        self,
+        current: VisualTrack,
+        visible_noncurrent: tuple[VisualTrack, ...],
+    ) -> None:
+        visible_ids = {track.track_id for track in visible_noncurrent}
+        for key, state in self._relationships.items():
+            if (
+                key[0] != current.track_id
+                or state.basis
+                is not GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+            ):
+                continue
+            if (
+                current.visible
+                or any(track_id != key[1] for track_id in visible_ids)
+                or any(
+                    track.track_id == key[1] and track.ambiguous
+                    for track in visible_noncurrent
+                )
+            ):
+                state.contended = True
 
     def _snapshot(
         self,
@@ -702,6 +929,24 @@ class RollingVisualGateGraph:
                     >= self.config.min_next_candidate_frames
                     and relation.observation_confidence
                     >= self.config.min_relationship_confidence
+                    and not relation.contended
+                    and (
+                        relation.basis
+                        is GateRelationshipBasis.SIMULTANEOUS_IMAGE
+                        or (
+                            pretracked.missed_camera_publications == 0
+                            and relation.sequential_observation_count
+                            >= self.config.min_next_candidate_frames
+                            and relation.latest_tracker_frame_sequence
+                            == frame_sequence
+                            and _adjacent_handoff_within_confirmation_horizon(
+                                current,
+                                track,
+                                relation,
+                                frame_sequence=frame_sequence,
+                            )
+                        )
+                    )
                 )
                 candidates.append(
                     NextGateCandidate(
@@ -773,10 +1018,16 @@ class RollingVisualGateGraph:
         return ObservedGateRelationship(
             current_track_id=key[0],
             next_track_id=key[1],
+            basis=state.basis,
+            current_anchor_token=state.current_anchor_token,
+            next_anchor_token=state.next_anchor_token,
+            anchor_publication_delta=state.anchor_publication_delta,
+            anchor_time_gap_ns=state.anchor_time_gap_ns,
             first_token=state.first_token,
             latest_token=state.latest_token,
             observation_count=state.observation_count,
             simultaneous_observation_count=state.simultaneous_observation_count,
+            sequential_observation_count=state.sequential_observation_count,
             latest_tracker_frame_sequence=state.latest_tracker_frame_sequence,
             current_bearing_norm=state.current_bearing_norm,
             current_elevation_norm=state.current_elevation_norm,
@@ -796,6 +1047,7 @@ class RollingVisualGateGraph:
             current_center_censored=state.current_center_censored,
             next_center_censored=state.next_center_censored,
             fresh=state.fresh,
+            contended=state.contended,
         )
 
     def _validate_race_advance(
@@ -918,6 +1170,255 @@ def _pretransition_tail(
         tail.append(sample)
     tail.reverse()
     return tuple(tail)
+
+
+def _adjacent_handoff_anchors(
+    current: VisualTrack,
+    candidate: VisualTrack,
+    *,
+    frame_sequence: int,
+    token: CameraFrameToken,
+    config: RollingGateGraphConfig,
+) -> Optional[tuple[VisualTrackSample, VisualTrackSample, int]]:
+    """Return exact sequential anchors only for the observed crossing boundary.
+
+    This is deliberately narrower than ordinary visual association.  It can
+    seed a graph edge between two different identities, but can never merge
+    them or label the successor with a gate index.  Race status remains the
+    sole authority for that later promotion.
+    """
+
+    if (
+        current.visible
+        or current.role is not VisualTrackRole.CURRENT
+        or current.authoritative_gate_index is None
+        or current.ambiguous
+        or current.missed_frame_count != 1
+        or not current.history
+        or not candidate.visible
+        or candidate.role is VisualTrackRole.RETIRED
+        or candidate.authoritative_gate_index is not None
+        or candidate.ambiguous
+        or candidate.missed_frame_count != 0
+        or candidate.consecutive_frame_count != 1
+        or candidate.total_observation_count != 1
+        or len(candidate.history) != 1
+        or candidate.first_token != token
+        or candidate.latest_token != token
+    ):
+        return None
+    current_sample = current.history[-1]
+    candidate_sample = candidate.history[0]
+    if (
+        current_sample.tracker_frame_sequence != frame_sequence - 1
+        or candidate_sample.tracker_frame_sequence != frame_sequence
+        or current_sample.provenance_basis
+        is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+        or candidate_sample.provenance_basis
+        is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+        or current_sample.confidence < config.min_track_confidence
+        or candidate_sample.confidence < config.min_track_confidence
+        or current_sample.association_confidence
+        < config.min_association_confidence
+        or candidate_sample.association_confidence
+        < config.min_association_confidence
+        or not _is_aperture_filling_crossing_sample(current_sample)
+        or candidate_sample.center_censored
+        or candidate_sample.apparent_scale
+        > (
+            current_sample.apparent_scale
+            * _ADJACENT_HANDOFF_MAX_NEXT_SCALE_RATIO
+        )
+        or not _tokens_are_adjacent_publications(
+            current_sample.token,
+            candidate_sample.token,
+        )
+    ):
+        return None
+    current_publish_ns = current_sample.publication_monotonic_ns
+    candidate_publish_ns = candidate_sample.publication_monotonic_ns
+    if current_publish_ns is None or candidate_publish_ns is None:
+        return None
+    gap_ns = candidate_publish_ns - current_publish_ns
+    if gap_ns <= 0 or gap_ns > _ADJACENT_HANDOFF_MAX_GAP_NS:
+        return None
+    return current_sample, candidate_sample, gap_ns
+
+
+def _is_recent_handoff_contender(
+    track: VisualTrack,
+    *,
+    current_tracker_frame_sequence: int,
+) -> bool:
+    """Keep recent identities in contention even when their match is ambiguous."""
+
+    if not track.history:
+        return False
+    latest_sequence = track.history[-1].tracker_frame_sequence
+    missed_publications = current_tracker_frame_sequence - latest_sequence
+    return (
+        0 <= missed_publications <= _MAX_PROMOTION_MISSED_CAMERA_PUBLICATIONS
+        and missed_publications == track.missed_frame_count
+    )
+
+
+def _is_aperture_filling_crossing_sample(sample: VisualTrackSample) -> bool:
+    left, top, right, bottom = sample.bbox_norm
+    return (
+        sample.center_censored
+        and sample.clipping & _ALL_FRAME_EDGES == _ALL_FRAME_EDGES
+        and sample.apparent_scale >= _ADJACENT_HANDOFF_MIN_CURRENT_SCALE
+        and left <= _ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE
+        and top <= _ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE
+        and right >= 1.0 - _ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE
+        and bottom >= 1.0 - _ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE
+    )
+
+
+def _tokens_are_adjacent_publications(
+    predecessor: CameraFrameToken,
+    successor: CameraFrameToken,
+) -> bool:
+    return (
+        predecessor.stream_id is not None
+        and predecessor.stream_id == successor.stream_id
+        and predecessor.generation == successor.generation
+        and predecessor.publication_sequence is not None
+        and successor.publication_sequence
+        == predecessor.publication_sequence + 1
+    )
+
+
+def _adjacent_handoff_confidence(
+    current_sample: VisualTrackSample,
+    candidate_sample: VisualTrackSample,
+) -> float:
+    confidence = math.sqrt(
+        max(0.0, current_sample.confidence)
+        * max(0.0, candidate_sample.confidence)
+    ) * min(
+        current_sample.association_confidence,
+        candidate_sample.association_confidence,
+    )
+    if current_sample.center_censored or candidate_sample.center_censored:
+        confidence *= 0.75
+    return confidence * _ADJACENT_HANDOFF_CONFIDENCE_FACTOR
+
+
+def _adjacent_handoff_step_is_contiguous(
+    previous: _RelationshipState,
+    candidate: VisualTrack,
+    *,
+    frame_sequence: int,
+    token: CameraFrameToken,
+) -> bool:
+    """Require every successor observation to preserve live publication order."""
+
+    if (
+        candidate.ambiguous
+        or not candidate.visible
+        or candidate.latest_token != token
+        or len(candidate.history) < 2
+        or previous.latest_tracker_frame_sequence != frame_sequence - 1
+        or not _tokens_are_adjacent_publications(previous.latest_token, token)
+    ):
+        return False
+    predecessor_sample = candidate.history[-2]
+    successor_sample = candidate.history[-1]
+    if (
+        predecessor_sample.token != previous.latest_token
+        or predecessor_sample.tracker_frame_sequence != frame_sequence - 1
+        or successor_sample.token != token
+        or successor_sample.tracker_frame_sequence != frame_sequence
+        or predecessor_sample.provenance_basis
+        is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+        or successor_sample.provenance_basis
+        is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+        or predecessor_sample.publication_monotonic_ns is None
+        or successor_sample.publication_monotonic_ns is None
+    ):
+        return False
+    gap_ns = (
+        successor_sample.publication_monotonic_ns
+        - predecessor_sample.publication_monotonic_ns
+    )
+    return 0 < gap_ns <= _ADJACENT_HANDOFF_MAX_GAP_NS
+
+
+def _adjacent_handoff_within_confirmation_horizon(
+    current: Optional[VisualTrack],
+    candidate: VisualTrack,
+    relationship: ObservedGateRelationship,
+    *,
+    frame_sequence: int,
+) -> bool:
+    """Keep the sequential exception inside the predecessor's live lease."""
+
+    if (
+        current is None
+        or current.role is not VisualTrackRole.CURRENT
+        or current.visible
+        or current.ambiguous
+        or current.missed_frame_count < 1
+        or current.missed_frame_count
+        > _ADJACENT_HANDOFF_MAX_CONFIRMATION_PUBLICATIONS
+        or not current.history
+        or not candidate.visible
+        or candidate.ambiguous
+        or candidate.latest_token != relationship.latest_token
+        or relationship.contended
+    ):
+        return False
+    current_anchor = current.history[-1]
+    if (
+        current_anchor.token != relationship.current_anchor_token
+        or frame_sequence - current_anchor.tracker_frame_sequence
+        != current.missed_frame_count
+        or frame_sequence - current_anchor.tracker_frame_sequence
+        > _ADJACENT_HANDOFF_MAX_CONFIRMATION_PUBLICATIONS
+    ):
+        return False
+    anchor_publication = relationship.current_anchor_token.publication_sequence
+    latest_publication = relationship.latest_token.publication_sequence
+    return (
+        anchor_publication is not None
+        and latest_publication is not None
+        and 1
+        <= latest_publication - anchor_publication
+        <= _ADJACENT_HANDOFF_MAX_CONFIRMATION_PUBLICATIONS
+    )
+
+
+def _validate_adjacent_handoff_credit_freshness(
+    candidate: NextGateCandidate,
+    pretransition_samples: tuple,
+    race_status: AuthoritativeRaceStatusRef,
+) -> None:
+    relationship = candidate.relationship
+    if (
+        relationship is None
+        or relationship.basis
+        is not GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+    ):
+        return
+    if race_status.provenance_basis is not RaceStatusProvenanceBasis.LIVE_INGRESS:
+        raise GateGraphError(
+            "adjacent handoff promotion requires live race ingress"
+        )
+    assert race_status.received_monotonic_ns is not None
+    latest_publish_ns = pretransition_samples[-1].publication_monotonic_ns
+    if latest_publish_ns is None:
+        raise GateGraphError(
+            "adjacent handoff promotion lacks live publication time"
+        )
+    credit_age_ns = race_status.received_monotonic_ns - latest_publish_ns
+    if (
+        credit_age_ns < 0
+        or credit_age_ns > _ADJACENT_HANDOFF_MAX_CREDIT_AGE_NS
+    ):
+        raise GateGraphError(
+            "adjacent handoff candidate is stale at race credit"
+        )
 
 
 def _pretracked_candidate_evidence(

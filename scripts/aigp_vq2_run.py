@@ -8144,6 +8144,51 @@ class VQ2Runner:
                     ),
                     "center_censored": candidate.center_censored,
                     "promotable": candidate.promotable,
+                    "relationship": (
+                        None
+                        if candidate.relationship is None
+                        else {
+                            "basis": candidate.relationship.basis.value,
+                            "current_anchor_frame_token": list(
+                                candidate.relationship.current_anchor_token
+                                .live_identity_tuple
+                                or candidate.relationship.current_anchor_token
+                                .exact_tuple
+                            ),
+                            "next_anchor_frame_token": list(
+                                candidate.relationship.next_anchor_token
+                                .live_identity_tuple
+                                or candidate.relationship.next_anchor_token
+                                .exact_tuple
+                            ),
+                            "anchor_publication_delta": (
+                                candidate.relationship.anchor_publication_delta
+                            ),
+                            "anchor_time_gap_ns": (
+                                candidate.relationship.anchor_time_gap_ns
+                            ),
+                            "observation_count": (
+                                candidate.relationship.observation_count
+                            ),
+                            "simultaneous_observation_count": (
+                                candidate.relationship
+                                .simultaneous_observation_count
+                            ),
+                            "sequential_observation_count": (
+                                candidate.relationship
+                                .sequential_observation_count
+                            ),
+                            "observation_confidence": (
+                                candidate.relationship.observation_confidence
+                            ),
+                            "fresh": candidate.relationship.fresh,
+                            "contended": candidate.relationship.contended,
+                            "relative_geometry_usable": (
+                                candidate.relationship
+                                .relative_geometry_usable
+                            ),
+                        }
+                    ),
                 }
                 for candidate in snapshot.next_candidates
             ],
@@ -8450,7 +8495,7 @@ class VQ2Runner:
                             ),
                             tracks=[
                                 self._visual_track_summary(track)
-                                for track in visual_update.tracks
+                                for track in refreshed_update.tracks
                             ],
                             associations=[
                                 {

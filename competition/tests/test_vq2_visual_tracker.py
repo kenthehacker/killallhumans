@@ -18,6 +18,7 @@ from competition.vq2_visual_tracker import (
 from planning.vq2_gate_graph import (
     AmbiguousGatePromotionError,
     AuthoritativeRaceStatusRef,
+    GateRelationshipBasis,
     GateGraphError,
     RollingVisualGateGraph,
 )
@@ -60,13 +61,24 @@ def _frame(
     detections: tuple[VisualDetection, ...],
     *,
     generation: int = 7,
+    frame_id: int | None = None,
+    publication_sequence: int | None = None,
+    timing_offset_ns: int = 0,
 ) -> VisualDetectionFrame:
-    final_packet = 1_000_000_000 + sequence * _FRAME_PERIOD_NS
+    final_packet = (
+        1_000_000_000
+        + sequence * _FRAME_PERIOD_NS
+        + timing_offset_ns
+    )
     return VisualDetectionFrame(
         token=CameraFrameToken(
             generation=generation,
-            frame_id=29_000 + sequence,
-            publication_sequence=sequence,
+            frame_id=29_000 + sequence if frame_id is None else frame_id,
+            publication_sequence=(
+                sequence
+                if publication_sequence is None
+                else publication_sequence
+            ),
             stream_id="vq2-camera",
         ),
         provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
@@ -336,7 +348,11 @@ def test_pretransition_next_track_promotes_without_reset_or_history_loss() -> No
     assert tuple(item.track_id for item in snapshot.next_candidates) == (next_id,)
     relationship = snapshot.next_candidates[0].relationship
     assert relationship is not None
+    assert relationship.basis is GateRelationshipBasis.SIMULTANEOUS_IMAGE
     assert relationship.observation_count == 3
+    assert relationship.simultaneous_observation_count == 3
+    assert relationship.sequential_observation_count == 0
+    assert relationship.relative_geometry_usable
     assert relationship.relative_bearing_norm > 0.0
     assert relationship.relative_elevation_norm > 0.0
     before = tracker.track(next_id)
@@ -366,6 +382,575 @@ def test_pretransition_next_track_promotes_without_reset_or_history_loss() -> No
     assert after.authoritative_gate_index == 1
     assert retired.role is VisualTrackRole.RETIRED
     assert retired.authoritative_gate_index == 0
+
+
+def test_adjacent_publication_handoff_promotes_without_synthetic_joint_sample() -> None:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    all_edges = (
+        FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
+    )
+    current_id = ""
+    for tracker_sequence, publication, frame_id in (
+        (1, 167, 40_100),
+        (2, 168, 40_350),
+        (3, 169, 40_900),
+    ):
+        update = tracker.update(
+            _frame(
+                tracker_sequence,
+                (
+                    _detection(
+                        0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        clipping=all_edges,
+                        center_censored=True,
+                    ),
+                ),
+                frame_id=frame_id,
+                publication_sequence=publication,
+            )
+        )
+        current_id = update.visible_track_ids[0]
+    graph.bind_initial_current(
+        tracker,
+        track_id=current_id,
+        race_status=_race(
+            sequence=70,
+            boot_ms=5_000,
+            gate_index=0,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+    )
+
+    next_id = ""
+    for tracker_sequence, publication, frame_id in (
+        (4, 170, 41_700),
+        (5, 171, 41_950),
+        (6, 172, 42_600),
+    ):
+        update = tracker.update(
+            _frame(
+                tracker_sequence,
+                (
+                    _detection(
+                        0,
+                        0.5625 + 0.01 * (tracker_sequence - 4),
+                        -0.5833 - 0.01 * (tracker_sequence - 4),
+                        0.13 + 0.005 * (tracker_sequence - 4),
+                        0.16 + 0.005 * (tracker_sequence - 4),
+                    ),
+                ),
+                frame_id=frame_id,
+                publication_sequence=publication,
+            )
+        )
+        if tracker_sequence == 4:
+            next_id = next(
+                track_id
+                for track_id in update.visible_track_ids
+                if track_id != current_id
+            )
+        snapshot = graph.observe(tracker)
+
+    assert tuple(item.track_id for item in snapshot.next_candidates) == (next_id,)
+    candidate = snapshot.next_candidates[0]
+    assert candidate.promotable
+    relationship = candidate.relationship
+    assert relationship is not None
+    assert (
+        relationship.basis
+        is GateRelationshipBasis.ADJACENT_PUBLICATION_HANDOFF
+    )
+    assert relationship.current_anchor_token.publication_sequence == 169
+    assert relationship.next_anchor_token.publication_sequence == 170
+    assert relationship.current_anchor_token.frame_id == 40_900
+    assert relationship.next_anchor_token.frame_id == 41_700
+    assert relationship.anchor_publication_delta == 1
+    assert 0 < relationship.anchor_time_gap_ns <= 100_000_000
+    assert relationship.first_token == relationship.next_anchor_token
+    assert relationship.observation_count == 3
+    assert relationship.simultaneous_observation_count == 0
+    assert relationship.sequential_observation_count == 3
+    assert not relationship.fresh
+    assert relationship.geometry_degraded
+    assert not relationship.relative_geometry_usable
+    assert not relationship.contended
+
+    before = tracker.track(next_id)
+    before_history = before.history
+    before_rates = (
+        before.bearing_rate_norm_s,
+        before.elevation_rate_norm_s,
+        before.log_scale_rate_s,
+    )
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=_race(
+            sequence=71,
+            boot_ms=5_250,
+            gate_index=1,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+        camera_token_at_credit=update.token,
+    )
+    after = tracker.track(next_id)
+    assert transition.promoted_track_id == next_id
+    assert transition.retired_track_id == current_id
+    assert transition.pretransition_frame_tokens == tuple(
+        sample.token for sample in before_history
+    )
+    assert after.first_token == relationship.next_anchor_token
+    assert after.history == before_history
+    assert (
+        after.bearing_rate_norm_s,
+        after.elevation_rate_norm_s,
+        after.log_scale_rate_s,
+    ) == before_rates
+    assert tracker.track(current_id).role is VisualTrackRole.RETIRED
+
+
+@pytest.mark.parametrize(
+    ("first_next_publication", "current_width", "current_clipping", "timing_offset_ns"),
+    (
+        pytest.param(171, 1.0, FrameEdge(15), 0, id="publication-gap"),
+        pytest.param(170, 0.90, FrameEdge.NONE, 0, id="no-crossing-geometry"),
+        pytest.param(
+            170,
+            1.0,
+            FrameEdge(15),
+            100_000_000,
+            id="timing-gap-over-100ms",
+        ),
+    ),
+)
+def test_adjacent_handoff_rejects_missing_or_unsupported_crossing_proof(
+    first_next_publication: int,
+    current_width: float,
+    current_clipping: FrameEdge,
+    timing_offset_ns: int,
+) -> None:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    current_id = ""
+    for sequence in range(1, 4):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _detection(
+                        0,
+                        0.0,
+                        0.0,
+                        current_width,
+                        current_width,
+                        clipping=current_clipping,
+                        center_censored=current_clipping != FrameEdge.NONE,
+                    ),
+                ),
+                publication_sequence=166 + sequence,
+            )
+        )
+        current_id = update.visible_track_ids[0]
+    graph.bind_initial_current(
+        tracker,
+        track_id=current_id,
+        race_status=_race(
+            sequence=80,
+            boot_ms=7_000,
+            gate_index=0,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+    )
+
+    for offset in range(3):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (_detection(0, 0.56, -0.58, 0.13, 0.16),),
+                publication_sequence=first_next_publication + offset,
+                timing_offset_ns=timing_offset_ns,
+            )
+        )
+        snapshot = graph.observe(tracker)
+
+    assert len(snapshot.next_candidates) == 1
+    assert snapshot.next_candidates[0].relationship is None
+    assert not snapshot.next_candidates[0].promotable
+    with pytest.raises(
+        GateGraphError,
+        match="no stable pretracked next gate is promotable",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_race(
+                sequence=81,
+                boot_ms=7_250,
+                gate_index=1,
+                received_ns=update.publish_monotonic_ns + 1,
+            ),
+            camera_token_at_credit=update.token,
+        )
+
+
+def test_adjacent_handoff_rejects_multiple_newcomers_even_with_explicit_id() -> None:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    all_edges = (
+        FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
+    )
+    for sequence in range(1, 4):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _detection(
+                        0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        clipping=all_edges,
+                        center_censored=True,
+                    ),
+                ),
+                publication_sequence=166 + sequence,
+            )
+        )
+    current_id = update.visible_track_ids[0]
+    graph.bind_initial_current(
+        tracker,
+        track_id=current_id,
+        race_status=_race(
+            sequence=90,
+            boot_ms=8_000,
+            gate_index=0,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+    )
+
+    for offset in range(3):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (
+                    _detection(0, 0.56, -0.58, 0.13, 0.16),
+                    _detection(1, -0.56, -0.58, 0.13, 0.16),
+                ),
+                publication_sequence=170 + offset,
+            )
+        )
+        snapshot = graph.observe(tracker)
+
+    assert len(snapshot.next_candidates) == 2
+    assert snapshot.next_selection_ambiguous
+    assert all(
+        candidate.relationship is None and not candidate.promotable
+        for candidate in snapshot.next_candidates
+    )
+    with pytest.raises(
+        AmbiguousGatePromotionError,
+        match="indistinguishable authority",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_race(
+                sequence=91,
+                boot_ms=8_250,
+                gate_index=1,
+                received_ns=update.publish_monotonic_ns + 1,
+            ),
+            camera_token_at_credit=update.token,
+            promoted_track_id=snapshot.next_candidates[0].track_id,
+        )
+
+
+def _bound_aperture_filling_current(
+    *,
+    include_pretracked_alternative: bool = False,
+) -> tuple[MultiTargetVisualTracker, RollingVisualGateGraph, str, str]:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    all_edges = (
+        FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
+    )
+    alternative_id = ""
+    for sequence in range(1, 4):
+        detections = [
+            _detection(
+                0,
+                0.0,
+                0.0,
+                1.0,
+                1.0,
+                clipping=all_edges,
+                center_censored=True,
+            )
+        ]
+        if include_pretracked_alternative:
+            detections.append(
+                _detection(1, -0.48, -0.30, 0.13, 0.16)
+            )
+        update = tracker.update(
+            _frame(
+                sequence,
+                tuple(detections),
+                publication_sequence=166 + sequence,
+            )
+        )
+    current_id = max(
+        update.visible_tracks,
+        key=lambda track: track.apparent_scale,
+    ).track_id
+    if include_pretracked_alternative:
+        alternative_id = next(
+            track_id
+            for track_id in update.visible_track_ids
+            if track_id != current_id
+        )
+    graph.bind_initial_current(
+        tracker,
+        track_id=current_id,
+        race_status=_race(
+            sequence=100,
+            boot_ms=9_000,
+            gate_index=0,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+    )
+    return tracker, graph, current_id, alternative_id
+
+
+@pytest.mark.parametrize(
+    ("publications", "timing_offsets_ns"),
+    (
+        pytest.param((170, 900, 901), (0, 0, 0), id="publication-gap"),
+        pytest.param(
+            (170, 171, 172),
+            (0, 200_000_000, 200_000_000),
+            id="timing-gap",
+        ),
+    ),
+)
+def test_adjacent_handoff_invalidates_noncontiguous_successor_observations(
+    publications: tuple[int, int, int],
+    timing_offsets_ns: tuple[int, int, int],
+) -> None:
+    tracker, graph, _, _ = _bound_aperture_filling_current()
+    for offset, (publication, timing_offset_ns) in enumerate(
+        zip(publications, timing_offsets_ns)
+    ):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (_detection(0, 0.56, -0.58, 0.13, 0.16),),
+                publication_sequence=publication,
+                timing_offset_ns=timing_offset_ns,
+            )
+        )
+        snapshot = graph.observe(tracker)
+
+    assert len(snapshot.next_candidates) == 1
+    relationship = snapshot.next_candidates[0].relationship
+    assert relationship is not None
+    assert relationship.sequential_observation_count == 1
+    assert relationship.contended
+    assert not snapshot.next_candidates[0].promotable
+
+
+def test_adjacent_handoff_expires_when_predecessor_track_lease_retires() -> None:
+    tracker, graph, _, _ = _bound_aperture_filling_current()
+    for offset in range(13):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (
+                    _detection(
+                        0,
+                        0.56 + 0.002 * offset,
+                        -0.58,
+                        0.13,
+                        0.16,
+                    ),
+                ),
+                publication_sequence=170 + offset,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        if offset == 11:
+            assert snapshot.next_candidates[0].promotable
+
+    assert snapshot.current_track is not None
+    assert snapshot.current_track.role is VisualTrackRole.RETIRED
+    assert len(snapshot.next_candidates) == 1
+    assert not snapshot.next_candidates[0].promotable
+    with pytest.raises(
+        GateGraphError,
+        match="no stable pretracked next gate is promotable",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_race(
+                sequence=101,
+                boot_ms=9_250,
+                gate_index=1,
+                received_ns=update.publish_monotonic_ns + 1,
+            ),
+            camera_token_at_credit=update.token,
+        )
+
+
+def test_adjacent_handoff_rejects_stale_race_credit_after_camera_freezes() -> None:
+    tracker, graph, _, _ = _bound_aperture_filling_current()
+    for offset in range(3):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (_detection(0, 0.56, -0.58, 0.13, 0.16),),
+                publication_sequence=170 + offset,
+            )
+        )
+        snapshot = graph.observe(tracker)
+
+    assert snapshot.next_candidates[0].promotable
+    with pytest.raises(
+        GateGraphError,
+        match="stale at race credit",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_race(
+                sequence=102,
+                boot_ms=9_250,
+                gate_index=1,
+                received_ns=(
+                    update.publish_monotonic_ns + 100_000_001
+                ),
+            ),
+            camera_token_at_credit=update.token,
+        )
+    assert tracker.track(snapshot.current_track_id).role is VisualTrackRole.CURRENT
+    assert tracker.track(
+        snapshot.next_candidates[0].track_id
+    ).authoritative_gate_index is None
+
+
+def test_adjacent_handoff_does_not_replace_recent_pretracked_candidate() -> None:
+    tracker, graph, _, alternative_id = _bound_aperture_filling_current(
+        include_pretracked_alternative=True,
+    )
+    newcomer_id = ""
+    for offset in range(3):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (_detection(0, 0.56, -0.58, 0.13, 0.16),),
+                publication_sequence=170 + offset,
+            )
+        )
+        if offset == 0:
+            newcomer_id = next(
+                track_id
+                for track_id in update.visible_track_ids
+                if track_id != alternative_id
+            )
+        snapshot = graph.observe(tracker)
+
+    candidate = next(
+        item for item in snapshot.next_candidates
+        if item.track_id == newcomer_id
+    )
+    assert tracker.track(alternative_id).missed_frame_count == 3
+    assert candidate.relationship is None
+    assert not candidate.promotable
+
+
+def test_adjacent_handoff_does_not_replace_recent_ambiguous_identities() -> None:
+    tracker = MultiTargetVisualTracker(
+        MultiTargetTrackerConfig(ambiguity_margin=0.20)
+    )
+    graph = RollingVisualGateGraph()
+    all_edges = (
+        FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
+    )
+    ambiguous_ids: tuple[str, ...] = ()
+    for sequence in range(1, 4):
+        candidate_centers = (
+            (-0.04, 0.04) if sequence < 3 else (0.0, 0.0)
+        )
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _detection(
+                        0,
+                        0.0,
+                        0.0,
+                        1.0,
+                        1.0,
+                        clipping=all_edges,
+                        center_censored=True,
+                    ),
+                    _detection(
+                        1,
+                        candidate_centers[0],
+                        -0.30,
+                        0.13,
+                        0.16,
+                    ),
+                    _detection(
+                        2,
+                        candidate_centers[1],
+                        -0.30,
+                        0.13,
+                        0.16,
+                    ),
+                ),
+                publication_sequence=166 + sequence,
+            )
+        )
+        if sequence == 3:
+            ambiguous_ids = update.ambiguous_track_ids
+    current_id = max(
+        update.visible_tracks,
+        key=lambda track: track.apparent_scale,
+    ).track_id
+    assert set(ambiguous_ids) == set(update.visible_track_ids) - {current_id}
+    graph.bind_initial_current(
+        tracker,
+        track_id=current_id,
+        race_status=_race(
+            sequence=110,
+            boot_ms=10_000,
+            gate_index=0,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+    )
+
+    newcomer_id = ""
+    for offset in range(3):
+        update = tracker.update(
+            _frame(
+                4 + offset,
+                (_detection(0, 0.56, -0.58, 0.13, 0.16),),
+                publication_sequence=170 + offset,
+            )
+        )
+        if offset == 0:
+            newcomer_id = update.visible_track_ids[0]
+        snapshot = graph.observe(tracker)
+
+    candidate = next(
+        item for item in snapshot.next_candidates
+        if item.track_id == newcomer_id
+    )
+    assert all(tracker.track(track_id).missed_frame_count == 3
+               for track_id in ambiguous_ids)
+    assert candidate.relationship is None
+    assert not candidate.promotable
 
 
 @pytest.mark.parametrize(
