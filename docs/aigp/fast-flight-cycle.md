@@ -20,18 +20,22 @@ The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`,
 scaffolding remains offline-only and is not admitted by this powered entry
 point.
 
-`sign-id` first reuses the bounded hover launch and level controller, including
-its launch-pad contact window and cumulative contact budget. Once stabilized,
-it excites yaw only at fixed `0.275` thrust: isolated `+0.08` and
-`-0.08 rad/s` pulses are surrounded by settled zero-rate image plateaus. The
-yaw phase has a `1.30 s` hard expiry and requires exact outbound wire receipts,
-at least four strictly newer gyro samples per pulse, and four distinct fresh
-primary-target frames per plateau. Paired gyro, heading, and image shifts must
-have opposite effects with consistent gains. Attitude excursion remains
-bounded by `0.05 rad`, measured yaw rate by `0.50 rad/s`, and every contact
-after launch is terminal. The result records controller-to-body and
-controller-to-image signs plus paired gyro and image-rate gains. Gate-1 yaw
-remains exact zero until three identical fixed-hash `sign-id` repeats are
+`sign-id` is a yaw-only below-hover epoch at fixed `0.235` thrust. It records a
+`0.24 s` neutral baseline, applies isolated `+0.08` and `-0.08 rad/s` yaw
+pulses for `0.21 s` each with a `0.12 s` zero-rate reversal dwell, then enters
+zero rate for `0.04 s` and cleanup. A `0.95 s` hard expiry keeps the epoch
+inside the empirically clean pad-contact horizon. Fresh frames observed at a
+segment boundary are attributed to the command that was still active, using
+its exact wire-release timestamp.
+
+The stage requires exact outbound wire receipts, at least four strictly newer
+gyro samples and four distinct fresh primary-target frames per measured
+window, and opposite paired gyro and differential image-slope effects with
+consistent gains. Roll and pitch remain exact zero. Attitude excursion stays
+bounded by `0.05 rad`, measured yaw rate by `0.50 rad/s`, and the existing
+collision watchdog remains unchanged. The result records controller-to-body
+and controller-to-image signs plus paired gyro and image-rate gains. Gate-1
+yaw remains exact zero until three identical fixed-hash `sign-id` repeats are
 reviewed and a separate calibrated candidate is committed.
 
 `gate1-recenter` is a user-authorized bounded no-passage diagnostic. Its
