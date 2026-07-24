@@ -363,12 +363,12 @@ def test_course_line_exit_counterroll_opposes_proved_turn_inside_bounds(
     assert abs(expected_roll) <= vq2_module.COURSE_LINE_PRETURN_LIMIT_RAD
 
 
-def test_gate0_centering_roll_counter_rotates_image_error_and_clamps():
-    assert vq2_module.gate0_centering_roll_target(0.25) < 0.0
-    assert vq2_module.gate0_centering_roll_target(-0.25) > 0.0
+def test_gate0_centering_roll_preserves_live_proved_sign_and_clamps():
+    assert vq2_module.gate0_centering_roll_target(0.25) > 0.0
+    assert vq2_module.gate0_centering_roll_target(-0.25) < 0.0
     assert vq2_module.gate0_centering_roll_target(0.0) == 0.0
-    assert vq2_module.gate0_centering_roll_target(10.0) == -0.08
-    assert vq2_module.gate0_centering_roll_target(-10.0) == 0.08
+    assert vq2_module.gate0_centering_roll_target(10.0) == 0.08
+    assert vq2_module.gate0_centering_roll_target(-10.0) == -0.08
 
 
 @pytest.mark.parametrize("normalized_x", (True, math.nan, math.inf, -math.inf))
@@ -1561,9 +1561,9 @@ def test_course_gate_roll_target_rejects_nonfinite_or_untyped_inputs(
         )
 
 
-def test_course_gate_roll_target_counter_rotates_then_banks_toward_gate():
-    assert vq2_module.course_gate_roll_target(0.25, recenter=True) < 0.0
-    assert vq2_module.course_gate_roll_target(-0.25, recenter=True) > 0.0
+def test_offline_course_gate_roll_target_uses_empirically_convergent_sign():
+    assert vq2_module.course_gate_roll_target(0.25, recenter=True) > 0.0
+    assert vq2_module.course_gate_roll_target(-0.25, recenter=True) < 0.0
     assert vq2_module.course_gate_roll_target(0.25, recenter=False) > 0.0
     assert vq2_module.course_gate_roll_target(-0.25, recenter=False) < 0.0
     assert vq2_module.course_gate_roll_target(0.0, recenter=True) == 0.0
@@ -1572,7 +1572,7 @@ def test_course_gate_roll_target_counter_rotates_then_banks_toward_gate():
 
 @pytest.mark.parametrize(
     ("recenter", "limit"),
-    ((True, 0.41), (False, 0.16)),
+    ((True, 0.05), (False, 0.16)),
     ids=("recenter", "approach"),
 )
 def test_course_gate_roll_target_uses_phase_specific_symmetric_clamps(
@@ -1580,37 +1580,28 @@ def test_course_gate_roll_target_uses_phase_specific_symmetric_clamps(
     limit,
 ):
     assert vq2_module.COURSE_ROLL_GAIN == 0.25
-    assert vq2_module.COURSE_RECENTER_ROLL_GAIN == 0.80
-    assert vq2_module.COURSE_RECENTER_ROLL_LIMIT_RAD == 0.41
+    assert vq2_module.COURSE_RECENTER_ROLL_GAIN == 0.12
+    assert vq2_module.COURSE_RECENTER_ROLL_LIMIT_RAD == 0.05
     assert vq2_module.COURSE_APPROACH_ROLL_LIMIT_RAD == 0.16
-    expected_sign = -1.0 if recenter else 1.0
     assert (
         vq2_module.course_gate_roll_target(10.0, recenter=recenter)
-        == expected_sign * limit
+        == limit
     )
     assert (
         vq2_module.course_gate_roll_target(-10.0, recenter=recenter)
-        == -expected_sign * limit
+        == -limit
     )
 
 
-def test_course_gate_recenter_pitch_uses_empirical_flight_sign_and_preserves_center():
-    assert vq2_module.COURSE_RECENTER_PITCH_GAIN == 0.80
-    assert vq2_module.COURSE_RECENTER_MIN_PITCH_RAD == -0.55
-    assert vq2_module.COURSE_RECENTER_MIN_PITCH_RAD > vq2_module.MIN_PITCH_RAD
-    assert vq2_module.course_gate_recenter_pitch_target(-0.05, 180.0) == -0.05
-    assert vq2_module.course_gate_recenter_pitch_target(
-        -0.05,
-        60.0,
-    ) == pytest.approx(-0.55)
-    assert vq2_module.course_gate_recenter_pitch_target(
-        -0.05,
-        80.0,
-    ) == pytest.approx(-0.49444444444444446)
-    assert vq2_module.course_gate_recenter_pitch_target(
-        -0.05,
-        300.0,
-    ) == pytest.approx(0.10)
+@pytest.mark.parametrize(
+    ("entry_pitch", "control_y"),
+    ((-0.05, 180.0), (-0.05, 60.0), (-0.05, 300.0)),
+)
+def test_course_gate_recenter_pitch_is_exact_zero(entry_pitch, control_y):
+    assert (
+        vq2_module.course_gate_recenter_pitch_target(entry_pitch, control_y)
+        == 0.0
+    )
 
 
 @pytest.mark.parametrize(
@@ -1648,71 +1639,44 @@ def test_course_gate_recenter_required_rejects_invalid_inputs(
 
 
 @pytest.mark.parametrize(
-    ("elapsed_s", "normalized_x", "control_y"),
+    ("elapsed_s", "expected"),
     (
-        (math.nextafter(0.60, 0.0), 0.35, 100.0),
-        (0.60, math.nextafter(0.35, math.inf), 100.0),
-        (0.60, -math.nextafter(0.35, math.inf), 100.0),
-        (0.60, 0.35, math.nextafter(100.0, 0.0)),
+        (math.nextafter(0.60, 0.0), True),
+        (0.60, False),
+        (math.nextafter(0.60, math.inf), False),
     ),
-    ids=("minimum-dwell", "right-error", "left-error", "gate-high"),
+    ids=("inside-window", "exact-deadline", "past-deadline"),
 )
-def test_course_gate_recenter_required_retains_braking_outside_corridor(
+def test_course_gate_recenter_window_is_hard_and_nonrenewable(
     elapsed_s,
-    normalized_x,
-    control_y,
+    expected,
 ):
     assert vq2_module.course_gate_recenter_required(
         elapsed_s,
-        normalized_x,
-        control_y,
-    )
-
-
-@pytest.mark.parametrize("normalized_x", (0.35, -0.35))
-def test_course_gate_recenter_releases_at_exact_safe_boundaries(normalized_x):
-    assert vq2_module.COURSE_RECENTER_DURATION_S == 0.60
-    assert vq2_module.COURSE_RECENTER_MAX_NORMALIZED_X == 0.35
-    assert vq2_module.COURSE_HIGH_GATE_Y_PX == 100.0
-    assert not vq2_module.course_gate_recenter_required(
-        0.60,
-        normalized_x,
-        100.0,
-    )
+        0.99,
+        -100.0,
+    ) is expected
 
 
 def test_course_recenter_rate_limit_preserves_zero_yaw_and_thrust():
-    assert vq2_module.COURSE_RECENTER_MAX_RATE_RAD_S == 0.25
+    assert vq2_module.COURSE_RECENTER_MAX_RATE_RAD_S == 0.12
     limited = vq2_module.limit_command_rates(
         AttitudeRateCommand(0.30, -0.30, 0.0, 0.30),
         vq2_module.COURSE_RECENTER_MAX_RATE_RAD_S,
     )
     assert limited == AttitudeRateCommand(
-        0.25,
-        -0.25,
+        0.12,
+        -0.12,
         0.0,
         0.30,
     )
 
 
-def test_course_recenter_rate_boost_reaches_clamp_without_changing_thrust():
-    assert vq2_module.COURSE_RECENTER_ROLL_RATE_SCALE == 1.60
-    assert vq2_module.COURSE_RECENTER_PITCH_RATE_SCALE == 1.60
-    boosted = vq2_module.course_recenter_rate_command(
-        AttitudeRateCommand(0.20, -0.11, 0.0, 0.35),
+def test_course_recenter_rate_command_never_amplifies_and_preserves_thrust():
+    limited = vq2_module.course_recenter_rate_command(
+        AttitudeRateCommand(0.20, -0.11, 0.0, 0.275),
     )
-    assert boosted.roll_rate == pytest.approx(0.25)
-    assert boosted.pitch_rate == pytest.approx(-0.176)
-    assert boosted.yaw_rate == 0.0
-    assert boosted.thrust == 0.35
-
-    clamped = vq2_module.course_recenter_rate_command(
-        AttitudeRateCommand(0.10, -0.20, 0.0, 0.35),
-    )
-    assert clamped.roll_rate == pytest.approx(0.16)
-    assert clamped.pitch_rate == pytest.approx(-0.25)
-    assert clamped.yaw_rate == 0.0
-    assert clamped.thrust == 0.35
+    assert limited == AttitudeRateCommand(0.12, -0.11, 0.0, 0.275)
 
 
 def test_official_lap_time_uses_finish_ns_minus_start_ms():
@@ -1937,35 +1901,6 @@ def test_gate0_boost_duration_rejects_invalid_bounds_before_sampling(
     assert adapter.commands == []
 
 
-@pytest.mark.parametrize(
-    "close_thrust_floor",
-    (True, math.nan, 0.20, math.nextafter(0.32, math.inf)),
-)
-def test_gate0_close_thrust_floor_rejects_invalid_bounds_before_sampling(
-    monkeypatch,
-    close_thrust_floor,
-):
-    adapter = _FakeAdapter()
-    runner = VQ2Runner(adapter, _FakeVision())
-    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
-
-    monkeypatch.setattr(
-        runner,
-        "_sample",
-        lambda: pytest.fail("invalid close thrust floor reached flight sampling"),
-    )
-
-    with pytest.raises(ValueError, match="close.*thrust.*floor"):
-        asyncio.run(
-            runner._run_gate0(
-                context,
-                close_thrust_floor=close_thrust_floor,
-            )
-        )
-
-    assert adapter.commands == []
-
-
 @pytest.mark.parametrize("observe_course_line", (None, 0, 1, 0.0, "true"))
 def test_gate0_course_line_observation_rejects_non_bool_before_sampling(
     monkeypatch,
@@ -2145,7 +2080,7 @@ def test_gate0_course_line_exit_counterroll_requires_preturn_before_sampling(
             True,
             False,
             True,
-            (0.015, 0.015, 0.13, 0.015, 0.015, 0.015),
+            (-0.015, -0.015, 0.115, -0.015, -0.015, -0.015),
         ),
         (
             (220, 100, 200, 160),
@@ -2279,7 +2214,6 @@ def _capture_first_gate0_thrust(
     elapsed_s,
     minimum_thrust=0.21,
     boost_until_s=0.45,
-    close_thrust_floor=0.21,
     pd_thrust=0.21,
     target_bbox=(282, 134, 80, 80),
     control_y=None,
@@ -2333,7 +2267,6 @@ def _capture_first_gate0_thrust(
                 context,
                 minimum_thrust=minimum_thrust,
                 boost_until_s=boost_until_s,
-                close_thrust_floor=close_thrust_floor,
             )
 
     with pytest.raises(CommandCaptured):
@@ -2379,65 +2312,6 @@ def test_gate0_extended_boost_switches_to_pixel_pd_at_exact_boundary(
         elapsed_s=elapsed_s,
         boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
         pd_thrust=0.23,
-    ) == expected_thrust
-
-
-@pytest.mark.parametrize(
-    ("elapsed_s", "target_bbox", "expected_thrust"),
-    (
-        (
-            math.nextafter(0.80, 0.0),
-            (192, 80, 256, 200),
-            0.32,
-        ),
-        (0.80, (192, 80, 255, 200), 0.23),
-        (0.80, (192, 80, 256, 200), 0.30),
-    ),
-    ids=("boost-precedes-floor", "below-eight-times", "at-eight-times"),
-)
-def test_gate0_close_floor_applies_only_after_boost_at_eight_times_area(
-    monkeypatch,
-    elapsed_s,
-    target_bbox,
-    expected_thrust,
-):
-    target_area = target_bbox[2] * target_bbox[3]
-    if target_bbox[2] == 255:
-        assert target_area < 8 * 6400
-    else:
-        assert target_area == 8 * 6400
-    assert _capture_first_gate0_thrust(
-        monkeypatch,
-        elapsed_s=elapsed_s,
-        boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
-        close_thrust_floor=vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR,
-        pd_thrust=0.23,
-        target_bbox=target_bbox,
-    ) == expected_thrust
-
-
-@pytest.mark.parametrize(
-    ("control_y", "expected_thrust"),
-    (
-        (190.0, 0.30),
-        (math.nextafter(190.0, math.inf), 0.23),
-    ),
-    ids=("at-control-row-limit", "beyond-control-row-limit"),
-)
-def test_gate0_close_floor_respects_exact_vertical_corridor_limit(
-    monkeypatch,
-    control_y,
-    expected_thrust,
-):
-    assert vq2_module.COURSE_GATE0_CLOSE_FLOOR_MAX_CONTROL_Y_PX == 190.0
-    assert _capture_first_gate0_thrust(
-        monkeypatch,
-        elapsed_s=0.80,
-        boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
-        close_thrust_floor=vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR,
-        pd_thrust=0.23,
-        target_bbox=(192, 80, 256, 200),
-        control_y=control_y,
     ) == expected_thrust
 
 
@@ -3638,9 +3512,6 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
             runner._run_gate0(
                 context,
                 boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
-                close_thrust_floor=(
-                    vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR
-                ),
             )
         )
         assert result["gate0_passed"]
@@ -3651,9 +3522,6 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
                 runner._run_gate0(
                     context,
                     boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
-                    close_thrust_floor=(
-                        vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR
-                    ),
                 )
             )
 
@@ -4217,103 +4085,23 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
     assert result.details == {"gate0_passed": True}
 
 
-def test_full_lap_stage_uses_normal_powered_lifecycle_and_cleanup(monkeypatch):
+def test_full_lap_is_rejected_before_any_powered_lifecycle(monkeypatch):
     adapter = _FakeAdapter()
     adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
     runner = VQ2Runner(adapter, _FakeVision())
-    calls = []
-    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
-    details = {
-        "race_finished": True,
-        "official_lap_time_s": 12.5,
-        "proved_transition_count": 6,
-    }
-
-    async def establish(**_kwargs):
-        calls.append("reset")
-
-    async def normalize():
-        calls.append("normalize")
-
-    async def wait_for_go():
-        calls.append("go")
-        return context
-
-    async def arm():
-        calls.append("arm")
-
-    async def full_lap(observed_context):
-        calls.append(("full-lap", observed_context is context))
-        return details
-
-    async def cleanup():
-        calls.append("cleanup")
-        return True
-
-    monkeypatch.setattr(runner, "establish_reset_epoch", establish)
-    monkeypatch.setattr(runner, "normalize_disarmed", normalize)
-    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
-    monkeypatch.setattr(runner, "arm_confirmed", arm)
-    monkeypatch.setattr(runner, "_run_full_lap", full_lap)
-    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
-
-    result = asyncio.run(
-        runner.run_powered_stage("full-lap", write_diagnostic_pngs=False)
+    monkeypatch.setattr(
+        runner,
+        "establish_reset_epoch",
+        lambda **_kwargs: pytest.fail("full-lap reached reset"),
     )
 
-    assert result.success
-    assert result.cleanup_confirmed
-    assert result.details is details
-    assert calls == [
-        "reset",
-        "normalize",
-        "go",
-        "arm",
-        ("full-lap", True),
-        "cleanup",
-    ]
+    with pytest.raises(ValueError, match="unsupported powered stage"):
+        asyncio.run(
+            runner.run_powered_stage("full-lap", write_diagnostic_pngs=False)
+        )
 
 
-def test_full_lap_rejects_anomalous_gate_reference_before_arm(monkeypatch):
-    adapter = _FakeAdapter()
-    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
-    runner = VQ2Runner(adapter, _FakeVision())
-    calls = []
-
-    async def establish(**_kwargs):
-        calls.append("reset")
-
-    async def normalize():
-        calls.append("normalize")
-
-    async def wait_for_go():
-        calls.append("go")
-        return vq2_module.StartContext(0.0, -0.31, 322, 185, 4_720, 1000)
-
-    async def arm():
-        calls.append("arm")
-
-    async def cleanup():
-        calls.append("cleanup")
-        return True
-
-    monkeypatch.setattr(runner, "establish_reset_epoch", establish)
-    monkeypatch.setattr(runner, "normalize_disarmed", normalize)
-    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
-    monkeypatch.setattr(runner, "arm_confirmed", arm)
-    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
-
-    result = asyncio.run(
-        runner.run_powered_stage("full-lap", write_diagnostic_pngs=False)
-    )
-
-    assert not result.success
-    assert result.cleanup_confirmed
-    assert "outside proved spawn area envelope (4720px)" in result.reason
-    assert calls == ["reset", "normalize", "go", "cleanup"]
-
-
-def test_full_lap_wires_stable_high_authority_preturn_and_default_close_floor(
+def test_offline_full_lap_scaffold_disables_unaccepted_gate0_overrides(
     monkeypatch,
 ):
     class Gate0Observed(Exception):
@@ -4330,7 +4118,6 @@ def test_full_lap_wires_stable_high_authority_preturn_and_default_close_floor(
         exit_pitch_rad=0.0,
         minimum_thrust=0.21,
         boost_until_s=0.45,
-        close_thrust_floor=0.21,
         observe_course_line=False,
         course_line_preturn=False,
         course_line_exit_counterroll_enabled=False,
@@ -4342,7 +4129,6 @@ def test_full_lap_wires_stable_high_authority_preturn_and_default_close_floor(
                 exit_pitch_rad,
                 minimum_thrust,
                 boost_until_s,
-                close_thrust_floor,
                 observe_course_line,
                 course_line_preturn,
                 course_line_exit_counterroll_enabled,
@@ -4359,17 +4145,14 @@ def test_full_lap_wires_stable_high_authority_preturn_and_default_close_floor(
         (
             context,
             False,
-            vq2_module.COURSE_GATE0_EXIT_PITCH_RAD,
-            vq2_module.COURSE_GATE0_MIN_THRUST,
-            vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+            0.0,
             0.21,
-            True,
-            True,
-            True,
+            0.45,
+            False,
+            False,
+            False,
         )
     ]
-    assert vq2_module.COURSE_GATE0_MIN_THRUST == 0.21
-    assert vq2_module.COURSE_GATE0_BOOST_UNTIL_S == 0.80
 
 
 def test_passive_preflight_requires_the_requested_continuous_healthy_dwell(

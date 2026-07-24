@@ -97,13 +97,13 @@ def test_compact_manifest_has_no_interactive_or_bulk_freeze_inputs(tmp_path):
     assert "attestation" not in json.dumps(manifest)
 
 
-def test_full_lap_is_an_explicit_fast_powered_stage():
-    assert "full-lap" in fast_cycle.FAST_POWERED_STAGES
-    parsed = fast_cycle.build_argument_parser().parse_args(["full-lap"])
-    assert parsed.stage == "full-lap"
+def test_full_lap_is_quarantined_from_fast_powered_stages():
+    assert "full-lap" not in fast_cycle.FAST_POWERED_STAGES
+    with pytest.raises(SystemExit):
+        fast_cycle.build_argument_parser().parse_args(["full-lap"])
 
 
-@pytest.mark.parametrize("requested_stage", ["calibration-excite", "full-lap"])
+@pytest.mark.parametrize("requested_stage", ["calibration-excite"])
 def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
     tmp_path,
     requested_stage,
@@ -152,9 +152,7 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
         "attempt_limit": 1,
     }
     assert manifest["execution"]["stage"] == requested_stage
-    assert (manifest["inputs"]["excitation_plan"] is None) is (
-        requested_stage == "full-lap"
-    )
+    assert manifest["inputs"]["excitation_plan"] is not None
     assert (run_directory / "session.jsonl.gz").read_bytes() == b"compact trace"
     assert result["trace"]["sha256"] == fast_cycle.hashlib.sha256(
         b"compact trace"

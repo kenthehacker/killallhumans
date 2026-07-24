@@ -43,7 +43,6 @@ FAST_POWERED_STAGES = (
     "hover",
     "gate0",
     "gate0-observe",
-    "full-lap",
     "calibration-excite",
 )
 _HEX40_RE = re.compile(r"[0-9a-f]{40}\Z")

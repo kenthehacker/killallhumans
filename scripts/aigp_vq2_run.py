@@ -122,6 +122,8 @@ CROSSING_MIN_WIDTH_PX = 512
 GATE0_FLIGHT_TIMEOUT_S = 5.0
 GATE0_PITCH_BLEND_S = 0.8
 
+# Retained only as an offline-scaffold identity. It is intentionally absent
+# from every live CLI and powered dispatcher.
 FULL_LAP_STAGE = "full-lap"
 FULL_LAP_TIMEOUT_S = 45.0
 FULL_LAP_MAX_GATE_INDEX = 15
@@ -132,18 +134,13 @@ COURSE_RECENTER_DURATION_S = 0.60
 COURSE_RECENTER_MAX_NORMALIZED_X = 0.35
 COURSE_APPROACH_PITCH_RAD = -0.20
 COURSE_CROSSING_AREA_CAP_PX = int(0.70 * 640 * 360)
-COURSE_RECENTER_MAX_RATE_RAD_S = 0.25
+COURSE_RECENTER_MAX_RATE_RAD_S = 0.12
 COURSE_ROLL_GAIN = 0.25
-COURSE_RECENTER_ROLL_GAIN = 0.80
-COURSE_RECENTER_ROLL_LIMIT_RAD = 0.41
-COURSE_RECENTER_ROLL_RATE_SCALE = 1.60
-COURSE_RECENTER_PITCH_RATE_SCALE = 1.60
+COURSE_RECENTER_ROLL_GAIN = 0.12
+COURSE_RECENTER_ROLL_LIMIT_RAD = 0.05
 COURSE_APPROACH_ROLL_LIMIT_RAD = 0.16
-COURSE_RECENTER_PITCH_GAIN = 0.80
-COURSE_RECENTER_MIN_PITCH_RAD = -0.55
-COURSE_RECENTER_MAX_PITCH_RAD = 0.10
-COURSE_TRANSITION_THRUST = 0.35
-COURSE_RECENTER_THRUST = 0.35
+COURSE_TRANSITION_THRUST = 0.0
+COURSE_RECENTER_THRUST = 0.275
 COURSE_HIGH_GATE_Y_PX = 100.0
 COURSE_GATE0_EXIT_PITCH_RAD = 0.0
 COURSE_GATE0_BOOST_UNTIL_S = 0.80
@@ -151,8 +148,6 @@ COURSE_GATE0_MIN_THRUST = 0.21
 COURSE_GATE0_EXPECTED_TARGET_LOSS_S = 2.50
 COURSE_RACE_PACKET_PERIOD_S = 0.250
 COURSE_RACE_PACKET_TARGET_LEAD_S = 0.060
-COURSE_GATE0_CLOSE_THRUST_FLOOR = 0.30
-COURSE_GATE0_CLOSE_FLOOR_MAX_CONTROL_Y_PX = 190.0
 COURSE_LINE_MIN_ROI_PIXELS = 128
 COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE = 1.30
 COURSE_LINE_PRETURN_MIN_SCORE = 0.04
@@ -6064,13 +6059,13 @@ def course_line_exit_counterroll(turn_score: float) -> float:
 
 
 def gate0_centering_roll_target(normalized_x: float) -> float:
-    """Counter-rotate Gate 0 toward image center before course pre-turn."""
+    """Apply the previously live-proved Gate 0 image-centering law."""
 
     if type(normalized_x) not in {int, float} or not math.isfinite(
         float(normalized_x)
     ):
         raise ValueError("gate-0 centering input must be finite and numeric")
-    return max(-0.08, min(0.08, -0.15 * float(normalized_x)))
+    return max(-0.08, min(0.08, 0.15 * float(normalized_x)))
 
 
 def select_primary_gate(
@@ -6857,15 +6852,9 @@ def limit_command_rates(
 def course_recenter_rate_command(
     command: AttitudeRateCommand,
 ) -> AttitudeRateCommand:
-    """Reach bounded recenter roll/pitch targets at the proved rate ceiling."""
+    """Tighten an offline recenter proposal without amplifying its rates."""
 
-    boosted = AttitudeRateCommand(
-        roll_rate=command.roll_rate * COURSE_RECENTER_ROLL_RATE_SCALE,
-        pitch_rate=command.pitch_rate * COURSE_RECENTER_PITCH_RATE_SCALE,
-        yaw_rate=0.0,
-        thrust=command.thrust,
-    )
-    return limit_command_rates(boosted, COURSE_RECENTER_MAX_RATE_RAD_S)
+    return limit_command_rates(command, COURSE_RECENTER_MAX_RATE_RAD_S)
 
 
 def course_gate_roll_target(normalized_x: float, *, recenter: bool) -> float:
@@ -6882,14 +6871,10 @@ def course_gate_roll_target(normalized_x: float, *, recenter: bool) -> float:
         if recenter
         else COURSE_APPROACH_ROLL_LIMIT_RAD
     )
-    # Reacquisition counter-rotates the camera while the Gate-0 turn velocity
-    # carries the vehicle right.  Once centered, approach guidance resumes a
-    # physical bank toward the gate.
-    direction = -1.0 if recenter else 1.0
     gain = COURSE_RECENTER_ROLL_GAIN if recenter else COURSE_ROLL_GAIN
     return max(
         -limit,
-        min(limit, direction * gain * float(normalized_x)),
+        min(limit, gain * float(normalized_x)),
     )
 
 
@@ -6897,7 +6882,7 @@ def course_gate_recenter_pitch_target(
     entry_pitch_rad: float,
     control_y: float,
 ) -> float:
-    """Counter vertical camera drift while a course gate is reacquired."""
+    """Return the exact-zero pitch objective required by bounded recentering."""
 
     if (
         type(entry_pitch_rad) not in {int, float}
@@ -6906,15 +6891,7 @@ def course_gate_recenter_pitch_target(
         or not math.isfinite(float(control_y))
     ):
         raise ValueError("course recenter pitch inputs must be finite and numeric")
-    vertical_error = max(-1.0, min(1.0, (180.0 - float(control_y)) / 180.0))
-    # Build-3385 flight evidence shows negative pitch moves a high course gate
-    # down in the image while adding forward speed; the static camera-only
-    # projection is dominated by vehicle translation in this phase.
-    target = float(entry_pitch_rad) - COURSE_RECENTER_PITCH_GAIN * vertical_error
-    return max(
-        COURSE_RECENTER_MIN_PITCH_RAD,
-        min(COURSE_RECENTER_MAX_PITCH_RAD, target),
-    )
+    return 0.0
 
 
 def course_gate_recenter_required(
@@ -6922,7 +6899,7 @@ def course_gate_recenter_required(
     normalized_x: float,
     control_y: float,
 ) -> bool:
-    """Keep braking until minimum dwell and a usable gate corridor are proved."""
+    """Retain recenter mode only inside its non-renewable hard window."""
 
     if (
         type(elapsed_s) not in {int, float}
@@ -6934,11 +6911,7 @@ def course_gate_recenter_required(
         or not math.isfinite(float(control_y))
     ):
         raise ValueError("course recenter inputs must be finite and typed")
-    return bool(
-        float(elapsed_s) < COURSE_RECENTER_DURATION_S
-        or abs(float(normalized_x)) > COURSE_RECENTER_MAX_NORMALIZED_X
-        or float(control_y) < COURSE_HIGH_GATE_Y_PX
-    )
+    return bool(float(elapsed_s) < COURSE_RECENTER_DURATION_S)
 
 
 def post_gate_observation_deadline(
@@ -9282,7 +9255,6 @@ class VQ2Runner:
         exit_pitch_rad: float = 0.0,
         minimum_thrust: float = 0.21,
         boost_until_s: float = 0.45,
-        close_thrust_floor: float = 0.21,
         observe_course_line: bool = False,
         course_line_preturn: bool = False,
         course_line_exit_counterroll_enabled: bool = False,
@@ -9300,12 +9272,6 @@ class VQ2Runner:
             or not 0.45 <= float(boost_until_s) <= 1.0
         ):
             raise ValueError("gate-0 boost duration is outside the validated envelope")
-        if (
-            type(close_thrust_floor) not in {int, float}
-            or not math.isfinite(float(close_thrust_floor))
-            or not 0.21 <= float(close_thrust_floor) <= 0.32
-        ):
-            raise ValueError("gate-0 close thrust floor is outside the validated envelope")
         if type(observe_course_line) is not bool:
             raise ValueError("gate-0 course-line observation flag must be bool")
         if type(course_line_preturn) is not bool:
@@ -9566,21 +9532,8 @@ class VQ2Runner:
                 # Steer the camera ray through the opening center.  Image-rate
                 # damping brakes climb before positional error grows near the
                 # rapidly approaching gate.
-                active_thrust_floor = float(minimum_thrust)
-                if (
-                    target.bbox_area >= 8 * context.initial_gate_area
-                    and control_y <= COURSE_GATE0_CLOSE_FLOOR_MAX_CONTROL_Y_PX
-                ):
-                    # Expansion/clipping makes image-rate damping unreliable at
-                    # the aperture.  Full-lap runs may preserve enough vertical
-                    # energy here to survive the mandatory zero-thrust credit
-                    # confirmation; the close corridor guard remains active.
-                    active_thrust_floor = max(
-                        active_thrust_floor,
-                        float(close_thrust_floor),
-                    )
                 thrust = max(
-                    active_thrust_floor,
+                    float(minimum_thrust),
                     gate_vertical_thrust(control_y, control_y_rate),
                 )
 
@@ -9613,18 +9566,16 @@ class VQ2Runner:
     ) -> Dict[str, Any]:
         """Collect a bounded view after a proved gate-0 pass.
 
-        The observation stage keeps its historical exact-zero default.  The
-        full-lap continuation may use a bounded vertical hold after race credit
-        so the vehicle does not fall onto the launch surface while the retired
-        target is replaced.
+        Observation authority is exact-zero. It never supplies Gate 1 control
+        or passage authority.
         """
 
         if (
             type(hold_thrust) not in {int, float}
             or not math.isfinite(float(hold_thrust))
-            or not 0.0 <= float(hold_thrust) <= COURSE_TRANSITION_THRUST
+            or float(hold_thrust) != 0.0
         ):
-            raise ValueError("post-gate hold thrust is outside the course envelope")
+            raise ValueError("post-gate observation requires exact-zero thrust")
         proof = self._gate0_transition_proof
         if proof is None or not gate0_details.get("gate_transition_proved"):
             raise SafetyAbort("gate-1 observation lacks an authoritative transition proof")
@@ -9900,11 +9851,7 @@ class VQ2Runner:
 
                 await self._send_flight_command(transition_command)
                 self._record_tick(
-                    (
-                        "gate0-observe/post-pass"
-                        if float(hold_thrust) == 0.0
-                        else "full-lap/gate1/acquire"
-                    ),
+                    "gate0-observe/post-pass",
                     send_checked_s - observation_started_s,
                     transition_command,
                 )
@@ -10580,24 +10527,21 @@ class VQ2Runner:
         return result
 
     async def _run_full_lap(self, context: StartContext) -> Dict[str, Any]:
-        """Run an unknown-count mapless lap until the simulator declares finish."""
+        """Exercise retained full-lap orchestration as offline-only scaffolding.
+
+        No live dispatcher admits this method. The unaccepted Gate 0 phase
+        alignment, launch overrides, and cyan-line actuation are deliberately
+        disabled even for direct test calls.
+        """
 
         lap_started_s = time.monotonic()
         lap_deadline_s = lap_started_s + FULL_LAP_TIMEOUT_S
-        phase_alignment = await self._align_gate0_race_phase()
-        gate0 = await self._run_gate0(
-            context,
-            exit_pitch_rad=COURSE_GATE0_EXIT_PITCH_RAD,
-            minimum_thrust=COURSE_GATE0_MIN_THRUST,
-            boost_until_s=COURSE_GATE0_BOOST_UNTIL_S,
-            observe_course_line=True,
-            course_line_preturn=True,
-            course_line_exit_counterroll_enabled=True,
-        )
-        gate1_observation = await self._observe_gate1(
-            gate0,
-            hold_thrust=COURSE_TRANSITION_THRUST,
-        )
+        phase_alignment = {
+            "applied": False,
+            "reason": "offline scaffold disables unaccepted race-phase actuation",
+        }
+        gate0 = await self._run_gate0(context)
+        gate1_observation = await self._observe_gate1(gate0)
         final_bbox = gate1_observation["final_gate_bbox"]
         acquisition: Dict[str, Any] = {
             **gate1_observation,
@@ -10670,7 +10614,6 @@ class VQ2Runner:
             "hover",
             "gate0",
             "gate0-observe",
-            FULL_LAP_STAGE,
             CALIBRATION_STAGE,
         }:
             raise ValueError(f"unsupported powered stage: {stage}")
@@ -10688,16 +10631,6 @@ class VQ2Runner:
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
             context = await self.wait_for_go()
-            if (
-                stage == FULL_LAP_STAGE
-                and not full_lap_initial_gate_reference_is_valid(
-                    context.initial_gate_area
-                )
-            ):
-                raise SafetyAbort(
-                    "full-lap initial gate reference outside proved spawn "
-                    f"area envelope ({context.initial_gate_area}px)"
-                )
             race = self.adapter.race_status
             gate_before = race.active_gate_index if race else None
             await self.arm_confirmed()
@@ -10726,7 +10659,7 @@ class VQ2Runner:
                     }
                     raise
             else:
-                details = await self._run_full_lap(context)
+                raise AssertionError("powered stage dispatch was not exhaustive")
             success = True
             reason = "stage completed"
         except (SafetyAbort, asyncio.CancelledError) as exc:
@@ -11797,7 +11730,6 @@ def main(
             "hover",
             "gate0",
             "gate0-observe",
-            FULL_LAP_STAGE,
         ),
         default="preflight",
     )
