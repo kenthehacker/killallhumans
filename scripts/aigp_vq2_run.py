@@ -11079,9 +11079,17 @@ class VQ2Runner:
                             "Gate-0 yaw-stop roll brake lacked a "
                             "same-sign measured roll excursion"
                         )
-                    raw_brake_target_rad = (
-                        2.0 * float(preshape_entry_roll_rad)
-                        - float(current_roll)
+                    if (
+                        float(preshape_entry_roll_rad)
+                        * preshape_latched_sign
+                        < 0.0
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 yaw-stop roll brake entry contradicted "
+                            "the latched turn direction"
+                        )
+                    raw_brake_target_rad = float(
+                        preshape_entry_roll_rad
                     )
                     if (
                         not math.isfinite(raw_brake_target_rad)
@@ -11094,12 +11102,6 @@ class VQ2Runner:
                             - float(preshape_entry_roll_rad)
                         )
                         > GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
-                        or (
-                            raw_brake_target_rad
-                            - float(preshape_entry_roll_rad)
-                        )
-                        * preshape_latched_sign
-                        >= 0.0
                         or (
                             raw_brake_target_rad
                             - float(current_roll)

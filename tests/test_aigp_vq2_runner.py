@@ -4244,6 +4244,7 @@ def _exercise_sustained_gate0_with_cue(
     yaw_stop_sample=7,
     post_yaw_stop_roll=None,
     authoritative_pass_sample=None,
+    area_boundary_sample=None,
     turn_score=0.20,
     entry_roll=0.0,
 ):
@@ -4255,7 +4256,9 @@ def _exercise_sustained_gate0_with_cue(
     document["turn_cue"]["sustained_preshape_enabled"] = True
     document["turn_cue"]["exit_counterroll_enabled"] = False
     document["turn_cue"]["preturn_roll_cap_rad"] = 0.12
-    document["turn_cue"]["preshape_end_gate_area_scale"] = 20.0
+    document["turn_cue"]["preshape_end_gate_area_scale"] = (
+        8.0 if area_boundary_sample is not None else 20.0
+    )
     document["yaw_control"]["gate0_turn_score_gain"] = -0.40
     document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
     document["forward_braking"]["gate0_turn_pitch_rad"] = 0.02
@@ -4363,7 +4366,11 @@ def _exercise_sustained_gate0_with_cue(
             bbox=(
                 (277, 132, 86, 96)
                 if sample_count[0] <= 3
-                else (280, 128, 80, 104)
+                else (
+                    (200, 70, 240, 220)
+                    if sample_count[0] == area_boundary_sample
+                    else (280, 128, 80, 104)
+                )
             ),
             confidence=0.8,
         )
@@ -4459,15 +4466,15 @@ def _exercise_sustained_gate0_with_cue(
                 and (
                     yaw_stop_roll is None
                     or (
-                        float(yaw_stop_roll)
+                        float(entry_roll) * float(turn_score) >= 0.0
+                        and float(yaw_stop_roll)
                         * float(turn_score)
                         > 0.0
                         and float(yaw_stop_excursion)
                         * -float(turn_score)
                         > 0.0
                         and abs(
-                            2.0 * float(entry_roll)
-                            - float(yaw_stop_roll)
+                            float(entry_roll)
                         )
                         <= 0.12
                         and abs(
@@ -4590,7 +4597,54 @@ def test_sustained_gate0_brake_ends_at_shared_deadline_from_turn_cue(
     )
 
 
-def test_sustained_gate0_yaw_stop_latches_symmetric_roll_brake_once(
+def test_sustained_gate0_gate_area_precedes_coincident_entry_roll_brake(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        yaw_stop_roll=0.05,
+        yaw_stop_sample=7,
+        area_boundary_sample=7,
+    )
+
+    preshape_end = next(
+        payload
+        for event, payload in events
+        if event == "gate0_preshape_ended"
+    )
+    assert preshape_end["reason"] == "gate_area"
+    assert not any(
+        event == "gate0_yaw_stop_roll_brake_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "course_line_yaw_stop_roll_brake_applied"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_pass_precedes_coincident_entry_roll_brake(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        yaw_stop_roll=0.05,
+        yaw_stop_sample=7,
+        authoritative_pass_sample=7,
+    )
+
+    assert any(event == "gate0_pass_proved" for event, _payload in events)
+    assert not any(
+        event == "gate0_yaw_stop_roll_brake_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "course_line_yaw_stop_roll_brake_applied"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_yaw_stop_latches_entry_roll_brake_once(
     monkeypatch,
 ):
     runner, commands, events = _exercise_sustained_gate0_with_cue(
@@ -4623,16 +4677,16 @@ def test_sustained_gate0_yaw_stop_latches_symmetric_roll_brake_once(
     assert brake_latches[0]["entry_roll_rad"] == pytest.approx(0.02)
     assert brake_latches[0]["trigger_roll_rad"] == pytest.approx(0.05)
     assert brake_latches[0]["roll_excursion_rad"] == pytest.approx(0.03)
-    assert brake_latches[0]["raw_target_roll_rad"] == pytest.approx(-0.01)
-    assert brake_latches[0]["target_roll_rad"] == pytest.approx(-0.01)
+    assert brake_latches[0]["raw_target_roll_rad"] == pytest.approx(0.02)
+    assert brake_latches[0]["target_roll_rad"] == pytest.approx(0.02)
     assert len(brake_commands) >= 2
     assert len(brake_command_ticks) == len(brake_commands)
     assert all(
-        payload["target_roll_rad"] == pytest.approx(-0.01)
+        payload["target_roll_rad"] == pytest.approx(0.02)
         for payload in brake_commands
     )
     assert all(
-        payload["target_roll_rad"] == pytest.approx(-0.01)
+        payload["target_roll_rad"] == pytest.approx(0.02)
         and payload["command_roll_rate_rad_s"] < 0.0
         for payload in brake_command_ticks
     )
@@ -4666,10 +4720,10 @@ def test_sustained_gate0_yaw_stop_latches_symmetric_roll_brake_once(
     ] == pytest.approx(0.03)
     assert runner._gate0_early_turn_summary[
         "roll_brake_raw_target_rad"
-    ] == pytest.approx(-0.01)
+    ] == pytest.approx(0.02)
     assert runner._gate0_early_turn_summary[
         "roll_brake_target_rad"
-    ] == pytest.approx(-0.01)
+    ] == pytest.approx(0.02)
     assert (
         runner._gate0_early_turn_summary["roll_brake_command_count"]
         == len(brake_commands)
@@ -4700,6 +4754,46 @@ def test_sustained_gate0_yaw_stop_rejects_wrong_sign_roll_excursion(
     _runner, commands, events = _exercise_sustained_gate0_with_cue(
         monkeypatch,
         yaw_stop_roll=-0.05,
+    )
+
+    assert len(commands) == 6
+    assert not any(
+        event == "gate0_yaw_stop_roll_brake_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "course_line_yaw_stop_roll_brake_applied"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_yaw_stop_allows_exact_zero_entry_roll(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_roll=0.0,
+        yaw_stop_roll=0.05,
+    )
+
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_yaw_stop_roll_brake_latched"
+    )
+    assert latch["entry_roll_rad"] == 0.0
+    assert latch["raw_target_roll_rad"] == 0.0
+    assert latch["target_roll_rad"] == 0.0
+    assert commands[6].roll_rate < 0.0
+
+
+def test_sustained_gate0_yaw_stop_rejects_opposite_sign_entry_roll(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_roll=-0.02,
+        yaw_stop_roll=0.05,
     )
 
     assert len(commands) == 6
@@ -4745,7 +4839,7 @@ def test_sustained_gate0_yaw_stop_rejects_out_of_envelope_raw_brake_target(
     )
 
 
-def test_sustained_gate0_yaw_stop_brake_mirrors_negative_turn(
+def test_sustained_gate0_yaw_stop_brake_returns_to_negative_entry_roll(
     monkeypatch,
 ):
     _runner, commands, events = _exercise_sustained_gate0_with_cue(
@@ -4763,9 +4857,45 @@ def test_sustained_gate0_yaw_stop_brake_mirrors_negative_turn(
     )
     assert latch["entry_roll_rad"] == pytest.approx(-0.02)
     assert latch["roll_excursion_rad"] == pytest.approx(-0.03)
-    assert latch["target_roll_rad"] == pytest.approx(0.01)
+    assert latch["target_roll_rad"] == pytest.approx(-0.02)
     assert latch["trigger_roll_rad"] == pytest.approx(-0.05)
     assert commands[6].roll_rate > 0.0
+    assert all(command.yaw_rate == 0.0 for command in commands[6:])
+
+
+def test_sustained_gate0_entry_roll_brake_reverses_after_overshoot(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        entry_roll=0.02,
+        yaw_stop_roll=0.05,
+        post_yaw_stop_roll=0.0,
+    )
+
+    applied = [
+        payload
+        for event, payload in events
+        if event == "course_line_yaw_stop_roll_brake_applied"
+    ]
+    command_ticks = [
+        payload
+        for event, payload in events
+        if (
+            event == "gate0_early_turn_command"
+            and payload["roll_brake_active"]
+        )
+    ]
+    assert all(
+        payload["target_roll_rad"] == pytest.approx(0.02)
+        for payload in applied
+    )
+    assert len(command_ticks) >= 2
+    assert command_ticks[0]["command_roll_rate_rad_s"] < 0.0
+    assert all(
+        payload["command_roll_rate_rad_s"] > 0.0
+        for payload in command_ticks[1:]
+    )
     assert all(command.yaw_rate == 0.0 for command in commands[6:])
 
 

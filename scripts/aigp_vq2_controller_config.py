@@ -22,7 +22,7 @@ from typing import Any, Mapping
 
 
 CONTROLLER_CONFIG_SCHEMA = "aigp-vq2-controller-config/1"
-CONTROLLER_FAMILY = "aigp-vq2-gate0-gate1-recenter/8"
+CONTROLLER_FAMILY = "aigp-vq2-gate0-gate1-recenter/9"
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
