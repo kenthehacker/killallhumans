@@ -378,6 +378,154 @@ def test_gate0_centering_roll_rejects_invalid_input(normalized_x):
         vq2_module.gate0_centering_roll_target(normalized_x)
 
 
+@pytest.mark.parametrize(
+    ("line_displacement_px", "gate_width_px", "expected_offset_px"),
+    (
+        (13.0, 200, -13.0),
+        (-13.0, 200, 13.0),
+        (64.0, 80, -20.0),
+        (-64.0, 80, 20.0),
+        (100.0, 200, -32.0),
+        (-100.0, 200, 32.0),
+    ),
+    ids=(
+        "positive-displacement-limited",
+        "negative-displacement-limited",
+        "positive-aperture-limited",
+        "negative-aperture-limited",
+        "positive-hard-limited",
+        "negative-hard-limited",
+    ),
+)
+def test_gate0_course_line_intercept_opposes_bend_inside_fixed_bounds(
+    line_displacement_px,
+    gate_width_px,
+    expected_offset_px,
+):
+    assert (
+        vq2_module.GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION
+        == 0.25
+    )
+    assert vq2_module.GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX == 32.0
+    offset_px = vq2_module.gate0_course_line_intercept_offset_px(
+        line_displacement_px,
+        gate_width_px,
+    )
+
+    assert offset_px == pytest.approx(expected_offset_px)
+    assert offset_px * line_displacement_px < 0.0
+    assert abs(offset_px) <= 0.25 * gate_width_px
+    assert abs(offset_px) <= 32.0
+
+
+@pytest.mark.parametrize(
+    ("line_displacement_px", "gate_width_px"),
+    (
+        (True, 80),
+        (math.nan, 80),
+        (math.inf, 80),
+        (-math.inf, 80),
+        (math.nextafter(12.8, 0.0), 80),
+        (math.nextafter(-12.8, 0.0), 80),
+        (math.nextafter(320.0, math.inf), 80),
+        (64.0, True),
+        (64.0, 0),
+        (64.0, 641),
+        (64.0, 80.0),
+    ),
+)
+def test_gate0_course_line_intercept_rejects_unproved_geometry(
+    line_displacement_px,
+    gate_width_px,
+):
+    with pytest.raises(ValueError, match="spatial-intercept geometry"):
+        vq2_module.gate0_course_line_intercept_offset_px(
+            line_displacement_px,
+            gate_width_px,
+        )
+
+
+@pytest.mark.parametrize(
+    (
+        "gate_center_x_px",
+        "gate_width_px",
+        "intercept_offset_px",
+        "expected_desired_center_x_px",
+        "expected_aperture_error",
+        "expected_target_roll_rad",
+    ),
+    (
+        (320, 80, -20.0, 300.0, 0.50, 0.075),
+        (310, 80, -20.0, 300.0, 0.25, 0.0375),
+        (300, 80, -20.0, 300.0, 0.00, 0.0),
+        (290, 80, -20.0, 300.0, -0.25, -0.0375),
+        (400, 80, -20.0, 300.0, 2.50, 0.08),
+        (320, 80, 20.0, 340.0, -0.50, -0.075),
+    ),
+    ids=(
+        "approach",
+        "taper",
+        "on-intercept",
+        "reversal",
+        "roll-cap",
+        "mirrored",
+    ),
+)
+def test_gate0_spatial_intercept_uses_aperture_error_without_additive_bias(
+    gate_center_x_px,
+    gate_width_px,
+    intercept_offset_px,
+    expected_desired_center_x_px,
+    expected_aperture_error,
+    expected_target_roll_rad,
+):
+    desired_center_x_px, aperture_error, target_roll_rad = (
+        vq2_module.gate0_spatial_intercept_roll_target(
+            gate_center_x_px,
+            gate_width_px,
+            intercept_offset_px,
+            gain=0.15,
+            cap_rad=0.08,
+        )
+    )
+
+    assert desired_center_x_px == pytest.approx(
+        expected_desired_center_x_px
+    )
+    assert aperture_error == pytest.approx(expected_aperture_error)
+    assert target_roll_rad == pytest.approx(expected_target_roll_rad)
+
+
+@pytest.mark.parametrize(
+    ("gate_center_x_px", "gate_width_px", "intercept_offset_px"),
+    (
+        (True, 80, -20.0),
+        (-1, 80, -20.0),
+        (641, 80, -20.0),
+        (320, True, -20.0),
+        (320, 0, -20.0),
+        (320, 641, -20.0),
+        (320, 80, True),
+        (320, 80, math.nan),
+        (320, 80, math.inf),
+        (320, 80, math.nextafter(32.0, math.inf)),
+    ),
+)
+def test_gate0_spatial_intercept_rejects_invalid_target_geometry(
+    gate_center_x_px,
+    gate_width_px,
+    intercept_offset_px,
+):
+    with pytest.raises(ValueError, match="spatial-intercept target"):
+        vq2_module.gate0_spatial_intercept_roll_target(
+            gate_center_x_px,
+            gate_width_px,
+            intercept_offset_px,
+            gain=0.15,
+            cap_rad=0.08,
+        )
+
+
 def test_sustained_preshape_pitch_target_uses_fixed_latch_relative_ceiling():
     entry_pitch = -0.176264
     target = vq2_module.gate0_sustained_preshape_pitch_target(
@@ -3600,6 +3748,7 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
     target_rolls = []
     preturn_events = []
     exit_counterroll_events = []
+    event_names = []
     adapter = _FakeAdapter()
     adapter.is_armed = True
     adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
@@ -3646,6 +3795,7 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
         clock[0] += 0.10
 
     def capture_event(event, **payload):
+        event_names.append(event)
         if event == "course_line_preturn_applied":
             preturn_events.append(payload)
         elif event == "course_line_exit_counterroll_applied":
@@ -3661,7 +3811,9 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
         "cyan_course_line_observation",
         lambda _image: vq2_module.CourseLineObservation(
             turn_score=turn_score,
-            upper_center_x=384.0,
+            upper_center_x=(
+                384.0 if turn_score > 0.0 else 256.0
+            ),
             lower_center_x=320.0,
             upper_pixel_count=136,
             lower_pixel_count=136,
@@ -3727,6 +3879,7 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
         abs(roll) == pytest.approx(0.08)
         for roll in expected_rolls
     )
+    assert "course_line_spatial_intercept_applied" not in event_names
 
 
 def test_configured_gate0_early_turn_combines_roll_negative_yaw_and_braking(
@@ -4013,15 +4166,21 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     latch_events = [
         payload for event, payload in events if event == "gate0_preshape_latched"
     ]
+    spatial_latch_events = [
+        payload
+        for event, payload in events
+        if event == "gate0_spatial_intercept_latched"
+    ]
     applied = [
         payload
         for event, payload in events
-        if event == "course_line_sustained_preshape_applied"
+        if event == "course_line_spatial_intercept_applied"
     ]
     end_events = [payload for event, payload in events if event == "gate0_preshape_ended"]
     assert len(brake_latch_events) == 1
     assert len(entry_proof_events) == 1
     assert len(latch_events) == 1
+    assert len(spatial_latch_events) == 1
     assert (
         brake_latch_events[0]["elapsed_s"]
         == latch_events[0]["elapsed_s"]
@@ -4034,9 +4193,43 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
         brake_latch_events[0]["area_proof_frame_count"]
         >= vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES
     )
+    spatial_latch = spatial_latch_events[0]
+    assert spatial_latch["vision_generation"] == 7
+    assert spatial_latch["frame_id"] == 6
+    assert spatial_latch["sim_time_ns"] == 6
+    assert spatial_latch["course_line_displacement_px"] == pytest.approx(
+        64.0
+    )
+    assert spatial_latch["course_line_turn_score"] > 0.0
+    assert spatial_latch["intercept_offset_px"] == pytest.approx(-20.0)
+    assert spatial_latch["desired_center_x_px"] == pytest.approx(300.0)
+    assert spatial_latch["gate_width_px"] == 80
+    assert (
+        spatial_latch["objective_mode"]
+        == "aperture_spatial_intercept"
+    )
     assert applied
     assert any(payload["gate_area_px"] > 8 * context.initial_gate_area for payload in applied)
     assert max(payload["max_abs_proved_score"] for payload in applied) > 0.20
+    assert all(
+        payload["objective_mode"] == "aperture_spatial_intercept"
+        and payload["intercept_offset_px"] == pytest.approx(-20.0)
+        and payload["desired_center_x_px"] == pytest.approx(300.0)
+        and payload["aperture_error"]
+        == pytest.approx(
+            (payload["gate_center_x_px"] - 300.0)
+            / (0.5 * payload["gate_width_px"])
+        )
+        and payload["target_roll_rad"]
+        == pytest.approx(
+            vq2_module.gate0_centering_roll_target(
+                payload["aperture_error"],
+                gain=config.roll_control.gate0_centering_gain,
+                cap_rad=config.roll_control.gate0_target_cap_rad,
+            )
+        )
+        for payload in applied
+    )
     assert len(end_events) == 1
     assert end_events[0]["reason"] == "duration"
     assert any(command.yaw_rate < 0.0 for command in commands)
@@ -4090,6 +4283,16 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     assert (
         runner._gate0_early_turn_summary["preshape_end_reason"]
         == "duration"
+    )
+    assert (
+        runner._gate0_early_turn_summary["roll_objective_mode"]
+        == "aperture_spatial_intercept"
+    )
+    assert (
+        runner._gate0_early_turn_summary[
+            "spatial_intercept_command_count"
+        ]
+        == len(applied)
     )
 
 
@@ -4416,6 +4619,7 @@ def _exercise_sustained_gate0_with_cue(
     entry_window_sample=None,
     entry_window_height_px=100,
     expected_abort_match=None,
+    center_x_by_sample=None,
     center_y_by_sample=None,
     bbox_by_sample=None,
     frame_id_by_sample=None,
@@ -4614,7 +4818,11 @@ def _exercise_sustained_gate0_with_cue(
             frame_id=frame_id,
             sim_time_ns=sim_time_ns,
             received_monotonic_s=received_s,
-            center_x=320,
+            center_x=(
+                320
+                if center_x_by_sample is None
+                else center_x_by_sample.get(sample_count[0], 320)
+            ),
             center_y=(
                 180
                 if center_y_by_sample is None
@@ -4679,9 +4887,10 @@ def _exercise_sustained_gate0_with_cue(
         )
         if score is None:
             return None
+        line_displacement_px = math.copysign(64.0, float(score))
         return vq2_module.CourseLineObservation(
             turn_score=float(score),
-            upper_center_x=384.0,
+            upper_center_x=320.0 + line_displacement_px,
             lower_center_x=320.0,
             upper_pixel_count=136,
             lower_pixel_count=136,
@@ -4778,6 +4987,110 @@ def _exercise_sustained_gate0_with_cue(
                 )
 
     return runner, commands, events
+
+
+def test_sustained_gate0_spatial_intercept_latches_current_exact_token(
+    monkeypatch,
+):
+    runner, _commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        center_x_by_sample={
+            6: 320,
+            7: 310,
+            8: 300,
+            9: 290,
+        },
+    )
+
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_spatial_intercept_latched"
+    )
+    applied = [
+        payload
+        for event, payload in events
+        if event == "course_line_spatial_intercept_applied"
+    ]
+    applied_by_frame = {
+        payload["frame_id"]: payload for payload in applied
+    }
+
+    assert latch["vision_generation"] == 7
+    assert latch["frame_id"] == 6
+    assert latch["sim_time_ns"] == 6
+    assert latch["received_monotonic_s"] == pytest.approx(
+        latch["elapsed_s"]
+    )
+    assert latch["course_line_displacement_px"] == pytest.approx(64.0)
+    assert latch["course_line_turn_score"] == pytest.approx(0.20)
+    assert latch["intercept_offset_px"] == pytest.approx(-20.0)
+    assert latch["desired_center_x_px"] == pytest.approx(300.0)
+    assert latch["gate_width_px"] == 80
+    assert {6, 7, 8, 9} <= set(applied_by_frame)
+    assert [
+        (
+            applied_by_frame[frame_id]["aperture_error"],
+            applied_by_frame[frame_id]["target_roll_rad"],
+        )
+        for frame_id in (6, 7, 8, 9)
+    ] == pytest.approx(
+        [
+            (0.50, 0.075),
+            (0.25, 0.0375),
+            (0.0, 0.0),
+            (-0.25, -0.0375),
+        ]
+    )
+    assert applied_by_frame[6]["target_roll_rad"] != pytest.approx(
+        0.12
+    )
+    assert all(
+        abs(payload["target_roll_rad"])
+        <= runner.controller_config.roll_control.gate0_target_cap_rad
+        for payload in applied
+    )
+    assert runner._gate0_early_turn_summary is not None
+    summary = runner._gate0_early_turn_summary
+    assert (
+        summary["roll_objective_mode"]
+        == "aperture_spatial_intercept"
+    )
+    assert summary["spatial_intercept_latch_detection_token"] == {
+        "generation": 7,
+        "frame_id": 6,
+        "sim_time_ns": 6,
+        "received_monotonic_s": pytest.approx(
+            latch["received_monotonic_s"]
+        ),
+    }
+    assert summary["spatial_intercept_command_count"] == len(applied)
+
+
+def test_sustained_gate0_spatial_intercept_aborts_before_send_when_aperture_contracts(
+    monkeypatch,
+):
+    _runner, commands, events = _exercise_sustained_gate0_with_cue(
+        monkeypatch,
+        bbox_by_sample={
+            7: (280, 128, 79, 104),
+        },
+        expected_abort_match="offset escaped the current aperture",
+    )
+
+    assert len(commands) == 6
+    latch = next(
+        payload
+        for event, payload in events
+        if event == "gate0_spatial_intercept_latched"
+    )
+    assert latch["intercept_offset_px"] == pytest.approx(-20.0)
+    assert latch["gate_width_px"] == 80
+    assert [
+        payload["frame_id"]
+        for event, payload in events
+        if event == "course_line_spatial_intercept_applied"
+    ] == [6]
 
 
 def test_sustained_gate0_cue_fails_closed_after_attitude_rejection(
@@ -5223,7 +5536,7 @@ def test_sustained_gate0_entry_window_boundary_precedes_ready_latch(
         for event, _payload in events
     )
     assert not any(
-        event == "course_line_sustained_preshape_applied"
+        event == "course_line_spatial_intercept_applied"
         for event, _payload in events
     )
 
@@ -5235,6 +5548,12 @@ def test_sustained_gate0_entry_just_below_window_admits(
         monkeypatch,
         entry_window_sample=6,
         entry_window_height_px=99,
+        bbox_by_sample={
+            7: (200, 100, 160, 99),
+            8: (200, 100, 160, 99),
+            9: (200, 100, 160, 99),
+            10: (200, 100, 160, 99),
+        },
     )
 
     proof = next(
@@ -5399,7 +5718,7 @@ def test_sustained_gate0_preshape_ends_on_conservative_fresh_area_projection(
         for command in commands[exit_command_index:]
     )
     assert not any(
-        event == "course_line_sustained_preshape_applied"
+        event == "course_line_spatial_intercept_applied"
         and payload["frame_id"] == 9
         for event, payload in events
     )
@@ -5666,6 +5985,11 @@ def test_sustained_gate0_yaw_stop_latches_entry_roll_brake_once(
         for event, payload in events
         if event == "course_line_yaw_stop_roll_brake_applied"
     ]
+    spatial_commands = [
+        payload
+        for event, payload in events
+        if event == "course_line_spatial_intercept_applied"
+    ]
     brake_command_ticks = [
         payload
         for event, payload in events
@@ -5682,6 +6006,11 @@ def test_sustained_gate0_yaw_stop_latches_entry_roll_brake_once(
     assert brake_latches[0]["raw_target_roll_rad"] == pytest.approx(0.02)
     assert brake_latches[0]["target_roll_rad"] == pytest.approx(0.02)
     assert len(brake_commands) >= 2
+    assert spatial_commands
+    assert all(
+        payload["frame_id"] < brake_latches[0]["frame_id"]
+        for payload in spatial_commands
+    )
     assert len(brake_command_ticks) == len(brake_commands)
     assert all(
         payload["target_roll_rad"] == pytest.approx(0.02)

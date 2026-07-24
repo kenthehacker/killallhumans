@@ -194,6 +194,8 @@ GATE0_PRESHAPE_MAX_PITCH_RAD = 0.10
 GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD = 0.12
 GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD = 0.10
 GATE0_PRESHAPE_MAX_MEASURED_BODY_RATE_RAD_S = 0.50
+GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION = 0.25
+GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX = 32.0
 COURSE_EDGE_CONTINUATION_MARGIN_PX = 2
 COURSE_EDGE_CONTINUATION_MAX_ASPECT_RATIO = 2.60
 COURSE_FRAGMENT_UNION_MAX_ASPECT_RATIO = 1.45
@@ -6210,6 +6212,68 @@ def gate0_centering_roll_target(
     )
 
 
+def gate0_course_line_intercept_offset_px(
+    course_line_displacement_px: float,
+    gate_width_px: int,
+) -> float:
+    """Latch an inside-aperture Gate-0 offset opposite the proved line bend."""
+
+    if (
+        type(course_line_displacement_px) not in {int, float}
+        or not math.isfinite(float(course_line_displacement_px))
+        or type(gate_width_px) is not int
+        or not 1 <= gate_width_px <= 640
+        or abs(float(course_line_displacement_px))
+        < COURSE_LINE_PRETURN_MIN_SCORE * 320.0
+        or abs(float(course_line_displacement_px)) > 320.0
+    ):
+        raise ValueError(
+            "Gate-0 spatial-intercept geometry is outside frozen bounds"
+        )
+    magnitude_px = min(
+        abs(float(course_line_displacement_px)),
+        GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION
+        * float(gate_width_px),
+        GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX,
+    )
+    return -math.copysign(magnitude_px, float(course_line_displacement_px))
+
+
+def gate0_spatial_intercept_roll_target(
+    gate_center_x_px: int,
+    gate_width_px: int,
+    intercept_offset_px: float,
+    *,
+    gain: float,
+    cap_rad: float,
+) -> Tuple[float, float, float]:
+    """Map a latched aperture offset through the bounded Gate-0 centering law."""
+
+    if (
+        type(gate_center_x_px) is not int
+        or not 0 <= gate_center_x_px <= 640
+        or type(gate_width_px) is not int
+        or not 1 <= gate_width_px <= 640
+        or type(intercept_offset_px) not in {int, float}
+        or not math.isfinite(float(intercept_offset_px))
+        or abs(float(intercept_offset_px))
+        > GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX
+    ):
+        raise ValueError(
+            "Gate-0 spatial-intercept target is outside frozen bounds"
+        )
+    desired_center_x_px = 320.0 + float(intercept_offset_px)
+    aperture_error = (
+        float(gate_center_x_px) - desired_center_x_px
+    ) / (0.5 * float(gate_width_px))
+    target_roll_rad = gate0_centering_roll_target(
+        aperture_error,
+        gain=gain,
+        cap_rad=cap_rad,
+    )
+    return desired_center_x_px, aperture_error, target_roll_rad
+
+
 def gate0_sustained_preshape_pitch_target(
     base_target_pitch_rad: float,
     configured_target_pitch_rad: float,
@@ -10285,6 +10349,11 @@ class VQ2Runner:
         course_turn_streak = 0
         last_course_turn_s: Optional[float] = None
         proved_course_turn_score: Optional[float] = None
+        latest_course_line_displacement_px: Optional[float] = None
+        latest_course_line_turn_score: Optional[float] = None
+        latest_course_line_detection_token: Optional[
+            Tuple[int, int, int, float]
+        ] = None
         course_line_exit_started = False
         early_turn_started_s: Optional[float] = None
         early_turn_command_count = 0
@@ -10310,6 +10379,12 @@ class VQ2Runner:
         preshape_entry_generation: Optional[int] = None
         preshape_entry_roll_rad: Optional[float] = None
         preshape_entry_pitch_rad: Optional[float] = None
+        preshape_intercept_offset_px: Optional[float] = None
+        preshape_intercept_latch_gate_width_px: Optional[int] = None
+        preshape_intercept_latch_detection_token: Optional[
+            Tuple[int, int, int, float]
+        ] = None
+        preshape_intercept_command_count = 0
         preshape_ended = False
         preshape_end_reason: Optional[str] = None
         preshape_recent_area_samples: List[
@@ -10781,7 +10856,28 @@ class VQ2Runner:
                         line is not None
                         and abs(line.turn_score) >= turn_cue.min_abs_score
                     ):
+                        line_displacement_px = (
+                            float(line.upper_center_x)
+                            - float(line.lower_center_x)
+                        )
+                        if (
+                            not math.isfinite(line_displacement_px)
+                            or line_displacement_px * line.turn_score <= 0.0
+                        ):
+                            raise SafetyAbort(
+                                "Gate-0 course-line spatial geometry "
+                                "contradicted its proved turn score"
+                            )
                         current_course_line_proved = True
+                        latest_course_line_displacement_px = (
+                            line_displacement_px
+                        )
+                        latest_course_line_turn_score = float(
+                            line.turn_score
+                        )
+                        latest_course_line_detection_token = (
+                            current_detection_token
+                        )
                         if (
                             course_turn_streak == 0
                             or filtered_course_turn * line.turn_score > 0.0
@@ -11131,6 +11227,64 @@ class VQ2Runner:
                             "Gate-0 sustained preshape cue escaped its "
                             "fixed attitude envelope"
                         )
+                    if (
+                        not current_course_line_proved
+                        or current_detection_token is None
+                        or latest_course_line_detection_token
+                        != current_detection_token
+                        or latest_course_line_displacement_px is None
+                        or latest_course_line_turn_score is None
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept latch lacked "
+                            "current exact-token proved line geometry"
+                        )
+                    try:
+                        intercept_offset_px = (
+                            gate0_course_line_intercept_offset_px(
+                                latest_course_line_displacement_px,
+                                target.bbox[2],
+                            )
+                        )
+                    except ValueError as exc:
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept latch escaped "
+                            "its fixed geometry bounds"
+                        ) from exc
+                    intercept_desired_center_x_px = (
+                        320.0 + intercept_offset_px
+                    )
+                    if (
+                        intercept_offset_px * filtered_course_turn
+                        >= 0.0
+                        or latest_course_line_displacement_px
+                        * latest_course_line_turn_score
+                        <= 0.0
+                        or latest_course_line_displacement_px
+                        * filtered_course_turn
+                        <= 0.0
+                        or abs(intercept_offset_px)
+                        > GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX
+                        or abs(intercept_offset_px)
+                        > (
+                            GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION
+                            * float(target.bbox[2])
+                        )
+                        or not 288.0
+                        <= intercept_desired_center_x_px
+                        <= 352.0
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept latch contradicted "
+                            "its proved bounded direction"
+                        )
+                    preshape_intercept_offset_px = intercept_offset_px
+                    preshape_intercept_latch_gate_width_px = (
+                        target.bbox[2]
+                    )
+                    preshape_intercept_latch_detection_token = (
+                        latest_course_line_detection_token
+                    )
                     longitudinal_brake_started_s = now
                     preshape_authority_started_s = now
                     preshape_entry_generation = (
@@ -11200,6 +11354,53 @@ class VQ2Runner:
                         "longitudinal_brake_command_count": 0,
                         "roll_brake_started": False,
                         "roll_brake_command_count": 0,
+                        "roll_objective_mode": (
+                            "aperture_spatial_intercept"
+                        ),
+                        "course_line_displacement_px": (
+                            latest_course_line_displacement_px
+                        ),
+                        "course_line_turn_score": (
+                            latest_course_line_turn_score
+                        ),
+                        "spatial_intercept_offset_px": (
+                            preshape_intercept_offset_px
+                        ),
+                        "spatial_intercept_desired_center_x_px": (
+                            320.0 + preshape_intercept_offset_px
+                        ),
+                        "spatial_intercept_latch_gate_width_px": (
+                            preshape_intercept_latch_gate_width_px
+                        ),
+                        "spatial_intercept_latch_detection_token": {
+                            "generation": (
+                                preshape_intercept_latch_detection_token[
+                                    0
+                                ]
+                            ),
+                            "frame_id": (
+                                preshape_intercept_latch_detection_token[
+                                    1
+                                ]
+                            ),
+                            "sim_time_ns": (
+                                preshape_intercept_latch_detection_token[
+                                    2
+                                ]
+                            ),
+                            "received_monotonic_s": (
+                                preshape_intercept_latch_detection_token[
+                                    3
+                                ]
+                            ),
+                        },
+                        "spatial_intercept_command_count": 0,
+                        "spatial_intercept_max_aperture_fraction": (
+                            GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION
+                        ),
+                        "spatial_intercept_max_offset_px": (
+                            GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX
+                        ),
                     }
                     self.recorder.emit(
                         "gate0_longitudinal_brake_latched",
@@ -11220,6 +11421,39 @@ class VQ2Runner:
                             phase_timing.gate0_preshape_max_duration_s,
                             GATE0_PRESHAPE_HARD_MAX_DURATION_S,
                         ),
+                    )
+                    self.recorder.emit(
+                        "gate0_spatial_intercept_latched",
+                        elapsed_s=elapsed,
+                        vision_generation=preshape_entry_generation,
+                        frame_id=target.frame_id,
+                        sim_time_ns=target.sim_time_ns,
+                        received_monotonic_s=(
+                            target.received_monotonic_s
+                        ),
+                        course_line_displacement_px=(
+                            latest_course_line_displacement_px
+                        ),
+                        course_line_turn_score=(
+                            latest_course_line_turn_score
+                        ),
+                        filtered_turn_score=filtered_course_turn,
+                        gate_width_px=(
+                            preshape_intercept_latch_gate_width_px
+                        ),
+                        intercept_offset_px=(
+                            preshape_intercept_offset_px
+                        ),
+                        desired_center_x_px=(
+                            320.0 + preshape_intercept_offset_px
+                        ),
+                        max_aperture_fraction=(
+                            GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION
+                        ),
+                        max_offset_px=(
+                            GATE0_SPATIAL_INTERCEPT_MAX_OFFSET_PX
+                        ),
+                        objective_mode="aperture_spatial_intercept",
                     )
                 self.recorder.emit(
                     "gate0_preshape_latched",
@@ -11580,30 +11814,92 @@ class VQ2Runner:
                 and early_turn_active
             ):
                 if preshape_roll_brake_target_rad is None:
-                    preturn_bias = course_line_preturn_roll(
-                        preshape_control_score,
-                        gain=turn_cue.preturn_gain,
-                        cap_rad=turn_cue.preturn_roll_cap_rad,
-                        min_abs_score=turn_cue.min_abs_score,
-                    )
-                    target_roll = max(
-                        -turn_cue.preturn_roll_cap_rad,
-                        min(
-                            turn_cue.preturn_roll_cap_rad,
-                            target_roll + preturn_bias,
-                        ),
-                    )
+                    if (
+                        preshape_intercept_offset_px is None
+                        or preshape_intercept_latch_gate_width_px is None
+                        or preshape_intercept_latch_detection_token
+                        is None
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept objective lacked "
+                            "its proved latch"
+                        )
+                    if (
+                        abs(preshape_intercept_offset_px)
+                        > (
+                            GATE0_SPATIAL_INTERCEPT_MAX_APERTURE_FRACTION
+                            * float(target.bbox[2])
+                        )
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept offset escaped "
+                            "the current aperture"
+                        )
+                    try:
+                        (
+                            intercept_desired_center_x_px,
+                            intercept_aperture_error,
+                            target_roll,
+                        ) = gate0_spatial_intercept_roll_target(
+                            target.center_x,
+                            target.bbox[2],
+                            preshape_intercept_offset_px,
+                            gain=roll_control.gate0_centering_gain,
+                            cap_rad=roll_control.gate0_target_cap_rad,
+                        )
+                    except ValueError as exc:
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept objective escaped "
+                            "its fixed numeric bounds"
+                        ) from exc
+                    if (
+                        abs(target_roll)
+                        > roll_control.gate0_target_cap_rad
+                        or abs(target_roll)
+                        > GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
+                        or (
+                            roll_control.gate0_centering_gain > 0.0
+                            and intercept_aperture_error != 0.0
+                            and target_roll
+                            * intercept_aperture_error
+                            <= 0.0
+                        )
+                    ):
+                        raise SafetyAbort(
+                            "Gate-0 spatial-intercept roll objective "
+                            "contradicted its bounded aperture error"
+                        )
+                    preshape_intercept_command_count += 1
+                    assert self._gate0_early_turn_summary is not None
+                    self._gate0_early_turn_summary[
+                        "spatial_intercept_command_count"
+                    ] = preshape_intercept_command_count
                     self.recorder.emit(
-                        "course_line_sustained_preshape_applied",
+                        "course_line_spatial_intercept_applied",
                         frame_id=target.frame_id,
                         elapsed_s=elapsed,
                         gate_area_px=target.bbox_area,
+                        gate_center_x_px=target.center_x,
+                        gate_width_px=target.bbox[2],
                         latched_turn_sign=preshape_latched_sign,
                         max_abs_proved_score=(
                             preshape_max_abs_proved_score
                         ),
-                        roll_bias_rad=preturn_bias,
+                        intercept_offset_px=(
+                            preshape_intercept_offset_px
+                        ),
+                        intercept_latch_gate_width_px=(
+                            preshape_intercept_latch_gate_width_px
+                        ),
+                        desired_center_x_px=(
+                            intercept_desired_center_x_px
+                        ),
+                        aperture_error=intercept_aperture_error,
                         target_roll_rad=target_roll,
+                        objective_mode="aperture_spatial_intercept",
+                        command_count=(
+                            preshape_intercept_command_count
+                        ),
                     )
                 else:
                     target_roll = preshape_roll_brake_target_rad

@@ -54,7 +54,7 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["schema"] == "aigp-vq2-controller-config/1"
     assert (
         mapping["controller_family"]
-        == "aigp-vq2-gate0-gate1-recenter/16"
+        == "aigp-vq2-gate0-gate1-recenter/17"
     )
     assert mapping["phase_timing"] == {
         "gate0_boost_until_s": 0.45,
