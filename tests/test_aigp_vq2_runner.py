@@ -3575,6 +3575,10 @@ def test_configured_gate0_early_turn_combines_roll_negative_yaw_and_braking(
         for (target_roll, target_pitch, thrust), _command in active
     )
     assert commands[0].yaw_rate == commands[1].yaw_rate == 0.0
+    assert objectives[0][1] < 0.04
+    assert objectives[1][1] < 0.04
+    assert objectives[0][2] > 0.24
+    assert objectives[1][2] > 0.24
     assert runner._gate0_early_turn_summary is not None
     assert runner._gate0_early_turn_summary["command_count"] >= len(active)
     assert runner._gate1_max_abs_yaw_excursion_rad == 0.0
@@ -3595,7 +3599,7 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     document["yaw_control"]["gate0_turn_score_gain"] = -0.40
     document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
     document["forward_braking"]["gate0_turn_pitch_rad"] = 0.02
-    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.275
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.24
     config = controller_config_module.validate_controller_config(document)
     clock = [0.0]
     sample_count = [0]
@@ -3603,7 +3607,17 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     objectives = []
     commands = []
     events = []
-    scores = [0.05, 0.10, 0.20, 0.40, None, None, None, None, None]
+    scores = [
+        None,
+        None,
+        0.05,
+        0.10,
+        0.20,
+        0.40,
+        None,
+        None,
+        None,
+    ]
     adapter = _FakeAdapter()
     adapter.is_armed = True
     adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
@@ -3619,6 +3633,7 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
         yaw=0.0,
     )
     runner._latest_detection_image = object()
+    runner._latest_detection_generation = 7
     context = vq2_module.StartContext(
         0.0,
         -0.31,
@@ -3630,13 +3645,13 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
 
     def sample():
         sample_count[0] += 1
-        runner._latest_detection_generation = 7
-        bbox = (
-            (240, 130, 160, 100)
-            if sample_count[0] <= 3
-            else (200, 80, 240, 240)
-        )
-        runner.tracker.target = vq2_module.GateTarget(
+        if sample_count[0] <= 3:
+            bbox = (277, 132, 86, 96)
+        elif sample_count[0] <= 6:
+            bbox = (280, 128, 80, 104)
+        else:
+            bbox = (200, 80, 240, 240)
+        target = vq2_module.GateTarget(
             frame_id=sample_count[0],
             sim_time_ns=sample_count[0],
             received_monotonic_s=clock[0],
@@ -3645,7 +3660,14 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
             bbox=bbox,
             confidence=0.8,
         )
+        runner.tracker.target = target
         runner.tracker.consecutive = 3
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = target
+        runner._latest_detection_generation = 7
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = target.received_monotonic_s
 
     def observe_line(_image):
         index = line_count[0]
@@ -3706,20 +3728,59 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
                 )
             )
 
-    latch_events = [payload for event, payload in events if event == "gate0_preshape_latched"]
+    brake_latch_events = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    ]
+    latch_events = [
+        payload for event, payload in events if event == "gate0_preshape_latched"
+    ]
     applied = [
         payload
         for event, payload in events
         if event == "course_line_sustained_preshape_applied"
     ]
     end_events = [payload for event, payload in events if event == "gate0_preshape_ended"]
+    assert len(brake_latch_events) == 1
     assert len(latch_events) == 1
+    assert (
+        brake_latch_events[0]["elapsed_s"]
+        < latch_events[0]["elapsed_s"]
+    )
+    assert brake_latch_events[0]["gate_area_scale"] == pytest.approx(
+        vq2_module.GATE0_LONGITUDINAL_BRAKE_LATCH_AREA_SCALE
+    )
+    assert brake_latch_events[0]["frame_id"] == 6
+    assert (
+        brake_latch_events[0]["area_proof_frame_count"]
+        == vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES
+    )
     assert applied
     assert any(payload["gate_area_px"] > 8 * context.initial_gate_area for payload in applied)
     assert max(payload["max_abs_proved_score"] for payload in applied) > 0.20
     assert len(end_events) == 1
     assert end_events[0]["reason"] == "duration"
     assert any(command.yaw_rate < 0.0 for command in commands)
+    assert objectives[0][1] < (
+        preshape_entry_pitch
+        + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
+    )
+    assert objectives[3][1] < (
+        preshape_entry_pitch
+        + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
+    )
+    assert objectives[4][1] < (
+        preshape_entry_pitch
+        + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
+    )
+    assert objectives[5][0] == pytest.approx(0.0)
+    assert objectives[5][1] == pytest.approx(
+        preshape_entry_pitch
+        + vq2_module.GATE0_PRESHAPE_MAX_PITCH_OBJECTIVE_DELTA_RAD
+    )
+    assert objectives[5][2] == pytest.approx(0.275)
+    assert commands[5].yaw_rate == 0.0
     active_objectives = [
         objective
         for objective, command in zip(objectives, commands)
@@ -3747,9 +3808,629 @@ def test_sustained_gate0_preshape_latches_peak_and_ends_once_at_duration(
     )
     assert runner._gate0_early_turn_summary is not None
     assert (
+        end_events[0]["elapsed_s"]
+        - brake_latch_events[0]["elapsed_s"]
+        == pytest.approx(0.40)
+    )
+    assert (
+        end_events[0]["elapsed_s"] - latch_events[0]["elapsed_s"]
+        < 0.40
+    )
+    assert (
         runner._gate0_early_turn_summary["preshape_end_reason"]
         == "duration"
     )
+
+
+@pytest.mark.parametrize(
+    "authority_fault",
+    (
+        "nonprimary",
+        "composite",
+        "identity",
+        "generation_restart",
+        "frame",
+        "sim_time",
+        "receipt",
+        "stale",
+    ),
+)
+def test_sustained_gate0_brake_refuses_unproved_frame_and_never_falls_back(
+    monkeypatch,
+    authority_fault,
+):
+    document = controller_config_module.default_controller_config_mapping()
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = 0.40
+    document["turn_cue"]["sustained_preshape_enabled"] = True
+    document["turn_cue"]["exit_counterroll_enabled"] = False
+    document["turn_cue"]["preturn_roll_cap_rad"] = 0.12
+    document["turn_cue"]["preshape_end_gate_area_scale"] = 20.0
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.40
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.02
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.275
+    config = controller_config_module.validate_controller_config(document)
+    clock = [0.0]
+    sample_count = [0]
+    commands = []
+    events = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(
+        adapter,
+        _FakeVision(),
+        controller_config=config,
+    )
+    runner.estimate = _estimate(roll=0.0, pitch=-0.176264, yaw=0.0)
+    runner._latest_detection_image = object()
+    runner._latest_detection_generation = 7
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6400,
+        1000,
+    )
+
+    def sample():
+        sample_count[0] += 1
+        received_s = (
+            clock[0] - vq2_module.MAX_VISION_AGE_S - 0.01
+            if authority_fault == "stale"
+            else clock[0]
+        )
+        target = vq2_module.GateTarget(
+            frame_id=sample_count[0],
+            sim_time_ns=sample_count[0],
+            received_monotonic_s=received_s,
+            center_x=320,
+            center_y=180,
+            bbox=(280, 128, 80, 104),
+            confidence=0.8,
+            composite=authority_fault == "composite",
+        )
+        runner.tracker.target = target
+        runner.tracker.consecutive = 3
+        runner.tracker.last_selection_mode = (
+            "edge" if authority_fault == "nonprimary" else "primary"
+        )
+        runner._latest_accepted_target = (
+            replace(target) if authority_fault == "identity" else target
+        )
+        runner._latest_detection_generation = (
+            8 if authority_fault == "generation_restart" else 7
+        )
+        runner._latest_detection_frame_id = (
+            target.frame_id + 1
+            if authority_fault == "frame"
+            else target.frame_id
+        )
+        runner._latest_detection_frame_sim_ns = (
+            target.sim_time_ns + 1
+            if authority_fault == "sim_time"
+            else target.sim_time_ns
+        )
+        runner._latest_detection_received_s = (
+            target.received_monotonic_s + 0.001
+            if authority_fault == "receipt"
+            else target.received_monotonic_s
+        )
+
+    async def capture_command(command, **_kwargs):
+        commands.append(command)
+        if len(commands) > 3:
+            raise AssertionError("unproved sustained authority did not fail closed")
+
+    async def advance_clock(_seconds):
+        clock[0] += 0.05
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "cyan_course_line_observation",
+        lambda _image: vq2_module.CourseLineObservation(
+            turn_score=0.20,
+            upper_center_x=384.0,
+            lower_center_x=320.0,
+            upper_pixel_count=136,
+            lower_pixel_count=136,
+        ),
+    )
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance_clock),
+        )
+        expected_abort = (
+            "vision generation changed inside the powered stage"
+            if authority_fault == "generation_restart"
+            else "cue lacked active early longitudinal-brake authority"
+        )
+        with pytest.raises(SafetyAbort, match=expected_abort):
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=False,
+                )
+            )
+
+    assert len(commands) == (
+        0 if authority_fault == "generation_restart" else 2
+    )
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_longitudinal_brake_objective"
+        for event, _payload in events
+    )
+
+
+def test_sustained_gate0_brake_enforces_attitude_guard_before_turn_cue(
+    monkeypatch,
+):
+    document = controller_config_module.default_controller_config_mapping()
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = 0.40
+    document["turn_cue"]["sustained_preshape_enabled"] = True
+    document["turn_cue"]["exit_counterroll_enabled"] = False
+    document["turn_cue"]["preturn_roll_cap_rad"] = 0.12
+    document["turn_cue"]["preshape_end_gate_area_scale"] = 20.0
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.40
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.02
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.275
+    config = controller_config_module.validate_controller_config(document)
+    clock = [0.0]
+    sample_count = [0]
+    commands = []
+    events = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(
+        adapter,
+        _FakeVision(),
+        controller_config=config,
+    )
+    entry_pitch = -0.176264
+    runner.estimate = _estimate(roll=0.0, pitch=entry_pitch, yaw=0.0)
+    runner._latest_detection_image = object()
+    runner._latest_detection_generation = 7
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6400,
+        1000,
+    )
+
+    def sample():
+        sample_count[0] += 1
+        runner.estimate = _estimate(
+            roll=0.0,
+            pitch=(
+                entry_pitch
+                if sample_count[0] <= 6
+                else entry_pitch
+                + vq2_module.GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
+                + 0.001
+            ),
+            yaw=0.0,
+        )
+        target = vq2_module.GateTarget(
+            frame_id=sample_count[0],
+            sim_time_ns=sample_count[0],
+            received_monotonic_s=clock[0],
+            center_x=320,
+            center_y=180,
+            bbox=(
+                (277, 132, 86, 96)
+                if sample_count[0] <= 3
+                else (280, 128, 80, 104)
+            ),
+            confidence=0.8,
+        )
+        runner.tracker.target = target
+        runner.tracker.consecutive = 3
+        runner.tracker.last_selection_mode = "primary"
+        runner._latest_accepted_target = target
+        runner._latest_detection_generation = 7
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = target.received_monotonic_s
+
+    async def capture_command(command, **_kwargs):
+        commands.append(command)
+
+    async def advance_clock(_seconds):
+        clock[0] += 0.05
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "cyan_course_line_observation",
+        lambda _image: (
+            None
+            if sample_count[0] <= 5
+            else vq2_module.CourseLineObservation(
+                turn_score=0.20,
+                upper_center_x=384.0,
+                lower_center_x=320.0,
+                upper_pixel_count=136,
+                lower_pixel_count=136,
+            )
+        ),
+    )
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance_clock),
+        )
+        with pytest.raises(
+            SafetyAbort,
+            match="sustained preshape exceeded its fixed attitude envelope",
+        ):
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=False,
+                )
+            )
+
+    assert len(commands) == 6
+    assert any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_preshape_latched"
+        for event, _payload in events
+    )
+
+
+def _exercise_sustained_gate0_without_cue(
+    monkeypatch,
+    *,
+    post_latch_fault=None,
+    entry_attitude_fault=False,
+    authority_boundary_fault=None,
+    pre_latch_rejection=False,
+):
+    class CommandsCaptured(Exception):
+        pass
+
+    document = controller_config_module.default_controller_config_mapping()
+    document["phase_timing"]["gate0_preshape_max_duration_s"] = 0.20
+    document["turn_cue"]["sustained_preshape_enabled"] = True
+    document["turn_cue"]["exit_counterroll_enabled"] = False
+    document["turn_cue"]["preturn_roll_cap_rad"] = 0.12
+    document["turn_cue"]["preshape_end_gate_area_scale"] = 20.0
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.40
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.04
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.02
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.275
+    config = controller_config_module.validate_controller_config(document)
+    clock = [0.0]
+    sample_count = [0]
+    last_target = [None]
+    commands = []
+    events = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(
+        adapter,
+        _FakeVision(),
+        controller_config=config,
+    )
+    runner.estimate = _estimate(roll=0.0, pitch=-0.176264, yaw=0.0)
+    runner._latest_detection_image = object()
+    runner._latest_detection_generation = 7
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6400,
+        1000,
+    )
+
+    def sample():
+        sample_count[0] += 1
+        if pre_latch_rejection and sample_count[0] == 5:
+            assert last_target[0] is not None
+            runner.tracker.target = last_target[0]
+            runner.tracker.consecutive = 0
+            runner.tracker.last_selection_mode = "none"
+            runner._latest_accepted_target = None
+            runner._latest_detection_generation = 7
+            runner._latest_detection_frame_id = sample_count[0]
+            runner._latest_detection_frame_sim_ns = sample_count[0]
+            runner._latest_detection_received_s = clock[0]
+            return
+        if entry_attitude_fault and sample_count[0] == 6:
+            runner.estimate = _estimate(
+                roll=vq2_module.GATE0_PRESHAPE_MAX_ABS_ROLL_RAD + 0.001,
+                pitch=-0.176264,
+                yaw=0.0,
+            )
+        if (
+            authority_boundary_fault == "duration"
+            and sample_count[0] == 10
+        ) or (
+            authority_boundary_fault == "pass"
+            and sample_count[0] == 7
+        ):
+            runner.estimate = _estimate(
+                roll=(
+                    vq2_module.GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
+                    + 0.001
+                ),
+                pitch=-0.176264,
+                yaw=0.0,
+            )
+        if authority_boundary_fault == "pass" and sample_count[0] == 7:
+            adapter.race_status = RaceStatus(1100, 1, -1, 0, -1)
+        received_s = (
+            clock[0] - vq2_module.MAX_VISION_AGE_S - 0.01
+            if post_latch_fault == "stale"
+            and sample_count[0] >= 7
+            else clock[0]
+        )
+        target = vq2_module.GateTarget(
+            frame_id=sample_count[0],
+            sim_time_ns=sample_count[0],
+            received_monotonic_s=received_s,
+            center_x=320,
+            center_y=180,
+            bbox=(
+                (277, 132, 86, 96)
+                if sample_count[0] <= 3
+                else (280, 128, 80, 104)
+            ),
+            confidence=0.8,
+        )
+        runner.tracker.target = target
+        last_target[0] = target
+        runner.tracker.consecutive = 3
+        runner.tracker.last_selection_mode = (
+            "edge"
+            if post_latch_fault == "nonprimary"
+            and sample_count[0] >= 7
+            else "primary"
+        )
+        runner._latest_accepted_target = (
+            replace(target)
+            if post_latch_fault == "identity"
+            and sample_count[0] >= 7
+            else target
+        )
+        runner._latest_detection_generation = 7
+        runner._latest_detection_frame_id = target.frame_id
+        runner._latest_detection_frame_sim_ns = target.sim_time_ns
+        runner._latest_detection_received_s = target.received_monotonic_s
+
+    async def capture_command(command, **_kwargs):
+        commands.append(command)
+        if len(commands) == 10:
+            raise CommandsCaptured
+
+    async def advance_clock(_seconds):
+        clock[0] += 0.05
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: events.append((event, payload)),
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "cyan_course_line_observation",
+        lambda _image: None,
+    )
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance_clock),
+        )
+        expected_exception = (
+            CommandsCaptured
+            if (
+                post_latch_fault is None
+                and not entry_attitude_fault
+                and authority_boundary_fault is None
+            )
+            else SafetyAbort
+        )
+        with pytest.raises(expected_exception):
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=False,
+                )
+            )
+
+    return runner, commands, events
+
+
+def test_sustained_gate0_brake_rejects_unsafe_eligible_entry(
+    monkeypatch,
+):
+    runner, commands, events = _exercise_sustained_gate0_without_cue(
+        monkeypatch,
+        entry_attitude_fault=True,
+    )
+
+    assert len(commands) == 5
+    assert not any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    assert runner._gate0_early_turn_summary is None
+
+
+def test_sustained_gate0_brake_area_streak_resets_on_rejected_frame(
+    monkeypatch,
+):
+    _runner, _commands, events = _exercise_sustained_gate0_without_cue(
+        monkeypatch,
+        pre_latch_rejection=True,
+    )
+    brake_latches = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    ]
+
+    assert len(brake_latches) == 1
+    assert brake_latches[0]["frame_id"] == 8
+    assert (
+        brake_latches[0]["area_proof_frame_count"]
+        == vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES
+    )
+
+
+def test_sustained_gate0_brake_ends_at_shared_deadline_without_turn_cue(
+    monkeypatch,
+):
+    runner, commands, events = _exercise_sustained_gate0_without_cue(
+        monkeypatch,
+    )
+    brake_latches = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_latched"
+    ]
+    brake_objectives = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_objective"
+    ]
+    brake_ends = [
+        payload
+        for event, payload in events
+        if event == "gate0_longitudinal_brake_ended"
+    ]
+
+    assert len(brake_latches) == 1
+    assert brake_objectives
+    assert len(brake_ends) == 1
+    assert brake_ends[0]["reason"] == "duration"
+    assert (
+        brake_ends[0]["elapsed_s"] - brake_latches[0]["elapsed_s"]
+        == pytest.approx(0.20)
+    )
+    assert max(
+        payload["elapsed_s"] for payload in brake_objectives
+    ) < brake_ends[0]["elapsed_s"]
+    assert not any(
+        event == "gate0_preshape_latched"
+        for event, _payload in events
+    )
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert runner._gate0_early_turn_summary is not None
+    assert (
+        runner._gate0_early_turn_summary[
+            "longitudinal_brake_end_reason"
+        ]
+        == "duration"
+    )
+
+
+@pytest.mark.parametrize(
+    ("authority_boundary_fault", "expected_commands"),
+    (("duration", 9), ("pass", 6)),
+)
+def test_sustained_gate0_guard_precedes_end_and_pass_boundaries(
+    monkeypatch,
+    authority_boundary_fault,
+    expected_commands,
+):
+    _runner, commands, events = _exercise_sustained_gate0_without_cue(
+        monkeypatch,
+        authority_boundary_fault=authority_boundary_fault,
+    )
+
+    assert len(commands) == expected_commands
+    assert not any(
+        event == "gate0_longitudinal_brake_ended"
+        for event, _payload in events
+    )
+    assert not any(
+        event == "gate0_pass_proved"
+        for event, _payload in events
+    )
+
+
+@pytest.mark.parametrize(
+    "post_latch_fault",
+    ("identity", "nonprimary", "stale"),
+)
+def test_sustained_gate0_brake_aborts_on_post_latch_authority_loss(
+    monkeypatch,
+    post_latch_fault,
+):
+    runner, commands, events = _exercise_sustained_gate0_without_cue(
+        monkeypatch,
+        post_latch_fault=post_latch_fault,
+    )
+
+    assert len(commands) == 6
+    assert any(
+        event == "gate0_longitudinal_brake_latched"
+        for event, _payload in events
+    )
+    assert sum(
+        event == "gate0_longitudinal_brake_objective"
+        for event, _payload in events
+    ) == 1
+    assert runner._gate0_early_turn_summary is not None
 
 
 def _capture_first_gate0_thrust(
