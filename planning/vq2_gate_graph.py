@@ -22,6 +22,8 @@ from competition.vq2_visual_tracker import (
     VisualTrackRole,
 )
 
+_MAX_PROMOTION_MISSED_CAMERA_PUBLICATIONS = 2
+
 
 class RaceStatusProvenanceBasis(str, Enum):
     """Authoritative live ingress or exact legacy capture ordering."""
@@ -285,6 +287,14 @@ class _RelationshipState:
     current_center_censored: bool
     next_center_censored: bool
     fresh: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PretrackedCandidateEvidence:
+    stable_frame_count: int
+    missed_camera_publications: int
+    confidence: float
+    association_confidence: float
 
 
 class RollingVisualGateGraph:
@@ -662,21 +672,30 @@ class RollingVisualGateGraph:
             if (
                 track.track_id == self._current_track_id
                 or track.role is VisualTrackRole.RETIRED
-                or not track.visible
             ):
                 continue
             relation = relationship_by_next.get(track.track_id)
-            if track.role is VisualTrackRole.NEXT and not track.ambiguous:
+            pretracked = _pretracked_candidate_evidence(
+                track,
+                current_tracker_frame_sequence=frame_sequence,
+                stability_target=self.config.min_next_candidate_frames,
+            )
+            if pretracked is not None and (
+                track.role is VisualTrackRole.NEXT or not track.visible
+            ):
                 score = _candidate_score(
                     track,
                     relation,
                     self.config.min_next_candidate_frames,
+                    stable_frame_count=pretracked.stable_frame_count,
+                    confidence=pretracked.confidence,
+                    association_confidence=pretracked.association_confidence,
                 )
                 promotable = (
-                    track.consecutive_frame_count
+                    pretracked.stable_frame_count
                     >= self.config.min_next_candidate_frames
-                    and track.confidence >= self.config.min_track_confidence
-                    and track.association_confidence
+                    and pretracked.confidence >= self.config.min_track_confidence
+                    and pretracked.association_confidence
                     >= self.config.min_association_confidence
                     and relation is not None
                     and relation.observation_count
@@ -688,7 +707,7 @@ class RollingVisualGateGraph:
                     NextGateCandidate(
                         track_id=track.track_id,
                         score=score,
-                        stable_frame_count=track.consecutive_frame_count,
+                        stable_frame_count=pretracked.stable_frame_count,
                         first_token=track.first_token,
                         latest_token=track.latest_token,
                         bearing_norm=track.bearing_norm,
@@ -697,14 +716,14 @@ class RollingVisualGateGraph:
                         elevation_rate_norm_s=track.elevation_rate_norm_s,
                         apparent_scale=track.apparent_scale,
                         log_scale_rate_s=track.log_scale_rate_s,
-                        confidence=track.confidence,
-                        association_confidence=track.association_confidence,
+                        confidence=pretracked.confidence,
+                        association_confidence=pretracked.association_confidence,
                         center_censored=track.center_censored,
                         promotable=promotable,
                         relationship=relation,
                     )
                 )
-            else:
+            elif track.visible:
                 provisional.append(track.track_id)
         candidates.sort(key=lambda item: (-item.score, item.track_id))
         ambiguous_next = (
@@ -901,6 +920,51 @@ def _pretransition_tail(
     return tuple(tail)
 
 
+def _pretracked_candidate_evidence(
+    track: VisualTrack,
+    *,
+    current_tracker_frame_sequence: int,
+    stability_target: int,
+) -> Optional[_PretrackedCandidateEvidence]:
+    """Return exact last-observation proof within the bounded miss grace.
+
+    A tracker miss intentionally clears its live association confidence and
+    consecutive count.  Promotion may nevertheless use the immediately
+    preceding exact observation streak for at most two subsequently processed
+    camera publications.  The grace cannot create proof: ambiguity, a broken
+    observation streak, insufficient confidence, or any wider publication gap
+    returns no candidate.
+    """
+
+    if track.ambiguous or not track.history:
+        return None
+    latest_sample = track.history[-1]
+    missed_publications = (
+        current_tracker_frame_sequence - latest_sample.tracker_frame_sequence
+    )
+    if (
+        missed_publications < 0
+        or missed_publications > _MAX_PROMOTION_MISSED_CAMERA_PUBLICATIONS
+        or missed_publications != track.missed_frame_count
+    ):
+        return None
+    tail_count = 1
+    expected_sequence = latest_sample.tracker_frame_sequence - 1
+    for sample in reversed(track.history[:-1]):
+        if sample.tracker_frame_sequence != expected_sequence:
+            break
+        tail_count += 1
+        expected_sequence -= 1
+    if tail_count < stability_target:
+        return None
+    return _PretrackedCandidateEvidence(
+        stable_frame_count=tail_count,
+        missed_camera_publications=missed_publications,
+        confidence=latest_sample.confidence,
+        association_confidence=latest_sample.association_confidence,
+    )
+
+
 def _token_precedes_or_equals(
     sample: CameraFrameToken,
     anchor: CameraFrameToken,
@@ -922,8 +986,12 @@ def _candidate_score(
     track: VisualTrack,
     relationship: Optional[ObservedGateRelationship],
     stability_target: int,
+    *,
+    stable_frame_count: int,
+    confidence: float,
+    association_confidence: float,
 ) -> float:
-    stability = min(1.0, track.consecutive_frame_count / stability_target)
+    stability = min(1.0, stable_frame_count / stability_target)
     relationship_confidence = (
         0.0 if relationship is None else relationship.observation_confidence
     )
@@ -937,8 +1005,8 @@ def _candidate_score(
     # next-gate identity.
     return censor_factor * (
         0.30 * stability
-        + 0.25 * track.confidence
-        + 0.20 * track.association_confidence
+        + 0.25 * confidence
+        + 0.20 * association_confidence
         + 0.15 * relationship_confidence
         + 0.10 * relationship_stability
     )

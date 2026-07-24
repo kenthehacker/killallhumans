@@ -368,6 +368,140 @@ def test_pretransition_next_track_promotes_without_reset_or_history_loss() -> No
     assert retired.authoritative_gate_index == 0
 
 
+@pytest.mark.parametrize(
+    "missed_publications",
+    (pytest.param(1, id="one-miss"), pytest.param(2, id="two-misses")),
+)
+def test_pretracked_next_gate_promotes_across_bounded_camera_misses(
+    missed_publications: int,
+) -> None:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    current_id = ""
+    next_id = ""
+    for sequence in range(1, 6):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _detection(0, -0.01, 0.01, 0.32, 0.36),
+                    _detection(1, 0.55, -0.55, 0.14, 0.16),
+                ),
+            )
+        )
+        if sequence == 1:
+            current_id, next_id = update.visible_track_ids
+        if sequence == 3:
+            graph.bind_initial_current(
+                tracker,
+                track_id=current_id,
+                race_status=_race(
+                    sequence=50,
+                    boot_ms=3_000,
+                    gate_index=0,
+                    received_ns=update.publish_monotonic_ns + 1,
+                ),
+            )
+        elif sequence > 3:
+            graph.observe(tracker)
+
+    proved_history = tracker.track(next_id).history
+    for sequence in range(6, 6 + missed_publications):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (_detection(0, -0.01, 0.01, 0.32, 0.36),),
+            )
+        )
+        snapshot = graph.observe(tracker)
+
+    assert tracker.track(next_id).missed_frame_count == missed_publications
+    assert not tracker.track(next_id).visible
+    assert tuple(item.track_id for item in snapshot.next_candidates) == (next_id,)
+    assert snapshot.next_candidates[0].promotable
+    assert snapshot.next_candidates[0].stable_frame_count == len(proved_history)
+
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=_race(
+            sequence=51,
+            boot_ms=3_250,
+            gate_index=1,
+            received_ns=update.publish_monotonic_ns + 1,
+        ),
+        camera_token_at_credit=update.token,
+    )
+
+    assert transition.promoted_track_id == next_id
+    assert transition.promoted_latest_token_before_credit == proved_history[-1].token
+    assert transition.pretransition_frame_tokens[-3:] == tuple(
+        sample.token for sample in proved_history[-3:]
+    )
+    assert tracker.track(next_id).history == proved_history
+
+
+def test_pretracked_next_gate_rejects_more_than_two_camera_misses() -> None:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    current_id = ""
+    next_id = ""
+    for sequence in range(1, 6):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _detection(0, -0.01, 0.01, 0.32, 0.36),
+                    _detection(1, 0.55, -0.55, 0.14, 0.16),
+                ),
+            )
+        )
+        if sequence == 1:
+            current_id, next_id = update.visible_track_ids
+        if sequence == 3:
+            graph.bind_initial_current(
+                tracker,
+                track_id=current_id,
+                race_status=_race(
+                    sequence=60,
+                    boot_ms=4_000,
+                    gate_index=0,
+                    received_ns=update.publish_monotonic_ns + 1,
+                ),
+            )
+        elif sequence > 3:
+            graph.observe(tracker)
+
+    proved_history = tracker.track(next_id).history
+    for sequence in range(6, 9):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (_detection(0, -0.01, 0.01, 0.32, 0.36),),
+            )
+        )
+        snapshot = graph.observe(tracker)
+
+    assert tracker.track(next_id).missed_frame_count == 3
+    assert tracker.track(next_id).history == proved_history
+    assert all(
+        candidate.track_id != next_id for candidate in snapshot.next_candidates
+    )
+    with pytest.raises(
+        GateGraphError,
+        match="no stable pretracked next gate is promotable",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_race(
+                sequence=61,
+                boot_ms=4_250,
+                gate_index=1,
+                received_ns=update.publish_monotonic_ns + 1,
+            ),
+            camera_token_at_credit=update.token,
+        )
+
+
 def test_ambiguous_next_candidates_reject_authoritative_promotion() -> None:
     tracker = MultiTargetVisualTracker()
     graph = RollingVisualGateGraph()
