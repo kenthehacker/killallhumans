@@ -9623,6 +9623,17 @@ class VQ2Runner:
                     target_roll = course_line_exit_counterroll(
                         proved_course_turn_score,
                     )
+                    self.recorder.emit(
+                        "course_line_exit_counterroll_applied",
+                        frame_id=target.frame_id,
+                        elapsed_s=elapsed,
+                        gate_area_px=target.bbox_area,
+                        proved_turn_score=proved_course_turn_score,
+                        filtered_turn_score=filtered_course_turn,
+                        consistent_frame_count=course_turn_streak,
+                        normalized_x=normalized_x,
+                        target_roll_rad=target_roll,
+                    )
             elif (
                 course_line_preturn
                 and stable_course_line
@@ -11025,7 +11036,7 @@ class VQ2Runner:
             context,
             crossing_hold_thrust=GATE1_RECENTER_TRANSITION_THRUST,
             course_line_preturn=True,
-            course_line_exit_counterroll_enabled=False,
+            course_line_exit_counterroll_enabled=True,
         )
         observation = await self._observe_gate1(
             gate0,
@@ -11843,7 +11854,7 @@ class VQ2Runner:
                         GATE1_RECENTER_TRANSITION_THRUST
                     ),
                     course_line_preturn=True,
-                    course_line_exit_counterroll_enabled=False,
+                    course_line_exit_counterroll_enabled=True,
                 )
                 details = {"gate0": gate0_details}
                 try:

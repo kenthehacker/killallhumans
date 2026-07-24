@@ -25,7 +25,8 @@ horizontal pixel-rate gain remains exactly zero pending M2 recorded-replay and
 tracker-isolation acceptance; the current diagnostic combines horizontal
 position error with a fixed bounded pitch brake. Its single structural
 hypothesis enables the existing bounded Gate 0 cyan-course-line preturn while
-explicitly leaving exit counterroll disabled. Applied preturn objectives are
+enabling its bounded late exit counterroll to align the Gate 1 handoff with the
+frozen recenter direction. Applied preturn and exit-counterroll objectives are
 recorded in the trace. It preserves exact `0.275` thrust with zero attitude
 rates during the visually armed Gate 0 crossing confirmation and authoritative
 Gate 1 acquisition so the motors do not cut during the continuation handoff.

@@ -2890,7 +2890,7 @@ def test_offline_gate1_recenter_composition_uses_proved_default_stages(
             {
                 "crossing_hold_thrust": 0.275,
                 "course_line_preturn": True,
-                "course_line_exit_counterroll_enabled": False,
+                "course_line_exit_counterroll_enabled": True,
             },
         ),
         (
@@ -3212,6 +3212,7 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
     sample_count = [0]
     target_rolls = []
     preturn_events = []
+    exit_counterroll_events = []
     adapter = _FakeAdapter()
     adapter.is_armed = True
     adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
@@ -3260,6 +3261,8 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
     def capture_event(event, **payload):
         if event == "course_line_preturn_applied":
             preturn_events.append(payload)
+        elif event == "course_line_exit_counterroll_applied":
+            exit_counterroll_events.append(payload)
 
     monkeypatch.setattr(runner, "_sample", sample)
     monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
@@ -3319,6 +3322,24 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
     )
     if target_bbox == (240, 130, 160, 100) and not exit_counterroll:
         assert preturn_events
+    assert all(
+        {
+            "frame_id",
+            "elapsed_s",
+            "gate_area_px",
+            "proved_turn_score",
+            "filtered_turn_score",
+            "consistent_frame_count",
+            "normalized_x",
+            "target_roll_rad",
+        }
+        == set(event)
+        for event in exit_counterroll_events
+    )
+    assert bool(exit_counterroll_events) is any(
+        abs(roll) == pytest.approx(0.08)
+        for roll in expected_rolls
+    )
 
 
 def _capture_first_gate0_thrust(
@@ -5417,7 +5438,7 @@ def test_gate1_recenter_powered_lifecycle_requires_criteria_and_cleanup(
     assert calls[0][2]["course_line_preturn"] is True
     assert (
         calls[0][2]["course_line_exit_counterroll_enabled"]
-        is False
+        is True
     )
     assert calls[1][2]["hold_thrust"] == 0.275
 
