@@ -4200,11 +4200,12 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
 
     assert vq2_module.SIGN_ID_RATE_RAD_S == 0.08
     assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 0.18
-    assert vq2_module.SIGN_ID_YAW_NEUTRAL_DURATION_S == 0.18
-    assert vq2_module.SIGN_ID_MIN_GYRO_SAMPLES == 3
+    assert vq2_module.SIGN_ID_YAW_NEUTRAL_DURATION_S == 0.24
+    assert vq2_module.SIGN_ID_YAW_PLATEAU_SETTLE_S == 0.08
+    assert vq2_module.SIGN_ID_HARD_EXPIRY_S == 1.30
     assert vq2_module.SIGN_ID_MIN_YAW_GYRO_SAMPLES == 4
     assert vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES == 4
-    assert vq2_module.SIGN_ID_MIN_IMAGE_EFFECT_PX_S == 15.0
+    assert vq2_module.SIGN_ID_MIN_IMAGE_SHIFT_PX == 2.0
     assert vq2_module.SIGN_ID_MAX_POLARITY_GAIN_RATIO == 2.0
     assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.05
     assert vq2_module.SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S == 0.50
@@ -4223,8 +4224,8 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     assert positive and negative
     assert all(
         command.roll_rate == command.pitch_rate == 0.0
-        and command.thrust == vq2_module.SIGN_ID_THRUST
-        for command in (*positive, *negative)
+        and command.thrust == 0.275
+        for command in adapter.commands
     )
     assert yaw["yaw_identified"] is True
     assert yaw["controller_to_body_sign"] == 1
@@ -4236,6 +4237,8 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     ) == expected_image_sign
     assert yaw["positive"]["wire_yaw_rate_rad_s"] == -0.08
     assert yaw["negative"]["wire_yaw_rate_rad_s"] == 0.08
+    assert yaw["positive"]["heading_delta_rad"] > 0.0
+    assert yaw["negative"]["heading_delta_rad"] < 0.0
     assert (
         yaw["positive"]["fresh_image_frame_count"]
         >= vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES
@@ -4279,6 +4282,72 @@ def test_sign_id_yaw_reuses_attitude_excursion_guard(monkeypatch):
 
     with pytest.raises(SafetyAbort, match="attitude excursion"):
         asyncio.run(runner._run_sign_id())
+
+
+def test_sign_id_powered_dispatch_stabilizes_before_yaw(monkeypatch):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        322,
+        174,
+        6_400,
+        1_000,
+    )
+    calls = []
+
+    async def establish(**_kwargs):
+        calls.append("reset")
+
+    async def normalize():
+        calls.append("normalize")
+
+    async def wait_for_go():
+        calls.append("go")
+        return context
+
+    async def arm():
+        calls.append("arm")
+
+    async def hover(observed_context):
+        calls.append(("hover", observed_context is context))
+        return {"level": True}
+
+    async def sign_id():
+        calls.append("yaw")
+        return {"yaw_calibration": {"yaw_identified": True}}
+
+    async def cleanup():
+        calls.append("cleanup")
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", establish)
+    monkeypatch.setattr(runner, "normalize_disarmed", normalize)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", arm)
+    monkeypatch.setattr(runner, "_run_hover", hover)
+    monkeypatch.setattr(runner, "_run_sign_id", sign_id)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(runner.run_powered_stage("sign-id"))
+
+    assert result.success
+    assert result.cleanup_confirmed
+    assert result.details == {
+        "stabilized_launch": {"level": True},
+        "yaw_calibration": {"yaw_identified": True},
+    }
+    assert calls == [
+        "reset",
+        "normalize",
+        "go",
+        "arm",
+        ("hover", True),
+        "yaw",
+        "cleanup",
+    ]
 
 
 def test_delayed_pre_reset_clocks_cannot_unlock_go():
