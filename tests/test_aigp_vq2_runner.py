@@ -2004,8 +2004,8 @@ def _configure_gate1_recenter_candidate(monkeypatch, *, entry_center_x=530):
         sim_time_ns=1030,
         received_monotonic_s=0.0,
         center_x=entry_center_x,
-        center_y=50,
-        bbox=(entry_center_x - 50, 0, 100, 100),
+        center_y=52,
+        bbox=(entry_center_x - 50, 2, 100, 100),
         confidence=0.8,
     )
     runner.tracker.target = entry
@@ -2026,21 +2026,21 @@ def _configure_gate1_recenter_candidate(monkeypatch, *, entry_center_x=530):
                 "sim_time_ns": 1010,
                 "received_monotonic_s": -0.2,
                 "center_px": [524, 50],
-                "bbox_xywh_px": [474, 2, 100, 100],
+                "bbox_xywh_px": [474, 0, 100, 100],
             },
             {
                 "frame_id": 102,
                 "sim_time_ns": 1020,
                 "received_monotonic_s": -0.1,
-                "center_px": [527, 50],
+                "center_px": [527, 51],
                 "bbox_xywh_px": [477, 1, 100, 100],
             },
             {
                 "frame_id": 103,
                 "sim_time_ns": 1030,
                 "received_monotonic_s": 0.0,
-                "center_px": [entry_center_x, 50],
-                "bbox_xywh_px": [entry_center_x - 50, 0, 100, 100],
+                "center_px": [entry_center_x, 52],
+                "bbox_xywh_px": [entry_center_x - 50, 2, 100, 100],
             },
         ],
         "gate_index": 1,
@@ -2089,8 +2089,8 @@ def _install_gate1_frame_sequence(
             sim_time_ns=previous.sim_time_ns + 10,
             received_monotonic_s=clock[0],
             center_x=center_x,
-            center_y=50,
-            bbox=(center_x - 50, 0, 100, 100),
+            center_y=52,
+            bbox=(center_x - 50, 2, 100, 100),
             confidence=0.8,
         )
         runner.tracker.target = target
@@ -2108,8 +2108,8 @@ def _install_gate1_frame_sequence(
 @pytest.mark.parametrize(
     "bbox",
     (
-        (370, 0, 160, 100),
-        (370, 0, 144, 160),
+        (370, 2, 160, 100),
+        (370, 2, 144, 160),
     ),
     ids=("width-equality", "area-equality"),
 )
@@ -2138,23 +2138,114 @@ def test_bounded_gate1_recenter_rejects_no_passage_entry_geometry(
     assert summary["no_passage_max_width_px"] == 160
 
 
-def test_bounded_gate1_recenter_rejects_top_edge_departure_before_command(
+def test_bounded_gate1_recenter_rejects_flat_top_edge_handoff_before_command(
     monkeypatch,
 ):
     runner, adapter, observation, _clock = _configure_gate1_recenter_candidate(
         monkeypatch
     )
-    observation["frames"][0]["center_px"][1] = 52
-    observation["frames"][1]["center_px"][1] = 51
+    observation["frames"][0]["center_px"][1] = 51
+    observation["frames"][1]["center_px"][1] = 50
+    observation["frames"][2]["center_px"][1] = 50
+    observation["frames"][2]["bbox_xywh_px"][1] = 0
 
     with pytest.raises(
         SafetyAbort,
-        match="unsafe top-edge departure geometry",
+        match="lacks a safe top-edge margin",
     ):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
     assert adapter.commands == []
     assert runner._gate1_recenter_summary is None
+
+
+def test_bounded_gate1_recenter_rejects_stacked_entry_pitch_authority(
+    monkeypatch,
+):
+    runner, adapter, observation, _clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    proof = runner._gate0_transition_proof
+    assert proof is not None
+    runner._gate0_transition_proof = replace(
+        proof,
+        pass_rpy_rad=(0.0, -0.18, 0.0),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="entry attitude approached its bound",
+    ):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+
+
+def test_bounded_gate1_recenter_enforces_pass_anchored_pitch_excursion(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    runner.estimate = _estimate(pitch=0.06)
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    advance_frame = runner._sample
+
+    def advance_beyond_pass_bound():
+        advance_frame()
+        runner.estimate = _estimate(pitch=0.08)
+
+    monkeypatch.setattr(runner, "_sample", advance_beyond_pass_bound)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="attitude excursion approached its bound",
+    ):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
+
+
+def test_bounded_gate1_recenter_rechecks_top_margin_before_command(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500],
+    )
+    advance_frame = runner._sample
+
+    def expose_top_edge():
+        advance_frame()
+        current = runner._latest_accepted_target
+        assert current is not None
+        clipped = replace(
+            current,
+            center_y=50,
+            bbox=(current.bbox[0], 0, current.bbox[2], current.bbox[3]),
+        )
+        runner.tracker.target = clipped
+        runner._latest_accepted_target = clipped
+
+    monkeypatch.setattr(runner, "_sample", expose_top_edge)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="top-edge safety margin was lost during control",
+    ):
+        asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    assert adapter.commands == []
 
 
 def test_bounded_gate1_recenter_rejects_hidden_large_raw_geometry(monkeypatch):
@@ -2173,7 +2264,7 @@ def test_bounded_gate1_recenter_allows_geometry_just_below_bounds(monkeypatch):
     )
     entry = runner.tracker.target
     assert entry is not None
-    below = replace(entry, bbox=(370, 0, 159, 144))
+    below = replace(entry, bbox=(370, 2, 159, 144))
     runner.tracker.target = below
     runner._latest_accepted_target = below
     observation["frames"][-1]["bbox_xywh_px"] = list(below.bbox)
@@ -2342,7 +2433,7 @@ def test_offline_gate1_recenter_duplicate_frames_do_not_count(monkeypatch):
                 sim_time_ns=previous.sim_time_ns + 10,
                 received_monotonic_s=clock[0],
                 center_x=center_x,
-                bbox=(center_x - 50, 0, 100, 100),
+                bbox=(center_x - 50, 2, 100, 100),
             )
             runner.tracker.target = target
             runner.tracker.consecutive += 1
@@ -2889,7 +2980,7 @@ def test_offline_gate1_recenter_reports_and_rechecks_final_cleanup_frame(
         if sample_calls[0] == 4:
             current = runner._latest_accepted_target
             assert current is not None
-            larger = replace(current, bbox=(380, 0, 140, 110))
+            larger = replace(current, bbox=(380, 2, 140, 110))
             runner.tracker.target = larger
             runner._latest_accepted_target = larger
 
@@ -6556,7 +6647,7 @@ def _publish_observation_frame(runner, *, frame_id, clock, detection):
 
 
 @pytest.mark.parametrize("hold_thrust", (0.0, 0.275))
-def test_gate1_observation_requires_three_new_frames_and_paced_zero_rates(
+def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     monkeypatch,
     hold_thrust,
 ):
@@ -6565,6 +6656,7 @@ def test_gate1_observation_requires_three_new_frames_and_paced_zero_rates(
     sample_count = [0]
     command_times = []
     watchdog_require_target = []
+    events = []
 
     def fake_monotonic():
         return clock[0]
@@ -6594,6 +6686,11 @@ def test_gate1_observation_requires_three_new_frames_and_paced_zero_rates(
     monkeypatch.setattr(runner, "_sample", fake_sample)
     monkeypatch.setattr(runner, "_watchdog", fake_watchdog)
     monkeypatch.setattr(adapter, "send_attitude_rate", recorded_send)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
 
     result = asyncio.run(
         runner._observe_gate1(details, hold_thrust=hold_thrust)
@@ -6602,11 +6699,54 @@ def test_gate1_observation_requires_three_new_frames_and_paced_zero_rates(
     assert result["gate1_observed"]
     assert result["frame_count"] == 3
     assert [frame["frame_id"] for frame in result["frames"]] == [101, 102, 103]
+    assert result["handoff_center_y_delta_px"] == 0
+    assert result["handoff_final_top_margin_px"] == 138
     assert len(adapter.commands) == 2
+    if hold_thrust == 0.0:
+        assert all(
+            command.roll_rate
+            == command.pitch_rate
+            == command.yaw_rate
+            == 0.0
+            and command.thrust == 0.0
+            for command in adapter.commands
+        )
+        assert result["pitch_recovery_enabled"] is False
+        assert result["pitch_recovery_command_count"] == 0
+    else:
+        assert all(
+            command.roll_rate == command.yaw_rate == 0.0
+            and 0.0
+            < command.pitch_rate
+            <= runner.controller_config.forward_braking.pitch_command_rate_cap_rad_s
+            and command.thrust == hold_thrust
+            for command in adapter.commands
+        )
+        assert result["pitch_recovery_enabled"] is True
+        assert result["pitch_recovery_target_pitch_rad"] == pytest.approx(
+            0.10
+        )
+        assert result["pitch_recovery_command_count"] == 2
+        assert result["pitch_recovery_min_pitch_rad"] == pytest.approx(
+            -0.05
+        )
+        assert result["pitch_recovery_max_pitch_rad"] == pytest.approx(
+            -0.05
+        )
+        assert result[
+            "pitch_recovery_max_abs_pass_delta_rad"
+        ] == pytest.approx(0.0)
+    recovery_events = [
+        fields
+        for event, fields in events
+        if event == "post_gate_pitch_recovery_command"
+    ]
+    assert len(recovery_events) == (2 if hold_thrust else 0)
     assert all(
-        command.roll_rate == command.pitch_rate == command.yaw_rate == 0.0
-        and command.thrust == hold_thrust
-        for command in adapter.commands
+        event["target_pitch_rad"] == pytest.approx(0.10)
+        and event["command_pitch_rate_rad_s"] > 0.0
+        and event["command_count"] == index
+        for index, event in enumerate(recovery_events, start=1)
     )
     assert all(
         later - earlier >= vq2_module.CONTROL_PERIOD_S - 1e-12
@@ -6615,6 +6755,61 @@ def test_gate1_observation_requires_three_new_frames_and_paced_zero_rates(
     assert watchdog_require_target == [False] * 6
     assert vision.reset_calls == 0
     assert vision.is_running is False
+
+
+@pytest.mark.parametrize(
+    ("fault", "match"),
+    (
+        ("attitude", "attitude changed over 5deg"),
+        ("body_rate", "body rate exceeded 1.0rad/s"),
+    ),
+)
+def test_powered_gate1_pitch_observation_checks_state_before_send(
+    monkeypatch,
+    fault,
+    match,
+):
+    clock = [10.0]
+    runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
+
+    async def fake_sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def fake_sample():
+        if fault == "attitude":
+            runner.estimate = _estimate(
+                roll=0.01,
+                pitch=(
+                    -0.05
+                    + vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD
+                    + 0.001
+                ),
+            )
+        else:
+            runner.estimate = replace(
+                _estimate(roll=0.01, pitch=-0.05),
+                body_rates=(
+                    vq2_module.POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S
+                    + 0.001,
+                    0.0,
+                    0.0,
+                ),
+            )
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(runner, "_sample", fake_sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+
+    with pytest.raises(SafetyAbort, match=match):
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=vq2_module.GATE1_RECENTER_TRANSITION_THRUST,
+            )
+        )
+
+    assert adapter.commands == []
 
 
 @pytest.mark.parametrize("geometry_source", ("accepted", "raw"))
@@ -6702,8 +6897,10 @@ def test_gate1_observation_resets_streak_after_missing_frame(monkeypatch):
     assert [frame["frame_id"] for frame in result["frames"]] == [103, 104, 105]
 
 
+@pytest.mark.parametrize("hold_thrust", (0.0, 0.275))
 def test_gate1_observation_uses_fixed_nested_deadline_and_never_catches_up(
     monkeypatch,
+    hold_thrust,
 ):
     clock = [10.0]
     runner, adapter, _vision, details = _configure_gate1_observer(
@@ -6735,13 +6932,18 @@ def test_gate1_observation_uses_fixed_nested_deadline_and_never_catches_up(
     monkeypatch.setattr(adapter, "send_attitude_rate", recorded_send)
 
     with pytest.raises(SafetyAbort, match="timed out"):
-        asyncio.run(runner._observe_gate1(details))
+        asyncio.run(
+            runner._observe_gate1(
+                details,
+                hold_thrust=hold_thrust,
+            )
+        )
 
     # crossing start + 0.40 is the fixed 10.05 hard limit; the injected send
     # completion overrun is observed once and never followed by catch-up sends.
     assert command_times == [10.0]
     assert clock[0] == pytest.approx(10.065)
-    assert all(command.thrust == 0.0 for command in adapter.commands)
+    assert all(command.thrust == hold_thrust for command in adapter.commands)
 
 
 def test_gate1_observation_cannot_accept_third_frame_after_hard_deadline(

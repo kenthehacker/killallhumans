@@ -233,6 +233,7 @@ GATE1_CONTROLLER_MAX_YAW_EXCURSION_RAD = 0.05
 GATE1_CONTROLLER_YAW_SOFT_STOP_RAD = 0.045
 GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX = COURSE_UNTRACKED_CONTACT_MIN_AREA_PX
 GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX = COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX
+GATE1_RECENTER_MIN_TOP_MARGIN_PX = 1
 
 MAX_BENIGN_PAD_CONTACTS = 12
 MAX_BENIGN_PAD_IMPULSE = 0.05
@@ -11466,6 +11467,21 @@ class VQ2Runner:
                 f"during {phase}"
             )
 
+    @staticmethod
+    def _assert_gate1_recenter_top_margin(
+        target: Optional[GateTarget],
+        *,
+        phase: str,
+    ) -> None:
+        if (
+            target is not None
+            and int(target.bbox[1]) < GATE1_RECENTER_MIN_TOP_MARGIN_PX
+        ):
+            raise SafetyAbort(
+                "gate-1 recenter top-edge safety margin was lost "
+                f"during {phase}"
+            )
+
     async def _observe_gate1(
         self,
         gate0_details: Dict[str, Any],
@@ -11474,9 +11490,10 @@ class VQ2Runner:
     ) -> Dict[str, Any]:
         """Collect a bounded view after a proved gate-0 pass.
 
-        Observation authority has exact-zero attitude rates. The powered
-        recenter stage may preserve its exact transition thrust so the motors
-        do not cut during handoff; no Gate 1 steering or passage is supplied.
+        Passive observation has exact-zero attitude rates. The powered
+        recenter handoff preserves its exact transition thrust and advances
+        only the existing bounded Gate-1 pitch objective; roll and yaw remain
+        exact zero, and no target-dependent steering or passage is supplied.
         """
 
         if (
@@ -11489,6 +11506,10 @@ class VQ2Runner:
                 "post-gate observation thrust must be exact zero or the "
                 "Gate-1 continuation value"
             )
+        powered_pitch_recovery = bool(
+            float(hold_thrust) == GATE1_RECENTER_TRANSITION_THRUST
+        )
+        forward_braking = self.controller_config.forward_braking
         proof = self._gate0_transition_proof
         if proof is None or not gate0_details.get("gate_transition_proved"):
             raise SafetyAbort("gate-1 observation lacks an authoritative transition proof")
@@ -11560,12 +11581,6 @@ class VQ2Runner:
                 else observation_started_s
             ),
         )
-        transition_command = AttitudeRateCommand(
-            0.0,
-            0.0,
-            0.0,
-            float(hold_thrust),
-        )
         last_processed_token = (
             int(watermark.generation),
             int(watermark.frame_id),
@@ -11573,6 +11588,9 @@ class VQ2Runner:
         )
         qualifying_frames: List[Dict[str, Any]] = []
         strict_high_rate_samples = 0
+        pitch_recovery_command_count = 0
+        pitch_recovery_min_pitch_rad = float(proof.pass_rpy_rad[1])
+        pitch_recovery_max_pitch_rad = float(proof.pass_rpy_rad[1])
         self.recorder.emit(
             "post_gate_observation_started",
             pre_gate_race_boot_ms=proof.pre_gate_race_boot_ms,
@@ -11580,6 +11598,17 @@ class VQ2Runner:
             hard_deadline_monotonic_s=hard_deadline,
             budget_s=hard_deadline - observation_started_s,
             hold_thrust=float(hold_thrust),
+            pitch_recovery_enabled=powered_pitch_recovery,
+            pitch_recovery_target_pitch_rad=(
+                forward_braking.gate1_target_pitch_rad
+                if powered_pitch_recovery
+                else None
+            ),
+            pitch_recovery_rate_cap_rad_s=(
+                forward_braking.pitch_command_rate_cap_rad_s
+                if powered_pitch_recovery
+                else 0.0
+            ),
             watermark={
                 "generation": watermark.generation,
                 "frame_id": watermark.frame_id,
@@ -11623,6 +11652,14 @@ class VQ2Runner:
                         phase="Gate-1 observation",
                     )
                 roll, pitch, _yaw = self.estimate.orientation.to_euler()
+                pitch_recovery_min_pitch_rad = min(
+                    pitch_recovery_min_pitch_rad,
+                    float(pitch),
+                )
+                pitch_recovery_max_pitch_rad = max(
+                    pitch_recovery_max_pitch_rad,
+                    float(pitch),
+                )
                 if (
                     abs(roll - proof.pass_rpy_rad[0])
                     > POST_GATE_MAX_ATTITUDE_DELTA_RAD
@@ -11630,7 +11667,7 @@ class VQ2Runner:
                     > POST_GATE_MAX_ATTITUDE_DELTA_RAD
                 ):
                     raise SafetyAbort(
-                        "attitude changed over 5deg during zero-rate "
+                        "attitude changed over 5deg during bounded "
                         "transition observation"
                     )
                 peak_rate = max(abs(value) for value in self.estimate.body_rates)
@@ -11758,6 +11795,48 @@ class VQ2Runner:
                                 "race_boot_ms": int(final_race.sim_boot_time_ms),
                                 "gate_index": int(final_race.active_gate_index),
                                 "hold_thrust": float(hold_thrust),
+                                "pitch_recovery_enabled": (
+                                    powered_pitch_recovery
+                                ),
+                                "pitch_recovery_target_pitch_rad": (
+                                    forward_braking.gate1_target_pitch_rad
+                                    if powered_pitch_recovery
+                                    else None
+                                ),
+                                "pitch_recovery_command_count": (
+                                    pitch_recovery_command_count
+                                ),
+                                "pitch_recovery_min_pitch_rad": (
+                                    pitch_recovery_min_pitch_rad
+                                ),
+                                "pitch_recovery_max_pitch_rad": (
+                                    pitch_recovery_max_pitch_rad
+                                ),
+                                "pitch_recovery_max_abs_pass_delta_rad": max(
+                                    abs(
+                                        pitch_recovery_min_pitch_rad
+                                        - float(proof.pass_rpy_rad[1])
+                                    ),
+                                    abs(
+                                        pitch_recovery_max_pitch_rad
+                                        - float(proof.pass_rpy_rad[1])
+                                    ),
+                                ),
+                                "handoff_center_y_delta_px": (
+                                    int(
+                                        qualifying_frames[-1][
+                                            "center_px"
+                                        ][1]
+                                    )
+                                    - int(
+                                        qualifying_frames[
+                                            -POST_GATE_REQUIRED_FRAMES
+                                        ]["center_px"][1]
+                                    )
+                                ),
+                                "handoff_final_top_margin_px": int(
+                                    accepted.bbox[1]
+                                ),
                             }
                             return result
 
@@ -11790,7 +11869,89 @@ class VQ2Runner:
                         phase="powered observation command send",
                     )
 
+                transition_command = AttitudeRateCommand(
+                    0.0,
+                    0.0,
+                    0.0,
+                    float(hold_thrust),
+                )
+                if powered_pitch_recovery:
+                    if self.estimate is None:
+                        raise SafetyAbort(
+                            "attitude estimate unavailable before powered "
+                            "observation pitch command"
+                        )
+                    send_roll, send_pitch, _send_yaw = (
+                        self.estimate.orientation.to_euler()
+                    )
+                    send_peak_rate = max(
+                        abs(float(value))
+                        for value in self.estimate.body_rates
+                    )
+                    if (
+                        abs(float(send_roll) - proof.pass_rpy_rad[0])
+                        > POST_GATE_MAX_ATTITUDE_DELTA_RAD
+                        or abs(float(send_pitch) - proof.pass_rpy_rad[1])
+                        > POST_GATE_MAX_ATTITUDE_DELTA_RAD
+                        or send_peak_rate
+                        > POST_GATE_IMMEDIATE_MAX_BODY_RATE_RAD_S
+                    ):
+                        raise SafetyAbort(
+                            "powered observation state changed before "
+                            "pitch command"
+                        )
+                    pitch_objective = attitude_rate_command(
+                        self.estimate,
+                        target_roll_rad=float(send_roll),
+                        target_pitch_rad=(
+                            forward_braking.gate1_target_pitch_rad
+                        ),
+                        thrust=float(hold_thrust),
+                    )
+                    pitch_rate = max(
+                        -forward_braking.pitch_command_rate_cap_rad_s,
+                        min(
+                            forward_braking.pitch_command_rate_cap_rad_s,
+                            pitch_objective.pitch_rate,
+                        ),
+                    )
+                    transition_command = AttitudeRateCommand(
+                        0.0,
+                        pitch_rate,
+                        0.0,
+                        float(hold_thrust),
+                    )
+                validate_command(transition_command)
+                if (
+                    transition_command.roll_rate != 0.0
+                    or transition_command.yaw_rate != 0.0
+                    or abs(transition_command.pitch_rate)
+                    > forward_braking.pitch_command_rate_cap_rad_s
+                    or transition_command.thrust != float(hold_thrust)
+                ):
+                    raise SafetyAbort(
+                        "gate-1 observation command escaped its fixed envelope"
+                    )
                 await self._send_flight_command(transition_command)
+                if powered_pitch_recovery:
+                    pitch_recovery_command_count += 1
+                    self.recorder.emit(
+                        "post_gate_pitch_recovery_command",
+                        elapsed_s=(
+                            send_checked_s - observation_started_s
+                        ),
+                        target_pitch_rad=(
+                            forward_braking.gate1_target_pitch_rad
+                        ),
+                        measured_pitch_rad=float(send_pitch),
+                        measured_pitch_rate_rad_s=float(
+                            self.estimate.body_rates[1]
+                        ),
+                        command_pitch_rate_rad_s=(
+                            transition_command.pitch_rate
+                        ),
+                        command_count=pitch_recovery_command_count,
+                    )
                 self._record_tick(
                     "gate0-observe/post-pass",
                     send_checked_s - observation_started_s,
@@ -11831,7 +11992,6 @@ class VQ2Runner:
             raise SafetyAbort("gate-1 recenter lacks the proved three-frame handoff")
         handoff_frames = list(frames[-POST_GATE_REQUIRED_FRAMES:])
         handoff_tokens: List[Tuple[int, int, float]] = []
-        handoff_center_ys: List[float] = []
         handoff_bbox_tops: List[int] = []
         for frame in handoff_frames:
             if not isinstance(frame, Mapping):
@@ -11866,7 +12026,6 @@ class VQ2Runner:
             handoff_tokens.append(
                 (frame_id, sim_time_ns, float(received_s))
             )
-            handoff_center_ys.append(float(center_px[1]))
             handoff_bbox_tops.append(int(bbox_xywh_px[1]))
         if any(
             handoff_tokens[index][0] <= handoff_tokens[index - 1][0]
@@ -11878,15 +12037,11 @@ class VQ2Runner:
                 "gate-1 recenter handoff frames did not advance strictly"
             )
         if (
-            handoff_bbox_tops[-1] <= 0
-            and all(
-                handoff_center_ys[index]
-                < handoff_center_ys[index - 1]
-                for index in range(1, len(handoff_center_ys))
-            )
+            handoff_bbox_tops[-1]
+            < GATE1_RECENTER_MIN_TOP_MARGIN_PX
         ):
             raise SafetyAbort(
-                "gate-1 recenter unsafe top-edge departure geometry"
+                "gate-1 recenter handoff lacks a safe top-edge margin"
             )
         first_handoff_token = handoff_tokens[0]
         if (
@@ -11928,8 +12083,10 @@ class VQ2Runner:
             "final_abs_horizontal_error_px": abs(entry_error_px),
             "entry_normalized_x": entry_normalized_x,
             "target_pitch_rad": forward_braking.gate1_target_pitch_rad,
+            "pass_pitch_basis_rad": float(proof.pass_rpy_rad[1]),
             "max_target_area_px": int(entry_target.bbox_area),
             "max_target_width_px": int(entry_target.bbox[2]),
+            "min_top_margin_px": GATE1_RECENTER_MIN_TOP_MARGIN_PX,
             "no_passage_max_area_px": (
                 GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX
             ),
@@ -11941,6 +12098,10 @@ class VQ2Runner:
             "cleanup_confirmed": False,
         }
         self._assert_gate1_no_passage_geometry(
+            entry_target,
+            phase="entry",
+        )
+        self._assert_gate1_recenter_top_margin(
             entry_target,
             phase="entry",
         )
@@ -11977,6 +12138,7 @@ class VQ2Runner:
         entry_roll, entry_pitch, entry_yaw = (
             self.estimate.orientation.to_euler()
         )
+        pass_pitch_basis_rad = float(proof.pass_rpy_rad[1])
         if (
             self._gate1_yaw_reference_rad is None
             and yaw_control.command_rate_cap_rad_s > 0.0
@@ -11994,6 +12156,8 @@ class VQ2Runner:
                 <= float(entry_pitch)
                 <= GATE1_RECENTER_MAX_PITCH_RAD
             )
+            or abs(float(entry_pitch) - pass_pitch_basis_rad)
+            > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
         ):
             raise SafetyAbort(
                 "gate-1 recenter entry attitude approached its bound"
@@ -12071,6 +12235,10 @@ class VQ2Runner:
             "entry_abs_horizontal_error_px": entry_abs_error_px,
             "entry_normalized_x": entry_normalized_x,
             "entry_yaw_rad": float(entry_yaw),
+            "pass_pitch_basis_rad": pass_pitch_basis_rad,
+            "entry_pass_pitch_delta_rad": (
+                float(entry_pitch) - pass_pitch_basis_rad
+            ),
             "entry_yaw_excursion_rad": entry_yaw_excursion,
             "entry_yaw_soft_stopped": entry_yaw_soft_stopped,
             "final_horizontal_error_px": entry_error_px,
@@ -12324,6 +12492,10 @@ class VQ2Runner:
                     accepted,
                     phase="control",
                 )
+                self._assert_gate1_recenter_top_margin(
+                    accepted,
+                    phase="control",
+                )
                 if self.estimate is None:
                     raise SafetyAbort(
                         "gate-1 recenter attitude estimate is unavailable"
@@ -12350,6 +12522,8 @@ class VQ2Runner:
                     or abs(float(roll) - entry_roll)
                     > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                     or abs(float(pitch) - entry_pitch)
+                    > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                    or abs(float(pitch) - pass_pitch_basis_rad)
                     > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                 ):
                     raise SafetyAbort(
@@ -12572,6 +12746,10 @@ class VQ2Runner:
                             cleanup_ready_target,
                             phase="cleanup readiness",
                         )
+                        self._assert_gate1_recenter_top_margin(
+                            cleanup_ready_target,
+                            phase="cleanup readiness",
+                        )
                         if self.estimate is None:
                             raise SafetyAbort(
                                 "gate-1 recenter attitude estimate changed "
@@ -12603,6 +12781,11 @@ class VQ2Runner:
                             or abs(float(cleanup_roll) - entry_roll)
                             > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                             or abs(float(cleanup_pitch) - entry_pitch)
+                            > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
+                            or abs(
+                                float(cleanup_pitch)
+                                - pass_pitch_basis_rad
+                            )
                             > GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD
                             or cleanup_peak_rate
                             > GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S
@@ -12832,6 +13015,10 @@ class VQ2Runner:
                         "gate-1 recenter authority changed before command send"
                     )
                 self._assert_gate1_no_passage_geometry(
+                    latest_target,
+                    phase="command send",
+                )
+                self._assert_gate1_recenter_top_margin(
                     latest_target,
                     phase="command send",
                 )
