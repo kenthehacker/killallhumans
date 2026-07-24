@@ -19,6 +19,15 @@ from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
 
+from competition.vq2_contracts import FrameEdge
+from competition.vq2_visual_tracker import (
+    CameraFrameToken,
+    FrameProvenanceBasis,
+    VisualTrack,
+    VisualTrackRole,
+    VisualTrackSample,
+)
+
 
 # These are code-owned controller authority ceilings.  The yaw-rate value is
 # the exact magnitude exercised by the successful paired build-3385 sign-ID
@@ -178,6 +187,8 @@ class VisualTarget:
     consecutive_frames: int
     clipped: bool = False
     center_censored: bool = False
+    horizontal_censored: bool = False
+    vertical_censored: bool = False
     ambiguous: bool = False
 
     def __post_init__(self) -> None:
@@ -228,63 +239,220 @@ class VisualTarget:
         if (
             type(self.clipped) is not bool
             or type(self.center_censored) is not bool
+            or type(self.horizontal_censored) is not bool
+            or type(self.vertical_censored) is not bool
             or type(self.ambiguous) is not bool
         ):
             raise VisualServoRefusal("target flags must be exact booleans")
 
+    @property
+    def horizontal_geometry_censored(self) -> bool:
+        """Whether image x geometry is unsafe for steering.
+
+        The two explicit axis flags are the production contract.  Treat an
+        older undifferentiated ``clipped``/``center_censored`` value as
+        censoring both axes so compatibility cannot accidentally create
+        authority.
+        """
+
+        if self.horizontal_censored:
+            return True
+        return bool(
+            not self.horizontal_censored
+            and not self.vertical_censored
+            and (self.clipped or self.center_censored)
+        )
+
+    @property
+    def vertical_geometry_censored(self) -> bool:
+        """Whether image y geometry is unsafe for steering."""
+
+        if self.vertical_censored:
+            return True
+        return bool(
+            not self.horizontal_censored
+            and not self.vertical_censored
+            and (self.clipped or self.center_censored)
+        )
+
     @classmethod
     def from_visual_track(
         cls,
-        track: object,
+        track: VisualTrack,
         *,
-        stream_id: str,
+        require_current_authority: bool = True,
+        expected_gate_index: Optional[int] = None,
     ) -> "VisualTarget":
-        """Adapt the tracker convention explicitly for live servo authority.
+        """Adapt one exact live tracker snapshot without inventing provenance.
 
         ``VisualTrack.center_norm[1]`` and its velocity are image-down
         positive.  The gate graph also exposes an elevation-up view, but this
         adapter intentionally consumes the raw image convention so the sign
         cannot be silently inverted at the runner boundary.
+
+        Current-gate authority additionally requires the race-labelled
+        ``CURRENT`` role.  Callers adapting a graph-vetted next-gate candidate
+        must explicitly set ``require_current_authority=False``; visibility,
+        exact live receiver provenance, and coherent latest history remain
+        mandatory.
         """
 
-        history = getattr(track, "history", None)
+        if type(track) is not VisualTrack:
+            raise VisualServoRefusal(
+                "servo adaptation requires an exact VisualTrack"
+            )
+        if type(require_current_authority) is not bool:
+            raise VisualServoRefusal(
+                "require_current_authority must be an exact bool"
+            )
+        if expected_gate_index is not None and (
+            type(expected_gate_index) is not int or expected_gate_index < 0
+        ):
+            raise VisualServoRefusal(
+                "expected gate index must be a nonnegative exact int or None"
+            )
+        if expected_gate_index is not None and not require_current_authority:
+            raise VisualServoRefusal(
+                "an expected gate index requires current-gate authority"
+            )
+
+        history = track.history
         if type(history) is not tuple or not history:
             raise VisualServoRefusal("visual track lacks exact sample history")
+        if any(type(item) is not VisualTrackSample for item in history):
+            raise VisualServoRefusal(
+                "visual track history must contain exact tracker samples"
+            )
         sample = history[-1]
-        token = getattr(track, "latest_token", None)
-        publication_sequence = getattr(token, "publication_sequence", None)
-        if type(publication_sequence) is not int or publication_sequence <= 0:
+        token = track.latest_token
+        if type(token) is not CameraFrameToken:
+            raise VisualServoRefusal("visual track latest token is invalid")
+        if type(track.first_token) is not CameraFrameToken:
+            raise VisualServoRefusal("visual track first token is invalid")
+        if history[0].token != track.first_token:
+            raise VisualServoRefusal(
+                "visual track first token disagrees with sample history"
+            )
+        if sample.token != token:
+            raise VisualServoRefusal(
+                "visual track latest token disagrees with sample history"
+            )
+        if (
+            type(token.stream_id) is not str
+            or not token.stream_id
+            or type(token.publication_sequence) is not int
+            or token.publication_sequence <= 0
+        ):
             raise VisualServoRefusal(
                 "live servo authority requires receiver publication provenance"
             )
-        center = getattr(track, "center_norm", None)
-        velocity = getattr(track, "center_velocity_norm_s", None)
+        if sample.provenance_basis is not FrameProvenanceBasis.RECEIVER_TIMING_V1:
+            raise VisualServoRefusal(
+                "live servo authority requires receiver timing provenance"
+            )
+        observation_ns = sample.observation_monotonic_ns
+        publication_ns = sample.publication_monotonic_ns
+        if (
+            type(observation_ns) is not int
+            or observation_ns < 0
+            or type(publication_ns) is not int
+            or publication_ns < observation_ns
+        ):
+            raise VisualServoRefusal(
+                "live servo authority requires coherent receiver times"
+            )
+        center = track.center_norm
+        velocity = track.center_velocity_norm_s
         if type(center) is not tuple or len(center) != 2:
             raise VisualServoRefusal("visual track center convention is invalid")
         if type(velocity) is not tuple or len(velocity) != 2:
             raise VisualServoRefusal("visual track velocity convention is invalid")
-        apparent_scale = getattr(track, "apparent_scale", None)
+        apparent_scale = track.apparent_scale
         if (
             type(apparent_scale) not in {int, float}
             or not math.isfinite(float(apparent_scale))
             or float(apparent_scale) <= 0.0
         ):
             raise VisualServoRefusal("visual track apparent scale is invalid")
-        clipping = getattr(track, "clipping", None)
-        try:
-            clipped = int(clipping) != 0
-        except (TypeError, ValueError) as exc:
-            raise VisualServoRefusal("visual track clipping state is invalid") from exc
-        observation_ns = getattr(sample, "observation_monotonic_ns", None)
-        if type(observation_ns) is not int or observation_ns < 0:
-            raise VisualServoRefusal("visual track observation time is invalid")
+        if type(track.clipping) is not FrameEdge:
+            raise VisualServoRefusal("visual track clipping state is invalid")
+        if type(track.center_censored) is not bool:
+            raise VisualServoRefusal("visual track censoring state is invalid")
+        if type(track.visible) is not bool or not track.visible:
+            raise VisualServoRefusal(
+                "servo adaptation requires a currently visible visual track"
+            )
+        if type(track.ambiguous) is not bool:
+            raise VisualServoRefusal("visual track ambiguity state is invalid")
+        if type(track.role) is not VisualTrackRole:
+            raise VisualServoRefusal("visual track role is invalid")
+        if track.ambiguous != (track.role is VisualTrackRole.AMBIGUOUS):
+            raise VisualServoRefusal(
+                "visual track ambiguity disagrees with its lifecycle role"
+            )
+        if (
+            sample.center_norm != track.center_norm
+            or sample.bbox_norm != track.bbox_norm
+            or sample.apparent_scale != track.apparent_scale
+            or sample.association_confidence != track.association_confidence
+            or sample.clipping != track.clipping
+            or sample.center_censored != track.center_censored
+        ):
+            raise VisualServoRefusal(
+                "visual track latest fields disagree with sample history"
+            )
+        for label, confidence in (
+            ("latest sample confidence", sample.confidence),
+            ("smoothed track confidence", track.confidence),
+        ):
+            if (
+                type(confidence) not in {int, float}
+                or not math.isfinite(float(confidence))
+                or not 0.0 <= float(confidence) <= 1.0
+            ):
+                raise VisualServoRefusal(f"{label} is outside [0, 1]")
+        if require_current_authority:
+            if track.role is not VisualTrackRole.CURRENT:
+                raise VisualServoRefusal(
+                    "current servo authority requires a CURRENT visual track"
+                )
+            if (
+                type(track.authoritative_gate_index) is not int
+                or track.authoritative_gate_index < 0
+            ):
+                raise VisualServoRefusal(
+                    "current servo authority requires an authoritative gate index"
+                )
+            if (
+                expected_gate_index is not None
+                and track.authoritative_gate_index != expected_gate_index
+            ):
+                raise VisualServoRefusal(
+                    "visual track authoritative gate index does not match"
+                )
+
+        horizontal_censored = bool(
+            track.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+        )
+        vertical_censored = bool(
+            track.clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+        )
+        # Exact tracker snapshots currently mark every edge fragment as
+        # center-censored.  If a future detector censors a center without
+        # identifying an edge, suppress both axes rather than guessing.
+        if track.center_censored and not (
+            horizontal_censored or vertical_censored
+        ):
+            horizontal_censored = True
+            vertical_censored = True
+
         return cls(
-            track_id=getattr(track, "track_id", None),
+            track_id=track.track_id,
             frame_token=ServoFrameToken(
-                stream_id=stream_id,
-                generation=getattr(token, "generation", None),
-                frame_id=getattr(token, "frame_id", None),
-                publication_sequence=publication_sequence,
+                stream_id=token.stream_id,
+                generation=token.generation,
+                frame_id=token.frame_id,
+                publication_sequence=token.publication_sequence,
             ),
             received_monotonic_s=observation_ns / 1_000_000_000.0,
             normalized_x=float(center[0]),
@@ -292,15 +460,15 @@ class VisualTarget:
             normalized_x_rate_s=float(velocity[0]),
             normalized_y_rate_down_s=float(velocity[1]),
             log_scale=math.log(float(apparent_scale)),
-            log_scale_rate_s=float(getattr(track, "log_scale_rate_s", math.nan)),
-            confidence=float(getattr(track, "confidence", math.nan)),
-            association_confidence=float(
-                getattr(track, "association_confidence", math.nan)
-            ),
-            consecutive_frames=getattr(track, "consecutive_frame_count", None),
-            clipped=clipped,
-            center_censored=getattr(track, "center_censored", None),
-            ambiguous=getattr(track, "ambiguous", None),
+            log_scale_rate_s=float(track.log_scale_rate_s),
+            confidence=float(track.confidence),
+            association_confidence=float(track.association_confidence),
+            consecutive_frames=track.consecutive_frame_count,
+            clipped=track.clipping != FrameEdge.NONE,
+            center_censored=track.center_censored,
+            horizontal_censored=horizontal_censored,
+            vertical_censored=vertical_censored,
+            ambiguous=track.ambiguous,
         )
 
 
@@ -343,7 +511,9 @@ class ImageVisualServo:
     def reset_segment(self) -> None:
         self._last_token: Optional[ServoFrameToken] = None
         self._segment_track_id: Optional[str] = None
-        self._last_abs_error: Optional[Tuple[float, float]] = None
+        self._last_abs_error: Optional[
+            Tuple[Optional[float], Optional[float]]
+        ] = None
         self._corridor_frames = 0
 
     @property
@@ -417,77 +587,112 @@ class ImageVisualServo:
                     "visual-servo exact publication token did not advance"
                 )
 
-        horizontal = float(current.normalized_x)
-        vertical = float(current.normalized_y_down)
-        horizontal_rate = float(current.normalized_x_rate_s)
-        vertical_rate = float(current.normalized_y_rate_down_s)
+        raw_horizontal = float(current.normalized_x)
+        raw_vertical = float(current.normalized_y_down)
+        raw_horizontal_rate = float(current.normalized_x_rate_s)
+        raw_vertical_rate = float(current.normalized_y_rate_down_s)
+        horizontal_censored = current.horizontal_geometry_censored
+        vertical_censored = current.vertical_geometry_censored
+        horizontal = 0.0 if horizontal_censored else raw_horizontal
+        vertical = 0.0 if vertical_censored else raw_vertical
+        horizontal_rate = (
+            0.0 if horizontal_censored else raw_horizontal_rate
+        )
+        vertical_rate = 0.0 if vertical_censored else raw_vertical_rate
         current_inside_position = (
-            abs(horizontal) <= self.tuning.horizontal_corridor
-            and abs(vertical) <= self.tuning.vertical_corridor
+            not horizontal_censored
+            and not vertical_censored
+            and abs(raw_horizontal) <= self.tuning.horizontal_corridor
+            and abs(raw_vertical) <= self.tuning.vertical_corridor
         )
 
         blend = 0.0
         next_horizontal: Optional[float] = None
         next_vertical: Optional[float] = None
+        next_edge_risk = False
+        next_ambiguity_risk = False
         if next_target is not None and float(requested_next_blend) > 0.0:
             next_age_s = (
                 float(now_monotonic_s)
                 - float(next_target.received_monotonic_s)
             )
             same_frame = next_target.frame_token == current.frame_token
-            next_authoritative = (
-                not next_target.ambiguous
+            next_horizontal_censored = (
+                next_target.horizontal_geometry_censored
+            )
+            next_vertical_censored = next_target.vertical_geometry_censored
+            next_edge_risk = bool(
+                next_target.clipped
+                or next_target.center_censored
+                or next_horizontal_censored
+                or next_vertical_censored
+            )
+            next_ambiguity_risk = next_target.ambiguous
+            next_usable = (
+                not next_ambiguity_risk
                 and next_target.confidence >= 0.10
                 and next_target.association_confidence >= 0.10
                 and next_target.consecutive_frames >= 3
-                and not next_target.clipped
-                and not next_target.center_censored
-                and abs(float(next_target.normalized_x_rate_s))
-                <= self.tuning.stable_rate_norm_s
-                and abs(float(next_target.normalized_y_rate_down_s))
-                <= self.tuning.stable_rate_norm_s
-                and abs(float(next_target.log_scale_rate_s))
-                <= self.tuning.stable_scale_rate_s
+                and not (
+                    next_horizontal_censored and next_vertical_censored
+                )
+                and (
+                    next_horizontal_censored
+                    or abs(float(next_target.normalized_x_rate_s))
+                    <= self.tuning.stable_rate_norm_s
+                )
+                and (
+                    next_vertical_censored
+                    or abs(float(next_target.normalized_y_rate_down_s))
+                    <= self.tuning.stable_rate_norm_s
+                )
+                and (
+                    next_edge_risk
+                    or abs(float(next_target.log_scale_rate_s))
+                    <= self.tuning.stable_scale_rate_s
+                )
                 and -1e-6 <= next_age_s <= MAX_VISUAL_OBSERVATION_AGE_S
                 and same_frame
                 and next_target.track_id != current.track_id
             )
             if (
-                next_authoritative
+                next_usable
                 and current_inside_position
                 and self._corridor_frames
                 >= self.tuning.required_corridor_frames
             ):
                 blend = float(requested_next_blend)
-                next_horizontal = float(next_target.normalized_x)
-                next_vertical = float(next_target.normalized_y_down)
-                horizontal = (
-                    (1.0 - blend) * horizontal
-                    + blend * next_horizontal
-                )
+                if not next_horizontal_censored:
+                    next_horizontal = float(next_target.normalized_x)
+                    horizontal = (
+                        (1.0 - blend) * horizontal
+                        + blend * next_horizontal
+                    )
+                    horizontal_rate = (
+                        (1.0 - blend) * horizontal_rate
+                        + blend * float(next_target.normalized_x_rate_s)
+                    )
                 # Preserve more vertical authority for the current aperture;
                 # early heading blend is useful, but a clipped next gate must
                 # not pull the vehicle out of the current vertical corridor.
-                vertical = (
-                    (1.0 - 0.5 * blend) * vertical
-                    + 0.5 * blend * next_vertical
-                )
-                horizontal_rate = (
-                    (1.0 - blend) * horizontal_rate
-                    + blend * float(next_target.normalized_x_rate_s)
-                )
-                vertical_rate = (
-                    (1.0 - 0.5 * blend) * vertical_rate
-                    + 0.5
-                    * blend
-                    * float(next_target.normalized_y_rate_down_s)
-                )
+                if not next_vertical_censored:
+                    next_vertical = float(next_target.normalized_y_down)
+                    vertical = (
+                        (1.0 - 0.5 * blend) * vertical
+                        + 0.5 * blend * next_vertical
+                    )
+                    vertical_rate = (
+                        (1.0 - 0.5 * blend) * vertical_rate
+                        + 0.5
+                        * blend
+                        * float(next_target.normalized_y_rate_down_s)
+                    )
 
         stable_rates = (
-            abs(float(current.normalized_x_rate_s))
-            <= self.tuning.stable_rate_norm_s
-            and abs(float(current.normalized_y_rate_down_s))
-            <= self.tuning.stable_rate_norm_s
+            not horizontal_censored
+            and not vertical_censored
+            and abs(raw_horizontal_rate) <= self.tuning.stable_rate_norm_s
+            and abs(raw_vertical_rate) <= self.tuning.stable_rate_norm_s
             and abs(float(current.log_scale_rate_s))
             <= self.tuning.stable_scale_rate_s
         )
@@ -495,17 +700,25 @@ class ImageVisualServo:
         previous_abs_error = self._last_abs_error
         horizontal_delta = (
             None
-            if previous_abs_error is None
-            else abs(float(current.normalized_x)) - previous_abs_error[0]
+            if (
+                horizontal_censored
+                or previous_abs_error is None
+                or previous_abs_error[0] is None
+            )
+            else abs(raw_horizontal) - previous_abs_error[0]
         )
         vertical_delta = (
             None
-            if previous_abs_error is None
-            else abs(float(current.normalized_y_down)) - previous_abs_error[1]
+            if (
+                vertical_censored
+                or previous_abs_error is None
+                or previous_abs_error[1] is None
+            )
+            else abs(raw_vertical) - previous_abs_error[1]
         )
         self._last_abs_error = (
-            abs(float(current.normalized_x)),
-            abs(float(current.normalized_y_down)),
+            None if horizontal_censored else abs(raw_horizontal),
+            None if vertical_censored else abs(raw_vertical),
         )
         self._last_token = current.frame_token
 
@@ -518,12 +731,15 @@ class ImageVisualServo:
             self._corridor_frames += 1
         else:
             self._corridor_frames = 0
-        edge_risk = bool(
-            abs(float(current.normalized_x)) >= self.tuning.edge_brake_x
-            or abs(float(current.normalized_y_down))
-            >= self.tuning.edge_brake_y
+        current_edge_risk = bool(
+            abs(raw_horizontal) >= self.tuning.edge_brake_x
+            or abs(raw_vertical) >= self.tuning.edge_brake_y
             or current.clipped
+            or current.center_censored
+            or horizontal_censored
+            or vertical_censored
         )
+        edge_risk = current_edge_risk or next_edge_risk
         scale_brake = (
             float(current.log_scale_rate_s) >= self.tuning.brake_scale_rate_s
         )
@@ -539,6 +755,7 @@ class ImageVisualServo:
             allow_advance
             and self._corridor_frames >= self.tuning.required_corridor_frames
             and not edge_risk
+            and not next_ambiguity_risk
             and not scale_brake
             and not scale_retreat
             and not close_scale_brake
@@ -546,8 +763,12 @@ class ImageVisualServo:
         )
 
         brake_reason: Optional[str] = None
-        if edge_risk:
+        if current_edge_risk:
             brake_reason = "target_edge_or_clipping"
+        elif next_ambiguity_risk:
+            brake_reason = "next_target_ambiguous"
+        elif next_edge_risk:
+            brake_reason = "next_target_edge_or_clipping"
         elif scale_brake:
             brake_reason = "scale_rate"
         elif scale_retreat:
@@ -577,9 +798,8 @@ class ImageVisualServo:
             brake_reason = "segment_yaw_outward_soft_stop"
 
         target_roll = _clamp(
-            self.tuning.roll_error_gain * float(current.normalized_x)
-            + self.tuning.roll_rate_gain
-            * float(current.normalized_x_rate_s),
+            self.tuning.roll_error_gain * horizontal
+            + self.tuning.roll_rate_gain * horizontal_rate,
             -MAX_VISUAL_TARGET_ROLL_RAD,
             MAX_VISUAL_TARGET_ROLL_RAD,
         )
@@ -593,6 +813,7 @@ class ImageVisualServo:
             thrust_basis = self.tuning.advance_thrust
         elif (
             edge_risk
+            or next_ambiguity_risk
             or scale_brake
             or scale_retreat
             or close_scale_brake
@@ -635,8 +856,8 @@ class ImageVisualServo:
             corridor_frames=self._corridor_frames,
             advance_enabled=advance_enabled,
             next_gate_blend=blend,
-            horizontal_error=float(current.normalized_x),
-            vertical_error_image_down=float(current.normalized_y_down),
+            horizontal_error=raw_horizontal,
+            vertical_error_image_down=raw_vertical,
             effective_horizontal_error=horizontal,
             effective_vertical_error_image_down=vertical,
             effective_horizontal_rate_s=horizontal_rate,

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 
+from competition.vq2_contracts import FrameEdge
+from competition.vq2_visual_tracker import (
+    CameraFrameToken,
+    FrameProvenanceBasis,
+    MultiTargetVisualTracker,
+    VisualDetection,
+    VisualDetectionFrame,
+    VisualTrack,
+    VisualTrackRole,
+    VisualTrackSample,
+)
 from planning.vq2_visual_servo import (
     ImageVisualServo,
     MAX_VISUAL_SEGMENT_DURATION_S,
@@ -31,6 +41,8 @@ def target(
     consecutive: int = 4,
     clipped: bool = False,
     center_censored: bool = False,
+    horizontal_censored: bool = False,
+    vertical_censored: bool = False,
     ambiguous: bool = False,
     publication_sequence: int | None = None,
 ) -> VisualTarget:
@@ -56,7 +68,77 @@ def target(
         consecutive_frames=consecutive,
         clipped=clipped,
         center_censored=center_censored,
+        horizontal_censored=horizontal_censored,
+        vertical_censored=vertical_censored,
         ambiguous=ambiguous,
+    )
+
+
+def tracker_track(
+    *,
+    token: CameraFrameToken | None = None,
+    sample_token: CameraFrameToken | None = None,
+    provenance: FrameProvenanceBasis = (
+        FrameProvenanceBasis.RECEIVER_TIMING_V1
+    ),
+    publication_monotonic_ns: int | None = 12_500_100_000,
+    center: tuple[float, float] = (0.25, -0.40),
+    velocity: tuple[float, float] = (0.10, -0.20),
+    clipping: FrameEdge = FrameEdge.NONE,
+    center_censored: bool = False,
+    role: VisualTrackRole = VisualTrackRole.CURRENT,
+    authoritative_gate_index: int | None = 1,
+    authority_sequence: int | None = 22,
+    authority_boot_ms: int | None = 6256,
+    ambiguous: bool = False,
+    visible: bool = True,
+) -> VisualTrack:
+    token = token or CameraFrameToken(
+        generation=3,
+        frame_id=91,
+        publication_sequence=17,
+        stream_id="camera0",
+    )
+    sample_token = token if sample_token is None else sample_token
+    sample = VisualTrackSample(
+        tracker_frame_sequence=5,
+        token=sample_token,
+        observation_monotonic_ns=12_500_000_000,
+        publication_monotonic_ns=publication_monotonic_ns,
+        provenance_basis=provenance,
+        camera_source_time_ns=123_000_000,
+        source_index=0,
+        center_norm=center,
+        bbox_norm=(0.50, 0.15, 0.70, 0.35),
+        apparent_scale=0.2,
+        confidence=0.8,
+        clipping=clipping,
+        center_censored=center_censored,
+        association_confidence=0.7,
+    )
+    return VisualTrack(
+        track_id="vq2-track-000001",
+        first_token=sample_token,
+        latest_token=token,
+        center_norm=center,
+        bbox_norm=sample.bbox_norm,
+        apparent_scale=sample.apparent_scale,
+        center_velocity_norm_s=velocity,
+        log_scale_rate_s=0.3,
+        confidence=sample.confidence,
+        association_confidence=sample.association_confidence,
+        consecutive_frame_count=5,
+        total_observation_count=5,
+        missed_frame_count=0,
+        clipping=clipping,
+        center_censored=center_censored,
+        role=role,
+        authoritative_gate_index=authoritative_gate_index,
+        authority_race_status_sequence=authority_sequence,
+        authority_race_status_boot_ms=authority_boot_ms,
+        ambiguous=ambiguous,
+        visible=visible,
+        history=(sample,),
     )
 
 
@@ -453,28 +535,282 @@ def test_output_distinguishes_raw_next_and_effective_blended_errors():
 
 
 def test_visual_track_adapter_preserves_image_down_axis_explicitly():
-    track = SimpleNamespace(
-        track_id="vq2-track-000001",
-        latest_token=SimpleNamespace(
-            generation=3,
-            frame_id=91,
-            publication_sequence=17,
-        ),
-        history=(
-            SimpleNamespace(observation_monotonic_ns=12_500_000_000),
-        ),
-        center_norm=(0.25, -0.40),
-        center_velocity_norm_s=(0.10, -0.20),
-        apparent_scale=0.2,
-        log_scale_rate_s=0.3,
-        confidence=0.8,
-        association_confidence=0.7,
-        consecutive_frame_count=5,
-        clipping=0,
-        center_censored=False,
-        ambiguous=False,
+    adapted = VisualTarget.from_visual_track(
+        tracker_track(),
+        expected_gate_index=1,
     )
-    adapted = VisualTarget.from_visual_track(track, stream_id="camera0")
     assert adapted.normalized_y_down == pytest.approx(-0.40)
     assert adapted.normalized_y_rate_down_s == pytest.approx(-0.20)
+    assert adapted.frame_token.stream_id == "camera0"
     assert adapted.frame_token.publication_sequence == 17
+    assert adapted.received_monotonic_s == pytest.approx(12.5)
+
+
+def test_visual_track_adapter_accepts_real_multiframe_smoothed_track():
+    tracker = MultiTargetVisualTracker()
+
+    def live_frame(
+        sequence: int,
+        *,
+        center_x: float,
+        confidence: float,
+    ) -> VisualDetectionFrame:
+        center_unit_x = 0.5 * (center_x + 1.0)
+        center_unit_y = 0.30
+        final_packet_ns = 12_000_000_000 + sequence * 33_000_000
+        return VisualDetectionFrame(
+            token=CameraFrameToken(
+                generation=3,
+                frame_id=90 + sequence,
+                publication_sequence=sequence,
+                stream_id="camera0",
+            ),
+            provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+            time_basis_id="vq2-host-monotonic",
+            image_size_px=(640, 360),
+            detections=(
+                VisualDetection(
+                    source_index=0,
+                    center_norm=(center_x, -0.40),
+                    bbox_norm=(
+                        center_unit_x - 0.10,
+                        center_unit_y - 0.10,
+                        center_unit_x + 0.10,
+                        center_unit_y + 0.10,
+                    ),
+                    confidence=confidence,
+                ),
+            ),
+            camera_source_time_ns=5_000_000_000 + sequence * 33_000_000,
+            final_unique_packet_monotonic_ns=final_packet_ns,
+            publish_monotonic_ns=final_packet_ns + 100_000,
+        )
+
+    first = tracker.update(live_frame(1, center_x=0.24, confidence=0.20))
+    track_id = first.visible_track_ids[0]
+    tracker.update(live_frame(2, center_x=0.25, confidence=0.90))
+    tracker.assign_role(track_id, VisualTrackRole.CURRENT)
+    tracker.confirm_authoritative_gate(
+        track_id,
+        gate_index=1,
+        race_status_sequence=22,
+        race_status_boot_ms=6256,
+    )
+    track = tracker.track(track_id)
+
+    # The public track confidence is intentionally smoothed; the latest
+    # sample retains raw detector confidence.  Both are valid, but they are
+    # not required to be equal.
+    assert track.confidence != track.history[-1].confidence
+    adapted = VisualTarget.from_visual_track(
+        track,
+        expected_gate_index=1,
+    )
+    assert adapted.confidence == pytest.approx(track.confidence)
+    assert adapted.normalized_x == pytest.approx(0.25)
+    assert adapted.frame_token.publication_sequence == 2
+
+
+def test_visual_track_adapter_rejects_duck_typed_and_incoherent_history():
+    with pytest.raises(VisualServoRefusal, match="exact VisualTrack"):
+        VisualTarget.from_visual_track(object())  # type: ignore[arg-type]
+
+    other_token = CameraFrameToken(
+        generation=3,
+        frame_id=92,
+        publication_sequence=18,
+        stream_id="camera0",
+    )
+    incoherent = tracker_track(sample_token=other_token)
+    with pytest.raises(VisualServoRefusal, match="latest token disagrees"):
+        VisualTarget.from_visual_track(incoherent)
+
+    stale_fields = replace(tracker_track(), center_norm=(0.1, -0.4))
+    with pytest.raises(VisualServoRefusal, match="latest fields disagree"):
+        VisualTarget.from_visual_track(stale_fields)
+
+
+@pytest.mark.parametrize(
+    ("track", "message"),
+    [
+        (
+            tracker_track(
+                provenance=FrameProvenanceBasis.LEGACY_CAPTURE,
+                publication_monotonic_ns=None,
+            ),
+            "receiver timing provenance",
+        ),
+        (
+            tracker_track(publication_monotonic_ns=None),
+            "coherent receiver times",
+        ),
+        (
+            tracker_track(
+                token=CameraFrameToken(generation=3, frame_id=91),
+            ),
+            "publication provenance",
+        ),
+    ],
+)
+def test_visual_track_adapter_requires_live_receiver_provenance(
+    track, message
+):
+    with pytest.raises(VisualServoRefusal, match=message):
+        VisualTarget.from_visual_track(track)
+
+
+def test_visual_track_adapter_requires_visible_race_labelled_current_authority():
+    with pytest.raises(VisualServoRefusal, match="currently visible"):
+        VisualTarget.from_visual_track(
+            tracker_track(visible=False),
+        )
+    with pytest.raises(VisualServoRefusal, match="CURRENT"):
+        VisualTarget.from_visual_track(
+            tracker_track(
+                role=VisualTrackRole.NEXT,
+                authoritative_gate_index=None,
+                authority_sequence=None,
+                authority_boot_ms=None,
+            )
+        )
+    with pytest.raises(VisualServoRefusal, match="gate index"):
+        VisualTarget.from_visual_track(
+            tracker_track(authoritative_gate_index=None),
+        )
+    with pytest.raises(VisualServoRefusal, match="does not match"):
+        VisualTarget.from_visual_track(
+            tracker_track(),
+            expected_gate_index=2,
+        )
+
+    next_candidate = VisualTarget.from_visual_track(
+        tracker_track(
+            role=VisualTrackRole.NEXT,
+            authoritative_gate_index=None,
+            authority_sequence=None,
+            authority_boot_ms=None,
+        ),
+        require_current_authority=False,
+    )
+    assert next_candidate.track_id == "vq2-track-000001"
+
+
+def test_top_clipping_suppresses_only_vertical_correction_and_brakes():
+    servo = ImageVisualServo()
+    output = step(
+        servo,
+        target(
+            1,
+            x=0.45,
+            y=-0.80,
+            y_rate=-0.4,
+            clipped=True,
+            center_censored=True,
+            vertical_censored=True,
+        ),
+    )
+
+    assert output.advance_enabled is False
+    assert output.brake_reason == "target_edge_or_clipping"
+    assert output.yaw_rate_rad_s < 0.0
+    assert output.effective_horizontal_error == pytest.approx(0.45)
+    assert output.effective_vertical_error_image_down == 0.0
+    assert output.effective_vertical_rate_down_s == 0.0
+    assert output.target_pitch_rad == pytest.approx(servo.tuning.brake_pitch_rad)
+    assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
+
+
+def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():
+    servo = ImageVisualServo()
+    output = step(
+        servo,
+        target(
+            1,
+            x=-0.85,
+            x_rate=-0.4,
+            y=-0.45,
+            clipped=True,
+            center_censored=True,
+            horizontal_censored=True,
+        ),
+    )
+
+    assert output.advance_enabled is False
+    assert output.brake_reason == "target_edge_or_clipping"
+    assert output.yaw_rate_rad_s == 0.0
+    assert output.effective_horizontal_error == 0.0
+    assert output.effective_horizontal_rate_s == 0.0
+    assert output.effective_vertical_error_image_down == pytest.approx(-0.45)
+    assert output.target_pitch_rad > servo.tuning.brake_pitch_rad
+    assert output.thrust > servo.tuning.brake_thrust
+
+
+def test_axis_clipping_is_derived_from_exact_tracker_edge_flags():
+    top = VisualTarget.from_visual_track(
+        tracker_track(
+            clipping=FrameEdge.TOP,
+            center_censored=True,
+        )
+    )
+    assert top.vertical_censored is True
+    assert top.horizontal_censored is False
+
+    left = VisualTarget.from_visual_track(
+        tracker_track(
+            clipping=FrameEdge.LEFT,
+            center_censored=True,
+        )
+    )
+    assert left.horizontal_censored is True
+    assert left.vertical_censored is False
+
+
+def test_top_clipped_next_gate_can_blend_heading_but_brakes_closure():
+    servo = ImageVisualServo()
+    for frame in (1, 2, 3):
+        step(servo, target(frame, x=0.01, y=0.01))
+    current = target(4, x=0.01, y=0.01)
+    next_gate = target(
+        4,
+        track_id="vq2-track-000002",
+        x=0.62,
+        y=-0.92,
+        clipped=True,
+        center_censored=True,
+        vertical_censored=True,
+    )
+    output = step(
+        servo,
+        current,
+        next_target=next_gate,
+        requested_next_blend=0.3,
+    )
+
+    assert output.next_gate_blend == pytest.approx(0.3)
+    assert output.next_horizontal_error == pytest.approx(0.62)
+    assert output.next_vertical_error_image_down is None
+    assert output.yaw_rate_rad_s < 0.0
+    assert output.advance_enabled is False
+    assert output.brake_reason == "next_target_edge_or_clipping"
+
+
+def test_ambiguous_next_gate_brakes_forward_closure_without_blending():
+    servo = ImageVisualServo()
+    for frame in (1, 2, 3):
+        step(servo, target(frame, x=0.01, y=0.01))
+    output = step(
+        servo,
+        target(4, x=0.01, y=0.01),
+        next_target=target(
+            4,
+            track_id="vq2-track-000002",
+            x=0.6,
+            ambiguous=True,
+        ),
+        requested_next_blend=0.3,
+    )
+
+    assert output.next_gate_blend == 0.0
+    assert output.advance_enabled is False
+    assert output.brake_reason == "next_target_ambiguous"
+    assert output.target_pitch_rad > 0.0
