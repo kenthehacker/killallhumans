@@ -1800,7 +1800,11 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
     assert vq2_module.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S == 0.12
     assert vq2_module.GATE1_RECENTER_THRUST == 0.275
     assert vq2_module.GATE1_RECENTER_TRANSITION_THRUST == 0.275
-    assert vq2_module.GATE1_RECENTER_TARGET_PITCH_RAD == -0.10
+    assert (
+        vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+        == -vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD
+        == -math.radians(5.0)
+    )
     assert vq2_module.GATE1_RECENTER_MIN_THRUST == 0.21
     assert vq2_module.GATE1_RECENTER_MAX_THRUST == 0.30
     assert vq2_module.GATE1_RECENTER_CORRIDOR_NORMALIZED_X == 0.35
@@ -1816,39 +1820,41 @@ def test_gate1_recenter_candidate_contract_constants_are_exact():
 
 def test_gate1_vertical_recovery_pitch_target_is_frozen_and_negative():
     assert vq2_module.gate1_vertical_recovery_pitch_target(
-        -0.10,
         -0.05,
-    ) == pytest.approx(-0.10)
+    ) == pytest.approx(-0.05 - math.radians(5.0))
     assert vq2_module.gate1_vertical_recovery_pitch_target(
-        -0.10,
-        -0.10 + vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD,
-    ) == pytest.approx(-0.10)
+        -0.07,
+    ) == pytest.approx(-0.07 - math.radians(5.0))
+    lower_boundary_basis = (
+        vq2_module.GATE1_RECENTER_MIN_PITCH_RAD
+        - vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+    )
+    assert vq2_module.gate1_vertical_recovery_pitch_target(
+        lower_boundary_basis,
+    ) == pytest.approx(vq2_module.GATE1_RECENTER_MIN_PITCH_RAD)
 
 
 @pytest.mark.parametrize(
-    ("target_pitch_rad", "reference_pitch_rad"),
+    "pass_pitch_basis_rad",
     (
-        (0.10, -0.05),
-        (0.0, -0.05),
-        (-0.099, -0.05),
-        (-0.101, -0.05),
-        (-0.10, -0.10),
         (
-            -0.10,
-            -0.10 + vq2_module.POST_GATE_MAX_ATTITUDE_DELTA_RAD + 1e-12,
+            vq2_module.GATE1_RECENTER_MIN_PITCH_RAD
+            - vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+            - 1e-12
         ),
-        (-0.10, math.nan),
-        (-0.10, True),
+        -vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD,
+        0.09,
+        -0.20,
+        math.nan,
+        True,
     ),
 )
 def test_gate1_vertical_recovery_pitch_target_rejects_other_authority(
-    target_pitch_rad,
-    reference_pitch_rad,
+    pass_pitch_basis_rad,
 ):
     with pytest.raises(ValueError, match="pitch"):
         vq2_module.gate1_vertical_recovery_pitch_target(
-            target_pitch_rad,
-            reference_pitch_rad,
+            pass_pitch_basis_rad,
         )
 
 
@@ -2212,7 +2218,7 @@ def test_bounded_gate1_recenter_rejects_stacked_entry_pitch_authority(
 
     with pytest.raises(
         SafetyAbort,
-        match="entry attitude approached its bound",
+        match="frozen negative envelope",
     ):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
@@ -2225,7 +2231,7 @@ def test_bounded_gate1_recenter_enforces_pass_anchored_pitch_excursion(
     runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
         monkeypatch
     )
-    runner.estimate = _estimate(pitch=-0.04)
+    runner.estimate = _estimate(pitch=-0.05)
     _install_gate1_frame_sequence(
         monkeypatch,
         runner,
@@ -2450,35 +2456,49 @@ def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
     with pytest.raises(SafetyAbort):
         asyncio.run(runner._run_bounded_gate1_recenter(observation))
 
+    expected_target_pitch = (
+        -0.05
+        + vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+    )
     assert observed
     assert all(
-        objective["target_pitch_rad"] == -0.10
+        objective["target_pitch_rad"] == expected_target_pitch
         and objective["thrust"] == 0.275
         for objective in observed
     )
     assert all(command.pitch_rate < 0.0 for command in _adapter.commands)
     summary = runner._gate1_recenter_summary
     assert summary is not None
-    assert summary["target_pitch_rad"] == pytest.approx(-0.10)
+    assert summary["target_pitch_rad"] == pytest.approx(expected_target_pitch)
+    assert summary["pass_pitch_basis_rad"] == pytest.approx(-0.05)
+    assert summary["pass_to_target_pitch_delta_rad"] == pytest.approx(
+        -math.radians(5.0)
+    )
     started = [
         fields for event, fields in events if event == "gate1_recenter_started"
     ]
     assert len(started) == 1
-    assert started[0]["control_law"]["target_pitch_rad"] == pytest.approx(-0.10)
+    assert started[0]["control_law"]["target_pitch_rad"] == pytest.approx(
+        expected_target_pitch
+    )
+    assert started[0]["control_law"][
+        "pass_to_target_pitch_delta_rad"
+    ] == pytest.approx(-math.radians(5.0))
 
 
-def test_bounded_gate1_recenter_rejects_positive_pitch_config_before_record_or_send(
+@pytest.mark.parametrize("pass_pitch_basis_rad", (0.09, False, "0"))
+def test_bounded_gate1_recenter_rejects_invalid_derived_target_before_record_or_send(
     monkeypatch,
+    pass_pitch_basis_rad,
 ):
     runner, adapter, observation, _clock = _configure_gate1_recenter_candidate(
         monkeypatch
     )
-    runner.controller_config = replace(
-        runner.controller_config,
-        forward_braking=replace(
-            runner.controller_config.forward_braking,
-            gate1_target_pitch_rad=0.10,
-        ),
+    proof = runner._gate0_transition_proof
+    assert proof is not None
+    runner._gate0_transition_proof = replace(
+        proof,
+        pass_rpy_rad=(0.0, pass_pitch_basis_rad, 0.0),
     )
     events = []
     monkeypatch.setattr(
@@ -7456,8 +7476,20 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
             for command in adapter.commands
         )
         assert result["pitch_recovery_enabled"] is True
+        expected_target_pitch = (
+            -0.05
+            + vq2_module.GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+        )
         assert result["pitch_recovery_target_pitch_rad"] == pytest.approx(
-            -0.10
+            expected_target_pitch
+        )
+        assert result["pitch_recovery_pass_pitch_basis_rad"] == pytest.approx(
+            -0.05
+        )
+        assert result[
+            "pitch_recovery_pass_to_target_pitch_delta_rad"
+        ] == pytest.approx(
+            -math.radians(5.0)
         )
         assert result["pitch_recovery_command_count"] == 2
         assert result["pitch_recovery_min_pitch_rad"] == pytest.approx(
@@ -7476,7 +7508,11 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     ]
     assert len(recovery_events) == (2 if hold_thrust else 0)
     assert all(
-        event["target_pitch_rad"] == pytest.approx(-0.10)
+        event["target_pitch_rad"]
+        == pytest.approx(-0.05 - math.radians(5.0))
+        and event["pass_pitch_basis_rad"] == pytest.approx(-0.05)
+        and event["pass_to_target_pitch_delta_rad"]
+        == pytest.approx(-math.radians(5.0))
         and event["command_pitch_rate_rad_s"] < 0.0
         and event["command_count"] == index
         for index, event in enumerate(recovery_events, start=1)
@@ -7490,17 +7526,18 @@ def test_gate1_observation_requires_three_frames_and_bounded_pitch_only(
     assert vision.is_running is False
 
 
-def test_powered_gate1_observation_rejects_positive_pitch_config_before_record_or_send(
+@pytest.mark.parametrize("pass_pitch_basis_rad", (0.09, False, "0"))
+def test_powered_gate1_observation_rejects_invalid_derived_target_before_record_or_send(
     monkeypatch,
+    pass_pitch_basis_rad,
 ):
     clock = [10.0]
     runner, adapter, _vision, details = _configure_gate1_observer(clock=clock)
-    runner.controller_config = replace(
-        runner.controller_config,
-        forward_braking=replace(
-            runner.controller_config.forward_braking,
-            gate1_target_pitch_rad=0.10,
-        ),
+    proof = runner._gate0_transition_proof
+    assert proof is not None
+    runner._gate0_transition_proof = replace(
+        proof,
+        pass_rpy_rad=(0.0, pass_pitch_basis_rad, 0.0),
     )
     events = []
     monkeypatch.setattr(

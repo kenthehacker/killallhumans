@@ -219,7 +219,9 @@ GATE1_RECENTER_MAX_ROLL_RAD = 0.12
 GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S = 0.12
 GATE1_RECENTER_THRUST = 0.275
 GATE1_RECENTER_TRANSITION_THRUST = GATE1_RECENTER_THRUST
-GATE1_RECENTER_TARGET_PITCH_RAD = -0.10
+GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD = (
+    -POST_GATE_MAX_ATTITUDE_DELTA_RAD
+)
 GATE1_RECENTER_MIN_THRUST = 0.21
 GATE1_RECENTER_MAX_THRUST = 0.30
 GATE1_RECENTER_CORRIDOR_NORMALIZED_X = 0.35
@@ -6285,36 +6287,37 @@ def gate1_recenter_roll_target(
 
 
 def gate1_vertical_recovery_pitch_target(
-    configured_target_pitch_rad: float,
-    reference_pitch_rad: float,
+    pass_pitch_basis_rad: float,
 ) -> float:
-    """Admit only the frozen negative Gate-1 pitch-sign experiment."""
+    """Derive the frozen negative Gate-1 target from the proved pass pitch."""
 
-    values = (configured_target_pitch_rad, reference_pitch_rad)
     if (
-        any(type(value) not in {int, float} for value in values)
-        or not all(math.isfinite(float(value)) for value in values)
+        type(pass_pitch_basis_rad) not in {int, float}
+        or not math.isfinite(float(pass_pitch_basis_rad))
     ):
         raise ValueError(
-            "Gate-1 vertical-recovery pitch inputs must be finite and numeric"
+            "Gate-1 vertical-recovery pass pitch must be finite and numeric"
         )
-    target_pitch_rad = float(configured_target_pitch_rad)
-    reference_pitch_rad = float(reference_pitch_rad)
+    pass_pitch_basis_rad = float(pass_pitch_basis_rad)
+    target_pitch_rad = (
+        pass_pitch_basis_rad
+        + GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+    )
     if (
-        target_pitch_rad != GATE1_RECENTER_TARGET_PITCH_RAD
-        or not (
+        not (
             GATE1_RECENTER_MIN_PITCH_RAD
             <= target_pitch_rad
             <= GATE1_RECENTER_MAX_PITCH_RAD
         )
         or not (
             GATE1_RECENTER_MIN_PITCH_RAD
-            <= reference_pitch_rad
+            <= pass_pitch_basis_rad
             <= GATE1_RECENTER_MAX_PITCH_RAD
         )
-        or target_pitch_rad >= reference_pitch_rad
-        or abs(target_pitch_rad - reference_pitch_rad)
-        > POST_GATE_MAX_ATTITUDE_DELTA_RAD
+        or target_pitch_rad >= pass_pitch_basis_rad
+        or target_pitch_rad >= 0.0
+        or GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+        != -POST_GATE_MAX_ATTITUDE_DELTA_RAD
     ):
         raise ValueError(
             "Gate-1 vertical-recovery pitch target is outside frozen bounds"
@@ -11736,8 +11739,7 @@ class VQ2Runner:
             try:
                 pitch_recovery_target_pitch_rad = (
                     gate1_vertical_recovery_pitch_target(
-                        forward_braking.gate1_target_pitch_rad,
-                        float(proof.pass_rpy_rad[1]),
+                        proof.pass_rpy_rad[1],
                     )
                 )
             except (IndexError, TypeError, ValueError) as exc:
@@ -11825,6 +11827,16 @@ class VQ2Runner:
             pitch_recovery_enabled=powered_pitch_recovery,
             pitch_recovery_target_pitch_rad=(
                 pitch_recovery_target_pitch_rad
+                if powered_pitch_recovery
+                else None
+            ),
+            pitch_recovery_pass_pitch_basis_rad=(
+                float(proof.pass_rpy_rad[1])
+                if powered_pitch_recovery
+                else None
+            ),
+            pitch_recovery_pass_to_target_pitch_delta_rad=(
+                GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
                 if powered_pitch_recovery
                 else None
             ),
@@ -12027,6 +12039,16 @@ class VQ2Runner:
                                     if powered_pitch_recovery
                                     else None
                                 ),
+                                "pitch_recovery_pass_pitch_basis_rad": (
+                                    float(proof.pass_rpy_rad[1])
+                                    if powered_pitch_recovery
+                                    else None
+                                ),
+                                "pitch_recovery_pass_to_target_pitch_delta_rad": (
+                                    GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+                                    if powered_pitch_recovery
+                                    else None
+                                ),
                                 "pitch_recovery_command_count": (
                                     pitch_recovery_command_count
                                 ),
@@ -12164,6 +12186,12 @@ class VQ2Runner:
                             send_checked_s - observation_started_s
                         ),
                         target_pitch_rad=pitch_recovery_target_pitch_rad,
+                        pass_pitch_basis_rad=float(
+                            proof.pass_rpy_rad[1]
+                        ),
+                        pass_to_target_pitch_delta_rad=(
+                            GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+                        ),
                         measured_pitch_rad=float(send_pitch),
                         measured_pitch_rate_rad_s=float(
                             self.estimate.body_rates[1]
@@ -12211,20 +12239,15 @@ class VQ2Runner:
             or len(frames) < POST_GATE_REQUIRED_FRAMES
         ):
             raise SafetyAbort("gate-1 recenter lacks the proved three-frame handoff")
-        configured_target_pitch_rad = (
-            forward_braking.gate1_target_pitch_rad
-        )
-        if (
-            type(configured_target_pitch_rad) not in {int, float}
-            or not math.isfinite(float(configured_target_pitch_rad))
-            or float(configured_target_pitch_rad)
-            != GATE1_RECENTER_TARGET_PITCH_RAD
-        ):
+        try:
+            target_pitch_rad = gate1_vertical_recovery_pitch_target(
+                proof.pass_rpy_rad[1],
+            )
+        except (IndexError, TypeError, ValueError) as exc:
             raise SafetyAbort(
                 "gate-1 recenter pitch target is outside its frozen "
                 "negative envelope"
-            )
-        target_pitch_rad = float(configured_target_pitch_rad)
+            ) from exc
         handoff_frames = list(frames[-POST_GATE_REQUIRED_FRAMES:])
         handoff_tokens: List[Tuple[int, int, float]] = []
         handoff_bbox_tops: List[int] = []
@@ -12319,6 +12342,9 @@ class VQ2Runner:
             "entry_normalized_x": entry_normalized_x,
             "target_pitch_rad": target_pitch_rad,
             "pass_pitch_basis_rad": float(proof.pass_rpy_rad[1]),
+            "pass_to_target_pitch_delta_rad": (
+                GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+            ),
             "max_target_area_px": int(entry_target.bbox_area),
             "max_target_width_px": int(entry_target.bbox[2]),
             "min_top_margin_px": GATE1_RECENTER_MIN_TOP_MARGIN_PX,
@@ -12397,25 +12423,15 @@ class VQ2Runner:
             raise SafetyAbort(
                 "gate-1 recenter entry attitude approached its bound"
             )
-        try:
-            pass_target_pitch_rad = gate1_vertical_recovery_pitch_target(
-                target_pitch_rad,
-                pass_pitch_basis_rad,
-            )
-            entry_target_pitch_rad = gate1_vertical_recovery_pitch_target(
-                target_pitch_rad,
-                float(entry_pitch),
-            )
-            if (
-                pass_target_pitch_rad != target_pitch_rad
-                or entry_target_pitch_rad != target_pitch_rad
-            ):
-                raise ValueError("Gate-1 pitch target changed at recenter entry")
-        except ValueError as exc:
+        if (
+            target_pitch_rad >= float(entry_pitch)
+            or abs(target_pitch_rad - float(entry_pitch))
+            > POST_GATE_MAX_ATTITUDE_DELTA_RAD
+        ):
             raise SafetyAbort(
                 "gate-1 recenter entry cannot preserve the frozen "
                 "negative pitch objective"
-            ) from exc
+            )
         entry_abs_error_px = abs(entry_error_px)
         fresh_error_samples: List[Tuple[float, float]] = [
             (float(entry_target.received_monotonic_s), entry_abs_error_px)
@@ -12518,6 +12534,9 @@ class VQ2Runner:
             "max_command_yaw_rate_rad_s": None,
             "command_count": 0,
             "target_pitch_rad": target_pitch_rad,
+            "pass_to_target_pitch_delta_rad": (
+                GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+            ),
             "forward_thrust": forward_braking.gate1_forward_thrust,
             "requested_duration_s": (
                 phase_timing.gate1_recenter_duration_s
@@ -12671,6 +12690,10 @@ class VQ2Runner:
                     GATE1_CONTROLLER_MAX_YAW_EXCURSION_RAD
                 ),
                 "target_pitch_rad": target_pitch_rad,
+                "pass_pitch_basis_rad": pass_pitch_basis_rad,
+                "pass_to_target_pitch_delta_rad": (
+                    GATE1_RECENTER_PASS_RELATIVE_PITCH_DELTA_RAD
+                ),
                 "thrust": forward_braking.gate1_forward_thrust,
                 "requested_duration_s": (
                     phase_timing.gate1_recenter_duration_s

@@ -22,7 +22,7 @@ from typing import Any, Mapping
 
 
 CONTROLLER_CONFIG_SCHEMA = "aigp-vq2-controller-config/1"
-CONTROLLER_FAMILY = "aigp-vq2-gate0-gate1-recenter/12"
+CONTROLLER_FAMILY = "aigp-vq2-gate0-gate1-recenter/13"
 
 _TOP_LEVEL_FIELDS = frozenset(
     {
@@ -82,7 +82,6 @@ _GROUP_FIELDS = {
         {
             "gate0_turn_pitch_rad",
             "gate0_turn_thrust_cap",
-            "gate1_target_pitch_rad",
             "pitch_command_rate_cap_rad_s",
             "gate1_forward_thrust",
         }
@@ -125,7 +124,6 @@ NUMERIC_FIELD_BOUNDS = MappingProxyType(
         "yaw_control.command_rate_cap_rad_s": (0.0, 0.08),
         "forward_braking.gate0_turn_pitch_rad": (0.0, 0.08),
         "forward_braking.gate0_turn_thrust_cap": (0.21, 0.32),
-        "forward_braking.gate1_target_pitch_rad": (-0.10, -0.10),
         "forward_braking.pitch_command_rate_cap_rad_s": (0.02, 0.12),
         "forward_braking.gate1_forward_thrust": (0.21, 0.30),
     }
@@ -171,7 +169,6 @@ _DEFAULT_DOCUMENT: dict[str, Any] = {
     "forward_braking": {
         "gate0_turn_pitch_rad": 0.0,
         "gate0_turn_thrust_cap": 0.32,
-        "gate1_target_pitch_rad": -0.10,
         "pitch_command_rate_cap_rad_s": 0.12,
         "gate1_forward_thrust": 0.275,
     },
@@ -228,7 +225,6 @@ class YawControlConfig:
 class ForwardBrakingConfig:
     gate0_turn_pitch_rad: float
     gate0_turn_thrust_cap: float
-    gate1_target_pitch_rad: float
     pitch_command_rate_cap_rad_s: float
     gate1_forward_thrust: float
 

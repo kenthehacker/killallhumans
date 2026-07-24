@@ -54,7 +54,7 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["schema"] == "aigp-vq2-controller-config/1"
     assert (
         mapping["controller_family"]
-        == "aigp-vq2-gate0-gate1-recenter/12"
+        == "aigp-vq2-gate0-gate1-recenter/13"
     )
     assert mapping["phase_timing"] == {
         "gate0_boost_until_s": 0.45,
@@ -103,7 +103,6 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["forward_braking"] == {
         "gate0_turn_pitch_rad": 0.0,
         "gate0_turn_thrust_cap": 0.32,
-        "gate1_target_pitch_rad": runner.GATE1_RECENTER_TARGET_PITCH_RAD,
         "pitch_command_rate_cap_rad_s": (
             runner.GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
         ),
@@ -169,6 +168,11 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
         (
             "controller_family",
             "aigp-vq2-gate0-gate1-recenter/11",
+            "must equal",
+        ),
+        (
+            "controller_family",
+            "aigp-vq2-gate0-gate1-recenter/12",
             "must equal",
         ),
         ("controller_family", "other", "must equal"),
@@ -331,8 +335,6 @@ def test_malformed_field_values_are_rejected(path, value, match):
         ("yaw_control.command_rate_cap_rad_s", 0.081),
         ("forward_braking.gate0_turn_pitch_rad", 0.081),
         ("forward_braking.gate0_turn_thrust_cap", 0.321),
-        ("forward_braking.gate1_target_pitch_rad", -0.101),
-        ("forward_braking.gate1_target_pitch_rad", -0.099),
         ("forward_braking.pitch_command_rate_cap_rad_s", 0.121),
         ("forward_braking.gate1_forward_thrust", 0.301),
     ),
@@ -348,6 +350,7 @@ def test_numeric_values_outside_conservative_bounds_are_rejected(path, value):
     (
         ("turn_cue", "required_frames", 3),
         ("turn_cue", "max_age_s", 0.25),
+        ("forward_braking", "gate1_target_pitch_rad", -0.10),
         ("forward_braking", "post_gate_hold_thrust", 0.275),
     ),
 )
