@@ -102,6 +102,7 @@ from scripts.aigp_vq2_run import (
 )
 from scripts import aigp_vq2_powered_attempt as powered_contract
 from scripts import aigp_vq2_powered_runtime as powered_runtime
+from scripts import aigp_vq2_controller_config as controller_config_module
 from tests import test_aigp_vq2_powered_attempt as powered_fixtures
 
 
@@ -2155,6 +2156,61 @@ def test_offline_gate1_recenter_requires_error_decrease_and_three_frame_hold(
     )
 
 
+def test_configured_gate1_yaw_uses_calibrated_negative_image_feedback(
+    monkeypatch,
+):
+    runner, adapter, observation, clock = _configure_gate1_recenter_candidate(
+        monkeypatch
+    )
+    document = controller_config_module.default_controller_config_mapping()
+    document["yaw_control"]["gate1_error_gain"] = -0.12
+    document["yaw_control"]["command_rate_cap_rad_s"] = 0.08
+    runner.controller_config = (
+        controller_config_module.validate_controller_config(document)
+    )
+    _install_gate1_frame_sequence(
+        monkeypatch,
+        runner,
+        clock,
+        [500, 460, 430, 420, 410],
+        sample_step_s=0.07,
+    )
+
+    result = asyncio.run(runner._run_bounded_gate1_recenter(observation))
+
+    nonzero_yaw = [
+        command.yaw_rate
+        for command in adapter.commands
+        if command.yaw_rate != 0.0
+    ]
+    assert result["recenter_criteria_met"] is True
+    assert nonzero_yaw
+    assert all(-0.08 <= value < 0.0 for value in nonzero_yaw)
+    assert result["min_command_yaw_rate_rad_s"] < 0.0
+    assert result["max_abs_yaw_excursion_rad"] == 0.0
+
+
+def test_gate1_yaw_envelope_soft_stops_then_aborts_strictly_over_bound():
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._gate1_yaw_reference_rad = 0.0
+    runner.estimate = _estimate(
+        yaw=0.046
+    )
+
+    excursion, soft_stopped = runner._gate1_yaw_envelope_state(
+        phase="test",
+    )
+
+    assert excursion == pytest.approx(0.046)
+    assert soft_stopped is True
+
+    runner.estimate = _estimate(
+        yaw=0.051
+    )
+    with pytest.raises(SafetyAbort, match="yaw excursion"):
+        runner._gate1_yaw_envelope_state(phase="test")
+
+
 def test_offline_gate1_recenter_wires_bounded_braking_pitch_and_fixed_thrust(
     monkeypatch,
 ):
@@ -3340,6 +3396,131 @@ def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
         abs(roll) == pytest.approx(0.08)
         for roll in expected_rolls
     )
+
+
+def test_configured_gate0_early_turn_combines_roll_negative_yaw_and_braking(
+    monkeypatch,
+):
+    class CommandsCaptured(Exception):
+        pass
+
+    document = controller_config_module.default_controller_config_mapping()
+    document["phase_timing"]["gate0_yaw_brake_duration_s"] = 0.21
+    document["turn_cue"]["exit_counterroll_enabled"] = False
+    document["yaw_control"]["gate0_turn_score_gain"] = -0.80
+    document["yaw_control"]["gate0_command_rate_cap_rad_s"] = 0.08
+    document["forward_braking"]["gate0_turn_pitch_rad"] = 0.04
+    document["forward_braking"]["gate0_turn_thrust_cap"] = 0.24
+    config = controller_config_module.validate_controller_config(document)
+    clock = [0.0]
+    sample_count = [0]
+    objectives = []
+    commands = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(
+        adapter,
+        _FakeVision(),
+        controller_config=config,
+    )
+    runner.estimate = _estimate(roll=0.0, pitch=0.0, yaw=0.0)
+    runner._latest_detection_image = object()
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6400,
+        1000,
+    )
+
+    def sample():
+        sample_count[0] += 1
+        runner.tracker.target = vq2_module.GateTarget(
+            frame_id=sample_count[0],
+            sim_time_ns=sample_count[0],
+            received_monotonic_s=clock[0],
+            center_x=320,
+            center_y=180,
+            bbox=(240, 130, 160, 100),
+            confidence=0.8,
+        )
+        runner.tracker.consecutive = 3
+
+    def capture_objective(
+        _estimate_value,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        objectives.append(
+            (target_roll_rad, target_pitch_rad, thrust)
+        )
+        return AttitudeRateCommand(0.0, 0.0, 0.0, thrust)
+
+    async def capture_command(command, **_kwargs):
+        commands.append(command)
+        if len(commands) == 8:
+            raise CommandsCaptured
+
+    async def advance_clock(_seconds):
+        clock[0] += 0.05
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+    monkeypatch.setattr(vq2_module, "attitude_rate_command", capture_objective)
+    monkeypatch.setattr(
+        vq2_module,
+        "cyan_course_line_observation",
+        lambda _image: vq2_module.CourseLineObservation(
+            turn_score=0.20,
+            upper_center_x=384.0,
+            lower_center_x=320.0,
+            upper_pixel_count=136,
+            lower_pixel_count=136,
+        ),
+    )
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance_clock),
+        )
+        with pytest.raises(CommandsCaptured):
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=False,
+                )
+            )
+
+    active = [
+        (objective, command)
+        for objective, command in zip(objectives, commands)
+        if command.yaw_rate != 0.0
+    ]
+    assert active
+    assert all(command.yaw_rate == -0.08 for _objective, command in active)
+    assert all(
+        target_roll == pytest.approx(0.13)
+        and target_pitch == pytest.approx(0.04)
+        and thrust == pytest.approx(0.24)
+        for (target_roll, target_pitch, thrust), _command in active
+    )
+    assert commands[0].yaw_rate == commands[1].yaw_rate == 0.0
+    assert runner._gate0_early_turn_summary is not None
+    assert runner._gate0_early_turn_summary["command_count"] >= len(active)
+    assert runner._gate1_max_abs_yaw_excursion_rad == 0.0
 
 
 def _capture_first_gate0_thrust(
@@ -6003,6 +6184,90 @@ def test_connect_failure_still_disconnects_partially_started_transport(monkeypat
             )
         )
 
+    assert adapter.disconnect_called is True
+
+
+def test_fast_cycle_trace_first_row_binds_complete_controller_identity(
+    tmp_path,
+    monkeypatch,
+):
+    from competition.aigp_mavlink import MavlinkIngressStats, MavlinkOutboundAudit
+
+    class FailingConnectAdapter(_FakeAdapter):
+        def __init__(self):
+            super().__init__()
+            self.disconnect_called = False
+
+        async def connect(self, _address):
+            raise ConnectionError("injected pre-contact failure")
+
+        async def disconnect(self):
+            self.disconnect_called = True
+
+        def drain_received_ingress(self):
+            return []
+
+        def ingress_stats(self):
+            return MavlinkIngressStats(
+                generation=1,
+                next_sequence=0,
+                highres_imu_received=0,
+                heartbeat_received=0,
+                race_status_received=0,
+                actuator_received=0,
+                dropped=0,
+                high_watermark=0,
+                imu_capacity=1,
+                other_capacity=1,
+                imu_dropped=0,
+                other_dropped=0,
+                imu_high_watermark=0,
+                other_high_watermark=0,
+                buffered_imu=0,
+                buffered_other=0,
+            )
+
+        def outbound_audit(self):
+            return MavlinkOutboundAudit(0, 0, 0, 0, 0, 0, 0, 0)
+
+    adapter = FailingConnectAdapter()
+    monkeypatch.setattr(
+        vq2_module,
+        "AIGPMavlinkAdapter",
+        lambda **_kwargs: adapter,
+    )
+    document = controller_config_module.default_controller_config_mapping()
+    document["yaw_control"]["gate1_error_gain"] = -0.12
+    document["yaw_control"]["command_rate_cap_rad_s"] = 0.08
+    config = controller_config_module.validate_controller_config(document)
+    trace = tmp_path / "binding.jsonl.gz"
+
+    with pytest.raises(ConnectionError, match="pre-contact"):
+        asyncio.run(
+            vq2_module.run_live(
+                "gate1-recenter",
+                "udpin:127.0.0.1:14550",
+                str(trace),
+                run_manifest_sha256="a" * 64,
+                controller_config=config,
+                candidate_commit="b" * 40,
+                expected_controller_config_sha256=(
+                    config.effective_config_sha256
+                ),
+            )
+        )
+
+    with vq2_module.gzip.open(trace, "rt", encoding="utf-8") as handle:
+        first = json.loads(handle.readline())
+    assert first["event"] == "fast_cycle_binding"
+    assert first["run_manifest_sha256"] == "a" * 64
+    assert first["controller"] == vq2_module.controller_config_evidence(
+        config,
+        candidate_commit="b" * 40,
+    )
+    assert first["controller"]["config_sha256"] == (
+        config.effective_config_sha256
+    )
     assert adapter.disconnect_called is True
 
 

@@ -171,13 +171,22 @@ interactive confirmation.
             )
         }
         'flight-cycle' {
-            if ($TaskArgs.Count -gt 1) {
-                throw 'flight-cycle accepts at most one powered stage.'
+            if ($TaskArgs.Count -notin @(0, 1, 3)) {
+                throw (
+                    'flight-cycle accepts [stage] or ' +
+                    '[stage --controller-config path].'
+                )
             }
-            $stage = if ($TaskArgs.Count -eq 1) {
+            $stage = if ($TaskArgs.Count -ge 1) {
                 $TaskArgs[0]
             } else {
                 'calibration-excite'
+            }
+            if (
+                $TaskArgs.Count -eq 3 -and
+                $TaskArgs[1] -ne '--controller-config'
+            ) {
+                throw 'flight-cycle accepts only --controller-config after stage.'
             }
             $allowed = @(
                 'sign-id', 'hover', 'gate0', 'gate0-observe', 'gate1-recenter',
@@ -190,10 +199,14 @@ interactive confirmation.
                 "Running one POWERED '$stage' cycle with compact evidence " +
                 'and no interactive preflight ceremony.'
             )
-            Invoke-Python @(
+            $flightArgs = @(
                 '-E', '-s', '-B',
                 '-m', 'scripts.aigp_vq2_fast_cycle', $stage
             )
+            if ($TaskArgs.Count -eq 3) {
+                $flightArgs += @('--controller-config', $TaskArgs[2])
+            }
+            Invoke-Python $flightArgs
         }
         'launch-sim' {
             if ($TaskArgs.Count -gt 1) { throw 'launch-sim accepts at most one FlightSim.exe path.' }
@@ -226,7 +239,8 @@ Unknown task '$Task'. Available tasks:
   test-promotion       Durable promotion-only full non-live suite (typically 10-13m)
   test-full-non-live   Compatibility alias for test-promotion
   preflight            Fast passive stream/target health check; no capture
-  flight-cycle [stage] Dedicated powered cycle (default: calibration-excite)
+  flight-cycle [stage] [--controller-config path]
+                       Dedicated powered cycle (default: calibration-excite)
   launch-sim [path]    Launch FlightSim in the active interactive session
   sbom [path]          Generate a local CycloneDX dependency inventory
 "@

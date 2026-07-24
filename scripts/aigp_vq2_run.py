@@ -68,6 +68,12 @@ from estimation.imu_attitude import (
 )
 from gate_detection.src.gate_detector import GateDetection
 from gate_detection.src.vq2_detector import VQ2GateDetector
+from scripts.aigp_vq2_controller_config import (
+    ControllerConfigError,
+    VQ2ControllerConfig,
+    default_controller_config,
+    validate_controller_config,
+)
 
 if TYPE_CHECKING:
     from aigp_loop.replay import AsyncReplayRecorder
@@ -212,6 +218,8 @@ GATE1_RECENTER_MIN_PITCH_RAD = -0.20
 GATE1_RECENTER_MAX_PITCH_RAD = 0.10
 GATE1_RECENTER_MAX_ATTITUDE_EXCURSION_RAD = 0.12
 GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S = 0.50
+GATE1_CONTROLLER_MAX_YAW_EXCURSION_RAD = 0.05
+GATE1_CONTROLLER_YAW_SOFT_STOP_RAD = 0.045
 GATE1_RECENTER_NO_PASSAGE_MAX_AREA_PX = COURSE_UNTRACKED_CONTACT_MIN_AREA_PX
 GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX = COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX
 
@@ -6004,6 +6012,34 @@ class StageResult:
     gate_index_after: Optional[int] = None
     cleanup_confirmed: bool = False
     details: Optional[Dict[str, Any]] = None
+    controller: Optional[Dict[str, Any]] = None
+
+
+def controller_config_evidence(
+    config: VQ2ControllerConfig,
+    *,
+    candidate_commit: Optional[str],
+) -> Dict[str, Any]:
+    """Bind one normalized effective controller to its exact source commit."""
+
+    if candidate_commit is not None and (
+        type(candidate_commit) is not str
+        or len(candidate_commit) != 40
+        or any(character not in "0123456789abcdef" for character in candidate_commit)
+    ):
+        raise ValueError("candidate_commit must be 40 lowercase hexadecimal characters")
+    effective = config.to_effective_mapping()
+    return {
+        "git_commit": candidate_commit,
+        "config_schema": config.schema,
+        "controller_family": config.controller_family,
+        "config_sha256": config.effective_config_sha256,
+        "effective_parameters": {
+            key: value
+            for key, value in effective.items()
+            if key not in {"schema", "controller_family"}
+        },
+    }
 
 
 def clock_rolled_back(pre_value: int, current_value: int, margin: int) -> bool:
@@ -6081,65 +6117,180 @@ def cyan_course_line_observation(image: Any) -> Optional[CourseLineObservation]:
     )
 
 
-def course_line_preturn_roll(turn_score: float) -> float:
+def course_line_preturn_roll(
+    turn_score: float,
+    *,
+    gain: float = COURSE_LINE_PRETURN_GAIN,
+    cap_rad: float = COURSE_LINE_PRETURN_LIMIT_RAD,
+    min_abs_score: float = COURSE_LINE_PRETURN_MIN_SCORE,
+) -> float:
     """Convert a proved cyan-line direction into a small Gate-0 bank bias."""
 
-    if type(turn_score) not in {int, float} or not math.isfinite(float(turn_score)):
+    values = (turn_score, gain, cap_rad, min_abs_score)
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or not 0.0 <= float(gain) <= COURSE_LINE_PRETURN_GAIN
+        or not 0.0 <= float(cap_rad) <= COURSE_LINE_PRETURN_LIMIT_RAD
+        or not COURSE_LINE_PRETURN_MIN_SCORE
+        <= float(min_abs_score)
+        <= 0.25
+    ):
         raise ValueError("course-line turn score must be finite and numeric")
     score = float(turn_score)
-    if abs(score) < COURSE_LINE_PRETURN_MIN_SCORE:
+    if abs(score) < float(min_abs_score):
         return 0.0
     # This is a physical course-turn bias, not an image-centering correction.
     # A route bending toward larger image x requests the simulator's positive
     # body roll even though the camera rotation initially moves the gate right.
     return max(
-        -COURSE_LINE_PRETURN_LIMIT_RAD,
-        min(COURSE_LINE_PRETURN_LIMIT_RAD, COURSE_LINE_PRETURN_GAIN * score),
+        -float(cap_rad),
+        min(float(cap_rad), float(gain) * score),
     )
 
 
-def course_line_exit_counterroll(turn_score: float) -> float:
+def course_line_exit_counterroll(
+    turn_score: float,
+    *,
+    cap_rad: float = COURSE_LINE_EXIT_COUNTERROLL_RAD,
+    min_abs_score: float = COURSE_LINE_PRETURN_MIN_SCORE,
+) -> float:
     """Counter-roll a proved course preturn before the Gate-0 crossing coast."""
 
-    if type(turn_score) not in {int, float} or not math.isfinite(float(turn_score)):
+    values = (turn_score, cap_rad, min_abs_score)
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or not 0.0 <= float(cap_rad) <= COURSE_LINE_EXIT_COUNTERROLL_RAD
+        or not COURSE_LINE_PRETURN_MIN_SCORE
+        <= float(min_abs_score)
+        <= 0.25
+    ):
         raise ValueError("course-line exit-counterroll score must be finite and numeric")
     score = float(turn_score)
-    if abs(score) < COURSE_LINE_PRETURN_MIN_SCORE:
+    if abs(score) < float(min_abs_score) or float(cap_rad) == 0.0:
         return 0.0
-    return -math.copysign(COURSE_LINE_EXIT_COUNTERROLL_RAD, score)
+    return -math.copysign(float(cap_rad), score)
 
 
-def gate0_centering_roll_target(normalized_x: float) -> float:
+def gate0_centering_roll_target(
+    normalized_x: float,
+    *,
+    gain: float = 0.15,
+    cap_rad: float = 0.08,
+) -> float:
     """Apply the previously live-proved Gate 0 image-centering law."""
 
-    if type(normalized_x) not in {int, float} or not math.isfinite(
-        float(normalized_x)
+    values = (normalized_x, gain, cap_rad)
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or not 0.0 <= float(gain) <= 0.15
+        or not 0.0 <= float(cap_rad) <= 0.08
     ):
         raise ValueError("gate-0 centering input must be finite and numeric")
-    return max(-0.08, min(0.08, 0.15 * float(normalized_x)))
+    return max(
+        -float(cap_rad),
+        min(float(cap_rad), float(gain) * float(normalized_x)),
+    )
 
 
 def gate1_recenter_roll_target(
     normalized_x: float,
     normalized_x_rate_s: float,
+    *,
+    error_gain: float = GATE1_RECENTER_ROLL_GAIN,
+    error_rate_gain: float = GATE1_RECENTER_ROLL_RATE_GAIN,
+    cap_rad: float = GATE1_RECENTER_MAX_ROLL_RAD,
 ) -> float:
     """Return the live-corrected, bounded Gate 1 recenter roll target."""
 
-    values = (normalized_x, normalized_x_rate_s)
+    values = (
+        normalized_x,
+        normalized_x_rate_s,
+        error_gain,
+        error_rate_gain,
+        cap_rad,
+    )
     if (
         any(type(value) not in {int, float} for value in values)
         or not all(math.isfinite(float(value)) for value in values)
         or abs(float(normalized_x_rate_s))
         > GATE1_RECENTER_MAX_ABS_X_RATE_NORM_S
+        or not -0.24 <= float(error_gain) <= 0.24
+        or not -0.025 <= float(error_rate_gain) <= 0.025
+        or not 0.0 <= float(cap_rad) <= GATE1_RECENTER_MAX_ROLL_RAD
     ):
         raise ValueError("gate-1 recenter horizontal inputs are outside bounds")
     target = (
-        GATE1_RECENTER_ROLL_GAIN * float(normalized_x)
-        + GATE1_RECENTER_ROLL_RATE_GAIN * float(normalized_x_rate_s)
+        float(error_gain) * float(normalized_x)
+        + float(error_rate_gain) * float(normalized_x_rate_s)
     )
     return max(
-        -GATE1_RECENTER_MAX_ROLL_RAD,
-        min(GATE1_RECENTER_MAX_ROLL_RAD, target),
+        -float(cap_rad),
+        min(float(cap_rad), target),
+    )
+
+
+def course_line_turn_yaw_rate(
+    turn_score: float,
+    *,
+    gain: float,
+    cap_rad_s: float,
+    min_abs_score: float,
+) -> float:
+    """Map a proved course turn to calibrated bounded local yaw."""
+
+    values = (turn_score, gain, cap_rad_s, min_abs_score)
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or not -0.80 <= float(gain) <= 0.0
+        or not 0.0 <= float(cap_rad_s) <= SIGN_ID_RATE_RAD_S
+        or not COURSE_LINE_PRETURN_MIN_SCORE
+        <= float(min_abs_score)
+        <= 0.25
+        or (float(gain) == 0.0) != (float(cap_rad_s) == 0.0)
+    ):
+        raise ValueError("course-line yaw control is outside bounds")
+    if abs(float(turn_score)) < float(min_abs_score):
+        return 0.0
+    return max(
+        -float(cap_rad_s),
+        min(float(cap_rad_s), float(gain) * float(turn_score)),
+    )
+
+
+def gate1_recenter_yaw_rate(
+    normalized_x: float,
+    *,
+    error_gain: float,
+    deadband_normalized_x: float,
+    cap_rad_s: float,
+) -> float:
+    """Apply calibrated negative image-error feedback through bounded yaw."""
+
+    values = (
+        normalized_x,
+        error_gain,
+        deadband_normalized_x,
+        cap_rad_s,
+    )
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or abs(float(normalized_x)) > 1.0
+        or not -0.12 <= float(error_gain) <= 0.0
+        or not 0.20 <= float(deadband_normalized_x) <= 0.35
+        or not 0.0 <= float(cap_rad_s) <= SIGN_ID_RATE_RAD_S
+        or (float(error_gain) == 0.0) != (float(cap_rad_s) == 0.0)
+    ):
+        raise ValueError("gate-1 recenter yaw control is outside bounds")
+    if abs(float(normalized_x)) <= float(deadband_normalized_x):
+        return 0.0
+    return max(
+        -float(cap_rad_s),
+        min(float(cap_rad_s), float(error_gain) * float(normalized_x)),
     )
 
 
@@ -6672,18 +6823,21 @@ def gate0_target_pitch_rad(
     spawn_pitch_rad: float,
     exit_pitch_rad: float,
     elapsed_s: float,
+    *,
+    blend_duration_s: float = GATE0_PITCH_BLEND_S,
 ) -> float:
     """Blend the Gate 0 pitch basis to a bounded full-lap exit pitch."""
 
-    values = (spawn_pitch_rad, exit_pitch_rad, elapsed_s)
+    values = (spawn_pitch_rad, exit_pitch_rad, elapsed_s, blend_duration_s)
     if (
         any(type(value) not in {int, float} for value in values)
         or not all(math.isfinite(float(value)) for value in values)
         or not -0.10 <= float(exit_pitch_rad) <= 0.0
         or float(elapsed_s) < 0.0
+        or not GATE0_PITCH_BLEND_S <= float(blend_duration_s) <= 1.0
     ):
         raise ValueError("gate-0 pitch schedule inputs are outside the envelope")
-    blend = min(1.0, float(elapsed_s) / GATE0_PITCH_BLEND_S)
+    blend = min(1.0, float(elapsed_s) / float(blend_duration_s))
     return (
         (1.0 - blend) * float(spawn_pitch_rad)
         + blend * float(exit_pitch_rad)
@@ -7031,16 +7185,26 @@ def post_gate_observation_deadline(
     pass_confirmed_s: float,
     flight_started_s: float,
     crossing_started_s: Optional[float],
+    requested_duration_s: float = POST_GATE_OBSERVATION_TIMEOUT_S,
 ) -> float:
     """Fixed observation deadline nested inside every existing flight bound."""
 
-    values = [float(pass_confirmed_s), float(flight_started_s)]
+    values = [
+        float(pass_confirmed_s),
+        float(flight_started_s),
+        float(requested_duration_s),
+    ]
     if crossing_started_s is not None:
         values.append(float(crossing_started_s))
-    if not all(math.isfinite(value) for value in values):
+    if (
+        not all(math.isfinite(value) for value in values)
+        or not 0.10
+        <= float(requested_duration_s)
+        <= POST_GATE_OBSERVATION_TIMEOUT_S
+    ):
         raise ValueError("post-gate deadline inputs must be finite")
     candidates = [
-        float(pass_confirmed_s) + POST_GATE_OBSERVATION_TIMEOUT_S,
+        float(pass_confirmed_s) + float(requested_duration_s),
         float(flight_started_s) + GATE0_FLIGHT_TIMEOUT_S,
     ]
     if crossing_started_s is not None:
@@ -7502,6 +7666,10 @@ class VQ2Runner:
         vision: VQ2VisionThread,
         *,
         recorder: Optional[JsonlRecorder] = None,
+        controller_config: Optional[
+            Mapping[str, Any] | VQ2ControllerConfig
+        ] = None,
+        controller_evidence: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if adapter.enable_vision:
             raise ValueError("VQ2Runner requires adapter vision disabled")
@@ -7512,6 +7680,33 @@ class VQ2Runner:
         self.detector = VQ2GateDetector()
         self.tracker = GateTargetTracker()
         self.recorder = recorder or JsonlRecorder(None)
+        try:
+            self.controller_config = (
+                default_controller_config()
+                if controller_config is None
+                else (
+                    validate_controller_config(
+                        controller_config.to_effective_mapping()
+                    )
+                    if isinstance(controller_config, VQ2ControllerConfig)
+                    else validate_controller_config(controller_config)
+                )
+            )
+        except ControllerConfigError as exc:
+            raise ValueError(f"controller configuration refused: {exc}") from exc
+        expected_controller = controller_config_evidence(
+            self.controller_config,
+            candidate_commit=(
+                None
+                if controller_evidence is None
+                else controller_evidence.get("git_commit")
+            ),
+        )
+        if controller_evidence is not None and dict(controller_evidence) != (
+            expected_controller
+        ):
+            raise ValueError("controller evidence does not match effective config")
+        self.controller_evidence = expected_controller
 
         config = ImuAttitudeConfig(
             gravity_correction_kp=0.0,
@@ -7560,8 +7755,53 @@ class VQ2Runner:
         self._epoch_vision_started_s: Optional[float] = None
         self._epoch_vision_initial_frames: Optional[int] = None
         self._gate0_transition_proof: Optional[GateTransitionProof] = None
+        self._gate0_early_turn_summary: Optional[Dict[str, Any]] = None
         self._gate1_recenter_summary: Optional[Dict[str, Any]] = None
+        self._gate1_yaw_reference_rad: Optional[float] = None
+        self._gate1_max_abs_yaw_excursion_rad = 0.0
+        self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
         self._deferred_pngs: List[Tuple[str, Any]] = []
+
+    def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
+        """Enforce the code-owned calibrated yaw excursion envelope."""
+
+        reference = self._gate1_yaw_reference_rad
+        if reference is None:
+            return 0.0, False
+        if self.estimate is None:
+            raise SafetyAbort(
+                f"Gate-1 yaw attitude estimate unavailable during {phase}"
+            )
+        _roll, _pitch, yaw = self.estimate.orientation.to_euler()
+        excursion = math.atan2(
+            math.sin(float(yaw) - reference),
+            math.cos(float(yaw) - reference),
+        )
+        self._gate1_max_abs_yaw_excursion_rad = max(
+            self._gate1_max_abs_yaw_excursion_rad,
+            abs(excursion),
+        )
+        self._gate1_max_abs_measured_yaw_rate_rad_s = max(
+            self._gate1_max_abs_measured_yaw_rate_rad_s,
+            abs(float(self.estimate.body_rates[2])),
+        )
+        if (
+            abs(float(self.estimate.body_rates[2]))
+            > GATE1_RECENTER_MAX_MEASURED_BODY_RATE_RAD_S
+        ):
+            raise SafetyAbort(
+                "Gate-1 calibrated measured yaw rate exceeded its fixed bound "
+                f"during {phase}"
+            )
+        if abs(excursion) > GATE1_CONTROLLER_MAX_YAW_EXCURSION_RAD:
+            raise SafetyAbort(
+                "Gate-1 calibrated yaw excursion exceeded its fixed bound "
+                f"during {phase}"
+            )
+        return (
+            excursion,
+            abs(excursion) >= GATE1_CONTROLLER_YAW_SOFT_STOP_RAD,
+        )
 
     def _replay_estimator_fields(self) -> Optional[Dict[str, Any]]:
         estimate = self.estimate
@@ -9824,6 +10064,16 @@ class VQ2Runner:
                 else None
             ),
             "flight_elapsed_s": pass_confirmed_s - flight_start_s,
+            "early_turn": (
+                dict(self._gate0_early_turn_summary)
+                if self._gate0_early_turn_summary is not None
+                else {
+                    "started": False,
+                    "command_count": 0,
+                    "max_abs_yaw_excursion_rad": 0.0,
+                    "max_abs_measured_yaw_rate_rad_s": 0.0,
+                }
+            ),
         }
         self.recorder.emit("gate0_pass_proved", **result)
         return result
@@ -9835,13 +10085,26 @@ class VQ2Runner:
         capture_transition: bool = False,
         exit_pitch_rad: float = 0.0,
         minimum_thrust: float = 0.21,
-        boost_until_s: float = 0.45,
+        boost_until_s: Optional[float] = None,
         observe_course_line: bool = False,
         course_line_preturn: bool = False,
         course_line_exit_counterroll_enabled: bool = False,
         crossing_hold_thrust: float = 0.0,
     ) -> Dict[str, Any]:
-        gate0_target_pitch_rad(context.spawn_pitch_rad, exit_pitch_rad, 0.0)
+        controller = self.controller_config
+        phase_timing = controller.phase_timing
+        turn_cue = controller.turn_cue
+        roll_control = controller.roll_control
+        yaw_control = controller.yaw_control
+        forward_braking = controller.forward_braking
+        if boost_until_s is None:
+            boost_until_s = phase_timing.gate0_boost_until_s
+        gate0_target_pitch_rad(
+            context.spawn_pitch_rad,
+            exit_pitch_rad,
+            0.0,
+            blend_duration_s=phase_timing.gate0_pitch_blend_s,
+        )
         if (
             type(minimum_thrust) not in {int, float}
             or not math.isfinite(float(minimum_thrust))
@@ -9874,6 +10137,7 @@ class VQ2Runner:
             )
 
         flight_start = await self._wait_for_next_flight_command_slot()
+        self._gate0_early_turn_summary = None
         next_tick = flight_start
         max_gate_area = context.initial_gate_area
         last_target_frame: Optional[int] = None
@@ -9889,6 +10153,8 @@ class VQ2Runner:
         last_course_turn_s: Optional[float] = None
         proved_course_turn_score: Optional[float] = None
         course_line_exit_started = False
+        early_turn_started_s: Optional[float] = None
+        early_turn_command_count = 0
         while True:
             now = time.monotonic()
             elapsed = now - flight_start
@@ -9909,9 +10175,14 @@ class VQ2Runner:
                 context.spawn_pitch_rad,
                 exit_pitch_rad,
                 elapsed,
+                blend_duration_s=phase_timing.gate0_pitch_blend_s,
             )
             normalized_x = (target.center_x - 320.0) / 320.0
-            target_roll = gate0_centering_roll_target(normalized_x)
+            target_roll = gate0_centering_roll_target(
+                normalized_x,
+                gain=roll_control.gate0_centering_gain,
+                cap_rad=roll_control.gate0_target_cap_rad,
+            )
 
             control_y = gate_control_center_y_px(
                 target,
@@ -9955,6 +10226,8 @@ class VQ2Runner:
             )
             if race.active_gate_index not in (0, 1):
                 raise SafetyAbort(f"unexpected gate-index jump to {race.active_gate_index}")
+            if self._gate1_yaw_reference_rad is not None:
+                self._gate1_yaw_envelope_state(phase="Gate-0 approach")
             if not crossing_confirming and race.active_gate_index == 1:
                 if last_gate0_race_boot_ms is None:
                     raise SafetyAbort("gate 1 appeared without a recorded gate-0 packet")
@@ -10037,7 +10310,7 @@ class VQ2Runner:
                 if (
                     (observe_course_line or course_line_preturn)
                     and target.bbox_area
-                    >= COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE
+                    >= turn_cue.min_gate_area_scale
                     * context.initial_gate_area
                 ):
                     line = cyan_course_line_observation(
@@ -10045,7 +10318,7 @@ class VQ2Runner:
                     )
                     if (
                         line is not None
-                        and abs(line.turn_score) >= COURSE_LINE_PRETURN_MIN_SCORE
+                        and abs(line.turn_score) >= turn_cue.min_abs_score
                     ):
                         if (
                             course_turn_streak == 0
@@ -10073,18 +10346,39 @@ class VQ2Runner:
                     )
             if (
                 last_course_turn_s is None
-                or elapsed - last_course_turn_s > COURSE_LINE_PRETURN_MAX_AGE_S
+                or elapsed - last_course_turn_s
+                > COURSE_LINE_PRETURN_MAX_AGE_S
             ):
                 course_turn_streak = 0
                 filtered_course_turn = 0.0
             stable_course_line = (
                 course_turn_streak >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
             )
+            if stable_course_line and early_turn_started_s is None:
+                early_turn_started_s = now
+                self._gate0_early_turn_summary = {
+                    "started": True,
+                    "started_elapsed_s": elapsed,
+                    "start_gate_area_scale": (
+                        float(target.bbox_area)
+                        / float(context.initial_gate_area)
+                    ),
+                    "turn_score": filtered_course_turn,
+                    "command_count": 0,
+                    "max_abs_yaw_excursion_rad": 0.0,
+                    "max_abs_measured_yaw_rate_rad_s": 0.0,
+                }
+            early_turn_active = bool(
+                stable_course_line
+                and early_turn_started_s is not None
+                and now - early_turn_started_s
+                < phase_timing.gate0_yaw_brake_duration_s
+            )
             if (
                 course_line_exit_counterroll_enabled
                 and stable_course_line
                 and target.bbox_area
-                < COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE
+                < turn_cue.exit_counterroll_onset_area_scale
                 * context.initial_gate_area
             ):
                 proved_course_turn_score = filtered_course_turn
@@ -10095,7 +10389,7 @@ class VQ2Runner:
                 and stable_course_line
                 and filtered_course_turn * proved_course_turn_score > 0.0
                 and target.bbox_area
-                >= COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE
+                >= turn_cue.exit_counterroll_onset_area_scale
                 * context.initial_gate_area
             ):
                 course_line_exit_started = True
@@ -10106,6 +10400,8 @@ class VQ2Runner:
                 ):
                     target_roll = course_line_exit_counterroll(
                         proved_course_turn_score,
+                        cap_rad=turn_cue.exit_counterroll_cap_rad,
+                        min_abs_score=turn_cue.min_abs_score,
                     )
                     self.recorder.emit(
                         "course_line_exit_counterroll_applied",
@@ -10122,16 +10418,19 @@ class VQ2Runner:
                 course_line_preturn
                 and stable_course_line
                 and target.bbox_area
-                < COURSE_LINE_PRETURN_TAPER_AREA_SCALE
+                < turn_cue.preturn_taper_area_scale
                 * context.initial_gate_area
             ):
                 preturn_bias = course_line_preturn_roll(
-                    filtered_course_turn
+                    filtered_course_turn,
+                    gain=turn_cue.preturn_gain,
+                    cap_rad=turn_cue.preturn_roll_cap_rad,
+                    min_abs_score=turn_cue.min_abs_score,
                 )
                 target_roll = max(
-                    -COURSE_LINE_PRETURN_LIMIT_RAD,
+                    -turn_cue.preturn_roll_cap_rad,
                     min(
-                        COURSE_LINE_PRETURN_LIMIT_RAD,
+                        turn_cue.preturn_roll_cap_rad,
                         target_roll + preturn_bias,
                     ),
                 )
@@ -10145,6 +10444,11 @@ class VQ2Runner:
                     roll_bias_rad=preturn_bias,
                     target_roll_rad=target_roll,
                 )
+            if early_turn_active:
+                target_pitch = max(
+                    target_pitch,
+                    forward_braking.gate0_turn_pitch_rad,
+                )
             if elapsed < 0.15:
                 thrust = 0.26
             elif elapsed < float(boost_until_s):
@@ -10156,6 +10460,11 @@ class VQ2Runner:
                 thrust = max(
                     float(minimum_thrust),
                     gate_vertical_thrust(control_y, control_y_rate),
+                )
+            if early_turn_active:
+                thrust = min(
+                    thrust,
+                    forward_braking.gate0_turn_thrust_cap,
                 )
 
             # At close range the uncorrected contour center becomes unsafe if
@@ -10174,6 +10483,77 @@ class VQ2Runner:
                 target_pitch_rad=target_pitch,
                 thrust=thrust,
             )
+            local_yaw_rate = 0.0
+            yaw_excursion = 0.0
+            yaw_soft_stopped = False
+            if (
+                early_turn_active
+                and yaw_control.gate0_command_rate_cap_rad_s > 0.0
+            ):
+                if self._gate1_yaw_reference_rad is None:
+                    _roll, _pitch, yaw = (
+                        self.estimate.orientation.to_euler()
+                    )
+                    self._gate1_yaw_reference_rad = float(yaw)
+                yaw_excursion, yaw_soft_stopped = (
+                    self._gate1_yaw_envelope_state(
+                        phase="Gate-0 early turn",
+                    )
+                )
+                if not yaw_soft_stopped:
+                    local_yaw_rate = course_line_turn_yaw_rate(
+                        filtered_course_turn,
+                        gain=yaw_control.gate0_turn_score_gain,
+                        cap_rad_s=(
+                            yaw_control.gate0_command_rate_cap_rad_s
+                        ),
+                        min_abs_score=turn_cue.min_abs_score,
+                    )
+            command = AttitudeRateCommand(
+                roll_rate=command.roll_rate,
+                pitch_rate=command.pitch_rate,
+                yaw_rate=local_yaw_rate,
+                thrust=command.thrust,
+            )
+            validate_command(command)
+            if (
+                abs(command.yaw_rate) > SIGN_ID_RATE_RAD_S
+                or (
+                    not early_turn_active
+                    and command.yaw_rate != 0.0
+                )
+            ):
+                raise SafetyAbort(
+                    "Gate-0 early-turn yaw escaped its fixed envelope"
+                )
+            if early_turn_active:
+                early_turn_command_count += 1
+                assert self._gate0_early_turn_summary is not None
+                self._gate0_early_turn_summary.update(
+                    {
+                        "command_count": early_turn_command_count,
+                        "last_command_yaw_rate_rad_s": local_yaw_rate,
+                        "last_yaw_excursion_rad": yaw_excursion,
+                        "yaw_soft_stopped": yaw_soft_stopped,
+                        "max_abs_yaw_excursion_rad": (
+                            self._gate1_max_abs_yaw_excursion_rad
+                        ),
+                        "max_abs_measured_yaw_rate_rad_s": (
+                            self._gate1_max_abs_measured_yaw_rate_rad_s
+                        ),
+                    }
+                )
+                self.recorder.emit(
+                    "gate0_early_turn_command",
+                    elapsed_s=elapsed,
+                    filtered_turn_score=filtered_course_turn,
+                    target_roll_rad=target_roll,
+                    target_pitch_rad=target_pitch,
+                    thrust=thrust,
+                    command_yaw_rate_rad_s=local_yaw_rate,
+                    yaw_excursion_rad=yaw_excursion,
+                    yaw_soft_stopped=yaw_soft_stopped,
+                )
             await self._send_flight_command(command)
             self._record_tick("gate0", elapsed, command)
             next_tick = next_control_deadline(next_tick, time.monotonic())
@@ -10280,6 +10660,10 @@ class VQ2Runner:
             pass_confirmed_s=proof.pass_confirmed_monotonic_s,
             flight_started_s=proof.flight_started_monotonic_s,
             crossing_started_s=proof.crossing_started_monotonic_s,
+            requested_duration_s=(
+                self.controller_config.phase_timing
+                .post_gate_observation_duration_s
+            ),
         )
         observation_started_s = time.monotonic()
         if observation_started_s >= hard_deadline:
@@ -10352,6 +10736,10 @@ class VQ2Runner:
                         phase="powered observation",
                     )
                 assert self.estimate is not None
+                if self._gate1_yaw_reference_rad is not None:
+                    self._gate1_yaw_envelope_state(
+                        phase="Gate-1 observation",
+                    )
                 roll, pitch, _yaw = self.estimate.orientation.to_euler()
                 if (
                     abs(roll - proof.pass_rpy_rad[0])
@@ -10540,6 +10928,10 @@ class VQ2Runner:
         """Run the user-authorized bounded, no-passage Gate 1 diagnostic."""
 
         self._gate1_recenter_summary = None
+        phase_timing = self.controller_config.phase_timing
+        roll_control = self.controller_config.roll_control
+        yaw_control = self.controller_config.yaw_control
+        forward_braking = self.controller_config.forward_braking
         if not isinstance(gate1_observation, Mapping):
             raise SafetyAbort("gate-1 recenter lacks a valid observation")
         proof = self._gate0_transition_proof
@@ -10615,6 +11007,7 @@ class VQ2Runner:
         ):
             raise SafetyAbort("gate-1 recenter requires a fresh primary target")
         entry_error_px = float(entry_target.center_x) - 320.0
+        entry_normalized_x = entry_error_px / 320.0
         self._gate1_recenter_summary = {
             "candidate_authority": "user_authorized_bounded_recenter_diagnostic",
             "success": False,
@@ -10625,7 +11018,8 @@ class VQ2Runner:
             "entry_abs_horizontal_error_px": abs(entry_error_px),
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": abs(entry_error_px),
-            "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
+            "entry_normalized_x": entry_normalized_x,
+            "target_pitch_rad": forward_braking.gate1_target_pitch_rad,
             "max_target_area_px": int(entry_target.bbox_area),
             "max_target_width_px": int(entry_target.bbox[2]),
             "no_passage_max_area_px": (
@@ -10672,7 +11066,19 @@ class VQ2Runner:
         if self.estimate is None:
             raise SafetyAbort("gate-1 recenter attitude estimate is unavailable")
 
-        entry_roll, entry_pitch, _entry_yaw = self.estimate.orientation.to_euler()
+        entry_roll, entry_pitch, entry_yaw = (
+            self.estimate.orientation.to_euler()
+        )
+        if (
+            self._gate1_yaw_reference_rad is None
+            and yaw_control.command_rate_cap_rad_s > 0.0
+        ):
+            self._gate1_yaw_reference_rad = float(entry_yaw)
+        entry_yaw_excursion, entry_yaw_soft_stopped = (
+            self._gate1_yaw_envelope_state(phase="Gate-1 recenter entry")
+            if self._gate1_yaw_reference_rad is not None
+            else (0.0, False)
+        )
         if (
             abs(float(entry_roll)) > GATE1_RECENTER_MAX_ABS_ROLL_RAD
             or not (
@@ -10690,6 +11096,8 @@ class VQ2Runner:
         ]
         min_roll = max_roll = float(entry_roll)
         min_pitch = max_pitch = float(entry_pitch)
+        min_command_yaw_rate: Optional[float] = None
+        max_command_yaw_rate: Optional[float] = None
         min_command_roll_rate: Optional[float] = None
         max_command_roll_rate: Optional[float] = None
         min_command_pitch_rate: Optional[float] = None
@@ -10710,7 +11118,14 @@ class VQ2Runner:
         last_received_s = float(entry_target.received_monotonic_s)
         latest_target = entry_target
         recenter_started_s = await self._wait_for_next_flight_command_slot()
-        hard_deadline_s = recenter_started_s + GATE1_RECENTER_DURATION_S
+        fixed_hard_deadline_s = (
+            recenter_started_s + GATE1_RECENTER_DURATION_S
+        )
+        hard_deadline_s = min(
+            fixed_hard_deadline_s,
+            recenter_started_s
+            + phase_timing.gate1_recenter_duration_s,
+        )
         wire_clock_anchor_ns = time.perf_counter_ns()
         wire_clock_anchor_s = time.monotonic()
         remaining_wire_budget_s = max(
@@ -10746,8 +11161,18 @@ class VQ2Runner:
             "corridor_accepted_elapsed_s": None,
             "entry_horizontal_error_px": entry_error_px,
             "entry_abs_horizontal_error_px": entry_abs_error_px,
+            "entry_normalized_x": entry_normalized_x,
+            "entry_yaw_rad": float(entry_yaw),
+            "entry_yaw_excursion_rad": entry_yaw_excursion,
+            "entry_yaw_soft_stopped": entry_yaw_soft_stopped,
             "final_horizontal_error_px": entry_error_px,
             "final_abs_horizontal_error_px": entry_abs_error_px,
+            "max_abs_yaw_excursion_rad": (
+                self._gate1_max_abs_yaw_excursion_rad
+            ),
+            "max_abs_measured_yaw_rate_rad_s": (
+                self._gate1_max_abs_measured_yaw_rate_rad_s
+            ),
             "fresh_abs_horizontal_error_slope_px_s": None,
             "fresh_control_frame_count": 0,
             "corridor_hold_frame_count": 0,
@@ -10759,8 +11184,15 @@ class VQ2Runner:
             "max_command_roll_rate_rad_s": None,
             "min_command_pitch_rate_rad_s": None,
             "max_command_pitch_rate_rad_s": None,
+            "min_command_yaw_rate_rad_s": None,
+            "max_command_yaw_rate_rad_s": None,
             "command_count": 0,
-            "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
+            "target_pitch_rad": forward_braking.gate1_target_pitch_rad,
+            "forward_thrust": forward_braking.gate1_forward_thrust,
+            "requested_duration_s": (
+                phase_timing.gate1_recenter_duration_s
+            ),
+            "fixed_hard_duration_s": GATE1_RECENTER_DURATION_S,
             "max_target_area_px": max_target_area,
             "max_target_width_px": max_target_width,
             "no_passage_max_area_px": (
@@ -10785,6 +11217,7 @@ class VQ2Runner:
             nonlocal min_roll, max_roll, min_pitch, max_pitch
             nonlocal min_command_roll_rate, max_command_roll_rate
             nonlocal min_command_pitch_rate, max_command_pitch_rate
+            nonlocal min_command_yaw_rate, max_command_yaw_rate
             nonlocal max_target_area, max_target_width, max_gate_index
             elapsed = max(0.0, time.monotonic() - recenter_started_s)
             slope = gate1_recenter_absolute_error_slope_px_s(
@@ -10805,6 +11238,12 @@ class VQ2Runner:
                     ),
                     "final_horizontal_error_px": final_error_px,
                     "final_abs_horizontal_error_px": abs(final_error_px),
+                    "max_abs_yaw_excursion_rad": (
+                        self._gate1_max_abs_yaw_excursion_rad
+                    ),
+                    "max_abs_measured_yaw_rate_rad_s": (
+                        self._gate1_max_abs_measured_yaw_rate_rad_s
+                    ),
                     "fresh_abs_horizontal_error_slope_px_s": slope,
                     "fresh_control_frame_count": fresh_control_frames,
                     "corridor_hold_frame_count": corridor_hold_frames,
@@ -10816,6 +11255,8 @@ class VQ2Runner:
                     "max_command_roll_rate_rad_s": max_command_roll_rate,
                     "min_command_pitch_rate_rad_s": min_command_pitch_rate,
                     "max_command_pitch_rate_rad_s": max_command_pitch_rate,
+                    "min_command_yaw_rate_rad_s": min_command_yaw_rate,
+                    "max_command_yaw_rate_rad_s": max_command_yaw_rate,
                     "command_count": command_count,
                     "max_target_area_px": max_target_area,
                     "max_target_width_px": max_target_width,
@@ -10883,15 +11324,30 @@ class VQ2Runner:
             ),
             drained_prior_outbound_receipt_count=len(prior_receipts),
             control_law={
-                "roll_gain": GATE1_RECENTER_ROLL_GAIN,
-                "roll_rate_gain": GATE1_RECENTER_ROLL_RATE_GAIN,
-                "max_roll_rad": GATE1_RECENTER_MAX_ROLL_RAD,
+                "roll_gain": roll_control.gate1_error_gain,
+                "roll_rate_gain": roll_control.gate1_error_rate_gain,
+                "max_roll_rad": roll_control.gate1_target_cap_rad,
                 "max_command_rate_rad_s": (
-                    GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
+                    roll_control.command_rate_cap_rad_s
                 ),
-                "target_pitch_rad": GATE1_RECENTER_TARGET_PITCH_RAD,
-                "thrust": GATE1_RECENTER_THRUST,
-                "duration_s": GATE1_RECENTER_DURATION_S,
+                "yaw_gain": yaw_control.gate1_error_gain,
+                "yaw_deadband_normalized_x": (
+                    yaw_control.gate1_deadband_normalized_x
+                ),
+                "max_yaw_command_rate_rad_s": (
+                    yaw_control.command_rate_cap_rad_s
+                ),
+                "max_yaw_excursion_rad": (
+                    GATE1_CONTROLLER_MAX_YAW_EXCURSION_RAD
+                ),
+                "target_pitch_rad": (
+                    forward_braking.gate1_target_pitch_rad
+                ),
+                "thrust": forward_braking.gate1_forward_thrust,
+                "requested_duration_s": (
+                    phase_timing.gate1_recenter_duration_s
+                ),
+                "fixed_hard_duration_s": GATE1_RECENTER_DURATION_S,
             },
         )
 
@@ -10964,7 +11420,14 @@ class VQ2Runner:
                     raise SafetyAbort(
                         "gate-1 recenter attitude estimate is unavailable"
                     )
-                roll, pitch, _yaw = self.estimate.orientation.to_euler()
+                roll, pitch, yaw = self.estimate.orientation.to_euler()
+                yaw_excursion, yaw_soft_stopped = (
+                    self._gate1_yaw_envelope_state(
+                        phase="Gate-1 recenter",
+                    )
+                    if self._gate1_yaw_reference_rad is not None
+                    else (0.0, False)
+                )
                 min_roll = min(min_roll, float(roll))
                 max_roll = max(max_roll, float(roll))
                 min_pitch = min(min_pitch, float(pitch))
@@ -11027,6 +11490,11 @@ class VQ2Runner:
                         gate1_recenter_roll_target(
                             (float(accepted.center_x) - 320.0) / 320.0,
                             current_x_rate_norm_s,
+                            error_gain=roll_control.gate1_error_gain,
+                            error_rate_gain=(
+                                roll_control.gate1_error_rate_gain
+                            ),
+                            cap_rad=roll_control.gate1_target_cap_rad,
                         )
                     except ValueError as exc:
                         raise SafetyAbort(
@@ -11075,6 +11543,9 @@ class VQ2Runner:
                         normalized_x=current_error_px / 320.0,
                         normalized_x_rate_s=current_x_rate_norm_s,
                         corridor_hold_frames=corridor_hold_frames,
+                        yaw_rad=float(yaw),
+                        yaw_excursion_rad=yaw_excursion,
+                        yaw_soft_stopped=yaw_soft_stopped,
                     )
                     last_token = token
                     last_center_x = float(accepted.center_x)
@@ -11201,6 +11672,10 @@ class VQ2Runner:
                         cleanup_roll, cleanup_pitch, _cleanup_yaw = (
                             self.estimate.orientation.to_euler()
                         )
+                        if self._gate1_yaw_reference_rad is not None:
+                            self._gate1_yaw_envelope_state(
+                                phase="Gate-1 recenter cleanup readiness",
+                            )
                         min_roll = min(min_roll, float(cleanup_roll))
                         max_roll = max(max_roll, float(cleanup_roll))
                         min_pitch = min(min_pitch, float(cleanup_pitch))
@@ -11263,6 +11738,15 @@ class VQ2Runner:
                                     )
                                     / 320.0,
                                     cleanup_x_rate_norm_s,
+                                    error_gain=(
+                                        roll_control.gate1_error_gain
+                                    ),
+                                    error_rate_gain=(
+                                        roll_control.gate1_error_rate_gain
+                                    ),
+                                    cap_rad=(
+                                        roll_control.gate1_target_cap_rad
+                                    ),
                                 )
                             except ValueError as rate_exc:
                                 raise SafetyAbort(
@@ -11325,6 +11809,11 @@ class VQ2Runner:
                     target_roll = gate1_recenter_roll_target(
                         normalized_x,
                         current_x_rate_norm_s,
+                        error_gain=roll_control.gate1_error_gain,
+                        error_rate_gain=(
+                            roll_control.gate1_error_rate_gain
+                        ),
+                        cap_rad=roll_control.gate1_target_cap_rad,
                     )
                 except ValueError as exc:
                     raise SafetyAbort(
@@ -11333,15 +11822,50 @@ class VQ2Runner:
                 command = attitude_rate_command(
                     self.estimate,
                     target_roll_rad=target_roll,
-                    target_pitch_rad=GATE1_RECENTER_TARGET_PITCH_RAD,
-                    thrust=GATE1_RECENTER_THRUST,
+                    target_pitch_rad=(
+                        forward_braking.gate1_target_pitch_rad
+                    ),
+                    thrust=forward_braking.gate1_forward_thrust,
                 )
                 command = limit_command_rates(
                     command,
-                    GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S,
+                    roll_control.command_rate_cap_rad_s,
                 )
+                pitch_rate = max(
+                    -forward_braking.pitch_command_rate_cap_rad_s,
+                    min(
+                        forward_braking.pitch_command_rate_cap_rad_s,
+                        command.pitch_rate,
+                    ),
+                )
+                try:
+                    yaw_rate = (
+                        0.0
+                        if yaw_soft_stopped
+                        else gate1_recenter_yaw_rate(
+                            normalized_x,
+                            error_gain=yaw_control.gate1_error_gain,
+                            deadband_normalized_x=(
+                                yaw_control.gate1_deadband_normalized_x
+                            ),
+                            cap_rad_s=(
+                                yaw_control.command_rate_cap_rad_s
+                            ),
+                        )
+                    )
+                except ValueError as exc:
+                    raise SafetyAbort(
+                        "gate-1 recenter yaw control is outside bounds"
+                    ) from exc
+                command = AttitudeRateCommand(
+                    roll_rate=command.roll_rate,
+                    pitch_rate=pitch_rate,
+                    yaw_rate=yaw_rate,
+                    thrust=command.thrust,
+                )
+                validate_command(command)
                 if (
-                    command.yaw_rate != 0.0
+                    abs(command.yaw_rate) > SIGN_ID_RATE_RAD_S
                     or abs(command.roll_rate)
                     > GATE1_RECENTER_MAX_COMMAND_RATE_RAD_S
                     or abs(command.pitch_rate)
@@ -11443,6 +11967,16 @@ class VQ2Runner:
                     if max_command_pitch_rate is None
                     else max(max_command_pitch_rate, command.pitch_rate)
                 )
+                min_command_yaw_rate = (
+                    command.yaw_rate
+                    if min_command_yaw_rate is None
+                    else min(min_command_yaw_rate, command.yaw_rate)
+                )
+                max_command_yaw_rate = (
+                    command.yaw_rate
+                    if max_command_yaw_rate is None
+                    else max(max_command_yaw_rate, command.yaw_rate)
+                )
                 self._record_tick(
                     "gate1-recenter/recenter",
                     send_checked_s - recenter_started_s,
@@ -11519,8 +12053,12 @@ class VQ2Runner:
         gate0 = await self._run_gate0(
             context,
             crossing_hold_thrust=GATE1_RECENTER_TRANSITION_THRUST,
-            course_line_preturn=True,
-            course_line_exit_counterroll_enabled=True,
+            course_line_preturn=(
+                self.controller_config.turn_cue.preturn_enabled
+            ),
+            course_line_exit_counterroll_enabled=(
+                self.controller_config.turn_cue.exit_counterroll_enabled
+            ),
         )
         observation = await self._observe_gate1(
             gate0,
@@ -12300,6 +12838,9 @@ class VQ2Runner:
             self._deferred_pngs = []
             self._post_gate_last_frame = None
             self._abort_latched = False
+            self._gate1_yaw_reference_rad = None
+            self._gate1_max_abs_yaw_excursion_rad = 0.0
+            self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
             context = await self.wait_for_go()
@@ -12337,8 +12878,13 @@ class VQ2Runner:
                     crossing_hold_thrust=(
                         GATE1_RECENTER_TRANSITION_THRUST
                     ),
-                    course_line_preturn=True,
-                    course_line_exit_counterroll_enabled=True,
+                    course_line_preturn=(
+                        self.controller_config.turn_cue.preturn_enabled
+                    ),
+                    course_line_exit_counterroll_enabled=(
+                        self.controller_config.turn_cue
+                        .exit_counterroll_enabled
+                    ),
                 )
                 details = {"gate0": gate0_details}
                 try:
@@ -12559,6 +13105,7 @@ class VQ2Runner:
             gate_index_after=gate_after,
             cleanup_confirmed=cleanup_confirmed,
             details=details,
+            controller=dict(self.controller_evidence),
         )
 
 
@@ -12591,10 +13138,49 @@ async def run_live(
     preflight_before_powered_stage: bool = True,
     write_diagnostic_pngs: bool = True,
     run_manifest_sha256: Optional[str] = None,
+    controller_config: Optional[
+        Mapping[str, Any] | VQ2ControllerConfig
+    ] = None,
+    candidate_commit: Optional[str] = None,
+    expected_controller_config_sha256: Optional[str] = None,
 ) -> StageResult:
     if type(stage) is not str or stage not in LIVE_RUN_STAGES:
         raise ValueError(f"unsupported live stage: {stage}")
-    _load_live_transport_dependencies()
+    try:
+        effective_controller = (
+            default_controller_config()
+            if controller_config is None
+            else (
+                validate_controller_config(
+                    controller_config.to_effective_mapping()
+                )
+                if isinstance(controller_config, VQ2ControllerConfig)
+                else validate_controller_config(controller_config)
+            )
+        )
+    except ControllerConfigError as exc:
+        raise ValueError(f"controller configuration refused: {exc}") from exc
+    controller = controller_config_evidence(
+        effective_controller,
+        candidate_commit=candidate_commit,
+    )
+    if (
+        stage != GATE1_RECENTER_STAGE
+        and effective_controller.effective_config_sha256
+        != default_controller_config().effective_config_sha256
+    ):
+        raise ValueError(
+            "custom controller configurations are admitted only for "
+            "gate1-recenter"
+        )
+    if expected_controller_config_sha256 is not None and (
+        type(expected_controller_config_sha256) is not str
+        or expected_controller_config_sha256
+        != effective_controller.effective_config_sha256
+    ):
+        raise ValueError(
+            "expected controller config hash does not match effective config"
+        )
     if type(recording_approved) is not bool:
         raise TypeError("recording_approved must be an exact bool")
     if type(preflight_before_powered_stage) is not bool:
@@ -12627,6 +13213,7 @@ async def run_live(
         or not 1.0 <= float(preflight_timeout_s) <= 10.0
     ):
         raise ValueError("preflight_timeout_s must be finite and in [1, 10]")
+    _load_live_transport_dependencies()
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
         require_track=False,
@@ -12738,8 +13325,20 @@ async def run_live(
             recorder.emit(
                 "fast_cycle_binding",
                 run_manifest_sha256=run_manifest_sha256,
+                controller=controller,
             )
-        runner = VQ2Runner(adapter, vision, recorder=recorder)
+        else:
+            recorder.emit(
+                "controller_configuration",
+                controller=controller,
+            )
+        runner = VQ2Runner(
+            adapter,
+            vision,
+            recorder=recorder,
+            controller_config=effective_controller,
+            controller_evidence=controller,
+        )
         await adapter.connect(address)
         preflight = None
         if stage == "preflight" or preflight_before_powered_stage:
@@ -12758,6 +13357,7 @@ async def run_live(
                 gate_index_after=preflight.get("race_gate_index"),
                 cleanup_confirmed=True,
                 details=preflight,
+                controller=dict(controller),
             )
         else:
             result = await runner.run_powered_stage(
