@@ -222,6 +222,161 @@ def test_primary_gate_uses_largest_plausible_pixel_box_only():
     assert select_primary_gate([far, line, near, low_confidence]) is near
 
 
+def _cyan_course_line_image(*, lower_center_x, upper_center_x):
+    image = np.zeros((360, 640, 3), dtype=np.uint8)
+    cyan_bgr = (255, 255, 0)
+    image[
+        120:128,
+        upper_center_x - 8 : upper_center_x + 9,
+    ] = cyan_bgr
+    image[
+        155:163,
+        lower_center_x - 8 : lower_center_x + 9,
+    ] = cyan_bgr
+    return image
+
+
+def test_cyan_course_line_observation_rejects_invalid_dimensions():
+    assert vq2_module.cyan_course_line_observation(None) is None
+    for shape in (
+        (360, 640),
+        (359, 640, 3),
+        (360, 639, 3),
+        (1, 360, 640, 3),
+    ):
+        assert (
+            vq2_module.cyan_course_line_observation(
+                np.zeros(shape, dtype=np.uint8)
+            )
+            is None
+        )
+
+
+def test_cyan_course_line_observation_requires_enough_pixels_in_both_bands():
+    assert vq2_module.COURSE_LINE_MIN_ROI_PIXELS == 128
+    image = np.zeros((360, 640, 3), dtype=np.uint8)
+    image[120, 100:227] = (255, 255, 0)
+    image[155, 100:227] = (255, 255, 0)
+
+    assert 227 - 100 == 127
+    assert vq2_module.cyan_course_line_observation(image) is None
+
+
+@pytest.mark.parametrize(
+    ("lower_center_x", "upper_center_x", "expected_score"),
+    (
+        (300, 400, 0.3125),
+        (400, 300, -0.3125),
+    ),
+    ids=("right-turn", "left-turn"),
+)
+def test_cyan_course_line_observation_reports_signed_turn_and_band_counts(
+    lower_center_x,
+    upper_center_x,
+    expected_score,
+):
+    observation = vq2_module.cyan_course_line_observation(
+        _cyan_course_line_image(
+            lower_center_x=lower_center_x,
+            upper_center_x=upper_center_x,
+        )
+    )
+
+    assert observation is not None
+    assert observation.turn_score == pytest.approx(expected_score)
+    assert observation.lower_center_x == pytest.approx(lower_center_x)
+    assert observation.upper_center_x == pytest.approx(upper_center_x)
+    assert observation.lower_pixel_count == 136
+    assert observation.upper_pixel_count == 136
+
+
+@pytest.mark.parametrize("score", (True, False, math.nan, math.inf, -math.inf))
+def test_course_line_preturn_roll_rejects_bool_and_nonfinite_scores(score):
+    with pytest.raises(ValueError):
+        vq2_module.course_line_preturn_roll(score)
+
+
+@pytest.mark.parametrize(
+    "score",
+    (
+        0.0,
+        math.nextafter(0.04, 0.0),
+        math.nextafter(-0.04, 0.0),
+    ),
+)
+def test_course_line_preturn_roll_has_exact_symmetric_deadband(score):
+    assert vq2_module.COURSE_LINE_PRETURN_MIN_SCORE == 0.04
+    assert vq2_module.course_line_preturn_roll(score) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("score", "expected_roll"),
+    (
+        (0.04, 0.032),
+        (-0.04, -0.032),
+        (0.10, 0.08),
+        (-0.10, -0.08),
+        (1.0, 0.13),
+        (-1.0, -0.13),
+    ),
+    ids=(
+        "positive-threshold",
+        "negative-threshold",
+        "positive-gain",
+        "negative-gain",
+        "positive-clamp",
+        "negative-clamp",
+    ),
+)
+def test_course_line_preturn_roll_preserves_physical_turn_sign_and_clamps(
+    score,
+    expected_roll,
+):
+    assert vq2_module.COURSE_LINE_PRETURN_GAIN == 0.80
+    assert vq2_module.COURSE_LINE_PRETURN_LIMIT_RAD == 0.13
+    assert vq2_module.course_line_preturn_roll(score) == pytest.approx(
+        expected_roll
+    )
+
+
+@pytest.mark.parametrize("score", (True, False, math.nan, math.inf, -math.inf))
+def test_course_line_exit_counterroll_rejects_bool_and_nonfinite_scores(score):
+    with pytest.raises(ValueError, match="exit-counterroll score"):
+        vq2_module.course_line_exit_counterroll(score)
+
+
+@pytest.mark.parametrize(
+    ("score", "expected_roll"),
+    (
+        (math.nextafter(0.04, 0.0), 0.0),
+        (math.nextafter(-0.04, 0.0), 0.0),
+        (0.20, -0.08),
+        (-0.20, 0.08),
+    ),
+)
+def test_course_line_exit_counterroll_opposes_proved_turn_inside_bounds(
+    score,
+    expected_roll,
+):
+    assert vq2_module.COURSE_LINE_EXIT_COUNTERROLL_RAD == 0.08
+    assert vq2_module.course_line_exit_counterroll(score) == expected_roll
+    assert abs(expected_roll) <= vq2_module.COURSE_LINE_PRETURN_LIMIT_RAD
+
+
+def test_gate0_centering_roll_counter_rotates_image_error_and_clamps():
+    assert vq2_module.gate0_centering_roll_target(0.25) < 0.0
+    assert vq2_module.gate0_centering_roll_target(-0.25) > 0.0
+    assert vq2_module.gate0_centering_roll_target(0.0) == 0.0
+    assert vq2_module.gate0_centering_roll_target(10.0) == -0.08
+    assert vq2_module.gate0_centering_roll_target(-10.0) == 0.08
+
+
+@pytest.mark.parametrize("normalized_x", (True, math.nan, math.inf, -math.inf))
+def test_gate0_centering_roll_rejects_invalid_input(normalized_x):
+    with pytest.raises(ValueError, match="gate-0 centering input"):
+        vq2_module.gate0_centering_roll_target(normalized_x)
+
+
 def test_gate_tracker_requires_temporal_continuity():
     tracker = GateTargetTracker()
     for frame_id in range(1, 4):
@@ -244,9 +399,418 @@ def test_gate_tracker_requires_temporal_continuity():
     assert tracker.target is previous
 
 
+def _confirmed_right_edge_tracker():
+    tracker = GateTargetTracker()
+    prior = _detection(580, 24, 60, 91, confidence=0.402)
+    for frame_id in range(1, 4):
+        assert tracker.update(
+            [prior],
+            frame_id=frame_id,
+            sim_time_ns=frame_id * 10,
+            received_monotonic_s=1.0 + frame_id * 0.01,
+        ) is not None
+    assert tracker.consecutive == 3
+    return tracker, prior
+
+
+def test_gate_tracker_default_rejects_live_oblique_edge_fragment():
+    tracker, prior = _confirmed_right_edge_tracker()
+    clipped = _detection(591, 23, 49, 94, confidence=0.360)
+
+    assert tracker.update(
+        [clipped],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+    ) is None
+    assert tracker.target is not None
+    assert tracker.target.bbox == prior.bbox
+    assert tracker.consecutive == 0
+    assert tracker.last_selection_mode is None
+
+
+def test_gate_tracker_course_fallback_follows_only_live_right_edge_sequence():
+    tracker, _prior = _confirmed_right_edge_tracker()
+    later_center_gate = _detection(280, 170, 68, 68, confidence=0.8)
+    later_left_gate = _detection(90, 240, 46, 44, confidence=0.8)
+    clipped_sequence = (
+        _detection(591, 23, 49, 94, confidence=0.360),
+        _detection(601, 20, 39, 98, confidence=0.197),
+        _detection(612, 22, 28, 52, confidence=0.363),
+    )
+
+    for frame_id, clipped in enumerate(clipped_sequence, start=4):
+        accepted = tracker.update(
+            [later_left_gate, later_center_gate, clipped],
+            frame_id=frame_id,
+            sim_time_ns=frame_id * 10,
+            received_monotonic_s=1.0 + frame_id * 0.01,
+            allow_tracked_edge_continuation=True,
+            image_width=640,
+            image_height=360,
+        )
+        assert accepted is not None
+        assert accepted.bbox == clipped.bbox
+        assert tracker.last_selected_detection is clipped
+        assert tracker.last_selection_mode == "tracked_edge_continuation"
+
+    last_edge_target = tracker.target
+    assert tracker.update(
+        [later_left_gate, later_center_gate],
+        frame_id=7,
+        sim_time_ns=70,
+        received_monotonic_s=1.07,
+        allow_tracked_edge_continuation=True,
+        image_width=640,
+        image_height=360,
+    ) is None
+    assert tracker.consecutive == 0
+    assert tracker.target is last_edge_target
+
+    # Once a frame is missed, even another plausible edge fragment cannot
+    # resurrect the stale target or hand tracking to a different course gate.
+    assert tracker.update(
+        [later_center_gate, clipped_sequence[-1]],
+        frame_id=8,
+        sim_time_ns=80,
+        received_monotonic_s=1.08,
+        allow_tracked_edge_continuation=True,
+        image_width=640,
+        image_height=360,
+    ) is None
+    assert tracker.consecutive == 0
+    assert tracker.target is last_edge_target
+
+
+def test_gate_tracker_course_fallback_accepts_latest_quarter_area_edge_fragment():
+    tracker = GateTargetTracker()
+    prior = _detection(585, 22, 55, 92, confidence=0.400)
+    for frame_id in range(1, 4):
+        assert tracker.update(
+            [prior],
+            frame_id=frame_id,
+            sim_time_ns=frame_id * 10,
+            received_monotonic_s=1.0 + frame_id * 0.01,
+        ) is not None
+    predecessor = _detection(596, 21, 44, 95, confidence=0.353)
+    assert tracker.update(
+        [predecessor],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_edge_continuation=True,
+        image_width=640,
+        image_height=360,
+    ) is not None
+    clipped = _detection(616, 20, 24, 42, confidence=0.388)
+    later_gate = _detection(294, 178, 43, 59, confidence=0.445)
+
+    accepted = tracker.update(
+        [later_gate, clipped],
+        frame_id=6,
+        sim_time_ns=60,
+        received_monotonic_s=1.10,
+        allow_tracked_edge_continuation=True,
+        image_width=640,
+        image_height=360,
+    )
+
+    assert clipped.bbox[2] * clipped.bbox[3] / predecessor.area == pytest.approx(
+        0.2411483254
+    )
+    assert accepted is not None
+    assert accepted.bbox == clipped.bbox
+    assert tracker.last_selection_mode == "tracked_edge_continuation"
+
+
+def test_gate_tracker_prefers_valid_primary_before_edge_fallback():
+    tracker, _prior = _confirmed_right_edge_tracker()
+    clipped = _detection(591, 23, 49, 94, confidence=0.360)
+    valid_primary = _detection(471, 29, 80, 80, confidence=0.8)
+
+    accepted = tracker.update(
+        [clipped, valid_primary],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_edge_continuation=True,
+        image_width=640,
+        image_height=360,
+    )
+
+    assert accepted is not None
+    assert accepted.bbox == valid_primary.bbox
+    assert tracker.last_selected_detection is valid_primary
+    assert tracker.last_selection_mode == "primary"
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    (
+        _detection(550, 23, 49, 94, confidence=0.360),
+        _detection(601, 0, 39, 98, confidence=0.197),
+        _detection(601, 120, 39, 98, confidence=0.197),
+        _detection(605, 20, 35, 100, confidence=0.197),
+        _detection(591, 23, 49, 94, confidence=0.01),
+    ),
+    ids=("not-at-edge", "top-and-right", "large-jump", "too-oblique", "low-confidence"),
+)
+def test_course_edge_fallback_rejects_unproved_geometry(candidate):
+    tracker, _prior = _confirmed_right_edge_tracker()
+
+    assert tracker.update(
+        [candidate],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_edge_continuation=True,
+        image_width=640,
+        image_height=360,
+    ) is None
+    assert tracker.consecutive == 0
+
+
+def test_gate_tracker_course_fragment_union_preserves_live_gate_geometry():
+    prior = _detection(466, 0, 137, 119, confidence=0.74)
+    upper = _detection(500, 0, 106, 80, confidence=0.69)
+    lower = _detection(466, 69, 43, 50, confidence=0.58)
+    later_gate = _detection(323, 132, 22, 32, confidence=0.41)
+
+    default_tracker = GateTargetTracker()
+    union_tracker = GateTargetTracker()
+    for tracker in (default_tracker, union_tracker):
+        for frame_id in range(1, 4):
+            assert tracker.update(
+                [prior],
+                frame_id=frame_id,
+                sim_time_ns=frame_id * 10,
+                received_monotonic_s=1.0 + frame_id * 0.01,
+            ) is not None
+
+    default_target = default_tracker.update(
+        [upper, lower, later_gate],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+    )
+    assert default_target is not None
+    assert default_target.bbox == upper.bbox
+    assert not default_target.composite
+
+    fused = union_tracker.update(
+        [upper, lower, later_gate],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_fragment_union=True,
+        image_width=640,
+        image_height=360,
+    )
+    assert fused is not None
+    assert fused.bbox == (466, 0, 140, 119)
+    assert (fused.center_x, fused.center_y) == (536, 59)
+    assert fused.composite
+    assert union_tracker.last_selected_detection is None
+    assert union_tracker.last_selected_detections == (upper, lower)
+    assert union_tracker.last_selection_mode == "tracked_fragment_union"
+
+
+def test_gate_tracker_fragment_union_preserves_directional_live_transition():
+    """The faster roll trace remains one continuous, near-square Gate 1."""
+
+    tracker = GateTargetTracker()
+    tracker.target = vq2_module.GateTarget(
+        frame_id=3,
+        sim_time_ns=30,
+        received_monotonic_s=1.03,
+        center_x=550,
+        center_y=59,
+        bbox=(465, 0, 171, 118),
+        confidence=0.50,
+        composite=True,
+    )
+    tracker.consecutive = 25
+    tracker._last_frame_id = 3
+    upper = _detection(514, 0, 126, 61, confidence=0.42)
+    lower = _detection(466, 63, 48, 55, confidence=0.56)
+    later_gate = _detection(313, 146, 25, 34, confidence=0.40)
+
+    fused = tracker.update(
+        [lower, later_gate, upper],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_fragment_union=True,
+        image_width=640,
+        image_height=360,
+    )
+
+    assert vq2_module.COURSE_FRAGMENT_UNION_MAX_ASPECT_RATIO == 1.45
+    assert (
+        vq2_module.COURSE_FRAGMENT_UNION_RIGHT_EDGE_MAX_ASPECT_RATIO
+        == 1.48
+    )
+    assert fused is not None
+    assert fused.bbox == (466, 0, 174, 118)
+    assert fused.composite
+    assert tracker.last_selected_detections == (upper, lower)
+    assert tracker.last_selection_mode == "tracked_fragment_union"
+    assert tracker.consecutive == 26
+
+
+def test_gate_tracker_fragment_union_keeps_strict_aspect_away_from_right_edge():
+    prior = vq2_module.GateTarget(
+        frame_id=3,
+        sim_time_ns=30,
+        received_monotonic_s=1.03,
+        center_x=540,
+        center_y=59,
+        bbox=(455, 0, 171, 118),
+        confidence=0.50,
+        composite=True,
+    )
+    upper = _detection(504, 0, 126, 61, confidence=0.42)
+    lower = _detection(456, 63, 48, 55, confidence=0.56)
+
+    assert (
+        vq2_module.select_tracked_fragment_union(
+            [upper, lower],
+            prior_target=prior,
+            image_width=640,
+            image_height=360,
+        )
+        is None
+    )
+
+
+def test_gate_tracker_fragment_union_exits_to_live_lower_fragment_without_gap():
+    tracker = GateTargetTracker()
+    tracker.target = vq2_module.GateTarget(
+        frame_id=3,
+        sim_time_ns=30,
+        received_monotonic_s=1.03,
+        center_x=567,
+        center_y=66,
+        bbox=(494, 0, 146, 133),
+        confidence=0.53,
+        composite=True,
+    )
+    tracker.consecutive = 20
+    tracker._last_frame_id = 3
+    upper = _detection(614, 0, 26, 50, confidence=0.34)
+    lower = _detection(498, 68, 56, 66, confidence=0.53)
+    later_gate = _detection(308, 173, 32, 41, confidence=0.40)
+
+    fused = tracker.update(
+        [lower, later_gate, upper],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_fragment_union=True,
+        image_width=640,
+        image_height=360,
+    )
+    assert fused is not None
+    assert fused.bbox == (498, 0, 142, 134)
+    assert fused.composite
+
+    lower_only = _detection(504, 68, 59, 68, confidence=0.51)
+    accepted = tracker.update(
+        [lower_only, later_gate],
+        frame_id=6,
+        sim_time_ns=60,
+        received_monotonic_s=1.10,
+        allow_tracked_fragment_union=True,
+        image_width=640,
+        image_height=360,
+    )
+    assert accepted is not None
+    assert accepted.bbox == lower_only.bbox
+    assert not accepted.composite
+    assert tracker.last_selection_mode == "primary"
+    assert tracker.consecutive == 22
+
+
+def test_gate_tracker_fragment_union_rejects_unrelated_top_and_later_gate():
+    tracker = GateTargetTracker()
+    prior = _detection(466, 0, 137, 119, confidence=0.74)
+    for frame_id in range(1, 4):
+        tracker.update(
+            [prior],
+            frame_id=frame_id,
+            sim_time_ns=frame_id * 10,
+            received_monotonic_s=1.0 + frame_id * 0.01,
+        )
+    upper = _detection(500, 0, 106, 80, confidence=0.69)
+    unrelated = _detection(321, 136, 23, 34, confidence=0.39)
+
+    accepted = tracker.update(
+        [upper, unrelated],
+        frame_id=4,
+        sim_time_ns=40,
+        received_monotonic_s=1.04,
+        allow_tracked_fragment_union=True,
+        image_width=640,
+        image_height=360,
+    )
+
+    assert accepted is not None
+    assert accepted.bbox == upper.bbox
+    assert not accepted.composite
+    assert tracker.last_selection_mode == "primary"
+
+
+def test_course_crossing_never_arms_from_composite_union_geometry():
+    composite = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=1.0,
+        center_x=320,
+        center_y=180,
+        bbox=(60, 0, 520, 360),
+        confidence=0.8,
+        composite=True,
+    )
+
+    assert not vq2_module.is_course_gate_crossing_candidate(
+        composite,
+        acquisition_gate_area=1000,
+        control_y=180.0,
+    )
+
+
 def test_pitch_leveling_moves_expected_gate_reference_down():
     reference = gate_vertical_reference_px(174.0, -0.311, -0.10)
     assert reference == pytest.approx(242.5, abs=1.0)
+
+
+@pytest.mark.parametrize(
+    ("elapsed_s", "expected_pitch"),
+    ((0.0, -0.31), (0.40, -0.155), (0.80, 0.0), (1.20, 0.0)),
+)
+def test_gate0_full_lap_pitch_schedule_reaches_bounded_exit_pitch(
+    elapsed_s,
+    expected_pitch,
+):
+    assert vq2_module.COURSE_GATE0_EXIT_PITCH_RAD == 0.0
+    assert vq2_module.gate0_target_pitch_rad(
+        -0.31,
+        vq2_module.COURSE_GATE0_EXIT_PITCH_RAD,
+        elapsed_s,
+    ) == pytest.approx(expected_pitch)
+
+
+@pytest.mark.parametrize(
+    ("spawn_pitch", "exit_pitch", "elapsed_s"),
+    ((True, -0.05, 0.0), (-0.31, math.nan, 0.0), (-0.31, -0.11, 0.0), (-0.31, -0.05, -0.01)),
+)
+def test_gate0_pitch_schedule_rejects_invalid_inputs(
+    spawn_pitch,
+    exit_pitch,
+    elapsed_s,
+):
+    with pytest.raises(ValueError, match="pitch schedule"):
+        vq2_module.gate0_target_pitch_rad(spawn_pitch, exit_pitch, elapsed_s)
 
 
 def test_clipped_square_gate_center_uses_visible_width():
@@ -280,6 +844,7 @@ def test_gate_vertical_thrust_has_position_and_motion_damping():
     assert gate_vertical_thrust(150.0, 0.0) > 0.275
     assert gate_vertical_thrust(210.0, 0.0) < 0.275
     assert gate_vertical_thrust(180.0, 60.0) < 0.275
+    assert gate_vertical_thrust(210.0, 300.0) == 0.21
     assert 0.21 <= gate_vertical_thrust(0.0, -999.0) <= 0.32
 
 
@@ -389,6 +954,776 @@ def test_crossing_wait_requires_authoritative_new_race_status():
         active_gate_index=2,
         elapsed_s=0.01,
     ) == "invalid_gate_index"
+
+
+def test_full_lap_crossing_requires_fresh_exact_progress_or_finish():
+    common = {
+        "baseline_race_boot_ms": 6000,
+        "expected_gate_index": 3,
+        "elapsed_s": 0.10,
+    }
+    assert vq2_module.full_lap_crossing_status_decision(
+        **common,
+        current_race_boot_ms=6000,
+        active_gate_index=4,
+        race_finished=True,
+    ) == "waiting"
+    assert vq2_module.full_lap_crossing_status_decision(
+        **common,
+        current_race_boot_ms=6250,
+        active_gate_index=4,
+        race_finished=False,
+    ) == "passed"
+    assert vq2_module.full_lap_crossing_status_decision(
+        **common,
+        current_race_boot_ms=6250,
+        active_gate_index=3,
+        race_finished=True,
+    ) == "finished"
+    assert vq2_module.full_lap_crossing_status_decision(
+        **common,
+        current_race_boot_ms=6250,
+        active_gate_index=5,
+        race_finished=False,
+    ) == "invalid_gate_index"
+    assert vq2_module.full_lap_crossing_status_decision(
+        **common,
+        current_race_boot_ms=6250,
+        active_gate_index=3,
+        race_finished=False,
+    ) == "not_credited"
+
+
+@pytest.mark.parametrize(
+    ("area_px", "expected"),
+    (
+        (5_999, False),
+        (6_000, True),
+        (8_000, True),
+        (8_001, False),
+        (True, False),
+    ),
+)
+def test_full_lap_initial_gate_reference_requires_proved_spawn_area(
+    area_px,
+    expected,
+):
+    assert (
+        vq2_module.full_lap_initial_gate_reference_is_valid(area_px)
+        is expected
+    )
+    assert vq2_module.FULL_LAP_INITIAL_GATE_MIN_AREA_PX == 6_000
+    assert vq2_module.FULL_LAP_INITIAL_GATE_MAX_AREA_PX == 8_000
+
+
+@pytest.mark.parametrize(
+    ("now_ns", "expected_delay_s"),
+    ((0, 0.190), (190_000_000, 0.0), (200_000_000, 0.240)),
+)
+def test_gate0_phase_alignment_targets_packet_lead(now_ns, expected_delay_s):
+    delay_s = vq2_module.gate0_phase_alignment_delay_s(
+        now_monotonic_ns=now_ns,
+        last_race_received_monotonic_ns=1_000_000_000,
+    )
+    assert delay_s == pytest.approx(expected_delay_s)
+    expected_loss_ns = now_ns + round(
+        (delay_s + vq2_module.COURSE_GATE0_EXPECTED_TARGET_LOSS_S)
+        * 1_000_000_000
+    )
+    lead_ns = round(vq2_module.COURSE_RACE_PACKET_TARGET_LEAD_S * 1_000_000_000)
+    period_ns = round(vq2_module.COURSE_RACE_PACKET_PERIOD_S * 1_000_000_000)
+    assert (expected_loss_ns + lead_ns - 1_000_000_000) % period_ns == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"now_monotonic_ns": True},
+        {"last_race_received_monotonic_ns": -1},
+        {"expected_target_loss_s": math.nan},
+        {"packet_period_s": 0.0},
+        {"target_lead_s": 0.250},
+    ),
+)
+def test_gate0_phase_alignment_rejects_invalid_inputs(overrides):
+    values = {
+        "now_monotonic_ns": 0,
+        "last_race_received_monotonic_ns": 1_000_000_000,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match="phase alignment"):
+        vq2_module.gate0_phase_alignment_delay_s(**values)
+
+
+@pytest.mark.parametrize(
+    ("last_sent_s", "expected_sleep_s"),
+    ((None, None), (0.97, None), (0.99, 0.01)),
+    ids=("no-prior-command", "slot-already-open", "wait-remainder"),
+)
+def test_next_flight_command_slot_waits_from_prior_send_completion(
+    monkeypatch,
+    last_sent_s,
+    expected_sleep_s,
+):
+    clock = [1.0]
+    sleeps = []
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = last_sent_s
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        ready_s = asyncio.run(runner._wait_for_next_flight_command_slot())
+
+    if expected_sleep_s is None:
+        assert sleeps == []
+        assert ready_s == 1.0
+    else:
+        assert sleeps == pytest.approx([expected_sleep_s])
+        assert ready_s == pytest.approx(1.0 + expected_sleep_s)
+    if last_sent_s is not None:
+        assert ready_s - last_sent_s >= vq2_module.CONTROL_PERIOD_S
+
+
+def test_next_flight_command_slot_retries_a_fractionally_early_wakeup(
+    monkeypatch,
+):
+    clock = [1.0]
+    sleeps = []
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = 0.99
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            clock[0] += 0.009
+        else:
+            clock[0] += seconds
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        ready_s = asyncio.run(runner._wait_for_next_flight_command_slot())
+
+    assert sleeps == pytest.approx([0.01, 0.001])
+    assert ready_s == pytest.approx(1.01)
+    assert ready_s - runner._last_flight_command_sent_s >= (
+        vq2_module.CONTROL_PERIOD_S
+    )
+
+
+@pytest.mark.parametrize(
+    "last_sent_s",
+    (True, math.nan, math.inf, -math.ulp(1.0), 1.01),
+)
+def test_next_flight_command_slot_rejects_invalid_prior_timestamp(
+    monkeypatch,
+    last_sent_s,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = last_sent_s
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: 1.0),
+    )
+
+    with pytest.raises(SafetyAbort, match="last flight-command timestamp"):
+        asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
+@pytest.mark.parametrize("now_s", (True, math.nan, math.inf, -math.ulp(1.0)))
+def test_next_flight_command_slot_rejects_invalid_current_timestamp(
+    monkeypatch,
+    now_s,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: now_s),
+    )
+
+    with pytest.raises(SafetyAbort, match="current flight-command timestamp"):
+        asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
+def test_next_flight_command_slot_fails_closed_if_wait_returns_early(monkeypatch):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = 0.99
+
+    async def return_early(_seconds):
+        return None
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: 1.0),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=return_early),
+        )
+        with pytest.raises(SafetyAbort, match="pacing wait returned early"):
+            asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
+def test_next_flight_command_slot_fails_closed_on_monotonic_regression(
+    monkeypatch,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = 0.0
+    clock = iter((10.0, 1.0))
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(clock)),
+    )
+
+    with pytest.raises(SafetyAbort, match="pacing wait returned early"):
+        asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
+def test_gate0_stage_waits_for_prior_flight_command_slot_before_sampling(
+    monkeypatch,
+):
+    class SampleReached(Exception):
+        pass
+
+    clock = [1.0]
+    events = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._last_flight_command_sent_s = 0.99
+    context = vq2_module.StartContext(0.0, -0.31, 320, 180, 6400, 1000)
+
+    async def advance(seconds):
+        events.append(("sleep", seconds))
+        clock[0] += seconds
+
+    def sample():
+        events.append(("sample", clock[0]))
+        raise SampleReached
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        with pytest.raises(SampleReached):
+            asyncio.run(runner._run_gate0(context))
+
+    assert events[0][0] == "sleep"
+    assert events[0][1] == pytest.approx(0.01)
+    assert events[1][0] == "sample"
+    assert events[1][1] == pytest.approx(1.01)
+
+
+def test_course_gate_stage_waits_for_prior_flight_command_slot_before_sampling(
+    monkeypatch,
+):
+    class SampleReached(Exception):
+        pass
+
+    clock = [1.0]
+    events = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 1, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate()
+    runner._last_flight_command_sent_s = 0.99
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=1.0,
+        center_x=320,
+        center_y=180,
+        bbox=(280, 140, 80, 80),
+        confidence=0.8,
+    )
+    runner.tracker.consecutive = vq2_module.POST_GATE_REQUIRED_FRAMES
+
+    async def advance(seconds):
+        events.append(("sleep", seconds))
+        clock[0] += seconds
+
+    def sample():
+        events.append(("sample", clock[0]))
+        raise SampleReached
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        with pytest.raises(SampleReached):
+            asyncio.run(
+                runner._run_course_gate(
+                    1,
+                    acquisition={"initial_gate_area_px": 6400},
+                    lap_started_s=0.0,
+                    lap_deadline_s=5.0,
+                )
+            )
+
+    assert events[0][0] == "sleep"
+    assert events[0][1] == pytest.approx(0.01)
+    assert events[1][0] == "sample"
+    assert events[1][1] == pytest.approx(1.01)
+
+
+def test_gate0_phase_alignment_holds_bounded_exact_zero(monkeypatch):
+    clock = [1.0]
+    commands = []
+    watchdogs = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    adapter.latest_received_race_status = SimpleNamespace(
+        validate_integrity=lambda: None,
+        ingress=SimpleNamespace(received_monotonic_ns=1_000_000_000, sequence=7),
+        race_status=SimpleNamespace(sim_boot_time_ms=1000),
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+
+    async def capture(command, **_kwargs):
+        commands.append(command)
+
+    async def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+    monkeypatch.setattr(runner, "_watchdog", lambda **kwargs: watchdogs.append(kwargs))
+    monkeypatch.setattr(runner, "_send_flight_command", capture)
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    monkeypatch.setattr(vq2_module, "gate0_phase_alignment_delay_s", lambda **_kwargs: 0.05)
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock[0],
+                perf_counter_ns=lambda: round(clock[0] * 1_000_000_000),
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        result = asyncio.run(runner._align_gate0_race_phase())
+
+    assert result["applied"]
+    assert result["planned_delay_s"] == pytest.approx(0.05)
+    assert result["actual_delay_s"] == pytest.approx(0.05)
+    assert result["command_count"] == len(commands) == 3
+    assert all(command == AttitudeRateCommand(0.0, 0.0, 0.0, 0.0) for command in commands)
+    assert all(item["require_target"] for item in watchdogs)
+
+
+def test_course_crossing_area_cap_is_attainable_from_observed_gate1_scale():
+    target = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=1.0,
+        center_x=320,
+        center_y=180,
+        bbox=(45, 0, 550, 360),
+        confidence=0.8,
+    )
+    assert 25 * (117 * 92) > 640 * 360
+    assert vq2_module.is_course_gate_crossing_candidate(
+        target,
+        acquisition_gate_area=117 * 92,
+        control_y=180.0,
+    )
+
+
+def test_untracked_contact_guard_selects_the_live_collision_precursor_only():
+    precursor = _detection(229, 90, 183, 151)
+    harmless = _detection(232, 262, 66, 95)
+    assert vq2_module.COURSE_UNTRACKED_CONTACT_MIN_AREA_PX == 23_040
+    assert vq2_module.COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX == 160
+    assert vq2_module.COURSE_UNTRACKED_CONTACT_MIN_HEIGHT_PX == 120
+    assert (
+        vq2_module.select_untracked_contact_risk(
+            [harmless, precursor],
+            accepted_target=None,
+        )
+        is precursor
+    )
+
+    accepted = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=1.0,
+        center_x=320,
+        center_y=180,
+        bbox=(229, 90, 183, 151),
+        confidence=0.8,
+    )
+    assert (
+        vq2_module.select_untracked_contact_risk(
+            [precursor],
+            accepted_target=accepted,
+        )
+        is None
+    )
+    assert (
+        vq2_module.select_untracked_contact_risk(
+            [_detection(229, 90, 159, 151)],
+            accepted_target=None,
+        )
+        is None
+    )
+    masking_non_risk = _detection(200, 80, 159, 180)
+    assert masking_non_risk.area > precursor.area
+    assert (
+        vq2_module.select_untracked_contact_risk(
+            [masking_non_risk, precursor],
+            accepted_target=None,
+        )
+        is precursor
+    )
+    with pytest.raises(ValueError, match="exact 640x360"):
+        vq2_module.select_untracked_contact_risk(
+            [precursor],
+            accepted_target=None,
+            image_width=641,
+        )
+
+
+def test_course_gate_aborts_large_current_raw_detection_rejected_by_tracker(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1_000, 0, -1, 1, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=-0.40, pitch=-0.40)
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=10,
+        sim_time_ns=10,
+        received_monotonic_s=0.90,
+        center_x=629,
+        center_y=73,
+        bbox=(618, 48, 22, 51),
+        confidence=0.8,
+    )
+    runner.tracker.consecutive = 3
+    runner._latest_raw_detections = [_detection(229, 90, 183, 151)]
+    runner._latest_accepted_target = None
+    runner._latest_detection_frame_id = 11
+    runner._latest_detection_frame_sim_ns = 11
+    runner._latest_detection_generation = 1
+    runner._latest_detection_received_s = 1.0
+
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: 1.0)
+
+    with pytest.raises(SafetyAbort, match="large untracked gate geometry at gate 1"):
+        asyncio.run(
+            runner._run_course_gate(
+                1,
+                acquisition={"initial_gate_area_px": 9_000},
+                lap_started_s=0.0,
+                lap_deadline_s=5.0,
+            )
+        )
+    assert adapter.commands == []
+
+
+def test_course_gate_aborts_if_vision_generation_changes(monkeypatch):
+    clock = [1.0]
+    samples = [0]
+    commands = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1_000, 0, -1, 1, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=-0.10, pitch=-0.20)
+    target = vq2_module.GateTarget(
+        frame_id=10,
+        sim_time_ns=10,
+        received_monotonic_s=0.95,
+        center_x=320,
+        center_y=180,
+        bbox=(270, 130, 100, 100),
+        confidence=0.8,
+    )
+    runner.tracker.target = target
+    runner.tracker.consecutive = 3
+    runner._latest_detection_generation = 1
+    runner._latest_detection_frame_id = target.frame_id
+    runner._latest_detection_frame_sim_ns = target.sim_time_ns
+    runner._latest_detection_received_s = target.received_monotonic_s
+    runner._latest_accepted_target = target
+
+    def sample():
+        samples[0] += 1
+        if samples[0] == 2:
+            runner._latest_detection_generation = 2
+
+    async def capture(command, **_kwargs):
+        commands.append(command)
+
+    async def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture)
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        with pytest.raises(
+            SafetyAbort,
+            match="vision generation changed during course gate",
+        ):
+            asyncio.run(
+                runner._run_course_gate(
+                    1,
+                    acquisition={"initial_gate_area_px": 10_000},
+                    lap_started_s=0.0,
+                    lap_deadline_s=5.0,
+                )
+            )
+    assert samples[0] == 2
+    assert len(commands) == 1
+
+
+@pytest.mark.parametrize(
+    ("normalized_x", "recenter"),
+    (
+        (True, True),
+        (math.nan, True),
+        (math.inf, True),
+        (0.0, 1),
+    ),
+)
+def test_course_gate_roll_target_rejects_nonfinite_or_untyped_inputs(
+    normalized_x,
+    recenter,
+):
+    with pytest.raises(ValueError, match="course roll target inputs"):
+        vq2_module.course_gate_roll_target(
+            normalized_x,
+            recenter=recenter,
+        )
+
+
+def test_course_gate_roll_target_counter_rotates_then_banks_toward_gate():
+    assert vq2_module.course_gate_roll_target(0.25, recenter=True) < 0.0
+    assert vq2_module.course_gate_roll_target(-0.25, recenter=True) > 0.0
+    assert vq2_module.course_gate_roll_target(0.25, recenter=False) > 0.0
+    assert vq2_module.course_gate_roll_target(-0.25, recenter=False) < 0.0
+    assert vq2_module.course_gate_roll_target(0.0, recenter=True) == 0.0
+    assert vq2_module.course_gate_roll_target(0.0, recenter=False) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("recenter", "limit"),
+    ((True, 0.41), (False, 0.16)),
+    ids=("recenter", "approach"),
+)
+def test_course_gate_roll_target_uses_phase_specific_symmetric_clamps(
+    recenter,
+    limit,
+):
+    assert vq2_module.COURSE_ROLL_GAIN == 0.25
+    assert vq2_module.COURSE_RECENTER_ROLL_GAIN == 0.80
+    assert vq2_module.COURSE_RECENTER_ROLL_LIMIT_RAD == 0.41
+    assert vq2_module.COURSE_APPROACH_ROLL_LIMIT_RAD == 0.16
+    expected_sign = -1.0 if recenter else 1.0
+    assert (
+        vq2_module.course_gate_roll_target(10.0, recenter=recenter)
+        == expected_sign * limit
+    )
+    assert (
+        vq2_module.course_gate_roll_target(-10.0, recenter=recenter)
+        == -expected_sign * limit
+    )
+
+
+def test_course_gate_recenter_pitch_uses_empirical_flight_sign_and_preserves_center():
+    assert vq2_module.COURSE_RECENTER_PITCH_GAIN == 0.80
+    assert vq2_module.COURSE_RECENTER_MIN_PITCH_RAD == -0.55
+    assert vq2_module.COURSE_RECENTER_MIN_PITCH_RAD > vq2_module.MIN_PITCH_RAD
+    assert vq2_module.course_gate_recenter_pitch_target(-0.05, 180.0) == -0.05
+    assert vq2_module.course_gate_recenter_pitch_target(
+        -0.05,
+        60.0,
+    ) == pytest.approx(-0.55)
+    assert vq2_module.course_gate_recenter_pitch_target(
+        -0.05,
+        80.0,
+    ) == pytest.approx(-0.49444444444444446)
+    assert vq2_module.course_gate_recenter_pitch_target(
+        -0.05,
+        300.0,
+    ) == pytest.approx(0.10)
+
+
+@pytest.mark.parametrize(
+    ("entry_pitch", "control_y"),
+    ((True, 180.0), (math.nan, 180.0), (0.0, True), (0.0, math.inf)),
+)
+def test_course_gate_recenter_pitch_rejects_invalid_inputs(entry_pitch, control_y):
+    with pytest.raises(ValueError, match="recenter pitch inputs"):
+        vq2_module.course_gate_recenter_pitch_target(entry_pitch, control_y)
+
+
+@pytest.mark.parametrize(
+    ("elapsed_s", "normalized_x", "control_y"),
+    (
+        (True, 0.0, 100.0),
+        (math.nan, 0.0, 100.0),
+        (-math.ulp(1.0), 0.0, 100.0),
+        (0.0, True, 100.0),
+        (0.0, math.inf, 100.0),
+        (0.0, 0.0, True),
+        (0.0, 0.0, math.nan),
+    ),
+)
+def test_course_gate_recenter_required_rejects_invalid_inputs(
+    elapsed_s,
+    normalized_x,
+    control_y,
+):
+    with pytest.raises(ValueError, match="course recenter inputs"):
+        vq2_module.course_gate_recenter_required(
+            elapsed_s,
+            normalized_x,
+            control_y,
+        )
+
+
+@pytest.mark.parametrize(
+    ("elapsed_s", "normalized_x", "control_y"),
+    (
+        (math.nextafter(0.60, 0.0), 0.35, 100.0),
+        (0.60, math.nextafter(0.35, math.inf), 100.0),
+        (0.60, -math.nextafter(0.35, math.inf), 100.0),
+        (0.60, 0.35, math.nextafter(100.0, 0.0)),
+    ),
+    ids=("minimum-dwell", "right-error", "left-error", "gate-high"),
+)
+def test_course_gate_recenter_required_retains_braking_outside_corridor(
+    elapsed_s,
+    normalized_x,
+    control_y,
+):
+    assert vq2_module.course_gate_recenter_required(
+        elapsed_s,
+        normalized_x,
+        control_y,
+    )
+
+
+@pytest.mark.parametrize("normalized_x", (0.35, -0.35))
+def test_course_gate_recenter_releases_at_exact_safe_boundaries(normalized_x):
+    assert vq2_module.COURSE_RECENTER_DURATION_S == 0.60
+    assert vq2_module.COURSE_RECENTER_MAX_NORMALIZED_X == 0.35
+    assert vq2_module.COURSE_HIGH_GATE_Y_PX == 100.0
+    assert not vq2_module.course_gate_recenter_required(
+        0.60,
+        normalized_x,
+        100.0,
+    )
+
+
+def test_course_recenter_rate_limit_preserves_zero_yaw_and_thrust():
+    assert vq2_module.COURSE_RECENTER_MAX_RATE_RAD_S == 0.25
+    limited = vq2_module.limit_command_rates(
+        AttitudeRateCommand(0.30, -0.30, 0.0, 0.30),
+        vq2_module.COURSE_RECENTER_MAX_RATE_RAD_S,
+    )
+    assert limited == AttitudeRateCommand(
+        0.25,
+        -0.25,
+        0.0,
+        0.30,
+    )
+
+
+def test_course_recenter_rate_boost_reaches_clamp_without_changing_thrust():
+    assert vq2_module.COURSE_RECENTER_ROLL_RATE_SCALE == 1.60
+    assert vq2_module.COURSE_RECENTER_PITCH_RATE_SCALE == 1.60
+    boosted = vq2_module.course_recenter_rate_command(
+        AttitudeRateCommand(0.20, -0.11, 0.0, 0.35),
+    )
+    assert boosted.roll_rate == pytest.approx(0.25)
+    assert boosted.pitch_rate == pytest.approx(-0.176)
+    assert boosted.yaw_rate == 0.0
+    assert boosted.thrust == 0.35
+
+    clamped = vq2_module.course_recenter_rate_command(
+        AttitudeRateCommand(0.10, -0.20, 0.0, 0.35),
+    )
+    assert clamped.roll_rate == pytest.approx(0.16)
+    assert clamped.pitch_rate == pytest.approx(-0.25)
+    assert clamped.yaw_rate == 0.0
+    assert clamped.thrust == 0.35
+
+
+def test_official_lap_time_uses_finish_ns_minus_start_ms():
+    race = RaceStatus(
+        sim_boot_time_ms=16_000,
+        race_start_boot_time_ms=3_300,
+        race_finish_time_ns=15_800_000_000,
+        active_gate_index=5,
+        last_gate_race_time=12_000_000_000,
+    )
+    assert VQ2Runner._official_lap_time_s(race) == pytest.approx(12.5)
 
 
 @pytest.mark.parametrize(
@@ -543,6 +1878,567 @@ class _FakeAdapter:
         collisions = self.collisions
         self.collisions = []
         return collisions
+
+
+@pytest.mark.parametrize(
+    "minimum_thrust",
+    (True, math.nan, 0.20, math.nextafter(0.32, math.inf)),
+)
+def test_gate0_minimum_thrust_rejects_invalid_bounds_before_sampling(
+    monkeypatch,
+    minimum_thrust,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid minimum thrust reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="minimum.*thrust"):
+        asyncio.run(
+            runner._run_gate0(context, minimum_thrust=minimum_thrust)
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    "boost_until_s",
+    (
+        True,
+        math.nan,
+        math.nextafter(0.45, 0.0),
+        math.nextafter(1.0, math.inf),
+    ),
+)
+def test_gate0_boost_duration_rejects_invalid_bounds_before_sampling(
+    monkeypatch,
+    boost_until_s,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid boost duration reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="boost.*duration"):
+        asyncio.run(
+            runner._run_gate0(context, boost_until_s=boost_until_s)
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    "close_thrust_floor",
+    (True, math.nan, 0.20, math.nextafter(0.32, math.inf)),
+)
+def test_gate0_close_thrust_floor_rejects_invalid_bounds_before_sampling(
+    monkeypatch,
+    close_thrust_floor,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid close thrust floor reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="close.*thrust.*floor"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                close_thrust_floor=close_thrust_floor,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize("observe_course_line", (None, 0, 1, 0.0, "true"))
+def test_gate0_course_line_observation_rejects_non_bool_before_sampling(
+    monkeypatch,
+    observe_course_line,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid observation option reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="course.*line.*observation"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                observe_course_line=observe_course_line,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize("course_line_preturn", (None, 0, 1, 0.0, "true"))
+def test_gate0_course_line_preturn_rejects_non_bool_before_sampling(
+    monkeypatch,
+    course_line_preturn,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid preturn option reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="preturn"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                course_line_preturn=course_line_preturn,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    "course_line_exit_counterroll_enabled",
+    (None, 0, 1, 0.0, "true"),
+)
+def test_gate0_course_line_exit_counterroll_rejects_non_bool_before_sampling(
+    monkeypatch,
+    course_line_exit_counterroll_enabled,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid counter-roll option reached flight sampling"),
+    )
+
+    with pytest.raises(ValueError, match="exit-counterroll flag"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                course_line_exit_counterroll_enabled=(
+                    course_line_exit_counterroll_enabled
+                ),
+            )
+        )
+
+    assert adapter.commands == []
+
+
+def test_gate0_course_line_exit_counterroll_requires_preturn_before_sampling(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        lambda: pytest.fail("invalid counter-roll combination reached sampling"),
+    )
+
+    with pytest.raises(ValueError, match="requires preturn"):
+        asyncio.run(
+            runner._run_gate0(
+                context,
+                course_line_exit_counterroll_enabled=True,
+            )
+        )
+
+    assert adapter.commands == []
+
+
+@pytest.mark.parametrize(
+    (
+        "target_bbox",
+        "target_center_x",
+        "turn_score",
+        "prove_before_exit",
+        "dip_after_exit",
+        "exit_counterroll",
+        "expected_rolls",
+    ),
+    (
+        (
+            (240, 130, 160, 100),
+            320,
+            0.20,
+            False,
+            False,
+            False,
+            (0.0, 0.0, 0.13, 0.13, 0.13, 0.0),
+        ),
+        (
+            (192, 80, 256, 200),
+            320,
+            0.20,
+            False,
+            False,
+            False,
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        ),
+        (
+            (240, 110, 160, 140),
+            320,
+            0.20,
+            True,
+            False,
+            True,
+            (0.0, 0.0, 0.13, -0.08, -0.08, -0.08),
+        ),
+        (
+            (220, 100, 200, 160),
+            320,
+            0.20,
+            True,
+            False,
+            False,
+            (0.0, 0.0, 0.13, 0.13, 0.13, 0.0),
+        ),
+        (
+            (220, 100, 200, 160),
+            320,
+            0.20,
+            False,
+            False,
+            True,
+            (0.0, 0.0, 0.13, 0.13, 0.13, 0.0),
+        ),
+        (
+            (220, 100, 200, 160),
+            320,
+            -0.20,
+            True,
+            False,
+            True,
+            (0.0, 0.0, -0.13, 0.08, 0.08, 0.08),
+        ),
+        (
+            (192, 80, 256, 200),
+            288,
+            0.20,
+            True,
+            False,
+            True,
+            (0.015, 0.015, 0.13, 0.015, 0.015, 0.015),
+        ),
+        (
+            (220, 100, 200, 160),
+            320,
+            0.20,
+            True,
+            True,
+            True,
+            (0.0, 0.0, 0.13, -0.08, -0.08, -0.08),
+        ),
+    ),
+    ids=(
+        "stable-cue",
+        "close-range-taper",
+        "exact-three-point-five-x-exit-counterroll",
+        "counterroll-disabled",
+        "no-pre-onset-proof",
+        "mirrored-exit-counterroll",
+        "wrong-side-retains-centering",
+        "latched-across-area-dip",
+    ),
+)
+def test_gate0_course_line_preturn_requires_fresh_streak_and_tapers_close(
+    monkeypatch,
+    target_bbox,
+    target_center_x,
+    turn_score,
+    prove_before_exit,
+    dip_after_exit,
+    exit_counterroll,
+    expected_rolls,
+):
+    class CommandsCaptured(Exception):
+        pass
+
+    clock = [0.0]
+    sample_count = [0]
+    target_rolls = []
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate(roll=0.0)
+    runner._latest_detection_image = object()
+    context = vq2_module.StartContext(0.0, -0.31, 320, 180, 6400, 1000)
+
+    def sample():
+        sample_count[0] += 1
+        frame_id = min(sample_count[0], 3)
+        active_bbox = target_bbox
+        if prove_before_exit and sample_count[0] <= 3:
+            active_bbox = (240, 130, 160, 100)
+        elif dip_after_exit and sample_count[0] >= 5:
+            active_bbox = (240, 130, 160, 100)
+        runner.tracker.target = vq2_module.GateTarget(
+            frame_id=frame_id,
+            sim_time_ns=frame_id,
+            received_monotonic_s=clock[0],
+            center_x=target_center_x,
+            center_y=180,
+            bbox=active_bbox,
+            confidence=0.8,
+        )
+        runner.tracker.consecutive = 3
+
+    def capture_target_roll(
+        _estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        del target_pitch_rad
+        target_rolls.append(target_roll_rad)
+        return AttitudeRateCommand(0.0, 0.0, 0.0, thrust)
+
+    async def capture_command(_command, **_kwargs):
+        if len(target_rolls) == 6:
+            raise CommandsCaptured
+
+    async def advance_clock(_seconds):
+        clock[0] += 0.10
+
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+    monkeypatch.setattr(vq2_module, "attitude_rate_command", capture_target_roll)
+    monkeypatch.setattr(
+        vq2_module,
+        "cyan_course_line_observation",
+        lambda _image: vq2_module.CourseLineObservation(
+            turn_score=turn_score,
+            upper_center_x=384.0,
+            lower_center_x=320.0,
+            upper_pixel_count=136,
+            lower_pixel_count=136,
+        ),
+    )
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance_clock),
+        )
+        with pytest.raises(CommandsCaptured):
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=exit_counterroll,
+                )
+            )
+
+    assert vq2_module.COURSE_LINE_PRETURN_REQUIRED_FRAMES == 3
+    assert vq2_module.COURSE_LINE_PRETURN_MAX_AGE_S == 0.25
+    assert vq2_module.COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE == 1.30
+    assert vq2_module.COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE == 3.5
+    assert vq2_module.COURSE_LINE_PRETURN_TAPER_AREA_SCALE == 8.0
+    assert target_rolls == pytest.approx(expected_rolls)
+
+
+def _capture_first_gate0_thrust(
+    monkeypatch,
+    *,
+    elapsed_s,
+    minimum_thrust=0.21,
+    boost_until_s=0.45,
+    close_thrust_floor=0.21,
+    pd_thrust=0.21,
+    target_bbox=(282, 134, 80, 80),
+    control_y=None,
+):
+    class CommandCaptured(Exception):
+        pass
+
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner.estimate = _estimate()
+    x, y, width, height = target_bbox
+    runner.tracker.target = vq2_module.GateTarget(
+        frame_id=1,
+        sim_time_ns=1,
+        received_monotonic_s=float(elapsed_s),
+        center_x=x + width // 2,
+        center_y=(y + height // 2 if control_y is None else control_y),
+        bbox=target_bbox,
+        confidence=0.8,
+    )
+    runner.tracker.consecutive = 3
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+    clock = iter((0.0, float(elapsed_s)))
+    commands = []
+
+    async def capture_command(command, **_kwargs):
+        commands.append(command)
+        raise CommandCaptured
+
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        vq2_module,
+        "gate_vertical_thrust",
+        lambda *_args: float(pd_thrust),
+    )
+    monkeypatch.setattr(runner, "_send_flight_command", capture_command)
+
+    async def capture_first_command():
+        # Replace only the runner module's binding. Mutating Python's shared
+        # time module would also consume this finite clock inside asyncio.
+        with monkeypatch.context() as clock_patch:
+            clock_patch.setattr(
+                vq2_module,
+                "time",
+                SimpleNamespace(monotonic=lambda: next(clock)),
+            )
+            await runner._run_gate0(
+                context,
+                minimum_thrust=minimum_thrust,
+                boost_until_s=boost_until_s,
+                close_thrust_floor=close_thrust_floor,
+            )
+
+    with pytest.raises(CommandCaptured):
+        asyncio.run(capture_first_command())
+
+    assert len(commands) == 1
+    return commands[0].thrust
+
+
+@pytest.mark.parametrize(
+    ("minimum_thrust", "expected_thrust"),
+    ((0.21, 0.21), (0.25, 0.25)),
+    ids=("legacy-floor", "configured-floor"),
+)
+def test_gate0_minimum_thrust_applies_only_after_boost_schedule(
+    monkeypatch,
+    minimum_thrust,
+    expected_thrust,
+):
+    assert _capture_first_gate0_thrust(
+        monkeypatch,
+        elapsed_s=0.5,
+        minimum_thrust=minimum_thrust,
+    ) == expected_thrust
+
+
+@pytest.mark.parametrize(
+    ("elapsed_s", "expected_thrust"),
+    (
+        (math.nextafter(0.80, 0.0), 0.32),
+        (0.80, 0.23),
+    ),
+    ids=("before-boundary-boost", "at-boundary-pd"),
+)
+def test_gate0_extended_boost_switches_to_pixel_pd_at_exact_boundary(
+    monkeypatch,
+    elapsed_s,
+    expected_thrust,
+):
+    assert vq2_module.COURSE_GATE0_BOOST_UNTIL_S == 0.80
+    assert _capture_first_gate0_thrust(
+        monkeypatch,
+        elapsed_s=elapsed_s,
+        boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+        pd_thrust=0.23,
+    ) == expected_thrust
+
+
+@pytest.mark.parametrize(
+    ("elapsed_s", "target_bbox", "expected_thrust"),
+    (
+        (
+            math.nextafter(0.80, 0.0),
+            (192, 80, 256, 200),
+            0.32,
+        ),
+        (0.80, (192, 80, 255, 200), 0.23),
+        (0.80, (192, 80, 256, 200), 0.30),
+    ),
+    ids=("boost-precedes-floor", "below-eight-times", "at-eight-times"),
+)
+def test_gate0_close_floor_applies_only_after_boost_at_eight_times_area(
+    monkeypatch,
+    elapsed_s,
+    target_bbox,
+    expected_thrust,
+):
+    target_area = target_bbox[2] * target_bbox[3]
+    if target_bbox[2] == 255:
+        assert target_area < 8 * 6400
+    else:
+        assert target_area == 8 * 6400
+    assert _capture_first_gate0_thrust(
+        monkeypatch,
+        elapsed_s=elapsed_s,
+        boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+        close_thrust_floor=vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR,
+        pd_thrust=0.23,
+        target_bbox=target_bbox,
+    ) == expected_thrust
+
+
+@pytest.mark.parametrize(
+    ("control_y", "expected_thrust"),
+    (
+        (190.0, 0.30),
+        (math.nextafter(190.0, math.inf), 0.23),
+    ),
+    ids=("at-control-row-limit", "beyond-control-row-limit"),
+)
+def test_gate0_close_floor_respects_exact_vertical_corridor_limit(
+    monkeypatch,
+    control_y,
+    expected_thrust,
+):
+    assert vq2_module.COURSE_GATE0_CLOSE_FLOOR_MAX_CONTROL_Y_PX == 190.0
+    assert _capture_first_gate0_thrust(
+        monkeypatch,
+        elapsed_s=0.80,
+        boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+        close_thrust_floor=vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR,
+        pd_thrust=0.23,
+        target_bbox=(192, 80, 256, 200),
+        control_y=control_y,
+    ) == expected_thrust
 
 
 def test_post_pass_sampling_filters_residue_before_tracker_selection():
@@ -1738,12 +3634,28 @@ def test_gate0_confirmation_cuts_thrust_then_uses_new_race_packet(
         go_boot_ms=1000,
     )
     if expected_reason is None:
-        result = asyncio.run(runner._run_gate0(context))
+        result = asyncio.run(
+            runner._run_gate0(
+                context,
+                boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+                close_thrust_floor=(
+                    vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR
+                ),
+            )
+        )
         assert result["gate0_passed"]
         assert result["crossing_confirmation_used"]
     else:
         with pytest.raises(SafetyAbort, match=expected_reason):
-            asyncio.run(runner._run_gate0(context))
+            asyncio.run(
+                runner._run_gate0(
+                    context,
+                    boost_until_s=vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+                    close_thrust_floor=(
+                        vq2_module.COURSE_GATE0_CLOSE_THRUST_FLOOR
+                    ),
+                )
+            )
 
     first_zero = next(
         index
@@ -2303,6 +4215,161 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
 
     assert result.success
     assert result.details == {"gate0_passed": True}
+
+
+def test_full_lap_stage_uses_normal_powered_lifecycle_and_cleanup(monkeypatch):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    calls = []
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+    details = {
+        "race_finished": True,
+        "official_lap_time_s": 12.5,
+        "proved_transition_count": 6,
+    }
+
+    async def establish(**_kwargs):
+        calls.append("reset")
+
+    async def normalize():
+        calls.append("normalize")
+
+    async def wait_for_go():
+        calls.append("go")
+        return context
+
+    async def arm():
+        calls.append("arm")
+
+    async def full_lap(observed_context):
+        calls.append(("full-lap", observed_context is context))
+        return details
+
+    async def cleanup():
+        calls.append("cleanup")
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", establish)
+    monkeypatch.setattr(runner, "normalize_disarmed", normalize)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", arm)
+    monkeypatch.setattr(runner, "_run_full_lap", full_lap)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(
+        runner.run_powered_stage("full-lap", write_diagnostic_pngs=False)
+    )
+
+    assert result.success
+    assert result.cleanup_confirmed
+    assert result.details is details
+    assert calls == [
+        "reset",
+        "normalize",
+        "go",
+        "arm",
+        ("full-lap", True),
+        "cleanup",
+    ]
+
+
+def test_full_lap_rejects_anomalous_gate_reference_before_arm(monkeypatch):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    calls = []
+
+    async def establish(**_kwargs):
+        calls.append("reset")
+
+    async def normalize():
+        calls.append("normalize")
+
+    async def wait_for_go():
+        calls.append("go")
+        return vq2_module.StartContext(0.0, -0.31, 322, 185, 4_720, 1000)
+
+    async def arm():
+        calls.append("arm")
+
+    async def cleanup():
+        calls.append("cleanup")
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", establish)
+    monkeypatch.setattr(runner, "normalize_disarmed", normalize)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", arm)
+    monkeypatch.setattr(runner, "safe_cleanup", cleanup)
+
+    result = asyncio.run(
+        runner.run_powered_stage("full-lap", write_diagnostic_pngs=False)
+    )
+
+    assert not result.success
+    assert result.cleanup_confirmed
+    assert "outside proved spawn area envelope (4720px)" in result.reason
+    assert calls == ["reset", "normalize", "go", "cleanup"]
+
+
+def test_full_lap_wires_stable_high_authority_preturn_and_default_close_floor(
+    monkeypatch,
+):
+    class Gate0Observed(Exception):
+        pass
+
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    context = vq2_module.StartContext(0.0, -0.31, 322, 174, 6400, 1000)
+    observed = []
+
+    async def gate0(
+        observed_context,
+        *,
+        capture_transition=False,
+        exit_pitch_rad=0.0,
+        minimum_thrust=0.21,
+        boost_until_s=0.45,
+        close_thrust_floor=0.21,
+        observe_course_line=False,
+        course_line_preturn=False,
+        course_line_exit_counterroll_enabled=False,
+    ):
+        observed.append(
+            (
+                observed_context,
+                capture_transition,
+                exit_pitch_rad,
+                minimum_thrust,
+                boost_until_s,
+                close_thrust_floor,
+                observe_course_line,
+                course_line_preturn,
+                course_line_exit_counterroll_enabled,
+            )
+        )
+        raise Gate0Observed
+
+    monkeypatch.setattr(runner, "_run_gate0", gate0)
+
+    with pytest.raises(Gate0Observed):
+        asyncio.run(runner._run_full_lap(context))
+
+    assert observed == [
+        (
+            context,
+            False,
+            vq2_module.COURSE_GATE0_EXIT_PITCH_RAD,
+            vq2_module.COURSE_GATE0_MIN_THRUST,
+            vq2_module.COURSE_GATE0_BOOST_UNTIL_S,
+            0.21,
+            True,
+            True,
+            True,
+        )
+    ]
+    assert vq2_module.COURSE_GATE0_MIN_THRUST == 0.21
+    assert vq2_module.COURSE_GATE0_BOOST_UNTIL_S == 0.80
 
 
 def test_passive_preflight_requires_the_requested_continuous_healthy_dwell(

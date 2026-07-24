@@ -6,6 +6,7 @@ This is the default loop for rapid FlightSim build-3385 Training iteration:
 .\scripts\dev.cmd test-target tests/test_aigp_vq2_fast_cycle.py tests/test_aigp_vq2_runner.py
 .\scripts\dev.cmd test-vq2
 .\scripts\dev.cmd flight-cycle
+.\scripts\dev.cmd flight-cycle full-lap
 ```
 
 `flight-cycle` defaults to `calibration-excite`; a different bounded stage may
@@ -14,6 +15,12 @@ generic test, and it never prompts for interactive confirmation. Invocation
 asserts that an existing direct user instruction authorizes that powered stage
 or a continuing scoped iteration; the command itself is not proof of
 authorization.
+
+The available stages are `sign-id`, `hover`, `gate0`, `gate0-observe`,
+`full-lap`, and `calibration-excite`. The `full-lap` stage advances only through
+strict, fresh race-status gate transitions. A lap is complete only when the
+authoritative race status reports `race_finished` (`race_finish_time_ns >= 0`);
+vision or an active-gate index alone never declares completion.
 
 ## What happens before flight
 

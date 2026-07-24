@@ -120,6 +120,57 @@ CROSSING_STATUS_TIMEOUT_S = 0.40
 CROSSING_MIN_AREA_RATIO = 25.0
 CROSSING_MIN_WIDTH_PX = 512
 GATE0_FLIGHT_TIMEOUT_S = 5.0
+GATE0_PITCH_BLEND_S = 0.8
+
+FULL_LAP_STAGE = "full-lap"
+FULL_LAP_TIMEOUT_S = 45.0
+FULL_LAP_MAX_GATE_INDEX = 15
+FULL_LAP_INITIAL_GATE_MIN_AREA_PX = 6_000
+FULL_LAP_INITIAL_GATE_MAX_AREA_PX = 8_000
+COURSE_GATE_TIMEOUT_S = 8.0
+COURSE_RECENTER_DURATION_S = 0.60
+COURSE_RECENTER_MAX_NORMALIZED_X = 0.35
+COURSE_APPROACH_PITCH_RAD = -0.20
+COURSE_CROSSING_AREA_CAP_PX = int(0.70 * 640 * 360)
+COURSE_RECENTER_MAX_RATE_RAD_S = 0.25
+COURSE_ROLL_GAIN = 0.25
+COURSE_RECENTER_ROLL_GAIN = 0.80
+COURSE_RECENTER_ROLL_LIMIT_RAD = 0.41
+COURSE_RECENTER_ROLL_RATE_SCALE = 1.60
+COURSE_RECENTER_PITCH_RATE_SCALE = 1.60
+COURSE_APPROACH_ROLL_LIMIT_RAD = 0.16
+COURSE_RECENTER_PITCH_GAIN = 0.80
+COURSE_RECENTER_MIN_PITCH_RAD = -0.55
+COURSE_RECENTER_MAX_PITCH_RAD = 0.10
+COURSE_TRANSITION_THRUST = 0.35
+COURSE_RECENTER_THRUST = 0.35
+COURSE_HIGH_GATE_Y_PX = 100.0
+COURSE_GATE0_EXIT_PITCH_RAD = 0.0
+COURSE_GATE0_BOOST_UNTIL_S = 0.80
+COURSE_GATE0_MIN_THRUST = 0.21
+COURSE_GATE0_EXPECTED_TARGET_LOSS_S = 2.50
+COURSE_RACE_PACKET_PERIOD_S = 0.250
+COURSE_RACE_PACKET_TARGET_LEAD_S = 0.060
+COURSE_GATE0_CLOSE_THRUST_FLOOR = 0.30
+COURSE_GATE0_CLOSE_FLOOR_MAX_CONTROL_Y_PX = 190.0
+COURSE_LINE_MIN_ROI_PIXELS = 128
+COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE = 1.30
+COURSE_LINE_PRETURN_MIN_SCORE = 0.04
+COURSE_LINE_PRETURN_GAIN = 0.80
+COURSE_LINE_PRETURN_LIMIT_RAD = 0.13
+COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE = 3.5
+COURSE_LINE_EXIT_COUNTERROLL_RAD = 0.08
+COURSE_LINE_PRETURN_TAPER_AREA_SCALE = 8.0
+COURSE_LINE_PRETURN_REQUIRED_FRAMES = 3
+COURSE_LINE_PRETURN_MAX_AGE_S = 0.25
+COURSE_EDGE_CONTINUATION_MARGIN_PX = 2
+COURSE_EDGE_CONTINUATION_MAX_ASPECT_RATIO = 2.60
+COURSE_FRAGMENT_UNION_MAX_ASPECT_RATIO = 1.45
+COURSE_FRAGMENT_UNION_RIGHT_EDGE_MAX_ASPECT_RATIO = 1.48
+COURSE_FRAGMENT_UNION_MIN_IOU = 0.75
+COURSE_UNTRACKED_CONTACT_MIN_AREA_PX = int(0.10 * 640 * 360)
+COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX = 160
+COURSE_UNTRACKED_CONTACT_MIN_HEIGHT_PX = 120
 
 POST_GATE_OBSERVATION_TIMEOUT_S = 0.20
 POST_GATE_REQUIRED_FRAMES = 3
@@ -5826,6 +5877,7 @@ class GateTarget:
     center_y: int
     bbox: Tuple[int, int, int, int]
     confidence: float
+    composite: bool = False
 
     @property
     def bbox_area(self) -> int:
@@ -5834,6 +5886,16 @@ class GateTarget:
     def age_s(self, now: Optional[float] = None) -> float:
         current = time.monotonic() if now is None else float(now)
         return max(0.0, current - self.received_monotonic_s)
+
+
+@dataclass(frozen=True)
+class GateFragmentUnion:
+    upper: GateDetection
+    lower: GateDetection
+    bbox: Tuple[int, int, int, int]
+    center_x: int
+    center_y: int
+    confidence: float
 
 
 @dataclass(frozen=True)
@@ -5876,6 +5938,17 @@ class GateTransitionProof:
 
 
 @dataclass(frozen=True)
+class CourseLineObservation:
+    """Pixel-space direction of the cyan racing line across two image bands."""
+
+    turn_score: float
+    upper_center_x: float
+    lower_center_x: float
+    upper_pixel_count: int
+    lower_pixel_count: int
+
+
+@dataclass(frozen=True)
 class StageResult:
     stage: str
     success: bool
@@ -5907,6 +5980,99 @@ def clock_within_epoch_envelope(
     return int(current_value) <= maximum
 
 
+def cyan_course_line_observation(image: Any) -> Optional[CourseLineObservation]:
+    """Measure a turn cue from the build-3385 cyan racing line."""
+
+    shape = getattr(image, "shape", None)
+    if shape is None or len(shape) != 3 or tuple(shape[:2]) != (360, 640):
+        return None
+    try:
+        import cv2
+        import numpy as np
+
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(
+            hsv,
+            np.array((85, 50, 40), dtype=np.uint8),
+            np.array((105, 255, 255), dtype=np.uint8),
+        )
+        mask[:115, :] = 0
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            np.ones((3, 3), dtype=np.uint8),
+        )
+        component_count, labels, stats, _centroids = (
+            cv2.connectedComponentsWithStats(mask, connectivity=8)
+        )
+        retained = np.zeros_like(mask)
+        for label in range(1, component_count):
+            if int(stats[label, cv2.CC_STAT_AREA]) >= 8:
+                retained[labels == label] = 255
+        mask = retained
+    except (ImportError, TypeError, ValueError):
+        return None
+
+    def band_center(y0: int, y1: int) -> Tuple[float, int]:
+        _ys, xs = np.nonzero(mask[y0:y1, :])
+        count = int(xs.size)
+        return (float(xs.mean()) if count else math.nan, count)
+
+    upper_x, upper_count = band_center(115, 145)
+    lower_x, lower_count = band_center(145, 180)
+    if (
+        upper_count < COURSE_LINE_MIN_ROI_PIXELS
+        or lower_count < COURSE_LINE_MIN_ROI_PIXELS
+    ):
+        return None
+    score = max(-1.0, min(1.0, (upper_x - lower_x) / 320.0))
+    return CourseLineObservation(
+        turn_score=score,
+        upper_center_x=upper_x,
+        lower_center_x=lower_x,
+        upper_pixel_count=upper_count,
+        lower_pixel_count=lower_count,
+    )
+
+
+def course_line_preturn_roll(turn_score: float) -> float:
+    """Convert a proved cyan-line direction into a small Gate-0 bank bias."""
+
+    if type(turn_score) not in {int, float} or not math.isfinite(float(turn_score)):
+        raise ValueError("course-line turn score must be finite and numeric")
+    score = float(turn_score)
+    if abs(score) < COURSE_LINE_PRETURN_MIN_SCORE:
+        return 0.0
+    # This is a physical course-turn bias, not an image-centering correction.
+    # A route bending toward larger image x requests the simulator's positive
+    # body roll even though the camera rotation initially moves the gate right.
+    return max(
+        -COURSE_LINE_PRETURN_LIMIT_RAD,
+        min(COURSE_LINE_PRETURN_LIMIT_RAD, COURSE_LINE_PRETURN_GAIN * score),
+    )
+
+
+def course_line_exit_counterroll(turn_score: float) -> float:
+    """Counter-roll a proved course preturn before the Gate-0 crossing coast."""
+
+    if type(turn_score) not in {int, float} or not math.isfinite(float(turn_score)):
+        raise ValueError("course-line exit-counterroll score must be finite and numeric")
+    score = float(turn_score)
+    if abs(score) < COURSE_LINE_PRETURN_MIN_SCORE:
+        return 0.0
+    return -math.copysign(COURSE_LINE_EXIT_COUNTERROLL_RAD, score)
+
+
+def gate0_centering_roll_target(normalized_x: float) -> float:
+    """Counter-rotate Gate 0 toward image center before course pre-turn."""
+
+    if type(normalized_x) not in {int, float} or not math.isfinite(
+        float(normalized_x)
+    ):
+        raise ValueError("gate-0 centering input must be finite and numeric")
+    return max(-0.08, min(0.08, -0.15 * float(normalized_x)))
+
+
 def select_primary_gate(
     detections: Iterable[GateDetection],
 ) -> Optional[GateDetection]:
@@ -5934,6 +6100,304 @@ def select_primary_gate(
     return max(candidates, key=lambda item: item.bbox[2] * item.bbox[3])
 
 
+def _bbox_iou(
+    first: Sequence[int],
+    second: Sequence[int],
+) -> float:
+    first_x, first_y, first_width, first_height = (int(value) for value in first)
+    second_x, second_y, second_width, second_height = (
+        int(value) for value in second
+    )
+    intersection_width = max(
+        0,
+        min(first_x + first_width, second_x + second_width)
+        - max(first_x, second_x),
+    )
+    intersection_height = max(
+        0,
+        min(first_y + first_height, second_y + second_height)
+        - max(first_y, second_y),
+    )
+    intersection = intersection_width * intersection_height
+    union = first_width * first_height + second_width * second_height - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def select_tracked_fragment_union(
+    detections: Iterable[GateDetection],
+    *,
+    prior_target: GateTarget,
+    image_width: int,
+    image_height: int,
+) -> Optional[GateFragmentUnion]:
+    """Fuse the proved complementary pieces of one top-clipped course gate.
+
+    Build 3385 splits Gate 1 into an upper/right and lower/left contour while
+    their union remains a stable near-square continuation of the prior gate.
+    This selector is deliberately narrower than normal tracking and supplies
+    guidance geometry only; a composite target can never arm a crossing.
+    """
+
+    if (
+        type(image_width) is not int
+        or type(image_height) is not int
+        or image_width <= 0
+        or image_height <= 0
+    ):
+        raise ValueError("fragment-union image dimensions must be positive ints")
+    prior_x, prior_y, prior_width, prior_height = prior_target.bbox
+    if (
+        prior_x < 0
+        or prior_y > COURSE_EDGE_CONTINUATION_MARGIN_PX
+        or prior_width < 20
+        or prior_height < 20
+        or prior_x + prior_width > image_width
+        or prior_y + prior_height > image_height
+    ):
+        return None
+
+    valid: List[GateDetection] = []
+    for detection in detections:
+        x, y, width, height = (int(value) for value in detection.bbox)
+        if (
+            x < 0
+            or y < 0
+            or width < 20
+            or height < 20
+            or x + width > image_width
+            or y + height > image_height
+        ):
+            continue
+        short = min(width, height)
+        long = max(width, height)
+        if short <= 0 or long / short > COURSE_EDGE_CONTINUATION_MAX_ASPECT_RATIO:
+            continue
+        if not math.isfinite(detection.confidence) or detection.confidence < 0.10:
+            continue
+        valid.append(detection)
+
+    candidates: List[
+        Tuple[float, float, float, GateFragmentUnion]
+    ] = []
+    prior_area = max(1, prior_target.bbox_area)
+    for upper in valid:
+        upper_x, upper_y, upper_width, upper_height = (
+            int(value) for value in upper.bbox
+        )
+        if upper_y > COURSE_EDGE_CONTINUATION_MARGIN_PX:
+            continue
+        for lower in valid:
+            if lower is upper:
+                continue
+            lower_x, lower_y, lower_width, lower_height = (
+                int(value) for value in lower.bbox
+            )
+            if (
+                lower_y <= COURSE_EDGE_CONTINUATION_MARGIN_PX
+                or int(upper.center_x) <= int(lower.center_x)
+                or int(upper.center_y) >= int(lower.center_y)
+            ):
+                continue
+
+            union_x = min(upper_x, lower_x)
+            union_y = min(upper_y, lower_y)
+            union_right = max(upper_x + upper_width, lower_x + lower_width)
+            union_bottom = max(upper_y + upper_height, lower_y + lower_height)
+            union_width = union_right - union_x
+            union_height = union_bottom - union_y
+            if union_width < 20 or union_height < 20:
+                continue
+            union_aspect = max(union_width, union_height) / min(
+                union_width, union_height
+            )
+            union_aspect_limit = COURSE_FRAGMENT_UNION_MAX_ASPECT_RATIO
+            if prior_target.composite and union_right == image_width:
+                # A faster right turn made the same proved Gate-1 union two
+                # frames wider while its upper fragment met the image edge.
+                # Keep this bridge edge- and composite-specific; ordinary
+                # unions retain the stricter near-square bound.
+                union_aspect_limit = (
+                    COURSE_FRAGMENT_UNION_RIGHT_EDGE_MAX_ASPECT_RATIO
+                )
+            if union_aspect > union_aspect_limit:
+                continue
+
+            horizontal_gap = max(
+                0,
+                max(upper_x, lower_x)
+                - min(upper_x + upper_width, lower_x + lower_width),
+            )
+            vertical_gap = max(
+                0,
+                max(upper_y, lower_y)
+                - min(upper_y + upper_height, lower_y + lower_height),
+            )
+            if (
+                horizontal_gap > 0.45 * union_width
+                or vertical_gap > 0.20 * union_height
+            ):
+                continue
+
+            intersection_width = max(
+                0,
+                min(upper_x + upper_width, lower_x + lower_width)
+                - max(upper_x, lower_x),
+            )
+            intersection_height = max(
+                0,
+                min(upper_y + upper_height, lower_y + lower_height)
+                - max(upper_y, lower_y),
+            )
+            visible_support = (
+                upper_width * upper_height
+                + lower_width * lower_height
+                - intersection_width * intersection_height
+            )
+            union_area = union_width * union_height
+            support_ratio = visible_support / union_area
+            if not 0.20 <= support_ratio <= 0.80:
+                continue
+
+            bbox = (union_x, union_y, union_width, union_height)
+            overlap = _bbox_iou(bbox, prior_target.bbox)
+            center_x = union_x + union_width // 2
+            center_y = union_y + union_height // 2
+            center_jump = math.hypot(
+                center_x - prior_target.center_x,
+                center_y - prior_target.center_y,
+            )
+            area_ratio = union_area / prior_area
+            if (
+                overlap < COURSE_FRAGMENT_UNION_MIN_IOU
+                or center_jump > 32.0
+                or not 0.70 <= area_ratio <= 1.35
+            ):
+                continue
+            union = GateFragmentUnion(
+                upper=upper,
+                lower=lower,
+                bbox=bbox,
+                center_x=center_x,
+                center_y=center_y,
+                confidence=min(float(upper.confidence), float(lower.confidence)),
+            )
+            candidates.append((-overlap, center_jump, -support_ratio, union))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[:3])[3]
+
+
+def _vertical_frame_edge(
+    bbox: Sequence[int],
+    *,
+    image_width: int,
+) -> int:
+    """Return the touched vertical edge without treating full-width blobs as gates."""
+
+    x, _y, width, _height = (int(value) for value in bbox)
+    touches_left = x <= COURSE_EDGE_CONTINUATION_MARGIN_PX
+    touches_right = (
+        x + width >= image_width - COURSE_EDGE_CONTINUATION_MARGIN_PX
+    )
+    if touches_left == touches_right:
+        return 0
+    return -1 if touches_left else 1
+
+
+def select_tracked_edge_continuation(
+    detections: Iterable[GateDetection],
+    *,
+    prior_target: GateTarget,
+    image_width: int,
+    image_height: int,
+) -> Optional[GateDetection]:
+    """Recover only the clipped continuation of a gate already at the right edge.
+
+    Build 3385 can turn a valid near-square target into a thin vertical fragment
+    for the last few frames before it leaves view.  The ordinary selector must
+    keep rejecting such fragments globally.  This narrow selector is eligible
+    only when both the proved prior target and candidate touch the right frame
+    edge and satisfy the much tighter geometry proved by the live trace.
+    """
+
+    if (
+        type(image_width) is not int
+        or type(image_height) is not int
+        or image_width <= 0
+        or image_height <= 0
+    ):
+        raise ValueError("edge-continuation image dimensions must be positive ints")
+    if prior_target.composite:
+        return None
+    prior_x, prior_y, prior_width, prior_height = prior_target.bbox
+    if (
+        prior_x < 0
+        or prior_y < 0
+        or prior_width < 20
+        or prior_height < 20
+        or prior_x + prior_width > image_width + COURSE_EDGE_CONTINUATION_MARGIN_PX
+        or prior_y + prior_height
+        > image_height + COURSE_EDGE_CONTINUATION_MARGIN_PX
+    ):
+        return None
+    prior_edge = _vertical_frame_edge(prior_target.bbox, image_width=image_width)
+    if (
+        prior_edge != 1
+        or prior_y <= COURSE_EDGE_CONTINUATION_MARGIN_PX
+        or prior_y + prior_height
+        >= image_height - COURSE_EDGE_CONTINUATION_MARGIN_PX
+    ):
+        return None
+
+    candidates: List[Tuple[float, float, int, GateDetection]] = []
+    prior_area = max(1, prior_target.bbox_area)
+    for detection in detections:
+        x, y, width, height = (int(value) for value in detection.bbox)
+        if (
+            x < 0
+            or y < 0
+            or width < 20
+            or height < 20
+            or x + width > image_width + COURSE_EDGE_CONTINUATION_MARGIN_PX
+            or y + height > image_height + COURSE_EDGE_CONTINUATION_MARGIN_PX
+        ):
+            continue
+        short = min(width, height)
+        long = max(width, height)
+        if short <= 0 or long / short > COURSE_EDGE_CONTINUATION_MAX_ASPECT_RATIO:
+            continue
+        if not math.isfinite(detection.confidence) or detection.confidence < 0.10:
+            continue
+        if _vertical_frame_edge(detection.bbox, image_width=image_width) != 1:
+            continue
+        if (
+            y <= COURSE_EDGE_CONTINUATION_MARGIN_PX
+            or y + height >= image_height - COURSE_EDGE_CONTINUATION_MARGIN_PX
+        ):
+            continue
+        dx = int(detection.center_x) - prior_target.center_x
+        dy = int(detection.center_y) - prior_target.center_y
+        center_jump = math.hypot(dx, dy)
+        area = int(width) * int(height)
+        area_ratio = area / prior_area
+        vertical_overlap = min(prior_y + prior_height, y + height) - max(
+            prior_y, y
+        )
+        if (
+            center_jump > 32.0
+            or not -3 <= dx <= 20
+            or not 0.20 <= area_ratio <= 1.10
+            or vertical_overlap < 0.50 * min(prior_height, height)
+        ):
+            continue
+        candidates.append(
+            (center_jump, abs(math.log(area_ratio)), -area, detection)
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[:3])[3]
+
+
 class GateTargetTracker:
     """Small temporal gate filter for the first bounded vision-only run."""
 
@@ -5944,6 +6408,9 @@ class GateTargetTracker:
         self.target: Optional[GateTarget] = None
         self.consecutive = 0
         self._last_frame_id: Optional[int] = None
+        self.last_selected_detection: Optional[GateDetection] = None
+        self.last_selected_detections: Tuple[GateDetection, ...] = ()
+        self.last_selection_mode: Optional[str] = None
 
     def update(
         self,
@@ -5952,39 +6419,127 @@ class GateTargetTracker:
         frame_id: int,
         sim_time_ns: int,
         received_monotonic_s: float,
+        allow_tracked_edge_continuation: bool = False,
+        allow_tracked_fragment_union: bool = False,
+        image_width: Optional[int] = None,
+        image_height: Optional[int] = None,
     ) -> Optional[GateTarget]:
         if self._last_frame_id == int(frame_id):
             return self.target
         self._last_frame_id = int(frame_id)
-        selected = select_primary_gate(detections)
-        if selected is None:
+        detection_list = list(detections)
+        previous_target = self.target
+        previous_streak = self.consecutive
+
+        def candidate_for(detection: GateDetection) -> GateTarget:
+            return GateTarget(
+                frame_id=int(frame_id),
+                sim_time_ns=int(sim_time_ns),
+                received_monotonic_s=float(received_monotonic_s),
+                center_x=int(detection.center_x),
+                center_y=int(detection.center_y),
+                bbox=tuple(int(value) for value in detection.bbox),
+                confidence=float(detection.confidence),
+            )
+
+        def candidate_for_union(union: GateFragmentUnion) -> GateTarget:
+            return GateTarget(
+                frame_id=int(frame_id),
+                sim_time_ns=int(sim_time_ns),
+                received_monotonic_s=float(received_monotonic_s),
+                center_x=union.center_x,
+                center_y=union.center_y,
+                bbox=union.bbox,
+                confidence=union.confidence,
+                composite=True,
+            )
+
+        def is_continuous(candidate: GateTarget) -> bool:
+            if previous_target is None:
+                return False
+            dx = candidate.center_x - previous_target.center_x
+            dy = candidate.center_y - previous_target.center_y
+            center_jump = math.hypot(dx, dy)
+            prior_area = max(1, previous_target.bbox_area)
+            area_ratio = candidate.bbox_area / prior_area
+            return center_jump <= 100.0 and 0.20 <= area_ratio <= 5.0
+
+        selected: Optional[GateDetection] = None
+        selected_detections: Tuple[GateDetection, ...] = ()
+        candidate: Optional[GateTarget] = None
+        selection_mode: Optional[str] = None
+        continuous = False
+
+        if (
+            allow_tracked_fragment_union
+            and previous_target is not None
+            and previous_streak >= POST_GATE_REQUIRED_FRAMES
+        ):
+            if image_width is None or image_height is None:
+                raise ValueError(
+                    "image dimensions are required for tracked fragment union"
+                )
+            union = select_tracked_fragment_union(
+                detection_list,
+                prior_target=previous_target,
+                image_width=image_width,
+                image_height=image_height,
+            )
+            if union is not None:
+                union_candidate = candidate_for_union(union)
+                if is_continuous(union_candidate):
+                    candidate = union_candidate
+                    continuous = True
+                    selected_detections = (union.upper, union.lower)
+                    selection_mode = "tracked_fragment_union"
+
+        if candidate is None:
+            primary = select_primary_gate(detection_list)
+            primary_candidate = candidate_for(primary) if primary is not None else None
+            primary_continuous = (
+                primary_candidate is not None and is_continuous(primary_candidate)
+            )
+            if primary_candidate is not None and (
+                previous_target is None or primary_continuous
+            ):
+                selected = primary
+                selected_detections = (primary,) if primary is not None else ()
+                candidate = primary_candidate
+                continuous = primary_continuous
+                selection_mode = "primary"
+
+        if (
+            candidate is None
+            and allow_tracked_edge_continuation
+            and previous_target is not None
+            and previous_streak >= POST_GATE_REQUIRED_FRAMES
+        ):
+            if image_width is None or image_height is None:
+                raise ValueError(
+                    "image dimensions are required for tracked edge continuation"
+                )
+            selected = select_tracked_edge_continuation(
+                detection_list,
+                prior_target=previous_target,
+                image_width=image_width,
+                image_height=image_height,
+            )
+            if selected is not None:
+                candidate = candidate_for(selected)
+                continuous = is_continuous(candidate)
+                if continuous:
+                    selected_detections = (selected,)
+                    selection_mode = "tracked_edge_continuation"
+                else:
+                    selected = None
+                    candidate = None
+        self.last_selected_detection = selected
+        self.last_selected_detections = selected_detections
+        self.last_selection_mode = selection_mode
+        if candidate is None:
             self.consecutive = 0
             return None
-
-        candidate = GateTarget(
-            frame_id=int(frame_id),
-            sim_time_ns=int(sim_time_ns),
-            received_monotonic_s=float(received_monotonic_s),
-            center_x=int(selected.center_x),
-            center_y=int(selected.center_y),
-            bbox=tuple(int(value) for value in selected.bbox),
-            confidence=float(selected.confidence),
-        )
-        continuous = False
-        if self.target is not None:
-            dx = candidate.center_x - self.target.center_x
-            dy = candidate.center_y - self.target.center_y
-            center_jump = math.hypot(dx, dy)
-            prior_area = max(1, self.target.bbox_area)
-            area_ratio = candidate.bbox_area / prior_area
-            continuous = center_jump <= 100.0 and 0.20 <= area_ratio <= 5.0
-            if not continuous:
-                # Do not let a one-frame red fragment replace the tracked near
-                # gate.  Build 3385 emits exactly this failure at very close
-                # range when the frame clips the image boundary.
-                self.consecutive = 0
-                return None
-        self.consecutive = self.consecutive + 1 if continuous else 1
+        self.consecutive = previous_streak + 1 if continuous else 1
         self.target = candidate
         return candidate
 
@@ -6004,6 +6559,28 @@ def gate_vertical_reference_px(
     delta = float(target_pitch_rad) - float(spawn_pitch_rad)
     delta = max(math.radians(-35.0), min(math.radians(35.0), delta))
     return float(initial_gate_y) + float(focal_length_px) * math.tan(delta)
+
+
+def gate0_target_pitch_rad(
+    spawn_pitch_rad: float,
+    exit_pitch_rad: float,
+    elapsed_s: float,
+) -> float:
+    """Blend the Gate 0 pitch basis to a bounded full-lap exit pitch."""
+
+    values = (spawn_pitch_rad, exit_pitch_rad, elapsed_s)
+    if (
+        any(type(value) not in {int, float} for value in values)
+        or not all(math.isfinite(float(value)) for value in values)
+        or not -0.10 <= float(exit_pitch_rad) <= 0.0
+        or float(elapsed_s) < 0.0
+    ):
+        raise ValueError("gate-0 pitch schedule inputs are outside the envelope")
+    blend = min(1.0, float(elapsed_s) / GATE0_PITCH_BLEND_S)
+    return (
+        (1.0 - blend) * float(spawn_pitch_rad)
+        + blend * float(exit_pitch_rad)
+    )
 
 
 def gate_control_center_y_px(
@@ -6101,6 +6678,267 @@ def crossing_status_decision(
     if active_gate_index == 0:
         return "not_credited"
     raise AssertionError("unreachable gate crossing decision")
+
+
+def full_lap_crossing_status_decision(
+    *,
+    baseline_race_boot_ms: int,
+    current_race_boot_ms: int,
+    expected_gate_index: int,
+    active_gate_index: int,
+    race_finished: bool,
+    elapsed_s: float,
+    timeout_s: float = CROSSING_STATUS_TIMEOUT_S,
+) -> str:
+    """Classify one mapless course crossing from authoritative race status."""
+
+    if (
+        not math.isfinite(elapsed_s)
+        or elapsed_s < 0.0
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0.0
+    ):
+        raise ValueError("crossing status timing must be finite with timeout_s > 0")
+    if expected_gate_index < 0 or active_gate_index < 0:
+        return "invalid_gate_index"
+    if current_race_boot_ms < baseline_race_boot_ms:
+        return "race_clock_regressed"
+    if current_race_boot_ms == baseline_race_boot_ms:
+        return "status_timeout" if elapsed_s >= timeout_s else "waiting"
+    if race_finished:
+        return "finished"
+    if active_gate_index == expected_gate_index + 1:
+        return "passed"
+    if active_gate_index == expected_gate_index:
+        return "not_credited"
+    return "invalid_gate_index"
+
+
+def gate0_phase_alignment_delay_s(
+    *,
+    now_monotonic_ns: int,
+    last_race_received_monotonic_ns: int,
+    expected_target_loss_s: float = COURSE_GATE0_EXPECTED_TARGET_LOSS_S,
+    packet_period_s: float = COURSE_RACE_PACKET_PERIOD_S,
+    target_lead_s: float = COURSE_RACE_PACKET_TARGET_LEAD_S,
+) -> float:
+    """Delay launch so expected Gate 0 loss precedes a race packet."""
+
+    if (
+        type(now_monotonic_ns) is not int
+        or type(last_race_received_monotonic_ns) is not int
+        or now_monotonic_ns < 0
+        or last_race_received_monotonic_ns < 0
+        or type(expected_target_loss_s) not in {int, float}
+        or type(packet_period_s) not in {int, float}
+        or type(target_lead_s) not in {int, float}
+        or not all(
+            math.isfinite(float(value))
+            for value in (expected_target_loss_s, packet_period_s, target_lead_s)
+        )
+        or float(expected_target_loss_s) <= 0.0
+        or float(packet_period_s) <= 0.0
+        or not 0.0 < float(target_lead_s) < float(packet_period_s)
+    ):
+        raise ValueError("gate-0 race-phase alignment inputs are invalid")
+    period_ns = round(float(packet_period_s) * 1_000_000_000)
+    target_loss_ns = round(float(expected_target_loss_s) * 1_000_000_000)
+    lead_ns = round(float(target_lead_s) * 1_000_000_000)
+    desired_start_phase_ns = (
+        int(last_race_received_monotonic_ns) - lead_ns - target_loss_ns
+    )
+    delay_ns = (desired_start_phase_ns - int(now_monotonic_ns)) % period_ns
+    return delay_ns / 1_000_000_000.0
+
+
+def is_course_gate_crossing_candidate(
+    target: GateTarget,
+    *,
+    acquisition_gate_area: int,
+    control_y: float,
+) -> bool:
+    """Attainable close-crossing predicate for gates acquired at larger scale."""
+
+    if (
+        target.composite
+        or acquisition_gate_area <= 0
+        or not math.isfinite(control_y)
+    ):
+        return False
+    _x, y, width, height = target.bbox
+    minimum_area = min(
+        CROSSING_MIN_AREA_RATIO * float(acquisition_gate_area),
+        float(COURSE_CROSSING_AREA_CAP_PX),
+    )
+    return bool(
+        target.bbox_area >= minimum_area
+        and width >= CROSSING_MIN_WIDTH_PX
+        and y <= 2
+        and y + height >= 358
+        and abs(target.center_x - 320.0) <= 0.15 * width
+        and abs(control_y - 180.0) <= 75.0
+    )
+
+
+def full_lap_initial_gate_reference_is_valid(initial_gate_area: int) -> bool:
+    """Whether Gate 0 has the proved build-3385 spawn-scale reference."""
+
+    return bool(
+        type(initial_gate_area) is int
+        and FULL_LAP_INITIAL_GATE_MIN_AREA_PX
+        <= initial_gate_area
+        <= FULL_LAP_INITIAL_GATE_MAX_AREA_PX
+    )
+
+
+def select_untracked_contact_risk(
+    detections: Iterable[GateDetection],
+    *,
+    accepted_target: Optional[GateTarget],
+    image_width: int = 640,
+    image_height: int = 360,
+) -> Optional[GateDetection]:
+    """Select large plausible gate geometry rejected by the live tracker.
+
+    A live collision trace showed the accepted right-edge fragment going stale
+    while a discontinuous, rapidly expanding view of the same gate remained in
+    the raw detections.  Continuing flight from that stale fragment caused an
+    impact.  This predicate never promotes the discontinuous geometry into
+    control or crossing evidence; it only supports a fail-closed course abort.
+    """
+
+    if image_width != 640 or image_height != 360:
+        raise ValueError("untracked-contact guard requires exact 640x360 vision")
+    if accepted_target is not None:
+        return None
+    candidates: List[GateDetection] = []
+    for detection in detections:
+        x, y, width, height = (int(value) for value in detection.bbox)
+        if (
+            x < 0
+            or y < 0
+            or x + width > image_width
+            or y + height > image_height
+            or width * height < COURSE_UNTRACKED_CONTACT_MIN_AREA_PX
+            or width < COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX
+            or height < COURSE_UNTRACKED_CONTACT_MIN_HEIGHT_PX
+            or select_primary_gate((detection,)) is not detection
+        ):
+            continue
+        candidates.append(detection)
+    return (
+        max(candidates, key=lambda item: item.bbox[2] * item.bbox[3])
+        if candidates
+        else None
+    )
+
+
+def limit_command_rates(
+    command: AttitudeRateCommand,
+    max_rate_rad_s: float,
+) -> AttitudeRateCommand:
+    """Tighten a validated command without changing yaw or thrust."""
+
+    if (
+        not math.isfinite(max_rate_rad_s)
+        or not 0.0 < max_rate_rad_s <= MAX_COMMAND_RATE_RAD_S
+    ):
+        raise ValueError("command-rate limit is outside the VQ2 envelope")
+    limited = AttitudeRateCommand(
+        roll_rate=max(-max_rate_rad_s, min(max_rate_rad_s, command.roll_rate)),
+        pitch_rate=max(-max_rate_rad_s, min(max_rate_rad_s, command.pitch_rate)),
+        yaw_rate=0.0,
+        thrust=command.thrust,
+    )
+    validate_command(limited)
+    return limited
+
+
+def course_recenter_rate_command(
+    command: AttitudeRateCommand,
+) -> AttitudeRateCommand:
+    """Reach bounded recenter roll/pitch targets at the proved rate ceiling."""
+
+    boosted = AttitudeRateCommand(
+        roll_rate=command.roll_rate * COURSE_RECENTER_ROLL_RATE_SCALE,
+        pitch_rate=command.pitch_rate * COURSE_RECENTER_PITCH_RATE_SCALE,
+        yaw_rate=0.0,
+        thrust=command.thrust,
+    )
+    return limit_command_rates(boosted, COURSE_RECENTER_MAX_RATE_RAD_S)
+
+
+def course_gate_roll_target(normalized_x: float, *, recenter: bool) -> float:
+    """Choose phase-specific mapless gate roll within the watchdog margin."""
+
+    if (
+        type(normalized_x) not in {int, float}
+        or not math.isfinite(float(normalized_x))
+        or type(recenter) is not bool
+    ):
+        raise ValueError("course roll target inputs must be finite and typed")
+    limit = (
+        COURSE_RECENTER_ROLL_LIMIT_RAD
+        if recenter
+        else COURSE_APPROACH_ROLL_LIMIT_RAD
+    )
+    # Reacquisition counter-rotates the camera while the Gate-0 turn velocity
+    # carries the vehicle right.  Once centered, approach guidance resumes a
+    # physical bank toward the gate.
+    direction = -1.0 if recenter else 1.0
+    gain = COURSE_RECENTER_ROLL_GAIN if recenter else COURSE_ROLL_GAIN
+    return max(
+        -limit,
+        min(limit, direction * gain * float(normalized_x)),
+    )
+
+
+def course_gate_recenter_pitch_target(
+    entry_pitch_rad: float,
+    control_y: float,
+) -> float:
+    """Counter vertical camera drift while a course gate is reacquired."""
+
+    if (
+        type(entry_pitch_rad) not in {int, float}
+        or not math.isfinite(float(entry_pitch_rad))
+        or type(control_y) not in {int, float}
+        or not math.isfinite(float(control_y))
+    ):
+        raise ValueError("course recenter pitch inputs must be finite and numeric")
+    vertical_error = max(-1.0, min(1.0, (180.0 - float(control_y)) / 180.0))
+    # Build-3385 flight evidence shows negative pitch moves a high course gate
+    # down in the image while adding forward speed; the static camera-only
+    # projection is dominated by vehicle translation in this phase.
+    target = float(entry_pitch_rad) - COURSE_RECENTER_PITCH_GAIN * vertical_error
+    return max(
+        COURSE_RECENTER_MIN_PITCH_RAD,
+        min(COURSE_RECENTER_MAX_PITCH_RAD, target),
+    )
+
+
+def course_gate_recenter_required(
+    elapsed_s: float,
+    normalized_x: float,
+    control_y: float,
+) -> bool:
+    """Keep braking until minimum dwell and a usable gate corridor are proved."""
+
+    if (
+        type(elapsed_s) not in {int, float}
+        or not math.isfinite(float(elapsed_s))
+        or float(elapsed_s) < 0.0
+        or type(normalized_x) not in {int, float}
+        or not math.isfinite(float(normalized_x))
+        or type(control_y) not in {int, float}
+        or not math.isfinite(float(control_y))
+    ):
+        raise ValueError("course recenter inputs must be finite and typed")
+    return bool(
+        float(elapsed_s) < COURSE_RECENTER_DURATION_S
+        or abs(float(normalized_x)) > COURSE_RECENTER_MAX_NORMALIZED_X
+        or float(control_y) < COURSE_HIGH_GATE_Y_PX
+    )
 
 
 def post_gate_observation_deadline(
@@ -6630,6 +7468,7 @@ class VQ2Runner:
         self._post_gate_last_frame: Optional[Tuple[Tuple[int, int, int], Any]] = None
         self._vision_diagnostic_logging = False
         self._post_gate_reacquisition = False
+        self._course_edge_continuation_gate_index: Optional[int] = None
         self._last_flight_command: Optional[AttitudeRateCommand] = None
         self._last_flight_command_started_ns: Optional[int] = None
         self._last_flight_command_sent_s: Optional[float] = None
@@ -6703,6 +7542,7 @@ class VQ2Runner:
         self._latest_detection_image = None
         self._vision_diagnostic_logging = False
         self._post_gate_reacquisition = False
+        self._course_edge_continuation_gate_index = None
         self._last_flight_command = None
         self._last_flight_command_started_ns = None
         self._last_flight_command_sent_s = None
@@ -6923,11 +7763,23 @@ class VQ2Runner:
                 tracking_started_ns = (
                     time.perf_counter_ns() if capture_enabled else None
                 )
+                race = self.adapter.race_status
+                course_edge_gate_index = self._course_edge_continuation_gate_index
+                allow_course_edge_continuation = bool(
+                    course_edge_gate_index is not None
+                    and race is not None
+                    and not race.race_finished
+                    and int(race.active_gate_index) == course_edge_gate_index
+                )
                 accepted = self.tracker.update(
                     tracking_detections,
                     frame_id=snapshot.frame_id,
                     sim_time_ns=snapshot.sim_time_ns,
                     received_monotonic_s=snapshot.received_monotonic_s,
+                    allow_tracked_edge_continuation=allow_course_edge_continuation,
+                    allow_tracked_fragment_union=allow_course_edge_continuation,
+                    image_width=image_width,
+                    image_height=image_height,
                 )
                 tracking_ended_ns = (
                     time.perf_counter_ns() if capture_enabled else None
@@ -6957,7 +7809,7 @@ class VQ2Runner:
                     else []
                 )
                 if self._vision_diagnostic_logging:
-                    selected = select_primary_gate(tracking_detections)
+                    selected = self.tracker.last_selected_detection
                     selected_index = next(
                         (
                             index
@@ -6966,6 +7818,16 @@ class VQ2Runner:
                         ),
                         None,
                     )
+                    selected_indices = [
+                        index
+                        for index, detection in enumerate(detections)
+                        if any(
+                            detection is selected_detection
+                            for selected_detection in (
+                                self.tracker.last_selected_detections
+                            )
+                        )
+                    ]
                     race = self.adapter.race_status
                     estimate = self.estimate
                     self.recorder.emit(
@@ -6985,6 +7847,8 @@ class VQ2Runner:
                         gate_index=(race.active_gate_index if race else None),
                         detections=summaries,
                         selected_detection_index=selected_index,
+                        tracker_selected_detection_indices=selected_indices,
+                        tracker_selection_mode=self.tracker.last_selection_mode,
                         tracker_streak=self.tracker.consecutive,
                         accepted_target=(asdict(accepted) if accepted else None),
                         tracker_target=(
@@ -7397,6 +8261,51 @@ class VQ2Runner:
                 frame_token=frame_token,
             )
         return wire_receipt
+
+    async def _wait_for_next_flight_command_slot(self) -> float:
+        """Prove a full control period after the previous completed send."""
+
+        now = time.monotonic()
+        if (
+            type(now) not in {int, float}
+            or not math.isfinite(float(now))
+            or float(now) < 0.0
+        ):
+            raise SafetyAbort("current flight-command timestamp is invalid")
+        last_sent_s = self._last_flight_command_sent_s
+        if last_sent_s is None:
+            return float(now)
+        if (
+            type(last_sent_s) not in {int, float}
+            or not math.isfinite(float(last_sent_s))
+            or float(last_sent_s) < 0.0
+            or float(last_sent_s) > float(now)
+        ):
+            raise SafetyAbort("last flight-command timestamp is invalid")
+        not_before_s = float(last_sent_s) + CONTROL_PERIOD_S
+        observed_s = float(now)
+        wait_attempts = 0
+        while observed_s < not_before_s:
+            if wait_attempts >= 8:
+                raise SafetyAbort("flight-command pacing wait returned early")
+            await asyncio.sleep(not_before_s - observed_s)
+            next_observed_s = time.monotonic()
+            if (
+                type(next_observed_s) not in {int, float}
+                or not math.isfinite(float(next_observed_s))
+                or float(next_observed_s) < observed_s
+            ):
+                raise SafetyAbort("flight-command pacing wait returned early")
+            observed_s = float(next_observed_s)
+            wait_attempts += 1
+        ready_s = time.monotonic()
+        if (
+            type(ready_s) not in {int, float}
+            or not math.isfinite(float(ready_s))
+            or float(ready_s) < max(observed_s, not_before_s)
+        ):
+            raise SafetyAbort("flight-command pacing wait returned early")
+        return float(ready_s)
 
     @staticmethod
     def _is_exact_zero_command(command: Optional[AttitudeRateCommand]) -> bool:
@@ -7951,7 +8860,7 @@ class VQ2Runner:
         ]
         responses: Dict[str, List[float]] = {"roll": [], "pitch": []}
         baseline_samples: List[Tuple[float, float]] = []
-        flight_start = time.monotonic()
+        flight_start = await self._wait_for_next_flight_command_slot()
         next_tick = flight_start
         for name, duration, rates in segments:
             segment_start = time.monotonic()
@@ -8249,7 +9158,7 @@ class VQ2Runner:
 
     async def _run_hover(self, context: StartContext) -> Dict[str, Any]:
         assert self.estimate is not None
-        flight_start = time.monotonic()
+        flight_start = await self._wait_for_next_flight_command_slot()
         next_tick = flight_start
         max_abs_roll = 0.0
         max_abs_rate = 0.0
@@ -8370,8 +9279,43 @@ class VQ2Runner:
         context: StartContext,
         *,
         capture_transition: bool = False,
+        exit_pitch_rad: float = 0.0,
+        minimum_thrust: float = 0.21,
+        boost_until_s: float = 0.45,
+        close_thrust_floor: float = 0.21,
+        observe_course_line: bool = False,
+        course_line_preturn: bool = False,
+        course_line_exit_counterroll_enabled: bool = False,
     ) -> Dict[str, Any]:
-        flight_start = time.monotonic()
+        gate0_target_pitch_rad(context.spawn_pitch_rad, exit_pitch_rad, 0.0)
+        if (
+            type(minimum_thrust) not in {int, float}
+            or not math.isfinite(float(minimum_thrust))
+            or not 0.21 <= float(minimum_thrust) <= 0.32
+        ):
+            raise ValueError("gate-0 minimum thrust is outside the validated envelope")
+        if (
+            type(boost_until_s) not in {int, float}
+            or not math.isfinite(float(boost_until_s))
+            or not 0.45 <= float(boost_until_s) <= 1.0
+        ):
+            raise ValueError("gate-0 boost duration is outside the validated envelope")
+        if (
+            type(close_thrust_floor) not in {int, float}
+            or not math.isfinite(float(close_thrust_floor))
+            or not 0.21 <= float(close_thrust_floor) <= 0.32
+        ):
+            raise ValueError("gate-0 close thrust floor is outside the validated envelope")
+        if type(observe_course_line) is not bool:
+            raise ValueError("gate-0 course-line observation flag must be bool")
+        if type(course_line_preturn) is not bool:
+            raise ValueError("gate-0 course-line preturn flag must be bool")
+        if type(course_line_exit_counterroll_enabled) is not bool:
+            raise ValueError("gate-0 course-line exit-counterroll flag must be bool")
+        if course_line_exit_counterroll_enabled and not course_line_preturn:
+            raise ValueError("gate-0 course-line exit counter-roll requires preturn")
+
+        flight_start = await self._wait_for_next_flight_command_slot()
         next_tick = flight_start
         max_gate_area = context.initial_gate_area
         last_target_frame: Optional[int] = None
@@ -8382,6 +9326,11 @@ class VQ2Runner:
         crossing_started_s: Optional[float] = None
         crossing_race_boot_ms: Optional[int] = None
         last_gate0_race_boot_ms: Optional[int] = int(context.go_boot_ms)
+        filtered_course_turn = 0.0
+        course_turn_streak = 0
+        last_course_turn_s: Optional[float] = None
+        proved_course_turn_score: Optional[float] = None
+        course_line_exit_started = False
         while True:
             now = time.monotonic()
             elapsed = now - flight_start
@@ -8398,10 +9347,13 @@ class VQ2Runner:
             if elapsed > 3.5 and max_gate_area < 1.25 * context.initial_gate_area:
                 raise SafetyAbort("no visual approach progress toward gate 0")
 
-            blend = min(1.0, elapsed / 0.8)
-            target_pitch = (1.0 - blend) * context.spawn_pitch_rad
+            target_pitch = gate0_target_pitch_rad(
+                context.spawn_pitch_rad,
+                exit_pitch_rad,
+                elapsed,
+            )
             normalized_x = (target.center_x - 320.0) / 320.0
-            target_roll = max(-0.08, min(0.08, 0.15 * normalized_x))
+            target_roll = gate0_centering_roll_target(normalized_x)
 
             control_y = gate_control_center_y_px(
                 target,
@@ -8518,15 +9470,119 @@ class VQ2Runner:
                 last_target_frame = target.frame_id
                 last_control_y = control_y
                 last_target_time = target.received_monotonic_s
+                if (
+                    (observe_course_line or course_line_preturn)
+                    and target.bbox_area
+                    >= COURSE_LINE_PRETURN_MIN_GATE_AREA_SCALE
+                    * context.initial_gate_area
+                ):
+                    line = cyan_course_line_observation(
+                        self._latest_detection_image,
+                    )
+                    if (
+                        line is not None
+                        and abs(line.turn_score) >= COURSE_LINE_PRETURN_MIN_SCORE
+                    ):
+                        if (
+                            course_turn_streak == 0
+                            or filtered_course_turn * line.turn_score > 0.0
+                        ):
+                            filtered_course_turn = (
+                                line.turn_score
+                                if course_turn_streak == 0
+                                else 0.65 * filtered_course_turn
+                                + 0.35 * line.turn_score
+                            )
+                            course_turn_streak += 1
+                        else:
+                            filtered_course_turn = line.turn_score
+                            course_turn_streak = 1
+                        last_course_turn_s = elapsed
+                    self.recorder.emit(
+                        "course_line_observation",
+                        frame_id=target.frame_id,
+                        elapsed_s=elapsed,
+                        gate_area_px=target.bbox_area,
+                        observation=(asdict(line) if line is not None else None),
+                        filtered_turn_score=filtered_course_turn,
+                        consistent_frame_count=course_turn_streak,
+                    )
+            if (
+                last_course_turn_s is None
+                or elapsed - last_course_turn_s > COURSE_LINE_PRETURN_MAX_AGE_S
+            ):
+                course_turn_streak = 0
+                filtered_course_turn = 0.0
+            stable_course_line = (
+                course_turn_streak >= COURSE_LINE_PRETURN_REQUIRED_FRAMES
+            )
+            if (
+                course_line_exit_counterroll_enabled
+                and stable_course_line
+                and target.bbox_area
+                < COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE
+                * context.initial_gate_area
+            ):
+                proved_course_turn_score = filtered_course_turn
+            if (
+                course_line_exit_counterroll_enabled
+                and not course_line_exit_started
+                and proved_course_turn_score is not None
+                and stable_course_line
+                and filtered_course_turn * proved_course_turn_score > 0.0
+                and target.bbox_area
+                >= COURSE_LINE_EXIT_COUNTERROLL_ONSET_AREA_SCALE
+                * context.initial_gate_area
+            ):
+                course_line_exit_started = True
+            if course_line_exit_started:
+                if (
+                    proved_course_turn_score is not None
+                    and proved_course_turn_score * normalized_x >= 0.0
+                ):
+                    target_roll = course_line_exit_counterroll(
+                        proved_course_turn_score,
+                    )
+            elif (
+                course_line_preturn
+                and stable_course_line
+                and target.bbox_area
+                < COURSE_LINE_PRETURN_TAPER_AREA_SCALE
+                * context.initial_gate_area
+            ):
+                target_roll = max(
+                    -COURSE_LINE_PRETURN_LIMIT_RAD,
+                    min(
+                        COURSE_LINE_PRETURN_LIMIT_RAD,
+                        target_roll
+                        + course_line_preturn_roll(filtered_course_turn),
+                    ),
+                )
             if elapsed < 0.15:
                 thrust = 0.26
-            elif elapsed < 0.45:
+            elif elapsed < float(boost_until_s):
                 thrust = 0.32
             else:
                 # Steer the camera ray through the opening center.  Image-rate
                 # damping brakes climb before positional error grows near the
                 # rapidly approaching gate.
-                thrust = gate_vertical_thrust(control_y, control_y_rate)
+                active_thrust_floor = float(minimum_thrust)
+                if (
+                    target.bbox_area >= 8 * context.initial_gate_area
+                    and control_y <= COURSE_GATE0_CLOSE_FLOOR_MAX_CONTROL_Y_PX
+                ):
+                    # Expansion/clipping makes image-rate damping unreliable at
+                    # the aperture.  Full-lap runs may preserve enough vertical
+                    # energy here to survive the mandatory zero-thrust credit
+                    # confirmation; the close corridor guard remains active.
+                    active_thrust_floor = max(
+                        active_thrust_floor,
+                        float(close_thrust_floor),
+                    )
+                thrust = max(
+                    active_thrust_floor,
+                    gate_vertical_thrust(control_y, control_y_rate),
+                )
 
             # At close range the uncorrected contour center becomes unsafe if
             # the lower gate edge is clipped.  Abort before impact when the
@@ -8552,9 +9608,23 @@ class VQ2Runner:
     async def _observe_gate1(
         self,
         gate0_details: Dict[str, Any],
+        *,
+        hold_thrust: float = 0.0,
     ) -> Dict[str, Any]:
-        """Collect a bounded, zero-thrust view after a proved gate-0 pass."""
+        """Collect a bounded view after a proved gate-0 pass.
 
+        The observation stage keeps its historical exact-zero default.  The
+        full-lap continuation may use a bounded vertical hold after race credit
+        so the vehicle does not fall onto the launch surface while the retired
+        target is replaced.
+        """
+
+        if (
+            type(hold_thrust) not in {int, float}
+            or not math.isfinite(float(hold_thrust))
+            or not 0.0 <= float(hold_thrust) <= COURSE_TRANSITION_THRUST
+        ):
+            raise ValueError("post-gate hold thrust is outside the course envelope")
         proof = self._gate0_transition_proof
         if proof is None or not gate0_details.get("gate_transition_proved"):
             raise SafetyAbort("gate-1 observation lacks an authoritative transition proof")
@@ -8622,7 +9692,12 @@ class VQ2Runner:
                 else observation_started_s
             ),
         )
-        zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+        transition_command = AttitudeRateCommand(
+            0.0,
+            0.0,
+            0.0,
+            float(hold_thrust),
+        )
         last_processed_token = (
             int(watermark.generation),
             int(watermark.frame_id),
@@ -8823,11 +9898,15 @@ class VQ2Runner:
                         "race status changed before gate-1 observation setpoint"
                     )
 
-                await self._send_flight_command(zero)
+                await self._send_flight_command(transition_command)
                 self._record_tick(
-                    "gate0-observe/post-pass",
+                    (
+                        "gate0-observe/post-pass"
+                        if float(hold_thrust) == 0.0
+                        else "full-lap/gate1/acquire"
+                    ),
                     send_checked_s - observation_started_s,
-                    zero,
+                    transition_command,
                 )
                 next_tick = next_control_deadline(next_tick, time.monotonic())
                 await asyncio.sleep(
@@ -8835,6 +9914,748 @@ class VQ2Runner:
                 )
         finally:
             self._post_gate_reacquisition = False
+
+    @staticmethod
+    def _official_lap_time_s(race: Any) -> float:
+        start_ms = int(race.race_start_boot_time_ms)
+        finish_ns = int(race.race_finish_time_ns)
+        if start_ms < 0 or finish_ns < 0:
+            raise SafetyAbort("authoritative lap timing is incomplete")
+        elapsed_ns = finish_ns - start_ms * 1_000_000
+        if elapsed_ns < 0:
+            raise SafetyAbort("authoritative lap finish predates race start")
+        return elapsed_ns / 1_000_000_000.0
+
+    async def _acquire_course_gate(
+        self,
+        expected_gate_index: int,
+        *,
+        transition_race_boot_ms: int,
+        lap_deadline_s: float,
+    ) -> Dict[str, Any]:
+        """Retire the crossed target and acquire one strictly newer gate."""
+
+        if not 1 <= expected_gate_index <= FULL_LAP_MAX_GATE_INDEX:
+            raise SafetyAbort(
+                f"course gate index is outside the bounded campaign ({expected_gate_index})"
+            )
+        watermark = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
+        if watermark is None:
+            raise SafetyAbort("camera unavailable at course-gate handoff")
+        self._last_frame_identity = (
+            int(watermark.generation),
+            int(watermark.frame_id),
+        )
+        self._last_frame_sim_ns = int(watermark.sim_time_ns)
+        self._latest_detection_frame_id = int(watermark.frame_id)
+        self._latest_detection_frame_sim_ns = int(watermark.sim_time_ns)
+        self._latest_detection_generation = int(watermark.generation)
+        self._latest_detection_received_s = float(watermark.received_monotonic_s)
+        self._latest_raw_detections = []
+        self._latest_accepted_target = None
+        self.tracker.reset()
+        self._post_gate_reacquisition = True
+
+        started_s = time.monotonic()
+        hard_deadline_s = min(
+            started_s + POST_GATE_OBSERVATION_TIMEOUT_S,
+            float(lap_deadline_s),
+        )
+        if started_s >= hard_deadline_s:
+            self._post_gate_reacquisition = False
+            raise SafetyAbort("course-gate acquisition has no remaining safety budget")
+        next_tick = max(
+            started_s,
+            (
+                self._last_flight_command_sent_s + CONTROL_PERIOD_S
+                if self._last_flight_command_sent_s is not None
+                else started_s
+            ),
+        )
+        last_token = (
+            int(watermark.generation),
+            int(watermark.frame_id),
+            int(watermark.sim_time_ns),
+        )
+        frames: List[Dict[str, Any]] = []
+        transition_command = AttitudeRateCommand(
+            0.0,
+            0.0,
+            0.0,
+            COURSE_TRANSITION_THRUST,
+        )
+        self.recorder.emit(
+            "course_gate_acquisition_started",
+            expected_gate_index=expected_gate_index,
+            transition_race_boot_ms=int(transition_race_boot_ms),
+            hard_deadline_monotonic_s=hard_deadline_s,
+            watermark={
+                "generation": watermark.generation,
+                "frame_id": watermark.frame_id,
+                "sim_time_ns": watermark.sim_time_ns,
+                "received_monotonic_s": watermark.received_monotonic_s,
+            },
+        )
+        try:
+            initial_wait = min(next_tick, hard_deadline_s) - time.monotonic()
+            if initial_wait > 0.0:
+                await asyncio.sleep(initial_wait)
+            while True:
+                if time.monotonic() >= hard_deadline_s:
+                    raise SafetyAbort(
+                        f"gate {expected_gate_index} acquisition timed out"
+                    )
+                self._sample()
+                self._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=False,
+                    enforce_benign_pad_budget=False,
+                )
+                now = time.monotonic()
+                race = self.adapter.race_status
+                if race is None:
+                    raise SafetyAbort("race status unavailable during gate acquisition")
+                if int(race.sim_boot_time_ms) < int(transition_race_boot_ms):
+                    raise SafetyAbort("race clock regressed during gate acquisition")
+                if (
+                    race.race_finished
+                    and int(race.sim_boot_time_ms) > int(transition_race_boot_ms)
+                ):
+                    return {
+                        "race_finished": True,
+                        "gate_index": int(race.active_gate_index),
+                        "race_boot_ms": int(race.sim_boot_time_ms),
+                        "race_finish_time_ns": int(race.race_finish_time_ns),
+                        "official_lap_time_s": self._official_lap_time_s(race),
+                        "acquisition_elapsed_s": now - started_s,
+                        "frame_count": len(frames),
+                    }
+                if int(race.active_gate_index) != expected_gate_index:
+                    raise SafetyAbort(
+                        "gate index changed during acquisition "
+                        f"({race.active_gate_index}, expected {expected_gate_index})"
+                    )
+
+                frame_token = self._latest_frame_token()
+                if frame_token is not None and frame_token != last_token:
+                    generation, frame_id, sim_time_ns = frame_token
+                    received_s = self._latest_detection_received_s
+                    if generation != int(watermark.generation):
+                        raise SafetyAbort("vision generation changed during gate acquisition")
+                    if (
+                        frame_id <= int(watermark.frame_id)
+                        or sim_time_ns <= int(watermark.sim_time_ns)
+                        or received_s is None
+                        or received_s <= float(watermark.received_monotonic_s)
+                    ):
+                        raise SafetyAbort("course camera frame did not advance strictly")
+                    last_token = frame_token
+                    accepted = self._latest_accepted_target
+                    if accepted is None or is_crossing_residue(accepted):
+                        self.tracker.reset()
+                        frames = []
+                    else:
+                        record = {
+                            "frame_id": accepted.frame_id,
+                            "sim_time_ns": accepted.sim_time_ns,
+                            "received_monotonic_s": accepted.received_monotonic_s,
+                            "center_px": [accepted.center_x, accepted.center_y],
+                            "bbox_xywh_px": list(accepted.bbox),
+                            "confidence": accepted.confidence,
+                            "tracker_streak": self.tracker.consecutive,
+                        }
+                        frames = (
+                            [record]
+                            if self.tracker.consecutive == 1
+                            else (frames + [record])[-self.tracker.consecutive :]
+                        )
+                        self.recorder.emit(
+                            "course_gate_candidate_frame",
+                            expected_gate_index=expected_gate_index,
+                            **record,
+                        )
+                        if (
+                            self.tracker.consecutive >= POST_GATE_REQUIRED_FRAMES
+                            and len(frames) >= POST_GATE_REQUIRED_FRAMES
+                            and accepted.age_s(time.monotonic()) <= MAX_VISION_AGE_S
+                        ):
+                            final_race = self.adapter.race_status
+                            if (
+                                final_race is None
+                                or int(final_race.active_gate_index)
+                                != expected_gate_index
+                                or int(final_race.sim_boot_time_ms)
+                                < int(transition_race_boot_ms)
+                            ):
+                                raise SafetyAbort(
+                                    "race status changed at gate acquisition acceptance"
+                                )
+                            result = {
+                                "race_finished": False,
+                                "gate_index": expected_gate_index,
+                                "race_boot_ms": int(final_race.sim_boot_time_ms),
+                                "acquisition_elapsed_s": time.monotonic() - started_s,
+                                "frame_count": POST_GATE_REQUIRED_FRAMES,
+                                "frames": frames[-POST_GATE_REQUIRED_FRAMES:],
+                                "initial_gate_area_px": int(accepted.bbox_area),
+                                "final_gate_bbox": list(accepted.bbox),
+                                "final_gate_center": [
+                                    accepted.center_x,
+                                    accepted.center_y,
+                                ],
+                            }
+                            self.recorder.emit("course_gate_acquired", **result)
+                            return result
+
+                if hard_deadline_s - time.monotonic() <= CONTROL_PERIOD_S:
+                    raise SafetyAbort(
+                        f"gate {expected_gate_index} acquisition timed out"
+                    )
+                await self._send_flight_command(transition_command)
+                self._record_tick(
+                    f"full-lap/gate{expected_gate_index}/acquire",
+                    time.monotonic() - started_s,
+                    transition_command,
+                )
+                next_tick = next_control_deadline(next_tick, time.monotonic())
+                await asyncio.sleep(
+                    max(0.0, min(next_tick, hard_deadline_s) - time.monotonic())
+                )
+        finally:
+            self._post_gate_reacquisition = False
+
+    def _complete_course_gate(
+        self,
+        *,
+        race: Any,
+        expected_gate_index: int,
+        gate_started_s: float,
+        lap_started_s: float,
+        crossing_started_s: Optional[float],
+        max_gate_area: int,
+        acquisition_gate_area: int,
+    ) -> Dict[str, Any]:
+        finished = bool(race.race_finished)
+        active_gate_index = int(race.active_gate_index)
+        if not finished and active_gate_index != expected_gate_index + 1:
+            raise SafetyAbort("course transition did not advance exactly one gate")
+        now = time.monotonic()
+        result: Dict[str, Any] = {
+            "gate_index": expected_gate_index,
+            "next_gate_index": None if finished else active_gate_index,
+            "race_finished": finished,
+            "race_boot_ms": int(race.sim_boot_time_ms),
+            "race_finish_time_ns": int(race.race_finish_time_ns),
+            "last_gate_race_time": int(race.last_gate_race_time),
+            "gate_elapsed_s": now - gate_started_s,
+            "lap_elapsed_s": now - lap_started_s,
+            "crossing_confirmation_used": crossing_started_s is not None,
+            "crossing_confirmation_elapsed_s": (
+                now - crossing_started_s
+                if crossing_started_s is not None
+                else None
+            ),
+            "acquisition_gate_area_px": int(acquisition_gate_area),
+            "max_gate_area_px": int(max_gate_area),
+        }
+        if finished:
+            result["official_lap_time_s"] = self._official_lap_time_s(race)
+        self.recorder.emit("course_gate_pass_proved", **result)
+        return result
+
+    async def _run_course_gate(
+        self,
+        expected_gate_index: int,
+        *,
+        acquisition: Dict[str, Any],
+        lap_started_s: float,
+        lap_deadline_s: float,
+    ) -> Dict[str, Any]:
+        """Visually center and pass one unknown-map course gate."""
+
+        race = self.adapter.race_status
+        if race is None or int(race.active_gate_index) != expected_gate_index:
+            raise SafetyAbort(
+                f"gate {expected_gate_index} approach lacks matching race status"
+            )
+        target = self.tracker.target
+        if target is None or self.tracker.consecutive < POST_GATE_REQUIRED_FRAMES:
+            raise SafetyAbort(
+                f"gate {expected_gate_index} approach lacks a confirmed target"
+            )
+        assert self.estimate is not None
+        _entry_roll, recenter_pitch_basis, _entry_yaw = (
+            self.estimate.orientation.to_euler()
+        )
+        acquisition_gate_area = int(
+            acquisition.get("initial_gate_area_px", target.bbox_area)
+        )
+        gate_started_s = await self._wait_for_next_flight_command_slot()
+        gate_deadline_s = min(
+            gate_started_s + COURSE_GATE_TIMEOUT_S,
+            float(lap_deadline_s),
+        )
+        next_tick = max(
+            gate_started_s,
+            (
+                self._last_flight_command_sent_s + CONTROL_PERIOD_S
+                if self._last_flight_command_sent_s is not None
+                else gate_started_s
+            ),
+        )
+        max_gate_area = max(acquisition_gate_area, target.bbox_area)
+        last_target_frame: Optional[int] = None
+        last_course_line_frame: Optional[int] = None
+        last_control_y: Optional[float] = None
+        last_target_time: Optional[float] = None
+        control_y_rate = 0.0
+        crossing_armed = False
+        crossing_started_s: Optional[float] = None
+        crossing_race_boot_ms: Optional[int] = None
+        last_current_gate_race_boot_ms = int(race.sim_boot_time_ms)
+        course_vision_generation: Optional[int] = None
+        while True:
+            now = time.monotonic()
+            if now >= gate_deadline_s:
+                raise SafetyAbort(f"gate {expected_gate_index} wall-time limit reached")
+            self._sample()
+            latest_vision_generation = self._latest_detection_generation
+            if (
+                type(latest_vision_generation) is not int
+                or latest_vision_generation < 0
+            ):
+                raise SafetyAbort("course vision generation is unavailable")
+            if course_vision_generation is None:
+                course_vision_generation = latest_vision_generation
+            elif latest_vision_generation != course_vision_generation:
+                raise SafetyAbort("vision generation changed during course gate")
+            race = self.adapter.race_status
+            assert race is not None and self.estimate is not None
+            if (
+                int(race.active_gate_index) == expected_gate_index
+                and not race.race_finished
+            ):
+                last_current_gate_race_boot_ms = int(race.sim_boot_time_ms)
+            target = self.tracker.target
+            assert target is not None
+            elapsed = now - gate_started_s
+            normalized_x = (target.center_x - 320.0) / 320.0
+            if (
+                self._latest_detection_frame_id is not None
+                and self._latest_detection_frame_id != last_course_line_frame
+            ):
+                last_course_line_frame = self._latest_detection_frame_id
+                course_line = cyan_course_line_observation(
+                    self._latest_detection_image,
+                )
+                self.recorder.emit(
+                    "course_gate_line_observation",
+                    expected_gate_index=expected_gate_index,
+                    elapsed_s=elapsed,
+                    frame_id=last_course_line_frame,
+                    observation=(
+                        asdict(course_line) if course_line is not None else None
+                    ),
+                )
+            max_gate_area = max(max_gate_area, target.bbox_area)
+            if elapsed > 5.0 and max_gate_area < 1.25 * acquisition_gate_area:
+                raise SafetyAbort(
+                    f"no visual approach progress toward gate {expected_gate_index}"
+                )
+
+            control_y = gate_control_center_y_px(
+                target,
+                previous_center_y=last_control_y,
+            )
+            if (
+                not crossing_armed
+                and target.age_s(now) <= CROSSING_TARGET_LOSS_S
+                and self.tracker.consecutive >= POST_GATE_REQUIRED_FRAMES
+                and int(race.active_gate_index) == expected_gate_index
+                and not race.race_finished
+                and is_course_gate_crossing_candidate(
+                    target,
+                    acquisition_gate_area=acquisition_gate_area,
+                    control_y=control_y,
+                )
+            ):
+                crossing_armed = True
+                self._course_edge_continuation_gate_index = None
+                self.recorder.emit(
+                    "course_crossing_candidate_armed",
+                    expected_gate_index=expected_gate_index,
+                    elapsed_s=elapsed,
+                    race_boot_ms=int(race.sim_boot_time_ms),
+                    target=asdict(target),
+                    control_y=control_y,
+                )
+            crossing_confirming = bool(
+                crossing_started_s is not None
+                or (
+                    crossing_armed
+                    and target.age_s(now) > CROSSING_TARGET_LOSS_S
+                )
+            )
+            self._watchdog(
+                require_target=not (
+                    crossing_confirming
+                    or race.race_finished
+                    or int(race.active_gate_index) == expected_gate_index + 1
+                ),
+                allow_benign_pad_contact=False,
+                enforce_benign_pad_budget=False,
+            )
+            active_gate_index = int(race.active_gate_index)
+            if (
+                not crossing_armed
+                and not crossing_confirming
+                and active_gate_index == expected_gate_index
+                and not race.race_finished
+                and self._latest_detection_frame_sim_ns is not None
+                and self._latest_detection_received_s is not None
+                and self._latest_detection_frame_sim_ns > target.sim_time_ns
+                and self._latest_detection_received_s
+                > target.received_monotonic_s
+                and 0.0
+                <= now - self._latest_detection_received_s
+                <= MAX_VISION_AGE_S
+            ):
+                contact_risk = select_untracked_contact_risk(
+                    self._latest_raw_detections,
+                    accepted_target=self._latest_accepted_target,
+                )
+                if contact_risk is not None:
+                    detector_index = next(
+                        (
+                            index
+                            for index, detection in enumerate(
+                                self._latest_raw_detections
+                            )
+                            if detection is contact_risk
+                        ),
+                        -1,
+                    )
+                    self.recorder.emit(
+                        "course_untracked_contact_risk",
+                        expected_gate_index=expected_gate_index,
+                        elapsed_s=elapsed,
+                        generation=self._latest_detection_generation,
+                        frame_id=self._latest_detection_frame_id,
+                        sim_time_ns=self._latest_detection_frame_sim_ns,
+                        receive_age_s=(
+                            now - self._latest_detection_received_s
+                        ),
+                        detection=gate_detection_summary(
+                            contact_risk,
+                            detector_index=detector_index,
+                        ),
+                    )
+                    raise SafetyAbort(
+                        f"large untracked gate geometry at gate "
+                        f"{expected_gate_index}"
+                    )
+            if not crossing_confirming:
+                if (
+                    int(race.sim_boot_time_ms) > last_current_gate_race_boot_ms
+                    and (
+                        race.race_finished
+                        or active_gate_index == expected_gate_index + 1
+                    )
+                ):
+                    return self._complete_course_gate(
+                        race=race,
+                        expected_gate_index=expected_gate_index,
+                        gate_started_s=gate_started_s,
+                        lap_started_s=lap_started_s,
+                        crossing_started_s=None,
+                        max_gate_area=max_gate_area,
+                        acquisition_gate_area=acquisition_gate_area,
+                    )
+                if active_gate_index != expected_gate_index:
+                    raise SafetyAbort(
+                        "unexpected course gate-index transition "
+                        f"{expected_gate_index}->{active_gate_index}"
+                    )
+
+            if crossing_confirming:
+                if crossing_started_s is None:
+                    crossing_started_s = now
+                    crossing_race_boot_ms = last_current_gate_race_boot_ms
+                    self.recorder.emit(
+                        "course_crossing_confirmation_started",
+                        expected_gate_index=expected_gate_index,
+                        elapsed_s=elapsed,
+                        baseline_race_boot_ms=crossing_race_boot_ms,
+                        target_age_s=target.age_s(now),
+                    )
+                assert crossing_race_boot_ms is not None
+                decision = full_lap_crossing_status_decision(
+                    baseline_race_boot_ms=crossing_race_boot_ms,
+                    current_race_boot_ms=int(race.sim_boot_time_ms),
+                    expected_gate_index=expected_gate_index,
+                    active_gate_index=active_gate_index,
+                    race_finished=bool(race.race_finished),
+                    elapsed_s=now - crossing_started_s,
+                )
+                if decision != "waiting":
+                    self.recorder.emit(
+                        "course_crossing_status_decision",
+                        expected_gate_index=expected_gate_index,
+                        decision=decision,
+                        baseline_race_boot_ms=crossing_race_boot_ms,
+                        current_race_boot_ms=int(race.sim_boot_time_ms),
+                        gate_index=active_gate_index,
+                        race_finished=bool(race.race_finished),
+                    )
+                    if decision in {"passed", "finished"}:
+                        return self._complete_course_gate(
+                            race=race,
+                            expected_gate_index=expected_gate_index,
+                            gate_started_s=gate_started_s,
+                            lap_started_s=lap_started_s,
+                            crossing_started_s=crossing_started_s,
+                            max_gate_area=max_gate_area,
+                            acquisition_gate_area=acquisition_gate_area,
+                        )
+                    raise SafetyAbort(
+                        f"gate {expected_gate_index} crossing "
+                        f"{decision.replace('_', ' ')}"
+                    )
+                command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+                await self._send_flight_command(command)
+                self._record_tick(
+                    f"full-lap/gate{expected_gate_index}/confirm",
+                    elapsed,
+                    command,
+                )
+                next_tick = next_control_deadline(next_tick, time.monotonic())
+                await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+                continue
+
+            if target.frame_id != last_target_frame:
+                if last_control_y is not None and last_target_time is not None:
+                    dt_target = target.received_monotonic_s - last_target_time
+                    if dt_target > 1e-3:
+                        raw_rate = (control_y - last_control_y) / dt_target
+                        raw_rate = max(-300.0, min(300.0, raw_rate))
+                        control_y_rate = 0.65 * control_y_rate + 0.35 * raw_rate
+                last_target_frame = target.frame_id
+                last_control_y = control_y
+                last_target_time = target.received_monotonic_s
+
+            recenter_required = course_gate_recenter_required(
+                elapsed,
+                normalized_x,
+                control_y,
+            )
+            if recenter_required:
+                target_roll = course_gate_roll_target(normalized_x, recenter=True)
+                target_pitch = course_gate_recenter_pitch_target(
+                    recenter_pitch_basis,
+                    control_y,
+                )
+                # Crossing confirmation necessarily commands zero thrust.  Use
+                # the existing hard thrust ceiling briefly after each credit to
+                # arrest the observed sink before accelerating at the next gate.
+                thrust = (
+                    COURSE_RECENTER_THRUST
+                    if elapsed < COURSE_RECENTER_DURATION_S
+                    or control_y < COURSE_HIGH_GATE_Y_PX
+                    else gate_vertical_thrust(control_y, control_y_rate)
+                )
+                phase = "recenter"
+            else:
+                normalized_y = (control_y - 180.0) / 180.0
+                image_error = max(abs(normalized_x), abs(normalized_y))
+                speed_scale = max(0.15, min(1.0, (0.90 - image_error) / 0.70))
+                target_roll = course_gate_roll_target(normalized_x, recenter=False)
+                target_pitch = COURSE_APPROACH_PITCH_RAD * speed_scale
+                thrust = gate_vertical_thrust(control_y, control_y_rate)
+                if control_y < COURSE_HIGH_GATE_Y_PX:
+                    # A high, top-clipped target coincided with residual sink in
+                    # live traces.  Preserve recovery authority until it returns
+                    # to a measurable vertical corridor.
+                    thrust = COURSE_RECENTER_THRUST
+                phase = "approach"
+
+            if (
+                target.bbox_area >= 8 * acquisition_gate_area
+                and abs(control_y - 180.0) > 75.0
+            ):
+                raise SafetyAbort(
+                    f"gate {expected_gate_index} close approach outside vertical "
+                    f"corridor ({control_y:.1f}px)"
+                )
+            command = attitude_rate_command(
+                self.estimate,
+                target_roll_rad=target_roll,
+                target_pitch_rad=target_pitch,
+                thrust=thrust,
+            )
+            if phase == "recenter":
+                command = course_recenter_rate_command(command)
+            await self._send_flight_command(command)
+            self._record_tick(
+                f"full-lap/gate{expected_gate_index}/{phase}",
+                elapsed,
+                command,
+            )
+            next_tick = next_control_deadline(next_tick, time.monotonic())
+            await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+
+    async def _align_gate0_race_phase(self) -> Dict[str, Any]:
+        """Hold exact zero briefly so Gate 0 credit lands on the next packet."""
+
+        received = getattr(self.adapter, "latest_received_race_status", None)
+        if received is None:
+            result = {"applied": False, "reason": "no exact race ingress"}
+            self.recorder.emit("gate0_phase_alignment_skipped", **result)
+            return result
+        try:
+            received.validate_integrity()
+            race_received_ns = int(received.ingress.received_monotonic_ns)
+            race_sequence = int(received.ingress.sequence)
+            race_boot_ms = int(received.race_status.sim_boot_time_ms)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise SafetyAbort("gate-0 phase alignment race ingress is invalid") from exc
+
+        planned_delay_s = gate0_phase_alignment_delay_s(
+            now_monotonic_ns=time.perf_counter_ns(),
+            last_race_received_monotonic_ns=race_received_ns,
+        )
+        if planned_delay_s <= 0.001:
+            result = {
+                "applied": False,
+                "reason": "already aligned",
+                "planned_delay_s": planned_delay_s,
+                "race_sequence": race_sequence,
+                "race_boot_ms": race_boot_ms,
+            }
+            self.recorder.emit("gate0_phase_alignment_skipped", **result)
+            return result
+
+        started_s = time.monotonic()
+        deadline_s = started_s + planned_delay_s
+        next_tick = started_s
+        zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
+        self.recorder.emit(
+            "gate0_phase_alignment_started",
+            planned_delay_s=planned_delay_s,
+            race_sequence=race_sequence,
+            race_boot_ms=race_boot_ms,
+            expected_target_loss_s=COURSE_GATE0_EXPECTED_TARGET_LOSS_S,
+            target_lead_s=COURSE_RACE_PACKET_TARGET_LEAD_S,
+        )
+        command_count = 0
+        while time.monotonic() < deadline_s:
+            self._sample()
+            self._watchdog(
+                require_target=True,
+                allow_benign_pad_contact=True,
+                enforce_benign_pad_budget=True,
+            )
+            race = self.adapter.race_status
+            if race is None or int(race.active_gate_index) != 0 or race.race_finished:
+                raise SafetyAbort("race state changed during gate-0 phase alignment")
+            await self._send_flight_command(zero)
+            self._record_tick(
+                "full-lap/gate0/phase-align",
+                time.monotonic() - started_s,
+                zero,
+            )
+            command_count += 1
+            next_tick = next_control_deadline(next_tick, time.monotonic())
+            await asyncio.sleep(
+                max(0.0, min(next_tick, deadline_s) - time.monotonic())
+            )
+        result = {
+            "applied": True,
+            "planned_delay_s": planned_delay_s,
+            "actual_delay_s": time.monotonic() - started_s,
+            "command_count": command_count,
+            "race_sequence": race_sequence,
+            "race_boot_ms": race_boot_ms,
+        }
+        self.recorder.emit("gate0_phase_alignment_complete", **result)
+        return result
+
+    async def _run_full_lap(self, context: StartContext) -> Dict[str, Any]:
+        """Run an unknown-count mapless lap until the simulator declares finish."""
+
+        lap_started_s = time.monotonic()
+        lap_deadline_s = lap_started_s + FULL_LAP_TIMEOUT_S
+        phase_alignment = await self._align_gate0_race_phase()
+        gate0 = await self._run_gate0(
+            context,
+            exit_pitch_rad=COURSE_GATE0_EXIT_PITCH_RAD,
+            minimum_thrust=COURSE_GATE0_MIN_THRUST,
+            boost_until_s=COURSE_GATE0_BOOST_UNTIL_S,
+            observe_course_line=True,
+            course_line_preturn=True,
+            course_line_exit_counterroll_enabled=True,
+        )
+        gate1_observation = await self._observe_gate1(
+            gate0,
+            hold_thrust=COURSE_TRANSITION_THRUST,
+        )
+        final_bbox = gate1_observation["final_gate_bbox"]
+        acquisition: Dict[str, Any] = {
+            **gate1_observation,
+            "initial_gate_area_px": int(final_bbox[2]) * int(final_bbox[3]),
+            "race_finished": False,
+        }
+        acquisitions: List[Dict[str, Any]] = [dict(acquisition)]
+        gates: List[Dict[str, Any]] = []
+        expected_gate_index = 1
+        while True:
+            if time.monotonic() >= lap_deadline_s:
+                raise SafetyAbort("full-lap wall-time limit reached")
+            self._course_edge_continuation_gate_index = expected_gate_index
+            try:
+                gate_result = await self._run_course_gate(
+                    expected_gate_index,
+                    acquisition=acquisition,
+                    lap_started_s=lap_started_s,
+                    lap_deadline_s=lap_deadline_s,
+                )
+            finally:
+                self._course_edge_continuation_gate_index = None
+            gates.append(gate_result)
+            if gate_result["race_finished"]:
+                return {
+                    "race_finished": True,
+                    "official_lap_time_s": gate_result["official_lap_time_s"],
+                    "race_finish_time_ns": gate_result["race_finish_time_ns"],
+                    "highest_gate_index": expected_gate_index,
+                    "proved_transition_count": 1 + len(gates),
+                    "gate0_phase_alignment": phase_alignment,
+                    "gate0": gate0,
+                    "gate1_observation": gate1_observation,
+                    "acquisitions": acquisitions,
+                    "course_gates": gates,
+                }
+            expected_gate_index = int(gate_result["next_gate_index"])
+            if expected_gate_index > FULL_LAP_MAX_GATE_INDEX:
+                raise SafetyAbort("full-lap exceeded the bounded gate-index limit")
+            acquisition = await self._acquire_course_gate(
+                expected_gate_index,
+                transition_race_boot_ms=int(gate_result["race_boot_ms"]),
+                lap_deadline_s=lap_deadline_s,
+            )
+            acquisitions.append(dict(acquisition))
+            if acquisition["race_finished"]:
+                return {
+                    "race_finished": True,
+                    "official_lap_time_s": acquisition["official_lap_time_s"],
+                    "race_finish_time_ns": acquisition["race_finish_time_ns"],
+                    "highest_gate_index": int(acquisition["gate_index"]),
+                    "proved_transition_count": 1 + len(gates),
+                    "gate0_phase_alignment": phase_alignment,
+                    "gate0": gate0,
+                    "gate1_observation": gate1_observation,
+                    "acquisitions": acquisitions,
+                    "course_gates": gates,
+                }
 
     async def run_powered_stage(
         self,
@@ -8849,6 +10670,7 @@ class VQ2Runner:
             "hover",
             "gate0",
             "gate0-observe",
+            FULL_LAP_STAGE,
             CALIBRATION_STAGE,
         }:
             raise ValueError(f"unsupported powered stage: {stage}")
@@ -8866,6 +10688,16 @@ class VQ2Runner:
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
             context = await self.wait_for_go()
+            if (
+                stage == FULL_LAP_STAGE
+                and not full_lap_initial_gate_reference_is_valid(
+                    context.initial_gate_area
+                )
+            ):
+                raise SafetyAbort(
+                    "full-lap initial gate reference outside proved spawn "
+                    f"area envelope ({context.initial_gate_area}px)"
+                )
             race = self.adapter.race_status
             gate_before = race.active_gate_index if race else None
             await self.arm_confirmed()
@@ -8877,7 +10709,7 @@ class VQ2Runner:
                 details = await self._run_calibration_excite(context)
             elif stage == "gate0":
                 details = await self._run_gate0(context)
-            else:
+            elif stage == "gate0-observe":
                 gate0_details = await self._run_gate0(
                     context,
                     capture_transition=write_diagnostic_pngs,
@@ -8893,6 +10725,8 @@ class VQ2Runner:
                         "reason": str(exc),
                     }
                     raise
+            else:
+                details = await self._run_full_lap(context)
             success = True
             reason = "stage completed"
         except (SafetyAbort, asyncio.CancelledError) as exc:
@@ -9957,7 +11791,14 @@ def main(
     )
     parser.add_argument(
         "--stage",
-        choices=("preflight", "sign-id", "hover", "gate0", "gate0-observe"),
+        choices=(
+            "preflight",
+            "sign-id",
+            "hover",
+            "gate0",
+            "gate0-observe",
+            FULL_LAP_STAGE,
+        ),
         default="preflight",
     )
     parser.add_argument("--address", default=DEFAULT_MAVLINK_URL)

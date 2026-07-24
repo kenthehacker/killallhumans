@@ -181,7 +181,7 @@ interactive confirmation.
             }
             $allowed = @(
                 'sign-id', 'hover', 'gate0', 'gate0-observe',
-                'calibration-excite'
+                'full-lap', 'calibration-excite'
             )
             if ($stage -notin $allowed) {
                 throw "Unsupported flight-cycle stage '$stage'."

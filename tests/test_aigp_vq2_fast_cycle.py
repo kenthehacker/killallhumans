@@ -97,7 +97,17 @@ def test_compact_manifest_has_no_interactive_or_bulk_freeze_inputs(tmp_path):
     assert "attestation" not in json.dumps(manifest)
 
 
-def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(tmp_path):
+def test_full_lap_is_an_explicit_fast_powered_stage():
+    assert "full-lap" in fast_cycle.FAST_POWERED_STAGES
+    parsed = fast_cycle.build_argument_parser().parse_args(["full-lap"])
+    assert parsed.stage == "full-lap"
+
+
+@pytest.mark.parametrize("requested_stage", ["calibration-excite", "full-lap"])
+def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
+    tmp_path,
+    requested_stage,
+):
     calls = []
 
     async def run_live(stage, address, record, **kwargs):
@@ -115,7 +125,7 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(tmp_path):
         )
 
     code, result = fast_cycle._execute_fast_cycle(
-        "calibration-excite",
+        requested_stage,
         evidence_root=tmp_path,
         now=lambda: UTC,
         load_runner=lambda: SimpleNamespace(run_live=run_live),
@@ -126,7 +136,7 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(tmp_path):
     assert result["success"] is True
     assert len(calls) == 1
     stage, address, record, kwargs = calls[0]
-    assert stage == "calibration-excite"
+    assert stage == requested_stage
     assert address == fast_cycle.DEFAULT_ADDRESS
     assert kwargs == {
         "preflight_before_powered_stage": False,
@@ -137,6 +147,14 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(tmp_path):
     manifest = json.loads((run_directory / "run-manifest.json").read_text())
     terminal = json.loads((run_directory / "result.json").read_text())
     assert manifest["run_id"] == terminal["run_id"] == result["run_id"]
+    assert manifest["authorization"]["scope"] == {
+        "stage": requested_stage,
+        "attempt_limit": 1,
+    }
+    assert manifest["execution"]["stage"] == requested_stage
+    assert (manifest["inputs"]["excitation_plan"] is None) is (
+        requested_stage == "full-lap"
+    )
     assert (run_directory / "session.jsonl.gz").read_bytes() == b"compact trace"
     assert result["trace"]["sha256"] == fast_cycle.hashlib.sha256(
         b"compact trace"
