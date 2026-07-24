@@ -23,15 +23,18 @@ point.
 `gate1-recenter` is a user-authorized bounded no-passage diagnostic. Its
 horizontal pixel-rate gain remains exactly zero pending M2 recorded-replay and
 tracker-isolation acceptance; the current diagnostic combines horizontal
-position error with a fixed bounded pitch brake. It preserves exact `0.275`
-thrust with zero attitude rates during the visually armed Gate 0 crossing
-confirmation and authoritative Gate 1 acquisition so the motors do not cut
-during the continuation handoff. Once Gate 1 is authoritative, the accepted
-and raw no-passage geometry guards apply before every such powered observation
-setpoint. It stops after 0.60 seconds, on any gate-index change, or before a
-primary target reaches 160 pixels wide or 23,040 square pixels; the existing
-raw large-geometry contact guard is enforced independently. Stage success
-still requires cleanup confirmation.
+position error with a fixed bounded pitch brake. Its single structural
+hypothesis enables the existing bounded Gate 0 cyan-course-line preturn while
+explicitly leaving exit counterroll disabled. Applied preturn objectives are
+recorded in the trace. It preserves exact `0.275` thrust with zero attitude
+rates during the visually armed Gate 0 crossing confirmation and authoritative
+Gate 1 acquisition so the motors do not cut during the continuation handoff.
+Once Gate 1 is authoritative, the accepted and raw no-passage geometry guards
+apply before every such powered observation setpoint. It stops after 0.60
+seconds, on any gate-index change, or before a primary target reaches 160
+pixels wide or 23,040 square pixels; the existing raw large-geometry contact
+guard is enforced independently. Stage success still requires cleanup
+confirmation.
 
 ## What happens before flight
 

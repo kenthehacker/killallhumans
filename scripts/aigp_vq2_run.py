@@ -9630,13 +9630,25 @@ class VQ2Runner:
                 < COURSE_LINE_PRETURN_TAPER_AREA_SCALE
                 * context.initial_gate_area
             ):
+                preturn_bias = course_line_preturn_roll(
+                    filtered_course_turn
+                )
                 target_roll = max(
                     -COURSE_LINE_PRETURN_LIMIT_RAD,
                     min(
                         COURSE_LINE_PRETURN_LIMIT_RAD,
-                        target_roll
-                        + course_line_preturn_roll(filtered_course_turn),
+                        target_roll + preturn_bias,
                     ),
+                )
+                self.recorder.emit(
+                    "course_line_preturn_applied",
+                    frame_id=target.frame_id,
+                    elapsed_s=elapsed,
+                    gate_area_px=target.bbox_area,
+                    filtered_turn_score=filtered_course_turn,
+                    consistent_frame_count=course_turn_streak,
+                    roll_bias_rad=preturn_bias,
+                    target_roll_rad=target_roll,
                 )
             if elapsed < 0.15:
                 thrust = 0.26
@@ -11012,6 +11024,8 @@ class VQ2Runner:
         gate0 = await self._run_gate0(
             context,
             crossing_hold_thrust=GATE1_RECENTER_TRANSITION_THRUST,
+            course_line_preturn=True,
+            course_line_exit_counterroll_enabled=False,
         )
         observation = await self._observe_gate1(
             gate0,
@@ -11828,6 +11842,8 @@ class VQ2Runner:
                     crossing_hold_thrust=(
                         GATE1_RECENTER_TRANSITION_THRUST
                     ),
+                    course_line_preturn=True,
+                    course_line_exit_counterroll_enabled=False,
                 )
                 details = {"gate0": gate0_details}
                 try:
