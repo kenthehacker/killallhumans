@@ -10240,11 +10240,11 @@ class VQ2Runner:
         preshape_entry_pitch_rad: Optional[float] = None
         preshape_ended = False
         preshape_end_reason: Optional[str] = None
-        preshape_roll_level_started_s: Optional[float] = None
-        preshape_roll_level_target_rad: Optional[float] = None
-        preshape_roll_level_command_count = 0
-        preshape_roll_level_min_roll_rad: Optional[float] = None
-        preshape_roll_level_max_roll_rad: Optional[float] = None
+        preshape_roll_brake_started_s: Optional[float] = None
+        preshape_roll_brake_target_rad: Optional[float] = None
+        preshape_roll_brake_command_count = 0
+        preshape_roll_brake_min_roll_rad: Optional[float] = None
+        preshape_roll_brake_max_roll_rad: Optional[float] = None
 
         def has_exact_primary_authority(
             current_target: GateTarget,
@@ -10336,6 +10336,92 @@ class VQ2Runner:
                 raise SafetyAbort(
                     "Gate-0 sustained preshape exceeded its "
                     "fixed attitude envelope"
+                )
+
+        def finalize_sustained_preshape(
+            *,
+            reason: str,
+            checked_s: float,
+            elapsed_s: float,
+            current_target: GateTarget,
+        ) -> None:
+            nonlocal preshape_ended, preshape_end_reason
+
+            if (
+                preshape_authority_started_s is None
+                or preshape_ended
+            ):
+                return
+            preshape_ended = True
+            preshape_end_reason = reason
+            assert self._gate0_early_turn_summary is not None
+            current_roll, _pitch, _yaw = (
+                self.estimate.orientation.to_euler()
+            )
+            current_area_scale = (
+                float(current_target.bbox_area)
+                / float(context.initial_gate_area)
+            )
+            elapsed_preshape_s = (
+                checked_s - preshape_authority_started_s
+            )
+            self._gate0_early_turn_summary.update(
+                {
+                    "preshape_end_reason": reason,
+                    "ended_elapsed_s": elapsed_s,
+                    "end_gate_area_scale": current_area_scale,
+                    "authority_elapsed_s": elapsed_preshape_s,
+                    "longitudinal_brake_end_reason": reason,
+                }
+            )
+            if preshape_roll_brake_started_s is not None:
+                self._gate0_early_turn_summary.update(
+                    {
+                        "roll_brake_end_reason": reason,
+                        "roll_brake_duration_s": (
+                            checked_s - preshape_roll_brake_started_s
+                        ),
+                        "roll_brake_final_roll_rad": float(current_roll),
+                        "roll_brake_min_roll_rad": (
+                            preshape_roll_brake_min_roll_rad
+                        ),
+                        "roll_brake_max_roll_rad": (
+                            preshape_roll_brake_max_roll_rad
+                        ),
+                    }
+                )
+                self.recorder.emit(
+                    "gate0_yaw_stop_roll_brake_ended",
+                    elapsed_s=elapsed_s,
+                    reason=reason,
+                    duration_s=(
+                        checked_s - preshape_roll_brake_started_s
+                    ),
+                    final_roll_rad=float(current_roll),
+                    final_roll_rate_rad_s=float(
+                        self.estimate.body_rates[0]
+                    ),
+                    min_roll_rad=preshape_roll_brake_min_roll_rad,
+                    max_roll_rad=preshape_roll_brake_max_roll_rad,
+                    command_count=preshape_roll_brake_command_count,
+                )
+            self.recorder.emit(
+                "gate0_preshape_ended",
+                elapsed_s=elapsed_s,
+                frame_id=current_target.frame_id,
+                gate_area_scale=current_area_scale,
+                reason=reason,
+            )
+            if longitudinal_brake_started_s is not None:
+                self.recorder.emit(
+                    "gate0_longitudinal_brake_ended",
+                    elapsed_s=elapsed_s,
+                    brake_elapsed_s=(
+                        checked_s - longitudinal_brake_started_s
+                    ),
+                    frame_id=current_target.frame_id,
+                    gate_area_scale=current_area_scale,
+                    reason=reason,
                 )
 
         while True:
@@ -10432,6 +10518,12 @@ class VQ2Runner:
             if not crossing_confirming and race.active_gate_index == 1:
                 if last_gate0_race_boot_ms is None:
                     raise SafetyAbort("gate 1 appeared without a recorded gate-0 packet")
+                finalize_sustained_preshape(
+                    reason="authoritative_pass",
+                    checked_s=now,
+                    elapsed_s=elapsed,
+                    current_target=target,
+                )
                 return self._complete_gate0_pass(
                     race=race,
                     pre_gate_race_boot_ms=last_gate0_race_boot_ms,
@@ -10476,6 +10568,12 @@ class VQ2Runner:
                         gate_index=race.active_gate_index,
                     )
                     if decision == "passed":
+                        finalize_sustained_preshape(
+                            reason="authoritative_pass",
+                            checked_s=now,
+                            elapsed_s=elapsed,
+                            current_target=target,
+                        )
                         return self._complete_gate0_pass(
                             race=race,
                             pre_gate_race_boot_ms=crossing_race_boot_ms,
@@ -10796,8 +10894,8 @@ class VQ2Runner:
                             preshape_entry_pitch_rad
                         ),
                         "longitudinal_brake_command_count": 0,
-                        "roll_level_started": False,
-                        "roll_level_command_count": 0,
+                        "roll_brake_started": False,
+                        "roll_brake_command_count": 0,
                     }
                     self.recorder.emit(
                         "gate0_longitudinal_brake_latched",
@@ -10884,83 +10982,12 @@ class VQ2Runner:
                     elif current_area_scale >= effective_end_area_scale:
                         preshape_end_reason = "gate_area"
                     if preshape_end_reason is not None:
-                        preshape_ended = True
-                        assert self._gate0_early_turn_summary is not None
-                        current_roll, _pitch, _yaw = (
-                            self.estimate.orientation.to_euler()
-                        )
-                        self._gate0_early_turn_summary.update(
-                            {
-                                "preshape_end_reason": preshape_end_reason,
-                                "ended_elapsed_s": elapsed,
-                                "end_gate_area_scale": current_area_scale,
-                                "authority_elapsed_s": elapsed_preshape_s,
-                                "longitudinal_brake_end_reason": (
-                                    preshape_end_reason
-                                ),
-                            }
-                        )
-                        if preshape_roll_level_started_s is not None:
-                            self._gate0_early_turn_summary.update(
-                                {
-                                    "roll_level_end_reason": (
-                                        preshape_end_reason
-                                    ),
-                                    "roll_level_duration_s": (
-                                        now
-                                        - preshape_roll_level_started_s
-                                    ),
-                                    "roll_level_final_roll_rad": (
-                                        float(current_roll)
-                                    ),
-                                    "roll_level_min_roll_rad": (
-                                        preshape_roll_level_min_roll_rad
-                                    ),
-                                    "roll_level_max_roll_rad": (
-                                        preshape_roll_level_max_roll_rad
-                                    ),
-                                }
-                            )
-                            self.recorder.emit(
-                                "gate0_yaw_stop_roll_level_ended",
-                                elapsed_s=elapsed,
-                                reason=preshape_end_reason,
-                                duration_s=(
-                                    now
-                                    - preshape_roll_level_started_s
-                                ),
-                                final_roll_rad=float(current_roll),
-                                final_roll_rate_rad_s=float(
-                                    self.estimate.body_rates[0]
-                                ),
-                                min_roll_rad=(
-                                    preshape_roll_level_min_roll_rad
-                                ),
-                                max_roll_rad=(
-                                    preshape_roll_level_max_roll_rad
-                                ),
-                                command_count=(
-                                    preshape_roll_level_command_count
-                                ),
-                            )
-                        self.recorder.emit(
-                            "gate0_preshape_ended",
-                            elapsed_s=elapsed,
-                            frame_id=target.frame_id,
-                            gate_area_scale=current_area_scale,
+                        finalize_sustained_preshape(
                             reason=preshape_end_reason,
+                            checked_s=now,
+                            elapsed_s=elapsed,
+                            current_target=target,
                         )
-                        if longitudinal_brake_started_s is not None:
-                            self.recorder.emit(
-                                "gate0_longitudinal_brake_ended",
-                                elapsed_s=elapsed,
-                                brake_elapsed_s=(
-                                    now - longitudinal_brake_started_s
-                                ),
-                                frame_id=target.frame_id,
-                                gate_area_scale=current_area_scale,
-                                reason=preshape_end_reason,
-                            )
                 longitudinal_brake_active = bool(
                     longitudinal_brake_started_s is not None
                     and not preshape_ended
@@ -11001,7 +11028,7 @@ class VQ2Runner:
                 ) = gate0_yaw_envelope_state
                 yaw_soft_stopped = bool(
                     measured_yaw_soft_stopped
-                    or preshape_roll_level_started_s is not None
+                    or preshape_roll_brake_started_s is not None
                 )
                 if not yaw_soft_stopped:
                     local_yaw_rate = course_line_turn_yaw_rate(
@@ -11015,7 +11042,7 @@ class VQ2Runner:
                 elif (
                     measured_yaw_soft_stopped
                     and turn_cue.sustained_preshape_enabled
-                    and preshape_roll_level_started_s is None
+                    and preshape_roll_brake_started_s is None
                 ):
                     assert preshape_entry_roll_rad is not None
                     assert preshape_latched_sign is not None
@@ -11040,44 +11067,79 @@ class VQ2Runner:
                         - float(preshape_entry_roll_rad)
                     )
                     if (
-                        roll_excursion * preshape_latched_sign
-                        <= 0.0
+                        not math.isfinite(roll_excursion)
+                        or not math.isfinite(float(current_roll))
+                        or not math.isfinite(
+                            float(preshape_entry_roll_rad)
+                        )
+                        or roll_excursion * preshape_latched_sign <= 0.0
                     ):
                         raise SafetyAbort(
-                            "Gate-0 yaw-stop roll release lacked a "
+                            "Gate-0 yaw-stop roll brake lacked a "
                             "same-sign measured roll excursion"
                         )
+                    raw_brake_target_rad = (
+                        2.0 * float(preshape_entry_roll_rad)
+                        - float(current_roll)
+                    )
                     if (
-                        abs(float(preshape_entry_roll_rad))
+                        not math.isfinite(raw_brake_target_rad)
+                        or abs(raw_brake_target_rad)
+                        > turn_cue.preturn_roll_cap_rad
+                        or abs(raw_brake_target_rad)
+                        > GATE0_PRESHAPE_MAX_ABS_ROLL_RAD
+                        or abs(
+                            raw_brake_target_rad
+                            - float(preshape_entry_roll_rad)
+                        )
                         > GATE0_PRESHAPE_MAX_ATTITUDE_EXCURSION_RAD
+                        or (
+                            raw_brake_target_rad
+                            - float(preshape_entry_roll_rad)
+                        )
+                        * preshape_latched_sign
+                        >= 0.0
+                        or (
+                            raw_brake_target_rad
+                            - float(current_roll)
+                        )
+                        * preshape_latched_sign
+                        >= 0.0
                     ):
                         raise SafetyAbort(
-                            "Gate-0 yaw-stop roll release cannot reach "
-                            "level inside its fixed entry-relative envelope"
+                            "Gate-0 yaw-stop roll brake target escaped "
+                            "its fixed attitude envelope"
                         )
-                    preshape_roll_level_started_s = now
-                    preshape_roll_level_target_rad = 0.0
-                    preshape_roll_level_min_roll_rad = float(
+                    preshape_roll_brake_started_s = now
+                    preshape_roll_brake_target_rad = raw_brake_target_rad
+                    preshape_roll_brake_min_roll_rad = float(
                         current_roll
                     )
-                    preshape_roll_level_max_roll_rad = float(
+                    preshape_roll_brake_max_roll_rad = float(
                         current_roll
                     )
                     assert self._gate0_early_turn_summary is not None
                     self._gate0_early_turn_summary.update(
                         {
-                            "roll_level_started": True,
-                            "roll_level_started_elapsed_s": elapsed,
-                            "roll_level_trigger_roll_rad": (
+                            "roll_brake_started": True,
+                            "roll_brake_started_elapsed_s": elapsed,
+                            "roll_brake_entry_roll_rad": (
+                                float(preshape_entry_roll_rad)
+                            ),
+                            "roll_brake_trigger_roll_rad": (
                                 float(current_roll)
                             ),
-                            "roll_level_target_rad": (
-                                preshape_roll_level_target_rad
+                            "roll_brake_excursion_rad": roll_excursion,
+                            "roll_brake_raw_target_rad": (
+                                raw_brake_target_rad
+                            ),
+                            "roll_brake_target_rad": (
+                                preshape_roll_brake_target_rad
                             ),
                         }
                     )
                     self.recorder.emit(
-                        "gate0_yaw_stop_roll_level_latched",
+                        "gate0_yaw_stop_roll_brake_latched",
                         elapsed_s=elapsed,
                         vision_generation=preshape_entry_generation,
                         frame_id=target.frame_id,
@@ -11091,8 +11153,10 @@ class VQ2Runner:
                         trigger_roll_rate_rad_s=float(
                             self.estimate.body_rates[0]
                         ),
+                        roll_excursion_rad=roll_excursion,
+                        raw_target_roll_rad=raw_brake_target_rad,
                         target_roll_rad=(
-                            preshape_roll_level_target_rad
+                            preshape_roll_brake_target_rad
                         ),
                     )
             if (
@@ -11118,7 +11182,7 @@ class VQ2Runner:
                 turn_cue.sustained_preshape_enabled
                 and early_turn_active
             ):
-                if preshape_roll_level_target_rad is None:
+                if preshape_roll_brake_target_rad is None:
                     preturn_bias = course_line_preturn_roll(
                         preshape_control_score,
                         gain=turn_cue.preturn_gain,
@@ -11145,25 +11209,25 @@ class VQ2Runner:
                         target_roll_rad=target_roll,
                     )
                 else:
-                    target_roll = preshape_roll_level_target_rad
+                    target_roll = preshape_roll_brake_target_rad
                     current_roll, _pitch, _yaw = (
                         self.estimate.orientation.to_euler()
                     )
-                    preshape_roll_level_min_roll_rad = min(
-                        float(preshape_roll_level_min_roll_rad),
+                    preshape_roll_brake_min_roll_rad = min(
+                        float(preshape_roll_brake_min_roll_rad),
                         float(current_roll),
                     )
-                    preshape_roll_level_max_roll_rad = max(
-                        float(preshape_roll_level_max_roll_rad),
+                    preshape_roll_brake_max_roll_rad = max(
+                        float(preshape_roll_brake_max_roll_rad),
                         float(current_roll),
                     )
-                    preshape_roll_level_command_count += 1
+                    preshape_roll_brake_command_count += 1
                     assert self._gate0_early_turn_summary is not None
                     self._gate0_early_turn_summary[
-                        "roll_level_command_count"
-                    ] = preshape_roll_level_command_count
+                        "roll_brake_command_count"
+                    ] = preshape_roll_brake_command_count
                     self.recorder.emit(
-                        "course_line_yaw_stop_roll_level_applied",
+                        "course_line_yaw_stop_roll_brake_applied",
                         frame_id=target.frame_id,
                         elapsed_s=elapsed,
                         gate_area_px=target.bbox_area,
@@ -11178,7 +11242,7 @@ class VQ2Runner:
                         ),
                         target_roll_rad=target_roll,
                         command_count=(
-                            preshape_roll_level_command_count
+                            preshape_roll_brake_command_count
                         ),
                     )
             elif course_line_exit_started:
@@ -11361,8 +11425,8 @@ class VQ2Runner:
                     command_yaw_rate_rad_s=local_yaw_rate,
                     yaw_excursion_rad=yaw_excursion,
                     yaw_soft_stopped=yaw_soft_stopped,
-                    roll_level_active=(
-                        preshape_roll_level_started_s is not None
+                    roll_brake_active=(
+                        preshape_roll_brake_started_s is not None
                     ),
                     measured_roll_rad=float(
                         self.estimate.orientation.to_euler()[0]
@@ -11767,6 +11831,8 @@ class VQ2Runner:
             raise SafetyAbort("gate-1 recenter lacks the proved three-frame handoff")
         handoff_frames = list(frames[-POST_GATE_REQUIRED_FRAMES:])
         handoff_tokens: List[Tuple[int, int, float]] = []
+        handoff_center_ys: List[float] = []
+        handoff_bbox_tops: List[int] = []
         for frame in handoff_frames:
             if not isinstance(frame, Mapping):
                 raise SafetyAbort(
@@ -11775,6 +11841,8 @@ class VQ2Runner:
             frame_id = frame.get("frame_id")
             sim_time_ns = frame.get("sim_time_ns")
             received_s = frame.get("received_monotonic_s")
+            center_px = frame.get("center_px")
+            bbox_xywh_px = frame.get("bbox_xywh_px")
             if (
                 type(frame_id) is not int
                 or type(sim_time_ns) is not int
@@ -11782,6 +11850,15 @@ class VQ2Runner:
                 or frame_id < 0
                 or sim_time_ns < 0
                 or not math.isfinite(float(received_s))
+                or not isinstance(center_px, Sequence)
+                or isinstance(center_px, (str, bytes))
+                or len(center_px) != 2
+                or type(center_px[1]) not in {int, float}
+                or not math.isfinite(float(center_px[1]))
+                or not isinstance(bbox_xywh_px, Sequence)
+                or isinstance(bbox_xywh_px, (str, bytes))
+                or len(bbox_xywh_px) != 4
+                or type(bbox_xywh_px[1]) is not int
             ):
                 raise SafetyAbort(
                     "gate-1 recenter handoff frame provenance is invalid"
@@ -11789,6 +11866,8 @@ class VQ2Runner:
             handoff_tokens.append(
                 (frame_id, sim_time_ns, float(received_s))
             )
+            handoff_center_ys.append(float(center_px[1]))
+            handoff_bbox_tops.append(int(bbox_xywh_px[1]))
         if any(
             handoff_tokens[index][0] <= handoff_tokens[index - 1][0]
             or handoff_tokens[index][1] <= handoff_tokens[index - 1][1]
@@ -11797,6 +11876,17 @@ class VQ2Runner:
         ):
             raise SafetyAbort(
                 "gate-1 recenter handoff frames did not advance strictly"
+            )
+        if (
+            handoff_bbox_tops[-1] <= 0
+            and all(
+                handoff_center_ys[index]
+                < handoff_center_ys[index - 1]
+                for index in range(1, len(handoff_center_ys))
+            )
+        ):
+            raise SafetyAbort(
+                "gate-1 recenter unsafe top-edge departure geometry"
             )
         first_handoff_token = handoff_tokens[0]
         if (
