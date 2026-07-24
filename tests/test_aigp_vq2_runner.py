@@ -3264,8 +3264,23 @@ def test_gate0_visual_blend_requires_zero_crossing_hold_before_sampling(
     assert adapter.commands == []
 
 
+@pytest.mark.parametrize(
+    ("withdrawal_exception", "withdrawal_reason"),
+    (
+        (
+            vq2_module.VisualApproachCurrentGeometryUnavailable,
+            "current_aperture_geometry_unavailable",
+        ),
+        (
+            vq2_module.VisualApproachPassageSafetyUnavailable,
+            "passage_safety_corridor_unavailable",
+        ),
+    ),
+)
 def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossing(
     monkeypatch,
+    withdrawal_exception,
+    withdrawal_reason,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = True
@@ -3311,9 +3326,18 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     runner.tracker.consecutive = 3
 
     class FakeApproach:
-        def __init__(self, expected_current_track_id, gate_index, _tuning):
+        def __init__(
+            self,
+            expected_current_track_id,
+            gate_index,
+            _tuning,
+            *,
+            next_gate_blend,
+        ):
             assert expected_current_track_id == current_track_id
             assert gate_index == 0
+            assert next_gate_blend == pytest.approx(0.25)
+            self.next_gate_blend = next_gate_blend
             self.calls = 0
 
         def observe(
@@ -3331,8 +3355,8 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
             )
             self.calls += 1
             if self.calls == 4:
-                raise vq2_module.VisualApproachCurrentGeometryUnavailable(
-                    "authoritative current aperture is clipped or censored"
+                raise withdrawal_exception(
+                    "optional pre-pass authority is unavailable"
                 )
             token = ServoFrameToken(
                 stream_id="vq2-camera",
@@ -3375,7 +3399,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
                 thrust=0.21,
                 corridor_frames=3,
                 advance_enabled=False,
-                next_gate_blend=MAX_NEXT_GATE_BLEND,
+                next_gate_blend=self.next_gate_blend,
                 horizontal_error=0.02,
                 vertical_error_image_down=-0.04,
                 effective_horizontal_error=0.118,
@@ -3507,10 +3531,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     assert summary["fresh_blend_frame_count"] == 3
     assert summary["command_count"] == 3
     assert summary["withdrawn_before_confirmation"] is True
-    assert (
-        summary["withdrawal_reason"]
-        == "current_aperture_geometry_unavailable"
-    )
+    assert summary["withdrawal_reason"] == withdrawal_reason
     visual_commands = sent_commands[: summary["command_count"]]
     assert visual_commands
     assert all(
@@ -3520,7 +3541,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         <= vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
         and abs(command.yaw_rate)
         <= vq2_module.VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
-        and 0.21 <= command.thrust <= vq2_module.VISUAL_GATE0_BLEND_THRUST_CAP
+        and command.thrust == pytest.approx(0.21)
         for command in visual_commands
     )
     assert confirmation_commands

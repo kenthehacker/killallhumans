@@ -10,6 +10,11 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
+    PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S,
+    PREPASS_CURRENT_MAX_ABS_X_NORM,
+    PREPASS_CURRENT_MAX_ABS_Y_NORM,
+    PREPASS_CURRENT_PROJECTION_HORIZON_S,
+    PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S,
 )
 from scripts.aigp_vq2_visual_config import (
     VISUAL_CONFIG_SCHEMA,
@@ -108,12 +113,20 @@ def test_immutable_safety_envelopes_are_not_configuration_fields():
         "watchdog",
         "max_segment_yaw_excursion",
         "max_segment_duration",
+        "prepass_current_max",
+        "prepass_next_max",
+        "prepass_projection",
     ):
         assert forbidden not in serialized
 
     assert MAX_VISUAL_YAW_RATE_RAD_S == 0.08
     assert MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD > 0.05
     assert MAX_VISUAL_SEGMENT_DURATION_S == 8.0
+    assert PREPASS_CURRENT_MAX_ABS_X_NORM == 0.20
+    assert PREPASS_CURRENT_MAX_ABS_Y_NORM == 0.28
+    assert PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S == 0.60
+    assert PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S == 0.60
+    assert PREPASS_CURRENT_PROJECTION_HORIZON_S == 0.10
 
 
 def test_validation_returns_new_immutable_nested_values():

@@ -95,6 +95,7 @@ from planning.vq2_gate_graph import (
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
     VisualApproachCurrentGeometryUnavailable,
+    VisualApproachPassageSafetyUnavailable,
     VisualApproachProposal,
     VisualApproachRefusal,
 )
@@ -10928,6 +10929,9 @@ class VQ2Runner:
                 bound.current_track_id,
                 0,
                 self.visual_config.servo,
+                next_gate_blend=(
+                    self.visual_config.lifecycle.next_gate_blend_max
+                ),
             )
             self._visual_gate0_blend_summary = {
                 "enabled": True,
@@ -11067,29 +11071,37 @@ class VQ2Runner:
                                     visual_yaw_excursion
                                 ),
                             )
-                        except VisualApproachCurrentGeometryUnavailable as exc:
+                        except (
+                            VisualApproachCurrentGeometryUnavailable,
+                            VisualApproachPassageSafetyUnavailable,
+                        ) as exc:
                             # The optional pre-pass blend owns no crossing
-                            # authority.  Withdraw it permanently when the
-                            # current aperture becomes censored and return to
-                            # the proved Gate-0 bootstrap controller.  All
-                            # identity/provenance refusals remain fatal below.
+                            # authority.  Withdraw it permanently when current
+                            # geometry becomes censored or a latched blend
+                            # leaves its immutable passage corridor, then
+                            # return to the proved Gate-0 bootstrap controller.
+                            # All identity/provenance refusals remain fatal.
+                            withdrawal_reason = (
+                                "current_aperture_geometry_unavailable"
+                                if isinstance(
+                                    exc,
+                                    VisualApproachCurrentGeometryUnavailable,
+                                )
+                                else "passage_safety_corridor_unavailable"
+                            )
                             visual_blend_withdrawn = True
                             latest_visual_proposal = None
                             self._visual_gate0_blend_summary.update(
                                 {
                                     "withdrawn_before_confirmation": True,
-                                    "withdrawal_reason": (
-                                        "current_aperture_geometry_unavailable"
-                                    ),
+                                    "withdrawal_reason": withdrawal_reason,
                                     "withdrawn_elapsed_s": elapsed,
                                 }
                             )
                             self.recorder.emit(
                                 "visual_next_gate_blend_withdrawn",
                                 elapsed_s=elapsed,
-                                reason=(
-                                    "current_aperture_geometry_unavailable"
-                                ),
+                                reason=withdrawal_reason,
                                 refusal=str(exc),
                                 current_track_id=(
                                     self._visual_gate0_blend_summary[
@@ -11514,7 +11526,15 @@ class VQ2Runner:
                         latest_visual_proposal.servo_output.target_pitch_rad,
                     ),
                 )
-                thrust = min(thrust, VISUAL_GATE0_BLEND_THRUST_CAP)
+                # The visual proposal owns only a reduction from the proved
+                # Gate-0 bootstrap collective.  Honor its align/brake result
+                # so large or increasing current/next image error cannot keep
+                # the former fixed forward-closure thrust.
+                thrust = min(
+                    thrust,
+                    latest_visual_proposal.servo_output.thrust,
+                    VISUAL_GATE0_BLEND_THRUST_CAP,
+                )
 
             # At close range the uncorrected contour center becomes unsafe if
             # the lower gate edge is clipped.  Abort before impact when the

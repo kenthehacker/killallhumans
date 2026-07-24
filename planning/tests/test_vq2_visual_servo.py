@@ -21,9 +21,16 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
+    PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S,
+    PREPASS_CURRENT_MAX_ABS_X_NORM,
+    PREPASS_CURRENT_MAX_ABS_Y_NORM,
+    PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S,
+    PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S,
     ServoFrameToken,
     VISUAL_SEGMENT_YAW_SOFT_STOP_RAD,
+    VisualServoPassageSafetyUnavailable,
     VisualServoRefusal,
+    VisualServoTuning,
     VisualTarget,
 )
 
@@ -309,6 +316,301 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
         requested_next_blend=0.3,
     )
     assert mismatched.next_gate_blend == 0.0
+
+
+def _latch_passage_blend(
+    servo: ImageVisualServo,
+    *,
+    requested_blend: float = 0.3,
+) -> None:
+    for frame_id in range(1, 4):
+        output = step(
+            servo,
+            target(frame_id),
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
+        assert output.next_gate_blend == 0.0
+    output = step(
+        servo,
+        target(4),
+        next_target=target(4, track_id="vq2-track-000002"),
+        requested_next_blend=requested_blend,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert output.next_gate_blend == pytest.approx(requested_blend)
+
+
+def test_passage_blend_requires_narrow_start_then_broad_continuation() -> None:
+    servo = ImageVisualServo()
+    outside_narrow = target(
+        1,
+        x=0.08,
+        y=-0.22,
+        x_rate=0.05,
+        y_rate=-0.05,
+        log_scale=-1.0,
+    )
+    next_gate = target(
+        1,
+        track_id="vq2-track-000002",
+        x=0.45,
+        y=-0.48,
+        x_rate=0.05,
+        y_rate=-0.05,
+        log_scale=-2.0,
+    )
+
+    withheld = step(
+        servo,
+        outside_narrow,
+        next_target=next_gate,
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert withheld.next_gate_blend == 0.0
+
+    servo.reset_segment()
+    _latch_passage_blend(servo)
+    current = target(
+        5,
+        x=0.08,
+        y=-0.22,
+        x_rate=0.25,
+        y_rate=-0.43,
+        log_scale=-1.0,
+        scale_rate=1.59,
+    )
+    next_gate = target(
+        5,
+        track_id="vq2-track-000002",
+        x=0.45,
+        y=-0.48,
+        x_rate=0.44,
+        y_rate=-0.44,
+        scale_rate=0.63,
+    )
+    continued = step(
+        servo,
+        current,
+        next_target=next_gate,
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert abs(current.normalized_y_down) > servo.tuning.vertical_corridor
+    assert abs(next_gate.normalized_x_rate_s) > (
+        servo.tuning.stable_rate_norm_s
+    )
+    assert continued.next_gate_blend == pytest.approx(0.3)
+    assert continued.effective_horizontal_error > current.normalized_x
+    assert continued.effective_vertical_error_image_down < (
+        current.normalized_y_down
+    )
+    assert continued.yaw_rate_rad_s < 0.0
+    assert continued.target_pitch_rad > 0.0
+    assert not continued.advance_enabled
+
+
+def test_exact_latch_frame_must_itself_be_stable_and_passage_safe() -> None:
+    servo = ImageVisualServo()
+    for frame_id in range(1, 4):
+        step(
+            servo,
+            target(frame_id),
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
+
+    unsafe_latch = step(
+        servo,
+        target(4, x_rate=8.0, log_scale=-0.30),
+        next_target=target(4, track_id="vq2-track-000002"),
+        requested_next_blend=0.25,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert unsafe_latch.next_gate_blend == 0.0
+    assert unsafe_latch.corridor_frames == 0
+
+    # This frame would be admissible only under broad continuation.  Its
+    # refusal proves the unsafe publication did not silently create a latch.
+    no_hidden_latch = step(
+        servo,
+        target(5, y=-0.22),
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x_rate=0.44,
+        ),
+        requested_next_blend=0.25,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert no_hidden_latch.next_gate_blend == 0.0
+
+
+@pytest.mark.parametrize(
+    "current",
+    (
+        target(
+            5,
+            x=PREPASS_CURRENT_MAX_ABS_X_NORM - 0.01,
+            x_rate=0.20,
+            log_scale=-1.0,
+        ),
+        target(
+            5,
+            y=-(PREPASS_CURRENT_MAX_ABS_Y_NORM - 0.01),
+            y_rate=-0.20,
+            log_scale=-1.0,
+        ),
+        target(
+            5,
+            x_rate=(
+                PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S + 1e-4
+            ),
+        ),
+        target(
+            5,
+            scale_rate=PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S + 1e-4,
+        ),
+        target(5, log_scale=-0.50),
+    ),
+    ids=(
+        "projected-horizontal-edge",
+        "projected-vertical-edge",
+        "center-rate",
+        "scale-rate",
+        "close-scale",
+    ),
+)
+def test_latched_passage_corridor_retires_unsafe_current(
+    current: VisualTarget,
+) -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    with pytest.raises(
+        VisualServoPassageSafetyUnavailable,
+        match="left its passage corridor",
+    ):
+        step(
+            servo,
+            current,
+            next_target=target(
+                5,
+                track_id="vq2-track-000002",
+            ),
+            requested_next_blend=0.3,
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
+
+
+def test_latched_passage_never_reuses_stale_next_geometry() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    missing = step(
+        servo,
+        target(5),
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert missing.next_gate_blend == 0.0
+
+    recovered = step(
+        servo,
+        target(6),
+        next_target=target(
+            6,
+            track_id="vq2-track-000002",
+            x_rate=PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert recovered.next_gate_blend == pytest.approx(0.3)
+
+    too_fast = step(
+        servo,
+        target(7),
+        next_target=target(
+            7,
+            track_id="vq2-track-000002",
+            x_rate=PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S + 1e-4,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert too_fast.next_gate_blend == 0.0
+
+
+def test_passage_blend_cannot_reverse_current_aperture_correction() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    with pytest.raises(
+        VisualServoPassageSafetyUnavailable,
+        match="reversed current-aperture correction",
+    ):
+        step(
+            servo,
+            target(5, x=-0.17),
+            next_target=target(
+                5,
+                track_id="vq2-track-000002",
+                x=1.0,
+            ),
+            requested_next_blend=0.3,
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
+
+
+def test_passage_safe_next_blend_cannot_enable_advance_authority() -> None:
+    servo = ImageVisualServo()
+
+    with pytest.raises(VisualServoRefusal, match="cannot coexist"):
+        step(
+            servo,
+            target(1),
+            next_target=target(1, track_id="vq2-track-000002"),
+            requested_next_blend=0.3,
+            allow_advance=True,
+            allow_passage_safe_next_blend=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "tuning",
+    (
+        VisualServoTuning(
+            horizontal_corridor=PREPASS_CURRENT_MAX_ABS_X_NORM,
+        ),
+        VisualServoTuning(
+            vertical_corridor=PREPASS_CURRENT_MAX_ABS_Y_NORM,
+        ),
+    ),
+)
+def test_configured_start_corridor_must_stay_inside_passage_bounds(
+    tuning: VisualServoTuning,
+) -> None:
+    servo = ImageVisualServo(tuning)
+
+    with pytest.raises(VisualServoRefusal, match="inside passage bounds"):
+        step(
+            servo,
+            target(1),
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
 
 
 def test_ambiguous_current_track_refuses_authority():

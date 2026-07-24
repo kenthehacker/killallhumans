@@ -44,12 +44,32 @@ MIN_VISUAL_THRUST = 0.21
 MAX_VISUAL_THRUST = 0.32
 MAX_VISUAL_OBSERVATION_AGE_S = 0.10
 MAX_NEXT_GATE_BLEND = 0.35
+# A no-advance pre-pass orientation may continue inside a broader
+# current-aperture corridor only after the next identity has first completed
+# the ordinary tight-corridor dwell.  These immutable continuation bounds are
+# grounded in the first exact live handoff trace.  All 54 jointly fresh
+# publications stayed below |x|=0.022, |y|=0.234, |vx|=0.265, |vy|=0.439 and
+# current log-scale rate=1.591/s.  The short projection rejects high image
+# momentum before an instantaneous center can consume the remaining margin.
+PREPASS_CURRENT_MAX_ABS_X_NORM = 0.20
+PREPASS_CURRENT_MAX_ABS_Y_NORM = 0.28
+PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S = 0.60
+PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S = -1.50
+PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S = 2.00
+PREPASS_CURRENT_MAX_APPARENT_SCALE = 0.55
+PREPASS_CURRENT_PROJECTION_HORIZON_S = 0.10
+PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S = 0.60
+PREPASS_NEXT_MAX_ABS_LOG_SCALE_RATE_S = 1.10
 VISUAL_CLOSE_SCALE_BRAKE_LOG = -0.18
 VISUAL_RAPID_RETREAT_LOG_SCALE_RATE_S = -1.50
 
 
 class VisualServoRefusal(ValueError):
     """The observation or requested tuning cannot safely produce authority."""
+
+
+class VisualServoPassageSafetyUnavailable(VisualServoRefusal):
+    """A latched pre-pass blend left its immutable passage corridor."""
 
 
 @dataclass(frozen=True)
@@ -515,6 +535,7 @@ class ImageVisualServo:
     def reset_segment(self) -> None:
         self._last_token: Optional[ServoFrameToken] = None
         self._segment_track_id: Optional[str] = None
+        self._latched_next_blend_track_id: Optional[str] = None
         self._last_abs_error: Optional[
             Tuple[Optional[float], Optional[float]]
         ] = None
@@ -534,12 +555,15 @@ class ImageVisualServo:
         next_target: Optional[VisualTarget] = None,
         requested_next_blend: float = 0.0,
         allow_advance: bool = True,
+        allow_passage_safe_next_blend: bool = False,
     ) -> VisualServoOutput:
         """Produce a bounded proposal from one distinct, authoritative frame.
 
-        A caller may pre-orient toward a stable next-gate track, but the blend
-        is suppressed unless the current aperture is already inside its safe
-        corridor.  The current gate therefore retains passage authority.
+        A caller may pre-orient toward a stable next-gate track.  Initial
+        authority still requires the tight advance corridor; after that exact
+        next identity is latched, a no-advance caller may continue within the
+        immutable passage corridor.  The current gate always retains passage
+        authority.
         """
 
         scalars = (
@@ -565,6 +589,23 @@ class ImageVisualServo:
             raise VisualServoRefusal("next-gate blend is outside bounds")
         if type(allow_advance) is not bool:
             raise VisualServoRefusal("allow_advance must be an exact bool")
+        if type(allow_passage_safe_next_blend) is not bool:
+            raise VisualServoRefusal(
+                "allow_passage_safe_next_blend must be an exact bool"
+            )
+        if allow_passage_safe_next_blend and allow_advance:
+            raise VisualServoRefusal(
+                "passage-safe next blend cannot coexist with advance authority"
+            )
+        if allow_passage_safe_next_blend and not (
+            self.tuning.horizontal_corridor
+            < PREPASS_CURRENT_MAX_ABS_X_NORM
+            and self.tuning.vertical_corridor
+            < PREPASS_CURRENT_MAX_ABS_Y_NORM
+        ):
+            raise VisualServoRefusal(
+                "configured start corridor must stay inside passage bounds"
+            )
         age_s = float(now_monotonic_s) - float(current.received_monotonic_s)
         if age_s < -1e-6 or age_s > MAX_VISUAL_OBSERVATION_AGE_S:
             raise VisualServoRefusal("current visual target is stale or future-dated")
@@ -609,6 +650,100 @@ class ImageVisualServo:
             and abs(raw_horizontal) <= self.tuning.horizontal_corridor
             and abs(raw_vertical) <= self.tuning.vertical_corridor
         )
+        stable_rates = (
+            not horizontal_censored
+            and not vertical_censored
+            and abs(raw_horizontal_rate) <= self.tuning.stable_rate_norm_s
+            and abs(raw_vertical_rate) <= self.tuning.stable_rate_norm_s
+            and abs(float(current.log_scale_rate_s))
+            <= self.tuning.stable_scale_rate_s
+        )
+        previous_abs_error = self._last_abs_error
+        horizontal_delta = (
+            None
+            if (
+                horizontal_censored
+                or previous_abs_error is None
+                or previous_abs_error[0] is None
+            )
+            else abs(raw_horizontal) - previous_abs_error[0]
+        )
+        vertical_delta = (
+            None
+            if (
+                vertical_censored
+                or previous_abs_error is None
+                or previous_abs_error[1] is None
+            )
+            else abs(raw_vertical) - previous_abs_error[1]
+        )
+        worsening = bool(
+            (horizontal_delta is not None and horizontal_delta > 0.015)
+            or (vertical_delta is not None and vertical_delta > 0.015)
+        )
+        inside_corridor = (
+            current_inside_position and stable_rates and not worsening
+        )
+        passage_continuation = bool(
+            allow_passage_safe_next_blend
+            and self._latched_next_blend_track_id is not None
+        )
+        passage_safe_current = bool(
+            passage_continuation
+            and not horizontal_censored
+            and not vertical_censored
+            and not current.clipped
+            and not current.center_censored
+            and abs(raw_horizontal)
+            <= PREPASS_CURRENT_MAX_ABS_X_NORM
+            and abs(raw_vertical)
+            <= PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and abs(raw_horizontal_rate)
+            <= PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+            and abs(raw_vertical_rate)
+            <= PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+            and PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S
+            <= float(current.log_scale_rate_s)
+            <= PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+            and abs(
+                raw_horizontal
+                + raw_horizontal_rate
+                * PREPASS_CURRENT_PROJECTION_HORIZON_S
+            )
+            <= PREPASS_CURRENT_MAX_ABS_X_NORM
+            and abs(
+                raw_vertical
+                + raw_vertical_rate
+                * PREPASS_CURRENT_PROJECTION_HORIZON_S
+            )
+            <= PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and math.exp(float(current.log_scale))
+            <= PREPASS_CURRENT_MAX_APPARENT_SCALE
+        )
+        if passage_continuation and not passage_safe_current:
+            raise VisualServoPassageSafetyUnavailable(
+                "latched pre-pass current aperture left its passage corridor"
+            )
+        passage_safe_start = bool(
+            allow_passage_safe_next_blend
+            and inside_corridor
+            and not current.clipped
+            and not current.center_censored
+            and abs(
+                raw_horizontal
+                + raw_horizontal_rate
+                * PREPASS_CURRENT_PROJECTION_HORIZON_S
+            )
+            <= PREPASS_CURRENT_MAX_ABS_X_NORM
+            and abs(
+                raw_vertical
+                + raw_vertical_rate
+                * PREPASS_CURRENT_PROJECTION_HORIZON_S
+            )
+            <= PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and math.exp(float(current.log_scale))
+            <= PREPASS_CURRENT_MAX_APPARENT_SCALE
+        )
 
         blend = 0.0
         next_horizontal: Optional[float] = None
@@ -632,28 +767,50 @@ class ImageVisualServo:
                 or next_vertical_censored
             )
             next_ambiguity_risk = next_target.ambiguous
+            if (
+                passage_continuation
+                and next_target.track_id
+                != self._latched_next_blend_track_id
+            ):
+                raise VisualServoRefusal(
+                    "latched next-gate identity changed without promotion"
+                )
+            next_center_rate_limit = (
+                PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S
+                if passage_continuation
+                else self.tuning.stable_rate_norm_s
+            )
+            next_scale_rate_limit = (
+                PREPASS_NEXT_MAX_ABS_LOG_SCALE_RATE_S
+                if passage_continuation
+                else self.tuning.stable_scale_rate_s
+            )
             next_usable = (
                 not next_ambiguity_risk
                 and next_target.confidence >= 0.10
                 and next_target.association_confidence >= 0.10
                 and next_target.consecutive_frames >= 3
+                and (
+                    not allow_passage_safe_next_blend
+                    or not next_edge_risk
+                )
                 and not (
                     next_horizontal_censored and next_vertical_censored
                 )
                 and (
                     next_horizontal_censored
                     or abs(float(next_target.normalized_x_rate_s))
-                    <= self.tuning.stable_rate_norm_s
+                    <= next_center_rate_limit
                 )
                 and (
                     next_vertical_censored
                     or abs(float(next_target.normalized_y_rate_down_s))
-                    <= self.tuning.stable_rate_norm_s
+                    <= next_center_rate_limit
                 )
                 and (
                     next_edge_risk
                     or abs(float(next_target.log_scale_rate_s))
-                    <= self.tuning.stable_scale_rate_s
+                    <= next_scale_rate_limit
                 )
                 and -1e-6 <= next_age_s <= MAX_VISUAL_OBSERVATION_AGE_S
                 and same_frame
@@ -661,9 +818,18 @@ class ImageVisualServo:
             )
             if (
                 next_usable
-                and current_inside_position
-                and self._corridor_frames
-                >= self.tuning.required_corridor_frames
+                and (
+                    passage_safe_current
+                    or (
+                        inside_corridor
+                        and self._corridor_frames
+                        >= self.tuning.required_corridor_frames
+                        and (
+                            not allow_passage_safe_next_blend
+                            or passage_safe_start
+                        )
+                    )
+                )
             ):
                 blend = float(requested_next_blend)
                 if not next_horizontal_censored:
@@ -691,46 +857,30 @@ class ImageVisualServo:
                         * blend
                         * float(next_target.normalized_y_rate_down_s)
                     )
+                if passage_continuation:
+                    if (
+                        abs(raw_horizontal)
+                        > self.tuning.horizontal_corridor
+                        and raw_horizontal * horizontal < 0.0
+                    ) or (
+                        abs(raw_vertical)
+                        > self.tuning.vertical_corridor
+                        and raw_vertical * vertical < 0.0
+                    ):
+                        raise VisualServoPassageSafetyUnavailable(
+                            "next-gate blend reversed current-aperture correction"
+                        )
+                if self._latched_next_blend_track_id is None:
+                    self._latched_next_blend_track_id = (
+                        next_target.track_id
+                    )
 
-        stable_rates = (
-            not horizontal_censored
-            and not vertical_censored
-            and abs(raw_horizontal_rate) <= self.tuning.stable_rate_norm_s
-            and abs(raw_vertical_rate) <= self.tuning.stable_rate_norm_s
-            and abs(float(current.log_scale_rate_s))
-            <= self.tuning.stable_scale_rate_s
-        )
-
-        previous_abs_error = self._last_abs_error
-        horizontal_delta = (
-            None
-            if (
-                horizontal_censored
-                or previous_abs_error is None
-                or previous_abs_error[0] is None
-            )
-            else abs(raw_horizontal) - previous_abs_error[0]
-        )
-        vertical_delta = (
-            None
-            if (
-                vertical_censored
-                or previous_abs_error is None
-                or previous_abs_error[1] is None
-            )
-            else abs(raw_vertical) - previous_abs_error[1]
-        )
         self._last_abs_error = (
             None if horizontal_censored else abs(raw_horizontal),
             None if vertical_censored else abs(raw_vertical),
         )
         self._last_token = current.frame_token
 
-        worsening = bool(
-            (horizontal_delta is not None and horizontal_delta > 0.015)
-            or (vertical_delta is not None and vertical_delta > 0.015)
-        )
-        inside_corridor = current_inside_position and stable_rates and not worsening
         if inside_corridor:
             self._corridor_frames += 1
         else:
@@ -885,9 +1035,19 @@ __all__ = [
     "MAX_VISUAL_SEGMENT_DURATION_S",
     "MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD",
     "MAX_VISUAL_YAW_RATE_RAD_S",
+    "PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S",
+    "PREPASS_CURRENT_MAX_ABS_X_NORM",
+    "PREPASS_CURRENT_MAX_ABS_Y_NORM",
+    "PREPASS_CURRENT_MAX_APPARENT_SCALE",
+    "PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S",
+    "PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S",
+    "PREPASS_CURRENT_PROJECTION_HORIZON_S",
+    "PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S",
+    "PREPASS_NEXT_MAX_ABS_LOG_SCALE_RATE_S",
     "ServoFrameToken",
     "VISUAL_SEGMENT_YAW_SOFT_STOP_RAD",
     "VisualServoOutput",
+    "VisualServoPassageSafetyUnavailable",
     "VisualServoRefusal",
     "VisualServoTuning",
     "VisualTarget",

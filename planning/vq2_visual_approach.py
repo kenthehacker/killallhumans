@@ -33,6 +33,7 @@ from planning.vq2_visual_servo import (
     MAX_NEXT_GATE_BLEND,
     MAX_VISUAL_OBSERVATION_AGE_S,
     VisualServoOutput,
+    VisualServoPassageSafetyUnavailable,
     VisualServoRefusal,
     VisualServoTuning,
     VisualTarget,
@@ -50,6 +51,10 @@ class VisualApproachRefusal(ValueError):
 
 class VisualApproachCurrentGeometryUnavailable(VisualApproachRefusal):
     """The optional visual blend must withdraw from a clipped current gate."""
+
+
+class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
+    """A latched no-advance blend left its immutable passage corridor."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +79,8 @@ class RollingVisualApproachServo:
         expected_current_track_id: str,
         expected_gate_index: int,
         tuning: Optional[VisualServoTuning] = None,
+        *,
+        next_gate_blend: float,
     ) -> None:
         if (
             type(expected_current_track_id) is not str
@@ -91,8 +98,21 @@ class RollingVisualApproachServo:
             raise VisualApproachRefusal(
                 "tuning must be an exact VisualServoTuning or None"
             )
+        if (
+            type(next_gate_blend) not in {int, float}
+            or not math.isfinite(float(next_gate_blend))
+            or not (
+                0.0
+                <= float(next_gate_blend)
+                <= MAX_NEXT_GATE_BLEND
+            )
+        ):
+            raise VisualApproachRefusal(
+                "next_gate_blend must stay inside its immutable ceiling"
+            )
         self.expected_current_track_id = expected_current_track_id
         self.expected_gate_index = expected_gate_index
+        self.next_gate_blend = float(next_gate_blend)
         self._servo = ImageVisualServo(tuning)
         self._last_camera_token: Optional[CameraFrameToken] = None
         self._last_tracker_frame_sequence: Optional[int] = None
@@ -225,7 +245,7 @@ class RollingVisualApproachServo:
                 )
             assert candidate.relationship is not None
             relationship_basis = candidate.relationship.basis
-            requested_blend = MAX_NEXT_GATE_BLEND
+            requested_blend = self.next_gate_blend
             withholding_reason = None
         else:
             different_visible = tuple(
@@ -261,7 +281,12 @@ class RollingVisualApproachServo:
                 next_target=next_target,
                 requested_next_blend=requested_blend,
                 allow_advance=False,
+                allow_passage_safe_next_blend=True,
             )
+        except VisualServoPassageSafetyUnavailable as exc:
+            raise VisualApproachPassageSafetyUnavailable(
+                f"image visual servo retired passage authority: {exc}"
+            ) from exc
         except VisualServoRefusal as exc:
             raise VisualApproachRefusal(
                 f"image visual servo refused approach authority: {exc}"
@@ -270,7 +295,7 @@ class RollingVisualApproachServo:
             raise VisualApproachRefusal(
                 "visual approach escaped its no-advance envelope"
             )
-        if output.next_gate_blend not in {0.0, MAX_NEXT_GATE_BLEND}:
+        if output.next_gate_blend not in {0.0, self.next_gate_blend}:
             raise VisualApproachRefusal(
                 "visual approach produced an unexpected blend magnitude"
             )
@@ -287,7 +312,7 @@ class RollingVisualApproachServo:
                 )
             withholding_reason = None
         elif next_target is not None:
-            withholding_reason = "current_corridor_not_ready"
+            withholding_reason = "current_passage_corridor_not_ready"
 
         self._last_camera_token = snapshot.latest_camera_token
         self._last_tracker_frame_sequence = snapshot.tracker_frame_sequence
@@ -507,6 +532,7 @@ class RollingVisualApproachServo:
 __all__ = [
     "RollingVisualApproachServo",
     "VisualApproachCurrentGeometryUnavailable",
+    "VisualApproachPassageSafetyUnavailable",
     "VisualApproachProposal",
     "VisualApproachRefusal",
 ]
