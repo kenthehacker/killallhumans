@@ -2016,6 +2016,431 @@ def _set_censored_current(
     host.visual_gate_graph.latest_snapshot = clipped
 
 
+def _set_bottom_transition_successor(
+    host,
+    *,
+    apparent_scale,
+    clipping,
+    center_censored=True,
+):
+    snapshot = _snapshot(
+        host.current_gate,
+        host.current_track_id,
+        host.sequence,
+    )
+    history = snapshot.current_track.history
+    prior_scale = getattr(host, "_test_previous_censored_scale", 0.80)
+    previous = replace(
+        history[0],
+        apparent_scale=prior_scale,
+        clipping=FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    current = replace(
+        history[-1],
+        apparent_scale=apparent_scale,
+        clipping=clipping,
+        center_censored=center_censored,
+    )
+    snapshot.current_track.history = (previous, current)
+    snapshot.current_track.clipping = clipping
+    snapshot.current_track.center_censored = center_censored
+    snapshot.current_track.apparent_scale = apparent_scale
+    host._test_previous_censored_scale = apparent_scale
+    host.visual_gate_graph.latest_snapshot = snapshot
+
+
+def test_bottom_transition_requires_full_censor_then_accepts_credit():
+    class BottomThenFullCreditHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.bottom_command = None
+            self.full_command = None
+            self.anchor_seen = False
+
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if not segments or segments[0]["crossing_anchor"] is None:
+                return
+            if not self.anchor_seen:
+                self.anchor_seen = True
+                return
+            transition = segments[0]["bottom_censored_transition"]
+            if transition is None:
+                _set_censored_current(
+                    self,
+                    apparent_scale=0.80,
+                    clipping=FrameEdge.BOTTOM,
+                )
+            elif (
+                transition["outcome"]
+                == "awaiting_full_vertical_censorship"
+            ):
+                _set_bottom_transition_successor(
+                    self,
+                    apparent_scale=0.82,
+                    clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(command, **kwargs)
+            token = kwargs.get("wire_visual_token")
+            snapshot = self.visual_gate_graph.latest_snapshot
+            if token is not None and snapshot.current_track.center_censored:
+                if snapshot.current_track.clipping == FrameEdge.BOTTOM:
+                    self.bottom_command = command
+                elif (
+                    snapshot.current_track.clipping
+                    & (FrameEdge.TOP | FrameEdge.BOTTOM)
+                    == (FrameEdge.TOP | FrameEdge.BOTTOM)
+                ):
+                    self.full_command = command
+                    self.disable_credit = False
+                    self._advance_race()
+            return receipt
+
+    host = BottomThenFullCreditHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            passage_preview_retire_once=True,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    transition = segment["bottom_censored_transition"]
+    assert result["race_finished"] is True
+    assert segment["next_preview_retired"] is True
+    assert segment["bottom_censored_transition_count"] == 1
+    assert transition["outcome"] == "full_vertical_censorship_confirmed"
+    assert transition["bottom_censored_camera_token"][
+        "publication_sequence"
+    ] + 1 == transition["full_vertical_censor_camera_token"][
+        "publication_sequence"
+    ]
+    assert segment["censored_passage_coast_fresh_frame_count"] == 2
+    assert segment["censored_passage_coast_command_count"] == 2
+    assert segment["advance_command_count"] == (
+        segment["crossing_anchor"]["advance_command_count"]
+    )
+    assert segment["censored_passage_coast"]["bottom_transition_pending"] is False
+    assert host.bottom_command is not None
+    assert host.full_command is not None
+    assert host.bottom_command.yaw_rate == 0.0
+    assert host.full_command.yaw_rate == 0.0
+    assert host.bottom_command.thrust == pytest.approx(
+        host.full_command.thrust
+    )
+    assert segment["crossing_wait_zero_command_count"] == 0
+
+
+@pytest.mark.parametrize("credit_timing", ("before_wire", "after_wire"))
+def test_bottom_transition_accepts_authoritative_credit(credit_timing):
+    class BottomCreditHost(_Host):
+        anchor_seen = False
+        credited = False
+        bottom_command = None
+
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if not segments or segments[0]["crossing_anchor"] is None:
+                return
+            if not self.anchor_seen:
+                self.anchor_seen = True
+                return
+            if segments[0]["bottom_censored_transition"] is None:
+                _set_censored_current(
+                    self,
+                    apparent_scale=0.80,
+                    clipping=FrameEdge.BOTTOM,
+                )
+
+        def _assert_visual_receiver_token_current(self, expected_token):
+            token = super()._assert_visual_receiver_token_current(
+                expected_token
+            )
+            snapshot = self.visual_gate_graph.latest_snapshot
+            if (
+                snapshot.current_track.clipping == FrameEdge.BOTTOM
+                and not self.credited
+                and credit_timing == "before_wire"
+            ):
+                self.credited = True
+                self.disable_credit = False
+                self._advance_race()
+            return token
+
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(command, **kwargs)
+            snapshot = self.visual_gate_graph.latest_snapshot
+            if (
+                snapshot.current_track.clipping == FrameEdge.BOTTOM
+                and not self.credited
+                and credit_timing == "after_wire"
+            ):
+                self.bottom_command = command
+                self.credited = True
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = BottomCreditHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            passage_preview_retire_once=True,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    transition = segment["bottom_censored_transition"]
+    assert result["race_finished"] is True
+    assert host.credited is True
+    assert segment["bottom_censored_transition_count"] == 1
+    assert transition["outcome"] == (
+        "authoritative_credit_before_full_censorship"
+    )
+    assert segment["censored_passage_coast_fresh_frame_count"] == 1
+    expected_coast_commands = 0 if credit_timing == "before_wire" else 1
+    assert (
+        segment["censored_passage_coast_command_count"]
+        == expected_coast_commands
+    )
+    assert segment["advance_command_count"] == (
+        segment["crossing_anchor"]["advance_command_count"]
+    )
+    assert segment["censored_passage_coast"]["bottom_transition_pending"] is False
+    bottom_token = transition["bottom_censored_camera_token"][
+        "publication_sequence"
+    ]
+    bottom_wire_commands = [
+        command
+        for command, kwargs, _gate in host.commands
+        if kwargs.get("wire_visual_token") is not None
+        and kwargs["wire_visual_token"].publication_sequence == bottom_token
+    ]
+    assert len(bottom_wire_commands) == expected_coast_commands
+    if credit_timing == "after_wire":
+        assert host.bottom_command is bottom_wire_commands[0]
+        assert host.bottom_command.yaw_rate == 0.0
+
+
+def test_bottom_transition_supersession_can_land_only_on_full_censor():
+    class SupersededBottomToFullHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.anchor_seen = False
+            self.superseded = False
+            self.reuse_receiver_snapshot = False
+            self.full_command = None
+
+        def _sample(self):
+            if self.reuse_receiver_snapshot:
+                self.reuse_receiver_snapshot = False
+                return
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if not segments or segments[0]["crossing_anchor"] is None:
+                return
+            if not self.anchor_seen:
+                self.anchor_seen = True
+                return
+            if segments[0]["bottom_censored_transition"] is None:
+                _set_censored_current(
+                    self,
+                    apparent_scale=0.80,
+                    clipping=FrameEdge.BOTTOM,
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            snapshot = self.visual_gate_graph.latest_snapshot
+            if (
+                expected is not None
+                and snapshot.current_track.clipping == FrameEdge.BOTTOM
+                and not self.superseded
+            ):
+                receiver = _token(expected.publication_sequence + 1)
+                self.superseded = True
+                self.sequence = receiver.publication_sequence
+                _set_bottom_transition_successor(
+                    self,
+                    apparent_scale=0.82,
+                    clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+                )
+                self.reuse_receiver_snapshot = True
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            receipt = await super()._send_flight_command(command, **kwargs)
+            if (
+                expected is not None
+                and snapshot.current_track.clipping
+                & (FrameEdge.TOP | FrameEdge.BOTTOM)
+                == (FrameEdge.TOP | FrameEdge.BOTTOM)
+            ):
+                self.full_command = command
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = SupersededBottomToFullHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            passage_preview_retire_once=True,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    assert result["race_finished"] is True
+    assert host.superseded is True
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["bottom_censored_transition"]["outcome"] == (
+        "full_vertical_censorship_confirmed"
+    )
+    assert segment["censored_passage_coast_fresh_frame_count"] == 2
+    assert segment["censored_passage_coast_command_count"] == 1
+    assert host.full_command is not None
+    assert host.full_command.yaw_rate == 0.0
+
+
+@pytest.mark.parametrize(
+    "successor",
+    (
+        "bottom",
+        "top",
+        "horizontal",
+        "uncensored",
+        "loss",
+        "scale_regression",
+    ),
+)
+def test_bottom_transition_refuses_any_non_full_successor(successor):
+    class InvalidBottomSuccessorHost(_Host):
+        anchor_seen = False
+
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if not segments or segments[0]["crossing_anchor"] is None:
+                return
+            if not self.anchor_seen:
+                self.anchor_seen = True
+                return
+            transition = segments[0]["bottom_censored_transition"]
+            if transition is None:
+                _set_censored_current(
+                    self,
+                    apparent_scale=0.80,
+                    clipping=FrameEdge.BOTTOM,
+                )
+                return
+            if (
+                transition["outcome"]
+                != "awaiting_full_vertical_censorship"
+            ):
+                return
+            if successor == "bottom":
+                _set_bottom_transition_successor(
+                    self,
+                    apparent_scale=0.82,
+                    clipping=FrameEdge.BOTTOM,
+                )
+            elif successor == "top":
+                _set_bottom_transition_successor(
+                    self,
+                    apparent_scale=0.82,
+                    clipping=FrameEdge.TOP,
+                )
+            elif successor == "horizontal":
+                _set_bottom_transition_successor(
+                    self,
+                    apparent_scale=0.82,
+                    clipping=FrameEdge.BOTTOM | FrameEdge.LEFT,
+                )
+            elif successor == "uncensored":
+                return
+            elif successor == "loss":
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+            elif successor == "scale_regression":
+                _set_bottom_transition_successor(
+                    self,
+                    apparent_scale=0.79,
+                    clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+                )
+
+    host = InvalidBottomSuccessorHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            passage_preview_retire_once=True,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(SafetyAbort, match="bottom-censored transition"):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["bottom_censored_transition_count"] == 1
+    assert segment["censored_passage_coast_fresh_frame_count"] == 1
+    assert segment["censored_passage_coast_command_count"] == 1
+    assert segment["crossing_wait_zero_command_count"] == 0
+
+
 def test_visible_censored_passage_coast_expires_before_a_ninth_frame():
     class NeverLostHost(_Host):
         def _sample(self):
@@ -2557,6 +2982,242 @@ def test_censored_passage_coast_accepts_retained_clean_epoch_suffix():
     )
 
 
+def _attempt18_bottom_transition_values():
+    track_id = "track-0"
+    anchor = _token(157)
+    previous_token = _token(163)
+    current_token = _token(164)
+    previous_sample = replace(
+        _history_sample(
+            track_id,
+            previous_token,
+            apparent_scale=0.706124005519908,
+        ),
+        center_norm=(0.00625, 0.016666666666666607),
+    )
+    current_sample = _history_sample(
+        track_id,
+        current_token,
+        previous_token=previous_token,
+        apparent_scale=0.7767118191253388,
+        clipping=FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    track = VisualTrack(
+        track_id=track_id,
+        first_token=previous_token,
+        latest_token=current_token,
+        center_norm=current_sample.center_norm,
+        bbox_norm=current_sample.bbox_norm,
+        apparent_scale=current_sample.apparent_scale,
+        center_velocity_norm_s=(0.0, 0.0),
+        log_scale_rate_s=0.0,
+        confidence=0.90,
+        association_confidence=0.80,
+        consecutive_frame_count=160,
+        total_observation_count=160,
+        missed_frame_count=0,
+        clipping=FrameEdge.BOTTOM,
+        center_censored=True,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=0,
+        authority_race_status_sequence=10,
+        authority_race_status_boot_ms=2_000,
+        ambiguous=False,
+        visible=True,
+        history=(previous_sample, current_sample),
+    )
+    snapshot = SimpleNamespace(
+        tracker_frame_sequence=164,
+        latest_camera_token=current_token,
+        current_gate_index=0,
+        current_track_id=track_id,
+        current_track=track,
+        authority_usable=True,
+        race_finished=False,
+    )
+    target = _target(_snapshot(0, track_id, 157), track_id)
+    admission = VisualApproachPassageAdmission(
+        basis="tight-current-corridor-dwell-v1",
+        current_gate_index=0,
+        current_target=target,
+        camera_token=anchor,
+        tracker_frame_sequence=157,
+        corridor_frames=26,
+        preview_track_id="track-1",
+        preview_blend=0.25,
+    )
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=0,
+        track_id=track_id,
+        anchor_camera_token=anchor,
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.105,
+        thrust=0.295,
+    )
+    return snapshot, admission, authority, previous_token
+
+
+def test_attempt18_bottom_transition_is_one_exact_pending_frame():
+    snapshot, admission, authority, previous = (
+        _attempt18_bottom_transition_values()
+    )
+
+    assert course_stage._bottom_censored_passage_transition_eligible(
+        snapshot,
+        current_gate_index=0,
+        current_track_id="track-0",
+        crossing_anchor_token=authority.anchor_camera_token,
+        authority=authority,
+        previous_visible_token=previous,
+        previous_apparent_scale=0.706124005519908,
+        minimum_apparent_scale=math.exp(-0.80),
+        passage_admission=admission,
+        next_preview_retired=True,
+        tuning=default_visual_config().servo,
+    )
+    assert not course_stage._censored_passage_coast_eligible(
+        snapshot,
+        current_gate_index=0,
+        current_track_id="track-0",
+        crossing_anchor_token=authority.anchor_camera_token,
+        authority=authority,
+        previous_visible_token=previous,
+        previous_apparent_scale=0.706124005519908,
+        minimum_apparent_scale=math.exp(-0.80),
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "preview_active",
+        "top_only",
+        "both_edges",
+        "horizontal_edge",
+        "nonadjacent",
+        "prior_not_near",
+        "scale_not_growing",
+        "prior_clipped",
+        "prior_center_outside",
+        "missed_association",
+        "ambiguous",
+        "wrong_identity",
+    ),
+)
+def test_bottom_transition_admission_fails_closed(mutation):
+    snapshot, admission, authority, previous = (
+        _attempt18_bottom_transition_values()
+    )
+    previous_scale = 0.706124005519908
+    next_preview_retired = True
+    track = snapshot.current_track
+    history = track.history
+
+    if mutation == "preview_active":
+        next_preview_retired = False
+    elif mutation == "top_only":
+        track = replace(
+            track,
+            clipping=FrameEdge.TOP,
+            history=(
+                history[0],
+                replace(history[1], clipping=FrameEdge.TOP),
+            ),
+        )
+    elif mutation == "both_edges":
+        clipping = FrameEdge.TOP | FrameEdge.BOTTOM
+        track = replace(
+            track,
+            clipping=clipping,
+            history=(
+                history[0],
+                replace(history[1], clipping=clipping),
+            ),
+        )
+    elif mutation == "horizontal_edge":
+        clipping = FrameEdge.BOTTOM | FrameEdge.LEFT
+        track = replace(
+            track,
+            clipping=clipping,
+            history=(
+                history[0],
+                replace(history[1], clipping=clipping),
+            ),
+        )
+    elif mutation == "nonadjacent":
+        previous = _token(162)
+    elif mutation == "prior_not_near":
+        previous_scale = 0.55
+        track = replace(
+            track,
+            history=(
+                replace(history[0], apparent_scale=0.55),
+                history[1],
+            ),
+        )
+    elif mutation == "scale_not_growing":
+        track = replace(
+            track,
+            apparent_scale=previous_scale,
+            history=(
+                history[0],
+                replace(history[1], apparent_scale=previous_scale),
+            ),
+        )
+    elif mutation == "prior_clipped":
+        track = replace(
+            track,
+            history=(
+                replace(history[0], clipping=FrameEdge.BOTTOM),
+                history[1],
+            ),
+        )
+    elif mutation == "prior_center_outside":
+        track = replace(
+            track,
+            history=(
+                replace(history[0], center_norm=(0.160001, 0.0)),
+                history[1],
+            ),
+        )
+    elif mutation == "missed_association":
+        association = history[1].accepted_association
+        assert association is not None
+        track = replace(
+            track,
+            history=(
+                history[0],
+                replace(
+                    history[1],
+                    accepted_association=replace(
+                        association,
+                        missed_frame_count_before_association=1,
+                    ),
+                ),
+            ),
+        )
+    elif mutation == "ambiguous":
+        track = replace(track, ambiguous=True)
+    elif mutation == "wrong_identity":
+        snapshot.current_track_id = "other-track"
+    snapshot.current_track = track
+
+    assert not course_stage._bottom_censored_passage_transition_eligible(
+        snapshot,
+        current_gate_index=0,
+        current_track_id="track-0",
+        crossing_anchor_token=authority.anchor_camera_token,
+        authority=authority,
+        previous_visible_token=previous,
+        previous_apparent_scale=previous_scale,
+        minimum_apparent_scale=math.exp(-0.80),
+        passage_admission=admission,
+        next_preview_retired=next_preview_retired,
+        tuning=default_visual_config().servo,
+    )
+
+
 def test_censored_passage_coast_rejects_same_id_reacquisition():
     track_id = "track-4"
     previous = _token(19)
@@ -2648,6 +3309,315 @@ def test_censored_passage_coast_rejects_same_id_reacquisition():
         previous_apparent_scale=0.78,
         minimum_apparent_scale=math.exp(-0.80),
     )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "nonadjacent_previous",
+        "nonadjacent_receiver",
+        "late_hold",
+        "repeated_supersession",
+        "incomplete_dwell",
+        "track_mismatch",
+        "token_mismatch",
+        "unsafe_geometry",
+        "advance_enabled",
+    ),
+)
+def test_retained_crossing_supersession_is_exact_and_fail_closed(case):
+    previous = _token(155)
+    expected = _token(156)
+    receiver = _token(157)
+    snapshot = _snapshot(0, "track-0", 156)
+    target, output, _admission = (
+        _attempt8_close_alignment_crossing_values()
+    )
+    target = replace(
+        target,
+        track_id="track-0",
+        frame_token=_target(snapshot, "track-0").frame_token,
+        received_monotonic_s=3.12,
+        normalized_x=-0.009375,
+        normalized_y_down=-0.05555555555555558,
+        normalized_x_rate_s=0.06504730414345428,
+        normalized_y_rate_down_s=0.12021386622797031,
+        log_scale=-0.8341951068701171,
+        log_scale_rate_s=1.3715516000267416,
+    )
+    supersession = course_stage._SupersededVisualProposal(
+        expected_camera_token=expected,
+        receiver_camera_token=receiver,
+        held_previous_command_s=0.031,
+        consecutive_count=1,
+    )
+    dwell = 8
+    current_track_id = "track-0"
+
+    if case == "nonadjacent_previous":
+        previous = _token(154)
+    elif case == "nonadjacent_receiver":
+        supersession = replace(
+            supersession,
+            receiver_camera_token=_token(158),
+        )
+    elif case == "late_hold":
+        supersession = replace(
+            supersession,
+            held_previous_command_s=0.032000001,
+        )
+    elif case == "repeated_supersession":
+        supersession = replace(supersession, consecutive_count=2)
+    elif case == "incomplete_dwell":
+        dwell = 2
+    elif case == "track_mismatch":
+        current_track_id = "other-track"
+    elif case == "token_mismatch":
+        target = replace(
+            target,
+            frame_token=_target(
+                _snapshot(0, "track-0", 155),
+                "track-0",
+            ).frame_token,
+        )
+    elif case == "unsafe_geometry":
+        target = replace(target, normalized_x=0.160001)
+    elif case == "advance_enabled":
+        output = replace(
+            output,
+            advance_enabled=True,
+            brake_reason=None,
+        )
+
+    assert not course_stage._retained_crossing_supersession_usable(
+        target,
+        output,
+        supersession,
+        last_accepted_camera_token=previous,
+        current_track_id=current_track_id,
+        retained_crossing_dwell_frames=dwell,
+        tuning=default_visual_config().servo,
+        limits=VisualCourseStageLimits(),
+    )
+
+
+def test_attempt18_safe_adjacent_supersession_preserves_completed_dwell():
+    previous = _token(155)
+    expected = _token(156)
+    receiver = _token(157)
+    snapshot = _snapshot(0, "track-0", 156)
+    target, output, _admission = (
+        _attempt8_close_alignment_crossing_values()
+    )
+    target = replace(
+        target,
+        frame_token=_target(snapshot, "track-0").frame_token,
+        received_monotonic_s=3.12,
+        normalized_x=-0.009375,
+        normalized_y_down=-0.05555555555555558,
+        normalized_x_rate_s=0.06504730414345428,
+        normalized_y_rate_down_s=0.12021386622797031,
+        log_scale=-0.8341951068701171,
+        log_scale_rate_s=1.3715516000267416,
+    )
+    supersession = course_stage._SupersededVisualProposal(
+        expected_camera_token=expected,
+        receiver_camera_token=receiver,
+        held_previous_command_s=0.031,
+        consecutive_count=1,
+    )
+
+    assert course_stage._retained_crossing_supersession_usable(
+        target,
+        output,
+        supersession,
+        last_accepted_camera_token=previous,
+        current_track_id="track-0",
+        retained_crossing_dwell_frames=8,
+        tuning=default_visual_config().servo,
+        limits=VisualCourseStageLimits(),
+    )
+    assert course_stage._retained_crossing_supersession_usable(
+        target,
+        output,
+        replace(supersession, held_previous_command_s=0.032),
+        last_accepted_camera_token=previous,
+        current_track_id="track-0",
+        retained_crossing_dwell_frames=8,
+        tuning=default_visual_config().servo,
+        limits=VisualCourseStageLimits(),
+    )
+
+
+def test_safe_adjacent_supersession_does_not_count_and_next_wire_anchors():
+    class SafeSupersededDwellServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.passage_observations = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            if kwargs["mode"] is not VisualApproachMode.PASSAGE:
+                return proposal
+            self.passage_observations += 1
+            target = replace(
+                proposal.current_target,
+                log_scale=-1.0,
+                log_scale_rate_s=0.2,
+            )
+            output = proposal.servo_output
+            if self.passage_observations >= 4:
+                retained_target, retained_output, _admission = (
+                    _attempt8_close_alignment_crossing_values()
+                )
+                target = replace(
+                    retained_target,
+                    track_id=proposal.current_target.track_id,
+                    frame_token=proposal.current_target.frame_token,
+                    received_monotonic_s=(
+                        proposal.current_target.received_monotonic_s
+                    ),
+                    log_scale=(
+                        -0.8341951068701171
+                        if self.passage_observations == 7
+                        else -1.0
+                    ),
+                )
+                output = replace(
+                    retained_output,
+                    yaw_rate_rad_s=0.0,
+                )
+                if self.passage_observations >= 8:
+                    target = replace(target, log_scale=-0.785089819945014)
+            return SimpleNamespace(
+                current_target=target,
+                servo_output=output,
+                passage_admission=proposal.passage_admission,
+                mode=proposal.mode,
+            )
+
+    class SafeSupersededDwellHost(_Host):
+        superseded = False
+        reuse_receiver_snapshot = False
+
+        def _sample(self):
+            if self.reuse_receiver_snapshot:
+                self.reuse_receiver_snapshot = False
+            else:
+                super()._sample()
+            navigation_count = sum(
+                bool(kwargs.get("require_wire_receipt"))
+                for _command, kwargs, _gate in self.commands
+            )
+            segments = getattr(
+                self,
+                "_visual_course_summary",
+                {},
+            ).get("segments", [])
+            if (
+                navigation_count >= 8
+                and segments
+                and segments[0]["crossing_anchor"] is not None
+                and not self.race.race_finished
+            ):
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if (
+                not self.superseded
+                and expected is not None
+                and expected.publication_sequence == 18
+            ):
+                self.superseded = True
+                receiver = _token(19)
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                self.reuse_receiver_snapshot = True
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            receipt = await super()._send_flight_command(
+                command,
+                **kwargs,
+            )
+            if (
+                command.roll_rate
+                == command.pitch_rate
+                == command.yaw_rate
+                == command.thrust
+                == 0.0
+                and self.crossing_zero_count >= 2
+            ):
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = SafeSupersededDwellHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: SafeSupersededDwellServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    assert host.superseded is True
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["passage_command_count"] == 7
+    assert segment["advance_command_count"] == 3
+    assert segment["retained_crossing_supersession_hold_count"] == 1
+    hold = segment["retained_crossing_supersession_hold"]
+    assert hold["retained_crossing_dwell_frames"] == 3
+    assert hold["superseded_camera_token"]["publication_sequence"] == 18
+    assert hold["receiver_camera_token"]["publication_sequence"] == 19
+    assert hold["outcome"] == "exact_receiver_successor_accepted"
+    assert segment["crossing_anchor"]["basis"] == (
+        course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+    )
+    assert segment["crossing_anchor"]["camera_token"][
+        "publication_sequence"
+    ] == 19
+    assert segment["crossing_anchor"][
+        "retained_crossing_dwell_frames"
+    ] == 4
+    sent_tokens = {
+        kwargs["wire_visual_token"].publication_sequence
+        for _command, kwargs, _gate in host.commands
+        if kwargs.get("require_wire_receipt")
+    }
+    assert 18 not in sent_tokens
+    assert 19 in sent_tokens
+    events = [
+        payload
+        for event, payload in host.recorder.events
+        if event
+        == "visual_course_retained_crossing_supersession_held"
+    ]
+    assert len(events) == 1
 
 
 def test_superseded_passage_proposal_breaks_retained_crossing_dwell():

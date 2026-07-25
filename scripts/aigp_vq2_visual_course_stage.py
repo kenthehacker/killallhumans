@@ -57,6 +57,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_TARGET_PITCH_RAD,
     MIN_VISUAL_THRUST,
+    PREPASS_CURRENT_MAX_APPARENT_SCALE,
 )
 from scripts.aigp_vq2_yaw_profile import (
     DEFAULT_YAW_CALIBRATION_PROFILE_PATH,
@@ -108,6 +109,9 @@ RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS = (
 )
 CENSORED_PASSAGE_COAST_BASIS = (
     "latched-clean-attitude-close-censored-passage-v1"
+)
+CENSORED_PASSAGE_BOTTOM_TRANSITION_BASIS = (
+    "latched-clean-attitude-bottom-transition-v1"
 )
 APPROACH_PREVIEW_REQUALIFICATION_BASIS = (
     "fresh-current-corridor-sealed-next-identity-v1"
@@ -237,6 +241,14 @@ class _AcceptedVisualCommand:
     wire_start_monotonic_ns: int
     target_roll_rad: float
     target_pitch_rad: float
+
+
+@dataclass(frozen=True, slots=True)
+class _SupersededVisualProposal:
+    expected_camera_token: CameraFrameToken
+    receiver_camera_token: CameraFrameToken
+    held_previous_command_s: float
+    consecutive_count: int
 
 
 class _PreviewRequalificationWireSlotUnavailable(RuntimeError):
@@ -1314,6 +1326,84 @@ def _token_strictly_newer(
     )
 
 
+def _tokens_are_adjacent_camera_publications(
+    current: CameraFrameToken,
+    previous: CameraFrameToken,
+) -> bool:
+    return bool(
+        type(current) is CameraFrameToken
+        and type(previous) is CameraFrameToken
+        and type(current.stream_id) is str
+        and current.stream_id
+        and current.stream_id == previous.stream_id
+        and type(current.generation) is int
+        and current.generation == previous.generation
+        and type(current.frame_id) is int
+        and type(previous.frame_id) is int
+        and current.frame_id == previous.frame_id + 1
+        and type(current.publication_sequence) is int
+        and type(previous.publication_sequence) is int
+        and current.publication_sequence
+        == previous.publication_sequence + 1
+    )
+
+
+def _retained_crossing_supersession_usable(
+    target: Any,
+    output: Any,
+    supersession: _SupersededVisualProposal,
+    *,
+    last_accepted_camera_token: Optional[CameraFrameToken],
+    current_track_id: str,
+    retained_crossing_dwell_frames: int,
+    tuning: Any,
+    limits: VisualCourseStageLimits,
+) -> bool:
+    """Preserve, but never extend, one completed safe retained dwell."""
+
+    target_token = getattr(target, "frame_token", None)
+    maximum_hold_s = (
+        limits.control_period_s + limits.max_validation_to_wire_delay_s
+    )
+    return bool(
+        type(supersession) is _SupersededVisualProposal
+        and supersession.consecutive_count == 1
+        and type(last_accepted_camera_token) is CameraFrameToken
+        and _tokens_are_adjacent_camera_publications(
+            supersession.expected_camera_token,
+            last_accepted_camera_token,
+        )
+        and _tokens_are_adjacent_camera_publications(
+            supersession.receiver_camera_token,
+            supersession.expected_camera_token,
+        )
+        and type(supersession.held_previous_command_s) is float
+        and math.isfinite(supersession.held_previous_command_s)
+        and 0.0 <= supersession.held_previous_command_s <= maximum_hold_s
+        and type(current_track_id) is str
+        and current_track_id
+        and getattr(target, "track_id", None) == current_track_id
+        and getattr(target_token, "stream_id", None)
+        == supersession.expected_camera_token.stream_id
+        and getattr(target_token, "generation", None)
+        == supersession.expected_camera_token.generation
+        and getattr(target_token, "frame_id", None)
+        == supersession.expected_camera_token.frame_id
+        and getattr(target_token, "publication_sequence", None)
+        == supersession.expected_camera_token.publication_sequence
+        and type(retained_crossing_dwell_frames) is int
+        and retained_crossing_dwell_frames
+        >= tuning.required_corridor_frames
+        and _retained_crossing_observation_usable(
+            target,
+            output,
+            tuning=tuning,
+            limits=limits,
+            yaw_soft_stop_zeroed=False,
+        )
+    )
+
+
 def _censored_passage_visibility_suffix_usable(
     track: Any,
     *,
@@ -1541,6 +1631,192 @@ def _censored_passage_coast_eligible(
             current_token=token,
             previous_apparent_scale=previous_apparent_scale,
             minimum_apparent_scale=minimum_apparent_scale,
+        )
+    )
+
+
+def _bottom_censored_passage_transition_eligible(
+    snapshot: Any,
+    *,
+    current_gate_index: int,
+    current_track_id: str,
+    crossing_anchor_token: CameraFrameToken,
+    authority: _CensoredPassageCoastAuthority,
+    previous_visible_token: CameraFrameToken,
+    previous_apparent_scale: Optional[float],
+    minimum_apparent_scale: float,
+    passage_admission: VisualApproachPassageAdmission,
+    next_preview_retired: bool,
+    tuning: Any,
+) -> bool:
+    """Admit one exact bottom-edge sample before full vertical censorship."""
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    history = getattr(track, "history", None)
+    if (
+        type(authority) is not _CensoredPassageCoastAuthority
+        or authority.gate_index != current_gate_index
+        or authority.track_id != current_track_id
+        or authority.anchor_camera_token != crossing_anchor_token
+        or type(token) is not CameraFrameToken
+        or type(previous_visible_token) is not CameraFrameToken
+        or not (
+            previous_visible_token == crossing_anchor_token
+            or _token_strictly_newer(
+                previous_visible_token,
+                crossing_anchor_token,
+            )
+        )
+        or not _tokens_are_adjacent_camera_publications(
+            token,
+            previous_visible_token,
+        )
+        or type(passage_admission) is not VisualApproachPassageAdmission
+        or passage_admission.current_gate_index != current_gate_index
+        or passage_admission.current_target.track_id != current_track_id
+        or type(next_preview_retired) is not bool
+        or (
+            passage_admission.preview_track_id is not None
+            and not next_preview_retired
+        )
+        or getattr(snapshot, "current_gate_index", None)
+        != current_gate_index
+        or getattr(snapshot, "current_track_id", None)
+        != current_track_id
+        or getattr(snapshot, "authority_usable", False) is not True
+        or getattr(snapshot, "race_finished", False) is not False
+        or track is None
+        or getattr(track, "track_id", None) != current_track_id
+        or getattr(track, "latest_token", None) != token
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "visible", False) is not True
+        or getattr(track, "missed_frame_count", 1) != 0
+        or getattr(track, "ambiguous", True) is not False
+        or getattr(track, "clipping", None) != FrameEdge.BOTTOM
+        or getattr(track, "center_censored", False) is not True
+        or type(history) is not tuple
+        or len(history) < 2
+        or type(getattr(track, "consecutive_frame_count", None)) is not int
+        or track.consecutive_frame_count < 2
+    ):
+        return False
+
+    previous = history[-2]
+    current = history[-1]
+    if (
+        type(previous) is not VisualTrackSample
+        or type(current) is not VisualTrackSample
+        or previous.token != previous_visible_token
+        or current.token != token
+        or type(previous.tracker_frame_sequence) is not int
+        or type(current.tracker_frame_sequence) is not int
+        or current.tracker_frame_sequence
+        != previous.tracker_frame_sequence + 1
+        or getattr(snapshot, "tracker_frame_sequence", None)
+        != current.tracker_frame_sequence
+        or previous.clipping is not FrameEdge.NONE
+        or previous.center_censored
+        or current.clipping != FrameEdge.BOTTOM
+        or current.center_censored is not True
+    ):
+        return False
+
+    association = current.accepted_association
+    if (
+        type(association) is not AssociationEvidence
+        or association.track_id != current_track_id
+        or association.previous_token != previous.token
+        or association.current_token != current.token
+        or association.detection_source_index != current.source_index
+        or type(association.missed_frame_count_before_association) is not int
+        or association.missed_frame_count_before_association != 0
+        or type(association.ambiguous) is not bool
+        or association.ambiguous
+        or type(association.track_ambiguous_before_association) is not bool
+        or association.track_ambiguous_before_association
+        or type(previous.observation_monotonic_ns) is not int
+        or type(current.observation_monotonic_ns) is not int
+        or current.observation_monotonic_ns
+        - previous.observation_monotonic_ns
+        != association.observation_gap_ns
+        or type(previous.publication_monotonic_ns) is not int
+        or type(current.publication_monotonic_ns) is not int
+        or current.publication_monotonic_ns
+        - previous.publication_monotonic_ns
+        != association.publication_gap_ns
+    ):
+        return False
+
+    previous_center = previous.center_norm
+    previous_scale = previous.apparent_scale
+    current_scale = current.apparent_scale
+    track_scale = getattr(track, "apparent_scale", None)
+    sample_confidence = current.confidence
+    sample_association_confidence = current.association_confidence
+    association_confidence = association.confidence
+    track_confidence = getattr(track, "confidence", None)
+    track_association_confidence = getattr(
+        track,
+        "association_confidence",
+        None,
+    )
+    return bool(
+        type(previous_center) is tuple
+        and len(previous_center) == 2
+        and all(
+            type(value) in {int, float} and math.isfinite(float(value))
+            for value in previous_center
+        )
+        and abs(float(previous_center[0])) <= tuning.horizontal_corridor
+        and abs(float(previous_center[1])) <= tuning.vertical_corridor
+        and type(previous_scale) in {int, float}
+        and math.isfinite(float(previous_scale))
+        and type(previous_apparent_scale) in {int, float}
+        and math.isfinite(float(previous_apparent_scale))
+        and math.isclose(
+            float(previous_scale),
+            float(previous_apparent_scale),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and float(previous_scale) > PREPASS_CURRENT_MAX_APPARENT_SCALE
+        and float(previous_scale) >= minimum_apparent_scale
+        and type(current_scale) in {int, float}
+        and math.isfinite(float(current_scale))
+        and float(current_scale) > float(previous_scale)
+        and float(current_scale) >= minimum_apparent_scale
+        and type(track_scale) in {int, float}
+        and math.isfinite(float(track_scale))
+        and math.isclose(
+            float(track_scale),
+            float(current_scale),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and all(
+            type(value) in {int, float}
+            and math.isfinite(float(value))
+            and 0.10 <= float(value) <= 1.0
+            for value in (
+                sample_confidence,
+                sample_association_confidence,
+                association_confidence,
+                track_confidence,
+                track_association_confidence,
+            )
+        )
+        and math.isclose(
+            float(sample_association_confidence),
+            float(association_confidence),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            float(sample_association_confidence),
+            float(track_association_confidence),
+            rel_tol=0.0,
+            abs_tol=1e-12,
         )
     )
 
@@ -1875,14 +2151,14 @@ async def _run_visual_course_stage_impl(
         segment_started_s: float,
         stage: str,
         preview_requalification_wire_deadline_ns: Optional[int] = None,
-    ) -> Optional[_AcceptedVisualCommand]:
+    ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
         nonlocal last_navigation_send_s
         nonlocal consecutive_superseded_proposals
 
         def drop_superseded_proposal(
             exc: BaseException,
-        ) -> Optional[_AcceptedVisualCommand]:
+        ) -> _SupersededVisualProposal:
             nonlocal consecutive_superseded_proposals
 
             expected_token = snapshot.latest_camera_token
@@ -1933,7 +2209,12 @@ async def _run_visual_course_stage_impl(
                     "visual-course receiver repeatedly superseded command "
                     "authority"
                 ) from exc
-            return None
+            return _SupersededVisualProposal(
+                expected_camera_token=expected_token,
+                receiver_camera_token=receiver_token,
+                held_previous_command_s=hold_s,
+                consecutive_count=consecutive_superseded_proposals,
+            )
 
         output = proposal.servo_output
         observation_monotonic_ns = (
@@ -2682,7 +2963,14 @@ async def _run_visual_course_stage_impl(
         censored_passage_coast_last_observed_scale: Optional[float] = None
         censored_passage_coast_fresh_frame_count = 0
         censored_passage_coast_command_count = 0
+        bottom_censored_transition_pending_token: Optional[
+            CameraFrameToken
+        ] = None
+        bottom_censored_transition_used = False
         retained_crossing_dwell_frames = 0
+        retained_crossing_supersession: Optional[
+            _SupersededVisualProposal
+        ] = None
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
@@ -2706,10 +2994,14 @@ async def _run_visual_course_stage_impl(
             "passage_admission_yaw_soft_stop_withheld_count": 0,
             "retained_crossing_dwell_frames": 0,
             "max_retained_crossing_dwell_frames": 0,
+            "retained_crossing_supersession_hold_count": 0,
+            "retained_crossing_supersession_hold": None,
             "crossing_wait_zero_command_count": 0,
             "censored_passage_coast_fresh_frame_count": 0,
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
+            "bottom_censored_transition_count": 0,
+            "bottom_censored_transition": None,
             "post_credit_zero_command_count": 0,
             "passage_authority_enabled": False,
             "passage_admission": None,
@@ -2777,6 +3069,38 @@ async def _run_visual_course_stage_impl(
 
         credited_race: Optional[AuthoritativeRaceStatusRef] = None
 
+        def accept_bottom_transition_credit() -> None:
+            nonlocal bottom_censored_transition_pending_token
+
+            if bottom_censored_transition_pending_token is None:
+                return
+            transition_evidence = segment[
+                "bottom_censored_transition"
+            ]
+            coast_evidence = segment["censored_passage_coast"]
+            if (
+                not isinstance(transition_evidence, dict)
+                or not isinstance(coast_evidence, dict)
+            ):
+                raise abort_type(
+                    "visual-course bottom-censored transition lost its "
+                    "credit evidence"
+                )
+            transition_evidence["outcome"] = (
+                "authoritative_credit_before_full_censorship"
+            )
+            coast_evidence["bottom_transition_pending"] = False
+            bottom_censored_transition_pending_token = None
+            host.recorder.emit(
+                "visual_course_bottom_censored_transition_credited",
+                gate_index=current_gate_index,
+                stage=(
+                    f"{VISUAL_COURSE_STAGE}/gate"
+                    f"{current_gate_index}/censored-passage"
+                ),
+                **transition_evidence,
+            )
+
         def accept_no_wire_race_boundary(
             exc: RaceActiveBoundaryChangedBeforeWire,
         ) -> AuthoritativeRaceStatusRef:
@@ -2814,6 +3138,7 @@ async def _run_visual_course_stage_impl(
             crossing_started_s = (
                 crossing_started_s or float(runtime.monotonic())
             )
+            accept_bottom_transition_credit()
             return refused_race
 
         def current_only_replan(
@@ -2985,6 +3310,7 @@ async def _run_visual_course_stage_impl(
                         "visual-course race credit arrived without credible "
                         "passage evidence"
                     )
+                accept_bottom_transition_credit()
                 credited_race = race
                 last_race = race
                 crossing_started_s = crossing_started_s or now
@@ -3085,6 +3411,37 @@ async def _run_visual_course_stage_impl(
                     )
             if last_planned_token is not None and token == last_planned_token:
                 continue
+            if bottom_censored_transition_pending_token is not None:
+                pending_track = getattr(snapshot, "current_track", None)
+                vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
+                if (
+                    not _tokens_are_adjacent_camera_publications(
+                        token,
+                        bottom_censored_transition_pending_token,
+                    )
+                    or pending_track is None
+                    or getattr(pending_track, "track_id", None)
+                    != current_track_id
+                    or getattr(pending_track, "latest_token", None) != token
+                    or getattr(pending_track, "visible", False) is not True
+                    or getattr(pending_track, "missed_frame_count", 1) != 0
+                    or getattr(pending_track, "ambiguous", True) is not False
+                    or type(getattr(pending_track, "clipping", None))
+                    is not FrameEdge
+                    or pending_track.clipping & vertical_edges
+                    != vertical_edges
+                    or getattr(
+                        pending_track,
+                        "center_censored",
+                        False,
+                    )
+                    is not True
+                ):
+                    raise abort_type(
+                        "visual-course bottom-censored transition did not "
+                        "become full vertical censorship on its exact "
+                        "successor"
+                    )
 
             preview_requalification_wire_candidate = False
             try:
@@ -3369,7 +3726,175 @@ async def _run_visual_course_stage_impl(
                         ),
                     )
                 )
+                bottom_transition_eligible = bool(
+                    type(exc)
+                    is VisualApproachCurrentGeometryUnavailable
+                    and mode is VisualApproachMode.PASSAGE
+                    and type(passage_admission)
+                    is VisualApproachPassageAdmission
+                    and crossing_anchor is not None
+                    and crossing_coast_authority is not None
+                    and censored_passage_coast_started_s is None
+                    and not bottom_censored_transition_used
+                    and bottom_censored_transition_pending_token is None
+                    and previous_visible_token is not None
+                    and _bottom_censored_passage_transition_eligible(
+                        snapshot,
+                        current_gate_index=current_gate_index,
+                        current_track_id=current_track_id,
+                        crossing_anchor_token=(
+                            crossing_anchor["camera_token"]
+                        ),
+                        authority=crossing_coast_authority,
+                        previous_visible_token=previous_visible_token,
+                        previous_apparent_scale=last_clean_passage_scale,
+                        minimum_apparent_scale=math.exp(
+                            limits.crossing_arm_min_log_scale
+                        ),
+                        passage_admission=passage_admission,
+                        next_preview_retired=next_preview_retired,
+                        tuning=host.visual_config.servo,
+                    )
+                )
+                if bottom_transition_eligible:
+                    bottom_censored_transition_used = True
+                    bottom_censored_transition_pending_token = token
+                    censored_passage_coast_started_s = now
+                    censored_passage_coast_last_observed_token = token
+                    censored_passage_coast_last_observed_scale = float(
+                        track.apparent_scale
+                    )
+                    censored_passage_coast_fresh_frame_count = 1
+                    transition_evidence = {
+                        "basis": (
+                            CENSORED_PASSAGE_BOTTOM_TRANSITION_BASIS
+                        ),
+                        "outcome": "awaiting_full_vertical_censorship",
+                        "anchor_camera_token": asdict(
+                            crossing_coast_authority.anchor_camera_token
+                        ),
+                        "previous_clean_camera_token": asdict(
+                            previous_visible_token
+                        ),
+                        "bottom_censored_camera_token": asdict(token),
+                        "full_vertical_censor_camera_token": None,
+                        "previous_apparent_scale": (
+                            last_clean_passage_scale
+                        ),
+                        "bottom_censored_apparent_scale": float(
+                            track.apparent_scale
+                        ),
+                    }
+                    segment["bottom_censored_transition_count"] = 1
+                    segment["bottom_censored_transition"] = (
+                        transition_evidence
+                    )
+                    segment["censored_passage_coast"] = {
+                        "basis": (
+                            CENSORED_PASSAGE_BOTTOM_TRANSITION_BASIS
+                        ),
+                        "anchor_camera_token": asdict(
+                            crossing_coast_authority.anchor_camera_token
+                        ),
+                        "first_censored_camera_token": asdict(token),
+                        "last_censored_camera_token": asdict(token),
+                        "loss_camera_token": None,
+                        "target_roll_rad": (
+                            crossing_coast_authority.target_roll_rad
+                        ),
+                        "target_pitch_rad": (
+                            crossing_coast_authority.target_pitch_rad
+                        ),
+                        "thrust": crossing_coast_authority.thrust,
+                        "max_duration_s": (
+                            limits.censored_passage_coast_max_duration_s
+                        ),
+                        "max_fresh_frames": (
+                            limits
+                            .censored_passage_coast_max_fresh_frames
+                        ),
+                        "elapsed_s": 0.0,
+                        "bottom_transition_pending": True,
+                    }
+                    segment[
+                        "censored_passage_coast_fresh_frame_count"
+                    ] = censored_passage_coast_fresh_frame_count
+                    last_planned_token = token
+                    host.recorder.emit(
+                        "visual_course_bottom_censored_transition_started",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/censored-passage"
+                        ),
+                        **transition_evidence,
+                    )
+                    refresh_live_summary()
+                    try:
+                        coast_command = (
+                            await send_censored_passage_coast(
+                                snapshot=snapshot,
+                                authority=crossing_coast_authority,
+                                yaw_reference_rad=yaw_reference_rad,
+                                segment_started_s=segment_started_s,
+                                stage=(
+                                    f"{VISUAL_COURSE_STAGE}/gate"
+                                    f"{current_gate_index}/"
+                                    "censored-passage"
+                                ),
+                            )
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc
+                        )
+                        break
+                    if coast_command is None:
+                        continue
+                    censored_passage_coast_command_count += 1
+                    passage_command_count += 1
+                    segment["passage_command_count"] = (
+                        passage_command_count
+                    )
+                    segment[
+                        "censored_passage_coast_command_count"
+                    ] = censored_passage_coast_command_count
+                    continue
                 if censored_coast_eligible:
+                    if bottom_censored_transition_pending_token is not None:
+                        bottom_censored_transition_pending_token = None
+                        transition_evidence = segment[
+                            "bottom_censored_transition"
+                        ]
+                        if not isinstance(transition_evidence, dict):
+                            raise abort_type(
+                                "visual-course bottom-censored transition "
+                                "lost its evidence"
+                            )
+                        transition_evidence["outcome"] = (
+                            "full_vertical_censorship_confirmed"
+                        )
+                        transition_evidence[
+                            "full_vertical_censor_camera_token"
+                        ] = asdict(token)
+                        coast_evidence = segment[
+                            "censored_passage_coast"
+                        ]
+                        if not isinstance(coast_evidence, dict):
+                            raise abort_type(
+                                "visual-course bottom-censored transition "
+                                "lost its coast evidence"
+                            )
+                        coast_evidence["bottom_transition_pending"] = False
+                        host.recorder.emit(
+                            "visual_course_bottom_censored_transition_confirmed",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/censored-passage"
+                            ),
+                            **transition_evidence,
+                        )
                     if censored_passage_coast_started_s is None:
                         censored_passage_coast_started_s = now
                         segment["censored_passage_coast"] = {
@@ -3468,6 +3993,11 @@ async def _run_visual_course_stage_impl(
                     ] = censored_passage_coast_command_count
                     continue
 
+                if bottom_censored_transition_pending_token is not None:
+                    raise abort_type(
+                        "visual-course bottom-censored transition lacked "
+                        "full vertical censorship on its exact successor"
+                    ) from exc
                 credible_loss = bool(
                     mode is VisualApproachMode.PASSAGE
                     and crossing_anchor is not None
@@ -3900,8 +4430,12 @@ async def _run_visual_course_stage_impl(
                 except RaceActiveBoundaryChangedBeforeWire as exc:
                     credited_race = accept_no_wire_race_boundary(exc)
                     break
-                if accepted is None:
+                if type(accepted) is _SupersededVisualProposal:
                     continue
+                if type(accepted) is not _AcceptedVisualCommand:
+                    raise abort_type(
+                        "visual-course approach command outcome is invalid"
+                    )
                 approach_command_count += 1
                 segment["approach_command_count"] = approach_command_count
                 if preview_requalification_wire_candidate:
@@ -3999,10 +4533,116 @@ async def _run_visual_course_stage_impl(
             except RaceActiveBoundaryChangedBeforeWire as exc:
                 credited_race = accept_no_wire_race_boundary(exc)
                 break
-            if accepted is None:
-                retained_crossing_dwell_frames = 0
-                segment["retained_crossing_dwell_frames"] = 0
+            if type(accepted) is _SupersededVisualProposal:
+                if (
+                    retained_crossing_supersession is None
+                    and _retained_crossing_supersession_usable(
+                        proposal.current_target,
+                        proposal.servo_output,
+                        accepted,
+                        last_accepted_camera_token=(
+                            last_clean_passage_token
+                        ),
+                        current_track_id=current_track_id,
+                        retained_crossing_dwell_frames=(
+                            retained_crossing_dwell_frames
+                        ),
+                        tuning=host.visual_config.servo,
+                        limits=limits,
+                    )
+                ):
+                    retained_crossing_supersession = accepted
+                    hold_evidence = {
+                        "basis": (
+                            "completed-retained-dwell-adjacent-"
+                            "supersession-v1"
+                        ),
+                        "outcome": "awaiting_exact_receiver_successor",
+                        "previous_accepted_camera_token": asdict(
+                            last_clean_passage_token
+                        ),
+                        "superseded_camera_token": asdict(
+                            accepted.expected_camera_token
+                        ),
+                        "receiver_camera_token": asdict(
+                            accepted.receiver_camera_token
+                        ),
+                        "held_previous_command_s": (
+                            accepted.held_previous_command_s
+                        ),
+                        "retained_crossing_dwell_frames": (
+                            retained_crossing_dwell_frames
+                        ),
+                        "track_id": proposal.current_target.track_id,
+                        "normalized_x": (
+                            proposal.current_target.normalized_x
+                        ),
+                        "normalized_y_down": (
+                            proposal.current_target.normalized_y_down
+                        ),
+                        "normalized_x_rate_s": (
+                            proposal.current_target.normalized_x_rate_s
+                        ),
+                        "normalized_y_rate_down_s": (
+                            proposal.current_target
+                            .normalized_y_rate_down_s
+                        ),
+                        "log_scale": proposal.current_target.log_scale,
+                        "log_scale_rate_s": (
+                            proposal.current_target.log_scale_rate_s
+                        ),
+                    }
+                    segment[
+                        "retained_crossing_supersession_hold_count"
+                    ] = int(
+                        segment[
+                            "retained_crossing_supersession_hold_count"
+                        ]
+                    ) + 1
+                    segment[
+                        "retained_crossing_supersession_hold"
+                    ] = hold_evidence
+                    host.recorder.emit(
+                        "visual_course_retained_crossing_supersession_held",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/passage"
+                        ),
+                        **hold_evidence,
+                    )
+                else:
+                    retained_crossing_supersession = None
+                    retained_crossing_dwell_frames = 0
+                segment["retained_crossing_dwell_frames"] = (
+                    retained_crossing_dwell_frames
+                )
+                refresh_live_summary()
                 continue
+            if type(accepted) is not _AcceptedVisualCommand:
+                raise abort_type(
+                    "visual-course passage command outcome is invalid"
+                )
+            if retained_crossing_supersession is not None:
+                exact_successor = bool(
+                    token
+                    == retained_crossing_supersession.receiver_camera_token
+                )
+                hold_evidence = segment[
+                    "retained_crossing_supersession_hold"
+                ]
+                if not exact_successor:
+                    retained_crossing_dwell_frames = 0
+                if isinstance(hold_evidence, dict):
+                    hold_evidence["outcome"] = (
+                        "exact_receiver_successor_accepted"
+                        if exact_successor
+                        else "receiver_successor_changed"
+                    )
+                    hold_evidence["accepted_successor_camera_token"] = (
+                        asdict(token)
+                    )
+                retained_crossing_supersession = None
             command = accepted.command
             target = proposal.current_target
             last_clean_passage_token = token
