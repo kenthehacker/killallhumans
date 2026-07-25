@@ -211,6 +211,9 @@ def test_launcher_is_parameterized_and_has_no_stale_host_or_session_id():
     assert "$taskQueryErrorAction = $ErrorActionPreference" in source
     assert "$ErrorActionPreference = 'Continue'" in source
     assert "$ErrorActionPreference = $taskQueryErrorAction" in source
+    assert "$CurrentSessionId -eq $InteractiveSessionId" in source
+    assert "$RunAsUser -ieq $CurrentIdentity" in source
+    assert "Start-Process -FilePath $SimulatorPath" in source
     assert "[Guid]::NewGuid()" in source
     assert source.index("Get-Process") < source.index("$querySession = Join-Path")
     assert "Kenichi" not in source

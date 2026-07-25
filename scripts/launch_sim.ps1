@@ -117,6 +117,7 @@ $interactive = Select-AigpInteractiveSession `
     -QueryExitCode $querySessionExitCode
 $InteractiveSessionId = $interactive.Id
 
+$RunAsUserWasExplicit = [bool]$RunAsUser
 if (-not $RunAsUser) {
     $RunAsUser = if ($interactive.User -match '[\\@]') {
         $interactive.User
@@ -126,6 +127,43 @@ if (-not $RunAsUser) {
 }
 if (-not $TaskName) {
     $TaskName = "LaunchAIGP-$PID-$([Guid]::NewGuid().ToString('N'))"
+}
+
+$CurrentSessionId = (Get-Process -Id $PID).SessionId
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$DirectUserMatches = (
+    -not $RunAsUserWasExplicit -or
+    $RunAsUser -ieq $CurrentIdentity
+)
+if (
+    $CurrentSessionId -eq $InteractiveSessionId -and
+    $DirectUserMatches
+) {
+    # A local shell already inhabits the selected interactive desktop.  Launch
+    # directly so Task Scheduler quoting and elevation are not introduced.
+    Start-Process -FilePath $SimulatorPath `
+        -WorkingDirectory $SimulatorDirectory | Out-Null
+    $deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
+    do {
+        Start-Sleep -Milliseconds 500
+        $processes = Get-Process `
+            -Name 'DCGame-Win64-Shipping', 'FlightSim' `
+            -ErrorAction SilentlyContinue
+        if (
+            $processes -and
+            ($processes.SessionId -contains $InteractiveSessionId)
+        ) {
+            Write-Output (
+                "Sim launched in interactive session {0} as {1}: {2}" -f `
+                    $InteractiveSessionId, $RunAsUser, $SimulatorPath
+            )
+            return
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw (
+        "FlightSim was not observed in interactive session " +
+        "$InteractiveSessionId within $StartupTimeoutSeconds seconds."
+    )
 }
 
 # Never overwrite an unrelated scheduled task. `/Create` intentionally omits

@@ -226,7 +226,6 @@ interactive confirmation.
             } else {
                 & $launcher
             }
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         }
         'sbom' {
             if ($TaskArgs.Count -gt 1) { throw 'sbom accepts at most one output path.' }
