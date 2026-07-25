@@ -31,9 +31,11 @@ from planning.vq2_visual_recovery import (
     RECOVERY_HISTORY_SAMPLE_COUNT,
     RECOVERY_MAX_ANCHOR_CREDIT_AGE_S,
     RECOVERY_MAX_CONTINUATION_AGE_S,
+    RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES,
     RECOVERY_MAX_PROJECTED_ABS_Y_NORM,
     RECOVERY_MAX_RAW_CENTER_RATE_NORM_S,
     RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S,
+    RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL,
     RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S,
     RECOVERY_MAX_REACQUISITION_GAP_S,
     RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S,
@@ -423,6 +425,173 @@ _SIX_EPOCH_ROWS = (
 _SIX_EPOCH_RACE_RECEIVED_NS = 76_199_121_890_000
 
 
+# Exact target observations and accepted associations from
+# 20260725T020716Z-visual-align-2767bf3e/session.jsonl.gz
+# (trace sha256 18a4c950eb40b5d50bab8bb9c08f65cb6983aa238b159aa91a3467898c046972).
+# Each row is frame/token/timing/source/geometry/detection confidence followed
+# by cost, association confidence, residual, IoU, log-width, log-height,
+# log-area residual, missed frames, observation gap, and publication gap.
+_LATEST_DELAYED_CREDIT_ROWS = (
+    (
+        2_333_617, 151, 148, 78_089_147_001_600, 78_089_148_037_700,
+        1_784_945_243_471_500_900, 1,
+        (0.390625, -0.5055555555555555),
+        (0.6546875, 0.16944444444444445, 0.7375, 0.3277777777777778),
+        0.11450755069717751, 0.6343436730112331,
+        (
+            0.053319768697105197, 0.9349758918327985,
+            0.008687179086291923, 0.9462461118784224,
+            0.01904819497069463, 0.017699577099400857,
+            0.00137181715702539, 0, 34_877_400, 34_857_400,
+        ),
+    ),
+    (
+        2_333_618, 152, 149, 78_089_181_453_200, 78_089_182_416_800,
+        1_784_945_243_506_220_000, 1,
+        (0.3968750000000001, -0.5055555555555555),
+        (0.65625, 0.16666666666666666, 0.740625, 0.3277777777777778),
+        0.11659223816361017, 0.6413631095722997,
+        (
+            0.0515506310857422, 0.9371333767247046,
+            0.00757305445271104, 0.9547490457470003,
+            0.018692133012151457, 0.01739174271186924,
+            0.0003945192621017668, 0, 34_451_600, 34_379_100,
+        ),
+    ),
+    (
+        2_333_619, 153, 150, 78_089_209_054_400, 78_089_209_971_300,
+        1_784_945_243_534_006_800, 1,
+        (0.3999999999999999, -0.5111111111111111),
+        (0.6578125, 0.1638888888888889, 0.74375, 0.325),
+        0.11766684372035782, 0.6837733333333332,
+        (
+            0.048561392675357695, 0.9407787894202955,
+            0.0031359242110125048, 0.9641116139572402,
+            0.018349138668196832, 0.0,
+            -0.010417540625599742, 0, 27_601_200, 27_554_500,
+        ),
+    ),
+    (
+        2_333_620, 154, 151, 78_089_244_266_100, 78_089_245_298_000,
+        1_784_945_243_568_756_500, 1,
+        (0.40625, -0.5166666666666666),
+        (0.659375, 0.16111111111111112, 0.746875, 0.325),
+        0.11975089885999922, 0.6508048408020507,
+        (
+            0.04573073870294791, 0.9442308064598196,
+            0.0016749289822118726, 0.9654963680387423,
+            0.018018505502677338, 0.01709443335930004,
+            0.005723888461855786, 0, 35_211_700, 35_326_700,
+        ),
+    ),
+    (
+        2_333_632, 166, 162, 78_089_647_016_900, 78_089_648_069_400,
+        1_784_945_243_971_487_400, 1,
+        (0.484375, -0.6),
+        (0.6828125, 0.1, 0.8015625, 0.30277777777777776),
+        0.15517687041280054, 0.7461,
+        (
+            0.24841293938177222, 0.6970573909978388,
+            0.02564783931026816, 0.5955299206921413,
+            0.3053816495511821, 0.21292199724267152,
+            0.1461438555509722, 10, 402_750_800, 402_771_400,
+        ),
+    ),
+    (
+        2_333_633, 167, 163, 78_089_681_679_400, 78_089_682_732_100,
+        1_784_945_244_006_265_800, 0,
+        (0.4937499999999999, -0.6055555555555556),
+        (0.6859375, 0.09444444444444444, 0.8078125, 0.3),
+        0.15827849927685486, 0.7487216438356163,
+        (
+            0.050419626340783924, 0.938512650803922,
+            0.003341881239523773, 0.9602755345101244,
+            0.025975486403262037, 0.013605652055778678,
+            0.000633655225919405, 0, 34_662_500, 34_662_700,
+        ),
+    ),
+    (
+        2_333_634, 168, 164, 78_089_708_875_800, 78_089_709_860_500,
+        1_784_945_244_034_031_700, 0,
+        (0.5, -0.6111111111111112),
+        (0.6875, 0.08888888888888889, 0.8125, 0.3),
+        0.16244657241348273, 0.7702199701869902,
+        (
+            0.052068216963669325, 0.9365021744345496,
+            0.0009090414733714438, 0.9493421052631587,
+            0.025317807984289353, 0.026668247082161273,
+            0.021154188913009797, 0, 27_196_400, 27_128_400,
+        ),
+    ),
+    (
+        2_333_635, 169, 165, 78_089_743_894_500, 78_089_744_606_200,
+        1_784_945_244_068_795_300, 0,
+        (0.5093749999999999, -0.6222222222222222),
+        (0.690625, 0.08333333333333333, 0.81875, 0.2972222222222222),
+        0.16554308771099105, 0.7597431578947368,
+        (
+            0.049093576023899785, 0.9401297853367075,
+            0.004682622239924742, 0.9629394995248657,
+            0.02469261259037098, 0.013072081567352921,
+            -0.016916351078995362, 0, 35_018_700, 34_745_700,
+        ),
+    ),
+    (
+        2_333_636, 170, 166, 78_089_778_648_000, 78_089_779_741_300,
+        1_784_945_244_103_491_100, 0,
+        (0.51875, -0.6333333333333333),
+        (0.69375, 0.075, 0.8265625, 0.29444444444444445),
+        0.170718965782299, 0.7651630769230768,
+        (
+            0.052461902297195995, 0.9360220703692732,
+            0.002192696157906789, 0.9402829486224866,
+            0.0359320092260638, 0.025642430613337652,
+            0.01654103249814698, 0, 34_753_500, 35_135_100,
+        ),
+    ),
+    (
+        2_333_637, 171, 167, 78_089_814_327_700, 78_089_815_363_500,
+        1_784_945_244_138_183_800, 0,
+        (0.53125, -0.6444444444444444),
+        (0.696875, 0.06666666666666667, 0.834375, 0.2916666666666667),
+        0.1758905909933786, 0.7597700000000001,
+        (
+            0.05160431217639609, 0.9370679119800047,
+            0.003255656551442854, 0.9420594837261506,
+            0.03468555798788968, 0.0250013022054174,
+            0.004113264544320927, 0, 35_679_700, 35_622_200,
+        ),
+    ),
+    (
+        2_333_638, 172, 168, 78_089_848_294_100, 78_089_849_325_400,
+        1_784_945_244_172_905_900, 0,
+        (0.5406249999999999, -0.6555555555555556),
+        (0.7, 0.05555555555555555, 0.8421875, 0.28888888888888886),
+        0.18214577495328663, 0.7818587951807229,
+        (
+            0.054581775524964835, 0.9334368591158966,
+            0.0014201482133938646, 0.932496075353218,
+            0.033522692038644074, 0.03636764417087458,
+            0.014831661021617926, 0, 33_966_400, 33_961_900,
+        ),
+    ),
+    (
+        2_333_639, 173, 169, 78_089_875_925_500, 78_089_876_839_700,
+        1_784_945_244_200_714_400, 0,
+        (0.55, -0.6666666666666667),
+        (0.703125, 0.05, 0.8484375, 0.2861111111111111),
+        0.1852293060866269, 0.7719485714285714,
+        (
+            0.04596394002889317, 0.9439464145989107,
+            0.0027167989658577274, 0.966982922201139,
+            0.021739986636405386, 0.011834457647003017,
+            -0.017851348107924103, 0, 27_631_400, 27_514_300,
+        ),
+    ),
+)
+_LATEST_DELAYED_CREDIT_RACE_RECEIVED_NS = 78_089_861_671_700
+
+
 def _accepted_sample(
     previous: VisualTrackSample,
     sample: VisualTrackSample,
@@ -485,6 +654,22 @@ def _bind_continuous_history(
     for sample in samples[1:]:
         bound.append(_accepted_sample(bound[-1], sample))
     return tuple(bound)
+
+
+def _forge_transition(
+    transition: ConfirmedGateTransition,
+    **changes,
+) -> ConfirmedGateTransition:
+    """Bypass constructor checks to exercise recovery's fail-closed boundary."""
+
+    forged = object.__new__(ConfirmedGateTransition)
+    for name in transition.__dataclass_fields__:
+        object.__setattr__(
+            forged,
+            name,
+            changes.get(name, getattr(transition, name)),
+        )
+    return forged
 
 
 def _prepend_established_identity(
@@ -596,9 +781,11 @@ def _fixture() -> tuple[
         camera_token_at_credit=track.latest_token,
         promoted_first_token=track.first_token,
         promoted_latest_token_before_credit=track.latest_token,
+        promoted_latest_token_at_promotion=track.latest_token,
         pretransition_frame_tokens=tuple(
             sample.token for sample in samples
         ),
+        promoted_history_length_at_credit=len(samples),
         history_length_before_promotion=len(samples),
         history_length_after_promotion=len(samples),
         promoted_history_sha256=visual_track_history_sha256(samples),
@@ -801,9 +988,11 @@ def _stable_tail_fixture() -> tuple[
         camera_token_at_credit=track.latest_token,
         promoted_first_token=track.first_token,
         promoted_latest_token_before_credit=track.latest_token,
+        promoted_latest_token_at_promotion=track.latest_token,
         pretransition_frame_tokens=tuple(
             sample.token for sample in bound_transition
         ),
+        promoted_history_length_at_credit=len(samples),
         history_length_before_promotion=len(samples),
         history_length_after_promotion=len(samples),
         promoted_history_sha256=visual_track_history_sha256(samples),
@@ -1008,14 +1197,269 @@ def _six_frame_epoch_fixture() -> tuple[
         camera_token_at_credit=track.latest_token,
         promoted_first_token=track.first_token,
         promoted_latest_token_before_credit=track.latest_token,
+        promoted_latest_token_at_promotion=track.latest_token,
         pretransition_frame_tokens=tuple(
             sample.token for sample in bound_epoch
         ),
+        promoted_history_length_at_credit=len(samples),
         history_length_before_promotion=len(samples),
         history_length_after_promotion=len(samples),
         promoted_history_sha256=visual_track_history_sha256(samples),
     )
     return track, transition
+
+
+def _delayed_credit_fixture() -> tuple[
+    VisualTrack,
+    ConfirmedGateTransition,
+]:
+    """Freeze one exact clean target publication after race credit."""
+
+    credit_track, credit_transition = _six_frame_epoch_fixture()
+    credit_sample = credit_track.history[-1]
+    assert credit_sample.publication_monotonic_ns is not None
+    promotion_sample = replace(
+        credit_sample,
+        tracker_frame_sequence=credit_sample.tracker_frame_sequence + 1,
+        token=replace(
+            credit_sample.token,
+            frame_id=credit_sample.token.frame_id + 1,
+            publication_sequence=(
+                credit_sample.token.publication_sequence + 1
+            ),
+        ),
+        observation_monotonic_ns=(
+            credit_sample.observation_monotonic_ns + 35_000_000
+        ),
+        publication_monotonic_ns=(
+            credit_sample.publication_monotonic_ns + 35_000_000
+        ),
+        camera_source_time_ns=(
+            None
+            if credit_sample.camera_source_time_ns is None
+            else credit_sample.camera_source_time_ns + 35_000_000
+        ),
+        confidence=0.78,
+        association_confidence=0.94,
+        accepted_association=None,
+    )
+    promotion_sample = _accepted_sample(credit_sample, promotion_sample)
+    history = credit_track.history + (promotion_sample,)
+    track = replace(
+        credit_track,
+        latest_token=promotion_sample.token,
+        center_norm=promotion_sample.center_norm,
+        bbox_norm=promotion_sample.bbox_norm,
+        apparent_scale=promotion_sample.apparent_scale,
+        confidence=promotion_sample.confidence,
+        association_confidence=promotion_sample.association_confidence,
+        consecutive_frame_count=credit_track.consecutive_frame_count + 1,
+        total_observation_count=credit_track.total_observation_count + 1,
+        history=history,
+    )
+    transition = replace(
+        credit_transition,
+        promoted_latest_token_at_promotion=promotion_sample.token,
+        history_length_before_promotion=len(history),
+        history_length_after_promotion=len(history),
+        promoted_history_sha256=visual_track_history_sha256(history),
+    )
+    return track, transition
+
+
+def _latest_delayed_credit_fixture() -> tuple[
+    VisualTrack,
+    ConfirmedGateTransition,
+]:
+    """Rebuild the exact compact target excerpt around delayed credit."""
+
+    samples: list[VisualTrackSample] = []
+    for row in _LATEST_DELAYED_CREDIT_ROWS:
+        (
+            frame_id,
+            publication_sequence,
+            tracker_frame_sequence,
+            observation_ns,
+            publication_ns,
+            camera_source_ns,
+            source_index,
+            center,
+            bbox,
+            scale,
+            detection_confidence,
+            association,
+        ) = row
+        token = CameraFrameToken(
+            generation=1,
+            frame_id=frame_id,
+            publication_sequence=publication_sequence,
+            stream_id="vq2-camera-udp-5600",
+        )
+        (
+            cost,
+            association_confidence,
+            residual,
+            bbox_iou,
+            log_width,
+            log_height,
+            log_area,
+            missed_frames,
+            observation_gap_ns,
+            publication_gap_ns,
+        ) = association
+        previous_token = (
+            samples[-1].token
+            if samples
+            else CameraFrameToken(
+                generation=1,
+                frame_id=frame_id - 1,
+                publication_sequence=publication_sequence - 1,
+                stream_id=token.stream_id,
+            )
+        )
+        evidence = AssociationEvidence(
+            track_id="vq2-track-000002",
+            previous_token=previous_token,
+            current_token=token,
+            detection_source_index=source_index,
+            cost=cost,
+            confidence=association_confidence,
+            predicted_center_residual_norm=residual,
+            bbox_iou=bbox_iou,
+            log_width_change=log_width,
+            log_height_change=log_height,
+            log_area_residual=log_area,
+            clipping_continuity=1.0,
+            temporal_consistency=1.0 / (missed_frames + 1),
+            appearance_distance=None,
+            ambiguous=False,
+            missed_frame_count_before_association=missed_frames,
+            observation_gap_ns=observation_gap_ns,
+            publication_gap_ns=publication_gap_ns,
+            track_ambiguous_before_association=False,
+        )
+        samples.append(
+            VisualTrackSample(
+                tracker_frame_sequence=tracker_frame_sequence,
+                token=token,
+                observation_monotonic_ns=observation_ns,
+                publication_monotonic_ns=publication_ns,
+                provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+                camera_source_time_ns=camera_source_ns,
+                source_index=source_index,
+                center_norm=center,
+                bbox_norm=bbox,
+                apparent_scale=scale,
+                confidence=detection_confidence,
+                clipping=FrameEdge.NONE,
+                center_censored=False,
+                association_confidence=association_confidence,
+                accepted_association=evidence,
+            )
+        )
+    history = tuple(samples)
+    race = AuthoritativeRaceStatusRef.live(
+        session_id=(
+            "3b3c890f6f1c0c78dad7f5659d88830"
+            "af39981c62c4d5ef4d05c2d3d028fed3e"
+        ),
+        reset_epoch=1,
+        race_generation=2,
+        race_status_sequence=1480,
+        race_status_boot_ms=6065,
+        active_gate_index=1,
+        received_monotonic_ns=_LATEST_DELAYED_CREDIT_RACE_RECEIVED_NS,
+        host_clock_id="host-perf-counter",
+    )
+    latest = history[-1]
+    track = VisualTrack(
+        track_id="vq2-track-000002",
+        first_token=history[0].token,
+        latest_token=latest.token,
+        center_norm=latest.center_norm,
+        bbox_norm=latest.bbox_norm,
+        apparent_scale=latest.apparent_scale,
+        center_velocity_norm_s=(
+            0.31772603394036564,
+            -0.36348311818350243,
+        ),
+        log_scale_rate_s=0.7529034166197579,
+        confidence=0.7720584207380771,
+        association_confidence=latest.association_confidence,
+        consecutive_frame_count=8,
+        total_observation_count=len(history),
+        missed_frame_count=0,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        authority_race_status_sequence=1480,
+        authority_race_status_boot_ms=6065,
+        ambiguous=False,
+        visible=True,
+        history=history,
+    )
+    transition = ConfirmedGateTransition(
+        from_gate_index=0,
+        to_gate_index=1,
+        retired_track_id="vq2-track-000001",
+        promoted_track_id=track.track_id,
+        race_status=race,
+        camera_token_at_credit=history[-2].token,
+        promoted_first_token=track.first_token,
+        promoted_latest_token_before_credit=history[-2].token,
+        promoted_history_length_at_credit=len(history) - 1,
+        promoted_latest_token_at_promotion=latest.token,
+        pretransition_frame_tokens=tuple(
+            sample.token for sample in history[4:-1]
+        ),
+        history_length_before_promotion=len(history),
+        history_length_after_promotion=len(history),
+        promoted_history_sha256=visual_track_history_sha256(history),
+    )
+    return track, transition
+
+
+def _append_clean_stationary_sample(track: VisualTrack) -> VisualTrack:
+    previous = track.history[-1]
+    assert previous.publication_monotonic_ns is not None
+    latest = replace(
+        previous,
+        tracker_frame_sequence=previous.tracker_frame_sequence + 1,
+        token=replace(
+            previous.token,
+            frame_id=previous.token.frame_id + 1,
+            publication_sequence=previous.token.publication_sequence + 1,
+        ),
+        observation_monotonic_ns=(
+            previous.observation_monotonic_ns + 35_000_000
+        ),
+        publication_monotonic_ns=(
+            previous.publication_monotonic_ns + 35_000_000
+        ),
+        camera_source_time_ns=(
+            None
+            if previous.camera_source_time_ns is None
+            else previous.camera_source_time_ns + 35_000_000
+        ),
+        confidence=0.78,
+        association_confidence=0.94,
+        accepted_association=None,
+    )
+    latest = _accepted_sample(previous, latest)
+    history = track.history + (latest,)
+    return replace(
+        track,
+        latest_token=latest.token,
+        center_norm=latest.center_norm,
+        bbox_norm=latest.bbox_norm,
+        apparent_scale=latest.apparent_scale,
+        confidence=latest.confidence,
+        association_confidence=latest.association_confidence,
+        consecutive_frame_count=track.consecutive_frame_count + 1,
+        total_observation_count=track.total_observation_count + 1,
+        history=history,
+    )
 
 
 def _shift_six_epoch_timing(
@@ -1272,8 +1716,8 @@ def test_exact_latest_transition_anchor_admits_only_predictive_recovery():
 
     assert type(admission) is TransitionRecoveryAdmission
     assert admission.track_id == "vq2-track-000002"
-    assert admission.anchor_token.publication_sequence == 172
-    assert admission.anchor_credit_age_s == pytest.approx(0.0043782)
+    assert admission.promotion_anchor_token.publication_sequence == 172
+    assert admission.credit_prefix_age_s == pytest.approx(0.0043782)
     assert admission.max_raw_horizontal_rate_s == pytest.approx(
         0.3706251408375522
     )
@@ -1340,7 +1784,7 @@ def test_exact_weak_frame_before_four_sample_stable_tail_admits():
     assert tuple(
         token.publication_sequence for token in admission.history_tokens
     ) == (168, 169, 170, 171)
-    assert admission.anchor_credit_age_s == pytest.approx(0.0183354)
+    assert admission.credit_prefix_age_s == pytest.approx(0.0183354)
     assert admission.stable_history_span_s == pytest.approx(0.1028149)
     assert admission.min_history_detection_confidence == pytest.approx(
         0.7534437837837838
@@ -1398,7 +1842,7 @@ def test_exact_six_frame_epoch_with_one_publication_skip_admits():
     assert tuple(
         token.publication_sequence for token in admission.history_tokens
     ) == (169, 170, 171, 172)
-    assert admission.anchor_credit_age_s == pytest.approx(0.009758)
+    assert admission.credit_prefix_age_s == pytest.approx(0.009758)
     assert admission.stable_history_span_s == pytest.approx(0.0965413)
     assert admission.min_history_detection_confidence == pytest.approx(
         0.7600233766233766
@@ -1450,6 +1894,346 @@ def test_exact_six_frame_epoch_with_one_publication_skip_admits():
         pytest.approx(0.6876519212560703)
     )
     assert admission.projected_bbox_norm_ltrb[1] > 6.0 / 360.0
+
+
+def test_one_clean_postcredit_promotion_anchor_admits_without_credit_relabel():
+    track, transition = _delayed_credit_fixture()
+    credit_index = transition.promoted_history_length_at_credit - 1
+    credit_sample = track.history[credit_index]
+    promotion_sample = track.history[-1]
+    assert promotion_sample.publication_monotonic_ns is not None
+
+    authority = require_promotion_history_authority(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+    )
+    admission = require_transition_recovery_admission(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.04001,
+        now_monotonic_ns=(
+            promotion_sample.publication_monotonic_ns + 1_000_000
+        ),
+        promotion_history_authority=authority,
+    )
+
+    assert RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES == 1
+    assert transition.history_length_after_promotion == len(track.history)
+    assert (
+        transition.history_length_after_promotion
+        - transition.promoted_history_length_at_credit
+        == 1
+    )
+    assert credit_sample.token.publication_sequence == 172
+    assert transition.promoted_latest_token_before_credit == (
+        credit_sample.token
+    )
+    assert promotion_sample.token.publication_sequence == 173
+    assert transition.promoted_latest_token_at_promotion == (
+        promotion_sample.token
+    )
+    assert (
+        credit_sample.publication_monotonic_ns
+        < transition.race_status.received_monotonic_ns
+        < promotion_sample.observation_monotonic_ns
+        < promotion_sample.publication_monotonic_ns
+    )
+    assert admission.credit_prefix_token == credit_sample.token
+    assert admission.promotion_anchor_token == promotion_sample.token
+    assert (
+        admission.promotion_anchor_token
+        != transition.camera_token_at_credit
+    )
+    assert admission.credit_prefix_publication_monotonic_ns == (
+        credit_sample.publication_monotonic_ns
+    )
+    assert admission.credit_prefix_age_s == pytest.approx(0.009758)
+    assert admission.promotion_anchor_observation_monotonic_ns == (
+        promotion_sample.observation_monotonic_ns
+    )
+    assert admission.promotion_anchor_publication_monotonic_ns == (
+        promotion_sample.publication_monotonic_ns
+    )
+    assert admission.promotion_anchor_publication_delta_from_credit_s == (
+        pytest.approx(0.025242)
+    )
+    assert tuple(
+        token.publication_sequence for token in admission.history_tokens
+    ) == (170, 171, 172, 173)
+    assert admission.promotion_identity_sha256 == (
+        transition.promoted_history_sha256
+    )
+    assert type(admission.reacquisition_bridge) is ReacquisitionBridgeAdmission
+
+
+def test_exact_latest_delayed_credit_bridge_and_projection_admit():
+    track, transition = _latest_delayed_credit_fixture()
+    expected_digest = (
+        "6796f69437ad87c19242e55b067d9e2f"
+        "3e26fe903534dd040094bf5ea36a96d6"
+    )
+
+    assert tuple(
+        sample.token.publication_sequence for sample in track.history
+    ) == (151, 152, 153, 154, 166, 167, 168, 169, 170, 171, 172, 173)
+    assert tuple(
+        sample.tracker_frame_sequence for sample in track.history
+    ) == (148, 149, 150, 151, 162, 163, 164, 165, 166, 167, 168, 169)
+    assert all(
+        type(sample.accepted_association) is AssociationEvidence
+        for sample in track.history
+    )
+    assert transition.camera_token_at_credit.publication_sequence == 172
+    assert (
+        transition.promoted_latest_token_before_credit.publication_sequence
+        == 172
+    )
+    assert (
+        transition.promoted_latest_token_at_promotion.publication_sequence
+        == 173
+    )
+    assert transition.promoted_history_length_at_credit == 11
+    assert transition.history_length_before_promotion == 12
+    assert transition.history_length_after_promotion == 12
+    assert tuple(
+        token.publication_sequence
+        for token in transition.pretransition_frame_tokens
+    ) == (166, 167, 168, 169, 170, 171, 172)
+    assert visual_track_history_sha256(track.history) == expected_digest
+    assert transition.promoted_history_sha256 == expected_digest
+
+    authority = require_promotion_history_authority(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+    )
+    assert authority.history_length == len(track.history)
+    assert authority.history == track.history
+    assert authority.history_sha256 == expected_digest
+    latest = track.history[-1]
+    assert latest.publication_monotonic_ns is not None
+    admission = require_transition_recovery_admission(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.04001,
+        now_monotonic_ns=latest.publication_monotonic_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+
+    assert admission.credit_prefix_token.publication_sequence == 172
+    assert admission.promotion_anchor_token.publication_sequence == 173
+    assert admission.credit_prefix_publication_monotonic_ns == (
+        78_089_849_325_400
+    )
+    assert admission.credit_prefix_age_s == pytest.approx(0.0123463)
+    assert admission.promotion_anchor_observation_monotonic_ns == (
+        78_089_875_925_500
+    )
+    assert admission.promotion_anchor_publication_monotonic_ns == (
+        78_089_876_839_700
+    )
+    assert admission.promotion_anchor_publication_delta_from_credit_s == (
+        pytest.approx(0.015168)
+    )
+    assert tuple(
+        token.publication_sequence for token in admission.history_tokens
+    ) == (170, 171, 172, 173)
+    assert admission.promotion_identity_sha256 == expected_digest
+
+    bridge = admission.reacquisition_bridge
+    assert type(bridge) is ReacquisitionBridgeAdmission
+    assert bridge.predecessor_token.publication_sequence == 154
+    assert bridge.reacquisition_token.publication_sequence == 166
+    assert bridge.missed_frame_count == 10
+    assert bridge.tracker_frame_delta == 11
+    assert bridge.publication_delta == 12
+    assert bridge.unobserved_publication_count == 1
+    assert bridge.log_area_residual == pytest.approx(0.1461438555509722)
+    assert (
+        RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL
+        - bridge.log_area_residual
+    ) == pytest.approx(0.003856144449027794)
+
+    assert admission.projection_horizon_s == pytest.approx(0.080)
+    assert admission.projected_abs_horizontal_error == pytest.approx(
+        0.5842771414838128
+    )
+    assert admission.projected_abs_vertical_error_image_down == pytest.approx(
+        0.7099472982830325
+    )
+    assert admission.projected_bbox_norm_ltrb == pytest.approx(
+        (
+            0.7,
+            0.018274791820413375,
+            0.8699630370012719,
+            0.29166666666666663,
+        )
+    )
+    assert admission.projected_apparent_scale == pytest.approx(
+        0.20111961123081862
+    )
+    assert (
+        POST_PROMOTION_ENTRY_MAX_ABS_X_NORM
+        - admission.projected_abs_horizontal_error
+    ) == pytest.approx(0.08572285851618724)
+    assert (
+        RECOVERY_MAX_PROJECTED_ABS_Y_NORM
+        - admission.projected_abs_vertical_error_image_down
+    ) == pytest.approx(0.005052701716967478)
+    assert (
+        admission.projected_bbox_norm_ltrb[1]
+        - recovery_policy.RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM
+    ) == pytest.approx(0.001608125153746709)
+    assert (
+        recovery_policy.RECOVERY_MAX_PROJECTED_APPARENT_SCALE
+        - admission.projected_apparent_scale
+    ) == pytest.approx(0.0288803887691814)
+
+
+def test_delayed_promotion_anchor_continues_on_exact_next_publication():
+    anchor, transition = _delayed_credit_fixture()
+    authority = require_promotion_history_authority(
+        anchor,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+    )
+    track = _append_clean_stationary_sample(anchor)
+    promotion_sample = anchor.history[-1]
+    latest = track.history[-1]
+    assert promotion_sample.publication_monotonic_ns is not None
+    assert latest.publication_monotonic_ns is not None
+    started_ns = promotion_sample.publication_monotonic_ns + 1_000_000
+
+    admission = require_recovery_continuation(
+        track,
+        transition,
+        previous_token=transition.promoted_latest_token_at_promotion,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.04001,
+        recovery_started_monotonic_ns=started_ns,
+        now_monotonic_ns=latest.publication_monotonic_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+
+    assert admission.previous_token.publication_sequence == 173
+    assert admission.frame_token.publication_sequence == 174
+    assert admission.promotion_identity_sha256 == authority.history_sha256
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("two_postcredit", "transition identity is inconsistent"),
+        ("skipped_publication", "association gap is inconsistent"),
+        ("postcredit_clipped", "clean live provenance"),
+        ("postcredit_before_credit", "suffix is not post-credit"),
+        ("credit_prefix_after_credit", "prefix is not pre-credit"),
+    ),
+)
+def test_delayed_credit_refuses_unsealed_or_unclean_promotion_suffix(
+    mutation,
+    reason,
+):
+    track, transition = _delayed_credit_fixture()
+    race_ns = transition.race_status.received_monotonic_ns
+    assert race_ns is not None
+
+    if mutation == "two_postcredit":
+        track = _append_clean_stationary_sample(track)
+        transition = _forge_transition(
+            transition,
+            promoted_latest_token_at_promotion=track.latest_token,
+            history_length_before_promotion=len(track.history),
+            history_length_after_promotion=len(track.history),
+            promoted_history_sha256=visual_track_history_sha256(
+                track.history
+            ),
+        )
+    else:
+        postcredit_index = transition.promoted_history_length_at_credit
+        postcredit = track.history[postcredit_index]
+        assert postcredit.accepted_association is not None
+        if mutation == "skipped_publication":
+            token = replace(
+                postcredit.token,
+                publication_sequence=postcredit.token.publication_sequence + 1,
+            )
+            postcredit = replace(
+                postcredit,
+                token=token,
+                accepted_association=replace(
+                    postcredit.accepted_association,
+                    current_token=token,
+                ),
+            )
+        elif mutation == "postcredit_clipped":
+            postcredit = replace(postcredit, clipping=FrameEdge.TOP)
+        elif mutation == "postcredit_before_credit":
+            previous = track.history[postcredit_index - 1]
+            postcredit = replace(
+                postcredit,
+                observation_monotonic_ns=race_ns,
+                publication_monotonic_ns=race_ns + 1,
+                accepted_association=replace(
+                    postcredit.accepted_association,
+                    observation_gap_ns=(
+                        race_ns - previous.observation_monotonic_ns
+                    ),
+                    publication_gap_ns=(
+                        race_ns
+                        + 1
+                        - previous.publication_monotonic_ns
+                    ),
+                ),
+            )
+        elif mutation == "credit_prefix_after_credit":
+            credit_index = postcredit_index - 1
+            credit = track.history[credit_index]
+            assert credit.accepted_association is not None
+            credit = replace(
+                credit,
+                publication_monotonic_ns=race_ns + 1,
+            )
+            history = (
+                track.history[:credit_index]
+                + (credit,)
+                + track.history[credit_index + 1 :]
+            )
+            track = replace(track, history=history)
+            transition = replace(
+                transition,
+                promoted_history_sha256=visual_track_history_sha256(history),
+            )
+            postcredit = None
+        if postcredit is not None:
+            history = (
+                track.history[:postcredit_index]
+                + (postcredit,)
+                + track.history[postcredit_index + 1 :]
+            )
+            track = replace(
+                track,
+                latest_token=history[-1].token,
+                clipping=history[-1].clipping,
+                history=history,
+            )
+            transition = replace(
+                transition,
+                promoted_latest_token_at_promotion=history[-1].token,
+                promoted_history_sha256=visual_track_history_sha256(history),
+            )
+
+    with pytest.raises(VisualRecoveryRefusal, match=reason):
+        require_transition_recovery_admission(
+            track,
+            transition,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=track.history[-1].publication_monotonic_ns + 1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1756,6 +2540,37 @@ def test_prevalidated_promotion_history_rejects_forgery_or_prefix_change():
         )
 
 
+def test_prevalidated_history_seal_binds_exact_transition_semantics():
+    track, transition = _delayed_credit_fixture()
+    authority = require_promotion_history_authority(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+    )
+    changed_transition = replace(
+        transition,
+        race_status=replace(
+            transition.race_status,
+            session_id="different-live-session",
+        ),
+    )
+    latest = track.history[-1]
+    assert latest.publication_monotonic_ns is not None
+
+    with pytest.raises(
+        VisualRecoveryRefusal,
+        match="prevalidated history changed",
+    ):
+        require_transition_recovery_admission(
+            track,
+            changed_transition,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=latest.publication_monotonic_ns + 1_000_000,
+            promotion_history_authority=authority,
+        )
+
+
 def _admit_stable_trace(
     track: VisualTrack,
     transition: ConfirmedGateTransition,
@@ -1782,6 +2597,8 @@ def test_reacquisition_bridge_requires_full_untruncated_track_history():
     truncated_transition = replace(
         transition,
         promoted_first_token=truncated.first_token,
+        promoted_latest_token_at_promotion=truncated.latest_token,
+        promoted_history_length_at_credit=len(truncated_history),
         history_length_before_promotion=len(truncated_history),
         history_length_after_promotion=len(truncated_history),
     )
@@ -1867,7 +2684,7 @@ def test_reacquisition_bridge_requires_full_untruncated_track_history():
         (
             lambda evidence: replace(
                 evidence,
-                log_area_residual=0.101,
+                log_area_residual=0.151,
             ),
             "reacquisition geometry is unsafe",
         ),
@@ -1905,6 +2722,61 @@ def test_reacquisition_bridge_rejects_missing_ambiguous_or_unsafe_evidence(
 
     with pytest.raises(VisualRecoveryRefusal, match=reason):
         _admit_stable_trace(track, transition)
+
+
+@pytest.mark.parametrize(
+    ("log_area_residual", "admitted"),
+    (
+        (0.15, True),
+        (-0.15, True),
+        (math.nextafter(0.15, math.inf), False),
+        (math.nextafter(-0.15, -math.inf), False),
+    ),
+)
+def test_reacquisition_log_area_residual_boundary_is_inclusive(
+    log_area_residual,
+    admitted,
+):
+    track, transition = _stable_tail_fixture()
+    bridge_index = (
+        transition.promoted_history_length_at_credit
+        - len(transition.pretransition_frame_tokens)
+    )
+    bridge = track.history[bridge_index]
+    assert bridge.accepted_association is not None
+    bridge = replace(
+        bridge,
+        accepted_association=replace(
+            bridge.accepted_association,
+            log_area_residual=log_area_residual,
+        ),
+    )
+    history = (
+        track.history[:bridge_index]
+        + (bridge,)
+        + track.history[bridge_index + 1 :]
+    )
+    track = replace(track, history=history)
+    transition = replace(
+        transition,
+        promoted_history_sha256=visual_track_history_sha256(history),
+    )
+
+    assert RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL == pytest.approx(
+        0.15
+    )
+    if admitted:
+        admission = _admit_stable_trace(track, transition)
+        assert admission.reacquisition_bridge is not None
+        assert admission.reacquisition_bridge.log_area_residual == (
+            log_area_residual
+        )
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="reacquisition geometry is unsafe",
+        ):
+            _admit_stable_trace(track, transition)
 
 
 def test_reacquisition_bridge_rejects_a_coherent_gap_over_four_ten_ms():
@@ -2096,6 +2968,7 @@ def test_reacquisition_bridge_rejects_twelve_misses_and_delta_thirteen():
         transition,
         camera_token_at_credit=history[-1].token,
         promoted_latest_token_before_credit=history[-1].token,
+        promoted_latest_token_at_promotion=history[-1].token,
         pretransition_frame_tokens=tuple(
             sample.token for sample in history[-5:]
         ),
@@ -2277,10 +3150,15 @@ def test_four_sample_stable_tail_requires_ninety_milliseconds():
                 track,
                 replace(
                     transition,
-                    camera_token_at_credit=track.history[-2].token,
+                    camera_token_at_credit=replace(
+                        transition.camera_token_at_credit,
+                        frame_id=(
+                            transition.camera_token_at_credit.frame_id + 1
+                        ),
+                    ),
                 ),
             ),
-            "transition identity is inconsistent",
+            "credit boundary is inconsistent",
         ),
         (
             lambda track, transition: (
@@ -2629,7 +3507,7 @@ def test_continuation_requires_exact_next_token_chain(mutation, reason):
         (
             lambda track, transition: (
                 track,
-                replace(
+                _forge_transition(
                     transition,
                     race_status=replace(
                         transition.race_status,
@@ -2642,7 +3520,7 @@ def test_continuation_requires_exact_next_token_chain(mutation, reason):
         (
             lambda track, transition: (
                 track,
-                replace(transition, from_gate_index=1),
+                _forge_transition(transition, from_gate_index=1),
             ),
             "unfinished adjacent transition",
         ),

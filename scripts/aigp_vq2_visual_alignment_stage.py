@@ -32,6 +32,7 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_COMMANDS,
     RECOVERY_MAX_CONTINUATION_AGE_S,
     RECOVERY_MAX_FRESH_FRAMES,
+    RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES,
     RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S,
     RECOVERY_MAX_THRUST,
     RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S,
@@ -222,8 +223,16 @@ async def run_visual_alignment_stage(
         or transition.promoted_track_id == initial_current_track_id
         or len(transition.pretransition_frame_tokens)
         < limits.required_pretransition_frames
+        or transition.promoted_history_length_at_credit <= 0
+        or transition.promoted_history_length_at_credit
+        > transition.history_length_before_promotion
         or transition.history_length_before_promotion
         != transition.history_length_after_promotion
+        or (
+            transition.history_length_before_promotion
+            - transition.promoted_history_length_at_credit
+        )
+        not in range(RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES + 1)
     ):
         raise abort_type(
             "visual alignment lacks the proved pretracked 0->1 promotion"
@@ -243,6 +252,10 @@ async def run_visual_alignment_stage(
         raise abort_type(
             "visual alignment lacks exact Gate-0 transition timing"
         )
+    initial_postcredit_promotion_frame_count = (
+        transition.history_length_before_promotion
+        - transition.promoted_history_length_at_credit
+    )
 
     summary: Dict[str, Any] = {
         "command_authority": "restricted_promoted_current_visual_track",
@@ -262,6 +275,27 @@ async def run_visual_alignment_stage(
         ),
         "promoted_current_track_id": promoted_track_id,
         "current_track_id": promoted_track_id,
+        "camera_token_at_credit": asdict(
+            transition.camera_token_at_credit
+        ),
+        "promoted_latest_token_before_credit": asdict(
+            transition.promoted_latest_token_before_credit
+        ),
+        "promoted_history_length_at_credit": (
+            transition.promoted_history_length_at_credit
+        ),
+        "promoted_latest_token_at_promotion": asdict(
+            transition.promoted_latest_token_at_promotion
+        ),
+        "history_length_before_promotion": (
+            transition.history_length_before_promotion
+        ),
+        "history_length_after_promotion": (
+            transition.history_length_after_promotion
+        ),
+        "initial_postcredit_promotion_frame_count": (
+            initial_postcredit_promotion_frame_count
+        ),
         "next_track_ids": [],
         "ambiguity": False,
         "collision_outcome": "none",
@@ -277,6 +311,10 @@ async def run_visual_alignment_stage(
             "max_fresh_frames": RECOVERY_MAX_FRESH_FRAMES,
             "max_commands": RECOVERY_MAX_COMMANDS,
             "max_thrust": RECOVERY_MAX_THRUST,
+            "max_initial_postcredit_promotion_frames": (
+                RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES
+            ),
+            "stale_credit_anchor_command_allowed": False,
             "anchor_admission": None,
             "fresh_frame_count": 0,
             "command_count": 0,
@@ -604,7 +642,10 @@ async def run_visual_alignment_stage(
                 "post-promotion recovery wire slot was not ready at validation"
             )
         try:
-            if send_track.latest_token == transition.camera_token_at_credit:
+            if (
+                send_track.latest_token
+                == transition.promoted_latest_token_at_promotion
+            ):
                 wire_admission = require_transition_recovery_admission(
                     send_track,
                     transition,
@@ -784,6 +825,42 @@ async def run_visual_alignment_stage(
             expected_track_id=promoted_track_id,
             now_s=target_clock_s(),
         )
+        if (
+            anchor_track.latest_token
+            != transition.promoted_latest_token_at_promotion
+        ):
+            raise abort_type(
+                "visual alignment promotion anchor changed before initial "
+                "authority"
+            )
+        initial_postcredit_observation_ready = False
+        if initial_postcredit_promotion_frame_count == 1:
+            promotion_index = transition.promoted_history_length_at_credit
+            if (
+                len(anchor_track.history)
+                < transition.history_length_after_promotion
+                or promotion_index >= len(anchor_track.history)
+            ):
+                raise abort_type(
+                    "visual alignment lacks the sealed post-credit promotion "
+                    "sample"
+                )
+            promotion_sample = anchor_track.history[promotion_index]
+            if (
+                promotion_sample.token
+                != transition.promoted_latest_token_at_promotion
+                or type(promotion_sample.observation_monotonic_ns) is not int
+                or type(promotion_sample.publication_monotonic_ns) is not int
+                or promotion_sample.observation_monotonic_ns
+                <= int(race_credit_ns)
+                or promotion_sample.publication_monotonic_ns
+                <= int(race_credit_ns)
+            ):
+                raise abort_type(
+                    "visual alignment promotion sample is not a fresh "
+                    "post-credit observation"
+                )
+            initial_postcredit_observation_ready = True
         host._assert_visual_alignment_no_passage(
             anchor_track,
             phase="transition-anchor admission",
@@ -854,7 +931,10 @@ async def run_visual_alignment_stage(
                 admission=asdict(recovery_admission),
             )
 
-        post_credit_ready = False
+        post_credit_ready = bool(
+            not recovery_required
+            and initial_postcredit_observation_ready
+        )
         if recovery_required:
             drain_receipts = getattr(
                 host.adapter,
@@ -912,9 +992,13 @@ async def run_visual_alignment_stage(
                 entry_pitch_rad=anchor_pitch,
                 phase="transition-anchor send admission",
             )
-            if anchor_track.latest_token != transition.camera_token_at_credit:
+            if (
+                anchor_track.latest_token
+                != transition.promoted_latest_token_at_promotion
+            ):
                 raise abort_type(
-                    "post-promotion recovery credit anchor changed before send"
+                    "post-promotion recovery promotion anchor changed before "
+                    "send"
                 )
             if promotion_history_authority is None:
                 raise abort_type(

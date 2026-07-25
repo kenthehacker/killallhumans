@@ -839,6 +839,30 @@ class MultiTargetVisualTracker:
         except KeyError as exc:
             raise KeyError(f"unknown camera frame token {token.exact_tuple}") from exc
 
+    def latest_processed_token_published_by(
+        self,
+        publish_monotonic_ns: int,
+    ) -> Optional[CameraFrameToken]:
+        """Return the exact processed camera watermark at one live time.
+
+        The processed-frame registry includes fresh frames with zero eligible
+        detections, unlike per-track histories. Live publication times are
+        strictly increasing within a reset generation.
+        """
+
+        cutoff_ns = _nonnegative_int(
+            publish_monotonic_ns,
+            "publish_monotonic_ns",
+        )
+        eligible = tuple(
+            (published, token)
+            for token, published in self._processed_publish_times.items()
+            if published is not None and published <= cutoff_ns
+        )
+        if not eligible:
+            return None
+        return max(eligible, key=lambda item: item[0])[1]
+
     def frame_provenance_basis(
         self,
         token: CameraFrameToken,

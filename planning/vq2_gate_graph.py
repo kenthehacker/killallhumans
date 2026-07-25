@@ -33,6 +33,7 @@ _ADJACENT_HANDOFF_MIN_CURRENT_SCALE = 0.95
 _ADJACENT_HANDOFF_MAX_NEXT_SCALE_RATIO = 0.50
 _ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE = 0.01
 _ADJACENT_HANDOFF_CONFIDENCE_FACTOR = 0.50
+_MAX_POST_CREDIT_PROMOTION_SAMPLES = 1
 _ALL_FRAME_EDGES = (
     FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
 )
@@ -282,10 +283,141 @@ class ConfirmedGateTransition:
     camera_token_at_credit: CameraFrameToken
     promoted_first_token: CameraFrameToken
     promoted_latest_token_before_credit: CameraFrameToken
+    promoted_history_length_at_credit: int
+    promoted_latest_token_at_promotion: CameraFrameToken
     pretransition_frame_tokens: tuple[CameraFrameToken, ...]
     history_length_before_promotion: int
     history_length_after_promotion: int
     promoted_history_sha256: str
+
+    def __post_init__(self) -> None:
+        _nonnegative_int(self.from_gate_index, "from_gate_index")
+        _nonnegative_int(self.to_gate_index, "to_gate_index")
+        if self.to_gate_index != self.from_gate_index + 1:
+            raise ValueError("confirmed transition must advance exactly one gate")
+        for name in ("retired_track_id", "promoted_track_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise TypeError(f"{name} must be a non-empty exact string")
+        if self.retired_track_id == self.promoted_track_id:
+            raise ValueError("retired and promoted track identities must differ")
+        if type(self.race_status) is not AuthoritativeRaceStatusRef:
+            raise TypeError(
+                "race_status must be an exact AuthoritativeRaceStatusRef"
+            )
+        if (
+            self.race_status.race_finished
+            or self.race_status.active_gate_index != self.to_gate_index
+        ):
+            raise ValueError("race status does not prove this gate transition")
+        for name in (
+            "camera_token_at_credit",
+            "promoted_first_token",
+            "promoted_latest_token_before_credit",
+            "promoted_latest_token_at_promotion",
+        ):
+            if type(getattr(self, name)) is not CameraFrameToken:
+                raise TypeError(f"{name} must be an exact CameraFrameToken")
+        if (
+            type(self.pretransition_frame_tokens) is not tuple
+            or not self.pretransition_frame_tokens
+            or any(
+                type(token) is not CameraFrameToken
+                for token in self.pretransition_frame_tokens
+            )
+        ):
+            raise TypeError(
+                "pretransition_frame_tokens must be a non-empty exact tuple "
+                "of CameraFrameToken values"
+            )
+        for name in (
+            "promoted_history_length_at_credit",
+            "history_length_before_promotion",
+            "history_length_after_promotion",
+        ):
+            _positive_int(getattr(self, name), name)
+        if (
+            self.history_length_before_promotion
+            != self.history_length_after_promotion
+        ):
+            raise ValueError("promotion must preserve the complete track history")
+        if (
+            self.promoted_history_length_at_credit
+            > self.history_length_before_promotion
+        ):
+            raise ValueError("credit prefix cannot exceed promotion history")
+        if (
+            self.history_length_before_promotion
+            - self.promoted_history_length_at_credit
+            > _MAX_POST_CREDIT_PROMOTION_SAMPLES
+        ):
+            raise ValueError("promotion has too many post-credit samples")
+        if (
+            len(self.pretransition_frame_tokens)
+            > self.promoted_history_length_at_credit
+        ):
+            raise ValueError("pretransition tail cannot exceed the credit prefix")
+        if (
+            self.pretransition_frame_tokens[-1]
+            != self.promoted_latest_token_before_credit
+        ):
+            raise ValueError(
+                "pretransition tail must end at the target's credit boundary"
+            )
+        if not _token_precedes_or_equals(
+            self.promoted_first_token,
+            self.promoted_latest_token_before_credit,
+        ):
+            raise ValueError("promoted credit boundary predates its first token")
+        if not _token_precedes_or_equals(
+            self.promoted_latest_token_before_credit,
+            self.camera_token_at_credit,
+        ):
+            raise ValueError("target credit prefix postdates the camera watermark")
+        if not _token_precedes_or_equals(
+            self.promoted_latest_token_before_credit,
+            self.promoted_latest_token_at_promotion,
+        ):
+            raise ValueError("promotion token predates the target credit prefix")
+        if (
+            self.promoted_history_length_at_credit
+            == self.history_length_before_promotion
+            and self.promoted_latest_token_at_promotion
+            != self.promoted_latest_token_before_credit
+        ):
+            raise ValueError(
+                "zero-delay promotion token must equal the credit-prefix token"
+            )
+        if (
+            self.promoted_history_length_at_credit
+            < self.history_length_before_promotion
+            and not _token_strictly_precedes(
+                self.camera_token_at_credit,
+                self.promoted_latest_token_at_promotion,
+            )
+        ):
+            raise ValueError(
+                "post-credit promotion token must follow the camera watermark"
+            )
+        for predecessor, successor in zip(
+            self.pretransition_frame_tokens,
+            self.pretransition_frame_tokens[1:],
+        ):
+            if not _token_strictly_precedes(predecessor, successor):
+                raise ValueError(
+                    "pretransition frame tokens must strictly advance"
+                )
+        if (
+            type(self.promoted_history_sha256) is not str
+            or len(self.promoted_history_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.promoted_history_sha256
+            )
+        ):
+            raise TypeError(
+                "promoted_history_sha256 must be a lowercase SHA-256 hex string"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +472,15 @@ class _PretrackedCandidateEvidence:
     missed_camera_publications: int
     confidence: float
     association_confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PromotionCreditBoundary:
+    """Exact target-history split at the authoritative race receipt."""
+
+    credit_prefix: tuple[VisualTrackSample, ...]
+    pretransition_tail: tuple[VisualTrackSample, ...]
+    post_credit_suffix: tuple[VisualTrackSample, ...]
 
 
 class RollingVisualGateGraph:
@@ -575,11 +716,12 @@ class RollingVisualGateGraph:
             )
 
         promoted_before = tracker.track(selected.track_id)
-        pretransition_samples = _pretransition_tail(
+        credit_boundary = _promotion_credit_boundary(
             promoted_before,
             camera_token_at_credit,
             race_status,
         )
+        pretransition_samples = credit_boundary.pretransition_tail
         if len(pretransition_samples) < self.config.min_next_candidate_frames:
             raise GateGraphError(
                 "promotion lacks three consecutive fresh pre-transition frames"
@@ -616,7 +758,13 @@ class RollingVisualGateGraph:
             race_status=race_status,
             camera_token_at_credit=camera_token_at_credit,
             promoted_first_token=promoted_before.first_token,
-            promoted_latest_token_before_credit=promoted_before.latest_token,
+            promoted_latest_token_before_credit=(
+                credit_boundary.credit_prefix[-1].token
+            ),
+            promoted_history_length_at_credit=len(
+                credit_boundary.credit_prefix
+            ),
+            promoted_latest_token_at_promotion=promoted_before.latest_token,
             pretransition_frame_tokens=tuple(
                 sample.token for sample in pretransition_samples
             ),
@@ -625,6 +773,11 @@ class RollingVisualGateGraph:
             promoted_history_sha256=visual_track_history_sha256(
                 promoted_before.history
             ),
+        )
+        _validate_transition_history(
+            transition,
+            promoted_before.history,
+            credit_boundary,
         )
         self._transitions.append(transition)
         if len(self._transitions) > self.config.relationship_history_limit:
@@ -1131,50 +1284,138 @@ class RollingVisualGateGraph:
             raise TypeError("race_status must be an exact AuthoritativeRaceStatusRef")
 
 
-def _pretransition_tail(
+def _promotion_credit_boundary(
     track: VisualTrack,
     anchor: CameraFrameToken,
     race_status: AuthoritativeRaceStatusRef,
-) -> tuple:
-    anchor_sample = next(
-        (sample for sample in track.history if sample.token == anchor),
-        None,
+) -> _PromotionCreditBoundary:
+    """Split one immutable track history at the authoritative credit boundary.
+
+    ``anchor`` is the global camera watermark and therefore need not be a
+    target observation.  For live ingress, the target prefix is maximal by
+    host-monotonic publication time.  A single already-processed observation
+    may follow race receipt; it remains in the full promotion snapshot but can
+    never be relabelled as pre-credit evidence.
+    """
+
+    history = track.history
+    if not history:
+        raise GateGraphError("promotion track has no visual history")
+    is_live = (
+        race_status.provenance_basis is RaceStatusProvenanceBasis.LIVE_INGRESS
     )
-    if anchor_sample is None:
-        # The candidate need not be detected on the exact credit-anchor frame;
-        # retain its latest earlier observation as long as provenance is exact.
-        anchor_sequence = max(
-            (
-                sample.tracker_frame_sequence
-                for sample in track.history
-                if _token_precedes_or_equals(sample.token, anchor)
-            ),
-            default=-1,
+    received_ns = race_status.received_monotonic_ns
+    eligibility: list[bool] = []
+    for sample in history:
+        token_precedes_credit = _token_precedes_or_equals(sample.token, anchor)
+        if is_live:
+            assert received_ns is not None
+            if (
+                sample.provenance_basis
+                is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+            ):
+                raise GateGraphError(
+                    "live promotion history contains legacy provenance"
+                )
+            publish_ns = sample.publication_monotonic_ns
+            if publish_ns is None:
+                raise GateGraphError(
+                    "live promotion history lacks publication provenance"
+                )
+            publication_precedes_credit = publish_ns <= received_ns
+            if token_precedes_credit != publication_precedes_credit:
+                raise GateGraphError(
+                    "target history disagrees with the camera credit watermark"
+                )
+            eligibility.append(publication_precedes_credit)
+        else:
+            if (
+                sample.provenance_basis
+                is not FrameProvenanceBasis.LEGACY_CAPTURE
+                or sample.publication_monotonic_ns is not None
+            ):
+                raise GateGraphError(
+                    "legacy promotion history invented live publication timing"
+                )
+            eligibility.append(token_precedes_credit)
+
+    first_ineligible = next(
+        (index for index, eligible in enumerate(eligibility) if not eligible),
+        len(history),
+    )
+    if any(eligibility[first_ineligible:]):
+        raise GateGraphError("target credit samples do not form an exact prefix")
+    credit_prefix = history[:first_ineligible]
+    post_credit_suffix = history[first_ineligible:]
+    if not credit_prefix:
+        raise GateGraphError("promotion has no target observation before credit")
+    if not is_live and post_credit_suffix:
+        raise GateGraphError(
+            "legacy capture cannot prove post-credit promotion samples"
         )
-    else:
-        anchor_sequence = anchor_sample.tracker_frame_sequence
-    eligible = [
-        sample
-        for sample in track.history
-        if sample.tracker_frame_sequence <= anchor_sequence
-    ]
-    if race_status.provenance_basis is RaceStatusProvenanceBasis.LIVE_INGRESS:
-        assert race_status.received_monotonic_ns is not None
-        eligible = [
-            sample
-            for sample in eligible
-            if sample.publication_monotonic_ns is not None
-            and sample.publication_monotonic_ns <= race_status.received_monotonic_ns
-        ]
-    if not eligible:
-        return ()
-    tail = [eligible[-1]]
-    for sample in reversed(eligible[:-1]):
+    if len(post_credit_suffix) > _MAX_POST_CREDIT_PROMOTION_SAMPLES:
+        raise GateGraphError(
+            "promotion has more than one post-credit target sample"
+        )
+    if is_live:
+        assert received_ns is not None
+        for sample in post_credit_suffix:
+            assert sample.publication_monotonic_ns is not None
+            if (
+                sample.observation_monotonic_ns <= received_ns
+                or sample.publication_monotonic_ns <= received_ns
+            ):
+                raise GateGraphError(
+                    "post-credit target observation and publication do not "
+                    "strictly postdate race receipt"
+                )
+            if not _token_strictly_precedes(anchor, sample.token):
+                raise GateGraphError(
+                    "post-credit target sample does not follow the camera "
+                    "watermark"
+                )
+
+    tail = [credit_prefix[-1]]
+    for sample in reversed(credit_prefix[:-1]):
         if sample.tracker_frame_sequence != tail[-1].tracker_frame_sequence - 1:
             break
         tail.append(sample)
     tail.reverse()
-    return tuple(tail)
+    return _PromotionCreditBoundary(
+        credit_prefix=credit_prefix,
+        pretransition_tail=tuple(tail),
+        post_credit_suffix=post_credit_suffix,
+    )
+
+
+def _validate_transition_history(
+    transition: ConfirmedGateTransition,
+    history: tuple[VisualTrackSample, ...],
+    boundary: _PromotionCreditBoundary,
+) -> None:
+    """Fail closed if construction fields drift from the frozen full history."""
+
+    if (
+        transition.history_length_before_promotion != len(history)
+        or transition.history_length_after_promotion != len(history)
+        or transition.promoted_history_sha256
+        != visual_track_history_sha256(history)
+        or transition.promoted_first_token != history[0].token
+        or transition.promoted_latest_token_at_promotion != history[-1].token
+        or transition.promoted_history_length_at_credit
+        != len(boundary.credit_prefix)
+        or transition.promoted_latest_token_before_credit
+        != boundary.credit_prefix[-1].token
+        or transition.pretransition_frame_tokens
+        != tuple(sample.token for sample in boundary.pretransition_tail)
+        or history[: transition.promoted_history_length_at_credit]
+        != boundary.credit_prefix
+        or history[transition.promoted_history_length_at_credit :]
+        != boundary.post_credit_suffix
+    ):
+        raise RuntimeError(
+            "confirmed transition fields disagree with frozen visual history"
+        )
 
 
 def _adjacent_handoff_anchors(
@@ -1475,7 +1716,14 @@ def _token_precedes_or_equals(
     sample: CameraFrameToken,
     anchor: CameraFrameToken,
 ) -> bool:
-    if sample.generation != anchor.generation:
+    if (
+        sample.generation != anchor.generation
+        or sample.stream_id != anchor.stream_id
+        or (
+            (sample.publication_sequence is None)
+            != (anchor.publication_sequence is None)
+        )
+    ):
         return False
     if (
         sample.publication_sequence is not None
@@ -1486,6 +1734,16 @@ def _token_precedes_or_equals(
     # receipt/source ordering separately.  UInt32 wrap is not crossed inside a
     # bounded captured transition excerpt.
     return sample.frame_id <= anchor.frame_id
+
+
+def _token_strictly_precedes(
+    sample: CameraFrameToken,
+    anchor: CameraFrameToken,
+) -> bool:
+    return (
+        sample != anchor
+        and _token_precedes_or_equals(sample, anchor)
+    )
 
 
 def _candidate_score(

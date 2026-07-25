@@ -1,9 +1,11 @@
 """Fail-closed admission for short post-promotion visual recovery.
 
 The ordinary visual-alignment entry gate remains authoritative.  This module
-only decides whether one already-promoted, pre-credit track has enough exact
-receiver history and image margin for a short no-advance response after race
-credit.  It derives no metric pose or world-frame map.
+only decides whether one already-promoted track has enough exact receiver
+history and image margin for a short no-advance response after race credit.
+Promotion may freeze exactly one clean target observation after credit; its
+pre-credit prefix remains the transition identity proof.  This module derives
+no metric pose or world-frame map.
 """
 
 from __future__ import annotations
@@ -58,7 +60,10 @@ RECOVERY_MIN_REACQUISITION_DIRECT_BBOX_IOU = 0.30
 RECOVERY_MAX_REACQUISITION_CENTER_RESIDUAL_NORM = 0.065
 RECOVERY_MAX_REACQUISITION_ABS_LOG_WIDTH_CHANGE = 0.32
 RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE = 0.22
-RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL = 0.10
+# The exact build-3385 delayed-credit bridge measured 0.1461438556.  This
+# narrow ceiling still composes with independent overlap, per-dimension,
+# residual, motion, timing, confidence, and clipping bounds below.
+RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL = 0.15
 RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S = 0.25
 RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S = 0.70
 RECOVERY_MIN_FRAME_DT_S = 0.020
@@ -67,6 +72,7 @@ RECOVERY_MAX_RECEIVER_PIPELINE_LATENCY_S = 0.010
 RECOVERY_MAX_ANCHOR_CREDIT_AGE_S = 0.020
 RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S = 0.060
 RECOVERY_MAX_CONTINUATION_AGE_S = 0.060
+RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES = 1
 RECOVERY_MAX_ABS_X_NORM = 0.60
 RECOVERY_MAX_ABS_Y_NORM = 0.68
 RECOVERY_MAX_FILTERED_CENTER_RATE_NORM_S = 0.40
@@ -119,6 +125,7 @@ class _PromotionHistorySeal:
         "history_length",
         "history_sha256",
         "history",
+        "transition",
         "_frozen",
     )
 
@@ -130,6 +137,7 @@ class _PromotionHistorySeal:
         history_length: int,
         history_sha256: str,
         history: tuple[VisualTrackSample, ...],
+        transition: ConfirmedGateTransition,
     ) -> None:
         if issuer is not _PROMOTION_HISTORY_AUTHORITY_ISSUER:
             raise TypeError("promotion history seals are module-issued")
@@ -137,6 +145,7 @@ class _PromotionHistorySeal:
         object.__setattr__(self, "history_length", history_length)
         object.__setattr__(self, "history_sha256", history_sha256)
         object.__setattr__(self, "history", history)
+        object.__setattr__(self, "transition", transition)
         object.__setattr__(self, "_frozen", True)
 
     def __setattr__(self, _name: str, _value: object) -> None:
@@ -186,13 +195,16 @@ class TransitionRecoveryAdmission:
     """Exact image-history and projection facts for one recovery anchor."""
 
     track_id: str
-    anchor_token: CameraFrameToken
+    credit_prefix_token: CameraFrameToken
+    promotion_anchor_token: CameraFrameToken
     history_tokens: tuple[CameraFrameToken, ...]
     race_status_sequence: int
     race_received_monotonic_ns: int
-    anchor_observation_monotonic_ns: int
-    anchor_publication_monotonic_ns: int
-    anchor_credit_age_s: float
+    credit_prefix_publication_monotonic_ns: int
+    credit_prefix_age_s: float
+    promotion_anchor_observation_monotonic_ns: int
+    promotion_anchor_publication_monotonic_ns: int
+    promotion_anchor_publication_delta_from_credit_s: float
     recovery_start_delay_s: float
     observation_age_s: float
     projection_horizon_s: float
@@ -320,12 +332,15 @@ def _require_live_transition_authority(
         or type(transition.promoted_first_token) is not CameraFrameToken
         or type(transition.promoted_latest_token_before_credit)
         is not CameraFrameToken
+        or type(transition.promoted_latest_token_at_promotion)
+        is not CameraFrameToken
         or type(transition.pretransition_frame_tokens) is not tuple
         or not transition.pretransition_frame_tokens
         or any(
             type(token) is not CameraFrameToken
             for token in transition.pretransition_frame_tokens
         )
+        or type(transition.promoted_history_length_at_credit) is not int
         or type(transition.history_length_before_promotion) is not int
         or type(transition.history_length_after_promotion) is not int
         or type(transition.promoted_history_sha256) is not str
@@ -384,28 +399,35 @@ def _require_live_transition_authority(
         raise VisualRecoveryRefusal(
             "post-promotion recovery track authority disagrees with transition"
         )
+    credit_length = transition.promoted_history_length_at_credit
+    promotion_length = transition.history_length_after_promotion
     if (
         transition.promoted_first_token != track.first_token
-        or transition.camera_token_at_credit
-        != transition.promoted_latest_token_before_credit
-        or transition.history_length_before_promotion
-        != transition.history_length_after_promotion
-        or transition.history_length_after_promotion <= 0
-        or len(track.history) < transition.history_length_after_promotion
+        or transition.history_length_before_promotion != promotion_length
+        or credit_length <= 0
+        or credit_length > promotion_length
+        or promotion_length <= 0
+        or promotion_length - credit_length
+        > RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES
+        or len(track.history) < promotion_length
     ):
         raise VisualRecoveryRefusal(
             "post-promotion recovery transition identity is inconsistent"
         )
-    promotion_length = transition.history_length_after_promotion
     promotion_history = track.history[:promotion_length]
+    credit_history = promotion_history[:credit_length]
+    credit_token = transition.promoted_latest_token_before_credit
+    promotion_token = transition.promoted_latest_token_at_promotion
+    camera_token = transition.camera_token_at_credit
     if (
         promotion_history[0].token != transition.promoted_first_token
-        or promotion_history[-1].token != transition.camera_token_at_credit
+        or credit_history[-1].token != credit_token
+        or promotion_history[-1].token != promotion_token
         or not transition.pretransition_frame_tokens
-        or len(transition.pretransition_frame_tokens) > promotion_length
+        or len(transition.pretransition_frame_tokens) > credit_length
         or tuple(
             sample.token
-            for sample in promotion_history[
+            for sample in credit_history[
                 -len(transition.pretransition_frame_tokens):
             ]
         )
@@ -413,6 +435,68 @@ def _require_live_transition_authority(
     ):
         raise VisualRecoveryRefusal(
             "post-promotion recovery history is not bound to the transition"
+        )
+    credit_sequence = credit_token.publication_sequence
+    camera_sequence = camera_token.publication_sequence
+    promotion_sequence = promotion_token.publication_sequence
+    if (
+        credit_token.stream_id != camera_token.stream_id
+        or credit_token.generation != camera_token.generation
+        or promotion_token.stream_id != credit_token.stream_id
+        or promotion_token.generation != credit_token.generation
+        or type(credit_sequence) is not int
+        or type(camera_sequence) is not int
+        or type(promotion_sequence) is not int
+        or credit_sequence <= 0
+        or camera_sequence < credit_sequence
+        or promotion_sequence < credit_sequence
+        or (
+            camera_sequence == credit_sequence
+            and camera_token != credit_token
+        )
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery credit boundary is inconsistent"
+        )
+    if any(
+        type(sample.publication_monotonic_ns) is not int
+        or type(sample.observation_monotonic_ns) is not int
+        or sample.observation_monotonic_ns < 0
+        or sample.publication_monotonic_ns
+        < sample.observation_monotonic_ns
+        or sample.publication_monotonic_ns > race.received_monotonic_ns
+        for sample in credit_history
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery credit prefix is not pre-credit"
+        )
+    postcredit_history = promotion_history[credit_length:]
+    if postcredit_history:
+        postcredit = postcredit_history[0]
+        precredit = credit_history[-1]
+        if (
+            camera_sequence >= promotion_sequence
+            or type(postcredit.observation_monotonic_ns) is not int
+            or postcredit.observation_monotonic_ns
+            <= race.received_monotonic_ns
+            or type(postcredit.publication_monotonic_ns) is not int
+            or postcredit.publication_monotonic_ns
+            <= race.received_monotonic_ns
+        ):
+            raise VisualRecoveryRefusal(
+                "post-promotion recovery promotion suffix is not post-credit"
+            )
+        _sample_geometry(
+            postcredit,
+            stream_id=credit_token.stream_id,
+            generation=credit_token.generation,
+        )
+        _require_accepted_association(
+            track,
+            precredit,
+            postcredit,
+            expected_missed_frames=0,
+            min_association_confidence=RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
         )
     return int(race.received_monotonic_ns), int(race.race_status_sequence)
 
@@ -422,11 +506,11 @@ def _require_exact_transition_anchor(
     transition: ConfirmedGateTransition,
 ) -> None:
     if (
-        track.latest_token != transition.camera_token_at_credit
+        track.latest_token != transition.promoted_latest_token_at_promotion
         or len(track.history) != transition.history_length_after_promotion
     ):
         raise VisualRecoveryRefusal(
-            "post-promotion recovery did not preserve the exact credit anchor"
+            "post-promotion recovery did not preserve the exact promotion anchor"
         )
 
 
@@ -460,6 +544,7 @@ def _require_promotion_history_digest(
             or authority.history_sha256 != seal.history_sha256
             or authority.history != seal.history
             or track.history[:promotion_length] != seal.history
+            or transition != seal.transition
         ):
             raise VisualRecoveryRefusal(
                 "post-promotion recovery prevalidated history changed"
@@ -501,6 +586,7 @@ def require_promotion_history_authority(
         history_length=promotion_length,
         history_sha256=transition.promoted_history_sha256,
         history=history,
+        transition=transition,
     )
     return PromotionHistoryAuthority(
         track_id=track.track_id,
@@ -821,6 +907,7 @@ def _require_promotion_identity_bridge(
     track: VisualTrack,
     transition: ConfirmedGateTransition,
 ) -> ReacquisitionBridgeAdmission | None:
+    credit_length = transition.promoted_history_length_at_credit
     promotion_length = transition.history_length_after_promotion
     pretransition_tokens = transition.pretransition_frame_tokens
     if (
@@ -831,14 +918,14 @@ def _require_promotion_identity_bridge(
         raise VisualRecoveryRefusal(
             "post-promotion recovery transition visibility proof is invalid"
         )
-    transition_epoch_start = promotion_length - len(pretransition_tokens)
+    transition_epoch_start = credit_length - len(pretransition_tokens)
     current_epoch_start = len(track.history) - track.consecutive_frame_count
     if transition_epoch_start != current_epoch_start:
         raise VisualRecoveryRefusal(
             "post-promotion recovery visibility epoch is inconsistent"
         )
     bridge_index = (
-        promotion_length - RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+        credit_length - RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
         if current_epoch_start == 0
         else current_epoch_start
     )
@@ -846,7 +933,7 @@ def _require_promotion_identity_bridge(
         raise VisualRecoveryRefusal(
             "post-promotion recovery lacks established pre-gap identity"
         )
-    stable_tail_start = promotion_length - RECOVERY_HISTORY_SAMPLE_COUNT
+    stable_tail_start = credit_length - RECOVERY_HISTORY_SAMPLE_COUNT
     if stable_tail_start <= bridge_index:
         raise VisualRecoveryRefusal(
             "post-promotion recovery stable epoch is insufficient"
@@ -1485,17 +1572,23 @@ def require_transition_recovery_admission(
             "post-promotion recovery filtered scale motion is unsafe"
         )
 
+    credit_sample = track.history[
+        transition.promoted_history_length_at_credit - 1
+    ]
     latest = track.history[-1]
     if (
-        type(latest.observation_monotonic_ns) is not int
+        type(credit_sample.publication_monotonic_ns) is not int
+        or type(credit_sample.observation_monotonic_ns) is not int
+        or type(latest.observation_monotonic_ns) is not int
         or latest.observation_monotonic_ns < 0
         or type(latest.publication_monotonic_ns) is not int
+        or latest.publication_monotonic_ns > now_monotonic_ns
     ):
         raise VisualRecoveryRefusal(
             "post-promotion recovery anchor lacks receiver timing"
         )
     credit_age_s = (
-        race_ns - latest.publication_monotonic_ns
+        race_ns - credit_sample.publication_monotonic_ns
     ) / 1_000_000_000.0
     if not 0.0 <= credit_age_s <= RECOVERY_MAX_ANCHOR_CREDIT_AGE_S:
         raise VisualRecoveryRefusal(
@@ -1516,17 +1609,29 @@ def require_transition_recovery_admission(
     )
     return TransitionRecoveryAdmission(
         track_id=track.track_id,
-        anchor_token=transition.camera_token_at_credit,
+        credit_prefix_token=(
+            transition.promoted_latest_token_before_credit
+        ),
+        promotion_anchor_token=(
+            transition.promoted_latest_token_at_promotion
+        ),
         history_tokens=projection.tokens,
         race_status_sequence=race_sequence,
         race_received_monotonic_ns=race_ns,
-        anchor_observation_monotonic_ns=(
+        credit_prefix_publication_monotonic_ns=(
+            credit_sample.publication_monotonic_ns
+        ),
+        credit_prefix_age_s=credit_age_s,
+        promotion_anchor_observation_monotonic_ns=(
             projection.latest_observation_monotonic_ns
         ),
-        anchor_publication_monotonic_ns=(
+        promotion_anchor_publication_monotonic_ns=(
             projection.latest_publication_monotonic_ns
         ),
-        anchor_credit_age_s=credit_age_s,
+        promotion_anchor_publication_delta_from_credit_s=(
+            projection.latest_publication_monotonic_ns - race_ns
+        )
+        / 1_000_000_000.0,
         recovery_start_delay_s=start_delay_s,
         observation_age_s=observation_age_s,
         projection_horizon_s=projection_horizon_s,
@@ -1736,6 +1841,7 @@ __all__ = [
     "RECOVERY_MAX_COMMANDS",
     "RECOVERY_MAX_CONTINUATION_AGE_S",
     "RECOVERY_MAX_FRESH_FRAMES",
+    "RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES",
     "RECOVERY_MAX_PROJECTED_ABS_Y_NORM",
     "RECOVERY_MAX_PROJECTION_HORIZON_S",
     "RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S",

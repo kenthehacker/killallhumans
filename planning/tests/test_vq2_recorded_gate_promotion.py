@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 from pathlib import Path
@@ -11,11 +12,14 @@ from competition.vq2_visual_tracker import (
     CameraFrameToken,
     FrameProvenanceBasis,
     MultiTargetVisualTracker,
+    VisualDetection,
     VisualDetectionFrame,
     VisualTrackRole,
+    visual_track_history_sha256,
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    GateGraphError,
     RollingVisualGateGraph,
 )
 
@@ -26,6 +30,7 @@ _FIXTURE = (
     / "vq2_gate0_observe_20260718T022458_tracker_excerpt.json"
 )
 _SOURCE_SHA256 = "2fca8cc6d2b5ed0ced6dca8e7683254c60eb774571a7756a315126022032bfd6"
+_LIVE_FRAME_PERIOD_NS = 33_000_000
 
 
 def _load_excerpt() -> dict:
@@ -92,6 +97,123 @@ def _legacy_race_status(payload: dict, row: dict) -> AuthoritativeRaceStatusRef:
         race_status_boot_ms=race_status_boot_ms,
         active_gate_index=active_gate_index,
     )
+
+
+def _live_detection(
+    source_index: int,
+    center_x: float,
+    center_y: float,
+    width: float,
+    height: float,
+) -> VisualDetection:
+    center_unit_x = 0.5 * (center_x + 1.0)
+    center_unit_y = 0.5 * (center_y + 1.0)
+    return VisualDetection(
+        source_index=source_index,
+        center_norm=(center_x, center_y),
+        bbox_norm=(
+            center_unit_x - width / 2.0,
+            center_unit_y - height / 2.0,
+            center_unit_x + width / 2.0,
+            center_unit_y + height / 2.0,
+        ),
+        confidence=0.9,
+    )
+
+
+def _live_frame(
+    sequence: int,
+    *,
+    include_next: bool = True,
+) -> VisualDetectionFrame:
+    packet_ns = 1_000_000_000 + sequence * _LIVE_FRAME_PERIOD_NS
+    detections = [
+        _live_detection(
+            0,
+            -0.03 + 0.004 * sequence,
+            0.02,
+            0.30 + 0.005 * sequence,
+            0.34 + 0.005 * sequence,
+        )
+    ]
+    if include_next:
+        detections.append(
+            _live_detection(
+                1,
+                0.52 + 0.004 * sequence,
+                -0.56 - 0.003 * sequence,
+                0.13 + 0.003 * sequence,
+                0.15 + 0.003 * sequence,
+            )
+        )
+    return VisualDetectionFrame(
+        token=CameraFrameToken(
+            generation=9,
+            frame_id=40_000 + sequence,
+            publication_sequence=sequence,
+            stream_id="vq2-credit-boundary-camera",
+        ),
+        provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+        time_basis_id="vq2-credit-boundary-clock",
+        image_size_px=(640, 360),
+        detections=tuple(detections),
+        camera_source_time_ns=5_000_000_000 + sequence * _LIVE_FRAME_PERIOD_NS,
+        final_unique_packet_monotonic_ns=packet_ns,
+        publish_monotonic_ns=packet_ns + 1_000_000,
+    )
+
+
+def _live_race(
+    *,
+    sequence: int,
+    boot_ms: int,
+    gate_index: int,
+    received_ns: int,
+) -> AuthoritativeRaceStatusRef:
+    return AuthoritativeRaceStatusRef.live(
+        session_id="credit-boundary-session",
+        reset_epoch=9,
+        race_generation=4,
+        race_status_sequence=sequence,
+        race_status_boot_ms=boot_ms,
+        active_gate_index=gate_index,
+        received_monotonic_ns=received_ns,
+        host_clock_id="vq2-credit-boundary-clock",
+    )
+
+
+def _prime_live_graph(
+    *,
+    final_sequence: int,
+    missing_next_sequences: tuple[int, ...] = (),
+) -> tuple[MultiTargetVisualTracker, RollingVisualGateGraph, str, str]:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    current_id = ""
+    next_id = ""
+    for sequence in range(1, final_sequence + 1):
+        update = tracker.update(
+            _live_frame(
+                sequence,
+                include_next=sequence not in missing_next_sequences,
+            )
+        )
+        if sequence == 1:
+            current_id, next_id = update.visible_track_ids
+        if sequence == 3:
+            graph.bind_initial_current(
+                tracker,
+                track_id=current_id,
+                race_status=_live_race(
+                    sequence=10,
+                    boot_ms=5_000,
+                    gate_index=0,
+                    received_ns=update.publish_monotonic_ns + 1,
+                ),
+            )
+        elif sequence > 3:
+            graph.observe(tracker)
+    return tracker, graph, current_id, next_id
 
 
 def test_recorded_next_gate_is_pretracked_and_promoted_without_reset() -> None:
@@ -219,6 +341,10 @@ def test_recorded_next_gate_is_pretracked_and_promoted_without_reset() -> None:
     assert transition.promoted_latest_token_before_credit == CameraFrameToken(
         1, 296788
     )
+    assert transition.promoted_history_length_at_credit == 8
+    assert transition.promoted_latest_token_at_promotion == CameraFrameToken(
+        1, 296788
+    )
     assert transition.history_length_before_promotion == 8
     assert transition.history_length_after_promotion == 8
     assert [token.frame_id for token in transition.pretransition_frame_tokens] == [
@@ -304,3 +430,137 @@ def test_recorded_next_gate_is_pretracked_and_promoted_without_reset() -> None:
     assert final_snapshot.current_gate_index == 1
     assert final_snapshot.current_track == promoted
     assert final_snapshot.confirmed_transitions == (transition,)
+
+
+def test_live_promotion_freezes_one_post_credit_sample_outside_credit_prefix() -> None:
+    tracker, graph, current_id, next_id = _prime_live_graph(final_sequence=6)
+    camera_token_at_credit = CameraFrameToken(
+        generation=9,
+        frame_id=40_005,
+        publication_sequence=5,
+        stream_id="vq2-credit-boundary-camera",
+    )
+    credit_received_ns = (
+        tracker.frame_publish_time_ns(camera_token_at_credit) + 2_000_000
+    )
+    before = tracker.track(next_id)
+    assert len(before.history) == 6
+    assert before.history[-2].token == camera_token_at_credit
+    assert before.history[-2].publication_monotonic_ns < credit_received_ns
+    assert before.history[-1].publication_monotonic_ns > credit_received_ns
+
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=_live_race(
+            sequence=11,
+            boot_ms=5_250,
+            gate_index=1,
+            received_ns=credit_received_ns,
+        ),
+        camera_token_at_credit=camera_token_at_credit,
+        promoted_track_id=next_id,
+    )
+
+    assert transition.retired_track_id == current_id
+    assert transition.promoted_track_id == next_id
+    assert transition.camera_token_at_credit == camera_token_at_credit
+    assert transition.promoted_history_length_at_credit == 5
+    assert transition.promoted_latest_token_before_credit == before.history[4].token
+    assert transition.promoted_latest_token_at_promotion == before.history[5].token
+    assert transition.history_length_before_promotion == 6
+    assert transition.history_length_after_promotion == 6
+    assert transition.promoted_history_sha256 == visual_track_history_sha256(
+        before.history
+    )
+    assert transition.pretransition_frame_tokens == tuple(
+        sample.token for sample in before.history[:5]
+    )
+    assert tracker.track(next_id).history == before.history
+
+
+def test_camera_credit_watermark_need_not_be_a_target_observation() -> None:
+    tracker, graph, _current_id, next_id = _prime_live_graph(
+        final_sequence=6,
+        missing_next_sequences=(6,),
+    )
+    camera_token_at_credit = tracker.latest_update.token
+    credit_received_ns = tracker.latest_update.publish_monotonic_ns + 1
+    before = tracker.track(next_id)
+    assert before.latest_token.publication_sequence == 5
+    assert camera_token_at_credit.publication_sequence == 6
+
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=_live_race(
+            sequence=11,
+            boot_ms=5_250,
+            gate_index=1,
+            received_ns=credit_received_ns,
+        ),
+        camera_token_at_credit=camera_token_at_credit,
+        promoted_track_id=next_id,
+    )
+
+    assert transition.camera_token_at_credit == camera_token_at_credit
+    assert transition.promoted_latest_token_before_credit == before.latest_token
+    assert transition.promoted_latest_token_at_promotion == before.latest_token
+    assert transition.promoted_history_length_at_credit == len(before.history)
+    assert transition.history_length_before_promotion == len(before.history)
+
+
+def test_live_promotion_rejects_more_than_one_post_credit_target_sample() -> None:
+    tracker, graph, _current_id, next_id = _prime_live_graph(final_sequence=7)
+    camera_token_at_credit = CameraFrameToken(
+        generation=9,
+        frame_id=40_005,
+        publication_sequence=5,
+        stream_id="vq2-credit-boundary-camera",
+    )
+    credit_received_ns = (
+        tracker.frame_publish_time_ns(camera_token_at_credit) + 2_000_000
+    )
+
+    with pytest.raises(
+        GateGraphError,
+        match="more than one post-credit target sample",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_live_race(
+                sequence=11,
+                boot_ms=5_250,
+                gate_index=1,
+                received_ns=credit_received_ns,
+            ),
+            camera_token_at_credit=camera_token_at_credit,
+            promoted_track_id=next_id,
+        )
+
+
+def test_live_promotion_rejects_precredit_observation_published_after_credit() -> None:
+    tracker, graph, _current_id, next_id = _prime_live_graph(final_sequence=5)
+    camera_token_at_credit = tracker.latest_update.token
+    credit_received_ns = tracker.latest_update.publish_monotonic_ns + 2_000_000
+    late_frame = replace(
+        _live_frame(6),
+        final_unique_packet_monotonic_ns=credit_received_ns - 1,
+        publish_monotonic_ns=credit_received_ns + 1,
+    )
+    tracker.update(late_frame)
+    graph.observe(tracker)
+
+    with pytest.raises(
+        GateGraphError,
+        match="observation and publication do not strictly postdate",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_live_race(
+                sequence=11,
+                boot_ms=5_250,
+                gate_index=1,
+                received_ns=credit_received_ns,
+            ),
+            camera_token_at_credit=camera_token_at_credit,
+            promoted_track_id=next_id,
+        )

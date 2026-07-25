@@ -344,6 +344,7 @@ def _prime_reacquisition_bridge_gate_graph(
     perf_clock_offset_ns,
     skipped_publication=None,
     final_publication=120,
+    race_credit_before_final=False,
 ):
     """Create one production-tracker identity across a bounded gap."""
 
@@ -410,12 +411,15 @@ def _prime_reacquisition_bridge_gate_graph(
 
     assert current_id is not None
     assert target_id is not None
+    race_received_ns = last_observation_ns + 18_004_000
+    if race_credit_before_final:
+        race_received_ns -= 33_000_000
     _set_race(
         adapter,
         gate_index=1,
         boot_ms=1_300,
         sequence=11,
-        received_ns=last_observation_ns + 18_004_000,
+        received_ns=race_received_ns,
     )
     transition = runner._confirm_visual_transition(
         from_gate_index=0,
@@ -458,6 +462,42 @@ def test_receiver_watermark_requires_the_exact_latest_camera_token():
         match="receiver advanced beyond",
     ):
         runner._assert_visual_receiver_token_current(expected)
+
+
+def test_race_credit_camera_watermark_includes_detectionless_frame():
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    runner._visual_tracking_enabled = True
+    first = _frame(
+        171,
+        [_detection(451, 19, 92, 85, confidence=0.95)],
+        final_packet_ns=10_200_000_000,
+    )
+    detectionless = _frame(
+        172,
+        [],
+        final_packet_ns=10_233_000_000,
+    )
+    _update_visual(runner, first)
+    _update_visual(runner, detectionless)
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=detectionless.publish_monotonic_ns + 1,
+    )
+
+    token = runner._visual_camera_token_at_race_credit(
+        runner._visual_race_status_ref()
+    )
+
+    assert token == detectionless.token
+    assert all(
+        sample.token != detectionless.token
+        for track in runner.visual_tracker.tracks()
+        for sample in track.history
+    )
 
 
 def test_sample_consumes_every_detection_with_exact_receiver_provenance(
@@ -669,6 +709,7 @@ def test_tracker_graph_recovery_admits_six_frame_epoch_with_one_receiver_skip():
             perf_clock_offset_ns=perf_clock_offset_ns,
             skipped_publication=110,
             final_publication=121,
+            race_credit_before_final=True,
         )
     )
 
@@ -679,7 +720,18 @@ def test_tracker_graph_recovery_admits_six_frame_epoch_with_one_receiver_skip():
     assert tuple(
         token.publication_sequence
         for token in transition.pretransition_frame_tokens
-    ) == (116, 117, 118, 119, 120, 121)
+    ) == (116, 117, 118, 119, 120)
+    assert transition.promoted_history_length_at_credit == 10
+    assert (
+        transition.promoted_latest_token_before_credit.publication_sequence
+        == 120
+    )
+    assert transition.history_length_before_promotion == 11
+    assert transition.history_length_after_promotion == 11
+    assert (
+        transition.promoted_latest_token_at_promotion.publication_sequence
+        == 121
+    )
     bridge_sample = promoted.history[5]
     assert bridge_sample.accepted_association is not None
     assert (
@@ -694,12 +746,14 @@ def test_tracker_graph_recovery_admits_six_frame_epoch_with_one_receiver_skip():
     )
     race_received_ns = transition.race_status.received_monotonic_ns
     assert race_received_ns is not None
+    promotion_publication_ns = promoted.history[-1].publication_monotonic_ns
+    assert promotion_publication_ns is not None
     admission = visual_recovery.require_transition_recovery_admission(
         promoted,
         transition,
         tracker_time_basis_id=_HOST_CLOCK,
         measured_pitch_rad=-0.04,
-        now_monotonic_ns=race_received_ns + 1_000_000,
+        now_monotonic_ns=promotion_publication_ns + 1_000_000,
         promotion_history_authority=authority,
     )
     bridge = admission.reacquisition_bridge
@@ -711,6 +765,44 @@ def test_tracker_graph_recovery_admits_six_frame_epoch_with_one_receiver_skip():
     assert asdict(admission)["reacquisition_bridge"][
         "unobserved_publication_count"
     ] == 1
+    assert admission.credit_prefix_token.publication_sequence == 120
+    assert admission.promotion_anchor_token.publication_sequence == 121
+    assert admission.promotion_anchor_publication_delta_from_credit_s > 0.0
+
+    latest_observation_ns = (
+        perf_clock_offset_ns + (122 - 100) * 33_000_000
+    )
+    runner.vision.current_snapshot = _snapshot(
+        frame_id=122,
+        publication_sequence=122,
+        final_packet_ns=latest_observation_ns,
+        generation=7,
+    )
+    _update_visual(
+        runner,
+        _frame(
+            122,
+            [_detection(440, 40, 80, 80, confidence=0.95)],
+            final_packet_ns=latest_observation_ns,
+        ),
+    )
+    continued = runner.visual_tracker.track(transition.promoted_track_id)
+    latest = continued.history[-1]
+    assert latest.publication_monotonic_ns is not None
+    continuation = visual_recovery.require_recovery_continuation(
+        continued,
+        transition,
+        previous_token=transition.promoted_latest_token_at_promotion,
+        tracker_time_basis_id=_HOST_CLOCK,
+        measured_pitch_rad=-0.04,
+        recovery_started_monotonic_ns=(
+            promotion_publication_ns + 1_000_000
+        ),
+        now_monotonic_ns=latest.publication_monotonic_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+    assert continuation.previous_token.publication_sequence == 121
+    assert continuation.frame_token.publication_sequence == 122
 
 
 def test_initial_gate_binding_rejects_two_plausible_visual_identities():
@@ -1556,6 +1648,8 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         ),
         "max_commands": visual_recovery.RECOVERY_MAX_COMMANDS,
         "max_thrust": visual_recovery.RECOVERY_MAX_THRUST,
+        "max_initial_postcredit_promotion_frames": 1,
+        "stale_credit_anchor_command_allowed": False,
         "anchor_admission": None,
         "fresh_frame_count": 0,
         "command_count": 0,
@@ -1605,7 +1699,7 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
 def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     monkeypatch,
 ):
-    """Recovery uses the exact credit anchor, then proves ordinary entry."""
+    """Recovery wires the sealed post-credit promotion anchor, never stale credit."""
 
     perf_offset_s = 10.0
     perf_offset_ns = round(perf_offset_s * 1_000_000_000)
@@ -1623,9 +1717,7 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         body_rates=(0.0, 0.0, 0.0),
         yaw=orientation.yaw,
     )
-    clock = [
-        race_credit_relative_ns / 1_000_000_000.0 + 0.001
-    ]
+    clock = [0.267]
     commands = []
     timeline = []
 
@@ -1638,6 +1730,24 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         assert _context is context
         assert capture_transition is False
         assert visual_next_gate_blend is True
+        promotion_observation_s = 0.2660666
+        promotion_packet_ns = round(
+            (perf_offset_s + promotion_observation_s) * 1_000_000_000
+        )
+        runner.vision.current_snapshot = _snapshot(
+            frame_id=173,
+            publication_sequence=173,
+            final_packet_ns=promotion_packet_ns,
+            generation=7,
+        )
+        _update_visual(
+            runner,
+            _frame(
+                173,
+                [_detection(451, 19, 92, 85, confidence=0.95)],
+                final_packet_ns=promotion_packet_ns,
+            ),
+        )
         _set_race(
             adapter,
             gate_index=1,
@@ -1654,9 +1764,12 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         assert transition.retired_track_id == initial_current_id
         assert transition.promoted_track_id == promoted_id
         assert transition.camera_token_at_credit.frame_id == 172
+        assert transition.promoted_latest_token_before_credit.frame_id == 172
+        assert transition.promoted_history_length_at_credit == 9
+        assert transition.promoted_latest_token_at_promotion.frame_id == 173
         assert transition.promoted_first_token.frame_id == 164
-        assert transition.history_length_before_promotion == 9
-        assert transition.history_length_after_promotion == 9
+        assert transition.history_length_before_promotion == 10
+        assert transition.history_length_after_promotion == 10
         runner._gate0_transition_proof = vq2_module.GateTransitionProof(
             pre_gate_race_boot_ms=1_000,
             post_gate_race_boot_ms=1_300,
@@ -1665,9 +1778,9 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
             pass_confirmed_monotonic_s=clock[0] - 0.001,
             next_control_deadline_s=clock[0],
             vision_generation=7,
-            vision_frame_id=172,
-            vision_sim_time_ns=172_000,
-            vision_received_monotonic_s=0.2316235,
+            vision_frame_id=173,
+            vision_sim_time_ns=173_000,
+            vision_received_monotonic_s=promotion_observation_s,
             pass_rpy_rad=(0.0, -0.04, 0.0),
         )
         return {
@@ -1685,12 +1798,12 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
             },
         }
 
-    # Frame 173 exactly reproduces the failed live token and is recovery-only:
-    # its outward center and scale rates fail ordinary entry.  Frames 174 and
-    # 175 move inward within the recovery envelope and establish two strict
-    # ordinary-entry admissions before restricted authority begins.
+    # Frame 173 exactly reproduces the failed live promotion token.  It was
+    # published after race ingress but processed before promotion, so it is the
+    # sole sealed post-credit promotion sample and is recovery-only.  Frames
+    # 174 and 175 move inward and establish two strict ordinary-entry
+    # admissions before restricted authority begins.
     publications = [
-        (173, 451, 19, 92, 85, 0.2660666),
         (174, 450, 19, 92, 84, 0.296),
         (175, 449, 22, 92, 83, 0.326),
     ]
@@ -1847,8 +1960,8 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     recovery = summary["postpromotion_recovery"]
     assert recovery["required"] is True
     assert recovery["outcome"] == "recovered"
-    assert recovery["fresh_frame_count"] == 3
-    assert recovery["command_count"] == 3
+    assert recovery["fresh_frame_count"] == 2
+    assert recovery["command_count"] == 2
     assert recovery["strict_entry_streak"] == 2
     assert recovery["completed_frame_token"]["frame_id"] == 175
     assert recovery["latest_wire_revalidation"]["kind"] == (
@@ -1862,6 +1975,15 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     ] == 174
     transition = runner._visual_transition
     assert transition is not None
+    assert summary["camera_token_at_credit"]["frame_id"] == 172
+    assert summary["promoted_latest_token_before_credit"]["frame_id"] == 172
+    assert summary["promoted_history_length_at_credit"] == 9
+    assert summary["promoted_latest_token_at_promotion"]["frame_id"] == 173
+    assert summary["history_length_before_promotion"] == 10
+    assert summary["history_length_after_promotion"] == 10
+    assert summary["initial_postcredit_promotion_frame_count"] == 1
+    assert recovery["max_initial_postcredit_promotion_frames"] == 1
+    assert recovery["stale_credit_anchor_command_allowed"] is False
     promotion_digest = transition.promoted_history_sha256
     assert len(promotion_digest) == 64
     assert recovery["anchor_admission"][
@@ -1887,7 +2009,10 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
             "validated_monotonic_ns"
         ]
     )
-    assert recovery["anchor_admission"]["anchor_token"][
+    assert recovery["anchor_admission"]["promotion_anchor_token"][
+        "frame_id"
+    ] == 173
+    assert recovery["anchor_admission"]["credit_prefix_token"][
         "frame_id"
     ] == 172
     assert recovery["anchor_admission"]["history_tokens"] == tuple(
@@ -1897,7 +2022,7 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
             "publication_sequence": frame_id,
             "stream_id": _CAMERA_STREAM,
         }
-        for frame_id in range(169, 173)
+        for frame_id in range(170, 174)
     )
 
     recovery_frames = [
@@ -1907,15 +2032,15 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     ]
     assert [
         item[3]["strict_entry_streak"] for item in recovery_frames
-    ] == [0, 1, 2]
-    assert recovery_frames[0][3]["strict_entry"] is None
+    ] == [1, 2]
+    assert recovery_frames[0][3]["strict_entry"] is not None
     assert [
         (
             item[3]["continuation"]["previous_token"]["frame_id"],
             item[3]["continuation"]["frame_token"]["frame_id"],
         )
         for item in recovery_frames
-    ] == [(172, 173), (173, 174), (174, 175)]
+    ] == [(173, 174), (174, 175)]
     for item in recovery_frames:
         continuation = item[3]["continuation"]
         assert continuation["track_id"] == promoted_id
@@ -1948,6 +2073,21 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         and item[3]["admission"]["reacquisition_bridge"] is None
         for item in admission_events
     )
+    transition_event = next(
+        item[3]
+        for item in timeline
+        if item[:2] == ("event", "visual_gate_transition_promoted")
+    )
+    assert transition_event["camera_token_at_credit"][-2:] == [172, 172]
+    assert transition_event["promoted_latest_token_before_credit"][-2:] == [
+        172,
+        172,
+    ]
+    assert transition_event["promoted_history_length_at_credit"] == 9
+    assert transition_event["promoted_latest_token_at_promotion"][-2:] == [
+        173,
+        173,
+    ]
     completion_index = next(
         index
         for index, item in enumerate(timeline)
@@ -1964,7 +2104,12 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     recovery_commands = commands[: recovery["command_count"]]
     assert [
         item["frame_token"].frame_id for item in recovery_commands
-    ] == [172, 173, 174]
+    ] == [173, 174]
+    assert all(
+        item["frame_token"].frame_id
+        != transition.promoted_latest_token_before_credit.frame_id
+        for item in recovery_commands
+    )
     assert all(
         item["track_id"] == promoted_id
         and item["kwargs"].get("require_wire_receipt") is True

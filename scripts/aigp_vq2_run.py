@@ -110,6 +110,7 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_FILTERED_CENTER_RATE_NORM_S,
     RECOVERY_MAX_FILTERED_LOG_SCALE_RATE_S,
     RECOVERY_MAX_FRESH_FRAMES,
+    RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES,
     RECOVERY_MAX_RAW_CENTER_RATE_NORM_S,
     RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S,
     RECOVERY_MAX_RAW_LOG_SCALE_RATE_S,
@@ -6231,6 +6232,13 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                 "postpromotion_no_advance_recovery": {
                     "conditional": True,
                     "exact_transition_anchor_required": True,
+                    "credit_boundary_identity_required": True,
+                    "promotion_anchor_identity_required": True,
+                    "promotion_history_length_at_credit_required": True,
+                    "max_initial_postcredit_promotion_frames": (
+                        RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES
+                    ),
+                    "stale_credit_anchor_command_allowed": False,
                     "receipt_backed_dispatch": True,
                     "fresh_postcredit_observation_required_before_repeat": True,
                     "wire_target_must_match_latest_receiver_publication": True,
@@ -10995,26 +11003,14 @@ class VQ2Runner:
         received_ns = race_status.received_monotonic_ns
         if received_ns is None:
             raise SafetyAbort("live race credit lacks host receive time")
-        eligible: Dict[
-            Tuple[str, int, int, int],
-            Tuple[int, VisualCameraFrameToken],
-        ] = {}
-        for track in self.visual_tracker.tracks():
-            for sample in track.history:
-                token = sample.token
-                identity = token.live_identity_tuple
-                published = sample.publication_monotonic_ns
-                if (
-                    identity is not None
-                    and published is not None
-                    and int(published) <= int(received_ns)
-                ):
-                    eligible[identity] = (int(published), token)
-        if not eligible:
+        token = self.visual_tracker.latest_processed_token_published_by(
+            int(received_ns)
+        )
+        if token is None:
             raise SafetyAbort(
                 "no exact camera publication precedes authoritative race credit"
             )
-        return max(eligible.values(), key=lambda item: item[0])[1]
+        return token
 
     def _confirm_visual_transition(
         self,
@@ -11047,8 +11043,18 @@ class VQ2Runner:
             or transition.to_gate_index != to_gate_index
             or len(transition.pretransition_frame_tokens)
             < VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES
+            or transition.promoted_history_length_at_credit <= 0
+            or transition.promoted_history_length_at_credit
+            > transition.history_length_before_promotion
             or transition.history_length_before_promotion
             != transition.history_length_after_promotion
+            or (
+                transition.history_length_before_promotion
+                - transition.promoted_history_length_at_credit
+            )
+            not in range(
+                RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES + 1
+            )
         ):
             raise SafetyAbort(
                 "visual gate promotion proof is incomplete or reset history"
@@ -11067,6 +11073,17 @@ class VQ2Runner:
             camera_token_at_credit=list(
                 transition.camera_token_at_credit.live_identity_tuple
                 or transition.camera_token_at_credit.exact_tuple
+            ),
+            promoted_latest_token_before_credit=list(
+                transition.promoted_latest_token_before_credit.live_identity_tuple
+                or transition.promoted_latest_token_before_credit.exact_tuple
+            ),
+            promoted_history_length_at_credit=(
+                transition.promoted_history_length_at_credit
+            ),
+            promoted_latest_token_at_promotion=list(
+                transition.promoted_latest_token_at_promotion.live_identity_tuple
+                or transition.promoted_latest_token_at_promotion.exact_tuple
             ),
             promoted_first_token=list(
                 transition.promoted_first_token.live_identity_tuple
@@ -11189,6 +11206,21 @@ class VQ2Runner:
                     ),
                     "pretransition_frame_count": len(
                         visual_transition.pretransition_frame_tokens
+                    ),
+                    "camera_token_at_credit": list(
+                        visual_transition.camera_token_at_credit.live_identity_tuple
+                        or visual_transition.camera_token_at_credit.exact_tuple
+                    ),
+                    "promoted_latest_token_before_credit": list(
+                        visual_transition.promoted_latest_token_before_credit.live_identity_tuple
+                        or visual_transition.promoted_latest_token_before_credit.exact_tuple
+                    ),
+                    "promoted_history_length_at_credit": (
+                        visual_transition.promoted_history_length_at_credit
+                    ),
+                    "promoted_latest_token_at_promotion": list(
+                        visual_transition.promoted_latest_token_at_promotion.live_identity_tuple
+                        or visual_transition.promoted_latest_token_at_promotion.exact_tuple
                     ),
                     "history_length_before_promotion": (
                         visual_transition.history_length_before_promotion
@@ -12342,6 +12374,21 @@ class VQ2Runner:
                 list(token.live_identity_tuple or token.exact_tuple)
                 for token in post_credit_tokens
             ],
+            "camera_token_at_credit": list(
+                transition.camera_token_at_credit.live_identity_tuple
+                or transition.camera_token_at_credit.exact_tuple
+            ),
+            "promoted_latest_token_before_credit": list(
+                transition.promoted_latest_token_before_credit.live_identity_tuple
+                or transition.promoted_latest_token_before_credit.exact_tuple
+            ),
+            "promoted_history_length_at_credit": (
+                transition.promoted_history_length_at_credit
+            ),
+            "promoted_latest_token_at_promotion": list(
+                transition.promoted_latest_token_at_promotion.live_identity_tuple
+                or transition.promoted_latest_token_at_promotion.exact_tuple
+            ),
             "history_length_before_promotion": (
                 transition.history_length_before_promotion
             ),

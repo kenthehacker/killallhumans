@@ -114,6 +114,31 @@ def _race(
     )
 
 
+def test_processed_camera_watermark_includes_detectionless_frames() -> None:
+    tracker = MultiTargetVisualTracker()
+    first = _frame(
+        1,
+        (_detection(0, 0.0, 0.0, 0.2, 0.2),),
+    )
+    detectionless = _frame(2, ())
+    tracker.update(first)
+    tracker.update(detectionless)
+
+    assert tracker.latest_processed_token_published_by(
+        first.publish_monotonic_ns
+    ) == first.token
+    assert tracker.latest_processed_token_published_by(
+        detectionless.publish_monotonic_ns
+    ) == detectionless.token
+    assert tracker.latest_processed_token_published_by(
+        first.publish_monotonic_ns - 1
+    ) is None
+    with pytest.raises(TypeError, match="exact integer"):
+        tracker.latest_processed_token_published_by(True)
+    with pytest.raises(ValueError, match="non-negative"):
+        tracker.latest_processed_token_published_by(-1)
+
+
 def test_tracks_every_detection_and_does_not_follow_largest_or_input_order() -> None:
     tracker = MultiTargetVisualTracker()
     first = tracker.update(
