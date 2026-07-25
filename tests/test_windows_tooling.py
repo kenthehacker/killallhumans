@@ -208,6 +208,9 @@ def test_launcher_is_parameterized_and_has_no_stale_host_or_session_id():
     assert "already exists; refusing to overwrite" in source
     assert "/RL HIGHEST /F" not in source
     assert "Could not delete temporary launcher task" in source
+    assert "$taskQueryErrorAction = $ErrorActionPreference" in source
+    assert "$ErrorActionPreference = 'Continue'" in source
+    assert "$ErrorActionPreference = $taskQueryErrorAction" in source
     assert "[Guid]::NewGuid()" in source
     assert source.index("Get-Process") < source.index("$querySession = Join-Path")
     assert "Kenichi" not in source

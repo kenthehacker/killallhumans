@@ -130,8 +130,17 @@ if (-not $TaskName) {
 
 # Never overwrite an unrelated scheduled task. `/Create` intentionally omits
 # `/F` as a second race-safe guard if a task appears after this query.
-& schtasks.exe /Query /TN $TaskName 2>$null | Out-Null
-$taskQueryExit = $LASTEXITCODE
+$taskQueryErrorAction = $ErrorActionPreference
+try {
+    # Windows PowerShell promotes schtasks.exe's expected "not found" stderr
+    # into a terminating NativeCommandError under Stop.  Preserve the exact
+    # exit code so the bounded 0/1 validation below remains authoritative.
+    $ErrorActionPreference = 'Continue'
+    & schtasks.exe /Query /TN $TaskName 2>$null | Out-Null
+    $taskQueryExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $taskQueryErrorAction
+}
 if ($taskQueryExit -eq 0) {
     throw "Scheduled task '$TaskName' already exists; refusing to overwrite it."
 }
