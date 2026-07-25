@@ -28,7 +28,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterator, Optional, Tuple
 
-from competition.adapter import CameraFrame
+from competition.adapter import (
+    CameraFrame,
+    VisionPublicationLeaseAcquisitionTimeout,
+)
 from competition.aigp_geometry import AIGP_CAM_UDP_PORT
 from competition.vq2_contracts import FrameIdentityV1, FrameTimingV1
 from competition.vq2_runtime import VQ2_HOST_CLOCK_ID
@@ -779,15 +782,16 @@ class VQ2VisionThread:
             acquired = self._data_lock.acquire()
         else:
             now_ns = self._read_monotonic_ns()
-            remaining_s = max(
-                0.0,
-                (
-                    acquire_deadline_monotonic_ns - now_ns
-                ) / 1_000_000_000.0,
-            )
+            if now_ns >= acquire_deadline_monotonic_ns:
+                raise VisionPublicationLeaseAcquisitionTimeout(
+                    "vision publication lease acquisition deadline was reached"
+                )
+            remaining_s = (
+                acquire_deadline_monotonic_ns - now_ns
+            ) / 1_000_000_000.0
             acquired = self._data_lock.acquire(timeout=remaining_s)
         if not acquired:
-            raise TimeoutError(
+            raise VisionPublicationLeaseAcquisitionTimeout(
                 "vision publication lease acquisition deadline was reached"
             )
         try:

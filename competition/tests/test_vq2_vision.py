@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 
 import competition.vq2_vision as vq2_vision_module
+from competition.adapter import VisionPublicationLeaseAcquisitionTimeout
 from competition.vision_udp import encode_packet
 from competition.vq2_contracts import validate_frame_timing_sequence
 from competition.vq2_runtime import (
@@ -718,7 +719,7 @@ def test_snapshot_publication_lease_acquisition_is_deadline_bounded():
     deadline_ns = receiver._read_monotonic_ns() + 20_000_000
     try:
         with pytest.raises(
-            TimeoutError,
+            VisionPublicationLeaseAcquisitionTimeout,
             match="acquisition deadline",
         ):
             with receiver.snapshot_publication_lease(
@@ -730,3 +731,16 @@ def test_snapshot_publication_lease_acquisition_is_deadline_bounded():
         worker.join(1.0)
 
     assert not worker.is_alive()
+
+
+def test_snapshot_publication_lease_rejects_already_reached_deadline():
+    receiver = VQ2VisionThread(monotonic_ns=lambda: 200)
+
+    with pytest.raises(
+        VisionPublicationLeaseAcquisitionTimeout,
+        match="acquisition deadline",
+    ):
+        with receiver.snapshot_publication_lease(
+            acquire_deadline_monotonic_ns=200,
+        ):
+            pytest.fail("expired publication lease was entered")

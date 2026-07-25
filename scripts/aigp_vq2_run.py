@@ -51,6 +51,7 @@ import statistics
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -73,6 +74,7 @@ from competition.adapter import (
     AttitudeRateCommand,
     Quaternion,
     RaceActiveBoundaryChangedBeforeWire,
+    VisionPublicationLeaseAcquisitionTimeout,
 )
 from competition.aigp_messages import RaceStatus
 from competition.vq2_capture import (
@@ -9749,81 +9751,85 @@ class VQ2Runner:
                 raise SafetyAbort(
                     "vision receiver lacks a publication-pinning lease"
                 )
-            try:
-                with publication_lease(
-                    max_age_s=MAX_VISION_AGE_S,
-                    acquire_deadline_monotonic_ns=(
-                        wire_start_deadline_ns
-                    ),
-                ) as snapshot:
-                    receiver_token = (
-                        self._assert_visual_receiver_snapshot_current(
-                            wire_visual_token,
-                            snapshot,
+            with ExitStack() as lease_stack:
+                try:
+                    snapshot = lease_stack.enter_context(
+                        publication_lease(
+                            max_age_s=MAX_VISION_AGE_S,
+                            acquire_deadline_monotonic_ns=(
+                                wire_start_deadline_ns
+                            ),
                         )
                     )
-                    lock_acquired_ns = time.perf_counter_ns()
-                    if (
-                        type(lock_acquired_ns) is not int
-                        or lock_acquired_ns < 0
-                        or lock_acquired_ns
-                        >= int(wire_start_deadline_ns)
-                    ):
+                except VisionPublicationLeaseAcquisitionTimeout as exc:
+                    raise SafetyAbort(
+                        "visual receiver publication lease acquisition "
+                        "expired"
+                    ) from exc
+                receiver_token = (
+                    self._assert_visual_receiver_snapshot_current(
+                        wire_visual_token,
+                        snapshot,
+                    )
+                )
+                lock_acquired_ns = time.perf_counter_ns()
+                if (
+                    type(lock_acquired_ns) is not int
+                    or lock_acquired_ns < 0
+                    or lock_acquired_ns
+                    >= int(wire_start_deadline_ns)
+                ):
+                    raise SafetyAbort(
+                        "visual receiver publication lease missed the "
+                        "wire deadline"
+                    )
+                if wire_race_gate_index is None:
+                    await self.adapter.send_attitude_rate(
+                        command,
+                        **send_options,
+                    )
+                else:
+                    guarded_send = getattr(
+                        self.adapter,
+                        "send_attitude_rate_if_race_active",
+                        None,
+                    )
+                    if not callable(guarded_send):
                         raise SafetyAbort(
-                            "visual receiver publication lease missed the "
-                            "wire deadline"
+                            "adapter lacks atomic race-active send "
+                            "authority"
                         )
-                    if wire_race_gate_index is None:
-                        await self.adapter.send_attitude_rate(
+                    try:
+                        guarded_authority = await guarded_send(
                             command,
+                            expected_active_gate_index=(
+                                wire_race_gate_index
+                            ),
                             **send_options,
                         )
-                    else:
-                        guarded_send = getattr(
-                            self.adapter,
-                            "send_attitude_rate_if_race_active",
-                            None,
-                        )
-                        if not callable(guarded_send):
-                            raise SafetyAbort(
-                                "adapter lacks atomic race-active send "
-                                "authority"
-                            )
-                        try:
-                            guarded_authority = await guarded_send(
-                                command,
-                                expected_active_gate_index=(
-                                    wire_race_gate_index
-                                ),
-                                **send_options,
-                            )
-                        except RaceActiveBoundaryChangedBeforeWire:
-                            raise
-                        except (RuntimeError, ValueError) as exc:
-                            raise SafetyAbort(
-                                "visual-course race boundary refused the "
-                                "atomic navigation send"
-                            ) from exc
-                        if not isinstance(guarded_authority, Mapping):
-                            raise SafetyAbort(
-                                "adapter returned invalid race-active send "
-                                "authority"
-                            )
-                        wire_race_authority = dict(
-                            guarded_authority
-                        )
-                    transport_return_ns = time.perf_counter_ns()
-                    if (
-                        type(transport_return_ns) is not int
-                        or transport_return_ns < lock_acquired_ns
-                    ):
+                    except RaceActiveBoundaryChangedBeforeWire:
+                        raise
+                    except (RuntimeError, ValueError) as exc:
                         raise SafetyAbort(
-                            "visual receiver publication lease clock regressed"
+                            "visual-course race boundary refused the "
+                            "atomic navigation send"
+                        ) from exc
+                    if not isinstance(guarded_authority, Mapping):
+                        raise SafetyAbort(
+                            "adapter returned invalid race-active send "
+                            "authority"
                         )
-            except TimeoutError as exc:
-                raise SafetyAbort(
-                    "visual receiver publication lease acquisition expired"
-                ) from exc
+                    wire_race_authority = dict(
+                        guarded_authority
+                    )
+                transport_return_ns = time.perf_counter_ns()
+                if (
+                    type(transport_return_ns) is not int
+                    or transport_return_ns < lock_acquired_ns
+                ):
+                    raise SafetyAbort(
+                        "visual receiver publication lease clock regressed"
+                    )
             wire_visual_authority = {
                 "schema": "aigp-vq2-visual-wire-authority/1",
                 "frame_token": asdict(receiver_token),
@@ -9963,7 +9969,7 @@ class VQ2Runner:
         return wire_receipt
 
     async def _wait_for_next_flight_command_slot(self) -> float:
-        """Prove a full control period after the previous completed send."""
+        """Prove coarse completion and exact wire-start pacing boundaries."""
 
         now = time.monotonic()
         if (
@@ -9973,36 +9979,85 @@ class VQ2Runner:
         ):
             raise SafetyAbort("current flight-command timestamp is invalid")
         last_sent_s = self._last_flight_command_sent_s
-        if last_sent_s is None:
-            return float(now)
-        if (
-            type(last_sent_s) not in {int, float}
-            or not math.isfinite(float(last_sent_s))
-            or float(last_sent_s) < 0.0
-            or float(last_sent_s) > float(now)
-        ):
-            raise SafetyAbort("last flight-command timestamp is invalid")
-        not_before_s = float(last_sent_s) + CONTROL_PERIOD_S
+        previous_wire_start_ns = self._last_flight_command_started_ns
         observed_s = float(now)
-        wait_attempts = 0
-        while observed_s < not_before_s:
-            if wait_attempts >= 8:
-                raise SafetyAbort("flight-command pacing wait returned early")
-            await asyncio.sleep(not_before_s - observed_s)
-            next_observed_s = time.monotonic()
+        if last_sent_s is None and previous_wire_start_ns is None:
+            return observed_s
+        if last_sent_s is not None:
             if (
-                type(next_observed_s) not in {int, float}
-                or not math.isfinite(float(next_observed_s))
-                or float(next_observed_s) < observed_s
+                type(last_sent_s) not in {int, float}
+                or not math.isfinite(float(last_sent_s))
+                or float(last_sent_s) < 0.0
+                or float(last_sent_s) > observed_s
             ):
-                raise SafetyAbort("flight-command pacing wait returned early")
-            observed_s = float(next_observed_s)
-            wait_attempts += 1
+                raise SafetyAbort("last flight-command timestamp is invalid")
+            completion_not_before_s = (
+                float(last_sent_s) + CONTROL_PERIOD_S
+            )
+            wait_attempts = 0
+            while observed_s < completion_not_before_s:
+                if wait_attempts >= 8:
+                    raise SafetyAbort(
+                        "flight-command pacing wait returned early"
+                    )
+                await asyncio.sleep(completion_not_before_s - observed_s)
+                next_observed_s = time.monotonic()
+                if (
+                    type(next_observed_s) not in {int, float}
+                    or not math.isfinite(float(next_observed_s))
+                    or float(next_observed_s) < observed_s
+                ):
+                    raise SafetyAbort(
+                        "flight-command pacing wait returned early"
+                    )
+                observed_s = float(next_observed_s)
+                wait_attempts += 1
+
+        if previous_wire_start_ns is not None:
+            if (
+                type(previous_wire_start_ns) is not int
+                or previous_wire_start_ns < 0
+            ):
+                raise SafetyAbort(
+                    "last flight-command wire timestamp is invalid"
+                )
+            wire_not_before_ns = previous_wire_start_ns + round(
+                CONTROL_PERIOD_S * 1_000_000_000
+            )
+            observed_ns = time.perf_counter_ns()
+            if (
+                type(observed_ns) is not int
+                or observed_ns < previous_wire_start_ns
+            ):
+                raise SafetyAbort(
+                    "current flight-command wire timestamp is invalid"
+                )
+            wait_attempts = 0
+            while observed_ns < wire_not_before_ns:
+                if wait_attempts >= 8:
+                    raise SafetyAbort(
+                        "flight-command exact pacing wait returned early"
+                    )
+                await asyncio.sleep(
+                    (wire_not_before_ns - observed_ns)
+                    / 1_000_000_000.0
+                )
+                next_observed_ns = time.perf_counter_ns()
+                if (
+                    type(next_observed_ns) is not int
+                    or next_observed_ns < observed_ns
+                ):
+                    raise SafetyAbort(
+                        "flight-command exact pacing wait returned early"
+                    )
+                observed_ns = next_observed_ns
+                wait_attempts += 1
+
         ready_s = time.monotonic()
         if (
             type(ready_s) not in {int, float}
             or not math.isfinite(float(ready_s))
-            or float(ready_s) < max(observed_s, not_before_s)
+            or float(ready_s) < observed_s
         ):
             raise SafetyAbort("flight-command pacing wait returned early")
         return float(ready_s)

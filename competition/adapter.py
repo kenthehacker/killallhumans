@@ -29,6 +29,10 @@ class RaceActiveBoundaryChangedBeforeWire(RuntimeError):
     """A guarded navigation send observed newer race state and sent nothing."""
 
 
+class VisionPublicationLeaseAcquisitionTimeout(TimeoutError):
+    """The vision publication lock was not acquired before its deadline."""
+
+
 @dataclass
 class Quaternion:
     """Unit quaternion (w, x, y, z) for orientation."""

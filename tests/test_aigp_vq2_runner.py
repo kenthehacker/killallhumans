@@ -29,6 +29,7 @@ from competition.adapter import (
     Quaternion,
     RaceActiveBoundaryChangedBeforeWire,
     TelemetryState,
+    VisionPublicationLeaseAcquisitionTimeout,
 )
 from competition.aigp_messages import RaceStatus
 from competition.aigp_mavlink import (
@@ -1143,6 +1144,121 @@ def test_next_flight_command_slot_retries_a_fractionally_early_wakeup(
     )
 
 
+def test_next_flight_command_slot_waits_for_exact_wire_start_after_coarse_release(
+    monkeypatch,
+):
+    coarse_clock_s = 1.03125
+    wire_clock_ns = [116_500_000]
+    sleeps = []
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = 1.0
+    runner._last_flight_command_started_ns = 100_000_000
+
+    async def advance(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            wire_clock_ns[0] += round(seconds * 1_000_000_000) - 100_000
+        else:
+            wire_clock_ns[0] += round(seconds * 1_000_000_000)
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: coarse_clock_s,
+                perf_counter_ns=lambda: wire_clock_ns[0],
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=advance),
+        )
+        ready_s = asyncio.run(
+            runner._wait_for_next_flight_command_slot()
+        )
+
+    assert sleeps == pytest.approx([0.0035, 0.0001])
+    assert wire_clock_ns[0] == 120_000_000
+    assert ready_s == coarse_clock_s
+
+
+def test_next_flight_command_slot_rejects_exact_wire_clock_regression(
+    monkeypatch,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_sent_s = 1.0
+    runner._last_flight_command_started_ns = 100_000_000
+    wire_clock = iter((116_500_000, 116_400_000))
+
+    async def return_early(_seconds):
+        return None
+
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: 1.03125,
+                perf_counter_ns=lambda: next(wire_clock),
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(sleep=return_early),
+        )
+        with pytest.raises(
+            SafetyAbort,
+            match="exact pacing wait returned early",
+        ):
+            asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
+@pytest.mark.parametrize("previous_wire_start_ns", (True, -1))
+def test_next_flight_command_slot_rejects_invalid_prior_exact_wire_timestamp(
+    monkeypatch,
+    previous_wire_start_ns,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_started_ns = previous_wire_start_ns
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: 1.0),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="last flight-command wire timestamp is invalid",
+    ):
+        asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
+@pytest.mark.parametrize("current_wire_ns", (True, -1, 99_999_999))
+def test_next_flight_command_slot_rejects_invalid_current_exact_wire_timestamp(
+    monkeypatch,
+    current_wire_ns,
+):
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._last_flight_command_started_ns = 100_000_000
+    monkeypatch.setattr(
+        vq2_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: 1.0,
+            perf_counter_ns=lambda: current_wire_ns,
+        ),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="current flight-command wire timestamp is invalid",
+    ):
+        asyncio.run(runner._wait_for_next_flight_command_slot())
+
+
 @pytest.mark.parametrize(
     "last_sent_s",
     (True, math.nan, math.inf, -math.ulp(1.0), 1.01),
@@ -2077,6 +2193,173 @@ def test_visual_wire_authority_pins_receiver_until_transport_returns():
         <= authority["call_end_monotonic_ns"]
         <= authority["transport_return_monotonic_ns"]
     )
+
+
+def test_visual_wire_maps_only_typed_publication_lease_acquisition_timeout(
+    monkeypatch,
+):
+    vision = VQ2VisionThread()
+    snapshot = _vision_snapshot(
+        frame_id=174,
+        sim_time_ns=174_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    with vision._data_lock:
+        vision._latest_snapshot = snapshot
+
+    def acquisition_timeout(**_kwargs):
+        raise VisionPublicationLeaseAcquisitionTimeout(
+            "vision publication lease acquisition deadline was reached"
+        )
+
+    monkeypatch.setattr(
+        vision,
+        "snapshot_publication_lease",
+        acquisition_timeout,
+    )
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, vision)
+    runner.visual_tracker._time_basis_id = "host-perf-counter"
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        snapshot
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="publication lease acquisition expired",
+    ) as raised:
+        asyncio.run(
+            runner._send_flight_command(
+                AttitudeRateCommand(0.0, 0.0, -0.05, 0.275),
+                require_wire_receipt=True,
+                wire_start_deadline_ns=(
+                    vq2_module.time.perf_counter_ns()
+                    + 1_000_000_000
+                ),
+                wire_visual_token=expected,
+            )
+        )
+
+    assert isinstance(
+        raised.value.__cause__,
+        VisionPublicationLeaseAcquisitionTimeout,
+    )
+    assert adapter.commands == []
+    assert adapter.drain_outbound_receipts() == []
+    assert runner._last_flight_command_started_ns is None
+    assert runner._last_flight_command_sent_s is None
+
+
+def test_visual_wire_preserves_adapter_pacing_timeout_after_lease_acquisition():
+    vision = VQ2VisionThread()
+    snapshot = _vision_snapshot(
+        frame_id=175,
+        sim_time_ns=175_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    with vision._data_lock:
+        vision._latest_snapshot = snapshot
+
+    class EarlyAdapter(_FakeAdapter):
+        async def send_attitude_rate(self, _command, **_kwargs):
+            raise TimeoutError(
+                "attitude-target call began before its pacing window"
+            )
+
+    adapter = EarlyAdapter()
+    runner = VQ2Runner(adapter, vision)
+    runner.visual_tracker._time_basis_id = "host-perf-counter"
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        snapshot
+    )
+
+    with pytest.raises(
+        TimeoutError,
+        match="attitude-target call began before its pacing window",
+    ):
+        asyncio.run(
+            runner._send_flight_command(
+                AttitudeRateCommand(0.0, 0.0, -0.05, 0.275),
+                require_wire_receipt=True,
+                wire_start_deadline_ns=(
+                    vq2_module.time.perf_counter_ns()
+                    + 1_000_000_000
+                ),
+                wire_visual_token=expected,
+            )
+        )
+
+    assert adapter.commands == []
+    assert adapter.drain_outbound_receipts() == []
+    assert runner._last_flight_command_started_ns is None
+    assert runner._last_flight_command_sent_s is None
+    with vision.snapshot_publication_lease() as latest:
+        assert latest is snapshot
+
+
+def test_visual_wire_never_maps_transport_lease_type_after_acquisition():
+    vision = VQ2VisionThread()
+    snapshot = _vision_snapshot(
+        frame_id=176,
+        sim_time_ns=176_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    with vision._data_lock:
+        vision._latest_snapshot = snapshot
+
+    class TransportLeaseTypeAdapter(_FakeAdapter):
+        async def send_attitude_rate(self, _command, **_kwargs):
+            call_ns = vq2_module.time.perf_counter_ns()
+            self.outbound_receipts.append(
+                {
+                    "schema": "aigp-vq2-attitude-target-outbound/1",
+                    "host_clock_id": "host-perf-counter",
+                    "call_start_monotonic_ns": call_ns,
+                    "call_end_monotonic_ns": call_ns,
+                    "api": "send_attitude_rate",
+                    "outcome": "raised",
+                    "error_type": (
+                        "VisionPublicationLeaseAcquisitionTimeout"
+                    ),
+                }
+            )
+            raise VisionPublicationLeaseAcquisitionTimeout(
+                "transport raised after admission"
+            )
+
+    adapter = TransportLeaseTypeAdapter()
+    runner = VQ2Runner(adapter, vision)
+    runner.visual_tracker._time_basis_id = "host-perf-counter"
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        snapshot
+    )
+
+    with pytest.raises(
+        VisionPublicationLeaseAcquisitionTimeout,
+        match="transport raised after admission",
+    ):
+        asyncio.run(
+            runner._send_flight_command(
+                AttitudeRateCommand(0.0, 0.0, -0.05, 0.275),
+                require_wire_receipt=True,
+                wire_start_deadline_ns=(
+                    vq2_module.time.perf_counter_ns()
+                    + 1_000_000_000
+                ),
+                wire_visual_token=expected,
+            )
+        )
+
+    receipts = adapter.drain_outbound_receipts()
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "raised"
+    assert runner._last_flight_command_started_ns is None
+    assert runner._last_flight_command_sent_s is None
+    with vision.snapshot_publication_lease() as latest:
+        assert latest is snapshot
 
 
 def _received_race_status(
