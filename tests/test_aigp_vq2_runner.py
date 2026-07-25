@@ -5266,7 +5266,11 @@ def test_cleanup_post_reset_exact_pad_contact_is_separate_and_bounded():
     runner = VQ2Runner(adapter, _FakeVision())
     runner._cleanup_in_progress = True
     adapter.collisions = [
-        {"id": 1002, "threat_level": 1, "impulse": 0.0025}
+        {
+            "id": 1002,
+            "threat_level": 2,
+            "impulse": 1.013804316520691,
+        }
     ]
     proof = ResetProof(
         attempt=1,
@@ -5286,9 +5290,59 @@ def test_cleanup_post_reset_exact_pad_contact_is_separate_and_bounded():
     assert safety["harmful_collision_count"] == 0
     assert safety["benign_reset_pad_contact_count"] == 1
     assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
-        0.0025
+        1.013804316520691
     )
     assert safety["observations"][0]["disposition"] == "benign_reset_pad"
+
+
+def test_cleanup_accepts_reproduced_proved_reset_settling_aggregate():
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    reproduced_max_impulse = 1.013804316520691
+    reproduced_cumulative_impulse = 4.59668993670493
+    remaining_impulse = (
+        reproduced_cumulative_impulse - reproduced_max_impulse
+    ) / 48
+    adapter.collisions = [
+        {
+            "id": 1002,
+            "threat_level": 2,
+            "impulse": reproduced_max_impulse,
+        },
+        *[
+            {
+                "id": 1002,
+                "threat_level": 1 + index % 2,
+                "impulse": remaining_impulse,
+            }
+            for index in range(48)
+        ],
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is True
+    assert safety["harmful_collision_count"] == 0
+    assert safety["benign_pre_reset_pad_contact_count"] == 0
+    assert safety["benign_reset_pad_contact_count"] == 49
+    assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
+        reproduced_cumulative_impulse
+    )
+    assert {row["disposition"] for row in safety["observations"]} == {
+        "benign_reset_pad"
+    }
 
 
 def test_cleanup_post_reset_pad_contact_budget_excess_is_unsafe():
@@ -5296,8 +5350,8 @@ def test_cleanup_post_reset_pad_contact_budget_excess_is_unsafe():
     runner = VQ2Runner(adapter, _FakeVision())
     runner._cleanup_in_progress = True
     adapter.collisions = [
-        {"id": 1002, "threat_level": 1, "impulse": 0.0025}
-        for _ in range(vq2_module.MAX_BENIGN_PAD_CONTACTS + 1)
+        {"id": 1002, "threat_level": 1, "impulse": 0.01}
+        for _ in range(vq2_module.MAX_PROVED_RESET_PAD_CONTACTS + 1)
     ]
     proof = ResetProof(
         attempt=1,
@@ -5317,6 +5371,177 @@ def test_cleanup_post_reset_pad_contact_budget_excess_is_unsafe():
     assert safety["harmful_collision_count"] == 1
     assert safety["observations"][-1]["disposition"] == (
         "reset_pad_budget_exceeded"
+    )
+
+
+@pytest.mark.parametrize(
+    "collision",
+    [
+        {"id": 1001, "threat_level": 2, "impulse": 1.0},
+        {"id": 1002, "threat_level": 3, "impulse": 1.0},
+        {
+            "id": 1002,
+            "threat_level": 2,
+            "impulse": (
+                vq2_module.MAX_PROVED_RESET_PAD_SINGLE_IMPULSE + 1e-6
+            ),
+        },
+        {"id": 1002, "threat_level": 2, "impulse": -0.001},
+    ],
+)
+def test_cleanup_proved_reset_pad_settling_rejects_wrong_identity_or_energy(
+    collision,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [collision]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][0]["disposition"] == "harmful"
+
+
+def test_cleanup_proved_reset_pad_settling_requires_disarmed_state():
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 2, "impulse": 1.0}
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][0]["disposition"] == "harmful"
+
+
+def test_cleanup_proved_reset_pad_cumulative_impulse_excess_is_unsafe():
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 2, "impulse": 1.0}
+        for _ in range(6)
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][-1]["disposition"] == (
+        "reset_pad_budget_exceeded"
+    )
+
+
+def test_cleanup_pre_reset_policy_rejects_proved_reset_settling_energy():
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+
+    runner._record_cleanup_collision_batch(
+        [{"id": 1002, "threat_level": 2, "impulse": 1.0}],
+        phase="cleanup-atomic-reset-boundary",
+        allow_benign_reset_pad=True,
+    )
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][0]["disposition"] == "harmful"
+
+
+def test_cleanup_proved_reset_flag_alone_cannot_grant_settling_authority():
+    runner = VQ2Runner(_FakeAdapter(), _FakeVision())
+    runner._cleanup_in_progress = True
+
+    runner._record_cleanup_collision_batch(
+        [{"id": 1002, "threat_level": 2, "impulse": 1.0}],
+        phase="cleanup-post-reset-proof",
+        allow_benign_reset_pad=False,
+        allow_proved_reset_pad_settling=True,
+    )
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][0]["disposition"] == "harmful"
+
+
+def test_cleanup_pre_reset_and_proved_reset_budgets_are_independent():
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    runner._record_cleanup_collision_batch(
+        [
+            {"id": 1002, "threat_level": 1, "impulse": 0.002}
+            for _ in range(vq2_module.MAX_BENIGN_PAD_CONTACTS)
+        ],
+        phase="cleanup-atomic-reset-boundary",
+        allow_benign_reset_pad=True,
+        benign_pad_disposition="benign_calibration_pad",
+    )
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 2, "impulse": 0.07}
+        for _ in range(49)
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is True
+    assert safety["benign_pre_reset_pad_contact_count"] == 12
+    assert safety["benign_reset_pad_contact_count"] == 49
+    assert safety["benign_pre_reset_pad_cumulative_impulse"] == pytest.approx(
+        0.024
+    )
+    assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
+        3.43
     )
 
 
@@ -5341,7 +5566,8 @@ def test_powered_stage_cleanup_collision_fails_stage_but_retains_reset_proof(
     async def wait_for_go():
         return context
 
-    async def stage_body():
+    async def stage_body(*, calibration_context):
+        assert calibration_context is context
         adapter.collisions = [
             {"id": 7, "threat_level": 2, "impulse": 0.1}
         ]
@@ -5707,7 +5933,11 @@ def _configured_yaw_sign_id(
     adapter.is_armed = True
     adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
     runner = VQ2Runner(adapter, _FakeVision())
-    runner.estimate = _estimate(roll=0.0, pitch=-0.31)
+    start_orientation = Quaternion.from_euler(0.0, -0.31, 0.0)
+    runner.estimate = replace(
+        _estimate(roll=0.0, pitch=-0.31),
+        orientation=start_orientation,
+    )
     target = vq2_module.GateTarget(
         frame_id=frame_id[0],
         sim_time_ns=frame_id[0] * 1_000,
@@ -5746,9 +5976,31 @@ def _configured_yaw_sign_id(
         imu_timestamp_us[0] += round(
             vq2_module.CONTROL_PERIOD_S * 1_000_000
         )
+        half_yaw = yaw[0] / 2.0
+        cosine = math.cos(half_yaw)
+        sine = math.sin(half_yaw)
+        body_z_orientation = Quaternion(
+            w=(
+                start_orientation.w * cosine
+                - start_orientation.z * sine
+            ),
+            x=(
+                start_orientation.x * cosine
+                + start_orientation.y * sine
+            ),
+            y=(
+                start_orientation.y * cosine
+                - start_orientation.x * sine
+            ),
+            z=(
+                start_orientation.w * sine
+                + start_orientation.z * cosine
+            ),
+        )
         runner.estimate = replace(
-            _estimate(roll=0.0, pitch=-0.31, yaw=yaw[0]),
+            _estimate(roll=0.0, pitch=-0.31),
             timestamp_us=imu_timestamp_us[0],
+            orientation=body_z_orientation,
             body_rates=body_rates,
         )
         runner._last_imu_received_monotonic_ns = round(
@@ -6133,7 +6385,8 @@ def test_sign_id_powered_dispatch_excites_only_yaw(monkeypatch):
     async def hover(_observed_context):
         raise AssertionError("yaw-only sign-ID must not enter hover")
 
-    async def sign_id():
+    async def sign_id(*, calibration_context):
+        assert calibration_context is context
         calls.append("yaw")
         return {"yaw_calibration": {"yaw_identified": True}}
 
@@ -6545,22 +6798,120 @@ def test_fast_calibration_missed_slot_aborts_without_catchup_send(monkeypatch):
 def test_fast_calibration_rejects_changed_decoded_dimensions():
     runner, _adapter, context = _fast_calibration_runner()
     runner._latest_detection_image = SimpleNamespace(shape=(180, 320, 3))
+    reference = runner.estimate.orientation
 
     with pytest.raises(SafetyAbort, match="dimensions changed"):
-        runner._check_calibration_envelope(context)
+        runner._check_calibration_envelope(
+            context,
+            reference_orientation=reference,
+        )
 
 
 def test_fast_calibration_excursion_matches_the_complete_waveform_envelope():
     runner, _adapter, context = _fast_calibration_runner()
+    reference = runner.estimate.orientation
     runner.estimate = _estimate(roll=0.024, pitch=-0.31)
     roll_excursion, _pitch_excursion, _area = (
-        runner._check_calibration_envelope(context)
+        runner._check_calibration_envelope(
+            context,
+            reference_orientation=reference,
+        )
     )
     assert roll_excursion == pytest.approx(0.024)
 
     runner.estimate = _estimate(roll=0.026, pitch=-0.31)
-    with pytest.raises(SafetyAbort, match="exceeded 0.025 rad"):
-        runner._check_calibration_envelope(context)
+    with pytest.raises(
+        SafetyAbort,
+        match="transverse body-axis excursion exceeded 0.025 rad",
+    ):
+        runner._check_calibration_envelope(
+            context,
+            reference_orientation=reference,
+        )
+
+
+def test_fast_calibration_allows_euler_roll_from_pure_body_z_yaw():
+    runner, _adapter, context = _fast_calibration_runner()
+    reference = runner.estimate.orientation
+    half_yaw = 0.12
+    cosine = math.cos(half_yaw)
+    sine = math.sin(half_yaw)
+    current = Quaternion(
+        w=reference.w * cosine - reference.z * sine,
+        x=reference.x * cosine + reference.y * sine,
+        y=reference.y * cosine - reference.x * sine,
+        z=reference.w * sine + reference.z * cosine,
+    )
+    runner.estimate = replace(runner.estimate, orientation=current)
+
+    roll_excursion, pitch_excursion, _area = (
+        runner._check_calibration_envelope(
+            context,
+            reference_orientation=reference,
+        )
+    )
+
+    assert roll_excursion > vq2_module.CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+    assert pitch_excursion < vq2_module.CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+    transverse, axial = vq2_module.calibration_body_axis_excursions_rad(
+        reference,
+        current,
+    )
+    assert transverse == pytest.approx(0.0, abs=1e-12)
+    assert axial == pytest.approx(0.24)
+
+
+def test_calibration_body_axis_corridor_cannot_stack_at_waveform_entry():
+    runner, _adapter, context = _fast_calibration_runner()
+    entry = Quaternion.from_euler(0.024, -0.31, 0.0)
+    half_roll = 0.012
+    cosine = math.cos(half_roll)
+    sine = math.sin(half_roll)
+    stacked = Quaternion(
+        w=entry.w * cosine - entry.x * sine,
+        x=entry.w * sine + entry.x * cosine,
+        y=entry.y * cosine + entry.z * sine,
+        z=-entry.y * sine + entry.z * cosine,
+    )
+    runner.estimate = replace(runner.estimate, orientation=entry)
+    runner._check_calibration_envelope(context)
+    reference = Quaternion.from_euler(
+        context.spawn_roll_rad,
+        context.spawn_pitch_rad,
+        context.spawn_yaw_rad,
+    )
+    runner.estimate = replace(runner.estimate, orientation=stacked)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="transverse body-axis excursion exceeded 0.025 rad",
+    ):
+        runner._check_calibration_envelope(
+            context,
+            reference_orientation=reference,
+        )
+
+
+def test_calibration_body_axis_replay_separates_failed_euler_endpoint():
+    reference = Quaternion.from_euler(
+        -0.0002940814507083663,
+        -0.31003194210690266,
+        -0.000040163373932831003,
+    )
+    failed_endpoint = Quaternion.from_euler(
+        -0.02465073641901364,
+        -0.3063967512776172,
+        0.08040249943217197,
+    )
+
+    transverse, axial = vq2_module.calibration_body_axis_excursions_rad(
+        reference,
+        failed_endpoint,
+    )
+
+    assert transverse == pytest.approx(0.0026768477920678007)
+    assert axial == pytest.approx(0.07668948152213152)
+    assert transverse < vq2_module.CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
 
 
 def test_powered_readiness_requires_20fps_and_exact_dimensions():

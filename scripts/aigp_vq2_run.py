@@ -423,6 +423,9 @@ GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX = COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX
 
 MAX_BENIGN_PAD_CONTACTS = 12
 MAX_BENIGN_PAD_IMPULSE = 0.05
+MAX_PROVED_RESET_PAD_CONTACTS = 64
+MAX_PROVED_RESET_PAD_IMPULSE = 5.0
+MAX_PROVED_RESET_PAD_SINGLE_IMPULSE = 1.10
 
 MAX_ROLL_RAD = math.radians(25.0)
 MIN_PITCH_RAD = math.radians(-35.0)
@@ -6171,6 +6174,7 @@ class StartContext:
     initial_gate_y: int
     initial_gate_area: int
     go_boot_ms: int
+    spawn_yaw_rad: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -8095,6 +8099,79 @@ def is_benign_pad_contact(
         return False
 
 
+def is_benign_proved_reset_pad_settling(
+    collision: Dict[str, Any],
+) -> bool:
+    """Exact build-3385 spawn-pad settling observed after a proved reset.
+
+    This higher-energy class is never available before the authoritative
+    reset epoch has been proved.  It remains tied to the exact spawn-pad
+    object and a separately bounded per-contact envelope.
+    """
+
+    try:
+        return (
+            collision.get("id") == 1002
+            and type(collision.get("threat_level")) is int
+            and 0 <= int(collision["threat_level"]) <= 2
+            and not isinstance(collision.get("impulse"), bool)
+            and isinstance(collision.get("impulse"), (int, float))
+            and math.isfinite(float(collision["impulse"]))
+            and 0.0
+            <= float(collision["impulse"])
+            <= MAX_PROVED_RESET_PAD_SINGLE_IMPULSE
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def calibration_body_axis_excursions_rad(
+    reference: Quaternion,
+    current: Quaternion,
+) -> Tuple[float, float]:
+    """Return transverse and axial swing/twist from ``reference`` to ``current``.
+
+    A body-z yaw applied from the pitched Training spawn necessarily appears
+    as changing Euler roll and pitch.  The relative quaternion instead keeps
+    that motion on its z twist and exposes any actual uncommanded body-x/y
+    attitude motion in the transverse swing.
+    """
+
+    def normalized(value: Quaternion) -> Tuple[float, float, float, float]:
+        components = (
+            float(value.w),
+            float(value.x),
+            float(value.y),
+            float(value.z),
+        )
+        if not all(math.isfinite(component) for component in components):
+            raise SafetyAbort("calibration quaternion is non-finite")
+        norm = math.sqrt(sum(component * component for component in components))
+        if norm <= 1e-9:
+            raise SafetyAbort("calibration quaternion has zero norm")
+        return (
+            components[0] / norm,
+            components[1] / norm,
+            components[2] / norm,
+            components[3] / norm,
+        )
+
+    rw, rx, ry, rz = normalized(reference)
+    cw, cx, cy, cz = normalized(current)
+    # conjugate(reference) * current: the attitude delta expressed in the
+    # reference body frame, where z is the calibrated command axis.
+    dw = rw * cw + rx * cx + ry * cy + rz * cz
+    dx = rw * cx - rx * cw - ry * cz + rz * cy
+    dy = rw * cy + rx * cz - ry * cw - rz * cx
+    dz = rw * cz - rx * cy + ry * cx - rz * cw
+    transverse = 2.0 * math.atan2(
+        math.hypot(dx, dy),
+        math.hypot(dw, dz),
+    )
+    axial = 2.0 * math.atan2(abs(dz), abs(dw))
+    return float(transverse), float(axial)
+
+
 class JsonlRecorder:
     def __init__(
         self,
@@ -8525,9 +8602,12 @@ class VQ2Runner:
         self._cleanup_allow_pre_reset_pad_contact = False
         self._cleanup_collision_observations: List[Dict[str, Any]] = []
         self._cleanup_harmful_collision_count = 0
+        self._cleanup_benign_pre_reset_pad_contact_count = 0
+        self._cleanup_benign_pre_reset_pad_impulse = 0.0
         self._cleanup_benign_reset_pad_contact_count = 0
         self._cleanup_benign_reset_pad_impulse = 0.0
         self._cleanup_collision_capture_complete = True
+        self._cleanup_proved_reset_epoch = False
 
     def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
         """Enforce the code-owned calibrated yaw excursion envelope."""
@@ -10195,6 +10275,7 @@ class VQ2Runner:
         *,
         phase: str,
         allow_benign_reset_pad: bool,
+        allow_proved_reset_pad_settling: bool = False,
         collision_stats: Any = None,
         require_exact_buffer_accounting: bool = False,
         benign_pad_disposition: str = "benign_reset_pad",
@@ -10205,6 +10286,12 @@ class VQ2Runner:
             raise TypeError("cleanup collision phase must be nonempty")
         if type(allow_benign_reset_pad) is not bool:
             raise TypeError("cleanup collision pad authority must be exact")
+        if type(allow_proved_reset_pad_settling) is not bool:
+            raise TypeError(
+                "cleanup proved-reset settling authority must be exact"
+            )
+        if allow_benign_reset_pad and allow_proved_reset_pad_settling:
+            raise ValueError("cleanup pad authorities must be disjoint")
         if type(require_exact_buffer_accounting) is not bool:
             raise TypeError("cleanup collision accounting flag must be exact")
         if benign_pad_disposition not in {
@@ -10310,28 +10397,58 @@ class VQ2Runner:
                     "detail": type(exc).__name__,
                 }
             else:
+                proved_reset_settling = bool(
+                    allow_proved_reset_pad_settling
+                    and self._cleanup_in_progress
+                    and self._cleanup_proved_reset_epoch
+                    and not self.adapter.is_armed
+                    and is_benign_proved_reset_pad_settling(collision)
+                )
                 benign = bool(
-                    allow_benign_reset_pad
-                    and is_benign_pad_contact(collision)
+                    proved_reset_settling
+                    or (
+                        allow_benign_reset_pad
+                        and is_benign_pad_contact(collision)
+                    )
                 )
                 if benign:
-                    next_count = (
-                        self._cleanup_benign_reset_pad_contact_count + 1
-                    )
-                    next_impulse = (
-                        self._cleanup_benign_reset_pad_impulse
-                        + abs(float(collision["impulse"]))
-                    )
-                    if (
-                        next_count <= MAX_BENIGN_PAD_CONTACTS
-                        and next_impulse <= MAX_BENIGN_PAD_IMPULSE
-                    ):
-                        self._cleanup_benign_reset_pad_contact_count = (
-                            next_count
+                    if proved_reset_settling:
+                        current_count = (
+                            self._cleanup_benign_reset_pad_contact_count
                         )
-                        self._cleanup_benign_reset_pad_impulse = (
-                            next_impulse
+                        current_impulse = (
+                            self._cleanup_benign_reset_pad_impulse
                         )
+                        max_count = MAX_PROVED_RESET_PAD_CONTACTS
+                        max_impulse = MAX_PROVED_RESET_PAD_IMPULSE
+                    else:
+                        current_count = (
+                            self._cleanup_benign_pre_reset_pad_contact_count
+                        )
+                        current_impulse = (
+                            self._cleanup_benign_pre_reset_pad_impulse
+                        )
+                        max_count = MAX_BENIGN_PAD_CONTACTS
+                        max_impulse = MAX_BENIGN_PAD_IMPULSE
+                    next_count = current_count + 1
+                    next_impulse = current_impulse + abs(
+                        float(collision["impulse"])
+                    )
+                    if next_count <= max_count and next_impulse <= max_impulse:
+                        if proved_reset_settling:
+                            self._cleanup_benign_reset_pad_contact_count = (
+                                next_count
+                            )
+                            self._cleanup_benign_reset_pad_impulse = (
+                                next_impulse
+                            )
+                        else:
+                            self._cleanup_benign_pre_reset_pad_contact_count = (
+                                next_count
+                            )
+                            self._cleanup_benign_pre_reset_pad_impulse = (
+                                next_impulse
+                            )
                         disposition = benign_pad_disposition
                     else:
                         self._cleanup_harmful_collision_count += 1
@@ -10355,6 +10472,7 @@ class VQ2Runner:
         *,
         phase: str,
         allow_benign_reset_pad: bool,
+        allow_proved_reset_pad_settling: bool = False,
         require_exact_buffer_accounting: bool = False,
         benign_pad_disposition: str = "benign_reset_pad",
     ) -> None:
@@ -10380,6 +10498,9 @@ class VQ2Runner:
             collisions,
             phase=phase,
             allow_benign_reset_pad=allow_benign_reset_pad,
+            allow_proved_reset_pad_settling=(
+                allow_proved_reset_pad_settling
+            ),
             collision_stats=stats,
             require_exact_buffer_accounting=(
                 require_exact_buffer_accounting
@@ -10391,10 +10512,14 @@ class VQ2Runner:
         safe = bool(
             self._cleanup_collision_capture_complete
             and self._cleanup_harmful_collision_count == 0
-            and self._cleanup_benign_reset_pad_contact_count
+            and self._cleanup_benign_pre_reset_pad_contact_count
             <= MAX_BENIGN_PAD_CONTACTS
-            and self._cleanup_benign_reset_pad_impulse
+            and self._cleanup_benign_pre_reset_pad_impulse
             <= MAX_BENIGN_PAD_IMPULSE
+            and self._cleanup_benign_reset_pad_contact_count
+            <= MAX_PROVED_RESET_PAD_CONTACTS
+            and self._cleanup_benign_reset_pad_impulse
+            <= MAX_PROVED_RESET_PAD_IMPULSE
         )
         return {
             "safe": safe,
@@ -10403,6 +10528,12 @@ class VQ2Runner:
             ),
             "harmful_collision_count": (
                 self._cleanup_harmful_collision_count
+            ),
+            "benign_pre_reset_pad_contact_count": (
+                self._cleanup_benign_pre_reset_pad_contact_count
+            ),
+            "benign_pre_reset_pad_cumulative_impulse": (
+                self._cleanup_benign_pre_reset_pad_impulse
             ),
             "benign_reset_pad_contact_count": (
                 self._cleanup_benign_reset_pad_contact_count
@@ -10429,13 +10560,19 @@ class VQ2Runner:
         self._epoch_imu_anchor_us = proof.post_imu_us
         self._epoch_anchor_monotonic_s = time.monotonic()
         self._countdown_observed = proof.countdown_observed
+        self._cleanup_proved_reset_epoch = bool(
+            self._cleanup_in_progress and not self.adapter.is_armed
+        )
         self._drain_cleanup_collisions(
             phase=(
                 "cleanup-post-reset-proof"
                 if self._cleanup_in_progress
                 else "initial-post-reset-proof"
             ),
-            allow_benign_reset_pad=True,
+            allow_benign_reset_pad=not self._cleanup_in_progress,
+            allow_proved_reset_pad_settling=(
+                self._cleanup_proved_reset_epoch
+            ),
         )
         if (
             not self._cleanup_in_progress
@@ -10673,7 +10810,7 @@ class VQ2Runner:
                     failures.append("fresh post-reset countdown was not observed")
                 if not failures:
                     assert self.estimate is not None and self.tracker.target is not None
-                    roll, pitch, _yaw = self.estimate.orientation.to_euler()
+                    roll, pitch, yaw = self.estimate.orientation.to_euler()
                     if abs(roll) > math.radians(5.0):
                         raise SafetyAbort("pad calibration roll is implausible")
                     if not MIN_PITCH_RAD <= pitch <= MAX_PITCH_RAD:
@@ -10685,6 +10822,7 @@ class VQ2Runner:
                         initial_gate_y=self.tracker.target.center_y,
                         initial_gate_area=self.tracker.target.bbox_area,
                         go_boot_ms=int(race.sim_boot_time_ms),
+                        spawn_yaw_rad=yaw,
                     )
                     self.recorder.emit(
                         "powered_vision_ready",
@@ -10844,7 +10982,12 @@ class VQ2Runner:
             disarmed = await self._disarm_confirmed()
         self._drain_cleanup_collisions(
             phase="cleanup-terminal-post-reset",
-            allow_benign_reset_pad=reset_proved,
+            allow_benign_reset_pad=False,
+            allow_proved_reset_pad_settling=bool(
+                reset_proved
+                and self._cleanup_proved_reset_epoch
+                and not self.adapter.is_armed
+            ),
         )
         confirmed = bool(disarmed and reset_proved and not self.adapter.is_armed)
         collision_safety = self._cleanup_collision_safety_summary()
@@ -10893,6 +11036,24 @@ class VQ2Runner:
                 "yaw calibration plan diverged from runner command bounds"
             )
         assert self.estimate is not None
+        if calibration_context is not None:
+            # Preserve the GO-to-waveform Euler corridor before switching to
+            # the body-axis invariant needed during the yaw excitation.
+            self._check_calibration_envelope(calibration_context)
+        calibration_reference_orientation = (
+            Quaternion.from_euler(
+                float(calibration_context.spawn_roll_rad),
+                float(calibration_context.spawn_pitch_rad),
+                float(calibration_context.spawn_yaw_rad),
+            )
+            if calibration_context is not None
+            else Quaternion(
+                w=float(self.estimate.orientation.w),
+                x=float(self.estimate.orientation.x),
+                y=float(self.estimate.orientation.y),
+                z=float(self.estimate.orientation.z),
+            )
+        )
         start_rpy = self.estimate.orientation.to_euler()
         max_excursion = 0.0
         max_abs_measured_yaw_rate = abs(float(self.estimate.body_rates[2]))
@@ -10998,7 +11159,10 @@ class VQ2Runner:
             self._watchdog(allow_benign_pad_contact=True)
             if calibration_context is not None:
                 self._check_calibration_envelope(
-                    calibration_context
+                    calibration_context,
+                    reference_orientation=(
+                        calibration_reference_orientation
+                    ),
                 )
             assert self.estimate is not None
             race = self.adapter.race_status
@@ -11700,6 +11864,8 @@ class VQ2Runner:
     def _check_calibration_envelope(
         self,
         context: StartContext,
+        *,
+        reference_orientation: Optional[Quaternion] = None,
     ) -> Tuple[float, float, float]:
         """Enforce the calibration-specific corridor on top of the watchdog."""
 
@@ -11734,12 +11900,27 @@ class VQ2Runner:
         roll, pitch, _yaw = self.estimate.orientation.to_euler()
         roll_excursion = abs(float(roll) - float(context.spawn_roll_rad))
         pitch_excursion = abs(float(pitch) - float(context.spawn_pitch_rad))
-        if (
-            roll_excursion > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
-            or pitch_excursion > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
-        ):
+        if reference_orientation is None:
+            excursion_exceeded = bool(
+                roll_excursion > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+                or pitch_excursion > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+            )
+            failure_kind = "attitude"
+        else:
+            transverse_excursion, _axial_excursion = (
+                calibration_body_axis_excursions_rad(
+                    reference_orientation,
+                    self.estimate.orientation,
+                )
+            )
+            excursion_exceeded = bool(
+                transverse_excursion
+                > CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD
+            )
+            failure_kind = "transverse body-axis"
+        if excursion_exceeded:
             raise SafetyAbort(
-                "calibration attitude excursion exceeded "
+                f"calibration {failure_kind} excursion exceeded "
                 f"{CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD:.3f} rad"
             )
         return roll_excursion, pitch_excursion, area
@@ -11852,7 +12033,9 @@ class VQ2Runner:
                 benign_pad_max_impulse=0.02,
             )
             roll_excursion, pitch_excursion, target_area = (
-                self._check_calibration_envelope(context)
+                self._check_calibration_envelope(
+                    context,
+                )
             )
             max_roll_excursion = max(max_roll_excursion, roll_excursion)
             max_pitch_excursion = max(max_pitch_excursion, pitch_excursion)
@@ -16833,9 +17016,12 @@ class VQ2Runner:
             }
             self._cleanup_collision_observations = []
             self._cleanup_harmful_collision_count = 0
+            self._cleanup_benign_pre_reset_pad_contact_count = 0
+            self._cleanup_benign_pre_reset_pad_impulse = 0.0
             self._cleanup_benign_reset_pad_contact_count = 0
             self._cleanup_benign_reset_pad_impulse = 0.0
             self._cleanup_collision_capture_complete = True
+            self._cleanup_proved_reset_epoch = False
             self._gate1_yaw_reference_rad = None
             self._gate1_max_abs_yaw_excursion_rad = 0.0
             self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
@@ -16858,7 +17044,9 @@ class VQ2Runner:
                 self._bind_initial_visual_gate(context)
             await self.arm_confirmed()
             if stage == "sign-id":
-                details = await self._run_sign_id()
+                details = await self._run_sign_id(
+                    calibration_context=context,
+                )
             elif stage == "hover":
                 details = await self._run_hover(context)
             elif stage == CALIBRATION_STAGE:
@@ -17937,8 +18125,12 @@ async def run_live(
                 )
             runner._drain_cleanup_collisions(
                 phase="post-disconnect-collision-tail",
-                allow_benign_reset_pad=bool(
-                    result is not None and result.cleanup_confirmed
+                allow_benign_reset_pad=False,
+                allow_proved_reset_pad_settling=bool(
+                    result is not None
+                    and result.cleanup_confirmed
+                    and runner._cleanup_proved_reset_epoch
+                    and not runner.adapter.is_armed
                 ),
                 require_exact_buffer_accounting=True,
             )
