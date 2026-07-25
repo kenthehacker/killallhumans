@@ -45,7 +45,7 @@ def test_default_effective_mapping_preserves_current_runner_behavior():
     assert mapping["phase_timing"] == {
         "gate0_boost_until_s": 0.45,
         "gate0_pitch_blend_s": runner.GATE0_PITCH_BLEND_S,
-        "gate0_yaw_brake_duration_s": runner.SIGN_ID_YAW_PULSE_DURATION_S,
+        "gate0_yaw_brake_duration_s": runner.GATE0_YAW_BRAKE_DURATION_S,
         "post_gate_observation_duration_s": (
             runner.POST_GATE_OBSERVATION_TIMEOUT_S
         ),

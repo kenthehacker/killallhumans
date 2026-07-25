@@ -50,7 +50,15 @@ SIMULATOR_BUILD = 3385
 SIMULATOR_MODE = "Training"
 DEFAULT_ADDRESS = "udpin:127.0.0.1:14550"
 ISOLATION_FLAGS = ("-E", "-s", "-B")
-VISUAL_POWERED_STAGES = ("visual-shadow", "visual-align")
+VISUAL_POWERED_STAGES = (
+    "visual-shadow",
+    "visual-align",
+    "visual-course",
+)
+VISUAL_REPLAY_STAGES = (
+    "visual-shadow",
+    "visual-align",
+)
 FAST_POWERED_STAGES = (
     "sign-id",
     "hover",
@@ -67,10 +75,13 @@ _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_vq2_controller_config.py",
     "scripts/aigp_vq2_visual_config.py",
     "scripts/aigp_vq2_visual_alignment_stage.py",
+    "scripts/aigp_vq2_visual_course_stage.py",
     "scripts/aigp_vq2_yaw_calibration.py",
+    "scripts/aigp_vq2_yaw_profile.py",
     "scripts/aigp_vq2_fast_cycle.py",
     "scripts/aigp_vq2_run.py",
     "scripts/aigp_vq2_powered_attempt.py",
+    "config/aigp_vq2_yaw_calibration_build3385.json",
     "competition/adapter.py",
     "competition/aigp_mavlink.py",
     "competition/aigp_messages.py",
@@ -235,7 +246,7 @@ def _git_snapshot(repo_root: Path) -> dict[str, Any]:
 
 
 def _excitation_plan_identity(stage: str) -> Mapping[str, Any] | None:
-    if stage != "calibration-excite":
+    if stage not in {"sign-id", "calibration-excite"}:
         return None
     from scripts import aigp_vq2_yaw_calibration as contract
 
@@ -248,6 +259,15 @@ def _excitation_plan_identity(stage: str) -> Mapping[str, Any] | None:
         "tick_count": plan["tick_count"],
         "control_period_ns": plan["control_period_ns"],
     }
+
+
+def _yaw_profile_identity(stage: str) -> Mapping[str, Any] | None:
+    if stage != "visual-course":
+        return None
+    from scripts import aigp_vq2_yaw_profile as profile_contract
+
+    profile = profile_contract.load_yaw_calibration_profile()
+    return profile_contract.yaw_calibration_profile_evidence(profile)
 
 
 def _controller_evidence(
@@ -351,6 +371,7 @@ def build_manifest(
     development_lock: Mapping[str, Any],
     excitation_plan: Mapping[str, Any] | None,
     controller_config: ControllerConfigValue | None = None,
+    yaw_calibration_profile: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the exact small manifest with one bounded controller identity."""
 
@@ -395,6 +416,11 @@ def build_manifest(
             "target_config": dict(target_config),
             "excitation_plan": (
                 None if excitation_plan is None else dict(excitation_plan)
+            ),
+            "yaw_calibration_profile": (
+                None
+                if yaw_calibration_profile is None
+                else dict(yaw_calibration_profile)
             ),
         },
         "execution": {
@@ -553,6 +579,7 @@ def _execute_fast_cycle(
             development_lock=development_lock,
             excitation_plan=_excitation_plan_identity(stage),
             controller_config=effective_controller,
+            yaw_calibration_profile=_yaw_profile_identity(stage),
         )
         manifest_path = run_directory / "run-manifest.json"
         manifest_payload = _canonical_json_bytes(manifest)
@@ -603,6 +630,13 @@ def _execute_fast_cycle(
                     expected_controller_config_sha256=(
                         manifest["controller"]["config_sha256"]
                     ),
+                    expected_yaw_calibration_profile_sha256=(
+                        manifest["inputs"]["yaw_calibration_profile"][
+                            "sha256"
+                        ]
+                        if stage == "visual-course"
+                        else None
+                    ),
                     replay_bundle=(
                         str(run_directory / replay_name)
                         if (
@@ -611,7 +645,7 @@ def _execute_fast_cycle(
                         )
                         else None
                     ),
-                    recording_approved=(stage in VISUAL_POWERED_STAGES),
+                    recording_approved=(stage in VISUAL_REPLAY_STAGES),
                 )
             )
             result_value = {

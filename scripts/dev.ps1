@@ -144,7 +144,10 @@ interactive confirmation.
                 'tests/test_aigp_vq2_powered_cleanup.py',
                 'tests/test_aigp_vq2_runner.py',
                 'tests/test_aigp_vq2_visual_config.py',
+                'tests/test_aigp_vq2_visual_course.py',
                 'tests/test_aigp_vq2_visual_shadow.py',
+                'tests/test_aigp_vq2_yaw_calibration.py',
+                'tests/test_aigp_vq2_yaw_profile.py',
                 'tests/test_vision_udp.py',
                 'tests/test_vision_udp_listener.py'
             )
@@ -196,7 +199,8 @@ interactive confirmation.
             }
             $allowed = @(
                 'sign-id', 'hover', 'gate0', 'gate0-observe', 'gate1-recenter',
-                'visual-shadow', 'visual-align', 'calibration-excite'
+                'visual-shadow', 'visual-align', 'visual-course',
+                'calibration-excite'
             )
             if ($stage -notin $allowed) {
                 throw "Unsupported flight-cycle stage '$stage'."

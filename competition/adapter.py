@@ -25,6 +25,10 @@ from typing import Optional, Tuple
 import numpy as np
 
 
+class RaceActiveBoundaryChangedBeforeWire(RuntimeError):
+    """A guarded navigation send observed newer race state and sent nothing."""
+
+
 @dataclass
 class Quaternion:
     """Unit quaternion (w, x, y, z) for orientation."""

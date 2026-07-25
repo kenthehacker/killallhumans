@@ -16,12 +16,14 @@ from typing import Any, Iterable, Mapping
 
 
 YAW_CALIBRATION_PLAN_SCHEMA = "aigp-vq2-yaw-calibration-plan/1"
-YAW_CALIBRATION_PLAN_ID = "vq2-build3385-training-yaw-calibration-v1"
+YAW_CALIBRATION_PLAN_ID = (
+    "vq2-build3385-training-yaw-envelope-calibration-v2"
+)
 
 YAW_CALIBRATION_CONTROL_PERIOD_NS = 20_000_000
-YAW_CALIBRATION_TICK_COUNT = 45
-YAW_CALIBRATION_NOMINAL_END_OFFSET_NS = 900_000_000
-YAW_CALIBRATION_HARD_EXPIRY_OFFSET_NS = 1_000_000_000
+YAW_CALIBRATION_TICK_COUNT = 148
+YAW_CALIBRATION_NOMINAL_END_OFFSET_NS = 2_960_000_000
+YAW_CALIBRATION_HARD_EXPIRY_OFFSET_NS = 3_100_000_000
 
 YAW_CALIBRATION_THRUST = 0.235
 YAW_CALIBRATION_ROLL_RATE_RAD_S = 0.0
@@ -56,25 +58,25 @@ _PLAN_LITERAL: dict[str, Any] = {
         {
             "segment_id": "yaw-positive",
             "first_tick": 12,
-            "last_tick": 22,
+            "last_tick": 71,
             "yaw_rate_rad_s": YAW_CALIBRATION_RATE_RAD_S,
         },
         {
             "segment_id": "neutral-reversal",
-            "first_tick": 23,
-            "last_tick": 28,
+            "first_tick": 72,
+            "last_tick": 79,
             "yaw_rate_rad_s": 0.0,
         },
         {
             "segment_id": "yaw-negative",
-            "first_tick": 29,
-            "last_tick": 39,
+            "first_tick": 80,
+            "last_tick": 139,
             "yaw_rate_rad_s": -YAW_CALIBRATION_RATE_RAD_S,
         },
         {
             "segment_id": "neutral-terminal",
-            "first_tick": 40,
-            "last_tick": 44,
+            "first_tick": 140,
+            "last_tick": 147,
             "yaw_rate_rad_s": 0.0,
         },
     ],
@@ -84,7 +86,7 @@ _PLAN_LITERAL: dict[str, Any] = {
 # This is intentionally a literal rather than being derived at import time: a
 # plan edit must make an explicit, reviewable identity change.
 YAW_CALIBRATION_PLAN_SHA256 = (
-    "827101741ddb335a1cbfcdbdcfca65c2f7579ad4a435c140179b8d9d0eb2be1b"
+    "b45dff221b1160528adb54313ec0947c065801538c39ade34cc9129c93fef0e1"
 )
 
 

@@ -1,0 +1,131 @@
+{
+  "schema": "aigp-vq2-yaw-calibration-profile/1",
+  "profile_id": "vq2-build3385-training-yaw-authority-v1",
+  "simulator": {
+    "build": 3385,
+    "mode": "Training",
+    "mode_basis": "configured_session_not_machine_readable"
+  },
+  "source": {
+    "commit": "f4eecd6afbca6ff69cf84b0a69339ed66238cfa0",
+    "stage": "calibration-excite",
+    "worktree_state": "clean"
+  },
+  "plan": {
+    "plan_id": "vq2-build3385-training-yaw-calibration-v1",
+    "sha256": "827101741ddb335a1cbfcdbdcfca65c2f7579ad4a435c140179b8d9d0eb2be1b"
+  },
+  "authority": {
+    "controller_to_body_sign": 1,
+    "controller_to_image_sign": 1,
+    "max_abs_yaw_rate_command_rad_s": 0.08,
+    "max_gyro_response_delay_s": 0.08,
+    "max_first_image_observation_delay_s": 0.09,
+    "max_attitude_excursion_rad": 0.05,
+    "max_abs_measured_yaw_rate_rad_s": 0.5,
+    "control_hold_horizon_s": 0.12
+  },
+  "observed_ranges": {
+    "gyro_rate_gain": {
+      "min": 1.8411235883831978,
+      "max": 1.8459140788763762
+    },
+    "image_rate_gain_px_per_command_rad": {
+      "min": 550.4827591855465,
+      "max": 590.2900124890429
+    },
+    "gyro_response_delay_upper_bound_s": {
+      "min": 0.0526169,
+      "max": 0.0559091
+    },
+    "first_image_observation_delay_s": {
+      "min": 0.047476,
+      "max": 0.0704515
+    },
+    "max_attitude_excursion_rad": {
+      "min": 0.024955882614386925,
+      "max": 0.025041502491647334
+    },
+    "max_abs_measured_yaw_rate_rad_s": {
+      "min": 0.2209992267526104,
+      "max": 0.22243007003911772
+    }
+  },
+  "evidence": [
+    {
+      "run_id": "20260725T060252Z-calibration-excite-0726702b",
+      "stage_success": true,
+      "cleanup_confirmed": true,
+      "unsafe_collision_count": 0,
+      "benign_pad_contact_count": 76,
+      "benign_pad_contact_cumulative_impulse": 0.20524404116440564,
+      "watchdog_violation_count": 0,
+      "artifacts_sha256": {
+        "result": "7092784cf67ec93cf13582562ce1581098d1783cd88d53acedab7012581f9a19",
+        "manifest": "fbb9d483692cd933a61e2260c35ef1b4da53c0483bb11804bdcadeaeed7a3b5c",
+        "trace": "78c5caf55034baaf4de430a876983863c143d387fd9dcdf233c8613e06cbeedb",
+        "live_lease": "d2fecfa5f33641cb9ac505fe47237121b3da0b8f61e8995d7337c0d8af35d4a6"
+      },
+      "controller_to_body_sign": 1,
+      "controller_to_image_sign": 1,
+      "command_rate_abs_rad_s": 0.08,
+      "control_hold_horizon_s": 0.12,
+      "gyro_rate_gain": 1.8459140788763762,
+      "image_rate_gain_px_per_command_rad": 580.6510718355021,
+      "gyro_response_delay_upper_bound_s": 0.0526169,
+      "first_image_observation_delay_s": 0.047476,
+      "max_attitude_excursion_rad": 0.025041502491647334,
+      "max_abs_measured_yaw_rate_rad_s": 0.22243007003911772
+    },
+    {
+      "run_id": "20260725T060328Z-calibration-excite-9e3562b1",
+      "stage_success": true,
+      "cleanup_confirmed": true,
+      "unsafe_collision_count": 0,
+      "benign_pad_contact_count": 76,
+      "benign_pad_contact_cumulative_impulse": 0.20600187953095883,
+      "watchdog_violation_count": 0,
+      "artifacts_sha256": {
+        "result": "c9a6ea5c6201d5150ef15786c23bcd378d57f5fc813b5192f13ad5c23e911fb9",
+        "manifest": "573de7ae64e44e1e8a06114a224bee32cbb9abf7eff1224c1886902e3b19e910",
+        "trace": "7017a19eef5f4fe918e56b25521837f7601805d6743ae47ea91757aabd4a2456",
+        "live_lease": "6b756d96d7e3ed022ef2e405ce083a66adec15de4e2dd168ccf9b1098f499387"
+      },
+      "controller_to_body_sign": 1,
+      "controller_to_image_sign": 1,
+      "command_rate_abs_rad_s": 0.08,
+      "control_hold_horizon_s": 0.12,
+      "gyro_rate_gain": 1.8447629641741514,
+      "image_rate_gain_px_per_command_rad": 550.4827591855465,
+      "gyro_response_delay_upper_bound_s": 0.0559091,
+      "first_image_observation_delay_s": 0.0704515,
+      "max_attitude_excursion_rad": 0.024955882614386925,
+      "max_abs_measured_yaw_rate_rad_s": 0.2209992267526104
+    },
+    {
+      "run_id": "20260725T060354Z-calibration-excite-d78746e7",
+      "stage_success": true,
+      "cleanup_confirmed": true,
+      "unsafe_collision_count": 0,
+      "benign_pad_contact_count": 76,
+      "benign_pad_contact_cumulative_impulse": 0.20585722976829857,
+      "watchdog_violation_count": 0,
+      "artifacts_sha256": {
+        "result": "402a108a4551c31b2f8909e2efd6ceec764e78797535c0e4759f58e1d4e8e19c",
+        "manifest": "c05682f040a505b7bb4923da94c74fecffaf6e4d74c2a5b6eabec1a101cdae09",
+        "trace": "3e2e31bd4b737facd1485facf088c89c5e27d4833532a600e7ec35ae7d0f61d8",
+        "live_lease": "11a80c6433218782f8bfd4aaec2b5469022bf07f2cb631ea5d4699dcd8130932"
+      },
+      "controller_to_body_sign": 1,
+      "controller_to_image_sign": 1,
+      "command_rate_abs_rad_s": 0.08,
+      "control_hold_horizon_s": 0.12,
+      "gyro_rate_gain": 1.8411235883831978,
+      "image_rate_gain_px_per_command_rad": 590.2900124890429,
+      "gyro_response_delay_upper_bound_s": 0.0548501,
+      "first_image_observation_delay_s": 0.0626949,
+      "max_attitude_excursion_rad": 0.025037872331467006,
+      "max_abs_measured_yaw_rate_rad_s": 0.22103251711669145
+    }
+  ]
+}

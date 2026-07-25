@@ -25,6 +25,10 @@ map.  This runner therefore performs only bounded training stages:
     Reuse that proved promotion, then apply at most 0.90 seconds of
     no-advance image servo authority to prove uninterrupted horizontal and
     vertical Gate-1 alignment before cleanup.  Passage is forbidden.
+``visual-course``
+    Repeat the rolling current/next visual lifecycle with reviewed passage
+    authority until a newer authoritative race status reports race_finished.
+    Completion still requires confirmed reset/disarm cleanup.
 
 Every powered stage proves both the race and IMU clocks rolled back after
 ``SIM_RESET``, calibrates a gyro-only flight estimator during the countdown,
@@ -65,7 +69,11 @@ from typing import (
     Tuple,
 )
 
-from competition.adapter import AttitudeRateCommand, Quaternion
+from competition.adapter import (
+    AttitudeRateCommand,
+    Quaternion,
+    RaceActiveBoundaryChangedBeforeWire,
+)
 from competition.aigp_messages import RaceStatus
 from competition.vq2_capture import (
     HOST_PERF_COUNTER_CLOCK_ID,
@@ -194,6 +202,19 @@ from scripts.aigp_vq2_visual_alignment_stage import (
     VisualAlignmentStageRuntime,
     run_visual_alignment_stage,
 )
+from scripts.aigp_vq2_visual_course_stage import (
+    DEFAULT_VISUAL_COURSE_LIMITS,
+    VisualCourseStageRuntime,
+    VisualCourseYawProfile,
+    run_visual_course_stage,
+)
+from scripts.aigp_vq2_yaw_profile import (
+    YAW_CALIBRATION_PROFILE_SHA256,
+    YawCalibrationProfileError,
+    load_yaw_calibration_profile,
+    validate_yaw_calibration_profile,
+    yaw_calibration_profile_evidence as build_yaw_calibration_profile_evidence,
+)
 
 if TYPE_CHECKING:
     from aigp_loop.replay import AsyncReplayRecorder
@@ -238,17 +259,20 @@ CONTROL_PERIOD_S = 1.0 / CONTROL_HZ
 SIGN_ID_RATE_RAD_S = 0.08
 SIGN_ID_THRUST = 0.235
 SIGN_ID_RESPONSE_SETTLE_S = 0.04
-SIGN_ID_YAW_PULSE_DURATION_S = 0.21
+SIGN_ID_YAW_PULSE_DURATION_S = 1.20
 SIGN_ID_YAW_NEUTRAL_DURATION_S = 0.24
-SIGN_ID_YAW_REVERSAL_DURATION_S = 0.12
-SIGN_ID_YAW_TERMINAL_DURATION_S = 0.04
-SIGN_ID_HARD_EXPIRY_S = 0.95
+SIGN_ID_YAW_REVERSAL_DURATION_S = 0.16
+SIGN_ID_YAW_TERMINAL_DURATION_S = 0.16
+SIGN_ID_HARD_EXPIRY_S = 3.10
+# The proved Gate-0 turn brake is a separate controller phase.  It must not
+# expand when the isolated yaw-calibration observation window changes.
+GATE0_YAW_BRAKE_DURATION_S = 0.21
 SIGN_ID_MIN_RESPONSE_RAD_S = 0.006
 SIGN_ID_MIN_YAW_GYRO_SAMPLES = 4
 SIGN_ID_MIN_FRESH_IMAGE_FRAMES = 4
 SIGN_ID_MIN_IMAGE_EFFECT_PX_S = 15.0
 SIGN_ID_MAX_POLARITY_GAIN_RATIO = 2.0
-SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD = 0.05
+SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD = 0.30
 SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S = 0.50
 SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S = 0.08
 SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S = 0.09
@@ -324,7 +348,9 @@ POST_GATE_SUSTAINED_MAX_BODY_RATE_RAD_S = 0.5
 GATE1_RECENTER_STAGE = "gate1-recenter"
 VISUAL_SHADOW_STAGE = "visual-shadow"
 VISUAL_ALIGN_STAGE = "visual-align"
-VISUAL_POWERED_STAGES = (VISUAL_SHADOW_STAGE, VISUAL_ALIGN_STAGE)
+VISUAL_COURSE_STAGE = "visual-course"
+VISUAL_CHECKPOINT_STAGES = (VISUAL_SHADOW_STAGE, VISUAL_ALIGN_STAGE)
+VISUAL_POWERED_STAGES = (*VISUAL_CHECKPOINT_STAGES, VISUAL_COURSE_STAGE)
 VISUAL_SHADOW_POST_CREDIT_TIMEOUT_S = 0.15
 VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
 VISUAL_ALIGN_HARD_DURATION_S = 0.90
@@ -6220,6 +6246,61 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
 
     if type(stage) is not str or stage not in LIVE_RUN_STAGES:
         raise ValueError("replay controller envelope requires a live stage")
+    if stage == VISUAL_COURSE_STAGE:
+        limits = DEFAULT_VISUAL_COURSE_LIMITS
+        return {
+            "control_hz": CONTROL_HZ,
+            "max_roll_pitch_command_rate_rad_s": (
+                limits.max_command_rate_rad_s
+            ),
+            "yaw_rate_rad_s": limits.max_yaw_rate_rad_s,
+            "max_thrust": limits.max_thrust,
+            "hard_stage_duration_s": limits.course_hard_duration_s,
+            "yaw_calibration_profile_sha256": (
+                YAW_CALIBRATION_PROFILE_SHA256
+            ),
+            "phase_envelopes": {
+                "generic_gate_approach": {
+                    "rolling_visual_graph_only": True,
+                    "allow_advance": False,
+                    "next_gate_preview": True,
+                    "segment_hard_duration_s": (
+                        limits.segment_hard_duration_s
+                    ),
+                },
+                "reviewed_gate_passage": {
+                    "allow_advance": True,
+                    "next_gate_preview": False,
+                    "passage_hard_duration_s": (
+                        limits.passage_hard_duration_s
+                    ),
+                    "max_segment_yaw_excursion_rad": (
+                        limits.max_segment_yaw_excursion_rad
+                    ),
+                    "max_measured_yaw_rate_rad_s": (
+                        limits.max_measured_yaw_rate_rad_s
+                    ),
+                },
+                "crossing_confirmation": {
+                    "exact_zero_rate_zero_thrust": True,
+                    "max_wait_s": limits.crossing_status_timeout_s,
+                    "newer_authoritative_race_status_required": True,
+                },
+                "post_credit_recovery": {
+                    "exact_zero_rate_zero_thrust": True,
+                    "max_wait_s": (
+                        limits.post_credit_fresh_frame_timeout_s
+                    ),
+                    "complete_visibility_epoch_admission_required": True,
+                    "promoted_history_preserved": True,
+                },
+                "terminal": {
+                    "authoritative_race_finished_required": True,
+                    "graph_finish_latch_required": True,
+                    "cleanup_reset_disarm_required": True,
+                },
+            },
+        }
     if stage == VISUAL_ALIGN_STAGE:
         return {
             "control_hz": CONTROL_HZ,
@@ -8251,6 +8332,10 @@ class VQ2Runner:
             Mapping[str, Any] | VisualNavigationConfig
         ] = None,
         visual_controller_evidence: Optional[Mapping[str, Any]] = None,
+        yaw_calibration_profile: Optional[Mapping[str, Any]] = None,
+        yaw_calibration_profile_evidence: Optional[
+            Mapping[str, Any]
+        ] = None,
         visual_session_id: str = "direct-live-session",
     ) -> None:
         if adapter.enable_vision:
@@ -8321,6 +8406,39 @@ class VQ2Runner:
                 "visual controller evidence does not match effective config"
             )
         self.visual_controller_evidence = expected_visual_controller
+        if yaw_calibration_profile is None:
+            if yaw_calibration_profile_evidence is not None:
+                raise ValueError(
+                    "yaw calibration evidence requires a validated profile"
+                )
+            self.yaw_calibration_profile = None
+            self.yaw_calibration_profile_evidence = None
+        else:
+            try:
+                accepted_yaw_profile = validate_yaw_calibration_profile(
+                    dict(yaw_calibration_profile),
+                )
+            except YawCalibrationProfileError as exc:
+                raise ValueError(
+                    f"yaw calibration profile refused: {exc}"
+                ) from exc
+            expected_yaw_evidence = (
+                build_yaw_calibration_profile_evidence(
+                    accepted_yaw_profile
+                )
+            )
+            if (
+                yaw_calibration_profile_evidence is not None
+                and dict(yaw_calibration_profile_evidence)
+                != expected_yaw_evidence
+            ):
+                raise ValueError(
+                    "yaw calibration evidence does not match the profile"
+                )
+            self.yaw_calibration_profile = accepted_yaw_profile
+            self.yaw_calibration_profile_evidence = (
+                expected_yaw_evidence
+            )
         if (
             type(visual_session_id) is not str
             or not visual_session_id
@@ -8397,8 +8515,19 @@ class VQ2Runner:
         self._visual_transition: Optional[ConfirmedGateTransition] = None
         self._visual_shadow_summary: Optional[Dict[str, Any]] = None
         self._visual_alignment_summary: Optional[Dict[str, Any]] = None
+        self._visual_course_summary: Optional[Dict[str, Any]] = None
         self._visual_gate0_blend_summary: Optional[Dict[str, Any]] = None
         self._visual_active_stage: Optional[str] = None
+        # These facts span reset epochs and therefore must never be cleared by
+        # ``_clear_epoch_state``.  They are reset exactly once at powered-stage
+        # entry and remain live through the post-disconnect collision tail.
+        self._cleanup_in_progress = False
+        self._cleanup_allow_pre_reset_pad_contact = False
+        self._cleanup_collision_observations: List[Dict[str, Any]] = []
+        self._cleanup_harmful_collision_count = 0
+        self._cleanup_benign_reset_pad_contact_count = 0
+        self._cleanup_benign_reset_pad_impulse = 0.0
+        self._cleanup_collision_capture_complete = True
 
     def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
         """Enforce the code-owned calibrated yaw excursion envelope."""
@@ -9443,6 +9572,7 @@ class VQ2Runner:
         wire_start_not_before_ns: Optional[int] = None,
         wire_start_deadline_ns: Optional[int] = None,
         wire_visual_token: Optional[VisualCameraFrameToken] = None,
+        wire_race_gate_index: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Send one validated setpoint and optionally prove wire-call timing."""
 
@@ -9471,6 +9601,23 @@ class VQ2Runner:
                 raise ValueError(
                     "visual wire authority requires a receipt and call-start "
                     "deadline"
+                )
+        if wire_race_gate_index is not None:
+            if (
+                type(wire_race_gate_index) is not int
+                or wire_race_gate_index < 0
+            ):
+                raise ValueError(
+                    "wire_race_gate_index must be a non-negative exact int"
+                )
+            if (
+                wire_visual_token is None
+                or not require_wire_receipt
+                or wire_start_deadline_ns is None
+            ):
+                raise ValueError(
+                    "race-active wire authority requires visual authority, "
+                    "an exact receipt, and a call-start deadline"
                 )
         drain_receipts = getattr(self.adapter, "drain_outbound_receipts", None)
         if require_wire_receipt:
@@ -9505,6 +9652,7 @@ class VQ2Runner:
         if wire_start_deadline_ns is not None:
             send_options["call_start_deadline_monotonic_ns"] = wire_start_deadline_ns
         wire_visual_authority: Optional[Dict[str, Any]] = None
+        wire_race_authority: Optional[Dict[str, Any]] = None
         if wire_visual_token is None:
             await self.adapter.send_attitude_rate(command, **send_options)
         else:
@@ -9541,10 +9689,45 @@ class VQ2Runner:
                             "visual receiver publication lease missed the "
                             "wire deadline"
                         )
-                    await self.adapter.send_attitude_rate(
-                        command,
-                        **send_options,
-                    )
+                    if wire_race_gate_index is None:
+                        await self.adapter.send_attitude_rate(
+                            command,
+                            **send_options,
+                        )
+                    else:
+                        guarded_send = getattr(
+                            self.adapter,
+                            "send_attitude_rate_if_race_active",
+                            None,
+                        )
+                        if not callable(guarded_send):
+                            raise SafetyAbort(
+                                "adapter lacks atomic race-active send "
+                                "authority"
+                            )
+                        try:
+                            guarded_authority = await guarded_send(
+                                command,
+                                expected_active_gate_index=(
+                                    wire_race_gate_index
+                                ),
+                                **send_options,
+                            )
+                        except RaceActiveBoundaryChangedBeforeWire:
+                            raise
+                        except (RuntimeError, ValueError) as exc:
+                            raise SafetyAbort(
+                                "visual-course race boundary refused the "
+                                "atomic navigation send"
+                            ) from exc
+                        if not isinstance(guarded_authority, Mapping):
+                            raise SafetyAbort(
+                                "adapter returned invalid race-active send "
+                                "authority"
+                            )
+                        wire_race_authority = dict(
+                            guarded_authority
+                        )
                     transport_return_ns = time.perf_counter_ns()
                     if (
                         type(transport_return_ns) is not int
@@ -9627,6 +9810,63 @@ class VQ2Runner:
                 wire_receipt["visual_receiver_authority"] = (
                     wire_visual_authority
                 )
+            if wire_race_gate_index is not None:
+                authority = wire_race_authority
+                received = (
+                    authority.get("received_race_status")
+                    if isinstance(authority, Mapping)
+                    else None
+                )
+                ingress = (
+                    received.get("ingress")
+                    if isinstance(received, Mapping)
+                    else None
+                )
+                race_payload = (
+                    received.get("race_status")
+                    if isinstance(received, Mapping)
+                    else None
+                )
+                received_ns = (
+                    ingress.get("received_monotonic_ns")
+                    if isinstance(ingress, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(authority, Mapping)
+                    or authority.get("schema")
+                    != "aigp-vq2-race-active-send-authority/1"
+                    or authority.get("expected_active_gate_index")
+                    != wire_race_gate_index
+                    or not isinstance(received, Mapping)
+                    or received.get("schema")
+                    != "aigp-vq2-received-race-status/1"
+                    or not isinstance(ingress, Mapping)
+                    or ingress.get("host_clock_id")
+                    != HOST_PERF_COUNTER_CLOCK_ID
+                    or ingress.get("message_type") != "RACE_STATUS"
+                    or type(received_ns) is not int
+                    or received_ns < 0
+                    or received_ns > call_start
+                    or not isinstance(race_payload, Mapping)
+                    or race_payload.get("active_gate_index")
+                    != wire_race_gate_index
+                    or type(race_payload.get("race_finish_time_ns"))
+                    is not int
+                    or race_payload["race_finish_time_ns"] >= 0
+                ):
+                    raise SafetyAbort(
+                        "race-active send authority does not precede the "
+                        "exact transport call"
+                    )
+                self.recorder.emit(
+                    "race_active_wire_authority",
+                    authority=authority,
+                    call_start_monotonic_ns=call_start,
+                    call_end_monotonic_ns=call_end,
+                )
+                wire_receipt = dict(wire_receipt)
+                wire_receipt["race_active_send_authority"] = authority
             self._last_flight_command_started_ns = call_start
             self.recorder.emit("attitude_target_outbound", receipt=wire_receipt)
         if callable(record_command):
@@ -9922,6 +10162,259 @@ class VQ2Runner:
             await asyncio.sleep(0.005)
         return None
 
+    @staticmethod
+    def _cleanup_collision_primitive(value: Any) -> Dict[str, Any]:
+        if type(value) is dict:
+            row = dict(value)
+        else:
+            convert = getattr(value, "to_primitive", None)
+            if not callable(convert):
+                raise TypeError("collision item lacks an exact primitive")
+            converted = convert()
+            if type(converted) is not dict:
+                raise TypeError("collision primitive must be an exact object")
+            row = dict(converted)
+        if set(row) != {"id", "threat_level", "impulse"}:
+            raise ValueError("collision primitive fields differ")
+        if (
+            type(row["id"]) is not int
+            or not 0 <= row["id"] <= 0xFFFFFFFF
+            or type(row["threat_level"]) is not int
+            or not 0 <= row["threat_level"] <= 0xFF
+            or isinstance(row["impulse"], bool)
+            or not isinstance(row["impulse"], (int, float))
+            or not math.isfinite(float(row["impulse"]))
+        ):
+            raise ValueError("collision primitive is invalid")
+        row["impulse"] = float(row["impulse"])
+        return row
+
+    def _record_cleanup_collision_batch(
+        self,
+        collisions: Any,
+        *,
+        phase: str,
+        allow_benign_reset_pad: bool,
+        collision_stats: Any = None,
+        require_exact_buffer_accounting: bool = False,
+        benign_pad_disposition: str = "benign_reset_pad",
+    ) -> None:
+        """Retain and classify one collision batch without blocking cleanup."""
+
+        if type(phase) is not str or not phase:
+            raise TypeError("cleanup collision phase must be nonempty")
+        if type(allow_benign_reset_pad) is not bool:
+            raise TypeError("cleanup collision pad authority must be exact")
+        if type(require_exact_buffer_accounting) is not bool:
+            raise TypeError("cleanup collision accounting flag must be exact")
+        if benign_pad_disposition not in {
+            "benign_reset_pad",
+            "benign_calibration_pad",
+        }:
+            raise ValueError("cleanup benign pad disposition is invalid")
+        try:
+            values = list(collisions)
+        except (TypeError, ValueError) as exc:
+            self._cleanup_collision_capture_complete = False
+            self._cleanup_harmful_collision_count += 1
+            self._cleanup_collision_observations.append(
+                {
+                    "phase": phase,
+                    "disposition": "invalid_collision_batch",
+                    "detail": type(exc).__name__,
+                }
+            )
+            return
+
+        stats_row: Optional[Dict[str, Any]] = None
+        if collision_stats is not None:
+            try:
+                if isinstance(collision_stats, Mapping):
+                    stats_row = dict(collision_stats)
+                else:
+                    convert = getattr(
+                        collision_stats,
+                        "to_primitive",
+                        None,
+                    )
+                    if callable(convert):
+                        converted = convert()
+                        if not isinstance(converted, Mapping):
+                            raise TypeError
+                        stats_row = dict(converted)
+                    else:
+                        stats_row = asdict(collision_stats)
+                dropped = stats_row.get("dropped")
+                buffered = stats_row.get("buffered")
+                if (
+                    type(dropped) is not int
+                    or dropped < 0
+                    or type(buffered) is not int
+                    or buffered < 0
+                ):
+                    raise ValueError
+                if dropped > 0:
+                    self._cleanup_collision_capture_complete = False
+                    self._cleanup_harmful_collision_count += 1
+                    self._cleanup_collision_observations.append(
+                        {
+                            "phase": phase,
+                            "disposition": "collision_buffer_dropped",
+                            "collision_stats": stats_row,
+                        }
+                    )
+                if (
+                    require_exact_buffer_accounting
+                    and buffered != len(values)
+                ):
+                    self._cleanup_collision_capture_complete = False
+                    self._cleanup_harmful_collision_count += 1
+                    self._cleanup_collision_observations.append(
+                        {
+                            "phase": phase,
+                            "disposition": (
+                                "collision_buffer_accounting_mismatch"
+                            ),
+                            "collision_count": len(values),
+                            "collision_stats": stats_row,
+                        }
+                    )
+            except (TypeError, ValueError):
+                self._cleanup_collision_capture_complete = False
+                self._cleanup_harmful_collision_count += 1
+                self._cleanup_collision_observations.append(
+                    {
+                        "phase": phase,
+                        "disposition": "invalid_collision_stats",
+                    }
+                )
+        elif require_exact_buffer_accounting:
+            self._cleanup_collision_capture_complete = False
+            self._cleanup_harmful_collision_count += 1
+            self._cleanup_collision_observations.append(
+                {
+                    "phase": phase,
+                    "disposition": "missing_collision_stats",
+                }
+            )
+
+        for value in values:
+            try:
+                collision = self._cleanup_collision_primitive(value)
+            except (TypeError, ValueError) as exc:
+                self._cleanup_collision_capture_complete = False
+                self._cleanup_harmful_collision_count += 1
+                observation = {
+                    "phase": phase,
+                    "disposition": "invalid_collision",
+                    "detail": type(exc).__name__,
+                }
+            else:
+                benign = bool(
+                    allow_benign_reset_pad
+                    and is_benign_pad_contact(collision)
+                )
+                if benign:
+                    next_count = (
+                        self._cleanup_benign_reset_pad_contact_count + 1
+                    )
+                    next_impulse = (
+                        self._cleanup_benign_reset_pad_impulse
+                        + abs(float(collision["impulse"]))
+                    )
+                    if (
+                        next_count <= MAX_BENIGN_PAD_CONTACTS
+                        and next_impulse <= MAX_BENIGN_PAD_IMPULSE
+                    ):
+                        self._cleanup_benign_reset_pad_contact_count = (
+                            next_count
+                        )
+                        self._cleanup_benign_reset_pad_impulse = (
+                            next_impulse
+                        )
+                        disposition = benign_pad_disposition
+                    else:
+                        self._cleanup_harmful_collision_count += 1
+                        disposition = "reset_pad_budget_exceeded"
+                else:
+                    self._cleanup_harmful_collision_count += 1
+                    disposition = "harmful"
+                observation = {
+                    "phase": phase,
+                    "disposition": disposition,
+                    "collision": collision,
+                }
+            self._cleanup_collision_observations.append(observation)
+            self.recorder.emit(
+                "cleanup_collision_observed",
+                **observation,
+            )
+
+    def _drain_cleanup_collisions(
+        self,
+        *,
+        phase: str,
+        allow_benign_reset_pad: bool,
+        require_exact_buffer_accounting: bool = False,
+        benign_pad_disposition: str = "benign_reset_pad",
+    ) -> None:
+        stats_fn = getattr(self.adapter, "collision_stats", None)
+        stats = stats_fn() if callable(stats_fn) else None
+        try:
+            collisions = self.adapter.drain_collisions()
+        except BaseException as exc:
+            self._cleanup_collision_capture_complete = False
+            self._cleanup_harmful_collision_count += 1
+            observation = {
+                "phase": phase,
+                "disposition": "collision_drain_failed",
+                "detail": type(exc).__name__,
+            }
+            self._cleanup_collision_observations.append(observation)
+            self.recorder.emit(
+                "cleanup_collision_observed",
+                **observation,
+            )
+            return
+        self._record_cleanup_collision_batch(
+            collisions,
+            phase=phase,
+            allow_benign_reset_pad=allow_benign_reset_pad,
+            collision_stats=stats,
+            require_exact_buffer_accounting=(
+                require_exact_buffer_accounting
+            ),
+            benign_pad_disposition=benign_pad_disposition,
+        )
+
+    def _cleanup_collision_safety_summary(self) -> Dict[str, Any]:
+        safe = bool(
+            self._cleanup_collision_capture_complete
+            and self._cleanup_harmful_collision_count == 0
+            and self._cleanup_benign_reset_pad_contact_count
+            <= MAX_BENIGN_PAD_CONTACTS
+            and self._cleanup_benign_reset_pad_impulse
+            <= MAX_BENIGN_PAD_IMPULSE
+        )
+        return {
+            "safe": safe,
+            "capture_complete": (
+                self._cleanup_collision_capture_complete
+            ),
+            "harmful_collision_count": (
+                self._cleanup_harmful_collision_count
+            ),
+            "benign_reset_pad_contact_count": (
+                self._cleanup_benign_reset_pad_contact_count
+            ),
+            "benign_reset_pad_cumulative_impulse": (
+                self._cleanup_benign_reset_pad_impulse
+            ),
+            "observations": list(
+                self._cleanup_collision_observations
+            ),
+        }
+
     def _accept_reset_proof(self, proof: ResetProof, *, restart_vision: bool) -> None:
         drain_imu = getattr(self.adapter, "drain_imu_samples", None)
         if callable(drain_imu):
@@ -9936,7 +10429,21 @@ class VQ2Runner:
         self._epoch_imu_anchor_us = proof.post_imu_us
         self._epoch_anchor_monotonic_s = time.monotonic()
         self._countdown_observed = proof.countdown_observed
-        self.adapter.drain_collisions()
+        self._drain_cleanup_collisions(
+            phase=(
+                "cleanup-post-reset-proof"
+                if self._cleanup_in_progress
+                else "initial-post-reset-proof"
+            ),
+            allow_benign_reset_pad=True,
+        )
+        if (
+            not self._cleanup_in_progress
+            and not self._cleanup_collision_safety_summary()["safe"]
+        ):
+            raise SafetyAbort(
+                "initial reset epoch contained unsafe collision evidence"
+            )
         if restart_vision:
             self.vision.reset()
             self.vision.start()
@@ -10007,7 +10514,106 @@ class VQ2Runner:
             )
             # This send is deliberately unconditional.  Stale/missing streams
             # may prevent proof, but can never prevent the emergency command.
-            await self.adapter.reset()
+            if self._cleanup_in_progress:
+                reset_with_boundary = getattr(
+                    self.adapter,
+                    "reset_calibration_with_boundary",
+                    None,
+                )
+                if callable(reset_with_boundary):
+                    captured_boundaries: List[Any] = []
+
+                    def retain_boundary(boundary: Any) -> None:
+                        captured_boundaries.append(boundary)
+
+                    returned_boundary: Any = None
+                    try:
+                        returned_boundary = await reset_with_boundary(
+                            retain_boundary
+                        )
+                    finally:
+                        if len(captured_boundaries) != 1:
+                            self._cleanup_collision_capture_complete = (
+                                False
+                            )
+                            self._cleanup_harmful_collision_count += 1
+                            self._cleanup_collision_observations.append(
+                                {
+                                    "phase": (
+                                        "cleanup-atomic-reset-boundary"
+                                    ),
+                                    "disposition": (
+                                        "invalid_reset_boundary_capture"
+                                    ),
+                                }
+                            )
+                        else:
+                            captured_boundary = captured_boundaries[0]
+                            if (
+                                returned_boundary is not None
+                                and returned_boundary
+                                is not captured_boundary
+                            ):
+                                self._cleanup_collision_capture_complete = (
+                                    False
+                                )
+                                self._cleanup_harmful_collision_count += 1
+                                self._cleanup_collision_observations.append(
+                                    {
+                                        "phase": (
+                                            "cleanup-atomic-reset-boundary"
+                                        ),
+                                        "disposition": (
+                                            "reset_boundary_return_mismatch"
+                                        ),
+                                    }
+                                )
+                            self._record_cleanup_collision_batch(
+                                getattr(
+                                    captured_boundary,
+                                    "collisions",
+                                    None,
+                                ),
+                                phase=(
+                                    "cleanup-atomic-reset-boundary"
+                                ),
+                            allow_benign_reset_pad=(
+                                self._cleanup_allow_pre_reset_pad_contact
+                            ),
+                            benign_pad_disposition=(
+                                "benign_calibration_pad"
+                                if self._cleanup_allow_pre_reset_pad_contact
+                                else "benign_reset_pad"
+                            ),
+                            collision_stats=getattr(
+                                    captured_boundary,
+                                    "collision_stats",
+                                    None,
+                                ),
+                                require_exact_buffer_accounting=True,
+                            )
+                else:
+                    # Preserve the unconditional reset fallback but make the
+                    # stage ineligible for success: this adapter cannot close
+                    # the pre-reset collision race atomically.
+                    self._cleanup_collision_capture_complete = False
+                    self._cleanup_harmful_collision_count += 1
+                    observation = {
+                        "phase": "cleanup-atomic-reset-boundary",
+                        "disposition": (
+                            "atomic_reset_boundary_unavailable"
+                        ),
+                    }
+                    self._cleanup_collision_observations.append(
+                        observation
+                    )
+                    self.recorder.emit(
+                        "cleanup_collision_observed",
+                        **observation,
+                    )
+                    await self.adapter.reset()
+            else:
+                await self.adapter.reset()
             if pre_race is not None and pre_imu is not None:
                 proof = await self._observe_reset_proof(
                     attempt=attempt,
@@ -10145,6 +10751,18 @@ class VQ2Runner:
         """Latch command production, cut thrust, confirm disarm, then reset."""
 
         self._abort_latched = True
+        self._cleanup_in_progress = True
+        self._drain_cleanup_collisions(
+            phase="cleanup-entry",
+            allow_benign_reset_pad=(
+                self._cleanup_allow_pre_reset_pad_contact
+            ),
+            benign_pad_disposition=(
+                "benign_calibration_pad"
+                if self._cleanup_allow_pre_reset_pad_contact
+                else "benign_reset_pad"
+            ),
+        )
         race_before_cleanup = self.adapter.race_status
         gate_index_before_cleanup = (
             int(race_before_cleanup.active_gate_index)
@@ -10204,6 +10822,17 @@ class VQ2Runner:
         disarmed = await self._disarm_confirmed(timeout_s=0.6)
         if not disarmed:
             logger.error("Disarm was not confirmed before reset fallback")
+        self._drain_cleanup_collisions(
+            phase="cleanup-after-zero-disarm",
+            allow_benign_reset_pad=(
+                self._cleanup_allow_pre_reset_pad_contact
+            ),
+            benign_pad_disposition=(
+                "benign_calibration_pad"
+                if self._cleanup_allow_pre_reset_pad_contact
+                else "benign_reset_pad"
+            ),
+        )
 
         reset_proved = False
         try:
@@ -10213,17 +10842,27 @@ class VQ2Runner:
 
         if not disarmed or self.adapter.is_armed:
             disarmed = await self._disarm_confirmed()
+        self._drain_cleanup_collisions(
+            phase="cleanup-terminal-post-reset",
+            allow_benign_reset_pad=reset_proved,
+        )
         confirmed = bool(disarmed and reset_proved and not self.adapter.is_armed)
+        collision_safety = self._cleanup_collision_safety_summary()
         self.recorder.emit(
             "cleanup_complete",
             disarmed=disarmed,
             reset_proved=reset_proved,
             confirmed=confirmed,
+            collision_safety=collision_safety,
             gate_index_before_cleanup=gate_index_before_cleanup,
             race_boot_before_cleanup=race_boot_before_cleanup,
         )
         if not confirmed:
             logger.critical("UNRESOLVED EMERGENCY: stop/reset state was not fully confirmed")
+        if not collision_safety["safe"]:
+            logger.error(
+                "Cleanup retained unsafe or incomplete collision evidence"
+            )
         return confirmed
 
     async def _run_sign_id(
@@ -11476,8 +12115,13 @@ class VQ2Runner:
         *,
         from_gate_index: int,
         to_gate_index: int,
+        race_status: AuthoritativeRaceStatusRef,
     ) -> ConfirmedGateTransition:
-        race_ref = self._visual_race_status_ref()
+        if type(race_status) is not AuthoritativeRaceStatusRef:
+            raise SafetyAbort(
+                "visual graph transition lacks an exact captured race status"
+            )
+        race_ref = race_status
         if (
             race_ref.active_gate_index != to_gate_index
             or to_gate_index != from_gate_index + 1
@@ -11618,9 +12262,11 @@ class VQ2Runner:
         self._gate0_transition_proof = proof
         visual_transition: Optional[ConfirmedGateTransition] = None
         if self._visual_tracking_enabled:
+            visual_race_ref = self._visual_race_status_ref()
             visual_transition = self._confirm_visual_transition(
                 from_gate_index=0,
                 to_gate_index=1,
+                race_status=visual_race_ref,
             )
         if capture_transition:
             self._defer_snapshot("gate1_race_credit")
@@ -13794,6 +14440,110 @@ class VQ2Runner:
                 validate_command=validate_command,
             ),
         )
+
+    async def _run_visual_course(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Delegate the generic lifecycle with exact tracked yaw authority."""
+
+        if (
+            self.yaw_calibration_profile is None
+            or self.yaw_calibration_profile_evidence is None
+        ):
+            raise SafetyAbort(
+                "visual-course lacks validated yaw calibration authority"
+            )
+        course_yaw_profile = VisualCourseYawProfile.load_tracked()
+        if (
+            course_yaw_profile.profile_sha256
+            != self.yaw_calibration_profile_evidence.get("sha256")
+            or course_yaw_profile.profile_sha256
+            != YAW_CALIBRATION_PROFILE_SHA256
+            or DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s
+            > course_yaw_profile.max_abs_yaw_rate_command_rad_s
+            or DEFAULT_VISUAL_COURSE_LIMITS.max_segment_yaw_excursion_rad
+            > course_yaw_profile.max_attitude_excursion_rad
+            or DEFAULT_VISUAL_COURSE_LIMITS.max_measured_yaw_rate_rad_s
+            > course_yaw_profile.max_abs_measured_yaw_rate_rad_s
+        ):
+            raise SafetyAbort(
+                "visual-course runtime limits differ from calibrated yaw "
+                "authority"
+            )
+        try:
+            summary = await run_visual_course_stage(
+                self,
+                context,
+                runtime=VisualCourseStageRuntime(
+                    safety_abort_type=SafetyAbort,
+                    cancelled_error_type=asyncio.CancelledError,
+                    monotonic=time.monotonic,
+                    perf_counter_ns=time.perf_counter_ns,
+                    sleep=asyncio.sleep,
+                    next_control_deadline=next_control_deadline,
+                    attitude_rate_command=attitude_rate_command,
+                    limit_command_rates=limit_command_rates,
+                    validate_command=validate_command,
+                    yaw_profile=course_yaw_profile,
+                    expected_yaw_profile_sha256=(
+                        self.yaw_calibration_profile_evidence["sha256"]
+                    ),
+                    limits=DEFAULT_VISUAL_COURSE_LIMITS,
+                ),
+            )
+            if not isinstance(summary, Mapping):
+                raise SafetyAbort(
+                    "visual-course coordinator returned an invalid summary"
+                )
+            self._visual_course_summary = dict(summary)
+            return dict(summary)
+        except BaseException as exc:
+            if self._visual_course_summary is None:
+                graph = self.visual_gate_graph.latest_snapshot
+                race = self.adapter.race_status
+                transitions = (
+                    [
+                        {
+                            "from_gate_index": item.from_gate_index,
+                            "to_gate_index": item.to_gate_index,
+                            "retired_track_id": item.retired_track_id,
+                            "promoted_track_id": item.promoted_track_id,
+                        }
+                        for item in graph.confirmed_transitions
+                    ]
+                    if graph is not None
+                    else []
+                )
+                gate_index = (
+                    int(race.active_gate_index)
+                    if race is not None
+                    else (
+                        graph.current_gate_index
+                        if graph is not None
+                        else None
+                    )
+                )
+                self._visual_course_summary = {
+                    "stage": VISUAL_COURSE_STAGE,
+                    "success": False,
+                    "outcome": "abort",
+                    "reason": str(exc) or type(exc).__name__,
+                    "race_finished": bool(
+                        race is not None and race.race_finished
+                    ),
+                    "initial_gate_index": 0,
+                    "maximum_authoritative_gate_index": gate_index,
+                    "final_gate_index": gate_index,
+                    "authoritative_transitions": transitions,
+                    "segments": [],
+                    "visual_navigation_command_count": None,
+                    "exact_zero_command_count": None,
+                    "yaw_calibration_profile": (
+                        self.yaw_calibration_profile_evidence
+                    ),
+                }
+            raise
 
     def _assert_gate1_no_passage_geometry(
         self,
@@ -16071,10 +16821,21 @@ class VQ2Runner:
         gate_before: Optional[int] = None
         gate_after: Optional[int] = None
         cleanup_confirmed = False
+        cleanup_collision_safe = False
         try:
             self._deferred_pngs = []
             self._post_gate_last_frame = None
             self._abort_latched = False
+            self._cleanup_in_progress = False
+            self._cleanup_allow_pre_reset_pad_contact = stage in {
+                "sign-id",
+                CALIBRATION_STAGE,
+            }
+            self._cleanup_collision_observations = []
+            self._cleanup_harmful_collision_count = 0
+            self._cleanup_benign_reset_pad_contact_count = 0
+            self._cleanup_benign_reset_pad_impulse = 0.0
+            self._cleanup_collision_capture_complete = True
             self._gate1_yaw_reference_rad = None
             self._gate1_max_abs_yaw_excursion_rad = 0.0
             self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
@@ -16086,6 +16847,7 @@ class VQ2Runner:
             self._visual_reset_epoch = 0
             self._visual_shadow_summary = None
             self._visual_alignment_summary = None
+            self._visual_course_summary = None
             self._visual_gate0_blend_summary = None
             await self.establish_reset_epoch(restart_vision=True)
             await self.normalize_disarmed()
@@ -16128,6 +16890,10 @@ class VQ2Runner:
                     "visual_alignment": await self._run_visual_alignment(
                         context
                     )
+                }
+            elif stage == VISUAL_COURSE_STAGE:
+                details = {
+                    "visual_course": await self._run_visual_course(context)
                 }
             elif stage == GATE1_RECENTER_STAGE:
                 gate0_details = await self._run_gate0(
@@ -16219,6 +16985,13 @@ class VQ2Runner:
                 details["visual_alignment"] = dict(
                     self._visual_alignment_summary
                 )
+            if (
+                stage == VISUAL_COURSE_STAGE
+                and self._visual_course_summary is not None
+            ):
+                details["visual_course"] = dict(
+                    self._visual_course_summary
+                )
             reason = str(exc) or type(exc).__name__
             logger.error("%s ABORT: %s", stage, reason)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
@@ -16246,6 +17019,13 @@ class VQ2Runner:
                 details["visual_alignment"] = dict(
                     self._visual_alignment_summary
                 )
+            if (
+                stage == VISUAL_COURSE_STAGE
+                and self._visual_course_summary is not None
+            ):
+                details["visual_course"] = dict(
+                    self._visual_course_summary
+                )
             reason = f"unexpected {type(exc).__name__}: {exc}"
             logger.exception("%s failed unexpectedly", stage)
             self.recorder.emit("stage_abort", stage=stage, reason=reason)
@@ -16261,10 +17041,29 @@ class VQ2Runner:
                 if cleanup_entry_race is not None
                 else None
             )
+            visual_graph_at_cleanup = (
+                self.visual_gate_graph.latest_snapshot
+                if stage in VISUAL_POWERED_STAGES
+                else None
+            )
+            visual_transition_pairs = (
+                [
+                    [
+                        transition.from_gate_index,
+                        transition.to_gate_index,
+                    ]
+                    for transition in (
+                        visual_graph_at_cleanup.confirmed_transitions
+                    )
+                ]
+                if visual_graph_at_cleanup is not None
+                else []
+            )
             if stage in VISUAL_POWERED_STAGES:
                 details["authoritative_cleanup_entry"] = {
                     "gate_index": cleanup_entry_gate_index,
                     "race_finished": cleanup_entry_race_finished,
+                    "transitions": visual_transition_pairs,
                     "transition": (
                         None
                         if self._visual_transition is None
@@ -16274,6 +17073,7 @@ class VQ2Runner:
                         ]
                     ),
                 }
+            if stage in VISUAL_CHECKPOINT_STAGES:
                 if success and (
                     cleanup_entry_gate_index != 1
                     or cleanup_entry_race_finished is not False
@@ -16327,6 +17127,116 @@ class VQ2Runner:
                         self._visual_alignment_summary = (
                             alignment_boundary
                         )
+            if stage == VISUAL_COURSE_STAGE and success:
+                course_summary = self._visual_course_summary
+                summary_transitions = (
+                    course_summary.get("authoritative_transitions")
+                    if isinstance(course_summary, Mapping)
+                    else None
+                )
+                summary_transition_pairs = (
+                    [
+                        [
+                            item.get("from_gate_index"),
+                            item.get("to_gate_index"),
+                        ]
+                        for item in summary_transitions
+                    ]
+                    if (
+                        type(summary_transitions) is list
+                        and all(
+                            isinstance(item, Mapping)
+                            for item in summary_transitions
+                        )
+                    )
+                    else None
+                )
+                ordered_transition_chain = bool(
+                    all(
+                        pair == [index, index + 1]
+                        for index, pair in enumerate(
+                            visual_transition_pairs
+                        )
+                    )
+                    and (
+                        (
+                            visual_transition_pairs
+                            and visual_transition_pairs[-1][1]
+                            == cleanup_entry_gate_index
+                        )
+                        or (
+                            not visual_transition_pairs
+                            and cleanup_entry_gate_index == 0
+                        )
+                    )
+                )
+                graph_race = (
+                    visual_graph_at_cleanup.latest_race_status
+                    if visual_graph_at_cleanup is not None
+                    else None
+                )
+                course_boundary_valid = bool(
+                    cleanup_entry_gate_index is not None
+                    and cleanup_entry_race_finished is True
+                    and visual_graph_at_cleanup is not None
+                    and visual_graph_at_cleanup.race_finished is True
+                    and visual_graph_at_cleanup.current_gate_index
+                    == cleanup_entry_gate_index
+                    and graph_race is not None
+                    and graph_race.race_finished is True
+                    and graph_race.active_gate_index
+                    == cleanup_entry_gate_index
+                    and ordered_transition_chain
+                    and isinstance(course_summary, Mapping)
+                    and course_summary.get("success") is True
+                    and course_summary.get("race_finished") is True
+                    and course_summary.get("initial_gate_index") == 0
+                    and course_summary.get("final_gate_index")
+                    == cleanup_entry_gate_index
+                    and type(
+                        course_summary.get(
+                            "maximum_authoritative_gate_index"
+                        )
+                    )
+                    is int
+                    and course_summary[
+                        "maximum_authoritative_gate_index"
+                    ]
+                    >= cleanup_entry_gate_index
+                    and summary_transition_pairs
+                    == visual_transition_pairs
+                    and course_summary.get(
+                        "yaw_calibration_profile"
+                    )
+                    == self.yaw_calibration_profile_evidence
+                )
+                if not course_boundary_valid:
+                    success = False
+                    boundary_reason = (
+                        "visual-course cleanup boundary lacks authoritative "
+                        "race_finished/ordered rolling-graph proof "
+                        f"(gate_index={cleanup_entry_gate_index}, "
+                        f"race_finished={cleanup_entry_race_finished}, "
+                        f"transitions={visual_transition_pairs})"
+                    )
+                    reason = (
+                        boundary_reason
+                        if reason in {"unknown", "stage completed"}
+                        else f"{reason}; {boundary_reason}"
+                    )
+                    self.recorder.emit(
+                        "stage_abort",
+                        stage=stage,
+                        reason=boundary_reason,
+                    )
+                    if self._visual_course_summary is not None:
+                        boundary_summary = dict(
+                            self._visual_course_summary
+                        )
+                        boundary_summary["success"] = False
+                        boundary_summary["outcome"] = "abort"
+                        boundary_summary["reason"] = boundary_reason
+                        self._visual_course_summary = boundary_summary
             if (
                 stage == GATE1_RECENTER_STAGE
                 and success
@@ -16385,7 +17295,39 @@ class VQ2Runner:
                 )
                 else None
             )
+            course_summary_before_cleanup = (
+                dict(self._visual_course_summary)
+                if (
+                    stage == VISUAL_COURSE_STAGE
+                    and self._visual_course_summary is not None
+                )
+                else None
+            )
             cleanup_confirmed = await self.safe_cleanup()
+            cleanup_collision_summary = (
+                self._cleanup_collision_safety_summary()
+            )
+            cleanup_collision_safe = bool(
+                cleanup_collision_summary["safe"]
+            )
+            details["cleanup_collision_safety"] = (
+                cleanup_collision_summary
+            )
+            if not cleanup_collision_safe:
+                success = False
+                collision_reason = (
+                    "cleanup collision evidence was unsafe or incomplete"
+                )
+                reason = (
+                    collision_reason
+                    if reason in {"unknown", "stage completed"}
+                    else f"{reason}; {collision_reason}"
+                )
+                self.recorder.emit(
+                    "stage_abort",
+                    stage=stage,
+                    reason=collision_reason,
+                )
             if (
                 stage == GATE1_RECENTER_STAGE
                 and recenter_summary_before_cleanup is not None
@@ -16403,8 +17345,14 @@ class VQ2Runner:
                 recenter_summary["success"] = bool(
                     success
                     and cleanup_confirmed
+                    and cleanup_collision_safe
                     and recenter_summary.get("recenter_criteria_met")
                 )
+                if not cleanup_collision_safe:
+                    recenter_summary["outcome"] = "abort"
+                    recenter_summary["reason"] = (
+                        "cleanup collision evidence was unsafe or incomplete"
+                    )
                 self._gate1_recenter_summary = recenter_summary
                 details["gate1_recenter"] = recenter_summary
                 self.recorder.emit(
@@ -16428,6 +17376,7 @@ class VQ2Runner:
                 alignment_summary["success"] = bool(
                     success
                     and cleanup_confirmed
+                    and cleanup_collision_safe
                     and alignment_summary.get(
                         "alignment_criteria_met"
                     )
@@ -16440,11 +17389,63 @@ class VQ2Runner:
                     alignment_summary["abort_outcome"] = (
                         "cleanup_unconfirmed"
                     )
+                elif not cleanup_collision_safe:
+                    alignment_summary["outcome"] = "abort"
+                    alignment_summary["reason"] = (
+                        "cleanup collision evidence was unsafe or incomplete"
+                    )
+                    alignment_summary["abort_outcome"] = (
+                        "cleanup_collision_unsafe"
+                    )
                 self._visual_alignment_summary = alignment_summary
                 details["visual_alignment"] = alignment_summary
                 self.recorder.emit(
                     "visual_alignment_post_cleanup",
                     **alignment_summary,
+                )
+            if (
+                stage == VISUAL_COURSE_STAGE
+                and course_summary_before_cleanup is not None
+            ):
+                course_summary = course_summary_before_cleanup
+                course_summary["cleanup_entry_gate_index"] = (
+                    cleanup_entry_gate_index
+                )
+                course_summary["cleanup_entry_race_finished"] = (
+                    cleanup_entry_race_finished
+                )
+                course_summary["cleanup_confirmed"] = bool(
+                    cleanup_confirmed
+                )
+                course_summary["success"] = bool(
+                    success
+                    and cleanup_confirmed
+                    and cleanup_collision_safe
+                    and course_summary.get("race_finished") is True
+                )
+                if not cleanup_confirmed:
+                    course_summary["outcome"] = "abort"
+                    course_summary["reason"] = (
+                        "visual-course cleanup was unconfirmed"
+                    )
+                    course_summary["first_causal_blocker"] = (
+                        course_summary.get("first_causal_blocker")
+                        or course_summary["reason"]
+                    )
+                elif not cleanup_collision_safe:
+                    course_summary["outcome"] = "abort"
+                    course_summary["reason"] = (
+                        "cleanup collision evidence was unsafe or incomplete"
+                    )
+                    course_summary["first_causal_blocker"] = (
+                        course_summary.get("first_causal_blocker")
+                        or course_summary["reason"]
+                    )
+                self._visual_course_summary = course_summary
+                details["visual_course"] = course_summary
+                self.recorder.emit(
+                    "visual_course_post_cleanup",
+                    **course_summary,
                 )
             race = self.adapter.race_status
             gate_after = race.active_gate_index if race else None
@@ -16493,8 +17494,16 @@ class VQ2Runner:
                 details["diagnostic_errors"] = diagnostic_errors
         return StageResult(
             stage=stage,
-            success=success and cleanup_confirmed,
-            reason=(reason if cleanup_confirmed else f"{reason}; cleanup unconfirmed"),
+            success=(
+                success
+                and cleanup_confirmed
+                and cleanup_collision_safe
+            ),
+            reason=(
+                reason
+                if cleanup_confirmed
+                else f"{reason}; cleanup unconfirmed"
+            ),
             duration_s=time.monotonic() - started,
             gate_index_before=gate_before,
             gate_index_after=gate_after,
@@ -16542,6 +17551,7 @@ async def run_live(
     ] = None,
     candidate_commit: Optional[str] = None,
     expected_controller_config_sha256: Optional[str] = None,
+    expected_yaw_calibration_profile_sha256: Optional[str] = None,
 ) -> StageResult:
     if type(stage) is not str or stage not in LIVE_RUN_STAGES:
         raise ValueError(f"unsupported live stage: {stage}")
@@ -16590,6 +17600,38 @@ async def run_live(
         if stage in VISUAL_POWERED_STAGES
         else legacy_controller
     )
+    accepted_yaw_profile: Optional[Dict[str, Any]] = None
+    accepted_yaw_profile_evidence: Optional[Dict[str, Any]] = None
+    if stage == VISUAL_COURSE_STAGE:
+        if (
+            expected_yaw_calibration_profile_sha256
+            != YAW_CALIBRATION_PROFILE_SHA256
+        ):
+            raise PermissionError(
+                "visual-course requires the exact reviewed yaw profile hash"
+            )
+        try:
+            accepted_yaw_profile = load_yaw_calibration_profile()
+            accepted_yaw_profile_evidence = (
+                build_yaw_calibration_profile_evidence(
+                    accepted_yaw_profile
+                )
+            )
+        except YawCalibrationProfileError as exc:
+            raise PermissionError(
+                f"visual-course yaw authority refused: {exc}"
+            ) from exc
+        if (
+            accepted_yaw_profile_evidence["sha256"]
+            != expected_yaw_calibration_profile_sha256
+        ):
+            raise PermissionError(
+                "visual-course yaw profile identity changed"
+            )
+    elif expected_yaw_calibration_profile_sha256 is not None:
+        raise ValueError(
+            "yaw calibration profile identity is valid only for visual-course"
+        )
     if (
         stage not in {GATE1_RECENTER_STAGE, *VISUAL_POWERED_STAGES}
         and effective_controller.effective_config_sha256
@@ -16644,18 +17686,29 @@ async def run_live(
     ):
         raise ValueError("preflight_timeout_s must be finite and in [1, 10]")
     if stage in VISUAL_POWERED_STAGES and (
-        run_manifest_sha256 is None
+        record is None
+        or run_manifest_sha256 is None
         or candidate_commit is None
         or expected_controller_config_sha256 is None
-        or replay_bundle is None
-        or recording_approved is not True
         or preflight_before_powered_stage is not False
         or write_diagnostic_pngs is not False
     ):
         raise PermissionError(
             "visual-navigation powered stages require the clean, "
-            "manifest-bound fast-cycle "
-            "wrapper with private replay capture"
+            "manifest-bound fast-cycle wrapper"
+        )
+    if stage in VISUAL_CHECKPOINT_STAGES and (
+        replay_bundle is None or recording_approved is not True
+    ):
+        raise PermissionError(
+            "visual checkpoint stages require private replay capture"
+        )
+    if stage == VISUAL_COURSE_STAGE and (
+        replay_bundle is not None or recording_approved is not False
+    ):
+        raise PermissionError(
+            "visual-course requires compact manifest/JSONL/result/lease "
+            "evidence without a replay bundle"
         )
     _load_live_transport_dependencies()
     adapter = AIGPMavlinkAdapter(
@@ -16767,6 +17820,9 @@ async def run_live(
                 "fast_cycle_binding",
                 run_manifest_sha256=run_manifest_sha256,
                 controller=controller,
+                yaw_calibration_profile=(
+                    accepted_yaw_profile_evidence
+                ),
             )
         else:
             recorder.emit(
@@ -16781,6 +17837,10 @@ async def run_live(
             controller_evidence=legacy_controller,
             visual_config=effective_visual_controller,
             visual_controller_evidence=visual_controller,
+            yaw_calibration_profile=accepted_yaw_profile,
+            yaw_calibration_profile_evidence=(
+                accepted_yaw_profile_evidence
+            ),
             visual_session_id=(
                 run_manifest_sha256
                 or candidate_commit
@@ -16859,10 +17919,69 @@ async def run_live(
             vision_capture_stats = {"unavailable": True}
             if replay is not None:
                 replay.fail("vision construction failed before capture ownership")
+        transport_disconnected = False
         try:
             await adapter.disconnect()
+            transport_disconnected = True
         except BaseException as exc:
             cleanup_exceptions.append(exc)
+        if runner is not None and stage != "preflight":
+            if not transport_disconnected:
+                runner._cleanup_collision_capture_complete = False
+                runner._cleanup_harmful_collision_count += 1
+                runner._cleanup_collision_observations.append(
+                    {
+                        "phase": "post-disconnect-collision-tail",
+                        "disposition": "transport_disconnect_unproved",
+                    }
+                )
+            runner._drain_cleanup_collisions(
+                phase="post-disconnect-collision-tail",
+                allow_benign_reset_pad=bool(
+                    result is not None and result.cleanup_confirmed
+                ),
+                require_exact_buffer_accounting=True,
+            )
+            tail_collision_safety = (
+                runner._cleanup_collision_safety_summary()
+            )
+            if result is not None:
+                details = dict(result.details or {})
+                details["cleanup_collision_safety"] = (
+                    tail_collision_safety
+                )
+                if not tail_collision_safety["safe"]:
+                    for summary_name in (
+                        "gate1_recenter",
+                        "visual_alignment",
+                        "visual_course",
+                    ):
+                        nested = details.get(summary_name)
+                        if isinstance(nested, Mapping):
+                            nested = dict(nested)
+                            nested["success"] = False
+                            nested["outcome"] = "abort"
+                            nested["reason"] = (
+                                "post-disconnect collision evidence was "
+                                "unsafe or incomplete"
+                            )
+                            if summary_name == "visual_course":
+                                nested["first_causal_blocker"] = (
+                                    nested.get("first_causal_blocker")
+                                    or nested["reason"]
+                                )
+                            details[summary_name] = nested
+                    result = replace(
+                        result,
+                        success=False,
+                        reason=(
+                            f"{result.reason}; post-disconnect collision "
+                            "evidence was unsafe or incomplete"
+                        ),
+                        details=details,
+                    )
+                else:
+                    result = replace(result, details=details)
         if recorder is not None:
             try:
                 final_estimator = (

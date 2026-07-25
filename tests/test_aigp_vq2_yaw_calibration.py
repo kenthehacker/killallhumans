@@ -11,12 +11,14 @@ def test_plan_identity_timing_and_segment_counts_are_exact():
     plan = calibration.yaw_calibration_plan()
 
     assert plan["schema"] == "aigp-vq2-yaw-calibration-plan/1"
-    assert plan["plan_id"] == "vq2-build3385-training-yaw-calibration-v1"
+    assert plan["plan_id"] == (
+        "vq2-build3385-training-yaw-envelope-calibration-v2"
+    )
     assert plan["stage"] == "calibration-excite"
     assert plan["control_period_ns"] == 20_000_000
-    assert plan["tick_count"] == 45
-    assert plan["nominal_end_offset_ns"] == 900_000_000
-    assert plan["powered_hard_expiry_offset_ns"] == 1_000_000_000
+    assert plan["tick_count"] == 148
+    assert plan["nominal_end_offset_ns"] == 2_960_000_000
+    assert plan["powered_hard_expiry_offset_ns"] == 3_100_000_000
 
     assert [
         (
@@ -27,10 +29,10 @@ def test_plan_identity_timing_and_segment_counts_are_exact():
         for segment in plan["segments"]
     ] == [
         ("neutral-initial", 12, 0.0),
-        ("yaw-positive", 11, 0.08),
-        ("neutral-reversal", 6, 0.0),
-        ("yaw-negative", 11, -0.08),
-        ("neutral-terminal", 5, 0.0),
+        ("yaw-positive", 60, 0.08),
+        ("neutral-reversal", 8, 0.0),
+        ("yaw-negative", 60, -0.08),
+        ("neutral-terminal", 8, 0.0),
     ]
 
 
@@ -41,7 +43,7 @@ def test_canonical_plan_hash_and_validation_are_deterministic():
         calibration.YAW_CALIBRATION_PLAN_SHA256
     )
     assert calibration.YAW_CALIBRATION_PLAN_SHA256 == (
-        "827101741ddb335a1cbfcdbdcfca65c2f7579ad4a435c140179b8d9d0eb2be1b"
+        "b45dff221b1160528adb54313ec0947c065801538c39ade34cc9129c93fef0e1"
     )
     assert calibration.validate_yaw_calibration_plan(plan) == plan
 
@@ -69,13 +71,13 @@ def test_plan_copy_is_defensive_and_frozen_plan_is_deeply_immutable():
 
 def test_every_tick_has_exact_timing_and_bounded_single_axis_command():
     ticks = list(calibration.iter_yaw_calibration_ticks())
-    assert len(ticks) == 45
+    assert len(ticks) == 148
     assert ticks[0]["release_offset_ns"] == 0
     assert ticks[0]["end_offset_ns"] == 20_000_000
-    assert ticks[-1]["release_offset_ns"] == 880_000_000
-    assert ticks[-1]["end_offset_ns"] == 900_000_000
+    assert ticks[-1]["release_offset_ns"] == 2_940_000_000
+    assert ticks[-1]["end_offset_ns"] == 2_960_000_000
     assert all(
-        tick["powered_expiry_offset_ns"] == 1_000_000_000 for tick in ticks
+        tick["powered_expiry_offset_ns"] == 3_100_000_000 for tick in ticks
     )
 
     commands = [tick["command"] for tick in ticks]
@@ -84,10 +86,10 @@ def test_every_tick_has_exact_timing_and_bounded_single_axis_command():
     assert all(command["thrust"] == 0.235 for command in commands)
     assert [command["yaw_rate_rad_s"] for command in commands] == (
         [0.0] * 12
-        + [0.08] * 11
-        + [0.0] * 6
-        + [-0.08] * 11
-        + [0.0] * 5
+        + [0.08] * 60
+        + [0.0] * 8
+        + [-0.08] * 60
+        + [0.0] * 8
     )
 
 
@@ -96,14 +98,14 @@ def test_tick_lookup_resolves_exact_segments_and_absolute_deadlines():
         "neutral-initial"
     )
     assert calibration.yaw_calibration_tick(12)["segment_id"] == "yaw-positive"
-    assert calibration.yaw_calibration_tick(22)["command"]["yaw_rate_rad_s"] == (
+    assert calibration.yaw_calibration_tick(71)["command"]["yaw_rate_rad_s"] == (
         0.08
     )
-    assert calibration.yaw_calibration_tick(23)["segment_id"] == (
+    assert calibration.yaw_calibration_tick(72)["segment_id"] == (
         "neutral-reversal"
     )
-    assert calibration.yaw_calibration_tick(29)["segment_id"] == "yaw-negative"
-    assert calibration.yaw_calibration_tick(40)["segment_id"] == (
+    assert calibration.yaw_calibration_tick(80)["segment_id"] == "yaw-negative"
+    assert calibration.yaw_calibration_tick(140)["segment_id"] == (
         "neutral-terminal"
     )
 
@@ -116,7 +118,7 @@ def test_tick_lookup_resolves_exact_segments_and_absolute_deadlines():
         "segment_id": "yaw-positive",
         "release_monotonic_ns": 8_240_000_000,
         "end_monotonic_ns": 8_260_000_000,
-        "powered_expiry_monotonic_ns": 9_000_000_000,
+        "powered_expiry_monotonic_ns": 11_100_000_000,
         "command": {
             "roll_rate_rad_s": 0.0,
             "pitch_rate_rad_s": 0.0,
@@ -126,7 +128,7 @@ def test_tick_lookup_resolves_exact_segments_and_absolute_deadlines():
     }
 
 
-@pytest.mark.parametrize("tick", [True, False, -1, 45, 1.0, "1", None])
+@pytest.mark.parametrize("tick", [True, False, -1, 148, 1.0, "1", None])
 def test_tick_lookup_rejects_non_exact_or_out_of_range_ticks(tick):
     with pytest.raises(calibration.YawCalibrationPlanError):
         calibration.yaw_calibration_tick(tick)
@@ -143,10 +145,10 @@ def test_tick_lookup_rejects_invalid_monotonic_anchors(anchor):
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("tick_count",), 44),
+        (("tick_count",), 147),
         (("control_period_ns",), 20_000_001),
-        (("nominal_end_offset_ns",), 899_999_999),
-        (("powered_hard_expiry_offset_ns",), 900_000_000),
+        (("nominal_end_offset_ns",), 2_959_999_999),
+        (("powered_hard_expiry_offset_ns",), 2_960_000_000),
         (("command", "thrust"), 0.236),
         (("command", "roll_rate_rad_s"), 0.01),
         (("segments", 1, "first_tick"), 13),

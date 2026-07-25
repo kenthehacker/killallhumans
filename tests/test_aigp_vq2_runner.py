@@ -27,10 +27,12 @@ from competition.adapter import (
     CameraFrame,
     IMUData,
     Quaternion,
+    RaceActiveBoundaryChangedBeforeWire,
     TelemetryState,
 )
 from competition.aigp_messages import RaceStatus
 from competition.aigp_mavlink import (
+    AIGPMavlinkAdapter,
     CalibrationCollisionV1,
     CalibrationResetBoundaryV1,
     MavlinkCollisionStats,
@@ -1881,9 +1883,29 @@ class _FakeAdapter:
         self.collisions = []
         self.commands = []
         self.outbound_receipts = []
+        self.collision_generation = 1
 
     async def reset(self):
         self.reset_calls += 1
+
+    async def reset_calibration_with_boundary(self, persist_boundary):
+        collisions = tuple(
+            CalibrationCollisionV1(
+                id=value["id"],
+                threat_level=value["threat_level"],
+                impulse=value["impulse"],
+            )
+            for value in self.collisions
+        )
+        boundary = SimpleNamespace(
+            collisions=collisions,
+            collision_stats=self.collision_stats(),
+        )
+        persist_boundary(boundary)
+        self.collisions = []
+        self.collision_generation += 1
+        self.reset_calls += 1
+        return boundary
 
     async def arm(self):
         self.arm_calls += 1
@@ -1935,6 +1957,16 @@ class _FakeAdapter:
         collisions = self.collisions
         self.collisions = []
         return collisions
+
+    def collision_stats(self):
+        return MavlinkCollisionStats(
+            generation=self.collision_generation,
+            handled=len(self.collisions),
+            dropped=0,
+            high_watermark=len(self.collisions),
+            capacity=128,
+            buffered=len(self.collisions),
+        )
 
 
 def test_visual_wire_authority_pins_receiver_until_transport_returns():
@@ -2039,6 +2071,227 @@ def test_visual_wire_authority_pins_receiver_until_transport_returns():
         <= authority["call_start_monotonic_ns"]
         <= authority["call_end_monotonic_ns"]
         <= authority["transport_return_monotonic_ns"]
+    )
+
+
+def _received_race_status(
+    *,
+    gate_index=0,
+    race_finish_time_ns=-1,
+    received_monotonic_ns=100,
+):
+    payload = RaceStatusPayloadV1(
+        sim_boot_time_ms=1_000,
+        race_start_boot_time_ms=0,
+        race_finish_time_ns=race_finish_time_ns,
+        active_gate_index=gate_index,
+        last_gate_race_time=-1,
+    )
+    return ReceivedRaceStatusV1(
+        ingress=MavlinkIngressV1(
+            stream_id="vq2-mavlink-udp-14550",
+            generation=1,
+            sequence=4,
+            message_type="RACE_STATUS",
+            host_clock_id="host-perf-counter",
+            received_monotonic_ns=received_monotonic_ns,
+            source_time_value=payload.sim_boot_time_ms,
+            source_time_unit="ms",
+        ),
+        race_status=payload,
+    )
+
+
+def _atomic_race_send_adapter(received):
+    clock = iter((200, 201))
+    calls = []
+
+    class Mav:
+        def set_attitude_target_send(self, *args):
+            calls.append(args)
+
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+        monotonic_ns=lambda: next(clock),
+    )
+    adapter._conn = SimpleNamespace(mav=Mav())
+    adapter._latest_received_race_status = received
+    return adapter, calls
+
+
+def test_adapter_atomic_race_active_send_starts_once_under_same_gate():
+    received = _received_race_status(received_monotonic_ns=100)
+    adapter, calls = _atomic_race_send_adapter(received)
+
+    authority = asyncio.run(
+        adapter.send_attitude_rate_if_race_active(
+            AttitudeRateCommand(0.0, 0.0, -0.04, 0.25),
+            expected_active_gate_index=0,
+            call_start_deadline_monotonic_ns=300,
+        )
+    )
+    receipts = adapter.drain_outbound_receipts()
+
+    assert len(calls) == 1
+    assert len(receipts) == 1
+    assert receipts[0].call_start_monotonic_ns == 200
+    assert authority == {
+        "schema": "aigp-vq2-race-active-send-authority/1",
+        "expected_active_gate_index": 0,
+        "received_race_status": received.to_primitive(),
+    }
+    assert (
+        authority["received_race_status"]["ingress"][
+            "received_monotonic_ns"
+        ]
+        < receipts[0].call_start_monotonic_ns
+    )
+
+
+@pytest.mark.parametrize(
+    "received",
+    (
+        _received_race_status(gate_index=1),
+        _received_race_status(race_finish_time_ns=5_000),
+    ),
+)
+def test_adapter_atomic_race_active_send_refuses_transition_or_finish(
+    received,
+):
+    adapter, calls = _atomic_race_send_adapter(received)
+
+    with pytest.raises(
+        RaceActiveBoundaryChangedBeforeWire,
+        match="boundary changed before wire",
+    ):
+        asyncio.run(
+            adapter.send_attitude_rate_if_race_active(
+                AttitudeRateCommand(0.0, 0.0, -0.04, 0.25),
+                expected_active_gate_index=0,
+                call_start_deadline_monotonic_ns=300,
+            )
+        )
+
+    assert calls == []
+    assert adapter.drain_outbound_receipts() == []
+    assert adapter.outbound_audit().attitude_target == 0
+
+
+def test_runner_preserves_typed_no_wire_race_boundary_outcome():
+    vision = VQ2VisionThread()
+    snapshot = _vision_snapshot(
+        frame_id=179,
+        sim_time_ns=179_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    with vision._data_lock:
+        vision._latest_snapshot = snapshot
+
+    class BoundaryAdapter(_FakeAdapter):
+        async def send_attitude_rate_if_race_active(
+            self,
+            _command,
+            *,
+            expected_active_gate_index,
+            **_kwargs,
+        ):
+            assert expected_active_gate_index == 0
+            raise RaceActiveBoundaryChangedBeforeWire(
+                "race-active send boundary changed before wire"
+            )
+
+    adapter = BoundaryAdapter()
+    runner = VQ2Runner(adapter, vision)
+    runner.visual_tracker._time_basis_id = "host-perf-counter"
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        snapshot
+    )
+
+    with pytest.raises(
+        RaceActiveBoundaryChangedBeforeWire,
+        match="boundary changed before wire",
+    ):
+        asyncio.run(
+            runner._send_flight_command(
+                AttitudeRateCommand(0.0, 0.0, -0.04, 0.25),
+                require_wire_receipt=True,
+                wire_start_deadline_ns=(
+                    vq2_module.time.perf_counter_ns()
+                    + 1_000_000_000
+                ),
+                wire_visual_token=expected,
+                wire_race_gate_index=0,
+            )
+        )
+
+    assert adapter.commands == []
+    assert adapter.drain_outbound_receipts() == []
+
+
+def test_runner_records_atomic_race_authority_with_visual_wire_receipt():
+    vision = VQ2VisionThread()
+    snapshot = _vision_snapshot(
+        frame_id=180,
+        sim_time_ns=180_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    with vision._data_lock:
+        vision._latest_snapshot = snapshot
+
+    class GuardedAdapter(_FakeAdapter):
+        async def send_attitude_rate_if_race_active(
+            self,
+            command,
+            *,
+            expected_active_gate_index,
+            **kwargs,
+        ):
+            await self.send_attitude_rate(command, **kwargs)
+            return {
+                "schema": "aigp-vq2-race-active-send-authority/1",
+                "expected_active_gate_index": (
+                    expected_active_gate_index
+                ),
+                "received_race_status": (
+                    _received_race_status(
+                        gate_index=expected_active_gate_index,
+                        received_monotonic_ns=1,
+                    ).to_primitive()
+                ),
+            }
+
+    adapter = GuardedAdapter()
+    runner = VQ2Runner(adapter, vision)
+    runner.visual_tracker._time_basis_id = "host-perf-counter"
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        snapshot
+    )
+
+    receipt = asyncio.run(
+        runner._send_flight_command(
+            AttitudeRateCommand(0.0, 0.0, -0.04, 0.25),
+            require_wire_receipt=True,
+            wire_start_deadline_ns=(
+                vq2_module.time.perf_counter_ns() + 1_000_000_000
+            ),
+            wire_visual_token=expected,
+            wire_race_gate_index=0,
+        )
+    )
+
+    assert receipt is not None
+    race_authority = receipt["race_active_send_authority"]
+    assert race_authority["expected_active_gate_index"] == 0
+    assert (
+        race_authority["received_race_status"]["ingress"][
+            "received_monotonic_ns"
+        ]
+        <= receipt["call_start_monotonic_ns"]
     )
 
 
@@ -4951,6 +5204,296 @@ def test_emergency_reset_is_sent_even_with_no_fresh_baseline(monkeypatch):
     assert adapter.reset_calls == 1
 
 
+def test_cleanup_atomic_reset_boundary_retains_harmful_collision(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(10_000, 0, -1, 3, 500)
+    adapter.latest_telemetry = TelemetryState(
+        timestamp_us=0,
+        position_ned=(0.0, 0.0, 0.0),
+        velocity_ned=(0.0, 0.0, 0.0),
+        orientation=Quaternion(),
+        angular_velocity=(0.0, 0.0, 0.0),
+        imu=IMUData(
+            timestamp_us=10_000_000,
+            accel=(0.0, 0.0, -9.81),
+            gyro=(0.0, 0.0, 0.0),
+        ),
+    )
+    adapter.collisions = [
+        {"id": 9, "threat_level": 2, "impulse": 0.2}
+    ]
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    async def observe(**_kwargs):
+        return proof
+
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe)
+
+    assert asyncio.run(runner.emergency_reset()) is proof
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["capture_complete"] is True
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"] == [
+        {
+            "phase": "cleanup-atomic-reset-boundary",
+            "disposition": "harmful",
+            "collision": {
+                "id": 9,
+                "threat_level": 2,
+                "impulse": 0.2,
+            },
+        }
+    ]
+    assert adapter.collisions == []
+
+
+def test_cleanup_post_reset_exact_pad_contact_is_separate_and_bounded():
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.0025}
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is True
+    assert safety["harmful_collision_count"] == 0
+    assert safety["benign_reset_pad_contact_count"] == 1
+    assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
+        0.0025
+    )
+    assert safety["observations"][0]["disposition"] == "benign_reset_pad"
+
+
+def test_cleanup_post_reset_pad_contact_budget_excess_is_unsafe():
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.0025}
+        for _ in range(vq2_module.MAX_BENIGN_PAD_CONTACTS + 1)
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][-1]["disposition"] == (
+        "reset_pad_budget_exceeded"
+    )
+
+
+def test_powered_stage_cleanup_collision_fails_stage_but_retains_reset_proof(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
+    runner = VQ2Runner(adapter, _FakeVision())
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        322,
+        174,
+        6_400,
+        1_000,
+    )
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def wait_for_go():
+        return context
+
+    async def stage_body():
+        adapter.collisions = [
+            {"id": 7, "threat_level": 2, "impulse": 0.1}
+        ]
+        return {"yaw_calibration": {"yaw_identified": True}}
+
+    async def disarm(*_args, **_kwargs):
+        adapter.is_armed = False
+        return True
+
+    async def reset():
+        return ResetProof(
+            attempt=1,
+            pre_race_boot_ms=10_000,
+            post_race_boot_ms=500,
+            pre_imu_us=10_000_000,
+            post_imu_us=500_000,
+            advancing_race_samples=3,
+            advancing_imu_samples=5,
+            countdown_observed=True,
+        )
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", no_op)
+    monkeypatch.setattr(runner, "normalize_disarmed", no_op)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(runner, "arm_confirmed", no_op)
+    monkeypatch.setattr(runner, "_run_sign_id", stage_body)
+    monkeypatch.setattr(runner, "_disarm_confirmed", disarm)
+    monkeypatch.setattr(runner, "emergency_reset", reset)
+
+    result = asyncio.run(runner.run_powered_stage("sign-id"))
+
+    assert result.success is False
+    assert result.cleanup_confirmed is True
+    assert "cleanup collision evidence" in result.reason
+    safety = result.details["cleanup_collision_safety"]
+    assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 1
+    assert safety["observations"][0]["phase"] == "cleanup-entry"
+
+
+def test_visual_course_cleanup_collision_downgrades_nested_success(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(1_500, 0, 42, 0, -1)
+    profile = vq2_module.load_yaw_calibration_profile()
+    profile_evidence = (
+        vq2_module.build_yaw_calibration_profile_evidence(profile)
+    )
+    runner = VQ2Runner(
+        adapter,
+        _FakeVision(),
+        yaw_calibration_profile=profile,
+        yaw_calibration_profile_evidence=profile_evidence,
+    )
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        322,
+        174,
+        6_400,
+        1_000,
+    )
+    finish_ref = vq2_module.AuthoritativeRaceStatusRef.live(
+        session_id="cleanup-summary-test",
+        reset_epoch=1,
+        race_generation=2,
+        race_status_sequence=3,
+        race_status_boot_ms=1_500,
+        active_gate_index=0,
+        received_monotonic_ns=500_000_000,
+        host_clock_id="host-perf-counter",
+        race_finished=True,
+    )
+    runner.visual_gate_graph._latest_snapshot = SimpleNamespace(
+        confirmed_transitions=(),
+        race_finished=True,
+        current_gate_index=0,
+        latest_race_status=finish_ref,
+    )
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def wait_for_go():
+        return context
+
+    def bind_initial(_context):
+        return None
+
+    async def run_course(_context):
+        summary = {
+            "stage": vq2_module.VISUAL_COURSE_STAGE,
+            "success": True,
+            "race_finished": True,
+            "outcome": "race_finished",
+            "first_causal_blocker": None,
+            "initial_gate_index": 0,
+            "final_gate_index": 0,
+            "maximum_authoritative_gate_index": 0,
+            "authoritative_transitions": [],
+            "yaw_calibration_profile": profile_evidence,
+        }
+        runner._visual_course_summary = dict(summary)
+        return summary
+
+    async def unsafe_cleanup():
+        runner._cleanup_harmful_collision_count = 1
+        runner._cleanup_collision_observations.append(
+            {
+                "phase": "cleanup-entry",
+                "disposition": "harmful",
+                "collision": {
+                    "id": 7,
+                    "threat_level": 2,
+                    "impulse": 0.1,
+                },
+            }
+        )
+        return True
+
+    monkeypatch.setattr(runner, "establish_reset_epoch", no_op)
+    monkeypatch.setattr(runner, "normalize_disarmed", no_op)
+    monkeypatch.setattr(runner, "wait_for_go", wait_for_go)
+    monkeypatch.setattr(
+        runner,
+        "_bind_initial_visual_gate",
+        bind_initial,
+    )
+    monkeypatch.setattr(runner, "arm_confirmed", no_op)
+    monkeypatch.setattr(runner, "_run_visual_course", run_course)
+    monkeypatch.setattr(runner, "safe_cleanup", unsafe_cleanup)
+
+    result = asyncio.run(
+        runner.run_powered_stage(
+            vq2_module.VISUAL_COURSE_STAGE,
+            write_diagnostic_pngs=False,
+        )
+    )
+
+    assert result.success is False
+    assert result.cleanup_confirmed is True
+    assert result.details["cleanup_collision_safety"]["safe"] is False
+    nested = result.details["visual_course"]
+    assert nested["success"] is False
+    assert nested["outcome"] == "abort"
+    assert nested["reason"] == (
+        "cleanup collision evidence was unsafe or incomplete"
+    )
+    assert nested["first_causal_blocker"] == nested["reason"]
+
+
 def test_invalid_imu_after_bootstrap_latches_estimator_failure():
     adapter = _FakeAdapter()
     vision = _FakeVision()
@@ -5323,16 +5866,16 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     from scripts import aigp_vq2_yaw_calibration as yaw_contract
 
     assert vq2_module.SIGN_ID_RATE_RAD_S == 0.08
-    assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 0.21
+    assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 1.20
     assert vq2_module.SIGN_ID_YAW_NEUTRAL_DURATION_S == 0.24
-    assert vq2_module.SIGN_ID_YAW_REVERSAL_DURATION_S == 0.12
-    assert vq2_module.SIGN_ID_YAW_TERMINAL_DURATION_S == 0.04
-    assert vq2_module.SIGN_ID_HARD_EXPIRY_S == 0.95
+    assert vq2_module.SIGN_ID_YAW_REVERSAL_DURATION_S == 0.16
+    assert vq2_module.SIGN_ID_YAW_TERMINAL_DURATION_S == 0.16
+    assert vq2_module.SIGN_ID_HARD_EXPIRY_S == 3.10
     assert vq2_module.SIGN_ID_MIN_YAW_GYRO_SAMPLES == 4
     assert vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES == 4
     assert vq2_module.SIGN_ID_MIN_IMAGE_EFFECT_PX_S == 15.0
     assert vq2_module.SIGN_ID_MAX_POLARITY_GAIN_RATIO == 2.0
-    assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.05
+    assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.30
     assert vq2_module.SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S == 0.50
     assert vq2_module.SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S == 0.08
     assert (
@@ -5536,10 +6079,11 @@ def test_sign_id_yaw_terminal_hold_runs_watchdog(monkeypatch):
         monkeypatch,
     )
     calls = [0]
+    from scripts import aigp_vq2_yaw_calibration as yaw_contract
 
     def watchdog(**_kwargs):
         calls[0] += 1
-        if calls[0] == 46:
+        if calls[0] == yaw_contract.YAW_CALIBRATION_TICK_COUNT + 1:
             raise SafetyAbort("terminal calibration collision")
 
     monkeypatch.setattr(runner, "_watchdog", watchdog)
@@ -5547,7 +6091,7 @@ def test_sign_id_yaw_terminal_hold_runs_watchdog(monkeypatch):
     with pytest.raises(SafetyAbort, match="terminal calibration collision"):
         asyncio.run(runner._run_sign_id())
 
-    assert calls[0] == 46
+    assert calls[0] == yaw_contract.YAW_CALIBRATION_TICK_COUNT + 1
     assert not any(
         event == "yaw_calibration_plan_complete"
         for event, _payload in events
@@ -5609,9 +6153,10 @@ def test_sign_id_powered_dispatch_excites_only_yaw(monkeypatch):
 
     assert result.success
     assert result.cleanup_confirmed
-    assert result.details == {
-        "yaw_calibration": {"yaw_identified": True},
+    assert result.details["yaw_calibration"] == {
+        "yaw_identified": True
     }
+    assert result.details["cleanup_collision_safety"]["safe"] is True
     assert calls == [
         "reset",
         "normalize",
@@ -5629,13 +6174,15 @@ def test_calibration_excite_delegates_only_to_bounded_yaw_plan(
     calls = []
 
     async def sign_id(*, calibration_context):
+        from scripts import aigp_vq2_yaw_calibration as yaw_contract
+
         calls.append(calibration_context)
         return {
             "calibration_kind": "yaw-sign-authority-delay",
             "plan_id": "yaw-plan",
             "plan_sha256": "a" * 64,
-            "ticks_sent": 45,
-            "ticks_expected": 45,
+            "ticks_sent": yaw_contract.YAW_CALIBRATION_TICK_COUNT,
+            "ticks_expected": yaw_contract.YAW_CALIBRATION_TICK_COUNT,
         }
 
     monkeypatch.setattr(runner, "_run_sign_id", sign_id)
@@ -5647,7 +6194,11 @@ def test_calibration_excite_delegates_only_to_bounded_yaw_plan(
     assert details["calibration_scope"] == (
         "yaw-only-sign-authority-delay-build3385"
     )
-    assert details["ticks_sent"] == details["ticks_expected"] == 45
+    from scripts import aigp_vq2_yaw_calibration as yaw_contract
+
+    assert details["ticks_sent"] == details["ticks_expected"] == (
+        yaw_contract.YAW_CALIBRATION_TICK_COUNT
+    )
 
 
 def test_delayed_pre_reset_clocks_cannot_unlock_go():
@@ -6049,9 +6600,11 @@ def test_fast_calibration_stage_retains_reset_go_arm_and_cleanup(monkeypatch):
         calls.append("arm_confirmed")
 
     async def excite(value):
+        from scripts import aigp_vq2_yaw_calibration as yaw_contract
+
         assert value == context
         calls.append("calibration-excite")
-        return {"ticks_sent": 245}
+        return {"ticks_sent": yaw_contract.YAW_CALIBRATION_TICK_COUNT}
 
     async def cleanup():
         calls.append("cleanup")
@@ -6886,7 +7439,8 @@ def test_gate0_stage_does_not_enter_post_pass_observation(monkeypatch):
     result = asyncio.run(runner.run_powered_stage("gate0"))
 
     assert result.success
-    assert result.details == {"gate0_passed": True}
+    assert result.details["gate0_passed"] is True
+    assert result.details["cleanup_collision_safety"]["safe"] is True
 
 
 @pytest.mark.parametrize("stage", ["full-lap"])
@@ -6931,6 +7485,264 @@ def test_unaccepted_course_stages_are_rejected_before_live_import_or_contact(
         )
 
     assert live_imports == []
+
+
+@pytest.mark.parametrize("profile_hash", [None, "f" * 64])
+def test_visual_course_refuses_missing_or_wrong_yaw_profile_before_transport(
+    monkeypatch,
+    profile_hash,
+):
+    live_imports = []
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        lambda: live_imports.append("visual-course"),
+    )
+
+    with pytest.raises(
+        PermissionError,
+        match="exact reviewed yaw profile hash",
+    ):
+        asyncio.run(
+            vq2_module.run_live(
+                vq2_module.VISUAL_COURSE_STAGE,
+                "udpin:127.0.0.1:14550",
+                None,
+                expected_yaw_calibration_profile_sha256=profile_hash,
+            )
+        )
+
+    assert live_imports == []
+
+
+def test_visual_course_rejects_replay_before_transport_with_other_bindings_valid(
+    tmp_path,
+    monkeypatch,
+):
+    live_imports = []
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        lambda: live_imports.append("visual-course"),
+    )
+    visual_config = vq2_module.default_visual_config()
+
+    with pytest.raises(
+        PermissionError,
+        match="compact manifest/JSONL/result/lease evidence",
+    ):
+        asyncio.run(
+            vq2_module.run_live(
+                vq2_module.VISUAL_COURSE_STAGE,
+                "udpin:127.0.0.1:14550",
+                str(tmp_path / "session.jsonl.gz"),
+                replay_bundle=str(tmp_path / "forbidden.vq2replay"),
+                recording_approved=True,
+                preflight_before_powered_stage=False,
+                write_diagnostic_pngs=False,
+                run_manifest_sha256="a" * 64,
+                candidate_commit="b" * 40,
+                expected_controller_config_sha256=(
+                    visual_config.effective_config_sha256
+                ),
+                expected_yaw_calibration_profile_sha256=(
+                    vq2_module.YAW_CALIBRATION_PROFILE_SHA256
+                ),
+            )
+        )
+
+    assert live_imports == []
+
+
+def test_visual_course_requires_compact_jsonl_before_transport(monkeypatch):
+    live_imports = []
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        lambda: live_imports.append("visual-course"),
+    )
+    visual_config = vq2_module.default_visual_config()
+
+    with pytest.raises(
+        PermissionError,
+        match="manifest-bound fast-cycle wrapper",
+    ):
+        asyncio.run(
+            vq2_module.run_live(
+                vq2_module.VISUAL_COURSE_STAGE,
+                "udpin:127.0.0.1:14550",
+                None,
+                replay_bundle=None,
+                recording_approved=False,
+                preflight_before_powered_stage=False,
+                write_diagnostic_pngs=False,
+                run_manifest_sha256="a" * 64,
+                candidate_commit="b" * 40,
+                expected_controller_config_sha256=(
+                    visual_config.effective_config_sha256
+                ),
+                expected_yaw_calibration_profile_sha256=(
+                    vq2_module.YAW_CALIBRATION_PROFILE_SHA256
+                ),
+            )
+        )
+
+    assert live_imports == []
+
+
+def test_visual_course_exact_compact_arguments_reach_mocked_transport(
+    tmp_path,
+    monkeypatch,
+):
+    from competition.aigp_mavlink import (
+        MavlinkIngressStats,
+        MavlinkOutboundAudit,
+    )
+
+    class ContactObserved(RuntimeError):
+        pass
+
+    observed = {
+        "loads": 0,
+        "adapter_kwargs": None,
+        "vision_kwargs": None,
+        "address": None,
+        "disconnects": 0,
+    }
+
+    class CompactAdapter(_FakeAdapter):
+        async def connect(self, address):
+            observed["address"] = address
+            raise ContactObserved("compact visual-course reached transport")
+
+        async def disconnect(self):
+            observed["disconnects"] += 1
+
+        def drain_received_ingress(self):
+            return []
+
+        def ingress_stats(self):
+            return MavlinkIngressStats(
+                generation=1,
+                next_sequence=0,
+                highres_imu_received=0,
+                heartbeat_received=0,
+                race_status_received=0,
+                actuator_received=0,
+                dropped=0,
+                high_watermark=0,
+                imu_capacity=1,
+                other_capacity=1,
+                imu_dropped=0,
+                other_dropped=0,
+                imu_high_watermark=0,
+                other_high_watermark=0,
+                buffered_imu=0,
+                buffered_other=0,
+            )
+
+        def outbound_audit(self):
+            return MavlinkOutboundAudit(0, 0, 0, 0, 0, 0, 0, 0)
+
+    def load_transport():
+        observed["loads"] += 1
+
+    def adapter_factory(**kwargs):
+        observed["adapter_kwargs"] = dict(kwargs)
+        return CompactAdapter()
+
+    def vision_factory(**kwargs):
+        observed["vision_kwargs"] = dict(kwargs)
+        return _FakeVision()
+
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        load_transport,
+    )
+    monkeypatch.setattr(vq2_module, "AIGPMavlinkAdapter", adapter_factory)
+    monkeypatch.setattr(vq2_module, "VQ2VisionThread", vision_factory)
+    monkeypatch.setattr(
+        vq2_module,
+        "_replay_capture_dependencies",
+        lambda: pytest.fail("compact visual-course constructed replay"),
+    )
+    visual_config = vq2_module.default_visual_config()
+    address = "udpin:127.0.0.1:14550"
+    trace = tmp_path / "session.jsonl.gz"
+
+    with pytest.raises(
+        ContactObserved,
+        match="reached transport",
+    ):
+        asyncio.run(
+            vq2_module.run_live(
+                vq2_module.VISUAL_COURSE_STAGE,
+                address,
+                str(trace),
+                replay_bundle=None,
+                recording_approved=False,
+                preflight_before_powered_stage=False,
+                write_diagnostic_pngs=False,
+                run_manifest_sha256="a" * 64,
+                candidate_commit="b" * 40,
+                expected_controller_config_sha256=(
+                    visual_config.effective_config_sha256
+                ),
+                expected_yaw_calibration_profile_sha256=(
+                    vq2_module.YAW_CALIBRATION_PROFILE_SHA256
+                ),
+            )
+        )
+
+    assert observed == {
+        "loads": 1,
+        "adapter_kwargs": {
+            "enable_vision": False,
+            "require_track": False,
+            "telemetry_mode": "imu",
+            "fetch_track_on_connect": False,
+        },
+        "vision_kwargs": {
+            "on_snapshot": None,
+            "capture_snapshot_queue_enabled": False,
+        },
+        "address": address,
+        "disconnects": 1,
+    }
+    with vq2_module.gzip.open(trace, "rt", encoding="utf-8") as handle:
+        binding = json.loads(handle.readline())
+    assert binding["event"] == "fast_cycle_binding"
+    assert binding["run_manifest_sha256"] == "a" * 64
+    assert binding["yaw_calibration_profile"]["sha256"] == (
+        vq2_module.YAW_CALIBRATION_PROFILE_SHA256
+    )
+
+
+def test_runner_binds_exact_yaw_profile_and_rejects_mismatched_evidence():
+    profile = vq2_module.load_yaw_calibration_profile()
+    evidence = vq2_module.build_yaw_calibration_profile_evidence(profile)
+
+    runner = VQ2Runner(
+        _FakeAdapter(),
+        _FakeVision(),
+        yaw_calibration_profile=profile,
+        yaw_calibration_profile_evidence=evidence,
+    )
+
+    assert runner.yaw_calibration_profile_evidence == evidence
+    altered = dict(evidence)
+    altered["sha256"] = "f" * 64
+    with pytest.raises(
+        ValueError,
+        match="evidence does not match",
+    ):
+        VQ2Runner(
+            _FakeAdapter(),
+            _FakeVision(),
+            yaw_calibration_profile=profile,
+            yaw_calibration_profile_evidence=altered,
+        )
 
 
 @pytest.mark.parametrize(
@@ -7478,7 +8290,7 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
             vq2_module.run_live(
                 vq2_module.VISUAL_ALIGN_STAGE,
                 "udp://127.0.0.1:14550",
-                None,
+                str(tmp_path / "visual-alignment.jsonl.gz"),
                 replay_bundle=str(bundle),
                 recording_approved=True,
                 preflight_before_powered_stage=False,

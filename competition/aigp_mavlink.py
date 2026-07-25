@@ -33,6 +33,7 @@ from competition.adapter import (
     IMUData,
     PositionCommand,
     Quaternion,
+    RaceActiveBoundaryChangedBeforeWire,
     TelemetryState,
 )
 from competition.aigp_geometry import AIGP_CAM_UDP_PORT
@@ -1946,6 +1947,108 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                     call_start_deadline_monotonic_ns
                 ),
             )
+
+    async def send_attitude_rate_if_race_active(
+        self,
+        cmd: AttitudeRateCommand,
+        *,
+        expected_active_gate_index: int,
+        powered_deadline_monotonic_ns: Optional[int] = None,
+        powered_cleanup: bool = False,
+        call_start_not_before_monotonic_ns: Optional[int] = None,
+        call_start_deadline_monotonic_ns: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically exclude race ingress while starting one rate command.
+
+        The lock order matches the existing reset-boundary transaction:
+        send -> ingress dispatch -> state.  Consequently, a race status whose
+        receive timestamp is admitted before the exact transport call-start
+        must be visible to this guard.  A transition or finish refuses the
+        command before any wire call; ingress received after the call waits
+        until the transport returns.
+        """
+
+        if (
+            type(expected_active_gate_index) is not int
+            or expected_active_gate_index < 0
+        ):
+            raise ValueError(
+                "expected_active_gate_index must be a non-negative exact int"
+            )
+        self._require_conn()
+        if not all(
+            math.isfinite(value)
+            for value in (cmd.roll_rate, cmd.pitch_rate, cmd.yaw_rate)
+        ):
+            raise ValueError("body rates must be finite")
+        thrust = _clamp_thrust(cmd.thrust)
+        sx, sy, sz = self._rate_sign
+        wire = self._attitude_wire_type(
+            time_boot_ms=self._time_boot_ms(),
+            target_system=self._target_system,
+            target_component=self._target_component,
+            type_mask=SET_ATTITUDE_TARGET_MASK_RATES_THRUST,
+            q_wxyz=(1.0, 0.0, 0.0, 0.0),
+            body_rates_rad_s=(
+                sx * cmd.roll_rate,
+                sy * cmd.pitch_rate,
+                sz * cmd.yaw_rate,
+            ),
+            thrust=thrust,
+        )
+        powered_exact_zero = None
+        if self._powered_transport is not None and powered_cleanup:
+            from scripts.aigp_vq2_powered_runtime import exact_zero_rate_thrust
+
+            powered_exact_zero = exact_zero_rate_thrust(
+                {
+                    "roll_rate_rad_s": cmd.roll_rate,
+                    "pitch_rate_rad_s": cmd.pitch_rate,
+                    "yaw_rate_rad_s": cmd.yaw_rate,
+                    "thrust": cmd.thrust,
+                }
+            )
+
+        with self._send_lock:
+            with self._ingress_dispatch_lock:
+                with self._state_lock:
+                    received = self._latest_received_race_status
+                    if received is None:
+                        raise RuntimeError(
+                            "race-active send lacks received race authority"
+                        )
+                    race_status = received.race_status
+                    if (
+                        race_status.active_gate_index
+                        != expected_active_gate_index
+                        or race_status.race_finish_time_ns >= 0
+                    ):
+                        raise RaceActiveBoundaryChangedBeforeWire(
+                            "race-active send boundary changed before wire"
+                        )
+                    race_authority = {
+                        "schema": "aigp-vq2-race-active-send-authority/1",
+                        "expected_active_gate_index": (
+                            expected_active_gate_index
+                        ),
+                        "received_race_status": received.to_primitive(),
+                    }
+                self._call_attitude_target_locked(
+                    api="send_attitude_rate",
+                    wire=wire,
+                    powered_deadline_monotonic_ns=(
+                        powered_deadline_monotonic_ns
+                    ),
+                    powered_cleanup=powered_cleanup,
+                    powered_exact_zero=powered_exact_zero,
+                    call_start_not_before_monotonic_ns=(
+                        call_start_not_before_monotonic_ns
+                    ),
+                    call_start_deadline_monotonic_ns=(
+                        call_start_deadline_monotonic_ns
+                    ),
+                )
+        return race_authority
 
     async def send_position(
         self,

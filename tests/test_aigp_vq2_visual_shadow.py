@@ -428,6 +428,7 @@ def _prime_reacquisition_bridge_gate_graph(
     transition = runner._confirm_visual_transition(
         from_gate_index=0,
         to_gate_index=1,
+        race_status=runner._visual_race_status_ref(),
     )
     assert transition.retired_track_id == current_id
     assert transition.promoted_track_id == target_id
@@ -502,6 +503,56 @@ def test_race_credit_camera_watermark_includes_detectionless_frame():
         for track in runner.visual_tracker.tracks()
         for sample in track.history
     )
+
+
+def test_transition_uses_captured_credit_when_newer_same_gate_status_arrives():
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    _context, current_id, promoted_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=300_000_000,
+    )
+    captured_credit = runner._visual_race_status_ref()
+
+    _update_visual(
+        runner,
+        _frame(
+            105,
+            [
+                _detection(280, 140, 80, 80, confidence=0.95),
+                _detection(465, 65, 50, 60, confidence=0.90),
+            ],
+            final_packet_ns=320_000_000,
+        ),
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_350,
+        sequence=12,
+        received_ns=340_000_000,
+    )
+
+    transition = runner._confirm_visual_transition(
+        from_gate_index=0,
+        to_gate_index=1,
+        race_status=captured_credit,
+    )
+
+    assert transition.retired_track_id == current_id
+    assert transition.promoted_track_id == promoted_id
+    assert transition.race_status == captured_credit
+    assert transition.race_status.race_status_sequence == 11
+    assert transition.camera_token_at_credit.frame_id == 104
+    assert transition.promoted_latest_token_at_promotion.frame_id == 105
+    assert runner._visual_race_status_ref().race_status_sequence == 12
 
 
 def test_sample_consumes_every_detection_with_exact_receiver_provenance(
@@ -975,6 +1026,7 @@ def test_shadow_promotes_precredit_track_without_reset_and_sends_only_zero(
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
             to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
         )
         assert transition.promoted_track_id == expected_next_id
         runner._gate0_transition_proof = vq2_module.GateTransitionProof(
@@ -1179,6 +1231,7 @@ def test_powered_shadow_requires_authoritative_boundary_and_confirmed_cleanup(
     assert result.details["authoritative_cleanup_entry"] == {
         "gate_index": cleanup_gate,
         "race_finished": False,
+        "transitions": [],
         "transition": [0, 1],
     }
 
@@ -1305,6 +1358,7 @@ def test_visual_alignment_current_authority_rejects_a_fresh_track_miss():
     runner._confirm_visual_transition(
         from_gate_index=0,
         to_gate_index=1,
+        race_status=runner._visual_race_status_ref(),
     )
     _update_visual(
         runner,
@@ -1358,6 +1412,7 @@ def test_visual_alignment_current_authority_defaults_to_receiver_clock(
     runner._confirm_visual_transition(
         from_gate_index=0,
         to_gate_index=1,
+        race_status=runner._visual_race_status_ref(),
     )
     _update_visual(
         runner,
@@ -1409,6 +1464,7 @@ def test_visual_alignment_rejects_graph_or_race_ambiguity():
     runner._confirm_visual_transition(
         from_gate_index=0,
         to_gate_index=1,
+        race_status=runner._visual_race_status_ref(),
     )
     _update_visual(
         runner,
@@ -1482,6 +1538,7 @@ def test_visual_alignment_no_passage_bounds_fail_closed(
     runner._confirm_visual_transition(
         from_gate_index=0,
         to_gate_index=1,
+        race_status=runner._visual_race_status_ref(),
     )
     promoted = runner.visual_tracker.track(promoted_id)
     unsafe = replace(
@@ -1537,6 +1594,7 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
             to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
         )
         assert transition.retired_track_id == initial_current_id
         assert transition.promoted_track_id == promoted_id
@@ -1836,6 +1894,7 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
             to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
         )
         assert transition.retired_track_id == initial_current_id
         assert transition.promoted_track_id == promoted_id
@@ -2298,6 +2357,7 @@ def test_visual_alignment_recovery_dispatch_abort_records_nested_outcome(
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
             to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
         )
         assert transition.retired_track_id == initial_current_id
         assert transition.promoted_track_id == promoted_id
@@ -2430,6 +2490,7 @@ def test_visual_alignment_rejects_blended_identity_promotion_mismatch(
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
             to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
         )
         assert transition.retired_track_id == initial_current_id
         assert transition.promoted_track_id == promoted_id
@@ -2489,6 +2550,7 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
         transition = runner._confirm_visual_transition(
             from_gate_index=0,
             to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
         )
         assert transition.promoted_track_id == promoted_id
         runner._gate0_transition_proof = vq2_module.GateTransitionProof(

@@ -15,15 +15,14 @@ from scripts import aigp_vq2_fast_cycle as fast_cycle
 from scripts import aigp_vq2_controller_config as controller_config
 from scripts import aigp_vq2_visual_config as visual_config
 from scripts import aigp_vq2_yaw_calibration as yaw_calibration
+from scripts import aigp_vq2_yaw_profile as yaw_profile
 
 
 UTC = datetime(2026, 7, 22, 20, 0, tzinfo=timezone.utc)
 
 
 def test_calibration_manifest_binds_exact_yaw_plan():
-    assert fast_cycle._excitation_plan_identity(
-        "calibration-excite"
-    ) == {
+    expected = {
         "plan_id": yaw_calibration.YAW_CALIBRATION_PLAN_ID,
         "sha256": yaw_calibration.YAW_CALIBRATION_PLAN_SHA256,
         "tick_count": yaw_calibration.YAW_CALIBRATION_TICK_COUNT,
@@ -31,9 +30,41 @@ def test_calibration_manifest_binds_exact_yaw_plan():
             yaw_calibration.YAW_CALIBRATION_CONTROL_PERIOD_NS
         ),
     }
+    assert fast_cycle._excitation_plan_identity(
+        "calibration-excite"
+    ) == expected
+    assert fast_cycle._excitation_plan_identity("sign-id") == expected
     assert fast_cycle._excitation_plan_identity("hover") is None
     assert (
         "scripts/aigp_vq2_yaw_calibration.py"
+        in fast_cycle._RUNTIME_SOURCE_PATHS
+    )
+
+
+def test_visual_course_manifest_binds_reviewed_yaw_profile():
+    identity = fast_cycle._yaw_profile_identity("visual-course")
+
+    assert identity == {
+        "profile_id": yaw_profile.YAW_CALIBRATION_PROFILE_ID,
+        "sha256": yaw_profile.YAW_CALIBRATION_PROFILE_SHA256,
+        "source_commit": yaw_profile.YAW_CALIBRATION_SOURCE_COMMIT,
+        "plan_id": yaw_profile.YAW_CALIBRATION_PLAN_ID,
+        "plan_sha256": yaw_profile.YAW_CALIBRATION_PLAN_SHA256,
+        "authority": yaw_profile.load_yaw_calibration_profile()[
+            "authority"
+        ],
+    }
+    assert fast_cycle._yaw_profile_identity("visual-align") is None
+    assert (
+        "scripts/aigp_vq2_visual_course_stage.py"
+        in fast_cycle._RUNTIME_SOURCE_PATHS
+    )
+    assert (
+        "scripts/aigp_vq2_yaw_profile.py"
+        in fast_cycle._RUNTIME_SOURCE_PATHS
+    )
+    assert (
+        "config/aigp_vq2_yaw_calibration_build3385.json"
         in fast_cycle._RUNTIME_SOURCE_PATHS
     )
 
@@ -77,12 +108,9 @@ def test_compact_manifest_has_no_interactive_or_bulk_freeze_inputs(tmp_path):
         ],
         target_config={"path": "target.json", "size_bytes": 2, "sha256": "f" * 64},
         development_lock={"path": "lock.txt", "size_bytes": 3, "sha256": "1" * 64},
-        excitation_plan={
-            "plan_id": "plan",
-            "sha256": "2" * 64,
-            "tick_count": 245,
-            "control_period_ns": 20_000_000,
-        },
+        excitation_plan=fast_cycle._excitation_plan_identity(
+            "calibration-excite"
+        ),
     )
 
     assert manifest["schema"] == fast_cycle.MANIFEST_SCHEMA
@@ -138,9 +166,10 @@ def test_gate1_recenter_is_admitted_as_the_bounded_position_only_stage():
     [
         ("visual-shadow", "shadow.vq2replay"),
         ("visual-align", "alignment.vq2replay"),
+        ("visual-course", None),
     ],
 )
-def test_visual_stage_is_admitted_with_visual_config_and_replay_evidence(
+def test_visual_stage_is_admitted_with_stage_scoped_compact_evidence(
     tmp_path,
     monkeypatch,
     requested_stage,
@@ -208,22 +237,42 @@ def test_visual_stage_is_admitted_with_visual_config_and_replay_evidence(
     assert kwargs["expected_controller_config_sha256"] == (
         effective.effective_config_sha256
     )
-    assert kwargs["recording_approved"] is True
+    assert kwargs["expected_yaw_calibration_profile_sha256"] == (
+        yaw_profile.YAW_CALIBRATION_PROFILE_SHA256
+        if requested_stage == "visual-course"
+        else None
+    )
+    assert kwargs["recording_approved"] is (
+        requested_stage in fast_cycle.VISUAL_REPLAY_STAGES
+    )
     assert kwargs["preflight_before_powered_stage"] is False
     assert kwargs["write_diagnostic_pngs"] is False
-    replay_path = Path(kwargs["replay_bundle"])
-    assert replay_path.parent == Path(record).parent
-    assert replay_path.name == expected_replay_name
+    replay_path = (
+        None
+        if kwargs["replay_bundle"] is None
+        else Path(kwargs["replay_bundle"])
+    )
+    if expected_replay_name is None:
+        assert replay_path is None
+    else:
+        assert replay_path is not None
+        assert replay_path.parent == Path(record).parent
+        assert replay_path.name == expected_replay_name
     manifest = json.loads(
         (Path(record).parent / "run-manifest.json").read_text()
     )
-    assert manifest["evidence"]["replay_bundle"] == str(replay_path)
+    assert manifest["evidence"]["replay_bundle"] == (
+        None if replay_path is None else str(replay_path)
+    )
     assert manifest["candidate"]["worktree_state"] == "clean"
+    assert manifest["inputs"]["yaw_calibration_profile"] == (
+        fast_cycle._yaw_profile_identity(requested_stage)
+    )
 
 
 @pytest.mark.parametrize(
     "requested_stage",
-    ["visual-shadow", "visual-align"],
+    ["visual-shadow", "visual-align", "visual-course"],
 )
 def test_visual_stage_refuses_dirty_candidate_before_live_contact(
     tmp_path,
@@ -262,7 +311,10 @@ def test_visual_stage_refuses_dirty_candidate_before_live_contact(
     assert called is False
 
 
-@pytest.mark.parametrize("requested_stage", ["calibration-excite"])
+@pytest.mark.parametrize(
+    "requested_stage",
+    ["sign-id", "calibration-excite"],
+)
 def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
     tmp_path,
     requested_stage,
@@ -286,7 +338,9 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
             gate_index_before=0,
             gate_index_after=0,
             cleanup_confirmed=True,
-            details={"ticks_sent": 245},
+            details={
+                "ticks_sent": yaw_calibration.YAW_CALIBRATION_TICK_COUNT
+            },
             controller=evidence,
         )
 
