@@ -10884,7 +10884,8 @@ class VQ2Runner:
                     returned_boundary: Any = None
                     try:
                         returned_boundary = await reset_with_boundary(
-                            retain_boundary
+                            retain_boundary,
+                            cleanup_post_reset_disarm=True,
                         )
                     finally:
                         if len(captured_boundaries) != 1:

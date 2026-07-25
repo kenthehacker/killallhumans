@@ -24,6 +24,7 @@ from competition.aigp_messages import (
 from competition.adapter import Quaternion, TelemetryState
 from competition.aigp_mavlink import (
     AIGPMavlinkAdapter,
+    MAV_CMD_COMPONENT_ARM_DISARM,
     POWERED_OUTBOUND_CALL_NS,
     POWERED_RECEIVE_MODE_EXTERNAL_CLEANUP,
     POWERED_WORKER_POLL_NS,
@@ -1413,6 +1414,133 @@ def test_powered_cleanup_persistence_failure_is_latched_but_cannot_suppress_rese
     adapter._powered_transport.close()
 
 
+def test_powered_cleanup_reset_and_atomic_disarm_are_adjacent_and_ordered():
+    ticks = iter((100, 200, 300, 400, 500))
+    adapter, raw_socket, guards, _production, _scratch, peer = _powered_adapter(
+        monotonic_ns=lambda: next(ticks)
+    )
+    _manually_promote_powered_adapter(adapter, guards, peer)
+    guards.enable_cleanup_live(
+        parent_alive=True,
+        lease_valid=True,
+        source_promoted=True,
+    )
+
+    boundary = asyncio.run(
+        adapter.reset_calibration_with_boundary(
+            lambda _boundary: None,
+            powered_deadline_monotonic_ns=1_000_000_000,
+            powered_cleanup=True,
+            cleanup_post_reset_disarm=True,
+        )
+    )
+
+    assert boundary.new_generation == 1
+    assert len(raw_socket.sent) == 2
+    assert adapter.outbound_audit().sim_reset == 1
+    assert adapter.outbound_audit().disarm == 1
+    receipts = adapter.drain_outbound_receipts()
+    assert [receipt.category for receipt in receipts] == [
+        "sim_reset",
+        "disarm",
+    ]
+    assert [receipt.outbound_sequence for receipt in receipts] == [0, 1]
+    assert receipts[0].wire.command == SIM_RESET_COMMAND
+    assert receipts[1].wire.command == MAV_CMD_COMPONENT_ARM_DISARM
+    assert receipts[1].wire.params == (0.0,) * 7
+    assert all(receipt.outcome == "returned" for receipt in receipts)
+    assert guards.cleanup_state == "enabled_live"
+    adapter._powered_transport.close()
+
+
+def test_atomic_post_reset_disarm_failure_does_not_suppress_reset_boundary():
+    class FailingDisarmMav(FakeMav):
+        def command_long_send(self, *args):
+            super().command_long_send(*args)
+            if args[2] == MAV_CMD_COMPONENT_ARM_DISARM:
+                raise RuntimeError("injected atomic disarm failure")
+
+    ticks = iter((100, 200, 300, 400, 500))
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+        monotonic_ns=lambda: next(ticks),
+    )
+    adapter._conn = FakeConn()
+    adapter._conn.mav = FailingDisarmMav()
+    persisted = []
+
+    boundary = asyncio.run(
+        adapter.reset_calibration_with_boundary(
+            persisted.append,
+            cleanup_post_reset_disarm=True,
+        )
+    )
+
+    assert persisted == [boundary]
+    assert [
+        call[1][2] for call in adapter._conn.mav.calls
+    ] == [SIM_RESET_COMMAND, MAV_CMD_COMPONENT_ARM_DISARM]
+    assert adapter.outbound_audit().sim_reset == 1
+    assert adapter.outbound_audit().disarm == 1
+    receipts = adapter.drain_outbound_receipts()
+    assert [receipt.category for receipt in receipts] == [
+        "sim_reset",
+        "disarm",
+    ]
+    assert receipts[0].outcome == "returned"
+    assert receipts[1].outcome == "raised"
+    assert receipts[1].error_type == "RuntimeError"
+
+
+def test_atomic_reset_failure_still_attempts_disarm_and_preserves_error():
+    class ResetBoom(RuntimeError):
+        pass
+
+    class FailingResetMav(FakeMav):
+        def command_long_send(self, *args):
+            super().command_long_send(*args)
+            if args[2] == SIM_RESET_COMMAND:
+                raise ResetBoom("injected reset failure")
+
+    ticks = iter((100, 200, 300, 400, 500))
+    adapter = AIGPMavlinkAdapter(
+        enable_vision=False,
+        require_track=False,
+        telemetry_mode="imu",
+        fetch_track_on_connect=False,
+        monotonic_ns=lambda: next(ticks),
+    )
+    adapter._conn = FakeConn()
+    adapter._conn.mav = FailingResetMav()
+    persisted = []
+
+    with pytest.raises(ResetBoom, match="injected reset failure"):
+        asyncio.run(
+            adapter.reset_calibration_with_boundary(
+                persisted.append,
+                cleanup_post_reset_disarm=True,
+            )
+        )
+
+    assert len(persisted) == 1
+    assert [
+        call[1][2] for call in adapter._conn.mav.calls
+    ] == [SIM_RESET_COMMAND, MAV_CMD_COMPONENT_ARM_DISARM]
+    assert adapter.outbound_audit().sim_reset == 1
+    assert adapter.outbound_audit().disarm == 1
+    receipts = adapter.drain_outbound_receipts()
+    assert [receipt.category for receipt in receipts] == [
+        "sim_reset",
+        "disarm",
+    ]
+    assert receipts[0].outcome == "raised"
+    assert receipts[0].error_type == "ResetBoom"
+    assert receipts[1].outcome == "returned"
+
+
 def test_powered_cleanup_reset_progress_can_take_over_after_boundary_before_send():
     authority = {
         "role_valid": True,
@@ -1509,8 +1637,18 @@ def test_powered_prepower_persistence_failure_still_suppresses_reset():
     adapter._powered_transport.close()
 
 
-def test_calibration_boundary_excludes_receiver_dispatch_through_reset_call():
-    ticks = iter((60_000, 60_010, 60_020))
+def test_calibration_boundary_excludes_dispatch_through_reset_and_disarm():
+    ticks = iter(
+        (
+            60_000,
+            60_010,
+            60_020,
+            60_030,
+            60_040,
+            60_050,
+            60_060,
+        )
+    )
     adapter = AIGPMavlinkAdapter(
         enable_vision=False,
         monotonic_ns=lambda: next(ticks),
@@ -1519,6 +1657,18 @@ def test_calibration_boundary_excludes_receiver_dispatch_through_reset_call():
     receiver_started = threading.Event()
     receiver_finished = threading.Event()
     receiver_thread = None
+    competing_send_started = threading.Event()
+    competing_send_finished = threading.Event()
+    competing_send_thread = None
+
+    class LockCheckingMav(FakeMav):
+        def command_long_send(self, *args):
+            if len(self.calls) < 2:
+                assert not receiver_finished.is_set()
+                assert not competing_send_finished.is_set()
+            super().command_long_send(*args)
+
+    adapter._conn.mav = LockCheckingMav()
 
     def receive_new_heartbeat():
         receiver_started.set()
@@ -1528,23 +1678,54 @@ def test_calibration_boundary_excludes_receiver_dispatch_through_reset_call():
         )
         receiver_finished.set()
 
+    def send_competing_arm():
+        competing_send_started.set()
+        try:
+            asyncio.run(adapter.arm())
+        finally:
+            competing_send_finished.set()
+
     def persist(_boundary):
-        nonlocal receiver_thread
+        nonlocal competing_send_thread, receiver_thread
         receiver_thread = threading.Thread(target=receive_new_heartbeat)
         receiver_thread.start()
+        competing_send_thread = threading.Thread(
+            target=send_competing_arm,
+        )
+        competing_send_thread.start()
         assert receiver_started.wait(0.5)
+        assert competing_send_started.wait(0.5)
         assert not receiver_finished.wait(0.02)
+        assert not competing_send_finished.wait(0.02)
         assert adapter.ingress_stats().next_sequence == 0
 
-    boundary = asyncio.run(adapter.reset_calibration_with_boundary(persist))
+    boundary = asyncio.run(
+        adapter.reset_calibration_with_boundary(
+            persist,
+            cleanup_post_reset_disarm=True,
+        )
+    )
     assert receiver_thread is not None
+    assert competing_send_thread is not None
     receiver_thread.join(timeout=0.5)
+    competing_send_thread.join(timeout=0.5)
     assert not receiver_thread.is_alive()
+    assert not competing_send_thread.is_alive()
     assert receiver_finished.is_set()
+    assert competing_send_finished.is_set()
     observations = adapter.drain_received_observations()
     assert len(observations) == 1
     assert observations[0].ingress.generation == boundary.new_generation
     assert observations[0].ingress.sequence == 0
+    assert [
+        call[1][2] for call in adapter._conn.mav.calls
+    ] == [
+        SIM_RESET_COMMAND,
+        MAV_CMD_COMPONENT_ARM_DISARM,
+        MAV_CMD_COMPONENT_ARM_DISARM,
+    ]
+    assert adapter._conn.mav.calls[1][1][4] == 0.0
+    assert adapter._conn.mav.calls[2][1][4] == 1.0
 
 
 def test_collision_diagnostics_count_bounded_overflow_and_legacy_drain():

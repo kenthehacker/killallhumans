@@ -2137,6 +2137,7 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         powered_deadline_monotonic_ns: Optional[int] = None,
         powered_cleanup: bool = False,
         powered_progress: Optional[Callable[[], None]] = None,
+        cleanup_post_reset_disarm: bool = False,
     ) -> CalibrationResetBoundaryV1:
         """Persist an atomic old-generation capture before sending SIM_RESET.
 
@@ -2151,6 +2152,10 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         powered cleanup, runs under the same atomic locks after persistence and
         immediately before the final reset authorization/send so parent-death
         takeover can complete without creating a second generation boundary.
+        ``cleanup_post_reset_disarm`` additionally attempts one cleanup-only
+        disarm immediately after that reset call while both the send and
+        ingress-dispatch locks remain held.  It is best-effort and never
+        replaces newer-heartbeat disarm confirmation.
 
         Collision rows here are immutable copies of the adapter's legacy raw
         collision facts.  The powered dispatcher, which knows phase and
@@ -2166,6 +2171,10 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 raise ValueError(
                     "powered_progress requires powered cleanup reset authority"
                 )
+        if type(cleanup_post_reset_disarm) is not bool:
+            raise TypeError(
+                "cleanup_post_reset_disarm must be an exact boolean"
+            )
         self._require_conn()
 
         # Exclude the announce thread and every command API from the boundary
@@ -2257,21 +2266,69 @@ class AIGPMavlinkAdapter(CompetitionInterface):
                 )
                 if powered_progress is not None:
                     powered_progress()
-                self._call_nonattitude_locked(
-                    category="sim_reset",
-                    api="command_long_send",
-                    audit_name="sim_reset",
-                    wire=wire,
-                    call=lambda: self._conn.mav.command_long_send(
-                        wire.target_system,
-                        wire.target_component,
-                        wire.command,
-                        wire.confirmation,
-                        *wire.params,
-                    ),
-                    powered_deadline_monotonic_ns=powered_deadline_monotonic_ns,
-                    powered_cleanup=powered_cleanup,
-                )
+                try:
+                    self._call_nonattitude_locked(
+                        category="sim_reset",
+                        api="command_long_send",
+                        audit_name="sim_reset",
+                        wire=wire,
+                        call=lambda: self._conn.mav.command_long_send(
+                            wire.target_system,
+                            wire.target_component,
+                            wire.command,
+                            wire.confirmation,
+                            *wire.params,
+                        ),
+                        powered_deadline_monotonic_ns=(
+                            powered_deadline_monotonic_ns
+                        ),
+                        powered_cleanup=powered_cleanup,
+                    )
+                finally:
+                    if cleanup_post_reset_disarm:
+                        disarm_wire = self._command_long_wire_type(
+                            target_system=self._target_system,
+                            target_component=self._target_component,
+                            command=MAV_CMD_COMPONENT_ARM_DISARM,
+                            confirmation=0,
+                            params=(
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                            ),
+                        )
+                        try:
+                            self._call_nonattitude_locked(
+                                category="disarm",
+                                api="command_long_send",
+                                audit_name="disarm",
+                                wire=disarm_wire,
+                                call=lambda: (
+                                    self._conn.mav.command_long_send(
+                                        disarm_wire.target_system,
+                                        disarm_wire.target_component,
+                                        disarm_wire.command,
+                                        disarm_wire.confirmation,
+                                        *disarm_wire.params,
+                                    )
+                                ),
+                                powered_deadline_monotonic_ns=(
+                                    powered_deadline_monotonic_ns
+                                ),
+                                powered_cleanup=powered_cleanup,
+                            )
+                        except Exception:
+                            # Reset proof and the independent final disarm
+                            # confirmation remain mandatory.  This adjacent
+                            # cleanup cut is deliberately best-effort so its
+                            # local send failure cannot suppress either.
+                            logger.exception(
+                                "Atomic post-reset cleanup disarm failed"
+                            )
         return boundary
 
     async def wait_for_track_data(self, timeout_s: float = 10.0) -> Optional[TrackData]:

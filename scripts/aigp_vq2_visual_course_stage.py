@@ -3991,56 +3991,11 @@ async def _run_visual_course_stage_impl(
                 segment[
                     "passage_next_preview_command_count"
                 ] = passage_next_preview_command_count
-            if (
-                accepted.yaw_soft_stop_zeroed
-                and proposal.servo_output.next_gate_blend > 0.0
-                and not next_preview_retired
-            ):
-                assert (
-                    type(passage_admission)
-                    is VisualApproachPassageAdmission
-                    and type(passage_admission.preview_track_id) is str
-                )
-                try:
-                    planner.retire_passage_preview(
-                        passage_admission.preview_track_id
-                    )
-                except VisualApproachRefusal as exc:
-                    raise abort_type(
-                        "visual-course could not retire preview at calibrated "
-                        "yaw soft stop"
-                    ) from exc
-                withdrawal = {
-                    "reason": "calibrated_yaw_soft_stop",
-                    "camera_token": asdict(token),
-                    "tracker_frame_sequence": (
-                        snapshot.tracker_frame_sequence
-                    ),
-                    "violation_codes": [
-                        "calibrated_yaw_soft_stop",
-                    ],
-                    "violation_evidence": [],
-                    "transient_eligible": False,
-                    "requested_yaw_rate_rad_s": (
-                        proposal.servo_output.yaw_rate_rad_s
-                    ),
-                    "admitted_yaw_rate_rad_s": 0.0,
-                }
-                next_preview_retired = True
-                segment["next_preview_withdrawal_count"] = int(
-                    segment["next_preview_withdrawal_count"]
-                ) + 1
-                segment["next_preview_withdrawal"] = withdrawal
-                segment["next_preview_retired"] = True
-                host.recorder.emit(
-                    "visual_course_next_preview_withdrawn",
-                    gate_index=current_gate_index,
-                    stage=(
-                        f"{VISUAL_COURSE_STAGE}/gate"
-                        f"{current_gate_index}/passage"
-                    ),
-                    **withdrawal,
-                )
+            # The calibrated yaw limiter owns only the yaw channel.  Keep the
+            # already sealed, same-identity preview alive so its independently
+            # bounded pitch/collective corrections remain fresh.  This frame
+            # still cannot count as advance or arm crossing below, and every
+            # later publication must independently re-pass the yaw limiter.
             refresh_live_summary()
             if (
                 proposal.servo_output.advance_enabled

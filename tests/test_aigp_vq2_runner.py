@@ -1994,6 +1994,7 @@ class _FakeAdapter:
 
     def __init__(self):
         self.reset_calls = 0
+        self.cleanup_post_reset_disarm_requests = 0
         self.arm_calls = 0
         self.imu_samples = []
         self.collisions = []
@@ -2004,7 +2005,15 @@ class _FakeAdapter:
     async def reset(self):
         self.reset_calls += 1
 
-    async def reset_calibration_with_boundary(self, persist_boundary):
+    async def reset_calibration_with_boundary(
+        self,
+        persist_boundary,
+        *,
+        cleanup_post_reset_disarm=False,
+    ):
+        assert type(cleanup_post_reset_disarm) is bool
+        if cleanup_post_reset_disarm:
+            self.cleanup_post_reset_disarm_requests += 1
         collisions = tuple(
             CalibrationCollisionV1(
                 id=value["id"],
@@ -5526,7 +5535,7 @@ def test_cleanup_reset_without_clock_baseline_reacts_to_newer_armed_heartbeat(
     assert disarm_observations == [(56, True)]
 
 
-def test_cleanup_reset_captures_anchor_without_sending_against_stale_state(
+def test_cleanup_reset_requests_atomic_disarm_before_proof_wait_without_claim(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -5560,8 +5569,16 @@ def test_cleanup_reset_captures_anchor_without_sending_against_stale_state(
     events = []
     reset_with_boundary = adapter.reset_calibration_with_boundary
 
-    async def reset_then_return(persist_boundary):
-        boundary = await reset_with_boundary(persist_boundary)
+    async def reset_then_return(
+        persist_boundary,
+        *,
+        cleanup_post_reset_disarm,
+    ):
+        assert cleanup_post_reset_disarm is True
+        boundary = await reset_with_boundary(
+            persist_boundary,
+            cleanup_post_reset_disarm=cleanup_post_reset_disarm,
+        )
         events.append("reset_returned")
         return boundary
 
@@ -5582,6 +5599,7 @@ def test_cleanup_reset_captures_anchor_without_sending_against_stale_state(
     monkeypatch.setattr(runner, "_observe_reset_proof", observe)
 
     assert asyncio.run(runner.emergency_reset()) is proof
+    assert adapter.cleanup_post_reset_disarm_requests == 1
     assert events == [
         "reset_returned",
         "proof_wait",
@@ -6254,6 +6272,115 @@ def test_cleanup_rejects_exact_high_energy_visual_course_reset_contact():
     assert {row["disposition"] for row in safety["observations"][1:]} == {
         "benign_reset_pad"
     }
+
+
+def test_cleanup_rejects_exact_attempt16_high_energy_reset_batch():
+    impulses = (
+        0.1466638594865799,
+        4.1180338859558105,
+        0.19095055758953094,
+        0.1753886342048645,
+        0.08287937194108963,
+        0.07079105079174042,
+        0.0691244974732399,
+        0.061687011271715164,
+        0.051315177232027054,
+        0.04146957769989967,
+        0.0427708774805069,
+        0.046275921165943146,
+        0.04794364795088768,
+        0.04766120761632919,
+        0.04559176415205002,
+        0.04379289224743843,
+        0.041580114513635635,
+        0.0400996096432209,
+        0.03893681615591049,
+        0.03808487206697464,
+        0.03750221058726311,
+        0.03688058257102966,
+        0.0365213118493557,
+        0.03598038852214813,
+        0.03544771671295166,
+        0.03490550443530083,
+        0.03435870632529259,
+        0.03385394811630249,
+        0.03336295485496521,
+        0.03292267397046089,
+        0.032543573528528214,
+        0.03211642801761627,
+        0.031827691942453384,
+        0.03149475157260895,
+        0.031158536672592163,
+        0.03090137429535389,
+        0.030699390918016434,
+        0.03036053664982319,
+        0.03014645352959633,
+        0.029964374378323555,
+        0.02973053604364395,
+        0.02953367494046688,
+        0.029382750391960144,
+        0.029180854558944702,
+        0.029059845954179764,
+        0.02888437733054161,
+        0.028735937550663948,
+        0.028646469116210938,
+        0.028477296233177185,
+    )
+    assert len(impulses) == 49
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {
+            "id": 1002,
+            "threat_level": 2 if index == 1 else 1,
+            "impulse": impulse,
+        }
+        for index, impulse in enumerate(impulses)
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=6_245,
+        post_race_boot_ms=250,
+        pre_imu_us=6_475_585,
+        post_imu_us=381_884,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    pending = runner._cleanup_collision_safety_summary()
+    assert pending["safe"] is False
+    assert pending["pending_reset_collision_count"] == 49
+
+    adapter.is_armed = False
+    runner._classify_quarantined_cleanup_reset_collisions()
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["capture_complete"] is True
+    assert safety["harmful_collision_count"] == 1
+    assert safety["benign_reset_pad_contact_count"] == 48
+    assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
+        2.247588312253356
+    )
+    assert safety["observations"][1] == {
+        "phase": "cleanup-post-reset-proof",
+        "disposition": "harmful",
+        "collision": {
+            "id": 1002,
+            "threat_level": 2,
+            "impulse": 4.1180338859558105,
+        },
+    }
+    assert {
+        row["disposition"]
+        for index, row in enumerate(safety["observations"])
+        if index != 1
+    } == {"benign_reset_pad"}
 
 
 def test_cleanup_post_reset_pad_contact_budget_excess_is_unsafe():

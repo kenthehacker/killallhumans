@@ -4594,7 +4594,7 @@ def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
     assert events[0]["admitted_yaw_rate_rad_s"] == 0.0
 
 
-def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
+def test_passage_yaw_soft_stop_withholds_crossing_but_retains_sealed_preview():
     profile = _yaw_profile()
     limits = VisualCourseStageLimits()
     response_reserve = (
@@ -4645,7 +4645,7 @@ def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
         def _sample(self):
             super()._sample()
             self.sample_count += 1
-            if self.sample_count == 4:
+            if self.sample_count in {4, 5}:
                 _set_attitude(
                     self,
                     yaw=excursion,
@@ -4653,7 +4653,7 @@ def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
                 )
             else:
                 _set_attitude(self)
-            if self.sample_count >= 5:
+            if self.sample_count >= 6:
                 self.visual_gate_graph.latest_snapshot = _snapshot(
                     self.current_gate,
                     self.current_track_id,
@@ -4682,21 +4682,26 @@ def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
         )
 
     segment = host._visual_course_summary["segments"][0]
-    assert segment["passage_command_count"] == 3
+    assert segment["passage_command_count"] == 4
     assert segment["advance_command_count"] == 2
-    assert segment["yaw_soft_stop_zero_command_count"] == 1
+    assert segment["yaw_soft_stop_zero_command_count"] == 2
     assert segment["crossing_anchor"] is None
-    assert segment["passage_next_preview_command_count"] == 3
-    assert segment["next_preview_retired"] is True
-    assert segment["next_preview_withdrawal"]["reason"] == (
-        "calibrated_yaw_soft_stop"
-    )
+    assert segment["passage_next_preview_command_count"] == 4
+    assert segment["passage_admission"]["preview_track_id"] == "track-4"
+    assert segment["next_preview_retired"] is False
+    assert segment["next_preview_withdrawal_count"] == 0
+    assert segment["next_preview_withdrawal"] is None
     navigation = [
         command
         for command, kwargs, _gate in host.commands
         if kwargs.get("require_wire_receipt")
     ]
-    assert navigation[-1].yaw_rate == 0.0
+    assert [command.yaw_rate for command in navigation[-2:]] == [0.0, 0.0]
+    assert [command.pitch_rate for command in navigation[-2:]] == [
+        navigation[-3].pitch_rate,
+        navigation[-3].pitch_rate,
+    ]
+    assert [command.thrust for command in navigation[-2:]] == [0.295, 0.295]
 
 
 @pytest.mark.parametrize(
