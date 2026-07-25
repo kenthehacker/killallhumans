@@ -25,7 +25,10 @@ from planning.vq2_visual_approach import (
     MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S,
     MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES,
     RollingVisualApproachServo,
+    VISUAL_PASSAGE_ADMISSION_BASIS,
     VisualApproachCurrentGeometryUnavailable,
+    VisualApproachMode,
+    VisualApproachPassageAdmission,
     VisualApproachPassageLease,
     VisualApproachPassageSafetyUnavailable,
     VisualApproachRefusal,
@@ -87,14 +90,18 @@ def _frame(
     )
 
 
-def _race(received_ns: int) -> AuthoritativeRaceStatusRef:
+def _race(
+    received_ns: int,
+    *,
+    active_gate_index: int = 0,
+) -> AuthoritativeRaceStatusRef:
     return AuthoritativeRaceStatusRef.live(
         session_id="visual-approach-test",
         reset_epoch=1,
         race_generation=1,
         race_status_sequence=1,
         race_status_boot_ms=5_000,
-        active_gate_index=0,
+        active_gate_index=active_gate_index,
         received_monotonic_ns=received_ns,
         host_clock_id=_HOST_CLOCK_ID,
     )
@@ -129,6 +136,7 @@ def _build_bound_graph(
     *,
     include_next: bool = True,
     current_center_y: float = 0.0,
+    current_gate_index: int = 0,
 ) -> tuple[
     MultiTargetVisualTracker,
     RollingVisualGateGraph,
@@ -159,7 +167,10 @@ def _build_bound_graph(
             snapshot = graph.bind_initial_current(
                 tracker,
                 track_id=current_id,
-                race_status=_race(update.publish_monotonic_ns + 1_000_000),
+                race_status=_race(
+                    update.publish_monotonic_ns + 1_000_000,
+                    active_gate_index=current_gate_index,
+                ),
             )
         elif sequence > 3:
             snapshot = graph.observe(tracker)
@@ -173,6 +184,7 @@ def _advance(
     sequence: int,
     *,
     include_next: bool = True,
+    include_competing_next: bool = False,
     include_provisional: bool = False,
     next_center_x: float = 0.30,
     current_center_y: float = 0.0,
@@ -188,6 +200,10 @@ def _advance(
     )
     if include_next:
         detections += (_next_detection(center_x=next_center_x),)
+    if include_competing_next:
+        detections += (
+            _next_detection(center_x=-0.30, source_index=2),
+        )
     if include_provisional:
         detections += (
             _detection(2, -0.55, 0.20, 0.12, 0.12),
@@ -206,6 +222,9 @@ def _observe(
     approach: RollingVisualApproachServo,
     snapshot: GateGraphSnapshot,
     tracker: MultiTargetVisualTracker,
+    *,
+    mode: VisualApproachMode = VisualApproachMode.APPROACH,
+    passage_admission: VisualApproachPassageAdmission | None = None,
 ):
     return approach.observe(
         snapshot,
@@ -213,13 +232,19 @@ def _observe(
         now_monotonic_s=_now_s(tracker),
         segment_elapsed_s=0.5,
         segment_yaw_excursion_rad=0.0,
+        mode=mode,
+        passage_admission=passage_admission,
     )
 
 
-def _approach(current_track_id: str) -> RollingVisualApproachServo:
+def _approach(
+    current_track_id: str,
+    *,
+    current_gate_index: int = 0,
+) -> RollingVisualApproachServo:
     return RollingVisualApproachServo(
         current_track_id,
-        0,
+        current_gate_index,
         next_gate_blend=_CONFIGURED_NEXT_BLEND,
     )
 
@@ -232,6 +257,8 @@ def test_stable_exact_next_track_starts_only_after_narrow_corridor() -> None:
     approach = _approach(current_id)
 
     proposal = _observe(approach, snapshot, tracker)
+    assert proposal.mode is VisualApproachMode.APPROACH
+    assert proposal.passage_admission is None
     assert proposal.servo_output.next_gate_blend == 0.0
     assert proposal.servo_output.corridor_frames == 1
     assert not proposal.servo_output.advance_enabled
@@ -262,6 +289,210 @@ def test_stable_exact_next_track_starts_only_after_narrow_corridor() -> None:
     assert proposal.withholding_reason is None
     assert proposal.latched_next_track_id == next_id
     assert approach.latched_next_track_id == next_id
+    assert not proposal.servo_output.advance_enabled
+    assert type(proposal.passage_admission) is VisualApproachPassageAdmission
+
+
+def test_generic_gate_seven_passage_uses_admission_without_preview() -> None:
+    tracker, graph, snapshot, current_id, next_id, sequence = (
+        _build_bound_graph(current_gate_index=7)
+    )
+    assert next_id is not None
+    approach = _approach(current_id, current_gate_index=7)
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(approach, snapshot, tracker)
+
+    admission = proposal.passage_admission
+    assert type(admission) is VisualApproachPassageAdmission
+    assert admission.basis == VISUAL_PASSAGE_ADMISSION_BASIS
+    assert admission.current_gate_index == 7
+    assert admission.current_target == proposal.current_target
+    assert admission.camera_token == snapshot.latest_camera_token
+    assert (
+        admission.tracker_frame_sequence
+        == snapshot.tracker_frame_sequence
+    )
+    assert admission.preview_track_id == next_id
+    assert admission.preview_blend == _CONFIGURED_NEXT_BLEND
+    assert proposal.mode is VisualApproachMode.APPROACH
+    assert not proposal.servo_output.advance_enabled
+
+    sequence += 1
+    snapshot = _advance(tracker, graph, sequence)
+    passage = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+
+    assert passage.mode is VisualApproachMode.PASSAGE
+    assert passage.current_target.track_id == current_id
+    assert passage.next_target is not None
+    assert passage.next_target.track_id == next_id
+    assert passage.candidate_track_ids == (next_id,)
+    assert passage.passage_admission == admission
+    assert passage.servo_output.advance_enabled
+    assert passage.servo_output.next_gate_blend == 0.0
+    assert passage.servo_output.next_horizontal_error is None
+    assert passage.servo_output.next_vertical_error_image_down is None
+    assert (
+        passage.withholding_reason
+        == "passage_advance_excludes_next_preview"
+    )
+
+    sequence += 1
+    snapshot = _advance(tracker, graph, sequence)
+    continued = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    assert continued.servo_output.advance_enabled
+    assert continued.passage_admission == admission
+
+    with pytest.raises(VisualApproachRefusal, match="cannot return"):
+        _observe(approach, snapshot, tracker)
+
+
+def test_passage_requires_latest_exact_reviewed_admission() -> None:
+    tracker, graph, snapshot, current_id, _, sequence = _build_bound_graph(
+        include_next=False,
+        current_gate_index=4,
+    )
+    approach = _approach(current_id, current_gate_index=4)
+
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="requires exact reviewed admission",
+    ):
+        _observe(
+            approach,
+            snapshot,
+            tracker,
+            mode=VisualApproachMode.PASSAGE,
+        )
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 3):
+        snapshot = _advance(
+            tracker,
+            graph,
+            sequence,
+            include_next=False,
+        )
+        proposal = _observe(approach, snapshot, tracker)
+
+    prior_admission = proposal.passage_admission
+    assert type(prior_admission) is VisualApproachPassageAdmission
+
+    sequence += 1
+    snapshot = _advance(
+        tracker,
+        graph,
+        sequence,
+        include_next=False,
+    )
+    proposal = _observe(approach, snapshot, tracker)
+    admission = proposal.passage_admission
+    assert type(admission) is VisualApproachPassageAdmission
+    assert admission != prior_admission
+
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="latest reviewed evidence",
+    ):
+        _observe(
+            approach,
+            snapshot,
+            tracker,
+            mode=VisualApproachMode.PASSAGE,
+            passage_admission=prior_admission,
+        )
+
+    forged = replace(admission, current_gate_index=5)
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="latest reviewed evidence",
+    ):
+        _observe(
+            approach,
+            snapshot,
+            tracker,
+            mode=VisualApproachMode.PASSAGE,
+            passage_admission=forged,
+        )
+
+    sequence += 1
+    snapshot = _advance(
+        tracker,
+        graph,
+        sequence,
+        include_next=False,
+    )
+    passage = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    assert passage.servo_output.advance_enabled
+    assert passage.servo_output.next_gate_blend == 0.0
+
+
+def test_passage_survives_next_only_identity_ambiguity() -> None:
+    tracker, graph, snapshot, current_id, _, sequence = _build_bound_graph(
+        current_gate_index=4,
+    )
+    approach = _approach(current_id, current_gate_index=4)
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(approach, snapshot, tracker)
+    admission = proposal.passage_admission
+    assert type(admission) is VisualApproachPassageAdmission
+
+    sequence += 1
+    snapshot = _advance(tracker, graph, sequence)
+    passage = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    assert passage.servo_output.advance_enabled
+
+    saw_withheld_identity = False
+    for sequence in range(sequence + 1, sequence + 5):
+        snapshot = _advance(
+            tracker,
+            graph,
+            sequence,
+            include_competing_next=True,
+        )
+        passage = _observe(
+            approach,
+            snapshot,
+            tracker,
+            mode=VisualApproachMode.PASSAGE,
+            passage_admission=admission,
+        )
+        assert passage.servo_output.advance_enabled
+        assert passage.servo_output.next_gate_blend == 0.0
+        assert passage.servo_output.next_horizontal_error is None
+        if passage.withholding_reason == "passage_next_identity_withheld":
+            saw_withheld_identity = True
+
+    assert saw_withheld_identity
 
 
 def test_current_outside_narrow_start_corridor_withholds_next_blend() -> None:

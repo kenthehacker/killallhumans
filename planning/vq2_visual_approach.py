@@ -1,15 +1,21 @@
-"""Pure Gate-0 visual-approach adapter for the rolling VQ2 gate graph.
+"""Pure visual approach/passage adapter for the rolling VQ2 gate graph.
 
 The adapter is deliberately narrower than the live runner.  It binds one
 authoritative current identity for one segment, admits at most one exact
 same-publication next-gate target, and delegates image-space control to
-``ImageVisualServo`` with forward advance disabled.  It owns no transport,
-race transition, reset, watchdog, collision, or cleanup authority.
+``ImageVisualServo``.  Approach mode cannot advance.  Passage mode is a
+one-way, bounded segment transition that requires an exact admission from a
+prior accepted approach publication and excludes simultaneous next-preview
+command authority.  It owns no transport, race transition, reset, watchdog,
+collision, or cleanup authority.  In particular, its yaw proposal is not yaw
+calibration or transport authority; build-3385 integration must retain the
+separate zero-yaw safety boundary.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import math
 from typing import Optional
 
@@ -59,6 +65,7 @@ MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES = 4
 MAX_PASSAGE_SUSPENSION_EPOCHS = 3
 MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S = 0.12
 MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S = 0.20
+VISUAL_PASSAGE_ADMISSION_BASIS = "tight-current-corridor-dwell-v1"
 
 
 class VisualApproachRefusal(ValueError):
@@ -377,9 +384,30 @@ class VisualApproachPassageLease:
         )
 
 
+class VisualApproachMode(Enum):
+    """Mutually exclusive command-authority modes for one visual segment."""
+
+    APPROACH = "approach"
+    PASSAGE = "passage"
+
+
+@dataclass(frozen=True, slots=True)
+class VisualApproachPassageAdmission:
+    """Exact prior-publication evidence admitting bounded passage mode."""
+
+    basis: str
+    current_gate_index: int
+    current_target: VisualTarget
+    camera_token: CameraFrameToken
+    tracker_frame_sequence: int
+    corridor_frames: int
+    preview_track_id: Optional[str]
+    preview_blend: float
+
+
 @dataclass(frozen=True, slots=True)
 class VisualApproachProposal:
-    """One exact-publication, no-advance visual-approach proposal."""
+    """One exact-publication visual approach or bounded passage proposal."""
 
     current_target: VisualTarget
     next_target: Optional[VisualTarget]
@@ -389,10 +417,12 @@ class VisualApproachProposal:
     withholding_reason: Optional[str]
     relationship_basis: Optional[GateRelationshipBasis]
     latched_next_track_id: Optional[str]
+    mode: VisualApproachMode = VisualApproachMode.APPROACH
+    passage_admission: Optional[VisualApproachPassageAdmission] = None
 
 
 class RollingVisualApproachServo:
-    """Keep current identity fixed while cautiously blending one next gate."""
+    """Keep current identity fixed through approach and bounded passage."""
 
     def __init__(
         self,
@@ -437,6 +467,12 @@ class RollingVisualApproachServo:
         self._last_camera_token: Optional[CameraFrameToken] = None
         self._last_tracker_frame_sequence: Optional[int] = None
         self._latched_next_track_id: Optional[str] = None
+        self._pending_passage_admission: Optional[
+            VisualApproachPassageAdmission
+        ] = None
+        self._active_passage_admission: Optional[
+            VisualApproachPassageAdmission
+        ] = None
 
     @property
     def latched_next_track_id(self) -> Optional[str]:
@@ -449,6 +485,8 @@ class RollingVisualApproachServo:
         self._last_camera_token = None
         self._last_tracker_frame_sequence = None
         self._latched_next_track_id = None
+        self._pending_passage_admission = None
+        self._active_passage_admission = None
 
     def observe(
         self,
@@ -457,17 +495,41 @@ class RollingVisualApproachServo:
         now_monotonic_s: float,
         segment_elapsed_s: float,
         segment_yaw_excursion_rad: float,
+        *,
+        mode: VisualApproachMode = VisualApproachMode.APPROACH,
+        passage_admission: Optional[
+            VisualApproachPassageAdmission
+        ] = None,
     ) -> VisualApproachProposal:
-        """Produce one current-only or current/next no-advance servo proposal.
+        """Produce one current-only or current/next visual-servo proposal.
 
         ``now_monotonic_s`` must be QueryPerformanceCounter seconds, matching
         the receiver's ``host-perf-counter`` final-packet observations.
+
+        ``APPROACH`` preserves the historical no-advance semantics and may
+        cautiously blend an exact next target.  ``PASSAGE`` requires the
+        module-issued admission from the latest safe approach dwell, never
+        combines that preview with advance authority, and cannot transition
+        back to approach without an explicit segment reset.
         """
 
         if type(snapshot) is not GateGraphSnapshot:
             raise TypeError("snapshot must be an exact GateGraphSnapshot")
         if type(tracker) is not MultiTargetVisualTracker:
             raise TypeError("tracker must be an exact MultiTargetVisualTracker")
+        self._validate_mode_request(mode, passage_admission)
+        starting_passage = bool(
+            mode is VisualApproachMode.PASSAGE
+            and self._active_passage_admission is None
+        )
+        if mode is VisualApproachMode.APPROACH:
+            # A newer attempted approach publication invalidates an older
+            # corridor admission even when a later check refuses that frame.
+            self._pending_passage_admission = None
+        elif starting_passage:
+            # The exact admission is single-use at passage entry.  A refused
+            # entry must earn a new approach admission on a fresh publication.
+            self._pending_passage_admission = None
         for name, value in (
             ("now_monotonic_s", now_monotonic_s),
             ("segment_elapsed_s", segment_elapsed_s),
@@ -509,7 +571,13 @@ class RollingVisualApproachServo:
             if track_id != self.expected_current_track_id
             and tracker.track(track_id).visible
         )
-        if snapshot.next_selection_ambiguous or visible_ambiguous:
+        next_identity_ambiguous = bool(
+            snapshot.next_selection_ambiguous or visible_ambiguous
+        )
+        if (
+            mode is VisualApproachMode.APPROACH
+            and next_identity_ambiguous
+        ):
             raise VisualApproachRefusal(
                 "next-gate visual identity is ambiguous"
             )
@@ -534,10 +602,28 @@ class RollingVisualApproachServo:
             # publication.  If it matures into a competing stable candidate,
             # the checks below refuse instead of silently keeping the latch.
             eligible = ()
-        if len(visible_stable) > 1 or len(eligible) > 1:
+        competing_next_identities = bool(
+            len(visible_stable) > 1 or len(eligible) > 1
+        )
+        if (
+            mode is VisualApproachMode.APPROACH
+            and competing_next_identities
+        ):
             raise VisualApproachRefusal(
                 "competing stable next-gate identities are present"
             )
+        if (
+            mode is VisualApproachMode.PASSAGE
+            and (
+                next_identity_ambiguous
+                or competing_next_identities
+            )
+        ):
+            # Passage has already consumed a reviewed current-gate admission.
+            # Next-gate identity is still audited for later promotion, but it
+            # has no command authority and cannot interrupt an otherwise-safe
+            # current-aperture crossing.
+            eligible = ()
 
         next_target: Optional[VisualTarget] = None
         relationship_basis: Optional[GateRelationshipBasis] = None
@@ -551,22 +637,34 @@ class RollingVisualApproachServo:
                 self._latched_next_track_id is not None
                 and eligible_id != self._latched_next_track_id
             ):
-                raise VisualApproachRefusal(
-                    "next-gate identity changed after blend latch"
+                if mode is VisualApproachMode.APPROACH:
+                    raise VisualApproachRefusal(
+                        "next-gate identity changed after blend latch"
+                    )
+                eligible = ()
+                eligible_id = None
+            if not eligible:
+                withholding_reason = (
+                    "passage_next_identity_withheld"
                 )
-            next_target = self._target(
-                next_track,
-                now_monotonic_s=float(now_monotonic_s),
-                require_current_authority=False,
-            )
-            if next_target.frame_token != current_target.frame_token:
-                raise VisualApproachRefusal(
-                    "current and next targets do not share one exact publication"
+            else:
+                next_target = self._target(
+                    next_track,
+                    now_monotonic_s=float(now_monotonic_s),
+                    require_current_authority=False,
                 )
-            assert candidate.relationship is not None
-            relationship_basis = candidate.relationship.basis
-            requested_blend = self.next_gate_blend
-            withholding_reason = None
+                if next_target.frame_token != current_target.frame_token:
+                    raise VisualApproachRefusal(
+                        "current and next targets do not share one exact publication"
+                    )
+                assert candidate.relationship is not None
+                relationship_basis = candidate.relationship.basis
+                requested_blend = (
+                    self.next_gate_blend
+                    if mode is VisualApproachMode.APPROACH
+                    else 0.0
+                )
+                withholding_reason = None
         else:
             different_visible = tuple(
                 candidate.track_id
@@ -578,10 +676,20 @@ class RollingVisualApproachServo:
                 )
             )
             if different_visible:
-                raise VisualApproachRefusal(
-                    "a different stable next-gate identity replaced the latch"
+                if mode is VisualApproachMode.APPROACH:
+                    raise VisualApproachRefusal(
+                        "a different stable next-gate identity replaced the latch"
+                    )
+                withholding_reason = "passage_next_identity_withheld"
+            elif (
+                mode is VisualApproachMode.PASSAGE
+                and (
+                    next_identity_ambiguous
+                    or competing_next_identities
                 )
-            if provisional_ids:
+            ):
+                withholding_reason = "passage_next_identity_withheld"
+            elif provisional_ids:
                 withholding_reason = "provisional_next_identity_unresolved"
             elif self._latched_next_track_id is not None:
                 withholding_reason = "latched_next_track_unavailable"
@@ -591,6 +699,11 @@ class RollingVisualApproachServo:
                 withholding_reason = "no_next_candidate"
 
         try:
+            servo_next_target = (
+                next_target
+                if mode is VisualApproachMode.APPROACH
+                else None
+            )
             output = self._servo.step(
                 current_target,
                 now_monotonic_s=float(now_monotonic_s),
@@ -598,10 +711,12 @@ class RollingVisualApproachServo:
                 segment_yaw_excursion_rad=float(
                     segment_yaw_excursion_rad
                 ),
-                next_target=next_target,
+                next_target=servo_next_target,
                 requested_next_blend=requested_blend,
-                allow_advance=False,
-                allow_passage_safe_next_blend=True,
+                allow_advance=mode is VisualApproachMode.PASSAGE,
+                allow_passage_safe_next_blend=(
+                    mode is VisualApproachMode.APPROACH
+                ),
             )
         except VisualServoPassageSafetyUnavailable as exc:
             raise VisualApproachPassageSafetyUnavailable.from_servo_refusal(
@@ -612,15 +727,32 @@ class RollingVisualApproachServo:
             ) from exc
         except VisualServoRefusal as exc:
             raise VisualApproachRefusal(
-                f"image visual servo refused approach authority: {exc}"
+                f"image visual servo refused {mode.value} authority: {exc}"
             ) from exc
-        if output.advance_enabled:
+        if (
+            mode is VisualApproachMode.APPROACH
+            and output.advance_enabled
+        ):
             raise VisualApproachRefusal(
                 "visual approach escaped its no-advance envelope"
             )
-        if output.next_gate_blend not in {0.0, self.next_gate_blend}:
+        if (
+            mode is VisualApproachMode.APPROACH
+            and output.next_gate_blend not in {0.0, self.next_gate_blend}
+        ):
             raise VisualApproachRefusal(
                 "visual approach produced an unexpected blend magnitude"
+            )
+        if (
+            mode is VisualApproachMode.PASSAGE
+            and (
+                output.next_gate_blend != 0.0
+                or output.next_horizontal_error is not None
+                or output.next_vertical_error_image_down is not None
+            )
+        ):
+            raise VisualApproachRefusal(
+                "passage advance combined incompatible next-preview authority"
             )
         if output.next_gate_blend > 0.0:
             if eligible_id is None or next_target is None:
@@ -635,7 +767,28 @@ class RollingVisualApproachServo:
                 )
             withholding_reason = None
         elif next_target is not None:
-            withholding_reason = "current_passage_corridor_not_ready"
+            withholding_reason = (
+                "passage_advance_excludes_next_preview"
+                if mode is VisualApproachMode.PASSAGE
+                else "current_passage_corridor_not_ready"
+            )
+
+        proposal_admission: Optional[
+            VisualApproachPassageAdmission
+        ]
+        if mode is VisualApproachMode.APPROACH:
+            proposal_admission = self._passage_admission_from_approach(
+                snapshot,
+                current_target,
+                next_target,
+                output,
+            )
+            self._pending_passage_admission = proposal_admission
+        else:
+            assert passage_admission is not None
+            if starting_passage:
+                self._active_passage_admission = passage_admission
+            proposal_admission = self._active_passage_admission
 
         self._last_camera_token = snapshot.latest_camera_token
         self._last_tracker_frame_sequence = snapshot.tracker_frame_sequence
@@ -648,6 +801,89 @@ class RollingVisualApproachServo:
             withholding_reason=withholding_reason,
             relationship_basis=relationship_basis,
             latched_next_track_id=self._latched_next_track_id,
+            mode=mode,
+            passage_admission=proposal_admission,
+        )
+
+    def _validate_mode_request(
+        self,
+        mode: VisualApproachMode,
+        passage_admission: Optional[
+            VisualApproachPassageAdmission
+        ],
+    ) -> None:
+        if type(mode) is not VisualApproachMode:
+            raise VisualApproachRefusal(
+                "visual approach mode must be an exact VisualApproachMode"
+            )
+        if mode is VisualApproachMode.APPROACH:
+            if passage_admission is not None:
+                raise VisualApproachRefusal(
+                    "approach mode cannot consume passage admission evidence"
+                )
+            if self._active_passage_admission is not None:
+                raise VisualApproachRefusal(
+                    "an active passage segment cannot return to approach mode"
+                )
+            return
+        if type(passage_admission) is not VisualApproachPassageAdmission:
+            raise VisualApproachRefusal(
+                "passage mode requires exact reviewed admission evidence"
+            )
+        expected = (
+            self._active_passage_admission
+            or self._pending_passage_admission
+        )
+        if expected is None or passage_admission != expected:
+            raise VisualApproachRefusal(
+                "passage admission does not match this segment's latest "
+                "reviewed evidence"
+            )
+        if self._active_passage_admission is None and (
+            self._last_camera_token != passage_admission.camera_token
+            or self._last_tracker_frame_sequence
+            != passage_admission.tracker_frame_sequence
+            or passage_admission.current_gate_index
+            != self.expected_gate_index
+            or passage_admission.current_target.track_id
+            != self.expected_current_track_id
+            or passage_admission.corridor_frames
+            < self._servo.tuning.required_corridor_frames
+            or passage_admission.basis
+            != VISUAL_PASSAGE_ADMISSION_BASIS
+        ):
+            raise VisualApproachRefusal(
+                "passage admission is stale or inconsistent with the segment"
+            )
+
+    def _passage_admission_from_approach(
+        self,
+        snapshot: GateGraphSnapshot,
+        current_target: VisualTarget,
+        next_target: Optional[VisualTarget],
+        output: VisualServoOutput,
+    ) -> Optional[VisualApproachPassageAdmission]:
+        if (
+            output.corridor_frames
+            < self._servo.tuning.required_corridor_frames
+            or output.brake_reason != "aligning"
+            or output.yaw_envelope_limited
+        ):
+            return None
+        preview_active = output.next_gate_blend > 0.0
+        return VisualApproachPassageAdmission(
+            basis=VISUAL_PASSAGE_ADMISSION_BASIS,
+            current_gate_index=self.expected_gate_index,
+            current_target=current_target,
+            camera_token=snapshot.latest_camera_token,
+            tracker_frame_sequence=snapshot.tracker_frame_sequence,
+            corridor_frames=output.corridor_frames,
+            preview_track_id=(
+                next_target.track_id
+                if preview_active and next_target is not None
+                else None
+            ),
+            preview_blend=output.next_gate_blend,
         )
 
     def _validate_snapshot(
@@ -859,7 +1095,10 @@ __all__ = [
     "MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S",
     "MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES",
     "RollingVisualApproachServo",
+    "VISUAL_PASSAGE_ADMISSION_BASIS",
     "VisualApproachCurrentGeometryUnavailable",
+    "VisualApproachMode",
+    "VisualApproachPassageAdmission",
     "VisualApproachPassageLease",
     "VisualApproachPassageLeaseState",
     "VisualApproachPassageSafetyUnavailable",
