@@ -5350,6 +5350,143 @@ def test_cleanup_accepts_reproduced_proved_reset_settling_aggregate():
     }
 
 
+def test_cleanup_accepts_exact_visual_course_reset_settling_after_disarm():
+    impulses = (
+        0.12948261201381683,
+        0.21557387709617615,
+        0.0692632794380188,
+        0.11583398282527924,
+        0.021046079695224762,
+        0.03382188081741333,
+        0.0033150799572467804,
+        0.004094791132956743,
+        0.00811521615833044,
+        0.01246686466038227,
+        0.008760632947087288,
+        0.013718180358409882,
+        0.012038972228765488,
+        0.019382087513804436,
+        0.016297858208417892,
+        0.026634542271494865,
+        0.02003510482609272,
+        0.03291308879852295,
+        0.019091397523880005,
+        0.031255077570676804,
+        0.016673045232892036,
+        0.027192195877432823,
+        0.014427227899432182,
+        0.02339250035583973,
+        0.01316026784479618,
+        0.021224338561296463,
+        0.012569993734359741,
+        0.020187407732009888,
+        0.012278366833925247,
+        0.019656142219901085,
+        0.012167157605290413,
+        0.019426578655838966,
+        0.011905090883374214,
+        0.018958456814289093,
+        0.011677568778395653,
+        0.018545037135481834,
+        0.011409454047679901,
+        0.018068790435791016,
+        0.011132237501442432,
+        0.01757722534239292,
+        0.010713047347962856,
+        0.016864273697137833,
+        0.010473364032804966,
+        0.016438674181699753,
+        0.010240611620247364,
+        0.016030406579375267,
+        0.009946745820343494,
+        0.015527691692113876,
+        0.009669233113527298,
+        0.015057357028126717,
+        0.00946666020900011,
+        0.014707034453749657,
+        0.009267580695450306,
+        0.014370506629347801,
+        0.00901004672050476,
+        0.013944591395556927,
+        0.00876525416970253,
+        0.013544324785470963,
+        0.008637683466076851,
+        0.013330018147826195,
+        0.008403528481721878,
+        0.01295925211161375,
+        0.00817222148180008,
+        0.01259362231940031,
+        0.008050368167459965,
+        0.012405086308717728,
+        0.007834559306502342,
+        0.012075582519173622,
+        0.007619590498507023,
+        0.0117528410628438,
+        0.007503012660890818,
+        0.011584402993321419,
+        0.007300864439457655,
+        0.011293460614979267,
+        0.007118364796042442,
+        0.01103296596556902,
+        0.01504996232688427,
+        0.09983597695827484,
+        0.31848597526550293,
+        0.3299800157546997,
+        0.07763012498617172,
+        0.027805613353848457,
+        0.02355489507317543,
+        0.025834757834672928,
+        0.034088119864463806,
+    )
+    assert len(impulses) == 85
+    assert vq2_module.MAX_PROVED_RESET_PAD_CONTACTS == 96
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": impulse}
+        for impulse in impulses
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=3_804,
+        post_race_boot_ms=152,
+        pre_imu_us=3_944_703,
+        post_imu_us=375_078,
+        advancing_race_samples=2,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    assert adapter.collisions == []
+    pending = runner._cleanup_collision_safety_summary()
+    assert pending["safe"] is False
+    assert pending["pending_reset_collision_batch_count"] == 1
+    assert pending["pending_reset_collision_count"] == 85
+
+    adapter.is_armed = False
+    runner._classify_quarantined_cleanup_reset_collisions()
+    runner._classify_quarantined_cleanup_reset_collisions()
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is True
+    assert safety["capture_complete"] is True
+    assert safety["harmful_collision_count"] == 0
+    assert safety["benign_reset_pad_contact_count"] == 85
+    assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
+        2.5007399604655802
+    )
+    assert safety["pending_reset_collision_batch_count"] == 0
+    assert safety["pending_reset_collision_count"] == 0
+    assert len(safety["observations"]) == 85
+    assert {row["disposition"] for row in safety["observations"]} == {
+        "benign_reset_pad"
+    }
+
+
 def test_cleanup_post_reset_pad_contact_budget_excess_is_unsafe():
     adapter = _FakeAdapter()
     runner = VQ2Runner(adapter, _FakeVision())

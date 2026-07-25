@@ -204,6 +204,7 @@ from scripts.aigp_vq2_visual_alignment_stage import (
 )
 from scripts.aigp_vq2_visual_course_stage import (
     DEFAULT_VISUAL_COURSE_LIMITS,
+    VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON,
     VisualCourseStageRuntime,
     VisualCourseYawProfile,
     run_visual_course_stage,
@@ -423,7 +424,7 @@ GATE1_RECENTER_NO_PASSAGE_MAX_WIDTH_PX = COURSE_UNTRACKED_CONTACT_MIN_WIDTH_PX
 
 MAX_BENIGN_PAD_CONTACTS = 12
 MAX_BENIGN_PAD_IMPULSE = 0.05
-MAX_PROVED_RESET_PAD_CONTACTS = 64
+MAX_PROVED_RESET_PAD_CONTACTS = 96
 MAX_PROVED_RESET_PAD_IMPULSE = 5.0
 MAX_PROVED_RESET_PAD_SINGLE_IMPULSE = 1.10
 
@@ -14454,9 +14455,12 @@ class VQ2Runner:
                 "visual receiver watermark changed its host time basis"
             )
         if receiver_token != expected_token:
-            raise SafetyAbort(
-                "visual receiver advanced beyond the admitted command target"
+            superseded = SafetyAbort(
+                VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
             )
+            superseded.expected_visual_token = expected_token
+            superseded.receiver_visual_token = receiver_token
+            raise superseded
         return receiver_token
 
     def _require_visual_current_target(

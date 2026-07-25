@@ -74,6 +74,11 @@ from scripts.aigp_vq2_yaw_profile import (
 
 
 VISUAL_COURSE_STAGE = "visual-course"
+VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON = (
+    "visual receiver advanced beyond the admitted command target"
+)
+MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S = 0.10
+MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS = 4
 VISUAL_COURSE_YAW_PROFILE_SCHEMA = YAW_CALIBRATION_PROFILE_SCHEMA
 INITIAL_PAD_PRELOAD_DURATION_S = 0.15
 INITIAL_PAD_PRELOAD_THRUST = 0.26
@@ -1044,6 +1049,23 @@ async def _run_visual_course_stage_impl(
         total_zero_commands += 1
         refresh_live_summary()
 
+    def assert_pending_supersession_hold(phase: str) -> None:
+        if consecutive_superseded_proposals <= 0:
+            return
+        now_s = float(runtime.monotonic())
+        if not math.isfinite(now_s) or now_s < last_navigation_send_s:
+            raise abort_type(
+                "visual-course supersession clock regressed"
+            )
+        if (
+            now_s - last_navigation_send_s
+            >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+        ):
+            raise abort_type(
+                "visual-course receiver supersession held prior command "
+                f"beyond its bound during {phase}"
+            )
+
     async def send_visual(
         *,
         proposal: Any,
@@ -1051,8 +1073,66 @@ async def _run_visual_course_stage_impl(
         yaw_reference_rad: float,
         segment_started_s: float,
         stage: str,
-    ) -> AttitudeRateCommand:
+    ) -> Optional[AttitudeRateCommand]:
         nonlocal total_navigation_commands
+        nonlocal last_navigation_send_s
+        nonlocal consecutive_superseded_proposals
+
+        def drop_superseded_proposal(
+            exc: BaseException,
+        ) -> Optional[AttitudeRateCommand]:
+            nonlocal consecutive_superseded_proposals
+
+            expected_token = snapshot.latest_camera_token
+            receiver_token = getattr(
+                exc,
+                "receiver_visual_token",
+                None,
+            )
+            if (
+                str(exc)
+                != VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                or getattr(exc, "expected_visual_token", None)
+                != expected_token
+                or not _token_strictly_newer(
+                    receiver_token,
+                    expected_token,
+                )
+            ):
+                raise exc
+            now_s = float(runtime.monotonic())
+            if not math.isfinite(now_s) or now_s < last_navigation_send_s:
+                raise abort_type(
+                    "visual-course supersession clock regressed"
+                ) from exc
+            consecutive_superseded_proposals += 1
+            segment["superseded_proposal_count"] = int(
+                segment["superseded_proposal_count"]
+            ) + 1
+            hold_s = now_s - last_navigation_send_s
+            host.recorder.emit(
+                "visual_course_proposal_superseded",
+                gate_index=current_gate_index,
+                stage=stage,
+                expected_frame_token=asdict(expected_token),
+                receiver_frame_token=asdict(receiver_token),
+                consecutive_count=consecutive_superseded_proposals,
+                total_count=segment["superseded_proposal_count"],
+                held_previous_command_s=hold_s,
+            )
+            refresh_live_summary()
+            if (
+                consecutive_superseded_proposals
+                > MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS
+                or hold_s
+                >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+            ):
+                raise abort_type(
+                    "visual-course receiver repeatedly superseded command "
+                    "authority"
+                ) from exc
+            return None
+
         output = proposal.servo_output
         requested_yaw = float(output.yaw_rate_rad_s)
         if requested_yaw != 0.0:
@@ -1078,6 +1158,7 @@ async def _run_visual_course_stage_impl(
                 "passage envelope"
             )
         launch = segment["launch_bootstrap"]
+        launch_evidence: Optional[Dict[str, Any]] = None
         if launch["enabled"]:
             assert launch_spawn_pitch_rad is not None
             launch_elapsed_s = max(
@@ -1115,17 +1196,16 @@ async def _run_visual_course_stage_impl(
                     "visual-course launch bootstrap escaped its fixed "
                     "attitude/thrust envelope"
                 )
-            if int(launch["command_count"]) == 0:
-                launch["first_target_pitch_rad"] = target_pitch_rad
-                launch["first_thrust"] = command_thrust
-            launch["command_count"] = int(launch["command_count"]) + 1
-            launch["last_elapsed_s"] = launch_elapsed_s
-            launch["last_pitch_blend"] = pitch_blend
-            launch["last_target_pitch_rad"] = target_pitch_rad
-            launch["last_thrust"] = command_thrust
-            launch["last_thrust_phase"] = thrust_phase
+            launch_evidence = {
+                "elapsed_s": launch_elapsed_s,
+                "pitch_blend": pitch_blend,
+                "target_pitch_rad": target_pitch_rad,
+                "thrust": command_thrust,
+                "thrust_phase": thrust_phase,
+            }
 
         await host._wait_for_next_flight_command_slot()
+        assert_pending_supersession_hold("command-slot wait")
         pad_contact = initial_pad_contact_authority()
         host._watchdog(
             require_target=False,
@@ -1133,9 +1213,12 @@ async def _run_visual_course_stage_impl(
             enforce_benign_pad_budget=True,
             count_rate_sample=False,
         )
-        receiver_token = host._assert_visual_receiver_token_current(
-            snapshot.latest_camera_token
-        )
+        try:
+            receiver_token = host._assert_visual_receiver_token_current(
+                snapshot.latest_camera_token
+            )
+        except abort_type as exc:
+            return drop_superseded_proposal(exc)
         if receiver_token != snapshot.latest_camera_token:
             raise abort_type("visual-course receiver watermark changed")
         send_race = host._visual_race_status_ref()
@@ -1189,6 +1272,7 @@ async def _run_visual_course_stage_impl(
             or not limits.min_thrust <= command.thrust <= limits.max_thrust
         ):
             raise abort_type("visual-course command escaped its fixed envelope")
+        assert_pending_supersession_hold("pre-wire validation")
         validation_ns = runtime.perf_counter_ns()
         if type(validation_ns) is not int or validation_ns < 0:
             raise abort_type("visual-course wire clock is invalid")
@@ -1201,14 +1285,49 @@ async def _run_visual_course_stage_impl(
         deadline_ns = validation_ns + round(
             limits.max_validation_to_wire_delay_s * 1_000_000_000
         )
-        receipt = await host._send_flight_command(
-            command,
-            require_wire_receipt=True,
-            wire_start_not_before_ns=not_before_ns,
-            wire_start_deadline_ns=deadline_ns,
-            wire_visual_token=snapshot.latest_camera_token,
-            wire_race_gate_index=current_gate_index,
-        )
+        if consecutive_superseded_proposals > 0:
+            hold_checked_s = float(runtime.monotonic())
+            if (
+                not math.isfinite(hold_checked_s)
+                or hold_checked_s < last_navigation_send_s
+            ):
+                raise abort_type(
+                    "visual-course supersession clock regressed"
+                )
+            hold_remaining_s = (
+                MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+                - (hold_checked_s - last_navigation_send_s)
+            )
+            if hold_remaining_s <= 0.0:
+                raise abort_type(
+                    "visual-course receiver supersession held prior command "
+                    "beyond its bound during wire deadline admission"
+                )
+            hold_deadline_ns = validation_ns + math.floor(
+                hold_remaining_s * 1_000_000_000
+            )
+            deadline_ns = min(deadline_ns, hold_deadline_ns)
+        if (
+            deadline_ns <= validation_ns
+            or (
+                not_before_ns is not None
+                and not_before_ns >= deadline_ns
+            )
+        ):
+            raise abort_type(
+                "visual-course supersession leaves no bounded wire slot"
+            )
+        try:
+            receipt = await host._send_flight_command(
+                command,
+                require_wire_receipt=True,
+                wire_start_not_before_ns=not_before_ns,
+                wire_start_deadline_ns=deadline_ns,
+                wire_visual_token=snapshot.latest_camera_token,
+                wire_race_gate_index=current_gate_index,
+            )
+        except abort_type as exc:
+            return drop_superseded_proposal(exc)
         if (
             not isinstance(receipt, Mapping)
             or not isinstance(
@@ -1217,12 +1336,30 @@ async def _run_visual_course_stage_impl(
             )
         ):
             raise abort_type("visual-course send lacks visual wire authority")
+        if launch_evidence is not None:
+            if int(launch["command_count"]) == 0:
+                launch["first_target_pitch_rad"] = launch_evidence[
+                    "target_pitch_rad"
+                ]
+                launch["first_thrust"] = launch_evidence["thrust"]
+            launch["command_count"] = int(launch["command_count"]) + 1
+            launch["last_elapsed_s"] = launch_evidence["elapsed_s"]
+            launch["last_pitch_blend"] = launch_evidence["pitch_blend"]
+            launch["last_target_pitch_rad"] = launch_evidence[
+                "target_pitch_rad"
+            ]
+            launch["last_thrust"] = launch_evidence["thrust"]
+            launch["last_thrust_phase"] = launch_evidence[
+                "thrust_phase"
+            ]
         host._record_tick(
             stage,
             float(runtime.monotonic()) - segment_started_s,
             command,
         )
         total_navigation_commands += 1
+        last_navigation_send_s = float(runtime.monotonic())
+        consecutive_superseded_proposals = 0
         if (
             transitions
             and transitions[-1]["to_gate_index"] == current_gate_index
@@ -1265,6 +1402,8 @@ async def _run_visual_course_stage_impl(
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
+        last_navigation_send_s = segment_started_s
+        consecutive_superseded_proposals = 0
         segment = {
             "segment_number": segment_number,
             "gate_index": current_gate_index,
@@ -1272,6 +1411,7 @@ async def _run_visual_course_stage_impl(
             "approach_command_count": 0,
             "passage_command_count": 0,
             "advance_command_count": 0,
+            "superseded_proposal_count": 0,
             "crossing_wait_zero_command_count": 0,
             "post_credit_zero_command_count": 0,
             "passage_authority_enabled": False,
@@ -1350,6 +1490,7 @@ async def _run_visual_course_stage_impl(
 
         while credited_race is None:
             now = await pace_tick()
+            assert_pending_supersession_hold("paced control tick")
             if now >= course_deadline_s:
                 raise abort_type("visual-course hard duration expired")
             if now >= segment_deadline_s:
@@ -1481,7 +1622,7 @@ async def _run_visual_course_stage_impl(
                         "visual-course approach acquired passage authority"
                     )
                 try:
-                    await send_visual(
+                    command = await send_visual(
                         proposal=proposal,
                         snapshot=snapshot,
                         yaw_reference_rad=yaw_reference_rad,
@@ -1494,6 +1635,8 @@ async def _run_visual_course_stage_impl(
                 except RaceActiveBoundaryChangedBeforeWire as exc:
                     credited_race = accept_no_wire_race_boundary(exc)
                     break
+                if command is None:
+                    continue
                 approach_command_count += 1
                 segment["approach_command_count"] = approach_command_count
                 if proposal.passage_admission is not None:
@@ -1542,6 +1685,8 @@ async def _run_visual_course_stage_impl(
             except RaceActiveBoundaryChangedBeforeWire as exc:
                 credited_race = accept_no_wire_race_boundary(exc)
                 break
+            if command is None:
+                continue
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
             if proposal.servo_output.advance_enabled:

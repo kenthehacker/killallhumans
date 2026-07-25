@@ -96,13 +96,20 @@ The powered runner still:
   640x360 dimensions before arm, then rechecks dimensions on calibration ticks;
 - confirms arm/disarm only on newer heartbeats;
 - sends no faster than 50 Hz, never catches up missed ticks, keeps
-  uncalibrated axes at zero, and retains the command envelope;
+  uncalibrated axes at zero, and retains the command envelope; an unsent
+  visual proposal superseded by a strictly newer same-stream publication is
+  dropped and replanned, with a `0.10 s`/four-consecutive hold bound;
 - aborts on stale/nonadvancing streams, target/corridor loss, estimator or
   attitude failure, unsafe collision, gate change, non-finite/out-of-bounds command,
   or missed waveform deadline;
 - on every runner exit path, latches command production, sends the safe stop
   when applicable, disarms, resets, proves the clean epoch, and marks failed
   cleanup as a failed stage.
+
+Proved-reset spawn-pad settling remains a separate cleanup-only class: exact
+object `1002`, threat at most 2, at most 96 contacts, at most `1.10` impulse
+per contact and `5.0` cumulative impulse, with exact collision-buffer
+accounting and a newer disarmed heartbeat. Any violated bound fails cleanup.
 
 The compact yaw-calibration waveform is a balanced 45-slot, 0.90-second
 system-ID burst with a 1.00-second hard expiry. Its values and safety limits

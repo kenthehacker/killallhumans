@@ -832,6 +832,398 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert later_navigation[0].thrust == 0.21
 
 
+def test_newer_receiver_publication_drops_unsent_proposal_and_replans():
+    class SupersedingHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.superseded_expected = None
+            self.superseded_receiver = None
+
+        async def _send_flight_command(self, command, **kwargs):
+            if (
+                self.superseded_expected is None
+                and kwargs.get("wire_visual_token") is not None
+            ):
+                expected = kwargs["wire_visual_token"]
+                receiver = _token(expected.publication_sequence + 1)
+                self.superseded_expected = expected
+                self.superseded_receiver = receiver
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            return await super()._send_flight_command(command, **kwargs)
+
+    host = SupersedingHost(initial_gate=0, finish_gate=0)
+    runtime, _calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    segment = result["segments"][0]
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["launch_bootstrap"]["command_count"] == (
+        result["visual_navigation_command_count"]
+    )
+    sent_tokens = [
+        kwargs["wire_visual_token"]
+        for _command, kwargs, _gate_index in host.commands
+        if kwargs.get("wire_visual_token") is not None
+    ]
+    assert host.superseded_expected not in sent_tokens
+    assert all(
+        token.publication_sequence
+        > host.superseded_expected.publication_sequence
+        for token in sent_tokens
+    )
+    events = [
+        payload
+        for event, payload in host.recorder.events
+        if event == "visual_course_proposal_superseded"
+    ]
+    assert len(events) == 1
+    assert events[0]["expected_frame_token"] == {
+        "generation": host.superseded_expected.generation,
+        "frame_id": host.superseded_expected.frame_id,
+        "publication_sequence": (
+            host.superseded_expected.publication_sequence
+        ),
+        "stream_id": host.superseded_expected.stream_id,
+    }
+    assert events[0]["receiver_frame_token"] == {
+        "generation": host.superseded_receiver.generation,
+        "frame_id": host.superseded_receiver.frame_id,
+        "publication_sequence": (
+            host.superseded_receiver.publication_sequence
+        ),
+        "stream_id": host.superseded_receiver.stream_id,
+    }
+
+
+def test_precheck_publication_supersession_replans_before_wire():
+    class PrecheckSupersedingHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.superseded_expected = None
+
+        def _assert_visual_receiver_token_current(self, expected_token):
+            if self.superseded_expected is None:
+                receiver = _token(
+                    expected_token.publication_sequence + 1
+                )
+                self.superseded_expected = expected_token
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected_token
+                exc.receiver_visual_token = receiver
+                raise exc
+            return super()._assert_visual_receiver_token_current(
+                expected_token
+            )
+
+    host = PrecheckSupersedingHost(initial_gate=0, finish_gate=0)
+    runtime, _calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["segments"][0]["superseded_proposal_count"] == 1
+    sent_tokens = [
+        kwargs["wire_visual_token"]
+        for _command, kwargs, _gate_index in host.commands
+        if kwargs.get("wire_visual_token") is not None
+    ]
+    assert host.superseded_expected not in sent_tokens
+    assert result["segments"][0]["launch_bootstrap"][
+        "command_count"
+    ] == result["visual_navigation_command_count"]
+
+
+def test_repeated_receiver_supersession_aborts_with_no_stale_send():
+    class AlwaysSupersedingHost(_Host):
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if expected is not None:
+                receiver = _token(expected.publication_sequence + 1)
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            return await super()._send_flight_command(command, **kwargs)
+
+    host = AlwaysSupersedingHost(
+        initial_gate=0,
+        finish_gate=0,
+    )
+    runtime, _calls = _runtime(host)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="repeatedly superseded command authority",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.commands == []
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["superseded_proposal_count"] == (
+        course_stage.MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS + 1
+    )
+    assert segment["launch_bootstrap"]["command_count"] == 0
+
+
+def test_single_supersession_with_stuck_graph_hits_hold_bound():
+    class StuckGraphHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.superseded = False
+
+        def _sample(self):
+            if not self.superseded:
+                super()._sample()
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if expected is not None and not self.superseded:
+                self.superseded = True
+                receiver = _token(expected.publication_sequence + 1)
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            return await super()._send_flight_command(command, **kwargs)
+
+    host = StuckGraphHost(initial_gate=0, finish_gate=0)
+    runtime, _calls = _runtime(host)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="paced control tick",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.commands == []
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["launch_bootstrap"]["command_count"] == 0
+
+
+def test_supersession_then_delayed_wire_slot_hits_hold_bound():
+    class DelayedSlotHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.superseded = False
+            self.delayed = False
+
+        def _sample(self):
+            if not self.superseded:
+                super()._sample()
+
+        async def _wait_for_next_flight_command_slot(self):
+            ready = await super()._wait_for_next_flight_command_slot()
+            if self.superseded and not self.delayed:
+                self.clock += (
+                    course_stage
+                    .MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+                    + 0.001
+                )
+                self.delayed = True
+            return ready
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if expected is not None and not self.superseded:
+                self.superseded = True
+                receiver = _token(expected.publication_sequence + 1)
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            return await super()._send_flight_command(command, **kwargs)
+
+    host = DelayedSlotHost(initial_gate=0, finish_gate=0)
+    runtime, _calls = _runtime(host)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="command-slot wait",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.commands == []
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["launch_bootstrap"]["command_count"] == 0
+
+
+def test_supersession_then_post_slot_validation_delay_hits_hold_bound():
+    class PostSlotDelayHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.receiver_checks = 0
+
+        def _assert_visual_receiver_token_current(self, expected_token):
+            self.receiver_checks += 1
+            if self.receiver_checks == 1:
+                receiver = _token(
+                    expected_token.publication_sequence + 1
+                )
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected_token
+                exc.receiver_visual_token = receiver
+                raise exc
+            if self.receiver_checks == 2:
+                self.clock = (
+                    0.20
+                    + course_stage
+                    .MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+                    + 0.001
+                )
+            return super()._assert_visual_receiver_token_current(
+                expected_token
+            )
+
+    host = PostSlotDelayHost(initial_gate=0, finish_gate=0)
+    runtime, _calls = _runtime(host)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="pre-wire validation",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.commands == []
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["launch_bootstrap"]["command_count"] == 0
+
+
+def test_supersession_clips_replacement_wire_deadline_to_hold_bound():
+    class NearHoldDeadlineHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.receiver_checks = 0
+
+        def _assert_visual_receiver_token_current(self, expected_token):
+            self.receiver_checks += 1
+            if self.receiver_checks == 1:
+                receiver = _token(
+                    expected_token.publication_sequence + 1
+                )
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected_token
+                exc.receiver_visual_token = receiver
+                raise exc
+            if self.receiver_checks == 2:
+                self.clock = (
+                    0.20
+                    + course_stage
+                    .MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+                    - 0.005
+                )
+            return super()._assert_visual_receiver_token_current(
+                expected_token
+            )
+
+    host = NearHoldDeadlineHost(initial_gate=0, finish_gate=0)
+    runtime, _calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    first_command_kwargs = next(
+        kwargs
+        for _command, kwargs, _gate_index in host.commands
+        if kwargs.get("wire_visual_token") is not None
+    )
+    hold_deadline_ns = round(
+        (
+            0.20
+            + course_stage
+            .MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+        )
+        * 1_000_000_000
+    )
+    assert (
+        first_command_kwargs["wire_start_deadline_ns"]
+        <= hold_deadline_ns
+    )
+    assert (
+        first_command_kwargs["wire_start_deadline_ns"]
+        < round((0.20 + 0.095 + 0.012) * 1_000_000_000)
+    )
+
+
 def test_exact_next_post_credit_frame_is_admitted_without_immediate_abort():
     host = _Host(initial_gate=1, finish_gate=2, fresh_after_samples=1)
     runtime, _calls = _runtime(host)
