@@ -225,7 +225,11 @@ class VisualCourseStageLimits:
     max_measured_yaw_rate_rad_s: float = 0.50
     min_thrust: float = MIN_VISUAL_THRUST
     max_thrust: float = MAX_VISUAL_THRUST
-    crossing_arm_min_log_scale: float = -0.80
+    # Attempt 10 supplied ten clean retained-close frames but the final safe
+    # uncensored observation landed at -0.801151 because of pixel-scale
+    # quantization.  A -0.81 boundary admits that exact history while keeping
+    # the independent closure, center-rate, dwell, yaw, and geometry guards.
+    crossing_arm_min_log_scale: float = -0.81
     crossing_arm_min_log_scale_rate_s: float = 0.0
     crossing_arm_min_advance_commands: int = 3
     max_gate_segments: int = 64

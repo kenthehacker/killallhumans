@@ -15,6 +15,7 @@ from competition.aigp_messages import RaceStatus
 from competition.vq2_visual_tracker import CameraFrameToken
 from planning.vq2_gate_graph import AuthoritativeRaceStatusRef
 from planning.vq2_visual_approach import (
+    VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
     VisualApproachPassageAdmission,
     VisualApproachPassageSafetyUnavailable,
@@ -763,6 +764,53 @@ def test_attempt8_close_alignment_uses_retained_advance_crossing_proof():
     ) == course_stage.RETAINED_ADVANCE_CROSSING_BASIS
 
 
+def test_attempt10_last_safe_frame_clears_only_evidenced_scale_margin():
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    publication_158 = replace(
+        target,
+        normalized_x=0.009374999999999911,
+        normalized_y_down=-0.06666666666666665,
+        normalized_x_rate_s=0.0580976279904446,
+        normalized_y_rate_down_s=0.14205879374503383,
+        log_scale=-0.8583646516890313,
+        log_scale_rate_s=1.2940521542445622,
+    )
+    publication_159 = replace(
+        target,
+        normalized_x=0.009374999999999911,
+        normalized_y_down=-0.05555555555555558,
+        normalized_x_rate_s=0.026143932595700067,
+        normalized_y_rate_down_s=0.24094107666176479,
+        log_scale=-0.8011509877843259,
+        log_scale_rate_s=1.493812414455355,
+    )
+
+    assert course_stage._crossing_anchor_basis(
+        publication_158,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=9,
+        tuning=tuning,
+        limits=limits,
+    ) is None
+    assert course_stage._crossing_anchor_basis(
+        publication_159,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=10,
+        tuning=tuning,
+        limits=limits,
+    ) == course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+
+
 @pytest.mark.parametrize(
     "case",
     (
@@ -805,7 +853,10 @@ def test_retained_advance_crossing_proof_fails_closed(case):
     elif case == "track_mismatch":
         target = replace(target, track_id="other-track")
     elif case == "not_close":
-        target = replace(target, log_scale=-0.800001)
+        target = replace(
+            target,
+            log_scale=limits.crossing_arm_min_log_scale - 0.000001,
+        )
     elif case == "retreating":
         target = replace(target, log_scale_rate_s=-0.000001)
     elif case == "scale_brake":
@@ -898,6 +949,10 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
             self.passage_observations = 0
 
         def observe(self, snapshot, *args, **kwargs):
+            if snapshot.current_track.center_censored:
+                raise VisualApproachCurrentGeometryUnavailable(
+                    "authoritative current aperture is clipped or censored"
+                )
             proposal = super().observe(snapshot, *args, **kwargs)
             if kwargs["mode"] is not VisualApproachMode.PASSAGE:
                 return proposal
@@ -942,12 +997,14 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
                 navigation_count >= 7
                 and not self.race.race_finished
             ):
-                self.visual_gate_graph.latest_snapshot = _snapshot(
+                clipped = _snapshot(
                     self.current_gate,
                     self.current_track_id,
                     self.sequence,
-                    visible=False,
                 )
+                clipped.current_track.clipping = 10
+                clipped.current_track.center_censored = True
+                self.visual_gate_graph.latest_snapshot = clipped
 
         async def _send_flight_command(self, command, **kwargs):
             receipt = await super()._send_flight_command(command, **kwargs)
