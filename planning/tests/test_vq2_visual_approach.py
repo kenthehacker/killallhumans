@@ -798,8 +798,86 @@ def test_latched_current_passage_violation_is_specialized_refusal() -> None:
     with pytest.raises(
         VisualApproachPassageSafetyUnavailable,
         match="retired passage authority",
-    ):
+    ) as caught:
         _observe(approach, snapshot, tracker)
+    assert caught.value.latched_next_track_id == (
+        proposal.latched_next_track_id
+    )
+
+
+def test_required_next_identity_must_remain_exact_and_continuously_visible():
+    tracker, graph, snapshot, current_id, next_id, sequence = (
+        _build_bound_graph()
+    )
+    assert next_id is not None
+    approach = RollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+        required_next_track_id=next_id,
+    )
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(approach, snapshot, tracker)
+
+    assert proposal.latched_next_track_id == next_id
+    assert proposal.next_target is not None
+    assert proposal.next_target.track_id == next_id
+    assert proposal.passage_admission is not None
+    assert proposal.passage_admission.preview_track_id == next_id
+
+    admission = proposal.passage_admission
+    sequence += 1
+    snapshot_without_preview = _advance(
+        tracker,
+        graph,
+        sequence,
+        include_next=False,
+    )
+    passage = _observe(
+        approach,
+        snapshot_without_preview,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    assert passage.servo_output.advance_enabled
+    assert passage.servo_output.next_gate_blend == 0.0
+    assert passage.latched_next_track_id == next_id
+
+    missing = RollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+        required_next_track_id="vq2-track-does-not-exist",
+    )
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="required.*identity",
+    ):
+        _observe(missing, snapshot_without_preview, tracker)
+
+    for sequence in range(sequence + 1, sequence + 5):
+        replacement_only = _advance(
+            tracker,
+            graph,
+            sequence,
+            include_next=False,
+            include_competing_next=True,
+        )
+    contender = RollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+        required_next_track_id=next_id,
+    )
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="required.*identity",
+    ):
+        _observe(contender, replacement_only, tracker)
 
 
 def test_passage_lease_resumes_exact_latest_two_frame_excursion() -> None:

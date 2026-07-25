@@ -87,6 +87,7 @@ class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
         violation_codes: tuple[str, ...],
         violation_evidence: tuple[tuple[str, float, float, float], ...],
         camera_observation_monotonic_s: float,
+        latched_next_track_id: Optional[str] = None,
     ) -> None:
         if (
             type(violation_codes) is not tuple
@@ -113,6 +114,14 @@ class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
             or type(camera_observation_monotonic_s) not in {int, float}
             or not math.isfinite(float(camera_observation_monotonic_s))
             or float(camera_observation_monotonic_s) < 0.0
+            or (
+                latched_next_track_id is not None
+                and (
+                    type(latched_next_track_id) is not str
+                    or not latched_next_track_id
+                    or len(latched_next_track_id) > 128
+                )
+            )
         ):
             raise ValueError(
                 "passage refusal requires structured immutable evidence"
@@ -122,6 +131,7 @@ class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
         self.camera_observation_monotonic_s = float(
             camera_observation_monotonic_s
         )
+        self.latched_next_track_id = latched_next_track_id
         transient_evidence = violation_evidence[0]
         self.transient_eligible = bool(
             violation_codes == ("current_projected_vertical",)
@@ -146,6 +156,7 @@ class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
         refusal: VisualServoPassageSafetyUnavailable,
         *,
         camera_observation_monotonic_s: float,
+        latched_next_track_id: Optional[str] = None,
     ) -> "VisualApproachPassageSafetyUnavailable":
         if type(refusal) is not VisualServoPassageSafetyUnavailable:
             raise TypeError(
@@ -168,6 +179,7 @@ class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
             camera_observation_monotonic_s=(
                 camera_observation_monotonic_s
             ),
+            latched_next_track_id=latched_next_track_id,
         )
 
 
@@ -434,6 +446,7 @@ class RollingVisualApproachServo:
         next_gate_blend: float,
         next_gate_blend_start_log_scale: Optional[float] = None,
         next_gate_blend_full_log_scale: Optional[float] = None,
+        required_next_track_id: Optional[str] = None,
     ) -> None:
         if (
             type(expected_current_track_id) is not str
@@ -462,6 +475,18 @@ class RollingVisualApproachServo:
         ):
             raise VisualApproachRefusal(
                 "next_gate_blend must stay inside its immutable ceiling"
+            )
+        if (
+            required_next_track_id is not None
+            and (
+                type(required_next_track_id) is not str
+                or not required_next_track_id
+                or len(required_next_track_id) > 128
+                or required_next_track_id == expected_current_track_id
+            )
+        ):
+            raise VisualApproachRefusal(
+                "required next track id must be a different bounded string"
             )
         ramp_values = (
             next_gate_blend_start_log_scale,
@@ -498,6 +523,7 @@ class RollingVisualApproachServo:
             if next_gate_blend_full_log_scale is None
             else float(next_gate_blend_full_log_scale)
         )
+        self.required_next_track_id = required_next_track_id
         self._servo = ImageVisualServo(tuning)
         self._last_camera_token: Optional[CameraFrameToken] = None
         self._last_tracker_frame_sequence: Optional[int] = None
@@ -670,6 +696,29 @@ class RollingVisualApproachServo:
             snapshot,
             tracker,
         )
+        if (
+            self.required_next_track_id is not None
+            and mode is VisualApproachMode.APPROACH
+        ):
+            required_candidates = tuple(
+                (candidate, track)
+                for candidate, track in visible_stable
+                if candidate.track_id == self.required_next_track_id
+            )
+            different_stable_ids = tuple(
+                candidate.track_id
+                for candidate, _track in visible_stable
+                if candidate.track_id != self.required_next_track_id
+            )
+            if different_stable_ids:
+                raise VisualApproachRefusal(
+                    "a different stable next-gate identity contended with "
+                    "the required identity"
+                )
+            if len(required_candidates) != 1:
+                raise VisualApproachRefusal(
+                    "required next-gate identity is not continuously visible"
+                )
         eligible = tuple(
             (candidate, track)
             for candidate, track in visible_stable
@@ -679,6 +728,12 @@ class RollingVisualApproachServo:
                 snapshot,
             )
         )
+        if self.required_next_track_id is not None:
+            eligible = tuple(
+                (candidate, track)
+                for candidate, track in eligible
+                if candidate.track_id == self.required_next_track_id
+            )
         if provisional_ids:
             # A new one-frame contour is not yet evidence that the stable
             # incumbent identity changed.  It is nevertheless unresolved
@@ -819,6 +874,7 @@ class RollingVisualApproachServo:
                 camera_observation_monotonic_s=(
                     current_target.received_monotonic_s
                 ),
+                latched_next_track_id=self._latched_next_track_id,
             ) from exc
         except VisualServoRefusal as exc:
             raise VisualApproachRefusal(

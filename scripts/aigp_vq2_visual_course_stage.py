@@ -109,6 +109,27 @@ RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS = (
 CENSORED_PASSAGE_COAST_BASIS = (
     "latched-clean-attitude-close-censored-passage-v1"
 )
+APPROACH_PREVIEW_REQUALIFICATION_BASIS = (
+    "fresh-current-corridor-sealed-next-identity-v1"
+)
+# Attempt 15's hard rate-only discontinuity occurred at publication 104.
+# The same continuously visible next identity first re-earned every ordinary
+# current-corridor and next-target predicate at publication 117: 12 newer
+# observations, publication delta 13, and 0.437 seconds later.  These bounds
+# create no preview command authority; they only bound one fresh-planner
+# opportunity to earn the unchanged ordinary admission.
+MAX_APPROACH_PREVIEW_REQUALIFICATION_FRESH_FRAMES = 12
+MAX_APPROACH_PREVIEW_REQUALIFICATION_PUBLICATION_DELTA = 13
+MAX_APPROACH_PREVIEW_REQUALIFICATION_DURATION_S = 0.45
+# Pub104->117 took 0.4534 seconds on the compact event wall clock.  Keep one
+# additional 50 Hz scheduling interval plus recorder jitter inside this
+# separate wall ceiling; the ordinary camera watchdog remains authoritative
+# for an actual stalled stream.
+MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S = 0.50
+_REQUALIFIABLE_APPROACH_PREVIEW_VIOLATIONS = (
+    "current_vertical_rate",
+    "current_log_scale_rate",
+)
 _YAW_PROFILE_ISSUER = object()
 
 
@@ -216,6 +237,16 @@ class _AcceptedVisualCommand:
     wire_start_monotonic_ns: int
     target_roll_rad: float
     target_pitch_rad: float
+
+
+class _PreviewRequalificationWireSlotUnavailable(RuntimeError):
+    """A preview candidate has no wire-start instant inside its wall bound."""
+
+    def __init__(self, checked_perf_counter_ns: int) -> None:
+        super().__init__(
+            "preview requalification has no bounded wire-start slot"
+        )
+        self.checked_perf_counter_ns = checked_perf_counter_ns
 
 
 @dataclass(frozen=True, slots=True)
@@ -1820,6 +1851,7 @@ async def _run_visual_course_stage_impl(
         yaw_reference_rad: float,
         segment_started_s: float,
         stage: str,
+        preview_requalification_wire_deadline_ns: Optional[int] = None,
     ) -> Optional[_AcceptedVisualCommand]:
         nonlocal total_navigation_commands
         nonlocal last_navigation_send_s
@@ -2055,6 +2087,27 @@ async def _run_visual_course_stage_impl(
         validation_ns = runtime.perf_counter_ns()
         if type(validation_ns) is not int or validation_ns < 0:
             raise abort_type("visual-course wire clock is invalid")
+        if preview_requalification_wire_deadline_ns is not None:
+            if (
+                type(preview_requalification_wire_deadline_ns) is not int
+                or preview_requalification_wire_deadline_ns < 0
+            ):
+                raise abort_type(
+                    "visual-course preview requalification wire deadline "
+                    "is invalid"
+                )
+            preview_wire_anchor_ns = (
+                preview_requalification_wire_deadline_ns
+                - round(
+                    MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                    * 1_000_000_000
+                )
+            )
+            if validation_ns < preview_wire_anchor_ns:
+                raise abort_type(
+                    "visual-course preview requalification wire clock "
+                    "regressed"
+                )
         not_before_ns = (
             None
             if host._last_flight_command_started_ns is None
@@ -2064,6 +2117,11 @@ async def _run_visual_course_stage_impl(
         deadline_ns = validation_ns + round(
             limits.max_validation_to_wire_delay_s * 1_000_000_000
         )
+        if preview_requalification_wire_deadline_ns is not None:
+            deadline_ns = min(
+                deadline_ns,
+                preview_requalification_wire_deadline_ns,
+            )
         if consecutive_superseded_proposals > 0:
             hold_checked_s = float(runtime.monotonic())
             if (
@@ -2093,6 +2151,10 @@ async def _run_visual_course_stage_impl(
                 and not_before_ns >= deadline_ns
             )
         ):
+            if preview_requalification_wire_deadline_ns is not None:
+                raise _PreviewRequalificationWireSlotUnavailable(
+                    validation_ns
+                )
             raise abort_type(
                 "visual-course supersession leaves no bounded wire slot"
             )
@@ -2129,6 +2191,11 @@ async def _run_visual_course_stage_impl(
             or top_level_wire_start_ns != wire_start_monotonic_ns
             or host._last_flight_command_started_ns
             != wire_start_monotonic_ns
+            or (
+                preview_requalification_wire_deadline_ns is not None
+                and wire_start_monotonic_ns
+                >= preview_requalification_wire_deadline_ns
+            )
             or not isinstance(wire_frame_token, Mapping)
             or dict(wire_frame_token)
             != asdict(snapshot.latest_camera_token)
@@ -2538,20 +2605,35 @@ async def _run_visual_course_stage_impl(
             if launch_enabled
             else None
         )
-        planner = runtime.servo_factory(
-            current_track_id,
-            current_gate_index,
-            host.visual_config.servo,
+
+        def make_planner(
+            *,
+            next_gate_blend: float,
+            required_next_track_id: Optional[str] = None,
+        ) -> Any:
+            kwargs = {
+                "next_gate_blend": next_gate_blend,
+                "next_gate_blend_start_log_scale": (
+                    host.visual_config.lifecycle
+                    .next_gate_blend_start_log_scale
+                ),
+                "next_gate_blend_full_log_scale": (
+                    host.visual_config.lifecycle
+                    .next_gate_blend_full_log_scale
+                ),
+            }
+            if required_next_track_id is not None:
+                kwargs["required_next_track_id"] = required_next_track_id
+            return runtime.servo_factory(
+                current_track_id,
+                current_gate_index,
+                host.visual_config.servo,
+                **kwargs,
+            )
+
+        planner = make_planner(
             next_gate_blend=(
                 host.visual_config.lifecycle.next_gate_blend_max
-            ),
-            next_gate_blend_start_log_scale=(
-                host.visual_config.lifecycle
-                .next_gate_blend_start_log_scale
-            ),
-            next_gate_blend_full_log_scale=(
-                host.visual_config.lifecycle
-                .next_gate_blend_full_log_scale
             ),
         )
         mode = VisualApproachMode.APPROACH
@@ -2562,6 +2644,8 @@ async def _run_visual_course_stage_impl(
         advance_command_count = 0
         approach_command_count = 0
         next_preview_retired = False
+        next_preview_requalification_used = False
+        next_preview_requalification: Optional[Dict[str, Any]] = None
         crossing_anchor: Optional[Dict[str, Any]] = None
         crossing_coast_authority: Optional[
             _CensoredPassageCoastAuthority
@@ -2593,6 +2677,8 @@ async def _run_visual_course_stage_impl(
             "next_preview_withdrawal_count": 0,
             "next_preview_withdrawal": None,
             "next_preview_retired": False,
+            "next_preview_requalification_count": 0,
+            "next_preview_requalification": None,
             "yaw_soft_stop_zero_command_count": 0,
             "passage_admission_yaw_soft_stop_withheld_count": 0,
             "retained_crossing_dwell_frames": 0,
@@ -2707,6 +2793,112 @@ async def _run_visual_course_stage_impl(
             )
             return refused_race
 
+        def current_only_replan(
+            snapshot: Any,
+            *,
+            now: float,
+            excursion: float,
+            required_next_track_id: Optional[str],
+        ) -> tuple[Any, Any]:
+            """Consume one exact approach publication with no preview."""
+
+            replacement = make_planner(
+                next_gate_blend=0.0,
+                required_next_track_id=required_next_track_id,
+            )
+            try:
+                replacement_proposal = replacement.observe(
+                    snapshot,
+                    host.visual_tracker,
+                    runtime.perf_counter_ns() / 1_000_000_000.0,
+                    now - segment_started_s,
+                    excursion,
+                    mode=VisualApproachMode.APPROACH,
+                    passage_admission=None,
+                )
+            except VisualApproachRefusal as exc:
+                raise abort_type(
+                    "visual-course current-only replan failed after preview "
+                    f"retirement: {exc}"
+                ) from exc
+            fallback_admission = replacement_proposal.passage_admission
+            identity_only_admission = bool(
+                type(fallback_admission)
+                is VisualApproachPassageAdmission
+                and type(fallback_admission.preview_track_id) is str
+                and bool(fallback_admission.preview_track_id)
+                and fallback_admission.preview_blend == 0.0
+                and (
+                    required_next_track_id is None
+                    or fallback_admission.preview_track_id
+                    == required_next_track_id
+                )
+            )
+            if (
+                replacement_proposal.mode
+                is not VisualApproachMode.APPROACH
+                or replacement_proposal.servo_output.advance_enabled
+                or replacement_proposal.servo_output.next_gate_blend != 0.0
+                or (
+                    fallback_admission is not None
+                    and not identity_only_admission
+                )
+            ):
+                raise abort_type(
+                    "visual-course preview retirement retained prior blend, "
+                    "advance, or unreviewed admission authority"
+                )
+            return replacement, replacement_proposal
+
+        def record_preview_retirement(
+            *,
+            reason: str,
+            token: CameraFrameToken,
+            tracker_frame_sequence: int,
+            violation_codes: list[str],
+            violation_evidence: list[Dict[str, Any]],
+            transient_eligible: bool,
+        ) -> None:
+            nonlocal next_preview_retired
+            nonlocal next_preview_requalification
+
+            if next_preview_retired:
+                raise abort_type(
+                    "visual-course attempted to retire preview more than once"
+                )
+            if next_preview_requalification is not None:
+                next_preview_requalification.update(
+                    {
+                        "outcome": "retired",
+                        "retirement_reason": reason,
+                        "retirement_camera_token": asdict(token),
+                    }
+                )
+                next_preview_requalification = None
+            next_preview_retired = True
+            withdrawal = {
+                "reason": reason,
+                "camera_token": asdict(token),
+                "tracker_frame_sequence": tracker_frame_sequence,
+                "violation_codes": violation_codes,
+                "violation_evidence": violation_evidence,
+                "transient_eligible": transient_eligible,
+            }
+            segment["next_preview_withdrawal_count"] = int(
+                segment["next_preview_withdrawal_count"]
+            ) + 1
+            segment["next_preview_withdrawal"] = withdrawal
+            segment["next_preview_retired"] = True
+            host.recorder.emit(
+                "visual_course_next_preview_withdrawn",
+                gate_index=current_gate_index,
+                stage=(
+                    f"{VISUAL_COURSE_STAGE}/gate"
+                    f"{current_gate_index}/approach"
+                ),
+                **withdrawal,
+            )
+
         while credited_race is None:
             now = await pace_tick()
             assert_pending_supersession_hold("paced control tick")
@@ -2795,9 +2987,83 @@ async def _run_visual_course_stage_impl(
             token = getattr(snapshot, "latest_camera_token", None)
             if type(token) is not CameraFrameToken:
                 raise abort_type("visual-course graph lacks exact camera token")
+            if next_preview_requalification is not None:
+                control_checked_ns = runtime.perf_counter_ns()
+                control_anchor_ns = int(
+                    next_preview_requalification[
+                        "refusal_control_perf_counter_ns"
+                    ]
+                )
+                if (
+                    type(control_checked_ns) is not int
+                    or control_checked_ns < control_anchor_ns
+                ):
+                    raise abort_type(
+                        "visual-course preview requalification control clock "
+                        "regressed"
+                    )
+                control_elapsed_ns = (
+                    control_checked_ns - control_anchor_ns
+                )
+                control_elapsed_s = (
+                    control_elapsed_ns / 1_000_000_000
+                )
+                next_preview_requalification["control_elapsed_s"] = (
+                    control_elapsed_s
+                )
+                next_preview_requalification["control_elapsed_ns"] = (
+                    control_elapsed_ns
+                )
+                if (
+                    control_elapsed_ns
+                    > round(
+                        MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                        * 1_000_000_000
+                    )
+                ):
+                    sealed_next_track_id = (
+                        next_preview_requalification[
+                            "sealed_next_track_id"
+                        ]
+                    )
+                    planner = make_planner(
+                        next_gate_blend=0.0,
+                        required_next_track_id=sealed_next_track_id,
+                    )
+                    record_preview_retirement(
+                        reason=(
+                            "preview_requalification_control_timeout"
+                        ),
+                        token=token,
+                        tracker_frame_sequence=(
+                            snapshot.tracker_frame_sequence
+                        ),
+                        violation_codes=[
+                            "requalification_control_duration_s",
+                        ],
+                        violation_evidence=[
+                            {
+                                "code": (
+                                    "requalification_control_duration_s"
+                                ),
+                                "observed": control_elapsed_s,
+                                "limit": (
+                                    MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                                ),
+                                "excess": (
+                                    control_elapsed_s
+                                    - (
+                                        MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                                    )
+                                ),
+                            },
+                        ],
+                        transient_eligible=False,
+                    )
             if last_planned_token is not None and token == last_planned_token:
                 continue
 
+            preview_requalification_wire_candidate = False
             try:
                 proposal = planner.observe(
                     snapshot,
@@ -2831,81 +3097,215 @@ async def _run_visual_course_stage_impl(
                     for code, observed, limit, excess
                     in exc.violation_evidence
                 ]
-                try:
-                    planner = runtime.servo_factory(
-                        current_track_id,
-                        current_gate_index,
-                        host.visual_config.servo,
-                        next_gate_blend=0.0,
-                        next_gate_blend_start_log_scale=(
-                            host.visual_config.lifecycle
-                            .next_gate_blend_start_log_scale
-                        ),
-                        next_gate_blend_full_log_scale=(
-                            host.visual_config.lifecycle
-                            .next_gate_blend_full_log_scale
-                        ),
-                    )
-                    proposal = planner.observe(
-                        snapshot,
-                        host.visual_tracker,
-                        runtime.perf_counter_ns() / 1_000_000_000.0,
-                        now - segment_started_s,
-                        excursion,
-                        mode=VisualApproachMode.APPROACH,
-                        passage_admission=None,
-                    )
-                except VisualApproachRefusal as fallback_exc:
-                    raise abort_type(
-                        "visual-course current-only replan failed after "
-                        f"preview retirement: {fallback_exc}"
-                    ) from fallback_exc
-                fallback_admission = proposal.passage_admission
-                identity_only_admission = bool(
-                    type(fallback_admission)
-                    is VisualApproachPassageAdmission
-                    and type(fallback_admission.preview_track_id) is str
-                    and bool(fallback_admission.preview_track_id)
-                    and fallback_admission.preview_blend == 0.0
-                )
+                sealed_next_track_id = exc.latched_next_track_id
                 if (
-                    proposal.mode is not VisualApproachMode.APPROACH
-                    or proposal.servo_output.advance_enabled
-                    or proposal.servo_output.next_gate_blend != 0.0
-                    or (
-                        fallback_admission is not None
-                        and not identity_only_admission
-                    )
+                    type(sealed_next_track_id) is not str
+                    or not sealed_next_track_id
                 ):
                     raise abort_type(
-                        "visual-course preview retirement retained prior "
-                        "blend, advance, or unreviewed admission authority"
-                    )
-                next_preview_retired = True
-                withdrawal = {
-                    "reason": "current_passage_safety_violation",
-                    "camera_token": asdict(token),
-                    "tracker_frame_sequence": (
-                        snapshot.tracker_frame_sequence
-                    ),
-                    "violation_codes": list(exc.violation_codes),
-                    "violation_evidence": violation_evidence,
-                    "transient_eligible": exc.transient_eligible,
-                }
-                segment["next_preview_withdrawal_count"] = int(
-                    segment["next_preview_withdrawal_count"]
-                ) + 1
-                segment["next_preview_withdrawal"] = withdrawal
-                segment["next_preview_retired"] = True
-                host.recorder.emit(
-                    "visual_course_next_preview_withdrawn",
-                    gate_index=current_gate_index,
-                    stage=(
-                        f"{VISUAL_COURSE_STAGE}/gate"
-                        f"{current_gate_index}/approach"
-                    ),
-                    **withdrawal,
+                        "visual-course passage safety refusal lacks its "
+                        "sealed next identity"
+                    ) from exc
+                refusal_history = getattr(
+                    getattr(snapshot, "current_track", None),
+                    "history",
+                    None,
                 )
+                refusal_sample = (
+                    refusal_history[-1]
+                    if type(refusal_history) is tuple
+                    and bool(refusal_history)
+                    else None
+                )
+                refusal_observation_ns = getattr(
+                    refusal_sample,
+                    "observation_monotonic_ns",
+                    None,
+                )
+                if (
+                    getattr(refusal_sample, "token", None) != token
+                    or type(refusal_observation_ns) is not int
+                    or refusal_observation_ns < 0
+                    or round(
+                        exc.camera_observation_monotonic_s
+                        * 1_000_000_000
+                    )
+                    != refusal_observation_ns
+                ):
+                    raise abort_type(
+                        "visual-course passage safety refusal lacks exact "
+                        "camera observation provenance"
+                    ) from exc
+                requalification_eligible = bool(
+                    not next_preview_requalification_used
+                    and next_preview_requalification is None
+                    and exc.violation_codes
+                    == _REQUALIFIABLE_APPROACH_PREVIEW_VIOLATIONS
+                )
+                if requalification_eligible:
+                    refusal_control_perf_counter_ns = (
+                        runtime.perf_counter_ns()
+                    )
+                    if (
+                        type(refusal_control_perf_counter_ns) is not int
+                        or refusal_control_perf_counter_ns < 0
+                    ):
+                        raise abort_type(
+                            "visual-course preview requalification wire "
+                            "deadline clock is invalid"
+                        )
+                    wire_start_deadline_monotonic_ns = (
+                        refusal_control_perf_counter_ns
+                        + round(
+                            MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                            * 1_000_000_000
+                        )
+                    )
+                    planner = make_planner(
+                        next_gate_blend=(
+                            host.visual_config.lifecycle
+                            .next_gate_blend_max
+                        ),
+                        required_next_track_id=sealed_next_track_id,
+                    )
+                    try:
+                        proposal = planner.observe(
+                            snapshot,
+                            host.visual_tracker,
+                            (
+                                runtime.perf_counter_ns()
+                                / 1_000_000_000.0
+                            ),
+                            now - segment_started_s,
+                            excursion,
+                            mode=VisualApproachMode.APPROACH,
+                            passage_admission=None,
+                        )
+                    except VisualApproachRefusal as requalify_exc:
+                        raise abort_type(
+                            "visual-course sealed preview requalification "
+                            "could not consume its refusal publication: "
+                            f"{requalify_exc}"
+                        ) from requalify_exc
+                    if (
+                        proposal.mode is not VisualApproachMode.APPROACH
+                        or proposal.servo_output.advance_enabled
+                        or proposal.servo_output.next_gate_blend != 0.0
+                        or proposal.passage_admission is not None
+                        or getattr(
+                            proposal,
+                            "latched_next_track_id",
+                            None,
+                        )
+                        is not None
+                    ):
+                        raise abort_type(
+                            "visual-course sealed preview requalification "
+                            "retained authority on its refusal publication"
+                        )
+                    next_preview_requalification_used = True
+                    next_preview_requalification = {
+                        "basis": (
+                            APPROACH_PREVIEW_REQUALIFICATION_BASIS
+                        ),
+                        "outcome": "pending",
+                        "sealed_next_track_id": sealed_next_track_id,
+                        "refusal_camera_token": asdict(token),
+                        "refusal_tracker_frame_sequence": (
+                            snapshot.tracker_frame_sequence
+                        ),
+                        "refusal_observation_monotonic_s": (
+                            exc.camera_observation_monotonic_s
+                        ),
+                        "refusal_observation_monotonic_ns": (
+                            refusal_observation_ns
+                        ),
+                        "refusal_control_monotonic_s": now,
+                        "refusal_control_perf_counter_ns": (
+                            refusal_control_perf_counter_ns
+                        ),
+                        "refusal_violation_codes": list(
+                            exc.violation_codes
+                        ),
+                        "refusal_violation_evidence": (
+                            violation_evidence
+                        ),
+                        "fresh_frame_count": 0,
+                        "latest_camera_token": asdict(token),
+                        "latest_tracker_frame_sequence": (
+                            snapshot.tracker_frame_sequence
+                        ),
+                        "publication_delta": 0,
+                        "elapsed_s": 0.0,
+                        "control_elapsed_s": 0.0,
+                        "control_elapsed_ns": 0,
+                        "max_fresh_frames": (
+                            MAX_APPROACH_PREVIEW_REQUALIFICATION_FRESH_FRAMES
+                        ),
+                        "max_publication_delta": (
+                            MAX_APPROACH_PREVIEW_REQUALIFICATION_PUBLICATION_DELTA
+                        ),
+                        "max_duration_s": (
+                            MAX_APPROACH_PREVIEW_REQUALIFICATION_DURATION_S
+                        ),
+                        "max_control_duration_s": (
+                            MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                        ),
+                        "wire_start_deadline_monotonic_ns": (
+                            wire_start_deadline_monotonic_ns
+                        ),
+                        "requalified_camera_token": None,
+                        "requalified_tracker_frame_sequence": None,
+                        "requalified_preview_blend": None,
+                        "retirement_reason": None,
+                        "retirement_camera_token": None,
+                    }
+                    segment["next_preview_requalification_count"] = 1
+                    segment["next_preview_requalification"] = (
+                        next_preview_requalification
+                    )
+                    host.recorder.emit(
+                        "visual_course_next_preview_requalification_started",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/approach"
+                        ),
+                        **next_preview_requalification,
+                    )
+                else:
+                    required_next_track_id = (
+                        next_preview_requalification[
+                            "sealed_next_track_id"
+                        ]
+                        if next_preview_requalification is not None
+                        else (
+                            sealed_next_track_id
+                        )
+                    )
+                    planner, proposal = current_only_replan(
+                        snapshot,
+                        now=now,
+                        excursion=excursion,
+                        required_next_track_id=(
+                            required_next_track_id
+                        ),
+                    )
+                    retirement_reason = (
+                        "preview_requalification_safety_violation"
+                        if next_preview_requalification is not None
+                        else "current_passage_safety_violation"
+                    )
+                    record_preview_retirement(
+                        reason=retirement_reason,
+                        token=token,
+                        tracker_frame_sequence=(
+                            snapshot.tracker_frame_sequence
+                        ),
+                        violation_codes=list(exc.violation_codes),
+                        violation_evidence=violation_evidence,
+                        transient_eligible=exc.transient_eligible,
+                    )
             except (
                 VisualApproachCurrentGeometryUnavailable,
                 VisualApproachRefusal,
@@ -3100,6 +3500,225 @@ async def _run_visual_course_stage_impl(
                     "visual-course censored passage coast returned to "
                     "uncensored geometry"
                 )
+            if next_preview_requalification is not None:
+                requalification = next_preview_requalification
+                sealed_next_track_id = requalification[
+                    "sealed_next_track_id"
+                ]
+                refusal_token = requalification[
+                    "refusal_camera_token"
+                ]
+                same_refusal_publication = bool(
+                    token.stream_id == refusal_token["stream_id"]
+                    and token.generation == refusal_token["generation"]
+                    and token.frame_id == refusal_token["frame_id"]
+                    and token.publication_sequence
+                    == refusal_token["publication_sequence"]
+                )
+                if not same_refusal_publication:
+                    if (
+                        token.stream_id != refusal_token["stream_id"]
+                        or token.generation != refusal_token["generation"]
+                        or token.publication_sequence
+                        <= refusal_token["publication_sequence"]
+                        or snapshot.tracker_frame_sequence
+                        <= requalification[
+                            "refusal_tracker_frame_sequence"
+                        ]
+                    ):
+                        raise abort_type(
+                            "visual-course preview requalification crossed "
+                            "or replayed its exact camera epoch"
+                        )
+                    requalification["fresh_frame_count"] = (
+                        int(requalification["fresh_frame_count"]) + 1
+                    )
+                observation_ns = (
+                    _current_target_observation_monotonic_ns(
+                        snapshot,
+                        proposal.current_target,
+                        abort_type=abort_type,
+                    )
+                )
+                requalification_elapsed_ns = (
+                    observation_ns
+                    - int(
+                        requalification[
+                            "refusal_observation_monotonic_ns"
+                        ]
+                    )
+                )
+                requalification_elapsed_s = (
+                    requalification_elapsed_ns / 1_000_000_000
+                )
+                publication_delta = (
+                    token.publication_sequence
+                    - refusal_token["publication_sequence"]
+                )
+                if (
+                    requalification_elapsed_ns < 0
+                    or publication_delta < 0
+                ):
+                    raise abort_type(
+                        "visual-course preview requalification timing "
+                        "regressed"
+                    )
+                requalification.update(
+                    {
+                        "latest_camera_token": asdict(token),
+                        "latest_tracker_frame_sequence": (
+                            snapshot.tracker_frame_sequence
+                        ),
+                        "publication_delta": publication_delta,
+                        "elapsed_s": requalification_elapsed_s,
+                        "elapsed_ns": requalification_elapsed_ns,
+                    }
+                )
+
+                proposal_latched_id = getattr(
+                    proposal,
+                    "latched_next_track_id",
+                    None,
+                )
+                reviewed_next_id = getattr(
+                    proposal.servo_output,
+                    "reviewed_next_track_id",
+                    None,
+                )
+                proposal_next_target = getattr(
+                    proposal,
+                    "next_target",
+                    None,
+                )
+                proposal_next_id = getattr(
+                    proposal_next_target,
+                    "track_id",
+                    None,
+                )
+                proposal_admission = proposal.passage_admission
+                admission_preview_id = getattr(
+                    proposal_admission,
+                    "preview_track_id",
+                    None,
+                )
+                if any(
+                    identity not in {None, sealed_next_track_id}
+                    for identity in (
+                        proposal_latched_id,
+                        reviewed_next_id,
+                        proposal_next_id,
+                        admission_preview_id,
+                    )
+                ):
+                    raise abort_type(
+                        "visual-course preview requalification changed its "
+                        "sealed next identity"
+                    )
+
+                preview_requalification_wire_candidate = bool(
+                    proposal.servo_output.next_gate_blend > 0.0
+                    and proposal_latched_id == sealed_next_track_id
+                    and reviewed_next_id == sealed_next_track_id
+                    and proposal_next_id == sealed_next_track_id
+                    and type(proposal_admission)
+                    is VisualApproachPassageAdmission
+                    and proposal_admission.preview_track_id
+                    == sealed_next_track_id
+                    and proposal_admission.preview_blend
+                    == proposal.servo_output.next_gate_blend
+                )
+                if (
+                    proposal.servo_output.next_gate_blend > 0.0
+                    and not preview_requalification_wire_candidate
+                ):
+                    raise abort_type(
+                        "visual-course preview requalification proposed "
+                        "authority before ordinary same-identity admission"
+                    )
+
+                requalification_bounds_exhausted = bool(
+                    int(requalification["fresh_frame_count"])
+                    > MAX_APPROACH_PREVIEW_REQUALIFICATION_FRESH_FRAMES
+                    or publication_delta
+                    > (
+                        MAX_APPROACH_PREVIEW_REQUALIFICATION_PUBLICATION_DELTA
+                    )
+                    or requalification_elapsed_ns
+                    > round(
+                        MAX_APPROACH_PREVIEW_REQUALIFICATION_DURATION_S
+                        * 1_000_000_000
+                    )
+                )
+                if requalification_bounds_exhausted:
+                    planner, proposal = current_only_replan(
+                        snapshot,
+                        now=now,
+                        excursion=excursion,
+                        required_next_track_id=sealed_next_track_id,
+                    )
+                    bound_evidence = [
+                        {
+                            "code": "requalification_fresh_frames",
+                            "observed": int(
+                                requalification["fresh_frame_count"]
+                            ),
+                            "limit": (
+                                MAX_APPROACH_PREVIEW_REQUALIFICATION_FRESH_FRAMES
+                            ),
+                            "excess": max(
+                                0,
+                                int(
+                                    requalification[
+                                        "fresh_frame_count"
+                                    ]
+                                )
+                                - (
+                                    MAX_APPROACH_PREVIEW_REQUALIFICATION_FRESH_FRAMES
+                                ),
+                            ),
+                        },
+                        {
+                            "code": "requalification_publication_delta",
+                            "observed": publication_delta,
+                            "limit": (
+                                MAX_APPROACH_PREVIEW_REQUALIFICATION_PUBLICATION_DELTA
+                            ),
+                            "excess": max(
+                                0,
+                                publication_delta
+                                - (
+                                    MAX_APPROACH_PREVIEW_REQUALIFICATION_PUBLICATION_DELTA
+                                ),
+                            ),
+                        },
+                        {
+                            "code": "requalification_duration_s",
+                            "observed": requalification_elapsed_s,
+                            "limit": (
+                                MAX_APPROACH_PREVIEW_REQUALIFICATION_DURATION_S
+                            ),
+                            "excess": max(
+                                0.0,
+                                requalification_elapsed_s
+                                - (
+                                    MAX_APPROACH_PREVIEW_REQUALIFICATION_DURATION_S
+                                ),
+                            ),
+                        },
+                    ]
+                    record_preview_retirement(
+                        reason="preview_requalification_bounds_exhausted",
+                        token=token,
+                        tracker_frame_sequence=(
+                            snapshot.tracker_frame_sequence
+                        ),
+                        violation_codes=[
+                            item["code"] for item in bound_evidence
+                        ],
+                        violation_evidence=bound_evidence,
+                        transient_eligible=False,
+                    )
+                    preview_requalification_wire_candidate = False
             last_planned_token = token
             if (
                 proposal.servo_output.passage_preview_retired
@@ -3171,7 +3790,90 @@ async def _run_visual_course_stage_impl(
                             f"{VISUAL_COURSE_STAGE}/gate"
                             f"{current_gate_index}/approach"
                         ),
+                        preview_requalification_wire_deadline_ns=(
+                            (
+                                int(
+                                    next_preview_requalification[
+                                        "wire_start_deadline_monotonic_ns"
+                                    ]
+                                )
+                            )
+                            if preview_requalification_wire_candidate
+                            and next_preview_requalification is not None
+                            else None
+                        ),
                     )
+                except _PreviewRequalificationWireSlotUnavailable as exc:
+                    if (
+                        not preview_requalification_wire_candidate
+                        or next_preview_requalification is None
+                    ):
+                        raise abort_type(
+                            "visual-course preview wire deadline expired "
+                            "without pending requalification authority"
+                        ) from exc
+                    sealed_next_track_id = next_preview_requalification[
+                        "sealed_next_track_id"
+                    ]
+                    planner = make_planner(
+                        next_gate_blend=0.0,
+                        required_next_track_id=sealed_next_track_id,
+                    )
+                    record_preview_retirement(
+                        reason=(
+                            "preview_requalification_wire_deadline_expired"
+                        ),
+                        token=token,
+                        tracker_frame_sequence=(
+                            snapshot.tracker_frame_sequence
+                        ),
+                        violation_codes=[
+                            "requalification_control_duration_s",
+                        ],
+                        violation_evidence=[
+                            {
+                                "code": (
+                                    "requalification_control_duration_s"
+                                ),
+                                "observed": (
+                                    (
+                                        exc.checked_perf_counter_ns
+                                        - int(
+                                            next_preview_requalification[
+                                                "refusal_control_perf_counter_ns"
+                                            ]
+                                        )
+                                    )
+                                    / 1_000_000_000
+                                ),
+                                "limit": (
+                                    MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                                ),
+                                "excess": max(
+                                    0.0,
+                                    (
+                                        exc.checked_perf_counter_ns
+                                        - int(
+                                            next_preview_requalification[
+                                                "refusal_control_perf_counter_ns"
+                                            ]
+                                        )
+                                    )
+                                    / 1_000_000_000
+                                    - (
+                                        MAX_APPROACH_PREVIEW_REQUALIFICATION_CONTROL_DURATION_S
+                                    ),
+                                ),
+                            },
+                        ],
+                        transient_eligible=False,
+                    )
+                    # The launch collective and other per-observation proofs
+                    # have already consumed this token while preparing the
+                    # rejected candidate.  Wait for the next exact camera
+                    # publication before planning sealed current-only
+                    # authority.
+                    continue
                 except RaceActiveBoundaryChangedBeforeWire as exc:
                     credited_race = accept_no_wire_race_boundary(exc)
                     break
@@ -3179,7 +3881,47 @@ async def _run_visual_course_stage_impl(
                     continue
                 approach_command_count += 1
                 segment["approach_command_count"] = approach_command_count
+                if preview_requalification_wire_candidate:
+                    if next_preview_requalification is None:
+                        raise abort_type(
+                            "visual-course preview requalification candidate "
+                            "lost its pending state"
+                        )
+                    next_preview_requalification.update(
+                        {
+                            "outcome": "requalified",
+                            "requalified_camera_token": asdict(token),
+                            "requalified_tracker_frame_sequence": (
+                                snapshot.tracker_frame_sequence
+                            ),
+                            "requalified_preview_blend": (
+                                proposal.servo_output.next_gate_blend
+                            ),
+                        }
+                    )
+                    host.recorder.emit(
+                        "visual_course_next_preview_requalified",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/approach"
+                        ),
+                        **next_preview_requalification,
+                    )
+                    next_preview_requalification = None
                 if proposal.passage_admission is not None:
+                    if next_preview_requalification is not None:
+                        launch = segment["launch_bootstrap"]
+                        launch["passage_admission_withheld_count"] = (
+                            int(
+                                launch.get(
+                                    "passage_admission_withheld_count",
+                                    0,
+                                )
+                            )
+                            + 1
+                        )
+                        continue
                     if accepted.yaw_soft_stop_zeroed:
                         segment[
                             "passage_admission_yaw_soft_stop_withheld_count"

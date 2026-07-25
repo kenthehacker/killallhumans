@@ -286,6 +286,7 @@ class _Servo:
         next_gate_blend,
         next_gate_blend_start_log_scale=None,
         next_gate_blend_full_log_scale=None,
+        required_next_track_id=None,
         yaw_rate=0.02,
         passage_advances=True,
         preview_track_id=None,
@@ -303,6 +304,7 @@ class _Servo:
         self.next_gate_blend_full_log_scale = (
             next_gate_blend_full_log_scale
         )
+        self.required_next_track_id = required_next_track_id
         self.yaw_rate = yaw_rate
         self.passage_advances = passage_advances
         self.preview_track_id = (
@@ -2986,12 +2988,228 @@ def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():
     )
 
 
-def test_approach_hard_passage_refusal_retires_preview_and_replans_same_frame():
-    host = _Host(initial_gate=0, finish_gate=0, fresh_after_samples=1)
+@pytest.mark.parametrize(
+    "wire_scenario",
+    (
+        "accepted",
+        "superseded",
+        "wall_before",
+        "wall_equal",
+        "wall_over",
+        "duplicate_timeout",
+        "second_refusal",
+        "refusal_superseded",
+        "observation_equal",
+        "observation_over",
+        "lying_receipt",
+        "qpc_wall_equal_frozen_monotonic",
+        "qpc_timeout_frozen_monotonic",
+    ),
+)
+def test_rate_only_refusal_requalifies_sealed_preview_at_exact_bounds(
+    wire_scenario,
+):
+    class RequalificationHost(_Host):
+        skip_one_publication = False
+        supersede_requalification_token = None
+        requalification_superseded = False
+        requalification_refusal_control_s = None
+        wall_slot_delayed = False
+        preview_candidate_send_calls = 0
+        preview_candidate_call_start_ns = None
+        refusal_token = None
+        refusal_frame_superseded = False
+        refusal_observation_ns = None
+        qpc_override_ns = None
+        qpc_override_set_monotonic_s = None
+
+        def _sample(self):
+            preview_withdrawn = any(
+                event == "visual_course_next_preview_withdrawn"
+                for event, _payload in self.recorder.events
+            )
+            if preview_withdrawn:
+                self.qpc_override_ns = None
+            if (
+                wire_scenario == "qpc_timeout_frozen_monotonic"
+                and self.requalification_refusal_control_s is not None
+                and not preview_withdrawn
+            ):
+                requalification = self._visual_course_summary[
+                    "segments"
+                ][0]["next_preview_requalification"]
+                self.qpc_override_ns = (
+                    requalification[
+                        "refusal_control_perf_counter_ns"
+                    ]
+                    + 500_000_001
+                )
+                self.qpc_override_set_monotonic_s = self.clock
+                return
+            if (
+                wire_scenario == "duplicate_timeout"
+                and self.requalification_refusal_control_s is not None
+                and not preview_withdrawn
+            ):
+                return
+            super()._sample()
+            if self.skip_one_publication:
+                self.skip_one_publication = False
+                self.sequence += 1
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+            if (
+                wire_scenario
+                in {"observation_equal", "observation_over"}
+                and self.refusal_token is not None
+            ):
+                snapshot = self.visual_gate_graph.latest_snapshot
+                publication_delta = (
+                    snapshot.latest_camera_token.publication_sequence
+                    - self.refusal_token.publication_sequence
+                )
+                assert self.refusal_observation_ns is not None
+                total_observation_delta_ns = (
+                    450_000_000
+                    + (1 if wire_scenario == "observation_over" else 0)
+                )
+                observation_ns = (
+                    self.refusal_observation_ns
+                    + math.floor(
+                        publication_delta
+                        * total_observation_delta_ns
+                        / 13
+                    )
+                )
+                history = snapshot.current_track.history
+                snapshot.current_track.history = (
+                    *history[:-1],
+                    replace(
+                        history[-1],
+                        observation_monotonic_ns=observation_ns,
+                    ),
+                )
+
+        async def _wait_for_next_flight_command_slot(self):
+            ready = await super()._wait_for_next_flight_command_slot()
+            if (
+                wire_scenario
+                in {
+                    "wall_before",
+                    "wall_equal",
+                    "wall_over",
+                    "qpc_wall_equal_frozen_monotonic",
+                }
+                and self.supersede_requalification_token
+                == self.visual_gate_graph.latest_snapshot.latest_camera_token
+                and not self.wall_slot_delayed
+            ):
+                requalification = self._visual_course_summary[
+                    "segments"
+                ][0]["next_preview_requalification"]
+                deadline_ns = requalification[
+                    "wire_start_deadline_monotonic_ns"
+                ]
+                if wire_scenario == "qpc_wall_equal_frozen_monotonic":
+                    self.qpc_override_ns = deadline_ns
+                    self.qpc_override_set_monotonic_s = self.clock
+                else:
+                    self.clock = (
+                        deadline_ns
+                        + {
+                            "wall_before": -1,
+                            "wall_equal": 0,
+                            "wall_over": 1,
+                        }[wire_scenario]
+                    ) / 1_000_000_000
+                self.wall_slot_delayed = True
+            return ready
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if (
+                wire_scenario == "refusal_superseded"
+                and expected == self.refusal_token
+                and not self.refusal_frame_superseded
+            ):
+                self.refusal_frame_superseded = True
+                receiver = _token(expected.publication_sequence + 1)
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            if (
+                expected is not None
+                and expected == self.supersede_requalification_token
+            ):
+                self.preview_candidate_send_calls += 1
+                self.preview_candidate_call_start_ns = round(
+                    self.clock * 1_000_000_000
+                )
+                assert (
+                    self.preview_candidate_call_start_ns
+                    < kwargs["wire_start_deadline_ns"]
+                )
+            if (
+                wire_scenario == "superseded"
+                and expected == self.supersede_requalification_token
+                and not self.requalification_superseded
+            ):
+                self.requalification_superseded = True
+                receiver = _token(expected.publication_sequence + 1)
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            receipt = await super()._send_flight_command(
+                command,
+                **kwargs,
+            )
+            if (
+                wire_scenario == "lying_receipt"
+                and expected == self.supersede_requalification_token
+            ):
+                deadline_ns = self._visual_course_summary["segments"][0][
+                    "next_preview_requalification"
+                ]["wire_start_deadline_monotonic_ns"]
+                self._last_flight_command_started_ns = deadline_ns
+                receipt["call_start_monotonic_ns"] = deadline_ns
+                receipt["visual_receiver_authority"][
+                    "call_start_monotonic_ns"
+                ] = deadline_ns
+            return receipt
+
+    host = RequalificationHost(
+        initial_gate=0,
+        finish_gate=0,
+        fresh_after_samples=1,
+    )
     runtime, _calls = _runtime(host)
     factory_blends = []
+    factory_required_ids = []
     refusal_tokens = []
-    replacement_tokens = []
+    requalification_tokens = []
 
     class RefusingPreviewServo(_Servo):
         def __init__(self, *args, **kwargs):
@@ -3002,6 +3220,12 @@ def test_approach_hard_passage_refusal_retires_preview_and_replans_same_frame():
             self.observe_count += 1
             if self.observe_count == 8:
                 refusal_tokens.append(snapshot.latest_camera_token)
+                host.refusal_token = snapshot.latest_camera_token
+                host.refusal_observation_ns = (
+                    snapshot.current_track.history[-1]
+                    .observation_monotonic_ns
+                )
+                host.requalification_refusal_control_s = host.clock
                 raise VisualApproachPassageSafetyUnavailable(
                     "exact attempt-6 current passage discontinuity",
                     violation_codes=(
@@ -3026,81 +3250,379 @@ def test_approach_hard_passage_refusal_retires_preview_and_replans_same_frame():
                         snapshot.latest_camera_token.publication_sequence
                         * 0.02
                     ),
+                    latched_next_track_id=self.preview_track_id,
                 )
             return super().observe(snapshot, *args, **kwargs)
 
-    class CurrentOnlyReplacementServo(_Servo):
+    class ObservationProvenanceServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            observation_ns = (
+                snapshot.current_track.history[-1]
+                .observation_monotonic_ns
+            )
+            target = replace(
+                proposal.current_target,
+                received_monotonic_s=(
+                    observation_ns / 1_000_000_000
+                ),
+            )
+            proposal.current_target = target
+            if proposal.passage_admission is not None:
+                proposal.passage_admission = replace(
+                    proposal.passage_admission,
+                    current_target=target,
+                )
+            return proposal
+
+    class SealedRequalificationServo(ObservationProvenanceServo):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.observe_count = 0
+            assert self.required_next_track_id == self.preview_track_id
 
         def observe(self, snapshot, *args, **kwargs):
             self.observe_count += 1
+            if (
+                wire_scenario == "second_refusal"
+                and self.observe_count == 2
+            ):
+                raise VisualApproachPassageSafetyUnavailable(
+                    "second sealed rate-only discontinuity",
+                    violation_codes=(
+                        "current_vertical_rate",
+                        "current_log_scale_rate",
+                    ),
+                    violation_evidence=(
+                        (
+                            "current_vertical_rate",
+                            0.61,
+                            0.60,
+                            0.01,
+                        ),
+                        (
+                            "current_log_scale_rate",
+                            -1.51,
+                            -1.50,
+                            0.01,
+                        ),
+                    ),
+                    camera_observation_monotonic_s=(
+                        snapshot.latest_camera_token.publication_sequence
+                        * 0.02
+                    ),
+                    latched_next_track_id=self.preview_track_id,
+                )
             proposal = super().observe(snapshot, *args, **kwargs)
             if self.observe_count == 1:
-                replacement_tokens.append(snapshot.latest_camera_token)
+                requalification_tokens.append(
+                    snapshot.latest_camera_token
+                )
+            if (
+                kwargs["mode"] is VisualApproachMode.APPROACH
+                and self.observe_count <= 12
+            ):
                 return SimpleNamespace(
                     current_target=proposal.current_target,
-                    servo_output=proposal.servo_output,
+                    next_target=None,
+                    servo_output=replace(
+                        proposal.servo_output,
+                        next_gate_blend=0.0,
+                        reviewed_next_track_id=None,
+                    ),
+                    candidate_track_ids=(self.preview_track_id,),
+                    provisional_track_ids=(),
+                    withholding_reason=(
+                        "current_passage_corridor_not_ready"
+                    ),
+                    relationship_basis=None,
+                    latched_next_track_id=None,
                     passage_admission=None,
+                    mode=proposal.mode,
+                )
+            if kwargs["mode"] is VisualApproachMode.APPROACH:
+                preview_blend = 0.05
+                if (
+                    wire_scenario
+                    in {
+                        "superseded",
+                        "wall_before",
+                        "wall_equal",
+                        "wall_over",
+                        "lying_receipt",
+                        "qpc_wall_equal_frozen_monotonic",
+                    }
+                    and self.observe_count == 13
+                ):
+                    host.supersede_requalification_token = (
+                        snapshot.latest_camera_token
+                    )
+                admission = VisualApproachPassageAdmission(
+                    basis="tight-current-corridor-dwell-v1",
+                    current_gate_index=self.gate_index,
+                    current_target=proposal.current_target,
+                    camera_token=snapshot.latest_camera_token,
+                    tracker_frame_sequence=(
+                        snapshot.tracker_frame_sequence
+                    ),
+                    corridor_frames=5,
+                    preview_track_id=self.preview_track_id,
+                    preview_blend=preview_blend,
+                )
+                return SimpleNamespace(
+                    current_target=proposal.current_target,
+                    next_target=SimpleNamespace(
+                        track_id=self.preview_track_id
+                    ),
+                    servo_output=replace(
+                        proposal.servo_output,
+                        next_gate_blend=preview_blend,
+                        next_horizontal_error=0.30,
+                        next_vertical_error_image_down=-0.20,
+                        reviewed_next_track_id=self.preview_track_id,
+                    ),
+                    candidate_track_ids=(self.preview_track_id,),
+                    provisional_track_ids=(),
+                    withholding_reason=None,
+                    relationship_basis=None,
+                    latched_next_track_id=self.preview_track_id,
+                    passage_admission=admission,
                     mode=proposal.mode,
                 )
             return proposal
 
     def factory(*args, **kwargs):
         factory_blends.append(kwargs["next_gate_blend"])
+        factory_required_ids.append(
+            kwargs.get("required_next_track_id")
+        )
         servo_type = (
             RefusingPreviewServo
             if len(factory_blends) == 1
-            else CurrentOnlyReplacementServo
+            else (
+                SealedRequalificationServo
+                if len(factory_blends) == 2
+                else ObservationProvenanceServo
+            )
         )
+        if (
+            len(factory_blends) == 2
+            and wire_scenario != "refusal_superseded"
+        ):
+            host.skip_one_publication = True
         return servo_type(*args, **kwargs)
 
     runtime = replace(runtime, servo_factory=factory)
+    if wire_scenario in {
+        "qpc_wall_equal_frozen_monotonic",
+        "qpc_timeout_frozen_monotonic",
+    }:
+        runtime = replace(
+            runtime,
+            perf_counter_ns=lambda: (
+                host.qpc_override_ns
+                if host.qpc_override_ns is not None
+                else round(host.clock * 1_000_000_000)
+            ),
+        )
+    if wire_scenario == "lying_receipt":
+        with pytest.raises(
+            SafetyAbort,
+            match="lacks exact visual wire timing",
+        ):
+            asyncio.run(
+                run_visual_course_stage(
+                    host,
+                    _context(),
+                    runtime=runtime,
+                )
+            )
+        assert host.preview_candidate_send_calls == 1
+        assert not any(
+            event == "visual_course_next_preview_requalified"
+            for event, _payload in host.recorder.events
+        )
+        assert (
+            host._visual_course_summary["segments"][0][
+                "next_preview_requalification"
+            ]["outcome"]
+            == "pending"
+        )
+        return
     result = asyncio.run(
         run_visual_course_stage(host, _context(), runtime=runtime)
     )
 
     assert result["success"] is True
-    assert factory_blends == [
+    expected_factory_blends = [
         host.visual_config.lifecycle.next_gate_blend_max,
-        0.0,
+        host.visual_config.lifecycle.next_gate_blend_max,
     ]
-    assert refusal_tokens == replacement_tokens
+    expected_factory_required_ids = [None, "track-1"]
+    preview_retired = wire_scenario in {
+        "superseded",
+        "wall_equal",
+        "wall_over",
+        "duplicate_timeout",
+        "second_refusal",
+        "observation_over",
+        "qpc_wall_equal_frozen_monotonic",
+        "qpc_timeout_frozen_monotonic",
+    }
+    if preview_retired:
+        expected_factory_blends.append(0.0)
+        expected_factory_required_ids.append("track-1")
+    assert factory_blends == expected_factory_blends
+    assert factory_required_ids == expected_factory_required_ids
+    assert refusal_tokens == requalification_tokens
     segment = result["segments"][0]
     assert segment["passage_admission"]["preview_track_id"] == "track-1"
-    assert segment["passage_admission"]["preview_blend"] == 0.0
-    assert segment["next_preview_retired"] is True
-    assert segment["next_preview_withdrawal_count"] == 1
-    withdrawal = segment["next_preview_withdrawal"]
-    assert withdrawal["camera_token"] == {
-        "generation": refusal_tokens[0].generation,
-        "frame_id": refusal_tokens[0].frame_id,
-        "publication_sequence": (
-            refusal_tokens[0].publication_sequence
-        ),
-        "stream_id": refusal_tokens[0].stream_id,
-    }
-    assert withdrawal["violation_codes"] == [
+    requalification = segment["next_preview_requalification"]
+    assert requalification["sealed_next_track_id"] == "track-1"
+    assert requalification["refusal_violation_codes"] == [
         "current_vertical_rate",
         "current_log_scale_rate",
     ]
-    assert withdrawal["transient_eligible"] is False
+    assert requalification["max_fresh_frames"] == 12
+    assert requalification["max_publication_delta"] == 13
+    assert requalification["max_duration_s"] == 0.45
+    assert requalification["max_control_duration_s"] == 0.50
+    if preview_retired:
+        if wire_scenario == "superseded":
+            assert requalification["fresh_frame_count"] > 12
+            assert requalification["publication_delta"] > 13
+            expected_retirement_reason = (
+                "preview_requalification_bounds_exhausted"
+            )
+        elif wire_scenario in {
+            "wall_equal",
+            "wall_over",
+            "qpc_wall_equal_frozen_monotonic",
+        }:
+            assert requalification["fresh_frame_count"] == 12
+            assert requalification["publication_delta"] == 13
+            expected_retirement_reason = (
+                "preview_requalification_wire_deadline_expired"
+            )
+        elif wire_scenario == "duplicate_timeout":
+            assert requalification["fresh_frame_count"] == 0
+            assert requalification["publication_delta"] == 0
+            assert requalification["control_elapsed_s"] > 0.50
+            expected_retirement_reason = (
+                "preview_requalification_control_timeout"
+            )
+        elif wire_scenario == "qpc_timeout_frozen_monotonic":
+            assert requalification["fresh_frame_count"] == 0
+            assert requalification["publication_delta"] == 0
+            assert requalification["control_elapsed_ns"] == 500_000_001
+            assert (
+                host.qpc_override_set_monotonic_s
+                - host.requalification_refusal_control_s
+                < 0.50
+            )
+            expected_retirement_reason = (
+                "preview_requalification_control_timeout"
+            )
+        elif wire_scenario == "second_refusal":
+            assert requalification["fresh_frame_count"] == 0
+            assert requalification["publication_delta"] == 0
+            expected_retirement_reason = (
+                "preview_requalification_safety_violation"
+            )
+        elif wire_scenario == "observation_over":
+            assert requalification["fresh_frame_count"] == 12
+            assert requalification["publication_delta"] == 13
+            assert requalification["elapsed_s"] == pytest.approx(
+                0.450000001
+            )
+            expected_retirement_reason = (
+                "preview_requalification_bounds_exhausted"
+            )
+        else:
+            raise AssertionError(
+                f"unexpected retired scenario {wire_scenario}"
+            )
+        assert segment["passage_admission"]["preview_blend"] == 0.0
+        assert segment["next_preview_retired"] is True
+        assert segment["next_preview_withdrawal_count"] == 1
+        assert segment["next_preview_withdrawal"]["reason"] == (
+            expected_retirement_reason
+        )
+        assert requalification["outcome"] == "retired"
+        assert requalification["retirement_reason"] == (
+            expected_retirement_reason
+        )
+        assert host.requalification_superseded is (
+            wire_scenario == "superseded"
+        )
+        assert (segment["superseded_proposal_count"] >= 1) is (
+            wire_scenario == "superseded"
+        )
+        if wire_scenario in {
+            "wall_equal",
+            "wall_over",
+            "qpc_wall_equal_frozen_monotonic",
+        }:
+            assert host.preview_candidate_send_calls == 0
+        if wire_scenario == "qpc_wall_equal_frozen_monotonic":
+            assert (
+                host.qpc_override_set_monotonic_s
+                - host.requalification_refusal_control_s
+                < 0.50
+            )
+    else:
+        assert requalification["fresh_frame_count"] == 12
+        assert requalification["publication_delta"] == 13
+        if wire_scenario == "observation_equal":
+            assert requalification["elapsed_s"] == pytest.approx(0.45)
+        assert segment["passage_admission"]["preview_blend"] == 0.05
+        assert segment["next_preview_retired"] is False
+        assert segment["next_preview_withdrawal_count"] == 0
+        assert segment["next_preview_withdrawal"] is None
+        assert requalification["outcome"] == "requalified"
+        assert requalification["requalified_preview_blend"] == 0.05
+        assert host.requalification_superseded is False
+        candidate_send = next(
+            kwargs
+            for _command, kwargs, _gate_index in host.commands
+            if kwargs.get("wire_visual_token")
+            == host.supersede_requalification_token
+        ) if wire_scenario == "wall_before" else None
+        if candidate_send is not None:
+            stored_deadline_ns = requalification[
+                "wire_start_deadline_monotonic_ns"
+            ]
+            candidate_wire_start_ns = stored_deadline_ns - 1
+            assert candidate_wire_start_ns < stored_deadline_ns
+            assert host.preview_candidate_send_calls == 1
+            assert (
+                host.preview_candidate_call_start_ns
+                == candidate_wire_start_ns
+            )
+            assert (
+                candidate_send["wire_start_deadline_ns"]
+                == stored_deadline_ns
+            )
     assert segment["passage_authority_enabled"] is True
     assert segment["advance_command_count"] >= 3
-    replacement_sends = [
+    refusal_sends = [
         command
         for command, kwargs, _gate_index in host.commands
         if kwargs.get("wire_visual_token") == refusal_tokens[0]
     ]
-    assert len(replacement_sends) == 1
-    assert replacement_sends[0].thrust in {
-        0.26,
-        host.visual_config.lifecycle.launch_boost_thrust,
-    }
-    assert replacement_sends[0].thrust != (
-        host.visual_config.servo.brake_thrust
-    )
+    if wire_scenario == "refusal_superseded":
+        assert refusal_sends == []
+        assert host.refusal_frame_superseded is True
+        assert segment["superseded_proposal_count"] >= 1
+    else:
+        assert len(refusal_sends) == 1
+        assert refusal_sends[0].thrust in {
+            0.26,
+            host.visual_config.lifecycle.launch_boost_thrust,
+        }
+        assert refusal_sends[0].thrust != (
+            host.visual_config.servo.brake_thrust
+        )
     navigation_send_count = sum(
         bool(kwargs.get("require_wire_receipt"))
         for _command, kwargs, _gate_index in host.commands
@@ -3109,9 +3631,170 @@ def test_approach_hard_passage_refusal_retires_preview_and_replans_same_frame():
         navigation_send_count
     )
     assert any(
+        event == "visual_course_next_preview_requalified"
+        for event, _payload in host.recorder.events
+    ) is (not preview_retired)
+    assert any(
         event == "visual_course_next_preview_withdrawn"
         for event, _payload in host.recorder.events
+    ) is preview_retired
+
+
+def test_rate_only_refusal_without_latched_identity_aborts_unsealed_replan():
+    host = _Host(initial_gate=0, finish_gate=0)
+
+    class MissingIdentityRefusalServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            raise VisualApproachPassageSafetyUnavailable(
+                "structured refusal omitted its identity",
+                violation_codes=(
+                    "current_vertical_rate",
+                    "current_log_scale_rate",
+                ),
+                violation_evidence=(
+                    (
+                        "current_vertical_rate",
+                        1.0,
+                        0.60,
+                        0.40,
+                    ),
+                    (
+                        "current_log_scale_rate",
+                        -3.0,
+                        -1.50,
+                        1.50,
+                    ),
+                ),
+                camera_observation_monotonic_s=(
+                    snapshot.latest_camera_token.publication_sequence
+                    * 0.02
+                ),
+            )
+
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: (
+            MissingIdentityRefusalServo(*args, **kwargs)
+        ),
     )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="lacks its sealed next identity",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+
+def test_preview_requalification_expiry_retires_to_same_identity_only():
+    host = _Host(initial_gate=0, finish_gate=0, fresh_after_samples=1)
+    factory_blends = []
+    factory_required_ids = []
+
+    class RefusingPreviewServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.observe_count = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            self.observe_count += 1
+            if self.observe_count == 8:
+                raise VisualApproachPassageSafetyUnavailable(
+                    "exact rate-only discontinuity",
+                    violation_codes=(
+                        "current_vertical_rate",
+                        "current_log_scale_rate",
+                    ),
+                    violation_evidence=(
+                        (
+                            "current_vertical_rate",
+                            1.0,
+                            0.60,
+                            0.40,
+                        ),
+                        (
+                            "current_log_scale_rate",
+                            -3.0,
+                            -1.50,
+                            1.50,
+                        ),
+                    ),
+                    camera_observation_monotonic_s=(
+                        snapshot.latest_camera_token.publication_sequence
+                        * 0.02
+                    ),
+                    latched_next_track_id=self.preview_track_id,
+                )
+            return super().observe(snapshot, *args, **kwargs)
+
+    class NeverRequalifiedServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            return SimpleNamespace(
+                current_target=proposal.current_target,
+                next_target=None,
+                servo_output=replace(
+                    proposal.servo_output,
+                    next_gate_blend=0.0,
+                    reviewed_next_track_id=None,
+                ),
+                candidate_track_ids=(self.preview_track_id,),
+                provisional_track_ids=(),
+                withholding_reason=(
+                    "current_passage_corridor_not_ready"
+                ),
+                relationship_basis=None,
+                latched_next_track_id=None,
+                passage_admission=None,
+                mode=proposal.mode,
+            )
+
+    def factory(*args, **kwargs):
+        factory_blends.append(kwargs["next_gate_blend"])
+        factory_required_ids.append(
+            kwargs.get("required_next_track_id")
+        )
+        servo_type = (
+            RefusingPreviewServo
+            if len(factory_blends) == 1
+            else (
+                NeverRequalifiedServo
+                if len(factory_blends) == 2
+                else _Servo
+            )
+        )
+        return servo_type(*args, **kwargs)
+
+    runtime, _calls = _runtime(host)
+    runtime = replace(runtime, servo_factory=factory)
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert factory_blends == [
+        host.visual_config.lifecycle.next_gate_blend_max,
+        host.visual_config.lifecycle.next_gate_blend_max,
+        0.0,
+    ]
+    assert factory_required_ids == [None, "track-1", "track-1"]
+    segment = result["segments"][0]
+    assert segment["next_preview_retired"] is True
+    assert segment["next_preview_withdrawal_count"] == 1
+    assert segment["next_preview_withdrawal"]["reason"] == (
+        "preview_requalification_bounds_exhausted"
+    )
+    requalification = segment["next_preview_requalification"]
+    assert requalification["outcome"] == "retired"
+    assert requalification["retirement_reason"] == (
+        "preview_requalification_bounds_exhausted"
+    )
+    assert requalification["fresh_frame_count"] == 13
+    assert requalification["publication_delta"] == 13
+    assert segment["passage_admission"]["preview_track_id"] == "track-1"
+    assert segment["passage_admission"]["preview_blend"] == 0.0
 
 
 def test_passage_safety_refusal_after_entry_remains_fatal():
