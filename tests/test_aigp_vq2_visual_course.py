@@ -32,6 +32,8 @@ from planning.vq2_visual_approach import (
 from planning.vq2_visual_recovery import VisualRecoveryRefusal
 from planning.vq2_visual_servo import (
     ImageVisualServo,
+    PassageSafetyViolation,
+    PassageSafetyViolationDetail,
     ServoFrameToken,
     VisualServoOutput,
     VisualTarget,
@@ -286,6 +288,9 @@ class _Servo:
         next_gate_blend_full_log_scale=None,
         yaw_rate=0.02,
         passage_advances=True,
+        preview_track_id=None,
+        passage_preview_blend=0.0,
+        passage_preview_retire_once=False,
         calls=None,
     ):
         self.track_id = expected_current_track_id
@@ -300,7 +305,22 @@ class _Servo:
         )
         self.yaw_rate = yaw_rate
         self.passage_advances = passage_advances
+        self.preview_track_id = (
+            preview_track_id
+            if preview_track_id is not None
+            else f"track-{expected_gate_index + 1}"
+        )
+        self.passage_preview_blend = passage_preview_blend
+        self.passage_preview_retire_once = (
+            passage_preview_retire_once
+        )
+        self.passage_preview_retirement_emitted = False
+        self.passage_preview_retired = False
         self.calls = calls if calls is not None else []
+
+    def retire_passage_preview(self, expected_track_id):
+        assert expected_track_id == self.preview_track_id
+        self.passage_preview_retired = True
 
     def observe(
         self,
@@ -323,6 +343,29 @@ class _Servo:
             mode is VisualApproachMode.PASSAGE
             and self.passage_advances
         )
+        retirement_details = ()
+        if (
+            mode is VisualApproachMode.PASSAGE
+            and self.passage_preview_retire_once
+            and not self.passage_preview_retirement_emitted
+        ):
+            self.passage_preview_retirement_emitted = True
+            self.passage_preview_retired = True
+            retirement_details = (
+                PassageSafetyViolationDetail(
+                    violation=(
+                        PassageSafetyViolation.CURRENT_APPARENT_SCALE
+                    ),
+                    observed=0.56,
+                    limit=0.55,
+                    excess=0.01,
+                ),
+            )
+        active_preview_blend = (
+            self.passage_preview_blend
+            if not self.passage_preview_retired
+            else 0.0
+        )
         output = VisualServoOutput(
             target_roll_rad=0.0,
             target_pitch_rad=-0.105 if advance else 0.0,
@@ -330,19 +373,41 @@ class _Servo:
             thrust=0.295 if advance else 0.21,
             corridor_frames=5,
             advance_enabled=advance,
-            next_gate_blend=0.0,
+            next_gate_blend=(
+                active_preview_blend
+                if mode is VisualApproachMode.PASSAGE
+                else 0.0
+            ),
             horizontal_error=0.04,
             vertical_error_image_down=0.03,
             effective_horizontal_error=0.04,
             effective_vertical_error_image_down=0.03,
             effective_horizontal_rate_s=0.0,
             effective_vertical_rate_down_s=0.0,
-            next_horizontal_error=None,
-            next_vertical_error_image_down=None,
+            next_horizontal_error=(
+                0.30
+                if (
+                    mode is VisualApproachMode.PASSAGE
+                    and active_preview_blend > 0.0
+                )
+                else None
+            ),
+            next_vertical_error_image_down=(
+                -0.20
+                if (
+                    mode is VisualApproachMode.PASSAGE
+                    and active_preview_blend > 0.0
+                )
+                else None
+            ),
             horizontal_abs_error_delta=0.0,
             vertical_abs_error_delta=0.0,
             brake_reason=None if advance else "aligning",
             yaw_envelope_limited=False,
+            passage_preview_retired=self.passage_preview_retired,
+            passage_preview_retirement_violations=(
+                retirement_details
+            ),
         )
         admission = passage_admission
         if mode is VisualApproachMode.APPROACH:
@@ -353,8 +418,12 @@ class _Servo:
                 camera_token=snapshot.latest_camera_token,
                 tracker_frame_sequence=snapshot.tracker_frame_sequence,
                 corridor_frames=5,
-                preview_track_id=None,
-                preview_blend=0.0,
+                preview_track_id=self.preview_track_id,
+                preview_blend=(
+                    self.next_gate_blend
+                    if self.preview_track_id is not None
+                    else 0.0
+                ),
             )
         return SimpleNamespace(
             current_target=target,
@@ -405,6 +474,7 @@ class _Host:
         self.credit_token = None
         self.confirmed_race_statuses = []
         self.promotion_tokens = []
+        self.requested_promotion_track_ids = []
         self.race = AuthoritativeRaceStatusRef.live(
             session_id="test-session",
             reset_epoch=2,
@@ -542,13 +612,15 @@ class _Host:
         from_gate_index,
         to_gate_index,
         race_status,
+        promoted_track_id=None,
     ):
         assert from_gate_index == self.current_gate
         assert to_gate_index == self.current_gate + 1
         assert race_status is self.race
         self.confirmed_race_statuses.append(race_status)
+        self.requested_promotion_track_ids.append(promoted_track_id)
         retired = self.current_track_id
-        promoted = f"track-{to_gate_index}"
+        promoted = promoted_track_id or f"track-{to_gate_index}"
         promotion_token = (
             self.visual_gate_graph.latest_snapshot.latest_camera_token
         )
@@ -766,6 +838,107 @@ def test_generic_course_repeats_lifecycle_from_nonzero_gate_until_finish():
     )
     assert host.visual_gate_graph.finish_calls
     assert host.recorder.events[-1][0] == "visual_course_complete"
+
+
+def test_transition_carries_exact_reviewed_passage_preview_identity():
+    host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={"preview_track_id": "reviewed-track-4"},
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert host.requested_promotion_track_ids == ["reviewed-track-4"]
+    transition = result["authoritative_transitions"][0]
+    assert transition["promoted_track_id"] == "reviewed-track-4"
+
+
+def test_passage_preview_wire_count_is_compact_and_transition_scoped():
+    host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={"passage_preview_blend": 0.20},
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment_count = sum(
+        segment["passage_next_preview_command_count"]
+        for segment in result["segments"]
+    )
+    assert segment_count > 0
+    assert result["passage_next_preview_command_count"] == segment_count
+    transition = result["authoritative_transitions"][0]
+    assert (
+        transition[
+            "pre_transition_passage_next_preview_command_count"
+        ]
+        > 0
+    )
+
+
+def test_passage_preview_hard_retirement_is_recorded_and_nonfatal():
+    host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={"passage_preview_retire_once": True},
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["passage_next_preview_command_count"] == 0
+    for segment in result["segments"]:
+        assert segment["next_preview_retired"] is True
+        assert segment["next_preview_withdrawal_count"] == 1
+        withdrawal = segment["next_preview_withdrawal"]
+        assert withdrawal["reason"] == (
+            "passage_preview_envelope_retired"
+        )
+        assert withdrawal["violation_codes"] == [
+            "current_apparent_scale"
+        ]
+        assert segment["passage_command_count"] > 0
+    events = [
+        payload
+        for event, payload in host.recorder.events
+        if (
+            event == "visual_course_next_preview_withdrawn"
+            and payload["reason"]
+            == "passage_preview_envelope_retired"
+        )
+    ]
+    assert len(events) == len(result["segments"])
+
+
+def test_nonterminal_transition_refuses_without_reviewed_preview_identity():
+    host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={"preview_track_id": ""},
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="nonterminal transition lacks its reviewed next-track identity",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.requested_promotion_track_ids == []
+    transition = host._visual_course_summary[
+        "authoritative_transitions"
+    ][0]
+    assert transition["promotion_confirmed"] is False
 
 
 def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
@@ -2895,6 +3068,8 @@ def test_approach_hard_passage_refusal_retires_preview_and_replans_same_frame():
     ]
     assert refusal_tokens == replacement_tokens
     segment = result["segments"][0]
+    assert segment["passage_admission"]["preview_track_id"] == "track-1"
+    assert segment["passage_admission"]["preview_blend"] == 0.0
     assert segment["next_preview_retired"] is True
     assert segment["next_preview_withdrawal_count"] == 1
     withdrawal = segment["next_preview_withdrawal"]
@@ -3813,6 +3988,7 @@ def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
         runtime,
         servo_factory=lambda *args, **kwargs: CloseThirdAdvanceServo(
             *args,
+            passage_preview_blend=0.20,
             **kwargs,
         ),
     )
@@ -3827,6 +4003,11 @@ def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
     assert segment["advance_command_count"] == 2
     assert segment["yaw_soft_stop_zero_command_count"] == 1
     assert segment["crossing_anchor"] is None
+    assert segment["passage_next_preview_command_count"] == 3
+    assert segment["next_preview_retired"] is True
+    assert segment["next_preview_withdrawal"]["reason"] == (
+        "calibrated_yaw_soft_stop"
+    )
     navigation = [
         command
         for command, kwargs, _gate in host.commands

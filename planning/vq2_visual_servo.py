@@ -45,10 +45,12 @@ MIN_VISUAL_THRUST = 0.21
 MAX_VISUAL_THRUST = 0.32
 MAX_VISUAL_OBSERVATION_AGE_S = 0.10
 MAX_NEXT_GATE_BLEND = 0.35
-# A no-advance pre-pass orientation may continue inside a broader
-# current-aperture corridor only after the next identity has first completed
-# the ordinary tight-corridor dwell.  These immutable continuation bounds are
-# grounded in the first exact live handoff trace.  All 54 jointly fresh
+# A pre-pass orientation may continue inside a broader current-aperture
+# corridor only after the next identity has first completed the ordinary
+# tight-corridor dwell.  Passage may retain this bounded preview while
+# requesting advance, but the current aperture remains primary and any failed
+# predicate withdraws preview authority.  These immutable continuation bounds
+# are grounded in the first exact live handoff trace.  All 54 jointly fresh
 # publications stayed below |x|=0.022, |y|=0.234, |vx|=0.265, |vy|=0.439 and
 # current log-scale rate=1.591/s.  The short projection rejects high image
 # momentum before an instantaneous center can consume the remaining margin.
@@ -619,6 +621,12 @@ class VisualServoOutput:
     vertical_abs_error_delta: Optional[float]
     brake_reason: Optional[str]
     yaw_envelope_limited: bool
+    reviewed_next_track_id: Optional[str] = None
+    passage_preview_retired: bool = False
+    passage_preview_retirement_violations: Tuple[
+        PassageSafetyViolationDetail,
+        ...,
+    ] = ()
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -658,6 +666,7 @@ class ImageVisualServo:
         self._last_token: Optional[ServoFrameToken] = None
         self._segment_track_id: Optional[str] = None
         self._latched_next_blend_track_id: Optional[str] = None
+        self._advance_passage_preview_retired = False
         self._last_abs_error: Optional[
             Tuple[Optional[float], Optional[float]]
         ] = None
@@ -666,6 +675,19 @@ class ImageVisualServo:
     @property
     def corridor_frames(self) -> int:
         return self._corridor_frames
+
+    @property
+    def latched_next_track_id(self) -> Optional[str]:
+        return self._latched_next_blend_track_id
+
+    def retire_advance_passage_preview(self) -> None:
+        """Permanently remove optional next-preview authority for this segment."""
+
+        if self._latched_next_blend_track_id is None:
+            raise VisualServoRefusal(
+                "cannot retire passage preview without an established latch"
+            )
+        self._advance_passage_preview_retired = True
 
     def step(
         self,
@@ -683,9 +705,9 @@ class ImageVisualServo:
 
         A caller may pre-orient toward a stable next-gate track.  Initial
         authority still requires the tight advance corridor; after that exact
-        next identity is latched, a no-advance caller may continue within the
-        immutable passage corridor.  The current gate always retains passage
-        authority.
+        next identity is latched, a caller may continue within the immutable
+        passage corridor while independently requesting advance.  The current
+        gate always retains passage authority.
         """
 
         scalars = (
@@ -694,6 +716,11 @@ class ImageVisualServo:
             segment_yaw_excursion_rad,
             requested_next_blend,
         )
+        passage_preview_retirement_violations: Tuple[
+            PassageSafetyViolationDetail,
+            ...,
+        ] = ()
+        reviewed_next_track_id: Optional[str] = None
         if not all(
             type(value) in {int, float} and math.isfinite(float(value))
             for value in scalars
@@ -715,9 +742,14 @@ class ImageVisualServo:
             raise VisualServoRefusal(
                 "allow_passage_safe_next_blend must be an exact bool"
             )
-        if allow_passage_safe_next_blend and allow_advance:
+        if (
+            allow_passage_safe_next_blend
+            and allow_advance
+            and self._latched_next_blend_track_id is None
+        ):
             raise VisualServoRefusal(
-                "passage-safe next blend cannot coexist with advance authority"
+                "advance passage preview requires an established next-track "
+                "latch"
             )
         if allow_passage_safe_next_blend and not (
             self.tuning.horizontal_corridor
@@ -809,6 +841,7 @@ class ImageVisualServo:
         passage_continuation = bool(
             allow_passage_safe_next_blend
             and self._latched_next_blend_track_id is not None
+            and not self._advance_passage_preview_retired
         )
         passage_violations = []
         if passage_continuation:
@@ -946,12 +979,22 @@ class ImageVisualServo:
             passage_continuation and not passage_violations
         )
         if passage_violations:
-            raise VisualServoPassageSafetyUnavailable(
-                "latched pre-pass current aperture left its passage corridor",
-                details=tuple(passage_violations),
+            if not allow_advance:
+                raise VisualServoPassageSafetyUnavailable(
+                    "latched pre-pass current aperture left its passage "
+                    "corridor",
+                    details=tuple(passage_violations),
+                )
+            # A hard current-envelope failure permanently retires only the
+            # optional next preview.  The ordinary current-gate passage
+            # controller remains independently safety-gated below.
+            self._advance_passage_preview_retired = True
+            passage_preview_retirement_violations = tuple(
+                passage_violations
             )
         passage_safe_start = bool(
             allow_passage_safe_next_blend
+            and not self._advance_passage_preview_retired
             and inside_corridor
             and not current.clipped
             and not current.center_censored
@@ -976,7 +1019,7 @@ class ImageVisualServo:
         next_vertical: Optional[float] = None
         next_edge_risk = False
         next_ambiguity_risk = False
-        if next_target is not None and float(requested_next_blend) > 0.0:
+        if next_target is not None:
             next_age_s = (
                 float(now_monotonic_s)
                 - float(next_target.received_monotonic_s)
@@ -994,7 +1037,8 @@ class ImageVisualServo:
             )
             next_ambiguity_risk = next_target.ambiguous
             if (
-                passage_continuation
+                allow_passage_safe_next_blend
+                and self._latched_next_blend_track_id is not None
                 and next_target.track_id
                 != self._latched_next_blend_track_id
             ):
@@ -1042,8 +1086,22 @@ class ImageVisualServo:
                 and same_frame
                 and next_target.track_id != current.track_id
             )
-            if (
+            identity_latch_ready = bool(
                 next_usable
+                and passage_safe_start
+                and self._corridor_frames + 1
+                >= self.tuning.required_corridor_frames
+            )
+            if (
+                identity_latch_ready
+                and self._latched_next_blend_track_id is None
+            ):
+                self._latched_next_blend_track_id = next_target.track_id
+            if identity_latch_ready:
+                reviewed_next_track_id = next_target.track_id
+            if (
+                float(requested_next_blend) > 0.0
+                and next_usable
                 and (
                     passage_safe_current
                     or (
@@ -1111,15 +1169,36 @@ class ImageVisualServo:
                                 limit=0.0,
                             )
                         )
-                    if correction_violations:
+                    if correction_violations and not allow_advance:
                         raise VisualServoPassageSafetyUnavailable(
                             "next-gate blend reversed current-aperture correction",
                             details=tuple(correction_violations),
                         )
-                if self._latched_next_blend_track_id is None:
-                    self._latched_next_blend_track_id = (
-                        next_target.track_id
-                    )
+                    if correction_violations:
+                        # Passage advance is independently governed by the
+                        # current aperture.  A next preview that would reverse
+                        # its correction loses all command authority for this
+                        # publication; never let optional preview geometry
+                        # abort or replace a still-valid current-only command.
+                        blend = 0.0
+                        next_horizontal = None
+                        next_vertical = None
+                        horizontal = (
+                            0.0 if horizontal_censored else raw_horizontal
+                        )
+                        vertical = 0.0 if vertical_censored else raw_vertical
+                        horizontal_rate = (
+                            0.0
+                            if horizontal_censored
+                            else raw_horizontal_rate
+                        )
+                        vertical_rate = (
+                            0.0 if vertical_censored else raw_vertical_rate
+                        )
+                        self._advance_passage_preview_retired = True
+                        passage_preview_retirement_violations = tuple(
+                            correction_violations
+                        )
 
         self._last_abs_error = (
             None if horizontal_censored else abs(raw_horizontal),
@@ -1139,7 +1218,22 @@ class ImageVisualServo:
             or horizontal_censored
             or vertical_censored
         )
-        edge_risk = current_edge_risk or next_edge_risk
+        optional_advance_preview = bool(
+            allow_advance
+            and allow_passage_safe_next_blend
+            and self._latched_next_blend_track_id is not None
+        )
+        next_risk_has_command_authority = bool(
+            float(requested_next_blend) > 0.0
+            and (not optional_advance_preview or blend > 0.0)
+        )
+        effective_next_edge_risk = bool(
+            next_edge_risk and next_risk_has_command_authority
+        )
+        effective_next_ambiguity_risk = bool(
+            next_ambiguity_risk and next_risk_has_command_authority
+        )
+        edge_risk = current_edge_risk or effective_next_edge_risk
         scale_brake = (
             float(current.log_scale_rate_s) >= self.tuning.brake_scale_rate_s
         )
@@ -1155,7 +1249,7 @@ class ImageVisualServo:
             allow_advance
             and self._corridor_frames >= self.tuning.required_corridor_frames
             and not edge_risk
-            and not next_ambiguity_risk
+            and not effective_next_ambiguity_risk
             and not scale_brake
             and not scale_retreat
             and not close_scale_brake
@@ -1165,9 +1259,9 @@ class ImageVisualServo:
         brake_reason: Optional[str] = None
         if current_edge_risk:
             brake_reason = "target_edge_or_clipping"
-        elif next_ambiguity_risk:
+        elif effective_next_ambiguity_risk:
             brake_reason = "next_target_ambiguous"
-        elif next_edge_risk:
+        elif effective_next_edge_risk:
             brake_reason = "next_target_edge_or_clipping"
         elif scale_brake:
             brake_reason = "scale_rate"
@@ -1213,7 +1307,7 @@ class ImageVisualServo:
             thrust_basis = self.tuning.advance_thrust
         elif (
             edge_risk
-            or next_ambiguity_risk
+            or effective_next_ambiguity_risk
             or scale_brake
             or scale_retreat
             or close_scale_brake
@@ -1271,6 +1365,13 @@ class ImageVisualServo:
             vertical_abs_error_delta=vertical_delta,
             brake_reason=brake_reason,
             yaw_envelope_limited=yaw_envelope_limited,
+            reviewed_next_track_id=reviewed_next_track_id,
+            passage_preview_retired=(
+                self._advance_passage_preview_retired
+            ),
+            passage_preview_retirement_violations=(
+                passage_preview_retirement_violations
+            ),
         )
 
 

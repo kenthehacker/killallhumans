@@ -5,11 +5,12 @@ authoritative current identity for one segment, admits at most one exact
 same-publication next-gate target, and delegates image-space control to
 ``ImageVisualServo``.  Approach mode cannot advance.  Passage mode is a
 one-way, bounded segment transition that requires an exact admission from a
-prior accepted approach publication and excludes simultaneous next-preview
-command authority.  It owns no transport, race transition, reset, watchdog,
-collision, or cleanup authority.  In particular, its yaw proposal is not yaw
-calibration or transport authority; build-3385 integration must retain the
-separate zero-yaw safety boundary.
+prior accepted approach publication.  It may retain only that admission's
+latched next identity under the immutable passage-preview envelope while the
+current aperture independently owns advance authority.  It owns no transport,
+race transition, reset, watchdog, collision, or cleanup authority.  In
+particular, its yaw proposal is not yaw calibration or transport authority;
+build-3385 integration must retain the separate calibrated-yaw safety boundary.
 """
 
 from __future__ import annotations
@@ -522,6 +523,27 @@ class RollingVisualApproachServo:
         self._pending_passage_admission = None
         self._active_passage_admission = None
 
+    def retire_passage_preview(self, expected_track_id: str) -> None:
+        """Permanently withdraw an active passage's optional preview."""
+
+        admission = self._active_passage_admission
+        if (
+            type(expected_track_id) is not str
+            or not expected_track_id
+            or type(admission) is not VisualApproachPassageAdmission
+            or admission.preview_track_id != expected_track_id
+            or self._latched_next_track_id != expected_track_id
+        ):
+            raise VisualApproachRefusal(
+                "passage preview retirement identity is inconsistent"
+            )
+        try:
+            self._servo.retire_advance_passage_preview()
+        except VisualServoRefusal as exc:
+            raise VisualApproachRefusal(
+                f"visual servo refused passage preview retirement: {exc}"
+            ) from exc
+
     def _requested_next_gate_blend(
         self,
         current_log_scale: float,
@@ -569,9 +591,10 @@ class RollingVisualApproachServo:
 
         ``APPROACH`` preserves the historical no-advance semantics and may
         cautiously blend an exact next target.  ``PASSAGE`` requires the
-        module-issued admission from the latest safe approach dwell, never
-        combines that preview with advance authority, and cannot transition
-        back to approach without an explicit segment reset.
+        module-issued admission from the latest safe approach dwell and may
+        retain only its exact latched preview identity while current-gate
+        advance remains independently safety-gated.  It cannot transition back
+        to approach without an explicit segment reset.
         """
 
         if type(snapshot) is not GateGraphSnapshot:
@@ -637,7 +660,6 @@ class RollingVisualApproachServo:
         )
         if (
             mode is VisualApproachMode.APPROACH
-            and self.next_gate_blend > 0.0
             and next_identity_ambiguous
         ):
             raise VisualApproachRefusal(
@@ -669,7 +691,6 @@ class RollingVisualApproachServo:
         )
         if (
             mode is VisualApproachMode.APPROACH
-            and self.next_gate_blend > 0.0
             and competing_next_identities
         ):
             raise VisualApproachRefusal(
@@ -683,10 +704,22 @@ class RollingVisualApproachServo:
             )
         ):
             # Passage has already consumed a reviewed current-gate admission.
-            # Next-gate identity is still audited for later promotion, but it
-            # has no command authority and cannot interrupt an otherwise-safe
-            # current-aperture crossing.
+            # Ambiguous next geometry loses all optional blend authority, but
+            # it cannot replace or interrupt the independently safe
+            # current-aperture controller.
             eligible = ()
+        if mode is VisualApproachMode.PASSAGE:
+            assert passage_admission is not None
+            sealed_preview_id = passage_admission.preview_track_id
+            eligible = tuple(
+                (candidate, track)
+                for candidate, track in eligible
+                if (
+                    sealed_preview_id is not None
+                    and candidate.track_id == sealed_preview_id
+                    and candidate.track_id == self._latched_next_track_id
+                )
+            )
 
         next_target: Optional[VisualTarget] = None
         relationship_basis: Optional[GateRelationshipBasis] = None
@@ -726,8 +759,6 @@ class RollingVisualApproachServo:
                     self._requested_next_gate_blend(
                         current_target.log_scale
                     )
-                    if mode is VisualApproachMode.APPROACH
-                    else 0.0
                 )
                 withholding_reason = None
         else:
@@ -764,11 +795,6 @@ class RollingVisualApproachServo:
                 withholding_reason = "no_next_candidate"
 
         try:
-            servo_next_target = (
-                next_target
-                if mode is VisualApproachMode.APPROACH
-                else None
-            )
             output = self._servo.step(
                 current_target,
                 now_monotonic_s=float(now_monotonic_s),
@@ -776,11 +802,15 @@ class RollingVisualApproachServo:
                 segment_yaw_excursion_rad=float(
                     segment_yaw_excursion_rad
                 ),
-                next_target=servo_next_target,
+                next_target=next_target,
                 requested_next_blend=requested_blend,
                 allow_advance=mode is VisualApproachMode.PASSAGE,
                 allow_passage_safe_next_blend=(
                     mode is VisualApproachMode.APPROACH
+                    or (
+                        passage_admission is not None
+                        and passage_admission.preview_track_id is not None
+                    )
                 ),
             )
         except VisualServoPassageSafetyUnavailable as exc:
@@ -810,30 +840,59 @@ class RollingVisualApproachServo:
             )
         if (
             mode is VisualApproachMode.PASSAGE
+            and output.next_gate_blend not in {0.0, requested_blend}
+        ):
+            raise VisualApproachRefusal(
+                "passage produced an unexpected next-preview blend magnitude"
+            )
+        if (
+            mode is VisualApproachMode.PASSAGE
+            and output.next_gate_blend == 0.0
             and (
-                output.next_gate_blend != 0.0
-                or output.next_horizontal_error is not None
+                output.next_horizontal_error is not None
                 or output.next_vertical_error_image_down is not None
             )
         ):
             raise VisualApproachRefusal(
-                "passage advance combined incompatible next-preview authority"
+                "passage retained next-preview geometry without authority"
+            )
+        reviewed_next_track_id = output.reviewed_next_track_id
+        if reviewed_next_track_id is not None:
+            if (
+                eligible_id != reviewed_next_track_id
+                or next_target is None
+                or next_target.track_id != reviewed_next_track_id
+            ):
+                raise VisualApproachRefusal(
+                    "visual servo reviewed an ineligible next-track identity"
+                )
+            if self._latched_next_track_id is None:
+                self._latched_next_track_id = reviewed_next_track_id
+            elif self._latched_next_track_id != reviewed_next_track_id:
+                raise VisualApproachRefusal(
+                    "visual servo changed its reviewed next-track identity"
+                )
+        servo_latched_next_track_id = self._servo.latched_next_track_id
+        if (
+            servo_latched_next_track_id
+            != self._latched_next_track_id
+        ):
+            raise VisualApproachRefusal(
+                "coordinator and visual servo next-track latches diverged"
             )
         if output.next_gate_blend > 0.0:
             if eligible_id is None or next_target is None:
                 raise VisualApproachRefusal(
                     "visual approach blended without an exact next target"
                 )
-            if self._latched_next_track_id is None:
-                self._latched_next_track_id = eligible_id
-            elif self._latched_next_track_id != eligible_id:
+            if self._latched_next_track_id != eligible_id:
                 raise VisualApproachRefusal(
                     "visual approach changed its latched next identity"
                 )
             withholding_reason = None
         elif next_target is not None:
             withholding_reason = (
-                "passage_advance_excludes_next_preview"
+                "passage_next_preview_safety_withheld"
                 if mode is VisualApproachMode.PASSAGE
                 else "current_passage_corridor_not_ready"
             )
@@ -904,6 +963,29 @@ class RollingVisualApproachServo:
                 "passage admission does not match this segment's latest "
                 "reviewed evidence"
             )
+        preview_id = passage_admission.preview_track_id
+        preview_blend = passage_admission.preview_blend
+        if (
+            type(preview_blend) not in {int, float}
+            or not math.isfinite(float(preview_blend))
+            or not 0.0 <= float(preview_blend) <= self.next_gate_blend
+            or (
+                preview_id is None
+                and float(preview_blend) != 0.0
+            )
+            or (
+                preview_id is not None
+                and (
+                    type(preview_id) is not str
+                    or not preview_id
+                    or len(preview_id) > 128
+                    or preview_id != self._latched_next_track_id
+                )
+            )
+        ):
+            raise VisualApproachRefusal(
+                "passage admission preview authority is inconsistent"
+            )
         if self._active_passage_admission is None and (
             self._last_camera_token != passage_admission.camera_token
             or self._last_tracker_frame_sequence
@@ -935,7 +1017,26 @@ class RollingVisualApproachServo:
             or output.yaw_envelope_limited
         ):
             return None
-        preview_active = output.next_gate_blend > 0.0
+        reviewed_preview_id = output.reviewed_next_track_id
+        if (
+            self._latched_next_track_id is not None
+            and reviewed_preview_id is None
+        ):
+            # Once an exact next identity is latched, a later frame with no
+            # fresh same-identity review cannot overwrite the pending passage
+            # evidence with an identity-less admission.
+            return None
+        if (
+            reviewed_preview_id is not None
+            and (
+                next_target is None
+                or next_target.track_id != reviewed_preview_id
+                or self._latched_next_track_id != reviewed_preview_id
+            )
+        ):
+            raise VisualApproachRefusal(
+                "passage admission next-track review is inconsistent"
+            )
         return VisualApproachPassageAdmission(
             basis=VISUAL_PASSAGE_ADMISSION_BASIS,
             current_gate_index=self.expected_gate_index,
@@ -944,9 +1045,7 @@ class RollingVisualApproachServo:
             tracker_frame_sequence=snapshot.tracker_frame_sequence,
             corridor_frames=output.corridor_frames,
             preview_track_id=(
-                next_target.track_id
-                if preview_active and next_target is not None
-                else None
+                reviewed_preview_id
             ),
             preview_blend=output.next_gate_blend,
         )

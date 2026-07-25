@@ -713,6 +713,7 @@ class VisualCourseStageHost(Protocol):
         from_gate_index: int,
         to_gate_index: int,
         race_status: AuthoritativeRaceStatusRef,
+        promoted_track_id: Optional[str] = None,
     ) -> Any: ...
 
     def _record_tick(
@@ -1603,6 +1604,7 @@ async def _run_visual_course_stage_impl(
         "visual_navigation_command_count": 0,
         "exact_zero_command_count": 0,
         "passage_authority_enabled": False,
+        "passage_next_preview_command_count": 0,
         "yaw_calibration_profile": (
             None
             if runtime.yaw_profile is None
@@ -1722,6 +1724,15 @@ async def _run_visual_course_stage_impl(
                 "exact_zero_command_count": total_zero_commands,
                 "passage_authority_enabled": any(
                     bool(item.get("passage_authority_enabled"))
+                    for item in segments
+                ),
+                "passage_next_preview_command_count": sum(
+                    int(
+                        item.get(
+                            "passage_next_preview_command_count",
+                            0,
+                        )
+                    )
                     for item in segments
                 ),
                 "course_elapsed_s": (
@@ -2547,6 +2558,7 @@ async def _run_visual_course_stage_impl(
         passage_admission: Optional[VisualApproachPassageAdmission] = None
         passage_started_s: Optional[float] = None
         passage_command_count = 0
+        passage_next_preview_command_count = 0
         advance_command_count = 0
         approach_command_count = 0
         next_preview_retired = False
@@ -2575,6 +2587,7 @@ async def _run_visual_course_stage_impl(
             "current_track_id": current_track_id,
             "approach_command_count": 0,
             "passage_command_count": 0,
+            "passage_next_preview_command_count": 0,
             "advance_command_count": 0,
             "superseded_proposal_count": 0,
             "next_preview_withdrawal_count": 0,
@@ -2847,16 +2860,27 @@ async def _run_visual_course_stage_impl(
                         "visual-course current-only replan failed after "
                         f"preview retirement: {fallback_exc}"
                     ) from fallback_exc
+                fallback_admission = proposal.passage_admission
+                identity_only_admission = bool(
+                    type(fallback_admission)
+                    is VisualApproachPassageAdmission
+                    and type(fallback_admission.preview_track_id) is str
+                    and bool(fallback_admission.preview_track_id)
+                    and fallback_admission.preview_blend == 0.0
+                )
                 if (
                     proposal.mode is not VisualApproachMode.APPROACH
                     or proposal.servo_output.advance_enabled
                     or proposal.servo_output.next_gate_blend != 0.0
-                    or proposal.passage_admission is not None
+                    or (
+                        fallback_admission is not None
+                        and not identity_only_admission
+                    )
                 ):
                     raise abort_type(
                         "visual-course preview retirement retained prior "
-                        "blend, advance, or admission authority"
-                )
+                        "blend, advance, or unreviewed admission authority"
+                    )
                 next_preview_retired = True
                 withdrawal = {
                     "reason": "current_passage_safety_violation",
@@ -3077,6 +3101,61 @@ async def _run_visual_course_stage_impl(
                     "uncensored geometry"
                 )
             last_planned_token = token
+            if (
+                proposal.servo_output.passage_preview_retired
+                and not segment["next_preview_retired"]
+            ):
+                if mode is not VisualApproachMode.PASSAGE:
+                    raise abort_type(
+                        "visual-course passage preview retired outside "
+                        "passage mode"
+                    )
+                retirement_details = (
+                    proposal.servo_output
+                    .passage_preview_retirement_violations
+                )
+                if not retirement_details:
+                    raise abort_type(
+                        "visual-course passage preview retirement lacks "
+                        "structured evidence"
+                    )
+                withdrawal = {
+                    "reason": "passage_preview_envelope_retired",
+                    "camera_token": asdict(token),
+                    "tracker_frame_sequence": (
+                        snapshot.tracker_frame_sequence
+                    ),
+                    "violation_codes": [
+                        detail.violation.value
+                        for detail in retirement_details
+                    ],
+                    "violation_evidence": [
+                        {
+                            "code": detail.violation.value,
+                            "observed": detail.observed,
+                            "limit": detail.limit,
+                            "excess": detail.excess,
+                        }
+                        for detail in retirement_details
+                    ],
+                    "transient_eligible": False,
+                }
+                next_preview_retired = True
+                segment["next_preview_withdrawal_count"] = int(
+                    segment["next_preview_withdrawal_count"]
+                ) + 1
+                segment["next_preview_withdrawal"] = withdrawal
+                segment["next_preview_retired"] = True
+                host.recorder.emit(
+                    "visual_course_next_preview_withdrawn",
+                    gate_index=current_gate_index,
+                    stage=(
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/passage"
+                    ),
+                    **withdrawal,
+                )
+                refresh_live_summary()
             if mode is VisualApproachMode.APPROACH:
                 if proposal.servo_output.advance_enabled:
                     raise abort_type(
@@ -3165,6 +3244,62 @@ async def _run_visual_course_stage_impl(
             last_clean_passage_scale = math.exp(float(target.log_scale))
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
+            if proposal.servo_output.next_gate_blend > 0.0:
+                passage_next_preview_command_count += 1
+                segment[
+                    "passage_next_preview_command_count"
+                ] = passage_next_preview_command_count
+            if (
+                accepted.yaw_soft_stop_zeroed
+                and proposal.servo_output.next_gate_blend > 0.0
+                and not next_preview_retired
+            ):
+                assert (
+                    type(passage_admission)
+                    is VisualApproachPassageAdmission
+                    and type(passage_admission.preview_track_id) is str
+                )
+                try:
+                    planner.retire_passage_preview(
+                        passage_admission.preview_track_id
+                    )
+                except VisualApproachRefusal as exc:
+                    raise abort_type(
+                        "visual-course could not retire preview at calibrated "
+                        "yaw soft stop"
+                    ) from exc
+                withdrawal = {
+                    "reason": "calibrated_yaw_soft_stop",
+                    "camera_token": asdict(token),
+                    "tracker_frame_sequence": (
+                        snapshot.tracker_frame_sequence
+                    ),
+                    "violation_codes": [
+                        "calibrated_yaw_soft_stop",
+                    ],
+                    "violation_evidence": [],
+                    "transient_eligible": False,
+                    "requested_yaw_rate_rad_s": (
+                        proposal.servo_output.yaw_rate_rad_s
+                    ),
+                    "admitted_yaw_rate_rad_s": 0.0,
+                }
+                next_preview_retired = True
+                segment["next_preview_withdrawal_count"] = int(
+                    segment["next_preview_withdrawal_count"]
+                ) + 1
+                segment["next_preview_withdrawal"] = withdrawal
+                segment["next_preview_retired"] = True
+                host.recorder.emit(
+                    "visual_course_next_preview_withdrawn",
+                    gate_index=current_gate_index,
+                    stage=(
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/passage"
+                    ),
+                    **withdrawal,
+                )
+            refresh_live_summary()
             if (
                 proposal.servo_output.advance_enabled
                 and not accepted.yaw_soft_stop_zeroed
@@ -3470,6 +3605,9 @@ async def _run_visual_course_stage_impl(
             "pre_transition_passage_command_count": (
                 passage_command_count
             ),
+            "pre_transition_passage_next_preview_command_count": (
+                passage_next_preview_command_count
+            ),
             "crossing_wait_zero_command_count": int(
                 segment["crossing_wait_zero_command_count"]
             ),
@@ -3489,11 +3627,31 @@ async def _run_visual_course_stage_impl(
         ]
         refresh_live_summary()
 
+        if (
+            type(passage_admission) is not VisualApproachPassageAdmission
+            or type(passage_admission.preview_track_id) is not str
+            or not passage_admission.preview_track_id
+        ):
+            raise abort_type(
+                "visual-course nonterminal transition lacks its reviewed "
+                "next-track identity"
+            )
+        requested_promoted_track_id = passage_admission.preview_track_id
         transition = host._confirm_visual_transition(
             from_gate_index=current_gate_index,
             to_gate_index=current_gate_index + 1,
             race_status=credited_race,
+            promoted_track_id=requested_promoted_track_id,
         )
+        if (
+            requested_promoted_track_id is not None
+            and transition.promoted_track_id
+            != requested_promoted_track_id
+        ):
+            raise abort_type(
+                "visual-course transition replaced its reviewed "
+                "next-track identity"
+            )
         if (
             transition.from_gate_index != current_gate_index
             or transition.to_gate_index != current_gate_index + 1

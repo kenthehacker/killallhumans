@@ -555,6 +555,44 @@ def test_transition_uses_captured_credit_when_newer_same_gate_status_arrives():
     assert runner._visual_race_status_ref().race_status_sequence == 12
 
 
+def test_transition_refuses_replacement_when_reviewed_identity_is_unavailable():
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    _context, current_id, replacement_id = _prime_bound_gate_graph(
+        runner,
+        adapter,
+    )
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=300_000_000,
+    )
+
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="requested promotion track is not promotable",
+    ):
+        runner._confirm_visual_transition(
+            from_gate_index=0,
+            to_gate_index=1,
+            race_status=runner._visual_race_status_ref(),
+            promoted_track_id="reviewed-track-that-is-now-unavailable",
+        )
+
+    snapshot = runner.visual_gate_graph.latest_snapshot
+    assert snapshot is not None
+    assert snapshot.current_gate_index == 0
+    assert snapshot.current_track_id == current_id
+    assert runner.visual_tracker.track(current_id).role is (
+        VisualTrackRole.CURRENT
+    )
+    assert runner.visual_tracker.track(replacement_id).role is (
+        VisualTrackRole.NEXT
+    )
+
+
 def test_sample_consumes_every_detection_with_exact_receiver_provenance(
     monkeypatch,
 ):

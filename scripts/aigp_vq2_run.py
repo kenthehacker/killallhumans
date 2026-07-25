@@ -12621,10 +12621,22 @@ class VQ2Runner:
         from_gate_index: int,
         to_gate_index: int,
         race_status: AuthoritativeRaceStatusRef,
+        promoted_track_id: Optional[str] = None,
     ) -> ConfirmedGateTransition:
         if type(race_status) is not AuthoritativeRaceStatusRef:
             raise SafetyAbort(
                 "visual graph transition lacks an exact captured race status"
+            )
+        if (
+            promoted_track_id is not None
+            and (
+                type(promoted_track_id) is not str
+                or not promoted_track_id
+            )
+        ):
+            raise SafetyAbort(
+                "visual graph transition requested an invalid promoted "
+                "track identity"
             )
         race_ref = race_status
         if (
@@ -12641,6 +12653,7 @@ class VQ2Runner:
                 self.visual_tracker,
                 race_status=race_ref,
                 camera_token_at_credit=camera_token,
+                promoted_track_id=promoted_track_id,
             )
         except GateGraphError as exc:
             raise SafetyAbort(

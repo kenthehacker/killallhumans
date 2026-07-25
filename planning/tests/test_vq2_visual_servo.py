@@ -27,6 +27,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
+    PREPASS_CURRENT_MAX_APPARENT_SCALE,
     PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S,
     PREPASS_CURRENT_MAX_ABS_X_NORM,
     PREPASS_CURRENT_MAX_ABS_Y_NORM,
@@ -1044,10 +1045,37 @@ def test_passage_blend_cannot_reverse_current_aperture_correction() -> None:
     )
 
 
-def test_passage_safe_next_blend_cannot_enable_advance_authority() -> None:
+def test_passage_safe_next_blend_can_retain_advance_authority() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    output = step(
+        servo,
+        target(5),
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=0.30,
+            y=-0.20,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert output.next_gate_blend == pytest.approx(0.3)
+    assert output.next_horizontal_error == pytest.approx(0.30)
+    assert output.next_vertical_error_image_down == pytest.approx(-0.20)
+    assert output.advance_enabled
+
+
+def test_advance_passage_preview_requires_an_existing_latch() -> None:
     servo = ImageVisualServo()
 
-    with pytest.raises(VisualServoRefusal, match="cannot coexist"):
+    with pytest.raises(
+        VisualServoRefusal,
+        match="requires an established next-track latch",
+    ):
         step(
             servo,
             target(1),
@@ -1056,6 +1084,251 @@ def test_passage_safe_next_blend_cannot_enable_advance_authority() -> None:
             allow_advance=True,
             allow_passage_safe_next_blend=True,
         )
+
+
+def test_zero_blend_can_review_identity_before_passage_growth() -> None:
+    servo = ImageVisualServo()
+    reviewed = None
+    for frame_id in range(1, 4):
+        reviewed = step(
+            servo,
+            target(frame_id),
+            next_target=target(
+                frame_id,
+                track_id="vq2-track-000002",
+                x=0.30,
+            ),
+            requested_next_blend=0.0,
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
+        )
+        assert reviewed.next_gate_blend == 0.0
+
+    assert reviewed is not None
+    assert reviewed.reviewed_next_track_id == "vq2-track-000002"
+    assert servo.latched_next_track_id == "vq2-track-000002"
+
+    passage = step(
+        servo,
+        target(4),
+        next_target=target(
+            4,
+            track_id="vq2-track-000002",
+            x=0.30,
+        ),
+        requested_next_blend=0.20,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert passage.next_gate_blend == pytest.approx(0.20)
+    assert passage.advance_enabled
+
+
+def test_broad_passage_preview_cannot_gain_forward_authority() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    output = step(
+        servo,
+        target(
+            5,
+            y=-0.22,
+            y_rate=-0.20,
+            scale_rate=1.20,
+        ),
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=0.30,
+            y=-0.20,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert output.next_gate_blend == pytest.approx(0.3)
+    assert not output.advance_enabled
+    assert output.target_pitch_rad >= 0.0
+
+
+def test_advance_passage_withdraws_preview_outside_blend_scale_envelope() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    output = step(
+        servo,
+        target(
+            5,
+            log_scale=math.log(
+                PREPASS_CURRENT_MAX_APPARENT_SCALE + 0.01
+            ),
+        ),
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=0.30,
+            y=-0.20,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert output.next_gate_blend == 0.0
+    assert output.next_horizontal_error is None
+    assert output.next_vertical_error_image_down is None
+    assert output.effective_horizontal_error == 0.0
+    assert output.effective_vertical_error_image_down == 0.0
+    assert output.advance_enabled
+    assert output.passage_preview_retired
+    assert [
+        detail.violation
+        for detail in output.passage_preview_retirement_violations
+    ] == [PassageSafetyViolation.CURRENT_APPARENT_SCALE]
+
+    retired = step(
+        servo,
+        target(6),
+        next_target=target(
+            6,
+            track_id="vq2-track-000002",
+            x=0.30,
+            y=-0.20,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert retired.next_gate_blend == 0.0
+    assert retired.next_horizontal_error is None
+    assert retired.next_vertical_error_image_down is None
+    assert retired.advance_enabled
+    assert retired.passage_preview_retired
+    assert retired.passage_preview_retirement_violations == ()
+
+    no_advance_revival = step(
+        servo,
+        target(7),
+        next_target=target(
+            7,
+            track_id="vq2-track-000002",
+            x=0.30,
+            y=-0.20,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert no_advance_revival.next_gate_blend == 0.0
+    assert no_advance_revival.passage_preview_retired
+
+
+def test_unusable_optional_passage_preview_is_current_only() -> None:
+    missing_servo = ImageVisualServo()
+    clipped_servo = ImageVisualServo()
+    _latch_passage_blend(missing_servo)
+    _latch_passage_blend(clipped_servo)
+
+    current = target(5)
+    missing = step(
+        missing_servo,
+        current,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    clipped = step(
+        clipped_servo,
+        current,
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=0.60,
+            y=-0.50,
+            clipped=True,
+            center_censored=True,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert clipped == missing
+
+
+def test_attempt14_late_passage_preview_retires_at_first_hard_violation() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+    apparent_scale_156 = 0.44464405239847
+    requested_blend_156 = 0.35 * (
+        (math.log(apparent_scale_156) + 1.80) / 1.30
+    )
+
+    publication_156 = step(
+        servo,
+        target(
+            156,
+            x=0.009374999999999911,
+            y=-0.0444444444444444,
+            x_rate=0.047301552867145616,
+            y_rate=0.1910371891752105,
+            log_scale=math.log(apparent_scale_156),
+            scale_rate=1.456276983534964,
+        ),
+        next_target=target(
+            156,
+            track_id="vq2-track-000002",
+            x=0.453125,
+            y=-0.43333333333333335,
+            x_rate=0.15383742246049958,
+            y_rate=-0.2198960994105984,
+            log_scale=math.log(0.11975089885999922),
+            scale_rate=0.42128522736511775,
+        ),
+        requested_next_blend=requested_blend_156,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert publication_156.next_gate_blend == pytest.approx(
+        requested_blend_156
+    )
+    assert publication_156.next_gate_blend == pytest.approx(
+        0.2664089079230311
+    )
+    assert not publication_156.advance_enabled
+
+    publication_157 = step(
+        servo,
+        target(
+            157,
+            x=0.09687500000000004,
+            y=-0.03888888888888886,
+            x_rate=1.790118948812271,
+            y_rate=0.19827360814611752,
+            log_scale=math.log(0.5199116845409634),
+            scale_rate=3.816682075186591,
+        ),
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert publication_157.next_gate_blend == 0.0
+    assert publication_157.brake_reason == "scale_rate"
+
+    safe_again = step(
+        servo,
+        target(158),
+        next_target=target(
+            158,
+            track_id="vq2-track-000002",
+            x=0.30,
+            y=-0.20,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert safe_again.next_gate_blend == 0.0
 
 
 @pytest.mark.parametrize(
