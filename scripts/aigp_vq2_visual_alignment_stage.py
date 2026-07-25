@@ -315,6 +315,8 @@ async def run_visual_alignment_stage(
                 RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES
             ),
             "stale_credit_anchor_command_allowed": False,
+            "promotion_identity_basis": None,
+            "cross_gap_identity_claimed": None,
             "anchor_admission": None,
             "fresh_frame_count": 0,
             "command_count": 0,
@@ -720,6 +722,25 @@ async def run_visual_alignment_stage(
             "promotion_identity_sha256": (
                 wire_admission.promotion_identity_sha256
             ),
+            "promotion_identity_basis": (
+                wire_admission.promotion_identity_basis
+            ),
+            "cross_gap_identity_claimed": (
+                wire_admission.cross_gap_identity_claimed
+            ),
+            "visibility_epoch_frame_count": (
+                wire_admission.visibility_epoch_frame_count
+            ),
+            "visibility_epoch_span_s": (
+                wire_admission.visibility_epoch_span_s
+            ),
+            "visibility_epoch_tokens": [
+                asdict(token)
+                for token in wire_admission.visibility_epoch_tokens
+            ],
+            "visibility_epoch_tracker_frame_sequences": list(
+                wire_admission.visibility_epoch_tracker_frame_sequences
+            ),
             "reacquisition_bridge": (
                 None
                 if wire_admission.reacquisition_bridge is None
@@ -922,6 +943,12 @@ async def run_visual_alignment_stage(
                 {
                     "required": True,
                     "outcome": "running",
+                    "promotion_identity_basis": (
+                        recovery_admission.promotion_identity_basis
+                    ),
+                    "cross_gap_identity_claimed": (
+                        recovery_admission.cross_gap_identity_claimed
+                    ),
                     "anchor_admission": asdict(recovery_admission),
                 }
             )

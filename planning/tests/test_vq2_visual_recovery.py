@@ -40,6 +40,10 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_REACQUISITION_GAP_S,
     RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S,
     RECOVERY_MAX_REACQUISITION_MISSED_FRAMES,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA,
+    PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH,
     RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
     RECOVERY_MIN_HISTORY_SPAN_S,
     RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE,
@@ -591,6 +595,95 @@ _LATEST_DELAYED_CREDIT_ROWS = (
 )
 _LATEST_DELAYED_CREDIT_RACE_RECEIVED_NS = 78_089_861_671_700
 
+# Exact compact excerpt from
+# 20260725T041145Z-visual-align-c6753a5f/session.jsonl.gz.  The tracker
+# sequences are the exact visual_gate_graph_frame ordinals, corroborated by
+# the explicit sequence at publication 155.  Publications 155--166 were
+# missed; 167--171 are the complete promotion-time visibility epoch.
+_LATEST_COMPLETE_EPOCH_ROWS = (
+    (
+        2_557_676, 151, 149, 85_557_779_889_100, 85_557_781_587_200,
+        1_784_952_712_103_720_200, 1,
+        (0.35624999999999996, -0.5055555555555555),
+        (0.6375, 0.17222222222222222, 0.71875, 0.325),
+        0.11141451630934118, 0.6442498003722453, 0.9384781641192754,
+        None,
+    ),
+    (
+        2_557_677, 152, 150, 85_557_815_174_100, 85_557_816_175_400,
+        1_784_952_712_138_435_100, 1,
+        (0.359375, -0.5111111111111111),
+        (0.6375, 0.16666666666666666, 0.721875, 0.32222222222222224),
+        0.11456439237389607, 0.6661889950731708, 0.9305667844082846,
+        (0.05693523678520668, 0.00237146273203683,
+         0.931600965911983, 0.03729854892245754, 0),
+    ),
+    (
+        2_557_678, 153, 151, 85_557_848_612_300, 85_557_849_423_900,
+        1_784_952_712_173_136_400, 1,
+        (0.36250000000000004, -0.5166666666666666),
+        (0.6390625, 0.1638888888888889, 0.7234375, 0.32222222222222224),
+        0.1155827625556683, 0.6629950825640282, 0.9489013577442054,
+        (0.041900886649751556, 0.0013068824076136612,
+         0.98105322322679, -0.019235003416264718, 0),
+    ),
+    (
+        2_557_679, 154, 152, 85_557_878_537_700, 85_557_879_757_800,
+        1_784_952_712_200_975_700, 1,
+        (0.3656250000000001, -0.5222222222222221),
+        (0.6390625, 0.16111111111111112, 0.7265625, 0.3194444444444444),
+        0.11770372409854613, 0.6798527871538127, 0.9409819394154024,
+        (0.04839480967937, 0.0011701507715032357,
+         0.9576825417018836, 0.012781035095469129, 0),
+    ),
+    (
+        2_557_692, 167, 165, 85_558_313_780_100, 85_558_314_620_800,
+        1_784_952_712_638_470_100, 0,
+        (0.4437500000000001, -0.6055555555555556),
+        (0.6625, 0.1, 0.78125, 0.2972222222222222),
+        0.15303639726839133, 0.7102010399335015, 0.6878014712257361,
+        (0.2560027935948964, 0.03647934185449377,
+         0.570874895506303, 0.0797210076190682, 12),
+    ),
+    (
+        2_557_693, 168, 166, 85_558_348_697_700, 85_558_349_879_900,
+        1_784_952_712_673_195_600, 0,
+        (0.453125, -0.6166666666666667),
+        (0.665625, 0.09166666666666666, 0.7875, 0.29444444444444445),
+        0.15720541233261232, 0.7280241346367423, 0.9300531221154416,
+        (0.057356439865337935, 0.006479732296708121,
+         0.937989534774398, 0.01451381758778858, 0),
+    ),
+    (
+        2_557_694, 169, 167, 85_558_378_952_600, 85_558_379_845_200,
+        1_784_952_712_700_925_200, 0,
+        (0.4593750000000001, -0.6222222222222222),
+        (0.6671875, 0.08611111111111111, 0.79375, 0.29444444444444445),
+        0.1623797632095822, 0.7488314502029989, 0.9318129700260742,
+        (0.05591336457861914, 0.0022148448681609132,
+         0.9372839506172841, 0.023851172891110384, 0),
+    ),
+    (
+        2_557_695, 170, 168, 85_558_411_224_300, 85_558_412_290_100,
+        1_784_952_712_735_656_100, 0,
+        (0.46875, -0.6333333333333333),
+        (0.6703125, 0.07777777777777778, 0.8, 0.2916666666666667),
+        0.16654943793894292, 0.7524968368018758, 0.9371674700164414,
+        (0.05152267458651805, 0.0048912744390170945,
+         0.9505554686277566, -0.006929264001608093, 0),
+    ),
+    (
+        2_557_696, 171, 169, 85_558_445_761_600, 85_558_446_732_700,
+        1_784_952_712_770_376_900, 0,
+        (0.48124999999999996, -0.6444444444444444),
+        (0.6734375, 0.06944444444444445, 0.8078125, 0.28888888888888886),
+        0.1717202586249573, 0.7631887723371107, 0.9342740076184929,
+        (0.05389531375283581, 0.003922775504051575,
+         0.9406829555490143, 0.0035433270649938287, 0),
+    ),
+)
+_LATEST_COMPLETE_EPOCH_RACE_RECEIVED_NS = 85_558_465_866_500
+
 
 def _accepted_sample(
     previous: VisualTrackSample,
@@ -993,6 +1086,112 @@ def _stable_tail_fixture() -> tuple[
             sample.token for sample in bound_transition
         ),
         promoted_history_length_at_credit=len(samples),
+        history_length_before_promotion=len(samples),
+        history_length_after_promotion=len(samples),
+        promoted_history_sha256=visual_track_history_sha256(samples),
+    )
+    return track, transition
+
+
+def _latest_complete_epoch_fixture() -> tuple[
+    VisualTrack,
+    ConfirmedGateTransition,
+]:
+    raw_samples = tuple(
+        VisualTrackSample(
+            tracker_frame_sequence=row[2],
+            token=CameraFrameToken(
+                generation=1,
+                frame_id=row[0],
+                publication_sequence=row[1],
+                stream_id="vq2-camera-udp-5600",
+            ),
+            observation_monotonic_ns=row[3],
+            publication_monotonic_ns=row[4],
+            provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+            camera_source_time_ns=row[5],
+            source_index=row[6],
+            center_norm=row[7],
+            bbox_norm=row[8],
+            apparent_scale=row[9],
+            confidence=row[10],
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            association_confidence=row[11],
+        )
+        for row in _LATEST_COMPLETE_EPOCH_ROWS
+    )
+    bound_samples = [raw_samples[0]]
+    for sample, row in zip(
+        raw_samples[1:],
+        _LATEST_COMPLETE_EPOCH_ROWS[1:],
+        strict=True,
+    ):
+        association = row[12]
+        assert association is not None
+        bound_samples.append(
+            _accepted_sample(
+                bound_samples[-1],
+                sample,
+                cost=association[0],
+                residual=association[1],
+                bbox_iou=association[2],
+                log_area_residual=association[3],
+                missed_frames=association[4],
+            )
+        )
+    samples = tuple(bound_samples)
+    race = AuthoritativeRaceStatusRef.live(
+        session_id="7" * 64,
+        reset_epoch=1,
+        race_generation=2,
+        race_status_sequence=1477,
+        race_status_boot_ms=6064,
+        active_gate_index=1,
+        received_monotonic_ns=_LATEST_COMPLETE_EPOCH_RACE_RECEIVED_NS,
+        host_clock_id="host-perf-counter",
+    )
+    track = VisualTrack(
+        track_id="vq2-track-000002",
+        first_token=samples[0].token,
+        latest_token=samples[-1].token,
+        center_norm=samples[-1].center_norm,
+        bbox_norm=samples[-1].bbox_norm,
+        apparent_scale=samples[-1].apparent_scale,
+        center_velocity_norm_s=(
+            0.3132939854935809,
+            -0.3059923517171168,
+        ),
+        log_scale_rate_s=0.8621783099865896,
+        confidence=samples[-1].confidence,
+        association_confidence=samples[-1].association_confidence,
+        consecutive_frame_count=5,
+        total_observation_count=len(samples),
+        missed_frame_count=0,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        authority_race_status_sequence=1477,
+        authority_race_status_boot_ms=6064,
+        ambiguous=False,
+        visible=True,
+        history=samples,
+    )
+    transition = ConfirmedGateTransition(
+        from_gate_index=0,
+        to_gate_index=1,
+        retired_track_id="vq2-track-000001",
+        promoted_track_id=track.track_id,
+        race_status=race,
+        camera_token_at_credit=track.latest_token,
+        promoted_first_token=track.first_token,
+        promoted_latest_token_before_credit=track.latest_token,
+        promoted_history_length_at_credit=len(samples),
+        promoted_latest_token_at_promotion=track.latest_token,
+        pretransition_frame_tokens=tuple(
+            sample.token for sample in samples[-5:]
+        ),
         history_length_before_promotion=len(samples),
         history_length_after_promotion=len(samples),
         promoted_history_sha256=visual_track_history_sha256(samples),
@@ -2042,6 +2241,12 @@ def test_exact_latest_delayed_credit_bridge_and_projection_admit():
         token.publication_sequence for token in admission.history_tokens
     ) == (170, 171, 172, 173)
     assert admission.promotion_identity_sha256 == expected_digest
+    assert admission.visibility_epoch_frame_count == (
+        len(transition.pretransition_frame_tokens) + 1
+    )
+    assert admission.visibility_epoch_tokens[-1] == (
+        transition.promoted_latest_token_at_promotion
+    )
 
     bridge = admission.reacquisition_bridge
     assert type(bridge) is ReacquisitionBridgeAdmission
@@ -2121,6 +2326,9 @@ def test_delayed_promotion_anchor_continues_on_exact_next_publication():
     assert admission.previous_token.publication_sequence == 173
     assert admission.frame_token.publication_sequence == 174
     assert admission.promotion_identity_sha256 == authority.history_sha256
+    assert admission.visibility_epoch_tokens[-1] == (
+        transition.promoted_latest_token_at_promotion
+    )
 
 
 @pytest.mark.parametrize(
@@ -2575,12 +2783,18 @@ def _admit_stable_trace(
     track: VisualTrack,
     transition: ConfirmedGateTransition,
 ) -> TransitionRecoveryAdmission:
+    race_received_ns = transition.race_status.received_monotonic_ns
+    latest_publication_ns = track.history[-1].publication_monotonic_ns
+    assert race_received_ns is not None
+    assert latest_publication_ns is not None
     return require_transition_recovery_admission(
         track,
         transition,
         tracker_time_basis_id="host-perf-counter",
         measured_pitch_rad=-0.04001,
-        now_monotonic_ns=_STABLE_TAIL_RACE_RECEIVED_NS + 1_000_000,
+        now_monotonic_ns=(
+            max(race_received_ns, latest_publication_ns) + 1_000_000
+        ),
     )
 
 
@@ -2922,10 +3136,17 @@ def test_reacquisition_bridge_rejects_excessive_center_or_scale_rate(
         _admit_stable_trace(track, transition)
 
 
-def test_reacquisition_bridge_rejects_twelve_misses_and_delta_thirteen():
-    track, transition = _stable_tail_fixture()
+def _shift_stable_tail_epoch_sequence(
+    track: VisualTrack,
+    transition: ConfirmedGateTransition,
+    *,
+    tracker_sequence_shift: int,
+    publication_sequence_shift: int,
+) -> tuple[VisualTrack, ConfirmedGateTransition, int]:
+    assert tracker_sequence_shift > 0
+    assert publication_sequence_shift > 0
     bridge_index = (
-        transition.history_length_after_promotion
+        transition.promoted_history_length_at_credit
         - len(transition.pretransition_frame_tokens)
     )
     shifted = list(track.history[:bridge_index])
@@ -2933,57 +3154,335 @@ def test_reacquisition_bridge_rejects_twelve_misses_and_delta_thirteen():
         assert sample.accepted_association is not None
         token = replace(
             sample.token,
-            frame_id=sample.token.frame_id + 1,
-            publication_sequence=sample.token.publication_sequence + 1,
+            frame_id=(
+                sample.token.frame_id + publication_sequence_shift
+            ),
+            publication_sequence=(
+                sample.token.publication_sequence
+                + publication_sequence_shift
+            ),
+        )
+        missed_frames = (
+            sample.accepted_association.missed_frame_count_before_association
+            + tracker_sequence_shift
+            if offset == 0
+            else 0
         )
         shifted_sample = replace(
             sample,
-            tracker_frame_sequence=sample.tracker_frame_sequence + 1,
+            tracker_frame_sequence=(
+                sample.tracker_frame_sequence + tracker_sequence_shift
+            ),
             token=token,
             accepted_association=replace(
                 sample.accepted_association,
                 previous_token=shifted[-1].token,
                 current_token=token,
-                missed_frame_count_before_association=(
-                    RECOVERY_MAX_REACQUISITION_MISSED_FRAMES + 1
-                    if offset == 0
-                    else 0
-                ),
-                temporal_consistency=(
-                    1.0 / (RECOVERY_MAX_REACQUISITION_MISSED_FRAMES + 2)
-                    if offset == 0
-                    else 1.0
-                ),
+                missed_frame_count_before_association=missed_frames,
+                temporal_consistency=1.0 / (missed_frames + 1),
             ),
         )
         shifted.append(shifted_sample)
     history = tuple(shifted)
-    bridge = history[bridge_index]
-    track = replace(
+    shifted_track = replace(
         track,
         latest_token=history[-1].token,
         history=history,
     )
-    transition = replace(
+    shifted_transition = replace(
         transition,
-        camera_token_at_credit=history[-1].token,
-        promoted_latest_token_before_credit=history[-1].token,
-        promoted_latest_token_at_promotion=history[-1].token,
-        pretransition_frame_tokens=tuple(
-            sample.token for sample in history[-5:]
+        camera_token_at_credit=replace(
+            transition.camera_token_at_credit,
+            frame_id=(
+                transition.camera_token_at_credit.frame_id
+                + publication_sequence_shift
+            ),
+            publication_sequence=(
+                transition.camera_token_at_credit.publication_sequence
+                + publication_sequence_shift
+            ),
         ),
+        promoted_latest_token_before_credit=history[
+            transition.promoted_history_length_at_credit - 1
+        ].token,
+        promoted_latest_token_at_promotion=history[
+            transition.history_length_after_promotion - 1
+        ].token,
+        pretransition_frame_tokens=tuple(
+            sample.token
+            for sample in history[
+                bridge_index:transition.promoted_history_length_at_credit
+            ]
+        ),
+        promoted_history_sha256=visual_track_history_sha256(history),
     )
+    return shifted_track, shifted_transition, bridge_index
+
+
+def test_complete_epoch_admits_twelve_misses_without_cross_gap_claim():
+    track, transition = _stable_tail_fixture()
+    track, transition, bridge_index = _shift_stable_tail_epoch_sequence(
+        track,
+        transition,
+        tracker_sequence_shift=1,
+        publication_sequence_shift=1,
+    )
+    history = track.history
+    bridge = history[bridge_index]
 
     assert RECOVERY_MAX_REACQUISITION_MISSED_FRAMES == 11
+    assert RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES == 12
+    assert RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA == 13
+    assert RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S == pytest.approx(0.450)
     assert (
         bridge.token.publication_sequence
         - history[bridge_index - 1].token.publication_sequence
     ) == 13
+    admission = _admit_stable_trace(track, transition)
+
+    assert admission.promotion_identity_basis == (
+        PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+    )
+    assert admission.cross_gap_identity_claimed is False
+    assert admission.reacquisition_bridge is None
+    assert admission.visibility_epoch_frame_count == 5
+    assert admission.visibility_epoch_tokens == tuple(
+        sample.token for sample in history[-5:]
+    )
+    assert tuple(
+        later - earlier
+        for earlier, later in zip(
+            admission.visibility_epoch_tracker_frame_sequences,
+            admission.visibility_epoch_tracker_frame_sequences[1:],
+        )
+    ) == (1, 1, 1, 1)
+
+
+def test_exact_latest_complete_epoch_replay_admits_without_gap_identity():
+    track, transition = _latest_complete_epoch_fixture()
+    bridge_index = len(track.history) - track.consecutive_frame_count
+    predecessor = track.history[bridge_index - 1]
+    root = track.history[bridge_index]
+    assert root.accepted_association is not None
+    latest = track.history[-1]
+    assert latest.publication_monotonic_ns is not None
+
+    assert root.confidence == pytest.approx(0.7102010399335015)
+    assert root.association_confidence == pytest.approx(0.6878014712257361)
+    assert root.accepted_association.missed_frame_count_before_association == 12
+    assert root.accepted_association.observation_gap_ns == 435_242_400
+    assert root.accepted_association.publication_gap_ns == 434_863_000
+    assert (
+        root.token.publication_sequence
+        - predecessor.token.publication_sequence
+    ) == 13
+    assert (
+        _LATEST_COMPLETE_EPOCH_RACE_RECEIVED_NS
+        - latest.publication_monotonic_ns
+    ) == 19_133_800
+
+    admission = require_transition_recovery_admission(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.04,
+        now_monotonic_ns=(
+            _LATEST_COMPLETE_EPOCH_RACE_RECEIVED_NS + 1_000_000
+        ),
+    )
+
+    assert admission.promotion_identity_basis == (
+        PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+    )
+    assert admission.cross_gap_identity_claimed is False
+    assert admission.reacquisition_bridge is None
+    assert admission.credit_prefix_age_s == pytest.approx(0.0191338)
+    assert admission.visibility_epoch_span_s == pytest.approx(0.1319815)
+    assert tuple(
+        token.publication_sequence
+        for token in admission.visibility_epoch_tokens
+    ) == (167, 168, 169, 170, 171)
+    assert admission.projected_abs_horizontal_error < (
+        POST_PROMOTION_ENTRY_MAX_ABS_X_NORM
+    )
+    assert admission.projected_abs_vertical_error_image_down < (
+        RECOVERY_MAX_PROJECTED_ABS_Y_NORM
+    )
+
+
+def test_complete_epoch_rejects_thirteen_misses_and_delta_fourteen():
+    track, transition = _stable_tail_fixture()
+    track, transition, bridge_index = _shift_stable_tail_epoch_sequence(
+        track,
+        transition,
+        tracker_sequence_shift=2,
+        publication_sequence_shift=2,
+    )
+    bridge = track.history[bridge_index]
+    predecessor = track.history[bridge_index - 1]
+
+    assert bridge.accepted_association is not None
+    assert bridge.accepted_association.missed_frame_count_before_association == 13
+    assert (
+        bridge.token.publication_sequence
+        - predecessor.token.publication_sequence
+    ) == 14
     with pytest.raises(
         VisualRecoveryRefusal,
-        match="reacquisition gap is outside bounds",
+        match="visibility epoch start is outside bounds",
     ):
         _admit_stable_trace(track, transition)
+
+
+def test_complete_epoch_rejects_one_unobserved_publication():
+    track, transition = _stable_tail_fixture()
+    track, transition, bridge_index = _shift_stable_tail_epoch_sequence(
+        track,
+        transition,
+        tracker_sequence_shift=1,
+        publication_sequence_shift=2,
+    )
+    bridge = track.history[bridge_index]
+    predecessor = track.history[bridge_index - 1]
+
+    assert bridge.accepted_association is not None
+    assert bridge.accepted_association.missed_frame_count_before_association == 12
+    assert (
+        bridge.token.publication_sequence
+        - predecessor.token.publication_sequence
+    ) == 14
+    with pytest.raises(
+        VisualRecoveryRefusal,
+        match="visibility epoch start timing is unsafe",
+    ):
+        _admit_stable_trace(track, transition)
+
+
+def test_complete_epoch_includes_one_delayed_credit_promotion_sample():
+    track, transition = _latest_delayed_credit_fixture()
+    track, transition, bridge_index = _shift_stable_tail_epoch_sequence(
+        track,
+        transition,
+        tracker_sequence_shift=2,
+        publication_sequence_shift=1,
+    )
+    bridge = track.history[bridge_index]
+    predecessor = track.history[bridge_index - 1]
+
+    assert bridge.accepted_association is not None
+    assert bridge.accepted_association.missed_frame_count_before_association == 12
+    assert (
+        bridge.token.publication_sequence
+        - predecessor.token.publication_sequence
+    ) == 13
+    admission = _admit_stable_trace(track, transition)
+
+    assert admission.promotion_identity_basis == (
+        PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+    )
+    assert admission.cross_gap_identity_claimed is False
+    assert admission.reacquisition_bridge is None
+    assert admission.visibility_epoch_frame_count == (
+        len(transition.pretransition_frame_tokens) + 1
+    )
+    assert admission.visibility_epoch_tokens[-1] == (
+        transition.promoted_latest_token_at_promotion
+    )
+    assert (
+        admission.visibility_epoch_tokens[-2]
+        == transition.promoted_latest_token_before_credit
+    )
+
+
+def test_complete_epoch_basis_is_frozen_across_continuation():
+    anchor, transition = _latest_delayed_credit_fixture()
+    anchor, transition, _bridge_index = _shift_stable_tail_epoch_sequence(
+        anchor,
+        transition,
+        tracker_sequence_shift=2,
+        publication_sequence_shift=1,
+    )
+    authority = require_promotion_history_authority(
+        anchor,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+    )
+    track = _append_clean_stationary_sample(anchor)
+    race_received_ns = transition.race_status.received_monotonic_ns
+    promotion_publication_ns = (
+        anchor.history[-1].publication_monotonic_ns
+    )
+    latest_publication_ns = track.history[-1].publication_monotonic_ns
+    assert race_received_ns is not None
+    assert promotion_publication_ns is not None
+    assert latest_publication_ns is not None
+
+    admission = require_recovery_continuation(
+        track,
+        transition,
+        previous_token=anchor.latest_token,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.04001,
+        recovery_started_monotonic_ns=(
+            max(race_received_ns, promotion_publication_ns) + 1_000_000
+        ),
+        now_monotonic_ns=latest_publication_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+
+    assert admission.promotion_identity_basis == (
+        PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+    )
+    assert admission.cross_gap_identity_claimed is False
+    assert admission.reacquisition_bridge is None
+    assert admission.visibility_epoch_tokens[-1] == anchor.latest_token
+    assert track.latest_token not in admission.visibility_epoch_tokens
+
+
+@pytest.mark.parametrize("extra_gap_ns", (0, 1))
+def test_complete_epoch_four_fifty_ms_gap_boundary_is_inclusive(
+    extra_gap_ns,
+):
+    track, transition = _stable_tail_fixture()
+    track, transition, bridge_index = _shift_stable_tail_epoch_sequence(
+        track,
+        transition,
+        tracker_sequence_shift=1,
+        publication_sequence_shift=1,
+    )
+    bridge = track.history[bridge_index]
+    assert bridge.accepted_association is not None
+    gap_limit_ns = round(
+        RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S * 1_000_000_000
+    )
+    track, transition = _shift_six_epoch_timing(
+        track,
+        transition,
+        observation_shift_ns=(
+            gap_limit_ns
+            + extra_gap_ns
+            - bridge.accepted_association.observation_gap_ns
+        ),
+        publication_shift_ns=(
+            gap_limit_ns
+            + extra_gap_ns
+            - bridge.accepted_association.publication_gap_ns
+        ),
+        rehash_transition=True,
+    )
+
+    if extra_gap_ns == 0:
+        admission = _admit_stable_trace(track, transition)
+        assert admission.promotion_identity_basis == (
+            PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+        )
+        assert admission.reacquisition_bridge is None
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="visibility epoch start timing is unsafe",
+        ):
+            _admit_stable_trace(track, transition)
 
 
 def test_reacquisition_bridge_keeps_a_separate_point_sixty_five_floor():

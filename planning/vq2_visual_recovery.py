@@ -66,6 +66,10 @@ RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE = 0.22
 RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL = 0.15
 RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S = 0.25
 RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S = 0.70
+RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES = 12
+RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA = 13
+RECOVERY_VISIBILITY_EPOCH_MAX_START_UNOBSERVED_PUBLICATIONS = 0
+RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S = 0.450
 RECOVERY_MIN_FRAME_DT_S = 0.020
 RECOVERY_MAX_FRAME_DT_S = 0.050
 RECOVERY_MAX_RECEIVER_PIPELINE_LATENCY_S = 0.010
@@ -110,6 +114,15 @@ RECOVERY_MAX_COMMAND_RATE_RAD_S = 0.12
 RECOVERY_MAX_YAW_RATE_RAD_S = 0.08
 RECOVERY_MAX_THRUST = 0.285
 RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES = 2
+PROMOTION_IDENTITY_BASIS_CONTINUOUS_TRANSITION_VISIBILITY = (
+    "continuous_transition_visibility_v1"
+)
+PROMOTION_IDENTITY_BASIS_BOUNDED_REACQUISITION_BRIDGE = (
+    "bounded_reacquisition_bridge_v1"
+)
+PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH = (
+    "complete_current_visibility_epoch_v1"
+)
 _PROMOTION_HISTORY_AUTHORITY_ISSUER = object()
 
 
@@ -212,6 +225,12 @@ class TransitionRecoveryAdmission:
     min_history_detection_confidence: float
     min_history_association_confidence: float
     promotion_identity_sha256: str
+    promotion_identity_basis: str
+    cross_gap_identity_claimed: bool
+    visibility_epoch_frame_count: int
+    visibility_epoch_span_s: float
+    visibility_epoch_tokens: tuple[CameraFrameToken, ...]
+    visibility_epoch_tracker_frame_sequences: tuple[int, ...]
     reacquisition_bridge: ReacquisitionBridgeAdmission | None
     horizontal_error: float
     vertical_error_image_down: float
@@ -248,6 +267,12 @@ class RecoveryContinuationAdmission:
     min_history_detection_confidence: float
     min_history_association_confidence: float
     promotion_identity_sha256: str
+    promotion_identity_basis: str
+    cross_gap_identity_claimed: bool
+    visibility_epoch_frame_count: int
+    visibility_epoch_span_s: float
+    visibility_epoch_tokens: tuple[CameraFrameToken, ...]
+    visibility_epoch_tracker_frame_sequences: tuple[int, ...]
     reacquisition_bridge: ReacquisitionBridgeAdmission | None
     capture: VisualAlignmentCaptureAdmission
     max_raw_horizontal_rate_s: float
@@ -285,6 +310,17 @@ class _HistoryProjection:
     projected_height_norm: float
     projected_area_norm: float
     projected_apparent_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class _PromotionIdentityEvidence:
+    basis: str
+    cross_gap_identity_claimed: bool
+    visibility_epoch_frame_count: int
+    visibility_epoch_span_s: float
+    visibility_epoch_tokens: tuple[CameraFrameToken, ...]
+    visibility_epoch_tracker_frame_sequences: tuple[int, ...]
+    reacquisition_bridge: ReacquisitionBridgeAdmission | None
 
 
 def _finite(value: object, label: str) -> float:
@@ -906,7 +942,7 @@ def _require_clean_history_segment(
 def _require_promotion_identity_bridge(
     track: VisualTrack,
     transition: ConfirmedGateTransition,
-) -> ReacquisitionBridgeAdmission | None:
+) -> _PromotionIdentityEvidence:
     credit_length = transition.promoted_history_length_at_credit
     promotion_length = transition.history_length_after_promotion
     pretransition_tokens = transition.pretransition_frame_tokens
@@ -938,6 +974,39 @@ def _require_promotion_identity_bridge(
         raise VisualRecoveryRefusal(
             "post-promotion recovery stable epoch is insufficient"
         )
+    credit_visibility_epoch = track.history[bridge_index:credit_length]
+    if (
+        len(credit_visibility_epoch)
+        < RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+        or tuple(sample.token for sample in credit_visibility_epoch)
+        != pretransition_tokens[-len(credit_visibility_epoch):]
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery credit visibility epoch is invalid"
+    )
+    visibility_epoch = track.history[bridge_index:promotion_length]
+    if any(
+        type(sample.tracker_frame_sequence) is not int
+        or type(sample.observation_monotonic_ns) is not int
+        for sample in visibility_epoch
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery visibility epoch is invalid"
+        )
+    visibility_epoch_span_s = (
+        visibility_epoch[-1].observation_monotonic_ns
+        - visibility_epoch[0].observation_monotonic_ns
+    ) / 1_000_000_000.0
+    if visibility_epoch_span_s < RECOVERY_MIN_HISTORY_SPAN_S:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery visibility epoch span is insufficient"
+        )
+    visibility_epoch_tokens = tuple(
+        sample.token for sample in visibility_epoch
+    )
+    visibility_epoch_tracker_frame_sequences = tuple(
+        sample.tracker_frame_sequence for sample in visibility_epoch
+    )
 
     _require_clean_history_segment(
         track,
@@ -998,16 +1067,28 @@ def _require_promotion_identity_bridge(
                 RECOVERY_MIN_ASSOCIATION_CONFIDENCE
             ),
         )
-        return None
+        return _PromotionIdentityEvidence(
+            basis=(
+                PROMOTION_IDENTITY_BASIS_CONTINUOUS_TRANSITION_VISIBILITY
+            ),
+            cross_gap_identity_claimed=False,
+            visibility_epoch_frame_count=len(visibility_epoch),
+            visibility_epoch_span_s=visibility_epoch_span_s,
+            visibility_epoch_tokens=visibility_epoch_tokens,
+            visibility_epoch_tracker_frame_sequences=(
+                visibility_epoch_tracker_frame_sequences
+            ),
+            reacquisition_bridge=None,
+        )
 
     if (
         type(missed_frames) is not int
         or not 1
         <= missed_frames
-        <= RECOVERY_MAX_REACQUISITION_MISSED_FRAMES
+        <= RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES
     ):
         raise VisualRecoveryRefusal(
-            "post-promotion recovery reacquisition gap is outside bounds"
+            "post-promotion recovery visibility epoch start is outside bounds"
         )
     _sample_geometry(
         bridge,
@@ -1043,9 +1124,41 @@ def _require_promotion_identity_bridge(
     observation_gap_s = evidence.observation_gap_ns / 1_000_000_000.0
     assert evidence.publication_gap_ns is not None
     publication_gap_s = evidence.publication_gap_ns / 1_000_000_000.0
+    requires_complete_epoch_basis = (
+        missed_frames > RECOVERY_MAX_REACQUISITION_MISSED_FRAMES
+        or publication_delta
+        > RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
+    )
+    if requires_complete_epoch_basis:
+        if (
+            publication_delta
+            > RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA
+            or unobserved_publication_count < 0
+            or unobserved_publication_count
+            > RECOVERY_VISIBILITY_EPOCH_MAX_START_UNOBSERVED_PUBLICATIONS
+            or observation_gap_s
+            > RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S
+            or publication_gap_s
+            > RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S
+        ):
+            raise VisualRecoveryRefusal(
+                "post-promotion recovery visibility epoch start timing is unsafe"
+            )
+        return _PromotionIdentityEvidence(
+            basis=(
+                PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+            ),
+            cross_gap_identity_claimed=False,
+            visibility_epoch_frame_count=len(visibility_epoch),
+            visibility_epoch_span_s=visibility_epoch_span_s,
+            visibility_epoch_tokens=visibility_epoch_tokens,
+            visibility_epoch_tracker_frame_sequences=(
+                visibility_epoch_tracker_frame_sequences
+            ),
+            reacquisition_bridge=None,
+        )
     if (
-        publication_delta > RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
-        or unobserved_publication_count < 0
+        unobserved_publication_count < 0
         or unobserved_publication_count
         > RECOVERY_MAX_REACQUISITION_UNOBSERVED_PUBLICATIONS
         or observation_gap_s > RECOVERY_MAX_REACQUISITION_GAP_S
@@ -1147,26 +1260,36 @@ def _require_promotion_identity_bridge(
         raise VisualRecoveryRefusal(
             "post-promotion recovery reacquisition motion is unsafe"
         )
-    return ReacquisitionBridgeAdmission(
-        predecessor_token=predecessor.token,
-        reacquisition_token=bridge.token,
-        missed_frame_count=missed_frames,
-        tracker_frame_delta=tracker_delta,
-        publication_delta=publication_delta,
-        unobserved_publication_count=unobserved_publication_count,
-        observation_gap_s=observation_gap_s,
-        publication_gap_s=publication_gap_s,
-        association_confidence=float(evidence.confidence),
-        association_cost=cost,
-        predicted_center_residual_norm=residual,
-        bbox_iou=bbox_iou,
-        direct_bbox_iou=direct_bbox_iou,
-        log_width_change=log_width,
-        log_height_change=log_height,
-        log_area_residual=log_area,
-        average_horizontal_rate_norm_s=horizontal_rate,
-        average_vertical_rate_norm_s=vertical_rate,
-        average_log_scale_rate_s=log_scale_rate,
+    return _PromotionIdentityEvidence(
+        basis=PROMOTION_IDENTITY_BASIS_BOUNDED_REACQUISITION_BRIDGE,
+        cross_gap_identity_claimed=True,
+        visibility_epoch_frame_count=len(visibility_epoch),
+        visibility_epoch_span_s=visibility_epoch_span_s,
+        visibility_epoch_tokens=visibility_epoch_tokens,
+        visibility_epoch_tracker_frame_sequences=(
+            visibility_epoch_tracker_frame_sequences
+        ),
+        reacquisition_bridge=ReacquisitionBridgeAdmission(
+            predecessor_token=predecessor.token,
+            reacquisition_token=bridge.token,
+            missed_frame_count=missed_frames,
+            tracker_frame_delta=tracker_delta,
+            publication_delta=publication_delta,
+            unobserved_publication_count=unobserved_publication_count,
+            observation_gap_s=observation_gap_s,
+            publication_gap_s=publication_gap_s,
+            association_confidence=float(evidence.confidence),
+            association_cost=cost,
+            predicted_center_residual_norm=residual,
+            bbox_iou=bbox_iou,
+            direct_bbox_iou=direct_bbox_iou,
+            log_width_change=log_width,
+            log_height_change=log_height,
+            log_area_residual=log_area,
+            average_horizontal_rate_norm_s=horizontal_rate,
+            average_vertical_rate_norm_s=vertical_rate,
+            average_log_scale_rate_s=log_scale_rate,
+        ),
     )
 
 
@@ -1502,7 +1625,7 @@ def require_transition_recovery_admission(
         tracker_time_basis_id=tracker_time_basis_id,
     )
     _require_exact_transition_anchor(track, transition)
-    reacquisition_bridge = _require_promotion_identity_bridge(
+    promotion_identity = _require_promotion_identity_bridge(
         track,
         transition,
     )
@@ -1643,7 +1766,19 @@ def require_transition_recovery_admission(
             projection.min_association_confidence
         ),
         promotion_identity_sha256=transition.promoted_history_sha256,
-        reacquisition_bridge=reacquisition_bridge,
+        promotion_identity_basis=promotion_identity.basis,
+        cross_gap_identity_claimed=(
+            promotion_identity.cross_gap_identity_claimed
+        ),
+        visibility_epoch_frame_count=(
+            promotion_identity.visibility_epoch_frame_count
+        ),
+        visibility_epoch_span_s=promotion_identity.visibility_epoch_span_s,
+        visibility_epoch_tokens=promotion_identity.visibility_epoch_tokens,
+        visibility_epoch_tracker_frame_sequences=(
+            promotion_identity.visibility_epoch_tracker_frame_sequences
+        ),
+        reacquisition_bridge=promotion_identity.reacquisition_bridge,
         horizontal_error=horizontal,
         vertical_error_image_down=vertical,
         filtered_horizontal_rate_s=filtered_x_rate,
@@ -1707,7 +1842,7 @@ def require_recovery_continuation(
         transition,
         tracker_time_basis_id=tracker_time_basis_id,
     )
-    reacquisition_bridge = _require_promotion_identity_bridge(
+    promotion_identity = _require_promotion_identity_bridge(
         track,
         transition,
     )
@@ -1806,7 +1941,19 @@ def require_recovery_continuation(
             projection.min_association_confidence
         ),
         promotion_identity_sha256=transition.promoted_history_sha256,
-        reacquisition_bridge=reacquisition_bridge,
+        promotion_identity_basis=promotion_identity.basis,
+        cross_gap_identity_claimed=(
+            promotion_identity.cross_gap_identity_claimed
+        ),
+        visibility_epoch_frame_count=(
+            promotion_identity.visibility_epoch_frame_count
+        ),
+        visibility_epoch_span_s=promotion_identity.visibility_epoch_span_s,
+        visibility_epoch_tokens=promotion_identity.visibility_epoch_tokens,
+        visibility_epoch_tracker_frame_sequences=(
+            promotion_identity.visibility_epoch_tracker_frame_sequences
+        ),
+        reacquisition_bridge=promotion_identity.reacquisition_bridge,
         capture=capture,
         max_raw_horizontal_rate_s=(
             projection.max_raw_horizontal_rate_s
@@ -1848,6 +1995,10 @@ __all__ = [
     "RECOVERY_MAX_THRUST",
     "RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S",
     "RECOVERY_MAX_YAW_RATE_RAD_S",
+    "RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S",
+    "RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES",
+    "RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA",
+    "RECOVERY_VISIBILITY_EPOCH_MAX_START_UNOBSERVED_PUBLICATIONS",
     "RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM",
     "RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM",
     "RECOVERY_MIN_HISTORY_SPAN_S",
@@ -1856,6 +2007,9 @@ __all__ = [
     "RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT",
     "RECOVERY_MIN_PROJECTION_HORIZON_S",
     "RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES",
+    "PROMOTION_IDENTITY_BASIS_BOUNDED_REACQUISITION_BRIDGE",
+    "PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH",
+    "PROMOTION_IDENTITY_BASIS_CONTINUOUS_TRANSITION_VISIBILITY",
     "PromotionHistoryAuthority",
     "ReacquisitionBridgeAdmission",
     "RecoveryContinuationAdmission",

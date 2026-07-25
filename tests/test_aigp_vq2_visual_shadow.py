@@ -343,6 +343,7 @@ def _prime_reacquisition_bridge_gate_graph(
     *,
     perf_clock_offset_ns,
     skipped_publication=None,
+    reacquisition_publication=116,
     final_publication=120,
     race_credit_before_final=False,
 ):
@@ -371,7 +372,10 @@ def _prime_reacquisition_bridge_gate_graph(
         detections = [
             _detection(280, 140, 80, 80, confidence=0.95),
         ]
-        if publication <= 104 or publication >= 116:
+        if (
+            publication <= 104
+            or publication >= reacquisition_publication
+        ):
             detections.append(
                 _detection(440, 40, 80, 80, confidence=0.95)
             )
@@ -676,6 +680,11 @@ def test_tracker_graph_recovery_emits_nested_reacquisition_bridge(
     assert bridge.average_horizontal_rate_norm_s == pytest.approx(0.0)
     assert bridge.average_vertical_rate_norm_s == pytest.approx(0.0)
     assert bridge.average_log_scale_rate_s == pytest.approx(0.0)
+    assert admission.promotion_identity_basis == (
+        "bounded_reacquisition_bridge_v1"
+    )
+    assert admission.cross_gap_identity_claimed is True
+    assert admission.visibility_epoch_frame_count == 5
     serialized = asdict(admission)
     assert serialized["promotion_identity_sha256"] == (
         transition.promoted_history_sha256
@@ -695,6 +704,71 @@ def test_tracker_graph_recovery_emits_nested_reacquisition_bridge(
     assert transition_events[0]["promoted_history_sha256"] == (
         transition.promoted_history_sha256
     )
+
+
+def test_tracker_graph_recovery_uses_complete_epoch_without_cross_gap_claim():
+    perf_clock_offset_ns = 10_000_000_000
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+
+    _context, transition, promoted = (
+        _prime_reacquisition_bridge_gate_graph(
+            runner,
+            adapter,
+            perf_clock_offset_ns=perf_clock_offset_ns,
+            reacquisition_publication=117,
+            final_publication=121,
+        )
+    )
+
+    assert tuple(
+        sample.token.publication_sequence
+        for sample in promoted.history
+    ) == (100, 101, 102, 103, 104, 117, 118, 119, 120, 121)
+    epoch_root = promoted.history[5]
+    assert epoch_root.accepted_association is not None
+    assert (
+        epoch_root.accepted_association
+        .missed_frame_count_before_association
+    ) == 12
+    assert tuple(
+        token.publication_sequence
+        for token in transition.pretransition_frame_tokens
+    ) == (117, 118, 119, 120, 121)
+
+    authority = visual_recovery.require_promotion_history_authority(
+        promoted,
+        transition,
+        tracker_time_basis_id=_HOST_CLOCK,
+    )
+    race_received_ns = transition.race_status.received_monotonic_ns
+    assert race_received_ns is not None
+    admission = visual_recovery.require_transition_recovery_admission(
+        promoted,
+        transition,
+        tracker_time_basis_id=_HOST_CLOCK,
+        measured_pitch_rad=-0.04,
+        now_monotonic_ns=race_received_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+
+    assert admission.promotion_identity_basis == (
+        "complete_current_visibility_epoch_v1"
+    )
+    assert admission.cross_gap_identity_claimed is False
+    assert admission.reacquisition_bridge is None
+    assert admission.visibility_epoch_frame_count == 5
+    assert tuple(
+        token.publication_sequence
+        for token in admission.visibility_epoch_tokens
+    ) == (117, 118, 119, 120, 121)
+    assert tuple(
+        later - earlier
+        for earlier, later in zip(
+            admission.visibility_epoch_tracker_frame_sequences,
+            admission.visibility_epoch_tracker_frame_sequences[1:],
+        )
+    ) == (1, 1, 1, 1)
 
 
 def test_tracker_graph_recovery_admits_six_frame_epoch_with_one_receiver_skip():
@@ -1650,6 +1724,8 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         "max_thrust": visual_recovery.RECOVERY_MAX_THRUST,
         "max_initial_postcredit_promotion_frames": 1,
         "stale_credit_anchor_command_allowed": False,
+        "promotion_identity_basis": None,
+        "cross_gap_identity_claimed": None,
         "anchor_admission": None,
         "fresh_frame_count": 0,
         "command_count": 0,
@@ -1960,6 +2036,10 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     recovery = summary["postpromotion_recovery"]
     assert recovery["required"] is True
     assert recovery["outcome"] == "recovered"
+    assert recovery["promotion_identity_basis"] == (
+        "continuous_transition_visibility_v1"
+    )
+    assert recovery["cross_gap_identity_claimed"] is False
     assert recovery["fresh_frame_count"] == 2
     assert recovery["command_count"] == 2
     assert recovery["strict_entry_streak"] == 2
@@ -1995,6 +2075,18 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     assert recovery["latest_wire_revalidation"][
         "promotion_identity_sha256"
     ] == promotion_digest
+    assert recovery["anchor_admission"]["promotion_identity_basis"] == (
+        "continuous_transition_visibility_v1"
+    )
+    assert recovery["latest_continuation"][
+        "promotion_identity_basis"
+    ] == "continuous_transition_visibility_v1"
+    assert recovery["latest_wire_revalidation"][
+        "promotion_identity_basis"
+    ] == "continuous_transition_visibility_v1"
+    assert recovery["latest_wire_revalidation"][
+        "cross_gap_identity_claimed"
+    ] is False
     assert recovery["latest_wire_revalidation"][
         "reacquisition_bridge"
     ] is None

@@ -155,6 +155,11 @@ from planning.vq2_visual_recovery import (
     RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT,
     RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES,
     RECOVERY_TRACKER_MAX_ASSIGNMENT_COST,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA,
+    RECOVERY_VISIBILITY_EPOCH_MAX_START_UNOBSERVED_PUBLICATIONS,
+    PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH,
 )
 from planning.vq2_visual_servo import (
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
@@ -6309,7 +6314,8 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                     "min_stable_tail_association_confidence": (
                         RECOVERY_MIN_ASSOCIATION_CONFIDENCE
                     ),
-                    "transition_tokens_equal_complete_visibility_epoch": True,
+                    "transition_tokens_equal_credit_visibility_epoch": True,
+                    "sealed_postcredit_promotion_suffix_included": True,
                     "post_bridge_epoch_clean_associations_required": True,
                     "non_bridge_publication_skips_allowed": False,
                     "max_filtered_center_rate_norm_s": (
@@ -6327,6 +6333,61 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                     "max_raw_log_dimension_rate_s": (
                         RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S
                     ),
+                    "complete_current_visibility_epoch": {
+                        "identity_basis": (
+                            PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+                        ),
+                        "cross_gap_identity_claimed": False,
+                        "full_promotion_history_seal_required": True,
+                        "transition_tail_must_equal_credit_epoch_prefix": True,
+                        "sealed_postcredit_promotion_suffix_included": True,
+                        "exact_tracker_and_publication_progression": True,
+                        "min_frame_count": (
+                            RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+                        ),
+                        "root_min_detection_confidence": (
+                            RECOVERY_MIN_REACQUISITION_DETECTION_CONFIDENCE
+                        ),
+                        "root_min_association_confidence": (
+                            RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE
+                        ),
+                        "pre_gap_history_sample_count": (
+                            RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT
+                        ),
+                        "min_pre_gap_history_span_s": (
+                            RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S
+                        ),
+                        "min_pre_gap_detection_confidence": (
+                            RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE
+                        ),
+                        "min_pre_gap_association_confidence": (
+                            RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE
+                        ),
+                        "max_epoch_start_missed_frames": (
+                            RECOVERY_VISIBILITY_EPOCH_MAX_START_MISSED_FRAMES
+                        ),
+                        "max_epoch_start_publication_delta": (
+                            RECOVERY_VISIBILITY_EPOCH_MAX_START_PUBLICATION_DELTA
+                        ),
+                        "max_epoch_start_unobserved_publications": (
+                            RECOVERY_VISIBILITY_EPOCH_MAX_START_UNOBSERVED_PUBLICATIONS
+                        ),
+                        "max_epoch_start_gap_s": (
+                            RECOVERY_VISIBILITY_EPOCH_MAX_START_GAP_S
+                        ),
+                        "stable_tail_sample_count": (
+                            RECOVERY_HISTORY_SAMPLE_COUNT
+                        ),
+                        "min_stable_tail_span_s": (
+                            RECOVERY_MIN_HISTORY_SPAN_S
+                        ),
+                        "min_stable_tail_detection_confidence": (
+                            RECOVERY_MIN_DETECTION_CONFIDENCE
+                        ),
+                        "min_stable_tail_association_confidence": (
+                            RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+                        ),
+                    },
                     "reacquisition_bridge": {
                         "exact_association_evidence_required": True,
                         "pre_association_ambiguity_allowed": False,
