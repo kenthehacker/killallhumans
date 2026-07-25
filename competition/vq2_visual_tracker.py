@@ -17,8 +17,10 @@ the largest contour as semantic gate identity.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
+import hashlib
+import json
 from typing import Any, Iterable, Optional, Sequence
 
 from competition.vq2_contracts import FrameEdge
@@ -497,6 +499,7 @@ class VisualTrackSample:
     clipping: FrameEdge
     center_censored: bool
     association_confidence: float
+    accepted_association: Optional["AssociationEvidence"] = None
 
     @property
     def bearing_norm(self) -> float:
@@ -570,6 +573,42 @@ class AssociationEvidence:
     temporal_consistency: float
     appearance_distance: Optional[float]
     ambiguous: bool
+    missed_frame_count_before_association: int
+    observation_gap_ns: int
+    publication_gap_ns: Optional[int]
+    track_ambiguous_before_association: bool
+
+
+def visual_track_history_sha256(
+    history: tuple[VisualTrackSample, ...],
+) -> str:
+    """Canonically freeze one exact, untruncated visual identity history."""
+
+    if (
+        type(history) is not tuple
+        or not history
+        or any(type(sample) is not VisualTrackSample for sample in history)
+    ):
+        raise TypeError(
+            "visual track history digest requires exact nonempty samples"
+        )
+    payload = {
+        "schema": "aigp-vq2-visual-track-history/1",
+        "samples": [asdict(sample) for sample in history],
+    }
+    try:
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "visual track history is not canonically hashable"
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1237,9 +1276,18 @@ class MultiTargetVisualTracker:
         ambiguous: bool,
     ) -> AssociationEvidence:
         latest = state.latest
-        dt_s = (
+        observation_gap_ns = (
             frame.observation_monotonic_ns - latest.observation_monotonic_ns
-        ) / _NS_PER_S
+        )
+        dt_s = observation_gap_ns / _NS_PER_S
+        publication_gap_ns = (
+            frame.publish_monotonic_ns - latest.publication_monotonic_ns
+            if frame.publish_monotonic_ns is not None
+            and latest.publication_monotonic_ns is not None
+            else None
+        )
+        missed_frame_count_before_association = state.missed_frame_count
+        track_ambiguous_before_association = state.ambiguous
         measured_velocity = (
             (detection.center_norm[0] - latest.center_norm[0]) / dt_s,
             (detection.center_norm[1] - latest.center_norm[1]) / dt_s,
@@ -1288,16 +1336,7 @@ class MultiTargetVisualTracker:
             detection.appearance,
             alpha=confidence_alpha,
         )
-        sample = _sample(
-            self._frame_sequence,
-            frame,
-            detection,
-            association_confidence,
-        )
-        state.history.append(sample)
-        if len(state.history) > self.config.history_limit:
-            del state.history[: len(state.history) - self.config.history_limit]
-        return AssociationEvidence(
+        evidence = AssociationEvidence(
             track_id=state.track_id,
             previous_token=latest.token,
             current_token=frame.token,
@@ -1313,7 +1352,26 @@ class MultiTargetVisualTracker:
             temporal_consistency=pair.temporal_consistency,
             appearance_distance=pair.appearance_distance,
             ambiguous=ambiguous,
+            missed_frame_count_before_association=(
+                missed_frame_count_before_association
+            ),
+            observation_gap_ns=observation_gap_ns,
+            publication_gap_ns=publication_gap_ns,
+            track_ambiguous_before_association=(
+                track_ambiguous_before_association
+            ),
         )
+        sample = _sample(
+            self._frame_sequence,
+            frame,
+            detection,
+            association_confidence,
+            accepted_association=evidence,
+        )
+        state.history.append(sample)
+        if len(state.history) > self.config.history_limit:
+            del state.history[: len(state.history) - self.config.history_limit]
+        return evidence
 
     def _new_track(
         self,
@@ -1463,6 +1521,8 @@ def _sample(
     frame: VisualDetectionFrame,
     detection: VisualDetection,
     association_confidence: float,
+    *,
+    accepted_association: Optional[AssociationEvidence] = None,
 ) -> VisualTrackSample:
     return VisualTrackSample(
         tracker_frame_sequence=frame_sequence,
@@ -1479,6 +1539,7 @@ def _sample(
         clipping=detection.clipping,
         center_censored=detection.center_censored,
         association_confidence=association_confidence,
+        accepted_association=accepted_association,
     )
 
 

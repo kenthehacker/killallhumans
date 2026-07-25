@@ -14,6 +14,7 @@ from competition.vq2_visual_tracker import (
     VisualDetection,
     VisualDetectionFrame,
     VisualTrackRole,
+    visual_track_history_sha256,
 )
 from planning.vq2_gate_graph import (
     AmbiguousGatePromotionError,
@@ -191,10 +192,36 @@ def test_bounded_aperture_occlusion_preserves_motion_consistent_identity() -> No
     assert update.associations[0].predicted_center_residual_norm < 0.08
     assert update.associations[0].bbox_iou > 0.35
     recovered = tracker.track(track_id)
+    bridge = recovered.history[-1].accepted_association
+    assert bridge is update.associations[0]
+    assert bridge.previous_token == recovered.history[-2].token
+    assert bridge.current_token == recovered.history[-1].token
+    assert bridge.missed_frame_count_before_association == 12
+    assert bridge.observation_gap_ns == 14 * _FRAME_PERIOD_NS
+    assert bridge.publication_gap_ns == 14 * _FRAME_PERIOD_NS
+    assert bridge.temporal_consistency == pytest.approx(1.0 / 13.0)
+    assert not bridge.ambiguous
+    assert not bridge.track_ambiguous_before_association
+    assert bridge.predicted_center_residual_norm < 0.08
+    assert bridge.bbox_iou > 0.35
     assert recovered.first_token == first_token
     assert recovered.total_observation_count == 6
     assert recovered.consecutive_frame_count == 1
     assert recovered.missed_frame_count == 0
+
+
+def test_new_track_sample_has_no_invented_association_bridge() -> None:
+    tracker = MultiTargetVisualTracker()
+    update = tracker.update(
+        _frame(
+            1,
+            (_detection(4, 0.22, -0.31, 0.16, 0.20, confidence=0.83),),
+        )
+    )
+
+    created = update.track(update.created_track_ids[0])
+    assert update.associations == ()
+    assert created.history[-1].accepted_association is None
 
 
 def test_nested_detections_retain_distinct_ids_through_contour_changes() -> None:
@@ -276,8 +303,22 @@ def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> N
         _frame(
             1,
             (
-                _detection(0, -0.04, 0.0, 0.18, 0.20),
-                _detection(1, 0.04, 0.0, 0.18, 0.20),
+                _detection(
+                    0,
+                    -0.04,
+                    0.0,
+                    0.18,
+                    0.20,
+                    appearance=(0.0,),
+                ),
+                _detection(
+                    1,
+                    0.04,
+                    0.0,
+                    0.18,
+                    0.20,
+                    appearance=(1.0,),
+                ),
             ),
         )
     )
@@ -293,6 +334,16 @@ def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> N
     )
     assert set(second.ambiguous_track_ids) == set(first.visible_track_ids)
     assert all(item.ambiguous for item in second.associations)
+    evidence_by_track = {
+        item.track_id: item for item in second.associations
+    }
+    for track_id in second.associated_track_ids:
+        accepted = second.track(track_id).history[-1].accepted_association
+        assert accepted is evidence_by_track[track_id]
+        assert accepted.ambiguous
+        assert accepted.missed_frame_count_before_association == 0
+        assert accepted.temporal_consistency == 1.0
+        assert accepted.track_ambiguous_before_association
     tracker.assign_role(first.visible_track_ids[0], VisualTrackRole.CURRENT)
     with pytest.raises(ValueError, match="ambiguous"):
         tracker.confirm_authoritative_gate(
@@ -301,6 +352,48 @@ def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> N
             race_status_sequence=1,
             race_status_boot_ms=100,
         )
+
+
+def test_association_retains_ambiguity_state_before_later_clean_frames() -> None:
+    tracker = MultiTargetVisualTracker(
+        MultiTargetTrackerConfig(ambiguity_margin=0.20)
+    )
+    first = tracker.update(
+        _frame(
+            1,
+            (
+                _detection(0, -0.04, 0.0, 0.18, 0.20),
+                _detection(1, 0.04, 0.0, 0.18, 0.20),
+            ),
+        )
+    )
+    second = tracker.update(
+        _frame(
+            2,
+            (
+                _detection(0, 0.0, 0.0, 0.18, 0.20),
+                _detection(1, 0.0, 0.0, 0.18, 0.20),
+            ),
+        )
+    )
+    assert all(item.ambiguous for item in second.associations)
+    retained_id, retired_id = first.visible_track_ids
+    tracker.retire_track(retired_id)
+    third = tracker.update(
+        _frame(
+            3,
+            (
+                _detection(0, 0.01, 0.0, 0.18, 0.20),
+            ),
+        )
+    )
+
+    assert third.associated_track_ids == (retained_id,)
+    assert all(not item.ambiguous for item in third.associations)
+    assert all(
+        item.track_ambiguous_before_association
+        for item in third.associations
+    )
 
 
 def test_duplicate_stale_and_cross_generation_frames_fail_closed() -> None:
@@ -428,6 +521,10 @@ def test_pretransition_next_track_promotes_without_reset_or_history_loss() -> No
     assert len(transition.pretransition_frame_tokens) >= 3
     assert transition.history_length_before_promotion == len(before.history)
     assert transition.history_length_after_promotion == len(before.history)
+    assert transition.promoted_history_sha256 == (
+        visual_track_history_sha256(before.history)
+    )
+    assert len(transition.promoted_history_sha256) == 64
     assert after.history == before.history
     assert after.first_token == before.first_token
     assert after.role is VisualTrackRole.CURRENT

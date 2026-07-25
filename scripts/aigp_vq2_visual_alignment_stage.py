@@ -37,7 +37,9 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S,
     RECOVERY_MAX_YAW_RATE_RAD_S,
     RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES,
+    PromotionHistoryAuthority,
     VisualRecoveryRefusal,
+    require_promotion_history_authority,
     require_recovery_continuation,
     require_transition_recovery_admission,
 )
@@ -305,6 +307,9 @@ async def run_visual_alignment_stage(
     latest_target: Optional[VisualTarget] = None
     latest_token: Any = None
     dispatch_attempt_s: Optional[float] = None
+    promotion_history_authority: Optional[
+        PromotionHistoryAuthority
+    ] = None
 
     def refresh_summary(
         *,
@@ -399,6 +404,10 @@ async def run_visual_alignment_stage(
         """Dispatch one receipt-backed, no-advance recovery command."""
 
         nonlocal dispatch_attempt_s
+        if promotion_history_authority is None:
+            raise abort_type(
+                "post-promotion recovery lacks prevalidated history authority"
+            )
         if (
             output.advance_enabled
             or output.next_gate_blend != 0.0
@@ -604,6 +613,9 @@ async def run_visual_alignment_stage(
                     ),
                     measured_pitch_rad=send_state["pitch_rad"],
                     now_monotonic_ns=wire_validation_ns,
+                    promotion_history_authority=(
+                        promotion_history_authority
+                    ),
                 )
                 wire_admission_kind = "transition_anchor"
             else:
@@ -623,6 +635,9 @@ async def run_visual_alignment_stage(
                         recovery_started_monotonic_ns
                     ),
                     now_monotonic_ns=wire_validation_ns,
+                    promotion_history_authority=(
+                        promotion_history_authority
+                    ),
                 )
                 wire_admission_kind = "postcredit_continuation"
         except VisualRecoveryRefusal as exc:
@@ -660,6 +675,14 @@ async def run_visual_alignment_stage(
             "receiver_checked_monotonic_ns": final_watermark_ns,
             "projection_horizon_s": (
                 wire_admission.projection_horizon_s
+            ),
+            "promotion_identity_sha256": (
+                wire_admission.promotion_identity_sha256
+            ),
+            "reacquisition_bridge": (
+                None
+                if wire_admission.reacquisition_bridge is None
+                else asdict(wire_admission.reacquisition_bridge)
             ),
         }
         dispatch_attempt_s = runtime.monotonic()
@@ -787,6 +810,15 @@ async def run_visual_alignment_stage(
             )
         except VisualAlignmentRefusal as exc:
             try:
+                promotion_history_authority = (
+                    require_promotion_history_authority(
+                        anchor_track,
+                        transition,
+                        tracker_time_basis_id=(
+                            host.visual_tracker.time_basis_id
+                        ),
+                    )
+                )
                 recovery_admission = (
                     require_transition_recovery_admission(
                         anchor_track,
@@ -796,6 +828,9 @@ async def run_visual_alignment_stage(
                         ),
                         measured_pitch_rad=anchor_pitch,
                         now_monotonic_ns=runtime.perf_counter_ns(),
+                        promotion_history_authority=(
+                            promotion_history_authority
+                        ),
                     )
                 )
             except VisualRecoveryRefusal as recovery_exc:
@@ -881,6 +916,11 @@ async def run_visual_alignment_stage(
                 raise abort_type(
                     "post-promotion recovery credit anchor changed before send"
                 )
+            if promotion_history_authority is None:
+                raise abort_type(
+                    "post-promotion recovery lost prevalidated history "
+                    "authority"
+                )
             try:
                 recovery_admission = require_transition_recovery_admission(
                     anchor_track,
@@ -890,6 +930,9 @@ async def run_visual_alignment_stage(
                     ),
                     measured_pitch_rad=anchor_state["pitch_rad"],
                     now_monotonic_ns=runtime.perf_counter_ns(),
+                    promotion_history_authority=(
+                        promotion_history_authority
+                    ),
                 )
             except VisualRecoveryRefusal as exc:
                 raise abort_type(
@@ -1057,6 +1100,9 @@ async def run_visual_alignment_stage(
                             recovery_started_monotonic_ns
                         ),
                         now_monotonic_ns=runtime.perf_counter_ns(),
+                        promotion_history_authority=(
+                            promotion_history_authority
+                        ),
                     )
                 except VisualRecoveryRefusal as exc:
                     raise abort_type(

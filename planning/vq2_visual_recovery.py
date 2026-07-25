@@ -13,11 +13,13 @@ import math
 
 from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import (
+    AssociationEvidence,
     CameraFrameToken,
     FrameProvenanceBasis,
     VisualTrack,
     VisualTrackRole,
     VisualTrackSample,
+    visual_track_history_sha256,
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
@@ -34,9 +36,30 @@ from planning.vq2_visual_alignment import (
 from planning.vq2_visual_servo import VisualTarget
 
 
-RECOVERY_HISTORY_SAMPLE_COUNT = 5
+RECOVERY_HISTORY_SAMPLE_COUNT = 4
+RECOVERY_MIN_HISTORY_SPAN_S = 0.090
 RECOVERY_MIN_ASSOCIATION_CONFIDENCE = 0.90
 RECOVERY_MIN_DETECTION_CONFIDENCE = 0.65
+RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT = 5
+RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT = 3
+RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S = 0.060
+RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE = 0.64
+RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE = 0.90
+RECOVERY_MIN_REACQUISITION_DETECTION_CONFIDENCE = 0.70
+RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE = 0.65
+RECOVERY_TRACKER_MAX_ASSIGNMENT_COST = 0.82
+RECOVERY_MAX_REACQUISITION_MISSED_FRAMES = 11
+RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA = 12
+RECOVERY_MAX_REACQUISITION_GAP_S = 0.400
+RECOVERY_MAX_REACQUISITION_ASSOCIATION_COST = 0.29
+RECOVERY_MIN_REACQUISITION_BBOX_IOU = 0.55
+RECOVERY_MIN_REACQUISITION_DIRECT_BBOX_IOU = 0.30
+RECOVERY_MAX_REACQUISITION_CENTER_RESIDUAL_NORM = 0.065
+RECOVERY_MAX_REACQUISITION_ABS_LOG_WIDTH_CHANGE = 0.32
+RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE = 0.22
+RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL = 0.10
+RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S = 0.25
+RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S = 0.70
 RECOVERY_MIN_FRAME_DT_S = 0.020
 RECOVERY_MAX_FRAME_DT_S = 0.050
 RECOVERY_MAX_RECEIVER_PIPELINE_LATENCY_S = 0.010
@@ -80,10 +103,80 @@ RECOVERY_MAX_COMMAND_RATE_RAD_S = 0.12
 RECOVERY_MAX_YAW_RATE_RAD_S = 0.08
 RECOVERY_MAX_THRUST = 0.285
 RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES = 2
+_PROMOTION_HISTORY_AUTHORITY_ISSUER = object()
 
 
 class VisualRecoveryRefusal(ValueError):
     """The transition anchor cannot safely support recovery authority."""
+
+
+class _PromotionHistorySeal:
+    """Module-issued immutable record bound to one validated history."""
+
+    __slots__ = (
+        "track_id",
+        "history_length",
+        "history_sha256",
+        "history",
+        "_frozen",
+    )
+
+    def __init__(
+        self,
+        *,
+        issuer: object,
+        track_id: str,
+        history_length: int,
+        history_sha256: str,
+        history: tuple[VisualTrackSample, ...],
+    ) -> None:
+        if issuer is not _PROMOTION_HISTORY_AUTHORITY_ISSUER:
+            raise TypeError("promotion history seals are module-issued")
+        object.__setattr__(self, "track_id", track_id)
+        object.__setattr__(self, "history_length", history_length)
+        object.__setattr__(self, "history_sha256", history_sha256)
+        object.__setattr__(self, "history", history)
+        object.__setattr__(self, "_frozen", True)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise TypeError("promotion history seals are immutable")
+        object.__setattr__(self, _name, _value)
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionHistoryAuthority:
+    """Validator-issued immutable promotion prefix for wire-time rechecks."""
+
+    track_id: str
+    history_length: int
+    history_sha256: str
+    history: tuple[VisualTrackSample, ...]
+    _validator_seal: _PromotionHistorySeal
+
+
+@dataclass(frozen=True, slots=True)
+class ReacquisitionBridgeAdmission:
+    """Exact identity evidence across one bounded visibility interruption."""
+
+    predecessor_token: CameraFrameToken
+    reacquisition_token: CameraFrameToken
+    missed_frame_count: int
+    tracker_frame_delta: int
+    publication_delta: int
+    observation_gap_s: float
+    publication_gap_s: float
+    association_confidence: float
+    association_cost: float
+    predicted_center_residual_norm: float
+    bbox_iou: float
+    direct_bbox_iou: float
+    log_width_change: float
+    log_height_change: float
+    log_area_residual: float
+    average_horizontal_rate_norm_s: float
+    average_vertical_rate_norm_s: float
+    average_log_scale_rate_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +194,11 @@ class TransitionRecoveryAdmission:
     recovery_start_delay_s: float
     observation_age_s: float
     projection_horizon_s: float
+    stable_history_span_s: float
+    min_history_detection_confidence: float
+    min_history_association_confidence: float
+    promotion_identity_sha256: str
+    reacquisition_bridge: ReacquisitionBridgeAdmission | None
     horizontal_error: float
     vertical_error_image_down: float
     filtered_horizontal_rate_s: float
@@ -132,6 +230,11 @@ class RecoveryContinuationAdmission:
     observation_age_s: float
     recovery_elapsed_s: float
     projection_horizon_s: float
+    stable_history_span_s: float
+    min_history_detection_confidence: float
+    min_history_association_confidence: float
+    promotion_identity_sha256: str
+    reacquisition_bridge: ReacquisitionBridgeAdmission | None
     capture: VisualAlignmentCaptureAdmission
     max_raw_horizontal_rate_s: float
     max_raw_vertical_rate_down_s: float
@@ -152,6 +255,9 @@ class _HistoryProjection:
     tokens: tuple[CameraFrameToken, ...]
     latest_observation_monotonic_ns: int
     latest_publication_monotonic_ns: int
+    stable_history_span_s: float
+    min_detection_confidence: float
+    min_association_confidence: float
     max_raw_horizontal_rate_s: float
     max_raw_vertical_rate_down_s: float
     max_raw_log_scale_rate_s: float
@@ -220,6 +326,12 @@ def _require_live_transition_authority(
         )
         or type(transition.history_length_before_promotion) is not int
         or type(transition.history_length_after_promotion) is not int
+        or type(transition.promoted_history_sha256) is not str
+        or len(transition.promoted_history_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in transition.promoted_history_sha256
+        )
     ):
         raise VisualRecoveryRefusal(
             "post-promotion recovery transition structure is invalid"
@@ -236,7 +348,7 @@ def _require_live_transition_authority(
         or not track.visible
         or track.missed_frame_count != 0
         or track.consecutive_frame_count < RECOVERY_HISTORY_SAMPLE_COUNT
-        or track.total_observation_count < len(track.history)
+        or track.total_observation_count != len(track.history)
         or track.consecutive_frame_count > track.total_observation_count
         or track.ambiguous
     ):
@@ -316,11 +428,96 @@ def _require_exact_transition_anchor(
         )
 
 
+def _require_promotion_history_digest(
+    track: VisualTrack,
+    transition: ConfirmedGateTransition,
+    *,
+    authority: PromotionHistoryAuthority | None = None,
+) -> None:
+    promotion_length = transition.history_length_after_promotion
+    if authority is not None:
+        if type(authority) is not PromotionHistoryAuthority:
+            raise VisualRecoveryRefusal(
+                "post-promotion recovery prevalidated history changed"
+            )
+        seal = authority._validator_seal
+        if (
+            type(seal) is not _PromotionHistorySeal
+            or authority.track_id != track.track_id
+            or authority.history_length != promotion_length
+            or authority.history_sha256
+            != transition.promoted_history_sha256
+            or type(authority.history) is not tuple
+            or len(authority.history) != promotion_length
+            or any(
+                type(sample) is not VisualTrackSample
+                for sample in authority.history
+            )
+            or authority.track_id != seal.track_id
+            or authority.history_length != seal.history_length
+            or authority.history_sha256 != seal.history_sha256
+            or authority.history != seal.history
+            or track.history[:promotion_length] != seal.history
+        ):
+            raise VisualRecoveryRefusal(
+                "post-promotion recovery prevalidated history changed"
+            )
+        return
+    try:
+        promotion_identity_sha256 = visual_track_history_sha256(
+            track.history[:promotion_length]
+        )
+    except (TypeError, ValueError) as exc:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery history digest is invalid"
+        ) from exc
+    if promotion_identity_sha256 != transition.promoted_history_sha256:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery history digest changed after promotion"
+        )
+
+
+def require_promotion_history_authority(
+    track: VisualTrack,
+    transition: ConfirmedGateTransition,
+    *,
+    tracker_time_basis_id: str,
+) -> PromotionHistoryAuthority:
+    """Verify the promotion digest once, outside the wire-critical lease."""
+
+    _require_live_transition_authority(
+        track,
+        transition,
+        tracker_time_basis_id=tracker_time_basis_id,
+    )
+    _require_promotion_history_digest(track, transition)
+    promotion_length = transition.history_length_after_promotion
+    history = track.history[:promotion_length]
+    seal = _PromotionHistorySeal(
+        issuer=_PROMOTION_HISTORY_AUTHORITY_ISSUER,
+        track_id=track.track_id,
+        history_length=promotion_length,
+        history_sha256=transition.promoted_history_sha256,
+        history=history,
+    )
+    return PromotionHistoryAuthority(
+        track_id=track.track_id,
+        history_length=promotion_length,
+        history_sha256=transition.promoted_history_sha256,
+        history=history,
+        _validator_seal=seal,
+    )
+
+
 def _sample_geometry(
     sample: VisualTrackSample,
     *,
     stream_id: str,
     generation: int,
+    min_detection_confidence: float = RECOVERY_MIN_DETECTION_CONFIDENCE,
+    min_association_confidence: float = (
+        RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+    ),
 ) -> tuple[float, float, float, float]:
     if type(sample) is not VisualTrackSample:
         raise VisualRecoveryRefusal(
@@ -361,10 +558,8 @@ def _sample_geometry(
         "sample association confidence",
     )
     if (
-        not RECOVERY_MIN_DETECTION_CONFIDENCE <= confidence <= 1.0
-        or not RECOVERY_MIN_ASSOCIATION_CONFIDENCE
-        <= association
-        <= 1.0
+        not min_detection_confidence <= confidence <= 1.0
+        or not min_association_confidence <= association <= 1.0
     ):
         raise VisualRecoveryRefusal(
             "post-promotion recovery history confidence is insufficient"
@@ -401,6 +596,457 @@ def _sample_geometry(
             "post-promotion recovery sample scale is invalid"
         )
     return left, top, right, bottom
+
+
+def _require_accepted_association(
+    track: VisualTrack,
+    previous: VisualTrackSample,
+    sample: VisualTrackSample,
+    *,
+    expected_missed_frames: int,
+    min_association_confidence: float,
+) -> AssociationEvidence:
+    evidence = sample.accepted_association
+    if type(evidence) is not AssociationEvidence:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery association provenance is absent"
+        )
+    if (
+        type(expected_missed_frames) is not int
+        or expected_missed_frames < 0
+        or type(evidence.missed_frame_count_before_association) is not int
+        or evidence.missed_frame_count_before_association
+        != expected_missed_frames
+        or type(evidence.observation_gap_ns) is not int
+        or evidence.observation_gap_ns <= 0
+        or type(evidence.publication_gap_ns) is not int
+        or evidence.publication_gap_ns <= 0
+        or type(evidence.ambiguous) is not bool
+        or evidence.ambiguous
+        or type(evidence.track_ambiguous_before_association) is not bool
+        or evidence.track_ambiguous_before_association
+        or evidence.track_id != track.track_id
+        or evidence.previous_token != previous.token
+        or evidence.current_token != sample.token
+        or evidence.detection_source_index != sample.source_index
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery association provenance is inconsistent"
+        )
+    if (
+        type(previous.tracker_frame_sequence) is not int
+        or type(sample.tracker_frame_sequence) is not int
+        or type(previous.token.publication_sequence) is not int
+        or type(sample.token.publication_sequence) is not int
+        or type(previous.observation_monotonic_ns) is not int
+        or type(sample.observation_monotonic_ns) is not int
+        or type(previous.publication_monotonic_ns) is not int
+        or type(sample.publication_monotonic_ns) is not int
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery association timing is invalid"
+        )
+    expected_delta = expected_missed_frames + 1
+    tracker_delta = (
+        sample.tracker_frame_sequence - previous.tracker_frame_sequence
+    )
+    publication_delta = (
+        sample.token.publication_sequence
+        - previous.token.publication_sequence
+    )
+    observation_gap_ns = (
+        sample.observation_monotonic_ns
+        - previous.observation_monotonic_ns
+    )
+    publication_gap_ns = (
+        sample.publication_monotonic_ns
+        - previous.publication_monotonic_ns
+    )
+    if (
+        sample.token.stream_id != previous.token.stream_id
+        or sample.token.generation != previous.token.generation
+        or tracker_delta != expected_delta
+        or publication_delta != expected_delta
+        or observation_gap_ns != evidence.observation_gap_ns
+        or publication_gap_ns != evidence.publication_gap_ns
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery association gap is inconsistent"
+        )
+
+    confidence = _finite(
+        evidence.confidence,
+        "association evidence confidence",
+    )
+    sample_confidence = _finite(
+        sample.association_confidence,
+        "sample association confidence",
+    )
+    cost = _finite(evidence.cost, "association evidence cost")
+    residual = _finite(
+        evidence.predicted_center_residual_norm,
+        "association center residual",
+    )
+    bbox_iou = _finite(evidence.bbox_iou, "association bbox overlap")
+    log_width = _finite(
+        evidence.log_width_change,
+        "association log-width change",
+    )
+    log_height = _finite(
+        evidence.log_height_change,
+        "association log-height change",
+    )
+    log_area = _finite(
+        evidence.log_area_residual,
+        "association log-area residual",
+    )
+    clipping_continuity = _finite(
+        evidence.clipping_continuity,
+        "association clipping continuity",
+    )
+    temporal_consistency = _finite(
+        evidence.temporal_consistency,
+        "association temporal consistency",
+    )
+    if evidence.appearance_distance is not None:
+        appearance_distance = _finite(
+            evidence.appearance_distance,
+            "association appearance distance",
+        )
+        if appearance_distance < 0.0:
+            raise VisualRecoveryRefusal(
+                "post-promotion recovery association appearance is invalid"
+            )
+    if (
+        not min_association_confidence <= confidence <= 1.0
+        or not math.isclose(
+            confidence,
+            sample_confidence,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or cost < 0.0
+        or not math.isclose(
+            confidence,
+            max(
+                0.0,
+                min(
+                    1.0,
+                    1.0 - cost / RECOVERY_TRACKER_MAX_ASSIGNMENT_COST,
+                ),
+            ),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or residual < 0.0
+        or not 0.0 <= bbox_iou <= 1.0
+        or not 0.0 <= clipping_continuity <= 1.0
+        or not math.isclose(
+            temporal_consistency,
+            1.0 / expected_delta,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not all(
+            math.isfinite(value)
+            for value in (log_width, log_height, log_area)
+        )
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery association authority is insufficient"
+        )
+    return evidence
+
+
+def _require_clean_history_segment(
+    track: VisualTrack,
+    *,
+    start_index: int,
+    sample_count: int,
+    min_detection_confidence: float,
+    min_association_confidence: float,
+    min_span_s: float,
+) -> tuple[VisualTrackSample, ...]:
+    if (
+        type(start_index) is not int
+        or type(sample_count) is not int
+        or sample_count <= 0
+        or start_index < 1
+        or start_index + sample_count > len(track.history)
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery clean history is unavailable"
+        )
+    samples = track.history[start_index : start_index + sample_count]
+    token = samples[-1].token
+    if type(token) is not CameraFrameToken:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery clean history lacks a token"
+        )
+    span_s = (
+        samples[-1].observation_monotonic_ns
+        - samples[0].observation_monotonic_ns
+    ) / 1_000_000_000.0
+    if span_s < min_span_s:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery clean history span is insufficient"
+        )
+    for offset, sample in enumerate(samples):
+        previous = track.history[start_index + offset - 1]
+        _sample_geometry(
+            sample,
+            stream_id=token.stream_id,
+            generation=token.generation,
+            min_detection_confidence=min_detection_confidence,
+            min_association_confidence=min_association_confidence,
+        )
+        _require_accepted_association(
+            track,
+            previous,
+            sample,
+            expected_missed_frames=0,
+            min_association_confidence=min_association_confidence,
+        )
+    return samples
+
+
+def _require_promotion_identity_bridge(
+    track: VisualTrack,
+    transition: ConfirmedGateTransition,
+) -> ReacquisitionBridgeAdmission | None:
+    promotion_length = transition.history_length_after_promotion
+    pretransition_tokens = transition.pretransition_frame_tokens
+    if (
+        len(pretransition_tokens)
+        < RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+        or promotion_length > len(track.history)
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery transition visibility proof is invalid"
+        )
+    bridge_index = (
+        promotion_length - RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+    )
+    if bridge_index < RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT + 1:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery lacks established pre-gap identity"
+        )
+    current_epoch_start = len(track.history) - track.consecutive_frame_count
+    if current_epoch_start not in (0, bridge_index):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery visibility epoch is inconsistent"
+        )
+
+    _require_clean_history_segment(
+        track,
+        start_index=bridge_index - RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT,
+        sample_count=RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT,
+        min_detection_confidence=(
+            RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE
+        ),
+        min_association_confidence=(
+            RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE
+        ),
+        min_span_s=RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S,
+    )
+    _require_clean_history_segment(
+        track,
+        start_index=bridge_index + 1,
+        sample_count=RECOVERY_HISTORY_SAMPLE_COUNT,
+        min_detection_confidence=RECOVERY_MIN_DETECTION_CONFIDENCE,
+        min_association_confidence=RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
+        min_span_s=RECOVERY_MIN_HISTORY_SPAN_S,
+    )
+
+    predecessor = track.history[bridge_index - 1]
+    bridge = track.history[bridge_index]
+    bridge_evidence = bridge.accepted_association
+    if type(bridge_evidence) is not AssociationEvidence:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition bridge is absent"
+        )
+    missed_frames = bridge_evidence.missed_frame_count_before_association
+    if current_epoch_start == 0:
+        if missed_frames != 0:
+            raise VisualRecoveryRefusal(
+                "post-promotion recovery continuous identity is inconsistent"
+            )
+        _sample_geometry(
+            bridge,
+            stream_id=bridge.token.stream_id,
+            generation=bridge.token.generation,
+        )
+        _require_accepted_association(
+            track,
+            predecessor,
+            bridge,
+            expected_missed_frames=0,
+            min_association_confidence=(
+                RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+            ),
+        )
+        return None
+
+    if (
+        type(missed_frames) is not int
+        or not 1
+        <= missed_frames
+        <= RECOVERY_MAX_REACQUISITION_MISSED_FRAMES
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition gap is outside bounds"
+        )
+    _sample_geometry(
+        bridge,
+        stream_id=bridge.token.stream_id,
+        generation=bridge.token.generation,
+        min_detection_confidence=(
+            RECOVERY_MIN_REACQUISITION_DETECTION_CONFIDENCE
+        ),
+        min_association_confidence=(
+            RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE
+        ),
+    )
+    evidence = _require_accepted_association(
+        track,
+        predecessor,
+        bridge,
+        expected_missed_frames=missed_frames,
+        min_association_confidence=(
+            RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE
+        ),
+    )
+    tracker_delta = (
+        bridge.tracker_frame_sequence - predecessor.tracker_frame_sequence
+    )
+    publication_delta = (
+        bridge.token.publication_sequence
+        - predecessor.token.publication_sequence
+    )
+    observation_gap_s = evidence.observation_gap_ns / 1_000_000_000.0
+    assert evidence.publication_gap_ns is not None
+    publication_gap_s = evidence.publication_gap_ns / 1_000_000_000.0
+    if (
+        publication_delta > RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
+        or observation_gap_s > RECOVERY_MAX_REACQUISITION_GAP_S
+        or publication_gap_s > RECOVERY_MAX_REACQUISITION_GAP_S
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition timing is unsafe"
+        )
+    cost = float(evidence.cost)
+    residual = float(evidence.predicted_center_residual_norm)
+    bbox_iou = float(evidence.bbox_iou)
+    log_width = float(evidence.log_width_change)
+    log_height = float(evidence.log_height_change)
+    log_area = float(evidence.log_area_residual)
+    if (
+        cost > RECOVERY_MAX_REACQUISITION_ASSOCIATION_COST
+        or bbox_iou < RECOVERY_MIN_REACQUISITION_BBOX_IOU
+        or residual
+        > RECOVERY_MAX_REACQUISITION_CENTER_RESIDUAL_NORM
+        or abs(log_width)
+        > RECOVERY_MAX_REACQUISITION_ABS_LOG_WIDTH_CHANGE
+        or abs(log_height)
+        > RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE
+        or abs(log_area)
+        > RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL
+        or not math.isclose(
+            float(evidence.clipping_continuity),
+            1.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition geometry is unsafe"
+        )
+    predecessor_width = (
+        predecessor.bbox_norm[2] - predecessor.bbox_norm[0]
+    )
+    predecessor_height = (
+        predecessor.bbox_norm[3] - predecessor.bbox_norm[1]
+    )
+    bridge_width = bridge.bbox_norm[2] - bridge.bbox_norm[0]
+    bridge_height = bridge.bbox_norm[3] - bridge.bbox_norm[1]
+    intersection_left = max(predecessor.bbox_norm[0], bridge.bbox_norm[0])
+    intersection_top = max(predecessor.bbox_norm[1], bridge.bbox_norm[1])
+    intersection_right = min(predecessor.bbox_norm[2], bridge.bbox_norm[2])
+    intersection_bottom = min(
+        predecessor.bbox_norm[3],
+        bridge.bbox_norm[3],
+    )
+    intersection_area = max(
+        0.0,
+        intersection_right - intersection_left,
+    ) * max(0.0, intersection_bottom - intersection_top)
+    predecessor_area = predecessor_width * predecessor_height
+    bridge_area = bridge_width * bridge_height
+    direct_bbox_iou = intersection_area / (
+        predecessor_area + bridge_area - intersection_area
+    )
+    if (
+        predecessor_width <= 0.0
+        or predecessor_height <= 0.0
+        or bridge_width <= 0.0
+        or bridge_height <= 0.0
+        or direct_bbox_iou < RECOVERY_MIN_REACQUISITION_DIRECT_BBOX_IOU
+        or not math.isclose(
+            log_width,
+            math.log(bridge_width / predecessor_width),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            log_height,
+            math.log(bridge_height / predecessor_height),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition contour is inconsistent"
+        )
+    horizontal_rate = (
+        bridge.center_norm[0] - predecessor.center_norm[0]
+    ) / observation_gap_s
+    vertical_rate = (
+        bridge.center_norm[1] - predecessor.center_norm[1]
+    ) / observation_gap_s
+    log_scale_rate = math.log(
+        bridge.apparent_scale / predecessor.apparent_scale
+    ) / observation_gap_s
+    if (
+        abs(horizontal_rate)
+        > RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S
+        or abs(vertical_rate)
+        > RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S
+        or abs(log_scale_rate)
+        > RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S
+    ):
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition motion is unsafe"
+        )
+    return ReacquisitionBridgeAdmission(
+        predecessor_token=predecessor.token,
+        reacquisition_token=bridge.token,
+        missed_frame_count=missed_frames,
+        tracker_frame_delta=tracker_delta,
+        publication_delta=publication_delta,
+        observation_gap_s=observation_gap_s,
+        publication_gap_s=publication_gap_s,
+        association_confidence=float(evidence.confidence),
+        association_cost=cost,
+        predicted_center_residual_norm=residual,
+        bbox_iou=bbox_iou,
+        direct_bbox_iou=direct_bbox_iou,
+        log_width_change=log_width,
+        log_height_change=log_height,
+        log_area_residual=log_area,
+        average_horizontal_rate_norm_s=horizontal_rate,
+        average_vertical_rate_norm_s=vertical_rate,
+        average_log_scale_rate_s=log_scale_rate,
+    )
 
 
 def _projection_horizon_s(
@@ -453,6 +1099,14 @@ def _validate_recent_history_and_project(
         )
         for sample in samples
     )
+    history_span_s = (
+        samples[-1].observation_monotonic_ns
+        - samples[0].observation_monotonic_ns
+    ) / 1_000_000_000.0
+    if history_span_s < RECOVERY_MIN_HISTORY_SPAN_S:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery stable history span is insufficient"
+        )
     if type(track.center_norm) is not tuple or len(track.center_norm) != 2:
         raise VisualRecoveryRefusal(
             "post-promotion recovery filtered center state is invalid"
@@ -569,6 +1223,21 @@ def _validate_recent_history_and_project(
         raise VisualRecoveryRefusal(
             "post-promotion recovery contour deformation is unsafe"
         )
+    history_start_index = len(track.history) - RECOVERY_HISTORY_SAMPLE_COUNT
+    if history_start_index < 1:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery stable history lacks identity provenance"
+        )
+    for offset, sample in enumerate(samples):
+        _require_accepted_association(
+            track,
+            track.history[history_start_index + offset - 1],
+            sample,
+            expected_missed_frames=0,
+            min_association_confidence=(
+                RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+            ),
+        )
 
     if (
         type(track.center_velocity_norm_s) is not tuple
@@ -667,6 +1336,13 @@ def _validate_recent_history_and_project(
         latest_publication_monotonic_ns=int(
             samples[-1].publication_monotonic_ns
         ),
+        stable_history_span_s=history_span_s,
+        min_detection_confidence=min(
+            float(sample.confidence) for sample in samples
+        ),
+        min_association_confidence=min(
+            float(sample.association_confidence) for sample in samples
+        ),
         max_raw_horizontal_rate_s=max_raw_x,
         max_raw_vertical_rate_down_s=max_raw_y,
         max_raw_log_scale_rate_s=max_raw_scale,
@@ -690,6 +1366,7 @@ def require_transition_recovery_admission(
     tracker_time_basis_id: str,
     measured_pitch_rad: float,
     now_monotonic_ns: int,
+    promotion_history_authority: PromotionHistoryAuthority | None = None,
 ) -> TransitionRecoveryAdmission:
     """Admit one transition-anchor-derived, no-advance recovery response."""
 
@@ -704,6 +1381,10 @@ def require_transition_recovery_admission(
         tracker_time_basis_id=tracker_time_basis_id,
     )
     _require_exact_transition_anchor(track, transition)
+    reacquisition_bridge = _require_promotion_identity_bridge(
+        track,
+        transition,
+    )
     if now_monotonic_ns < race_ns:
         raise VisualRecoveryRefusal(
             "post-promotion recovery time precedes authoritative credit"
@@ -794,6 +1475,11 @@ def require_transition_recovery_admission(
         track,
         projection_horizon_s=projection_horizon_s,
     )
+    _require_promotion_history_digest(
+        track,
+        transition,
+        authority=promotion_history_authority,
+    )
     return TransitionRecoveryAdmission(
         track_id=track.track_id,
         anchor_token=transition.camera_token_at_credit,
@@ -810,6 +1496,15 @@ def require_transition_recovery_admission(
         recovery_start_delay_s=start_delay_s,
         observation_age_s=observation_age_s,
         projection_horizon_s=projection_horizon_s,
+        stable_history_span_s=projection.stable_history_span_s,
+        min_history_detection_confidence=(
+            projection.min_detection_confidence
+        ),
+        min_history_association_confidence=(
+            projection.min_association_confidence
+        ),
+        promotion_identity_sha256=transition.promoted_history_sha256,
+        reacquisition_bridge=reacquisition_bridge,
         horizontal_error=horizontal,
         vertical_error_image_down=vertical,
         filtered_horizontal_rate_s=filtered_x_rate,
@@ -851,6 +1546,7 @@ def require_recovery_continuation(
     measured_pitch_rad: float,
     recovery_started_monotonic_ns: int,
     now_monotonic_ns: int,
+    promotion_history_authority: PromotionHistoryAuthority | None = None,
 ) -> RecoveryContinuationAdmission:
     """Revalidate one exactly-next post-credit recovery publication."""
 
@@ -871,6 +1567,10 @@ def require_recovery_continuation(
         track,
         transition,
         tracker_time_basis_id=tracker_time_basis_id,
+    )
+    reacquisition_bridge = _require_promotion_identity_bridge(
+        track,
+        transition,
     )
     if (
         recovery_started_monotonic_ns < race_ns
@@ -947,6 +1647,11 @@ def require_recovery_continuation(
         track,
         projection_horizon_s=projection_horizon_s,
     )
+    _require_promotion_history_digest(
+        track,
+        transition,
+        authority=promotion_history_authority,
+    )
     return RecoveryContinuationAdmission(
         track_id=track.track_id,
         previous_token=previous_token,
@@ -954,6 +1659,15 @@ def require_recovery_continuation(
         observation_age_s=observation_age_s,
         recovery_elapsed_s=recovery_elapsed_s,
         projection_horizon_s=projection_horizon_s,
+        stable_history_span_s=projection.stable_history_span_s,
+        min_history_detection_confidence=(
+            projection.min_detection_confidence
+        ),
+        min_history_association_confidence=(
+            projection.min_association_confidence
+        ),
+        promotion_identity_sha256=transition.promoted_history_sha256,
+        reacquisition_bridge=reacquisition_bridge,
         capture=capture,
         max_raw_horizontal_rate_s=(
             projection.max_raw_horizontal_rate_s
@@ -996,11 +1710,18 @@ __all__ = [
     "RECOVERY_MAX_YAW_RATE_RAD_S",
     "RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM",
     "RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM",
+    "RECOVERY_MIN_HISTORY_SPAN_S",
+    "RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE",
+    "RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT",
+    "RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT",
     "RECOVERY_MIN_PROJECTION_HORIZON_S",
     "RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES",
+    "PromotionHistoryAuthority",
+    "ReacquisitionBridgeAdmission",
     "RecoveryContinuationAdmission",
     "TransitionRecoveryAdmission",
     "VisualRecoveryRefusal",
+    "require_promotion_history_authority",
     "require_recovery_continuation",
     "require_transition_recovery_admission",
 ]

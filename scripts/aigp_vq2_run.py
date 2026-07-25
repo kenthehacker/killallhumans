@@ -108,6 +108,16 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_COMMAND_RATE_RAD_S,
     RECOVERY_MAX_COMMANDS,
     RECOVERY_MAX_FRESH_FRAMES,
+    RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL,
+    RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE,
+    RECOVERY_MAX_REACQUISITION_ABS_LOG_WIDTH_CHANGE,
+    RECOVERY_MAX_REACQUISITION_ASSOCIATION_COST,
+    RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S,
+    RECOVERY_MAX_REACQUISITION_CENTER_RESIDUAL_NORM,
+    RECOVERY_MAX_REACQUISITION_GAP_S,
+    RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S,
+    RECOVERY_MAX_REACQUISITION_MISSED_FRAMES,
+    RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA,
     RECOVERY_MAX_PROJECTED_ABS_Y_NORM,
     RECOVERY_MAX_PROJECTION_HORIZON_S,
     RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S,
@@ -116,8 +126,22 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_YAW_RATE_RAD_S,
     RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM,
     RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM,
+    RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
+    RECOVERY_MIN_DETECTION_CONFIDENCE,
+    RECOVERY_MIN_HISTORY_SPAN_S,
+    RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE,
+    RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE,
+    RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S,
+    RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE,
+    RECOVERY_MIN_REACQUISITION_BBOX_IOU,
+    RECOVERY_MIN_REACQUISITION_DETECTION_CONFIDENCE,
+    RECOVERY_MIN_REACQUISITION_DIRECT_BBOX_IOU,
     RECOVERY_MIN_PROJECTION_HORIZON_S,
+    RECOVERY_HISTORY_SAMPLE_COUNT,
+    RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT,
+    RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT,
     RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES,
+    RECOVERY_TRACKER_MAX_ASSIGNMENT_COST,
 )
 from planning.vq2_visual_servo import (
     MAX_VISUAL_OBSERVATION_AGE_S,
@@ -6208,6 +6232,11 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                         True
                     ),
                     "wire_time_projection_revalidation": True,
+                    "promotion_history_sha256_required": True,
+                    "promotion_history_prevalidated_before_wire_lease": True,
+                    "wire_time_history_check": (
+                        "module_sealed_exact_prefix"
+                    ),
                     "max_validation_to_wire_delay_s": (
                         RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S
                     ),
@@ -6217,6 +6246,82 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                     "min_projection_horizon_s": (
                         RECOVERY_MIN_PROJECTION_HORIZON_S
                     ),
+                    "stable_tail_sample_count": (
+                        RECOVERY_HISTORY_SAMPLE_COUNT
+                    ),
+                    "min_stable_tail_span_s": (
+                        RECOVERY_MIN_HISTORY_SPAN_S
+                    ),
+                    "min_stable_tail_detection_confidence": (
+                        RECOVERY_MIN_DETECTION_CONFIDENCE
+                    ),
+                    "min_stable_tail_association_confidence": (
+                        RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+                    ),
+                    "reacquisition_bridge": {
+                        "exact_association_evidence_required": True,
+                        "pre_association_ambiguity_allowed": False,
+                        "current_association_ambiguity_allowed": False,
+                        "pretransition_visibility_sample_count": (
+                            RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+                        ),
+                        "pre_gap_history_sample_count": (
+                            RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT
+                        ),
+                        "min_pre_gap_history_span_s": (
+                            RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S
+                        ),
+                        "min_pre_gap_detection_confidence": (
+                            RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE
+                        ),
+                        "min_pre_gap_association_confidence": (
+                            RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE
+                        ),
+                        "max_missed_frames": (
+                            RECOVERY_MAX_REACQUISITION_MISSED_FRAMES
+                        ),
+                        "max_publication_delta": (
+                            RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
+                        ),
+                        "max_gap_s": RECOVERY_MAX_REACQUISITION_GAP_S,
+                        "min_association_confidence": (
+                            RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE
+                        ),
+                        "min_detection_confidence": (
+                            RECOVERY_MIN_REACQUISITION_DETECTION_CONFIDENCE
+                        ),
+                        "max_association_cost": (
+                            RECOVERY_MAX_REACQUISITION_ASSOCIATION_COST
+                        ),
+                        "tracker_max_assignment_cost": (
+                            RECOVERY_TRACKER_MAX_ASSIGNMENT_COST
+                        ),
+                        "min_bbox_iou": (
+                            RECOVERY_MIN_REACQUISITION_BBOX_IOU
+                        ),
+                        "min_direct_bbox_iou": (
+                            RECOVERY_MIN_REACQUISITION_DIRECT_BBOX_IOU
+                        ),
+                        "max_center_residual_norm": (
+                            RECOVERY_MAX_REACQUISITION_CENTER_RESIDUAL_NORM
+                        ),
+                        "max_abs_log_width_change": (
+                            RECOVERY_MAX_REACQUISITION_ABS_LOG_WIDTH_CHANGE
+                        ),
+                        "max_abs_log_height_change": (
+                            RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE
+                        ),
+                        "max_abs_log_area_residual": (
+                            RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL
+                        ),
+                        "max_center_rate_norm_s": (
+                            RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S
+                        ),
+                        "max_log_scale_rate_s": (
+                            RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S
+                        ),
+                        "required_clipping_continuity": 1.0,
+                    },
                     "max_projection_horizon_s": (
                         RECOVERY_MAX_PROJECTION_HORIZON_S
                     ),
@@ -8653,6 +8758,14 @@ class VQ2Runner:
                             associations=[
                                 {
                                     "track_id": item.track_id,
+                                    "previous_frame_token": list(
+                                        item.previous_token.live_identity_tuple
+                                        or item.previous_token.exact_tuple
+                                    ),
+                                    "current_frame_token": list(
+                                        item.current_token.live_identity_tuple
+                                        or item.current_token.exact_tuple
+                                    ),
                                     "detection_source_index": (
                                         item.detection_source_index
                                     ),
@@ -8675,7 +8788,22 @@ class VQ2Runner:
                                     "temporal_consistency": (
                                         item.temporal_consistency
                                     ),
+                                    "appearance_distance": (
+                                        item.appearance_distance
+                                    ),
                                     "ambiguous": item.ambiguous,
+                                    "track_ambiguous_before_association": (
+                                        item.track_ambiguous_before_association
+                                    ),
+                                    "missed_frame_count_before_association": (
+                                        item.missed_frame_count_before_association
+                                    ),
+                                    "observation_gap_ns": (
+                                        item.observation_gap_ns
+                                    ),
+                                    "publication_gap_ns": (
+                                        item.publication_gap_ns
+                                    ),
                                 }
                                 for item in visual_update.associations
                             ],
@@ -10927,6 +11055,7 @@ class VQ2Runner:
             history_length_after_promotion=(
                 transition.history_length_after_promotion
             ),
+            promoted_history_sha256=transition.promoted_history_sha256,
             graph=self._visual_graph_summary(
                 self._visual_latest_graph_snapshot
             ),
@@ -11039,6 +11168,9 @@ class VQ2Runner:
                     ),
                     "history_length_after_promotion": (
                         visual_transition.history_length_after_promotion
+                    ),
+                    "promoted_history_sha256": (
+                        visual_transition.promoted_history_sha256
                     ),
                 }
             ),
@@ -12188,6 +12320,9 @@ class VQ2Runner:
             ),
             "history_length_after_promotion": (
                 transition.history_length_after_promotion
+            ),
+            "promoted_history_sha256": (
+                transition.promoted_history_sha256
             ),
             "horizontal_abs_error_trend": self._signed_error_trend(
                 horizontal_errors

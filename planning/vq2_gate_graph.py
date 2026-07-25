@@ -22,6 +22,7 @@ from competition.vq2_visual_tracker import (
     VisualTrack,
     VisualTrackRole,
     VisualTrackSample,
+    visual_track_history_sha256,
 )
 
 _MAX_PROMOTION_MISSED_CAMERA_PUBLICATIONS = 2
@@ -284,6 +285,7 @@ class ConfirmedGateTransition:
     pretransition_frame_tokens: tuple[CameraFrameToken, ...]
     history_length_before_promotion: int
     history_length_after_promotion: int
+    promoted_history_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -620,6 +622,9 @@ class RollingVisualGateGraph:
             ),
             history_length_before_promotion=len(promoted_before.history),
             history_length_after_promotion=len(promoted_after.history),
+            promoted_history_sha256=visual_track_history_sha256(
+                promoted_before.history
+            ),
         )
         self._transitions.append(transition)
         if len(self._transitions) > self.config.relationship_history_limit:

@@ -17,6 +17,7 @@ from competition.vq2_visual_tracker import (
     FrameProvenanceBasis,
     VisualDetectionFrame,
     VisualTrackRole,
+    visual_track_history_sha256,
 )
 from gate_detection.src.gate_detector import GateDetection
 import planning.vq2_visual_recovery as visual_recovery
@@ -258,6 +259,12 @@ _RECOVERY_ANCHOR_BOXES = (
     (171, 447, 26, 86, 80, 196_773_800),
     (172, 449, 23, 89, 82, 231_623_500),
 )
+_RECOVERY_ESTABLISHED_PREFIX_BOXES = (
+    (164, 433, 38, 75, 71, -32_000_000),
+    (165, 435, 36, 76, 72, 1_000_000),
+    (166, 437, 35, 77, 73, 34_000_000),
+    (167, 439, 34, 78, 74, 67_000_000),
+)
 
 
 def _prime_recovery_gate_graph(
@@ -266,7 +273,7 @@ def _prime_recovery_gate_graph(
     *,
     perf_clock_offset_ns,
 ):
-    """Bind Gate 0 while preserving the exact five-frame recovery anchor."""
+    """Bind Gate 0 with established identity before the exact anchor tail."""
 
     runner._visual_tracking_enabled = True
     runner._visual_reset_epoch = 1
@@ -281,7 +288,7 @@ def _prime_recovery_gate_graph(
     current_id = None
     latest_update = None
     for index, (frame_id, x, y, width, height, observed_ns) in enumerate(
-        _RECOVERY_ANCHOR_BOXES
+        _RECOVERY_ESTABLISHED_PREFIX_BOXES + _RECOVERY_ANCHOR_BOXES
     ):
         runner.vision.current_snapshot = _snapshot(
             frame_id=frame_id,
@@ -300,7 +307,7 @@ def _prime_recovery_gate_graph(
                 final_packet_ns=perf_clock_offset_ns + observed_ns,
             ),
         )
-        if index == 2:
+        if frame_id == 170:
             _set_race(
                 adapter,
                 gate_index=0,
@@ -326,8 +333,93 @@ def _prime_recovery_gate_graph(
     promoted = runner.visual_tracker.track(promoted_id)
     assert tuple(
         sample.token.frame_id for sample in promoted.history
-    ) == (168, 169, 170, 171, 172)
+    ) == (164, 165, 166, 167, 168, 169, 170, 171, 172)
     return context, current_id, promoted_id
+
+
+def _prime_reacquisition_bridge_gate_graph(
+    runner,
+    adapter,
+    *,
+    perf_clock_offset_ns,
+):
+    """Create one production-tracker identity across exactly eleven misses."""
+
+    runner._visual_tracking_enabled = True
+    runner._visual_reset_epoch = 1
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6_400,
+        1_000,
+    )
+    current_id = None
+    target_id = None
+    last_observation_ns = 0
+    for publication in range(100, 121):
+        last_observation_ns = (
+            perf_clock_offset_ns
+            + (publication - 100) * 33_000_000
+        )
+        detections = [
+            _detection(280, 140, 80, 80, confidence=0.95),
+        ]
+        if publication <= 104 or publication >= 116:
+            detections.append(
+                _detection(440, 40, 80, 80, confidence=0.95)
+            )
+        runner.vision.current_snapshot = _snapshot(
+            frame_id=publication,
+            publication_sequence=publication,
+            final_packet_ns=last_observation_ns,
+            generation=7,
+        )
+        update = _update_visual(
+            runner,
+            _frame(
+                publication,
+                detections,
+                final_packet_ns=last_observation_ns,
+            ),
+        )
+        if publication == 102:
+            _set_race(
+                adapter,
+                gate_index=0,
+                boot_ms=1_000,
+                sequence=10,
+                received_ns=last_observation_ns + 5_000_000,
+            )
+            bound = runner._bind_initial_visual_gate(context)
+            current_id = bound.current_track_id
+            assert current_id is not None
+        if publication == 104:
+            target_ids = [
+                track.track_id
+                for track in update.visible_tracks
+                if track.track_id != current_id
+            ]
+            assert len(target_ids) == 1
+            target_id = target_ids[0]
+
+    assert current_id is not None
+    assert target_id is not None
+    _set_race(
+        adapter,
+        gate_index=1,
+        boot_ms=1_300,
+        sequence=11,
+        received_ns=last_observation_ns + 18_004_000,
+    )
+    transition = runner._confirm_visual_transition(
+        from_gate_index=0,
+        to_gate_index=1,
+    )
+    assert transition.retired_track_id == current_id
+    assert transition.promoted_track_id == target_id
+    return context, transition, runner.visual_tracker.track(target_id)
 
 
 def test_receiver_watermark_requires_the_exact_latest_camera_token():
@@ -401,6 +493,160 @@ def test_sample_consumes_every_detection_with_exact_receiver_provenance(
         track.history[-1].source_index for track in update.visible_tracks
     } == {0, 1}
     assert len(runner._latest_raw_detections) == 2
+
+
+def test_visual_trace_retains_exact_association_bridge_provenance(
+    monkeypatch,
+):
+    runner = vq2_module.VQ2Runner(_Adapter(), _Vision())
+    runner._visual_tracking_enabled = True
+    runner._visual_diagnostic_logging = True
+    events = []
+    detections = [
+        _detection(390, 100, 96, 110, confidence=0.93),
+    ]
+    monkeypatch.setattr(runner.detector, "detect", lambda _image: detections)
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    for frame_id, publication_sequence, packet_ns in (
+        (41, 73, 12_000_000),
+        (42, 74, 45_000_000),
+    ):
+        runner.vision.current_snapshot = _snapshot(
+            frame_id=frame_id,
+            publication_sequence=publication_sequence,
+            final_packet_ns=packet_ns,
+        )
+        runner._sample()
+
+    visual_events = [
+        fields
+        for event, fields in events
+        if event == "visual_gate_graph_frame"
+    ]
+    assert len(visual_events) == 2
+    associations = visual_events[-1]["associations"]
+    assert len(associations) == 1
+    association = associations[0]
+    evidence = runner._visual_latest_tracker_update.associations[0]
+    assert association["previous_frame_token"] == [
+        _CAMERA_STREAM,
+        7,
+        41,
+        73,
+    ]
+    assert association["current_frame_token"] == [
+        _CAMERA_STREAM,
+        7,
+        42,
+        74,
+    ]
+    assert association["missed_frame_count_before_association"] == 0
+    assert association["observation_gap_ns"] == 33_000_000
+    assert association["publication_gap_ns"] == 33_000_000
+    assert association["ambiguous"] is False
+    assert association["track_ambiguous_before_association"] is False
+    assert association["detection_source_index"] == (
+        evidence.detection_source_index
+    )
+    assert association["cost"] == evidence.cost
+    assert association["confidence"] == evidence.confidence
+    assert association["bbox_iou"] == evidence.bbox_iou
+    assert association["predicted_center_residual_norm"] == (
+        evidence.predicted_center_residual_norm
+    )
+    assert association["log_width_change"] == evidence.log_width_change
+    assert association["log_height_change"] == evidence.log_height_change
+    assert association["log_area_residual"] == evidence.log_area_residual
+    assert association["clipping_continuity"] == (
+        evidence.clipping_continuity
+    )
+    assert association["temporal_consistency"] == (
+        evidence.temporal_consistency
+    )
+    assert association["appearance_distance"] is None
+
+
+def test_tracker_graph_recovery_emits_nested_reacquisition_bridge(
+    monkeypatch,
+):
+    perf_clock_offset_ns = 10_000_000_000
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    events = []
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **fields: events.append((event, fields)),
+    )
+
+    _context, transition, promoted = (
+        _prime_reacquisition_bridge_gate_graph(
+            runner,
+            adapter,
+            perf_clock_offset_ns=perf_clock_offset_ns,
+        )
+    )
+    assert tuple(
+        sample.token.publication_sequence
+        for sample in promoted.history
+    ) == (100, 101, 102, 103, 104, 116, 117, 118, 119, 120)
+    bridge_sample = promoted.history[5]
+    assert bridge_sample.accepted_association is not None
+    assert (
+        bridge_sample.accepted_association
+        .missed_frame_count_before_association
+    ) == 11
+    assert tuple(
+        token.publication_sequence
+        for token in transition.pretransition_frame_tokens
+    ) == (116, 117, 118, 119, 120)
+
+    authority = visual_recovery.require_promotion_history_authority(
+        promoted,
+        transition,
+        tracker_time_basis_id=_HOST_CLOCK,
+    )
+    race_received_ns = transition.race_status.received_monotonic_ns
+    assert race_received_ns is not None
+    admission = visual_recovery.require_transition_recovery_admission(
+        promoted,
+        transition,
+        tracker_time_basis_id=_HOST_CLOCK,
+        measured_pitch_rad=-0.04,
+        now_monotonic_ns=race_received_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+    bridge = admission.reacquisition_bridge
+    assert bridge is not None
+    assert bridge.predecessor_token.publication_sequence == 104
+    assert bridge.reacquisition_token.publication_sequence == 116
+    assert bridge.missed_frame_count == 11
+    assert bridge.publication_delta == 12
+    assert bridge.direct_bbox_iou == pytest.approx(1.0)
+    assert bridge.average_horizontal_rate_norm_s == pytest.approx(0.0)
+    assert bridge.average_vertical_rate_norm_s == pytest.approx(0.0)
+    assert bridge.average_log_scale_rate_s == pytest.approx(0.0)
+    serialized = asdict(admission)
+    assert serialized["promotion_identity_sha256"] == (
+        transition.promoted_history_sha256
+    )
+    assert serialized["reacquisition_bridge"][
+        "missed_frame_count"
+    ] == 11
+    transition_events = [
+        fields
+        for event, fields in events
+        if event == "visual_gate_transition_promoted"
+    ]
+    assert len(transition_events) == 1
+    assert transition_events[0]["promoted_history_sha256"] == (
+        transition.promoted_history_sha256
+    )
 
 
 def test_initial_gate_binding_rejects_two_plausible_visual_identities():
@@ -573,8 +819,16 @@ def test_shadow_promotes_precredit_track_without_reset_and_sends_only_zero(
     assert transition.history_length_before_promotion == (
         transition.history_length_after_promotion
     )
+    assert len(transition.promoted_history_sha256) == 64
     assert len(transition.pretransition_frame_tokens) >= 3
     promoted = runner.visual_tracker.track(expected_next_id)
+    assert transition.promoted_history_sha256 == (
+        visual_track_history_sha256(
+            promoted.history[
+                : transition.history_length_after_promotion
+            ]
+        )
+    )
     assert promoted.first_token.frame_id == 100
     assert promoted.latest_token.frame_id == 105
     assert promoted.role is VisualTrackRole.CURRENT
@@ -600,6 +854,9 @@ def test_shadow_promotes_precredit_track_without_reset_and_sends_only_zero(
     assert summary["pretransition_frame_count"] >= 3
     assert summary["history_length_before_promotion"] == (
         summary["history_length_after_promotion"]
+    )
+    assert summary["promoted_history_sha256"] == (
+        transition.promoted_history_sha256
     )
     assert all(
         token[:2] == [_CAMERA_STREAM, 7]
@@ -1333,9 +1590,9 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         assert transition.retired_track_id == initial_current_id
         assert transition.promoted_track_id == promoted_id
         assert transition.camera_token_at_credit.frame_id == 172
-        assert transition.promoted_first_token.frame_id == 168
-        assert transition.history_length_before_promotion == 5
-        assert transition.history_length_after_promotion == 5
+        assert transition.promoted_first_token.frame_id == 164
+        assert transition.history_length_before_promotion == 9
+        assert transition.history_length_after_promotion == 9
         runner._gate0_transition_proof = vq2_module.GateTransitionProof(
             pre_gate_race_boot_ms=1_000,
             post_gate_race_boot_ms=1_300,
@@ -1539,6 +1796,22 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     assert recovery["latest_wire_revalidation"]["frame_token"][
         "frame_id"
     ] == 174
+    transition = runner._visual_transition
+    assert transition is not None
+    promotion_digest = transition.promoted_history_sha256
+    assert len(promotion_digest) == 64
+    assert recovery["anchor_admission"][
+        "promotion_identity_sha256"
+    ] == promotion_digest
+    assert recovery["latest_continuation"][
+        "promotion_identity_sha256"
+    ] == promotion_digest
+    assert recovery["latest_wire_revalidation"][
+        "promotion_identity_sha256"
+    ] == promotion_digest
+    assert recovery["latest_wire_revalidation"][
+        "reacquisition_bridge"
+    ] is None
     assert recovery["latest_wire_revalidation"]["wire_authority"][
         "publication_pinned_through_transport_return"
     ] is True
@@ -1560,7 +1833,7 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
             "publication_sequence": frame_id,
             "stream_id": _CAMERA_STREAM,
         }
-        for frame_id in range(168, 173)
+        for frame_id in range(169, 173)
     )
 
     recovery_frames = [
@@ -1591,6 +1864,26 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         assert continuation["observation_age_s"] <= (
             visual_recovery.RECOVERY_MAX_CONTINUATION_AGE_S
         )
+        assert continuation["promotion_identity_sha256"] == (
+            promotion_digest
+        )
+        assert continuation["reacquisition_bridge"] is None
+    admission_events = [
+        item
+        for item in timeline
+        if item[:2]
+        in {
+            ("event", "visual_alignment_recovery_admitted"),
+            ("event", "visual_alignment_recovery_anchor"),
+        }
+    ]
+    assert len(admission_events) == 2
+    assert all(
+        item[3]["admission"]["promotion_identity_sha256"]
+        == promotion_digest
+        and item[3]["admission"]["reacquisition_bridge"] is None
+        for item in admission_events
+    )
     completion_index = next(
         index
         for index, item in enumerate(timeline)
@@ -1645,11 +1938,11 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
     )
 
     promoted = runner.visual_tracker.track(promoted_id)
-    assert promoted.first_token.frame_id == 168
+    assert promoted.first_token.frame_id == 164
     assert promoted.role is VisualTrackRole.CURRENT
     assert promoted.authoritative_gate_index == 1
     assert tuple(
-        sample.token.frame_id for sample in promoted.history[:8]
+        sample.token.frame_id for sample in promoted.history[4:12]
     ) == (168, 169, 170, 171, 172, 173, 174, 175)
     assert all(
         sample.provenance_basis
@@ -1657,7 +1950,7 @@ def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
         and sample.association_confidence >= (
             visual_recovery.RECOVERY_MIN_ASSOCIATION_CONFIDENCE
         )
-        for sample in promoted.history[:8]
+        for sample in promoted.history[4:12]
     )
 
 
