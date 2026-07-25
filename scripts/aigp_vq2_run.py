@@ -259,11 +259,11 @@ CONTROL_PERIOD_S = 1.0 / CONTROL_HZ
 SIGN_ID_RATE_RAD_S = 0.08
 SIGN_ID_THRUST = 0.235
 SIGN_ID_RESPONSE_SETTLE_S = 0.04
-SIGN_ID_YAW_PULSE_DURATION_S = 1.20
+SIGN_ID_YAW_PULSE_DURATION_S = 0.22
 SIGN_ID_YAW_NEUTRAL_DURATION_S = 0.24
-SIGN_ID_YAW_REVERSAL_DURATION_S = 0.16
-SIGN_ID_YAW_TERMINAL_DURATION_S = 0.16
-SIGN_ID_HARD_EXPIRY_S = 3.10
+SIGN_ID_YAW_REVERSAL_DURATION_S = 0.12
+SIGN_ID_YAW_TERMINAL_DURATION_S = 0.10
+SIGN_ID_HARD_EXPIRY_S = 1.00
 # The proved Gate-0 turn brake is a separate controller phase.  It must not
 # expand when the isolated yaw-calibration observation window changes.
 GATE0_YAW_BRAKE_DURATION_S = 0.21
@@ -272,7 +272,7 @@ SIGN_ID_MIN_YAW_GYRO_SAMPLES = 4
 SIGN_ID_MIN_FRESH_IMAGE_FRAMES = 4
 SIGN_ID_MIN_IMAGE_EFFECT_PX_S = 15.0
 SIGN_ID_MAX_POLARITY_GAIN_RATIO = 2.0
-SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD = 0.30
+SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD = 0.05
 SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S = 0.50
 SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S = 0.08
 SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S = 0.09
@@ -8608,6 +8608,9 @@ class VQ2Runner:
         self._cleanup_benign_reset_pad_impulse = 0.0
         self._cleanup_collision_capture_complete = True
         self._cleanup_proved_reset_epoch = False
+        self._cleanup_pending_reset_collision_batches: List[
+            Tuple[str, List[Any], Any]
+        ] = []
 
     def _gate1_yaw_envelope_state(self, *, phase: str) -> Tuple[float, bool]:
         """Enforce the code-owned calibrated yaw excursion envelope."""
@@ -10476,10 +10479,22 @@ class VQ2Runner:
         require_exact_buffer_accounting: bool = False,
         benign_pad_disposition: str = "benign_reset_pad",
     ) -> None:
-        stats_fn = getattr(self.adapter, "collision_stats", None)
-        stats = stats_fn() if callable(stats_fn) else None
         try:
-            collisions = self.adapter.drain_collisions()
+            if require_exact_buffer_accounting:
+                drain_with_stats = getattr(
+                    self.adapter,
+                    "drain_collisions_with_stats",
+                    None,
+                )
+                if not callable(drain_with_stats):
+                    raise RuntimeError(
+                        "adapter lacks atomic collision drain"
+                    )
+                collisions, stats = drain_with_stats()
+            else:
+                stats_fn = getattr(self.adapter, "collision_stats", None)
+                stats = stats_fn() if callable(stats_fn) else None
+                collisions = self.adapter.drain_collisions()
         except BaseException as exc:
             self._cleanup_collision_capture_complete = False
             self._cleanup_harmful_collision_count += 1
@@ -10508,10 +10523,74 @@ class VQ2Runner:
             benign_pad_disposition=benign_pad_disposition,
         )
 
+    def _quarantine_cleanup_reset_collisions(self, *, phase: str) -> None:
+        """Drain an exact reset-generation batch without classifying it yet."""
+
+        try:
+            drain_with_stats = getattr(
+                self.adapter,
+                "drain_collisions_with_stats",
+                None,
+            )
+            if not callable(drain_with_stats):
+                raise RuntimeError("adapter lacks atomic collision drain")
+            collisions, stats = drain_with_stats()
+            collisions = list(collisions)
+        except BaseException as exc:
+            self._cleanup_collision_capture_complete = False
+            self._cleanup_harmful_collision_count += 1
+            observation = {
+                "phase": phase,
+                "disposition": "collision_quarantine_failed",
+                "detail": type(exc).__name__,
+            }
+            self._cleanup_collision_observations.append(observation)
+            self.recorder.emit(
+                "cleanup_collision_observed",
+                **observation,
+            )
+            return
+        self._cleanup_pending_reset_collision_batches.append(
+            (phase, collisions, stats)
+        )
+        self.recorder.emit(
+            "cleanup_reset_collision_batch_quarantined",
+            phase=phase,
+            collision_count=len(collisions),
+        )
+
+    def _classify_quarantined_cleanup_reset_collisions(self) -> None:
+        """Classify quarantined reset contacts only after disarm is current."""
+
+        if (
+            not self._cleanup_pending_reset_collision_batches
+            or not self._cleanup_in_progress
+            or not self._cleanup_proved_reset_epoch
+            or self.adapter.is_armed
+        ):
+            return
+        batches = list(self._cleanup_pending_reset_collision_batches)
+        self._cleanup_pending_reset_collision_batches = []
+        for phase, collisions, stats in batches:
+            self._record_cleanup_collision_batch(
+                collisions,
+                phase=phase,
+                allow_benign_reset_pad=False,
+                allow_proved_reset_pad_settling=True,
+                collision_stats=stats,
+                require_exact_buffer_accounting=True,
+            )
+
     def _cleanup_collision_safety_summary(self) -> Dict[str, Any]:
+        pending_reset_collision_count = sum(
+            len(collisions)
+            for _phase, collisions, _stats
+            in self._cleanup_pending_reset_collision_batches
+        )
         safe = bool(
             self._cleanup_collision_capture_complete
             and self._cleanup_harmful_collision_count == 0
+            and not self._cleanup_pending_reset_collision_batches
             and self._cleanup_benign_pre_reset_pad_contact_count
             <= MAX_BENIGN_PAD_CONTACTS
             and self._cleanup_benign_pre_reset_pad_impulse
@@ -10528,6 +10607,12 @@ class VQ2Runner:
             ),
             "harmful_collision_count": (
                 self._cleanup_harmful_collision_count
+            ),
+            "pending_reset_collision_batch_count": len(
+                self._cleanup_pending_reset_collision_batches
+            ),
+            "pending_reset_collision_count": (
+                pending_reset_collision_count
             ),
             "benign_pre_reset_pad_contact_count": (
                 self._cleanup_benign_pre_reset_pad_contact_count
@@ -10561,19 +10646,32 @@ class VQ2Runner:
         self._epoch_anchor_monotonic_s = time.monotonic()
         self._countdown_observed = proof.countdown_observed
         self._cleanup_proved_reset_epoch = bool(
-            self._cleanup_in_progress and not self.adapter.is_armed
+            self._cleanup_in_progress
         )
-        self._drain_cleanup_collisions(
-            phase=(
-                "cleanup-post-reset-proof"
-                if self._cleanup_in_progress
-                else "initial-post-reset-proof"
-            ),
-            allow_benign_reset_pad=not self._cleanup_in_progress,
-            allow_proved_reset_pad_settling=(
-                self._cleanup_proved_reset_epoch
-            ),
-        )
+        if self._cleanup_in_progress and self.adapter.is_armed:
+            # Build 3385 can briefly publish an armed heartbeat after
+            # SIM_RESET even when the pre-reset disarm was confirmed.  Keep
+            # the new-generation collision buffer intact until a newer
+            # disarmed heartbeat arrives; only then may the proved-reset
+            # settling classifier inspect it.
+            self._quarantine_cleanup_reset_collisions(
+                phase="cleanup-post-reset-proof",
+            )
+        else:
+            self._drain_cleanup_collisions(
+                phase=(
+                    "cleanup-post-reset-proof"
+                    if self._cleanup_in_progress
+                    else "initial-post-reset-proof"
+                ),
+                allow_benign_reset_pad=not self._cleanup_in_progress,
+                allow_proved_reset_pad_settling=(
+                    self._cleanup_proved_reset_epoch
+                ),
+                require_exact_buffer_accounting=(
+                    self._cleanup_in_progress
+                ),
+            )
         if (
             not self._cleanup_in_progress
             and not self._cleanup_collision_safety_summary()["safe"]
@@ -10980,6 +11078,7 @@ class VQ2Runner:
 
         if not disarmed or self.adapter.is_armed:
             disarmed = await self._disarm_confirmed()
+        self._classify_quarantined_cleanup_reset_collisions()
         self._drain_cleanup_collisions(
             phase="cleanup-terminal-post-reset",
             allow_benign_reset_pad=False,
@@ -10988,6 +11087,7 @@ class VQ2Runner:
                 and self._cleanup_proved_reset_epoch
                 and not self.adapter.is_armed
             ),
+            require_exact_buffer_accounting=True,
         )
         confirmed = bool(disarmed and reset_proved and not self.adapter.is_armed)
         collision_safety = self._cleanup_collision_safety_summary()
@@ -17022,6 +17122,7 @@ class VQ2Runner:
             self._cleanup_benign_reset_pad_impulse = 0.0
             self._cleanup_collision_capture_complete = True
             self._cleanup_proved_reset_epoch = False
+            self._cleanup_pending_reset_collision_batches = []
             self._gate1_yaw_reference_rad = None
             self._gate1_max_abs_yaw_excursion_rad = 0.0
             self._gate1_max_abs_measured_yaw_rate_rad_s = 0.0
@@ -18123,6 +18224,7 @@ async def run_live(
                         "disposition": "transport_disconnect_unproved",
                     }
                 )
+            runner._classify_quarantined_cleanup_reset_collisions()
             runner._drain_cleanup_collisions(
                 phase="post-disconnect-collision-tail",
                 allow_benign_reset_pad=False,

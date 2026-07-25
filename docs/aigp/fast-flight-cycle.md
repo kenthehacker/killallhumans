@@ -23,9 +23,10 @@ that continues until authoritative race status reports `race_finished`;
 
 `sign-id` is a yaw-only below-hover epoch at fixed `0.235` thrust. It records a
 `0.24 s` neutral baseline, applies isolated `+0.08` and `-0.08 rad/s` yaw
-pulses for `1.20 s` each with a `0.16 s` zero-rate reversal dwell, then enters
-zero rate for `0.16 s` and cleanup. The exact 148-slot plan ends at `2.96 s`
-and has a `3.10 s` hard expiry. Fresh frames observed at a segment boundary
+pulses for 11 slots (`0.22 s`) each with a 6-slot (`0.12 s`) zero-rate
+reversal dwell, then enters zero rate for 5 slots (`0.10 s`) and cleanup.
+The exact 45-slot plan ends at `0.90 s` and has a `1.00 s` hard expiry. Fresh
+frames observed at a segment boundary
 are attributed to the command that was still active, using its exact
 wire-release timestamp.
 
@@ -33,7 +34,7 @@ The stage requires exact outbound wire receipts, at least four strictly newer
 gyro samples and four distinct fresh primary-target frames per measured
 window, and opposite paired gyro and differential image-slope effects with
 consistent gains. Roll and pitch remain exact zero. Calibration collection
-stays inside a `0.30 rad` attitude safety bound and a `0.50 rad/s` measured
+stays inside a `0.05 rad` attitude safety bound and a `0.50 rad/s` measured
 yaw-rate bound; this collection limit does not itself grant production
 authority. The existing collision watchdog remains unchanged. The result
 records controller-to-body and controller-to-image signs plus paired gyro and
@@ -103,8 +104,8 @@ The powered runner still:
   when applicable, disarms, resets, proves the clean epoch, and marks failed
   cleanup as a failed stage.
 
-The compact yaw-calibration waveform is a balanced 148-slot, 2.96-second
-system-ID burst with a 3.10-second hard expiry. Its values and safety limits
+The compact yaw-calibration waveform is a balanced 45-slot, 0.90-second
+system-ID burst with a 1.00-second hard expiry. Its values and safety limits
 are code-owned and cannot be changed through the manifest. Both `sign-id` and
 `calibration-excite` bind this exact plan identity into the run manifest.
 

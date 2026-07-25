@@ -2571,6 +2571,17 @@ class AIGPMavlinkAdapter(CompetitionInterface):
         with self._state_lock:
             return self._collision_stats_locked()
 
+    def drain_collisions_with_stats(
+        self,
+    ) -> tuple[list[dict[str, int | float]], MavlinkCollisionStats]:
+        """Atomically snapshot collision accounting and drain its exact batch."""
+
+        with self._state_lock:
+            stats = self._collision_stats_locked()
+            collisions = [dict(item) for item in self._collisions]
+            self._collisions.clear()
+            return collisions, stats
+
     @property
     def race_status(self) -> Optional[RaceStatus]:
         with self._state_lock:

@@ -1958,6 +1958,11 @@ class _FakeAdapter:
         self.collisions = []
         return collisions
 
+    def drain_collisions_with_stats(self):
+        stats = self.collision_stats()
+        collisions = self.drain_collisions()
+        return collisions, stats
+
     def collision_stats(self):
         return MavlinkCollisionStats(
             generation=self.collision_generation,
@@ -5415,7 +5420,7 @@ def test_cleanup_proved_reset_pad_settling_rejects_wrong_identity_or_energy(
     assert safety["observations"][0]["disposition"] == "harmful"
 
 
-def test_cleanup_proved_reset_pad_settling_requires_disarmed_state():
+def test_cleanup_proved_reset_pad_settling_waits_for_disarmed_state():
     adapter = _FakeAdapter()
     adapter.is_armed = True
     runner = VQ2Runner(adapter, _FakeVision())
@@ -5436,10 +5441,71 @@ def test_cleanup_proved_reset_pad_settling_requires_disarmed_state():
 
     runner._accept_reset_proof(proof, restart_vision=False)
 
+    assert adapter.collisions == []
     safety = runner._cleanup_collision_safety_summary()
     assert safety["safe"] is False
+    assert safety["harmful_collision_count"] == 0
+    assert safety["benign_reset_pad_contact_count"] == 0
+    assert safety["pending_reset_collision_batch_count"] == 1
+    assert safety["pending_reset_collision_count"] == 1
+
+    adapter.is_armed = False
+    runner._classify_quarantined_cleanup_reset_collisions()
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is True
+    assert safety["harmful_collision_count"] == 0
+    assert safety["benign_reset_pad_contact_count"] == 1
+    assert safety["pending_reset_collision_batch_count"] == 0
+    assert safety["pending_reset_collision_count"] == 0
+    assert safety["observations"][0]["disposition"] == "benign_reset_pad"
+
+
+def test_cleanup_quarantined_reset_batch_retains_dropped_accounting(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {"id": 1002, "threat_level": 1, "impulse": 0.05}
+    ]
+    monkeypatch.setattr(
+        adapter,
+        "collision_stats",
+        lambda: MavlinkCollisionStats(
+            generation=2,
+            handled=1,
+            dropped=1,
+            high_watermark=2,
+            capacity=128,
+            buffered=1,
+        ),
+    )
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+    adapter.is_armed = False
+    runner._classify_quarantined_cleanup_reset_collisions()
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["capture_complete"] is False
     assert safety["harmful_collision_count"] == 1
-    assert safety["observations"][0]["disposition"] == "harmful"
+    assert safety["observations"][0]["disposition"] == (
+        "collision_buffer_dropped"
+    )
+    assert safety["observations"][1]["disposition"] == "benign_reset_pad"
 
 
 def test_cleanup_proved_reset_pad_cumulative_impulse_excess_is_unsafe():
@@ -6118,16 +6184,16 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     from scripts import aigp_vq2_yaw_calibration as yaw_contract
 
     assert vq2_module.SIGN_ID_RATE_RAD_S == 0.08
-    assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 1.20
+    assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 0.22
     assert vq2_module.SIGN_ID_YAW_NEUTRAL_DURATION_S == 0.24
-    assert vq2_module.SIGN_ID_YAW_REVERSAL_DURATION_S == 0.16
-    assert vq2_module.SIGN_ID_YAW_TERMINAL_DURATION_S == 0.16
-    assert vq2_module.SIGN_ID_HARD_EXPIRY_S == 3.10
+    assert vq2_module.SIGN_ID_YAW_REVERSAL_DURATION_S == 0.12
+    assert vq2_module.SIGN_ID_YAW_TERMINAL_DURATION_S == 0.10
+    assert vq2_module.SIGN_ID_HARD_EXPIRY_S == 1.00
     assert vq2_module.SIGN_ID_MIN_YAW_GYRO_SAMPLES == 4
     assert vq2_module.SIGN_ID_MIN_FRESH_IMAGE_FRAMES == 4
     assert vq2_module.SIGN_ID_MIN_IMAGE_EFFECT_PX_S == 15.0
     assert vq2_module.SIGN_ID_MAX_POLARITY_GAIN_RATIO == 2.0
-    assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.30
+    assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.05
     assert vq2_module.SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S == 0.50
     assert vq2_module.SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S == 0.08
     assert (

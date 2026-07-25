@@ -1566,12 +1566,14 @@ def test_collision_diagnostics_count_bounded_overflow_and_legacy_drain():
     assert stats.high_watermark == 128
     assert stats.capacity == 128
     assert stats.buffered == 128
-    collisions = adapter.drain_collisions()
+    collisions, drained_batch_stats = adapter.drain_collisions_with_stats()
+    assert drained_batch_stats == stats
     assert [item["id"] for item in collisions] == list(range(1, 129))
     drained_stats = adapter.collision_stats()
     assert drained_stats.handled == 129
     assert drained_stats.dropped == 1
     assert drained_stats.buffered == 0
+    assert adapter.drain_collisions() == []
 
 
 def test_powered_transport_construction_failure_closes_owned_endpoint():
