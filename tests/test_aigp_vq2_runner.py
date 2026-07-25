@@ -5441,7 +5441,7 @@ def test_cleanup_reset_proof_does_not_disarm_before_clock_rollback(
     assert disarm_calls == []
 
 
-def test_safe_cleanup_does_not_reuse_pre_reset_disarm_confirmation(
+def test_safe_cleanup_does_not_claim_pre_reset_disarm_confirmation(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -5457,27 +5457,173 @@ def test_safe_cleanup_does_not_reuse_pre_reset_disarm_confirmation(
         advancing_imu_samples=5,
         countdown_observed=True,
     )
-    disarm_confirmations = []
+    events = []
 
-    async def disarm_confirmed(*_args, **_kwargs):
-        disarm_confirmations.append(adapter.heartbeat_sequence)
-        # The pre-reset attempt succeeds.  No newer post-reset heartbeat is
-        # available, so cleanup must not reuse that earlier confirmation.
-        return len(disarm_confirmations) == 1
+    async def pre_reset_disarm():
+        events.append("pre_reset_disarm_returned")
+
+    async def final_disarm_confirmed(*_args, **_kwargs):
+        events.append("final_disarm_confirmation")
+        # No newer post-reset heartbeat is available.  The earlier returned
+        # send must not be promoted into cleanup confirmation.
+        return False
 
     async def reset():
+        events.append("reset")
         runner._cleanup_proved_reset_epoch = True
         return proof
 
+    monkeypatch.setattr(adapter, "disarm", pre_reset_disarm)
     monkeypatch.setattr(
         runner,
         "_disarm_confirmed",
-        disarm_confirmed,
+        final_disarm_confirmed,
     )
     monkeypatch.setattr(runner, "emergency_reset", reset)
 
     assert asyncio.run(runner.safe_cleanup()) is False
-    assert disarm_confirmations == [1, 1]
+    assert events == [
+        "pre_reset_disarm_returned",
+        "reset",
+        "final_disarm_confirmation",
+    ]
+
+
+def test_safe_cleanup_orders_zero_disarm_send_reset_then_final_proof(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+    order = []
+    recorded = []
+
+    async def zero_send(_command):
+        order.append("zero")
+
+    async def pre_reset_disarm():
+        order.append("pre_reset_disarm")
+
+    async def reset():
+        order.append("reset")
+        runner._cleanup_proved_reset_epoch = True
+        return proof
+
+    async def final_disarm_confirmed(*_args, **_kwargs):
+        order.append("final_disarm_confirmation")
+        adapter.is_armed = False
+        return True
+
+    monkeypatch.setattr(adapter, "send_attitude_rate", zero_send)
+    monkeypatch.setattr(adapter, "disarm", pre_reset_disarm)
+    monkeypatch.setattr(runner, "emergency_reset", reset)
+    monkeypatch.setattr(
+        runner,
+        "_disarm_confirmed",
+        final_disarm_confirmed,
+    )
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: recorded.append((event, payload)),
+    )
+
+    assert asyncio.run(runner.safe_cleanup()) is True
+    assert order == [
+        "zero",
+        "pre_reset_disarm",
+        "reset",
+        "final_disarm_confirmation",
+    ]
+    pre_reset_events = [
+        payload
+        for event, payload in recorded
+        if event == "cleanup_pre_reset_disarm_attempt"
+    ]
+    assert pre_reset_events == [
+        {
+            "outcome": "returned",
+            "error_type": None,
+            "heartbeat_sequence_before": 1,
+            "armed_before": True,
+        }
+    ]
+
+
+def test_safe_cleanup_reset_is_unconditional_after_pre_reset_disarm_failure(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = False
+    runner = VQ2Runner(adapter, _FakeVision())
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+    order = []
+    recorded = []
+
+    async def failed_pre_reset_disarm():
+        order.append("pre_reset_disarm")
+        raise RuntimeError("injected pre-reset send failure")
+
+    async def reset():
+        order.append("reset")
+        runner._cleanup_proved_reset_epoch = True
+        return proof
+
+    async def final_disarm_confirmed(*_args, **_kwargs):
+        order.append("final_disarm_confirmation")
+        return True
+
+    monkeypatch.setattr(adapter, "disarm", failed_pre_reset_disarm)
+    monkeypatch.setattr(runner, "emergency_reset", reset)
+    monkeypatch.setattr(
+        runner,
+        "_disarm_confirmed",
+        final_disarm_confirmed,
+    )
+    monkeypatch.setattr(
+        runner.recorder,
+        "emit",
+        lambda event, **payload: recorded.append((event, payload)),
+    )
+
+    assert asyncio.run(runner.safe_cleanup()) is True
+    assert order == [
+        "pre_reset_disarm",
+        "reset",
+        "final_disarm_confirmation",
+    ]
+    pre_reset_events = [
+        payload
+        for event, payload in recorded
+        if event == "cleanup_pre_reset_disarm_attempt"
+    ]
+    assert pre_reset_events == [
+        {
+            "outcome": "raised",
+            "error_type": "RuntimeError",
+            "heartbeat_sequence_before": 1,
+            "armed_before": False,
+        }
+    ]
 
 
 def test_cleanup_atomic_reset_boundary_retains_harmful_collision(

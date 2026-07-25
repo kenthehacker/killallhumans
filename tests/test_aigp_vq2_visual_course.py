@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -691,6 +692,436 @@ def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
         == 0.0
         for command in crossing
     )
+
+
+def _attempt8_close_alignment_crossing_values():
+    snapshot = _snapshot(0, "track-0", 157)
+    target = replace(
+        _target(snapshot, "track-0"),
+        normalized_x=0.009375,
+        normalized_y_down=-0.0444444444444444,
+        normalized_x_rate_s=0.0501729262260095,
+        normalized_y_rate_down_s=0.218327071392714,
+        log_scale=-0.7898068361159876,
+        log_scale_rate_s=1.57677074528819,
+    )
+    output = VisualServoOutput(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=-0.00457,
+        thrust=0.21,
+        corridor_frames=0,
+        advance_enabled=False,
+        next_gate_blend=0.0,
+        horizontal_error=target.normalized_x,
+        vertical_error_image_down=target.normalized_y_down,
+        effective_horizontal_error=target.normalized_x,
+        effective_vertical_error_image_down=target.normalized_y_down,
+        effective_horizontal_rate_s=target.normalized_x_rate_s,
+        effective_vertical_rate_down_s=target.normalized_y_rate_down_s,
+        next_horizontal_error=None,
+        next_vertical_error_image_down=None,
+        horizontal_abs_error_delta=0.003125,
+        vertical_abs_error_delta=-0.0111111111111112,
+        brake_reason="aligning",
+        yaw_envelope_limited=False,
+    )
+    admission = VisualApproachPassageAdmission(
+        basis="tight-current-corridor-dwell-v1",
+        current_gate_index=0,
+        current_target=replace(target, log_scale=-1.6),
+        camera_token=snapshot.latest_camera_token,
+        tracker_frame_sequence=121,
+        corridor_frames=25,
+        preview_track_id="track-1",
+        preview_blend=0.032425,
+    )
+    return target, output, admission
+
+
+def test_attempt8_close_alignment_uses_retained_advance_crossing_proof():
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+
+    assert course_stage._retained_crossing_observation_usable(
+        target,
+        output,
+        tuning=tuning,
+        limits=limits,
+    )
+    assert course_stage._crossing_anchor_basis(
+        target,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=3,
+        tuning=tuning,
+        limits=limits,
+    ) == course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "too_few_advance",
+        "too_little_dwell",
+        "missing_admission",
+        "admission_gate_mismatch",
+        "track_mismatch",
+        "not_close",
+        "retreating",
+        "scale_brake",
+        "horizontal_position",
+        "vertical_position",
+        "horizontal_rate",
+        "vertical_rate",
+        "clipped",
+        "center_censored",
+        "horizontal_censored",
+        "vertical_censored",
+        "ambiguous",
+        "wrong_brake_reason",
+        "planner_yaw_stop",
+    ),
+)
+def test_retained_advance_crossing_proof_fails_closed(case):
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    advance_count = 24
+    dwell = 3
+
+    if case == "too_few_advance":
+        advance_count = 2
+    elif case == "too_little_dwell":
+        dwell = 2
+    elif case == "missing_admission":
+        admission = None
+    elif case == "admission_gate_mismatch":
+        admission = replace(admission, current_gate_index=1)
+    elif case == "track_mismatch":
+        target = replace(target, track_id="other-track")
+    elif case == "not_close":
+        target = replace(target, log_scale=-0.800001)
+    elif case == "retreating":
+        target = replace(target, log_scale_rate_s=-0.000001)
+    elif case == "scale_brake":
+        target = replace(
+            target,
+            log_scale_rate_s=tuning.brake_scale_rate_s,
+        )
+    elif case == "horizontal_position":
+        target = replace(
+            target,
+            normalized_x=tuning.horizontal_corridor + 0.000001,
+        )
+    elif case == "vertical_position":
+        target = replace(
+            target,
+            normalized_y_down=tuning.vertical_corridor + 0.000001,
+        )
+    elif case == "horizontal_rate":
+        target = replace(
+            target,
+            normalized_x_rate_s=tuning.stable_rate_norm_s + 0.000001,
+        )
+    elif case == "vertical_rate":
+        target = replace(
+            target,
+            normalized_y_rate_down_s=(
+                tuning.stable_rate_norm_s + 0.000001
+            ),
+        )
+    elif case == "clipped":
+        target = replace(target, clipped=True)
+    elif case == "center_censored":
+        target = replace(target, center_censored=True)
+    elif case == "horizontal_censored":
+        target = replace(target, horizontal_censored=True)
+    elif case == "vertical_censored":
+        target = replace(target, vertical_censored=True)
+    elif case == "ambiguous":
+        target = replace(target, ambiguous=True)
+    elif case == "wrong_brake_reason":
+        output = replace(output, brake_reason="scale_rate")
+    elif case == "planner_yaw_stop":
+        output = replace(
+            output,
+            brake_reason="segment_yaw_outward_soft_stop",
+            yaw_envelope_limited=True,
+        )
+
+    assert course_stage._crossing_anchor_basis(
+        target,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=advance_count,
+        retained_crossing_dwell_frames=dwell,
+        tuning=tuning,
+        limits=limits,
+    ) is None
+
+
+def test_current_advance_crossing_proof_is_preserved():
+    target, output, _admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    output = replace(
+        output,
+        corridor_frames=tuning.required_corridor_frames,
+        advance_enabled=True,
+        brake_reason=None,
+    )
+
+    assert course_stage._crossing_anchor_basis(
+        target,
+        output,
+        passage_admission=None,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=3,
+        retained_crossing_dwell_frames=0,
+        tuning=tuning,
+        limits=limits,
+    ) == course_stage.CURRENT_ADVANCE_CROSSING_BASIS
+
+
+def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
+    class RetainedCrossingServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.passage_observations = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            if kwargs["mode"] is not VisualApproachMode.PASSAGE:
+                return proposal
+            self.passage_observations += 1
+            if self.passage_observations <= 3:
+                return SimpleNamespace(
+                    current_target=replace(
+                        proposal.current_target,
+                        log_scale=-1.0,
+                        log_scale_rate_s=0.2,
+                    ),
+                    servo_output=proposal.servo_output,
+                    passage_admission=proposal.passage_admission,
+                    mode=proposal.mode,
+                )
+            target, output, _admission = (
+                _attempt8_close_alignment_crossing_values()
+            )
+            target = replace(
+                target,
+                track_id=proposal.current_target.track_id,
+                frame_token=proposal.current_target.frame_token,
+                received_monotonic_s=(
+                    proposal.current_target.received_monotonic_s
+                ),
+            )
+            return SimpleNamespace(
+                current_target=target,
+                servo_output=replace(output, yaw_rate_rad_s=0.0),
+                passage_admission=proposal.passage_admission,
+                mode=proposal.mode,
+            )
+
+    class RetainedLossHost(_Host):
+        def _sample(self):
+            super()._sample()
+            navigation_count = sum(
+                bool(kwargs.get("require_wire_receipt"))
+                for _command, kwargs, _gate in self.commands
+            )
+            if (
+                navigation_count >= 7
+                and not self.race.race_finished
+            ):
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(command, **kwargs)
+            if (
+                command.roll_rate
+                == command.pitch_rate
+                == command.yaw_rate
+                == command.thrust
+                == 0.0
+                and self.crossing_zero_count >= 2
+            ):
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = RetainedLossHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: RetainedCrossingServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    anchor = result["segments"][0]["crossing_anchor"]
+    assert result["race_finished"] is True
+    assert anchor["basis"] == (
+        course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+    )
+    assert anchor["advance_command_count"] == 3
+    assert anchor["current_advance_enabled"] is False
+    assert anchor["retained_crossing_dwell_frames"] == 3
+    assert anchor["camera_token"]["publication_sequence"] == 17
+    assert result["segments"][0]["crossing_wait_zero_command_count"] == 2
+
+
+def test_superseded_passage_proposal_breaks_retained_crossing_dwell():
+    class SupersededDwellServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.passage_observations = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            if kwargs["mode"] is not VisualApproachMode.PASSAGE:
+                return proposal
+            self.passage_observations += 1
+            if self.passage_observations <= 3:
+                return SimpleNamespace(
+                    current_target=replace(
+                        proposal.current_target,
+                        log_scale=-1.0,
+                        log_scale_rate_s=0.2,
+                    ),
+                    servo_output=proposal.servo_output,
+                    passage_admission=proposal.passage_admission,
+                    mode=proposal.mode,
+                )
+            target, output, _admission = (
+                _attempt8_close_alignment_crossing_values()
+            )
+            target = replace(
+                target,
+                track_id=proposal.current_target.track_id,
+                frame_token=proposal.current_target.frame_token,
+                received_monotonic_s=(
+                    proposal.current_target.received_monotonic_s
+                ),
+            )
+            if self.passage_observations == 6:
+                target = replace(target, normalized_x=0.50)
+                output = replace(
+                    output,
+                    horizontal_error=0.50,
+                    effective_horizontal_error=0.50,
+                )
+            return SimpleNamespace(
+                current_target=target,
+                servo_output=replace(output, yaw_rate_rad_s=0.0),
+                passage_admission=proposal.passage_admission,
+                mode=proposal.mode,
+            )
+
+    class SupersededDwellHost(_Host):
+        superseded = False
+
+        def _sample(self):
+            super()._sample()
+            navigation_count = sum(
+                bool(kwargs.get("require_wire_receipt"))
+                for _command, kwargs, _gate in self.commands
+            )
+            if navigation_count >= 9 and not self.race.race_finished:
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if (
+                not self.superseded
+                and expected is not None
+                and expected.publication_sequence == 17
+            ):
+                self.superseded = True
+                receiver = _token(18)
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            receipt = await super()._send_flight_command(command, **kwargs)
+            if (
+                command.roll_rate
+                == command.pitch_rate
+                == command.yaw_rate
+                == command.thrust
+                == 0.0
+                and self.crossing_zero_count >= 2
+            ):
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = SupersededDwellHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: SupersededDwellServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    assert host.superseded is True
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["crossing_anchor"]["basis"] == (
+        course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+    )
+    assert segment["crossing_anchor"]["camera_token"][
+        "publication_sequence"
+    ] == 21
+    assert segment["crossing_anchor"][
+        "retained_crossing_dwell_frames"
+    ] == 3
 
 
 def test_crossing_wait_accepts_newer_same_gate_status_before_credit():
@@ -1771,20 +2202,20 @@ def _set_attitude(
 
 
 @pytest.mark.parametrize("direction", (-1.0, 1.0))
-def test_yaw_at_hard_excursion_refuses_outward_but_allows_inward(direction):
+def test_yaw_at_hard_excursion_zeroes_outward_but_allows_inward(direction):
     profile = _yaw_profile()
     limits = VisualCourseStageLimits()
     excursion = direction * limits.max_segment_yaw_excursion_rad
 
-    with pytest.raises(SafetyAbort, match="soft boundary"):
-        course_stage._limit_calibrated_yaw_request(
-            direction * 0.02,
-            excursion_rad=excursion,
-            measured_euler_yaw_rate_rad_s=0.0,
-            limits=limits,
-            profile=profile,
-            abort_type=SafetyAbort,
-        )
+    outward = course_stage._limit_calibrated_yaw_request(
+        direction * 0.02,
+        excursion_rad=excursion,
+        measured_euler_yaw_rate_rad_s=0.0,
+        limits=limits,
+        profile=profile,
+        abort_type=SafetyAbort,
+    )
+    assert outward == 0.0
 
     admitted = course_stage._limit_calibrated_yaw_request(
         -direction * 0.02,
@@ -1798,7 +2229,7 @@ def test_yaw_at_hard_excursion_refuses_outward_but_allows_inward(direction):
 
 
 @pytest.mark.parametrize("direction", (-1.0, 1.0))
-def test_yaw_delayed_projection_at_soft_boundary_refuses(direction):
+def test_yaw_delayed_projection_at_soft_boundary_zeroes_outward(direction):
     profile = _yaw_profile()
     limits = VisualCourseStageLimits()
     response_reserve = (
@@ -1814,15 +2245,186 @@ def test_yaw_delayed_projection_at_soft_boundary_refuses(direction):
         + 1e-9
     )
 
-    with pytest.raises(SafetyAbort, match="soft boundary"):
-        course_stage._limit_calibrated_yaw_request(
-            direction * 0.02,
-            excursion_rad=excursion,
-            measured_euler_yaw_rate_rad_s=rate_to_boundary,
-            limits=limits,
-            profile=profile,
-            abort_type=SafetyAbort,
+    admitted = course_stage._limit_calibrated_yaw_request(
+        direction * 0.02,
+        excursion_rad=excursion,
+        measured_euler_yaw_rate_rad_s=rate_to_boundary,
+        limits=limits,
+        profile=profile,
+        abort_type=SafetyAbort,
+    )
+    assert admitted == 0.0
+
+
+def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
+    profile = _yaw_profile()
+    limits = VisualCourseStageLimits()
+    response_reserve = (
+        profile.observed_max_abs_measured_yaw_rate_rad_s
+        / math.cos(
+            max(
+                abs(limits.min_measured_pitch_rad),
+                abs(limits.max_measured_pitch_rad),
+            )
         )
+        * profile.control_hold_horizon_s
+    )
+    soft_boundary = (
+        limits.max_segment_yaw_excursion_rad - response_reserve
+    )
+    excursion = 0.005
+    rate_to_soft_stop = (
+        (soft_boundary - excursion) / profile.max_gyro_response_delay_s
+        + 1e-6
+    )
+
+    class SoftStopHost(_Host):
+        sample_count = 0
+
+        def _sample(self):
+            super()._sample()
+            self.sample_count += 1
+            if self.sample_count == 1:
+                _set_attitude(
+                    self,
+                    yaw=excursion,
+                    rates=(0.0, 0.0, rate_to_soft_stop),
+                )
+            else:
+                _set_attitude(self)
+
+    host = SoftStopHost(initial_gate=3, finish_gate=3)
+    runtime, calls = _runtime(host, limits=limits)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    assert result["success"] is True
+    assert segment["yaw_soft_stop_zero_command_count"] == 1
+    assert (
+        segment["passage_admission_yaw_soft_stop_withheld_count"]
+        == 1
+    )
+    assert calls[0][1] is VisualApproachMode.APPROACH
+    assert calls[1][1] is VisualApproachMode.APPROACH
+    assert calls[2][1] is VisualApproachMode.PASSAGE
+    navigation = [
+        command
+        for command, kwargs, _gate in host.commands
+        if kwargs.get("require_wire_receipt")
+    ]
+    assert navigation
+    assert navigation[0].yaw_rate == 0.0
+    assert all(command.yaw_rate == 0.02 for command in navigation[1:])
+    events = [
+        payload
+        for event, payload in host.recorder.events
+        if event == "visual_course_yaw_soft_stop_zeroed"
+    ]
+    assert len(events) == 1
+    assert events[0]["requested_yaw_rate_rad_s"] == pytest.approx(0.02)
+    assert events[0]["admitted_yaw_rate_rad_s"] == 0.0
+
+
+def test_passage_yaw_soft_stop_cannot_count_advance_or_arm_crossing():
+    profile = _yaw_profile()
+    limits = VisualCourseStageLimits()
+    response_reserve = (
+        profile.observed_max_abs_measured_yaw_rate_rad_s
+        / math.cos(
+            max(
+                abs(limits.min_measured_pitch_rad),
+                abs(limits.max_measured_pitch_rad),
+            )
+        )
+        * profile.control_hold_horizon_s
+    )
+    excursion = 0.005
+    rate_to_soft_stop = (
+        (
+            limits.max_segment_yaw_excursion_rad
+            - response_reserve
+            - excursion
+        )
+        / profile.max_gyro_response_delay_s
+        + 1e-6
+    )
+
+    class CloseThirdAdvanceServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.passage_observations = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            if kwargs["mode"] is VisualApproachMode.PASSAGE:
+                self.passage_observations += 1
+                if self.passage_observations <= 2:
+                    return SimpleNamespace(
+                        current_target=replace(
+                            proposal.current_target,
+                            log_scale=-1.0,
+                        ),
+                        servo_output=proposal.servo_output,
+                        passage_admission=proposal.passage_admission,
+                        mode=proposal.mode,
+                    )
+            return proposal
+
+    class SoftStopThenLossHost(_Host):
+        sample_count = 0
+
+        def _sample(self):
+            super()._sample()
+            self.sample_count += 1
+            if self.sample_count == 4:
+                _set_attitude(
+                    self,
+                    yaw=excursion,
+                    rates=(0.0, 0.0, rate_to_soft_stop),
+                )
+            else:
+                _set_attitude(self)
+            if self.sample_count >= 5:
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+
+    host = SoftStopThenLossHost(
+        initial_gate=3,
+        finish_gate=3,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host, limits=limits)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: CloseThirdAdvanceServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(SafetyAbort, match="visual authority refused"):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["passage_command_count"] == 3
+    assert segment["advance_command_count"] == 2
+    assert segment["yaw_soft_stop_zero_command_count"] == 1
+    assert segment["crossing_anchor"] is None
+    navigation = [
+        command
+        for command, kwargs, _gate in host.commands
+        if kwargs.get("require_wire_receipt")
+    ]
+    assert navigation[-1].yaw_rate == 0.0
 
 
 @pytest.mark.parametrize(
@@ -1900,23 +2502,22 @@ def test_measured_roll_pitch_and_all_axis_rate_envelopes_fail_closed(
         )
 
 
-def test_repeated_same_sign_yaw_requests_refuse_before_hard_boundary():
+def test_repeated_same_sign_yaw_requests_zero_before_hard_boundary():
     profile = _yaw_profile()
     limits = VisualCourseStageLimits()
     excursion = 0.0
     admitted = 0
 
     while True:
-        try:
-            course_stage._limit_calibrated_yaw_request(
-                0.02,
-                excursion_rad=excursion,
-                measured_euler_yaw_rate_rad_s=0.0,
-                limits=limits,
-                profile=profile,
-                abort_type=SafetyAbort,
-            )
-        except SafetyAbort:
+        request = course_stage._limit_calibrated_yaw_request(
+            0.02,
+            excursion_rad=excursion,
+            measured_euler_yaw_rate_rad_s=0.0,
+            limits=limits,
+            profile=profile,
+            abort_type=SafetyAbort,
+        )
+        if request == 0.0:
             break
         admitted += 1
         excursion += (

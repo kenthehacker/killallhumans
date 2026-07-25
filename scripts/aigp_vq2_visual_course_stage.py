@@ -93,6 +93,10 @@ GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR = 0.50
 GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE = 5.0 / 3.0
 GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA = 0.35
 GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
+CURRENT_ADVANCE_CROSSING_BASIS = "current-advance-corridor-v1"
+RETAINED_ADVANCE_CROSSING_BASIS = (
+    "retained-advance-close-alignment-dwell-v1"
+)
 _YAW_PROFILE_ISSUER = object()
 
 
@@ -190,6 +194,12 @@ class _Gate0ProvedCollectiveState:
             self.filtered_vertical_rate,
         )
         return thrust, self.filtered_vertical_rate
+
+
+@dataclass(frozen=True, slots=True)
+class _AcceptedVisualCommand:
+    command: AttitudeRateCommand
+    yaw_soft_stop_zeroed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -811,12 +821,91 @@ def _limit_calibrated_yaw_request(
     )
     remaining_soft_headroom = soft_boundary_rad - directional_start
     if remaining_soft_headroom <= 0.0:
-        raise abort_type(
-            "visual-course outward yaw request reached its calibrated "
-            "soft boundary"
-        )
+        # Exact zero removes outward authority while measured excursion,
+        # measured rate, and the longer hard-envelope projection continue to
+        # be checked independently on every control tick and immediately
+        # before every send.  Do not scale to an uncalibrated nonzero request.
+        return 0.0
 
     return requested
+
+
+def _retained_crossing_observation_usable(
+    target: Any,
+    output: Any,
+    *,
+    tuning: Any,
+    limits: VisualCourseStageLimits,
+) -> bool:
+    """Admit one current-only close-alignment sample to crossing dwell."""
+
+    return bool(
+        not target.clipped
+        and not target.center_censored
+        and not target.horizontal_geometry_censored
+        and not target.vertical_geometry_censored
+        and not target.ambiguous
+        and abs(float(target.normalized_x)) <= tuning.horizontal_corridor
+        and abs(float(target.normalized_y_down)) <= tuning.vertical_corridor
+        and abs(float(target.normalized_x_rate_s))
+        <= tuning.stable_rate_norm_s
+        and abs(float(target.normalized_y_rate_down_s))
+        <= tuning.stable_rate_norm_s
+        and limits.crossing_arm_min_log_scale_rate_s
+        <= float(target.log_scale_rate_s)
+        < tuning.brake_scale_rate_s
+        and not output.advance_enabled
+        and output.brake_reason == "aligning"
+        and not output.yaw_envelope_limited
+    )
+
+
+def _crossing_anchor_basis(
+    target: Any,
+    output: Any,
+    *,
+    passage_admission: Optional[VisualApproachPassageAdmission],
+    current_gate_index: int,
+    current_track_id: str,
+    advance_command_count: int,
+    retained_crossing_dwell_frames: int,
+    tuning: Any,
+    limits: VisualCourseStageLimits,
+) -> Optional[str]:
+    """Select an exact-frame crossing proof without adding motion authority."""
+
+    if (
+        advance_command_count
+        < limits.crossing_arm_min_advance_commands
+        or float(target.log_scale) < limits.crossing_arm_min_log_scale
+        or float(target.log_scale_rate_s)
+        < limits.crossing_arm_min_log_scale_rate_s
+        or target.clipped
+        or target.center_censored
+        or target.ambiguous
+    ):
+        return None
+    if (
+        output.corridor_frames >= tuning.required_corridor_frames
+        and output.advance_enabled
+    ):
+        return CURRENT_ADVANCE_CROSSING_BASIS
+    if (
+        type(passage_admission) is VisualApproachPassageAdmission
+        and passage_admission.current_gate_index == current_gate_index
+        and passage_admission.current_target.track_id == current_track_id
+        and target.track_id == current_track_id
+        and retained_crossing_dwell_frames
+        >= tuning.required_corridor_frames
+        and _retained_crossing_observation_usable(
+            target,
+            output,
+            tuning=tuning,
+            limits=limits,
+        )
+    ):
+        return RETAINED_ADVANCE_CROSSING_BASIS
+    return None
 
 
 def _race_relation(
@@ -1183,14 +1272,14 @@ async def _run_visual_course_stage_impl(
         yaw_reference_rad: float,
         segment_started_s: float,
         stage: str,
-    ) -> Optional[AttitudeRateCommand]:
+    ) -> Optional[_AcceptedVisualCommand]:
         nonlocal total_navigation_commands
         nonlocal last_navigation_send_s
         nonlocal consecutive_superseded_proposals
 
         def drop_superseded_proposal(
             exc: BaseException,
-        ) -> Optional[AttitudeRateCommand]:
+        ) -> Optional[_AcceptedVisualCommand]:
             nonlocal consecutive_superseded_proposals
 
             expected_token = snapshot.latest_camera_token
@@ -1371,6 +1460,7 @@ async def _run_visual_course_stage_impl(
             phase=f"{stage} pre-send",
         )
         bounded_yaw = requested_yaw
+        yaw_soft_stop_zeroed = False
         if requested_yaw != 0.0:
             assert runtime.yaw_profile is not None
             bounded_yaw = _limit_calibrated_yaw_request(
@@ -1381,6 +1471,7 @@ async def _run_visual_course_stage_impl(
                 profile=runtime.yaw_profile,
                 abort_type=abort_type,
             )
+            yaw_soft_stop_zeroed = bounded_yaw == 0.0
         base = runtime.attitude_rate_command(
             host.estimate,
             target_roll_rad=target_roll_rad,
@@ -1469,6 +1560,21 @@ async def _run_visual_course_stage_impl(
             )
         ):
             raise abort_type("visual-course send lacks visual wire authority")
+        if yaw_soft_stop_zeroed:
+            segment["yaw_soft_stop_zero_command_count"] = int(
+                segment["yaw_soft_stop_zero_command_count"]
+            ) + 1
+            host.recorder.emit(
+                "visual_course_yaw_soft_stop_zeroed",
+                gate_index=current_gate_index,
+                stage=stage,
+                camera_token=asdict(snapshot.latest_camera_token),
+                requested_yaw_rate_rad_s=requested_yaw,
+                admitted_yaw_rate_rad_s=bounded_yaw,
+                yaw_excursion_rad=excursion,
+                measured_euler_yaw_rate_rad_s=euler_yaw_rate,
+                count=segment["yaw_soft_stop_zero_command_count"],
+            )
         if launch_evidence is not None:
             if int(launch["command_count"]) == 0:
                 launch["first_target_pitch_rad"] = launch_evidence[
@@ -1518,7 +1624,10 @@ async def _run_visual_course_stage_impl(
                 ]
             ) + 1
         refresh_live_summary()
-        return command
+        return _AcceptedVisualCommand(
+            command=command,
+            yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
+        )
 
     for segment_number in range(limits.max_gate_segments):
         segment_started_s = float(runtime.monotonic())
@@ -1564,6 +1673,7 @@ async def _run_visual_course_stage_impl(
         approach_command_count = 0
         next_preview_retired = False
         crossing_anchor: Optional[Dict[str, Any]] = None
+        retained_crossing_dwell_frames = 0
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
@@ -1580,6 +1690,10 @@ async def _run_visual_course_stage_impl(
             "next_preview_withdrawal_count": 0,
             "next_preview_withdrawal": None,
             "next_preview_retired": False,
+            "yaw_soft_stop_zero_command_count": 0,
+            "passage_admission_yaw_soft_stop_withheld_count": 0,
+            "retained_crossing_dwell_frames": 0,
+            "max_retained_crossing_dwell_frames": 0,
             "crossing_wait_zero_command_count": 0,
             "post_credit_zero_command_count": 0,
             "passage_authority_enabled": False,
@@ -1904,7 +2018,7 @@ async def _run_visual_course_stage_impl(
                         "visual-course approach acquired passage authority"
                     )
                 try:
-                    command = await send_visual(
+                    accepted = await send_visual(
                         proposal=proposal,
                         snapshot=snapshot,
                         yaw_reference_rad=yaw_reference_rad,
@@ -1917,11 +2031,20 @@ async def _run_visual_course_stage_impl(
                 except RaceActiveBoundaryChangedBeforeWire as exc:
                     credited_race = accept_no_wire_race_boundary(exc)
                     break
-                if command is None:
+                if accepted is None:
                     continue
                 approach_command_count += 1
                 segment["approach_command_count"] = approach_command_count
                 if proposal.passage_admission is not None:
+                    if accepted.yaw_soft_stop_zeroed:
+                        segment[
+                            "passage_admission_yaw_soft_stop_withheld_count"
+                        ] = int(
+                            segment[
+                                "passage_admission_yaw_soft_stop_withheld_count"
+                            ]
+                        ) + 1
+                        continue
                     launch_ready = bool(
                         not segment["launch_bootstrap"]["enabled"]
                         or float(runtime.monotonic()) - course_started_s
@@ -1954,7 +2077,7 @@ async def _run_visual_course_stage_impl(
             if proposal.mode is not VisualApproachMode.PASSAGE:
                 raise abort_type("visual-course passage mode was not retained")
             try:
-                command = await send_visual(
+                accepted = await send_visual(
                     proposal=proposal,
                     snapshot=snapshot,
                     yaw_reference_rad=yaw_reference_rad,
@@ -1967,28 +2090,58 @@ async def _run_visual_course_stage_impl(
             except RaceActiveBoundaryChangedBeforeWire as exc:
                 credited_race = accept_no_wire_race_boundary(exc)
                 break
-            if command is None:
+            if accepted is None:
+                retained_crossing_dwell_frames = 0
+                segment["retained_crossing_dwell_frames"] = 0
                 continue
+            command = accepted.command
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
-            if proposal.servo_output.advance_enabled:
+            if (
+                proposal.servo_output.advance_enabled
+                and not accepted.yaw_soft_stop_zeroed
+            ):
                 advance_command_count += 1
                 segment["advance_command_count"] = advance_command_count
             target = proposal.current_target
-            if (
-                advance_command_count
-                >= limits.crossing_arm_min_advance_commands
-                and proposal.servo_output.corridor_frames
-                >= host.visual_config.servo.required_corridor_frames
-                and proposal.servo_output.advance_enabled
-                and target.log_scale >= limits.crossing_arm_min_log_scale
-                and target.log_scale_rate_s
-                >= limits.crossing_arm_min_log_scale_rate_s
-                and not target.clipped
-                and not target.center_censored
-                and not target.ambiguous
+            if accepted.yaw_soft_stop_zeroed:
+                retained_crossing_dwell_frames = 0
+            elif _retained_crossing_observation_usable(
+                target,
+                proposal.servo_output,
+                tuning=host.visual_config.servo,
+                limits=limits,
             ):
+                retained_crossing_dwell_frames += 1
+            else:
+                retained_crossing_dwell_frames = 0
+            segment["retained_crossing_dwell_frames"] = (
+                retained_crossing_dwell_frames
+            )
+            segment["max_retained_crossing_dwell_frames"] = max(
+                int(segment["max_retained_crossing_dwell_frames"]),
+                retained_crossing_dwell_frames,
+            )
+            crossing_basis = (
+                None
+                if accepted.yaw_soft_stop_zeroed
+                else _crossing_anchor_basis(
+                    target,
+                    proposal.servo_output,
+                    passage_admission=passage_admission,
+                    current_gate_index=current_gate_index,
+                    current_track_id=current_track_id,
+                    advance_command_count=advance_command_count,
+                    retained_crossing_dwell_frames=(
+                        retained_crossing_dwell_frames
+                    ),
+                    tuning=host.visual_config.servo,
+                    limits=limits,
+                )
+            )
+            if crossing_basis is not None:
                 crossing_anchor = {
+                    "basis": crossing_basis,
                     "camera_token": token,
                     "tracker_frame_sequence": (
                         snapshot.tracker_frame_sequence
@@ -1998,6 +2151,19 @@ async def _run_visual_course_stage_impl(
                     "log_scale_rate_s": target.log_scale_rate_s,
                     "corridor_frames": (
                         proposal.servo_output.corridor_frames
+                    ),
+                    "retained_crossing_dwell_frames": (
+                        retained_crossing_dwell_frames
+                    ),
+                    "advance_command_count": advance_command_count,
+                    "current_advance_enabled": (
+                        proposal.servo_output.advance_enabled
+                    ),
+                    "normalized_x": target.normalized_x,
+                    "normalized_y_down": target.normalized_y_down,
+                    "normalized_x_rate_s": target.normalized_x_rate_s,
+                    "normalized_y_rate_down_s": (
+                        target.normalized_y_rate_down_s
                     ),
                     "command": asdict(command),
                 }

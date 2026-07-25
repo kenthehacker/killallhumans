@@ -11121,7 +11121,7 @@ class VQ2Runner:
         return True
 
     async def safe_cleanup(self) -> bool:
-        """Cut thrust, pre-disarm, reset, then prove a newer disarm."""
+        """Cut thrust, request pre-disarm, reset, then prove a newer disarm."""
 
         self._abort_latched = True
         self._cleanup_in_progress = True
@@ -11190,11 +11190,38 @@ class VQ2Runner:
                     )
         except Exception:
             logger.exception("Could not send the one-shot zero-thrust command")
-        # Do not delay the unconditional reset fallback behind a long heartbeat
-        # wait when the abort itself may be a transport failure.
-        disarmed = await self._disarm_confirmed(timeout_s=0.6)
-        if not disarmed:
-            logger.error("Disarm was not confirmed before reset fallback")
+        # A vehicle already closing on an obstacle must not coast while cleanup
+        # waits for a pre-reset heartbeat.  Send the disarm request once, record
+        # only that send outcome, and issue the unconditional reset immediately.
+        # Reset proof and the independent final newer-heartbeat disarm below
+        # remain the only cleanup confirmation.
+        heartbeat_before_pre_reset_disarm = (
+            self.adapter.heartbeat_sequence
+        )
+        armed_before_pre_reset_disarm = self.adapter.is_armed
+        try:
+            await self.adapter.disarm()
+        except Exception as exc:
+            logger.exception("Pre-reset disarm send failed")
+            self.recorder.emit(
+                "cleanup_pre_reset_disarm_attempt",
+                outcome="raised",
+                error_type=type(exc).__name__,
+                heartbeat_sequence_before=(
+                    heartbeat_before_pre_reset_disarm
+                ),
+                armed_before=armed_before_pre_reset_disarm,
+            )
+        else:
+            self.recorder.emit(
+                "cleanup_pre_reset_disarm_attempt",
+                outcome="returned",
+                error_type=None,
+                heartbeat_sequence_before=(
+                    heartbeat_before_pre_reset_disarm
+                ),
+                armed_before=armed_before_pre_reset_disarm,
+            )
         self._drain_cleanup_collisions(
             phase="cleanup-after-zero-disarm",
             allow_benign_reset_pad=(
