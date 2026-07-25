@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 import math
 from types import SimpleNamespace
 
@@ -91,6 +91,14 @@ def _track(
         missed_frame_count=0 if visible else 1,
         clipping=0,
         center_censored=False,
+        history=(
+            SimpleNamespace(
+                token=token,
+                observation_monotonic_ns=(
+                    token.publication_sequence * 20_000_000
+                ),
+            ),
+        ),
     )
 
 
@@ -408,9 +416,18 @@ class _Host:
             if self.lose_before_credit and self.crossing_zero_count >= 2:
                 self._advance_race()
         if kwargs.get("require_wire_receipt"):
+            token = kwargs["wire_visual_token"]
             return {
+                "call_start_monotonic_ns": (
+                    self._last_flight_command_started_ns
+                ),
                 "visual_receiver_authority": {
-                    "schema": "aigp-vq2-visual-wire-authority/1"
+                    "schema": "aigp-vq2-visual-wire-authority/1",
+                    "frame_token": asdict(token),
+                    "call_start_monotonic_ns": (
+                        self._last_flight_command_started_ns
+                    ),
+                    "publication_pinned_through_transport_return": True,
                 }
             }
         return None
@@ -764,12 +781,13 @@ def test_attempt8_close_alignment_uses_retained_advance_crossing_proof():
     ) == course_stage.RETAINED_ADVANCE_CROSSING_BASIS
 
 
-def test_attempt10_last_safe_frame_clears_only_evidenced_scale_margin():
+def test_attempt10_wire_projection_admits_only_the_last_safe_frame():
     target, output, admission = _attempt8_close_alignment_crossing_values()
     tuning = default_visual_config().servo
     limits = VisualCourseStageLimits()
     publication_158 = replace(
         target,
+        received_monotonic_s=117777179027800 / 1_000_000_000.0,
         normalized_x=0.009374999999999911,
         normalized_y_down=-0.06666666666666665,
         normalized_x_rate_s=0.0580976279904446,
@@ -779,6 +797,7 @@ def test_attempt10_last_safe_frame_clears_only_evidenced_scale_margin():
     )
     publication_159 = replace(
         target,
+        received_monotonic_s=117777213551000 / 1_000_000_000.0,
         normalized_x=0.009374999999999911,
         normalized_y_down=-0.05555555555555558,
         normalized_x_rate_s=0.026143932595700067,
@@ -786,7 +805,38 @@ def test_attempt10_last_safe_frame_clears_only_evidenced_scale_margin():
         log_scale=-0.8011509877843259,
         log_scale_rate_s=1.493812414455355,
     )
+    projection_158 = course_stage._retained_crossing_wire_projection(
+        publication_158,
+        observation_monotonic_ns=117777179027800,
+        wire_start_monotonic_ns=117777203077700,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+    projection_159 = course_stage._retained_crossing_wire_projection(
+        publication_159,
+        observation_monotonic_ns=117777213551000,
+        wire_start_monotonic_ns=117777234757300,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
 
+    assert limits.crossing_arm_min_log_scale == -0.80
+    assert projection_158 is not None
+    assert projection_159 is not None
+    assert projection_158.observation_to_wire_s == pytest.approx(
+        0.0240499
+    )
+    assert projection_158.projected_log_scale == pytest.approx(
+        -0.827242826784665
+    )
+    assert projection_159.observation_to_wire_s == pytest.approx(
+        0.0212063
+    )
+    assert projection_159.projected_log_scale == pytest.approx(
+        -0.7694727535796613
+    )
     assert course_stage._crossing_anchor_basis(
         publication_158,
         output,
@@ -797,6 +847,7 @@ def test_attempt10_last_safe_frame_clears_only_evidenced_scale_margin():
         retained_crossing_dwell_frames=9,
         tuning=tuning,
         limits=limits,
+        retained_wire_projection=projection_158,
     ) is None
     assert course_stage._crossing_anchor_basis(
         publication_159,
@@ -808,7 +859,329 @@ def test_attempt10_last_safe_frame_clears_only_evidenced_scale_margin():
         retained_crossing_dwell_frames=10,
         tuning=tuning,
         limits=limits,
-    ) == course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+        retained_wire_projection=projection_159,
+    ) == (
+        course_stage.RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
+    )
+
+
+def test_attempt11_wire_projection_admits_only_the_last_safe_frame():
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    publication_156 = replace(
+        target,
+        received_monotonic_s=118787645850200 / 1_000_000_000.0,
+        normalized_x=0.009374999999999911,
+        normalized_y_down=-0.061111111111111116,
+        normalized_x_rate_s=0.09642996990836059,
+        normalized_y_rate_down_s=0.15786849612897946,
+        log_scale=-0.8783520348010684,
+        log_scale_rate_s=1.2578718503651323,
+    )
+    publication_157 = replace(
+        target,
+        received_monotonic_s=118787681367200 / 1_000_000_000.0,
+        normalized_x=0.009374999999999911,
+        normalized_y_down=-0.05555555555555558,
+        normalized_x_rate_s=0.04339348645876226,
+        normalized_y_rate_down_s=0.15707161289555363,
+        log_scale=-0.8270869031377459,
+        log_scale_rate_s=1.3599106890803176,
+    )
+    projection_156 = course_stage._retained_crossing_wire_projection(
+        publication_156,
+        observation_monotonic_ns=118787645850200,
+        wire_start_monotonic_ns=118787671633500,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+    projection_157 = course_stage._retained_crossing_wire_projection(
+        publication_157,
+        observation_monotonic_ns=118787681367200,
+        wire_start_monotonic_ns=118787703677900,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+
+    assert projection_156 is not None
+    assert projection_157 is not None
+    assert projection_156.projected_log_scale == pytest.approx(
+        -0.8459199475215491
+    )
+    assert projection_157.projected_log_scale == pytest.approx(
+        -0.7967463437268817
+    )
+    assert course_stage._crossing_anchor_basis(
+        publication_156,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=8,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projection_156,
+    ) is None
+    assert course_stage._crossing_anchor_basis(
+        publication_157,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=9,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projection_157,
+    ) == (
+        course_stage.RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
+    )
+
+
+def test_retained_projection_is_narrowed_by_raw_and_projected_scales():
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    target = replace(
+        target,
+        received_monotonic_s=1.0,
+        log_scale=limits.retained_crossing_projection_min_log_scale,
+        log_scale_rate_s=1.0,
+    )
+    projection = course_stage._retained_crossing_wire_projection(
+        target,
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_030_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+    assert projection is not None
+    assert projection.projected_log_scale == pytest.approx(-0.80)
+    assert course_stage._crossing_anchor_basis(
+        target,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=3,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projection,
+    ) == (
+        course_stage.RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
+    )
+
+    below_floor = replace(
+        target,
+        log_scale=(
+            limits.retained_crossing_projection_min_log_scale
+            - 0.000001
+        ),
+        log_scale_rate_s=1.9,
+    )
+    below_floor_projection = (
+        course_stage._retained_crossing_wire_projection(
+            below_floor,
+            observation_monotonic_ns=1_000_000_000,
+            wire_start_monotonic_ns=1_030_000_000,
+            tuning=tuning,
+            limits=limits,
+            abort_type=SafetyAbort,
+        )
+    )
+    assert below_floor_projection is not None
+    assert below_floor_projection.projected_log_scale > -0.80
+    assert course_stage._crossing_anchor_basis(
+        below_floor,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=3,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=below_floor_projection,
+    ) is None
+
+    projected_below = replace(
+        target,
+        log_scale_rate_s=(0.03 - 0.000001) / 0.03,
+    )
+    projected_below_proof = (
+        course_stage._retained_crossing_wire_projection(
+            projected_below,
+            observation_monotonic_ns=1_000_000_000,
+            wire_start_monotonic_ns=1_030_000_000,
+            tuning=tuning,
+            limits=limits,
+            abort_type=SafetyAbort,
+        )
+    )
+    assert projected_below_proof is not None
+    assert projected_below_proof.projected_log_scale == pytest.approx(
+        -0.800001
+    )
+    assert course_stage._crossing_anchor_basis(
+        projected_below,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=24,
+        retained_crossing_dwell_frames=3,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projected_below_proof,
+    ) is None
+
+
+def test_retained_projection_must_match_and_recompute_for_target():
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    target = replace(
+        target,
+        received_monotonic_s=1.0,
+        log_scale=-0.81,
+        log_scale_rate_s=1.0,
+    )
+    projection = course_stage._retained_crossing_wire_projection(
+        target,
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_020_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+    assert projection is not None
+
+    for mismatched_target, mismatched_projection in (
+        (replace(target, normalized_x=0.01), projection),
+            (
+                target,
+                replace(projection, projected_log_scale=-0.78),
+            ),
+        (
+            target,
+            replace(projection, observation_to_wire_ns=19_000_000),
+        ),
+    ):
+        assert course_stage._crossing_anchor_basis(
+            mismatched_target,
+            output,
+            passage_admission=admission,
+            current_gate_index=0,
+            current_track_id="track-0",
+            advance_command_count=24,
+            retained_crossing_dwell_frames=3,
+            tuning=tuning,
+            limits=limits,
+            retained_wire_projection=mismatched_projection,
+        ) is None
+
+
+def test_retained_wire_projection_is_bounded_and_fail_closed():
+    target, _output, _admission = (
+        _attempt8_close_alignment_crossing_values()
+    )
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    target = replace(
+        target,
+        received_monotonic_s=1.0,
+        log_scale=-0.81,
+        log_scale_rate_s=1.0,
+    )
+
+    at_bound = course_stage._retained_crossing_wire_projection(
+        target,
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_032_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+    assert at_bound is not None
+    assert at_bound.projected_log_scale == pytest.approx(-0.778)
+    assert course_stage._retained_crossing_wire_projection(
+        target,
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_032_000_001,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    ) is None
+    assert course_stage._retained_crossing_wire_projection(
+        replace(target, log_scale_rate_s=0.0),
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_020_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    ) is None
+    assert course_stage._retained_crossing_wire_projection(
+        replace(target, log_scale_rate_s=-0.1),
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_020_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    ) is None
+    assert course_stage._retained_crossing_wire_projection(
+        replace(
+            target,
+            normalized_x=tuning.horizontal_corridor,
+            normalized_x_rate_s=tuning.stable_rate_norm_s,
+        ),
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_032_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    ) is None
+
+
+@pytest.mark.parametrize("wire_start", (None, True, -1))
+def test_retained_wire_projection_rejects_invalid_wire_timing(wire_start):
+    target, _output, _admission = (
+        _attempt8_close_alignment_crossing_values()
+    )
+
+    with pytest.raises(SafetyAbort, match="exact wire timing"):
+        course_stage._retained_crossing_wire_projection(
+            target,
+            observation_monotonic_ns=round(
+                target.received_monotonic_s * 1_000_000_000
+            ),
+            wire_start_monotonic_ns=wire_start,
+            tuning=default_visual_config().servo,
+            limits=VisualCourseStageLimits(),
+            abort_type=SafetyAbort,
+        )
+
+
+def test_retained_wire_projection_rejects_wire_before_observation():
+    target, _output, _admission = (
+        _attempt8_close_alignment_crossing_values()
+    )
+    target = replace(target, received_monotonic_s=1.0)
+
+    with pytest.raises(SafetyAbort, match="predates observation"):
+        course_stage._retained_crossing_wire_projection(
+            target,
+            observation_monotonic_ns=1_000_000_000,
+            wire_start_monotonic_ns=999_999_999,
+            tuning=default_visual_config().servo,
+            limits=VisualCourseStageLimits(),
+            abort_type=SafetyAbort,
+        )
 
 
 @pytest.mark.parametrize(
@@ -929,8 +1302,38 @@ def test_current_advance_crossing_proof_is_preserved():
         brake_reason=None,
     )
 
-    assert course_stage._crossing_anchor_basis(
+    not_raw_close = replace(
         target,
+        received_monotonic_s=1.0,
+        log_scale=limits.crossing_arm_min_log_scale - 0.01,
+        log_scale_rate_s=1.0,
+    )
+    projection = course_stage._retained_crossing_wire_projection(
+        not_raw_close,
+        observation_monotonic_ns=1_000_000_000,
+        wire_start_monotonic_ns=1_020_000_000,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+    assert projection is not None
+    assert course_stage._crossing_anchor_basis(
+        not_raw_close,
+        output,
+        passage_admission=None,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=3,
+        retained_crossing_dwell_frames=0,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projection,
+    ) is None
+    assert course_stage._crossing_anchor_basis(
+        replace(
+            target,
+            log_scale=limits.crossing_arm_min_log_scale,
+        ),
         output,
         passage_admission=None,
         current_gate_index=0,
@@ -940,6 +1343,91 @@ def test_current_advance_crossing_proof_is_preserved():
         tuning=tuning,
         limits=limits,
     ) == course_stage.CURRENT_ADVANCE_CROSSING_BASIS
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "schema",
+        "nested_start",
+        "top_start",
+        "host_start",
+        "frame_token",
+        "not_pinned",
+    ),
+)
+def test_visual_send_rejects_unbound_wire_timing(case):
+    class UnboundReceiptHost(_Host):
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(command, **kwargs)
+            if receipt is None:
+                return receipt
+            authority = receipt["visual_receiver_authority"]
+            if case == "schema":
+                authority["schema"] = "other"
+            elif case == "nested_start":
+                authority["call_start_monotonic_ns"] = True
+            elif case == "top_start":
+                receipt["call_start_monotonic_ns"] += 1
+            elif case == "host_start":
+                self._last_flight_command_started_ns += 1
+            elif case == "frame_token":
+                authority["frame_token"] = asdict(
+                    _token(
+                        kwargs[
+                            "wire_visual_token"
+                        ].publication_sequence
+                        + 1
+                    )
+                )
+            else:
+                authority[
+                    "publication_pinned_through_transport_return"
+                ] = False
+            return receipt
+
+    host = UnboundReceiptHost(initial_gate=3, finish_gate=3)
+    runtime, _calls = _runtime(host)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="lacks exact visual wire timing",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+
+@pytest.mark.parametrize("case", ("token", "observation"))
+def test_current_target_rejects_inconsistent_observation_provenance(case):
+    snapshot = _snapshot(0, "track-0", 10)
+    target = _target(snapshot, "track-0")
+    sample = snapshot.current_track.history[-1]
+    if case == "token":
+        snapshot.current_track.history = (
+            SimpleNamespace(
+                **{
+                    **vars(sample),
+                    "token": _token(11),
+                },
+            ),
+        )
+    else:
+        snapshot.current_track.history = (
+            SimpleNamespace(
+                **{
+                    **vars(sample),
+                    "observation_monotonic_ns": 200_000_001,
+                },
+            ),
+        )
+
+    with pytest.raises(SafetyAbort, match="provenance is inconsistent"):
+        course_stage._current_target_observation_monotonic_ns(
+            snapshot,
+            target,
+            abort_type=SafetyAbort,
+        )
 
 
 def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
@@ -978,6 +1466,8 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
                 received_monotonic_s=(
                     proposal.current_target.received_monotonic_s
                 ),
+                log_scale=-0.81,
+                log_scale_rate_s=1.0,
             )
             return SimpleNamespace(
                 current_target=target,
@@ -1008,6 +1498,17 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
 
         async def _send_flight_command(self, command, **kwargs):
             receipt = await super()._send_flight_command(command, **kwargs)
+            token = kwargs.get("wire_visual_token")
+            if receipt is not None and token is not None:
+                wire_start_ns = (
+                    token.publication_sequence * 20_000_000
+                    + 20_000_000
+                )
+                self._last_flight_command_started_ns = wire_start_ns
+                receipt["call_start_monotonic_ns"] = wire_start_ns
+                receipt["visual_receiver_authority"][
+                    "call_start_monotonic_ns"
+                ] = wire_start_ns
             if (
                 command.roll_rate
                 == command.pitch_rate
@@ -1041,9 +1542,18 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
     anchor = result["segments"][0]["crossing_anchor"]
     assert result["race_finished"] is True
     assert anchor["basis"] == (
-        course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+        course_stage
+        .RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
     )
     assert anchor["advance_command_count"] == 3
+    assert anchor["observation_to_wire_ns"] == 20_000_000
+    assert anchor["wire_projected_log_scale"] == pytest.approx(-0.79)
+    assert anchor["wire_projected_normalized_x"] == pytest.approx(
+        0.0103784585245201
+    )
+    assert anchor["wire_projected_normalized_y_down"] == pytest.approx(
+        -0.0400779026492578
+    )
     assert anchor["current_advance_enabled"] is False
     assert anchor["retained_crossing_dwell_frames"] == 3
     assert anchor["camera_token"]["publication_sequence"] == 17
@@ -2223,6 +2733,11 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
         ("passage_hard_duration_s", 8.01, "passage duration"),
         ("crossing_status_timeout_s", 0.41, "crossing wait"),
         ("post_credit_fresh_frame_timeout_s", 0.21, "fresh-frame"),
+        (
+            "retained_crossing_projection_min_log_scale",
+            -0.830001,
+            "retained projection scale",
+        ),
     ),
 )
 def test_course_limits_refuse_widened_safety_envelopes(

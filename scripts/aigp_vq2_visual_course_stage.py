@@ -97,6 +97,9 @@ CURRENT_ADVANCE_CROSSING_BASIS = "current-advance-corridor-v1"
 RETAINED_ADVANCE_CROSSING_BASIS = (
     "retained-advance-close-alignment-dwell-v1"
 )
+RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS = (
+    "retained-advance-wire-projected-close-alignment-dwell-v1"
+)
 _YAW_PROFILE_ISSUER = object()
 
 
@@ -200,6 +203,20 @@ class _Gate0ProvedCollectiveState:
 class _AcceptedVisualCommand:
     command: AttitudeRateCommand
     yaw_soft_stop_zeroed: bool
+    observation_monotonic_ns: int
+    wire_start_monotonic_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedCrossingWireProjection:
+    target: Any
+    observation_monotonic_ns: int
+    wire_start_monotonic_ns: int
+    observation_to_wire_ns: int
+    observation_to_wire_s: float
+    projected_log_scale: float
+    projected_normalized_x: float
+    projected_normalized_y_down: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,11 +242,11 @@ class VisualCourseStageLimits:
     max_measured_yaw_rate_rad_s: float = 0.50
     min_thrust: float = MIN_VISUAL_THRUST
     max_thrust: float = MAX_VISUAL_THRUST
-    # Attempt 10 supplied ten clean retained-close frames but the final safe
-    # uncensored observation landed at -0.801151 because of pixel-scale
-    # quantization.  A -0.81 boundary admits that exact history while keeping
-    # the independent closure, center-rate, dwell, yaw, and geometry guards.
-    crossing_arm_min_log_scale: float = -0.81
+    crossing_arm_min_log_scale: float = -0.80
+    # The last clean retained observations in attempts 10 and 11 were
+    # -0.801151 and -0.827087.  Projection may refine command-wire timing,
+    # but may never expand authority beyond this independently replayed floor.
+    retained_crossing_projection_min_log_scale: float = -0.83
     crossing_arm_min_log_scale_rate_s: float = 0.0
     crossing_arm_min_advance_commands: int = 3
     max_gate_segments: int = 64
@@ -254,6 +271,7 @@ class VisualCourseStageLimits:
             self.min_thrust,
             self.max_thrust,
             self.crossing_arm_min_log_scale,
+            self.retained_crossing_projection_min_log_scale,
             self.crossing_arm_min_log_scale_rate_s,
         )
         if not all(
@@ -340,6 +358,14 @@ class VisualCourseStageLimits:
             raise ValueError("visual-course thrust bounds are invalid")
         if not -1.50 <= self.crossing_arm_min_log_scale <= -0.20:
             raise ValueError("visual-course crossing scale is outside bounds")
+        if not (
+            -0.83
+            <= self.retained_crossing_projection_min_log_scale
+            <= self.crossing_arm_min_log_scale
+        ):
+            raise ValueError(
+                "visual-course retained projection scale is outside bounds"
+            )
         if not 0.0 <= self.crossing_arm_min_log_scale_rate_s <= 1.0:
             raise ValueError("visual-course crossing scale rate is invalid")
         if (
@@ -864,6 +890,233 @@ def _retained_crossing_observation_usable(
     )
 
 
+def _retained_crossing_wire_projection(
+    target: Any,
+    *,
+    observation_monotonic_ns: int,
+    wire_start_monotonic_ns: int,
+    tuning: Any,
+    limits: VisualCourseStageLimits,
+    abort_type: type[BaseException],
+) -> Optional[_RetainedCrossingWireProjection]:
+    """Project retained visual scale and center to its accepted wire instant."""
+
+    if type(wire_start_monotonic_ns) is not int or wire_start_monotonic_ns < 0:
+        raise abort_type(
+            "visual-course retained crossing lacks exact wire timing"
+        )
+    if (
+        type(observation_monotonic_ns) is not int
+        or observation_monotonic_ns < 0
+    ):
+        raise abort_type(
+            "visual-course retained crossing lacks exact observation timing"
+        )
+    received_s = float(target.received_monotonic_s)
+    raw_log_scale = float(target.log_scale)
+    log_scale_rate_s = float(target.log_scale_rate_s)
+    normalized_x = float(target.normalized_x)
+    normalized_y_down = float(target.normalized_y_down)
+    normalized_x_rate_s = float(target.normalized_x_rate_s)
+    normalized_y_rate_down_s = float(
+        target.normalized_y_rate_down_s
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (
+            received_s,
+            raw_log_scale,
+            log_scale_rate_s,
+            normalized_x,
+            normalized_y_down,
+            normalized_x_rate_s,
+            normalized_y_rate_down_s,
+        )
+    ) or received_s < 0.0:
+        raise abort_type(
+            "visual-course retained crossing timing is invalid"
+        )
+    if round(received_s * 1_000_000_000) != observation_monotonic_ns:
+        raise abort_type(
+            "visual-course retained crossing observation timing differs "
+            "from its target"
+        )
+    observation_to_wire_ns = (
+        wire_start_monotonic_ns - observation_monotonic_ns
+    )
+    if observation_to_wire_ns < 0:
+        raise abort_type(
+            "visual-course retained crossing wire predates observation"
+        )
+    max_projection_ns = round(
+        (
+            limits.control_period_s
+            + limits.max_validation_to_wire_delay_s
+        )
+        * 1_000_000_000
+    )
+    if (
+        observation_to_wire_ns > max_projection_ns
+        or log_scale_rate_s <= 0.0
+    ):
+        return None
+    observation_to_wire_s = observation_to_wire_ns / 1_000_000_000.0
+    projected_log_scale = (
+        raw_log_scale + log_scale_rate_s * observation_to_wire_s
+    )
+    projected_normalized_x = (
+        normalized_x + normalized_x_rate_s * observation_to_wire_s
+    )
+    projected_normalized_y_down = (
+        normalized_y_down
+        + normalized_y_rate_down_s * observation_to_wire_s
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (
+            projected_log_scale,
+            projected_normalized_x,
+            projected_normalized_y_down,
+        )
+    ):
+        raise abort_type(
+            "visual-course retained crossing projection is invalid"
+        )
+    if (
+        abs(projected_normalized_x) > tuning.horizontal_corridor
+        or abs(projected_normalized_y_down) > tuning.vertical_corridor
+    ):
+        return None
+    return _RetainedCrossingWireProjection(
+        target=target,
+        observation_monotonic_ns=observation_monotonic_ns,
+        wire_start_monotonic_ns=wire_start_monotonic_ns,
+        observation_to_wire_ns=observation_to_wire_ns,
+        observation_to_wire_s=observation_to_wire_s,
+        projected_log_scale=projected_log_scale,
+        projected_normalized_x=projected_normalized_x,
+        projected_normalized_y_down=projected_normalized_y_down,
+    )
+
+
+def _retained_crossing_projection_matches_target(
+    target: Any,
+    projection: Any,
+    *,
+    tuning: Any,
+    limits: VisualCourseStageLimits,
+) -> bool:
+    """Recompute a private projection before it may prove crossing."""
+
+    if (
+        type(projection) is not _RetainedCrossingWireProjection
+        or projection.target is not target
+    ):
+        return False
+    observation_ns = round(
+        float(target.received_monotonic_s) * 1_000_000_000
+    )
+    horizon_ns = (
+        projection.wire_start_monotonic_ns - observation_ns
+    )
+    max_horizon_ns = round(
+        (
+            limits.control_period_s
+            + limits.max_validation_to_wire_delay_s
+        )
+        * 1_000_000_000
+    )
+    if (
+        projection.observation_monotonic_ns != observation_ns
+        or horizon_ns != projection.observation_to_wire_ns
+        or not 0 <= horizon_ns <= max_horizon_ns
+        or float(target.log_scale_rate_s) <= 0.0
+    ):
+        return False
+    horizon_s = horizon_ns / 1_000_000_000.0
+    expected_log_scale = (
+        float(target.log_scale)
+        + float(target.log_scale_rate_s) * horizon_s
+    )
+    expected_x = (
+        float(target.normalized_x)
+        + float(target.normalized_x_rate_s) * horizon_s
+    )
+    expected_y = (
+        float(target.normalized_y_down)
+        + float(target.normalized_y_rate_down_s) * horizon_s
+    )
+    return bool(
+        math.isclose(
+            projection.observation_to_wire_s,
+            horizon_s,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            projection.projected_log_scale,
+            expected_log_scale,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            projection.projected_normalized_x,
+            expected_x,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            projection.projected_normalized_y_down,
+            expected_y,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and abs(expected_x) <= tuning.horizontal_corridor
+        and abs(expected_y) <= tuning.vertical_corridor
+    )
+
+
+def _current_target_observation_monotonic_ns(
+    snapshot: Any,
+    target: Any,
+    *,
+    abort_type: type[BaseException],
+) -> int:
+    """Bind the proposal to the exact latest receiver observation QPC."""
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    history = getattr(track, "history", None)
+    if (
+        type(token) is not CameraFrameToken
+        or not _servo_token_matches_camera(target.frame_token, token)
+        or type(history) is not tuple
+        or not history
+    ):
+        raise abort_type(
+            "visual-course target lacks exact observation provenance"
+        )
+    latest_sample = history[-1]
+    observation_monotonic_ns = getattr(
+        latest_sample,
+        "observation_monotonic_ns",
+        None,
+    )
+    if (
+        getattr(latest_sample, "token", None) != token
+        or type(observation_monotonic_ns) is not int
+        or observation_monotonic_ns < 0
+        or round(
+            float(target.received_monotonic_s) * 1_000_000_000
+        )
+        != observation_monotonic_ns
+    ):
+        raise abort_type(
+            "visual-course target observation provenance is inconsistent"
+        )
+    return observation_monotonic_ns
+
+
 def _crossing_anchor_basis(
     target: Any,
     output: Any,
@@ -875,13 +1128,15 @@ def _crossing_anchor_basis(
     retained_crossing_dwell_frames: int,
     tuning: Any,
     limits: VisualCourseStageLimits,
+    retained_wire_projection: Optional[
+        _RetainedCrossingWireProjection
+    ] = None,
 ) -> Optional[str]:
     """Select an exact-frame crossing proof without adding motion authority."""
 
     if (
         advance_command_count
         < limits.crossing_arm_min_advance_commands
-        or float(target.log_scale) < limits.crossing_arm_min_log_scale
         or float(target.log_scale_rate_s)
         < limits.crossing_arm_min_log_scale_rate_s
         or target.clipped
@@ -890,7 +1145,8 @@ def _crossing_anchor_basis(
     ):
         return None
     if (
-        output.corridor_frames >= tuning.required_corridor_frames
+        float(target.log_scale) >= limits.crossing_arm_min_log_scale
+        and output.corridor_frames >= tuning.required_corridor_frames
         and output.advance_enabled
     ):
         return CURRENT_ADVANCE_CROSSING_BASIS
@@ -908,7 +1164,21 @@ def _crossing_anchor_basis(
             limits=limits,
         )
     ):
-        return RETAINED_ADVANCE_CROSSING_BASIS
+        if float(target.log_scale) >= limits.crossing_arm_min_log_scale:
+            return RETAINED_ADVANCE_CROSSING_BASIS
+        if (
+            float(target.log_scale)
+            >= limits.retained_crossing_projection_min_log_scale
+            and _retained_crossing_projection_matches_target(
+                target,
+                retained_wire_projection,
+                tuning=tuning,
+                limits=limits,
+            )
+            and retained_wire_projection.projected_log_scale
+            >= limits.crossing_arm_min_log_scale
+        ):
+            return RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
     return None
 
 
@@ -1337,6 +1607,13 @@ async def _run_visual_course_stage_impl(
             return None
 
         output = proposal.servo_output
+        observation_monotonic_ns = (
+            _current_target_observation_monotonic_ns(
+                snapshot,
+                proposal.current_target,
+                abort_type=abort_type,
+            )
+        )
         requested_yaw = float(output.yaw_rate_rad_s)
         if requested_yaw != 0.0:
             profile = runtime.yaw_profile
@@ -1564,6 +1841,31 @@ async def _run_visual_course_stage_impl(
             )
         ):
             raise abort_type("visual-course send lacks visual wire authority")
+        visual_wire_authority = receipt["visual_receiver_authority"]
+        wire_start_monotonic_ns = visual_wire_authority.get(
+            "call_start_monotonic_ns"
+        )
+        top_level_wire_start_ns = receipt.get("call_start_monotonic_ns")
+        wire_frame_token = visual_wire_authority.get("frame_token")
+        if (
+            visual_wire_authority.get("schema")
+            != "aigp-vq2-visual-wire-authority/1"
+            or type(wire_start_monotonic_ns) is not int
+            or wire_start_monotonic_ns < 0
+            or top_level_wire_start_ns != wire_start_monotonic_ns
+            or host._last_flight_command_started_ns
+            != wire_start_monotonic_ns
+            or not isinstance(wire_frame_token, Mapping)
+            or dict(wire_frame_token)
+            != asdict(snapshot.latest_camera_token)
+            or visual_wire_authority.get(
+                "publication_pinned_through_transport_return"
+            )
+            is not True
+        ):
+            raise abort_type(
+                "visual-course send lacks exact visual wire timing"
+            )
         if yaw_soft_stop_zeroed:
             segment["yaw_soft_stop_zero_command_count"] = int(
                 segment["yaw_soft_stop_zero_command_count"]
@@ -1631,6 +1933,8 @@ async def _run_visual_course_stage_impl(
         return _AcceptedVisualCommand(
             command=command,
             yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
+            observation_monotonic_ns=observation_monotonic_ns,
+            wire_start_monotonic_ns=wire_start_monotonic_ns,
         )
 
     for segment_number in range(limits.max_gate_segments):
@@ -2108,6 +2412,12 @@ async def _run_visual_course_stage_impl(
                 advance_command_count += 1
                 segment["advance_command_count"] = advance_command_count
             target = proposal.current_target
+            target_observation_monotonic_ns = (
+                accepted.observation_monotonic_ns
+            )
+            retained_wire_projection: Optional[
+                _RetainedCrossingWireProjection
+            ] = None
             if accepted.yaw_soft_stop_zeroed:
                 retained_crossing_dwell_frames = 0
             elif _retained_crossing_observation_usable(
@@ -2117,6 +2427,25 @@ async def _run_visual_course_stage_impl(
                 limits=limits,
             ):
                 retained_crossing_dwell_frames += 1
+                if (
+                    limits.retained_crossing_projection_min_log_scale
+                    <= float(target.log_scale)
+                    < limits.crossing_arm_min_log_scale
+                ):
+                    retained_wire_projection = (
+                        _retained_crossing_wire_projection(
+                            target,
+                            observation_monotonic_ns=(
+                                target_observation_monotonic_ns
+                            ),
+                            wire_start_monotonic_ns=(
+                                accepted.wire_start_monotonic_ns
+                            ),
+                            tuning=host.visual_config.servo,
+                            limits=limits,
+                            abort_type=abort_type,
+                        )
+                    )
             else:
                 retained_crossing_dwell_frames = 0
             segment["retained_crossing_dwell_frames"] = (
@@ -2141,6 +2470,7 @@ async def _run_visual_course_stage_impl(
                     ),
                     tuning=host.visual_config.servo,
                     limits=limits,
+                    retained_wire_projection=retained_wire_projection,
                 )
             )
             if crossing_basis is not None:
@@ -2152,7 +2482,53 @@ async def _run_visual_course_stage_impl(
                     ),
                     "track_id": target.track_id,
                     "log_scale": target.log_scale,
+                    "observation_log_scale": target.log_scale,
                     "log_scale_rate_s": target.log_scale_rate_s,
+                    "observation_monotonic_ns": (
+                        target_observation_monotonic_ns
+                    ),
+                    "wire_start_monotonic_ns": (
+                        accepted.wire_start_monotonic_ns
+                    ),
+                    "observation_to_wire_s": (
+                        None
+                        if retained_wire_projection is None
+                        else (
+                            retained_wire_projection
+                            .observation_to_wire_s
+                        )
+                    ),
+                    "observation_to_wire_ns": (
+                        None
+                        if retained_wire_projection is None
+                        else (
+                            retained_wire_projection
+                            .observation_to_wire_ns
+                        )
+                    ),
+                    "wire_projected_log_scale": (
+                        None
+                        if retained_wire_projection is None
+                        else (
+                            retained_wire_projection.projected_log_scale
+                        )
+                    ),
+                    "wire_projected_normalized_x": (
+                        None
+                        if retained_wire_projection is None
+                        else (
+                            retained_wire_projection
+                            .projected_normalized_x
+                        )
+                    ),
+                    "wire_projected_normalized_y_down": (
+                        None
+                        if retained_wire_projection is None
+                        else (
+                            retained_wire_projection
+                            .projected_normalized_y_down
+                        )
+                    ),
                     "corridor_frames": (
                         proposal.servo_output.corridor_frames
                     ),
