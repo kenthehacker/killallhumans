@@ -14,9 +14,28 @@ import pytest
 from scripts import aigp_vq2_fast_cycle as fast_cycle
 from scripts import aigp_vq2_controller_config as controller_config
 from scripts import aigp_vq2_visual_config as visual_config
+from scripts import aigp_vq2_yaw_calibration as yaw_calibration
 
 
 UTC = datetime(2026, 7, 22, 20, 0, tzinfo=timezone.utc)
+
+
+def test_calibration_manifest_binds_exact_yaw_plan():
+    assert fast_cycle._excitation_plan_identity(
+        "calibration-excite"
+    ) == {
+        "plan_id": yaw_calibration.YAW_CALIBRATION_PLAN_ID,
+        "sha256": yaw_calibration.YAW_CALIBRATION_PLAN_SHA256,
+        "tick_count": yaw_calibration.YAW_CALIBRATION_TICK_COUNT,
+        "control_period_ns": (
+            yaw_calibration.YAW_CALIBRATION_CONTROL_PERIOD_NS
+        ),
+    }
+    assert fast_cycle._excitation_plan_identity("hover") is None
+    assert (
+        "scripts/aigp_vq2_yaw_calibration.py"
+        in fast_cycle._RUNTIME_SOURCE_PATHS
+    )
 
 
 @contextmanager

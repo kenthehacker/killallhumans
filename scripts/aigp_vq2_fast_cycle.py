@@ -67,6 +67,7 @@ _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_vq2_controller_config.py",
     "scripts/aigp_vq2_visual_config.py",
     "scripts/aigp_vq2_visual_alignment_stage.py",
+    "scripts/aigp_vq2_yaw_calibration.py",
     "scripts/aigp_vq2_fast_cycle.py",
     "scripts/aigp_vq2_run.py",
     "scripts/aigp_vq2_powered_attempt.py",
@@ -236,12 +237,14 @@ def _git_snapshot(repo_root: Path) -> dict[str, Any]:
 def _excitation_plan_identity(stage: str) -> Mapping[str, Any] | None:
     if stage != "calibration-excite":
         return None
-    from scripts import aigp_vq2_powered_attempt as contract
+    from scripts import aigp_vq2_yaw_calibration as contract
 
-    plan = contract.fast_excitation_plan()
+    plan = contract.validate_yaw_calibration_plan(
+        contract.yaw_calibration_plan()
+    )
     return {
         "plan_id": plan["plan_id"],
-        "sha256": contract.canonical_object_sha256(plan),
+        "sha256": contract.YAW_CALIBRATION_PLAN_SHA256,
         "tick_count": plan["tick_count"],
         "control_period_ns": plan["control_period_ns"],
     }

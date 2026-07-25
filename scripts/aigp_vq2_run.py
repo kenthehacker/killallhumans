@@ -67,8 +67,15 @@ from typing import (
 
 from competition.adapter import AttitudeRateCommand, Quaternion
 from competition.aigp_messages import RaceStatus
-from competition.vq2_capture import MavlinkIngressV1, ReceivedIMUSampleV1
-from competition.vq2_contracts import FrameEdge
+from competition.vq2_capture import (
+    HOST_PERF_COUNTER_CLOCK_ID,
+    MavlinkIngressV1,
+    ReceivedIMUSampleV1,
+)
+from competition.vq2_contracts import (
+    FrameEdge,
+    FrameTimingV1,
+)
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from competition.vq2_visual_tracker import (
     CameraFrameToken as VisualCameraFrameToken,
@@ -243,6 +250,9 @@ SIGN_ID_MIN_IMAGE_EFFECT_PX_S = 15.0
 SIGN_ID_MAX_POLARITY_GAIN_RATIO = 2.0
 SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD = 0.05
 SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S = 0.50
+SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S = 0.08
+SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S = 0.09
+SIGN_ID_CONTROL_HOLD_HORIZON_S = 0.12
 
 MAX_HEARTBEAT_AGE_S = 1.5
 MAX_IMU_AGE_S = 0.050
@@ -8330,6 +8340,8 @@ class VQ2Runner:
         self.estimate: Optional[AttitudeEstimate] = None
         self._last_imu_us: Optional[int] = None
         self._last_imu_advance_s = 0.0
+        self._last_imu_received_monotonic_ns: Optional[int] = None
+        self._last_imu_receipt_exact = False
         self._last_race_boot_ms: Optional[int] = None
         self._last_race_advance_s = 0.0
         self._last_frame_identity: Optional[Tuple[int, int]] = None
@@ -8355,6 +8367,7 @@ class VQ2Runner:
         self._latest_detection_frame_sim_ns: Optional[int] = None
         self._latest_detection_generation: Optional[int] = None
         self._latest_detection_received_s: Optional[float] = None
+        self._latest_detection_timing: Optional[FrameTimingV1] = None
         self._latest_detection_image: Any = None
         self._post_gate_last_frame: Optional[Tuple[Tuple[int, int, int], Any]] = None
         self._vision_diagnostic_logging = False
@@ -8595,6 +8608,8 @@ class VQ2Runner:
         self.estimate = None
         self._last_imu_us = None
         self._last_imu_advance_s = 0.0
+        self._last_imu_received_monotonic_ns = None
+        self._last_imu_receipt_exact = False
         self._last_race_boot_ms = None
         self._last_race_advance_s = 0.0
         self._last_frame_identity = None
@@ -8619,6 +8634,7 @@ class VQ2Runner:
         self._latest_detection_frame_sim_ns = None
         self._latest_detection_generation = None
         self._latest_detection_received_s = None
+        self._latest_detection_timing = None
         self._latest_detection_image = None
         self._vision_diagnostic_logging = False
         self._post_gate_reacquisition = False
@@ -8663,6 +8679,22 @@ class VQ2Runner:
             estimate = self.estimator.update_imu(imu)
             self._last_imu_us = stamp
             self._last_imu_advance_s = now
+            if received_sample is None:
+                self._last_imu_received_monotonic_ns = None
+                self._last_imu_receipt_exact = False
+            else:
+                ingress = getattr(received_sample, "ingress", None)
+                received_ns = getattr(
+                    ingress,
+                    "received_monotonic_ns",
+                    None,
+                )
+                if type(received_ns) is not int or received_ns < 0:
+                    raise TypeError(
+                        "received IMU sample lacks an exact host receipt"
+                    )
+                self._last_imu_received_monotonic_ns = received_ns
+                self._last_imu_receipt_exact = True
             if estimate is None and estimator_was_ready:
                 # Transport freshness is not estimator health. Once the
                 # estimator is ready, any rejected newer sample must latch
@@ -8811,6 +8843,22 @@ class VQ2Runner:
             self._latest_detection_frame_sim_ns = int(snapshot.sim_time_ns)
             self._latest_detection_generation = int(snapshot.generation)
             self._latest_detection_received_s = float(snapshot.received_monotonic_s)
+            timing = getattr(snapshot, "timing", None)
+            self._latest_detection_timing = (
+                timing
+                if (
+                    type(timing) is FrameTimingV1
+                    and timing.host_clock_id
+                    == HOST_PERF_COUNTER_CLOCK_ID
+                    and timing.identity.generation
+                    == int(snapshot.generation)
+                    and timing.identity.frame_id
+                    == int(snapshot.frame_id)
+                    and timing.camera_source_time_ns
+                    == int(snapshot.sim_time_ns)
+                )
+                else None
+            )
             work_started_ns = (
                 time.perf_counter_ns() if capture_enabled else None
             )
@@ -10178,39 +10226,45 @@ class VQ2Runner:
             logger.critical("UNRESOLVED EMERGENCY: stop/reset state was not fully confirmed")
         return confirmed
 
-    async def _run_sign_id(self) -> Dict[str, Any]:
+    async def _run_sign_id(
+        self,
+        *,
+        calibration_context: Optional[StartContext] = None,
+    ) -> Dict[str, Any]:
+        from scripts.aigp_vq2_yaw_calibration import (
+            YAW_CALIBRATION_CONTROL_PERIOD_NS,
+            YAW_CALIBRATION_HARD_EXPIRY_OFFSET_NS,
+            YAW_CALIBRATION_PLAN_ID,
+            YAW_CALIBRATION_PLAN_SHA256,
+            YAW_CALIBRATION_RATE_RAD_S,
+            YAW_CALIBRATION_THRUST,
+            iter_yaw_calibration_ticks,
+            validate_yaw_calibration_plan,
+            yaw_calibration_plan,
+        )
+
+        plan = validate_yaw_calibration_plan(yaw_calibration_plan())
+        if (
+            YAW_CALIBRATION_CONTROL_PERIOD_NS
+            != round(CONTROL_PERIOD_S * 1_000_000_000)
+            or YAW_CALIBRATION_RATE_RAD_S != SIGN_ID_RATE_RAD_S
+            or YAW_CALIBRATION_THRUST != SIGN_ID_THRUST
+        ):
+            raise SafetyAbort(
+                "yaw calibration plan diverged from runner command bounds"
+            )
         assert self.estimate is not None
         start_rpy = self.estimate.orientation.to_euler()
         max_excursion = 0.0
         max_abs_measured_yaw_rate = abs(float(self.estimate.body_rates[2]))
-        segments = [
-            (
-                "neutral-pre-yaw",
-                SIGN_ID_YAW_NEUTRAL_DURATION_S,
-                (0.0, 0.0, 0.0),
-            ),
-            (
-                "yaw-positive",
-                SIGN_ID_YAW_PULSE_DURATION_S,
-                (0.0, 0.0, SIGN_ID_RATE_RAD_S),
-            ),
-            (
-                "neutral-reversal",
-                SIGN_ID_YAW_REVERSAL_DURATION_S,
-                (0.0, 0.0, 0.0),
-            ),
-            (
-                "yaw-negative",
-                SIGN_ID_YAW_PULSE_DURATION_S,
-                (0.0, 0.0, -SIGN_ID_RATE_RAD_S),
-            ),
-            (
-                "neutral-terminal",
-                SIGN_ID_YAW_TERMINAL_DURATION_S,
-                (0.0, 0.0, 0.0),
-            ),
-        ]
-        responses: Dict[str, List[Tuple[int, float]]] = {
+        segment_names = {
+            "neutral-initial": "neutral-pre-yaw",
+            "yaw-positive": "yaw-positive",
+            "neutral-reversal": "neutral-reversal",
+            "yaw-negative": "yaw-negative",
+            "neutral-terminal": "neutral-terminal",
+        }
+        responses: Dict[str, List[Tuple[int, int, float]]] = {
             "neutral-pre-yaw": [],
             "yaw-positive": [],
             "yaw-negative": [],
@@ -10220,13 +10274,16 @@ class VQ2Runner:
             "yaw-positive",
             "yaw-negative",
         )
-        image_samples: Dict[str, List[Tuple[float, float]]] = {
+        image_samples: Dict[str, List[Tuple[int, float]]] = {
             name: [] for name in image_segment_names
         }
         wire_yaw_rates: Dict[str, List[float]] = {
             "yaw-positive": [],
             "yaw-negative": [],
         }
+        wire_start_ns: Dict[str, int] = {}
+        wire_release_ns: Dict[str, int] = {}
+        wire_imu_anchor_us: Dict[str, int] = {}
 
         def wrapped_yaw_excursion(yaw: float) -> float:
             delta = float(yaw) - float(start_rpy[2])
@@ -10246,7 +10303,8 @@ class VQ2Runner:
                     f"sign-ID {name} image times did not advance"
                 )
             pairwise_slopes = [
-                (later[1] - earlier[1]) / (later[0] - earlier[0])
+                (later[1] - earlier[1])
+                / ((later[0] - earlier[0]) / 1_000_000_000.0)
                 for index, earlier in enumerate(samples)
                 for later in samples[index + 1 :]
             ]
@@ -10289,9 +10347,186 @@ class VQ2Runner:
                 raise SafetyAbort("sign-ID yaw wire mapping is invalid")
             return float(body_rates[2])
 
+        def observe_calibration_state(
+            *,
+            active_segment: Optional[str],
+            active_wire_release_ns: Optional[int],
+            last_image_token: Optional[Tuple[int, int, int]],
+        ) -> Optional[Tuple[int, int, int]]:
+            nonlocal max_excursion, max_abs_measured_yaw_rate
+
+            self._sample()
+            self._watchdog(allow_benign_pad_contact=True)
+            if calibration_context is not None:
+                self._check_calibration_envelope(
+                    calibration_context
+                )
+            assert self.estimate is not None
+            race = self.adapter.race_status
+            if race is None or int(race.active_gate_index) != 0:
+                raise SafetyAbort(
+                    "sign-ID active gate changed from gate 0"
+                )
+            current_rpy = self.estimate.orientation.to_euler()
+            yaw_excursion = wrapped_yaw_excursion(current_rpy[2])
+            max_excursion = max(
+                max_excursion,
+                abs(current_rpy[0] - start_rpy[0]),
+                abs(current_rpy[1] - start_rpy[1]),
+                abs(yaw_excursion),
+            )
+            measured_yaw_rate = float(self.estimate.body_rates[2])
+            max_abs_measured_yaw_rate = max(
+                max_abs_measured_yaw_rate,
+                abs(measured_yaw_rate),
+            )
+            if max_excursion > SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD:
+                raise SafetyAbort(
+                    "sign-ID attitude excursion too large "
+                    f"({max_excursion:.3f}rad)"
+                )
+            if (
+                abs(measured_yaw_rate)
+                > SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S
+            ):
+                raise SafetyAbort(
+                    "sign-ID measured yaw rate exceeded "
+                    f"{SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S:.2f}rad/s"
+                )
+
+            target = self.tracker.target
+            if (
+                target is None
+                or target.composite
+                or self.tracker.last_selection_mode != "primary"
+                or type(self._latest_detection_generation) is not int
+            ):
+                raise SafetyAbort(
+                    "sign-ID yaw image target lost primary authority"
+                )
+            image_token = (
+                int(self._latest_detection_generation),
+                int(target.frame_id),
+                int(target.sim_time_ns),
+            )
+            if image_token != last_image_token:
+                if (
+                    last_image_token is not None
+                    and (
+                        image_token[0] != last_image_token[0]
+                        or image_token[1] <= last_image_token[1]
+                        or image_token[2] <= last_image_token[2]
+                    )
+                ):
+                    raise SafetyAbort(
+                        "sign-ID yaw image frame did not advance"
+                    )
+                last_image_token = image_token
+                timing = self._latest_detection_timing
+                if (
+                    type(timing) is not FrameTimingV1
+                    or timing.host_clock_id
+                    != HOST_PERF_COUNTER_CLOCK_ID
+                    or timing.identity.generation != image_token[0]
+                    or timing.identity.frame_id != image_token[1]
+                    or timing.camera_source_time_ns != image_token[2]
+                ):
+                    raise SafetyAbort(
+                        "sign-ID yaw image frame lacks exact host timing"
+                    )
+                if (
+                    active_segment in image_samples
+                    and active_wire_release_ns is not None
+                    and timing.first_unique_packet_monotonic_ns
+                    >= active_wire_release_ns
+                    + round(
+                        SIGN_ID_RESPONSE_SETTLE_S
+                        * 1_000_000_000
+                    )
+                ):
+                    assert active_segment is not None
+                    image_samples[active_segment].append(
+                        (
+                            timing.final_unique_packet_monotonic_ns,
+                            float(target.center_x),
+                        )
+                    )
+                    self.recorder.emit(
+                        "sign_id_yaw_image_frame",
+                        segment=active_segment,
+                        frame_id=target.frame_id,
+                        sim_time_ns=target.sim_time_ns,
+                        host_clock_id=timing.host_clock_id,
+                        publication_sequence=(
+                            timing.publication_sequence
+                        ),
+                        first_unique_packet_monotonic_ns=(
+                            timing.first_unique_packet_monotonic_ns
+                        ),
+                        final_unique_packet_monotonic_ns=(
+                            timing.final_unique_packet_monotonic_ns
+                        ),
+                        center_x=target.center_x,
+                    )
+
+            if (
+                active_segment in responses
+                and active_wire_release_ns is not None
+            ):
+                assert active_segment is not None
+                timestamp_us = int(self.estimate.timestamp_us)
+                received_ns = self._last_imu_received_monotonic_ns
+                if (
+                    self._last_imu_receipt_exact is not True
+                    or type(received_ns) is not int
+                    or active_segment not in wire_release_ns
+                    or active_segment not in wire_imu_anchor_us
+                ):
+                    raise SafetyAbort(
+                        "sign-ID yaw response lacks exact HIGHRES_IMU "
+                        "receipt provenance"
+                    )
+                if (
+                    timestamp_us
+                    > wire_imu_anchor_us[active_segment]
+                    and received_ns
+                    >= wire_release_ns[active_segment]
+                    + round(
+                        SIGN_ID_RESPONSE_SETTLE_S
+                        * 1_000_000_000
+                    )
+                    and (
+                        not responses[active_segment]
+                        or timestamp_us
+                        > responses[active_segment][-1][0]
+                    )
+                ):
+                    responses[active_segment].append(
+                        (
+                            timestamp_us,
+                            received_ns,
+                            float(self.estimate.body_rates[2]),
+                        )
+                    )
+            return last_image_token
+
         try:
-            flight_start = await self._wait_for_next_flight_command_slot()
-            next_tick = flight_start
+            await self._wait_for_next_flight_command_slot()
+            flight_start_ns = time.perf_counter_ns()
+            flight_start = flight_start_ns / 1_000_000_000.0
+            hard_deadline_ns = (
+                flight_start_ns
+                + YAW_CALIBRATION_HARD_EXPIRY_OFFSET_NS
+            )
+            self.recorder.emit(
+                "yaw_calibration_plan_start",
+                plan_id=YAW_CALIBRATION_PLAN_ID,
+                plan_sha256=YAW_CALIBRATION_PLAN_SHA256,
+                tick_count=plan["tick_count"],
+                control_period_ns=plan["control_period_ns"],
+                flight_start_monotonic_ns=flight_start_ns,
+                hard_deadline_monotonic_ns=hard_deadline_ns,
+            )
             initial_target = self.tracker.target
             last_image_token = (
                 None
@@ -10306,161 +10541,151 @@ class VQ2Runner:
                 )
             )
             active_segment: Optional[str] = None
-            active_wire_release_s: Optional[float] = None
-            for name, duration, rates in segments:
-                segment_start = time.monotonic()
-                while time.monotonic() - segment_start < duration:
-                    elapsed = time.monotonic() - flight_start
-                    if elapsed >= SIGN_ID_HARD_EXPIRY_S:
-                        raise SafetyAbort("sign-ID hard expiry reached")
-                    self._sample()
-                    self._watchdog(allow_benign_pad_contact=True)
-                    assert self.estimate is not None
-                    race = self.adapter.race_status
-                    if (
-                        race is None
-                        or int(race.active_gate_index) != 0
-                    ):
-                        raise SafetyAbort(
-                            "sign-ID active gate changed from gate 0"
-                        )
-                    current_rpy = self.estimate.orientation.to_euler()
-                    yaw_excursion = wrapped_yaw_excursion(current_rpy[2])
-                    max_excursion = max(
-                        max_excursion,
-                        abs(current_rpy[0] - start_rpy[0]),
-                        abs(current_rpy[1] - start_rpy[1]),
-                        abs(yaw_excursion),
+            active_wire_release_ns: Optional[int] = None
+            previous_wire_start_ns = self._last_flight_command_started_ns
+            ticks_sent = 0
+            for planned_tick in iter_yaw_calibration_ticks(
+                anchor_monotonic_ns=flight_start_ns,
+            ):
+                nominal_release_ns = int(
+                    planned_tick["release_monotonic_ns"]
+                )
+                slot_end_ns = int(planned_tick["end_monotonic_ns"])
+                now_ns = time.perf_counter_ns()
+                if now_ns < nominal_release_ns:
+                    self._wait_for_calibration_release(
+                        nominal_release_ns
                     )
-                    measured_yaw_rate = float(self.estimate.body_rates[2])
-                    max_abs_measured_yaw_rate = max(
-                        max_abs_measured_yaw_rate,
-                        abs(measured_yaw_rate),
+                now_ns = time.perf_counter_ns()
+                if now_ns >= slot_end_ns or now_ns >= hard_deadline_ns:
+                    self.recorder.emit(
+                        "yaw_calibration_slot_missed",
+                        absolute_tick=planned_tick["absolute_tick"],
+                        observed_monotonic_ns=now_ns,
                     )
-                    if max_excursion > SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD:
-                        raise SafetyAbort(
-                            "sign-ID attitude excursion too large "
-                            f"({max_excursion:.3f}rad)"
-                        )
-                    if (
-                        abs(measured_yaw_rate)
-                        > SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S
-                    ):
-                        raise SafetyAbort(
-                            "sign-ID measured yaw rate exceeded "
-                            f"{SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S:.2f}rad/s"
-                        )
+                    raise SafetyAbort(
+                        "sign-ID yaw calibration slot was missed; "
+                        "no catch-up send"
+                    )
 
-                    target = self.tracker.target
-                    if (
-                        target is None
-                        or target.composite
-                        or self.tracker.last_selection_mode != "primary"
-                        or type(self._latest_detection_generation) is not int
-                    ):
-                        raise SafetyAbort(
-                            "sign-ID yaw image target lost primary authority"
-                        )
-                    image_token = (
-                        int(self._latest_detection_generation),
-                        int(target.frame_id),
-                        int(target.sim_time_ns),
-                    )
-                    if image_token != last_image_token:
-                        if (
-                            last_image_token is not None
-                            and (
-                                image_token[0] != last_image_token[0]
-                                or image_token[1] <= last_image_token[1]
-                                or image_token[2] <= last_image_token[2]
-                            )
-                        ):
-                            raise SafetyAbort(
-                                "sign-ID yaw image frame did not advance"
-                            )
-                        last_image_token = image_token
-                        if (
-                            active_segment in image_samples
-                            and active_wire_release_s is not None
-                            and float(target.received_monotonic_s)
-                            >= active_wire_release_s
-                            + SIGN_ID_RESPONSE_SETTLE_S
-                        ):
-                            assert active_segment is not None
-                            image_samples[active_segment].append(
-                                (
-                                    float(target.received_monotonic_s),
-                                    float(target.center_x),
-                                )
-                            )
-                            self.recorder.emit(
-                                "sign_id_yaw_image_frame",
-                                segment=active_segment,
-                                frame_id=target.frame_id,
-                                sim_time_ns=target.sim_time_ns,
-                                received_monotonic_s=(
-                                    target.received_monotonic_s
-                                ),
-                                center_x=target.center_x,
-                            )
+                last_image_token = observe_calibration_state(
+                    active_segment=active_segment,
+                    active_wire_release_ns=active_wire_release_ns,
+                    last_image_token=last_image_token,
+                )
+                command_value = planned_tick["command"]
+                command = AttitudeRateCommand(
+                    float(command_value["roll_rate_rad_s"]),
+                    float(command_value["pitch_rate_rad_s"]),
+                    float(command_value["yaw_rate_rad_s"]),
+                    float(command_value["thrust"]),
+                )
+                validate_command(command)
 
-                    if (
-                        active_segment in responses
-                        and active_wire_release_s is not None
-                        and time.monotonic()
-                        >= active_wire_release_s
-                        + SIGN_ID_RESPONSE_SETTLE_S
-                    ):
-                        assert active_segment is not None
-                        timestamp_us = int(self.estimate.timestamp_us)
-                        if (
-                            not responses[active_segment]
-                            or timestamp_us
-                            > responses[active_segment][-1][0]
-                        ):
-                            responses[active_segment].append(
-                                (
-                                    timestamp_us,
-                                    float(self.estimate.body_rates[2]),
-                                )
-                            )
+                earliest_send_ns = nominal_release_ns
+                if previous_wire_start_ns is not None:
+                    earliest_send_ns = max(
+                        earliest_send_ns,
+                        previous_wire_start_ns
+                        + YAW_CALIBRATION_CONTROL_PERIOD_NS,
+                    )
+                checked_ns = time.perf_counter_ns()
+                if checked_ns < earliest_send_ns:
+                    self._wait_for_calibration_release(
+                        earliest_send_ns
+                    )
+                    checked_ns = time.perf_counter_ns()
+                if (
+                    checked_ns >= slot_end_ns
+                    or checked_ns >= hard_deadline_ns
+                ):
+                    self.recorder.emit(
+                        "yaw_calibration_slot_missed",
+                        absolute_tick=planned_tick["absolute_tick"],
+                        observed_monotonic_ns=checked_ns,
+                    )
+                    raise SafetyAbort(
+                        "sign-ID yaw calibration slot expired before send"
+                    )
+                receipt = await self._send_flight_command(
+                    command,
+                    require_wire_receipt=True,
+                    wire_start_not_before_ns=earliest_send_ns,
+                    wire_start_deadline_ns=min(
+                        slot_end_ns,
+                        hard_deadline_ns,
+                    ),
+                )
+                wire_yaw = validate_wire_yaw(receipt, command)
+                assert receipt is not None
+                call_start_ns = receipt.get("call_start_monotonic_ns")
+                call_end_ns = receipt.get("call_end_monotonic_ns")
+                if (
+                    type(call_start_ns) is not int
+                    or type(call_end_ns) is not int
+                    or call_start_ns < nominal_release_ns
+                    or call_start_ns >= slot_end_ns
+                    or call_start_ns >= hard_deadline_ns
+                    or call_end_ns < call_start_ns
+                    or call_end_ns >= hard_deadline_ns
+                ):
+                    raise SafetyAbort(
+                        "sign-ID yaw wire timing left its exact slot"
+                    )
+                if (
+                    previous_wire_start_ns is not None
+                    and call_start_ns - previous_wire_start_ns
+                    < YAW_CALIBRATION_CONTROL_PERIOD_NS
+                ):
+                    raise SafetyAbort(
+                        "sign-ID yaw wire dispatch exceeded 50 Hz"
+                    )
+                previous_wire_start_ns = call_start_ns
+                name = segment_names[str(planned_tick["segment_id"])]
+                if active_segment != name:
+                    active_segment = name
+                    active_wire_release_ns = call_end_ns
+                    wire_start_ns[name] = call_start_ns
+                    wire_release_ns[name] = call_end_ns
+                    wire_imu_anchor_us[name] = int(
+                        self.estimate.timestamp_us
+                    )
+                if name in wire_yaw_rates:
+                    wire_yaw_rates[name].append(wire_yaw)
+                ticks_sent += 1
+                elapsed = (
+                    call_start_ns - flight_start_ns
+                ) / 1_000_000_000.0
+                self._record_tick(
+                    f"sign-id/{name}",
+                    elapsed,
+                    command,
+                )
 
-                    command = AttitudeRateCommand(
-                        rates[0],
-                        rates[1],
-                        rates[2],
-                        SIGN_ID_THRUST,
-                    )
-                    validate_command(command)
-                    receipt = await self._send_flight_command(
-                        command,
-                        require_wire_receipt=True,
-                    )
-                    wire_yaw = validate_wire_yaw(receipt, command)
-                    if active_segment != name:
-                        assert receipt is not None
-                        call_end_ns = receipt.get(
-                            "call_end_monotonic_ns"
-                        )
-                        if type(call_end_ns) is not int or call_end_ns < 0:
-                            raise SafetyAbort(
-                                "sign-ID wire release timestamp is invalid"
-                            )
-                        active_segment = name
-                        active_wire_release_s = (
-                            call_end_ns / 1_000_000_000.0
-                        )
-                    if name in wire_yaw_rates:
-                        wire_yaw_rates[name].append(wire_yaw)
-                    elapsed = time.monotonic() - flight_start
-                    self._record_tick(f"sign-id/{name}", elapsed, command)
-                    next_tick = next_control_deadline(
-                        next_tick,
-                        time.monotonic(),
-                    )
-                    await asyncio.sleep(
-                        max(0.0, next_tick - time.monotonic())
-                    )
+            plan_end_ns = (
+                flight_start_ns
+                + int(plan["nominal_end_offset_ns"])
+            )
+            if time.perf_counter_ns() < plan_end_ns:
+                self._wait_for_calibration_release(plan_end_ns)
+            last_image_token = observe_calibration_state(
+                active_segment=active_segment,
+                active_wire_release_ns=active_wire_release_ns,
+                last_image_token=last_image_token,
+            )
+            if (
+                ticks_sent != int(plan["tick_count"])
+                or time.perf_counter_ns() >= hard_deadline_ns
+            ):
+                raise SafetyAbort(
+                    "sign-ID yaw calibration did not complete its exact plan"
+                )
+            self.recorder.emit(
+                "yaw_calibration_plan_complete",
+                plan_id=YAW_CALIBRATION_PLAN_ID,
+                plan_sha256=YAW_CALIBRATION_PLAN_SHA256,
+                ticks_sent=ticks_sent,
+            )
 
             sparse_responses = [
                 name
@@ -10483,7 +10708,7 @@ class VQ2Runner:
             raw_means = {
                 axis: (
                     statistics.fmean(
-                        sample[1] for sample in values
+                        sample[2] for sample in values
                     )
                     if values
                     else 0.0
@@ -10492,7 +10717,7 @@ class VQ2Runner:
             }
             yaw_medians = {
                 name: statistics.median(
-                    sample[1] for sample in responses[name]
+                    sample[2] for sample in responses[name]
                 )
                 for name in (
                     "neutral-pre-yaw",
@@ -10525,6 +10750,47 @@ class VQ2Runner:
                     f"{means}"
                 )
 
+            def gyro_response_delay_upper_bound_s(name: str) -> float:
+                samples = responses[name]
+                expected_response = means[name]
+                baseline_rate = yaw_medians["neutral-pre-yaw"]
+                for index in range(len(samples) - 1):
+                    first = samples[index]
+                    second = samples[index + 1]
+                    first_response = first[2] - baseline_rate
+                    second_response = second[2] - baseline_rate
+                    if (
+                        abs(first_response)
+                        >= SIGN_ID_MIN_RESPONSE_RAD_S
+                        and abs(second_response)
+                        >= SIGN_ID_MIN_RESPONSE_RAD_S
+                        and first_response * expected_response > 0.0
+                        and second_response * expected_response > 0.0
+                    ):
+                        delay_s = (
+                            first[1] - wire_start_ns[name]
+                        ) / 1_000_000_000.0
+                        if (
+                            not math.isfinite(delay_s)
+                            or delay_s < SIGN_ID_RESPONSE_SETTLE_S
+                            or delay_s
+                            > SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S
+                        ):
+                            raise SafetyAbort(
+                                "sign-ID yaw gyro response delay exceeded "
+                                "its calibrated envelope: "
+                                f"{name}={delay_s:.6f}s"
+                            )
+                        return float(delay_s)
+                raise SafetyAbort(
+                    "sign-ID yaw lacks two consecutive exact gyro response "
+                    f"samples for {name}"
+                )
+
+            gyro_response_delays_s = {
+                name: gyro_response_delay_upper_bound_s(name)
+                for name in ("yaw-positive", "yaw-negative")
+            }
             slopes = {
                 name: image_slope(name)
                 for name in image_segment_names
@@ -10546,6 +10812,25 @@ class VQ2Runner:
                     "sign-ID yaw image response is inconclusive/wrong: "
                     f"positive={positive_effect:.6f}px/s, "
                     f"negative={negative_effect:.6f}px/s"
+                )
+            first_image_observation_delays_s = {
+                name: (
+                    image_samples[name][0][0]
+                    - wire_start_ns[name]
+                ) / 1_000_000_000.0
+                for name in ("yaw-positive", "yaw-negative")
+            }
+            if any(
+                not math.isfinite(delay_s)
+                or delay_s + 1e-9 < SIGN_ID_RESPONSE_SETTLE_S
+                or delay_s
+                > SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S
+                for delay_s in first_image_observation_delays_s.values()
+            ):
+                raise SafetyAbort(
+                    "sign-ID yaw first image observation exceeded its "
+                    "calibrated delay envelope: "
+                    f"{first_image_observation_delays_s}"
                 )
 
             gyro_gain = (
@@ -10604,9 +10889,17 @@ class VQ2Runner:
                     "corrected_median_yaw_rate_rad_s": (
                         means["yaw-positive"]
                     ),
+                    "gyro_response_delay_upper_bound_s": (
+                        gyro_response_delays_s["yaw-positive"]
+                    ),
                     "gyro_rate_gain": positive_gyro_gain,
                     "fresh_image_frame_count": len(
                         image_samples["yaw-positive"]
+                    ),
+                    "first_image_observation_delay_s": (
+                        first_image_observation_delays_s[
+                            "yaw-positive"
+                        ]
                     ),
                     "image_start_x_px": image_samples[
                         "yaw-positive"
@@ -10631,9 +10924,17 @@ class VQ2Runner:
                     "corrected_median_yaw_rate_rad_s": (
                         means["yaw-negative"]
                     ),
+                    "gyro_response_delay_upper_bound_s": (
+                        gyro_response_delays_s["yaw-negative"]
+                    ),
                     "gyro_rate_gain": negative_gyro_gain,
                     "fresh_image_frame_count": len(
                         image_samples["yaw-negative"]
+                    ),
+                    "first_image_observation_delay_s": (
+                        first_image_observation_delays_s[
+                            "yaw-negative"
+                        ]
                     ),
                     "image_start_x_px": image_samples[
                         "yaw-negative"
@@ -10653,6 +10954,10 @@ class VQ2Runner:
             }
             yaw_calibration = {
                 "yaw_identified": True,
+                "plan_id": YAW_CALIBRATION_PLAN_ID,
+                "plan_sha256": YAW_CALIBRATION_PLAN_SHA256,
+                "ticks_sent": ticks_sent,
+                "ticks_expected": int(plan["tick_count"]),
                 "controller_to_body_sign": controller_to_body_sign,
                 "controller_to_image_sign": controller_to_image_sign,
                 "command_rate_abs_rad_s": SIGN_ID_RATE_RAD_S,
@@ -10669,6 +10974,39 @@ class VQ2Runner:
                 "gyro_polarity_gain_ratio": gyro_gain_ratio,
                 "image_rate_gain_px_per_command_rad": image_gain,
                 "image_polarity_gain_ratio": image_gain_ratio,
+                "response_delay_basis": (
+                    "wire-call-start-to-first-of-two-consecutive-exact-"
+                    "highres-imu-threshold-crossings"
+                ),
+                "max_gyro_response_delay_upper_bound_s": max(
+                    gyro_response_delays_s.values()
+                ),
+                "max_first_image_observation_delay_s": max(
+                    first_image_observation_delays_s.values()
+                ),
+                "control_hold_horizon_s": (
+                    SIGN_ID_CONTROL_HOLD_HORIZON_S
+                ),
+                "conservative_command_envelope": {
+                    "max_abs_yaw_rate_command_rad_s": (
+                        SIGN_ID_RATE_RAD_S
+                    ),
+                    "max_gyro_response_delay_s": (
+                        SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S
+                    ),
+                    "max_first_image_observation_delay_s": (
+                        SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S
+                    ),
+                    "max_attitude_excursion_rad": (
+                        SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD
+                    ),
+                    "max_abs_measured_yaw_rate_rad_s": (
+                        SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S
+                    ),
+                    "control_hold_horizon_s": (
+                        SIGN_ID_CONTROL_HOLD_HORIZON_S
+                    ),
+                },
                 "neutral_image_slope_px_s": slopes[
                     "neutral-pre-yaw"
                 ],
@@ -10687,6 +11025,11 @@ class VQ2Runner:
                 **yaw_calibration,
             )
             return {
+                "calibration_kind": "yaw-sign-authority-delay",
+                "plan_id": YAW_CALIBRATION_PLAN_ID,
+                "plan_sha256": YAW_CALIBRATION_PLAN_SHA256,
+                "ticks_sent": ticks_sent,
+                "ticks_expected": int(plan["tick_count"]),
                 "mean_responses_rad_s": means,
                 "raw_mean_responses_rad_s": raw_means,
                 "baseline_rates_rad_s": baseline,
@@ -10700,6 +11043,8 @@ class VQ2Runner:
                     "sign_id_yaw_terminal",
                     success=False,
                     reason=str(exc) or type(exc).__name__,
+                    plan_id=YAW_CALIBRATION_PLAN_ID,
+                    plan_sha256=YAW_CALIBRATION_PLAN_SHA256,
                     max_attitude_excursion_rad=max_excursion,
                     max_abs_measured_yaw_rate_rad_s=(
                         max_abs_measured_yaw_rate
@@ -10791,12 +11136,28 @@ class VQ2Runner:
         self,
         context: StartContext,
     ) -> Dict[str, Any]:
-        """Run the reviewed 4.9 s waveform without the task-local freeze ceremony.
+        """Measure bounded yaw sign, authority, and exact response delay."""
 
-        This is intentionally only an execution shortcut. It retains the same
-        gate-zero corridor, attitude-excursion limit, zero yaw, exact 50 Hz
-        half-open slots, per-tick watchdog, and fail-closed cleanup owned by
-        ``run_powered_stage``. A missed slot aborts instead of being replayed.
+        details = await self._run_sign_id(
+            calibration_context=context,
+        )
+        return {
+            **details,
+            "stage": CALIBRATION_STAGE,
+            "calibration_scope": (
+                "yaw-only-sign-authority-delay-build3385"
+            ),
+        }
+
+    async def _run_legacy_roll_pitch_calibration_waveform(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Retain the historical reviewed roll/pitch waveform for replay tests.
+
+        The live ``calibration-excite`` stage now uses the shorter yaw-only
+        plan above.  This helper remains non-dispatched so historical exact
+        waveform contracts stay reviewable without widening live authority.
         """
 
         from scripts import aigp_vq2_powered_attempt as calibration_contract

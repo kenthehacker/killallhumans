@@ -5150,6 +5150,7 @@ def _configured_yaw_sign_id(
     *,
     image_command_sign=1.0,
     yaw_response_gain=2.0,
+    legacy_clock_offset_s=0.0,
 ):
     clock = [0.0]
     center_x = [322.0]
@@ -5167,7 +5168,7 @@ def _configured_yaw_sign_id(
     target = vq2_module.GateTarget(
         frame_id=frame_id[0],
         sim_time_ns=frame_id[0] * 1_000,
-        received_monotonic_s=clock[0],
+        received_monotonic_s=clock[0] + legacy_clock_offset_s,
         center_x=round(center_x[0]),
         center_y=174,
         bbox=(282, 134, 80, 80),
@@ -5207,6 +5208,10 @@ def _configured_yaw_sign_id(
             timestamp_us=imu_timestamp_us[0],
             body_rates=body_rates,
         )
+        runner._last_imu_received_monotonic_ns = round(
+            clock[0] * 1_000_000_000
+        )
+        runner._last_imu_receipt_exact = True
         if clock[0] + 1e-9 < next_camera_frame_s[0]:
             return
         while next_camera_frame_s[0] <= clock[0] + 1e-9:
@@ -5216,7 +5221,9 @@ def _configured_yaw_sign_id(
         current = vq2_module.GateTarget(
             frame_id=frame_id[0],
             sim_time_ns=frame_id[0] * 1_000,
-            received_monotonic_s=clock[0],
+            received_monotonic_s=(
+                clock[0] + legacy_clock_offset_s
+            ),
             center_x=current_x,
             center_y=174,
             bbox=(current_x - 40, 134, 80, 80),
@@ -5228,6 +5235,23 @@ def _configured_yaw_sign_id(
         runner._latest_detection_frame_id = current.frame_id
         runner._latest_detection_frame_sim_ns = current.sim_time_ns
         runner._latest_detection_received_s = current.received_monotonic_s
+        exact_frame_ns = round(clock[0] * 1_000_000_000)
+        runner._latest_detection_timing = FrameTimingV1(
+            identity=FrameIdentityV1(
+                stream_id="vq2-camera",
+                generation=1,
+                frame_id=current.frame_id,
+            ),
+            camera_source_time_ns=current.sim_time_ns,
+            host_clock_id="host-perf-counter",
+            publication_sequence=current.frame_id,
+            first_unique_packet_monotonic_ns=exact_frame_ns,
+            final_unique_packet_monotonic_ns=exact_frame_ns,
+            reassembly_complete_monotonic_ns=exact_frame_ns,
+            decode_start_monotonic_ns=exact_frame_ns,
+            decode_end_monotonic_ns=exact_frame_ns,
+            publish_monotonic_ns=exact_frame_ns,
+        )
 
     async def send(command, **kwargs):
         send_options.append(dict(kwargs))
@@ -5260,6 +5284,14 @@ def _configured_yaw_sign_id(
         lambda: round(clock[0] * 1_000_000_000),
     )
     monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_calibration_release",
+        lambda deadline_ns: clock.__setitem__(
+            0,
+            max(clock[0], deadline_ns / 1_000_000_000.0),
+        ),
+    )
     monkeypatch.setattr(runner, "_sample", sample)
     monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
     monkeypatch.setattr(runner, "_send_flight_command", send)
@@ -5288,6 +5320,7 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
 
     details = asyncio.run(runner._run_sign_id())
     yaw = details["yaw_calibration"]
+    from scripts import aigp_vq2_yaw_calibration as yaw_contract
 
     assert vq2_module.SIGN_ID_RATE_RAD_S == 0.08
     assert vq2_module.SIGN_ID_YAW_PULSE_DURATION_S == 0.21
@@ -5301,9 +5334,30 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     assert vq2_module.SIGN_ID_MAX_POLARITY_GAIN_RATIO == 2.0
     assert vq2_module.SIGN_ID_MAX_ATTITUDE_EXCURSION_RAD == 0.05
     assert vq2_module.SIGN_ID_MAX_MEASURED_YAW_RATE_RAD_S == 0.50
+    assert vq2_module.SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S == 0.08
+    assert (
+        vq2_module.SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S
+        == 0.09
+    )
+    assert vq2_module.SIGN_ID_CONTROL_HOLD_HORIZON_S == 0.12
     assert all(
-        option == {"require_wire_receipt": True}
+        option.get("require_wire_receipt") is True
+        and type(option.get("wire_start_not_before_ns")) is int
+        and type(option.get("wire_start_deadline_ns")) is int
+        and option["wire_start_not_before_ns"]
+        < option["wire_start_deadline_ns"]
         for option in send_options
+    )
+    assert (
+        len(adapter.commands)
+        == details["ticks_sent"]
+        == details["ticks_expected"]
+        == yaw_contract.YAW_CALIBRATION_TICK_COUNT
+    )
+    assert details["plan_id"] == yaw_contract.YAW_CALIBRATION_PLAN_ID
+    assert (
+        details["plan_sha256"]
+        == yaw_contract.YAW_CALIBRATION_PLAN_SHA256
     )
     positive = [
         command for command in adapter.commands
@@ -5323,6 +5377,18 @@ def test_sign_id_yaw_calibration_is_paired_isolated_and_measured(
     assert yaw["controller_to_body_sign"] == 1
     assert yaw["controller_to_image_sign"] == expected_image_sign
     assert yaw["gyro_rate_gain"] == pytest.approx(2.0)
+    assert (
+        yaw["max_gyro_response_delay_upper_bound_s"]
+        <= vq2_module.SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S
+    )
+    assert (
+        yaw["max_first_image_observation_delay_s"]
+        <= vq2_module.SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S
+    )
+    assert (
+        yaw["control_hold_horizon_s"]
+        == vq2_module.SIGN_ID_CONTROL_HOLD_HORIZON_S
+    )
     assert math.copysign(
         1.0,
         yaw["image_rate_gain_px_per_command_rad"],
@@ -5372,6 +5438,24 @@ def test_sign_id_yaw_rejects_stationary_image_response(monkeypatch):
     assert terminals[-1]["success"] is False
 
 
+def test_sign_id_yaw_delay_uses_exact_frame_clock_not_legacy_seconds(
+    monkeypatch,
+):
+    runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+        legacy_clock_offset_s=17.0,
+    )
+
+    details = asyncio.run(runner._run_sign_id())
+
+    yaw = details["yaw_calibration"]
+    assert yaw["max_first_image_observation_delay_s"] >= 0.04
+    assert (
+        yaw["max_first_image_observation_delay_s"]
+        <= vq2_module.SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S
+    )
+
+
 def test_sign_id_yaw_reuses_attitude_excursion_guard(monkeypatch):
     runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
         monkeypatch,
@@ -5381,6 +5465,98 @@ def test_sign_id_yaw_reuses_attitude_excursion_guard(monkeypatch):
 
     with pytest.raises(SafetyAbort, match="attitude excursion"):
         asyncio.run(runner._run_sign_id())
+
+
+def test_sign_id_yaw_requires_exact_imu_receipt_provenance(monkeypatch):
+    runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+    )
+    sample = runner._sample
+
+    def sample_without_exact_receipt():
+        sample()
+        runner._last_imu_receipt_exact = False
+
+    monkeypatch.setattr(runner, "_sample", sample_without_exact_receipt)
+
+    with pytest.raises(SafetyAbort, match="exact HIGHRES_IMU receipt"):
+        asyncio.run(runner._run_sign_id())
+
+
+def test_sign_id_yaw_requires_exact_frame_timing(monkeypatch):
+    runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+    )
+    sample = runner._sample
+
+    def sample_without_exact_frame_timing():
+        sample()
+        runner._latest_detection_timing = None
+
+    monkeypatch.setattr(
+        runner,
+        "_sample",
+        sample_without_exact_frame_timing,
+    )
+
+    with pytest.raises(SafetyAbort, match="exact host timing"):
+        asyncio.run(runner._run_sign_id())
+
+
+def test_sign_id_yaw_rejects_response_outside_delay_envelope(monkeypatch):
+    runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "SIGN_ID_MAX_GYRO_RESPONSE_DELAY_S",
+        0.03,
+    )
+
+    with pytest.raises(SafetyAbort, match="gyro response delay"):
+        asyncio.run(runner._run_sign_id())
+
+
+def test_sign_id_yaw_rejects_late_first_image_observation(monkeypatch):
+    runner, _adapter, _events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "SIGN_ID_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S",
+        0.03,
+    )
+
+    with pytest.raises(SafetyAbort, match="first image observation"):
+        asyncio.run(runner._run_sign_id())
+
+
+def test_sign_id_yaw_terminal_hold_runs_watchdog(monkeypatch):
+    runner, _adapter, events, _send_options = _configured_yaw_sign_id(
+        monkeypatch,
+    )
+    calls = [0]
+
+    def watchdog(**_kwargs):
+        calls[0] += 1
+        if calls[0] == 46:
+            raise SafetyAbort("terminal calibration collision")
+
+    monkeypatch.setattr(runner, "_watchdog", watchdog)
+
+    with pytest.raises(SafetyAbort, match="terminal calibration collision"):
+        asyncio.run(runner._run_sign_id())
+
+    assert calls[0] == 46
+    assert not any(
+        event == "yaw_calibration_plan_complete"
+        for event, _payload in events
+    )
+    assert [
+        payload
+        for event, payload in events
+        if event == "sign_id_yaw_terminal"
+    ][-1]["success"] is False
 
 
 def test_sign_id_powered_dispatch_excites_only_yaw(monkeypatch):
@@ -5444,6 +5620,34 @@ def test_sign_id_powered_dispatch_excites_only_yaw(monkeypatch):
         "yaw",
         "cleanup",
     ]
+
+
+def test_calibration_excite_delegates_only_to_bounded_yaw_plan(
+    monkeypatch,
+):
+    runner, _adapter, context = _fast_calibration_runner()
+    calls = []
+
+    async def sign_id(*, calibration_context):
+        calls.append(calibration_context)
+        return {
+            "calibration_kind": "yaw-sign-authority-delay",
+            "plan_id": "yaw-plan",
+            "plan_sha256": "a" * 64,
+            "ticks_sent": 45,
+            "ticks_expected": 45,
+        }
+
+    monkeypatch.setattr(runner, "_run_sign_id", sign_id)
+
+    details = asyncio.run(runner._run_calibration_excite(context))
+
+    assert calls == [context]
+    assert details["stage"] == "calibration-excite"
+    assert details["calibration_scope"] == (
+        "yaw-only-sign-authority-delay-build3385"
+    )
+    assert details["ticks_sent"] == details["ticks_expected"] == 45
 
 
 def test_delayed_pre_reset_clocks_cannot_unlock_go():
@@ -5606,7 +5810,9 @@ def test_fast_calibration_waveform_is_exact_50hz_zero_yaw_and_complete(
     )
     monkeypatch.setattr(adapter, "send_attitude_rate", send)
 
-    details = asyncio.run(runner._run_calibration_excite(context))
+    details = asyncio.run(
+        runner._run_legacy_roll_pitch_calibration_waveform(context)
+    )
 
     fast_plan = powered_contract.fast_excitation_plan()
     assert (
@@ -5698,7 +5904,9 @@ def test_fast_calibration_variable_safety_cost_does_not_creep_phase(monkeypatch)
     monkeypatch.setattr(runner, "_watchdog", watchdog)
     monkeypatch.setattr(adapter, "send_attitude_rate", send)
 
-    details = asyncio.run(runner._run_calibration_excite(context))
+    details = asyncio.run(
+        runner._run_legacy_roll_pitch_calibration_waveform(context)
+    )
 
     fast_plan = powered_contract.fast_excitation_plan()
     assert details["ticks_sent"] == fast_plan["tick_count"]
@@ -5744,7 +5952,11 @@ def test_fast_calibration_transport_deadline_blocks_late_wire_send(monkeypatch):
     monkeypatch.setattr(adapter, "send_attitude_rate", delayed_send)
 
     with pytest.raises(TimeoutError, match="call-start deadline"):
-        asyncio.run(runner._run_calibration_excite(context))
+        asyncio.run(
+            runner._run_legacy_roll_pitch_calibration_waveform(
+                context
+            )
+        )
 
     assert adapter.commands == []
 
@@ -5770,7 +5982,11 @@ def test_fast_calibration_missed_slot_aborts_without_catchup_send(monkeypatch):
     monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
 
     with pytest.raises(SafetyAbort, match="expired before send"):
-        asyncio.run(runner._run_calibration_excite(context))
+        asyncio.run(
+            runner._run_legacy_roll_pitch_calibration_waveform(
+                context
+            )
+        )
 
     assert adapter.commands == []
 
