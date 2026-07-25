@@ -301,6 +301,10 @@ class VisualCourseStageLimits:
     # -0.801151 and -0.827087.  Projection may refine command-wire timing,
     # but may never expand authority beyond this independently replayed floor.
     retained_crossing_projection_min_log_scale: float = -0.83
+    # Attempt 17's last centered, stable retained observation reached the
+    # command wire in 0.0334435 s.  Keep this exact projection below one
+    # 30-Hz camera period plus the reviewed transport allowance.
+    retained_crossing_max_observation_to_wire_s: float = 0.035
     crossing_arm_min_log_scale_rate_s: float = 0.0
     crossing_arm_min_advance_commands: int = 3
     max_gate_segments: int = 64
@@ -327,6 +331,7 @@ class VisualCourseStageLimits:
             self.max_thrust,
             self.crossing_arm_min_log_scale,
             self.retained_crossing_projection_min_log_scale,
+            self.retained_crossing_max_observation_to_wire_s,
             self.crossing_arm_min_log_scale_rate_s,
         )
         if not all(
@@ -424,6 +429,14 @@ class VisualCourseStageLimits:
         ):
             raise ValueError(
                 "visual-course retained projection scale is outside bounds"
+            )
+        if not (
+            0.032
+            <= self.retained_crossing_max_observation_to_wire_s
+            <= 0.035
+        ):
+            raise ValueError(
+                "visual-course retained projection timing is outside bounds"
             )
         if not 0.0 <= self.crossing_arm_min_log_scale_rate_s <= 1.0:
             raise ValueError("visual-course crossing scale rate is invalid")
@@ -930,11 +943,13 @@ def _retained_crossing_observation_usable(
     *,
     tuning: Any,
     limits: VisualCourseStageLimits,
+    yaw_soft_stop_zeroed: bool = False,
 ) -> bool:
-    """Admit one current-only close-alignment sample to crossing dwell."""
+    """Admit one close-alignment sample to non-advance crossing dwell."""
 
     return bool(
-        not target.clipped
+        type(yaw_soft_stop_zeroed) is bool
+        and not target.clipped
         and not target.center_censored
         and not target.horizontal_geometry_censored
         and not target.vertical_geometry_censored
@@ -948,8 +963,17 @@ def _retained_crossing_observation_usable(
         and limits.crossing_arm_min_log_scale_rate_s
         <= float(target.log_scale_rate_s)
         < tuning.brake_scale_rate_s
-        and not output.advance_enabled
-        and output.brake_reason == "aligning"
+        and (
+            (
+                not output.advance_enabled
+                and output.brake_reason == "aligning"
+            )
+            or (
+                yaw_soft_stop_zeroed
+                and output.advance_enabled
+                and output.brake_reason is None
+            )
+        )
         and not output.yaw_envelope_limited
     )
 
@@ -1013,10 +1037,7 @@ def _retained_crossing_wire_projection(
             "visual-course retained crossing wire predates observation"
         )
     max_projection_ns = round(
-        (
-            limits.control_period_s
-            + limits.max_validation_to_wire_delay_s
-        )
+        limits.retained_crossing_max_observation_to_wire_s
         * 1_000_000_000
     )
     if (
@@ -1084,10 +1105,7 @@ def _retained_crossing_projection_matches_target(
         projection.wire_start_monotonic_ns - observation_ns
     )
     max_horizon_ns = round(
-        (
-            limits.control_period_s
-            + limits.max_validation_to_wire_delay_s
-        )
+        limits.retained_crossing_max_observation_to_wire_s
         * 1_000_000_000
     )
     if (
@@ -1195,9 +1213,12 @@ def _crossing_anchor_basis(
     retained_wire_projection: Optional[
         _RetainedCrossingWireProjection
     ] = None,
+    yaw_soft_stop_zeroed: bool = False,
 ) -> Optional[str]:
     """Select an exact-frame crossing proof without adding motion authority."""
 
+    if type(yaw_soft_stop_zeroed) is not bool:
+        return None
     if (
         advance_command_count
         < limits.crossing_arm_min_advance_commands
@@ -1209,7 +1230,8 @@ def _crossing_anchor_basis(
     ):
         return None
     if (
-        float(target.log_scale) >= limits.crossing_arm_min_log_scale
+        not yaw_soft_stop_zeroed
+        and float(target.log_scale) >= limits.crossing_arm_min_log_scale
         and output.corridor_frames >= tuning.required_corridor_frames
         and output.advance_enabled
     ):
@@ -1226,6 +1248,7 @@ def _crossing_anchor_basis(
             output,
             tuning=tuning,
             limits=limits,
+            yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
         )
     ):
         if float(target.log_scale) >= limits.crossing_arm_min_log_scale:
@@ -3994,8 +4017,9 @@ async def _run_visual_course_stage_impl(
             # The calibrated yaw limiter owns only the yaw channel.  Keep the
             # already sealed, same-identity preview alive so its independently
             # bounded pitch/collective corrections remain fresh.  This frame
-            # still cannot count as advance or arm crossing below, and every
-            # later publication must independently re-pass the yaw limiter.
+            # still cannot count as advance or arm current-advance crossing
+            # below, and every later publication must independently re-pass
+            # the yaw limiter.
             refresh_live_summary()
             if (
                 proposal.servo_output.advance_enabled
@@ -4009,13 +4033,14 @@ async def _run_visual_course_stage_impl(
             retained_wire_projection: Optional[
                 _RetainedCrossingWireProjection
             ] = None
-            if accepted.yaw_soft_stop_zeroed:
-                retained_crossing_dwell_frames = 0
-            elif _retained_crossing_observation_usable(
+            if _retained_crossing_observation_usable(
                 target,
                 proposal.servo_output,
                 tuning=host.visual_config.servo,
                 limits=limits,
+                yaw_soft_stop_zeroed=(
+                    accepted.yaw_soft_stop_zeroed
+                ),
             ):
                 retained_crossing_dwell_frames += 1
                 if (
@@ -4046,23 +4071,20 @@ async def _run_visual_course_stage_impl(
                 int(segment["max_retained_crossing_dwell_frames"]),
                 retained_crossing_dwell_frames,
             )
-            crossing_basis = (
-                None
-                if accepted.yaw_soft_stop_zeroed
-                else _crossing_anchor_basis(
-                    target,
-                    proposal.servo_output,
-                    passage_admission=passage_admission,
-                    current_gate_index=current_gate_index,
-                    current_track_id=current_track_id,
-                    advance_command_count=advance_command_count,
-                    retained_crossing_dwell_frames=(
-                        retained_crossing_dwell_frames
-                    ),
-                    tuning=host.visual_config.servo,
-                    limits=limits,
-                    retained_wire_projection=retained_wire_projection,
-                )
+            crossing_basis = _crossing_anchor_basis(
+                target,
+                proposal.servo_output,
+                passage_admission=passage_admission,
+                current_gate_index=current_gate_index,
+                current_track_id=current_track_id,
+                advance_command_count=advance_command_count,
+                retained_crossing_dwell_frames=(
+                    retained_crossing_dwell_frames
+                ),
+                tuning=host.visual_config.servo,
+                limits=limits,
+                retained_wire_projection=retained_wire_projection,
+                yaw_soft_stop_zeroed=accepted.yaw_soft_stop_zeroed,
             )
             if crossing_basis is not None:
                 crossing_anchor = {
@@ -4129,6 +4151,9 @@ async def _run_visual_course_stage_impl(
                     "advance_command_count": advance_command_count,
                     "current_advance_enabled": (
                         proposal.servo_output.advance_enabled
+                    ),
+                    "yaw_soft_stop_zeroed": (
+                        accepted.yaw_soft_stop_zeroed
                     ),
                     "normalized_x": target.normalized_x,
                     "normalized_y_down": target.normalized_y_down,

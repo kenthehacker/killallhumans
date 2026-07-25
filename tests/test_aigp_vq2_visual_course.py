@@ -1207,6 +1207,88 @@ def test_attempt11_wire_projection_admits_only_the_last_safe_frame():
     )
 
 
+def test_attempt17_yaw_soft_stop_retains_only_exact_projected_crossing():
+    target, output, admission = _attempt8_close_alignment_crossing_values()
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    target = replace(
+        target,
+        received_monotonic_s=136_468.312,
+        normalized_x=-0.006249999999999978,
+        normalized_y_down=-0.050000000000000044,
+        normalized_x_rate_s=0.09978301265856465,
+        normalized_y_rate_down_s=0.14650777115619515,
+        log_scale=-0.8127695326567331,
+        log_scale_rate_s=1.4305436485446084,
+    )
+    output = replace(
+        output,
+        advance_enabled=True,
+        brake_reason=None,
+    )
+    projection = course_stage._retained_crossing_wire_projection(
+        target,
+        observation_monotonic_ns=136_468_312_000_000,
+        wire_start_monotonic_ns=136_468_345_443_500,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+
+    assert limits.retained_crossing_max_observation_to_wire_s == 0.035
+    assert projection is not None
+    assert projection.observation_to_wire_ns == 33_443_500
+    assert projection.projected_log_scale == pytest.approx(
+        -0.7649271461466315
+    )
+    assert projection.projected_normalized_x == pytest.approx(
+        -0.0029129068161532707
+    )
+    assert projection.projected_normalized_y_down == pytest.approx(
+        -0.04510026735533783
+    )
+    assert not course_stage._retained_crossing_observation_usable(
+        target,
+        output,
+        tuning=tuning,
+        limits=limits,
+    )
+    assert course_stage._retained_crossing_observation_usable(
+        target,
+        output,
+        tuning=tuning,
+        limits=limits,
+        yaw_soft_stop_zeroed=True,
+    )
+    assert course_stage._crossing_anchor_basis(
+        target,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=25,
+        retained_crossing_dwell_frames=3,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projection,
+    ) is None
+    assert course_stage._crossing_anchor_basis(
+        target,
+        output,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=25,
+        retained_crossing_dwell_frames=3,
+        tuning=tuning,
+        limits=limits,
+        retained_wire_projection=projection,
+        yaw_soft_stop_zeroed=True,
+    ) == (
+        course_stage.RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
+    )
+
+
 def test_retained_projection_is_narrowed_by_raw_and_projected_scales():
     target, output, admission = _attempt8_close_alignment_crossing_values()
     tuning = default_visual_config().servo
@@ -1365,20 +1447,26 @@ def test_retained_wire_projection_is_bounded_and_fail_closed():
         log_scale_rate_s=1.0,
     )
 
+    max_horizon_ns = round(
+        limits.retained_crossing_max_observation_to_wire_s
+        * 1_000_000_000
+    )
     at_bound = course_stage._retained_crossing_wire_projection(
         target,
         observation_monotonic_ns=1_000_000_000,
-        wire_start_monotonic_ns=1_032_000_000,
+        wire_start_monotonic_ns=1_000_000_000 + max_horizon_ns,
         tuning=tuning,
         limits=limits,
         abort_type=SafetyAbort,
     )
     assert at_bound is not None
-    assert at_bound.projected_log_scale == pytest.approx(-0.778)
+    assert at_bound.projected_log_scale == pytest.approx(-0.775)
     assert course_stage._retained_crossing_wire_projection(
         target,
         observation_monotonic_ns=1_000_000_000,
-        wire_start_monotonic_ns=1_032_000_001,
+        wire_start_monotonic_ns=(
+            1_000_000_000 + max_horizon_ns + 1
+        ),
         tuning=tuning,
         limits=limits,
         abort_type=SafetyAbort,
@@ -1832,6 +1920,7 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
         -0.0400779026492578
     )
     assert anchor["current_advance_enabled"] is False
+    assert anchor["yaw_soft_stop_zeroed"] is False
     assert anchor["retained_crossing_dwell_frames"] == 3
     assert anchor["camera_token"]["publication_sequence"] == 17
     segment = result["segments"][0]
@@ -4432,6 +4521,11 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
             -0.830001,
             "retained projection scale",
         ),
+        (
+            "retained_crossing_max_observation_to_wire_s",
+            0.035001,
+            "retained projection timing",
+        ),
     ),
 )
 def test_course_limits_refuse_widened_safety_envelopes(
@@ -4594,9 +4688,12 @@ def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
     assert events[0]["admitted_yaw_rate_rad_s"] == 0.0
 
 
-def test_passage_yaw_soft_stop_withholds_crossing_but_retains_sealed_preview():
+def test_passage_yaw_soft_stop_accrues_only_retained_crossing_dwell():
     profile = _yaw_profile()
-    limits = VisualCourseStageLimits()
+    limits = replace(
+        VisualCourseStageLimits(),
+        crossing_arm_min_advance_commands=2,
+    )
     response_reserve = (
         profile.observed_max_abs_measured_yaw_rate_rad_s
         / math.cos(
@@ -4645,7 +4742,7 @@ def test_passage_yaw_soft_stop_withholds_crossing_but_retains_sealed_preview():
         def _sample(self):
             super()._sample()
             self.sample_count += 1
-            if self.sample_count in {4, 5}:
+            if self.sample_count in {4, 5, 6}:
                 _set_attitude(
                     self,
                     yaw=excursion,
@@ -4653,7 +4750,7 @@ def test_passage_yaw_soft_stop_withholds_crossing_but_retains_sealed_preview():
                 )
             else:
                 _set_attitude(self)
-            if self.sample_count >= 6:
+            if self.sample_count >= 7:
                 self.visual_gate_graph.latest_snapshot = _snapshot(
                     self.current_gate,
                     self.current_track_id,
@@ -4676,17 +4773,23 @@ def test_passage_yaw_soft_stop_withholds_crossing_but_retains_sealed_preview():
         ),
     )
 
-    with pytest.raises(SafetyAbort, match="visual authority refused"):
+    with pytest.raises(SafetyAbort, match="gate 3 credit timed out"):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)
         )
 
     segment = host._visual_course_summary["segments"][0]
-    assert segment["passage_command_count"] == 4
+    assert segment["passage_command_count"] == 5
     assert segment["advance_command_count"] == 2
-    assert segment["yaw_soft_stop_zero_command_count"] == 2
-    assert segment["crossing_anchor"] is None
-    assert segment["passage_next_preview_command_count"] == 4
+    assert segment["yaw_soft_stop_zero_command_count"] == 3
+    assert segment["retained_crossing_dwell_frames"] == 3
+    assert segment["max_retained_crossing_dwell_frames"] == 3
+    assert segment["crossing_anchor"]["basis"] == (
+        course_stage.RETAINED_ADVANCE_CROSSING_BASIS
+    )
+    assert segment["crossing_anchor"]["current_advance_enabled"] is True
+    assert segment["crossing_anchor"]["yaw_soft_stop_zeroed"] is True
+    assert segment["passage_next_preview_command_count"] == 5
     assert segment["passage_admission"]["preview_track_id"] == "track-4"
     assert segment["next_preview_retired"] is False
     assert segment["next_preview_withdrawal_count"] == 0
@@ -4696,12 +4799,21 @@ def test_passage_yaw_soft_stop_withholds_crossing_but_retains_sealed_preview():
         for command, kwargs, _gate in host.commands
         if kwargs.get("require_wire_receipt")
     ]
-    assert [command.yaw_rate for command in navigation[-2:]] == [0.0, 0.0]
-    assert [command.pitch_rate for command in navigation[-2:]] == [
-        navigation[-3].pitch_rate,
-        navigation[-3].pitch_rate,
+    assert [command.yaw_rate for command in navigation[-3:]] == [
+        0.0,
+        0.0,
+        0.0,
     ]
-    assert [command.thrust for command in navigation[-2:]] == [0.295, 0.295]
+    assert [command.pitch_rate for command in navigation[-3:]] == [
+        navigation[-4].pitch_rate,
+        navigation[-4].pitch_rate,
+        navigation[-4].pitch_rate,
+    ]
+    assert [command.thrust for command in navigation[-3:]] == [
+        0.295,
+        0.295,
+        0.295,
+    ]
 
 
 @pytest.mark.parametrize(
