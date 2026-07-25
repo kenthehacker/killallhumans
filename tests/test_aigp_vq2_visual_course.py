@@ -3880,6 +3880,173 @@ def test_gate0_proved_vertical_collective_rejects_nonfinite_input():
         )
 
 
+@pytest.mark.parametrize(
+    (
+        "proved_collective",
+        "current_vertical",
+        "next_vertical",
+        "preview_blend",
+        "expected",
+    ),
+    (
+        (
+            0.3171871091857116,
+            -0.16666666666666663,
+            -0.28888888888888886,
+            0.03983091428968513,
+            0.00038945782861025464,
+        ),
+        (
+            0.2528945018839622,
+            -0.07222222222222219,
+            -0.3666666666666667,
+            0.1810863001315085,
+            0.004265588403097756,
+        ),
+        (
+            0.25971237467284425,
+            -0.0444444444444444,
+            -0.4277777777777778,
+            0.2719750825987748,
+            0.00834056919969576,
+        ),
+    ),
+)
+def test_attempt20_gate0_next_preview_collective_replay_is_exact(
+    proved_collective,
+    current_vertical,
+    next_vertical,
+    preview_blend,
+    expected,
+):
+    delta = course_stage._gate0_proved_next_preview_collective_delta(
+        proved_collective=proved_collective,
+        current_vertical=current_vertical,
+        next_vertical=next_vertical,
+        preview_blend=preview_blend,
+    )
+
+    assert delta == pytest.approx(expected)
+    assert proved_collective + delta <= 0.32
+
+
+def test_gate0_next_preview_collective_is_capped_by_delta_and_headroom():
+    assert course_stage._gate0_proved_next_preview_collective_delta(
+        proved_collective=0.275,
+        current_vertical=-0.10,
+        next_vertical=-1.0,
+        preview_blend=0.35,
+    ) == pytest.approx(0.012)
+    assert course_stage._gate0_proved_next_preview_collective_delta(
+        proved_collective=0.319,
+        current_vertical=-0.10,
+        next_vertical=-1.0,
+        preview_blend=0.35,
+    ) == pytest.approx(0.001)
+
+
+@pytest.mark.parametrize(
+    ("current_vertical", "next_vertical", "preview_blend"),
+    (
+        (0.01, -0.40, 0.35),
+        (-0.10, -0.05, 0.35),
+        (-0.10, -0.40, 0.0),
+    ),
+)
+def test_gate0_next_preview_collective_never_opposes_current_aperture(
+    current_vertical,
+    next_vertical,
+    preview_blend,
+):
+    assert course_stage._gate0_proved_next_preview_collective_delta(
+        proved_collective=0.275,
+        current_vertical=current_vertical,
+        next_vertical=next_vertical,
+        preview_blend=preview_blend,
+    ) == 0.0
+
+
+def test_gate0_next_preview_collective_requires_exact_latched_publication():
+    current = replace(
+        _target(_snapshot(0, "track-0", 126), "track-0"),
+        normalized_y_down=-0.16666666666666663,
+    )
+    next_target = replace(
+        current,
+        track_id="track-1",
+        normalized_y_down=-0.28888888888888886,
+    )
+    output = SimpleNamespace(
+        next_gate_blend=0.03983091428968513,
+        # Retained passage publications need not repeat the one-shot servo
+        # review marker; the coordinator latch remains authoritative.
+        reviewed_next_track_id=None,
+        vertical_error_image_down=current.normalized_y_down,
+        next_vertical_error_image_down=(
+            next_target.normalized_y_down
+        ),
+        yaw_envelope_limited=True,
+    )
+
+    thrust, delta = (
+        course_stage._gate0_proved_collective_with_exact_next_preview(
+            proved_collective=0.3171871091857116,
+            current_target=current,
+            next_target=next_target,
+            latched_next_track_id="track-1",
+            servo_output=output,
+        )
+    )
+
+    assert delta == pytest.approx(0.00038945782861025464)
+    assert thrust == pytest.approx(0.31757656701432185)
+
+    with pytest.raises(ValueError, match="one exact publication"):
+        course_stage._gate0_proved_collective_with_exact_next_preview(
+            proved_collective=0.3171871091857116,
+            current_target=current,
+            next_target=replace(
+                next_target,
+                frame_token=replace(
+                    next_target.frame_token,
+                    publication_sequence=127,
+                ),
+            ),
+            latched_next_track_id="track-1",
+            servo_output=output,
+        )
+
+    with pytest.raises(ValueError, match="persistent coordinator latch"):
+        course_stage._gate0_proved_collective_with_exact_next_preview(
+            proved_collective=0.3171871091857116,
+            current_target=current,
+            next_target=next_target,
+            latched_next_track_id=None,
+            servo_output=output,
+        )
+
+
+def test_gate0_next_preview_collective_is_zero_after_preview_retirement():
+    current = replace(
+        _target(_snapshot(0, "track-0", 159), "track-0"),
+        normalized_y_down=-0.03,
+    )
+    output = SimpleNamespace(next_gate_blend=0.0)
+
+    thrust, delta = (
+        course_stage._gate0_proved_collective_with_exact_next_preview(
+            proved_collective=0.265,
+            current_target=current,
+            next_target=None,
+            latched_next_track_id=None,
+            servo_output=output,
+        )
+    )
+
+    assert thrust == 0.265
+    assert delta == 0.0
+
+
 def test_gate0_proved_collective_recreates_new_frame_rate_filter():
     state = course_stage._Gate0ProvedCollectiveState()
 
@@ -3956,6 +4123,15 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         5.0 / 3.0
     )
     assert launch["post_boost_collective_rate_filter_alpha"] == 0.35
+    assert launch["post_boost_next_preview_collective_basis"] == (
+        course_stage.GATE0_PROVED_NEXT_PREVIEW_BASIS
+    )
+    assert launch[
+        "post_boost_next_preview_collective_error_gain"
+    ] == 0.080
+    assert launch[
+        "post_boost_next_preview_collective_max_thrust_delta"
+    ] == 0.012
     assert launch["pitch_blend_s"] == (
         host.visual_config.lifecycle.launch_pitch_blend_s
     )
@@ -3982,6 +4158,10 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["last_current_vertical_error_image_down"] == 0.03
     assert launch["last_current_vertical_rate_down_s"] == 0.0
     assert launch["last_proved_filtered_vertical_rate_down_s"] == 0.0
+    assert launch["next_preview_collective_command_count"] == 0
+    assert launch["max_next_preview_collective_delta"] == 0.0
+    assert launch["last_next_preview_collective_delta"] == 0.0
+    assert launch["last_next_preview_collective_track_id"] is None
     assert any(
         command.thrust == pytest.approx(0.2726)
         for command, _kwargs in gate0_commands
@@ -4001,6 +4181,9 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert later["launch_bootstrap"][
         "post_boost_collective_basis"
     ] is None
+    assert later["launch_bootstrap"][
+        "post_boost_next_preview_collective_basis"
+    ] is None
     gate0_passage = [
         command
         for stage, _elapsed, command in host.ticks
@@ -4018,6 +4201,89 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     )
     assert gate1_passage
     assert all(command.thrust == 0.295 for command in gate1_passage)
+
+
+def test_initial_gate_applies_only_exact_latched_next_preview_collective():
+    class ExactPreviewServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            current = replace(
+                proposal.current_target,
+                normalized_y_down=-0.10,
+            )
+            next_target = replace(
+                current,
+                track_id=self.preview_track_id,
+                normalized_y_down=-0.40,
+            )
+            output = replace(
+                proposal.servo_output,
+                next_gate_blend=0.35,
+                vertical_error_image_down=current.normalized_y_down,
+                effective_vertical_error_image_down=-0.1525,
+                next_vertical_error_image_down=(
+                    next_target.normalized_y_down
+                ),
+                reviewed_next_track_id=self.preview_track_id,
+            )
+            admission = proposal.passage_admission
+            if admission is not None:
+                admission = replace(
+                    admission,
+                    current_target=current,
+                    preview_track_id=self.preview_track_id,
+                    preview_blend=0.35,
+                )
+            return SimpleNamespace(
+                current_target=current,
+                next_target=next_target,
+                servo_output=output,
+                candidate_track_ids=(self.preview_track_id,),
+                provisional_track_ids=(),
+                withholding_reason=None,
+                relationship_basis=None,
+                latched_next_track_id=self.preview_track_id,
+                passage_admission=admission,
+                mode=proposal.mode,
+            )
+
+    host = _Host(
+        initial_gate=0,
+        finish_gate=1,
+        fresh_after_samples=1,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: ExactPreviewServo(
+            *args,
+            yaw_rate=0.0,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    launch = result["segments"][0]["launch_bootstrap"]
+    assert launch["next_preview_collective_command_count"] > 0
+    assert launch["max_next_preview_collective_delta"] == pytest.approx(
+        0.0084
+    )
+    assert launch["last_next_preview_collective_delta"] == pytest.approx(
+        0.0084
+    )
+    assert launch["last_next_preview_collective_track_id"] == "track-1"
+    assert launch["last_thrust"] == pytest.approx(0.2914)
+    crossing = result["segments"][0]["crossing_anchor"]
+    assert crossing["command"]["thrust"] == pytest.approx(0.2914)
+    assert crossing["next_preview_collective_delta"] == pytest.approx(
+        0.0084
+    )
+    assert crossing["current_only_crossing_coast_thrust"] == (
+        pytest.approx(0.283)
+    )
 
 
 def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():
@@ -4430,8 +4696,10 @@ def test_rate_only_refusal_requalifies_sealed_preview_at_exact_bounds(
                 )
                 return SimpleNamespace(
                     current_target=proposal.current_target,
-                    next_target=SimpleNamespace(
-                        track_id=self.preview_track_id
+                    next_target=replace(
+                        proposal.current_target,
+                        track_id=self.preview_track_id,
+                        normalized_y_down=-0.20,
                     ),
                     servo_output=replace(
                         proposal.servo_output,

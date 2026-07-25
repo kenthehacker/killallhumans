@@ -50,6 +50,7 @@ from planning.vq2_visual_recovery import (
     require_transition_recovery_admission,
 )
 from planning.vq2_visual_servo import (
+    MAX_NEXT_GATE_BLEND,
     MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_TARGET_ROLL_RAD,
     MAX_VISUAL_SEGMENT_DURATION_S,
@@ -100,6 +101,11 @@ GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR = 0.50
 GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE = 5.0 / 3.0
 GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA = 0.35
 GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
+GATE0_PROVED_NEXT_PREVIEW_ERROR_GAIN = 0.080
+GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA = 0.012
+GATE0_PROVED_NEXT_PREVIEW_BASIS = (
+    "proved-gate0-reviewed-next-preview-collective-v1"
+)
 CURRENT_ADVANCE_CROSSING_BASIS = "current-advance-corridor-v1"
 RETAINED_ADVANCE_CROSSING_BASIS = (
     "retained-advance-close-alignment-dwell-v1"
@@ -172,6 +178,130 @@ def _gate0_proved_vertical_collective(
     )
 
 
+def _gate0_proved_next_preview_collective_delta(
+    *,
+    proved_collective: float,
+    current_vertical: float,
+    next_vertical: float,
+    preview_blend: float,
+) -> float:
+    """Add bounded lift only when preview reinforces the proved correction."""
+
+    proved_collective = float(proved_collective)
+    current_vertical = float(current_vertical)
+    next_vertical = float(next_vertical)
+    preview_blend = float(preview_blend)
+    if not all(
+        math.isfinite(value)
+        for value in (
+            proved_collective,
+            current_vertical,
+            next_vertical,
+            preview_blend,
+        )
+    ):
+        raise ValueError("Gate-0 next-preview collective inputs must be finite")
+    if not MIN_VISUAL_THRUST <= proved_collective <= MAX_VISUAL_THRUST:
+        raise ValueError(
+            "Gate-0 next-preview collective base is outside its fixed envelope"
+        )
+    if not 0.0 <= preview_blend <= MAX_NEXT_GATE_BLEND:
+        raise ValueError(
+            "Gate-0 next-preview blend is outside its immutable ceiling"
+        )
+    # Never weaken or reverse the already live-proved current-aperture law.
+    # Image-down negative means the current aperture is high and already asks
+    # for lift.  A still-higher reviewed next aperture may add lift; every
+    # other geometry receives no new collective authority.
+    if (
+        preview_blend == 0.0
+        or current_vertical > 0.0
+        or next_vertical >= current_vertical
+    ):
+        return 0.0
+    requested = (
+        -GATE0_PROVED_NEXT_PREVIEW_ERROR_GAIN
+        * preview_blend
+        * (next_vertical - current_vertical)
+    )
+    return max(
+        0.0,
+        min(
+            requested,
+            GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA,
+            MAX_VISUAL_THRUST - proved_collective,
+        ),
+    )
+
+
+def _gate0_proved_collective_with_exact_next_preview(
+    *,
+    proved_collective: float,
+    current_target: Any,
+    next_target: Any,
+    latched_next_track_id: Optional[str],
+    servo_output: Any,
+) -> tuple[float, float]:
+    """Apply only an exact, identity-latched same-publication preview."""
+
+    blend = float(servo_output.next_gate_blend)
+    if blend == 0.0:
+        return float(proved_collective), 0.0
+    if next_target is None:
+        raise ValueError("Gate-0 next-preview target is missing")
+    if next_target.frame_token != current_target.frame_token:
+        raise ValueError(
+            "Gate-0 next-preview targets do not share one exact publication"
+        )
+    if (
+        latched_next_track_id is None
+        or latched_next_track_id != next_target.track_id
+    ):
+        raise ValueError(
+            "Gate-0 next-preview identity lacks the persistent coordinator "
+            "latch"
+        )
+    current_reviewed_track_id = getattr(
+        servo_output,
+        "reviewed_next_track_id",
+        None,
+    )
+    if (
+        current_reviewed_track_id is not None
+        and current_reviewed_track_id != next_target.track_id
+    ):
+        raise ValueError(
+            "Gate-0 next-preview identity conflicts with current servo review"
+        )
+    next_vertical = getattr(
+        servo_output,
+        "next_vertical_error_image_down",
+        None,
+    )
+    if (
+        next_vertical is None
+        or bool(getattr(current_target, "vertical_censored", False))
+        or bool(getattr(next_target, "vertical_censored", False))
+    ):
+        return float(proved_collective), 0.0
+    current_vertical = float(current_target.normalized_y_down)
+    next_vertical = float(next_vertical)
+    if (
+        float(servo_output.vertical_error_image_down) != current_vertical
+        or float(next_target.normalized_y_down) != next_vertical
+    ):
+        raise ValueError(
+            "Gate-0 next-preview geometry diverged from reviewed targets"
+        )
+    delta = _gate0_proved_next_preview_collective_delta(
+        proved_collective=proved_collective,
+        current_vertical=current_vertical,
+        next_vertical=next_vertical,
+        preview_blend=blend,
+    )
+    return float(proved_collective) + delta, delta
+
+
 @dataclass(slots=True)
 class _Gate0ProvedCollectiveState:
     last_token_key: Optional[tuple[str, int, int, int]] = None
@@ -241,6 +371,7 @@ class _AcceptedVisualCommand:
     wire_start_monotonic_ns: int
     target_roll_rad: float
     target_pitch_rad: float
+    next_preview_collective_delta: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -2270,6 +2401,8 @@ async def _run_visual_course_stage_impl(
             ) = launch_collective_state.observe(
                 proposal.current_target
             )
+            next_preview_collective_delta = 0.0
+            next_preview_collective_track_id: Optional[str] = None
             if launch_elapsed_s < INITIAL_PAD_PRELOAD_DURATION_S:
                 command_thrust = INITIAL_PAD_PRELOAD_THRUST
                 thrust_phase = "preload"
@@ -2287,7 +2420,34 @@ async def _run_visual_course_stage_impl(
                 # exact attempt-7 history and drove a centered aperture into
                 # the top edge.  This remains Gate-0 launch-only and inside
                 # the unchanged controller thrust envelope.
-                command_thrust = proved_collective
+                try:
+                    (
+                        command_thrust,
+                        next_preview_collective_delta,
+                    ) = _gate0_proved_collective_with_exact_next_preview(
+                        proved_collective=proved_collective,
+                        current_target=proposal.current_target,
+                        next_target=getattr(
+                            proposal,
+                            "next_target",
+                            None,
+                        ),
+                        latched_next_track_id=getattr(
+                            proposal,
+                            "latched_next_track_id",
+                            None,
+                        ),
+                        servo_output=output,
+                    )
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise abort_type(
+                        "visual-course Gate-0 next-preview collective "
+                        f"refused exact authority: {exc}"
+                    ) from exc
+                if next_preview_collective_delta > 0.0:
+                    next_preview_collective_track_id = str(
+                        proposal.next_target.track_id
+                    )
                 thrust_phase = GATE0_PROVED_COLLECTIVE_BASIS
             if (
                 target_pitch_rad < limits.min_measured_pitch_rad
@@ -2314,6 +2474,12 @@ async def _run_visual_course_stage_impl(
                 ),
                 "proved_filtered_vertical_rate_down_s": (
                     proved_filtered_vertical_rate
+                ),
+                "next_preview_collective_delta": (
+                    next_preview_collective_delta
+                ),
+                "next_preview_collective_track_id": (
+                    next_preview_collective_track_id
                 ),
             }
 
@@ -2555,6 +2721,30 @@ async def _run_visual_course_stage_impl(
                     "proved_filtered_vertical_rate_down_s"
                 ]
             )
+            preview_delta = float(
+                launch_evidence["next_preview_collective_delta"]
+            )
+            launch["last_next_preview_collective_delta"] = (
+                preview_delta
+            )
+            launch["max_next_preview_collective_delta"] = max(
+                float(launch["max_next_preview_collective_delta"]),
+                preview_delta,
+            )
+            if preview_delta > 0.0:
+                launch["next_preview_collective_command_count"] = (
+                    int(
+                        launch[
+                            "next_preview_collective_command_count"
+                        ]
+                    )
+                    + 1
+                )
+                launch["last_next_preview_collective_track_id"] = (
+                    launch_evidence[
+                        "next_preview_collective_track_id"
+                    ]
+                )
         host._record_tick(
             stage,
             float(runtime.monotonic()) - segment_started_s,
@@ -2582,6 +2772,15 @@ async def _run_visual_course_stage_impl(
             wire_start_monotonic_ns=wire_start_monotonic_ns,
             target_roll_rad=target_roll_rad,
             target_pitch_rad=target_pitch_rad,
+            next_preview_collective_delta=(
+                0.0
+                if launch_evidence is None
+                else float(
+                    launch_evidence[
+                        "next_preview_collective_delta"
+                    ]
+                )
+            ),
         )
 
     async def send_censored_passage_coast(
@@ -3046,6 +3245,21 @@ async def _run_visual_course_stage_impl(
                     if launch_enabled
                     else None
                 ),
+                "post_boost_next_preview_collective_basis": (
+                    GATE0_PROVED_NEXT_PREVIEW_BASIS
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_next_preview_collective_error_gain": (
+                    GATE0_PROVED_NEXT_PREVIEW_ERROR_GAIN
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_next_preview_collective_max_thrust_delta": (
+                    GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA
+                    if launch_enabled
+                    else None
+                ),
                 "boost_duration_s": float(
                     host.visual_config.lifecycle.launch_boost_duration_s
                 ),
@@ -3062,6 +3276,10 @@ async def _run_visual_course_stage_impl(
                     else None
                 ),
                 "command_count": 0,
+                "next_preview_collective_command_count": 0,
+                "max_next_preview_collective_delta": 0.0,
+                "last_next_preview_collective_delta": 0.0,
+                "last_next_preview_collective_track_id": None,
             },
         }
         segments.append(segment)
@@ -4727,6 +4945,21 @@ async def _run_visual_course_stage_impl(
                 yaw_soft_stop_zeroed=accepted.yaw_soft_stop_zeroed,
             )
             if crossing_basis is not None:
+                crossing_coast_thrust = (
+                    float(command.thrust)
+                    - accepted.next_preview_collective_delta
+                )
+                if (
+                    not math.isfinite(crossing_coast_thrust)
+                    or crossing_coast_thrust
+                    < limits.min_thrust - 1e-12
+                    or crossing_coast_thrust
+                    > limits.max_thrust + 1e-12
+                ):
+                    raise abort_type(
+                        "visual-course current-only crossing coast thrust "
+                        "escaped its fixed envelope"
+                    )
                 crossing_anchor = {
                     "basis": crossing_basis,
                     "camera_token": token,
@@ -4802,6 +5035,12 @@ async def _run_visual_course_stage_impl(
                         target.normalized_y_rate_down_s
                     ),
                     "command": asdict(command),
+                    "next_preview_collective_delta": (
+                        accepted.next_preview_collective_delta
+                    ),
+                    "current_only_crossing_coast_thrust": (
+                        crossing_coast_thrust
+                    ),
                 }
                 crossing_coast_authority = (
                     _CensoredPassageCoastAuthority(
@@ -4810,7 +5049,12 @@ async def _run_visual_course_stage_impl(
                         anchor_camera_token=token,
                         target_roll_rad=accepted.target_roll_rad,
                         target_pitch_rad=accepted.target_pitch_rad,
-                        thrust=float(command.thrust),
+                        # Optional next-preview authority retires with the
+                        # live preview.  The existing censored-passage coast
+                        # remains current-aperture-only and therefore latches
+                        # the proved base rather than reintroducing a retired
+                        # preview delta after a visibility gap.
+                        thrust=crossing_coast_thrust,
                     )
                 )
                 segment["crossing_anchor"] = {
