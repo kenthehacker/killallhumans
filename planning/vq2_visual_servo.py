@@ -16,6 +16,7 @@ collision, stage-duration, reset, or cleanup watchdogs.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import math
 from typing import Optional, Tuple
 
@@ -58,6 +59,11 @@ PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S = -1.50
 PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S = 2.00
 PREPASS_CURRENT_MAX_APPARENT_SCALE = 0.55
 PREPASS_CURRENT_PROJECTION_HORIZON_S = 0.10
+# The latest exact replay's four projection-only misses exceeded the vertical
+# bound by at most 0.00537 normalized image units.  A transient lease is
+# permitted only inside this additional immutable margin; a larger prediction
+# miss is a hard withdrawal even when every instantaneous predicate passes.
+MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM = 0.01
 PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S = 0.60
 PREPASS_NEXT_MAX_ABS_LOG_SCALE_RATE_S = 1.10
 VISUAL_CLOSE_SCALE_BRAKE_LOG = -0.18
@@ -68,8 +74,97 @@ class VisualServoRefusal(ValueError):
     """The observation or requested tuning cannot safely produce authority."""
 
 
+class PassageSafetyViolation(str, Enum):
+    """Structured reasons a latched blend lost passage authority."""
+
+    CURRENT_GEOMETRY_CENSORED = "current_geometry_censored"
+    CURRENT_HORIZONTAL_POSITION = "current_horizontal_position"
+    CURRENT_VERTICAL_POSITION = "current_vertical_position"
+    CURRENT_HORIZONTAL_RATE = "current_horizontal_rate"
+    CURRENT_VERTICAL_RATE = "current_vertical_rate"
+    CURRENT_LOG_SCALE_RATE = "current_log_scale_rate"
+    CURRENT_PROJECTED_HORIZONTAL = "current_projected_horizontal"
+    CURRENT_PROJECTED_VERTICAL = "current_projected_vertical"
+    CURRENT_APPARENT_SCALE = "current_apparent_scale"
+    CURRENT_HORIZONTAL_CORRECTION_REVERSAL = (
+        "current_horizontal_correction_reversal"
+    )
+    CURRENT_VERTICAL_CORRECTION_REVERSAL = (
+        "current_vertical_correction_reversal"
+    )
+
+
+@dataclass(frozen=True)
+class PassageSafetyViolationDetail:
+    """One failed immutable predicate and its scalar margin."""
+
+    violation: PassageSafetyViolation
+    observed: float
+    limit: float
+    excess: float
+
+    def __post_init__(self) -> None:
+        if type(self.violation) is not PassageSafetyViolation:
+            raise ValueError("passage violation detail requires an exact code")
+        for name, value in (
+            ("observed", self.observed),
+            ("limit", self.limit),
+            ("excess", self.excess),
+        ):
+            if (
+                type(value) not in {int, float}
+                or not math.isfinite(float(value))
+            ):
+                raise ValueError(f"passage violation {name} must be finite")
+        if float(self.excess) <= 0.0:
+            raise ValueError("passage violation excess must be positive")
+
+
 class VisualServoPassageSafetyUnavailable(VisualServoRefusal):
     """A latched pre-pass blend left its immutable passage corridor."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Tuple[PassageSafetyViolationDetail, ...],
+    ) -> None:
+        if (
+            type(details) is not tuple
+            or not details
+            or any(
+                type(detail) is not PassageSafetyViolationDetail
+                for detail in details
+            )
+            or len(details)
+            != len({detail.violation for detail in details})
+        ):
+            raise ValueError(
+                "passage-safety refusal requires unique structured violations"
+            )
+        self.details = details
+        self.violations = tuple(detail.violation for detail in details)
+        # The latest exact build-3385 replay proves only a short projected
+        # vertical excursion that re-enters every unchanged predicate.  Do not
+        # generalize the suspension lease to raw geometry, rate, scale, or
+        # correction-reversal failures.
+        self.transient_projection_only = bool(
+            self.violations
+            == (PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,)
+            and details[0].observed
+            < -PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and details[0].limit
+            == -PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and math.isclose(
+                details[0].limit - details[0].observed,
+                details[0].excess,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and details[0].excess
+            <= MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM
+        )
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -530,6 +625,28 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
 
 
+def _passage_violation_detail(
+    violation: PassageSafetyViolation,
+    *,
+    observed: float,
+    limit: float,
+    excess: Optional[float] = None,
+) -> PassageSafetyViolationDetail:
+    observed_value = float(observed)
+    limit_value = float(limit)
+    excess_value = (
+        observed_value - limit_value
+        if excess is None
+        else float(excess)
+    )
+    return PassageSafetyViolationDetail(
+        violation=violation,
+        observed=observed_value,
+        limit=limit_value,
+        excess=excess_value,
+    )
+
+
 class ImageVisualServo:
     """Stateful fresh-frame visual servo with align-before-advance gating."""
 
@@ -693,41 +810,145 @@ class ImageVisualServo:
             allow_passage_safe_next_blend
             and self._latched_next_blend_track_id is not None
         )
-        passage_safe_current = bool(
-            passage_continuation
-            and not horizontal_censored
-            and not vertical_censored
-            and not current.clipped
-            and not current.center_censored
-            and abs(raw_horizontal)
-            <= PREPASS_CURRENT_MAX_ABS_X_NORM
-            and abs(raw_vertical)
-            <= PREPASS_CURRENT_MAX_ABS_Y_NORM
-            and abs(raw_horizontal_rate)
-            <= PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
-            and abs(raw_vertical_rate)
-            <= PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
-            and PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S
-            <= float(current.log_scale_rate_s)
-            <= PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
-            and abs(
+        passage_violations = []
+        if passage_continuation:
+            if (
+                horizontal_censored
+                or vertical_censored
+                or current.clipped
+                or current.center_censored
+            ):
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_GEOMETRY_CENSORED,
+                        observed=1.0,
+                        limit=0.0,
+                    )
+                )
+            if abs(raw_horizontal) > PREPASS_CURRENT_MAX_ABS_X_NORM:
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_HORIZONTAL_POSITION,
+                        observed=abs(raw_horizontal),
+                        limit=PREPASS_CURRENT_MAX_ABS_X_NORM,
+                    )
+                )
+            if abs(raw_vertical) > PREPASS_CURRENT_MAX_ABS_Y_NORM:
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_VERTICAL_POSITION,
+                        observed=abs(raw_vertical),
+                        limit=PREPASS_CURRENT_MAX_ABS_Y_NORM,
+                    )
+                )
+            if (
+                abs(raw_horizontal_rate)
+                > PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+            ):
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_HORIZONTAL_RATE,
+                        observed=abs(raw_horizontal_rate),
+                        limit=(
+                            PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+                        ),
+                    )
+                )
+            if (
+                abs(raw_vertical_rate)
+                > PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+            ):
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_VERTICAL_RATE,
+                        observed=abs(raw_vertical_rate),
+                        limit=(
+                            PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+                        ),
+                    )
+                )
+            if not (
+                PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S
+                <= float(current.log_scale_rate_s)
+                <= PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+            ):
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_LOG_SCALE_RATE,
+                        observed=float(current.log_scale_rate_s),
+                        limit=(
+                            PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+                            if float(current.log_scale_rate_s)
+                            > PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+                            else PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S
+                        ),
+                        excess=(
+                            float(current.log_scale_rate_s)
+                            - PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+                            if float(current.log_scale_rate_s)
+                            > PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+                            else PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S
+                            - float(current.log_scale_rate_s)
+                        ),
+                    )
+                )
+            if abs(
                 raw_horizontal
                 + raw_horizontal_rate
                 * PREPASS_CURRENT_PROJECTION_HORIZON_S
-            )
-            <= PREPASS_CURRENT_MAX_ABS_X_NORM
-            and abs(
+            ) > PREPASS_CURRENT_MAX_ABS_X_NORM:
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_PROJECTED_HORIZONTAL,
+                        observed=abs(
+                            raw_horizontal
+                            + raw_horizontal_rate
+                            * PREPASS_CURRENT_PROJECTION_HORIZON_S
+                        ),
+                        limit=PREPASS_CURRENT_MAX_ABS_X_NORM,
+                    )
+                )
+            projected_vertical = (
                 raw_vertical
                 + raw_vertical_rate
                 * PREPASS_CURRENT_PROJECTION_HORIZON_S
             )
-            <= PREPASS_CURRENT_MAX_ABS_Y_NORM
-            and math.exp(float(current.log_scale))
-            <= PREPASS_CURRENT_MAX_APPARENT_SCALE
+            if (
+                abs(projected_vertical)
+                > PREPASS_CURRENT_MAX_ABS_Y_NORM
+            ):
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,
+                        observed=projected_vertical,
+                        limit=math.copysign(
+                            PREPASS_CURRENT_MAX_ABS_Y_NORM,
+                            projected_vertical,
+                        ),
+                        excess=(
+                            abs(projected_vertical)
+                            - PREPASS_CURRENT_MAX_ABS_Y_NORM
+                        ),
+                    )
+                )
+            if (
+                math.exp(float(current.log_scale))
+                > PREPASS_CURRENT_MAX_APPARENT_SCALE
+            ):
+                passage_violations.append(
+                    _passage_violation_detail(
+                        PassageSafetyViolation.CURRENT_APPARENT_SCALE,
+                        observed=math.exp(float(current.log_scale)),
+                        limit=PREPASS_CURRENT_MAX_APPARENT_SCALE,
+                    )
+                )
+        passage_safe_current = bool(
+            passage_continuation and not passage_violations
         )
-        if passage_continuation and not passage_safe_current:
+        if passage_violations:
             raise VisualServoPassageSafetyUnavailable(
-                "latched pre-pass current aperture left its passage corridor"
+                "latched pre-pass current aperture left its passage corridor",
+                details=tuple(passage_violations),
             )
         passage_safe_start = bool(
             allow_passage_safe_next_blend
@@ -863,17 +1084,37 @@ class ImageVisualServo:
                         * float(next_target.normalized_y_rate_down_s)
                     )
                 if passage_continuation:
+                    correction_violations = []
                     if (
                         abs(raw_horizontal)
                         > self.tuning.horizontal_corridor
                         and raw_horizontal * horizontal < 0.0
-                    ) or (
+                    ):
+                        correction_violations.append(
+                            _passage_violation_detail(
+                                PassageSafetyViolation
+                                .CURRENT_HORIZONTAL_CORRECTION_REVERSAL,
+                                observed=-(raw_horizontal * horizontal),
+                                limit=0.0,
+                            )
+                        )
+                    if (
                         abs(raw_vertical)
                         > self.tuning.vertical_corridor
                         and raw_vertical * vertical < 0.0
                     ):
+                        correction_violations.append(
+                            _passage_violation_detail(
+                                PassageSafetyViolation
+                                .CURRENT_VERTICAL_CORRECTION_REVERSAL,
+                                observed=-(raw_vertical * vertical),
+                                limit=0.0,
+                            )
+                        )
+                    if correction_violations:
                         raise VisualServoPassageSafetyUnavailable(
-                            "next-gate blend reversed current-aperture correction"
+                            "next-gate blend reversed current-aperture correction",
+                            details=tuple(correction_violations),
                         )
                 if self._latched_next_blend_track_id is None:
                     self._latched_next_blend_track_id = (
@@ -1036,6 +1277,7 @@ class ImageVisualServo:
 __all__ = [
     "ImageVisualServo",
     "MAX_NEXT_GATE_BLEND",
+    "MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM",
     "MAX_VISUAL_OBSERVATION_AGE_S",
     "MAX_VISUAL_SEGMENT_DURATION_S",
     "MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD",
@@ -1049,6 +1291,8 @@ __all__ = [
     "PREPASS_CURRENT_PROJECTION_HORIZON_S",
     "PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S",
     "PREPASS_NEXT_MAX_ABS_LOG_SCALE_RATE_S",
+    "PassageSafetyViolation",
+    "PassageSafetyViolationDetail",
     "ServoFrameToken",
     "VISUAL_SEGMENT_YAW_SOFT_STOP_RAD",
     "VisualServoOutput",

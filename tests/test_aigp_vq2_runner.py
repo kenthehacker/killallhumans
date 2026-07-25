@@ -3403,22 +3403,57 @@ def test_gate0_visual_blend_requires_zero_crossing_hold_before_sampling(
 
 
 @pytest.mark.parametrize(
-    ("withdrawal_exception", "withdrawal_reason"),
+    (
+        "withdrawal_exception",
+        "passage_violation_kind",
+        "withdrawal_reason",
+        "expected_suspended_frames",
+    ),
     (
         (
             vq2_module.VisualApproachCurrentGeometryUnavailable,
+            None,
             "current_aperture_geometry_unavailable",
+            0,
         ),
         (
             vq2_module.VisualApproachPassageSafetyUnavailable,
-            "passage_safety_corridor_unavailable",
+            "transient_projected_vertical",
+            "crossing_candidate_armed",
+            1,
+        ),
+        (
+            vq2_module.VisualApproachPassageSafetyUnavailable,
+            "hard_apparent_scale",
+            "passage_safety_hard_violation",
+            0,
+        ),
+        (
+            vq2_module.VisualApproachPassageSafetyUnavailable,
+            "transient_wall",
+            "passage_safety_suspension_wall_duration_exhausted",
+            1,
+        ),
+        (
+            vq2_module.VisualApproachPassageSafetyUnavailable,
+            "transient_resume",
+            "crossing_candidate_armed",
+            1,
+        ),
+        (
+            vq2_module.VisualApproachPassageSafetyUnavailable,
+            "transient_total_wall",
+            "passage_safety_suspension_wall_duration_exhausted",
+            3,
         ),
     ),
 )
-def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossing(
+def test_gate0_visual_blend_hard_withdraws_geometry_but_suspends_passage(
     monkeypatch,
     withdrawal_exception,
+    passage_violation_kind,
     withdrawal_reason,
+    expected_suspended_frames,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = True
@@ -3430,7 +3465,12 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     )
     runner = VQ2Runner(adapter, vision)
     runner.estimate = _estimate(pitch=-0.05)
-    clock = [0.0]
+    cumulative_wall_case = (
+        passage_violation_kind == "transient_total_wall"
+    )
+    publication_base = 100 if cumulative_wall_case else 1
+    clock = [1.0 if cumulative_wall_case else 0.0]
+    flight_clock_origin = clock[0]
     sample_count = [0]
     sent_commands = []
     confirmation_commands = []
@@ -3445,10 +3485,11 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
             current_track_id=current_track_id,
             current_gate_index=0,
             authority_usable=True,
+            tracker_frame_sequence=0,
             latest_camera_token=vq2_module.VisualCameraFrameToken(
                 generation=1,
                 frame_id=100,
-                publication_sequence=1,
+                publication_sequence=publication_base,
                 stream_id="vq2-camera",
             ),
         )
@@ -3457,7 +3498,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     runner.tracker.target = vq2_module.GateTarget(
         frame_id=100,
         sim_time_ns=100,
-        received_monotonic_s=0.0,
+        received_monotonic_s=flight_clock_origin,
         center_x=320,
         center_y=180,
         bbox=(240, 120, 160, 120),
@@ -3495,14 +3536,44 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
             )
             self.calls += 1
             if self.calls == 4:
+                if passage_violation_kind is None:
+                    raise withdrawal_exception(
+                        "optional pre-pass authority is unavailable"
+                    )
+                if (
+                    passage_violation_kind
+                    in {
+                        "transient_projected_vertical",
+                        "transient_resume",
+                        "transient_total_wall",
+                        "transient_wall",
+                    }
+                ):
+                    violation = (
+                        "current_projected_vertical",
+                        -0.283,
+                        -0.28,
+                        0.003,
+                    )
+                else:
+                    assert passage_violation_kind == "hard_apparent_scale"
+                    violation = (
+                        "current_apparent_scale",
+                        0.56,
+                        0.55,
+                        0.01,
+                    )
                 raise withdrawal_exception(
-                    "optional pre-pass authority is unavailable"
+                    "optional pre-pass authority is unavailable",
+                    violation_codes=(violation[0],),
+                    violation_evidence=(violation,),
+                    camera_observation_monotonic_s=now_monotonic_s,
                 )
             token = ServoFrameToken(
                 stream_id="vq2-camera",
                 generation=1,
                 frame_id=100 + self.calls,
-                publication_sequence=1 + self.calls,
+                publication_sequence=publication_base + self.calls,
             )
             current = VisualTarget(
                 track_id=current_track_id,
@@ -3566,14 +3637,22 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
 
     def sample():
         sample_count[0] += 1
-        graph.latest_snapshot.latest_camera_token = (
-            vq2_module.VisualCameraFrameToken(
-                generation=1,
-                frame_id=100 + sample_count[0],
-                publication_sequence=1 + sample_count[0],
-                stream_id="vq2-camera",
+        if not (
+            passage_violation_kind
+            in {"transient_total_wall", "transient_wall"}
+            and sample_count[0] == 5
+        ):
+            graph.latest_snapshot.tracker_frame_sequence = sample_count[0]
+            graph.latest_snapshot.latest_camera_token = (
+                vq2_module.VisualCameraFrameToken(
+                    generation=1,
+                    frame_id=100 + sample_count[0],
+                    publication_sequence=(
+                        publication_base + sample_count[0]
+                    ),
+                    stream_id="vq2-camera",
+                )
             )
-        )
         if sample_count[0] in {2, 3}:
             center_y = 170 if sample_count[0] == 2 else 150
             runner.tracker.target = vq2_module.GateTarget(
@@ -3586,7 +3665,17 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
                 confidence=0.9,
             )
             runner.tracker.consecutive += 1
-        if sample_count[0] == 5:
+        crossing_sample = (
+            6
+            if passage_violation_kind
+            in {
+                "transient_resume",
+                "transient_total_wall",
+                "transient_wall",
+            }
+            else 5
+        )
+        if sample_count[0] == crossing_sample:
             runner.tracker.target = vq2_module.GateTarget(
                 frame_id=200,
                 sim_time_ns=200,
@@ -3597,7 +3686,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
                 confidence=0.9,
             )
             runner.tracker.consecutive = 3
-        if sample_count[0] == 7:
+        if sample_count[0] == crossing_sample + 2:
             adapter.race_status = RaceStatus(1250, 0, -1, 1, 123)
 
     async def send(command, **_kwargs):
@@ -3605,7 +3694,18 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         runner._last_flight_command_sent_s = clock[0]
 
     async def sleep(seconds):
-        minimum_step = 0.45 if clock[0] == 0.0 else 0.25
+        minimum_step = (
+            0.45
+            if sample_count[0] == 1
+            else (
+                0.05
+                if (
+                    passage_violation_kind == "transient_resume"
+                    and sample_count[0] in {4, 5}
+                )
+                else 0.25
+            )
+        )
         clock[0] += max(float(seconds), minimum_step)
 
     async def next_slot():
@@ -3620,7 +3720,11 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     ):
         del target_roll_rad
         bootstrap_attitude_targets.append(
-            (clock[0], target_pitch_rad, thrust)
+            (
+                clock[0] - flight_clock_origin,
+                target_pitch_rad,
+                thrust,
+            )
         )
         command = AttitudeRateCommand(
             roll_rate=0.18,
@@ -3647,6 +3751,36 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         if stage == "gate0/confirm":
             confirmation_commands.append(command)
 
+    if cumulative_wall_case:
+        base_passage_lease = vq2_module.VisualApproachPassageLease
+
+        class PreloadedPassageLease(base_passage_lease):
+            def __init__(self):
+                super().__init__()
+                for publication, observation_s, safe, blend in (
+                    (1, 0.00, True, True),
+                    (2, 0.01, False, False),
+                    (3, 0.10, True, True),
+                    (4, 0.11, False, False),
+                    (5, 0.20, True, True),
+                ):
+                    self.observe(
+                        vq2_module.VisualCameraFrameToken(
+                            generation=1,
+                            frame_id=10 + publication,
+                            publication_sequence=publication,
+                            stream_id="vq2-camera",
+                        ),
+                        observation_monotonic_s=observation_s,
+                        passage_safe=safe,
+                        blend_active=blend,
+                    )
+
+        monkeypatch.setattr(
+            vq2_module,
+            "VisualApproachPassageLease",
+            PreloadedPassageLease,
+        )
     monkeypatch.setattr(
         vq2_module,
         "RollingVisualApproachServo",
@@ -3706,10 +3840,70 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
     assert result["gate0_passed"] is True
     assert summary["started"] is True
     assert summary["blended_next_track_id"] == next_track_id
-    assert summary["fresh_blend_frame_count"] == 3
-    assert summary["command_count"] == 3
+    expected_visual_command_count = (
+        4 if passage_violation_kind == "transient_resume" else 3
+    )
+    assert (
+        summary["fresh_blend_frame_count"]
+        == expected_visual_command_count
+    )
+    assert summary["command_count"] == expected_visual_command_count
     assert summary["withdrawn_before_confirmation"] is True
     assert summary["withdrawal_reason"] == withdrawal_reason
+    assert (
+        summary["passage_suspension_fresh_frame_count"]
+        == expected_suspended_frames
+    )
+    assert summary["passage_suspension_epoch_count"] == (
+        3
+        if cumulative_wall_case
+        else (1 if expected_suspended_frames else 0)
+    )
+    assert summary["passage_suspension_resume_count"] == (
+        2
+        if cumulative_wall_case
+        else (1 if passage_violation_kind == "transient_resume" else 0)
+    )
+    assert summary["passage_suspension_max_streak"] == (
+        1 if expected_suspended_frames else 0
+    )
+    assert summary["passage_suspension_currently_active"] is False
+    assert summary["passage_suspension_lease_exhausted"] is (
+        passage_violation_kind
+        in {"transient_total_wall", "transient_wall"}
+    )
+    assert summary["passage_suspension_retirement_reason"] == (
+        (
+            "total_suspension_wall_duration_exhausted"
+            if cumulative_wall_case
+            else "suspension_epoch_wall_duration_exhausted"
+        )
+        if passage_violation_kind == "transient_wall"
+        or cumulative_wall_case
+        else None
+    )
+    assert summary["max_passage_suspension_fresh_frames"] == 2
+    assert summary["max_total_passage_suspension_fresh_frames"] == 4
+    assert summary["max_passage_suspension_epochs"] == 3
+    assert summary["max_passage_suspension_epoch_duration_s"] == 0.12
+    assert summary["max_total_passage_suspension_duration_s"] == 0.20
+    assert (
+        summary[
+            "passage_suspension_visual_authority_withheld_tick_count"
+        ]
+        == (
+            2
+            if passage_violation_kind
+            in {"transient_total_wall", "transient_wall"}
+            else (1 if expected_suspended_frames else 0)
+        )
+    )
+    if passage_violation_kind == "hard_apparent_scale":
+        assert summary["passage_hard_violation_codes"] == [
+            "current_apparent_scale"
+        ]
+    else:
+        assert "passage_hard_violation_codes" not in summary
     assert summary["launch_collective_hold_s"] == pytest.approx(0.45)
     assert summary["launch_boost_thrust"] == pytest.approx(0.32)
     assert summary["command_axis_authority"] == {
@@ -3717,9 +3911,21 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         "pitch": "bounded_visual_brake",
         "roll_collective": "proved_gate0_bootstrap",
     }
-    visual_commands = sent_commands[: summary["command_count"]]
-    visual_attitude_targets = bootstrap_attitude_targets[
-        : summary["command_count"]
+    visual_command_indices = (
+        [0, 1, 2, 4]
+        if passage_violation_kind == "transient_resume"
+        else [0, 1, 2]
+    )
+    visual_commands = [
+        sent_commands[index] for index in visual_command_indices
+    ]
+    visual_attitude_targets = [
+        bootstrap_attitude_targets[index]
+        for index in visual_command_indices
+    ]
+    visual_bootstrap_commands = [
+        bootstrap_commands[index]
+        for index in visual_command_indices
     ]
     assert visual_commands
     assert len(visual_attitude_targets) == len(visual_commands)
@@ -3732,6 +3938,24 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         <= vq2_module.VISUAL_ALIGN_MAX_YAW_RATE_RAD_S
         for command in visual_commands
     )
+    if passage_violation_kind in {
+        "transient_projected_vertical",
+        "transient_resume",
+        "transient_total_wall",
+        "transient_wall",
+    }:
+        suspended_command = sent_commands[3]
+        suspended_bootstrap = bootstrap_commands[3]
+        assert suspended_command == suspended_bootstrap
+        assert suspended_command.roll_rate == pytest.approx(0.18)
+        assert suspended_command.pitch_rate == pytest.approx(-0.20)
+        assert suspended_command.yaw_rate == 0.0
+        assert all(
+            command.pitch_rate == pytest.approx(
+                -vq2_module.VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S
+            )
+            for command in visual_commands
+        )
     assert all(
         command.roll_rate == bootstrap.roll_rate
         and command.pitch_rate
@@ -3747,7 +3971,7 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         and command.thrust == bootstrap.thrust
         for command, bootstrap in zip(
             visual_commands,
-            bootstrap_commands[: summary["command_count"]],
+            visual_bootstrap_commands,
             strict=True,
         )
     )
@@ -3771,12 +3995,21 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
         0.65 * first_rate
         + 0.35 * ((150.0 - 170.0) / 0.25)
     )
+    expected_visual_thrusts = [
+        0.26,
+        (
+            0.32
+            if cumulative_wall_case
+            else vq2_module.gate_vertical_thrust(170.0, first_rate)
+        ),
+        vq2_module.gate_vertical_thrust(150.0, second_rate),
+    ]
+    if passage_violation_kind == "transient_resume":
+        expected_visual_thrusts.append(
+            vq2_module.gate_vertical_thrust(150.0, second_rate)
+        )
     assert [target[2] for target in visual_attitude_targets] == pytest.approx(
-        [
-            0.26,
-            vq2_module.gate_vertical_thrust(170.0, first_rate),
-            vq2_module.gate_vertical_thrust(150.0, second_rate),
-        ]
+        expected_visual_thrusts
     )
     assert [command.thrust for command in visual_commands] == pytest.approx(
         [target[2] for target in visual_attitude_targets]
@@ -3788,10 +4021,13 @@ def test_gate0_visual_blend_path_withdraws_and_keeps_latched_yaw_and_zero_crossi
             visual_commands,
             strict=True,
         )
-        if targets[0] >= 0.45
+        if targets[0] >= 0.45 - 1e-9
     ]
+    expected_boundary_times = [0.45, 0.70]
+    if passage_violation_kind == "transient_resume":
+        expected_boundary_times.append(1.00)
     assert [targets[0] for targets, _command in boundary_and_later] == (
-        pytest.approx([0.45, 0.70])
+        pytest.approx(expected_boundary_times)
     )
     assert all(
         targets[1] == pytest.approx(0.03)
@@ -7056,6 +7292,39 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
         "pitch": "bounded_visual_brake",
         "roll_collective": "proved_gate0_bootstrap",
     }
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "passage_refusal_command_authority"
+    ] == "exact_zero_visual"
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "max_consecutive_passage_suspension_fresh_frames"
+    ] == 2
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "max_total_passage_suspension_fresh_frames"
+    ] == 4
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "max_passage_suspension_epochs"
+    ] == 3
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "max_passage_suspension_epoch_duration_s"
+    ] == 0.12
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "max_total_passage_suspension_duration_s"
+    ] == 0.20
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "transient_passage_violation_codes"
+    ] == ["current_projected_vertical"]
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "transient_projected_vertical_side"
+    ] == "negative_image_down"
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "transient_projected_vertical_limit_norm"
+    ] == -0.28
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "max_transient_projected_vertical_excess_norm"
+    ] == 0.01
+    assert phases["gate0_visual_handoff_bootstrap"][
+        "resume_requires_same_latched_identity"
+    ] is True
     assert phases["crossing_confirmation"] == {
         "exact_zero_rate_zero_thrust": True,
         "max_wait_s": 0.40,

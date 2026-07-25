@@ -5,7 +5,15 @@ import json
 
 import pytest
 
+from planning.vq2_visual_approach import (
+    MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S,
+    MAX_PASSAGE_SUSPENSION_EPOCHS,
+    MAX_PASSAGE_SUSPENSION_FRESH_FRAMES,
+    MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S,
+    MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES,
+)
 from planning.vq2_visual_servo import (
+    MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_SEGMENT_DURATION_S,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
@@ -120,6 +128,7 @@ def test_immutable_safety_envelopes_are_not_configuration_fields():
         "prepass_current_max",
         "prepass_next_max",
         "prepass_projection",
+        "passage_suspension",
     ):
         assert forbidden not in serialized
 
@@ -131,6 +140,12 @@ def test_immutable_safety_envelopes_are_not_configuration_fields():
     assert PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S == 0.60
     assert PREPASS_NEXT_MAX_ABS_CENTER_RATE_NORM_S == 0.60
     assert PREPASS_CURRENT_PROJECTION_HORIZON_S == 0.10
+    assert MAX_PASSAGE_SUSPENSION_FRESH_FRAMES == 2
+    assert MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES == 4
+    assert MAX_PASSAGE_SUSPENSION_EPOCHS == 3
+    assert MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S == 0.12
+    assert MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S == 0.20
+    assert MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM == 0.01
 
 
 def test_validation_returns_new_immutable_nested_values():

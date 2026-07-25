@@ -31,7 +31,9 @@ from planning.vq2_gate_graph import (
 from planning.vq2_visual_servo import (
     ImageVisualServo,
     MAX_NEXT_GATE_BLEND,
+    MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_OBSERVATION_AGE_S,
+    PREPASS_CURRENT_MAX_ABS_Y_NORM,
     VisualServoOutput,
     VisualServoPassageSafetyUnavailable,
     VisualServoRefusal,
@@ -43,6 +45,20 @@ from planning.vq2_visual_servo import (
 _QPC_TIME_BASIS_ID = "host-perf-counter"
 _FUTURE_TOLERANCE_S = 1e-6
 _REQUIRED_NEXT_FRAMES = 3
+# A passage-corridor refusal removes authority for its exact publication, but
+# one short predictive excursion must not destroy a proved same-identity latch.
+# The latest exact build-3385 handoff left only the projected vertical bound
+# for publications 117 and 118, then re-entered every unchanged bound at 119.
+# A third consecutive refused fresh publication retires the lease.
+MAX_PASSAGE_SUSPENSION_FRESH_FRAMES = 2
+# The same replay contains three brief predictive-excursion epochs totaling
+# four refused fresh publications before the close-range contour merger.
+# These whole-segment limits prevent alternating safe/unsafe frames from
+# manufacturing an unbounded lease.
+MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES = 4
+MAX_PASSAGE_SUSPENSION_EPOCHS = 3
+MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S = 0.12
+MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S = 0.20
 
 
 class VisualApproachRefusal(ValueError):
@@ -54,7 +70,311 @@ class VisualApproachCurrentGeometryUnavailable(VisualApproachRefusal):
 
 
 class VisualApproachPassageSafetyUnavailable(VisualApproachRefusal):
-    """A latched no-advance blend left its immutable passage corridor."""
+    """One exact publication cannot safely continue a latched blend."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        violation_codes: tuple[str, ...],
+        violation_evidence: tuple[tuple[str, float, float, float], ...],
+        camera_observation_monotonic_s: float,
+    ) -> None:
+        if (
+            type(violation_codes) is not tuple
+            or not violation_codes
+            or any(
+                type(code) is not str or not code
+                for code in violation_codes
+            )
+            or len(violation_codes) != len(set(violation_codes))
+            or type(violation_evidence) is not tuple
+            or any(
+                type(item) is not tuple
+                or len(item) != 4
+                or type(item[0]) is not str
+                or any(
+                    type(value) not in {int, float}
+                    or not math.isfinite(float(value))
+                    for value in item[1:]
+                )
+                for item in violation_evidence
+            )
+            or tuple(item[0] for item in violation_evidence)
+            != violation_codes
+            or type(camera_observation_monotonic_s) not in {int, float}
+            or not math.isfinite(float(camera_observation_monotonic_s))
+            or float(camera_observation_monotonic_s) < 0.0
+        ):
+            raise ValueError(
+                "passage refusal requires structured immutable evidence"
+            )
+        self.violation_codes = violation_codes
+        self.violation_evidence = violation_evidence
+        self.camera_observation_monotonic_s = float(
+            camera_observation_monotonic_s
+        )
+        transient_evidence = violation_evidence[0]
+        self.transient_eligible = bool(
+            violation_codes == ("current_projected_vertical",)
+            and transient_evidence[1]
+            < -PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and transient_evidence[2]
+            == -PREPASS_CURRENT_MAX_ABS_Y_NORM
+            and math.isclose(
+                transient_evidence[2] - transient_evidence[1],
+                transient_evidence[3],
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            and 0.0 < float(transient_evidence[3])
+            <= MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM
+        )
+        super().__init__(message)
+
+    @classmethod
+    def from_servo_refusal(
+        cls,
+        refusal: VisualServoPassageSafetyUnavailable,
+        *,
+        camera_observation_monotonic_s: float,
+    ) -> "VisualApproachPassageSafetyUnavailable":
+        if type(refusal) is not VisualServoPassageSafetyUnavailable:
+            raise TypeError(
+                "passage wrapper requires an exact visual-servo refusal"
+            )
+        return cls(
+            f"image visual servo retired passage authority: {refusal}",
+            violation_codes=tuple(
+                violation.value for violation in refusal.violations
+            ),
+            violation_evidence=tuple(
+                (
+                    detail.violation.value,
+                    detail.observed,
+                    detail.limit,
+                    detail.excess,
+                )
+                for detail in refusal.details
+            ),
+            camera_observation_monotonic_s=(
+                camera_observation_monotonic_s
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VisualApproachPassageLeaseState:
+    """Exact-token state for a short, zero-authority passage suspension."""
+
+    camera_token: CameraFrameToken
+    passage_safe: bool
+    blend_active: bool
+    recovered: bool
+    resumed: bool
+    suspension_streak: int
+    total_suspended_fresh_frames: int
+    suspension_epoch_count: int
+    suspension_epoch_duration_s: float
+    total_suspension_duration_s: float
+    resume_count: int
+    retirement_required: bool
+    retirement_reason: Optional[str]
+
+
+class VisualApproachPassageLease:
+    """Bound retries after a fresh-frame passage refusal.
+
+    This lease never creates a command.  The runner clears its visual proposal
+    on every refused publication and may resume only after the ordinary
+    approach path accepts a newer exact token with the same latched identity.
+    """
+
+    def __init__(self) -> None:
+        self._last_token: Optional[CameraFrameToken] = None
+        self._suspension_streak = 0
+        self._total_suspended_fresh_frames = 0
+        self._suspension_epoch_count = 0
+        self._suspension_epoch_started_s: Optional[float] = None
+        self._completed_suspension_duration_s = 0.0
+        self._last_observation_monotonic_s: Optional[float] = None
+        self._corridor_recovery_reported = False
+        self._resume_count = 0
+        self._retired = False
+        self._retirement_reason: Optional[str] = None
+
+    def observe(
+        self,
+        camera_token: CameraFrameToken,
+        *,
+        observation_monotonic_s: float,
+        passage_safe: bool,
+        blend_active: bool,
+    ) -> VisualApproachPassageLeaseState:
+        """Consume one newer exact camera token and update the bounded lease."""
+
+        if type(camera_token) is not CameraFrameToken:
+            raise VisualApproachRefusal(
+                "passage suspension requires an exact camera token"
+            )
+        if camera_token.live_identity_tuple is None:
+            raise VisualApproachRefusal(
+                "passage suspension requires live publication provenance"
+            )
+        if (
+            type(observation_monotonic_s) not in {int, float}
+            or not math.isfinite(float(observation_monotonic_s))
+            or float(observation_monotonic_s) < 0.0
+        ):
+            raise VisualApproachRefusal(
+                "passage suspension observation time must be finite"
+            )
+        if type(passage_safe) is not bool or type(blend_active) is not bool:
+            raise VisualApproachRefusal(
+                "passage suspension flags must be exact booleans"
+            )
+        if blend_active and not passage_safe:
+            raise VisualApproachRefusal(
+                "an unsafe passage publication cannot retain blend authority"
+            )
+        if self._retired and blend_active:
+            raise VisualApproachRefusal(
+                "a retired passage suspension lease cannot reactivate blend "
+                "authority"
+            )
+        previous = self._last_token
+        if previous is not None and (
+            camera_token.stream_id != previous.stream_id
+            or camera_token.generation != previous.generation
+            or camera_token.publication_sequence
+            <= previous.publication_sequence
+        ):
+            raise VisualApproachRefusal(
+                "passage suspension camera token did not strictly advance"
+            )
+        observation_s = float(observation_monotonic_s)
+        if (
+            self._last_observation_monotonic_s is not None
+            and observation_s <= self._last_observation_monotonic_s
+        ):
+            raise VisualApproachRefusal(
+                "passage suspension observation time did not strictly advance"
+            )
+        self._last_token = camera_token
+        self._last_observation_monotonic_s = observation_s
+
+        recovered = False
+        resumed = False
+        epoch_duration_s = (
+            0.0
+            if self._suspension_epoch_started_s is None
+            else observation_s - self._suspension_epoch_started_s
+        )
+        total_duration_s = (
+            self._completed_suspension_duration_s + epoch_duration_s
+        )
+        if self._retired:
+            retirement_required = True
+            retirement_reason = self._retirement_reason
+        elif passage_safe:
+            pending_suspension = self._suspension_streak > 0
+            recovered = bool(
+                pending_suspension
+                and (
+                    blend_active
+                    or not self._corridor_recovery_reported
+                )
+            )
+            if (
+                pending_suspension
+                and epoch_duration_s
+                > MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+            ):
+                retirement_reason = "suspension_epoch_duration_exhausted"
+            elif (
+                pending_suspension
+                and total_duration_s
+                > MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+            ):
+                retirement_reason = "total_suspension_duration_exhausted"
+            else:
+                retirement_reason = None
+            retirement_required = retirement_reason is not None
+            if retirement_required:
+                self._retired = True
+                self._retirement_reason = retirement_reason
+            elif pending_suspension and blend_active:
+                resumed = True
+                self._resume_count += 1
+                self._completed_suspension_duration_s = total_duration_s
+                self._suspension_streak = 0
+                self._suspension_epoch_started_s = None
+                self._corridor_recovery_reported = False
+            elif pending_suspension:
+                self._corridor_recovery_reported = True
+            else:
+                self._suspension_streak = 0
+                self._suspension_epoch_started_s = None
+                self._corridor_recovery_reported = False
+        else:
+            if self._suspension_streak == 0:
+                self._suspension_epoch_count += 1
+                self._suspension_epoch_started_s = observation_s
+                self._corridor_recovery_reported = False
+                epoch_duration_s = 0.0
+                total_duration_s = (
+                    self._completed_suspension_duration_s
+                )
+            self._suspension_streak += 1
+            self._total_suspended_fresh_frames += 1
+            retirement_reason = None
+            if (
+                self._suspension_streak
+                > MAX_PASSAGE_SUSPENSION_FRESH_FRAMES
+            ):
+                retirement_reason = "consecutive_fresh_frames_exhausted"
+            elif (
+                self._total_suspended_fresh_frames
+                > MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES
+            ):
+                retirement_reason = "total_fresh_frames_exhausted"
+            elif (
+                self._suspension_epoch_count
+                > MAX_PASSAGE_SUSPENSION_EPOCHS
+            ):
+                retirement_reason = "suspension_epochs_exhausted"
+            elif (
+                epoch_duration_s
+                > MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+            ):
+                retirement_reason = "suspension_epoch_duration_exhausted"
+            elif (
+                total_duration_s
+                > MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+            ):
+                retirement_reason = "total_suspension_duration_exhausted"
+            retirement_required = retirement_reason is not None
+            if retirement_required:
+                self._retired = True
+                self._retirement_reason = retirement_reason
+
+        return VisualApproachPassageLeaseState(
+            camera_token=camera_token,
+            passage_safe=passage_safe,
+            blend_active=blend_active,
+            recovered=recovered,
+            resumed=resumed,
+            suspension_streak=self._suspension_streak,
+            total_suspended_fresh_frames=(
+                self._total_suspended_fresh_frames
+            ),
+            suspension_epoch_count=self._suspension_epoch_count,
+            suspension_epoch_duration_s=epoch_duration_s,
+            total_suspension_duration_s=total_duration_s,
+            resume_count=self._resume_count,
+            retirement_required=retirement_required,
+            retirement_reason=retirement_reason,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,8 +604,11 @@ class RollingVisualApproachServo:
                 allow_passage_safe_next_blend=True,
             )
         except VisualServoPassageSafetyUnavailable as exc:
-            raise VisualApproachPassageSafetyUnavailable(
-                f"image visual servo retired passage authority: {exc}"
+            raise VisualApproachPassageSafetyUnavailable.from_servo_refusal(
+                exc,
+                camera_observation_monotonic_s=(
+                    current_target.received_monotonic_s
+                ),
             ) from exc
         except VisualServoRefusal as exc:
             raise VisualApproachRefusal(
@@ -530,8 +853,15 @@ class RollingVisualApproachServo:
 
 
 __all__ = [
+    "MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S",
+    "MAX_PASSAGE_SUSPENSION_EPOCHS",
+    "MAX_PASSAGE_SUSPENSION_FRESH_FRAMES",
+    "MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S",
+    "MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES",
     "RollingVisualApproachServo",
     "VisualApproachCurrentGeometryUnavailable",
+    "VisualApproachPassageLease",
+    "VisualApproachPassageLeaseState",
     "VisualApproachPassageSafetyUnavailable",
     "VisualApproachProposal",
     "VisualApproachRefusal",

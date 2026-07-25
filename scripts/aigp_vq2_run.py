@@ -93,8 +93,14 @@ from planning.vq2_gate_graph import (
     RollingVisualGateGraph,
 )
 from planning.vq2_visual_approach import (
+    MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S,
+    MAX_PASSAGE_SUSPENSION_EPOCHS,
+    MAX_PASSAGE_SUSPENSION_FRESH_FRAMES,
+    MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S,
+    MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES,
     RollingVisualApproachServo,
     VisualApproachCurrentGeometryUnavailable,
+    VisualApproachPassageLease,
     VisualApproachPassageSafetyUnavailable,
     VisualApproachProposal,
     VisualApproachRefusal,
@@ -151,9 +157,11 @@ from planning.vq2_visual_recovery import (
     RECOVERY_TRACKER_MAX_ASSIGNMENT_COST,
 )
 from planning.vq2_visual_servo import (
+    MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_OBSERVATION_AGE_S,
     MAX_VISUAL_THRUST,
     MAX_VISUAL_YAW_RATE_RAD_S,
+    PREPASS_CURRENT_MAX_ABS_Y_NORM,
     VisualServoRefusal,
     VisualTarget,
 )
@@ -6217,6 +6225,35 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                         "pitch": "bounded_visual_brake",
                         "roll_collective": "proved_gate0_bootstrap",
                     },
+                    "passage_refusal_command_authority": "exact_zero_visual",
+                    "max_consecutive_passage_suspension_fresh_frames": (
+                        MAX_PASSAGE_SUSPENSION_FRESH_FRAMES
+                    ),
+                    "max_total_passage_suspension_fresh_frames": (
+                        MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES
+                    ),
+                    "max_passage_suspension_epochs": (
+                        MAX_PASSAGE_SUSPENSION_EPOCHS
+                    ),
+                    "max_passage_suspension_epoch_duration_s": (
+                        MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+                    ),
+                    "max_total_passage_suspension_duration_s": (
+                        MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+                    ),
+                    "transient_passage_violation_codes": [
+                        "current_projected_vertical"
+                    ],
+                    "transient_projected_vertical_side": (
+                        "negative_image_down"
+                    ),
+                    "transient_projected_vertical_limit_norm": (
+                        -PREPASS_CURRENT_MAX_ABS_Y_NORM
+                    ),
+                    "max_transient_projected_vertical_excess_norm": (
+                        MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM
+                    ),
+                    "resume_requires_same_latched_identity": True,
                 },
                 "crossing_confirmation": {
                     "exact_zero_rate_zero_thrust": True,
@@ -11360,8 +11397,15 @@ class VQ2Runner:
         early_turn_started_s: Optional[float] = None
         early_turn_command_count = 0
         visual_approach: Optional[RollingVisualApproachServo] = None
+        visual_passage_lease: Optional[VisualApproachPassageLease] = None
         latest_visual_proposal: Optional[VisualApproachProposal] = None
         last_visual_approach_token: Optional[VisualCameraFrameToken] = None
+        last_visual_authorized_token: Optional[VisualCameraFrameToken] = None
+        last_visual_suspension_token: Optional[VisualCameraFrameToken] = None
+        visual_passage_suspension_started_s: Optional[float] = None
+        visual_passage_suspension_completed_duration_s: Optional[
+            float
+        ] = None
         visual_yaw_reference_rad: Optional[float] = None
         visual_blend_withdrawn = False
         if visual_next_gate_blend:
@@ -11383,6 +11427,7 @@ class VQ2Runner:
                     self.visual_config.lifecycle.next_gate_blend_max
                 ),
             )
+            visual_passage_lease = VisualApproachPassageLease()
             self._visual_gate0_blend_summary = {
                 "enabled": True,
                 "started": False,
@@ -11391,6 +11436,32 @@ class VQ2Runner:
                 "observed_next_track_ids": [],
                 "fresh_blend_frame_count": 0,
                 "command_count": 0,
+                "passage_suspension_fresh_frame_count": 0,
+                "passage_suspension_epoch_count": 0,
+                "passage_suspension_resume_count": 0,
+                "passage_suspension_max_streak": 0,
+                "passage_suspension_current_streak": 0,
+                "passage_suspension_currently_active": False,
+                "passage_suspension_lease_exhausted": False,
+                "passage_suspension_retirement_reason": None,
+                "passage_suspension_latest_epoch_duration_s": 0.0,
+                "passage_suspension_total_duration_s": 0.0,
+                "passage_suspension_visual_authority_withheld_tick_count": 0,
+                "max_passage_suspension_fresh_frames": (
+                    MAX_PASSAGE_SUSPENSION_FRESH_FRAMES
+                ),
+                "max_total_passage_suspension_fresh_frames": (
+                    MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES
+                ),
+                "max_passage_suspension_epochs": (
+                    MAX_PASSAGE_SUSPENSION_EPOCHS
+                ),
+                "max_passage_suspension_epoch_duration_s": (
+                    MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+                ),
+                "max_total_passage_suspension_duration_s": (
+                    MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+                ),
                 "withdrawn_before_confirmation": False,
                 "withdrawal_reason": None,
                 "yaw_reference_rad": None,
@@ -11468,9 +11539,12 @@ class VQ2Runner:
                 assert self._visual_gate0_blend_summary is not None
                 if crossing_armed and not visual_blend_withdrawn:
                     visual_blend_withdrawn = True
+                    visual_passage_suspension_started_s = None
+                    visual_passage_suspension_completed_duration_s = None
                     latest_visual_proposal = None
                     self._visual_gate0_blend_summary.update(
                         {
+                            "passage_suspension_currently_active": False,
                             "withdrawn_before_confirmation": True,
                             "withdrawal_reason": "crossing_candidate_armed",
                             "withdrawn_elapsed_s": elapsed,
@@ -11528,28 +11602,23 @@ class VQ2Runner:
                                     visual_yaw_excursion
                                 ),
                             )
-                        except (
-                            VisualApproachCurrentGeometryUnavailable,
-                            VisualApproachPassageSafetyUnavailable,
-                        ) as exc:
+                        except VisualApproachCurrentGeometryUnavailable as exc:
                             # The optional pre-pass blend owns no crossing
-                            # authority.  Withdraw it permanently when current
-                            # geometry becomes censored or a latched blend
-                            # leaves its immutable passage corridor, then
-                            # return to the proved Gate-0 bootstrap controller.
-                            # All identity/provenance refusals remain fatal.
+                            # authority.  Censored current-aperture geometry is
+                            # a hard withdrawal; all identity/provenance
+                            # refusals remain fatal.
                             withdrawal_reason = (
                                 "current_aperture_geometry_unavailable"
-                                if isinstance(
-                                    exc,
-                                    VisualApproachCurrentGeometryUnavailable,
-                                )
-                                else "passage_safety_corridor_unavailable"
                             )
                             visual_blend_withdrawn = True
+                            visual_passage_suspension_started_s = None
+                            visual_passage_suspension_completed_duration_s = (
+                                None
+                            )
                             latest_visual_proposal = None
                             self._visual_gate0_blend_summary.update(
                                 {
+                                    "passage_suspension_currently_active": False,
                                     "withdrawn_before_confirmation": True,
                                     "withdrawal_reason": withdrawal_reason,
                                     "withdrawn_elapsed_s": elapsed,
@@ -11571,14 +11640,458 @@ class VQ2Runner:
                                     ]
                                 ),
                             )
+                        except VisualApproachPassageSafetyUnavailable as exc:
+                            latest_visual_proposal = None
+                            violation_evidence = [
+                                {
+                                    "code": code,
+                                    "observed": observed,
+                                    "limit": limit,
+                                    "excess": excess,
+                                }
+                                for (
+                                    code,
+                                    observed,
+                                    limit,
+                                    excess,
+                                ) in exc.violation_evidence
+                            ]
+                            # Only the replay-proved projected-vertical miss
+                            # receives a bounded lease.  Raw position, rate,
+                            # scale, and correction-reversal failures retire
+                            # immediately without weakening any predicate.
+                            if not exc.transient_eligible:
+                                withdrawal_reason = (
+                                    "passage_safety_hard_violation"
+                                )
+                                visual_blend_withdrawn = True
+                                visual_passage_suspension_started_s = None
+                                visual_passage_suspension_completed_duration_s = (
+                                    None
+                                )
+                                last_visual_approach_token = (
+                                    graph.latest_camera_token
+                                )
+                                self._visual_gate0_blend_summary.update(
+                                    {
+                                        "passage_suspension_currently_active": (
+                                            False
+                                        ),
+                                        "passage_hard_violation_codes": list(
+                                            exc.violation_codes
+                                        ),
+                                        "withdrawn_before_confirmation": True,
+                                        "withdrawal_reason": withdrawal_reason,
+                                        "withdrawn_elapsed_s": elapsed,
+                                    }
+                                )
+                                self.recorder.emit(
+                                    "visual_next_gate_blend_withdrawn",
+                                    elapsed_s=elapsed,
+                                    reason=withdrawal_reason,
+                                    refusal=str(exc),
+                                    violation_codes=list(
+                                        exc.violation_codes
+                                    ),
+                                    violation_evidence=violation_evidence,
+                                    transient_eligible=False,
+                                    camera_token=asdict(
+                                        graph.latest_camera_token
+                                    ),
+                                    tracker_frame_sequence=(
+                                        graph.tracker_frame_sequence
+                                    ),
+                                    current_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "current_track_id"
+                                        ]
+                                    ),
+                                    blended_next_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "blended_next_track_id"
+                                        ]
+                                    ),
+                                )
+                            else:
+                                # This exact publication receives zero visual
+                                # authority.  Keep the same-identity latch only
+                                # for the immutable fresh-frame lease.
+                                assert visual_passage_lease is not None
+                                try:
+                                    passage_state = (
+                                        visual_passage_lease.observe(
+                                            graph.latest_camera_token,
+                                            observation_monotonic_s=(
+                                                exc
+                                                .camera_observation_monotonic_s
+                                            ),
+                                            passage_safe=False,
+                                            blend_active=False,
+                                        )
+                                    )
+                                except VisualApproachRefusal as lease_exc:
+                                    raise SafetyAbort(
+                                        "Gate-0 passage suspension refused "
+                                        f"exact provenance: {lease_exc}"
+                                    ) from lease_exc
+                                # Consume the refused token exactly once.
+                                # Retrying one receiver publication on a faster
+                                # control tick could exhaust the lease falsely.
+                                last_visual_approach_token = (
+                                    graph.latest_camera_token
+                                )
+                                last_visual_suspension_token = (
+                                    graph.latest_camera_token
+                                )
+                                if passage_state.suspension_streak == 1:
+                                    visual_passage_suspension_started_s = (
+                                        elapsed
+                                    )
+                                    visual_passage_suspension_completed_duration_s = (
+                                        passage_state
+                                        .total_suspension_duration_s
+                                    )
+                                self._visual_gate0_blend_summary.update(
+                                    {
+                                        "passage_suspension_fresh_frame_count": (
+                                            passage_state
+                                            .total_suspended_fresh_frames
+                                        ),
+                                        "passage_suspension_epoch_count": (
+                                            passage_state
+                                            .suspension_epoch_count
+                                        ),
+                                        "passage_suspension_resume_count": (
+                                            passage_state.resume_count
+                                        ),
+                                        "passage_suspension_max_streak": max(
+                                            int(
+                                                self
+                                                ._visual_gate0_blend_summary[
+                                                    "passage_suspension_max_streak"
+                                                ]
+                                            ),
+                                            passage_state.suspension_streak,
+                                        ),
+                                        "passage_suspension_current_streak": (
+                                            passage_state.suspension_streak
+                                        ),
+                                        "passage_suspension_currently_active": (
+                                            not passage_state
+                                            .retirement_required
+                                        ),
+                                        "passage_suspension_lease_exhausted": (
+                                            passage_state.retirement_required
+                                        ),
+                                        "passage_suspension_retirement_reason": (
+                                            passage_state.retirement_reason
+                                        ),
+                                        "passage_suspension_latest_epoch_duration_s": (
+                                            passage_state
+                                            .suspension_epoch_duration_s
+                                        ),
+                                        "passage_suspension_total_duration_s": (
+                                            passage_state
+                                            .total_suspension_duration_s
+                                        ),
+                                    }
+                                )
+                                self.recorder.emit(
+                                    "visual_next_gate_blend_suspended",
+                                    elapsed_s=elapsed,
+                                    camera_token=asdict(
+                                        passage_state.camera_token
+                                    ),
+                                    tracker_frame_sequence=(
+                                        graph.tracker_frame_sequence
+                                    ),
+                                    previous_authorized_camera_token=(
+                                        None
+                                        if last_visual_authorized_token is None
+                                        else asdict(
+                                            last_visual_authorized_token
+                                        )
+                                    ),
+                                    refusal=str(exc),
+                                    violation_codes=list(
+                                        exc.violation_codes
+                                    ),
+                                    violation_evidence=violation_evidence,
+                                    transient_eligible=True,
+                                    suspension_streak=(
+                                        passage_state.suspension_streak
+                                    ),
+                                    total_suspended_fresh_frames=(
+                                        passage_state
+                                        .total_suspended_fresh_frames
+                                    ),
+                                    suspension_epoch_count=(
+                                        passage_state.suspension_epoch_count
+                                    ),
+                                    suspension_epoch_duration_s=(
+                                        passage_state
+                                        .suspension_epoch_duration_s
+                                    ),
+                                    total_suspension_duration_s=(
+                                        passage_state
+                                        .total_suspension_duration_s
+                                    ),
+                                    max_consecutive_suspension_fresh_frames=(
+                                        MAX_PASSAGE_SUSPENSION_FRESH_FRAMES
+                                    ),
+                                    max_total_suspension_fresh_frames=(
+                                        MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES
+                                    ),
+                                    max_suspension_epochs=(
+                                        MAX_PASSAGE_SUSPENSION_EPOCHS
+                                    ),
+                                    max_suspension_epoch_duration_s=(
+                                        MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+                                    ),
+                                    max_total_suspension_duration_s=(
+                                        MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+                                    ),
+                                    retirement_required=(
+                                        passage_state.retirement_required
+                                    ),
+                                    retirement_reason=(
+                                        passage_state.retirement_reason
+                                    ),
+                                    current_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "current_track_id"
+                                        ]
+                                    ),
+                                    blended_next_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "blended_next_track_id"
+                                        ]
+                                    ),
+                                )
+                                if passage_state.retirement_required:
+                                    withdrawal_reason = (
+                                        "passage_safety_suspension_lease_"
+                                        "exhausted"
+                                    )
+                                    visual_blend_withdrawn = True
+                                    visual_passage_suspension_started_s = None
+                                    visual_passage_suspension_completed_duration_s = (
+                                        None
+                                    )
+                                    self._visual_gate0_blend_summary.update(
+                                        {
+                                            "passage_suspension_currently_active": (
+                                                False
+                                            ),
+                                            "withdrawn_before_confirmation": (
+                                                True
+                                            ),
+                                            "withdrawal_reason": (
+                                                withdrawal_reason
+                                            ),
+                                            "withdrawn_elapsed_s": elapsed,
+                                        }
+                                    )
+                                    self.recorder.emit(
+                                        "visual_next_gate_blend_withdrawn",
+                                        elapsed_s=elapsed,
+                                        reason=withdrawal_reason,
+                                        refusal=str(exc),
+                                        violation_codes=list(
+                                            exc.violation_codes
+                                        ),
+                                        retirement_reason=(
+                                            passage_state.retirement_reason
+                                        ),
+                                        camera_token=asdict(
+                                            passage_state.camera_token
+                                        ),
+                                        tracker_frame_sequence=(
+                                            graph.tracker_frame_sequence
+                                        ),
+                                        current_track_id=(
+                                            self
+                                            ._visual_gate0_blend_summary[
+                                                "current_track_id"
+                                            ]
+                                        ),
+                                        blended_next_track_id=(
+                                            self
+                                            ._visual_gate0_blend_summary[
+                                                "blended_next_track_id"
+                                            ]
+                                        ),
+                                    )
                         except VisualApproachRefusal as exc:
                             raise SafetyAbort(
                                 f"gate-0 visual blend refused: {exc}"
                             ) from exc
                         else:
+                            assert visual_passage_lease is not None
+                            blend_active = bool(
+                                proposal.servo_output.next_gate_blend > 0.0
+                            )
+                            try:
+                                passage_state = visual_passage_lease.observe(
+                                    graph.latest_camera_token,
+                                    observation_monotonic_s=(
+                                        proposal.current_target
+                                        .received_monotonic_s
+                                    ),
+                                    passage_safe=True,
+                                    blend_active=blend_active,
+                                )
+                            except VisualApproachRefusal as lease_exc:
+                                raise SafetyAbort(
+                                    "Gate-0 passage suspension refused exact "
+                                    f"provenance: {lease_exc}"
+                                ) from lease_exc
                             last_visual_approach_token = (
                                 graph.latest_camera_token
                             )
+                            if (
+                                blend_active
+                                and not passage_state.retirement_required
+                            ):
+                                last_visual_authorized_token = (
+                                    graph.latest_camera_token
+                                )
+                            self._visual_gate0_blend_summary.update(
+                                {
+                                    "passage_suspension_fresh_frame_count": (
+                                        passage_state
+                                        .total_suspended_fresh_frames
+                                    ),
+                                    "passage_suspension_epoch_count": (
+                                        passage_state.suspension_epoch_count
+                                    ),
+                                    "passage_suspension_resume_count": (
+                                        passage_state.resume_count
+                                    ),
+                                    "passage_suspension_current_streak": (
+                                        passage_state.suspension_streak
+                                    ),
+                                    "passage_suspension_currently_active": bool(
+                                        passage_state.suspension_streak > 0
+                                        and not passage_state
+                                        .retirement_required
+                                    ),
+                                    "passage_suspension_lease_exhausted": (
+                                        passage_state.retirement_required
+                                    ),
+                                    "passage_suspension_retirement_reason": (
+                                        passage_state.retirement_reason
+                                    ),
+                                    "passage_suspension_latest_epoch_duration_s": (
+                                        passage_state
+                                        .suspension_epoch_duration_s
+                                    ),
+                                    "passage_suspension_total_duration_s": (
+                                        passage_state
+                                        .total_suspension_duration_s
+                                    ),
+                                }
+                            )
+                            if (
+                                passage_state.resumed
+                                or passage_state.retirement_required
+                            ):
+                                visual_passage_suspension_started_s = None
+                                visual_passage_suspension_completed_duration_s = (
+                                    None
+                                )
+                            if passage_state.retirement_required:
+                                withdrawal_reason = (
+                                    "passage_safety_suspension_lease_exhausted"
+                                )
+                                visual_blend_withdrawn = True
+                                latest_visual_proposal = None
+                                self._visual_gate0_blend_summary.update(
+                                    {
+                                        "passage_suspension_currently_active": (
+                                            False
+                                        ),
+                                        "withdrawn_before_confirmation": True,
+                                        "withdrawal_reason": withdrawal_reason,
+                                        "withdrawn_elapsed_s": elapsed,
+                                    }
+                                )
+                                self.recorder.emit(
+                                    "visual_next_gate_blend_withdrawn",
+                                    elapsed_s=elapsed,
+                                    reason=withdrawal_reason,
+                                    retirement_reason=(
+                                        passage_state.retirement_reason
+                                    ),
+                                    camera_token=asdict(
+                                        passage_state.camera_token
+                                    ),
+                                    tracker_frame_sequence=(
+                                        graph.tracker_frame_sequence
+                                    ),
+                                    current_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "current_track_id"
+                                        ]
+                                    ),
+                                    blended_next_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "blended_next_track_id"
+                                        ]
+                                    ),
+                                )
+                            if (
+                                passage_state.recovered
+                                and not passage_state.retirement_required
+                            ):
+                                recovery_event = (
+                                    "visual_next_gate_blend_resumed"
+                                    if passage_state.resumed
+                                    else (
+                                        "visual_next_gate_passage_corridor_"
+                                        "recovered_without_blend"
+                                    )
+                                )
+                                self.recorder.emit(
+                                    recovery_event,
+                                    elapsed_s=elapsed,
+                                    camera_token=asdict(
+                                        passage_state.camera_token
+                                    ),
+                                    tracker_frame_sequence=(
+                                        graph.tracker_frame_sequence
+                                    ),
+                                    last_suspension_camera_token=(
+                                        None
+                                        if last_visual_suspension_token is None
+                                        else asdict(
+                                            last_visual_suspension_token
+                                        )
+                                    ),
+                                    blend_active=blend_active,
+                                    same_latched_identity=bool(
+                                        proposal.latched_next_track_id
+                                        == self._visual_gate0_blend_summary[
+                                            "blended_next_track_id"
+                                        ]
+                                    ),
+                                    total_suspended_fresh_frames=(
+                                        passage_state
+                                        .total_suspended_fresh_frames
+                                    ),
+                                    suspension_epoch_count=(
+                                        passage_state.suspension_epoch_count
+                                    ),
+                                    resume_count=passage_state.resume_count,
+                                    current_track_id=(
+                                        self._visual_gate0_blend_summary[
+                                            "current_track_id"
+                                        ]
+                                    ),
+                                    blended_next_track_id=(
+                                        proposal.latched_next_track_id
+                                    ),
+                                )
                             observed_ids = list(
                                 self._visual_gate0_blend_summary[
                                     "observed_next_track_ids"
@@ -11590,7 +12103,10 @@ class VQ2Runner:
                             self._visual_gate0_blend_summary[
                                 "observed_next_track_ids"
                             ] = observed_ids
-                            if proposal.servo_output.next_gate_blend > 0.0:
+                            if (
+                                not passage_state.retirement_required
+                                and proposal.servo_output.next_gate_blend > 0.0
+                            ):
                                 if visual_yaw_reference_rad is None:
                                     visual_yaw_reference_rad = float(
                                         measured_yaw
@@ -11958,6 +12474,133 @@ class VQ2Runner:
                     forward_braking.gate0_turn_thrust_cap,
                 )
             visual_blend_active = latest_visual_proposal is not None
+            if (
+                self._visual_gate0_blend_summary is not None
+                and self._visual_gate0_blend_summary[
+                    "passage_suspension_currently_active"
+                ]
+            ):
+                if visual_blend_active:
+                    raise SafetyAbort(
+                        "suspended Gate-0 publication retained visual authority"
+                    )
+                if visual_passage_suspension_started_s is None:
+                    raise SafetyAbort(
+                        "Gate-0 passage suspension lacks a wall-time anchor"
+                    )
+                if (
+                    visual_passage_suspension_completed_duration_s
+                    is None
+                ):
+                    raise SafetyAbort(
+                        "Gate-0 passage suspension lacks a cumulative-duration "
+                        "anchor"
+                    )
+                suspension_control_elapsed_s = (
+                    elapsed - visual_passage_suspension_started_s
+                )
+                suspension_control_total_duration_s = (
+                    visual_passage_suspension_completed_duration_s
+                    + suspension_control_elapsed_s
+                )
+                self._visual_gate0_blend_summary[
+                    "passage_suspension_control_elapsed_s"
+                ] = suspension_control_elapsed_s
+                self._visual_gate0_blend_summary[
+                    "passage_suspension_total_duration_s"
+                ] = max(
+                    float(
+                        self._visual_gate0_blend_summary[
+                            "passage_suspension_total_duration_s"
+                        ]
+                    ),
+                    suspension_control_total_duration_s,
+                )
+                self._visual_gate0_blend_summary[
+                    "passage_suspension_visual_authority_withheld_tick_count"
+                ] = (
+                    int(
+                        self._visual_gate0_blend_summary[
+                            "passage_suspension_visual_authority_withheld_"
+                            "tick_count"
+                        ]
+                    )
+                    + 1
+                )
+                total_duration_budget_this_epoch_s = max(
+                    0.0,
+                    MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+                    - visual_passage_suspension_completed_duration_s,
+                )
+                wall_retirement_reason = None
+                if (
+                    total_duration_budget_this_epoch_s
+                    < MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+                    and suspension_control_elapsed_s
+                    > total_duration_budget_this_epoch_s
+                ):
+                    wall_retirement_reason = (
+                        "total_suspension_wall_duration_exhausted"
+                    )
+                elif suspension_control_elapsed_s > (
+                    MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+                ):
+                    wall_retirement_reason = (
+                        "suspension_epoch_wall_duration_exhausted"
+                    )
+                if wall_retirement_reason is not None:
+                    withdrawal_reason = (
+                        "passage_safety_suspension_wall_duration_exhausted"
+                    )
+                    visual_blend_withdrawn = True
+                    visual_passage_suspension_started_s = None
+                    visual_passage_suspension_completed_duration_s = None
+                    self._visual_gate0_blend_summary.update(
+                        {
+                            "passage_suspension_currently_active": False,
+                            "passage_suspension_lease_exhausted": True,
+                            "passage_suspension_retirement_reason": (
+                                wall_retirement_reason
+                            ),
+                            "withdrawn_before_confirmation": True,
+                            "withdrawal_reason": withdrawal_reason,
+                            "withdrawn_elapsed_s": elapsed,
+                        }
+                    )
+                    self.recorder.emit(
+                        "visual_next_gate_blend_withdrawn",
+                        elapsed_s=elapsed,
+                        reason=withdrawal_reason,
+                        retirement_reason=(
+                            wall_retirement_reason
+                        ),
+                        suspension_control_elapsed_s=(
+                            suspension_control_elapsed_s
+                        ),
+                        suspension_control_total_duration_s=(
+                            suspension_control_total_duration_s
+                        ),
+                        completed_suspension_duration_at_epoch_start_s=(
+                            suspension_control_total_duration_s
+                            - suspension_control_elapsed_s
+                        ),
+                        max_suspension_epoch_duration_s=(
+                            MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S
+                        ),
+                        max_total_suspension_duration_s=(
+                            MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S
+                        ),
+                        current_track_id=(
+                            self._visual_gate0_blend_summary[
+                                "current_track_id"
+                            ]
+                        ),
+                        blended_next_track_id=(
+                            self._visual_gate0_blend_summary[
+                                "blended_next_track_id"
+                            ]
+                        ),
+                    )
             if visual_blend_active:
                 assert latest_visual_proposal is not None
                 visual_age_s = (

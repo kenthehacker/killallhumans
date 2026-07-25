@@ -19,8 +19,14 @@ from planning.vq2_gate_graph import (
     RollingVisualGateGraph,
 )
 from planning.vq2_visual_approach import (
+    MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S,
+    MAX_PASSAGE_SUSPENSION_EPOCHS,
+    MAX_PASSAGE_SUSPENSION_FRESH_FRAMES,
+    MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S,
+    MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES,
     RollingVisualApproachServo,
     VisualApproachCurrentGeometryUnavailable,
+    VisualApproachPassageLease,
     VisualApproachPassageSafetyUnavailable,
     VisualApproachRefusal,
 )
@@ -331,6 +337,316 @@ def test_latched_current_passage_violation_is_specialized_refusal() -> None:
         match="retired passage authority",
     ):
         _observe(approach, snapshot, tracker)
+
+
+def test_passage_lease_resumes_exact_latest_two_frame_excursion() -> None:
+    """Regress exact publication provenance from the latest live handoff."""
+
+    lease = VisualApproachPassageLease()
+    tokens = tuple(
+        CameraFrameToken(
+            stream_id="vq2-camera-udp-5600",
+            generation=1,
+            frame_id=2_426_752 + publication,
+            publication_sequence=publication,
+        )
+        for publication in (116, 117, 118, 119)
+    )
+
+    initial = lease.observe(
+        tokens[0],
+        observation_monotonic_s=20.0,
+        passage_safe=True,
+        blend_active=True,
+    )
+    first = lease.observe(
+        tokens[1],
+        observation_monotonic_s=20.033,
+        passage_safe=False,
+        blend_active=False,
+    )
+    second = lease.observe(
+        tokens[2],
+        observation_monotonic_s=20.066,
+        passage_safe=False,
+        blend_active=False,
+    )
+    resumed = lease.observe(
+        tokens[3],
+        observation_monotonic_s=20.099,
+        passage_safe=True,
+        blend_active=True,
+    )
+
+    assert MAX_PASSAGE_SUSPENSION_FRESH_FRAMES == 2
+    assert MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES == 4
+    assert MAX_PASSAGE_SUSPENSION_EPOCHS == 3
+    assert MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S == 0.12
+    assert MAX_PASSAGE_SUSPENSION_TOTAL_DURATION_S == 0.20
+    assert initial.suspension_streak == 0
+    assert first.suspension_streak == 1
+    assert second.suspension_streak == 2
+    assert not first.retirement_required
+    assert not second.retirement_required
+    assert resumed.camera_token == tokens[3]
+    assert resumed.recovered
+    assert resumed.resumed
+    assert resumed.suspension_streak == 0
+    assert resumed.total_suspended_fresh_frames == 2
+    assert resumed.suspension_epoch_count == 1
+    assert resumed.suspension_epoch_duration_s == pytest.approx(0.066)
+    assert resumed.total_suspension_duration_s == pytest.approx(0.066)
+    assert resumed.resume_count == 1
+    assert not resumed.retirement_required
+
+
+def test_passage_lease_retires_on_third_fresh_refusal_and_never_revives() -> None:
+    lease = VisualApproachPassageLease()
+    states = tuple(
+        lease.observe(
+            CameraFrameToken(
+                stream_id="vq2-camera-udp-5600",
+                generation=4,
+                frame_id=900 + publication,
+                publication_sequence=publication,
+            ),
+            observation_monotonic_s=publication * 0.033,
+            passage_safe=False,
+            blend_active=False,
+        )
+        for publication in (1, 2, 3)
+    )
+    after_retirement = lease.observe(
+        CameraFrameToken(
+            stream_id="vq2-camera-udp-5600",
+            generation=4,
+            frame_id=904,
+            publication_sequence=4,
+        ),
+        observation_monotonic_s=0.132,
+        passage_safe=True,
+        blend_active=False,
+    )
+
+    assert [state.suspension_streak for state in states] == [1, 2, 3]
+    assert [state.retirement_required for state in states] == [
+        False,
+        False,
+        True,
+    ]
+    assert states[-1].retirement_reason == (
+        "consecutive_fresh_frames_exhausted"
+    )
+    assert after_retirement.retirement_required
+    assert after_retirement.retirement_reason == (
+        "consecutive_fresh_frames_exhausted"
+    )
+    assert not after_retirement.recovered
+    assert not after_retirement.resumed
+    assert after_retirement.resume_count == 0
+
+    with pytest.raises(VisualApproachRefusal, match="cannot reactivate"):
+        lease.observe(
+            CameraFrameToken(
+                stream_id="vq2-camera-udp-5600",
+                generation=4,
+                frame_id=905,
+                publication_sequence=5,
+            ),
+            observation_monotonic_s=0.165,
+            passage_safe=True,
+            blend_active=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda token: token,
+        lambda token: replace(token, publication_sequence=116),
+        lambda token: replace(token, generation=2),
+        lambda token: replace(token, stream_id="different-camera"),
+    ),
+)
+def test_passage_lease_rejects_replayed_or_cross_stream_token(mutation) -> None:
+    lease = VisualApproachPassageLease()
+    token = CameraFrameToken(
+        stream_id="vq2-camera-udp-5600",
+        generation=1,
+        frame_id=2_426_868,
+        publication_sequence=116,
+    )
+    lease.observe(
+        token,
+        observation_monotonic_s=1.0,
+        passage_safe=True,
+        blend_active=True,
+    )
+
+    with pytest.raises(VisualApproachRefusal, match="strictly advance"):
+        lease.observe(
+            mutation(token),
+            observation_monotonic_s=1.033,
+            passage_safe=False,
+            blend_active=False,
+        )
+
+
+def test_passage_lease_never_allows_blend_on_unsafe_publication() -> None:
+    lease = VisualApproachPassageLease()
+    with pytest.raises(VisualApproachRefusal, match="cannot retain"):
+        lease.observe(
+            CameraFrameToken(
+                stream_id="vq2-camera-udp-5600",
+                generation=1,
+                frame_id=2_426_869,
+                publication_sequence=117,
+            ),
+            observation_monotonic_s=1.0,
+            passage_safe=False,
+            blend_active=True,
+        )
+
+
+def test_passage_lease_retires_alternating_epochs_at_whole_segment_cap() -> None:
+    """The exact replay pattern cannot manufacture an unlimited lease."""
+
+    lease = VisualApproachPassageLease()
+
+    def observe(publication: int, *, safe: bool):
+        return lease.observe(
+            CameraFrameToken(
+                stream_id="vq2-camera-udp-5600",
+                generation=1,
+                frame_id=2_426_752 + publication,
+                publication_sequence=publication,
+            ),
+            observation_monotonic_s=(
+                20.0 + 0.033 * (publication - 116)
+            ),
+            passage_safe=safe,
+            blend_active=safe,
+        )
+
+    observe(116, safe=True)
+    for publication, safe in (
+        (117, False),
+        (118, False),
+        (119, True),
+        (122, False),
+        (123, True),
+        (124, False),
+        (125, True),
+    ):
+        state = observe(publication, safe=safe)
+        assert not state.retirement_required
+
+    assert state.total_suspended_fresh_frames == 4
+    assert state.suspension_epoch_count == 3
+    exhausted = observe(153, safe=False)
+    assert exhausted.retirement_required
+    assert exhausted.total_suspended_fresh_frames == 5
+    assert exhausted.suspension_epoch_count == 4
+    assert exhausted.retirement_reason == "total_fresh_frames_exhausted"
+
+
+def test_passage_lease_keeps_pending_until_same_identity_blend_resumes() -> None:
+    lease = VisualApproachPassageLease()
+
+    def observe(
+        publication: int,
+        observation_s: float,
+        *,
+        safe: bool,
+        blend: bool,
+    ):
+        return lease.observe(
+            CameraFrameToken(
+                stream_id="vq2-camera-udp-5600",
+                generation=1,
+                frame_id=3_000_000 + publication,
+                publication_sequence=publication,
+            ),
+            observation_monotonic_s=observation_s,
+            passage_safe=safe,
+            blend_active=blend,
+        )
+
+    observe(200, 30.000, safe=True, blend=True)
+    suspended = observe(201, 30.033, safe=False, blend=False)
+    no_next = observe(202, 30.066, safe=True, blend=False)
+    still_no_next = observe(203, 30.077, safe=True, blend=False)
+    resumed = observe(204, 30.099, safe=True, blend=True)
+
+    assert suspended.suspension_streak == 1
+    assert no_next.recovered
+    assert not no_next.resumed
+    assert no_next.suspension_streak == 1
+    assert not still_no_next.recovered
+    assert not still_no_next.resumed
+    assert still_no_next.suspension_streak == 1
+    assert resumed.recovered
+    assert resumed.resumed
+    assert resumed.suspension_streak == 0
+    assert resumed.resume_count == 1
+    assert resumed.total_suspension_duration_s == pytest.approx(0.066)
+
+
+def test_passage_lease_retires_reentry_after_epoch_wall_duration() -> None:
+    lease = VisualApproachPassageLease()
+    first = CameraFrameToken(
+        stream_id="vq2-camera-udp-5600",
+        generation=1,
+        frame_id=400,
+        publication_sequence=1,
+    )
+    second = replace(first, frame_id=401, publication_sequence=2)
+    lease.observe(
+        first,
+        observation_monotonic_s=1.0,
+        passage_safe=False,
+        blend_active=False,
+    )
+    retired = lease.observe(
+        second,
+        observation_monotonic_s=(
+            1.0 + MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S + 0.001
+        ),
+        passage_safe=True,
+        blend_active=True,
+    )
+
+    assert retired.retirement_required
+    assert not retired.resumed
+    assert retired.retirement_reason == (
+        "suspension_epoch_duration_exhausted"
+    )
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        CameraFrameToken(generation=1, frame_id=1),
+        CameraFrameToken(
+            generation=1,
+            frame_id=1,
+            publication_sequence=1,
+        ),
+    ),
+)
+def test_passage_lease_rejects_partial_live_provenance(
+    token: CameraFrameToken,
+) -> None:
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="live publication provenance",
+    ):
+        VisualApproachPassageLease().observe(
+            token,
+            observation_monotonic_s=1.0,
+            passage_safe=False,
+            blend_active=False,
+        )
 
 
 @pytest.mark.parametrize(
