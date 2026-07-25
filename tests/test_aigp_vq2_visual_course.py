@@ -5293,12 +5293,32 @@ def test_supersession_clips_replacement_wire_deadline_to_hold_bound():
 def test_exact_next_post_credit_frame_is_admitted_without_immediate_abort():
     host = _Host(initial_gate=1, finish_gate=2, fresh_after_samples=1)
     runtime, _calls = _runtime(host)
+    continuation_admission = runtime.recovery_continuation_admission
+    navigation_counts_at_admission = []
+
+    def audited_continuation_admission(*args, **kwargs):
+        navigation_counts_at_admission.append(
+            sum(
+                command.thrust > 0.0
+                for command, _wire, gate_index in host.commands
+                if gate_index == 2
+            )
+        )
+        return continuation_admission(*args, **kwargs)
+
+    runtime = replace(
+        runtime,
+        recovery_continuation_admission=(
+            audited_continuation_admission
+        ),
+    )
 
     result = asyncio.run(
         run_visual_course_stage(host, _context(), runtime=runtime)
     )
 
     transition = result["authoritative_transitions"][0]
+    assert navigation_counts_at_admission == [0]
     assert transition["post_transition_zero_command_count"] == 0
     assert transition["recovery_admission"]["admission_kind"] == (
         "exact_next_continuation"

@@ -23,12 +23,14 @@ from planning.vq2_gate_graph import (
     ConfirmedGateTransition,
 )
 from planning.vq2_visual_alignment import (
+    POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S,
     VisualAlignmentRefusal,
     require_visual_alignment_entry,
 )
 from planning.vq2_visual_recovery import (
     RECOVERY_HARD_DURATION_S,
     RECOVERY_HISTORY_SAMPLE_COUNT,
+    RECOVERY_MAX_ABS_X_NORM,
     RECOVERY_MAX_ANCHOR_CREDIT_AGE_S,
     RECOVERY_MAX_CONTINUATION_AGE_S,
     RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES,
@@ -684,6 +686,187 @@ _LATEST_COMPLETE_EPOCH_ROWS = (
 )
 _LATEST_COMPLETE_EPOCH_RACE_RECEIVED_NS = 85_558_465_866_500
 
+# Exact compact recovery window from
+# 20260725T192942Z-visual-course-a98d3bb6/session.jsonl.gz.  Publications
+# 159--170 were missed.  Publications 171--179 are the complete current
+# visibility epoch frozen at authoritative credit; publication 180 is the
+# exact-next clean post-credit continuation.
+_ATTEMPT19_RECOVERY_ROWS = (
+    (
+        561878, 155, 154, 140_634_841_292_300, 140_634_842_491_800,
+        1_785_007_789_164_642_400, 1,
+        (0.41874999999999996, -0.4),
+        (0.66875, 0.2222222222222222, 0.75, 0.37777777777777777),
+        0.11242281302693372, 0.669710588235294, 0.9386898001942038,
+        None,
+    ),
+    (
+        561879, 156, 155, 140_634_869_089_300, 140_634_870_159_900,
+        1_785_007_789_192_427_800, 1,
+        (0.421875, -0.4111111111111111),
+        (0.66875, 0.21666666666666667, 0.753125, 0.375),
+        0.11558276255566836, 0.6317001086812131, 0.9316489712293522,
+        (
+            0.05604784359193118, 0.005075837209840692,
+            0.946068875893437, 0.031473097052924004, 0,
+        ),
+    ),
+    (
+        561880, 157, 156, 140_634_905_506_700, 140_634_906_615_300,
+        1_785_007_789_227_146_200, 1,
+        (0.4281250000000001, -0.41666666666666663),
+        (0.671875, 0.2111111111111111, 0.75625, 0.37222222222222223),
+        0.11659223816361017, 0.6767384905660377, 0.9367829153011473,
+        (
+            0.051838009453059206, 0.006275678583125494,
+            0.9606427639748344, -0.03668608709945875, 0,
+        ),
+    ),
+    (
+        561881, 158, 157, 140_634_938_983_900, 140_634_940_078_600,
+        1_785_007_789_261_906_500, 1,
+        (0.4312499999999999, -0.4222222222222223),
+        (
+            0.6734375, 0.20833333333333334,
+            0.759375, 0.36944444444444446,
+        ),
+        0.11766684372035782, 0.6847333333333331, 0.944199264819788,
+        (
+            0.045756602847773865, 0.0028154060426524674,
+            0.9694975250573646, -0.012814349468914799, 0,
+        ),
+    ),
+    (
+        561894, 171, 170, 140_635_369_540_100, 140_635_370_368_500,
+        1_785_007_789_694_739_200, 1,
+        (0.51875, -0.5388888888888889),
+        (0.7, 0.13055555555555556, 0.8203125, 0.3333333333333333),
+        0.15619443456438803, 0.7582571869032683, 0.6533621275708419,
+        (
+            0.28424305539190964, 0.04917929424224398,
+            0.558334643964895, 0.2563337156736103, 12,
+        ),
+    ),
+    (
+        561895, 172, 171, 140_635_405_683_800, 140_635_406_700_000,
+        1_785_007_789_729_446_400, 0,
+        (0.528125, -0.55),
+        (0.703125, 0.125, 0.8265625, 0.3277777777777778),
+        0.15820992998053074, 0.7417999999999998, 0.9405113148653836,
+        (
+            0.04878072181038546, 0.004262496794952395,
+            0.9604087613064006, -0.012229081695341648, 0,
+        ),
+    ),
+    (
+        561896, 173, 172, 140_635_439_354_600, 140_635_440_304_600,
+        1_785_007_789_764_192_100, 0,
+        (0.5375000000000001, -0.5611111111111111),
+        (0.70625, 0.11666666666666667, 0.8328125, 0.325),
+        0.1623797632095822, 0.7492156756756757, 0.9368340896745028,
+        (
+            0.05179604646690775, 0.0027659812285289313,
+            0.9493004115226342, 0.023015388746509657, 0,
+        ),
+    ),
+    (
+        561897, 174, 173, 140_635_473_518_100, 140_635_474_391_300,
+        1_785_007_789_798_917_800, 0,
+        (0.55, -0.5722222222222222),
+        (
+            0.709375, 0.10833333333333334,
+            0.840625, 0.32222222222222224,
+        ),
+        0.16754974385735916, 0.7440084210526315, 0.9342923214046609,
+        (
+            0.0538802964481781, 0.0039886141758003375,
+            0.9392393320964746, 0.020402107056277874, 0,
+        ),
+    ),
+    (
+        561898, 175, 174, 140_635_501_792_300, 140_635_502_633_300,
+        1_785_007_789_826_668_600, 0,
+        (0.5562499999999999, -0.5777777777777777),
+        (
+            0.7125, 0.10277777777777777,
+            0.8453125, 0.3194444444444444,
+        ),
+        0.16963502488185234, 0.7493272727272726, 0.9441031417023126,
+        (
+            0.045835423804103714, 0.004289615704056613,
+            0.9755656108597286, -0.01954281481140896, 0,
+        ),
+    ),
+    (
+        561899, 176, 175, 140_635_536_627_200, 140_635_537_656_100,
+        1_785_007_789_861_413_100, 0,
+        (0.5687500000000001, -0.5888888888888889),
+        (
+            0.715625, 0.09444444444444444,
+            0.853125, 0.31666666666666665,
+        ),
+        0.1748014746950253, 0.7525202531645571, 0.9346635619403681,
+        (
+            0.053575879208898114, 0.004106736241756732,
+            0.9417613636363632, 0.018690495381351813, 0,
+        ),
+    ),
+    (
+        561900, 177, 176, 140_635_571_228_100, 140_635_572_249_000,
+        1_785_007_789_896_097_800, 0,
+        (0.578125, -0.6055555555555556),
+        (
+            0.71875, 0.08333333333333333,
+            0.8609375, 0.3138888888888889,
+        ),
+        0.18105832777189665, 0.7586117073170732, 0.9287801845030667,
+        (
+            0.058400248707485315, 0.006874170566477421,
+            0.9320799682245469, 0.01909059059451579, 0,
+        ),
+    ),
+    (
+        561901, 178, 177, 140_635_605_886_000, 140_635_606_729_000,
+        1_785_007_789_930_858_200, 0,
+        (0.590625, -0.6222222222222222),
+        (
+            0.721875, 0.07222222222222222,
+            0.86875, 0.30833333333333335,
+        ),
+        0.18622249983405453, 0.7840771428571427, 0.9345751069568435,
+        (
+            0.05364841229538832, 0.0038426901512180916,
+            0.9453066332916148, -0.005601692424404003, 0,
+        ),
+    ),
+    (
+        561902, 179, 178, 140_635_640_694_300, 140_635_641_695_100,
+        1_785_007_789_965_554_900, 0,
+        (0.6000000000000001, -0.6333333333333333),
+        (
+            0.7234375, 0.06111111111111111,
+            0.8765625, 0.3055555555555556,
+        ),
+        0.19346977943739838, 0.7142972413793103, 0.9247420619189597,
+        (
+            0.06171150922645307, 0.004758967963722349,
+            0.9264842300556579, 0.017336546852473322, 0,
+        ),
+    ),
+    (
+        561903, 180, 179, 140_635_673_595_600, 140_635_674_404_900,
+        1_785_007_789_993_319_700, 0,
+        (0.60625, -0.65),
+        (0.725, 0.05, 0.88125, 0.30277777777777776),
+        0.19873733362853033, 0.7877, 0.9309501782094968,
+        (
+            0.05662085386821265, 0.005579772518001449,
+            0.9454347390412681, -0.011075470467420523, 0,
+        ),
+    ),
+)
+_ATTEMPT19_RACE_RECEIVED_NS = 140_635_655_219_200
+
 
 def _accepted_sample(
     previous: VisualTrackSample,
@@ -1197,6 +1380,126 @@ def _latest_complete_epoch_fixture() -> tuple[
         promoted_history_sha256=visual_track_history_sha256(samples),
     )
     return track, transition
+
+
+def _attempt19_recovery_fixture() -> tuple[
+    VisualTrack,
+    ConfirmedGateTransition,
+    CameraFrameToken,
+    int,
+    int,
+]:
+    raw_samples = tuple(
+        VisualTrackSample(
+            tracker_frame_sequence=row[2],
+            token=CameraFrameToken(
+                generation=1,
+                frame_id=row[0],
+                publication_sequence=row[1],
+                stream_id="vq2-camera-udp-5600",
+            ),
+            observation_monotonic_ns=row[3],
+            publication_monotonic_ns=row[4],
+            provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+            camera_source_time_ns=row[5],
+            source_index=row[6],
+            center_norm=row[7],
+            bbox_norm=row[8],
+            apparent_scale=row[9],
+            confidence=row[10],
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            association_confidence=row[11],
+        )
+        for row in _ATTEMPT19_RECOVERY_ROWS
+    )
+    bound_samples = [raw_samples[0]]
+    for sample, row in zip(
+        raw_samples[1:],
+        _ATTEMPT19_RECOVERY_ROWS[1:],
+        strict=True,
+    ):
+        association = row[12]
+        assert association is not None
+        bound_samples.append(
+            _accepted_sample(
+                bound_samples[-1],
+                sample,
+                cost=association[0],
+                residual=association[1],
+                bbox_iou=association[2],
+                log_area_residual=association[3],
+                missed_frames=association[4],
+            )
+        )
+    samples = tuple(bound_samples)
+    anchor_samples = samples[:-1]
+    race = AuthoritativeRaceStatusRef.live(
+        session_id="f3b1be4670560e21455b5d59560d3dc2adcc169844f15e5a9c018612373bffa9",
+        reset_epoch=1,
+        race_generation=2,
+        race_status_sequence=1535,
+        race_status_boot_ms=6321,
+        active_gate_index=1,
+        received_monotonic_ns=_ATTEMPT19_RACE_RECEIVED_NS,
+        host_clock_id="host-perf-counter",
+    )
+    track = VisualTrack(
+        track_id="vq2-track-000002",
+        first_token=samples[0].token,
+        latest_token=samples[-1].token,
+        center_norm=samples[-1].center_norm,
+        bbox_norm=samples[-1].bbox_norm,
+        apparent_scale=samples[-1].apparent_scale,
+        center_velocity_norm_s=(
+            0.23783256859167312,
+            -0.44713025909630655,
+        ),
+        log_scale_rate_s=0.8922042756137537,
+        confidence=0.7661168066494254,
+        association_confidence=samples[-1].association_confidence,
+        consecutive_frame_count=10,
+        total_observation_count=len(samples),
+        missed_frame_count=0,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        authority_race_status_sequence=1535,
+        authority_race_status_boot_ms=6321,
+        ambiguous=False,
+        visible=True,
+        history=samples,
+    )
+    transition = ConfirmedGateTransition(
+        from_gate_index=0,
+        to_gate_index=1,
+        retired_track_id="vq2-track-000001",
+        promoted_track_id=track.track_id,
+        race_status=race,
+        camera_token_at_credit=anchor_samples[-1].token,
+        promoted_first_token=anchor_samples[0].token,
+        promoted_latest_token_before_credit=anchor_samples[-1].token,
+        promoted_latest_token_at_promotion=anchor_samples[-1].token,
+        pretransition_frame_tokens=tuple(
+            sample.token for sample in anchor_samples[-9:]
+        ),
+        promoted_history_length_at_credit=len(anchor_samples),
+        history_length_before_promotion=len(anchor_samples),
+        history_length_after_promotion=len(anchor_samples),
+        promoted_history_sha256=visual_track_history_sha256(
+            anchor_samples
+        ),
+    )
+    latest_publication_ns = samples[-1].publication_monotonic_ns
+    assert latest_publication_ns is not None
+    return (
+        track,
+        transition,
+        anchor_samples[-1].token,
+        _ATTEMPT19_RACE_RECEIVED_NS + 1_000_000,
+        latest_publication_ns + 1_000_000,
+    )
 
 
 def _six_frame_epoch_fixture() -> tuple[
@@ -3784,6 +4087,291 @@ def test_continuation_admits_exact_next_postcredit_publication():
     )
 
 
+def test_exact_attempt19_postcredit_continuation_admits():
+    fixture = _attempt19_recovery_fixture()
+    track, transition, previous, started_ns, now_ns = fixture
+
+    admission = require_recovery_continuation(
+        track,
+        transition,
+        previous_token=previous,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.0641419364687695,
+        recovery_started_monotonic_ns=started_ns,
+        now_monotonic_ns=now_ns,
+    )
+
+    assert admission.promotion_identity_basis == (
+        PROMOTION_IDENTITY_BASIS_COMPLETE_CURRENT_VISIBILITY_EPOCH
+    )
+    assert admission.cross_gap_identity_claimed is False
+    assert admission.reacquisition_bridge is None
+    assert admission.frame_token.publication_sequence == 180
+    assert admission.previous_token.publication_sequence == 179
+    assert tuple(
+        token.publication_sequence
+        for token in admission.visibility_epoch_tokens
+    ) == tuple(range(171, 180))
+    assert admission.visibility_epoch_frame_count == 9
+    assert admission.visibility_epoch_span_s == pytest.approx(0.2711542)
+    assert admission.capture.horizontal_error == pytest.approx(0.60625)
+    assert admission.capture.vertical_error_image_down == pytest.approx(-0.65)
+    assert admission.capture.vertical_rate_down_s == pytest.approx(
+        -0.44713025909630655
+    )
+    assert admission.capture.projected_horizontal_error == pytest.approx(
+        0.6300332568591673
+    )
+    assert (
+        admission.capture.projected_vertical_error_image_down
+        == pytest.approx(-0.6947130259096307)
+    )
+    assert admission.capture.projected_apparent_scale == pytest.approx(
+        track.apparent_scale
+        * math.exp(
+            track.log_scale_rate_s
+            * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+        )
+    )
+    assert admission.max_raw_vertical_rate_down_s == pytest.approx(
+        0.5065655966988148
+    )
+    assert admission.projected_abs_horizontal_error == pytest.approx(
+        0.6413534504398708
+    )
+    assert admission.projected_abs_vertical_error_image_down == pytest.approx(
+        0.7016363588470163
+    )
+    assert admission.projected_apparent_scale == pytest.approx(
+        0.21696377525528765
+    )
+    assert admission.projected_bbox_norm_ltrb[1] == pytest.approx(
+        0.01742761262050775
+    )
+    assert admission.projected_bbox_norm_ltrb[1] > 6.0 / 360.0
+
+
+@pytest.mark.parametrize(
+    ("confidence", "admitted"),
+    (
+        (
+            recovery_policy
+            .RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE,
+            True,
+        ),
+        (
+            math.nextafter(
+                recovery_policy
+                .RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE,
+                -math.inf,
+            ),
+            False,
+        ),
+    ),
+)
+def test_complete_epoch_pre_gap_detection_floor_is_inclusive(
+    confidence,
+    admitted,
+):
+    track, transition, previous, started_ns, now_ns = (
+        _attempt19_recovery_fixture()
+    )
+    sample_index = next(
+        index
+        for index, sample in enumerate(track.history)
+        if sample.token.publication_sequence == 156
+    )
+    sample = replace(track.history[sample_index], confidence=confidence)
+    history = (
+        track.history[:sample_index]
+        + (sample,)
+        + track.history[sample_index + 1 :]
+    )
+    track = replace(track, history=history)
+    transition = replace(
+        transition,
+        promoted_history_sha256=visual_track_history_sha256(history[:-1]),
+    )
+
+    if admitted:
+        result = require_recovery_continuation(
+            track,
+            transition,
+            previous_token=previous,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.0641419364687695,
+            recovery_started_monotonic_ns=started_ns,
+            now_monotonic_ns=now_ns,
+        )
+        assert result.frame_token == track.latest_token
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="history confidence is insufficient",
+        ):
+            require_recovery_continuation(
+                track,
+                transition,
+                previous_token=previous,
+                tracker_time_basis_id="host-perf-counter",
+                measured_pitch_rad=-0.0641419364687695,
+                recovery_started_monotonic_ns=started_ns,
+                now_monotonic_ns=now_ns,
+            )
+
+
+@pytest.mark.parametrize(
+    ("horizontal", "admitted"),
+    (
+        (RECOVERY_MAX_ABS_X_NORM, True),
+        (math.nextafter(RECOVERY_MAX_ABS_X_NORM, math.inf), False),
+    ),
+)
+def test_recovery_horizontal_cap_is_inclusive(horizontal, admitted):
+    track, transition, previous, started_ns, now_ns = (
+        _attempt19_recovery_fixture()
+    )
+    latest = replace(track.history[-1], center_norm=(horizontal, -0.65))
+    track = replace(
+        track,
+        center_norm=latest.center_norm,
+        history=track.history[:-1] + (latest,),
+    )
+
+    if admitted:
+        result = require_recovery_continuation(
+            track,
+            transition,
+            previous_token=previous,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.0641419364687695,
+            recovery_started_monotonic_ns=started_ns,
+            now_monotonic_ns=now_ns,
+        )
+        assert result.frame_token == latest.token
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="horizontal position is unsafe",
+        ):
+            require_recovery_continuation(
+                track,
+                transition,
+                previous_token=previous,
+                tracker_time_basis_id="host-perf-counter",
+                measured_pitch_rad=-0.0641419364687695,
+                recovery_started_monotonic_ns=started_ns,
+                now_monotonic_ns=now_ns,
+            )
+
+
+@pytest.mark.parametrize(
+    ("confidence", "admitted"),
+    (
+        (
+            recovery_policy.RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE,
+            True,
+        ),
+        (
+            math.nextafter(
+                recovery_policy.RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE,
+                -math.inf,
+            ),
+            False,
+        ),
+    ),
+)
+def test_bounded_reacquisition_pre_gap_detection_floor_is_inclusive(
+    confidence,
+    admitted,
+):
+    track, transition = _stable_tail_fixture()
+    bridge_index = len(track.history) - track.consecutive_frame_count
+    sample_index = (
+        bridge_index - recovery_policy.RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT
+    )
+    sample = replace(track.history[sample_index], confidence=confidence)
+    history = (
+        track.history[:sample_index]
+        + (sample,)
+        + track.history[sample_index + 1 :]
+    )
+    track = replace(track, history=history)
+    transition = replace(
+        transition,
+        promoted_history_sha256=visual_track_history_sha256(history),
+    )
+
+    if admitted:
+        result = _admit_stable_trace(track, transition)
+        assert result.promotion_identity_basis == (
+            recovery_policy.PROMOTION_IDENTITY_BASIS_BOUNDED_REACQUISITION_BRIDGE
+        )
+        assert result.cross_gap_identity_claimed is True
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="history confidence is insufficient",
+        ):
+            _admit_stable_trace(track, transition)
+
+
+@pytest.mark.parametrize("admitted", (True, False))
+def test_recovery_raw_center_rate_cap_is_inclusive(admitted):
+    track, transition, previous, started_ns, now_ns = (
+        _attempt19_recovery_fixture()
+    )
+    prior = track.history[-2]
+    latest = track.history[-1]
+    dt_s = (
+        latest.observation_monotonic_ns
+        - prior.observation_monotonic_ns
+    ) / 1_000_000_000.0
+    boundary_y = (
+        prior.center_norm[1]
+        - RECOVERY_MAX_RAW_CENTER_RATE_NORM_S * dt_s
+    )
+    if not admitted:
+        boundary_y = math.nextafter(boundary_y, -math.inf)
+    latest = replace(
+        latest,
+        center_norm=(latest.center_norm[0], boundary_y),
+    )
+    track = replace(
+        track,
+        center_norm=latest.center_norm,
+        history=track.history[:-1] + (latest,),
+    )
+
+    if admitted:
+        result = require_recovery_continuation(
+            track,
+            transition,
+            previous_token=previous,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.0641419364687695,
+            recovery_started_monotonic_ns=started_ns,
+            now_monotonic_ns=now_ns,
+        )
+        assert result.max_raw_vertical_rate_down_s == (
+            RECOVERY_MAX_RAW_CENTER_RATE_NORM_S
+        )
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="raw center motion is unsafe",
+        ):
+            require_recovery_continuation(
+                track,
+                transition,
+                previous_token=previous,
+                tracker_time_basis_id="host-perf-counter",
+                measured_pitch_rad=-0.0641419364687695,
+                recovery_started_monotonic_ns=started_ns,
+                now_monotonic_ns=now_ns,
+            )
+
+
 def test_continuation_revalidates_the_frozen_reacquisition_bridge():
     anchor, transition = _stable_tail_fixture()
     previous = anchor.history[-1]
@@ -4095,7 +4683,16 @@ def test_continuation_rejects_precredit_stale_and_future_frames():
 @pytest.mark.parametrize(
     ("center_norm", "reason"),
     (
-        ((0.6001, -0.63), "horizontal position is unsafe"),
+        (
+            (
+                math.nextafter(
+                    RECOVERY_MAX_ABS_X_NORM,
+                    math.inf,
+                ),
+                -0.63,
+            ),
+            "horizontal position is unsafe",
+        ),
         ((0.53, -0.6801), "vertical position is unsafe"),
     ),
 )

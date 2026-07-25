@@ -780,7 +780,10 @@ def test_progress_plugin_publishes_current_test_heartbeats_and_final_state(
     while process.poll() is None and time.monotonic() < deadline:
         try:
             value = json.loads(progress.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError):
+            # Windows can transiently deny a reader while os.replace swaps
+            # the diagnostic snapshot.  The production progress reader
+            # treats the same condition as one unavailable heartbeat.
             time.sleep(0.01)
             continue
         if value.get("current_test"):

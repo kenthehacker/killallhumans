@@ -5532,7 +5532,10 @@ def test_cleanup_reset_without_clock_baseline_reacts_to_newer_armed_heartbeat(
 
     assert proof is None
     assert adapter.reset_calls == 1
-    assert disarm_observations == [(56, True)]
+    assert disarm_observations == [
+        (55, False),
+        (56, True),
+    ]
 
 
 def test_cleanup_reset_requests_atomic_disarm_before_proof_wait_without_claim(
@@ -5691,12 +5694,53 @@ def test_cleanup_reset_proof_cuts_on_rollback_then_newer_armed_heartbeat(
     ]
 
 
-def test_cleanup_reset_proof_does_not_disarm_before_clock_rollback(
+def test_cleanup_reset_disarm_cadence_is_exact_and_drops_missed_ticks(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
     adapter.heartbeat_sequence = 55
-    adapter.is_armed = False
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    clock = [0.0]
+    disarm_times = []
+
+    async def disarm():
+        disarm_times.append(clock[0])
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(adapter, "disarm", disarm)
+
+    async def exercise():
+        next_deadline = 0.0
+        observed_deadlines = []
+        for now_s in (0.0, 0.019, 0.020, 0.075, 0.075, 0.095):
+            clock[0] = now_s
+            next_deadline = await (
+                runner._advance_cleanup_reset_disarm_cadence(
+                    attempt=1,
+                    heartbeat_anchor=55,
+                    next_deadline_s=next_deadline,
+                    reset_clock_rolled_back=False,
+                )
+            )
+            assert next_deadline is not None
+            observed_deadlines.append(next_deadline)
+        return observed_deadlines
+
+    deadlines = asyncio.run(exercise())
+
+    assert disarm_times == pytest.approx([0.0, 0.020, 0.075, 0.095])
+    assert deadlines == pytest.approx(
+        [0.020, 0.020, 0.040, 0.095, 0.095, 0.115]
+    )
+
+
+def test_cleanup_reset_disarm_cadence_stops_at_first_clock_rollback(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.heartbeat_sequence = 55
+    adapter.is_armed = True
     adapter.race_status = RaceStatus(11_000, 0, -1, 0, -1)
     adapter.latest_telemetry = TelemetryState(
         timestamp_us=0,
@@ -5716,15 +5760,25 @@ def test_cleanup_reset_proof_does_not_disarm_before_clock_rollback(
 
     async def advance(delay):
         clock[0] += delay
-        # Even a newer armed heartbeat remains insufficient until an
-        # authoritative simulator clock proves that reset was applied.
-        adapter.heartbeat_sequence = 56
-        adapter.is_armed = True
+        if clock[0] >= 0.025:
+            adapter.race_status = RaceStatus(100, 1_000, -1, 0, -1)
+            adapter.latest_telemetry = TelemetryState(
+                timestamp_us=0,
+                position_ned=(0.0, 0.0, 0.0),
+                velocity_ned=(0.0, 0.0, 0.0),
+                orientation=Quaternion(),
+                angular_velocity=(0.0, 0.0, 0.0),
+                imu=IMUData(
+                    timestamp_us=100_000,
+                    accel=(0.0, 0.0, -9.81),
+                    gyro=(0.0, 0.0, 0.0),
+                ),
+            )
 
     async def disarm():
-        disarm_calls.append(adapter.heartbeat_sequence)
+        disarm_calls.append(clock[0])
 
-    monkeypatch.setattr(vq2_module, "RESET_PROOF_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(vq2_module, "RESET_PROOF_TIMEOUT_S", 0.061)
     monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
     monkeypatch.setattr(adapter, "disarm", disarm)
@@ -5739,7 +5793,109 @@ def test_cleanup_reset_proof_does_not_disarm_before_clock_rollback(
     )
 
     assert proof is None
+    # 0.025 is the preserved one-shot rollback reaction.  The 50 Hz cadence
+    # sent at 0.000 and 0.020, then remained stopped for the rest of the wait.
+    assert disarm_calls == pytest.approx([0.0, 0.020, 0.025])
+
+
+def test_cleanup_reset_disarm_cadence_stops_on_newer_disarmed_heartbeat(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.heartbeat_sequence = 56
+    adapter.is_armed = False
+    runner = VQ2Runner(adapter, _FakeVision())
+    disarm_calls = []
+
+    async def disarm():
+        disarm_calls.append(True)
+
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: 0.0)
+    monkeypatch.setattr(adapter, "disarm", disarm)
+
+    next_deadline = asyncio.run(
+        runner._advance_cleanup_reset_disarm_cadence(
+            attempt=1,
+            heartbeat_anchor=55,
+            next_deadline_s=0.0,
+            reset_clock_rolled_back=False,
+        )
+    )
+
+    assert next_deadline is None
     assert disarm_calls == []
+
+
+def test_cleanup_reset_disarm_send_failure_does_not_suppress_reset_proof(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.heartbeat_sequence = 55
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(11_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = TelemetryState(
+        timestamp_us=0,
+        position_ned=(0.0, 0.0, 0.0),
+        velocity_ned=(0.0, 0.0, 0.0),
+        orientation=Quaternion(),
+        angular_velocity=(0.0, 0.0, 0.0),
+        imu=IMUData(
+            timestamp_us=11_000_000,
+            accel=(0.0, 0.0, -9.81),
+            gyro=(0.0, 0.0, 0.0),
+        ),
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    clock = [0.0]
+    sample_index = [0]
+    disarm_calls = []
+
+    async def advance(delay):
+        clock[0] += delay
+        sample_index[0] += 1
+        index = sample_index[0]
+        adapter.race_status = RaceStatus(
+            100 + 50 * (index - 1),
+            1_000,
+            -1,
+            0,
+            -1,
+        )
+        adapter.latest_telemetry = TelemetryState(
+            timestamp_us=0,
+            position_ned=(0.0, 0.0, 0.0),
+            velocity_ned=(0.0, 0.0, 0.0),
+            orientation=Quaternion(),
+            angular_velocity=(0.0, 0.0, 0.0),
+            imu=IMUData(
+                timestamp_us=100_000 * index,
+                accel=(0.0, 0.0, -9.81),
+                gyro=(0.0, 0.0, 0.0),
+            ),
+        )
+
+    async def failed_disarm():
+        disarm_calls.append(clock[0])
+        raise RuntimeError("injected disarm send failure")
+
+    monkeypatch.setattr(vq2_module, "RESET_PROOF_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(adapter, "disarm", failed_disarm)
+
+    proof = asyncio.run(
+        runner._observe_reset_proof(
+            attempt=1,
+            pre_race=10_000,
+            pre_imu=10_000_000,
+            cleanup_disarm_heartbeat_anchor=55,
+        )
+    )
+
+    assert proof is not None
+    assert proof.post_race_boot_ms == 300
+    assert proof.post_imu_us == 500_000
+    assert disarm_calls == pytest.approx([0.0, 0.005])
 
 
 def test_safe_cleanup_does_not_claim_pre_reset_disarm_confirmation(
@@ -6817,6 +6973,142 @@ def test_visual_course_cleanup_collision_downgrades_nested_success(
         "cleanup collision evidence was unsafe or incomplete"
     )
     assert nested["first_causal_blocker"] == nested["reason"]
+
+
+def test_live_finalizer_preserves_existing_cleanup_cause_for_empty_tail(
+    tmp_path,
+    monkeypatch,
+):
+    from competition.aigp_mavlink import MavlinkOutboundAudit
+
+    class LiveAdapter(_FakeAdapter):
+        async def connect(self, _address):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        def drain_received_ingress(self):
+            return []
+
+        def ingress_stats(self):
+            return MavlinkIngressStats(
+                generation=1,
+                next_sequence=0,
+                highres_imu_received=0,
+                heartbeat_received=0,
+                race_status_received=0,
+                actuator_received=0,
+                dropped=0,
+                high_watermark=0,
+                imu_capacity=1,
+                other_capacity=1,
+                imu_dropped=0,
+                other_dropped=0,
+                imu_high_watermark=0,
+                other_high_watermark=0,
+                buffered_imu=0,
+                buffered_other=0,
+            )
+
+        def outbound_audit(self):
+            return MavlinkOutboundAudit(0, 0, 0, 0, 0, 0, 0, 0)
+
+    adapter = LiveAdapter()
+    vision = VQ2VisionThread()
+    runner = VQ2Runner(adapter, vision)
+    runner._cleanup_in_progress = True
+    runner._cleanup_harmful_collision_count = 1
+    runner._cleanup_collision_observations.append(
+        {
+            "phase": "cleanup-entry",
+            "disposition": "harmful",
+            "collision": {
+                "id": 7,
+                "threat_level": 2,
+                "impulse": 0.1,
+            },
+        }
+    )
+    cleanup_reason = "cleanup collision evidence was unsafe or incomplete"
+    stage_reason = f"visual course finished; {cleanup_reason}"
+    stage_result = vq2_module.StageResult(
+        stage=vq2_module.VISUAL_COURSE_STAGE,
+        success=False,
+        reason=stage_reason,
+        duration_s=1.0,
+        gate_index_before=0,
+        gate_index_after=0,
+        cleanup_confirmed=True,
+        details={
+            "cleanup_collision_safety": (
+                runner._cleanup_collision_safety_summary()
+            ),
+            "visual_course": {
+                "success": False,
+                "outcome": "abort",
+                "reason": cleanup_reason,
+                "first_causal_blocker": cleanup_reason,
+            },
+        },
+        controller={},
+    )
+
+    async def run_stage(*_args, **_kwargs):
+        return stage_result
+
+    monkeypatch.setattr(runner, "run_powered_stage", run_stage)
+    monkeypatch.setattr(
+        vq2_module,
+        "_load_live_transport_dependencies",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "AIGPMavlinkAdapter",
+        lambda **_kwargs: adapter,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "VQ2VisionThread",
+        lambda **_kwargs: vision,
+    )
+    monkeypatch.setattr(
+        vq2_module,
+        "VQ2Runner",
+        lambda *_args, **_kwargs: runner,
+    )
+    visual_config = vq2_module.default_visual_config()
+
+    result = asyncio.run(
+        vq2_module.run_live(
+            vq2_module.VISUAL_COURSE_STAGE,
+            "udpin:127.0.0.1:14550",
+            str(tmp_path / "empty-tail.jsonl.gz"),
+            replay_bundle=None,
+            recording_approved=False,
+            preflight_before_powered_stage=False,
+            write_diagnostic_pngs=False,
+            run_manifest_sha256="a" * 64,
+            candidate_commit="b" * 40,
+            expected_controller_config_sha256=(
+                visual_config.effective_config_sha256
+            ),
+            expected_yaw_calibration_profile_sha256=(
+                vq2_module.YAW_CALIBRATION_PROFILE_SHA256
+            ),
+        )
+    )
+
+    assert result.success is False
+    assert result.reason == stage_reason
+    assert "post-disconnect" not in result.reason
+    nested = result.details["visual_course"]
+    assert nested["reason"] == cleanup_reason
+    assert nested["first_causal_blocker"] == cleanup_reason
+    safety = result.details["cleanup_collision_safety"]
+    assert safety["harmful_collision_count"] == 1
+    assert len(safety["observations"]) == 1
 
 
 def test_invalid_imu_after_bootstrap_latches_estimator_failure():
@@ -9841,7 +10133,7 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
         "non_bridge_publication_skips_allowed": False,
         "max_filtered_center_rate_norm_s": 0.40,
         "max_filtered_log_scale_rate_s": 1.00,
-        "max_raw_center_rate_norm_s": 0.50,
+        "max_raw_center_rate_norm_s": 0.51,
         "max_raw_log_scale_rate_s": 1.10,
         "max_raw_log_dimension_rate_s": 1.30,
         "complete_current_visibility_epoch": {
@@ -9856,7 +10148,7 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
             "root_min_association_confidence": 0.65,
             "pre_gap_history_sample_count": 3,
             "min_pre_gap_history_span_s": 0.060,
-            "min_pre_gap_detection_confidence": 0.64,
+            "min_pre_gap_detection_confidence": 0.63,
             "min_pre_gap_association_confidence": 0.90,
             "max_epoch_start_missed_frames": 12,
             "max_epoch_start_publication_delta": 13,
@@ -9896,7 +10188,7 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
         },
         "max_projection_horizon_s": 0.140,
         "max_actual_abs_center_norm": {
-            "horizontal": 0.60,
+            "horizontal": 0.61,
             "vertical": 0.68,
         },
         "max_projected_abs_vertical_center_norm": 0.715,

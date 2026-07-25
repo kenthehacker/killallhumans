@@ -330,6 +330,13 @@ def test_predictive_capture_projection_constants_are_actually_enforced():
 
 
 def test_post_promotion_entry_accepts_exact_code_owned_bounds():
+    assert POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD == pytest.approx(
+        -0.065
+    )
+    assert (
+        POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S
+        == pytest.approx(0.45)
+    )
     target = _target(
         1,
         x=-POST_PROMOTION_ENTRY_MAX_ABS_X_NORM,
@@ -352,7 +359,9 @@ def test_post_promotion_entry_accepts_exact_code_owned_bounds():
     assert admission.horizontal_outward_rate_s == 0.25
     assert admission.vertical_outward_rate_down_s == 0.25
     assert admission.log_scale_rate_s == 0.85
-    assert admission.measured_pitch_rad == -0.06
+    assert admission.measured_pitch_rad == (
+        POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD
+    )
     with pytest.raises(FrozenInstanceError):
         admission.horizontal_error = 0.0
 

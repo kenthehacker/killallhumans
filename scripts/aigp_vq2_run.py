@@ -157,6 +157,7 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM,
     RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM,
     RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
+    RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE,
     RECOVERY_MIN_DETECTION_CONFIDENCE,
     RECOVERY_MIN_HISTORY_SPAN_S,
     RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE,
@@ -6456,7 +6457,7 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                             RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S
                         ),
                         "min_pre_gap_detection_confidence": (
-                            RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE
+                            RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE
                         ),
                         "min_pre_gap_association_confidence": (
                             RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE
@@ -10274,6 +10275,37 @@ class VQ2Runner:
         )
         return True
 
+    async def _advance_cleanup_reset_disarm_cadence(
+        self,
+        *,
+        attempt: int,
+        heartbeat_anchor: int,
+        next_deadline_s: float,
+        reset_clock_rolled_back: bool,
+    ) -> Optional[float]:
+        """Reassert disarm at 50 Hz until reset application is observable."""
+
+        if (
+            reset_clock_rolled_back
+            or (
+                self.adapter.heartbeat_sequence > heartbeat_anchor
+                and not self.adapter.is_armed
+            )
+        ):
+            return None
+        now_s = time.monotonic()
+        if now_s < next_deadline_s:
+            return next_deadline_s
+        await self._best_effort_post_reset_disarm(
+            attempt=attempt,
+            heartbeat_anchor=heartbeat_anchor,
+            trigger="reset_return_cadence",
+        )
+        return next_control_deadline(
+            next_deadline_s,
+            time.monotonic(),
+        )
+
     async def _observe_reset_proof(
         self,
         *,
@@ -10291,6 +10323,11 @@ class VQ2Runner:
         cleanup_disarm_attempted = False
         cleanup_reset_applied_disarm_attempted = False
         cleanup_rearm_heartbeat_anchor: Optional[int] = None
+        cleanup_disarm_next_deadline_s = (
+            time.monotonic()
+            if cleanup_disarm_heartbeat_anchor is not None
+            else None
+        )
         while time.monotonic() < deadline:
             telemetry = self.adapter.latest_telemetry
             imu = telemetry.imu if telemetry is not None else None
@@ -10307,10 +10344,29 @@ class VQ2Runner:
                 if clock_rolled_back(pre_imu, stamp, RESET_IMU_DROP_US):
                     if not imu_samples or stamp > imu_samples[-1]:
                         imu_samples.append(stamp)
+            reset_clock_rolled_back = bool(race_samples or imu_samples)
+            if (
+                cleanup_disarm_heartbeat_anchor is not None
+                and cleanup_disarm_next_deadline_s is not None
+            ):
+                cleanup_disarm_next_deadline_s = await (
+                    self._advance_cleanup_reset_disarm_cadence(
+                        attempt=attempt,
+                        heartbeat_anchor=(
+                            cleanup_disarm_heartbeat_anchor
+                        ),
+                        next_deadline_s=(
+                            cleanup_disarm_next_deadline_s
+                        ),
+                        reset_clock_rolled_back=(
+                            reset_clock_rolled_back
+                        ),
+                    )
+                )
             if (
                 cleanup_disarm_heartbeat_anchor is not None
                 and not cleanup_reset_applied_disarm_attempted
-                and (race_samples or imu_samples)
+                and reset_clock_rolled_back
             ):
                 # A rolled-back authoritative simulator clock proves the
                 # reset has applied earlier than build 3385's next heartbeat.
@@ -10987,18 +11043,43 @@ class VQ2Runner:
                     await asyncio.sleep(0.5)
                 else:
                     # Missing clock baselines make reset proof unavailable,
-                    # but must not suppress the same bounded opportunity to
-                    # remove authority after a reset-time re-arm.
+                    # but must not suppress the same bounded disarm cadence or
+                    # the existing newer-armed-heartbeat reaction.
                     disarm_deadline = time.monotonic() + 0.5
+                    cleanup_disarm_next_deadline_s: Optional[float] = (
+                        time.monotonic()
+                    )
+                    newer_armed_disarm_attempted = False
                     while time.monotonic() < disarm_deadline:
-                        if await (
-                            self._react_to_newer_cleanup_armed_heartbeat(
+                        if (
+                            not newer_armed_disarm_attempted
+                            and await (
+                                self._react_to_newer_cleanup_armed_heartbeat(
+                                    attempt=attempt,
+                                    heartbeat_anchor=(
+                                        cleanup_disarm_heartbeat_anchor
+                                    ),
+                                )
+                            )
+                        ):
+                            newer_armed_disarm_attempted = True
+                            cleanup_disarm_next_deadline_s = (
+                                time.monotonic() + CONTROL_PERIOD_S
+                            )
+                        assert cleanup_disarm_next_deadline_s is not None
+                        cleanup_disarm_next_deadline_s = await (
+                            self._advance_cleanup_reset_disarm_cadence(
                                 attempt=attempt,
                                 heartbeat_anchor=(
                                     cleanup_disarm_heartbeat_anchor
                                 ),
+                                next_deadline_s=(
+                                    cleanup_disarm_next_deadline_s
+                                ),
+                                reset_clock_rolled_back=False,
                             )
-                        ):
+                        )
+                        if cleanup_disarm_next_deadline_s is None:
                             break
                         await asyncio.sleep(0.005)
             logger.warning(
@@ -11135,16 +11216,18 @@ class VQ2Runner:
 
         Build 3385 can republish an armed heartbeat after ``SIM_RESET`` even
         when cleanup proved a disarm immediately before the reset.  The caller
-        admits this send either at the first authoritative clock rollback or
-        after a heartbeat newer than ``heartbeat_anchor`` reports armed.
-        This send does not gate reset proof and does not satisfy cleanup's
-        final disarm requirement; :meth:`safe_cleanup` still requires a
-        separate newer-heartbeat confirmation after proof.
+        admits this send on the bounded reset-return cadence, at the first
+        authoritative clock rollback, or after a heartbeat newer than
+        ``heartbeat_anchor`` reports armed.  This send does not gate reset
+        proof and does not satisfy cleanup's final disarm requirement;
+        :meth:`safe_cleanup` still requires a separate newer-heartbeat
+        confirmation after proof.
         """
 
         if trigger not in {
             "clock_rollback",
             "newer_armed_heartbeat",
+            "reset_return_cadence",
         }:
             raise ValueError("post-reset disarm trigger is invalid")
         heartbeat_before = self.adapter.heartbeat_sequence
@@ -18464,6 +18547,9 @@ async def run_live(
                     }
                 )
             runner._classify_quarantined_cleanup_reset_collisions()
+            collision_safety_before_disconnect_tail = (
+                runner._cleanup_collision_safety_summary()
+            )
             runner._drain_cleanup_collisions(
                 phase="post-disconnect-collision-tail",
                 allow_benign_reset_pad=False,
@@ -18478,12 +18564,30 @@ async def run_live(
             tail_collision_safety = (
                 runner._cleanup_collision_safety_summary()
             )
+            disconnect_tail_introduced_unsafe_evidence = bool(
+                not transport_disconnected
+                or (
+                    tail_collision_safety["harmful_collision_count"]
+                    > collision_safety_before_disconnect_tail[
+                        "harmful_collision_count"
+                    ]
+                )
+                or (
+                    collision_safety_before_disconnect_tail[
+                        "capture_complete"
+                    ]
+                    and not tail_collision_safety["capture_complete"]
+                )
+            )
             if result is not None:
                 details = dict(result.details or {})
                 details["cleanup_collision_safety"] = (
                     tail_collision_safety
                 )
-                if not tail_collision_safety["safe"]:
+                if (
+                    not tail_collision_safety["safe"]
+                    and disconnect_tail_introduced_unsafe_evidence
+                ):
                     for summary_name in (
                         "gate1_recenter",
                         "visual_alignment",

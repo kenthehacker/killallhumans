@@ -28,23 +28,26 @@ POST_PROMOTION_ENTRY_MAX_ABS_X_NORM = 0.67
 POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM = 0.71
 POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S = 0.25
 POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S = 0.85
-# Two collision-free build-3385 Gate-0 passages reached post-credit zero
-# authority at -0.0473 and -0.0448 rad.  Admit that proved handoff with a
-# small fixed margin; the alignment stage still requires a nonnegative
-# braking target to be reachable inside its separate 0.08 rad entry-attitude
-# delta and 0.12 rad/s command-rate envelopes.
-POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD = -0.06
+# Two earlier collision-free build-3385 Gate-0 passages reached post-credit
+# zero authority at -0.0473 and -0.0448 rad; attempt 19 reached the same clean
+# handoff at -0.064325 rad.  The -0.065 floor retains a measured margin while
+# still requiring a nonnegative braking target to be reachable inside the
+# separate 0.08 rad entry-attitude delta and 0.12 rad/s command-rate envelopes.
+POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD = -0.065
 
 # A promoted track that misses the ordinary entry-rate gate may receive a
 # short no-advance capture response only inside this stricter predictive
 # envelope.  These bounds cover the latest unclipped build-3385 handoff
 # (x=0.553, y=-0.661, vx=0.333/s, vy=-0.383/s, scale-rate=0.928/s)
-# without admitting the earlier clipped/out-of-bounds handoffs.  They are
-# code-owned safety policy, not controller configuration.
+# without admitting the earlier clipped/out-of-bounds handoffs.  The exact
+# attempt-19 continuation remained clean and projected inside every unchanged
+# image/scale bound at |vertical rate|=0.4471302591/s, so retain 0.45/s as the
+# narrow capture ceiling.  These are code-owned safety policy, not controller
+# configuration.
 POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S = 0.10
 POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM = 0.62
 POST_PROMOTION_CAPTURE_MAX_ABS_Y_NORM = 0.70
-POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S = 0.40
+POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S = 0.45
 POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S = 1.00
 POST_PROMOTION_CAPTURE_MAX_APPARENT_SCALE = 0.20
 POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_X_NORM = 0.67

@@ -46,6 +46,12 @@ RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT = 5
 RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT = 3
 RECOVERY_MIN_PRE_GAP_HISTORY_SPAN_S = 0.060
 RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE = 0.64
+# Attempt 19's complete-current-visibility proof retained strong independent
+# pre-gap association (0.9316489712) while one raw detector confidence was
+# 0.6317001087.  Only the basis that explicitly makes no cross-gap identity
+# claim may use this narrower floor; continuous and bounded-reacquisition
+# identity proofs retain the 0.64 requirement above.
+RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE = 0.63
 RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE = 0.90
 RECOVERY_MIN_REACQUISITION_DETECTION_CONFIDENCE = 0.70
 RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE = 0.65
@@ -77,11 +83,11 @@ RECOVERY_MAX_ANCHOR_CREDIT_AGE_S = 0.020
 RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S = 0.060
 RECOVERY_MAX_CONTINUATION_AGE_S = 0.060
 RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES = 1
-RECOVERY_MAX_ABS_X_NORM = 0.60
+RECOVERY_MAX_ABS_X_NORM = 0.61
 RECOVERY_MAX_ABS_Y_NORM = 0.68
 RECOVERY_MAX_FILTERED_CENTER_RATE_NORM_S = 0.40
 RECOVERY_MAX_FILTERED_LOG_SCALE_RATE_S = 1.00
-RECOVERY_MAX_RAW_CENTER_RATE_NORM_S = 0.50
+RECOVERY_MAX_RAW_CENTER_RATE_NORM_S = 0.51
 RECOVERY_MAX_RAW_LOG_SCALE_RATE_S = 1.10
 RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S = 1.30
 RECOVERY_MIN_PROJECTION_HORIZON_S = 0.080
@@ -1008,12 +1014,41 @@ def _require_promotion_identity_bridge(
         sample.tracker_frame_sequence for sample in visibility_epoch
     )
 
+    predecessor = track.history[bridge_index - 1]
+    bridge = track.history[bridge_index]
+    bridge_evidence = bridge.accepted_association
+    if type(bridge_evidence) is not AssociationEvidence:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery reacquisition bridge is absent"
+        )
+    missed_frames = bridge_evidence.missed_frame_count_before_association
+    candidate_publication_delta = None
+    if (
+        type(bridge.token.publication_sequence) is int
+        and type(predecessor.token.publication_sequence) is int
+    ):
+        candidate_publication_delta = (
+            bridge.token.publication_sequence
+            - predecessor.token.publication_sequence
+        )
+    requires_complete_epoch_basis = bool(
+        current_epoch_start > 0
+        and type(missed_frames) is int
+        and type(candidate_publication_delta) is int
+        and (
+            missed_frames > RECOVERY_MAX_REACQUISITION_MISSED_FRAMES
+            or candidate_publication_delta
+            > RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
+        )
+    )
     _require_clean_history_segment(
         track,
         start_index=bridge_index - RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT,
         sample_count=RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT,
         min_detection_confidence=(
-            RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE
+            RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE
+            if requires_complete_epoch_basis
+            else RECOVERY_MIN_PRE_GAP_DETECTION_CONFIDENCE
         ),
         min_association_confidence=(
             RECOVERY_MIN_PRE_GAP_ASSOCIATION_CONFIDENCE
@@ -1040,14 +1075,6 @@ def _require_promotion_identity_bridge(
             min_span_s=RECOVERY_MIN_HISTORY_SPAN_S,
         )
 
-    predecessor = track.history[bridge_index - 1]
-    bridge = track.history[bridge_index]
-    bridge_evidence = bridge.accepted_association
-    if type(bridge_evidence) is not AssociationEvidence:
-        raise VisualRecoveryRefusal(
-            "post-promotion recovery reacquisition bridge is absent"
-        )
-    missed_frames = bridge_evidence.missed_frame_count_before_association
     if current_epoch_start == 0:
         if missed_frames != 0:
             raise VisualRecoveryRefusal(
@@ -1120,15 +1147,14 @@ def _require_promotion_identity_bridge(
         bridge.token.publication_sequence
         - predecessor.token.publication_sequence
     )
+    if publication_delta != candidate_publication_delta:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery publication progression is inconsistent"
+        )
     unobserved_publication_count = publication_delta - tracker_delta
     observation_gap_s = evidence.observation_gap_ns / 1_000_000_000.0
     assert evidence.publication_gap_ns is not None
     publication_gap_s = evidence.publication_gap_ns / 1_000_000_000.0
-    requires_complete_epoch_basis = (
-        missed_frames > RECOVERY_MAX_REACQUISITION_MISSED_FRAMES
-        or publication_delta
-        > RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
-    )
     if requires_complete_epoch_basis:
         if (
             publication_delta
@@ -2001,6 +2027,7 @@ __all__ = [
     "RECOVERY_VISIBILITY_EPOCH_MAX_START_UNOBSERVED_PUBLICATIONS",
     "RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM",
     "RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM",
+    "RECOVERY_COMPLETE_EPOCH_MIN_PRE_GAP_DETECTION_CONFIDENCE",
     "RECOVERY_MIN_HISTORY_SPAN_S",
     "RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE",
     "RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT",
