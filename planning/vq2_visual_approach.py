@@ -431,6 +431,8 @@ class RollingVisualApproachServo:
         tuning: Optional[VisualServoTuning] = None,
         *,
         next_gate_blend: float,
+        next_gate_blend_start_log_scale: Optional[float] = None,
+        next_gate_blend_full_log_scale: Optional[float] = None,
     ) -> None:
         if (
             type(expected_current_track_id) is not str
@@ -460,9 +462,41 @@ class RollingVisualApproachServo:
             raise VisualApproachRefusal(
                 "next_gate_blend must stay inside its immutable ceiling"
             )
+        ramp_values = (
+            next_gate_blend_start_log_scale,
+            next_gate_blend_full_log_scale,
+        )
+        if (ramp_values[0] is None) != (ramp_values[1] is None):
+            raise VisualApproachRefusal(
+                "next_gate_blend scale ramp must provide both boundaries"
+            )
+        if ramp_values[0] is not None:
+            if (
+                any(
+                    type(value) not in {int, float}
+                    or not math.isfinite(float(value))
+                    for value in ramp_values
+                )
+                or not -3.0 <= float(ramp_values[0]) <= -1.0
+                or not -1.0 <= float(ramp_values[1]) <= -0.20
+                or float(ramp_values[0]) >= float(ramp_values[1])
+            ):
+                raise VisualApproachRefusal(
+                    "next_gate_blend scale ramp is outside its fixed bounds"
+                )
         self.expected_current_track_id = expected_current_track_id
         self.expected_gate_index = expected_gate_index
         self.next_gate_blend = float(next_gate_blend)
+        self.next_gate_blend_start_log_scale = (
+            None
+            if next_gate_blend_start_log_scale is None
+            else float(next_gate_blend_start_log_scale)
+        )
+        self.next_gate_blend_full_log_scale = (
+            None
+            if next_gate_blend_full_log_scale is None
+            else float(next_gate_blend_full_log_scale)
+        )
         self._servo = ImageVisualServo(tuning)
         self._last_camera_token: Optional[CameraFrameToken] = None
         self._last_tracker_frame_sequence: Optional[int] = None
@@ -487,6 +521,33 @@ class RollingVisualApproachServo:
         self._latched_next_track_id = None
         self._pending_passage_admission = None
         self._active_passage_admission = None
+
+    def _requested_next_gate_blend(
+        self,
+        current_log_scale: float,
+    ) -> float:
+        """Ramp preview authority with the current aperture's apparent scale."""
+
+        if (
+            self.next_gate_blend_start_log_scale is None
+            or self.next_gate_blend_full_log_scale is None
+        ):
+            return self.next_gate_blend
+        if (
+            type(current_log_scale) not in {int, float}
+            or not math.isfinite(float(current_log_scale))
+        ):
+            raise VisualApproachRefusal(
+                "current gate log scale is invalid for next-gate blending"
+            )
+        fraction = (
+            float(current_log_scale)
+            - self.next_gate_blend_start_log_scale
+        ) / (
+            self.next_gate_blend_full_log_scale
+            - self.next_gate_blend_start_log_scale
+        )
+        return self.next_gate_blend * max(0.0, min(1.0, fraction))
 
     def observe(
         self,
@@ -660,7 +721,9 @@ class RollingVisualApproachServo:
                 assert candidate.relationship is not None
                 relationship_basis = candidate.relationship.basis
                 requested_blend = (
-                    self.next_gate_blend
+                    self._requested_next_gate_blend(
+                        current_target.log_scale
+                    )
                     if mode is VisualApproachMode.APPROACH
                     else 0.0
                 )
@@ -738,7 +801,7 @@ class RollingVisualApproachServo:
             )
         if (
             mode is VisualApproachMode.APPROACH
-            and output.next_gate_blend not in {0.0, self.next_gate_blend}
+            and output.next_gate_blend not in {0.0, requested_blend}
         ):
             raise VisualApproachRefusal(
                 "visual approach produced an unexpected blend magnitude"

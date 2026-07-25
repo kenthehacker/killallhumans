@@ -181,6 +181,8 @@ class _Servo:
         tuning,
         *,
         next_gate_blend,
+        next_gate_blend_start_log_scale=None,
+        next_gate_blend_full_log_scale=None,
         yaw_rate=0.02,
         passage_advances=True,
         calls=None,
@@ -189,6 +191,12 @@ class _Servo:
         self.gate_index = expected_gate_index
         self.tuning = tuning
         self.next_gate_blend = next_gate_blend
+        self.next_gate_blend_start_log_scale = (
+            next_gate_blend_start_log_scale
+        )
+        self.next_gate_blend_full_log_scale = (
+            next_gate_blend_full_log_scale
+        )
         self.yaw_rate = yaw_rate
         self.passage_advances = passage_advances
         self.calls = calls if calls is not None else []
@@ -830,6 +838,33 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     ]
     assert later_navigation
     assert later_navigation[0].thrust == 0.21
+
+
+def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():
+    host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
+    runtime, _calls = _runtime(host)
+    factory_calls = []
+
+    def capture_factory(*args, **kwargs):
+        factory_calls.append(dict(kwargs))
+        return _Servo(*args, **kwargs)
+
+    runtime = replace(runtime, servo_factory=capture_factory)
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert len(factory_calls) == 2
+    assert all(
+        call["next_gate_blend"]
+        == host.visual_config.lifecycle.next_gate_blend_max
+        and call["next_gate_blend_start_log_scale"]
+        == host.visual_config.lifecycle.next_gate_blend_start_log_scale
+        and call["next_gate_blend_full_log_scale"]
+        == host.visual_config.lifecycle.next_gate_blend_full_log_scale
+        for call in factory_calls
+    )
 
 
 def test_newer_receiver_publication_drops_unsent_proposal_and_replans():

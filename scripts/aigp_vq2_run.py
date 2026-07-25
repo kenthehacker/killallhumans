@@ -10850,6 +10850,10 @@ class VQ2Runner:
                     await self.adapter.reset()
             else:
                 await self.adapter.reset()
+            if self._cleanup_in_progress:
+                await self._best_effort_post_reset_disarm(
+                    attempt=attempt,
+                )
             if pre_race is not None and pre_imu is not None:
                 proof = await self._observe_reset_proof(
                     attempt=attempt,
@@ -10984,8 +10988,43 @@ class VQ2Runner:
                 await asyncio.sleep(0.01)
         return False
 
+    async def _best_effort_post_reset_disarm(self, *, attempt: int) -> bool:
+        """Remove reset-time authority before waiting for clock proof.
+
+        Build 3385 can republish an armed heartbeat after ``SIM_RESET`` even
+        when cleanup proved a disarm immediately before the reset.  This
+        one-shot send does not gate reset proof and does not satisfy cleanup's
+        final disarm requirement; :meth:`safe_cleanup` still requires a
+        separate newer-heartbeat confirmation after the reset proof.
+        """
+
+        heartbeat_before = self.adapter.heartbeat_sequence
+        armed_before = self.adapter.is_armed
+        try:
+            await self.adapter.disarm()
+        except Exception as exc:
+            logger.exception("Immediate post-reset disarm send failed")
+            self.recorder.emit(
+                "cleanup_post_reset_disarm_attempt",
+                attempt=attempt,
+                outcome="raised",
+                error_type=type(exc).__name__,
+                heartbeat_sequence_before=heartbeat_before,
+                armed_before=armed_before,
+            )
+            return False
+        self.recorder.emit(
+            "cleanup_post_reset_disarm_attempt",
+            attempt=attempt,
+            outcome="returned",
+            error_type=None,
+            heartbeat_sequence_before=heartbeat_before,
+            armed_before=armed_before,
+        )
+        return True
+
     async def safe_cleanup(self) -> bool:
-        """Latch command production, cut thrust, confirm disarm, then reset."""
+        """Cut thrust, pre-disarm, reset, then prove a newer disarm."""
 
         self._abort_latched = True
         self._cleanup_in_progress = True
@@ -11077,8 +11116,11 @@ class VQ2Runner:
         except Exception:
             logger.exception("Emergency SIM_RESET send/proof path failed")
 
-        if not disarmed or self.adapter.is_armed:
-            disarmed = await self._disarm_confirmed()
+        # A pre-reset disarm confirmation cannot prove the state after
+        # SIM_RESET: build 3385 can transiently republish armed.  Always issue
+        # another disarm and require a strictly newer heartbeat after the
+        # reset-proof wait, even when the current cached state is disarmed.
+        disarmed = await self._disarm_confirmed()
         self._classify_quarantined_cleanup_reset_collisions()
         self._drain_cleanup_collisions(
             phase="cleanup-terminal-post-reset",

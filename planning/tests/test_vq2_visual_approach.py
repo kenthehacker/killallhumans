@@ -293,6 +293,65 @@ def test_stable_exact_next_track_starts_only_after_narrow_corridor() -> None:
     assert type(proposal.passage_admission) is VisualApproachPassageAdmission
 
 
+def test_next_preview_honors_current_scale_ramp_and_exact_attempt_five_frame():
+    approach = RollingVisualApproachServo(
+        "vq2-track-000001",
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+    )
+
+    assert approach._requested_next_gate_blend(-1.81) == 0.0
+    assert approach._requested_next_gate_blend(-0.50) == 0.35
+    assert approach._requested_next_gate_blend(-0.40) == 0.35
+    assert approach._requested_next_gate_blend(
+        -1.7610061763715115
+    ) == pytest.approx(0.0104983371307469)
+
+    current_x = -0.009375000000000022
+    current_x_rate = -0.0637333103798879
+    next_x = 0.31562500000000004
+    next_x_rate = -0.0238675148682927
+    blend = approach._requested_next_gate_blend(-1.7610061763715115)
+    effective_x = (1.0 - blend) * current_x + blend * next_x
+    effective_x_rate = (
+        (1.0 - blend) * current_x_rate + blend * next_x_rate
+    )
+    yaw_request = -0.30 * effective_x - 0.035 * effective_x_rate
+
+    assert effective_x == pytest.approx(-0.00596304043250727)
+    assert effective_x_rate == pytest.approx(-0.06331478581862175)
+    assert yaw_request == pytest.approx(0.004004929633403943)
+
+    tracker, graph, snapshot, current_id, _next_id, sequence = (
+        _build_bound_graph()
+    )
+    integrated = RollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+    )
+    proposal = _observe(integrated, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(integrated, snapshot, tracker)
+    integrated_fraction = (
+        proposal.current_target.log_scale + 1.80
+    ) / 1.30
+    expected_integrated_blend = 0.35 * max(
+        0.0,
+        min(1.0, integrated_fraction),
+    )
+
+    assert proposal.servo_output.next_gate_blend == pytest.approx(
+        expected_integrated_blend
+    )
+    assert 0.0 < proposal.servo_output.next_gate_blend < 0.35
+
+
 def test_generic_gate_seven_passage_uses_admission_without_preview() -> None:
     tracker, graph, snapshot, current_id, next_id, sequence = (
         _build_bound_graph(current_gate_index=7)
@@ -893,6 +952,29 @@ def test_next_blend_configuration_is_bounded_and_exact(value: object) -> None:
             "vq2-track-000001",
             0,
             next_gate_blend=value,
+        )
+
+
+@pytest.mark.parametrize(
+    ("start", "full"),
+    (
+        (None, -0.5),
+        (-1.8, None),
+        (True, -0.5),
+        (-1.8, float("nan")),
+        (-0.9, -0.5),
+        (-1.8, -1.1),
+        (-1.8, -1.8),
+    ),
+)
+def test_next_blend_scale_ramp_is_bounded_and_complete(start, full):
+    with pytest.raises(VisualApproachRefusal, match="scale ramp"):
+        RollingVisualApproachServo(
+            "vq2-track-000001",
+            0,
+            next_gate_blend=_CONFIGURED_NEXT_BLEND,
+            next_gate_blend_start_log_scale=start,
+            next_gate_blend_full_log_scale=full,
         )
 
 

@@ -1391,6 +1391,14 @@ async def _run_visual_course_stage_impl(
             next_gate_blend=(
                 host.visual_config.lifecycle.next_gate_blend_max
             ),
+            next_gate_blend_start_log_scale=(
+                host.visual_config.lifecycle
+                .next_gate_blend_start_log_scale
+            ),
+            next_gate_blend_full_log_scale=(
+                host.visual_config.lifecycle
+                .next_gate_blend_full_log_scale
+            ),
         )
         mode = VisualApproachMode.APPROACH
         passage_admission: Optional[VisualApproachPassageAdmission] = None

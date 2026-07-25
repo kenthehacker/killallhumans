@@ -5209,6 +5209,167 @@ def test_emergency_reset_is_sent_even_with_no_fresh_baseline(monkeypatch):
     assert adapter.reset_calls == 1
 
 
+def test_cleanup_reset_sends_immediate_disarm_before_proof_wait(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(10_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = TelemetryState(
+        timestamp_us=0,
+        position_ned=(0.0, 0.0, 0.0),
+        velocity_ned=(0.0, 0.0, 0.0),
+        orientation=Quaternion(),
+        angular_velocity=(0.0, 0.0, 0.0),
+        imu=IMUData(
+            timestamp_us=10_000_000,
+            accel=(0.0, 0.0, -9.81),
+            gyro=(0.0, 0.0, 0.0),
+        ),
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+    events = []
+    reset_with_boundary = adapter.reset_calibration_with_boundary
+
+    async def reset_then_return(persist_boundary):
+        boundary = await reset_with_boundary(persist_boundary)
+        events.append("reset_returned")
+        return boundary
+
+    async def disarm():
+        events.append("post_reset_disarm")
+
+    async def observe(**_kwargs):
+        events.append("proof_wait")
+        return proof
+
+    monkeypatch.setattr(
+        adapter,
+        "reset_calibration_with_boundary",
+        reset_then_return,
+    )
+    monkeypatch.setattr(adapter, "disarm", disarm)
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe)
+
+    assert asyncio.run(runner.emergency_reset()) is proof
+    assert events == [
+        "reset_returned",
+        "post_reset_disarm",
+        "proof_wait",
+    ]
+
+
+def test_cleanup_reset_proof_survives_immediate_disarm_send_failure(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.race_status = RaceStatus(10_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = TelemetryState(
+        timestamp_us=0,
+        position_ned=(0.0, 0.0, 0.0),
+        velocity_ned=(0.0, 0.0, 0.0),
+        orientation=Quaternion(),
+        angular_velocity=(0.0, 0.0, 0.0),
+        imu=IMUData(
+            timestamp_us=10_000_000,
+            accel=(0.0, 0.0, -9.81),
+            gyro=(0.0, 0.0, 0.0),
+        ),
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+    events = []
+    reset_with_boundary = adapter.reset_calibration_with_boundary
+
+    async def reset_then_return(persist_boundary):
+        boundary = await reset_with_boundary(persist_boundary)
+        events.append("reset_returned")
+        return boundary
+
+    async def failed_disarm():
+        events.append("post_reset_disarm")
+        raise RuntimeError("injected post-reset disarm failure")
+
+    async def observe(**_kwargs):
+        events.append("proof_wait")
+        return proof
+
+    monkeypatch.setattr(
+        adapter,
+        "reset_calibration_with_boundary",
+        reset_then_return,
+    )
+    monkeypatch.setattr(adapter, "disarm", failed_disarm)
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe)
+
+    assert asyncio.run(runner.emergency_reset()) is proof
+    assert adapter.reset_calls == 1
+    assert events == [
+        "reset_returned",
+        "post_reset_disarm",
+        "proof_wait",
+    ]
+
+
+def test_safe_cleanup_does_not_reuse_pre_reset_disarm_confirmation(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = False
+    runner = VQ2Runner(adapter, _FakeVision())
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+    disarm_confirmations = []
+
+    async def disarm_confirmed(*_args, **_kwargs):
+        disarm_confirmations.append(adapter.heartbeat_sequence)
+        # The pre-reset attempt succeeds.  No newer post-reset heartbeat is
+        # available, so cleanup must not reuse that earlier confirmation.
+        return len(disarm_confirmations) == 1
+
+    async def reset():
+        runner._cleanup_proved_reset_epoch = True
+        return proof
+
+    monkeypatch.setattr(
+        runner,
+        "_disarm_confirmed",
+        disarm_confirmed,
+    )
+    monkeypatch.setattr(runner, "emergency_reset", reset)
+
+    assert asyncio.run(runner.safe_cleanup()) is False
+    assert disarm_confirmations == [1, 1]
+
+
 def test_cleanup_atomic_reset_boundary_retains_harmful_collision(
     monkeypatch,
 ):
@@ -5483,6 +5644,75 @@ def test_cleanup_accepts_exact_visual_course_reset_settling_after_disarm():
     assert safety["pending_reset_collision_count"] == 0
     assert len(safety["observations"]) == 85
     assert {row["disposition"] for row in safety["observations"]} == {
+        "benign_reset_pad"
+    }
+
+
+def test_cleanup_rejects_exact_high_energy_visual_course_reset_contact():
+    impulses = (
+        2.3850607872009277,
+        0.02875417098402977,
+        0.0446980856359005,
+        0.28195932507514954,
+        0.14218781888484955,
+        0.026842674240469933,
+        0.02054809033870697,
+        0.04731355607509613,
+        0.06768640875816345,
+        0.08198506385087967,
+        0.09091061353683472,
+    )
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    runner = VQ2Runner(adapter, _FakeVision())
+    runner._cleanup_in_progress = True
+    adapter.collisions = [
+        {
+            "id": 1002,
+            "threat_level": 2 if index == 0 else 1,
+            "impulse": impulse,
+        }
+        for index, impulse in enumerate(impulses)
+    ]
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=4_067,
+        post_race_boot_ms=216,
+        pre_imu_us=4_152_508,
+        post_imu_us=388_831,
+        advancing_race_samples=2,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
+
+    runner._accept_reset_proof(proof, restart_vision=False)
+
+    pending = runner._cleanup_collision_safety_summary()
+    assert pending["safe"] is False
+    assert pending["pending_reset_collision_count"] == 11
+
+    adapter.is_armed = False
+    runner._classify_quarantined_cleanup_reset_collisions()
+
+    safety = runner._cleanup_collision_safety_summary()
+    assert safety["safe"] is False
+    assert safety["capture_complete"] is True
+    assert safety["harmful_collision_count"] == 1
+    assert safety["benign_reset_pad_contact_count"] == 10
+    assert safety["benign_reset_pad_cumulative_impulse"] == pytest.approx(
+        0.8328858073800802
+    )
+    assert len(safety["observations"]) == 11
+    assert safety["observations"][0] == {
+        "phase": "cleanup-post-reset-proof",
+        "disposition": "harmful",
+        "collision": {
+            "id": 1002,
+            "threat_level": 2,
+            "impulse": 2.3850607872009277,
+        },
+    }
+    assert {row["disposition"] for row in safety["observations"][1:]} == {
         "benign_reset_pad"
     }
 
