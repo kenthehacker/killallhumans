@@ -10199,12 +10199,32 @@ class VQ2Runner:
             await asyncio.sleep(0.01)
         raise SafetyAbort("could not obtain fresh, advancing pre-reset race/IMU clocks")
 
+    async def _react_to_newer_cleanup_armed_heartbeat(
+        self,
+        *,
+        attempt: int,
+        heartbeat_anchor: int,
+    ) -> bool:
+        """Send once only after reset publishes a newer armed heartbeat."""
+
+        if (
+            self.adapter.heartbeat_sequence <= heartbeat_anchor
+            or not self.adapter.is_armed
+        ):
+            return False
+        await self._best_effort_post_reset_disarm(
+            attempt=attempt,
+            heartbeat_anchor=heartbeat_anchor,
+        )
+        return True
+
     async def _observe_reset_proof(
         self,
         *,
         attempt: int,
         pre_race: int,
         pre_imu: int,
+        cleanup_disarm_heartbeat_anchor: Optional[int] = None,
     ) -> Optional[ResetProof]:
         """Observe rollback after a reset that has already been sent."""
 
@@ -10212,7 +10232,24 @@ class VQ2Runner:
         race_samples: List[int] = []
         imu_samples: List[int] = []
         countdown_observed = False
+        cleanup_disarm_attempted = False
         while time.monotonic() < deadline:
+            if (
+                cleanup_disarm_heartbeat_anchor is not None
+                and not cleanup_disarm_attempted
+            ):
+                # A reset can reassert arm after overwriting a disarm sent
+                # against cached pre-reset state.  React exactly once to
+                # authoritative newer armed state without delaying or gating
+                # the independent race/IMU rollback proof.
+                cleanup_disarm_attempted = await (
+                    self._react_to_newer_cleanup_armed_heartbeat(
+                        attempt=attempt,
+                        heartbeat_anchor=(
+                            cleanup_disarm_heartbeat_anchor
+                        ),
+                    )
+                )
             telemetry = self.adapter.latest_telemetry
             imu = telemetry.imu if telemetry is not None else None
             race = self.adapter.race_status
@@ -10748,6 +10785,11 @@ class VQ2Runner:
                 pre_gate_index=(int(race.active_gate_index) if race is not None else None),
                 pre_imu_us=pre_imu,
             )
+            cleanup_disarm_heartbeat_anchor = (
+                self.adapter.heartbeat_sequence
+                if self._cleanup_in_progress
+                else None
+            )
             # This send is deliberately unconditional.  Stale/missing streams
             # may prevent proof, but can never prevent the emergency command.
             if self._cleanup_in_progress:
@@ -10850,21 +10892,37 @@ class VQ2Runner:
                     await self.adapter.reset()
             else:
                 await self.adapter.reset()
-            if self._cleanup_in_progress:
-                await self._best_effort_post_reset_disarm(
-                    attempt=attempt,
-                )
             if pre_race is not None and pre_imu is not None:
                 proof = await self._observe_reset_proof(
                     attempt=attempt,
                     pre_race=pre_race,
                     pre_imu=pre_imu,
+                    cleanup_disarm_heartbeat_anchor=(
+                        cleanup_disarm_heartbeat_anchor
+                    ),
                 )
                 if proof is not None:
                     self._accept_reset_proof(proof, restart_vision=False)
                     return proof
             else:
-                await asyncio.sleep(0.5)
+                if cleanup_disarm_heartbeat_anchor is None:
+                    await asyncio.sleep(0.5)
+                else:
+                    # Missing clock baselines make reset proof unavailable,
+                    # but must not suppress the same bounded opportunity to
+                    # remove authority after a reset-time re-arm.
+                    disarm_deadline = time.monotonic() + 0.5
+                    while time.monotonic() < disarm_deadline:
+                        if await (
+                            self._react_to_newer_cleanup_armed_heartbeat(
+                                attempt=attempt,
+                                heartbeat_anchor=(
+                                    cleanup_disarm_heartbeat_anchor
+                                ),
+                            )
+                        ):
+                            break
+                        await asyncio.sleep(0.005)
             logger.warning(
                 "Emergency reset attempt %d was sent but not proved; retrying",
                 attempt,
@@ -10988,14 +11046,20 @@ class VQ2Runner:
                 await asyncio.sleep(0.01)
         return False
 
-    async def _best_effort_post_reset_disarm(self, *, attempt: int) -> bool:
-        """Remove reset-time authority before waiting for clock proof.
+    async def _best_effort_post_reset_disarm(
+        self,
+        *,
+        attempt: int,
+        heartbeat_anchor: int,
+    ) -> bool:
+        """React once to authoritative newer reset-time armed state.
 
         Build 3385 can republish an armed heartbeat after ``SIM_RESET`` even
-        when cleanup proved a disarm immediately before the reset.  This
-        one-shot send does not gate reset proof and does not satisfy cleanup's
-        final disarm requirement; :meth:`safe_cleanup` still requires a
-        separate newer-heartbeat confirmation after the reset proof.
+        when cleanup proved a disarm immediately before the reset.  The caller
+        admits this send only after a heartbeat newer than ``heartbeat_anchor``
+        reports armed.  This one-shot send does not gate reset proof and does
+        not satisfy cleanup's final disarm requirement; :meth:`safe_cleanup`
+        still requires a separate newer-heartbeat confirmation after proof.
         """
 
         heartbeat_before = self.adapter.heartbeat_sequence
@@ -11003,12 +11067,13 @@ class VQ2Runner:
         try:
             await self.adapter.disarm()
         except Exception as exc:
-            logger.exception("Immediate post-reset disarm send failed")
+            logger.exception("Reactive post-reset disarm send failed")
             self.recorder.emit(
                 "cleanup_post_reset_disarm_attempt",
                 attempt=attempt,
                 outcome="raised",
                 error_type=type(exc).__name__,
+                heartbeat_sequence_anchor=heartbeat_anchor,
                 heartbeat_sequence_before=heartbeat_before,
                 armed_before=armed_before,
             )
@@ -11018,6 +11083,7 @@ class VQ2Runner:
             attempt=attempt,
             outcome="returned",
             error_type=None,
+            heartbeat_sequence_anchor=heartbeat_anchor,
             heartbeat_sequence_before=heartbeat_before,
             armed_before=armed_before,
         )

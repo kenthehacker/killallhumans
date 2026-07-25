@@ -16,6 +16,7 @@ from planning.vq2_gate_graph import AuthoritativeRaceStatusRef
 from planning.vq2_visual_approach import (
     VisualApproachMode,
     VisualApproachPassageAdmission,
+    VisualApproachPassageSafetyUnavailable,
     VisualApproachRefusal,
 )
 from planning.vq2_visual_recovery import VisualRecoveryRefusal
@@ -865,6 +866,174 @@ def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():
         == host.visual_config.lifecycle.next_gate_blend_full_log_scale
         for call in factory_calls
     )
+
+
+def test_approach_hard_passage_refusal_retires_preview_and_replans_same_frame():
+    host = _Host(initial_gate=0, finish_gate=0, fresh_after_samples=1)
+    runtime, _calls = _runtime(host)
+    factory_blends = []
+    refusal_tokens = []
+    replacement_tokens = []
+
+    class RefusingPreviewServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.observe_count = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            self.observe_count += 1
+            if self.observe_count == 8:
+                refusal_tokens.append(snapshot.latest_camera_token)
+                raise VisualApproachPassageSafetyUnavailable(
+                    "exact attempt-6 current passage discontinuity",
+                    violation_codes=(
+                        "current_vertical_rate",
+                        "current_log_scale_rate",
+                    ),
+                    violation_evidence=(
+                        (
+                            "current_vertical_rate",
+                            0.9084642237935744,
+                            0.60,
+                            0.3084642237935744,
+                        ),
+                        (
+                            "current_log_scale_rate",
+                            -2.6499873864506065,
+                            -1.50,
+                            1.1499873864506065,
+                        ),
+                    ),
+                    camera_observation_monotonic_s=(
+                        snapshot.latest_camera_token.publication_sequence
+                        * 0.02
+                    ),
+                )
+            return super().observe(snapshot, *args, **kwargs)
+
+    class CurrentOnlyReplacementServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.observe_count = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            self.observe_count += 1
+            proposal = super().observe(snapshot, *args, **kwargs)
+            if self.observe_count == 1:
+                replacement_tokens.append(snapshot.latest_camera_token)
+                return SimpleNamespace(
+                    current_target=proposal.current_target,
+                    servo_output=proposal.servo_output,
+                    passage_admission=None,
+                    mode=proposal.mode,
+                )
+            return proposal
+
+    def factory(*args, **kwargs):
+        factory_blends.append(kwargs["next_gate_blend"])
+        servo_type = (
+            RefusingPreviewServo
+            if len(factory_blends) == 1
+            else CurrentOnlyReplacementServo
+        )
+        return servo_type(*args, **kwargs)
+
+    runtime = replace(runtime, servo_factory=factory)
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert factory_blends == [
+        host.visual_config.lifecycle.next_gate_blend_max,
+        0.0,
+    ]
+    assert refusal_tokens == replacement_tokens
+    segment = result["segments"][0]
+    assert segment["next_preview_retired"] is True
+    assert segment["next_preview_withdrawal_count"] == 1
+    withdrawal = segment["next_preview_withdrawal"]
+    assert withdrawal["camera_token"] == {
+        "generation": refusal_tokens[0].generation,
+        "frame_id": refusal_tokens[0].frame_id,
+        "publication_sequence": (
+            refusal_tokens[0].publication_sequence
+        ),
+        "stream_id": refusal_tokens[0].stream_id,
+    }
+    assert withdrawal["violation_codes"] == [
+        "current_vertical_rate",
+        "current_log_scale_rate",
+    ]
+    assert withdrawal["transient_eligible"] is False
+    assert segment["passage_authority_enabled"] is True
+    assert segment["advance_command_count"] >= 3
+    replacement_sends = [
+        command
+        for command, kwargs, _gate_index in host.commands
+        if kwargs.get("wire_visual_token") == refusal_tokens[0]
+    ]
+    assert len(replacement_sends) == 1
+    assert replacement_sends[0].thrust in {
+        0.26,
+        host.visual_config.lifecycle.launch_boost_thrust,
+    }
+    assert replacement_sends[0].thrust != (
+        host.visual_config.servo.brake_thrust
+    )
+    navigation_send_count = sum(
+        bool(kwargs.get("require_wire_receipt"))
+        for _command, kwargs, _gate_index in host.commands
+    )
+    assert segment["launch_bootstrap"]["command_count"] == (
+        navigation_send_count
+    )
+    assert any(
+        event == "visual_course_next_preview_withdrawn"
+        for event, _payload in host.recorder.events
+    )
+
+
+def test_passage_safety_refusal_after_entry_remains_fatal():
+    host = _Host(initial_gate=3, finish_gate=3, disable_credit=True)
+
+    class PassageRefusingServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            if kwargs["mode"] is VisualApproachMode.PASSAGE:
+                raise VisualApproachPassageSafetyUnavailable(
+                    "passage authority left its corridor",
+                    violation_codes=("current_vertical_rate",),
+                    violation_evidence=(
+                        (
+                            "current_vertical_rate",
+                            0.61,
+                            0.60,
+                            0.01,
+                        ),
+                    ),
+                    camera_observation_monotonic_s=(
+                        snapshot.latest_camera_token.publication_sequence
+                        * 0.02
+                    ),
+                )
+            return super().observe(snapshot, *args, **kwargs)
+
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: PassageRefusingServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="after preview retirement or passage entry",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
 
 
 def test_newer_receiver_publication_drops_unsent_proposal_and_replans():

@@ -637,6 +637,7 @@ class RollingVisualApproachServo:
         )
         if (
             mode is VisualApproachMode.APPROACH
+            and self.next_gate_blend > 0.0
             and next_identity_ambiguous
         ):
             raise VisualApproachRefusal(
@@ -668,6 +669,7 @@ class RollingVisualApproachServo:
         )
         if (
             mode is VisualApproachMode.APPROACH
+            and self.next_gate_blend > 0.0
             and competing_next_identities
         ):
             raise VisualApproachRefusal(

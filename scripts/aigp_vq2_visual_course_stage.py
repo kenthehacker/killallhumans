@@ -33,6 +33,7 @@ from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
     VisualApproachPassageAdmission,
+    VisualApproachPassageSafetyUnavailable,
     VisualApproachRefusal,
 )
 from planning.vq2_visual_recovery import (
@@ -1406,6 +1407,7 @@ async def _run_visual_course_stage_impl(
         passage_command_count = 0
         advance_command_count = 0
         approach_command_count = 0
+        next_preview_retired = False
         crossing_anchor: Optional[Dict[str, Any]] = None
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
@@ -1420,6 +1422,9 @@ async def _run_visual_course_stage_impl(
             "passage_command_count": 0,
             "advance_command_count": 0,
             "superseded_proposal_count": 0,
+            "next_preview_withdrawal_count": 0,
+            "next_preview_withdrawal": None,
+            "next_preview_retired": False,
             "crossing_wait_zero_command_count": 0,
             "post_credit_zero_command_count": 0,
             "passage_authority_enabled": False,
@@ -1589,6 +1594,89 @@ async def _run_visual_course_stage_impl(
                         if mode is VisualApproachMode.PASSAGE
                         else None
                     ),
+                )
+            except VisualApproachPassageSafetyUnavailable as exc:
+                if (
+                    mode is not VisualApproachMode.APPROACH
+                    or next_preview_retired
+                ):
+                    raise abort_type(
+                        "visual-course passage safety failed after preview "
+                        "retirement or passage entry"
+                    ) from exc
+                violation_evidence = [
+                    {
+                        "code": code,
+                        "observed": observed,
+                        "limit": limit,
+                        "excess": excess,
+                    }
+                    for code, observed, limit, excess
+                    in exc.violation_evidence
+                ]
+                try:
+                    planner = runtime.servo_factory(
+                        current_track_id,
+                        current_gate_index,
+                        host.visual_config.servo,
+                        next_gate_blend=0.0,
+                        next_gate_blend_start_log_scale=(
+                            host.visual_config.lifecycle
+                            .next_gate_blend_start_log_scale
+                        ),
+                        next_gate_blend_full_log_scale=(
+                            host.visual_config.lifecycle
+                            .next_gate_blend_full_log_scale
+                        ),
+                    )
+                    proposal = planner.observe(
+                        snapshot,
+                        host.visual_tracker,
+                        runtime.perf_counter_ns() / 1_000_000_000.0,
+                        now - segment_started_s,
+                        excursion,
+                        mode=VisualApproachMode.APPROACH,
+                        passage_admission=None,
+                    )
+                except VisualApproachRefusal as fallback_exc:
+                    raise abort_type(
+                        "visual-course current-only replan failed after "
+                        f"preview retirement: {fallback_exc}"
+                    ) from fallback_exc
+                if (
+                    proposal.mode is not VisualApproachMode.APPROACH
+                    or proposal.servo_output.advance_enabled
+                    or proposal.servo_output.next_gate_blend != 0.0
+                    or proposal.passage_admission is not None
+                ):
+                    raise abort_type(
+                        "visual-course preview retirement retained prior "
+                        "blend, advance, or admission authority"
+                )
+                next_preview_retired = True
+                withdrawal = {
+                    "reason": "current_passage_safety_violation",
+                    "camera_token": asdict(token),
+                    "tracker_frame_sequence": (
+                        snapshot.tracker_frame_sequence
+                    ),
+                    "violation_codes": list(exc.violation_codes),
+                    "violation_evidence": violation_evidence,
+                    "transient_eligible": exc.transient_eligible,
+                }
+                segment["next_preview_withdrawal_count"] = int(
+                    segment["next_preview_withdrawal_count"]
+                ) + 1
+                segment["next_preview_withdrawal"] = withdrawal
+                segment["next_preview_retired"] = True
+                host.recorder.emit(
+                    "visual_course_next_preview_withdrawn",
+                    gate_index=current_gate_index,
+                    stage=(
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/approach"
+                    ),
+                    **withdrawal,
                 )
             except (
                 VisualApproachCurrentGeometryUnavailable,

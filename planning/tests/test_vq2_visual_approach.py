@@ -990,6 +990,27 @@ def test_graph_next_identity_ambiguity_refuses_authority() -> None:
         )
 
 
+def test_zero_preview_authority_ignores_next_identity_ambiguity():
+    tracker, _, snapshot, current_id, _, _ = _build_bound_graph()
+    approach = RollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.0,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+    )
+
+    proposal = _observe(
+        approach,
+        replace(snapshot, next_selection_ambiguous=True),
+        tracker,
+    )
+
+    assert proposal.current_target.track_id == current_id
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.servo_output.advance_enabled is False
+
+
 def test_provisional_contour_withholds_blend_without_changing_latch() -> None:
     tracker, graph, snapshot, current_id, next_id, sequence = (
         _build_bound_graph()
