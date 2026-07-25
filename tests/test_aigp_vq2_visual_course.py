@@ -376,7 +376,15 @@ class _Host:
     async def _send_flight_command(self, command, **kwargs):
         self.commands.append((command, dict(kwargs), self.current_gate))
         self._last_flight_command_started_ns = round(self.clock * 1e9)
-        if command.thrust == 0.295:
+        passage_wire_command = bool(
+            command.thrust == 0.295
+            or (
+                self.current_gate == 0
+                and command.pitch_rate == -0.105
+                and command.thrust > 0.0
+            )
+        )
+        if passage_wire_command:
             self.passage_counts[self.current_gate] = (
                 self.passage_counts.get(self.current_gate, 0) + 1
             )
@@ -785,6 +793,77 @@ def test_atomic_no_wire_credit_uses_latched_passage_and_finishes():
     assert host.post_credit_navigation_attempts == 0
 
 
+@pytest.mark.parametrize(
+    ("vertical", "vertical_rate", "expected"),
+    [
+        (-0.08333333333333333, -0.23, 0.3106466666666667),
+        (-1.0, 0.5, 0.252),
+        (1.0, -0.5, 0.298),
+        (-1.0, -1.0, 0.32),
+        (1.0, 1.0, 0.21),
+    ],
+)
+def test_gate0_proved_vertical_collective_is_exact_and_bounded(
+    vertical,
+    vertical_rate,
+    expected,
+):
+    assert course_stage._gate0_proved_vertical_collective(
+        vertical,
+        vertical_rate,
+    ) == pytest.approx(expected)
+
+
+def test_gate0_proved_vertical_collective_rejects_nonfinite_input():
+    with pytest.raises(ValueError, match="must be finite"):
+        course_stage._gate0_proved_vertical_collective(
+            float("nan"),
+            0.0,
+        )
+
+
+def test_gate0_proved_collective_recreates_new_frame_rate_filter():
+    state = course_stage._Gate0ProvedCollectiveState()
+
+    def observed(sequence, received, vertical):
+        target = _target(
+            _snapshot(0, "track-0", sequence),
+            "track-0",
+        )
+        return replace(
+            target,
+            received_monotonic_s=received,
+            normalized_y_down=vertical,
+        )
+
+    first = observed(1, 1.0, 0.0)
+    second = observed(2, 1.1, -0.02)
+    first_thrust, first_rate = state.observe(first)
+    second_thrust, second_rate = state.observe(second)
+    duplicate_thrust, duplicate_rate = state.observe(
+        replace(
+            second,
+            frame_token=replace(
+                second.frame_token,
+                publication_sequence=3,
+            ),
+            received_monotonic_s=1.15,
+        )
+    )
+    third_thrust, third_rate = state.observe(
+        observed(4, 1.2, -0.03)
+    )
+
+    assert first_rate == 0.0
+    assert first_thrust == pytest.approx(0.275)
+    assert second_rate == pytest.approx(-0.07)
+    assert second_thrust == pytest.approx(0.28542)
+    assert duplicate_rate == pytest.approx(-0.07)
+    assert duplicate_thrust == pytest.approx(0.28542)
+    assert third_rate == pytest.approx(-0.0805)
+    assert third_thrust == pytest.approx(0.287543)
+
+
 def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     host = _Host(
         initial_gate=0,
@@ -808,6 +887,17 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["boost_thrust"] == (
         host.visual_config.lifecycle.launch_boost_thrust
     )
+    assert launch["post_boost_collective_basis"] == (
+        course_stage.GATE0_PROVED_COLLECTIVE_BASIS
+    )
+    assert launch["post_boost_collective_base"] == 0.275
+    assert launch["post_boost_collective_error_gain"] == 0.080
+    assert launch["post_boost_collective_rate_gain"] == 0.126
+    assert launch["post_boost_collective_max_abs_error"] == 0.50
+    assert launch["post_boost_collective_max_abs_rate"] == pytest.approx(
+        5.0 / 3.0
+    )
+    assert launch["post_boost_collective_rate_filter_alpha"] == 0.35
     assert launch["pitch_blend_s"] == (
         host.visual_config.lifecycle.launch_pitch_blend_s
     )
@@ -827,6 +917,17 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         == host.visual_config.lifecycle.launch_boost_thrust
         for command, _kwargs in gate0_commands
     )
+    assert launch["last_thrust_phase"] == (
+        course_stage.GATE0_PROVED_COLLECTIVE_BASIS
+    )
+    assert launch["last_thrust"] == pytest.approx(0.2726)
+    assert launch["last_current_vertical_error_image_down"] == 0.03
+    assert launch["last_current_vertical_rate_down_s"] == 0.0
+    assert launch["last_proved_filtered_vertical_rate_down_s"] == 0.0
+    assert any(
+        command.thrust == pytest.approx(0.2726)
+        for command, _kwargs in gate0_commands
+    )
     assert all(
         kwargs["wire_race_gate_index"] == 0
         for _command, kwargs in gate0_commands
@@ -839,6 +940,26 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     ]
     assert later_navigation
     assert later_navigation[0].thrust == 0.21
+    assert later["launch_bootstrap"][
+        "post_boost_collective_basis"
+    ] is None
+    gate0_passage = [
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage == "visual-course/gate0/passage"
+    ]
+    gate1_passage = [
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage == "visual-course/gate1/passage"
+    ]
+    assert gate0_passage
+    assert all(
+        command.thrust == pytest.approx(0.2726)
+        for command in gate0_passage
+    )
+    assert gate1_passage
+    assert all(command.thrust == 0.295 for command in gate1_passage)
 
 
 def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():

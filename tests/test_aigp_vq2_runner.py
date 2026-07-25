@@ -5306,7 +5306,7 @@ def test_cleanup_reset_captures_anchor_without_sending_against_stale_state(
 
 
 @pytest.mark.parametrize("disarm_raises", [False, True])
-def test_cleanup_reset_proof_reacts_once_to_newer_armed_heartbeat(
+def test_cleanup_reset_proof_cuts_on_rollback_then_newer_armed_heartbeat(
     monkeypatch,
     disarm_raises,
 ):
@@ -5351,9 +5351,13 @@ def test_cleanup_reset_proof_reacts_once_to_newer_armed_heartbeat(
     install_sample(0)
 
     async def disarm():
-        assert adapter.heartbeat_sequence == 57
-        assert adapter.is_armed is True
-        events.append("reactive_disarm")
+        events.append(
+            (
+                "reactive_disarm",
+                adapter.heartbeat_sequence,
+                adapter.is_armed,
+            )
+        )
         if disarm_raises:
             raise RuntimeError("injected reactive disarm failure")
 
@@ -5379,7 +5383,62 @@ def test_cleanup_reset_proof_reacts_once_to_newer_armed_heartbeat(
     assert proof is not None
     assert proof.post_race_boot_ms == 300
     assert proof.post_imu_us == 500_000
-    assert events == ["reactive_disarm", "proof_returned"]
+    assert events == [
+        ("reactive_disarm", 55, False),
+        ("reactive_disarm", 57, True),
+        "proof_returned",
+    ]
+
+
+def test_cleanup_reset_proof_does_not_disarm_before_clock_rollback(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.heartbeat_sequence = 55
+    adapter.is_armed = False
+    adapter.race_status = RaceStatus(11_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = TelemetryState(
+        timestamp_us=0,
+        position_ned=(0.0, 0.0, 0.0),
+        velocity_ned=(0.0, 0.0, 0.0),
+        orientation=Quaternion(),
+        angular_velocity=(0.0, 0.0, 0.0),
+        imu=IMUData(
+            timestamp_us=11_000_000,
+            accel=(0.0, 0.0, -9.81),
+            gyro=(0.0, 0.0, 0.0),
+        ),
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    clock = [0.0]
+    disarm_calls = []
+
+    async def advance(delay):
+        clock[0] += delay
+        # Even a newer armed heartbeat remains insufficient until an
+        # authoritative simulator clock proves that reset was applied.
+        adapter.heartbeat_sequence = 56
+        adapter.is_armed = True
+
+    async def disarm():
+        disarm_calls.append(adapter.heartbeat_sequence)
+
+    monkeypatch.setattr(vq2_module, "RESET_PROOF_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(adapter, "disarm", disarm)
+
+    proof = asyncio.run(
+        runner._observe_reset_proof(
+            attempt=1,
+            pre_race=10_000,
+            pre_imu=10_000_000,
+            cleanup_disarm_heartbeat_anchor=55,
+        )
+    )
+
+    assert proof is None
+    assert disarm_calls == []
 
 
 def test_safe_cleanup_does_not_reuse_pre_reset_disarm_confirmation(

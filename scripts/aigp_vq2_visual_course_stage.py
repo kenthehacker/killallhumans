@@ -83,7 +83,113 @@ MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS = 4
 VISUAL_COURSE_YAW_PROFILE_SCHEMA = YAW_CALIBRATION_PROFILE_SCHEMA
 INITIAL_PAD_PRELOAD_DURATION_S = 0.15
 INITIAL_PAD_PRELOAD_THRUST = 0.26
+# Exact normalized form of the build-3385 Gate-0 pixel-space collective that
+# already completed Gate 0 under the same launch pitch schedule:
+# 0.275 + 0.040 * ((180 - row) / 90) - 0.00070 * row_rate.
+GATE0_PROVED_COLLECTIVE_BASE = 0.275
+GATE0_PROVED_COLLECTIVE_ERROR_GAIN = 0.080
+GATE0_PROVED_COLLECTIVE_RATE_GAIN = 0.126
+GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR = 0.50
+GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE = 5.0 / 3.0
+GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA = 0.35
+GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
 _YAW_PROFILE_ISSUER = object()
+
+
+def _gate0_proved_vertical_collective(
+    vertical: float,
+    filtered_vertical_rate: float,
+) -> float:
+    """Return the live-proved Gate-0 collective in normalized image space."""
+
+    vertical = float(vertical)
+    filtered_vertical_rate = float(filtered_vertical_rate)
+    if not all(
+        math.isfinite(value)
+        for value in (vertical, filtered_vertical_rate)
+    ):
+        raise ValueError("Gate-0 collective inputs must be finite")
+    bounded_vertical = max(
+        -GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR,
+        min(GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR, vertical),
+    )
+    bounded_rate = max(
+        -GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE,
+        min(
+            GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE,
+            filtered_vertical_rate,
+        ),
+    )
+    requested = (
+        GATE0_PROVED_COLLECTIVE_BASE
+        - GATE0_PROVED_COLLECTIVE_ERROR_GAIN * bounded_vertical
+        - GATE0_PROVED_COLLECTIVE_RATE_GAIN * bounded_rate
+    )
+    return max(
+        MIN_VISUAL_THRUST,
+        min(MAX_VISUAL_THRUST, requested),
+    )
+
+
+@dataclass(slots=True)
+class _Gate0ProvedCollectiveState:
+    last_token_key: Optional[tuple[str, int, int, int]] = None
+    last_received_monotonic_s: Optional[float] = None
+    last_vertical: Optional[float] = None
+    filtered_vertical_rate: float = 0.0
+
+    def observe(self, target: Any) -> tuple[float, float]:
+        """Apply the proved 0.35 filter on exact graph receiver timing."""
+
+        token = target.frame_token
+        token_key = (
+            str(token.stream_id),
+            int(token.generation),
+            int(token.frame_id),
+            int(token.publication_sequence),
+        )
+        received = float(target.received_monotonic_s)
+        vertical = float(target.normalized_y_down)
+        if not math.isfinite(received) or not math.isfinite(vertical):
+            raise ValueError("Gate-0 collective observation must be finite")
+        if self.last_token_key is not None:
+            if (
+                token_key[0] != self.last_token_key[0]
+                or token_key[1] != self.last_token_key[1]
+                or token_key[3] <= self.last_token_key[3]
+                or self.last_received_monotonic_s is None
+                or self.last_vertical is None
+            ):
+                raise ValueError(
+                    "Gate-0 collective publication did not advance"
+                )
+            if token_key[2] != self.last_token_key[2]:
+                elapsed = received - self.last_received_monotonic_s
+                if elapsed > 1e-3:
+                    raw_rate = (vertical - self.last_vertical) / elapsed
+                    raw_rate = max(
+                        -GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE,
+                        min(
+                            GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE,
+                            raw_rate,
+                        ),
+                    )
+                    alpha = GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA
+                    self.filtered_vertical_rate = (
+                        (1.0 - alpha) * self.filtered_vertical_rate
+                        + alpha * raw_rate
+                    )
+                self.last_received_monotonic_s = received
+                self.last_vertical = vertical
+        else:
+            self.last_received_monotonic_s = received
+            self.last_vertical = vertical
+        self.last_token_key = token_key
+        thrust = _gate0_proved_vertical_collective(
+            vertical,
+            self.filtered_vertical_rate,
+        )
+        return thrust, self.filtered_vertical_rate
 
 
 @dataclass(frozen=True, slots=True)
@@ -965,6 +1071,9 @@ async def _run_visual_course_stage_impl(
     total_zero_commands = 0
     max_gate_index = current_gate_index
     latest_authoritative_gate_index = current_gate_index
+    launch_collective_state: Optional[
+        _Gate0ProvedCollectiveState
+    ] = None
     host._visual_course_summary.update(
         {
             "outcome": "running",
@@ -1174,6 +1283,13 @@ async def _run_visual_course_stage_impl(
                 (1.0 - pitch_blend) * launch_spawn_pitch_rad
                 + pitch_blend * target_pitch_rad
             )
+            assert launch_collective_state is not None
+            (
+                proved_collective,
+                proved_filtered_vertical_rate,
+            ) = launch_collective_state.observe(
+                proposal.current_target
+            )
             if launch_elapsed_s < INITIAL_PAD_PRELOAD_DURATION_S:
                 command_thrust = INITIAL_PAD_PRELOAD_THRUST
                 thrust_phase = "preload"
@@ -1185,7 +1301,14 @@ async def _run_visual_course_stage_impl(
                 )
                 thrust_phase = "boost"
             else:
-                thrust_phase = "servo"
+                # Preserve the already live-proved Gate-0 vertical collective
+                # after the fixed launch boost.  The generic minimum-
+                # collective approach output lost vertical authority in the
+                # exact attempt-7 history and drove a centered aperture into
+                # the top edge.  This remains Gate-0 launch-only and inside
+                # the unchanged controller thrust envelope.
+                command_thrust = proved_collective
+                thrust_phase = GATE0_PROVED_COLLECTIVE_BASIS
             if (
                 target_pitch_rad < limits.min_measured_pitch_rad
                 or target_pitch_rad > limits.max_measured_pitch_rad
@@ -1203,6 +1326,15 @@ async def _run_visual_course_stage_impl(
                 "target_pitch_rad": target_pitch_rad,
                 "thrust": command_thrust,
                 "thrust_phase": thrust_phase,
+                "current_vertical_error_image_down": float(
+                    proposal.current_target.normalized_y_down
+                ),
+                "current_vertical_rate_down_s": float(
+                    proposal.current_target.normalized_y_rate_down_s
+                ),
+                "proved_filtered_vertical_rate_down_s": (
+                    proved_filtered_vertical_rate
+                ),
             }
 
         await host._wait_for_next_flight_command_slot()
@@ -1353,6 +1485,19 @@ async def _run_visual_course_stage_impl(
             launch["last_thrust_phase"] = launch_evidence[
                 "thrust_phase"
             ]
+            launch["last_current_vertical_error_image_down"] = (
+                launch_evidence[
+                    "current_vertical_error_image_down"
+                ]
+            )
+            launch["last_current_vertical_rate_down_s"] = (
+                launch_evidence["current_vertical_rate_down_s"]
+            )
+            launch["last_proved_filtered_vertical_rate_down_s"] = (
+                launch_evidence[
+                    "proved_filtered_vertical_rate_down_s"
+                ]
+            )
         host._record_tick(
             stage,
             float(runtime.monotonic()) - segment_started_s,
@@ -1384,6 +1529,16 @@ async def _run_visual_course_stage_impl(
         _roll, _pitch, yaw_reference_rad, _rates = _attitude_state(
             host,
             abort_type,
+        )
+        launch_enabled = bool(
+            segment_number == 0
+            and initial_gate_index == 0
+            and current_gate_index == initial_gate_index
+        )
+        launch_collective_state = (
+            _Gate0ProvedCollectiveState()
+            if launch_enabled
+            else None
         )
         planner = runtime.servo_factory(
             current_track_id,
@@ -1432,13 +1587,44 @@ async def _run_visual_course_stage_impl(
             "crossing_anchor": None,
             "outcome": "running",
             "launch_bootstrap": {
-                "enabled": bool(
-                    segment_number == 0
-                    and initial_gate_index == 0
-                    and current_gate_index == initial_gate_index
-                ),
+                "enabled": launch_enabled,
                 "preload_duration_s": INITIAL_PAD_PRELOAD_DURATION_S,
                 "preload_thrust": INITIAL_PAD_PRELOAD_THRUST,
+                "post_boost_collective_basis": (
+                    GATE0_PROVED_COLLECTIVE_BASIS
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_collective_base": (
+                    GATE0_PROVED_COLLECTIVE_BASE
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_collective_error_gain": (
+                    GATE0_PROVED_COLLECTIVE_ERROR_GAIN
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_collective_rate_gain": (
+                    GATE0_PROVED_COLLECTIVE_RATE_GAIN
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_collective_max_abs_error": (
+                    GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_collective_max_abs_rate": (
+                    GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE
+                    if launch_enabled
+                    else None
+                ),
+                "post_boost_collective_rate_filter_alpha": (
+                    GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA
+                    if launch_enabled
+                    else None
+                ),
                 "boost_duration_s": float(
                     host.visual_config.lifecycle.launch_boost_duration_s
                 ),

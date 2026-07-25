@@ -10215,6 +10215,7 @@ class VQ2Runner:
         await self._best_effort_post_reset_disarm(
             attempt=attempt,
             heartbeat_anchor=heartbeat_anchor,
+            trigger="newer_armed_heartbeat",
         )
         return True
 
@@ -10233,23 +10234,9 @@ class VQ2Runner:
         imu_samples: List[int] = []
         countdown_observed = False
         cleanup_disarm_attempted = False
+        cleanup_reset_applied_disarm_attempted = False
+        cleanup_rearm_heartbeat_anchor: Optional[int] = None
         while time.monotonic() < deadline:
-            if (
-                cleanup_disarm_heartbeat_anchor is not None
-                and not cleanup_disarm_attempted
-            ):
-                # A reset can reassert arm after overwriting a disarm sent
-                # against cached pre-reset state.  React exactly once to
-                # authoritative newer armed state without delaying or gating
-                # the independent race/IMU rollback proof.
-                cleanup_disarm_attempted = await (
-                    self._react_to_newer_cleanup_armed_heartbeat(
-                        attempt=attempt,
-                        heartbeat_anchor=(
-                            cleanup_disarm_heartbeat_anchor
-                        ),
-                    )
-                )
             telemetry = self.adapter.latest_telemetry
             imu = telemetry.imu if telemetry is not None else None
             race = self.adapter.race_status
@@ -10265,6 +10252,41 @@ class VQ2Runner:
                 if clock_rolled_back(pre_imu, stamp, RESET_IMU_DROP_US):
                     if not imu_samples or stamp > imu_samples[-1]:
                         imu_samples.append(stamp)
+            if (
+                cleanup_disarm_heartbeat_anchor is not None
+                and not cleanup_reset_applied_disarm_attempted
+                and (race_samples or imu_samples)
+            ):
+                # A rolled-back authoritative simulator clock proves the
+                # reset has applied earlier than build 3385's next heartbeat.
+                # Remove any reset-time arm at that first boundary, then keep
+                # the independent newer-armed-heartbeat fallback below.
+                cleanup_reset_applied_disarm_attempted = True
+                cleanup_rearm_heartbeat_anchor = (
+                    self.adapter.heartbeat_sequence
+                )
+                await self._best_effort_post_reset_disarm(
+                    attempt=attempt,
+                    heartbeat_anchor=(
+                        cleanup_disarm_heartbeat_anchor
+                    ),
+                    trigger="clock_rollback",
+                )
+            if (
+                cleanup_rearm_heartbeat_anchor is not None
+                and not cleanup_disarm_attempted
+                and self.adapter.heartbeat_sequence
+                > cleanup_rearm_heartbeat_anchor
+                and self.adapter.is_armed
+            ):
+                # Only a heartbeat strictly newer than the sequence observed
+                # at reset application can prove a subsequent re-arm.
+                cleanup_disarm_attempted = True
+                await self._best_effort_post_reset_disarm(
+                    attempt=attempt,
+                    heartbeat_anchor=cleanup_rearm_heartbeat_anchor,
+                    trigger="newer_armed_heartbeat",
+                )
             if (
                 len(race_samples) >= 2
                 and len(imu_samples) >= 5
@@ -11051,17 +11073,24 @@ class VQ2Runner:
         *,
         attempt: int,
         heartbeat_anchor: int,
+        trigger: str,
     ) -> bool:
-        """React once to authoritative newer reset-time armed state.
+        """Best-effort authority cut after an authoritative reset boundary.
 
         Build 3385 can republish an armed heartbeat after ``SIM_RESET`` even
         when cleanup proved a disarm immediately before the reset.  The caller
-        admits this send only after a heartbeat newer than ``heartbeat_anchor``
-        reports armed.  This one-shot send does not gate reset proof and does
-        not satisfy cleanup's final disarm requirement; :meth:`safe_cleanup`
-        still requires a separate newer-heartbeat confirmation after proof.
+        admits this send either at the first authoritative clock rollback or
+        after a heartbeat newer than ``heartbeat_anchor`` reports armed.
+        This send does not gate reset proof and does not satisfy cleanup's
+        final disarm requirement; :meth:`safe_cleanup` still requires a
+        separate newer-heartbeat confirmation after proof.
         """
 
+        if trigger not in {
+            "clock_rollback",
+            "newer_armed_heartbeat",
+        }:
+            raise ValueError("post-reset disarm trigger is invalid")
         heartbeat_before = self.adapter.heartbeat_sequence
         armed_before = self.adapter.is_armed
         try:
@@ -11073,6 +11102,7 @@ class VQ2Runner:
                 attempt=attempt,
                 outcome="raised",
                 error_type=type(exc).__name__,
+                trigger=trigger,
                 heartbeat_sequence_anchor=heartbeat_anchor,
                 heartbeat_sequence_before=heartbeat_before,
                 armed_before=armed_before,
@@ -11083,6 +11113,7 @@ class VQ2Runner:
             attempt=attempt,
             outcome="returned",
             error_type=None,
+            trigger=trigger,
             heartbeat_sequence_anchor=heartbeat_anchor,
             heartbeat_sequence_before=heartbeat_before,
             armed_before=armed_before,
