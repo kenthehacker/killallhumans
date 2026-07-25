@@ -10281,18 +10281,9 @@ class VQ2Runner:
         attempt: int,
         heartbeat_anchor: int,
         next_deadline_s: float,
-        reset_clock_rolled_back: bool,
-    ) -> Optional[float]:
-        """Reassert disarm at 50 Hz until reset application is observable."""
+    ) -> float:
+        """Reassert disarm at 50 Hz throughout the reset-proof wait."""
 
-        if (
-            reset_clock_rolled_back
-            or (
-                self.adapter.heartbeat_sequence > heartbeat_anchor
-                and not self.adapter.is_armed
-            )
-        ):
-            return None
         now_s = time.monotonic()
         if now_s < next_deadline_s:
             return next_deadline_s
@@ -10345,24 +10336,7 @@ class VQ2Runner:
                     if not imu_samples or stamp > imu_samples[-1]:
                         imu_samples.append(stamp)
             reset_clock_rolled_back = bool(race_samples or imu_samples)
-            if (
-                cleanup_disarm_heartbeat_anchor is not None
-                and cleanup_disarm_next_deadline_s is not None
-            ):
-                cleanup_disarm_next_deadline_s = await (
-                    self._advance_cleanup_reset_disarm_cadence(
-                        attempt=attempt,
-                        heartbeat_anchor=(
-                            cleanup_disarm_heartbeat_anchor
-                        ),
-                        next_deadline_s=(
-                            cleanup_disarm_next_deadline_s
-                        ),
-                        reset_clock_rolled_back=(
-                            reset_clock_rolled_back
-                        ),
-                    )
-                )
+            reactive_disarm_sent = False
             if (
                 cleanup_disarm_heartbeat_anchor is not None
                 and not cleanup_reset_applied_disarm_attempted
@@ -10383,6 +10357,7 @@ class VQ2Runner:
                     ),
                     trigger="clock_rollback",
                 )
+                reactive_disarm_sent = True
             if (
                 cleanup_rearm_heartbeat_anchor is not None
                 and not cleanup_disarm_attempted
@@ -10398,6 +10373,28 @@ class VQ2Runner:
                     heartbeat_anchor=cleanup_rearm_heartbeat_anchor,
                     trigger="newer_armed_heartbeat",
                 )
+                reactive_disarm_sent = True
+            if (
+                cleanup_disarm_heartbeat_anchor is not None
+                and cleanup_disarm_next_deadline_s is not None
+            ):
+                if reactive_disarm_sent:
+                    now_s = time.monotonic()
+                    cleanup_disarm_next_deadline_s = (
+                        next_control_deadline(now_s, now_s)
+                    )
+                else:
+                    cleanup_disarm_next_deadline_s = await (
+                        self._advance_cleanup_reset_disarm_cadence(
+                            attempt=attempt,
+                            heartbeat_anchor=(
+                                cleanup_disarm_heartbeat_anchor
+                            ),
+                            next_deadline_s=(
+                                cleanup_disarm_next_deadline_s
+                            ),
+                        )
+                    )
             if (
                 len(race_samples) >= 2
                 and len(imu_samples) >= 5
@@ -11046,9 +11043,7 @@ class VQ2Runner:
                     # but must not suppress the same bounded disarm cadence or
                     # the existing newer-armed-heartbeat reaction.
                     disarm_deadline = time.monotonic() + 0.5
-                    cleanup_disarm_next_deadline_s: Optional[float] = (
-                        time.monotonic()
-                    )
+                    cleanup_disarm_next_deadline_s = time.monotonic()
                     newer_armed_disarm_attempted = False
                     while time.monotonic() < disarm_deadline:
                         if (
@@ -11076,11 +11071,8 @@ class VQ2Runner:
                                 next_deadline_s=(
                                     cleanup_disarm_next_deadline_s
                                 ),
-                                reset_clock_rolled_back=False,
                             )
                         )
-                        if cleanup_disarm_next_deadline_s is None:
-                            break
                         await asyncio.sleep(0.005)
             logger.warning(
                 "Emergency reset attempt %d was sent but not proved; retrying",
@@ -11216,12 +11208,12 @@ class VQ2Runner:
 
         Build 3385 can republish an armed heartbeat after ``SIM_RESET`` even
         when cleanup proved a disarm immediately before the reset.  The caller
-        admits this send on the bounded reset-return cadence, at the first
-        authoritative clock rollback, or after a heartbeat newer than
-        ``heartbeat_anchor`` reports armed.  This send does not gate reset
-        proof and does not satisfy cleanup's final disarm requirement;
-        :meth:`safe_cleanup` still requires a separate newer-heartbeat
-        confirmation after proof.
+        admits this send on the bounded reset-return cadence throughout the
+        proof wait, at the first authoritative clock rollback, or after a
+        heartbeat newer than ``heartbeat_anchor`` reports armed.  This send
+        does not gate reset proof and does not satisfy cleanup's final disarm
+        requirement; :meth:`safe_cleanup` still requires a separate
+        newer-heartbeat confirmation after proof.
         """
 
         if trigger not in {

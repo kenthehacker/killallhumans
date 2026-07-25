@@ -5519,7 +5519,11 @@ def test_cleanup_reset_without_clock_baseline_reacts_to_newer_armed_heartbeat(
 
     async def disarm():
         disarm_observations.append(
-            (adapter.heartbeat_sequence, adapter.is_armed)
+            (
+                round(clock[0], 6),
+                adapter.heartbeat_sequence,
+                adapter.is_armed,
+            )
         )
         adapter.is_armed = False
 
@@ -5532,10 +5536,23 @@ def test_cleanup_reset_without_clock_baseline_reacts_to_newer_armed_heartbeat(
 
     assert proof is None
     assert adapter.reset_calls == 1
-    assert disarm_observations == [
-        (55, False),
-        (56, True),
+    assert disarm_observations[:2] == [
+        (0.0, 55, False),
+        (0.005, 56, True),
     ]
+    cadence_times = [row[0] for row in disarm_observations[2:]]
+    assert len(cadence_times) == 24
+    assert cadence_times[0] == pytest.approx(0.025)
+    assert cadence_times[-1] < 0.5
+    assert all(
+        vq2_module.CONTROL_PERIOD_S - 1e-12
+        <= later - earlier
+        <= vq2_module.CONTROL_PERIOD_S + 0.005 + 1e-12
+        for earlier, later in zip(cadence_times, cadence_times[1:])
+    )
+    assert all(
+        row[1:] == (56, True) for row in disarm_observations[2:]
+    )
 
 
 def test_cleanup_reset_requests_atomic_disarm_before_proof_wait_without_claim(
@@ -5720,7 +5737,6 @@ def test_cleanup_reset_disarm_cadence_is_exact_and_drops_missed_ticks(
                     attempt=1,
                     heartbeat_anchor=55,
                     next_deadline_s=next_deadline,
-                    reset_clock_rolled_back=False,
                 )
             )
             assert next_deadline is not None
@@ -5735,7 +5751,7 @@ def test_cleanup_reset_disarm_cadence_is_exact_and_drops_missed_ticks(
     )
 
 
-def test_cleanup_reset_disarm_cadence_stops_at_first_clock_rollback(
+def test_cleanup_reset_disarm_cadence_continues_through_clock_rollback(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -5793,12 +5809,12 @@ def test_cleanup_reset_disarm_cadence_stops_at_first_clock_rollback(
     )
 
     assert proof is None
-    # 0.025 is the preserved one-shot rollback reaction.  The 50 Hz cadence
-    # sent at 0.000 and 0.020, then remained stopped for the rest of the wait.
-    assert disarm_calls == pytest.approx([0.0, 0.020, 0.025])
+    # 0.025 is the preserved one-shot rollback reaction.  It resets the
+    # cadence deadline, which then continues through the bounded proof wait.
+    assert disarm_calls == pytest.approx([0.0, 0.020, 0.025, 0.045])
 
 
-def test_cleanup_reset_disarm_cadence_stops_on_newer_disarmed_heartbeat(
+def test_cleanup_reset_disarm_cadence_ignores_newer_disarmed_heartbeat(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -5818,12 +5834,112 @@ def test_cleanup_reset_disarm_cadence_stops_on_newer_disarmed_heartbeat(
             attempt=1,
             heartbeat_anchor=55,
             next_deadline_s=0.0,
-            reset_clock_rolled_back=False,
         )
     )
 
-    assert next_deadline is None
-    assert disarm_calls == []
+    assert next_deadline == pytest.approx(vq2_module.CONTROL_PERIOD_S)
+    assert disarm_calls == [True]
+
+
+def test_cleanup_reset_disarm_cadence_survives_attempt20_reset_rearm_sequence(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    runner = VQ2Runner(adapter, _FakeVision())
+    clock = [0.0]
+    disarm_calls = []
+
+    def install_state():
+        now_s = round(clock[0], 6)
+        if now_s < 0.040:
+            race_boot_ms = 11_000
+            imu_us = 11_000_000
+        else:
+            race_boot_ms = 150 if now_s >= 0.100 else 100
+            if now_s >= 0.100:
+                imu_us = 500_000
+            elif now_s >= 0.090:
+                imu_us = 400_000
+            elif now_s >= 0.080:
+                imu_us = 300_000
+            elif now_s >= 0.060:
+                imu_us = 200_000
+            else:
+                imu_us = 100_000
+        adapter.race_status = RaceStatus(
+            race_boot_ms,
+            -1,
+            -1,
+            0,
+            -1,
+        )
+        adapter.latest_telemetry = TelemetryState(
+            timestamp_us=0,
+            position_ned=(0.0, 0.0, 0.0),
+            velocity_ned=(0.0, 0.0, 0.0),
+            orientation=Quaternion(),
+            angular_velocity=(0.0, 0.0, 0.0),
+            imu=IMUData(
+                timestamp_us=imu_us,
+                accel=(0.0, 0.0, -9.81),
+                gyro=(0.0, 0.0, 0.0),
+            ),
+        )
+        if now_s < 0.010:
+            adapter.heartbeat_sequence = 79
+            adapter.is_armed = True
+        elif now_s < 0.080:
+            adapter.heartbeat_sequence = 80
+            adapter.is_armed = False
+        else:
+            adapter.heartbeat_sequence = 91
+            adapter.is_armed = True
+
+    install_state()
+
+    async def disarm():
+        disarm_calls.append(
+            (
+                round(clock[0], 6),
+                adapter.heartbeat_sequence,
+                adapter.is_armed,
+            )
+        )
+
+    async def advance(delay):
+        clock[0] += delay
+        install_state()
+
+    monkeypatch.setattr(vq2_module, "RESET_PROOF_TIMEOUT_S", 0.121)
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(adapter, "disarm", disarm)
+
+    proof = asyncio.run(
+        runner._observe_reset_proof(
+            attempt=1,
+            pre_race=10_000,
+            pre_imu=10_000_000,
+            cleanup_disarm_heartbeat_anchor=79,
+        )
+    )
+
+    assert proof is not None
+    assert proof.post_race_boot_ms == 150
+    assert proof.post_imu_us == 500_000
+    assert disarm_calls == [
+        (0.0, 79, True),
+        (0.02, 80, False),
+        (0.04, 80, False),
+        (0.065, 80, False),
+        (0.08, 91, True),
+        (0.1, 91, True),
+    ]
+    assert all(
+        later[0] - earlier[0]
+        <= vq2_module.CONTROL_PERIOD_S + 0.005 + 1e-12
+        for earlier, later in zip(disarm_calls, disarm_calls[1:])
+    )
 
 
 def test_cleanup_reset_disarm_send_failure_does_not_suppress_reset_proof(
@@ -5895,7 +6011,7 @@ def test_cleanup_reset_disarm_send_failure_does_not_suppress_reset_proof(
     assert proof is not None
     assert proof.post_race_boot_ms == 300
     assert proof.post_imu_us == 500_000
-    assert disarm_calls == pytest.approx([0.0, 0.005])
+    assert disarm_calls == pytest.approx([0.0, 0.005, 0.025])
 
 
 def test_safe_cleanup_does_not_claim_pre_reset_disarm_confirmation(
