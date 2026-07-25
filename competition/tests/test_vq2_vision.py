@@ -677,3 +677,56 @@ def test_freshness_rejects_invalid_max_age(max_age):
     receiver = VQ2VisionThread()
     with pytest.raises(ValueError):
         receiver.is_fresh(max_age)
+
+
+def test_snapshot_publication_lease_blocks_reset_until_release():
+    receiver = VQ2VisionThread()
+    reset_started = threading.Event()
+    reset_completed = threading.Event()
+
+    def reset_receiver():
+        reset_started.set()
+        receiver.reset()
+        reset_completed.set()
+
+    with receiver.snapshot_publication_lease():
+        worker = threading.Thread(target=reset_receiver)
+        worker.start()
+        assert reset_started.wait(1.0)
+        worker.join(0.02)
+        assert worker.is_alive()
+        assert not reset_completed.is_set()
+
+    worker.join(1.0)
+    assert not worker.is_alive()
+    assert reset_completed.is_set()
+
+
+def test_snapshot_publication_lease_acquisition_is_deadline_bounded():
+    receiver = VQ2VisionThread()
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_publication_lock():
+        with receiver._data_lock:
+            lock_held.set()
+            assert release_lock.wait(1.0)
+
+    worker = threading.Thread(target=hold_publication_lock)
+    worker.start()
+    assert lock_held.wait(1.0)
+    deadline_ns = receiver._read_monotonic_ns() + 20_000_000
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="acquisition deadline",
+        ):
+            with receiver.snapshot_publication_lease(
+                acquire_deadline_monotonic_ns=deadline_ns,
+            ):
+                pytest.fail("expired publication lease was entered")
+    finally:
+        release_lock.set()
+        worker.join(1.0)
+
+    assert not worker.is_alive()

@@ -127,6 +127,10 @@ interactive confirmation.
                 'estimation/tests',
                 'gate_detection/tests',
                 'planning/tests/test_vq2_guidance.py',
+                'planning/tests/test_vq2_recorded_gate_promotion.py',
+                'planning/tests/test_vq2_visual_alignment.py',
+                'planning/tests/test_vq2_visual_recovery.py',
+                'planning/tests/test_vq2_visual_servo.py',
                 'tests/test_aigp_live_lease.py',
                 'tests/test_aigp_vq2_build_reference.py',
                 'tests/test_aigp_vq2_calibration_target.py',
@@ -139,6 +143,8 @@ interactive confirmation.
                 'tests/test_aigp_vq2_powered_calibration_analysis.py',
                 'tests/test_aigp_vq2_powered_cleanup.py',
                 'tests/test_aigp_vq2_runner.py',
+                'tests/test_aigp_vq2_visual_config.py',
+                'tests/test_aigp_vq2_visual_shadow.py',
                 'tests/test_vision_udp.py',
                 'tests/test_vision_udp_listener.py'
             )
@@ -171,17 +177,26 @@ interactive confirmation.
             )
         }
         'flight-cycle' {
-            if ($TaskArgs.Count -gt 1) {
-                throw 'flight-cycle accepts at most one powered stage.'
+            if ($TaskArgs.Count -notin @(0, 1, 3)) {
+                throw (
+                    'flight-cycle accepts [stage] or ' +
+                    '[stage --controller-config path].'
+                )
             }
-            $stage = if ($TaskArgs.Count -eq 1) {
+            $stage = if ($TaskArgs.Count -ge 1) {
                 $TaskArgs[0]
             } else {
                 'calibration-excite'
             }
+            if (
+                $TaskArgs.Count -eq 3 -and
+                $TaskArgs[1] -ne '--controller-config'
+            ) {
+                throw 'flight-cycle accepts only --controller-config after stage.'
+            }
             $allowed = @(
-                'sign-id', 'hover', 'gate0', 'gate0-observe',
-                'calibration-excite'
+                'sign-id', 'hover', 'gate0', 'gate0-observe', 'gate1-recenter',
+                'visual-shadow', 'visual-align', 'calibration-excite'
             )
             if ($stage -notin $allowed) {
                 throw "Unsupported flight-cycle stage '$stage'."
@@ -190,10 +205,14 @@ interactive confirmation.
                 "Running one POWERED '$stage' cycle with compact evidence " +
                 'and no interactive preflight ceremony.'
             )
-            Invoke-Python @(
+            $flightArgs = @(
                 '-E', '-s', '-B',
                 '-m', 'scripts.aigp_vq2_fast_cycle', $stage
             )
+            if ($TaskArgs.Count -eq 3) {
+                $flightArgs += @('--controller-config', $TaskArgs[2])
+            }
+            Invoke-Python $flightArgs
         }
         'launch-sim' {
             if ($TaskArgs.Count -gt 1) { throw 'launch-sim accepts at most one FlightSim.exe path.' }
@@ -226,7 +245,8 @@ Unknown task '$Task'. Available tasks:
   test-promotion       Durable promotion-only full non-live suite (typically 10-13m)
   test-full-non-live   Compatibility alias for test-promotion
   preflight            Fast passive stream/target health check; no capture
-  flight-cycle [stage] Dedicated powered cycle (default: calibration-excite)
+  flight-cycle [stage] [--controller-config path]
+                       Dedicated powered cycle (default: calibration-excite)
   launch-sim [path]    Launch FlightSim in the active interactive session
   sbom [path]          Generate a local CycloneDX dependency inventory
 "@

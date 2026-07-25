@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import aigp_vq2_fast_cycle as fast_cycle
+from scripts import aigp_vq2_controller_config as controller_config
+from scripts import aigp_vq2_visual_config as visual_config
 
 
 UTC = datetime(2026, 7, 22, 20, 0, tzinfo=timezone.utc)
@@ -34,6 +36,7 @@ class _StageResult:
     gate_index_after: int | None
     cleanup_confirmed: bool
     details: dict[str, object]
+    controller: dict[str, object] | None = None
 
 
 def test_compact_manifest_has_no_interactive_or_bulk_freeze_inputs(tmp_path):
@@ -97,25 +100,71 @@ def test_compact_manifest_has_no_interactive_or_bulk_freeze_inputs(tmp_path):
     assert "attestation" not in json.dumps(manifest)
 
 
-def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(tmp_path):
+def test_full_lap_is_quarantined_from_fast_powered_stages():
+    assert "full-lap" not in fast_cycle.FAST_POWERED_STAGES
+    with pytest.raises(SystemExit):
+        fast_cycle.build_argument_parser().parse_args(["full-lap"])
+
+
+def test_gate1_recenter_is_admitted_as_the_bounded_position_only_stage():
+    assert "gate1-recenter" in fast_cycle.FAST_POWERED_STAGES
+    arguments = fast_cycle.build_argument_parser().parse_args(
+        ["gate1-recenter"]
+    )
+    assert arguments.stage == "gate1-recenter"
+
+
+@pytest.mark.parametrize(
+    ("requested_stage", "expected_replay_name"),
+    [
+        ("visual-shadow", "shadow.vq2replay"),
+        ("visual-align", "alignment.vq2replay"),
+    ],
+)
+def test_visual_stage_is_admitted_with_visual_config_and_replay_evidence(
+    tmp_path,
+    monkeypatch,
+    requested_stage,
+    expected_replay_name,
+):
+    git_snapshot = {
+        "head_commit": "a" * 40,
+        "head_tree": "b" * 40,
+        "worktree_state": "clean",
+        "status_sha256": "c" * 64,
+        "tracked_diff_sha256": "d" * 64,
+    }
+    monkeypatch.setattr(
+        fast_cycle,
+        "_git_snapshot",
+        lambda _root: dict(git_snapshot),
+    )
     calls = []
 
     async def run_live(stage, address, record, **kwargs):
         calls.append((stage, address, record, kwargs))
-        Path(record).write_bytes(b"compact trace")
+        Path(record).write_bytes(b"visual navigation trace")
+        effective = visual_config.validate_visual_config(
+            kwargs["controller_config"]
+        )
+        evidence = fast_cycle._controller_evidence(
+            effective,
+            candidate_commit=kwargs["candidate_commit"],
+        )
         return _StageResult(
             stage=stage,
             success=True,
             reason="stage completed",
-            duration_s=5.0,
+            duration_s=4.0,
             gate_index_before=0,
             gate_index_after=0,
             cleanup_confirmed=True,
-            details={"ticks_sent": 245},
+            details={"authoritative_transition": [0, 1]},
+            controller=evidence,
         )
 
     code, result = fast_cycle._execute_fast_cycle(
-        "calibration-excite",
+        requested_stage,
         evidence_root=tmp_path,
         now=lambda: UTC,
         load_runner=lambda: SimpleNamespace(run_live=run_live),
@@ -126,17 +175,149 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(tmp_path):
     assert result["success"] is True
     assert len(calls) == 1
     stage, address, record, kwargs = calls[0]
-    assert stage == "calibration-excite"
+    assert stage == requested_stage
     assert address == fast_cycle.DEFAULT_ADDRESS
-    assert kwargs == {
-        "preflight_before_powered_stage": False,
-        "write_diagnostic_pngs": False,
-        "run_manifest_sha256": result["run_manifest_sha256"],
-    }
+    effective = visual_config.validate_visual_config(
+        kwargs["controller_config"]
+    )
+    assert result["controller"]["controller_family"] == (
+        visual_config.VISUAL_CONTROLLER_FAMILY
+    )
+    assert result["controller"]["config_sha256"] == (
+        effective.effective_config_sha256
+    )
+    assert kwargs["expected_controller_config_sha256"] == (
+        effective.effective_config_sha256
+    )
+    assert kwargs["recording_approved"] is True
+    assert kwargs["preflight_before_powered_stage"] is False
+    assert kwargs["write_diagnostic_pngs"] is False
+    replay_path = Path(kwargs["replay_bundle"])
+    assert replay_path.parent == Path(record).parent
+    assert replay_path.name == expected_replay_name
+    manifest = json.loads(
+        (Path(record).parent / "run-manifest.json").read_text()
+    )
+    assert manifest["evidence"]["replay_bundle"] == str(replay_path)
+    assert manifest["candidate"]["worktree_state"] == "clean"
+
+
+@pytest.mark.parametrize(
+    "requested_stage",
+    ["visual-shadow", "visual-align"],
+)
+def test_visual_stage_refuses_dirty_candidate_before_live_contact(
+    tmp_path,
+    monkeypatch,
+    requested_stage,
+):
+    monkeypatch.setattr(
+        fast_cycle,
+        "_git_snapshot",
+        lambda _root: {
+            "head_commit": "a" * 40,
+            "head_tree": "b" * 40,
+            "worktree_state": "dirty",
+            "status_sha256": "c" * 64,
+            "tracked_diff_sha256": "d" * 64,
+        },
+    )
+    called = False
+
+    async def run_live(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("dirty visual candidate must not contact live runner")
+
+    with pytest.raises(
+        fast_cycle.FastCycleError,
+        match="require a clean exact commit",
+    ):
+        fast_cycle._execute_fast_cycle(
+            requested_stage,
+            evidence_root=tmp_path,
+            now=lambda: UTC,
+            load_runner=lambda: SimpleNamespace(run_live=run_live),
+            lease_factory=_fake_lease,
+        )
+    assert called is False
+
+
+@pytest.mark.parametrize("requested_stage", ["calibration-excite"])
+def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
+    tmp_path,
+    requested_stage,
+):
+    calls = []
+
+    async def run_live(stage, address, record, **kwargs):
+        calls.append((stage, address, record, kwargs))
+        Path(record).write_bytes(b"compact trace")
+        evidence = fast_cycle._controller_evidence(
+            controller_config.validate_controller_config(
+                kwargs["controller_config"]
+            ),
+            candidate_commit=kwargs["candidate_commit"],
+        )
+        return _StageResult(
+            stage=stage,
+            success=True,
+            reason="stage completed",
+            duration_s=5.0,
+            gate_index_before=0,
+            gate_index_after=0,
+            cleanup_confirmed=True,
+            details={"ticks_sent": 245},
+            controller=evidence,
+        )
+
+    code, result = fast_cycle._execute_fast_cycle(
+        requested_stage,
+        evidence_root=tmp_path,
+        now=lambda: UTC,
+        load_runner=lambda: SimpleNamespace(run_live=run_live),
+        lease_factory=_fake_lease,
+    )
+
+    assert code == 0
+    assert result["success"] is True
+    assert len(calls) == 1
+    stage, address, record, kwargs = calls[0]
+    assert stage == requested_stage
+    assert address == fast_cycle.DEFAULT_ADDRESS
+    assert kwargs["preflight_before_powered_stage"] is False
+    assert kwargs["write_diagnostic_pngs"] is False
+    assert kwargs["run_manifest_sha256"] == result["run_manifest_sha256"]
+    effective = controller_config.validate_controller_config(
+        kwargs["controller_config"]
+    )
+    assert kwargs["candidate_commit"] == result["controller"]["git_commit"]
+    assert (
+        kwargs["expected_controller_config_sha256"]
+        == effective.effective_config_sha256
+        == result["controller"]["config_sha256"]
+    )
     run_directory = Path(record).parent
     manifest = json.loads((run_directory / "run-manifest.json").read_text())
     terminal = json.loads((run_directory / "result.json").read_text())
     assert manifest["run_id"] == terminal["run_id"] == result["run_id"]
+    assert manifest["authorization"]["scope"] == {
+        "stage": requested_stage,
+        "attempt_limit": 1,
+    }
+    assert manifest["execution"]["stage"] == requested_stage
+    assert manifest["controller"] == result["controller"]
+    assert terminal["controller"] == result["controller"]
+    assert result["runner_result"]["controller"] == result["controller"]
+    assert (
+        result["controller"]["effective_parameters"]
+        == {
+            key: value
+            for key, value in effective.to_effective_mapping().items()
+            if key not in {"schema", "controller_family"}
+        }
+    )
+    assert manifest["inputs"]["excitation_plan"] is not None
     assert (run_directory / "session.jsonl.gz").read_bytes() == b"compact trace"
     assert result["trace"]["sha256"] == fast_cycle.hashlib.sha256(
         b"compact trace"
@@ -286,3 +467,52 @@ def test_evidence_root_inside_worktree_is_rejected():
             evidence_root=repo_root / ".artifacts/fast-flight",
             lease_factory=_fake_lease,
         )
+
+
+def test_controller_config_cli_and_loader_require_one_complete_document(tmp_path):
+    path = tmp_path / "controller.json"
+    path.write_text(
+        json.dumps(controller_config.default_controller_config_mapping()),
+        encoding="utf-8",
+    )
+    parsed = fast_cycle.build_argument_parser().parse_args(
+        ["gate1-recenter", "--controller-config", str(path)]
+    )
+    assert parsed.controller_config == path
+    assert (
+        fast_cycle._load_controller_config(path)
+        == controller_config.default_controller_config()
+    )
+
+    path.write_text('{"schema":"incomplete"}', encoding="utf-8")
+    with pytest.raises(
+        fast_cycle.FastCycleError,
+        match="controller configuration refused",
+    ):
+        fast_cycle._load_controller_config(path)
+
+
+def test_custom_controller_is_rejected_for_unrelated_stage_before_lease(tmp_path):
+    document = controller_config.default_controller_config_mapping()
+    document["yaw_control"]["gate1_error_gain"] = -0.08
+    document["yaw_control"]["command_rate_cap_rad_s"] = 0.08
+    lease_called = False
+
+    @contextmanager
+    def forbidden_lease(*_args, **_kwargs):
+        nonlocal lease_called
+        lease_called = True
+        yield
+
+    with pytest.raises(
+        fast_cycle.FastCycleError,
+        match="only for gate1-recenter",
+    ):
+        fast_cycle._execute_fast_cycle(
+            "hover",
+            evidence_root=tmp_path,
+            lease_factory=forbidden_lease,
+            controller_config=document,
+        )
+    assert lease_called is False
+    assert list(tmp_path.iterdir()) == []

@@ -24,8 +24,9 @@ import struct
 import threading
 import time
 from collections import OrderedDict, deque
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Deque, Optional, Tuple
+from typing import Callable, Deque, Iterator, Optional, Tuple
 
 from competition.adapter import CameraFrame
 from competition.aigp_geometry import AIGP_CAM_UDP_PORT
@@ -735,6 +736,71 @@ class VQ2VisionThread:
     def capture_snapshot_queue_depth(self) -> int:
         with self._data_lock:
             return len(self._capture_snapshot_queue)
+
+    @contextmanager
+    def snapshot_publication_lease(
+        self,
+        *,
+        max_age_s: Optional[float] = None,
+        now_monotonic_s: Optional[float] = None,
+        acquire_deadline_monotonic_ns: Optional[int] = None,
+    ) -> Iterator[Optional[VQ2VisionSnapshot]]:
+        """Pin the latest publication during one bounded synchronous action.
+
+        This narrow lease is for a wire-call boundary that must prove no newer
+        JPEG can publish between an exact-token check and the synchronous
+        transport return.  Callers must not invoke another receiver method
+        while holding it.
+        """
+
+        max_age = (
+            None
+            if max_age_s is None
+            else _validate_max_age(max_age_s)
+        )
+        if (
+            now_monotonic_s is not None
+            and not math.isfinite(now_monotonic_s)
+        ):
+            raise ValueError("now_monotonic_s must be finite")
+        if (
+            acquire_deadline_monotonic_ns is not None
+            and (
+                type(acquire_deadline_monotonic_ns) is not int
+                or acquire_deadline_monotonic_ns < 0
+            )
+        ):
+            raise ValueError(
+                "acquire_deadline_monotonic_ns must be a non-negative "
+                "exact integer"
+            )
+
+        if acquire_deadline_monotonic_ns is None:
+            acquired = self._data_lock.acquire()
+        else:
+            now_ns = self._read_monotonic_ns()
+            remaining_s = max(
+                0.0,
+                (
+                    acquire_deadline_monotonic_ns - now_ns
+                ) / 1_000_000_000.0,
+            )
+            acquired = self._data_lock.acquire(timeout=remaining_s)
+        if not acquired:
+            raise TimeoutError(
+                "vision publication lease acquisition deadline was reached"
+            )
+        try:
+            snapshot = self._latest_snapshot
+            if (
+                snapshot is not None
+                and max_age is not None
+                and not snapshot.is_fresh(max_age, now_monotonic_s)
+            ):
+                snapshot = None
+            yield snapshot
+        finally:
+            self._data_lock.release()
 
     def snapshot(
         self,
