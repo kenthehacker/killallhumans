@@ -22,7 +22,13 @@ from competition.adapter import (
     AttitudeRateCommand,
     RaceActiveBoundaryChangedBeforeWire,
 )
-from competition.vq2_visual_tracker import CameraFrameToken
+from competition.vq2_contracts import FrameEdge
+from competition.vq2_visual_tracker import (
+    AssociationEvidence,
+    CameraFrameToken,
+    VisualTrackRole,
+    VisualTrackSample,
+)
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     GateGraphError,
@@ -99,6 +105,9 @@ RETAINED_ADVANCE_CROSSING_BASIS = (
 )
 RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS = (
     "retained-advance-wire-projected-close-alignment-dwell-v1"
+)
+CENSORED_PASSAGE_COAST_BASIS = (
+    "latched-clean-attitude-close-censored-passage-v1"
 )
 _YAW_PROFILE_ISSUER = object()
 
@@ -205,6 +214,18 @@ class _AcceptedVisualCommand:
     yaw_soft_stop_zeroed: bool
     observation_monotonic_ns: int
     wire_start_monotonic_ns: int
+    target_roll_rad: float
+    target_pitch_rad: float
+
+
+@dataclass(frozen=True, slots=True)
+class _CensoredPassageCoastAuthority:
+    gate_index: int
+    track_id: str
+    anchor_camera_token: CameraFrameToken
+    target_roll_rad: float
+    target_pitch_rad: float
+    thrust: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +249,8 @@ class VisualCourseStageLimits:
     segment_hard_duration_s: float = MAX_VISUAL_SEGMENT_DURATION_S
     passage_hard_duration_s: float = MAX_VISUAL_SEGMENT_DURATION_S
     crossing_status_timeout_s: float = 0.40
+    censored_passage_coast_max_duration_s: float = 0.30
+    censored_passage_coast_max_fresh_frames: int = 8
     post_credit_fresh_frame_timeout_s: float = 0.20
     max_validation_to_wire_delay_s: float = 0.012
     max_command_rate_rad_s: float = 0.25
@@ -258,6 +281,7 @@ class VisualCourseStageLimits:
             self.segment_hard_duration_s,
             self.passage_hard_duration_s,
             self.crossing_status_timeout_s,
+            self.censored_passage_coast_max_duration_s,
             self.post_credit_fresh_frame_timeout_s,
             self.max_validation_to_wire_delay_s,
             self.max_command_rate_rad_s,
@@ -298,6 +322,10 @@ class VisualCourseStageLimits:
             raise ValueError("visual-course passage duration is outside bounds")
         if not 0.05 <= self.crossing_status_timeout_s <= 0.40:
             raise ValueError("visual-course crossing wait is outside bounds")
+        if not 0.20 <= self.censored_passage_coast_max_duration_s <= 0.30:
+            raise ValueError(
+                "visual-course censored passage coast is outside bounds"
+            )
         if not 0.05 <= self.post_credit_fresh_frame_timeout_s <= 0.20:
             raise ValueError("visual-course fresh-frame wait is outside bounds")
         if not 0.0 < self.max_validation_to_wire_delay_s < (
@@ -371,6 +399,10 @@ class VisualCourseStageLimits:
         if (
             type(self.crossing_arm_min_advance_commands) is not int
             or not 2 <= self.crossing_arm_min_advance_commands <= 8
+            or type(self.censored_passage_coast_max_fresh_frames) is not int
+            or not 4
+            <= self.censored_passage_coast_max_fresh_frames
+            <= 8
             or type(self.max_gate_segments) is not int
             or not 1 <= self.max_gate_segments <= 128
         ):
@@ -1227,6 +1259,237 @@ def _token_strictly_newer(
     )
 
 
+def _censored_passage_visibility_suffix_usable(
+    track: Any,
+    *,
+    previous_visible_token: CameraFrameToken,
+    current_token: CameraFrameToken,
+    previous_apparent_scale: Optional[float],
+    minimum_apparent_scale: float,
+) -> bool:
+    """Prove one uninterrupted near-plane visibility epoch through history."""
+
+    history = getattr(track, "history", None)
+    consecutive_frames = getattr(track, "consecutive_frame_count", None)
+    if (
+        type(history) is not tuple
+        or len(history) < 2
+        or type(consecutive_frames) is not int
+        or consecutive_frames < 2
+        or type(previous_visible_token) is not CameraFrameToken
+        or type(current_token) is not CameraFrameToken
+        or type(minimum_apparent_scale) not in {int, float}
+        or not math.isfinite(float(minimum_apparent_scale))
+        or (
+            previous_apparent_scale is not None
+            and (
+                type(previous_apparent_scale) not in {int, float}
+                or not math.isfinite(float(previous_apparent_scale))
+            )
+        )
+    ):
+        return False
+
+    retained_epoch_length = min(consecutive_frames, len(history))
+    visibility_epoch = history[len(history) - retained_epoch_length :]
+    if any(type(sample) is not VisualTrackSample for sample in visibility_epoch):
+        return False
+    previous_indices = [
+        index
+        for index, sample in enumerate(visibility_epoch)
+        if sample.token == previous_visible_token
+    ]
+    if len(previous_indices) != 1:
+        return False
+    suffix = visibility_epoch[previous_indices[0] :]
+    if len(suffix) < 2 or suffix[-1].token != current_token:
+        return False
+
+    previous = suffix[0]
+    previous_scale = previous.apparent_scale
+    if (
+        type(previous_scale) not in {int, float}
+        or not math.isfinite(float(previous_scale))
+        or (
+            previous_apparent_scale is not None
+            and not math.isclose(
+                float(previous_scale),
+                float(previous_apparent_scale),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        )
+    ):
+        return False
+
+    vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
+    for sample in suffix[1:]:
+        evidence = sample.accepted_association
+        sample_scale = sample.apparent_scale
+        sample_confidence = sample.confidence
+        sample_association_confidence = sample.association_confidence
+        evidence_confidence = getattr(evidence, "confidence", None)
+        if (
+            type(evidence) is not AssociationEvidence
+            or type(sample.token) is not CameraFrameToken
+            or type(previous.token) is not CameraFrameToken
+            or type(sample.tracker_frame_sequence) is not int
+            or type(previous.tracker_frame_sequence) is not int
+            or type(sample.observation_monotonic_ns) is not int
+            or type(previous.observation_monotonic_ns) is not int
+            or type(sample.publication_monotonic_ns) is not int
+            or type(previous.publication_monotonic_ns) is not int
+            or evidence.track_id != getattr(track, "track_id", None)
+            or evidence.previous_token != previous.token
+            or evidence.current_token != sample.token
+            or evidence.detection_source_index != sample.source_index
+            or type(evidence.missed_frame_count_before_association) is not int
+            or evidence.missed_frame_count_before_association != 0
+            or type(evidence.ambiguous) is not bool
+            or evidence.ambiguous
+            or type(evidence.track_ambiguous_before_association) is not bool
+            or evidence.track_ambiguous_before_association
+            or type(sample_confidence) not in {int, float}
+            or not math.isfinite(float(sample_confidence))
+            or not 0.0 <= float(sample_confidence) <= 1.0
+            or type(sample_association_confidence) not in {int, float}
+            or not math.isfinite(float(sample_association_confidence))
+            or not 0.10 <= float(sample_association_confidence) <= 1.0
+            or type(evidence_confidence) not in {int, float}
+            or not math.isfinite(float(evidence_confidence))
+            or not math.isclose(
+                float(sample_association_confidence),
+                float(evidence_confidence),
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or sample.token.stream_id != previous.token.stream_id
+            or sample.token.generation != previous.token.generation
+            or sample.tracker_frame_sequence
+            - previous.tracker_frame_sequence
+            != 1
+            or sample.token.publication_sequence is None
+            or previous.token.publication_sequence is None
+            or sample.token.publication_sequence
+            - previous.token.publication_sequence
+            != 1
+            or sample.observation_monotonic_ns
+            - previous.observation_monotonic_ns
+            != evidence.observation_gap_ns
+            or sample.publication_monotonic_ns
+            - previous.publication_monotonic_ns
+            != evidence.publication_gap_ns
+            or type(sample.clipping) is not FrameEdge
+            or sample.clipping & vertical_edges != vertical_edges
+            or sample.center_censored is not True
+            or type(sample_scale) not in {int, float}
+            or not math.isfinite(float(sample_scale))
+            or float(sample_scale) < minimum_apparent_scale
+            or float(sample_scale) < float(previous_scale)
+        ):
+            return False
+        previous = sample
+        previous_scale = sample_scale
+
+    latest = suffix[-1]
+    track_scale = getattr(track, "apparent_scale", None)
+    track_confidence = getattr(track, "confidence", None)
+    track_association_confidence = getattr(
+        track,
+        "association_confidence",
+        None,
+    )
+    return bool(
+        latest.clipping == getattr(track, "clipping", None)
+        and latest.center_censored
+        == getattr(track, "center_censored", None)
+        and type(track_confidence) in {int, float}
+        and math.isfinite(float(track_confidence))
+        and 0.10 <= float(track_confidence) <= 1.0
+        and type(track_association_confidence) in {int, float}
+        and math.isfinite(float(track_association_confidence))
+        and 0.10 <= float(track_association_confidence) <= 1.0
+        and math.isclose(
+            float(latest.association_confidence),
+            float(track_association_confidence),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and type(track_scale) in {int, float}
+        and math.isfinite(float(track_scale))
+        and math.isclose(
+            float(latest.apparent_scale),
+            float(track_scale),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    )
+
+
+def _censored_passage_coast_eligible(
+    snapshot: Any,
+    *,
+    current_gate_index: int,
+    current_track_id: str,
+    crossing_anchor_token: CameraFrameToken,
+    authority: _CensoredPassageCoastAuthority,
+    previous_visible_token: CameraFrameToken,
+    previous_apparent_scale: Optional[float],
+    minimum_apparent_scale: float,
+) -> bool:
+    """Admit only the exact near-plane censor pattern seen before target loss."""
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    clipping = getattr(track, "clipping", None)
+    apparent_scale = getattr(track, "apparent_scale", None)
+    vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
+    return bool(
+        type(authority) is _CensoredPassageCoastAuthority
+        and authority.gate_index == current_gate_index
+        and authority.track_id == current_track_id
+        and authority.anchor_camera_token == crossing_anchor_token
+        and type(token) is CameraFrameToken
+        and type(crossing_anchor_token) is CameraFrameToken
+        and _token_strictly_newer(token, crossing_anchor_token)
+        and type(previous_visible_token) is CameraFrameToken
+        and _token_strictly_newer(token, previous_visible_token)
+        and token.publication_sequence
+        - previous_visible_token.publication_sequence
+        <= 2
+        and getattr(snapshot, "current_gate_index", None)
+        == current_gate_index
+        and getattr(snapshot, "current_track_id", None)
+        == current_track_id
+        and getattr(snapshot, "authority_usable", False) is True
+        and getattr(snapshot, "race_finished", False) is False
+        and track is not None
+        and getattr(track, "track_id", None) == current_track_id
+        and getattr(track, "latest_token", None) == token
+        and getattr(track, "role", None) is VisualTrackRole.CURRENT
+        and getattr(track, "visible", False) is True
+        and getattr(track, "missed_frame_count", 1) == 0
+        and getattr(track, "ambiguous", True) is False
+        and type(clipping) is FrameEdge
+        and clipping & vertical_edges == vertical_edges
+        and getattr(track, "center_censored", False) is True
+        and type(apparent_scale) in {int, float}
+        and math.isfinite(float(apparent_scale))
+        and float(apparent_scale) >= minimum_apparent_scale
+        and (
+            previous_apparent_scale is None
+            or float(apparent_scale) >= float(previous_apparent_scale)
+        )
+        and _censored_passage_visibility_suffix_usable(
+            track,
+            previous_visible_token=previous_visible_token,
+            current_token=token,
+            previous_apparent_scale=previous_apparent_scale,
+            minimum_apparent_scale=minimum_apparent_scale,
+        )
+    )
+
+
 def _current_snapshot_ready(
     snapshot: Any,
     *,
@@ -1935,7 +2198,314 @@ async def _run_visual_course_stage_impl(
             yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
             observation_monotonic_ns=observation_monotonic_ns,
             wire_start_monotonic_ns=wire_start_monotonic_ns,
+            target_roll_rad=target_roll_rad,
+            target_pitch_rad=target_pitch_rad,
         )
+
+    async def send_censored_passage_coast(
+        *,
+        snapshot: Any,
+        authority: _CensoredPassageCoastAuthority,
+        yaw_reference_rad: float,
+        segment_started_s: float,
+        stage: str,
+    ) -> Optional[AttitudeRateCommand]:
+        """Reissue one frozen clean attitude target on an exact censored frame."""
+
+        nonlocal total_navigation_commands
+        nonlocal last_navigation_send_s
+        nonlocal consecutive_superseded_proposals
+
+        def drop_superseded_coast(
+            exc: BaseException,
+        ) -> Optional[AttitudeRateCommand]:
+            nonlocal consecutive_superseded_proposals
+
+            expected_token = snapshot.latest_camera_token
+            receiver_token = getattr(exc, "receiver_visual_token", None)
+            if (
+                str(exc)
+                != VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                or getattr(exc, "expected_visual_token", None)
+                != expected_token
+                or not _token_strictly_newer(
+                    receiver_token,
+                    expected_token,
+                )
+            ):
+                raise exc
+            now_s = float(runtime.monotonic())
+            if not math.isfinite(now_s) or now_s < last_navigation_send_s:
+                raise abort_type(
+                    "visual-course supersession clock regressed"
+                ) from exc
+            consecutive_superseded_proposals += 1
+            segment["superseded_proposal_count"] = int(
+                segment["superseded_proposal_count"]
+            ) + 1
+            hold_s = now_s - last_navigation_send_s
+            host.recorder.emit(
+                "visual_course_proposal_superseded",
+                gate_index=current_gate_index,
+                stage=stage,
+                expected_frame_token=asdict(expected_token),
+                receiver_frame_token=asdict(receiver_token),
+                consecutive_count=consecutive_superseded_proposals,
+                total_count=segment["superseded_proposal_count"],
+                held_previous_command_s=hold_s,
+            )
+            refresh_live_summary()
+            if (
+                consecutive_superseded_proposals
+                > MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS
+                or hold_s
+                >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+            ):
+                raise abort_type(
+                    "visual-course receiver repeatedly superseded command "
+                    "authority"
+                ) from exc
+            return None
+
+        values = (
+            authority.target_roll_rad,
+            authority.target_pitch_rad,
+            authority.thrust,
+        )
+        if (
+            authority.gate_index != current_gate_index
+            or authority.track_id != current_track_id
+            or not all(math.isfinite(value) for value in values)
+            or abs(authority.target_roll_rad)
+            > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+            or authority.target_pitch_rad
+            < MIN_VISUAL_TARGET_PITCH_RAD - 1e-12
+            or authority.target_pitch_rad
+            > MAX_VISUAL_TARGET_PITCH_RAD + 1e-12
+            or not limits.min_thrust
+            <= authority.thrust
+            <= limits.max_thrust
+        ):
+            raise abort_type(
+                "visual-course censored passage coast authority is invalid"
+            )
+
+        await host._wait_for_next_flight_command_slot()
+        assert_pending_supersession_hold("censored coast command-slot wait")
+        pad_contact = initial_pad_contact_authority()
+        host._watchdog(
+            require_target=False,
+            allow_benign_pad_contact=pad_contact,
+            enforce_benign_pad_budget=True,
+            count_rate_sample=False,
+        )
+        try:
+            receiver_token = host._assert_visual_receiver_token_current(
+                snapshot.latest_camera_token
+            )
+        except abort_type as exc:
+            return drop_superseded_coast(exc)
+        if receiver_token != snapshot.latest_camera_token:
+            raise abort_type("visual-course receiver watermark changed")
+        send_race = host._visual_race_status_ref()
+        if (
+            send_race.race_finished
+            or send_race.active_gate_index != current_gate_index
+        ):
+            raise RaceActiveBoundaryChangedBeforeWire(
+                "visual-course race boundary changed before navigation send"
+            )
+        if censored_passage_coast_started_s is None:
+            raise abort_type(
+                "visual-course censored passage coast lacks a start time"
+            )
+        coast_deadline_s = (
+            censored_passage_coast_started_s
+            + limits.censored_passage_coast_max_duration_s
+        )
+        _assert_course_attitude_state(
+            host,
+            yaw_reference_rad=yaw_reference_rad,
+            limits=limits,
+            yaw_profile=runtime.yaw_profile,
+            abort_type=abort_type,
+            phase=f"{stage} pre-send",
+        )
+        if float(runtime.monotonic()) >= coast_deadline_s:
+            raise abort_type(
+                "visual-course censored passage coast expired"
+            )
+        base = runtime.attitude_rate_command(
+            host.estimate,
+            target_roll_rad=authority.target_roll_rad,
+            target_pitch_rad=authority.target_pitch_rad,
+            thrust=authority.thrust,
+        )
+        limited = runtime.limit_command_rates(
+            base,
+            limits.max_command_rate_rad_s,
+        )
+        command = AttitudeRateCommand(
+            roll_rate=float(limited.roll_rate),
+            pitch_rate=float(limited.pitch_rate),
+            yaw_rate=0.0,
+            thrust=float(limited.thrust),
+        )
+        runtime.validate_command(command)
+        if (
+            max(abs(command.roll_rate), abs(command.pitch_rate))
+            > limits.max_command_rate_rad_s + 1e-12
+            or command.yaw_rate != 0.0
+            or command.thrust != authority.thrust
+            or not limits.min_thrust <= command.thrust <= limits.max_thrust
+        ):
+            raise abort_type(
+                "visual-course censored passage command escaped its fixed "
+                "envelope"
+            )
+        assert_pending_supersession_hold(
+            "censored coast pre-wire validation"
+        )
+        validation_ns = runtime.perf_counter_ns()
+        if type(validation_ns) is not int or validation_ns < 0:
+            raise abort_type("visual-course wire clock is invalid")
+        not_before_ns = (
+            None
+            if host._last_flight_command_started_ns is None
+            else host._last_flight_command_started_ns
+            + round(limits.control_period_s * 1_000_000_000)
+        )
+        deadline_ns = validation_ns + round(
+            limits.max_validation_to_wire_delay_s * 1_000_000_000
+        )
+        coast_deadline_ns = round(
+            coast_deadline_s * 1_000_000_000
+        )
+        deadline_ns = min(deadline_ns, coast_deadline_ns)
+        if consecutive_superseded_proposals > 0:
+            hold_checked_s = float(runtime.monotonic())
+            if (
+                not math.isfinite(hold_checked_s)
+                or hold_checked_s < last_navigation_send_s
+            ):
+                raise abort_type(
+                    "visual-course supersession clock regressed"
+                )
+            hold_remaining_s = (
+                MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
+                - (hold_checked_s - last_navigation_send_s)
+            )
+            if hold_remaining_s <= 0.0:
+                raise abort_type(
+                    "visual-course receiver supersession held prior command "
+                    "beyond its bound during wire deadline admission"
+                )
+            deadline_ns = min(
+                deadline_ns,
+                validation_ns
+                + math.floor(hold_remaining_s * 1_000_000_000),
+            )
+        if (
+            deadline_ns <= validation_ns
+            or (
+                not_before_ns is not None
+                and not_before_ns >= deadline_ns
+            )
+        ):
+            raise abort_type(
+                "visual-course supersession leaves no bounded wire slot"
+            )
+        try:
+            receipt = await host._send_flight_command(
+                command,
+                require_wire_receipt=True,
+                wire_start_not_before_ns=not_before_ns,
+                wire_start_deadline_ns=deadline_ns,
+                wire_visual_token=snapshot.latest_camera_token,
+                wire_race_gate_index=current_gate_index,
+            )
+        except abort_type as exc:
+            return drop_superseded_coast(exc)
+        if (
+            not isinstance(receipt, Mapping)
+            or not isinstance(
+                receipt.get("visual_receiver_authority"),
+                Mapping,
+            )
+        ):
+            raise abort_type(
+                "visual-course censored passage send lacks visual wire "
+                "authority"
+            )
+        visual_wire_authority = receipt["visual_receiver_authority"]
+        wire_start_monotonic_ns = visual_wire_authority.get(
+            "call_start_monotonic_ns"
+        )
+        wire_frame_token = visual_wire_authority.get("frame_token")
+        if (
+            visual_wire_authority.get("schema")
+            != "aigp-vq2-visual-wire-authority/1"
+            or type(wire_start_monotonic_ns) is not int
+            or wire_start_monotonic_ns < 0
+            or wire_start_monotonic_ns >= coast_deadline_ns
+            or receipt.get("call_start_monotonic_ns")
+            != wire_start_monotonic_ns
+            or host._last_flight_command_started_ns
+            != wire_start_monotonic_ns
+            or not isinstance(wire_frame_token, Mapping)
+            or dict(wire_frame_token)
+            != asdict(snapshot.latest_camera_token)
+            or visual_wire_authority.get(
+                "publication_pinned_through_transport_return"
+            )
+            is not True
+        ):
+            raise abort_type(
+                "visual-course censored passage send lacks exact visual "
+                "wire timing"
+            )
+
+        host._record_tick(
+            stage,
+            float(runtime.monotonic()) - segment_started_s,
+            command,
+        )
+        total_navigation_commands += 1
+        last_navigation_send_s = float(runtime.monotonic())
+        consecutive_superseded_proposals = 0
+        if segment["launch_bootstrap"]["enabled"]:
+            launch = segment["launch_bootstrap"]
+            launch["command_count"] = int(launch["command_count"]) + 1
+            launch["last_elapsed_s"] = (
+                float(runtime.monotonic()) - course_started_s
+            )
+            launch["last_target_pitch_rad"] = authority.target_pitch_rad
+            launch["last_thrust"] = authority.thrust
+            launch["last_thrust_phase"] = CENSORED_PASSAGE_COAST_BASIS
+        if (
+            transitions
+            and transitions[-1]["to_gate_index"] == current_gate_index
+        ):
+            transitions[-1][
+                "post_transition_navigation_command_count"
+            ] = int(
+                transitions[-1][
+                    "post_transition_navigation_command_count"
+                ]
+            ) + 1
+        host.recorder.emit(
+            "visual_course_censored_passage_coast_command",
+            gate_index=current_gate_index,
+            stage=stage,
+            camera_token=asdict(snapshot.latest_camera_token),
+            anchor_camera_token=asdict(authority.anchor_camera_token),
+            target_roll_rad=authority.target_roll_rad,
+            target_pitch_rad=authority.target_pitch_rad,
+            thrust=authority.thrust,
+            command=asdict(command),
+        )
+        refresh_live_summary()
+        return command
 
     for segment_number in range(limits.max_gate_segments):
         segment_started_s = float(runtime.monotonic())
@@ -1981,6 +2551,18 @@ async def _run_visual_course_stage_impl(
         approach_command_count = 0
         next_preview_retired = False
         crossing_anchor: Optional[Dict[str, Any]] = None
+        crossing_coast_authority: Optional[
+            _CensoredPassageCoastAuthority
+        ] = None
+        last_clean_passage_token: Optional[CameraFrameToken] = None
+        last_clean_passage_scale: Optional[float] = None
+        censored_passage_coast_started_s: Optional[float] = None
+        censored_passage_coast_last_observed_token: Optional[
+            CameraFrameToken
+        ] = None
+        censored_passage_coast_last_observed_scale: Optional[float] = None
+        censored_passage_coast_fresh_frame_count = 0
+        censored_passage_coast_command_count = 0
         retained_crossing_dwell_frames = 0
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
@@ -2003,6 +2585,9 @@ async def _run_visual_course_stage_impl(
             "retained_crossing_dwell_frames": 0,
             "max_retained_crossing_dwell_frames": 0,
             "crossing_wait_zero_command_count": 0,
+            "censored_passage_coast_fresh_frame_count": 0,
+            "censored_passage_coast_command_count": 0,
+            "censored_passage_coast": None,
             "post_credit_zero_command_count": 0,
             "passage_authority_enabled": False,
             "passage_admission": None,
@@ -2181,6 +2766,17 @@ async def _run_visual_course_stage_impl(
                     "visual-course authoritative gate index jumped "
                     f"{current_gate_index}->{race.active_gate_index}"
                 )
+            if (
+                censored_passage_coast_started_s is not None
+                and now
+                >= (
+                    censored_passage_coast_started_s
+                    + limits.censored_passage_coast_max_duration_s
+                )
+            ):
+                raise abort_type(
+                    "visual-course censored passage coast expired"
+                )
 
             snapshot = host.visual_gate_graph.latest_snapshot
             token = getattr(snapshot, "latest_camera_token", None)
@@ -2291,21 +2887,173 @@ async def _run_visual_course_stage_impl(
                 VisualApproachRefusal,
             ) as exc:
                 track = getattr(snapshot, "current_track", None)
+                previous_visible_token = (
+                    censored_passage_coast_last_observed_token
+                    or last_clean_passage_token
+                )
+                censored_coast_eligible = bool(
+                    type(exc)
+                    is VisualApproachCurrentGeometryUnavailable
+                    and mode is VisualApproachMode.PASSAGE
+                    and type(passage_admission)
+                    is VisualApproachPassageAdmission
+                    and crossing_anchor is not None
+                    and crossing_coast_authority is not None
+                    and previous_visible_token is not None
+                    and _censored_passage_coast_eligible(
+                        snapshot,
+                        current_gate_index=current_gate_index,
+                        current_track_id=current_track_id,
+                        crossing_anchor_token=(
+                            crossing_anchor["camera_token"]
+                        ),
+                        authority=crossing_coast_authority,
+                        previous_visible_token=previous_visible_token,
+                        previous_apparent_scale=(
+                            censored_passage_coast_last_observed_scale
+                            if (
+                                censored_passage_coast_last_observed_scale
+                                is not None
+                            )
+                            else last_clean_passage_scale
+                        ),
+                        minimum_apparent_scale=math.exp(
+                            limits.crossing_arm_min_log_scale
+                        ),
+                    )
+                )
+                if censored_coast_eligible:
+                    if censored_passage_coast_started_s is None:
+                        censored_passage_coast_started_s = now
+                        segment["censored_passage_coast"] = {
+                            "basis": CENSORED_PASSAGE_COAST_BASIS,
+                            "anchor_camera_token": asdict(
+                                crossing_coast_authority
+                                .anchor_camera_token
+                            ),
+                            "first_censored_camera_token": asdict(token),
+                            "last_censored_camera_token": None,
+                            "loss_camera_token": None,
+                            "target_roll_rad": (
+                                crossing_coast_authority.target_roll_rad
+                            ),
+                            "target_pitch_rad": (
+                                crossing_coast_authority.target_pitch_rad
+                            ),
+                            "thrust": crossing_coast_authority.thrust,
+                            "max_duration_s": (
+                                limits
+                                .censored_passage_coast_max_duration_s
+                            ),
+                            "max_fresh_frames": (
+                                limits
+                                .censored_passage_coast_max_fresh_frames
+                            ),
+                            "elapsed_s": 0.0,
+                        }
+                        host.recorder.emit(
+                            "visual_course_censored_passage_coast_started",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/censored-passage"
+                            ),
+                            **segment["censored_passage_coast"],
+                        )
+                    coast_elapsed_s = (
+                        now - censored_passage_coast_started_s
+                    )
+                    if (
+                        coast_elapsed_s
+                        >= limits.censored_passage_coast_max_duration_s
+                        or censored_passage_coast_fresh_frame_count
+                        >= (
+                            limits
+                            .censored_passage_coast_max_fresh_frames
+                        )
+                    ):
+                        raise abort_type(
+                            "visual-course censored passage coast expired"
+                        ) from exc
+                    censored_passage_coast_last_observed_token = token
+                    censored_passage_coast_last_observed_scale = float(
+                        track.apparent_scale
+                    )
+                    censored_passage_coast_fresh_frame_count += 1
+                    segment[
+                        "censored_passage_coast_fresh_frame_count"
+                    ] = censored_passage_coast_fresh_frame_count
+                    segment["censored_passage_coast"].update(
+                        {
+                            "last_censored_camera_token": asdict(token),
+                            "elapsed_s": coast_elapsed_s,
+                        }
+                    )
+                    last_planned_token = token
+                    try:
+                        coast_command = (
+                            await send_censored_passage_coast(
+                                snapshot=snapshot,
+                                authority=crossing_coast_authority,
+                                yaw_reference_rad=yaw_reference_rad,
+                                segment_started_s=segment_started_s,
+                                stage=(
+                                    f"{VISUAL_COURSE_STAGE}/gate"
+                                    f"{current_gate_index}/"
+                                    "censored-passage"
+                                ),
+                            )
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc
+                        )
+                        break
+                    if coast_command is None:
+                        continue
+                    censored_passage_coast_command_count += 1
+                    passage_command_count += 1
+                    segment["passage_command_count"] = (
+                        passage_command_count
+                    )
+                    segment[
+                        "censored_passage_coast_command_count"
+                    ] = censored_passage_coast_command_count
+                    continue
+
                 credible_loss = bool(
                     mode is VisualApproachMode.PASSAGE
                     and crossing_anchor is not None
+                    and previous_visible_token is not None
+                    and getattr(snapshot, "current_gate_index", None)
+                    == current_gate_index
+                    and getattr(snapshot, "current_track_id", None)
+                    == current_track_id
                     and track is not None
+                    and getattr(track, "track_id", None)
+                    == current_track_id
+                    and getattr(track, "latest_token", None)
+                    == previous_visible_token
+                    and getattr(track, "role", None)
+                    is VisualTrackRole.CURRENT
                     and getattr(track, "ambiguous", True) is False
-                    and (
-                        getattr(track, "visible", True) is False
-                        or getattr(track, "missed_frame_count", 0) > 0
-                        or getattr(track, "clipping", 0) != 0
-                        or getattr(track, "center_censored", False) is True
+                    and getattr(track, "visible", True) is False
+                    and type(
+                        getattr(track, "missed_frame_count", None)
                     )
+                    is int
+                    and getattr(track, "missed_frame_count", 0) > 0
                     and _token_strictly_newer(
                         token,
-                        crossing_anchor["camera_token"],
+                        previous_visible_token,
                     )
+                    and token.publication_sequence
+                    - previous_visible_token.publication_sequence
+                    == track.missed_frame_count
+                    and type(getattr(track, "history", None)) is tuple
+                    and bool(track.history)
+                    and getattr(track.history[-1], "token", None)
+                    == previous_visible_token
                 )
                 if not credible_loss:
                     raise abort_type(
@@ -2317,8 +3065,17 @@ async def _run_visual_course_stage_impl(
                     raise abort_type(
                         "visual-course crossing lacks a race baseline"
                     )
+                if segment["censored_passage_coast"] is not None:
+                    segment["censored_passage_coast"][
+                        "loss_camera_token"
+                    ] = asdict(token)
                 break
 
+            if censored_passage_coast_started_s is not None:
+                raise abort_type(
+                    "visual-course censored passage coast returned to "
+                    "uncensored geometry"
+                )
             last_planned_token = token
             if mode is VisualApproachMode.APPROACH:
                 if proposal.servo_output.advance_enabled:
@@ -2403,6 +3160,9 @@ async def _run_visual_course_stage_impl(
                 segment["retained_crossing_dwell_frames"] = 0
                 continue
             command = accepted.command
+            target = proposal.current_target
+            last_clean_passage_token = token
+            last_clean_passage_scale = math.exp(float(target.log_scale))
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
             if (
@@ -2411,7 +3171,6 @@ async def _run_visual_course_stage_impl(
             ):
                 advance_command_count += 1
                 segment["advance_command_count"] = advance_command_count
-            target = proposal.current_target
             target_observation_monotonic_ns = (
                 accepted.observation_monotonic_ns
             )
@@ -2547,6 +3306,16 @@ async def _run_visual_course_stage_impl(
                     ),
                     "command": asdict(command),
                 }
+                crossing_coast_authority = (
+                    _CensoredPassageCoastAuthority(
+                        gate_index=current_gate_index,
+                        track_id=current_track_id,
+                        anchor_camera_token=token,
+                        target_roll_rad=accepted.target_roll_rad,
+                        target_pitch_rad=accepted.target_pitch_rad,
+                        thrust=float(command.thrust),
+                    )
+                )
                 segment["crossing_anchor"] = {
                     **crossing_anchor,
                     "camera_token": asdict(token),

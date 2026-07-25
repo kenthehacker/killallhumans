@@ -12,7 +12,15 @@ from competition.adapter import (
     RaceActiveBoundaryChangedBeforeWire,
 )
 from competition.aigp_messages import RaceStatus
-from competition.vq2_visual_tracker import CameraFrameToken
+from competition.vq2_contracts import FrameEdge
+from competition.vq2_visual_tracker import (
+    AssociationEvidence,
+    CameraFrameToken,
+    FrameProvenanceBasis,
+    VisualTrack,
+    VisualTrackRole,
+    VisualTrackSample,
+)
 from planning.vq2_gate_graph import AuthoritativeRaceStatusRef
 from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
@@ -77,28 +85,105 @@ def _token(sequence: int) -> CameraFrameToken:
     )
 
 
+def _history_sample(
+    track_id: str,
+    token: CameraFrameToken,
+    *,
+    previous_token: CameraFrameToken | None = None,
+    missed_frames_before_association: int = 0,
+    apparent_scale: float = math.exp(-0.50),
+    clipping: FrameEdge = FrameEdge.NONE,
+    center_censored: bool = False,
+) -> VisualTrackSample:
+    publication_sequence = token.publication_sequence
+    assert publication_sequence is not None
+    accepted_association = None
+    if previous_token is not None:
+        previous_publication_sequence = previous_token.publication_sequence
+        assert previous_publication_sequence is not None
+        gap_ns = (
+            publication_sequence - previous_publication_sequence
+        ) * 20_000_000
+        accepted_association = AssociationEvidence(
+            track_id=track_id,
+            previous_token=previous_token,
+            current_token=token,
+            detection_source_index=0,
+            cost=0.10,
+            confidence=0.80,
+            predicted_center_residual_norm=0.01,
+            bbox_iou=0.90,
+            log_width_change=0.0,
+            log_height_change=0.0,
+            log_area_residual=0.0,
+            clipping_continuity=1.0,
+            temporal_consistency=(
+                1.0 / (missed_frames_before_association + 1)
+            ),
+            appearance_distance=0.0,
+            ambiguous=False,
+            missed_frame_count_before_association=(
+                missed_frames_before_association
+            ),
+            observation_gap_ns=gap_ns,
+            publication_gap_ns=gap_ns,
+            track_ambiguous_before_association=False,
+        )
+    return VisualTrackSample(
+        tracker_frame_sequence=publication_sequence,
+        token=token,
+        observation_monotonic_ns=publication_sequence * 20_000_000,
+        publication_monotonic_ns=publication_sequence * 20_000_000,
+        provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+        camera_source_time_ns=publication_sequence * 20_000_000,
+        source_index=0,
+        center_norm=(0.04, 0.03),
+        bbox_norm=(-0.20, -0.20, 0.20, 0.20),
+        apparent_scale=apparent_scale,
+        confidence=0.90,
+        clipping=clipping,
+        center_censored=center_censored,
+        association_confidence=(
+            0.90 if accepted_association is None else 0.80
+        ),
+        accepted_association=accepted_association,
+    )
+
+
 def _track(
     track_id: str,
     *,
     visible: bool = True,
     token: CameraFrameToken,
 ):
+    publication_sequence = token.publication_sequence
+    assert publication_sequence is not None
+    if publication_sequence == 1:
+        history = (_history_sample(track_id, token),)
+    else:
+        previous_token = _token(publication_sequence - 1)
+        history = (
+            _history_sample(track_id, previous_token),
+            _history_sample(
+                track_id,
+                token,
+                previous_token=previous_token,
+            ),
+        )
     return SimpleNamespace(
         track_id=track_id,
         latest_token=token,
         visible=visible,
         ambiguous=False,
         missed_frame_count=0 if visible else 1,
-        clipping=0,
+        consecutive_frame_count=len(history),
+        confidence=0.90,
+        association_confidence=0.80,
+        clipping=FrameEdge.NONE,
         center_censored=False,
-        history=(
-            SimpleNamespace(
-                token=token,
-                observation_monotonic_ns=(
-                    token.publication_sequence * 20_000_000
-                ),
-            ),
-        ),
+        apparent_scale=math.exp(-0.50),
+        role=VisualTrackRole.CURRENT,
+        history=history,
     )
 
 
@@ -111,12 +196,17 @@ def _snapshot(
     race_finished: bool = False,
 ):
     token = _token(sequence)
+    track_token = token if visible else _token(sequence - 1)
     return SimpleNamespace(
         tracker_frame_sequence=sequence,
         latest_camera_token=token,
         current_gate_index=gate_index,
         current_track_id=track_id,
-        current_track=_track(track_id, visible=visible, token=token),
+        current_track=_track(
+            track_id,
+            visible=visible,
+            token=track_token,
+        ),
         authority_usable=visible and not race_finished,
         race_finished=race_finished,
     )
@@ -1405,21 +1495,11 @@ def test_current_target_rejects_inconsistent_observation_provenance(case):
     sample = snapshot.current_track.history[-1]
     if case == "token":
         snapshot.current_track.history = (
-            SimpleNamespace(
-                **{
-                    **vars(sample),
-                    "token": _token(11),
-                },
-            ),
+            replace(sample, token=_token(11)),
         )
     else:
         snapshot.current_track.history = (
-            SimpleNamespace(
-                **{
-                    **vars(sample),
-                    "observation_monotonic_ns": 200_000_001,
-                },
-            ),
+            replace(sample, observation_monotonic_ns=200_000_001),
         )
 
     with pytest.raises(SafetyAbort, match="provenance is inconsistent"):
@@ -1484,17 +1564,39 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
                 for _command, kwargs, _gate in self.commands
             )
             if (
-                navigation_count >= 7
+                navigation_count >= 14
                 and not self.race.race_finished
             ):
-                clipped = _snapshot(
+                self.visual_gate_graph.latest_snapshot = _snapshot(
                     self.current_gate,
                     self.current_track_id,
                     self.sequence,
+                    visible=False,
                 )
-                clipped.current_track.clipping = 10
-                clipped.current_track.center_censored = True
-                self.visual_gate_graph.latest_snapshot = clipped
+            elif (
+                navigation_count >= 7
+                and not self.race.race_finished
+            ):
+                coast_index = navigation_count - 7
+                scales = (
+                    0.802340,
+                    0.853302,
+                    0.912586,
+                    0.984251,
+                    1.0,
+                    1.0,
+                    1.0,
+                )
+                _set_censored_current(
+                    self,
+                    apparent_scale=scales[coast_index],
+                    previous_apparent_scale=math.exp(-0.81),
+                    clipping=(
+                        FrameEdge(15)
+                        if coast_index >= 4
+                        else FrameEdge.TOP | FrameEdge.BOTTOM
+                    ),
+                )
 
         async def _send_flight_command(self, command, **kwargs):
             receipt = await super()._send_flight_command(command, **kwargs)
@@ -1557,7 +1659,731 @@ def test_retained_crossing_dwell_latches_only_after_accepted_wire_commands():
     assert anchor["current_advance_enabled"] is False
     assert anchor["retained_crossing_dwell_frames"] == 3
     assert anchor["camera_token"]["publication_sequence"] == 17
-    assert result["segments"][0]["crossing_wait_zero_command_count"] == 2
+    segment = result["segments"][0]
+    assert segment["censored_passage_coast_fresh_frame_count"] == 7
+    assert segment["censored_passage_coast_command_count"] == 7
+    assert segment["passage_command_count"] == 13
+    coast = segment["censored_passage_coast"]
+    assert coast["basis"] == course_stage.CENSORED_PASSAGE_COAST_BASIS
+    assert coast["anchor_camera_token"]["publication_sequence"] == 17
+    assert coast["first_censored_camera_token"][
+        "publication_sequence"
+    ] == 18
+    assert coast["last_censored_camera_token"][
+        "publication_sequence"
+    ] == 24
+    assert coast["loss_camera_token"]["publication_sequence"] == 25
+    assert segment["crossing_wait_zero_command_count"] == 2
+    coast_commands = [
+        (command, kwargs["wire_visual_token"])
+        for command, kwargs, _gate in host.commands
+        if kwargs.get("wire_visual_token") is not None
+        and 18 <= kwargs["wire_visual_token"].publication_sequence <= 24
+    ]
+    assert [
+        token.publication_sequence for _command, token in coast_commands
+    ] == list(range(18, 25))
+    assert all(
+        command.yaw_rate == 0.0 and command.thrust > 0.0
+        for command, _token_value in coast_commands
+    )
+    first_zero_index = next(
+        index
+        for index, (command, _kwargs, _gate) in enumerate(host.commands)
+        if command.thrust == 0.0
+    )
+    assert first_zero_index > max(
+        index
+        for index, (_command, kwargs, _gate) in enumerate(host.commands)
+        if kwargs.get("wire_visual_token") is not None
+    )
+
+
+class _CensoredPassageServo(_Servo):
+    def observe(self, snapshot, *args, **kwargs):
+        if snapshot.current_track.center_censored:
+            raise VisualApproachCurrentGeometryUnavailable(
+                "authoritative current aperture is clipped or censored"
+            )
+        return super().observe(snapshot, *args, **kwargs)
+
+
+def _set_censored_current(
+    host,
+    *,
+    apparent_scale,
+    clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+    previous_apparent_scale=None,
+):
+    clipped = _snapshot(
+        host.current_gate,
+        host.current_track_id,
+        host.sequence,
+    )
+    clipped.current_track.clipping = clipping
+    clipped.current_track.center_censored = True
+    clipped.current_track.apparent_scale = apparent_scale
+    history = clipped.current_track.history
+    previous_censored_scale = getattr(
+        host,
+        "_test_previous_censored_scale",
+        previous_apparent_scale,
+    )
+    if previous_censored_scale is not None:
+        history = (
+            replace(
+                history[0],
+                apparent_scale=previous_censored_scale,
+                clipping=clipping,
+                center_censored=True,
+            ),
+            *history[1:],
+        )
+    clipped.current_track.history = (
+        *history[:-1],
+        replace(
+            history[-1],
+            apparent_scale=apparent_scale,
+            clipping=clipped.current_track.clipping,
+            center_censored=True,
+        ),
+    )
+    host._test_previous_censored_scale = apparent_scale
+    host.visual_gate_graph.latest_snapshot = clipped
+
+
+def test_visible_censored_passage_coast_expires_before_a_ninth_frame():
+    class NeverLostHost(_Host):
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if segments and segments[0]["crossing_anchor"] is not None:
+                coast_count = segments[0][
+                    "censored_passage_coast_command_count"
+                ]
+                _set_censored_current(
+                    self,
+                    apparent_scale=0.80 + 0.01 * coast_count,
+                )
+
+    host = NeverLostHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="censored passage coast expired",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["censored_passage_coast_fresh_frame_count"] == 8
+    assert segment["censored_passage_coast_command_count"] == 8
+    assert segment["crossing_wait_zero_command_count"] == 0
+    assert all(command.thrust > 0.0 for command, _kwargs, _gate in host.commands)
+
+
+def test_censored_passage_coast_deadline_applies_during_duplicate_frames():
+    class FrozenCensoredHost(_Host):
+        def _sample(self):
+            segments = self._visual_course_summary.get("segments", ())
+            if (
+                segments
+                and segments[0][
+                    "censored_passage_coast_command_count"
+                ]
+                >= 1
+            ):
+                return
+            super()._sample()
+            if segments and segments[0]["crossing_anchor"] is not None:
+                _set_censored_current(self, apparent_scale=0.80)
+
+    host = FrozenCensoredHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="censored passage coast expired",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["censored_passage_coast_fresh_frame_count"] == 1
+    assert segment["censored_passage_coast_command_count"] == 1
+    assert segment["crossing_wait_zero_command_count"] == 0
+
+
+def test_censored_passage_coast_cannot_wait_past_deadline_before_wire():
+    class DelayedCoastSlotHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.delayed_coast_slot = False
+            self.commands_before_delay = None
+
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if segments and segments[0]["crossing_anchor"] is not None:
+                _set_censored_current(self, apparent_scale=0.80)
+
+        async def _wait_for_next_flight_command_slot(self):
+            ready = await super()._wait_for_next_flight_command_slot()
+            snapshot = self.visual_gate_graph.latest_snapshot
+            if (
+                snapshot.current_track.center_censored
+                and not self.delayed_coast_slot
+            ):
+                self.commands_before_delay = len(self.commands)
+                self.clock += (
+                    course_stage.DEFAULT_VISUAL_COURSE_LIMITS
+                    .censored_passage_coast_max_duration_s
+                    + 0.001
+                )
+                self.delayed_coast_slot = True
+            return ready
+
+    host = DelayedCoastSlotHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="censored passage coast expired",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.delayed_coast_slot is True
+    assert host.commands_before_delay is not None
+    assert len(host.commands) == host.commands_before_delay
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["censored_passage_coast_fresh_frame_count"] == 1
+    assert segment["censored_passage_coast_command_count"] == 0
+    assert segment["crossing_wait_zero_command_count"] == 0
+
+
+def test_first_censored_coast_frame_cannot_regress_from_last_clean_scale():
+    class RegressingScaleHost(_Host):
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if segments and segments[0]["crossing_anchor"] is not None:
+                _set_censored_current(self, apparent_scale=0.60)
+
+    host = RegressingScaleHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    with pytest.raises(SafetyAbort, match="visual authority refused"):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["censored_passage_coast_fresh_frame_count"] == 0
+    assert segment["censored_passage_coast_command_count"] == 0
+    assert segment["crossing_wait_zero_command_count"] == 0
+
+
+def test_gate0_coast_recomputes_rates_and_accepts_credit_without_post_credit_send():
+    class CreditDuringCoastHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.coast_command = None
+
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if segments and segments[0]["crossing_anchor"] is not None:
+                _set_attitude(self, pitch=0.05)
+                _set_censored_current(self, apparent_scale=0.80)
+
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(command, **kwargs)
+            snapshot = self.visual_gate_graph.latest_snapshot
+            if (
+                kwargs.get("wire_visual_token") is not None
+                and snapshot.current_track.center_censored
+                and not self.race.race_finished
+            ):
+                self.coast_command = command
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = CreditDuringCoastHost(
+        initial_gate=0,
+        finish_gate=0,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+
+    def attitude_rate(
+        estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        roll, pitch, _yaw = estimate.orientation.to_euler()
+        return AttitudeRateCommand(
+            target_roll_rad - roll,
+            target_pitch_rad - pitch,
+            0.0,
+            thrust,
+        )
+
+    runtime = replace(
+        runtime,
+        attitude_rate_command=attitude_rate,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    anchor = segment["crossing_anchor"]
+    coast = segment["censored_passage_coast"]
+    assert result["race_finished"] is True
+    assert segment["censored_passage_coast_command_count"] == 1
+    assert segment["crossing_wait_zero_command_count"] == 0
+    assert host.coast_command is not None
+    assert host.coast_command.pitch_rate == pytest.approx(-0.155)
+    assert host.coast_command.pitch_rate != pytest.approx(
+        anchor["command"]["pitch_rate"]
+    )
+    assert host.coast_command.yaw_rate == 0.0
+    assert coast["thrust"] == pytest.approx(
+        anchor["command"]["thrust"]
+    )
+    assert coast["thrust"] != pytest.approx(
+        host.visual_config.servo.advance_thrust
+    )
+    commands_at_credit = len(host.commands)
+    assert commands_at_credit == result["visual_navigation_command_count"]
+    assert segment["post_credit_zero_command_count"] == 0
+
+
+def test_censored_coast_accepts_atomic_credit_before_wire():
+    class CreditAtCoastPrecheckHost(_Host):
+        credited = False
+
+        def _sample(self):
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if segments and segments[0]["crossing_anchor"] is not None:
+                _set_censored_current(self, apparent_scale=0.80)
+
+        def _assert_visual_receiver_token_current(self, expected_token):
+            token = super()._assert_visual_receiver_token_current(
+                expected_token
+            )
+            if (
+                self.visual_gate_graph.latest_snapshot
+                .current_track.center_censored
+                and not self.credited
+            ):
+                self.credited = True
+                self.disable_credit = False
+                self._advance_race()
+            return token
+
+    host = CreditAtCoastPrecheckHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    assert result["race_finished"] is True
+    assert host.credited is True
+    assert segment["censored_passage_coast_fresh_frame_count"] == 1
+    assert segment["censored_passage_coast_command_count"] == 0
+    assert segment["crossing_wait_zero_command_count"] == 0
+    censored_token = segment["censored_passage_coast"][
+        "first_censored_camera_token"
+    ]["publication_sequence"]
+    assert all(
+        kwargs.get("wire_visual_token") is None
+        or kwargs["wire_visual_token"].publication_sequence
+        != censored_token
+        for _command, kwargs, _gate in host.commands
+    )
+
+
+def test_censored_coast_supersession_preserves_observed_loss_lineage():
+    class SupersededLossHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.superseded = False
+            self.expected = None
+            self.receiver = None
+
+        def _sample(self):
+            if self.superseded:
+                return
+            super()._sample()
+            segments = self._visual_course_summary.get("segments", ())
+            if segments and segments[0]["crossing_anchor"] is not None:
+                _set_censored_current(self, apparent_scale=0.80)
+
+        async def _send_flight_command(self, command, **kwargs):
+            expected = kwargs.get("wire_visual_token")
+            if (
+                expected is not None
+                and self.visual_gate_graph.latest_snapshot
+                .current_track.center_censored
+                and not self.superseded
+            ):
+                receiver = _token(expected.publication_sequence + 1)
+                self.superseded = True
+                self.expected = expected
+                self.receiver = receiver
+                self.sequence = receiver.publication_sequence
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+                exc = SafetyAbort(
+                    course_stage
+                    .VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+                )
+                exc.expected_visual_token = expected
+                exc.receiver_visual_token = receiver
+                raise exc
+            receipt = await super()._send_flight_command(
+                command,
+                **kwargs,
+            )
+            if (
+                command.roll_rate
+                == command.pitch_rate
+                == command.yaw_rate
+                == command.thrust
+                == 0.0
+                and self.crossing_zero_count >= 2
+            ):
+                self.disable_credit = False
+                self._advance_race()
+            return receipt
+
+    host = SupersededLossHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: _CensoredPassageServo(
+            *args,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    segment = result["segments"][0]
+    assert result["race_finished"] is True
+    assert host.superseded is True
+    assert segment["superseded_proposal_count"] == 1
+    assert segment["censored_passage_coast_fresh_frame_count"] == 1
+    assert segment["censored_passage_coast_command_count"] == 0
+    assert segment["censored_passage_coast"][
+        "last_censored_camera_token"
+    ] == asdict(host.expected)
+    assert segment["censored_passage_coast"][
+        "loss_camera_token"
+    ] == asdict(host.receiver)
+    assert segment["crossing_wait_zero_command_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "top_only",
+        "wrong_role",
+        "ambiguous",
+        "visible_missed",
+        "publication_gap",
+        "scale_regression",
+        "not_center_censored",
+        "low_association_confidence",
+        "low_track_confidence",
+    ),
+)
+def test_censored_passage_coast_admission_fails_closed(mutation):
+    snapshot = _snapshot(4, "track-4", 21)
+    snapshot.current_track.clipping = (
+        FrameEdge.TOP | FrameEdge.BOTTOM
+    )
+    snapshot.current_track.center_censored = True
+    snapshot.current_track.apparent_scale = 0.80
+    history = snapshot.current_track.history
+    snapshot.current_track.history = (
+        *history[:-1],
+        replace(
+            history[-1],
+            apparent_scale=0.80,
+            clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+            center_censored=True,
+        ),
+    )
+    previous = _token(20)
+    anchor = _token(19)
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=4,
+        track_id="track-4",
+        anchor_camera_token=anchor,
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.105,
+        thrust=0.295,
+    )
+
+    if mutation == "top_only":
+        snapshot.current_track.clipping = FrameEdge.TOP
+    elif mutation == "wrong_role":
+        snapshot.current_track.role = VisualTrackRole.NEXT
+    elif mutation == "ambiguous":
+        snapshot.current_track.ambiguous = True
+    elif mutation == "visible_missed":
+        snapshot.current_track.missed_frame_count = 1
+    elif mutation == "publication_gap":
+        previous = _token(18)
+    elif mutation == "scale_regression":
+        snapshot.current_track.apparent_scale = 0.75
+    elif mutation == "not_center_censored":
+        snapshot.current_track.center_censored = False
+    elif mutation == "low_association_confidence":
+        latest = snapshot.current_track.history[-1]
+        assert latest.accepted_association is not None
+        snapshot.current_track.association_confidence = 0.09
+        snapshot.current_track.history = (
+            *snapshot.current_track.history[:-1],
+            replace(
+                latest,
+                association_confidence=0.09,
+                accepted_association=replace(
+                    latest.accepted_association,
+                    confidence=0.09,
+                ),
+            ),
+        )
+    elif mutation == "low_track_confidence":
+        snapshot.current_track.confidence = 0.09
+
+    assert not course_stage._censored_passage_coast_eligible(
+        snapshot,
+        current_gate_index=4,
+        current_track_id="track-4",
+        crossing_anchor_token=anchor,
+        authority=authority,
+        previous_visible_token=previous,
+        previous_apparent_scale=(
+            0.80 if mutation == "scale_regression" else None
+        ),
+        minimum_apparent_scale=math.exp(-0.80),
+    )
+
+
+def test_censored_passage_coast_accepts_retained_clean_epoch_suffix():
+    snapshot = _snapshot(4, "track-4", 21)
+    clipping = FrameEdge.TOP | FrameEdge.BOTTOM
+    snapshot.current_track.clipping = clipping
+    snapshot.current_track.center_censored = True
+    snapshot.current_track.apparent_scale = 0.80
+    snapshot.current_track.consecutive_frame_count = 300
+    history = snapshot.current_track.history
+    snapshot.current_track.history = (
+        *history[:-1],
+        replace(
+            history[-1],
+            apparent_scale=0.80,
+            clipping=clipping,
+            center_censored=True,
+        ),
+    )
+    anchor = _token(19)
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=4,
+        track_id="track-4",
+        anchor_camera_token=anchor,
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.105,
+        thrust=0.295,
+    )
+
+    assert course_stage._censored_passage_coast_eligible(
+        snapshot,
+        current_gate_index=4,
+        current_track_id="track-4",
+        crossing_anchor_token=anchor,
+        authority=authority,
+        previous_visible_token=_token(20),
+        previous_apparent_scale=math.exp(-0.50),
+        minimum_apparent_scale=math.exp(-0.80),
+    )
+
+
+def test_censored_passage_coast_rejects_same_id_reacquisition():
+    track_id = "track-4"
+    previous = _token(19)
+    current = _token(21)
+    clipping = FrameEdge.TOP | FrameEdge.BOTTOM
+    previous_sample = _history_sample(
+        track_id,
+        previous,
+        apparent_scale=0.78,
+    )
+    reacquired_sample = _history_sample(
+        track_id,
+        current,
+        previous_token=previous,
+        missed_frames_before_association=1,
+        apparent_scale=0.80,
+        clipping=clipping,
+        center_censored=True,
+    )
+    track = VisualTrack(
+        track_id=track_id,
+        first_token=previous,
+        latest_token=current,
+        center_norm=reacquired_sample.center_norm,
+        bbox_norm=reacquired_sample.bbox_norm,
+        apparent_scale=reacquired_sample.apparent_scale,
+        center_velocity_norm_s=(0.0, 0.0),
+        log_scale_rate_s=0.0,
+        confidence=0.90,
+        association_confidence=0.80,
+        consecutive_frame_count=1,
+        total_observation_count=2,
+        missed_frame_count=0,
+        clipping=clipping,
+        center_censored=True,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=4,
+        authority_race_status_sequence=10,
+        authority_race_status_boot_ms=2_000,
+        ambiguous=False,
+        visible=True,
+        history=(previous_sample, reacquired_sample),
+    )
+    snapshot = SimpleNamespace(
+        tracker_frame_sequence=21,
+        latest_camera_token=current,
+        current_gate_index=4,
+        current_track_id=track_id,
+        current_track=track,
+        authority_usable=True,
+        race_finished=False,
+    )
+    anchor = _token(18)
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=4,
+        track_id=track_id,
+        anchor_camera_token=anchor,
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.105,
+        thrust=0.295,
+    )
+
+    assert (
+        reacquired_sample.accepted_association
+        .missed_frame_count_before_association
+        == 1
+    )
+    assert not course_stage._censored_passage_coast_eligible(
+        snapshot,
+        current_gate_index=4,
+        current_track_id=track_id,
+        crossing_anchor_token=anchor,
+        authority=authority,
+        previous_visible_token=previous,
+        previous_apparent_scale=0.78,
+        minimum_apparent_scale=math.exp(-0.80),
+    )
+    snapshot.current_track = replace(
+        track,
+        consecutive_frame_count=2,
+    )
+    assert not course_stage._censored_passage_coast_eligible(
+        snapshot,
+        current_gate_index=4,
+        current_track_id=track_id,
+        crossing_anchor_token=anchor,
+        authority=authority,
+        previous_visible_token=previous,
+        previous_apparent_scale=0.78,
+        minimum_apparent_scale=math.exp(-0.80),
+    )
 
 
 def test_superseded_passage_proposal_breaks_retained_crossing_dwell():
@@ -2732,6 +3558,16 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
         ("control_period_s", 0.019, "exactly 50 Hz"),
         ("passage_hard_duration_s", 8.01, "passage duration"),
         ("crossing_status_timeout_s", 0.41, "crossing wait"),
+        (
+            "censored_passage_coast_max_duration_s",
+            0.301,
+            "censored passage coast",
+        ),
+        (
+            "censored_passage_coast_max_fresh_frames",
+            9,
+            "discrete bounds",
+        ),
         ("post_credit_fresh_frame_timeout_s", 0.21, "fresh-frame"),
         (
             "retained_crossing_projection_min_log_scale",
