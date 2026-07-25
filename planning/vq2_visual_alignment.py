@@ -35,6 +35,22 @@ POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S = 0.85
 # delta and 0.12 rad/s command-rate envelopes.
 POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD = -0.06
 
+# A promoted track that misses the ordinary entry-rate gate may receive a
+# short no-advance capture response only inside this stricter predictive
+# envelope.  These bounds cover the latest unclipped build-3385 handoff
+# (x=0.553, y=-0.661, vx=0.333/s, vy=-0.383/s, scale-rate=0.928/s)
+# without admitting the earlier clipped/out-of-bounds handoffs.  They are
+# code-owned safety policy, not controller configuration.
+POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S = 0.10
+POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM = 0.62
+POST_PROMOTION_CAPTURE_MAX_ABS_Y_NORM = 0.70
+POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S = 0.40
+POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S = 1.00
+POST_PROMOTION_CAPTURE_MAX_APPARENT_SCALE = 0.20
+POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_X_NORM = 0.67
+POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_Y_NORM = 0.71
+POST_PROMOTION_CAPTURE_MAX_PROJECTED_APPARENT_SCALE = 0.22
+
 
 class VisualAlignmentRefusal(ValueError):
     """The supplied observation cannot support a bounded alignment claim."""
@@ -65,17 +81,30 @@ class VisualAlignmentEntryAdmission:
     measured_pitch_rad: float
 
 
-def require_visual_alignment_entry(
+@dataclass(frozen=True)
+class VisualAlignmentCaptureAdmission:
+    """Predictive facts authorizing only short no-advance capture."""
+
+    track_id: str
+    frame_token: ServoFrameToken
+    horizontal_error: float
+    vertical_error_image_down: float
+    horizontal_rate_s: float
+    vertical_rate_down_s: float
+    log_scale_rate_s: float
+    apparent_scale: float
+    projected_horizontal_error: float
+    projected_vertical_error_image_down: float
+    projected_apparent_scale: float
+    measured_pitch_rad: float
+
+
+def _require_entry_observation(
     target: VisualTarget,
     *,
     measured_pitch_rad: float,
-) -> VisualAlignmentEntryAdmission:
-    """Fail closed unless a promoted target is safe for first command authority.
-
-    The check is deliberately image-relative and does not claim metric pose or
-    distance.  Its bounds are immutable module policy for the post-promotion
-    handoff; callers cannot loosen them through controller configuration.
-    """
+) -> tuple[float, float, float]:
+    """Validate common promoted-track authority and return signed geometry."""
 
     if type(target) is not VisualTarget:
         raise VisualAlignmentRefusal(
@@ -101,9 +130,29 @@ def require_visual_alignment_entry(
         raise VisualAlignmentRefusal(
             "post-promotion entry target geometry is clipped or censored"
         )
+    return (
+        float(target.normalized_x),
+        float(target.normalized_y_down),
+        float(measured_pitch_rad),
+    )
 
-    horizontal = float(target.normalized_x)
-    vertical = float(target.normalized_y_down)
+
+def require_visual_alignment_entry(
+    target: VisualTarget,
+    *,
+    measured_pitch_rad: float,
+) -> VisualAlignmentEntryAdmission:
+    """Fail closed unless a promoted target is safe for first command authority.
+
+    The check is deliberately image-relative and does not claim metric pose or
+    distance.  Its bounds are immutable module policy for the post-promotion
+    handoff; callers cannot loosen them through controller configuration.
+    """
+
+    horizontal, vertical, measured_pitch = _require_entry_observation(
+        target,
+        measured_pitch_rad=measured_pitch_rad,
+    )
     if abs(horizontal) > POST_PROMOTION_ENTRY_MAX_ABS_X_NORM:
         raise VisualAlignmentRefusal(
             "post-promotion horizontal error exceeds the entry bound"
@@ -143,7 +192,7 @@ def require_visual_alignment_entry(
             "post-promotion scale closure exceeds the entry bound"
         )
     if (
-        float(measured_pitch_rad)
+        measured_pitch
         < POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD
     ):
         raise VisualAlignmentRefusal(
@@ -157,7 +206,104 @@ def require_visual_alignment_entry(
         horizontal_outward_rate_s=horizontal_outward_rate,
         vertical_outward_rate_down_s=vertical_outward_rate,
         log_scale_rate_s=float(target.log_scale_rate_s),
-        measured_pitch_rad=float(measured_pitch_rad),
+        measured_pitch_rad=measured_pitch,
+    )
+
+
+def require_visual_alignment_capture_entry(
+    target: VisualTarget,
+    *,
+    measured_pitch_rad: float,
+) -> VisualAlignmentCaptureAdmission:
+    """Admit only a short predictive, no-advance post-promotion response.
+
+    This is deliberately separate from :func:`require_visual_alignment_entry`:
+    it does not weaken the ordinary entry gate.  A caller must revalidate this
+    envelope on every fresh frame and prove the ordinary entry gate before
+    claiming alignment.
+    """
+
+    horizontal, vertical, measured_pitch = _require_entry_observation(
+        target,
+        measured_pitch_rad=measured_pitch_rad,
+    )
+    horizontal_rate = float(target.normalized_x_rate_s)
+    vertical_rate = float(target.normalized_y_rate_down_s)
+    scale_rate = float(target.log_scale_rate_s)
+    log_scale = float(target.log_scale)
+    if abs(horizontal) > POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM:
+        raise VisualAlignmentRefusal(
+            "post-promotion capture horizontal error exceeds its bound"
+        )
+    if abs(vertical) > POST_PROMOTION_CAPTURE_MAX_ABS_Y_NORM:
+        raise VisualAlignmentRefusal(
+            "post-promotion capture vertical error exceeds its bound"
+        )
+    if (
+        abs(horizontal_rate)
+        > POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S
+        or abs(vertical_rate)
+        > POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion capture center motion exceeds its bound"
+        )
+    if (
+        abs(scale_rate)
+        > POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion capture scale motion exceeds its bound"
+        )
+    if measured_pitch < POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD:
+        raise VisualAlignmentRefusal(
+            "post-promotion measured pitch has not reached the entry brake bound"
+        )
+
+    max_log_scale = math.log(
+        POST_PROMOTION_CAPTURE_MAX_APPARENT_SCALE
+    )
+    if log_scale > max_log_scale:
+        raise VisualAlignmentRefusal(
+            "post-promotion capture apparent scale exceeds its bound"
+        )
+    horizon = POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+    projected_horizontal = horizontal + horizontal_rate * horizon
+    projected_vertical = vertical + vertical_rate * horizon
+    projected_log_scale = log_scale + scale_rate * horizon
+    if (
+        abs(projected_horizontal)
+        > POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_X_NORM
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion capture horizontal projection exceeds its bound"
+        )
+    if (
+        abs(projected_vertical)
+        > POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_Y_NORM
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion capture vertical projection exceeds its bound"
+        )
+    if projected_log_scale > math.log(
+        POST_PROMOTION_CAPTURE_MAX_PROJECTED_APPARENT_SCALE
+    ):
+        raise VisualAlignmentRefusal(
+            "post-promotion capture scale projection exceeds its bound"
+        )
+    return VisualAlignmentCaptureAdmission(
+        track_id=target.track_id,
+        frame_token=target.frame_token,
+        horizontal_error=horizontal,
+        vertical_error_image_down=vertical,
+        horizontal_rate_s=horizontal_rate,
+        vertical_rate_down_s=vertical_rate,
+        log_scale_rate_s=scale_rate,
+        apparent_scale=math.exp(log_scale),
+        projected_horizontal_error=projected_horizontal,
+        projected_vertical_error_image_down=projected_vertical,
+        projected_apparent_scale=math.exp(projected_log_scale),
+        measured_pitch_rad=measured_pitch,
     )
 
 
@@ -471,9 +617,20 @@ __all__ = [
     "POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S",
     "POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S",
     "POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD",
+    "POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S",
+    "POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S",
+    "POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM",
+    "POST_PROMOTION_CAPTURE_MAX_ABS_Y_NORM",
+    "POST_PROMOTION_CAPTURE_MAX_APPARENT_SCALE",
+    "POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_X_NORM",
+    "POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_Y_NORM",
+    "POST_PROMOTION_CAPTURE_MAX_PROJECTED_APPARENT_SCALE",
+    "POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S",
     "RestrictedAlignmentMonitor",
+    "VisualAlignmentCaptureAdmission",
     "VisualAlignmentEntryAdmission",
     "VisualAlignmentRefusal",
     "VisualAlignmentTrend",
+    "require_visual_alignment_capture_entry",
     "require_visual_alignment_entry",
 ]

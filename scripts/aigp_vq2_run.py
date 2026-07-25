@@ -100,6 +100,25 @@ from planning.vq2_visual_approach import (
     VisualApproachRefusal,
 )
 from planning.vq2_visual_alignment import VisualAlignmentTrend
+from planning.vq2_visual_recovery import (
+    RECOVERY_COMMAND_RESPONSE_HORIZON_S,
+    RECOVERY_HARD_DURATION_S,
+    RECOVERY_MAX_ABS_X_NORM,
+    RECOVERY_MAX_ABS_Y_NORM,
+    RECOVERY_MAX_COMMAND_RATE_RAD_S,
+    RECOVERY_MAX_COMMANDS,
+    RECOVERY_MAX_FRESH_FRAMES,
+    RECOVERY_MAX_PROJECTED_ABS_Y_NORM,
+    RECOVERY_MAX_PROJECTION_HORIZON_S,
+    RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S,
+    RECOVERY_MAX_THRUST,
+    RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S,
+    RECOVERY_MAX_YAW_RATE_RAD_S,
+    RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM,
+    RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM,
+    RECOVERY_MIN_PROJECTION_HORIZON_S,
+    RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES,
+)
 from planning.vq2_visual_servo import (
     MAX_VISUAL_OBSERVATION_AGE_S,
     MAX_VISUAL_THRUST,
@@ -6174,9 +6193,67 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                 },
                 "post_credit_fresh_frame_wait": {
                     "exact_zero_rate_zero_thrust": True,
+                    "conditional_when_recovery_not_required": True,
                     "max_wait_s": (
                         VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S
                     ),
+                },
+                "postpromotion_no_advance_recovery": {
+                    "conditional": True,
+                    "exact_transition_anchor_required": True,
+                    "receipt_backed_dispatch": True,
+                    "fresh_postcredit_observation_required_before_repeat": True,
+                    "wire_target_must_match_latest_receiver_publication": True,
+                    "receiver_publication_lock_held_through_transport_return": (
+                        True
+                    ),
+                    "wire_time_projection_revalidation": True,
+                    "max_validation_to_wire_delay_s": (
+                        RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S
+                    ),
+                    "command_response_horizon_s": (
+                        RECOVERY_COMMAND_RESPONSE_HORIZON_S
+                    ),
+                    "min_projection_horizon_s": (
+                        RECOVERY_MIN_PROJECTION_HORIZON_S
+                    ),
+                    "max_projection_horizon_s": (
+                        RECOVERY_MAX_PROJECTION_HORIZON_S
+                    ),
+                    "max_actual_abs_center_norm": {
+                        "horizontal": RECOVERY_MAX_ABS_X_NORM,
+                        "vertical": RECOVERY_MAX_ABS_Y_NORM,
+                    },
+                    "max_projected_abs_vertical_center_norm": (
+                        RECOVERY_MAX_PROJECTED_ABS_Y_NORM
+                    ),
+                    "min_projected_bbox_edge_margin_norm": {
+                        "horizontal": (
+                            RECOVERY_MIN_PROJECTED_EDGE_MARGIN_X_NORM
+                        ),
+                        "vertical": (
+                            RECOVERY_MIN_PROJECTED_EDGE_MARGIN_Y_NORM
+                        ),
+                    },
+                    "forward_advance_allowed": False,
+                    "next_gate_blend": 0.0,
+                    "target_roll_rad": 0.0,
+                    "minimum_target_pitch_rad": 0.0,
+                    "max_roll_pitch_command_rate_rad_s": (
+                        RECOVERY_MAX_COMMAND_RATE_RAD_S
+                    ),
+                    "yaw_rate_rad_s": RECOVERY_MAX_YAW_RATE_RAD_S,
+                    "max_thrust": RECOVERY_MAX_THRUST,
+                    "max_start_delay_after_credit_s": (
+                        RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S
+                    ),
+                    "hard_duration_s": RECOVERY_HARD_DURATION_S,
+                    "max_fresh_frames": RECOVERY_MAX_FRESH_FRAMES,
+                    "max_commands": RECOVERY_MAX_COMMANDS,
+                    "required_consecutive_strict_entry_frames": (
+                        RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES
+                    ),
+                    "ordinary_entry_required_after_recovery": True,
                 },
                 "restricted_post_promotion_alignment": {
                     "max_roll_pitch_command_rate_rad_s": (
@@ -9056,6 +9133,7 @@ class VQ2Runner:
         require_wire_receipt: bool = False,
         wire_start_not_before_ns: Optional[int] = None,
         wire_start_deadline_ns: Optional[int] = None,
+        wire_visual_token: Optional[VisualCameraFrameToken] = None,
     ) -> Optional[Dict[str, Any]]:
         """Send one validated setpoint and optionally prove wire-call timing."""
 
@@ -9072,6 +9150,19 @@ class VQ2Runner:
             and not require_wire_receipt
         ):
             raise ValueError("wire timing guards require an exact outbound receipt")
+        if wire_visual_token is not None:
+            if type(wire_visual_token) is not VisualCameraFrameToken:
+                raise TypeError(
+                    "wire_visual_token must be an exact camera token"
+                )
+            if (
+                not require_wire_receipt
+                or wire_start_deadline_ns is None
+            ):
+                raise ValueError(
+                    "visual wire authority requires a receipt and call-start "
+                    "deadline"
+                )
         drain_receipts = getattr(self.adapter, "drain_outbound_receipts", None)
         if require_wire_receipt:
             if not callable(drain_receipts):
@@ -9104,7 +9195,68 @@ class VQ2Runner:
             )
         if wire_start_deadline_ns is not None:
             send_options["call_start_deadline_monotonic_ns"] = wire_start_deadline_ns
-        await self.adapter.send_attitude_rate(command, **send_options)
+        wire_visual_authority: Optional[Dict[str, Any]] = None
+        if wire_visual_token is None:
+            await self.adapter.send_attitude_rate(command, **send_options)
+        else:
+            publication_lease = getattr(
+                self.vision,
+                "snapshot_publication_lease",
+                None,
+            )
+            if not callable(publication_lease):
+                raise SafetyAbort(
+                    "vision receiver lacks a publication-pinning lease"
+                )
+            try:
+                with publication_lease(
+                    max_age_s=MAX_VISION_AGE_S,
+                    acquire_deadline_monotonic_ns=(
+                        wire_start_deadline_ns
+                    ),
+                ) as snapshot:
+                    receiver_token = (
+                        self._assert_visual_receiver_snapshot_current(
+                            wire_visual_token,
+                            snapshot,
+                        )
+                    )
+                    lock_acquired_ns = time.perf_counter_ns()
+                    if (
+                        type(lock_acquired_ns) is not int
+                        or lock_acquired_ns < 0
+                        or lock_acquired_ns
+                        >= int(wire_start_deadline_ns)
+                    ):
+                        raise SafetyAbort(
+                            "visual receiver publication lease missed the "
+                            "wire deadline"
+                        )
+                    await self.adapter.send_attitude_rate(
+                        command,
+                        **send_options,
+                    )
+                    transport_return_ns = time.perf_counter_ns()
+                    if (
+                        type(transport_return_ns) is not int
+                        or transport_return_ns < lock_acquired_ns
+                    ):
+                        raise SafetyAbort(
+                            "visual receiver publication lease clock regressed"
+                        )
+            except TimeoutError as exc:
+                raise SafetyAbort(
+                    "visual receiver publication lease acquisition expired"
+                ) from exc
+            wire_visual_authority = {
+                "schema": "aigp-vq2-visual-wire-authority/1",
+                "frame_token": asdict(receiver_token),
+                "publication_lock_acquired_monotonic_ns": (
+                    lock_acquired_ns
+                ),
+                "transport_return_monotonic_ns": transport_return_ns,
+                "publication_pinned_through_transport_return": True,
+            }
         self._last_flight_command = command
         self._last_flight_command_sent_s = time.monotonic()
         wire_receipt: Optional[Dict[str, Any]] = None
@@ -9137,6 +9289,35 @@ class VQ2Runner:
                 or call_end < call_start
             ):
                 raise SafetyAbort("adapter outbound receipt is invalid")
+            if wire_visual_authority is not None:
+                if not (
+                    wire_visual_authority[
+                        "publication_lock_acquired_monotonic_ns"
+                    ]
+                    <= call_start
+                    <= call_end
+                    <= wire_visual_authority[
+                        "transport_return_monotonic_ns"
+                    ]
+                ):
+                    raise SafetyAbort(
+                        "visual receiver publication lease did not cover "
+                        "the exact transport receipt"
+                    )
+                wire_visual_authority.update(
+                    {
+                        "call_start_monotonic_ns": call_start,
+                        "call_end_monotonic_ns": call_end,
+                    }
+                )
+                self.recorder.emit(
+                    "visual_receiver_wire_authority",
+                    authority=wire_visual_authority,
+                )
+                wire_receipt = dict(wire_receipt)
+                wire_receipt["visual_receiver_authority"] = (
+                    wire_visual_authority
+                )
             self._last_flight_command_started_ns = call_start
             self.recorder.emit("attitude_target_outbound", receipt=wire_receipt)
         if callable(record_command):
@@ -12025,6 +12206,55 @@ class VQ2Runner:
         self._visual_shadow_summary = summary
         self.recorder.emit("visual_shadow_complete", **summary)
         return summary
+
+    def _assert_visual_receiver_token_current(
+        self,
+        expected_token: VisualCameraFrameToken,
+    ) -> VisualCameraFrameToken:
+        """Prove the command target is still the receiver's latest JPEG."""
+
+        snapshot = self.vision.snapshot(max_age_s=MAX_VISION_AGE_S)
+        return self._assert_visual_receiver_snapshot_current(
+            expected_token,
+            snapshot,
+        )
+
+    def _assert_visual_receiver_snapshot_current(
+        self,
+        expected_token: VisualCameraFrameToken,
+        snapshot: Any,
+    ) -> VisualCameraFrameToken:
+        """Validate one receiver snapshot, optionally under its data lock."""
+
+        if type(expected_token) is not VisualCameraFrameToken:
+            raise SafetyAbort(
+                "visual receiver watermark requires an exact camera token"
+            )
+        if snapshot is None:
+            raise SafetyAbort(
+                "visual receiver watermark is unavailable before command"
+            )
+        try:
+            receiver_token = VisualCameraFrameToken.from_vision_snapshot(
+                snapshot
+            )
+        except (TypeError, ValueError) as exc:
+            raise SafetyAbort(
+                "visual receiver watermark lacks exact timing provenance"
+            ) from exc
+        timing = snapshot.timing
+        if (
+            getattr(timing, "host_clock_id", None)
+            != self.visual_tracker.time_basis_id
+        ):
+            raise SafetyAbort(
+                "visual receiver watermark changed its host time basis"
+            )
+        if receiver_token != expected_token:
+            raise SafetyAbort(
+                "visual receiver advanced beyond the admitted command target"
+            )
+        return receiver_token
 
     def _require_visual_current_target(
         self,

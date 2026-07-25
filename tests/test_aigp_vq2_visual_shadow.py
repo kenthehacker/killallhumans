@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from dataclasses import asdict, replace
 import math
 from types import SimpleNamespace
 
@@ -19,6 +19,7 @@ from competition.vq2_visual_tracker import (
     VisualTrackRole,
 )
 from gate_detection.src.gate_detector import GateDetection
+import planning.vq2_visual_recovery as visual_recovery
 import scripts.aigp_vq2_run as vq2_module
 
 
@@ -245,6 +246,122 @@ def _prime_bound_gate_graph(
     ]
     assert len(next_ids) == 1
     return context, current_id, next_ids[0]
+
+
+# Integer detector boxes reproducing the exact normalized centers, extents,
+# and observation deltas in frames 168--172 of the accepted build-3385
+# transition-anchor excerpt.  The absolute QPC epoch is supplied by each test.
+_RECOVERY_ANCHOR_BOXES = (
+    (168, 441, 32, 79, 75, 100_000_000),
+    (169, 443, 31, 80, 76, 127_098_200),
+    (170, 445, 28, 83, 78, 163_047_000),
+    (171, 447, 26, 86, 80, 196_773_800),
+    (172, 449, 23, 89, 82, 231_623_500),
+)
+
+
+def _prime_recovery_gate_graph(
+    runner,
+    adapter,
+    *,
+    perf_clock_offset_ns,
+):
+    """Bind Gate 0 while preserving the exact five-frame recovery anchor."""
+
+    runner._visual_tracking_enabled = True
+    runner._visual_reset_epoch = 1
+    context = vq2_module.StartContext(
+        0.0,
+        -0.31,
+        320,
+        180,
+        6_400,
+        1_000,
+    )
+    current_id = None
+    latest_update = None
+    for index, (frame_id, x, y, width, height, observed_ns) in enumerate(
+        _RECOVERY_ANCHOR_BOXES
+    ):
+        runner.vision.current_snapshot = _snapshot(
+            frame_id=frame_id,
+            publication_sequence=frame_id,
+            final_packet_ns=perf_clock_offset_ns + observed_ns,
+            generation=7,
+        )
+        latest_update = _update_visual(
+            runner,
+            _frame(
+                frame_id,
+                [
+                    _detection(280, 140, 80, 80, confidence=0.95),
+                    _detection(x, y, width, height, confidence=0.95),
+                ],
+                final_packet_ns=perf_clock_offset_ns + observed_ns,
+            ),
+        )
+        if index == 2:
+            _set_race(
+                adapter,
+                gate_index=0,
+                boot_ms=1_000,
+                sequence=10,
+                received_ns=(
+                    perf_clock_offset_ns + observed_ns + 5_000_000
+                ),
+            )
+            bound = runner._bind_initial_visual_gate(context)
+            current_id = bound.current_track_id
+            assert current_id is not None
+
+    assert current_id is not None
+    assert latest_update is not None
+    next_ids = [
+        track.track_id
+        for track in latest_update.visible_tracks
+        if track.track_id != current_id
+    ]
+    assert len(next_ids) == 1
+    promoted_id = next_ids[0]
+    promoted = runner.visual_tracker.track(promoted_id)
+    assert tuple(
+        sample.token.frame_id for sample in promoted.history
+    ) == (168, 169, 170, 171, 172)
+    return context, current_id, promoted_id
+
+
+def test_receiver_watermark_requires_the_exact_latest_camera_token():
+    vision = _Vision()
+    runner = vq2_module.VQ2Runner(_Adapter(), vision)
+    _update_visual(
+        runner,
+        _frame(
+            172,
+            [_detection(451, 19, 92, 85, confidence=0.95)],
+            final_packet_ns=10_231_623_500,
+        ),
+    )
+    vision.current_snapshot = _snapshot(
+        frame_id=172,
+        publication_sequence=172,
+        final_packet_ns=10_231_623_500,
+    )
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        vision.current_snapshot
+    )
+
+    assert runner._assert_visual_receiver_token_current(expected) == expected
+
+    vision.current_snapshot = _snapshot(
+        frame_id=173,
+        publication_sequence=173,
+        final_packet_ns=10_266_066_600,
+    )
+    with pytest.raises(
+        vq2_module.SafetyAbort,
+        match="receiver advanced beyond",
+    ):
+        runner._assert_visual_receiver_token_current(expected)
 
 
 def test_sample_consumes_every_detection_with_exact_receiver_provenance(
@@ -966,16 +1083,16 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
 
     publications = [
         (105, 465, 65, 0.320),
-        (106, 458, 71, 0.360),
-        (107, 451, 77, 0.380),
-        (108, 444, 83, 0.400),
-        (109, 437, 89, 0.420),
-        (110, 430, 95, 0.440),
-        (111, 423, 101, 0.460),
-        (112, 416, 107, 0.480),
-        (113, 409, 113, 0.500),
-        (114, 402, 119, 0.520),
-        (115, 395, 125, 0.540),
+        (106, 458, 71, 0.340),
+        (107, 451, 77, 0.360),
+        (108, 444, 83, 0.380),
+        (109, 437, 89, 0.400),
+        (110, 430, 95, 0.420),
+        (111, 423, 101, 0.440),
+        (112, 416, 107, 0.460),
+        (113, 409, 113, 0.480),
+        (114, 402, 119, 0.500),
+        (115, 395, 125, 0.520),
     ]
     publication_index = [0]
 
@@ -987,16 +1104,25 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         ]
         if clock[0] + 1e-9 < observed_s:
             return
-        _update_visual(
-            runner,
-            _frame(
-                frame_id,
-                [_detection(x, y, 50, 60)],
-                final_packet_ns=round(
-                    (perf_offset_s + observed_s) * 1_000_000_000
-                ),
+        frame = _frame(
+            frame_id,
+            [_detection(x, y, 50, 60)],
+            final_packet_ns=round(
+                (
+                    perf_offset_s
+                    + (0.299 if frame_id == 105 else observed_s)
+                )
+                * 1_000_000_000
             ),
         )
+        if frame_id == 105:
+            # A pre-credit observation decoded and published after credit is
+            # not the required fresh post-credit camera observation.
+            frame = replace(
+                frame,
+                publish_monotonic_ns=perf_offset_ns + 305_000_000,
+            )
+        _update_visual(runner, frame)
         publication_index[0] += 1
 
     async def send(command, **kwargs):
@@ -1088,8 +1214,47 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         summary["eligible_joint_frame_count"]
     )
     assert summary["ambiguity"] is False
-    assert summary["post_credit_zero_command_count"] == 0
-    navigation_commands = commands
+    assert summary["post_credit_zero_command_count"] == 1
+    late_published_sample = next(
+        sample
+        for sample in runner.visual_tracker.track(promoted_id).history
+        if sample.token.frame_id == 105
+    )
+    assert (
+        late_published_sample.observation_monotonic_ns
+        < perf_offset_ns + 300_000_000
+        < late_published_sample.publication_monotonic_ns
+    )
+    assert summary["postpromotion_recovery"] == {
+        "required": False,
+        "outcome": "not_required",
+        "reason": None,
+        "hard_duration_s": visual_recovery.RECOVERY_HARD_DURATION_S,
+        "max_fresh_frames": (
+            visual_recovery.RECOVERY_MAX_FRESH_FRAMES
+        ),
+        "max_commands": visual_recovery.RECOVERY_MAX_COMMANDS,
+        "max_thrust": visual_recovery.RECOVERY_MAX_THRUST,
+        "anchor_admission": None,
+        "fresh_frame_count": 0,
+        "command_count": 0,
+        "strict_entry_streak": 0,
+        "completed_frame_token": None,
+        "completion_elapsed_s": None,
+        "latest_continuation": None,
+        "latest_wire_revalidation": None,
+    }
+    zero_commands = commands[: summary["post_credit_zero_command_count"]]
+    assert len(zero_commands) == 1
+    assert zero_commands[0][1] == AttitudeRateCommand(
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )
+    navigation_commands = commands[
+        summary["post_credit_zero_command_count"]:
+    ]
     assert navigation_commands
     assert navigation_commands[0][1].yaw_rate < 0.0
     assert all(
@@ -1114,6 +1279,532 @@ def test_restricted_visual_alignment_preserves_promoted_identity_and_improves(
         <= vq2_module.VISUAL_ALIGN_MAX_THRUST
         for _sent_s, command, _kwargs in navigation_commands
     )
+
+
+def test_visual_alignment_recovers_promoted_anchor_before_restricted_authority(
+    monkeypatch,
+):
+    """Recovery uses the exact credit anchor, then proves ordinary entry."""
+
+    perf_offset_s = 10.0
+    perf_offset_ns = round(perf_offset_s * 1_000_000_000)
+    race_credit_relative_ns = 236_005_700
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    context, initial_current_id, promoted_id = _prime_recovery_gate_graph(
+        runner,
+        adapter,
+        perf_clock_offset_ns=perf_offset_ns,
+    )
+    orientation = _Orientation(pitch=-0.04)
+    runner.estimate = SimpleNamespace(
+        orientation=orientation,
+        body_rates=(0.0, 0.0, 0.0),
+        yaw=orientation.yaw,
+    )
+    clock = [
+        race_credit_relative_ns / 1_000_000_000.0 + 0.001
+    ]
+    commands = []
+    timeline = []
+
+    async def run_gate0(
+        _context,
+        *,
+        capture_transition=False,
+        visual_next_gate_blend=False,
+    ):
+        assert _context is context
+        assert capture_transition is False
+        assert visual_next_gate_blend is True
+        _set_race(
+            adapter,
+            gate_index=1,
+            boot_ms=1_300,
+            sequence=11,
+            received_ns=(
+                perf_offset_ns + race_credit_relative_ns
+            ),
+        )
+        transition = runner._confirm_visual_transition(
+            from_gate_index=0,
+            to_gate_index=1,
+        )
+        assert transition.retired_track_id == initial_current_id
+        assert transition.promoted_track_id == promoted_id
+        assert transition.camera_token_at_credit.frame_id == 172
+        assert transition.promoted_first_token.frame_id == 168
+        assert transition.history_length_before_promotion == 5
+        assert transition.history_length_after_promotion == 5
+        runner._gate0_transition_proof = vq2_module.GateTransitionProof(
+            pre_gate_race_boot_ms=1_000,
+            post_gate_race_boot_ms=1_300,
+            flight_started_monotonic_s=0.05,
+            crossing_started_monotonic_s=clock[0] - 0.020,
+            pass_confirmed_monotonic_s=clock[0] - 0.001,
+            next_control_deadline_s=clock[0],
+            vision_generation=7,
+            vision_frame_id=172,
+            vision_sim_time_ns=172_000,
+            vision_received_monotonic_s=0.2316235,
+            pass_rpy_rad=(0.0, -0.04, 0.0),
+        )
+        return {
+            "gate0_passed": True,
+            "visual_next_gate_blend": {
+                "enabled": True,
+                "started": True,
+                "current_track_id": initial_current_id,
+                "blended_next_track_id": promoted_id,
+                "fresh_blend_frame_count": 5,
+                "command_count": 5,
+                "withdrawn_before_confirmation": True,
+                "yaw_reference_rad": 0.0,
+                "max_abs_yaw_excursion_rad": 0.01,
+            },
+        }
+
+    # Frame 173 exactly reproduces the failed live token and is recovery-only:
+    # its outward center and scale rates fail ordinary entry.  Frames 174 and
+    # 175 move inward within the recovery envelope and establish two strict
+    # ordinary-entry admissions before restricted authority begins.
+    publications = [
+        (173, 451, 19, 92, 85, 0.2660666),
+        (174, 450, 19, 92, 84, 0.296),
+        (175, 449, 22, 92, 83, 0.326),
+    ]
+    publications.extend(
+        (
+            176 + offset,
+            448 - 3 * offset,
+            24 + 2 * offset,
+            89,
+            82,
+            0.346 + 0.020 * offset,
+        )
+        for offset in range(20)
+    )
+    publication_index = [0]
+
+    def sample():
+        if publication_index[0] >= len(publications):
+            return
+        frame_id, x, y, width, height, observed_s = publications[
+            publication_index[0]
+        ]
+        if clock[0] + 1e-9 < observed_s:
+            return
+        final_packet_ns = round(
+            (perf_offset_s + observed_s) * 1_000_000_000
+        )
+        runner.vision.current_snapshot = _snapshot(
+            frame_id=frame_id,
+            publication_sequence=frame_id,
+            final_packet_ns=final_packet_ns,
+            generation=7,
+        )
+        _update_visual(
+            runner,
+            _frame(
+                frame_id,
+                [_detection(x, y, width, height, confidence=0.95)],
+                final_packet_ns=final_packet_ns,
+            ),
+        )
+        publication_index[0] += 1
+
+    async def send(command, **kwargs):
+        start_ns = round(
+            (perf_offset_s + clock[0]) * 1_000_000_000
+        )
+        not_before_ns = kwargs.get("wire_start_not_before_ns")
+        deadline_ns = kwargs.get("wire_start_deadline_ns")
+        if not_before_ns is not None:
+            assert start_ns >= not_before_ns
+        if deadline_ns is not None:
+            assert start_ns < deadline_ns
+        current = runner.visual_tracker.track(promoted_id)
+        commands.append(
+            {
+                "sent_s": clock[0],
+                "command": command,
+                "kwargs": dict(kwargs),
+                "track_id": current.track_id,
+                "frame_token": current.latest_token,
+                "normalized_x": current.center_norm[0],
+            }
+        )
+        runner._last_flight_command_sent_s = clock[0]
+        if kwargs.get("require_wire_receipt"):
+            runner._last_flight_command_started_ns = start_ns
+            wire_token = kwargs.get("wire_visual_token")
+            wire_authority = None
+            if wire_token is not None:
+                wire_authority = {
+                    "schema": "aigp-vq2-visual-wire-authority/1",
+                    "frame_token": asdict(wire_token),
+                    "publication_lock_acquired_monotonic_ns": start_ns,
+                    "call_start_monotonic_ns": start_ns,
+                    "call_end_monotonic_ns": start_ns + 1,
+                    "transport_return_monotonic_ns": start_ns + 1,
+                    "publication_pinned_through_transport_return": True,
+                }
+            return {
+                "schema": "aigp-vq2-attitude-target-outbound/1",
+                "host_clock_id": _HOST_CLOCK,
+                "api": "send_attitude_rate",
+                "outcome": "returned",
+                "call_start_monotonic_ns": start_ns,
+                "call_end_monotonic_ns": start_ns + 1,
+                "visual_receiver_authority": wire_authority,
+            }
+        return None
+
+    async def sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def attitude_command(
+        _estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        return AttitudeRateCommand(
+            roll_rate=target_roll_rad,
+            pitch_rate=target_pitch_rad,
+            yaw_rate=0.0,
+            thrust=thrust,
+        )
+
+    def record_tick(stage, elapsed_s, command):
+        timeline.append(
+            ("tick", stage, clock[0], elapsed_s, command)
+        )
+
+    def record_event(event, **fields):
+        timeline.append(("event", event, clock[0], fields))
+        return True
+
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", send)
+    monkeypatch.setattr(runner, "_record_tick", record_tick)
+    monkeypatch.setattr(runner.recorder, "emit", record_event)
+    monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        attitude_command,
+    )
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock[0],
+                perf_counter_ns=lambda: round(
+                    (perf_offset_s + clock[0]) * 1_000_000_000
+                ),
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(
+                sleep=sleep,
+                CancelledError=asyncio.CancelledError,
+            ),
+        )
+        summary = asyncio.run(
+            runner._run_visual_alignment(context)
+        )
+
+    assert summary["success"] is True
+    assert summary["authoritative_transition"] == [0, 1]
+    assert summary["promoted_current_track_id"] == promoted_id
+    recovery = summary["postpromotion_recovery"]
+    assert recovery["required"] is True
+    assert recovery["outcome"] == "recovered"
+    assert recovery["fresh_frame_count"] == 3
+    assert recovery["command_count"] == 3
+    assert recovery["strict_entry_streak"] == 2
+    assert recovery["completed_frame_token"]["frame_id"] == 175
+    assert recovery["latest_wire_revalidation"]["kind"] == (
+        "postcredit_continuation"
+    )
+    assert recovery["latest_wire_revalidation"]["frame_token"] == (
+        recovery["latest_wire_revalidation"]["receiver_token"]
+    )
+    assert recovery["latest_wire_revalidation"]["frame_token"][
+        "frame_id"
+    ] == 174
+    assert recovery["latest_wire_revalidation"]["wire_authority"][
+        "publication_pinned_through_transport_return"
+    ] is True
+    assert (
+        recovery["latest_wire_revalidation"][
+            "receiver_checked_monotonic_ns"
+        ]
+        >= recovery["latest_wire_revalidation"][
+            "validated_monotonic_ns"
+        ]
+    )
+    assert recovery["anchor_admission"]["anchor_token"][
+        "frame_id"
+    ] == 172
+    assert recovery["anchor_admission"]["history_tokens"] == tuple(
+        {
+            "generation": 7,
+            "frame_id": frame_id,
+            "publication_sequence": frame_id,
+            "stream_id": _CAMERA_STREAM,
+        }
+        for frame_id in range(168, 173)
+    )
+
+    recovery_frames = [
+        item
+        for item in timeline
+        if item[:2] == ("event", "visual_alignment_recovery_frame")
+    ]
+    assert [
+        item[3]["strict_entry_streak"] for item in recovery_frames
+    ] == [0, 1, 2]
+    assert recovery_frames[0][3]["strict_entry"] is None
+    assert [
+        (
+            item[3]["continuation"]["previous_token"]["frame_id"],
+            item[3]["continuation"]["frame_token"]["frame_id"],
+        )
+        for item in recovery_frames
+    ] == [(172, 173), (173, 174), (174, 175)]
+    for item in recovery_frames:
+        continuation = item[3]["continuation"]
+        assert continuation["track_id"] == promoted_id
+        assert continuation["frame_token"]["stream_id"] == _CAMERA_STREAM
+        assert continuation["frame_token"]["generation"] == 7
+        assert (
+            continuation["frame_token"]["publication_sequence"]
+            == continuation["previous_token"]["publication_sequence"] + 1
+        )
+        assert continuation["observation_age_s"] <= (
+            visual_recovery.RECOVERY_MAX_CONTINUATION_AGE_S
+        )
+    completion_index = next(
+        index
+        for index, item in enumerate(timeline)
+        if item[:2]
+        == ("event", "visual_alignment_recovery_complete")
+    )
+    restricted_tick_index = next(
+        index
+        for index, item in enumerate(timeline)
+        if item[:2] == ("tick", "visual-align/restricted")
+    )
+    assert completion_index < restricted_tick_index
+
+    recovery_commands = commands[: recovery["command_count"]]
+    assert [
+        item["frame_token"].frame_id for item in recovery_commands
+    ] == [172, 173, 174]
+    assert all(
+        item["track_id"] == promoted_id
+        and item["kwargs"].get("require_wire_receipt") is True
+        and item["kwargs"].get("wire_start_deadline_ns") is not None
+        and item["kwargs"].get("wire_visual_token")
+        == item["frame_token"]
+        for item in recovery_commands
+    )
+    assert all(
+        item["kwargs"]["wire_start_deadline_ns"]
+        - round((perf_offset_s + item["sent_s"]) * 1_000_000_000)
+        <= round(
+            visual_recovery.RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S
+            * 1_000_000_000
+        )
+        for item in recovery_commands
+    )
+    assert all(
+        command["normalized_x"] * command["command"].yaw_rate < 0.0
+        and command["command"].roll_rate == 0.0
+        and 0.0
+        <= command["command"].pitch_rate
+        <= visual_recovery.RECOVERY_MAX_COMMAND_RATE_RAD_S
+        and abs(command["command"].yaw_rate)
+        <= visual_recovery.RECOVERY_MAX_YAW_RATE_RAD_S
+        and vq2_module.VISUAL_ALIGN_MIN_THRUST
+        <= command["command"].thrust
+        <= visual_recovery.RECOVERY_MAX_THRUST
+        for command in recovery_commands
+    )
+    assert all(
+        later["sent_s"] - earlier["sent_s"]
+        >= vq2_module.CONTROL_PERIOD_S - 1e-9
+        for earlier, later in zip(commands, commands[1:])
+    )
+
+    promoted = runner.visual_tracker.track(promoted_id)
+    assert promoted.first_token.frame_id == 168
+    assert promoted.role is VisualTrackRole.CURRENT
+    assert promoted.authoritative_gate_index == 1
+    assert tuple(
+        sample.token.frame_id for sample in promoted.history[:8]
+    ) == (168, 169, 170, 171, 172, 173, 174, 175)
+    assert all(
+        sample.provenance_basis
+        is FrameProvenanceBasis.RECEIVER_TIMING_V1
+        and sample.association_confidence >= (
+            visual_recovery.RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+        )
+        for sample in promoted.history[:8]
+    )
+
+
+def test_visual_alignment_recovery_dispatch_abort_records_nested_outcome(
+    monkeypatch,
+):
+    perf_offset_s = 10.0
+    perf_offset_ns = round(perf_offset_s * 1_000_000_000)
+    race_credit_relative_ns = 236_005_700
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+    context, initial_current_id, promoted_id = _prime_recovery_gate_graph(
+        runner,
+        adapter,
+        perf_clock_offset_ns=perf_offset_ns,
+    )
+    orientation = _Orientation(pitch=-0.04)
+    runner.estimate = SimpleNamespace(
+        orientation=orientation,
+        body_rates=(0.0, 0.0, 0.0),
+        yaw=orientation.yaw,
+    )
+    clock = [
+        race_credit_relative_ns / 1_000_000_000.0 + 0.001
+    ]
+    failure_observed_s = []
+
+    async def run_gate0(
+        _context,
+        *,
+        capture_transition=False,
+        visual_next_gate_blend=False,
+    ):
+        assert _context is context
+        assert capture_transition is False
+        assert visual_next_gate_blend is True
+        _set_race(
+            adapter,
+            gate_index=1,
+            boot_ms=1_300,
+            sequence=11,
+            received_ns=perf_offset_ns + race_credit_relative_ns,
+        )
+        transition = runner._confirm_visual_transition(
+            from_gate_index=0,
+            to_gate_index=1,
+        )
+        assert transition.retired_track_id == initial_current_id
+        assert transition.promoted_track_id == promoted_id
+        runner._gate0_transition_proof = vq2_module.GateTransitionProof(
+            pre_gate_race_boot_ms=1_000,
+            post_gate_race_boot_ms=1_300,
+            flight_started_monotonic_s=0.05,
+            crossing_started_monotonic_s=clock[0] - 0.020,
+            pass_confirmed_monotonic_s=clock[0] - 0.001,
+            next_control_deadline_s=clock[0],
+            vision_generation=7,
+            vision_frame_id=172,
+            vision_sim_time_ns=172_000,
+            vision_received_monotonic_s=0.2316235,
+            pass_rpy_rad=(0.0, -0.04, 0.0),
+        )
+        return {
+            "gate0_passed": True,
+            "visual_next_gate_blend": {
+                "enabled": True,
+                "started": True,
+                "current_track_id": initial_current_id,
+                "blended_next_track_id": promoted_id,
+                "fresh_blend_frame_count": 5,
+                "command_count": 5,
+                "withdrawn_before_confirmation": True,
+                "yaw_reference_rad": 0.0,
+                "max_abs_yaw_excursion_rad": 0.01,
+            },
+        }
+
+    async def fail_dispatch(_command, **kwargs):
+        assert kwargs["require_wire_receipt"] is True
+        failure_observed_s.append(clock[0])
+        raise RuntimeError("uncertain recovery transport failure")
+
+    async def sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    def attitude_command(
+        _estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+    ):
+        return AttitudeRateCommand(
+            roll_rate=target_roll_rad,
+            pitch_rate=target_pitch_rad,
+            yaw_rate=0.0,
+            thrust=thrust,
+        )
+
+    monkeypatch.setattr(runner, "_run_gate0", run_gate0)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", fail_dispatch)
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    monkeypatch.setattr(
+        vq2_module,
+        "attitude_rate_command",
+        attitude_command,
+    )
+    with monkeypatch.context() as clock_patch:
+        clock_patch.setattr(
+            vq2_module,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: clock[0],
+                perf_counter_ns=lambda: round(
+                    (perf_offset_s + clock[0]) * 1_000_000_000
+                ),
+            ),
+        )
+        clock_patch.setattr(
+            vq2_module,
+            "asyncio",
+            SimpleNamespace(
+                sleep=sleep,
+                CancelledError=asyncio.CancelledError,
+            ),
+        )
+        with pytest.raises(
+            vq2_module.SafetyAbort,
+            match="recovery dispatch failed closed",
+        ):
+            asyncio.run(runner._run_visual_alignment(context))
+
+    assert len(failure_observed_s) == 1
+    assert clock[0] >= (
+        failure_observed_s[0] + vq2_module.CONTROL_PERIOD_S - 1e-9
+    )
+    summary = runner._visual_alignment_summary
+    assert summary is not None
+    assert summary["outcome"] == "abort"
+    assert summary["success"] is False
+    assert summary["postpromotion_recovery"]["required"] is True
+    assert summary["postpromotion_recovery"]["outcome"] == "abort"
+    assert "recovery dispatch failed closed" in (
+        summary["postpromotion_recovery"]["reason"]
+    )
+    assert summary["postpromotion_recovery"]["command_count"] == 0
 
 
 def test_visual_alignment_rejects_blended_identity_promotion_mismatch(

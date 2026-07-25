@@ -73,6 +73,7 @@ _RUNTIME_SOURCE_PATHS = (
     "competition/adapter.py",
     "competition/aigp_mavlink.py",
     "competition/aigp_messages.py",
+    "competition/vq2_contracts.py",
     "competition/vq2_capture.py",
     "competition/vq2_visual_tracker.py",
     "competition/vq2_vision.py",
@@ -83,6 +84,7 @@ _RUNTIME_SOURCE_PATHS = (
     "planning/vq2_gate_graph.py",
     "planning/vq2_visual_approach.py",
     "planning/vq2_visual_alignment.py",
+    "planning/vq2_visual_recovery.py",
     "planning/vq2_visual_servo.py",
 )
 

@@ -26,6 +26,21 @@ from planning.vq2_visual_servo import (
     VisualServoRefusal,
     VisualTarget,
 )
+from planning.vq2_visual_recovery import (
+    RECOVERY_HARD_DURATION_S,
+    RECOVERY_MAX_COMMAND_RATE_RAD_S,
+    RECOVERY_MAX_COMMANDS,
+    RECOVERY_MAX_CONTINUATION_AGE_S,
+    RECOVERY_MAX_FRESH_FRAMES,
+    RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S,
+    RECOVERY_MAX_THRUST,
+    RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S,
+    RECOVERY_MAX_YAW_RATE_RAD_S,
+    RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES,
+    VisualRecoveryRefusal,
+    require_recovery_continuation,
+    require_transition_recovery_admission,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +112,11 @@ class VisualAlignmentStageHost(Protocol):
     ) -> Optional[Dict[str, Any]]: ...
 
     def _sample(self) -> None: ...
+
+    def _assert_visual_receiver_token_current(
+        self,
+        expected_token: Any,
+    ) -> Any: ...
 
     def _watchdog(self, **kwargs: Any) -> None: ...
 
@@ -247,6 +267,23 @@ async def run_visual_alignment_stage(
         "cleanup_confirmed": False,
         "visual_navigation_command_count": 0,
         "post_credit_zero_command_count": 0,
+        "postpromotion_recovery": {
+            "required": False,
+            "outcome": "not_required",
+            "reason": None,
+            "hard_duration_s": RECOVERY_HARD_DURATION_S,
+            "max_fresh_frames": RECOVERY_MAX_FRESH_FRAMES,
+            "max_commands": RECOVERY_MAX_COMMANDS,
+            "max_thrust": RECOVERY_MAX_THRUST,
+            "anchor_admission": None,
+            "fresh_frame_count": 0,
+            "command_count": 0,
+            "strict_entry_streak": 0,
+            "completed_frame_token": None,
+            "completion_elapsed_s": None,
+            "latest_continuation": None,
+            "latest_wire_revalidation": None,
+        },
         "fresh_control_frame_count": 0,
         "thrust_saturation_count": 0,
         "max_abs_yaw_excursion_rad": float(
@@ -346,18 +383,861 @@ async def run_visual_alignment_stage(
             )
         return value / 1_000_000_000.0
 
+    async def send_recovery_command(
+        *,
+        target: VisualTarget,
+        output: VisualServoOutput,
+        entry_roll: float,
+        entry_pitch: float,
+        yaw_reference: float,
+        recovery_started_s: float,
+        recovery_started_monotonic_ns: int,
+        recovery_deadline_s: float,
+        last_wire_start_ns: int,
+        command_lease_deadline_ns: int,
+    ) -> AttitudeRateCommand:
+        """Dispatch one receipt-backed, no-advance recovery command."""
+
+        nonlocal dispatch_attempt_s
+        if (
+            output.advance_enabled
+            or output.next_gate_blend != 0.0
+            or output.target_roll_rad != 0.0
+            or output.target_pitch_rad < 0.0
+            or abs(output.yaw_rate_rad_s) > min(
+                limits.max_yaw_rate_rad_s,
+                RECOVERY_MAX_YAW_RATE_RAD_S,
+            )
+            or not (
+                limits.min_thrust
+                <= output.thrust
+                <= limits.max_visual_controller_thrust
+            )
+        ):
+            raise abort_type(
+                "post-promotion recovery servo escaped its no-advance envelope"
+            )
+        if (
+            abs(float(target.normalized_x))
+            > host.visual_config.servo.horizontal_corridor
+            and (
+                output.yaw_rate_rad_s == 0.0
+                or float(target.normalized_x) * output.yaw_rate_rad_s >= 0.0
+            )
+        ):
+            raise abort_type(
+                "post-promotion recovery servo lacks calibrated inward yaw"
+            )
+        state = host._assert_visual_alignment_attitude(
+            entry_roll_rad=entry_roll,
+            entry_pitch_rad=entry_pitch,
+            phase="post-promotion recovery command",
+        )
+        summary["max_peak_body_rate_rad_s"] = max(
+            float(summary["max_peak_body_rate_rad_s"]),
+            float(state["peak_body_rate_rad_s"]),
+        )
+        target_pitch_upper = min(
+            limits.max_pitch_rad,
+            entry_pitch + limits.max_entry_attitude_delta_rad,
+        )
+        if target_pitch_upper < 0.0:
+            raise abort_type(
+                "post-promotion recovery cannot retain a nonnegative pitch "
+                "target inside its attitude envelope"
+            )
+        target_pitch = max(
+            0.0,
+            min(float(output.target_pitch_rad), target_pitch_upper),
+        )
+        command_thrust = min(
+            RECOVERY_MAX_THRUST,
+            limits.max_thrust,
+            max(limits.min_thrust, float(output.thrust)),
+        )
+        if command_thrust != float(output.thrust):
+            summary["thrust_saturation_count"] = int(
+                summary["thrust_saturation_count"]
+            ) + 1
+        base_command = runtime.attitude_rate_command(
+            host.estimate,
+            target_roll_rad=0.0,
+            target_pitch_rad=target_pitch,
+            thrust=command_thrust,
+        )
+        limited = runtime.limit_command_rates(
+            base_command,
+            min(
+                limits.max_command_rate_rad_s,
+                RECOVERY_MAX_COMMAND_RATE_RAD_S,
+            ),
+        )
+        yaw_rate, yaw_excursion = runtime.visual_alignment_yaw_rate(
+            requested_rate_rad_s=output.yaw_rate_rad_s,
+            measured_yaw_rad=state["yaw_rad"],
+            reference_yaw_rad=yaw_reference,
+            measured_yaw_rate_rad_s=state["yaw_rate_rad_s"],
+            horizontal_error_norm=output.effective_horizontal_error,
+            horizontal_corridor_norm=(
+                host.visual_config.servo.horizontal_corridor
+            ),
+        )
+        command = AttitudeRateCommand(
+            roll_rate=limited.roll_rate,
+            pitch_rate=limited.pitch_rate,
+            yaw_rate=yaw_rate,
+            thrust=limited.thrust,
+        )
+        runtime.validate_command(command)
+        if (
+            command.roll_rate != limited.roll_rate
+            or abs(command.roll_rate) > min(
+                limits.max_command_rate_rad_s,
+                RECOVERY_MAX_COMMAND_RATE_RAD_S,
+            )
+            or abs(command.pitch_rate) > min(
+                limits.max_command_rate_rad_s,
+                RECOVERY_MAX_COMMAND_RATE_RAD_S,
+            )
+            or abs(command.yaw_rate) > min(
+                limits.max_yaw_rate_rad_s,
+                RECOVERY_MAX_YAW_RATE_RAD_S,
+            )
+            or not (
+                limits.min_thrust
+                <= command.thrust
+                <= min(limits.max_thrust, RECOVERY_MAX_THRUST)
+            )
+        ):
+            raise abort_type(
+                "post-promotion recovery command escaped its fixed envelope"
+            )
+        send_now_s = runtime.monotonic()
+        if (
+            send_now_s < recovery_started_s
+            or recovery_deadline_s - send_now_s
+            <= limits.control_period_s
+        ):
+            raise abort_type(
+                "post-promotion recovery lease expired before send"
+            )
+        host._watchdog(
+            require_target=False,
+            allow_benign_pad_contact=False,
+            enforce_benign_pad_budget=False,
+            count_rate_sample=False,
+        )
+        host._assert_visual_alignment_race_boundary()
+        send_state = host._assert_visual_alignment_attitude(
+            entry_roll_rad=entry_roll,
+            entry_pitch_rad=entry_pitch,
+            phase="post-promotion recovery send",
+        )
+        summary["max_peak_body_rate_rad_s"] = max(
+            float(summary["max_peak_body_rate_rad_s"]),
+            float(send_state["peak_body_rate_rad_s"]),
+        )
+        send_track, send_target = host._require_visual_current_target(
+            expected_gate_index=1,
+            expected_track_id=promoted_track_id,
+            now_s=target_clock_s(),
+        )
+        host._assert_visual_alignment_no_passage(
+            send_track,
+            phase="post-promotion recovery send",
+        )
+        if send_target.frame_token != target.frame_token:
+            raise abort_type(
+                "post-promotion recovery target changed before send"
+            )
+        yaw_rate, send_excursion = runtime.visual_alignment_yaw_rate(
+            requested_rate_rad_s=command.yaw_rate,
+            measured_yaw_rad=send_state["yaw_rad"],
+            reference_yaw_rad=yaw_reference,
+            measured_yaw_rate_rad_s=send_state["yaw_rate_rad_s"],
+            horizontal_error_norm=output.effective_horizontal_error,
+            horizontal_corridor_norm=(
+                host.visual_config.servo.horizontal_corridor
+            ),
+        )
+        command = replace(command, yaw_rate=yaw_rate)
+        runtime.validate_command(command)
+        if (
+            abs(float(send_target.normalized_x))
+            > host.visual_config.servo.horizontal_corridor
+            and (
+                command.yaw_rate == 0.0
+                or float(send_target.normalized_x) * command.yaw_rate >= 0.0
+            )
+        ):
+            raise abort_type(
+                "post-promotion recovery command lacks calibrated inward yaw"
+            )
+        wire_not_before_ns = (
+            None
+            if host._last_flight_command_started_ns is None
+            else host._last_flight_command_started_ns
+            + round(limits.control_period_s * 1_000_000_000)
+        )
+        wire_validation_ns = runtime.perf_counter_ns()
+        if (
+            type(command_lease_deadline_ns) is not int
+            or wire_validation_ns >= command_lease_deadline_ns
+        ):
+            raise abort_type(
+                "post-promotion recovery command freshness lease expired"
+            )
+        if (
+            wire_not_before_ns is not None
+            and wire_not_before_ns > wire_validation_ns
+        ):
+            raise abort_type(
+                "post-promotion recovery wire slot was not ready at validation"
+            )
+        try:
+            if send_track.latest_token == transition.camera_token_at_credit:
+                wire_admission = require_transition_recovery_admission(
+                    send_track,
+                    transition,
+                    tracker_time_basis_id=(
+                        host.visual_tracker.time_basis_id
+                    ),
+                    measured_pitch_rad=send_state["pitch_rad"],
+                    now_monotonic_ns=wire_validation_ns,
+                )
+                wire_admission_kind = "transition_anchor"
+            else:
+                if len(send_track.history) < 2:
+                    raise VisualRecoveryRefusal(
+                        "wire revalidation lacks a previous camera token"
+                    )
+                wire_admission = require_recovery_continuation(
+                    send_track,
+                    transition,
+                    previous_token=send_track.history[-2].token,
+                    tracker_time_basis_id=(
+                        host.visual_tracker.time_basis_id
+                    ),
+                    measured_pitch_rad=send_state["pitch_rad"],
+                    recovery_started_monotonic_ns=(
+                        recovery_started_monotonic_ns
+                    ),
+                    now_monotonic_ns=wire_validation_ns,
+                )
+                wire_admission_kind = "postcredit_continuation"
+        except VisualRecoveryRefusal as exc:
+            raise abort_type(
+                "post-promotion recovery wire revalidation refused: "
+                f"{exc}"
+            ) from exc
+        validation_to_wire_deadline_ns = (
+            wire_validation_ns
+            + round(
+                RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S
+                * 1_000_000_000
+            )
+        )
+        # Recheck both authorities after projection work so the final
+        # synchronous boundary immediately preceding transport is exact.
+        host._assert_visual_alignment_race_boundary()
+        receiver_token = host._assert_visual_receiver_token_current(
+            send_track.latest_token
+        )
+        final_watermark_ns = runtime.perf_counter_ns()
+        if (
+            final_watermark_ns < wire_validation_ns
+            or final_watermark_ns >= validation_to_wire_deadline_ns
+        ):
+            raise abort_type(
+                "post-promotion recovery final receiver watermark exhausted "
+                "the validation-to-wire lease"
+            )
+        summary["postpromotion_recovery"]["latest_wire_revalidation"] = {
+            "kind": wire_admission_kind,
+            "validated_monotonic_ns": wire_validation_ns,
+            "frame_token": asdict(send_track.latest_token),
+            "receiver_token": asdict(receiver_token),
+            "receiver_checked_monotonic_ns": final_watermark_ns,
+            "projection_horizon_s": (
+                wire_admission.projection_horizon_s
+            ),
+        }
+        dispatch_attempt_s = runtime.monotonic()
+        try:
+            wire_receipt = await host._send_flight_command(
+                command,
+                require_wire_receipt=True,
+                wire_start_not_before_ns=wire_not_before_ns,
+                wire_start_deadline_ns=min(
+                    last_wire_start_ns,
+                    command_lease_deadline_ns,
+                    validation_to_wire_deadline_ns,
+                ),
+                wire_visual_token=send_track.latest_token,
+            )
+            dispatch_attempt_s = None
+        except BaseException as exc:
+            dispatch_attempt_s = runtime.monotonic()
+            if isinstance(exc, runtime.cancelled_error_type):
+                raise
+            raise abort_type(
+                "post-promotion recovery dispatch failed closed"
+            ) from exc
+        if not isinstance(wire_receipt, dict):
+            raise abort_type(
+                "post-promotion recovery lacks visual wire authority"
+            )
+        wire_authority = wire_receipt.get(
+            "visual_receiver_authority"
+        )
+        if (
+            not isinstance(wire_authority, dict)
+            or wire_authority.get("schema")
+            != "aigp-vq2-visual-wire-authority/1"
+            or wire_authority.get("frame_token")
+            != asdict(send_track.latest_token)
+            or wire_authority.get(
+                "publication_pinned_through_transport_return"
+            )
+            is not True
+        ):
+            raise abort_type(
+                "post-promotion recovery visual wire authority is invalid"
+            )
+        summary["postpromotion_recovery"][
+            "latest_wire_revalidation"
+        ]["wire_authority"] = wire_authority
+        recovery_summary = summary["postpromotion_recovery"]
+        recovery_summary["command_count"] = int(
+            recovery_summary["command_count"]
+        ) + 1
+        summary["visual_navigation_command_count"] = int(
+            summary["visual_navigation_command_count"]
+        ) + 1
+        summary["min_command_yaw_rate_rad_s"] = (
+            command.yaw_rate
+            if summary["min_command_yaw_rate_rad_s"] is None
+            else min(
+                float(summary["min_command_yaw_rate_rad_s"]),
+                command.yaw_rate,
+            )
+        )
+        summary["max_command_yaw_rate_rad_s"] = (
+            command.yaw_rate
+            if summary["max_command_yaw_rate_rad_s"] is None
+            else max(
+                float(summary["max_command_yaw_rate_rad_s"]),
+                command.yaw_rate,
+            )
+        )
+        summary["min_command_thrust"] = (
+            command.thrust
+            if summary["min_command_thrust"] is None
+            else min(float(summary["min_command_thrust"]), command.thrust)
+        )
+        summary["max_command_thrust"] = (
+            command.thrust
+            if summary["max_command_thrust"] is None
+            else max(float(summary["max_command_thrust"]), command.thrust)
+        )
+        summary["max_abs_yaw_excursion_rad"] = max(
+            float(summary["max_abs_yaw_excursion_rad"]),
+            abs(send_excursion),
+        )
+        summary["max_abs_measured_yaw_rate_rad_s"] = max(
+            float(summary["max_abs_measured_yaw_rate_rad_s"]),
+            abs(float(send_state["yaw_rate_rad_s"])),
+        )
+        host._record_tick(
+            "visual-align/post-promotion-recovery",
+            send_now_s - recovery_started_s,
+            command,
+        )
+        return command
+
     try:
-        post_credit_deadline_s = runtime.post_gate_observation_deadline(
-            pass_confirmed_s=proof.pass_confirmed_monotonic_s,
-            flight_started_s=proof.flight_started_monotonic_s,
-            crossing_started_s=proof.crossing_started_monotonic_s,
-            requested_duration_s=limits.post_credit_frame_timeout_s,
+        anchor_track, anchor_target = host._require_visual_current_target(
+            expected_gate_index=1,
+            expected_track_id=promoted_track_id,
+            now_s=target_clock_s(),
         )
-        next_tick = max(
-            proof.next_control_deadline_s,
-            await host._wait_for_next_flight_command_slot(),
+        host._assert_visual_alignment_no_passage(
+            anchor_track,
+            phase="transition-anchor admission",
         )
-        while True:
+        if host.estimate is None:
+            raise abort_type(
+                "visual alignment lacks a transition-anchor attitude estimate"
+            )
+        anchor_roll, anchor_pitch, anchor_yaw = (
+            float(value)
+            for value in host.estimate.orientation.to_euler()
+        )
+        anchor_state = host._assert_visual_alignment_attitude(
+            entry_roll_rad=anchor_roll,
+            entry_pitch_rad=anchor_pitch,
+            phase="transition-anchor admission",
+        )
+        yaw_reference = float(gate0_blend["yaw_reference_rad"])
+        recovery_required = False
+        try:
+            require_visual_alignment_entry(
+                anchor_target,
+                measured_pitch_rad=anchor_pitch,
+            )
+        except VisualAlignmentRefusal as exc:
+            try:
+                recovery_admission = (
+                    require_transition_recovery_admission(
+                        anchor_track,
+                        transition,
+                        tracker_time_basis_id=(
+                            host.visual_tracker.time_basis_id
+                        ),
+                        measured_pitch_rad=anchor_pitch,
+                        now_monotonic_ns=runtime.perf_counter_ns(),
+                    )
+                )
+            except VisualRecoveryRefusal as recovery_exc:
+                raise abort_type(
+                    "visual alignment transition anchor is neither directly "
+                    f"admissible ({exc}) nor predictively recoverable "
+                    f"({recovery_exc})"
+                ) from recovery_exc
+            recovery_required = True
+            recovery_summary = summary["postpromotion_recovery"]
+            recovery_summary.update(
+                {
+                    "required": True,
+                    "outcome": "running",
+                    "anchor_admission": asdict(recovery_admission),
+                }
+            )
+            host.recorder.emit(
+                "visual_alignment_recovery_admitted",
+                ordinary_entry_refusal=str(exc),
+                admission=asdict(recovery_admission),
+            )
+
+        post_credit_ready = False
+        if recovery_required:
+            drain_receipts = getattr(
+                host.adapter,
+                "drain_outbound_receipts",
+                None,
+            )
+            if not callable(drain_receipts):
+                raise abort_type(
+                    "post-promotion recovery requires exact outbound receipts"
+                )
+            prior_receipts = [
+                host._outbound_receipt_primitive(value)
+                for value in drain_receipts()
+            ]
+            host.recorder.emit(
+                "visual_alignment_recovery_prior_receipts_drained",
+                count=len(prior_receipts),
+            )
+            recovery_started_s = (
+                await host._wait_for_next_flight_command_slot()
+            )
+            recovery_deadline_s = (
+                recovery_started_s + RECOVERY_HARD_DURATION_S
+            )
+            recovery_wire_anchor_ns = runtime.perf_counter_ns()
+            recovery_started_monotonic_ns = recovery_wire_anchor_ns
+            recovery_wire_anchor_s = runtime.monotonic()
+            recovery_last_wire_start_ns = (
+                recovery_wire_anchor_ns
+                + math.floor(
+                    max(
+                        0.0,
+                        recovery_deadline_s
+                        - recovery_wire_anchor_s
+                        - limits.control_period_s,
+                    )
+                    * 1_000_000_000
+                )
+            )
+            # The awaited control slot must not silently consume the short
+            # transition-anchor lease.
+            anchor_track, anchor_target = (
+                host._require_visual_current_target(
+                    expected_gate_index=1,
+                    expected_track_id=promoted_track_id,
+                    now_s=target_clock_s(),
+                )
+            )
+            host._assert_visual_alignment_no_passage(
+                anchor_track,
+                phase="transition-anchor send admission",
+            )
+            anchor_state = host._assert_visual_alignment_attitude(
+                entry_roll_rad=anchor_roll,
+                entry_pitch_rad=anchor_pitch,
+                phase="transition-anchor send admission",
+            )
+            if anchor_track.latest_token != transition.camera_token_at_credit:
+                raise abort_type(
+                    "post-promotion recovery credit anchor changed before send"
+                )
+            try:
+                recovery_admission = require_transition_recovery_admission(
+                    anchor_track,
+                    transition,
+                    tracker_time_basis_id=(
+                        host.visual_tracker.time_basis_id
+                    ),
+                    measured_pitch_rad=anchor_state["pitch_rad"],
+                    now_monotonic_ns=runtime.perf_counter_ns(),
+                )
+            except VisualRecoveryRefusal as exc:
+                raise abort_type(
+                    "post-promotion recovery anchor lease revalidation "
+                    f"refused: {exc}"
+                ) from exc
+            summary["postpromotion_recovery"]["anchor_admission"] = (
+                asdict(recovery_admission)
+            )
+            recovery_servo = ImageVisualServo(host.visual_config.servo)
+            _anchor_probe, anchor_excursion = (
+                runtime.visual_alignment_yaw_rate(
+                    requested_rate_rad_s=0.0,
+                    measured_yaw_rad=anchor_yaw,
+                    reference_yaw_rad=yaw_reference,
+                    measured_yaw_rate_rad_s=anchor_state["yaw_rate_rad_s"],
+                    horizontal_error_norm=anchor_target.normalized_x,
+                    horizontal_corridor_norm=(
+                        host.visual_config.servo.horizontal_corridor
+                    ),
+                )
+            )
+            try:
+                anchor_output = recovery_servo.step(
+                    anchor_target,
+                    now_monotonic_s=target_clock_s(),
+                    segment_elapsed_s=0.0,
+                    segment_yaw_excursion_rad=anchor_excursion,
+                    requested_next_blend=0.0,
+                    allow_advance=False,
+                )
+            except VisualServoRefusal as exc:
+                raise abort_type(
+                    f"post-promotion recovery anchor servo refused: {exc}"
+                ) from exc
+            host.recorder.emit(
+                "visual_alignment_recovery_anchor",
+                target=asdict(anchor_target),
+                servo=asdict(anchor_output),
+                admission=asdict(recovery_admission),
+            )
+            await send_recovery_command(
+                target=anchor_target,
+                output=anchor_output,
+                entry_roll=anchor_roll,
+                entry_pitch=anchor_pitch,
+                yaw_reference=yaw_reference,
+                recovery_started_s=recovery_started_s,
+                recovery_started_monotonic_ns=(
+                    recovery_started_monotonic_ns
+                ),
+                recovery_deadline_s=recovery_deadline_s,
+                last_wire_start_ns=recovery_last_wire_start_ns,
+                command_lease_deadline_ns=(
+                    int(race_credit_ns)
+                    + round(
+                        RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S
+                        * 1_000_000_000
+                    )
+                ),
+            )
+            recovery_last_token = anchor_track.latest_token
+            recovery_last_errors = (
+                abs(float(anchor_target.normalized_x)),
+                abs(float(anchor_target.normalized_y_down)),
+            )
+            recovery_horizontal_worsening_streak = 0
+            recovery_vertical_worsening_streak = 0
+            strict_entry_streak = 0
+            recovery_next_tick = runtime.next_control_deadline(
+                recovery_started_s,
+                runtime.monotonic(),
+            )
+            await runtime.sleep(
+                max(
+                    0.0,
+                    min(recovery_next_tick, recovery_deadline_s)
+                    - runtime.monotonic(),
+                )
+            )
+            while True:
+                recovery_now_s = runtime.monotonic()
+                if recovery_now_s >= recovery_deadline_s:
+                    raise abort_type(
+                        "post-promotion recovery hard window expired"
+                    )
+                host._sample()
+                host._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=False,
+                    enforce_benign_pad_budget=False,
+                    count_rate_sample=False,
+                )
+                host._assert_visual_alignment_race_boundary()
+                recovery_state = host._assert_visual_alignment_attitude(
+                    entry_roll_rad=anchor_roll,
+                    entry_pitch_rad=anchor_pitch,
+                    phase="post-promotion recovery",
+                )
+                recovery_track, recovery_target = (
+                    host._require_visual_current_target(
+                        expected_gate_index=1,
+                        expected_track_id=promoted_track_id,
+                        now_s=target_clock_s(),
+                    )
+                )
+                recovery_geometry = (
+                    host._assert_visual_alignment_no_passage(
+                        recovery_track,
+                        phase="post-promotion recovery",
+                    )
+                )
+                summary["max_peak_body_rate_rad_s"] = max(
+                    float(summary["max_peak_body_rate_rad_s"]),
+                    float(recovery_state["peak_body_rate_rad_s"]),
+                )
+                summary["latest_geometry"] = recovery_geometry
+                if recovery_track.latest_token == recovery_last_token:
+                    if (
+                        target_clock_s()
+                        - recovery_target.received_monotonic_s
+                        > 0.050
+                    ):
+                        raise abort_type(
+                            "post-promotion recovery lacks a fresh "
+                            "continuation frame"
+                        )
+                    recovery_next_tick = runtime.next_control_deadline(
+                        recovery_next_tick,
+                        runtime.monotonic(),
+                    )
+                    await runtime.sleep(
+                        max(
+                            0.0,
+                            min(
+                                recovery_next_tick,
+                                recovery_deadline_s,
+                            )
+                            - runtime.monotonic(),
+                        )
+                    )
+                    continue
+                recovery_summary = summary["postpromotion_recovery"]
+                recovery_summary["fresh_frame_count"] = int(
+                    recovery_summary["fresh_frame_count"]
+                ) + 1
+                if (
+                    int(recovery_summary["fresh_frame_count"])
+                    > RECOVERY_MAX_FRESH_FRAMES
+                ):
+                    raise abort_type(
+                        "post-promotion recovery exceeded its fresh-frame cap"
+                    )
+                strict_admission = None
+                try:
+                    continuation_admission = require_recovery_continuation(
+                        recovery_track,
+                        transition,
+                        previous_token=recovery_last_token,
+                        tracker_time_basis_id=(
+                            host.visual_tracker.time_basis_id
+                        ),
+                        measured_pitch_rad=recovery_state["pitch_rad"],
+                        recovery_started_monotonic_ns=(
+                            recovery_started_monotonic_ns
+                        ),
+                        now_monotonic_ns=runtime.perf_counter_ns(),
+                    )
+                except VisualRecoveryRefusal as exc:
+                    raise abort_type(
+                        "post-promotion recovery continuation refused: "
+                        f"{exc}"
+                    ) from exc
+                recovery_summary["latest_continuation"] = asdict(
+                    continuation_admission
+                )
+                try:
+                    strict_admission = require_visual_alignment_entry(
+                        recovery_target,
+                        measured_pitch_rad=recovery_state["pitch_rad"],
+                    )
+                except VisualAlignmentRefusal:
+                    strict_entry_streak = 0
+                else:
+                    strict_entry_streak += 1
+                recovery_summary["strict_entry_streak"] = strict_entry_streak
+
+                current_errors = (
+                    abs(float(recovery_target.normalized_x)),
+                    abs(float(recovery_target.normalized_y_down)),
+                )
+                recovery_horizontal_worsening_streak = (
+                    recovery_horizontal_worsening_streak + 1
+                    if current_errors[0] > recovery_last_errors[0]
+                    else 0
+                )
+                recovery_vertical_worsening_streak = (
+                    recovery_vertical_worsening_streak + 1
+                    if current_errors[1] > recovery_last_errors[1]
+                    else 0
+                )
+                if (
+                    recovery_horizontal_worsening_streak >= 2
+                    or recovery_vertical_worsening_streak >= 2
+                ):
+                    raise abort_type(
+                        "post-promotion recovery errors worsened "
+                        "uninterrupted"
+                    )
+                recovery_last_errors = current_errors
+                recovery_last_token = recovery_track.latest_token
+                host.recorder.emit(
+                    "visual_alignment_recovery_frame",
+                    elapsed_s=recovery_now_s - recovery_started_s,
+                    target=asdict(recovery_target),
+                    geometry=recovery_geometry,
+                    strict_entry=(
+                        None
+                        if strict_admission is None
+                        else asdict(strict_admission)
+                    ),
+                    continuation=(
+                        None
+                        if continuation_admission is None
+                        else asdict(continuation_admission)
+                    ),
+                    strict_entry_streak=strict_entry_streak,
+                    horizontal_worsening_streak=(
+                        recovery_horizontal_worsening_streak
+                    ),
+                    vertical_worsening_streak=(
+                        recovery_vertical_worsening_streak
+                    ),
+                )
+                if (
+                    strict_entry_streak
+                    >= RECOVERY_REQUIRED_STRICT_ENTRY_FRAMES
+                ):
+                    assert strict_admission is not None
+                    completion_now_s = runtime.monotonic()
+                    if completion_now_s >= recovery_deadline_s:
+                        raise abort_type(
+                            "post-promotion recovery hard window expired "
+                            "during completion"
+                        )
+                    recovery_summary.update(
+                        {
+                            "outcome": "recovered",
+                            "completed_frame_token": asdict(
+                                recovery_target.frame_token
+                            ),
+                            "completion_elapsed_s": (
+                                completion_now_s - recovery_started_s
+                            ),
+                        }
+                    )
+                    summary["entry_admission"] = asdict(
+                        strict_admission
+                    )
+                    host.recorder.emit(
+                        "visual_alignment_recovery_complete",
+                        **recovery_summary,
+                    )
+                    post_credit_ready = True
+                    break
+                if (
+                    int(recovery_summary["command_count"])
+                    >= RECOVERY_MAX_COMMANDS
+                ):
+                    raise abort_type(
+                        "post-promotion recovery exceeded its command cap"
+                    )
+                _recovery_probe, recovery_excursion = (
+                    runtime.visual_alignment_yaw_rate(
+                        requested_rate_rad_s=0.0,
+                        measured_yaw_rad=recovery_state["yaw_rad"],
+                        reference_yaw_rad=yaw_reference,
+                        measured_yaw_rate_rad_s=(
+                            recovery_state["yaw_rate_rad_s"]
+                        ),
+                        horizontal_error_norm=(
+                            recovery_target.normalized_x
+                        ),
+                        horizontal_corridor_norm=(
+                            host.visual_config.servo.horizontal_corridor
+                        ),
+                    )
+                )
+                try:
+                    recovery_output = recovery_servo.step(
+                        recovery_target,
+                        now_monotonic_s=target_clock_s(),
+                        segment_elapsed_s=(
+                            recovery_now_s - recovery_started_s
+                        ),
+                        segment_yaw_excursion_rad=recovery_excursion,
+                        requested_next_blend=0.0,
+                        allow_advance=False,
+                    )
+                except VisualServoRefusal as exc:
+                    raise abort_type(
+                        "post-promotion recovery servo refused: "
+                        f"{exc}"
+                    ) from exc
+                await send_recovery_command(
+                    target=recovery_target,
+                    output=recovery_output,
+                    entry_roll=anchor_roll,
+                    entry_pitch=anchor_pitch,
+                    yaw_reference=yaw_reference,
+                    recovery_started_s=recovery_started_s,
+                    recovery_started_monotonic_ns=(
+                        recovery_started_monotonic_ns
+                    ),
+                    recovery_deadline_s=recovery_deadline_s,
+                    last_wire_start_ns=recovery_last_wire_start_ns,
+                    command_lease_deadline_ns=(
+                        recovery_track.history[-1].observation_monotonic_ns
+                        + round(
+                            RECOVERY_MAX_CONTINUATION_AGE_S
+                            * 1_000_000_000
+                        )
+                    ),
+                )
+                recovery_next_tick = runtime.next_control_deadline(
+                    recovery_next_tick,
+                    runtime.monotonic(),
+                )
+                await runtime.sleep(
+                    max(
+                        0.0,
+                        min(recovery_next_tick, recovery_deadline_s)
+                        - runtime.monotonic(),
+                    )
+                )
+
+        if not post_credit_ready:
+            post_credit_deadline_s = runtime.post_gate_observation_deadline(
+                pass_confirmed_s=proof.pass_confirmed_monotonic_s,
+                flight_started_s=proof.flight_started_monotonic_s,
+                crossing_started_s=proof.crossing_started_monotonic_s,
+                requested_duration_s=limits.post_credit_frame_timeout_s,
+            )
+            next_tick = max(
+                proof.next_control_deadline_s,
+                await host._wait_for_next_flight_command_slot(),
+            )
+        while not post_credit_ready:
             now_s = runtime.monotonic()
             if now_s >= post_credit_deadline_s:
                 raise abort_type(
@@ -372,7 +1252,11 @@ async def run_visual_alignment_stage(
             )
             host._assert_visual_alignment_race_boundary()
             current = host.visual_tracker.track(promoted_track_id)
-            current_publish_ns = current.history[-1].publication_monotonic_ns
+            current_sample = current.history[-1]
+            current_observation_ns = (
+                current_sample.observation_monotonic_ns
+            )
+            current_publish_ns = current_sample.publication_monotonic_ns
             new_publication = bool(
                 previous_update is None
                 or host.visual_tracker.latest_update is None
@@ -392,7 +1276,9 @@ async def run_visual_alignment_stage(
                     "ambiguous on its first post-credit publication"
                 )
             if (
-                current_publish_ns is not None
+                type(current_observation_ns) is int
+                and int(current_observation_ns) > int(race_credit_ns)
+                and current_publish_ns is not None
                 and int(current_publish_ns) > int(race_credit_ns)
             ):
                 # Exact post-credit visual provenance is now available.  Do
@@ -481,8 +1367,9 @@ async def run_visual_alignment_stage(
             float(summary["max_abs_yaw_excursion_rad"]),
             abs(entry_yaw_excursion),
         )
-        summary["max_peak_body_rate_rad_s"] = float(
-            entry_state["peak_body_rate_rad_s"]
+        summary["max_peak_body_rate_rad_s"] = max(
+            float(summary["max_peak_body_rate_rad_s"]),
+            float(entry_state["peak_body_rate_rad_s"]),
         )
         if entry_pitch + limits.max_entry_attitude_delta_rad < 0.0:
             raise abort_type(
@@ -599,6 +1486,19 @@ async def run_visual_alignment_stage(
                     terminal_track,
                     phase="terminal acceptance",
                 )
+            )
+            try:
+                terminal_entry_admission = require_visual_alignment_entry(
+                    terminal_target,
+                    measured_pitch_rad=terminal_state["pitch_rad"],
+                )
+            except VisualAlignmentRefusal as exc:
+                raise abort_type(
+                    "visual alignment terminal entry recheck refused: "
+                    f"{exc}"
+                ) from exc
+            summary["terminal_entry_admission"] = asdict(
+                terminal_entry_admission
             )
             if terminal_target.frame_token != latest_token:
                 try:
@@ -1004,6 +1904,14 @@ async def run_visual_alignment_stage(
         if "collision reported" in terminal_reason:
             summary["collision_outcome"] = "collision"
         summary["abort_outcome"] = terminal_reason
+        recovery_summary = summary.get("postpromotion_recovery")
+        if (
+            isinstance(recovery_summary, dict)
+            and recovery_summary.get("required") is True
+            and recovery_summary.get("outcome") == "running"
+        ):
+            recovery_summary["outcome"] = "abort"
+            recovery_summary["reason"] = terminal_reason
         refresh_summary(
             outcome=(
                 "abort"

@@ -55,6 +55,7 @@ from competition.vq2_capture import (
 )
 from competition.vq2_contracts import FrameIdentityV1, FrameTimingV1
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
+from competition.vq2_vision import VQ2VisionThread
 from estimation.imu_attitude import (
     AttitudeEstimate,
     ImuAttitudeConfig,
@@ -171,6 +172,7 @@ def _vision_snapshot(
             (received_monotonic_s if now is None else now)
             - received_monotonic_s,
         ),
+        is_fresh=lambda _max_age, _now=None: True,
     )
 
 
@@ -1933,6 +1935,111 @@ class _FakeAdapter:
         collisions = self.collisions
         self.collisions = []
         return collisions
+
+
+def test_visual_wire_authority_pins_receiver_until_transport_returns():
+    vision = VQ2VisionThread()
+    old_snapshot = _vision_snapshot(
+        frame_id=172,
+        sim_time_ns=172_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    new_snapshot = _vision_snapshot(
+        frame_id=173,
+        sim_time_ns=173_000,
+        received_monotonic_s=vq2_module.time.monotonic(),
+        generation=7,
+    )
+    with vision._data_lock:
+        vision._latest_snapshot = old_snapshot
+
+    publication_attempted = threading.Event()
+    publication_completed = threading.Event()
+
+    def publish_new_snapshot():
+        publication_attempted.set()
+        with vision._data_lock:
+            vision._latest_snapshot = new_snapshot
+        publication_completed.set()
+
+    publisher = threading.Thread(target=publish_new_snapshot)
+
+    class InterleavingAdapter(_FakeAdapter):
+        async def send_attitude_rate(
+            self,
+            command,
+            *,
+            call_start_not_before_monotonic_ns=None,
+            call_start_deadline_monotonic_ns=None,
+        ):
+            call_start = vq2_module.time.perf_counter_ns()
+            assert (
+                call_start_not_before_monotonic_ns is None
+                or call_start >= call_start_not_before_monotonic_ns
+            )
+            assert (
+                call_start_deadline_monotonic_ns is not None
+                and call_start < call_start_deadline_monotonic_ns
+            )
+            publisher.start()
+            assert publication_attempted.wait(1.0)
+            publisher.join(0.02)
+            assert publisher.is_alive()
+            assert vision._latest_snapshot is old_snapshot
+            call_end = vq2_module.time.perf_counter_ns()
+            self.commands.append(command)
+            self.outbound_receipts.append(
+                {
+                    "schema": "aigp-vq2-attitude-target-outbound/1",
+                    "host_clock_id": "host-perf-counter",
+                    "call_start_monotonic_ns": call_start,
+                    "call_end_monotonic_ns": call_end,
+                    "api": "send_attitude_rate",
+                    "outcome": "returned",
+                }
+            )
+
+    adapter = InterleavingAdapter()
+    runner = VQ2Runner(adapter, vision)
+    # The receiver and tracker establish this clock identity during their
+    # normal first exact-frame update; isolate only the wire lease here.
+    runner.visual_tracker._time_basis_id = "host-perf-counter"
+    expected = vq2_module.VisualCameraFrameToken.from_vision_snapshot(
+        old_snapshot
+    )
+    deadline_ns = vq2_module.time.perf_counter_ns() + 1_000_000_000
+
+    receipt = asyncio.run(
+        runner._send_flight_command(
+            AttitudeRateCommand(0.0, 0.0, -0.05, 0.275),
+            require_wire_receipt=True,
+            wire_start_deadline_ns=deadline_ns,
+            wire_visual_token=expected,
+        )
+    )
+    publisher.join(1.0)
+
+    assert not publisher.is_alive()
+    assert publication_completed.is_set()
+    assert vision._latest_snapshot is new_snapshot
+    assert receipt is not None
+    authority = receipt["visual_receiver_authority"]
+    assert authority["frame_token"] == {
+        "generation": 7,
+        "frame_id": 172,
+        "publication_sequence": 172,
+        "stream_id": "vq2-camera-udp-5600",
+    }
+    assert authority[
+        "publication_pinned_through_transport_return"
+    ] is True
+    assert (
+        authority["publication_lock_acquired_monotonic_ns"]
+        <= authority["call_start_monotonic_ns"]
+        <= authority["call_end_monotonic_ns"]
+        <= authority["transport_return_monotonic_ns"]
+    )
 
 
 def _configure_gate1_recenter_candidate(monkeypatch, *, entry_center_x=530):
@@ -6955,7 +7062,43 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
     }
     assert phases["post_credit_fresh_frame_wait"] == {
         "exact_zero_rate_zero_thrust": True,
+        "conditional_when_recovery_not_required": True,
         "max_wait_s": 0.12,
+    }
+    assert phases["postpromotion_no_advance_recovery"] == {
+        "conditional": True,
+        "exact_transition_anchor_required": True,
+        "receipt_backed_dispatch": True,
+        "fresh_postcredit_observation_required_before_repeat": True,
+        "wire_target_must_match_latest_receiver_publication": True,
+        "receiver_publication_lock_held_through_transport_return": True,
+        "wire_time_projection_revalidation": True,
+        "max_validation_to_wire_delay_s": 0.005,
+        "command_response_horizon_s": 0.045,
+        "min_projection_horizon_s": 0.080,
+        "max_projection_horizon_s": 0.140,
+        "max_actual_abs_center_norm": {
+            "horizontal": 0.60,
+            "vertical": 0.68,
+        },
+        "max_projected_abs_vertical_center_norm": 0.715,
+        "min_projected_bbox_edge_margin_norm": {
+            "horizontal": 6.0 / 640.0,
+            "vertical": 6.0 / 360.0,
+        },
+        "forward_advance_allowed": False,
+        "next_gate_blend": 0.0,
+        "target_roll_rad": 0.0,
+        "minimum_target_pitch_rad": 0.0,
+        "max_roll_pitch_command_rate_rad_s": 0.12,
+        "yaw_rate_rad_s": 0.08,
+        "max_thrust": 0.285,
+        "max_start_delay_after_credit_s": 0.06,
+        "hard_duration_s": 0.16,
+        "max_fresh_frames": 5,
+        "max_commands": 8,
+        "required_consecutive_strict_entry_frames": 2,
+        "ordinary_entry_required_after_recovery": True,
     }
     assert phases["restricted_post_promotion_alignment"] == {
         "max_roll_pitch_command_rate_rad_s": 0.12,

@@ -7,14 +7,25 @@ import pytest
 
 from planning.vq2_visual_alignment import (
     MAX_ALIGNMENT_DIVERGENCE_NORM,
+    POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S,
+    POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S,
+    POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM,
+    POST_PROMOTION_CAPTURE_MAX_ABS_Y_NORM,
+    POST_PROMOTION_CAPTURE_MAX_APPARENT_SCALE,
+    POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_X_NORM,
+    POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_Y_NORM,
+    POST_PROMOTION_CAPTURE_MAX_PROJECTED_APPARENT_SCALE,
+    POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S,
     POST_PROMOTION_ENTRY_MAX_ABS_X_NORM,
     POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM,
     POST_PROMOTION_ENTRY_MAX_LOG_SCALE_RATE_S,
     POST_PROMOTION_ENTRY_MAX_OUTWARD_RATE_NORM_S,
     POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD,
     RestrictedAlignmentMonitor,
+    VisualAlignmentCaptureAdmission,
     VisualAlignmentEntryAdmission,
     VisualAlignmentRefusal,
+    require_visual_alignment_capture_entry,
     require_visual_alignment_entry,
 )
 from planning.vq2_visual_servo import ServoFrameToken, VisualTarget
@@ -33,7 +44,10 @@ def _target(
     clipped: bool | None = None,
     center_censored: bool | None = None,
     ambiguous: bool = False,
+    log_scale: float = -1.5,
     scale_rate: float = 0.5,
+    confidence: float = 0.8,
+    association_confidence: float = 0.8,
 ) -> VisualTarget:
     if clipped is None:
         clipped = horizontal_censored or vertical_censored
@@ -52,16 +66,266 @@ def _target(
         normalized_y_down=y,
         normalized_x_rate_s=x_rate,
         normalized_y_rate_down_s=y_rate,
-        log_scale=-1.5,
+        log_scale=log_scale,
         log_scale_rate_s=scale_rate,
-        confidence=0.8,
-        association_confidence=0.8,
+        confidence=confidence,
+        association_confidence=association_confidence,
         consecutive_frames=5,
         clipped=clipped,
         center_censored=center_censored,
         horizontal_censored=horizontal_censored,
         vertical_censored=vertical_censored,
         ambiguous=ambiguous,
+    )
+
+
+def test_predictive_capture_admits_bounded_no_advance_geometry():
+    target = _target(
+        1,
+        x=0.58,
+        y=-0.65,
+        x_rate=0.30,
+        y_rate=-0.30,
+        log_scale=math.log(0.18),
+        scale_rate=0.80,
+    )
+
+    admission = require_visual_alignment_capture_entry(
+        target,
+        measured_pitch_rad=-0.04,
+    )
+
+    assert type(admission) is VisualAlignmentCaptureAdmission
+    assert admission.track_id == target.track_id
+    assert admission.frame_token == target.frame_token
+    assert admission.horizontal_error == pytest.approx(0.58)
+    assert admission.vertical_error_image_down == pytest.approx(-0.65)
+    assert admission.apparent_scale == pytest.approx(0.18)
+    assert admission.projected_horizontal_error == pytest.approx(
+        0.58
+        + 0.30 * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+    )
+    assert admission.projected_vertical_error_image_down == pytest.approx(
+        -0.65
+        - 0.30 * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+    )
+    assert admission.projected_apparent_scale == pytest.approx(
+        0.18
+        * math.exp(
+            0.80 * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+        )
+    )
+    with pytest.raises(FrozenInstanceError):
+        admission.horizontal_error = 0.0
+
+
+@pytest.mark.parametrize(
+    ("target", "pitch", "reason"),
+    (
+        (
+            _target(
+                1,
+                ambiguous=True,
+                log_scale=math.log(0.18),
+            ),
+            0.0,
+            "ambiguous",
+        ),
+        (
+            _target(
+                1,
+                clipped=True,
+                log_scale=math.log(0.18),
+            ),
+            0.0,
+            "clipped or censored",
+        ),
+        (
+            _target(
+                1,
+                x=math.nextafter(
+                    POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM,
+                    math.inf,
+                ),
+                log_scale=math.log(0.18),
+            ),
+            0.0,
+            "horizontal error",
+        ),
+        (
+            _target(
+                1,
+                y=math.nextafter(
+                    -POST_PROMOTION_CAPTURE_MAX_ABS_Y_NORM,
+                    -math.inf,
+                ),
+                log_scale=math.log(0.18),
+            ),
+            0.0,
+            "vertical error",
+        ),
+        (
+            _target(
+                1,
+                x_rate=math.nextafter(
+                    POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S,
+                    math.inf,
+                ),
+                log_scale=math.log(0.18),
+            ),
+            0.0,
+            "center motion",
+        ),
+        (
+            _target(
+                1,
+                y_rate=math.nextafter(
+                    -POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S,
+                    -math.inf,
+                ),
+                log_scale=math.log(0.18),
+            ),
+            0.0,
+            "center motion",
+        ),
+        (
+            _target(
+                1,
+                log_scale=math.log(0.18),
+                scale_rate=math.nextafter(
+                    POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S,
+                    math.inf,
+                ),
+            ),
+            0.0,
+            "scale motion",
+        ),
+        (
+                _target(
+                    1,
+                    log_scale=math.log(
+                        POST_PROMOTION_CAPTURE_MAX_APPARENT_SCALE
+                        + 0.000001
+                    ),
+                    scale_rate=0.0,
+                ),
+            0.0,
+            "apparent scale",
+        ),
+        (
+            _target(
+                1,
+                x=0.64,
+                x_rate=0.31,
+                log_scale=math.log(0.18),
+                scale_rate=0.0,
+            ),
+            0.0,
+            "horizontal error",
+        ),
+        (
+            _target(
+                1,
+                x=0.61,
+                y=-0.68,
+                y_rate=-0.31,
+                log_scale=math.log(0.18),
+                scale_rate=0.0,
+            ),
+            0.0,
+            "vertical projection",
+        ),
+        (
+            _target(
+                1,
+                x=0.61,
+                log_scale=math.log(0.20),
+                scale_rate=1.0,
+            ),
+            0.0,
+            "scale projection",
+        ),
+        (
+            _target(
+                1,
+                log_scale=math.log(0.18),
+            ),
+            math.nextafter(
+                POST_PROMOTION_ENTRY_MIN_MEASURED_PITCH_RAD,
+                -math.inf,
+            ),
+            "measured pitch",
+        ),
+    ),
+)
+def test_predictive_capture_rejects_each_authority_bound(
+    target,
+    pitch,
+    reason,
+):
+    with pytest.raises(VisualAlignmentRefusal, match=reason):
+        require_visual_alignment_capture_entry(
+            target,
+            measured_pitch_rad=pitch,
+        )
+
+
+@pytest.mark.parametrize("pitch", (True, "0.0", math.nan, math.inf, -math.inf))
+def test_predictive_capture_requires_exact_finite_inputs(pitch):
+    with pytest.raises(VisualAlignmentRefusal, match="pitch must be finite"):
+        require_visual_alignment_capture_entry(
+            _target(1, log_scale=math.log(0.18)),
+            measured_pitch_rad=pitch,
+        )
+    with pytest.raises(VisualAlignmentRefusal, match="exact VisualTarget"):
+        require_visual_alignment_capture_entry(
+            object(),
+            measured_pitch_rad=0.0,
+        )
+
+
+def test_predictive_capture_projection_constants_are_actually_enforced():
+    admitted = require_visual_alignment_capture_entry(
+        _target(
+            1,
+            x=POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM,
+            y=-(
+                POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_Y_NORM
+                - (
+                    POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S
+                    * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+                )
+            ),
+            x_rate=POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S,
+            y_rate=-POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S,
+            log_scale=math.log(
+                POST_PROMOTION_CAPTURE_MAX_PROJECTED_APPARENT_SCALE
+            )
+            - (
+                POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S
+                * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+            ),
+            scale_rate=POST_PROMOTION_CAPTURE_MAX_ABS_LOG_SCALE_RATE_S,
+        ),
+        measured_pitch_rad=0.0,
+    )
+
+    assert abs(admitted.projected_horizontal_error) == pytest.approx(
+        POST_PROMOTION_CAPTURE_MAX_ABS_X_NORM
+        + (
+            POST_PROMOTION_CAPTURE_MAX_ABS_CENTER_RATE_NORM_S
+            * POST_PROMOTION_CAPTURE_PROJECTION_HORIZON_S
+        )
+    )
+    assert (
+        abs(admitted.projected_horizontal_error)
+        < POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_X_NORM
+    )
+    assert abs(admitted.projected_vertical_error_image_down) == pytest.approx(
+        POST_PROMOTION_CAPTURE_MAX_PROJECTED_ABS_Y_NORM
+    )
+    assert admitted.projected_apparent_scale == pytest.approx(
+        POST_PROMOTION_CAPTURE_MAX_PROJECTED_APPARENT_SCALE
     )
 
 

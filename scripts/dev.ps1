@@ -129,6 +129,7 @@ interactive confirmation.
                 'planning/tests/test_vq2_guidance.py',
                 'planning/tests/test_vq2_recorded_gate_promotion.py',
                 'planning/tests/test_vq2_visual_alignment.py',
+                'planning/tests/test_vq2_visual_recovery.py',
                 'planning/tests/test_vq2_visual_servo.py',
                 'tests/test_aigp_live_lease.py',
                 'tests/test_aigp_vq2_build_reference.py',
