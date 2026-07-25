@@ -107,7 +107,12 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_ABS_Y_NORM,
     RECOVERY_MAX_COMMAND_RATE_RAD_S,
     RECOVERY_MAX_COMMANDS,
+    RECOVERY_MAX_FILTERED_CENTER_RATE_NORM_S,
+    RECOVERY_MAX_FILTERED_LOG_SCALE_RATE_S,
     RECOVERY_MAX_FRESH_FRAMES,
+    RECOVERY_MAX_RAW_CENTER_RATE_NORM_S,
+    RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S,
+    RECOVERY_MAX_RAW_LOG_SCALE_RATE_S,
     RECOVERY_MAX_REACQUISITION_ABS_LOG_AREA_RESIDUAL,
     RECOVERY_MAX_REACQUISITION_ABS_LOG_HEIGHT_CHANGE,
     RECOVERY_MAX_REACQUISITION_ABS_LOG_WIDTH_CHANGE,
@@ -118,6 +123,7 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S,
     RECOVERY_MAX_REACQUISITION_MISSED_FRAMES,
     RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA,
+    RECOVERY_MAX_REACQUISITION_UNOBSERVED_PUBLICATIONS,
     RECOVERY_MAX_PROJECTED_ABS_Y_NORM,
     RECOVERY_MAX_PROJECTION_HORIZON_S,
     RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S,
@@ -6258,11 +6264,29 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                     "min_stable_tail_association_confidence": (
                         RECOVERY_MIN_ASSOCIATION_CONFIDENCE
                     ),
+                    "transition_tokens_equal_complete_visibility_epoch": True,
+                    "post_bridge_epoch_clean_associations_required": True,
+                    "non_bridge_publication_skips_allowed": False,
+                    "max_filtered_center_rate_norm_s": (
+                        RECOVERY_MAX_FILTERED_CENTER_RATE_NORM_S
+                    ),
+                    "max_filtered_log_scale_rate_s": (
+                        RECOVERY_MAX_FILTERED_LOG_SCALE_RATE_S
+                    ),
+                    "max_raw_center_rate_norm_s": (
+                        RECOVERY_MAX_RAW_CENTER_RATE_NORM_S
+                    ),
+                    "max_raw_log_scale_rate_s": (
+                        RECOVERY_MAX_RAW_LOG_SCALE_RATE_S
+                    ),
+                    "max_raw_log_dimension_rate_s": (
+                        RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S
+                    ),
                     "reacquisition_bridge": {
                         "exact_association_evidence_required": True,
                         "pre_association_ambiguity_allowed": False,
                         "current_association_ambiguity_allowed": False,
-                        "pretransition_visibility_sample_count": (
+                        "min_pretransition_visibility_sample_count": (
                             RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
                         ),
                         "pre_gap_history_sample_count": (
@@ -6282,6 +6306,9 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                         ),
                         "max_publication_delta": (
                             RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
+                        ),
+                        "max_unobserved_publications": (
+                            RECOVERY_MAX_REACQUISITION_UNOBSERVED_PUBLICATIONS
                         ),
                         "max_gap_s": RECOVERY_MAX_REACQUISITION_GAP_S,
                         "min_association_confidence": (

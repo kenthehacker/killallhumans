@@ -33,7 +33,9 @@ from planning.vq2_visual_recovery import (
     RECOVERY_MAX_CONTINUATION_AGE_S,
     RECOVERY_MAX_PROJECTED_ABS_Y_NORM,
     RECOVERY_MAX_RAW_CENTER_RATE_NORM_S,
+    RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S,
     RECOVERY_MAX_REACQUISITION_CENTER_RATE_NORM_S,
+    RECOVERY_MAX_REACQUISITION_GAP_S,
     RECOVERY_MAX_REACQUISITION_LOG_SCALE_RATE_S,
     RECOVERY_MAX_REACQUISITION_MISSED_FRAMES,
     RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
@@ -50,6 +52,7 @@ from planning.vq2_visual_recovery import (
 )
 from planning.vq2_visual_servo import VisualTarget
 from planning.vq2_visual_alignment import (
+    POST_PROMOTION_ENTRY_MAX_ABS_X_NORM,
     POST_PROMOTION_ENTRY_MAX_ABS_Y_NORM,
 )
 
@@ -248,6 +251,178 @@ _STABLE_TAIL_ROWS = (
 _STABLE_TAIL_RACE_RECEIVED_NS = 70_991_899_845_000
 
 
+# Exact recorded scalars from the six-publication reacquisition epoch in
+# 20260725T013545Z-visual-align-e1439c6e/session.jsonl.gz
+# (trace sha256 da5882c0162938d0a9081c76ac316b5639f73bd3246f14b3636ccb95de07052f).
+# Publication 152 is the excerpt boundary; its association to 151 is omitted.
+_SIX_EPOCH_PRE_GAP_ROWS = (
+    (
+        2_276_896,
+        152,
+        76_198_445_439_600,
+        76_198_446_361_300,
+        (0.3968750000000001, -0.5111111111111111),
+        (
+            0.6578125,
+            0.16666666666666666,
+            0.740625,
+            0.325,
+        ),
+        0.11450755069717744,
+        0.6726830769230769,
+        0.9343610519413472,
+        1_784_943_352_769_850_500,
+    ),
+    (
+        2_276_897,
+        153,
+        76_198_480_662_400,
+        76_198_481_500_700,
+        (0.40312499999999996, -0.5111111111111111),
+        (0.659375, 0.1638888888888889, 0.74375, 0.325),
+        0.11659223816361017,
+        0.6764584905660377,
+        0.936356123439321,
+        1_784_943_352_804_590_400,
+    ),
+    (
+        2_276_898,
+        154,
+        76_198_514_327_900,
+        76_198_515_505_500,
+        (0.40625, -0.5166666666666666),
+        (
+            0.6609375,
+            0.16111111111111112,
+            0.746875,
+            0.32222222222222224,
+        ),
+        0.11766684372035782,
+        0.6847533333333333,
+        0.944615557833968,
+        1_784_943_352_839_307_200,
+    ),
+    (
+        2_276_899,
+        155,
+        76_198_541_992_200,
+        76_198_543_067_700,
+        (0.4125000000000001, -0.5222222222222221),
+        (
+            0.6625,
+            0.15555555555555556,
+            0.75,
+            0.32222222222222224,
+        ),
+        0.12076147288491201,
+        0.6824818181818182,
+        0.9369815497402262,
+        1_784_943_352_867_098_000,
+    ),
+)
+
+_SIX_EPOCH_ROWS = (
+    (
+        2_276_911,
+        167,
+        76_198_946_068_500,
+        76_198_946_888_800,
+        (0.4906250000000001, -0.6055555555555556),
+        (
+            0.6859375,
+            0.09722222222222222,
+            0.80625,
+            0.3,
+        ),
+        0.15619443456438803,
+        0.7447333333333332,
+        0.7177611644314987,
+        1_784_943_353_269_865_500,
+    ),
+    (
+        2_276_912,
+        168,
+        76_198_979_573_000,
+        76_198_980_260_000,
+        (0.5, -0.6111111111111112),
+        (
+            0.6890625,
+            0.09166666666666666,
+            0.8125,
+            0.2972222222222222,
+        ),
+        0.1592898737801273,
+        0.7471720547945205,
+        0.9397230908814789,
+        1_784_943_353_304_582_600,
+    ),
+    (
+        2_276_913,
+        169,
+        76_199_014_758_400,
+        76_199_015_720_500,
+        (0.5093749999999999, -0.6222222222222222),
+        (
+            0.6921875,
+            0.08333333333333333,
+            0.81875,
+            0.2972222222222222,
+        ),
+        0.16453058226360232,
+        0.7606905263157895,
+        0.930226705465556,
+        1_784_943_353_339_318_300,
+    ),
+    (
+        2_276_914,
+        170,
+        76_199_043_532_900,
+        76_199_044_715_500,
+        (0.51875, -0.6277777777777778),
+        (
+            0.69375,
+            0.07777777777777778,
+            0.825,
+            0.29444444444444445,
+        ),
+        0.1686342195404005,
+        0.7600233766233766,
+        0.9394573212354178,
+        1_784_943_353_367_088_900,
+    ),
+    (
+        2_276_915,
+        171,
+        76_199_077_024_300,
+        76_199_078_014_900,
+        (0.528125, -0.6388888888888888),
+        (
+            0.696875,
+            0.06944444444444445,
+            0.8328125,
+            0.2916666666666667,
+        ),
+        0.17380544678845172,
+        0.7660777215189873,
+        0.9353120615583702,
+        1_784_943_353_401_824_300,
+    ),
+    (
+        2_276_916,
+        172,
+        76_199_111_299_700,
+        76_199_112_132_000,
+        (0.5375000000000001, -0.65),
+        (0.7, 0.06111111111111111, 0.8390625, 0.28888888888888886),
+        0.17797569278477957,
+        0.7749340740740741,
+        0.9403938961628551,
+        1_784_943_353_436_536_600,
+    ),
+)
+_SIX_EPOCH_RACE_RECEIVED_NS = 76_199_121_890_000
+
+
 def _accepted_sample(
     previous: VisualTrackSample,
     sample: VisualTrackSample,
@@ -422,7 +597,7 @@ def _fixture() -> tuple[
         promoted_first_token=track.first_token,
         promoted_latest_token_before_credit=track.latest_token,
         pretransition_frame_tokens=tuple(
-            sample.token for sample in transition_samples
+            sample.token for sample in samples
         ),
         history_length_before_promotion=len(samples),
         history_length_after_promotion=len(samples),
@@ -634,6 +809,274 @@ def _stable_tail_fixture() -> tuple[
         promoted_history_sha256=visual_track_history_sha256(samples),
     )
     return track, transition
+
+
+def _six_frame_epoch_fixture() -> tuple[
+    VisualTrack,
+    ConfirmedGateTransition,
+]:
+    prefix_samples = tuple(
+        VisualTrackSample(
+            tracker_frame_sequence=150 + index,
+            token=CameraFrameToken(
+                generation=1,
+                frame_id=row[0],
+                publication_sequence=row[1],
+                stream_id="vq2-camera-udp-5600",
+            ),
+            observation_monotonic_ns=row[2],
+            publication_monotonic_ns=row[3],
+            provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+            camera_source_time_ns=row[9],
+            source_index=1,
+            center_norm=row[4],
+            bbox_norm=row[5],
+            apparent_scale=row[6],
+            confidence=row[7],
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            association_confidence=row[8],
+        )
+        for index, row in enumerate(_SIX_EPOCH_PRE_GAP_ROWS)
+    )
+    bound_prefix = [prefix_samples[0]]
+    exact_prefix_associations = (
+        (
+            0.052187978779756825,
+            0.00795877570372995,
+            0.9519854981376425,
+            -0.0008049934776899192,
+        ),
+        (
+            0.045415242576146195,
+            0.002972858922451899,
+            0.9682849759606584,
+            -0.016485597546768815,
+        ),
+        (
+            0.05167512921301456,
+            0.003482668878445401,
+            0.9494047619047616,
+            0.03074573304372752,
+        ),
+    )
+    for sample, evidence in zip(
+        prefix_samples[1:],
+        exact_prefix_associations,
+        strict=True,
+    ):
+        bound_prefix.append(
+            _accepted_sample(
+                bound_prefix[-1],
+                sample,
+                cost=evidence[0],
+                residual=evidence[1],
+                bbox_iou=evidence[2],
+                log_area_residual=evidence[3],
+            )
+        )
+
+    epoch_samples = tuple(
+        VisualTrackSample(
+            tracker_frame_sequence=164 + index,
+            token=CameraFrameToken(
+                generation=1,
+                frame_id=row[0],
+                publication_sequence=row[1],
+                stream_id="vq2-camera-udp-5600",
+            ),
+            observation_monotonic_ns=row[2],
+            publication_monotonic_ns=row[3],
+            provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+            camera_source_time_ns=row[9],
+            source_index=1 if index == 0 else 0,
+            center_norm=row[4],
+            bbox_norm=row[5],
+            apparent_scale=row[6],
+            confidence=row[7],
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            association_confidence=row[8],
+        )
+        for index, row in enumerate(_SIX_EPOCH_ROWS)
+    )
+    bound_epoch = [
+        _accepted_sample(
+            bound_prefix[-1],
+            epoch_samples[0],
+            missed_frames=10,
+            cost=0.23143584516617108,
+            residual=0.015530124412322066,
+            bbox_iou=0.5977584059775841,
+            log_area_residual=-0.04170914425679895,
+        )
+    ]
+    exact_epoch_associations = (
+        (
+            0.0494270654771873,
+            0.003240237653215293,
+            0.9614459664977612,
+            -0.004974292674191805,
+        ),
+        (
+            0.057214101518244125,
+            0.004990318344826129,
+            0.9373096039762703,
+            0.02117376376835356,
+        ),
+        (
+            0.04964499658695737,
+            0.0027071155715102323,
+            0.9519230769230772,
+            0.004117688592047308,
+        ),
+        (
+            0.05304410952213641,
+            0.003764036772643817,
+            0.941379310344828,
+            0.005217962331851123,
+        ),
+        (
+            0.04887700514645889,
+            0.0015217735110336194,
+            0.9536859413537945,
+            -0.011999331758205223,
+        ),
+    )
+    for sample, evidence in zip(
+        epoch_samples[1:],
+        exact_epoch_associations,
+        strict=True,
+    ):
+        bound_epoch.append(
+            _accepted_sample(
+                bound_epoch[-1],
+                sample,
+                cost=evidence[0],
+                residual=evidence[1],
+                bbox_iou=evidence[2],
+                log_area_residual=evidence[3],
+            )
+        )
+
+    samples = tuple(bound_prefix + bound_epoch)
+    race = AuthoritativeRaceStatusRef.live(
+        session_id=(
+            "4b336a6a696a82066b7d7154337bed19dc7a3e451c605ae4bdd343fffc6bf151"
+        ),
+        reset_epoch=1,
+        race_generation=2,
+        race_status_sequence=1478,
+        race_status_boot_ms=6068,
+        active_gate_index=1,
+        received_monotonic_ns=_SIX_EPOCH_RACE_RECEIVED_NS,
+        host_clock_id="host-perf-counter",
+    )
+    track = VisualTrack(
+        track_id="vq2-track-000002",
+        first_token=samples[0].token,
+        latest_token=samples[-1].token,
+        center_norm=samples[-1].center_norm,
+        bbox_norm=samples[-1].bbox_norm,
+        apparent_scale=samples[-1].apparent_scale,
+        center_velocity_norm_s=(
+            0.2791059905697063,
+            -0.30498914969929664,
+        ),
+        log_scale_rate_s=0.7705316781003424,
+        confidence=0.7686564964069769,
+        association_confidence=samples[-1].association_confidence,
+        consecutive_frame_count=len(bound_epoch),
+        total_observation_count=len(samples),
+        missed_frame_count=0,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        authority_race_status_sequence=1478,
+        authority_race_status_boot_ms=6068,
+        ambiguous=False,
+        visible=True,
+        history=samples,
+    )
+    transition = ConfirmedGateTransition(
+        from_gate_index=0,
+        to_gate_index=1,
+        retired_track_id="vq2-track-000001",
+        promoted_track_id=track.track_id,
+        race_status=race,
+        camera_token_at_credit=track.latest_token,
+        promoted_first_token=track.first_token,
+        promoted_latest_token_before_credit=track.latest_token,
+        pretransition_frame_tokens=tuple(
+            sample.token for sample in bound_epoch
+        ),
+        history_length_before_promotion=len(samples),
+        history_length_after_promotion=len(samples),
+        promoted_history_sha256=visual_track_history_sha256(samples),
+    )
+    return track, transition
+
+
+def _shift_six_epoch_timing(
+    track: VisualTrack,
+    transition: ConfirmedGateTransition,
+    *,
+    observation_shift_ns: int,
+    publication_shift_ns: int,
+    rehash_transition: bool,
+) -> tuple[VisualTrack, ConfirmedGateTransition]:
+    epoch_start = len(track.history) - track.consecutive_frame_count
+    shifted = list(track.history[:epoch_start])
+    for sample in track.history[epoch_start:]:
+        shifted_sample = replace(
+            sample,
+            observation_monotonic_ns=(
+                sample.observation_monotonic_ns + observation_shift_ns
+            ),
+            publication_monotonic_ns=(
+                sample.publication_monotonic_ns + publication_shift_ns
+                if sample.publication_monotonic_ns is not None
+                else None
+            ),
+        )
+        assert shifted_sample.accepted_association is not None
+        previous = shifted[-1]
+        shifted_sample = replace(
+            shifted_sample,
+            accepted_association=replace(
+                shifted_sample.accepted_association,
+                observation_gap_ns=(
+                    shifted_sample.observation_monotonic_ns
+                    - previous.observation_monotonic_ns
+                ),
+                publication_gap_ns=(
+                    shifted_sample.publication_monotonic_ns
+                    - previous.publication_monotonic_ns
+                ),
+            ),
+        )
+        shifted.append(shifted_sample)
+    history = tuple(shifted)
+    shifted_track = replace(track, history=history)
+    assert transition.race_status.received_monotonic_ns is not None
+    shifted_race = replace(
+        transition.race_status,
+        received_monotonic_ns=(
+            transition.race_status.received_monotonic_ns
+            + publication_shift_ns
+        ),
+    )
+    shifted_transition = replace(
+        transition,
+        race_status=shifted_race,
+        promoted_history_sha256=(
+            visual_track_history_sha256(history)
+            if rehash_transition
+            else transition.promoted_history_sha256
+        ),
+    )
+    return shifted_track, shifted_transition
 
 
 def _admit(
@@ -912,6 +1355,7 @@ def test_exact_weak_frame_before_four_sample_stable_tail_admits():
     assert bridge.missed_frame_count == 11
     assert bridge.tracker_frame_delta == 12
     assert bridge.publication_delta == 12
+    assert bridge.unobserved_publication_count == 0
     assert bridge.observation_gap_s == pytest.approx(0.3946363)
     assert bridge.publication_gap_s == pytest.approx(0.3953314)
     assert bridge.association_confidence == pytest.approx(
@@ -932,6 +1376,283 @@ def test_exact_weak_frame_before_four_sample_stable_tail_admits():
     assert bridge.average_log_scale_rate_s == pytest.approx(
         0.629527786654983
     )
+
+
+def test_exact_six_frame_epoch_with_one_publication_skip_admits():
+    track, transition = _six_frame_epoch_fixture()
+
+    admission = require_transition_recovery_admission(
+        track,
+        transition,
+        tracker_time_basis_id="host-perf-counter",
+        measured_pitch_rad=-0.04001,
+        now_monotonic_ns=_SIX_EPOCH_RACE_RECEIVED_NS + 1_000_000,
+    )
+
+    assert track.consecutive_frame_count == 6
+    assert len(transition.pretransition_frame_tokens) == 6
+    assert tuple(
+        token.publication_sequence
+        for token in transition.pretransition_frame_tokens
+    ) == (167, 168, 169, 170, 171, 172)
+    assert tuple(
+        token.publication_sequence for token in admission.history_tokens
+    ) == (169, 170, 171, 172)
+    assert admission.anchor_credit_age_s == pytest.approx(0.009758)
+    assert admission.stable_history_span_s == pytest.approx(0.0965413)
+    assert admission.min_history_detection_confidence == pytest.approx(
+        0.7600233766233766
+    )
+    assert admission.min_history_association_confidence == pytest.approx(
+        0.930226705465556
+    )
+    bridge = admission.reacquisition_bridge
+    assert type(bridge) is ReacquisitionBridgeAdmission
+    assert bridge.missed_frame_count == 10
+    assert bridge.tracker_frame_delta == 11
+    assert bridge.publication_delta == 12
+    assert bridge.publication_delta == bridge.tracker_frame_delta + 1
+    assert bridge.unobserved_publication_count == 1
+    assert bridge.observation_gap_s == pytest.approx(0.4040763)
+    assert bridge.publication_gap_s == pytest.approx(0.4038211)
+    assert 0.400 < bridge.observation_gap_s <= (
+        RECOVERY_MAX_REACQUISITION_GAP_S
+    )
+    assert RECOVERY_MAX_REACQUISITION_GAP_S == pytest.approx(0.410)
+    assert bridge.direct_bbox_iou == pytest.approx(
+        0.3112863191706818
+    )
+    assert bridge.average_horizontal_rate_norm_s == pytest.approx(
+        0.19334219799577457
+    )
+    assert bridge.average_vertical_rate_norm_s == pytest.approx(
+        -0.2062316778621599
+    )
+    assert bridge.average_log_scale_rate_s == pytest.approx(
+        0.636722086948461
+    )
+    assert admission.max_raw_log_width_rate_s == pytest.approx(
+        1.2638844869893338
+    )
+    assert 1.25 < admission.max_raw_log_width_rate_s <= (
+        RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S
+    )
+    assert RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S == pytest.approx(1.30)
+    assert admission.projected_abs_horizontal_error == pytest.approx(
+        0.5698147448261486
+    )
+    assert (
+        POST_PROMOTION_ENTRY_MAX_ABS_X_NORM
+        - admission.projected_abs_horizontal_error
+        == pytest.approx(0.10018525517385146)
+    )
+    assert admission.projected_abs_vertical_error_image_down == (
+        pytest.approx(0.6876519212560703)
+    )
+    assert admission.projected_bbox_norm_ltrb[1] > 6.0 / 360.0
+
+
+@pytest.mark.parametrize(
+    (
+        "observation_gap_ns",
+        "publication_gap_ns",
+        "admitted",
+    ),
+    (
+        (410_000_000, 410_000_000, True),
+        (410_000_001, 410_000_000, False),
+        (410_000_000, 410_000_001, False),
+    ),
+)
+def test_reacquisition_gap_four_ten_boundary_is_inclusive(
+    observation_gap_ns,
+    publication_gap_ns,
+    admitted,
+):
+    track, transition = _six_frame_epoch_fixture()
+    bridge_index = len(track.history) - track.consecutive_frame_count
+    predecessor = track.history[bridge_index - 1]
+    bridge = track.history[bridge_index]
+    assert predecessor.publication_monotonic_ns is not None
+    assert bridge.publication_monotonic_ns is not None
+    observation_shift_ns = (
+        observation_gap_ns
+        - (
+            bridge.observation_monotonic_ns
+            - predecessor.observation_monotonic_ns
+        )
+    )
+    publication_shift_ns = (
+        publication_gap_ns
+        - (
+            bridge.publication_monotonic_ns
+            - predecessor.publication_monotonic_ns
+        )
+    )
+    track, transition = _shift_six_epoch_timing(
+        track,
+        transition,
+        observation_shift_ns=observation_shift_ns,
+        publication_shift_ns=publication_shift_ns,
+        rehash_transition=admitted,
+    )
+    now_ns = (
+        transition.race_status.received_monotonic_ns + 1_000_000
+    )
+
+    if admitted:
+        admission = require_transition_recovery_admission(
+            track,
+            transition,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=now_ns,
+        )
+        assert admission.reacquisition_bridge is not None
+        assert admission.reacquisition_bridge.observation_gap_s == (
+            pytest.approx(0.410)
+        )
+        assert admission.reacquisition_bridge.publication_gap_s == (
+            pytest.approx(0.410)
+        )
+    else:
+        with pytest.raises(
+            VisualRecoveryRefusal,
+            match="reacquisition timing is unsafe",
+        ):
+            require_transition_recovery_admission(
+                track,
+                transition,
+                tracker_time_basis_id="host-perf-counter",
+                measured_pitch_rad=-0.04001,
+                now_monotonic_ns=now_ns,
+            )
+
+
+def test_reacquisition_bridge_rejects_two_unobserved_publications():
+    track, transition = _six_frame_epoch_fixture()
+    bridge_index = len(track.history) - track.consecutive_frame_count
+    shifted = list(track.history[:bridge_index])
+    for offset, sample in enumerate(track.history[bridge_index:]):
+        assert sample.accepted_association is not None
+        shifted_sample = replace(
+            sample,
+            tracker_frame_sequence=sample.tracker_frame_sequence - 1,
+            accepted_association=replace(
+                sample.accepted_association,
+                missed_frame_count_before_association=(
+                    9 if offset == 0 else 0
+                ),
+                temporal_consistency=(0.1 if offset == 0 else 1.0),
+            ),
+        )
+        shifted.append(shifted_sample)
+    track = replace(track, history=tuple(shifted))
+
+    with pytest.raises(
+        VisualRecoveryRefusal,
+        match="association gap is inconsistent",
+    ):
+        require_transition_recovery_admission(
+            track,
+            transition,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=_SIX_EPOCH_RACE_RECEIVED_NS + 1_000_000,
+        )
+
+
+def test_six_frame_epoch_rejects_last_five_token_relabel_or_hidden_ambiguity():
+    track, transition = _six_frame_epoch_fixture()
+    shortened = replace(
+        transition,
+        pretransition_frame_tokens=transition.pretransition_frame_tokens[-5:],
+    )
+    with pytest.raises(
+        VisualRecoveryRefusal,
+        match="visibility epoch is inconsistent",
+    ):
+        require_transition_recovery_admission(
+            track,
+            shortened,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=_SIX_EPOCH_RACE_RECEIVED_NS + 1_000_000,
+        )
+
+    epoch_start = len(track.history) - track.consecutive_frame_count
+    hidden = track.history[epoch_start + 1]
+    assert hidden.accepted_association is not None
+    hidden = replace(
+        hidden,
+        accepted_association=replace(
+            hidden.accepted_association,
+            ambiguous=True,
+        ),
+    )
+    track = replace(
+        track,
+        history=(
+            track.history[: epoch_start + 1]
+            + (hidden,)
+            + track.history[epoch_start + 2 :]
+        ),
+    )
+    with pytest.raises(
+        VisualRecoveryRefusal,
+        match="association provenance is inconsistent",
+    ):
+        require_transition_recovery_admission(
+            track,
+            transition,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=_SIX_EPOCH_RACE_RECEIVED_NS + 1_000_000,
+        )
+
+
+def test_clean_stable_tail_rejects_an_unobserved_publication():
+    track, transition = _six_frame_epoch_fixture()
+    changed_index = len(track.history) - 3
+    changed = track.history[changed_index]
+    assert changed.accepted_association is not None
+    changed_token = replace(
+        changed.token,
+        publication_sequence=changed.token.publication_sequence + 1,
+    )
+    changed = replace(
+        changed,
+        token=changed_token,
+        accepted_association=replace(
+            changed.accepted_association,
+            current_token=changed_token,
+        ),
+    )
+    history = (
+        track.history[:changed_index]
+        + (changed,)
+        + track.history[changed_index + 1 :]
+    )
+    epoch_start = len(history) - track.consecutive_frame_count
+    transition = replace(
+        transition,
+        pretransition_frame_tokens=tuple(
+            sample.token for sample in history[epoch_start:]
+        ),
+    )
+    track = replace(track, history=history)
+
+    with pytest.raises(
+        VisualRecoveryRefusal,
+        match="association gap is inconsistent",
+    ):
+        require_transition_recovery_admission(
+            track,
+            transition,
+            tracker_time_basis_id="host-perf-counter",
+            measured_pitch_rad=-0.04001,
+            now_monotonic_ns=_SIX_EPOCH_RACE_RECEIVED_NS + 1_000_000,
+        )
 
 
 def test_prevalidated_promotion_history_avoids_wire_time_rehash(
@@ -1186,7 +1907,7 @@ def test_reacquisition_bridge_rejects_missing_ambiguous_or_unsafe_evidence(
         _admit_stable_trace(track, transition)
 
 
-def test_reacquisition_bridge_rejects_a_coherent_gap_over_four_hundred_ms():
+def test_reacquisition_bridge_rejects_a_coherent_gap_over_four_ten_ms():
     track, transition = _stable_tail_fixture()
     bridge_index = (
         transition.history_length_after_promotion
@@ -1197,10 +1918,10 @@ def test_reacquisition_bridge_rejects_a_coherent_gap_over_four_hundred_ms():
         shifted_sample = replace(
             sample,
             observation_monotonic_ns=(
-                sample.observation_monotonic_ns + 6_000_000
+                sample.observation_monotonic_ns + 16_000_000
             ),
             publication_monotonic_ns=(
-                sample.publication_monotonic_ns + 6_000_000
+                sample.publication_monotonic_ns + 16_000_000
                 if sample.publication_monotonic_ns is not None
                 else None
             ),

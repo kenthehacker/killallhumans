@@ -342,8 +342,10 @@ def _prime_reacquisition_bridge_gate_graph(
     adapter,
     *,
     perf_clock_offset_ns,
+    skipped_publication=None,
+    final_publication=120,
 ):
-    """Create one production-tracker identity across exactly eleven misses."""
+    """Create one production-tracker identity across a bounded gap."""
 
     runner._visual_tracking_enabled = True
     runner._visual_reset_epoch = 1
@@ -358,11 +360,13 @@ def _prime_reacquisition_bridge_gate_graph(
     current_id = None
     target_id = None
     last_observation_ns = 0
-    for publication in range(100, 121):
+    for publication in range(100, final_publication + 1):
         last_observation_ns = (
             perf_clock_offset_ns
             + (publication - 100) * 33_000_000
         )
+        if publication == skipped_publication:
+            continue
         detections = [
             _detection(280, 140, 80, 80, confidence=0.95),
         ]
@@ -627,6 +631,7 @@ def test_tracker_graph_recovery_emits_nested_reacquisition_bridge(
     assert bridge.reacquisition_token.publication_sequence == 116
     assert bridge.missed_frame_count == 11
     assert bridge.publication_delta == 12
+    assert bridge.unobserved_publication_count == 0
     assert bridge.direct_bbox_iou == pytest.approx(1.0)
     assert bridge.average_horizontal_rate_norm_s == pytest.approx(0.0)
     assert bridge.average_vertical_rate_norm_s == pytest.approx(0.0)
@@ -638,6 +643,9 @@ def test_tracker_graph_recovery_emits_nested_reacquisition_bridge(
     assert serialized["reacquisition_bridge"][
         "missed_frame_count"
     ] == 11
+    assert serialized["reacquisition_bridge"][
+        "unobserved_publication_count"
+    ] == 0
     transition_events = [
         fields
         for event, fields in events
@@ -647,6 +655,62 @@ def test_tracker_graph_recovery_emits_nested_reacquisition_bridge(
     assert transition_events[0]["promoted_history_sha256"] == (
         transition.promoted_history_sha256
     )
+
+
+def test_tracker_graph_recovery_admits_six_frame_epoch_with_one_receiver_skip():
+    perf_clock_offset_ns = 10_000_000_000
+    adapter = _Adapter()
+    runner = vq2_module.VQ2Runner(adapter, _Vision())
+
+    _context, transition, promoted = (
+        _prime_reacquisition_bridge_gate_graph(
+            runner,
+            adapter,
+            perf_clock_offset_ns=perf_clock_offset_ns,
+            skipped_publication=110,
+            final_publication=121,
+        )
+    )
+
+    assert tuple(
+        sample.token.publication_sequence
+        for sample in promoted.history
+    ) == (100, 101, 102, 103, 104, 116, 117, 118, 119, 120, 121)
+    assert tuple(
+        token.publication_sequence
+        for token in transition.pretransition_frame_tokens
+    ) == (116, 117, 118, 119, 120, 121)
+    bridge_sample = promoted.history[5]
+    assert bridge_sample.accepted_association is not None
+    assert (
+        bridge_sample.accepted_association
+        .missed_frame_count_before_association
+    ) == 10
+
+    authority = visual_recovery.require_promotion_history_authority(
+        promoted,
+        transition,
+        tracker_time_basis_id=_HOST_CLOCK,
+    )
+    race_received_ns = transition.race_status.received_monotonic_ns
+    assert race_received_ns is not None
+    admission = visual_recovery.require_transition_recovery_admission(
+        promoted,
+        transition,
+        tracker_time_basis_id=_HOST_CLOCK,
+        measured_pitch_rad=-0.04,
+        now_monotonic_ns=race_received_ns + 1_000_000,
+        promotion_history_authority=authority,
+    )
+    bridge = admission.reacquisition_bridge
+    assert bridge is not None
+    assert bridge.missed_frame_count == 10
+    assert bridge.tracker_frame_delta == 11
+    assert bridge.publication_delta == 12
+    assert bridge.unobserved_publication_count == 1
+    assert asdict(admission)["reacquisition_bridge"][
+        "unobserved_publication_count"
+    ] == 1
 
 
 def test_initial_gate_binding_rejects_two_plausible_visual_identities():

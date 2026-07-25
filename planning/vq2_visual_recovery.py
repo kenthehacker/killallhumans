@@ -50,7 +50,8 @@ RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE = 0.65
 RECOVERY_TRACKER_MAX_ASSIGNMENT_COST = 0.82
 RECOVERY_MAX_REACQUISITION_MISSED_FRAMES = 11
 RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA = 12
-RECOVERY_MAX_REACQUISITION_GAP_S = 0.400
+RECOVERY_MAX_REACQUISITION_UNOBSERVED_PUBLICATIONS = 1
+RECOVERY_MAX_REACQUISITION_GAP_S = 0.410
 RECOVERY_MAX_REACQUISITION_ASSOCIATION_COST = 0.29
 RECOVERY_MIN_REACQUISITION_BBOX_IOU = 0.55
 RECOVERY_MIN_REACQUISITION_DIRECT_BBOX_IOU = 0.30
@@ -72,7 +73,7 @@ RECOVERY_MAX_FILTERED_CENTER_RATE_NORM_S = 0.40
 RECOVERY_MAX_FILTERED_LOG_SCALE_RATE_S = 1.00
 RECOVERY_MAX_RAW_CENTER_RATE_NORM_S = 0.50
 RECOVERY_MAX_RAW_LOG_SCALE_RATE_S = 1.10
-RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S = 1.25
+RECOVERY_MAX_RAW_LOG_DIMENSION_RATE_S = 1.30
 RECOVERY_MIN_PROJECTION_HORIZON_S = 0.080
 RECOVERY_MAX_VALIDATION_TO_WIRE_DELAY_S = 0.005
 RECOVERY_COMMAND_RESPONSE_HORIZON_S = 0.045
@@ -164,6 +165,7 @@ class ReacquisitionBridgeAdmission:
     missed_frame_count: int
     tracker_frame_delta: int
     publication_delta: int
+    unobserved_publication_count: int
     observation_gap_s: float
     publication_gap_s: float
     association_confidence: float
@@ -605,6 +607,7 @@ def _require_accepted_association(
     *,
     expected_missed_frames: int,
     min_association_confidence: float,
+    max_unobserved_publications: int = 0,
 ) -> AssociationEvidence:
     evidence = sample.accepted_association
     if type(evidence) is not AssociationEvidence:
@@ -614,6 +617,8 @@ def _require_accepted_association(
     if (
         type(expected_missed_frames) is not int
         or expected_missed_frames < 0
+        or type(max_unobserved_publications) is not int
+        or max_unobserved_publications < 0
         or type(evidence.missed_frame_count_before_association) is not int
         or evidence.missed_frame_count_before_association
         != expected_missed_frames
@@ -666,7 +671,9 @@ def _require_accepted_association(
         sample.token.stream_id != previous.token.stream_id
         or sample.token.generation != previous.token.generation
         or tracker_delta != expected_delta
-        or publication_delta != expected_delta
+        or publication_delta < tracker_delta
+        or publication_delta - tracker_delta
+        > max_unobserved_publications
         or observation_gap_ns != evidence.observation_gap_ns
         or publication_gap_ns != evidence.publication_gap_ns
     ):
@@ -824,17 +831,25 @@ def _require_promotion_identity_bridge(
         raise VisualRecoveryRefusal(
             "post-promotion recovery transition visibility proof is invalid"
         )
+    transition_epoch_start = promotion_length - len(pretransition_tokens)
+    current_epoch_start = len(track.history) - track.consecutive_frame_count
+    if transition_epoch_start != current_epoch_start:
+        raise VisualRecoveryRefusal(
+            "post-promotion recovery visibility epoch is inconsistent"
+        )
     bridge_index = (
         promotion_length - RECOVERY_PRETRANSITION_VISIBILITY_SAMPLE_COUNT
+        if current_epoch_start == 0
+        else current_epoch_start
     )
     if bridge_index < RECOVERY_PRE_GAP_HISTORY_SAMPLE_COUNT + 1:
         raise VisualRecoveryRefusal(
             "post-promotion recovery lacks established pre-gap identity"
         )
-    current_epoch_start = len(track.history) - track.consecutive_frame_count
-    if current_epoch_start not in (0, bridge_index):
+    stable_tail_start = promotion_length - RECOVERY_HISTORY_SAMPLE_COUNT
+    if stable_tail_start <= bridge_index:
         raise VisualRecoveryRefusal(
-            "post-promotion recovery visibility epoch is inconsistent"
+            "post-promotion recovery stable epoch is insufficient"
         )
 
     _require_clean_history_segment(
@@ -851,12 +866,23 @@ def _require_promotion_identity_bridge(
     )
     _require_clean_history_segment(
         track,
-        start_index=bridge_index + 1,
+        start_index=stable_tail_start,
         sample_count=RECOVERY_HISTORY_SAMPLE_COUNT,
         min_detection_confidence=RECOVERY_MIN_DETECTION_CONFIDENCE,
         min_association_confidence=RECOVERY_MIN_ASSOCIATION_CONFIDENCE,
         min_span_s=RECOVERY_MIN_HISTORY_SPAN_S,
     )
+    if current_epoch_start > 0:
+        _require_clean_history_segment(
+            track,
+            start_index=bridge_index + 1,
+            sample_count=promotion_length - bridge_index - 1,
+            min_detection_confidence=RECOVERY_MIN_DETECTION_CONFIDENCE,
+            min_association_confidence=(
+                RECOVERY_MIN_ASSOCIATION_CONFIDENCE
+            ),
+            min_span_s=RECOVERY_MIN_HISTORY_SPAN_S,
+        )
 
     predecessor = track.history[bridge_index - 1]
     bridge = track.history[bridge_index]
@@ -915,6 +941,9 @@ def _require_promotion_identity_bridge(
         min_association_confidence=(
             RECOVERY_MIN_REACQUISITION_ASSOCIATION_CONFIDENCE
         ),
+        max_unobserved_publications=(
+            RECOVERY_MAX_REACQUISITION_UNOBSERVED_PUBLICATIONS
+        ),
     )
     tracker_delta = (
         bridge.tracker_frame_sequence - predecessor.tracker_frame_sequence
@@ -923,11 +952,15 @@ def _require_promotion_identity_bridge(
         bridge.token.publication_sequence
         - predecessor.token.publication_sequence
     )
+    unobserved_publication_count = publication_delta - tracker_delta
     observation_gap_s = evidence.observation_gap_ns / 1_000_000_000.0
     assert evidence.publication_gap_ns is not None
     publication_gap_s = evidence.publication_gap_ns / 1_000_000_000.0
     if (
         publication_delta > RECOVERY_MAX_REACQUISITION_PUBLICATION_DELTA
+        or unobserved_publication_count < 0
+        or unobserved_publication_count
+        > RECOVERY_MAX_REACQUISITION_UNOBSERVED_PUBLICATIONS
         or observation_gap_s > RECOVERY_MAX_REACQUISITION_GAP_S
         or publication_gap_s > RECOVERY_MAX_REACQUISITION_GAP_S
     ):
@@ -1033,6 +1066,7 @@ def _require_promotion_identity_bridge(
         missed_frame_count=missed_frames,
         tracker_frame_delta=tracker_delta,
         publication_delta=publication_delta,
+        unobserved_publication_count=unobserved_publication_count,
         observation_gap_s=observation_gap_s,
         publication_gap_s=publication_gap_s,
         association_confidence=float(evidence.confidence),
