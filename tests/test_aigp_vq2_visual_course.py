@@ -1289,6 +1289,1475 @@ def test_attempt17_yaw_soft_stop_retains_only_exact_projected_crossing():
     )
 
 
+def _adjacent_scale_jump_values(attempt: int):
+    assert attempt in {21, 22}
+    track_id = "track-0"
+    predecessor_token = _token(156)
+    current_token = _token(157)
+    predecessor_observation_ns = 1_000_000_000
+    if attempt == 21:
+        observation_gap_ns = 35_113_400
+        publication_gap_ns = 35_002_600
+        predecessor_publication_lag_ns = 1_046_300
+        current_publication_lag_ns = 935_500
+        predecessor_wire_horizon_ns = 9_261_400
+        current_wire_horizon_ns = 21_602_700
+        predecessor_x_rate = 0.054681877492265246
+        predecessor_y_rate = 0.1650276276621681
+        predecessor_log_rate = 1.3543449906669605
+        predecessor_association_confidence = 0.920870407022822
+        current_x_rate = 1.444114782012327
+        current_y_rate = 0.24830171976025958
+        current_log_rate = 3.298164252248494
+        current_track_confidence = 0.9390822408339867
+        current_association_confidence = 0.7550452801378533
+        association_cost = 0.2008628702869602
+        center_residual = 0.08886410766423516
+        log_area_residual = 0.24819673912588014
+    else:
+        observation_gap_ns = 34_219_300
+        publication_gap_ns = 34_261_000
+        predecessor_publication_lag_ns = 1_062_100
+        current_publication_lag_ns = 1_103_800
+        predecessor_wire_horizon_ns = 19_065_500
+        current_wire_horizon_ns = 16_341_500
+        predecessor_x_rate = 0.05623396244008611
+        predecessor_y_rate = 0.09398952704978852
+        predecessor_log_rate = 1.3463671155547394
+        predecessor_association_confidence = 0.926161824400433
+        current_x_rate = 1.4819028756846795
+        current_y_rate = 0.2208819651906913
+        current_log_rate = 3.3648262218633915
+        current_track_confidence = 0.9389365757581126
+        current_association_confidence = 0.7546846330904398
+        association_cost = 0.2011586008658394
+        center_residual = 0.08905136302563234
+        log_area_residual = 0.25116457344184595
+
+    current_observation_ns = (
+        predecessor_observation_ns + observation_gap_ns
+    )
+    predecessor_publication_ns = (
+        predecessor_observation_ns + predecessor_publication_lag_ns
+    )
+    current_publication_ns = (
+        current_observation_ns + current_publication_lag_ns
+    )
+    assert (
+        current_publication_ns - predecessor_publication_ns
+        == publication_gap_ns
+    )
+    predecessor_log_scale = -0.8438405125363927
+    current_log_scale = -0.6721864855781673
+    predecessor_bbox = (
+        0.3296875,
+        0.19722222222222222,
+        0.6609375,
+        0.7555555555555555,
+    )
+    current_bbox = (
+        0.3203125,
+        0.18611111111111112,
+        0.7609375,
+        0.7777777777777778,
+    )
+    predecessor_predecessor_token = _token(155)
+    predecessor_association = AssociationEvidence(
+        track_id=track_id,
+        previous_token=predecessor_predecessor_token,
+        current_token=predecessor_token,
+        detection_source_index=0,
+        cost=0.06,
+        confidence=predecessor_association_confidence,
+        predicted_center_residual_norm=0.006,
+        bbox_iou=0.90,
+        log_width_change=0.04,
+        log_height_change=0.04,
+        log_area_residual=0.02,
+        clipping_continuity=1.0,
+        temporal_consistency=1.0,
+        appearance_distance=None,
+        ambiguous=False,
+        missed_frame_count_before_association=0,
+        observation_gap_ns=30_000_000,
+        publication_gap_ns=30_000_000,
+        track_ambiguous_before_association=False,
+    )
+    current_association = AssociationEvidence(
+        track_id=track_id,
+        previous_token=predecessor_token,
+        current_token=current_token,
+        detection_source_index=0,
+        cost=association_cost,
+        confidence=current_association_confidence,
+        predicted_center_residual_norm=center_residual,
+        bbox_iou=0.7094196383977621,
+        log_width_change=0.2853207962661015,
+        log_height_change=0.057987257650349316,
+        log_area_residual=log_area_residual,
+        clipping_continuity=1.0,
+        temporal_consistency=1.0,
+        appearance_distance=None,
+        ambiguous=False,
+        missed_frame_count_before_association=0,
+        observation_gap_ns=observation_gap_ns,
+        publication_gap_ns=publication_gap_ns,
+        track_ambiguous_before_association=False,
+    )
+    predecessor_sample = VisualTrackSample(
+        tracker_frame_sequence=153,
+        token=predecessor_token,
+        observation_monotonic_ns=predecessor_observation_ns,
+        publication_monotonic_ns=predecessor_publication_ns,
+        provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+        camera_source_time_ns=3_000_000_000,
+        source_index=0,
+        center_norm=(-0.009375, -0.05),
+        bbox_norm=predecessor_bbox,
+        apparent_scale=math.exp(predecessor_log_scale),
+        confidence=0.9835,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        association_confidence=predecessor_association_confidence,
+        accepted_association=predecessor_association,
+    )
+    current_sample = VisualTrackSample(
+        tracker_frame_sequence=154,
+        token=current_token,
+        observation_monotonic_ns=current_observation_ns,
+        publication_monotonic_ns=current_publication_ns,
+        provenance_basis=FrameProvenanceBasis.RECEIVER_TIMING_V1,
+        camera_source_time_ns=3_000_000_000 + observation_gap_ns,
+        source_index=0,
+        center_norm=(0.08125, -0.03888888888888886),
+        bbox_norm=current_bbox,
+        apparent_scale=math.exp(current_log_scale),
+        confidence=0.9023584905660378,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        association_confidence=current_association_confidence,
+        accepted_association=current_association,
+    )
+    track = VisualTrack(
+        track_id=track_id,
+        first_token=_token(4),
+        latest_token=current_token,
+        center_norm=current_sample.center_norm,
+        bbox_norm=current_bbox,
+        apparent_scale=current_sample.apparent_scale,
+        center_velocity_norm_s=(current_x_rate, current_y_rate),
+        log_scale_rate_s=current_log_rate,
+        confidence=current_track_confidence,
+        association_confidence=current_association_confidence,
+        consecutive_frame_count=154,
+        total_observation_count=154,
+        missed_frame_count=0,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=0,
+        authority_race_status_sequence=10,
+        authority_race_status_boot_ms=2_000,
+        ambiguous=False,
+        visible=True,
+        history=(predecessor_sample, current_sample),
+    )
+    snapshot = SimpleNamespace(
+        tracker_frame_sequence=154,
+        latest_camera_token=current_token,
+        current_gate_index=0,
+        current_track_id=track_id,
+        current_track=track,
+        authority_usable=True,
+        race_finished=False,
+    )
+    predecessor_target = VisualTarget(
+        track_id=track_id,
+        frame_token=ServoFrameToken(
+            stream_id=predecessor_token.stream_id,
+            generation=predecessor_token.generation,
+            frame_id=predecessor_token.frame_id,
+            publication_sequence=(
+                predecessor_token.publication_sequence
+            ),
+        ),
+        received_monotonic_s=predecessor_observation_ns / 1e9,
+        normalized_x=-0.009375,
+        normalized_y_down=-0.05,
+        normalized_x_rate_s=predecessor_x_rate,
+        normalized_y_rate_down_s=predecessor_y_rate,
+        log_scale=predecessor_log_scale,
+        log_scale_rate_s=predecessor_log_rate,
+        confidence=0.9836,
+        association_confidence=predecessor_association_confidence,
+        consecutive_frames=153,
+    )
+    predecessor_output = VisualServoOutput(
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.105,
+        yaw_rate_rad_s=-0.033,
+        thrust=0.295,
+        corridor_frames=9,
+        advance_enabled=True,
+        next_gate_blend=0.25,
+        horizontal_error=predecessor_target.normalized_x,
+        vertical_error_image_down=(
+            predecessor_target.normalized_y_down
+        ),
+        effective_horizontal_error=(
+            predecessor_target.normalized_x
+        ),
+        effective_vertical_error_image_down=(
+            predecessor_target.normalized_y_down
+        ),
+        effective_horizontal_rate_s=predecessor_x_rate,
+        effective_vertical_rate_down_s=predecessor_y_rate,
+        next_horizontal_error=0.40,
+        next_vertical_error_image_down=-0.40,
+        horizontal_abs_error_delta=-0.01,
+        vertical_abs_error_delta=-0.01,
+        brake_reason=None,
+        yaw_envelope_limited=False,
+        reviewed_next_track_id="track-1",
+    )
+    predecessor_accepted = course_stage._AcceptedVisualCommand(
+        command=AttitudeRateCommand(
+            roll_rate=-0.001,
+            pitch_rate=0.043,
+            yaw_rate=0.0,
+            thrust=0.272,
+        ),
+        yaw_soft_stop_zeroed=True,
+        observation_monotonic_ns=predecessor_observation_ns,
+        wire_start_monotonic_ns=(
+            predecessor_observation_ns
+            + predecessor_wire_horizon_ns
+        ),
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.105,
+        next_preview_collective_delta=0.0075,
+    )
+    tuning = default_visual_config().servo
+    limits = VisualCourseStageLimits()
+    predecessor_projection = (
+        course_stage._retained_crossing_wire_projection(
+            predecessor_target,
+            observation_monotonic_ns=predecessor_observation_ns,
+            wire_start_monotonic_ns=(
+                predecessor_accepted.wire_start_monotonic_ns
+            ),
+            tuning=tuning,
+            limits=limits,
+            abort_type=SafetyAbort,
+        )
+    )
+    assert predecessor_projection is not None
+    predecessor = course_stage._RetainedCrossingCandidate(
+        gate_index=0,
+        track_id=track_id,
+        camera_token=predecessor_token,
+        tracker_frame_sequence=153,
+        target=predecessor_target,
+        output=predecessor_output,
+        accepted=predecessor_accepted,
+        wire_projection=predecessor_projection,
+        retained_crossing_dwell_frames=9,
+        advance_command_count=26,
+    )
+    target = VisualTarget(
+        track_id=track_id,
+        frame_token=ServoFrameToken(
+            stream_id=current_token.stream_id,
+            generation=current_token.generation,
+            frame_id=current_token.frame_id,
+            publication_sequence=current_token.publication_sequence,
+        ),
+        received_monotonic_s=current_observation_ns / 1e9,
+        normalized_x=current_sample.center_norm[0],
+        normalized_y_down=current_sample.center_norm[1],
+        normalized_x_rate_s=current_x_rate,
+        normalized_y_rate_down_s=current_y_rate,
+        log_scale=current_log_scale,
+        log_scale_rate_s=current_log_rate,
+        confidence=current_track_confidence,
+        association_confidence=current_association_confidence,
+        consecutive_frames=154,
+    )
+    output = VisualServoOutput(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.035,
+        yaw_rate_rad_s=-0.076,
+        thrust=0.21,
+        corridor_frames=0,
+        advance_enabled=False,
+        next_gate_blend=0.0,
+        horizontal_error=target.normalized_x,
+        vertical_error_image_down=target.normalized_y_down,
+        effective_horizontal_error=target.normalized_x,
+        effective_vertical_error_image_down=target.normalized_y_down,
+        effective_horizontal_rate_s=target.normalized_x_rate_s,
+        effective_vertical_rate_down_s=target.normalized_y_rate_down_s,
+        next_horizontal_error=None,
+        next_vertical_error_image_down=None,
+        horizontal_abs_error_delta=0.09,
+        vertical_abs_error_delta=-0.01,
+        brake_reason="scale_rate",
+        yaw_envelope_limited=False,
+        reviewed_next_track_id=None,
+        passage_preview_retired=True,
+    )
+    accepted = course_stage._AcceptedVisualCommand(
+        command=AttitudeRateCommand(
+            roll_rate=-0.001,
+            pitch_rate=0.053,
+            yaw_rate=0.0,
+            thrust=(0.251477 if attempt == 21 else 0.254573),
+        ),
+        yaw_soft_stop_zeroed=True,
+        observation_monotonic_ns=current_observation_ns,
+        wire_start_monotonic_ns=(
+            current_observation_ns + current_wire_horizon_ns
+        ),
+        target_roll_rad=0.0,
+        target_pitch_rad=0.035,
+        next_preview_collective_delta=0.0,
+    )
+    admission = VisualApproachPassageAdmission(
+        basis="tight-current-corridor-dwell-v1",
+        current_gate_index=0,
+        current_target=replace(predecessor_target, log_scale=-1.6),
+        camera_token=_token(121),
+        tracker_frame_sequence=118,
+        corridor_frames=25,
+        preview_track_id="track-1",
+        preview_blend=0.25,
+    )
+    return (
+        snapshot,
+        target,
+        output,
+        accepted,
+        predecessor,
+        admission,
+        tuning,
+        limits,
+    )
+
+
+@pytest.mark.parametrize("attempt", (21, 22))
+def test_attempt21_and_22_adjacent_scale_jump_predicates_are_exact(attempt):
+    (
+        snapshot,
+        target,
+        output,
+        accepted,
+        predecessor,
+        admission,
+        tuning,
+        limits,
+    ) = _adjacent_scale_jump_values(attempt)
+
+    proof = course_stage._adjacent_scale_jump_crossing_proof(
+        snapshot,
+        target,
+        output,
+        accepted,
+        predecessor=predecessor,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=26,
+        next_preview_retired=True,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    )
+
+    assert proof is not None
+    assert proof.predecessor is predecessor
+    assert proof.association is (
+        snapshot.current_track.history[-1].accepted_association
+    )
+    assert proof.predecessor_projected_log_scale == pytest.approx(
+        -0.7962849 if attempt == 21 else -0.7977688,
+        abs=1e-6,
+    )
+    expected_wire_x = 0.11245 if attempt == 21 else 0.10547
+    expected_wire_y = -0.03352 if attempt == 21 else -0.03528
+    assert proof.current_wire_projection.projected_normalized_x == (
+        pytest.approx(expected_wire_x, abs=1e-5)
+    )
+    assert (
+        proof.current_wire_projection.projected_normalized_y_down
+        == pytest.approx(expected_wire_y, abs=1e-5)
+    )
+    assert (
+        limits.retained_crossing_projection_min_log_scale == -0.83
+    )
+    assert limits.crossing_arm_min_log_scale == -0.80
+    assert (
+        limits.retained_crossing_max_observation_to_wire_s == 0.035
+    )
+    assert (
+        course_stage.ADJACENT_SCALE_JUMP_MIN_PREDECESSOR_LOG_SCALE
+        == -0.85
+    )
+    assert course_stage.ADJACENT_SCALE_JUMP_MAX_LOG_DELTA == 0.18
+    assert (
+        course_stage.ADJACENT_SCALE_JUMP_MAX_OBSERVATION_GAP_S
+        == 0.036
+    )
+    assert (
+        course_stage
+        .ADJACENT_SCALE_JUMP_MAX_ABS_CURRENT_HORIZONTAL_RATE_S
+        == 1.50
+    )
+    assert (
+        course_stage.ADJACENT_SCALE_JUMP_MAX_CURRENT_LOG_SCALE_RATE_S
+        == 3.40
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing_predecessor",
+        "incomplete_dwell",
+        "too_few_advances",
+        "advance_count_changed",
+        "admission_gate",
+        "admission_track",
+        "nonadjacent_token",
+        "tracker_sequence",
+        "history_predecessor_token",
+        "missing_association",
+        "missed_association",
+        "association_ambiguous",
+        "prior_track_ambiguous",
+        "association_confidence",
+        "association_cost",
+        "bbox_iou",
+        "center_residual",
+        "log_width_change",
+        "log_height_change",
+        "log_area_residual",
+        "observation_gap",
+        "predecessor_below_floor",
+        "predecessor_projection_short",
+        "current_below_plane",
+        "jump_too_large",
+        "current_raw_center",
+        "current_wire_center",
+        "current_horizontal_rate",
+        "current_vertical_rate",
+        "current_log_scale_rate",
+        "current_clipped",
+        "track_missed",
+        "not_scale_brake",
+        "advance_enabled",
+        "preview_active",
+        "preview_blend",
+        "preview_collective",
+        "yaw_not_soft_stopped",
+        "nonzero_wire_yaw",
+        "wire_horizon",
+        "predecessor_publication_before_observation",
+        "current_publication_before_observation",
+        "predecessor_wire_before_publication",
+        "current_wire_before_publication",
+        "predecessor_command_rate",
+        "predecessor_command_thrust",
+        "predecessor_command_yaw",
+        "predecessor_command_nonfinite",
+        "predecessor_target_attitude_mismatch",
+        "predecessor_preview_collective",
+        "predecessor_not_advance",
+        "predecessor_zero_requested_yaw",
+        "predecessor_preview_retired",
+        "stage_preview_not_retired",
+    ),
+)
+def test_adjacent_scale_jump_crossing_proof_fails_closed(case):
+    (
+        snapshot,
+        target,
+        output,
+        accepted,
+        predecessor,
+        admission,
+        tuning,
+        limits,
+    ) = _adjacent_scale_jump_values(22)
+    advance_command_count = 26
+    next_preview_retired = True
+
+    def replace_current_association(**changes):
+        nonlocal snapshot
+        history = snapshot.current_track.history
+        association = replace(
+            history[-1].accepted_association,
+            **changes,
+        )
+        current = replace(
+            history[-1],
+            accepted_association=association,
+        )
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(history[-2], current),
+        )
+
+    def replace_predecessor_target(**changes):
+        nonlocal predecessor
+        changed_target = replace(predecessor.target, **changes)
+        changed_projection = (
+            course_stage._retained_crossing_wire_projection(
+                changed_target,
+                observation_monotonic_ns=(
+                    predecessor.accepted.observation_monotonic_ns
+                ),
+                wire_start_monotonic_ns=(
+                    predecessor.accepted.wire_start_monotonic_ns
+                ),
+                tuning=tuning,
+                limits=limits,
+                abort_type=SafetyAbort,
+            )
+        )
+        assert changed_projection is not None
+        predecessor = replace(
+            predecessor,
+            target=changed_target,
+            wire_projection=changed_projection,
+        )
+
+    if case == "missing_predecessor":
+        predecessor = None
+    elif case == "incomplete_dwell":
+        predecessor = replace(
+            predecessor,
+            retained_crossing_dwell_frames=2,
+        )
+    elif case == "too_few_advances":
+        predecessor = replace(predecessor, advance_command_count=2)
+        advance_command_count = 2
+    elif case == "advance_count_changed":
+        advance_command_count = 27
+    elif case == "admission_gate":
+        admission = replace(admission, current_gate_index=1)
+    elif case == "admission_track":
+        admission = replace(
+            admission,
+            current_target=replace(
+                admission.current_target,
+                track_id="other-track",
+            ),
+        )
+    elif case == "nonadjacent_token":
+        snapshot.latest_camera_token = _token(158)
+    elif case == "tracker_sequence":
+        snapshot.tracker_frame_sequence += 1
+    elif case == "history_predecessor_token":
+        history = snapshot.current_track.history
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(
+                replace(history[-2], token=_token(155)),
+                history[-1],
+            ),
+        )
+    elif case == "missing_association":
+        history = snapshot.current_track.history
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(
+                history[-2],
+                replace(history[-1], accepted_association=None),
+            ),
+        )
+    elif case == "missed_association":
+        replace_current_association(
+            missed_frame_count_before_association=1,
+        )
+    elif case == "association_ambiguous":
+        replace_current_association(ambiguous=True)
+    elif case == "prior_track_ambiguous":
+        replace_current_association(
+            track_ambiguous_before_association=True,
+        )
+    elif case == "association_confidence":
+        below = (
+            course_stage
+            .ADJACENT_SCALE_JUMP_MIN_ASSOCIATION_CONFIDENCE
+            - 0.000001
+        )
+        replace_current_association(confidence=below)
+        history = snapshot.current_track.history
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            association_confidence=below,
+            history=(
+                history[-2],
+                replace(
+                    history[-1],
+                    association_confidence=below,
+                ),
+            ),
+        )
+        target = replace(target, association_confidence=below)
+    elif case == "association_cost":
+        replace_current_association(
+            cost=(
+                course_stage.ADJACENT_SCALE_JUMP_MAX_ASSOCIATION_COST
+                + 0.000001
+            ),
+        )
+    elif case == "bbox_iou":
+        replace_current_association(
+            bbox_iou=(
+                course_stage.ADJACENT_SCALE_JUMP_MIN_BBOX_IOU
+                - 0.000001
+            ),
+        )
+    elif case == "center_residual":
+        replace_current_association(
+            predicted_center_residual_norm=(
+                course_stage
+                .ADJACENT_SCALE_JUMP_MAX_CENTER_RESIDUAL_NORM
+                + 0.000001
+            ),
+        )
+    elif case == "log_width_change":
+        replace_current_association(
+            log_width_change=(
+                course_stage
+                .ADJACENT_SCALE_JUMP_MAX_ABS_LOG_WIDTH_CHANGE
+                + 0.000001
+            ),
+        )
+    elif case == "log_height_change":
+        replace_current_association(
+            log_height_change=(
+                course_stage
+                .ADJACENT_SCALE_JUMP_MAX_ABS_LOG_HEIGHT_CHANGE
+                + 0.000001
+            ),
+        )
+    elif case == "log_area_residual":
+        replace_current_association(
+            log_area_residual=(
+                course_stage
+                .ADJACENT_SCALE_JUMP_MAX_ABS_LOG_AREA_RESIDUAL
+                + 0.000001
+            ),
+        )
+    elif case == "observation_gap":
+        history = snapshot.current_track.history
+        extra_ns = 2_000_000
+        current = replace(
+            history[-1],
+            observation_monotonic_ns=(
+                history[-1].observation_monotonic_ns + extra_ns
+            ),
+            publication_monotonic_ns=(
+                history[-1].publication_monotonic_ns + extra_ns
+            ),
+            accepted_association=replace(
+                history[-1].accepted_association,
+                observation_gap_ns=(
+                    history[-1].accepted_association.observation_gap_ns
+                    + extra_ns
+                ),
+                publication_gap_ns=(
+                    history[-1].accepted_association.publication_gap_ns
+                    + extra_ns
+                ),
+            ),
+        )
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(history[-2], current),
+        )
+        target = replace(
+            target,
+            received_monotonic_s=(
+                current.observation_monotonic_ns / 1e9
+            ),
+        )
+        accepted = replace(
+            accepted,
+            observation_monotonic_ns=current.observation_monotonic_ns,
+            wire_start_monotonic_ns=(
+                current.observation_monotonic_ns + 16_000_000
+            ),
+        )
+    elif case == "predecessor_below_floor":
+        replace_predecessor_target(log_scale=-0.850001)
+        history = snapshot.current_track.history
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(
+                replace(
+                    history[-2],
+                    apparent_scale=math.exp(-0.850001),
+                ),
+                history[-1],
+            ),
+        )
+    elif case == "predecessor_projection_short":
+        replace_predecessor_target(log_scale_rate_s=1.0)
+    elif case == "current_below_plane":
+        target = replace(target, log_scale=-0.800001)
+    elif case == "jump_too_large":
+        target = replace(
+            target,
+            log_scale=(
+                predecessor.target.log_scale
+                + course_stage.ADJACENT_SCALE_JUMP_MAX_LOG_DELTA
+                + 0.000001
+            ),
+        )
+    elif case == "current_raw_center":
+        target = replace(
+            target,
+            normalized_x=tuning.horizontal_corridor + 0.000001,
+        )
+    elif case == "current_wire_center":
+        target = replace(target, normalized_x_rate_s=5.0)
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            center_velocity_norm_s=(
+                target.normalized_x_rate_s,
+                target.normalized_y_rate_down_s,
+            ),
+        )
+    elif case == "current_horizontal_rate":
+        target = replace(
+            target,
+            normalized_x_rate_s=(
+                course_stage
+                .ADJACENT_SCALE_JUMP_MAX_ABS_CURRENT_HORIZONTAL_RATE_S
+                + 0.000001
+            ),
+        )
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            center_velocity_norm_s=(
+                target.normalized_x_rate_s,
+                target.normalized_y_rate_down_s,
+            ),
+        )
+    elif case == "current_vertical_rate":
+        target = replace(
+            target,
+            normalized_y_rate_down_s=(
+                tuning.stable_rate_norm_s + 0.000001
+            ),
+        )
+    elif case == "current_log_scale_rate":
+        target = replace(
+            target,
+            log_scale_rate_s=(
+                course_stage
+                .ADJACENT_SCALE_JUMP_MAX_CURRENT_LOG_SCALE_RATE_S
+                + 0.000001
+            ),
+        )
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            log_scale_rate_s=target.log_scale_rate_s,
+        )
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            center_velocity_norm_s=(
+                target.normalized_x_rate_s,
+                target.normalized_y_rate_down_s,
+            ),
+        )
+    elif case == "current_clipped":
+        target = replace(target, clipped=True)
+    elif case == "track_missed":
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            missed_frame_count=1,
+        )
+    elif case == "not_scale_brake":
+        output = replace(output, brake_reason="aligning")
+    elif case == "advance_enabled":
+        output = replace(
+            output,
+            advance_enabled=True,
+            brake_reason=None,
+        )
+    elif case == "preview_active":
+        output = replace(output, passage_preview_retired=False)
+    elif case == "preview_blend":
+        output = replace(output, next_gate_blend=0.000001)
+    elif case == "preview_collective":
+        accepted = replace(
+            accepted,
+            next_preview_collective_delta=0.000001,
+        )
+    elif case == "yaw_not_soft_stopped":
+        accepted = replace(accepted, yaw_soft_stop_zeroed=False)
+    elif case == "nonzero_wire_yaw":
+        accepted = replace(
+            accepted,
+            command=replace(
+                accepted.command,
+                yaw_rate=0.000001,
+            ),
+        )
+    elif case == "wire_horizon":
+        accepted = replace(
+            accepted,
+            wire_start_monotonic_ns=(
+                accepted.observation_monotonic_ns
+                + round(
+                    limits.retained_crossing_max_observation_to_wire_s
+                    * 1e9
+                )
+                + 1
+            ),
+        )
+    elif case == "predecessor_publication_before_observation":
+        history = snapshot.current_track.history
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(
+                replace(
+                    history[-2],
+                    publication_monotonic_ns=(
+                        history[-2].observation_monotonic_ns - 1
+                    ),
+                ),
+                history[-1],
+            ),
+        )
+    elif case == "current_publication_before_observation":
+        history = snapshot.current_track.history
+        snapshot.current_track = replace(
+            snapshot.current_track,
+            history=(
+                history[-2],
+                replace(
+                    history[-1],
+                    publication_monotonic_ns=(
+                        history[-1].observation_monotonic_ns - 1
+                    ),
+                ),
+            ),
+        )
+    elif case == "predecessor_wire_before_publication":
+        history = snapshot.current_track.history
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                wire_start_monotonic_ns=(
+                    history[-2].publication_monotonic_ns - 1
+                ),
+            ),
+        )
+    elif case == "current_wire_before_publication":
+        history = snapshot.current_track.history
+        accepted = replace(
+            accepted,
+            wire_start_monotonic_ns=(
+                history[-1].publication_monotonic_ns - 1
+            ),
+        )
+    elif case == "predecessor_command_rate":
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                command=replace(
+                    predecessor.accepted.command,
+                    pitch_rate=limits.max_command_rate_rad_s + 0.000001,
+                ),
+            ),
+        )
+    elif case == "predecessor_command_thrust":
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                command=replace(
+                    predecessor.accepted.command,
+                    thrust=limits.max_thrust + 0.000001,
+                ),
+            ),
+        )
+    elif case == "predecessor_command_yaw":
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                command=replace(
+                    predecessor.accepted.command,
+                    yaw_rate=0.000001,
+                ),
+            ),
+        )
+    elif case == "predecessor_command_nonfinite":
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                command=replace(
+                    predecessor.accepted.command,
+                    roll_rate=math.nan,
+                ),
+            ),
+        )
+    elif case == "predecessor_target_attitude_mismatch":
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                target_pitch_rad=(
+                    predecessor.accepted.target_pitch_rad + 0.000001
+                ),
+            ),
+        )
+    elif case == "predecessor_preview_collective":
+        predecessor = replace(
+            predecessor,
+            accepted=replace(
+                predecessor.accepted,
+                next_preview_collective_delta=(
+                    course_stage
+                    .GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA
+                    + 0.000001
+                ),
+            ),
+        )
+    elif case == "predecessor_not_advance":
+        predecessor = replace(
+            predecessor,
+            output=replace(
+                predecessor.output,
+                advance_enabled=False,
+                brake_reason="aligning",
+            ),
+        )
+    elif case == "predecessor_zero_requested_yaw":
+        predecessor = replace(
+            predecessor,
+            output=replace(
+                predecessor.output,
+                yaw_rate_rad_s=0.0,
+            ),
+        )
+    elif case == "predecessor_preview_retired":
+        predecessor = replace(
+            predecessor,
+            output=replace(
+                predecessor.output,
+                passage_preview_retired=True,
+            ),
+        )
+    elif case == "stage_preview_not_retired":
+        next_preview_retired = False
+
+    assert course_stage._adjacent_scale_jump_crossing_proof(
+        snapshot,
+        target,
+        output,
+        accepted,
+        predecessor=predecessor,
+        passage_admission=admission,
+        current_gate_index=0,
+        current_track_id="track-0",
+        advance_command_count=advance_command_count,
+        next_preview_retired=next_preview_retired,
+        tuning=tuning,
+        limits=limits,
+        abort_type=SafetyAbort,
+    ) is None
+
+
+def test_adjacent_scale_jump_stage_latches_current_only_brake_and_credit():
+    class AdjacentJumpServo(_Servo):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.passage_observations = 0
+
+        def observe(self, snapshot, *args, **kwargs):
+            proposal = super().observe(snapshot, *args, **kwargs)
+            if kwargs["mode"] is not VisualApproachMode.PASSAGE:
+                return proposal
+            self.passage_observations += 1
+            output = proposal.servo_output
+            if self.passage_observations in {4, 5}:
+                return SimpleNamespace(
+                    current_target=replace(
+                        proposal.current_target,
+                        log_scale=-1.0,
+                        log_scale_rate_s=0.2,
+                    ),
+                    servo_output=output,
+                    passage_admission=proposal.passage_admission,
+                    mode=proposal.mode,
+                )
+            if self.passage_observations not in {6, 7}:
+                return SimpleNamespace(
+                    current_target=replace(
+                        proposal.current_target,
+                        log_scale=-1.0,
+                        log_scale_rate_s=0.2,
+                    ),
+                    servo_output=output,
+                    passage_admission=proposal.passage_admission,
+                    mode=proposal.mode,
+                )
+
+            target = VisualTarget.from_visual_track(
+                snapshot.current_track,
+                expected_gate_index=self.gate_index,
+            )
+            if self.passage_observations == 6:
+                output = replace(
+                    output,
+                    target_pitch_rad=-0.105,
+                    yaw_rate_rad_s=0.02,
+                    thrust=0.295,
+                    corridor_frames=9,
+                    advance_enabled=True,
+                    next_gate_blend=0.20,
+                    horizontal_error=target.normalized_x,
+                    vertical_error_image_down=(
+                        target.normalized_y_down
+                    ),
+                    effective_horizontal_error=(
+                        target.normalized_x
+                    ),
+                    effective_vertical_error_image_down=(
+                        target.normalized_y_down
+                    ),
+                    effective_horizontal_rate_s=(
+                        target.normalized_x_rate_s
+                    ),
+                    effective_vertical_rate_down_s=(
+                        target.normalized_y_rate_down_s
+                    ),
+                    next_horizontal_error=0.40,
+                    next_vertical_error_image_down=-0.40,
+                    brake_reason=None,
+                    yaw_envelope_limited=False,
+                    reviewed_next_track_id="track-7",
+                )
+            else:
+                retirement = (
+                    PassageSafetyViolationDetail(
+                        violation=(
+                            PassageSafetyViolation
+                            .CURRENT_LOG_SCALE_RATE
+                        ),
+                        observed=target.log_scale_rate_s,
+                        limit=self.tuning.brake_scale_rate_s,
+                        excess=(
+                            target.log_scale_rate_s
+                            - self.tuning.brake_scale_rate_s
+                        ),
+                    ),
+                )
+                output = replace(
+                    output,
+                    target_pitch_rad=0.035,
+                    yaw_rate_rad_s=0.02,
+                    thrust=0.21,
+                    corridor_frames=0,
+                    advance_enabled=False,
+                    next_gate_blend=0.0,
+                    horizontal_error=target.normalized_x,
+                    vertical_error_image_down=(
+                        target.normalized_y_down
+                    ),
+                    effective_horizontal_error=(
+                        target.normalized_x
+                    ),
+                    effective_vertical_error_image_down=(
+                        target.normalized_y_down
+                    ),
+                    effective_horizontal_rate_s=(
+                        target.normalized_x_rate_s
+                    ),
+                    effective_vertical_rate_down_s=(
+                        target.normalized_y_rate_down_s
+                    ),
+                    next_horizontal_error=None,
+                    next_vertical_error_image_down=None,
+                    brake_reason="scale_rate",
+                    yaw_envelope_limited=False,
+                    reviewed_next_track_id=None,
+                    passage_preview_retired=True,
+                    passage_preview_retirement_violations=retirement,
+                )
+            return SimpleNamespace(
+                current_target=target,
+                servo_output=output,
+                passage_admission=proposal.passage_admission,
+                mode=proposal.mode,
+            )
+
+    class AdjacentJumpHost(_Host):
+        jump_sent = False
+        jump_token = None
+        predecessor_samples = None
+        crossing_zero_count = 0
+
+        @staticmethod
+        def _association(
+            *,
+            previous,
+            current,
+            previous_target_rate,
+            previous_log_rate,
+            confidence,
+            cost,
+        ):
+            observation_gap_ns = (
+                current.observation_monotonic_ns
+                - previous.observation_monotonic_ns
+            )
+            publication_gap_ns = (
+                current.publication_monotonic_ns
+                - previous.publication_monotonic_ns
+            )
+            gap_s = observation_gap_ns / 1e9
+            projected_x = (
+                previous.center_norm[0]
+                + previous_target_rate[0] * gap_s
+            )
+            projected_y = (
+                previous.center_norm[1]
+                + previous_target_rate[1] * gap_s
+            )
+            projected_log = (
+                math.log(previous.apparent_scale)
+                + previous_log_rate * gap_s
+            )
+            previous_width = (
+                previous.bbox_norm[2] - previous.bbox_norm[0]
+            )
+            previous_height = (
+                previous.bbox_norm[3] - previous.bbox_norm[1]
+            )
+            current_width = (
+                current.bbox_norm[2] - current.bbox_norm[0]
+            )
+            current_height = (
+                current.bbox_norm[3] - current.bbox_norm[1]
+            )
+            return AssociationEvidence(
+                track_id="track-6",
+                previous_token=previous.token,
+                current_token=current.token,
+                detection_source_index=current.source_index,
+                cost=cost,
+                confidence=confidence,
+                predicted_center_residual_norm=math.hypot(
+                    current.center_norm[0] - projected_x,
+                    current.center_norm[1] - projected_y,
+                ),
+                bbox_iou=0.7094196383977621,
+                log_width_change=math.log(
+                    current_width / previous_width
+                ),
+                log_height_change=math.log(
+                    current_height / previous_height
+                ),
+                log_area_residual=2.0 * (
+                    math.log(current.apparent_scale) - projected_log
+                ),
+                clipping_continuity=1.0,
+                temporal_consistency=1.0,
+                appearance_distance=None,
+                ambiguous=False,
+                missed_frame_count_before_association=0,
+                observation_gap_ns=observation_gap_ns,
+                publication_gap_ns=publication_gap_ns,
+                track_ambiguous_before_association=False,
+            )
+
+        def _jump_predecessor_snapshot(self):
+            token = self.visual_gate_graph.latest_snapshot.latest_camera_token
+            prior_token = _token(token.publication_sequence - 1)
+            observation_ns = round((self.clock - 0.030) * 1e9)
+            prior = VisualTrackSample(
+                tracker_frame_sequence=self.sequence - 1,
+                token=prior_token,
+                observation_monotonic_ns=observation_ns - 34_000_000,
+                publication_monotonic_ns=(
+                    observation_ns - 33_000_000
+                ),
+                provenance_basis=(
+                    FrameProvenanceBasis.RECEIVER_TIMING_V1
+                ),
+                camera_source_time_ns=observation_ns - 34_000_000,
+                source_index=0,
+                center_norm=(-0.011, -0.054),
+                bbox_norm=(0.34, 0.21, 0.65, 0.74),
+                apparent_scale=math.exp(-0.89),
+                confidence=0.98,
+                clipping=FrameEdge.NONE,
+                center_censored=False,
+                association_confidence=0.93,
+                accepted_association=None,
+            )
+            predecessor = VisualTrackSample(
+                tracker_frame_sequence=self.sequence,
+                token=token,
+                observation_monotonic_ns=observation_ns,
+                publication_monotonic_ns=observation_ns + 1_000_000,
+                provenance_basis=(
+                    FrameProvenanceBasis.RECEIVER_TIMING_V1
+                ),
+                camera_source_time_ns=observation_ns,
+                source_index=0,
+                center_norm=(-0.009375, -0.05),
+                bbox_norm=(
+                    0.3296875,
+                    0.19722222222222222,
+                    0.6609375,
+                    0.7555555555555555,
+                ),
+                apparent_scale=math.exp(-0.8438405125363927),
+                confidence=0.9835,
+                clipping=FrameEdge.NONE,
+                center_censored=False,
+                association_confidence=0.926,
+                accepted_association=None,
+            )
+            predecessor = replace(
+                predecessor,
+                accepted_association=self._association(
+                    previous=prior,
+                    current=predecessor,
+                    previous_target_rate=(0.02, 0.02),
+                    previous_log_rate=0.8,
+                    confidence=0.926,
+                    cost=0.06,
+                ),
+            )
+            track = VisualTrack(
+                track_id="track-6",
+                first_token=prior.token,
+                latest_token=predecessor.token,
+                center_norm=predecessor.center_norm,
+                bbox_norm=predecessor.bbox_norm,
+                apparent_scale=predecessor.apparent_scale,
+                center_velocity_norm_s=(0.056, 0.094),
+                log_scale_rate_s=1.346,
+                confidence=0.984,
+                association_confidence=0.926,
+                consecutive_frame_count=153,
+                total_observation_count=153,
+                missed_frame_count=0,
+                clipping=FrameEdge.NONE,
+                center_censored=False,
+                role=VisualTrackRole.CURRENT,
+                authoritative_gate_index=6,
+                authority_race_status_sequence=1,
+                authority_race_status_boot_ms=1_000,
+                ambiguous=False,
+                visible=True,
+                history=(prior, predecessor),
+            )
+            self.predecessor_samples = (prior, predecessor)
+            return SimpleNamespace(
+                tracker_frame_sequence=predecessor.tracker_frame_sequence,
+                latest_camera_token=predecessor.token,
+                current_gate_index=6,
+                current_track_id="track-6",
+                current_track=track,
+                authority_usable=True,
+                race_finished=False,
+            )
+
+        def _jump_current_snapshot(self):
+            prior, predecessor = self.predecessor_samples
+            token = self.visual_gate_graph.latest_snapshot.latest_camera_token
+            observation_ns = (
+                predecessor.observation_monotonic_ns + 34_000_000
+            )
+            current = VisualTrackSample(
+                tracker_frame_sequence=(
+                    predecessor.tracker_frame_sequence + 1
+                ),
+                token=token,
+                observation_monotonic_ns=observation_ns,
+                publication_monotonic_ns=(
+                    predecessor.publication_monotonic_ns + 34_000_000
+                ),
+                provenance_basis=(
+                    FrameProvenanceBasis.RECEIVER_TIMING_V1
+                ),
+                camera_source_time_ns=observation_ns,
+                source_index=0,
+                center_norm=(0.08125, -0.03888888888888886),
+                bbox_norm=(
+                    0.3203125,
+                    0.18611111111111112,
+                    0.7609375,
+                    0.7777777777777778,
+                ),
+                apparent_scale=math.exp(-0.6721864855781673),
+                confidence=0.903,
+                clipping=FrameEdge.NONE,
+                center_censored=False,
+                association_confidence=0.755,
+                accepted_association=None,
+            )
+            current = replace(
+                current,
+                accepted_association=self._association(
+                    previous=predecessor,
+                    current=current,
+                    previous_target_rate=(0.056, 0.094),
+                    previous_log_rate=1.346,
+                    confidence=0.755,
+                    cost=0.201,
+                ),
+            )
+            track = VisualTrack(
+                track_id="track-6",
+                first_token=prior.token,
+                latest_token=current.token,
+                center_norm=current.center_norm,
+                bbox_norm=current.bbox_norm,
+                apparent_scale=current.apparent_scale,
+                center_velocity_norm_s=(1.48, 0.22),
+                log_scale_rate_s=3.36,
+                confidence=0.939,
+                association_confidence=0.755,
+                consecutive_frame_count=154,
+                total_observation_count=154,
+                missed_frame_count=0,
+                clipping=FrameEdge.NONE,
+                center_censored=False,
+                role=VisualTrackRole.CURRENT,
+                authoritative_gate_index=6,
+                authority_race_status_sequence=1,
+                authority_race_status_boot_ms=1_000,
+                ambiguous=False,
+                visible=True,
+                history=(prior, predecessor, current),
+            )
+            return SimpleNamespace(
+                tracker_frame_sequence=current.tracker_frame_sequence,
+                latest_camera_token=current.token,
+                current_gate_index=6,
+                current_track_id="track-6",
+                current_track=track,
+                authority_usable=True,
+                race_finished=False,
+            )
+
+        def _sample(self):
+            if self.jump_sent:
+                super()._sample()
+                self.visual_gate_graph.latest_snapshot = _snapshot(
+                    self.current_gate,
+                    self.current_track_id,
+                    self.sequence,
+                    visible=False,
+                )
+                _set_attitude(self, yaw=0.049)
+                return
+            super()._sample()
+            upcoming = self.passage_counts.get(self.current_gate, 0) + 1
+            if upcoming >= 4:
+                _set_attitude(self, yaw=0.049)
+            else:
+                _set_attitude(self)
+            if upcoming == 6:
+                self.visual_gate_graph.latest_snapshot = (
+                    self._jump_predecessor_snapshot()
+                )
+            elif upcoming == 7:
+                self.visual_gate_graph.latest_snapshot = (
+                    self._jump_current_snapshot()
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(
+                command,
+                **kwargs,
+            )
+            token = kwargs.get("wire_visual_token")
+            if (
+                token is not None
+                and self.predecessor_samples is not None
+                and token
+                == self.visual_gate_graph.latest_snapshot.latest_camera_token
+                and command.thrust == 0.21
+            ):
+                self.jump_sent = True
+                self.jump_token = token
+                self.jump_command = command
+            if (
+                command.roll_rate
+                == command.pitch_rate
+                == command.yaw_rate
+                == command.thrust
+                == 0.0
+            ):
+                if self.crossing_zero_count >= 2:
+                    self.disable_credit = False
+                    self._advance_race()
+            return receipt
+
+    host = AdjacentJumpHost(
+        initial_gate=6,
+        finish_gate=6,
+        disable_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: AdjacentJumpServo(
+            *args,
+            passage_preview_blend=0.20,
+            **kwargs,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    segment = result["segments"][0]
+    assert segment["adjacent_scale_jump_crossing_count"] == 1
+    anchor = segment["crossing_anchor"]
+    assert anchor["basis"] == (
+        course_stage.RETAINED_ADJACENT_SCALE_JUMP_CROSSING_BASIS
+    )
+    assert anchor["camera_token"] == asdict(host.jump_token)
+    assert anchor["retained_crossing_dwell_frames"] == 3
+    assert anchor["current_advance_enabled"] is False
+    assert anchor["yaw_soft_stop_zeroed"] is True
+    assert anchor["next_preview_collective_delta"] == 0.0
+    assert anchor["command"] == asdict(host.jump_command)
+    assert anchor["current_only_crossing_coast_thrust"] == (
+        host.jump_command.thrust
+    )
+    evidence = anchor["adjacent_scale_jump_evidence"]
+    assert evidence["predecessor_retained_crossing_dwell_frames"] == 3
+    assert evidence["predecessor_log_scale"] == pytest.approx(
+        -0.8438405125363927
+    )
+    assert (
+        evidence["predecessor_projected_log_scale_at_current"]
+        >= VisualCourseStageLimits().crossing_arm_min_log_scale
+    )
+    assert segment["crossing_wait_zero_command_count"] == 2
+
+
 def test_retained_projection_is_narrowed_by_raw_and_projected_scales():
     target, output, admission = _attempt8_close_alignment_crossing_values()
     tuning = default_visual_config().servo
