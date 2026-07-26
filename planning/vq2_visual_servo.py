@@ -1330,14 +1330,9 @@ class ImageVisualServo:
             1.0,
         )
         heading_forward_authority = _clamp(
-            (
-                self.tuning.edge_brake_x
-                - abs(projected_heading_horizontal)
-            )
-            / (
-                self.tuning.edge_brake_x
-                - self.tuning.horizontal_corridor
-            ),
+            1.0
+            - abs(projected_heading_horizontal)
+            / self.tuning.edge_brake_x,
             0.0,
             1.0,
         )
@@ -1394,11 +1389,12 @@ class ImageVisualServo:
             )
         advance_enabled = forward_authority > 0.0
 
-        # An adjacent preview is useful early, but it must not build lateral
-        # gate-frame momentum as the current aperture rapidly expands.  Taper
-        # only the preview contribution with the same continuous expansion
-        # and proximity authority used for closure.  Current-aperture error
-        # retains full yaw/roll authority, including after promotion.
+        # Taper the adjacent preview's reported bearing/elevation blend as the
+        # current aperture expands, while the separately corridor-constrained
+        # heading above retains coordinated yaw/bank authority.  This starts
+        # lateral interception before the physical handoff without allowing
+        # successor steering to spend the current aperture's projected
+        # horizontal margin.
         if blend > 0.0:
             assert next_target is not None
             preview_steering_authority = (
@@ -1462,8 +1458,8 @@ class ImageVisualServo:
             brake_reason = "segment_yaw_outward_soft_stop"
 
         target_roll = _clamp(
-            self.tuning.roll_error_gain * horizontal
-            + self.tuning.roll_rate_gain * horizontal_rate,
+            self.tuning.roll_error_gain * heading_horizontal
+            + self.tuning.roll_rate_gain * heading_horizontal_rate,
             -MAX_VISUAL_TARGET_ROLL_RAD,
             MAX_VISUAL_TARGET_ROLL_RAD,
         )
@@ -1501,8 +1497,23 @@ class ImageVisualServo:
             pitch_basis = self.tuning.brake_pitch_rad
             thrust_basis = self.tuning.brake_thrust
         else:
-            pitch_basis = 0.0
-            thrust_basis = self.tuning.align_thrust
+            maneuver_brake_authority = max(
+                1.0 - heading_forward_authority,
+                1.0 - expansion_authority,
+                1.0 - proximity_authority,
+            )
+            pitch_basis = (
+                maneuver_brake_authority
+                * self.tuning.brake_pitch_rad
+            )
+            thrust_basis = (
+                self.tuning.align_thrust
+                + maneuver_brake_authority
+                * (
+                    self.tuning.brake_thrust
+                    - self.tuning.align_thrust
+                )
+            )
         raw_target_pitch = pitch_basis + vertical_correction
         if not advance_enabled:
             # Normalized collective owns vertical alignment until the target is
