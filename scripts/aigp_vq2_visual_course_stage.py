@@ -410,7 +410,9 @@ class VisualCourseStageLimits:
     course_hard_duration_s: float = 120.0
     segment_hard_duration_s: float = MAX_VISUAL_SEGMENT_DURATION_S
     passage_hard_duration_s: float = MAX_VISUAL_SEGMENT_DURATION_S
-    crossing_status_timeout_s: float = 0.40
+    # Three nominal 4 Hz race packets cover the observed censor-to-credit
+    # interval without changing command envelopes, freshness, or segment time.
+    crossing_status_timeout_s: float = 0.75
     censored_passage_coast_max_duration_s: float = 0.30
     censored_passage_coast_max_fresh_frames: int = 8
     post_credit_fresh_frame_timeout_s: float = 0.20
@@ -474,7 +476,7 @@ class VisualCourseStageLimits:
             self.segment_hard_duration_s
         ):
             raise ValueError("visual-course passage duration is outside bounds")
-        if not 0.05 <= self.crossing_status_timeout_s <= 0.40:
+        if not 0.05 <= self.crossing_status_timeout_s <= 0.75:
             raise ValueError("visual-course crossing wait is outside bounds")
         if not 0.20 <= self.censored_passage_coast_max_duration_s <= 0.30:
             raise ValueError(

@@ -1199,7 +1199,15 @@ def test_latched_crossing_without_authoritative_credit_times_out_bounded():
     segment = host._visual_course_summary["segments"][0]
     assert segment["near_plane_latch"] is not None
     assert segment["crossing_wait_zero_command_count"] == 0
-    assert 1 <= segment["crossing_wait_coast_command_count"] <= 20
+    max_crossing_commands = math.ceil(
+        runtime.limits.crossing_status_timeout_s
+        / runtime.limits.control_period_s
+    )
+    assert (
+        1
+        <= segment["crossing_wait_coast_command_count"]
+        <= max_crossing_commands
+    )
     assert host.race.active_gate_index == 6
     assert host.race.race_finished is False
 
@@ -2416,7 +2424,7 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
     (
         ("control_period_s", 0.019, "exactly 50 Hz"),
         ("passage_hard_duration_s", 8.01, "passage duration"),
-        ("crossing_status_timeout_s", 0.41, "crossing wait"),
+        ("crossing_status_timeout_s", 0.76, "crossing wait"),
         (
             "censored_passage_coast_max_duration_s",
             0.301,
