@@ -1238,11 +1238,10 @@ class ImageVisualServo:
             # successor identity.  Allocate its heading authority from the
             # current aperture's horizontal margin rather than multiplying
             # the scale ramp twice.  Two independent current-gate barriers
-            # make steering return to current-only before either measured or
-            # projected position spends the aperture.  Retain successor bank
-            # while that margin exists: closure is reduced independently by
-            # pitch and collective, so approaching the near plane must not
-            # erase the lateral intercept before the physical handoff.
+            # make yaw unwind before either measured or projected position
+            # spends the aperture.  Bank builds the early spatial intercept
+            # and then returns continuously to current-only as passage scale
+            # progress approaches the near plane.
             projected_current_horizontal = (
                 raw_horizontal
                 + raw_horizontal_rate
@@ -1277,7 +1276,15 @@ class ImageVisualServo:
                 + current_barrier_authority
                 * float(next_target.normalized_x_rate_s)
             )
-            bank_authority = current_barrier_authority
+            passage_scale_progress = _clamp(
+                blend / MAX_NEXT_GATE_BLEND,
+                0.0,
+                1.0,
+            )
+            bank_authority = (
+                current_barrier_authority
+                * (1.0 - passage_scale_progress)
+            )
             bank_horizontal = (
                 (1.0 - bank_authority) * raw_horizontal
                 + bank_authority * next_horizontal

@@ -866,6 +866,7 @@ def _assert_course_zero_receipts(
 def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
     calls = []
     options = dict(servo_options or {})
+    host.intercept_response_authorities = []
 
     def servo_factory(*args, **kwargs):
         return _Servo(*args, **kwargs, calls=calls, **options)
@@ -886,6 +887,9 @@ def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
         intercept_response_authority=0.0,
     ):
         assert intercept_response_authority in {0.0, 1.0}
+        host.intercept_response_authorities.append(
+            intercept_response_authority
+        )
         return AttitudeRateCommand(
             target_roll_rad,
             target_pitch_rad,
@@ -2711,6 +2715,9 @@ def test_credit_wait_uses_one_stable_adjacent_without_advance():
         and host.commands[index][0].thrust == 0.27
         for index in adjacent_tick_indexes
     )
+    assert host.intercept_response_authorities.count(1.0) >= transition[
+        "crossing_wait_adjacent_command_count"
+    ]
     assert any(
         gate_index == 7
         and mode is VisualApproachMode.ADJACENT_RECENTER

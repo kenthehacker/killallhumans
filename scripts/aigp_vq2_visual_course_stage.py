@@ -3886,6 +3886,12 @@ async def _run_visual_course_stage_impl(
                         snapshot=snapshot,
                         target_track=adjacent_track,
                         apply_launch_bootstrap=False,
+                        # Once the near plane is latched and the old aperture
+                        # has disappeared, apply the already flight-proved
+                        # pitch response to fresh successor braking.  This
+                        # moves closure control before race-packet latency
+                        # without changing roll, yaw, thrust, or any bound.
+                        intercept_response_authority=1.0,
                         command_deadline_s=min(
                             course_deadline_s,
                             crossing_deadline_s,
