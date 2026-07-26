@@ -7902,8 +7902,20 @@ def test_yaw_capability_entry_is_short_braked_and_bounded(monkeypatch):
     async def sleep(seconds):
         clock[0] += max(0.0, float(seconds))
 
-    async def send(command, **_kwargs):
+    async def send(command, **kwargs):
+        assert kwargs["require_wire_receipt"] is True
         commands.append(command)
+        return {
+            "wire": {
+                "type_mask": 128,
+                "body_rates_rad_s": [
+                    -command.roll_rate,
+                    -command.pitch_rate,
+                    -command.yaw_rate,
+                ],
+                "thrust": command.thrust,
+            }
+        }
 
     monkeypatch.setattr(
         runner,

@@ -12452,7 +12452,33 @@ class VQ2Runner:
                 target_pitch_rad=MAX_VISUAL_TARGET_PITCH_RAD,
                 thrust=thrust,
             )
-            await self._send_flight_command(command)
+            receipt = await self._send_flight_command(
+                command,
+                require_wire_receipt=True,
+            )
+            wire = (
+                None
+                if not isinstance(receipt, Mapping)
+                else receipt.get("wire")
+            )
+            if (
+                not isinstance(wire, Mapping)
+                or wire.get("type_mask") != 128
+                or tuple(
+                    float(value)
+                    for value in wire.get("body_rates_rad_s", ())
+                )
+                != (
+                    -float(command.roll_rate),
+                    -float(command.pitch_rate),
+                    -float(command.yaw_rate),
+                )
+                or float(wire.get("thrust", math.nan))
+                != float(command.thrust)
+            ):
+                raise SafetyAbort(
+                    "yaw capability entry wire mapping is invalid"
+                )
             command_count += 1
             max_abs_body_rate = max(
                 max_abs_body_rate,
