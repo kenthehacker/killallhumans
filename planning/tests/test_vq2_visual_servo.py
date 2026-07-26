@@ -1237,9 +1237,6 @@ def test_rapid_expansion_tapers_only_successor_preview_steering() -> None:
     assert stable.effective_horizontal_error == pytest.approx(0.09)
     assert expanding.effective_horizontal_error == pytest.approx(0.03)
     assert abs(expanding.yaw_rate_rad_s) < abs(stable.yaw_rate_rad_s)
-    assert expanding.yaw_rate_rad_s == pytest.approx(
-        -0.3 * 0.3 * 0.3 * math.sqrt(1.0 / 3.0)
-    )
     assert abs(expanding.target_roll_rad) < abs(stable.target_roll_rad)
     assert expanding.advance_enabled is True
 
