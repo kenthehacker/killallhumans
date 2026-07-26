@@ -84,6 +84,20 @@ _SOURCES = (
         ),
         "replay_bundle": None,
     },
+    {
+        "run_id": "20260726T042145Z-visual-course-93d97b28",
+        "commit": "cab574e138f552d20d5cca80b9dcc07c02d46790",
+        "configuration_sha256": (
+            "ca07ccf0b60840e77db43137e9c5e2f33449d23bb6f7933994695e62fbb93e11"
+        ),
+        "trace_sha256": (
+            "4013133b12496e813e650ff4a6c1d0fa02a784b8df7d329cea592ac63b5eddec"
+        ),
+        "result_sha256": (
+            "67aee8be848b7b1b0db85a4453a8453da1793f171101506e5a494c250e1b4d86"
+        ),
+        "replay_bundle": None,
+    },
 )
 _CAMERA_STREAM = "vq2-camera-udp-5600"
 _CURRENT_TRACK = "vq2-track-000001"

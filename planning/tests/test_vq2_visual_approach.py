@@ -1417,6 +1417,92 @@ def test_clipped_or_censored_current_aperture_refuses_authority() -> None:
         _observe(approach, snapshot, tracker)
 
 
+def test_recovery_mode_accepts_exactly_one_censored_edge_without_advance():
+    tracker, graph, _, current_id, _, sequence = _build_bound_graph()
+    snapshot = _advance(
+        tracker,
+        graph,
+        sequence + 1,
+        current_clipping=FrameEdge.TOP,
+        current_center_censored=True,
+    )
+    approach = _approach(current_id)
+
+    proposal = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PROMOTE_REACQUIRE,
+    )
+
+    assert proposal.mode is VisualApproachMode.PROMOTE_REACQUIRE
+    assert proposal.current_target.vertical_geometry_censored
+    assert not proposal.current_target.horizontal_geometry_censored
+    assert proposal.next_target is None
+    assert proposal.passage_admission is None
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.servo_output.advance_enabled is False
+    assert proposal.servo_output.brake_reason == "target_edge_or_clipping"
+
+
+def test_recovery_mode_does_not_consume_next_candidate_bookkeeping():
+    tracker, graph, _, current_id, _, sequence = _build_bound_graph()
+    snapshot = _advance(tracker, graph, sequence + 1)
+    snapshot = replace(
+        snapshot,
+        next_candidates=snapshot.next_candidates * 2,
+        provisional_track_ids=("unreviewed", "unreviewed"),
+        next_selection_ambiguous=True,
+    )
+
+    proposal = _observe(
+        _approach(current_id),
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PROMOTE_REACQUIRE,
+    )
+
+    assert proposal.next_target is None
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.servo_output.advance_enabled is False
+
+
+@pytest.mark.parametrize(
+    "clipping",
+    (
+        FrameEdge.TOP | FrameEdge.RIGHT,
+        FrameEdge.TOP | FrameEdge.BOTTOM,
+        (
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM
+        ),
+    ),
+)
+def test_recovery_mode_rejects_multi_edge_current(clipping) -> None:
+    tracker, graph, _, current_id, _, sequence = _build_bound_graph()
+    snapshot = _advance(
+        tracker,
+        graph,
+        sequence + 1,
+        current_clipping=clipping,
+        current_center_censored=True,
+    )
+    approach = _approach(current_id)
+
+    with pytest.raises(
+        VisualApproachCurrentGeometryUnavailable,
+        match="clipped or censored",
+    ):
+        _observe(
+            approach,
+            snapshot,
+            tracker,
+            mode=VisualApproachMode.PROMOTE_REACQUIRE,
+        )
+
+
 def test_latched_next_identity_conflict_withholds_without_switching() -> None:
     tracker, graph, snapshot, current_id, next_id, sequence = (
         _build_bound_graph()

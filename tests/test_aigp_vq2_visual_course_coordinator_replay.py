@@ -21,8 +21,10 @@ from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import VisualTrackRole
 from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
+    VisualApproachMode,
 )
 from scripts.aigp_vq2_visual_course_stage import (
+    VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON,
     VisualCourseStageLimits,
     run_visual_course_stage,
 )
@@ -32,6 +34,7 @@ from tests.test_aigp_vq2_visual_course import (
     _Servo as _CoordinatorServo,
     _context,
     _runtime,
+    _snapshot,
     _token,
 )
 
@@ -485,3 +488,401 @@ def test_coordinator_replay_off_center_censor_aborts_before_coast_or_credit():
     assert segment["censored_passage_coast_command_count"] == 0
     assert segment["crossing_wait_zero_command_count"] == 0
     assert host.requested_promotion_track_ids == []
+
+
+_ATTEMPT5_POST_CREDIT_ROWS = {
+    180: {
+        "center": (0.59375, -0.6555555555555556),
+        "velocity": (0.27821149946603263, -0.5777751631733091),
+        "scale": 0.1957335738815506,
+        "confidence": 0.7872491939937416,
+        "association": 0.9297907186380104,
+        "clipping": FrameEdge.NONE,
+        "center_censored": False,
+    },
+    181: {
+        "center": (0.6031249999999999, -0.6722222222222223),
+        "velocity": (0.27110915873146013, -0.5194014615999842),
+        "scale": 0.2019866607256804,
+        "confidence": 0.7945289760068612,
+        "association": 0.9345003622370058,
+        "clipping": FrameEdge.NONE,
+        "center_censored": False,
+    },
+    182: {
+        "center": (0.6125, -0.6944444444444444),
+        "velocity": (0.3144518037296715, -0.6899147935434264),
+        "scale": 0.20823956223008577,
+        "confidence": 0.8015915392030875,
+        "association": 0.9297269854038298,
+        "clipping": FrameEdge.NONE,
+        "center_censored": False,
+    },
+    183: {
+        "center": (0.621875, -0.7222222222222222),
+        "velocity": (0.2885910808222251, -0.7462772693726882),
+        "scale": 0.21556208824579728,
+        "confidence": 0.8131901926413894,
+        "association": 0.8605656550353479,
+        "clipping": FrameEdge.TOP,
+        "center_censored": True,
+    },
+}
+
+
+class _Attempt5RecoveryHost(_CoordinatorHost):
+    """Coordinator fact replay with exact logged post-credit tracker rows.
+
+    Planner proposals, IMU, and stage boundaries remain deterministic mocks;
+    this is not JPEG, detector, or full tracker replay.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            initial_gate=3,
+            finish_gate=99,
+            fresh_after_samples=1,
+        )
+        self.clock = 3.50
+        self.sequence = 175
+        self.visual_gate_graph.latest_snapshot = _snapshot(
+            self.current_gate,
+            self.current_track_id,
+            self.sequence,
+        )
+
+    def _watchdog(self, **kwargs):
+        assert kwargs["enforce_benign_pad_budget"] is True
+        assert type(kwargs["allow_benign_pad_contact"]) is bool
+        self.watchdogs += 1
+
+    def _sample(self) -> None:
+        # Credit is received during the accepted publication-179 wire.  Keep
+        # that exact camera watermark until promotion consumes the boundary.
+        if (
+            self.after_promotion_samples is None
+            and not self.race.race_finished
+            and self.race.active_gate_index == self.current_gate + 1
+        ):
+            return
+        super()._sample()
+        if self.after_promotion_samples is None:
+            return
+        snapshot = self.visual_gate_graph.latest_snapshot
+        track = snapshot.current_track
+        row = _ATTEMPT5_POST_CREDIT_ROWS.get(self.sequence)
+        if row is not None:
+            track.center_norm = row["center"]
+            track.center_velocity_norm_s = row["velocity"]
+            track.apparent_scale = row["scale"]
+            track.confidence = row["confidence"]
+            track.association_confidence = row["association"]
+            track.clipping = row["clipping"]
+            track.center_censored = row["center_censored"]
+            snapshot.authority_usable = True
+            return
+        if self.sequence >= 184:
+            track.visible = False
+            track.missed_frame_count = 1
+            track.latest_token = _token(self.sequence - 1)
+            snapshot.authority_usable = False
+
+
+class _Attempt5RecoveryServo(_CoordinatorServo):
+    """Expose exact target facts while retaining deterministic wire control."""
+
+    def observe(self, snapshot, *args, **kwargs):
+        proposal = super().observe(snapshot, *args, **kwargs)
+        if kwargs["mode"] is not VisualApproachMode.PROMOTE_REACQUIRE:
+            return proposal
+        track = snapshot.current_track
+        latest = track.history[-1]
+        clipping = track.clipping
+        target = replace(
+            proposal.current_target,
+            received_monotonic_s=(
+                latest.observation_monotonic_ns / 1_000_000_000.0
+            ),
+            normalized_x=track.center_norm[0],
+            normalized_y_down=track.center_norm[1],
+            normalized_x_rate_s=track.center_velocity_norm_s[0],
+            normalized_y_rate_down_s=track.center_velocity_norm_s[1],
+            log_scale=math.log(track.apparent_scale),
+            confidence=track.confidence,
+            association_confidence=track.association_confidence,
+            clipped=clipping != FrameEdge.NONE,
+            center_censored=track.center_censored,
+            horizontal_censored=bool(
+                clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+            ),
+            vertical_censored=bool(
+                clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+            ),
+        )
+        one_edge = clipping != FrameEdge.NONE
+        proposal.current_target = target
+        proposal.passage_admission = None
+        proposal.servo_output = replace(
+            proposal.servo_output,
+            target_pitch_rad=0.035 if one_edge else 0.08,
+            yaw_rate_rad_s=-0.08,
+            thrust=0.21 if one_edge else 0.29,
+            corridor_frames=0,
+            advance_enabled=False,
+            next_gate_blend=0.0,
+            brake_reason=(
+                "target_edge_or_clipping" if one_edge else "aligning"
+            ),
+        )
+        return proposal
+
+
+def _attempt5_runtime(host):
+    limits = replace(
+        VisualCourseStageLimits(),
+        post_credit_fresh_frame_timeout_s=0.05,
+    )
+    runtime, _calls = _runtime(host, limits=limits)
+    servo_calls = []
+
+    def servo_factory(*args, **kwargs):
+        return _Attempt5RecoveryServo(
+            *args,
+            **kwargs,
+            calls=servo_calls,
+            yaw_rate=0.0,
+        )
+
+    return replace(runtime, servo_factory=servo_factory)
+
+
+def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
+    """Recorded tracker rows with candidate output, not recorded flight wires."""
+
+    host = _Attempt5RecoveryHost()
+
+    with pytest.raises(SafetyAbort, match="post-credit recovery timed out"):
+        asyncio.run(
+            run_visual_course_stage(
+                host,
+                _context(),
+                runtime=_attempt5_runtime(host),
+            )
+        )
+
+    candidate_wires = [
+        (kwargs["wire_visual_token"].publication_sequence, command)
+        for command, kwargs, gate_index in host.commands
+        if (
+            gate_index == 4
+            and kwargs.get("wire_visual_token") is not None
+        )
+    ]
+    assert [sequence for sequence, _command in candidate_wires] == [
+        180,
+        181,
+        182,
+        183,
+    ]
+    top_command = candidate_wires[-1][1]
+    assert top_command.pitch_rate >= 0.0
+    assert top_command.yaw_rate < 0.0
+    assert top_command.thrust == pytest.approx(0.21)
+
+    transition = host._visual_course_summary[
+        "authoritative_transitions"
+    ][0]
+    assert transition["from_gate_index"] == 3
+    assert transition["to_gate_index"] == 4
+    assert transition["recovery_admission"]["admitted_frame_token"][
+        "publication_sequence"
+    ] == 180
+    assert transition["recovery_admission"]["wire_frame_token"][
+        "publication_sequence"
+    ] == 180
+    recovery = host._visual_course_summary["segments"][1]
+    assert recovery["lifecycle"] == "promote_reacquire"
+    assert recovery["recovery_clean_command_count"] == 3
+    assert recovery["recovery_one_edge_command_count"] == 1
+    # The accepted TOP-censored brake wire renews the existing 50 ms
+    # publication-gap bound; the following losses therefore receive two
+    # zero-only ticks before the bounded timeout.
+    assert recovery["recovery_zero_command_count"] == 2
+
+
+class _Attempt5OutsideImageHost(_Attempt5RecoveryHost):
+    """Counterfactual unsafe mutation of the recorded publication 183."""
+
+    def _sample(self):
+        super()._sample()
+        if self.after_promotion_samples is not None and self.sequence == 183:
+            self.visual_gate_graph.latest_snapshot.current_track.center_norm = (
+                1.01,
+                -0.7222222222222222,
+            )
+
+
+def test_attempt5_outside_observable_axis_aborts_before_pub183_wire():
+    host = _Attempt5OutsideImageHost()
+
+    with pytest.raises(
+        SafetyAbort,
+        match="post-credit recovery measurement became unsafe",
+    ):
+        asyncio.run(
+            run_visual_course_stage(
+                host,
+                _context(),
+                runtime=_attempt5_runtime(host),
+            )
+        )
+
+    assert [
+        kwargs["wire_visual_token"].publication_sequence
+        for _command, kwargs, gate_index in host.commands
+        if gate_index == 4 and kwargs.get("wire_visual_token") is not None
+    ] == [180, 181, 182]
+
+
+class _RecoverySlotReplacementHost(_CadencedCoordinatorHost):
+    """Publish one receiver frame during the admitted recovery wire wait."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            credit_policy="delayed",
+            finish_gate=2,
+        )
+        self.recovery_slot_replacement_injected = False
+        self.recovery_replacement_sequence = None
+        self.recovery_replacement_received_s = None
+        self.recovery_refresh_sample_s = None
+        self.receiver_camera_token = (
+            self.visual_gate_graph.latest_snapshot.latest_camera_token
+        )
+
+    async def _wait_for_next_flight_command_slot(self):
+        ready = await super()._wait_for_next_flight_command_slot()
+        if (
+            not self.recovery_slot_replacement_injected
+            and self.current_gate == 2
+            and self.after_promotion_samples is not None
+            and self.visual_gate_graph.latest_snapshot.current_track.visible
+        ):
+            self.clock += 0.021
+            self._next_camera_s = min(
+                self._next_camera_s,
+                self.clock,
+            )
+            self.receiver_camera_token = _token(self.sequence + 1)
+            self.recovery_slot_replacement_injected = True
+            self.recovery_replacement_received_s = self.clock
+            self.recovery_replacement_sequence = (
+                self.receiver_camera_token.publication_sequence
+            )
+        return ready
+
+    def _sample(self):
+        graph_token = (
+            self.visual_gate_graph.latest_snapshot.latest_camera_token
+        )
+        if self.receiver_camera_token != graph_token:
+            self.recovery_refresh_sample_s = self.clock
+        super()._sample()
+        self.receiver_camera_token = (
+            self.visual_gate_graph.latest_snapshot.latest_camera_token
+        )
+
+    def _assert_visual_receiver_token_current(self, expected_token):
+        receiver_token = self.receiver_camera_token
+        if receiver_token != expected_token:
+            exc = SafetyAbort(
+                VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+            )
+            exc.expected_visual_token = expected_token
+            exc.receiver_visual_token = receiver_token
+            raise exc
+        return receiver_token
+
+
+def test_recovery_replans_when_receiver_replaces_candidate_in_wire_slot():
+    host = _RecoverySlotReplacementHost()
+
+    result = asyncio.run(
+        run_visual_course_stage(
+            host,
+            _context(),
+            runtime=_cadenced_runtime(host),
+        )
+    )
+
+    assert result["race_finished"] is True
+    assert host.recovery_slot_replacement_injected
+    assert host.recovery_refresh_sample_s == pytest.approx(
+        host.recovery_replacement_received_s,
+        abs=1e-12,
+    )
+    transition = result["authoritative_transitions"][0]
+    admission = transition["recovery_admission"]
+    admitted_sequence = admission["admitted_frame_token"][
+        "publication_sequence"
+    ]
+    wire_sequence = admission["wire_frame_token"][
+        "publication_sequence"
+    ]
+    assert wire_sequence == host.recovery_replacement_sequence
+    assert wire_sequence > admitted_sequence
+    assert all(
+        wire["token"].publication_sequence != admitted_sequence
+        for wire in host.navigation_wires
+        if wire["gate_index"] == 2
+    )
+    recovery_segment = result["segments"][1]
+    assert recovery_segment["superseded_proposal_count"] >= 1
+    assert recovery_segment["recovery_clean_command_count"] >= 2
+
+
+class _RecoveryClippedReplacementHost(_RecoverySlotReplacementHost):
+    """Keep every replacement publication TOP-censored before first wire."""
+
+    def _censor_recovery_current(self):
+        if (
+            not self.recovery_slot_replacement_injected
+            or self.current_gate != 2
+            or self.after_promotion_samples is None
+        ):
+            return
+        snapshot = self.visual_gate_graph.latest_snapshot
+        snapshot.current_track.clipping = FrameEdge.TOP
+        snapshot.current_track.center_censored = True
+
+    def _sample(self):
+        super()._sample()
+        self._censor_recovery_current()
+
+    async def _wait_for_next_flight_command_slot(self):
+        ready = await super()._wait_for_next_flight_command_slot()
+        self._censor_recovery_current()
+        return ready
+
+
+def test_recovery_one_edge_cannot_anchor_before_a_clean_wire():
+    host = _RecoveryClippedReplacementHost()
+
+    with pytest.raises(SafetyAbort, match="post-credit recovery timed out"):
+        asyncio.run(
+            run_visual_course_stage(
+                host,
+                _context(),
+                runtime=_cadenced_runtime(host),
+            )
+        )
+
+    assert host.recovery_slot_replacement_injected
+    assert not [
+        wire
+        for wire in host.navigation_wires
+        if wire["gate_index"] == 2
+    ]
+    recovery = host._visual_course_summary["segments"][1]
+    assert recovery["recovery_navigation_command_count"] == 0
+    assert recovery["recovery_zero_command_count"] > 0

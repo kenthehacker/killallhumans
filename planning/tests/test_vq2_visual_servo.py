@@ -1866,18 +1866,62 @@ def test_visual_track_adapter_requires_visible_race_labelled_current_authority()
     assert next_candidate.track_id == "vq2-track-000001"
 
 
-def test_failed_top_clipped_geometry_brakes_at_minimum_collective():
+@pytest.mark.parametrize(
+    (
+        "frame_id",
+        "publication_sequence",
+        "x",
+        "y",
+        "x_rate",
+        "y_rate",
+        "scale",
+        "scale_rate",
+    ),
+    (
+        (
+            1,
+            1,
+            0.65625,
+            -0.7277777777777779,
+            0.345412,
+            -0.607664,
+            math.exp(-1.530552),
+            1.0593890808936899,
+        ),
+        (
+            1_519_525,
+            183,
+            0.621875,
+            -0.7222222222222222,
+            0.2885910808222251,
+            -0.7462772693726882,
+            0.21556208824579728,
+            1.009549,
+        ),
+    ),
+)
+def test_top_clip_uses_observable_horizontal_brake_authority(
+    frame_id,
+    publication_sequence,
+    x,
+    y,
+    x_rate,
+    y_rate,
+    scale,
+    scale_rate,
+):
     servo = ImageVisualServo()
     output = step(
         servo,
         target(
-            1,
-            x=0.65625,
-            y=-0.7277777777777779,
-            x_rate=0.345412,
-            y_rate=-0.607664,
-            log_scale=-1.530552,
-            scale_rate=1.0593890808936899,
+            frame_id,
+            publication_sequence=publication_sequence,
+            x=x,
+            y=y,
+            x_rate=x_rate,
+            y_rate=y_rate,
+            log_scale=math.log(scale),
+            scale_rate=scale_rate,
             clipped=True,
             center_censored=True,
             vertical_censored=True,
@@ -1887,7 +1931,7 @@ def test_failed_top_clipped_geometry_brakes_at_minimum_collective():
     assert output.advance_enabled is False
     assert output.brake_reason == "target_edge_or_clipping"
     assert output.yaw_rate_rad_s < 0.0
-    assert output.effective_horizontal_error == pytest.approx(0.65625)
+    assert output.effective_horizontal_error == pytest.approx(x)
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
     assert output.target_pitch_rad >= 0.0

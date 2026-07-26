@@ -43,7 +43,9 @@ from planning.vq2_course_lifecycle import (
     NearPlaneEvidence,
     NearPlaneLatch,
     NearPlaneWireSample,
+    PostCreditMeasurementMode,
     advance_near_plane_evidence,
+    classify_post_credit_measurement,
     classify_latched_measurement,
 )
 from planning.vq2_visual_approach import (
@@ -370,19 +372,6 @@ class _CensoredPassageCoastAuthority:
 
 
 @dataclass(frozen=True, slots=True)
-class _FreshPostCreditHandoff:
-    """A graph-promoted current track ready for the ordinary next segment."""
-
-    track_id: str
-    frame_token: CameraFrameToken
-    promotion_identity_sha256: str
-    promotion_identity_basis: str
-    cross_gap_identity_claimed: bool
-    retained_history_frame_count: int
-    retained_history_span_s: float
-
-
-@dataclass(frozen=True, slots=True)
 class _ConfirmedCourseHandoff:
     """Common command boundary for retained promotion or fresh reacquisition."""
 
@@ -397,6 +386,18 @@ class _ConfirmedCourseHandoff:
     history_length_after_promotion: int
     promotion_identity_basis: str
     cross_gap_identity_claimed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPostCreditRecovery:
+    """Carry one admitted promoted publication into its command segment."""
+
+    from_gate_index: int
+    to_gate_index: int
+    track_id: str
+    camera_token_at_credit: CameraFrameToken
+    admitted_camera_token: CameraFrameToken
+    deadline_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -1317,6 +1318,9 @@ async def _run_visual_course_stage_impl(
     launch_collective_state: Optional[
         _Gate0ProvedCollectiveState
     ] = None
+    pending_post_credit_recovery: Optional[
+        _PendingPostCreditRecovery
+    ] = None
     host._visual_course_summary.update(
         {
             "outcome": "running",
@@ -1388,6 +1392,8 @@ async def _run_visual_course_stage_impl(
         yaw_reference_rad: float,
     ) -> None:
         nonlocal total_zero_commands
+        nonlocal last_command_send_s
+        nonlocal consecutive_superseded_proposals
         await host._wait_for_next_flight_command_slot()
         pad_contact = initial_pad_contact_authority()
         host._watchdog(
@@ -1413,21 +1419,23 @@ async def _run_visual_course_stage_impl(
         if not isinstance(receipt, Mapping):
             raise abort_type(
                 f"{stage} zero command lacks exact outbound receipt"
-            )
+        )
         host._record_tick(stage, elapsed_s, command)
         total_zero_commands += 1
+        last_command_send_s = float(runtime.monotonic())
+        consecutive_superseded_proposals = 0
         refresh_live_summary()
 
     def assert_pending_supersession_hold(phase: str) -> None:
         if consecutive_superseded_proposals <= 0:
             return
         now_s = float(runtime.monotonic())
-        if not math.isfinite(now_s) or now_s < last_navigation_send_s:
+        if not math.isfinite(now_s) or now_s < last_command_send_s:
             raise abort_type(
                 "visual-course supersession clock regressed"
             )
         if (
-            now_s - last_navigation_send_s
+            now_s - last_command_send_s
             >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
         ):
             raise abort_type(
@@ -1444,7 +1452,7 @@ async def _run_visual_course_stage_impl(
         stage: str,
     ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
-        nonlocal last_navigation_send_s
+        nonlocal last_command_send_s
         nonlocal consecutive_superseded_proposals
 
         def drop_superseded_proposal(
@@ -1470,7 +1478,7 @@ async def _run_visual_course_stage_impl(
             ):
                 raise exc
             now_s = float(runtime.monotonic())
-            if not math.isfinite(now_s) or now_s < last_navigation_send_s:
+            if not math.isfinite(now_s) or now_s < last_command_send_s:
                 raise abort_type(
                     "visual-course supersession clock regressed"
                 ) from exc
@@ -1478,7 +1486,7 @@ async def _run_visual_course_stage_impl(
             segment["superseded_proposal_count"] = int(
                 segment["superseded_proposal_count"]
             ) + 1
-            hold_s = now_s - last_navigation_send_s
+            hold_s = now_s - last_command_send_s
             host.recorder.emit(
                 "visual_course_proposal_superseded",
                 gate_index=current_gate_index,
@@ -1751,14 +1759,14 @@ async def _run_visual_course_stage_impl(
             hold_checked_s = float(runtime.monotonic())
             if (
                 not math.isfinite(hold_checked_s)
-                or hold_checked_s < last_navigation_send_s
+                or hold_checked_s < last_command_send_s
             ):
                 raise abort_type(
                     "visual-course supersession clock regressed"
                 )
             hold_remaining_s = (
                 MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-                - (hold_checked_s - last_navigation_send_s)
+                - (hold_checked_s - last_command_send_s)
             )
             if hold_remaining_s <= 0.0:
                 raise abort_type(
@@ -1902,7 +1910,7 @@ async def _run_visual_course_stage_impl(
             command,
         )
         total_navigation_commands += 1
-        last_navigation_send_s = float(runtime.monotonic())
+        last_command_send_s = float(runtime.monotonic())
         consecutive_superseded_proposals = 0
         if (
             transitions
@@ -1950,7 +1958,7 @@ async def _run_visual_course_stage_impl(
         """Reissue one frozen clean attitude target on an exact censored frame."""
 
         nonlocal total_navigation_commands
-        nonlocal last_navigation_send_s
+        nonlocal last_command_send_s
         nonlocal consecutive_superseded_proposals
 
         def drop_superseded_coast(
@@ -1972,7 +1980,7 @@ async def _run_visual_course_stage_impl(
             ):
                 raise exc
             now_s = float(runtime.monotonic())
-            if not math.isfinite(now_s) or now_s < last_navigation_send_s:
+            if not math.isfinite(now_s) or now_s < last_command_send_s:
                 raise abort_type(
                     "visual-course supersession clock regressed"
                 ) from exc
@@ -1980,7 +1988,7 @@ async def _run_visual_course_stage_impl(
             segment["superseded_proposal_count"] = int(
                 segment["superseded_proposal_count"]
             ) + 1
-            hold_s = now_s - last_navigation_send_s
+            hold_s = now_s - last_command_send_s
             host.recorder.emit(
                 "visual_course_proposal_superseded",
                 gate_index=current_gate_index,
@@ -2123,14 +2131,14 @@ async def _run_visual_course_stage_impl(
             hold_checked_s = float(runtime.monotonic())
             if (
                 not math.isfinite(hold_checked_s)
-                or hold_checked_s < last_navigation_send_s
+                or hold_checked_s < last_command_send_s
             ):
                 raise abort_type(
                     "visual-course supersession clock regressed"
                 )
             hold_remaining_s = (
                 MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-                - (hold_checked_s - last_navigation_send_s)
+                - (hold_checked_s - last_command_send_s)
             )
             if hold_remaining_s <= 0.0:
                 raise abort_type(
@@ -2208,7 +2216,7 @@ async def _run_visual_course_stage_impl(
             command,
         )
         total_navigation_commands += 1
-        last_navigation_send_s = float(runtime.monotonic())
+        last_command_send_s = float(runtime.monotonic())
         consecutive_superseded_proposals = 0
         if segment["launch_bootstrap"]["enabled"]:
             launch = segment["launch_bootstrap"]
@@ -2259,6 +2267,26 @@ async def _run_visual_course_stage_impl(
             and initial_gate_index == 0
             and current_gate_index == initial_gate_index
         )
+        post_credit_recovery = pending_post_credit_recovery
+        pending_post_credit_recovery = None
+        if post_credit_recovery is not None and (
+            segment_number <= 0
+            or post_credit_recovery.to_gate_index
+            != current_gate_index
+            or post_credit_recovery.track_id != current_track_id
+            or post_credit_recovery.from_gate_index
+            != current_gate_index - 1
+            or not _token_strictly_newer(
+                post_credit_recovery.admitted_camera_token,
+                post_credit_recovery.camera_token_at_credit,
+            )
+            or not math.isfinite(post_credit_recovery.deadline_s)
+            or post_credit_recovery.deadline_s <= segment_started_s
+        ):
+            raise abort_type(
+                "visual-course pending post-credit recovery is invalid "
+                "or expired"
+            )
         launch_collective_state = (
             _Gate0ProvedCollectiveState()
             if launch_enabled
@@ -2292,8 +2320,38 @@ async def _run_visual_course_stage_impl(
                 host.visual_config.lifecycle.next_gate_blend_max
             ),
         )
-        mode = VisualApproachMode.APPROACH
-        lifecycle = CourseLifecycle.APPROACH
+        mode = (
+            VisualApproachMode.PROMOTE_REACQUIRE
+            if post_credit_recovery is not None
+            else VisualApproachMode.APPROACH
+        )
+        lifecycle = (
+            CourseLifecycle.PROMOTE_REACQUIRE
+            if post_credit_recovery is not None
+            else CourseLifecycle.APPROACH
+        )
+        recovery_deadline_s = (
+            None
+            if post_credit_recovery is None
+            else post_credit_recovery.deadline_s
+        )
+        recovery_previous_camera_token = (
+            None
+            if post_credit_recovery is None
+            else post_credit_recovery.camera_token_at_credit
+        )
+        recovery_last_track_token = (
+            None
+            if post_credit_recovery is None
+            else post_credit_recovery.admitted_camera_token
+        )
+        recovery_reuse_graph_snapshot = (
+            post_credit_recovery is not None
+        )
+        recovery_refresh_receiver_snapshot = False
+        recovery_first_clean_wire_token: Optional[
+            CameraFrameToken
+        ] = None
         passage_admission: Optional[VisualApproachPassageAdmission] = None
         passage_started_s: Optional[float] = None
         passage_command_count = 0
@@ -2316,7 +2374,7 @@ async def _run_visual_course_stage_impl(
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
-        last_navigation_send_s = segment_started_s
+        last_command_send_s = segment_started_s
         consecutive_superseded_proposals = 0
         segment = {
             "segment_number": segment_number,
@@ -2337,6 +2395,10 @@ async def _run_visual_course_stage_impl(
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
             "post_credit_zero_command_count": 0,
+            "recovery_navigation_command_count": 0,
+            "recovery_clean_command_count": 0,
+            "recovery_one_edge_command_count": 0,
+            "recovery_zero_command_count": 0,
             "passage_authority_enabled": False,
             "passage_admission": None,
             "lifecycle": lifecycle.value,
@@ -2532,13 +2594,40 @@ async def _run_visual_course_stage_impl(
             return refused_race
 
         while credited_race is None:
-            now = await pace_tick()
-            assert_pending_supersession_hold("paced control tick")
+            reuse_recovery_graph = bool(recovery_reuse_graph_snapshot)
+            refresh_recovery_receiver = bool(
+                recovery_refresh_receiver_snapshot
+            )
+            if reuse_recovery_graph or refresh_recovery_receiver:
+                recovery_reuse_graph_snapshot = False
+                recovery_refresh_receiver_snapshot = False
+                now = float(runtime.monotonic())
+                if not math.isfinite(now):
+                    raise abort_type(
+                        "visual-course recovery clock is invalid"
+                    )
+                assert_pending_supersession_hold(
+                    "admitted recovery control tick"
+                )
+            else:
+                now = await pace_tick()
+                assert_pending_supersession_hold("paced control tick")
             if now >= course_deadline_s:
                 raise abort_type("visual-course hard duration expired")
             if now >= segment_deadline_s:
                 raise abort_type(
                     f"visual-course gate {current_gate_index} segment expired"
+                )
+            if (
+                lifecycle is CourseLifecycle.PROMOTE_REACQUIRE
+                and (
+                    recovery_deadline_s is None
+                    or now >= recovery_deadline_s
+                )
+            ):
+                raise abort_type(
+                    f"visual-course gate {current_gate_index} "
+                    "post-credit recovery timed out"
                 )
             if (
                 passage_started_s is not None
@@ -2549,7 +2638,8 @@ async def _run_visual_course_stage_impl(
                     f"visual-course gate {current_gate_index} passage expired"
                 )
 
-            host._sample()
+            if not reuse_recovery_graph:
+                host._sample()
             pad_contact = initial_pad_contact_authority()
             host._watchdog(
                 require_target=False,
@@ -2632,7 +2722,87 @@ async def _run_visual_course_stage_impl(
             if type(token) is not CameraFrameToken:
                 raise abort_type("visual-course graph lacks exact camera token")
             if last_planned_token is not None and token == last_planned_token:
+                if refresh_recovery_receiver:
+                    raise abort_type(
+                        "visual-course receiver replacement did not publish "
+                        "a newer tracker/graph snapshot"
+                    )
                 continue
+            recovery_measurement_mode: Optional[
+                PostCreditMeasurementMode
+            ] = None
+            if lifecycle is CourseLifecycle.PROMOTE_REACQUIRE:
+                assert post_credit_recovery is not None
+                if (
+                    (
+                        reuse_recovery_graph
+                        or refresh_recovery_receiver
+                    )
+                    and token
+                    != post_credit_recovery.admitted_camera_token
+                ):
+                    if not _token_strictly_newer(
+                        token,
+                        post_credit_recovery.admitted_camera_token,
+                    ):
+                        raise abort_type(
+                            "visual-course recovery lost its admitted "
+                            "camera publication"
+                        )
+                assert recovery_previous_camera_token is not None
+                assert recovery_last_track_token is not None
+                recovery_measurement_mode = (
+                    classify_post_credit_measurement(
+                        snapshot,
+                        gate_index=current_gate_index,
+                        track_id=current_track_id,
+                        previous_camera_token=(
+                            recovery_previous_camera_token
+                        ),
+                        last_track_token=recovery_last_track_token,
+                    )
+                )
+                if (
+                    recovery_measurement_mode
+                    is PostCreditMeasurementMode.UNSAFE
+                ):
+                    raise abort_type(
+                        "visual-course post-credit recovery measurement "
+                        "became unsafe"
+                )
+                recovery_previous_camera_token = token
+                recovery_last_track_token = (
+                    snapshot.current_track.latest_token
+                )
+                if (
+                    recovery_measurement_mode
+                    is PostCreditMeasurementMode.REACQUIRE
+                    or (
+                        recovery_measurement_mode
+                        is PostCreditMeasurementMode.ONE_EDGE_CENSORED
+                        and recovery_first_clean_wire_token is None
+                    )
+                ):
+                    last_planned_token = token
+                    await send_zero(
+                        (
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/recovery-zero"
+                        ),
+                        now - segment_started_s,
+                        yaw_reference_rad=yaw_reference_rad,
+                    )
+                    segment["recovery_zero_command_count"] = int(
+                        segment["recovery_zero_command_count"]
+                    ) + 1
+                    transitions[-1][
+                        "post_transition_zero_command_count"
+                    ] = int(
+                        transitions[-1][
+                            "post_transition_zero_command_count"
+                        ]
+                    ) + 1
+                    continue
             passage_forward_closure_authorized = bool(
                 not segment["launch_bootstrap"]["enabled"]
                 or now - course_started_s
@@ -3068,6 +3238,136 @@ async def _run_visual_course_stage_impl(
                     **withdrawal,
                 )
                 refresh_live_summary()
+            if mode is VisualApproachMode.PROMOTE_REACQUIRE:
+                if (
+                    lifecycle is not CourseLifecycle.PROMOTE_REACQUIRE
+                    or recovery_measurement_mode
+                    not in {
+                        PostCreditMeasurementMode.CLEAN,
+                        PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+                    }
+                    or proposal.mode
+                    is not VisualApproachMode.PROMOTE_REACQUIRE
+                    or proposal.passage_admission is not None
+                    or proposal.servo_output.advance_enabled
+                    or proposal.servo_output.next_gate_blend != 0.0
+                ):
+                    raise abort_type(
+                        "visual-course recovery proposal escaped its "
+                        "current-only no-advance authority"
+                    )
+                recovery_stage_suffix = (
+                    "recovery-clean"
+                    if recovery_measurement_mode
+                    is PostCreditMeasurementMode.CLEAN
+                    else "recovery-one-edge"
+                )
+                try:
+                    accepted = await send_visual(
+                        proposal=proposal,
+                        snapshot=snapshot,
+                        yaw_reference_rad=yaw_reference_rad,
+                        segment_started_s=segment_started_s,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/"
+                            f"{recovery_stage_suffix}"
+                        ),
+                    )
+                except RaceActiveBoundaryChangedBeforeWire as exc:
+                    raise abort_type(
+                        "visual-course race boundary changed during "
+                        "post-credit recovery"
+                    ) from exc
+                if type(accepted) is _SupersededVisualProposal:
+                    recovery_refresh_receiver_snapshot = True
+                    continue
+                if type(accepted) is not _AcceptedVisualCommand:
+                    raise abort_type(
+                        "visual-course recovery command outcome is invalid"
+                    )
+                segment["recovery_navigation_command_count"] = int(
+                    segment["recovery_navigation_command_count"]
+                ) + 1
+                if recovery_first_clean_wire_token is None:
+                    admission_evidence = transitions[-1].get(
+                        "recovery_admission"
+                    )
+                    if (
+                        not isinstance(admission_evidence, dict)
+                        or admission_evidence.get("wire_frame_token")
+                        is not None
+                    ):
+                        raise abort_type(
+                            "visual-course recovery wire lacks its exact "
+                            "candidate evidence"
+                        )
+                    admission_evidence.update(
+                        {
+                            "wire_frame_token": asdict(
+                                accepted.wire_camera_token
+                            ),
+                            "wire_start_monotonic_ns": (
+                                accepted.wire_start_monotonic_ns
+                            ),
+                            "wire_return_monotonic_ns": (
+                                accepted.wire_return_monotonic_ns
+                            ),
+                        }
+                    )
+                recovery_deadline_s = min(
+                    course_deadline_s,
+                    segment_deadline_s,
+                    float(runtime.monotonic())
+                    + limits.post_credit_fresh_frame_timeout_s,
+                )
+                if (
+                    recovery_measurement_mode
+                    is PostCreditMeasurementMode.CLEAN
+                ):
+                    segment["recovery_clean_command_count"] = int(
+                        segment["recovery_clean_command_count"]
+                    ) + 1
+                    if recovery_first_clean_wire_token is None:
+                        recovery_first_clean_wire_token = (
+                            accepted.wire_camera_token
+                        )
+                else:
+                    segment["recovery_one_edge_command_count"] = int(
+                        segment["recovery_one_edge_command_count"]
+                    ) + 1
+                recovery_completed = bool(
+                    recovery_measurement_mode
+                    is PostCreditMeasurementMode.CLEAN
+                    and recovery_first_clean_wire_token is not None
+                    and _token_strictly_newer(
+                        accepted.wire_camera_token,
+                        recovery_first_clean_wire_token,
+                    )
+                    and proposal.servo_output.corridor_frames
+                    >= (
+                        host.visual_config.servo
+                        .required_corridor_frames
+                    )
+                    and proposal.servo_output.brake_reason == "aligning"
+                    and not accepted.yaw_soft_stop_zeroed
+                )
+                if recovery_completed:
+                    lifecycle = CourseLifecycle.APPROACH
+                    mode = VisualApproachMode.APPROACH
+                    segment["lifecycle"] = lifecycle.value
+                    host.recorder.emit(
+                        "visual_course_recovery_completed",
+                        gate_index=current_gate_index,
+                        camera_token=asdict(
+                            accepted.wire_camera_token
+                        ),
+                        clean_command_count=(
+                            segment["recovery_clean_command_count"]
+                        ),
+                    )
+                refresh_live_summary()
+                continue
             if mode is VisualApproachMode.APPROACH:
                 if proposal.servo_output.advance_enabled:
                     raise abort_type(
@@ -3695,19 +3995,13 @@ async def _run_visual_course_stage_impl(
         current_track_id = course_handoff.promoted_track_id
         max_gate_index = max(max_gate_index, current_gate_index)
         refresh_live_summary()
-        recovery_admission: Any = None
-        recovery_admission_kind: Optional[str] = None
         admitted_recovery_token: Optional[CameraFrameToken] = None
         latest_recovery_refusal: Optional[str] = None
 
         def evaluate_recovery_candidate(snapshot: Any) -> bool:
-            nonlocal recovery_admission
-            nonlocal recovery_admission_kind
             nonlocal admitted_recovery_token
             nonlocal latest_recovery_refusal
 
-            recovery_admission = None
-            recovery_admission_kind = None
             admitted_recovery_token = None
             if _current_snapshot_ready(
                 snapshot,
@@ -3718,59 +4012,7 @@ async def _run_visual_course_stage_impl(
                     course_handoff.race_status.received_monotonic_ns
                 ),
             ):
-                token = snapshot.latest_camera_token
-                promoted_track = host.visual_tracker.track(
-                    current_track_id
-                )
-                history = getattr(promoted_track, "history", None)
-                if (
-                    getattr(promoted_track, "latest_token", None) != token
-                    or type(history) is not tuple
-                    or not history
-                ):
-                    raise abort_type(
-                        "visual-course fresh promoted current is not bound "
-                        "to the ready graph snapshot"
-                    )
-                first_observation_ns = getattr(
-                    history[0],
-                    "observation_monotonic_ns",
-                    None,
-                )
-                last_observation_ns = getattr(
-                    history[-1],
-                    "observation_monotonic_ns",
-                    None,
-                )
-                if (
-                    type(first_observation_ns) is not int
-                    or type(last_observation_ns) is not int
-                    or last_observation_ns < first_observation_ns
-                ):
-                    raise abort_type(
-                        "visual-course fresh promoted current lacks exact "
-                        "history timing"
-                    )
-                recovery_admission = _FreshPostCreditHandoff(
-                    track_id=current_track_id,
-                    frame_token=token,
-                    promotion_identity_sha256=(
-                        course_handoff.promoted_history_sha256
-                    ),
-                    promotion_identity_basis=(
-                        course_handoff.promotion_identity_basis
-                    ),
-                    cross_gap_identity_claimed=(
-                        course_handoff.cross_gap_identity_claimed
-                    ),
-                    retained_history_frame_count=len(history),
-                    retained_history_span_s=(
-                        last_observation_ns - first_observation_ns
-                    )
-                    / 1_000_000_000.0,
-                )
-                recovery_admission_kind = "fresh_promoted_current"
-                admitted_recovery_token = token
+                admitted_recovery_token = snapshot.latest_camera_token
                 latest_recovery_refusal = None
                 return True
             latest_recovery_refusal = (
@@ -3848,29 +4090,34 @@ async def _run_visual_course_stage_impl(
             transition_summary["post_transition_zero_command_count"] = int(
                 transition_summary["post_transition_zero_command_count"]
             ) + 1
-        assert recovery_admission is not None
-        assert recovery_admission_kind is not None
         assert admitted_recovery_token is not None
         transition_summary["recovery_admission"] = {
-            "admission_kind": recovery_admission_kind,
+            "admission_kind": "fresh_promoted_current",
             "admitted_frame_token": asdict(admitted_recovery_token),
-            "track_id": recovery_admission.track_id,
+            "wire_frame_token": None,
+            "wire_start_monotonic_ns": None,
+            "wire_return_monotonic_ns": None,
+            "track_id": current_track_id,
             "promotion_identity_sha256": (
-                recovery_admission.promotion_identity_sha256
+                course_handoff.promoted_history_sha256
             ),
             "promotion_identity_basis": (
-                recovery_admission.promotion_identity_basis
+                course_handoff.promotion_identity_basis
             ),
             "cross_gap_identity_claimed": (
-                recovery_admission.cross_gap_identity_claimed
-            ),
-            "retained_history_frame_count": (
-                recovery_admission.retained_history_frame_count
-            ),
-            "retained_history_span_s": (
-                recovery_admission.retained_history_span_s
+                course_handoff.cross_gap_identity_claimed
             ),
         }
+        pending_post_credit_recovery = _PendingPostCreditRecovery(
+            from_gate_index=course_handoff.from_gate_index,
+            to_gate_index=course_handoff.to_gate_index,
+            track_id=course_handoff.promoted_track_id,
+            camera_token_at_credit=(
+                course_handoff.camera_token_at_credit
+            ),
+            admitted_camera_token=admitted_recovery_token,
+            deadline_s=fresh_deadline_s,
+        )
 
     raise abort_type("visual-course exceeded its gate-segment bound")
 

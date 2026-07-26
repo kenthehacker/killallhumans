@@ -50,6 +50,102 @@ class LatchedMeasurementMode(str, Enum):
     UNSAFE = "unsafe"
 
 
+class PostCreditMeasurementMode(str, Enum):
+    """Permitted response while a promoted gate is being reacquired."""
+
+    CLEAN = "clean"
+    ONE_EDGE_CENSORED = "one_edge_censored"
+    REACQUIRE = "reacquire"
+    UNSAFE = "unsafe"
+
+
+def classify_post_credit_measurement(
+    snapshot: object,
+    *,
+    gate_index: int,
+    track_id: str,
+    previous_camera_token: CameraFrameToken,
+    last_track_token: CameraFrameToken,
+) -> PostCreditMeasurementMode:
+    """Classify one newer promoted-current camera publication."""
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    clipping = getattr(track, "clipping", None)
+    if (
+        type(gate_index) is not int
+        or gate_index < 0
+        or type(track_id) is not str
+        or not track_id
+        or not _token_strictly_newer(token, previous_camera_token)
+        or getattr(snapshot, "current_gate_index", None) != gate_index
+        or getattr(snapshot, "current_track_id", None) != track_id
+        or track is None
+        or getattr(track, "track_id", None) != track_id
+        or getattr(track, "ambiguous", True)
+        or type(clipping) is not FrameEdge
+    ):
+        return PostCreditMeasurementMode.UNSAFE
+
+    if not getattr(track, "visible", False):
+        latest_track_token = getattr(track, "latest_token", None)
+        retained_loss = bool(
+            getattr(track, "missed_frame_count", 0) > 0
+            and getattr(track, "role", None) is VisualTrackRole.CURRENT
+            and getattr(track, "authoritative_gate_index", None) == gate_index
+            and _token_not_older(latest_track_token, last_track_token)
+            and _token_not_older(token, latest_track_token)
+        )
+        return (
+            PostCreditMeasurementMode.REACQUIRE
+            if retained_loss
+            else PostCreditMeasurementMode.UNSAFE
+        )
+
+    if (
+        getattr(track, "missed_frame_count", -1) != 0
+        or getattr(track, "latest_token", None) != token
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "authoritative_gate_index", None) != gate_index
+        or getattr(snapshot, "authority_usable", False) is not True
+    ):
+        return PostCreditMeasurementMode.UNSAFE
+    if clipping == FrameEdge.NONE and not getattr(
+        track,
+        "center_censored",
+        True,
+    ):
+        return PostCreditMeasurementMode.CLEAN
+    if clipping in {
+        FrameEdge.LEFT,
+        FrameEdge.TOP,
+        FrameEdge.RIGHT,
+        FrameEdge.BOTTOM,
+    }:
+        center = getattr(track, "center_norm", None)
+        velocity = getattr(track, "center_velocity_norm_s", None)
+        observable_axis = (
+            0
+            if clipping in {FrameEdge.TOP, FrameEdge.BOTTOM}
+            else 1
+        )
+        if (
+            type(center) is not tuple
+            or len(center) != 2
+            or type(velocity) is not tuple
+            or len(velocity) != 2
+            or not _finite(center[observable_axis])
+            or abs(float(center[observable_axis])) > 1.0
+            or not _finite(velocity[observable_axis])
+        ):
+            # A censored dimension owns no geometry.  The remaining dimension
+            # must still be an actual finite image coordinate; +/-1 is the
+            # normalized image boundary, not a navigation tuning threshold.
+            return PostCreditMeasurementMode.UNSAFE
+        return PostCreditMeasurementMode.ONE_EDGE_CENSORED
+    return PostCreditMeasurementMode.REACQUIRE
+
+
 def _finite(value: object) -> bool:
     return bool(
         type(value) in {int, float} and math.isfinite(float(value))
@@ -668,6 +764,8 @@ __all__ = [
     "NearPlaneEvidence",
     "NearPlaneLatch",
     "NearPlaneWireSample",
+    "PostCreditMeasurementMode",
     "advance_near_plane_evidence",
+    "classify_post_credit_measurement",
     "classify_latched_measurement",
 ]

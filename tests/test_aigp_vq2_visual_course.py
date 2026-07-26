@@ -162,6 +162,7 @@ def _history_sample(
 def _track(
     track_id: str,
     *,
+    gate_index: int,
     visible: bool = True,
     token: CameraFrameToken,
 ):
@@ -192,6 +193,9 @@ def _track(
         center_censored=False,
         apparent_scale=math.exp(-0.50),
         role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=gate_index,
+        center_norm=(0.04, 0.03),
+        center_velocity_norm_s=(0.0, 0.0),
         history=history,
     )
 
@@ -213,6 +217,7 @@ def _snapshot(
         current_track_id=track_id,
         current_track=_track(
             track_id,
+            gate_index=gate_index,
             visible=visible,
             token=track_token,
         ),
@@ -857,16 +862,44 @@ def test_generic_course_repeats_lifecycle_from_nonzero_gate_until_finish():
         item["advance_command_count"] >= 3
         for item in result["segments"]
     )
-    assert all(
-        calls[index][1] is VisualApproachMode.APPROACH
-        and calls[index + 1][1] is VisualApproachMode.PASSAGE
-        for index in (0, 4)
-    )
+    assert [call[1] for call in calls] == [
+        VisualApproachMode.APPROACH,
+        VisualApproachMode.PASSAGE,
+        VisualApproachMode.PASSAGE,
+        VisualApproachMode.PASSAGE,
+        VisualApproachMode.PROMOTE_REACQUIRE,
+        VisualApproachMode.PROMOTE_REACQUIRE,
+        VisualApproachMode.APPROACH,
+        VisualApproachMode.PASSAGE,
+        VisualApproachMode.PASSAGE,
+        VisualApproachMode.PASSAGE,
+    ]
     transition = result["authoritative_transitions"][0]
     assert transition["promotion_confirmed"] is True
     assert transition["pre_transition_approach_command_count"] == 1
     assert transition["pre_transition_passage_command_count"] == 3
-    assert transition["post_transition_navigation_command_count"] == 4
+    assert transition["post_transition_navigation_command_count"] == 6
+    assert (
+        transition["recovery_admission"]["admitted_frame_token"]
+        == transition["recovery_admission"]["wire_frame_token"]
+    )
+    recovery_segment = result["segments"][1]
+    assert recovery_segment["recovery_navigation_command_count"] == 2
+    assert recovery_segment["recovery_clean_command_count"] == 2
+    recovery_completed = [
+        fields
+        for name, fields in host.recorder.events
+        if name == "visual_course_recovery_completed"
+    ]
+    assert len(recovery_completed) == 1
+    assert (
+        recovery_completed[0]["camera_token"][
+            "publication_sequence"
+        ]
+        > transition["recovery_admission"]["wire_frame_token"][
+            "publication_sequence"
+        ]
+    )
     assert transition["passage_authority_enabled"] is True
     assert transition["history_length_before_promotion"] == (
         transition["history_length_after_promotion"]

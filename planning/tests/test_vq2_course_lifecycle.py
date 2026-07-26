@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,7 +22,9 @@ from planning.vq2_course_lifecycle import (
     NearPlaneEvidence,
     NearPlaneLatch,
     NearPlaneWireSample,
+    PostCreditMeasurementMode,
     advance_near_plane_evidence,
+    classify_post_credit_measurement,
     classify_latched_measurement,
 )
 
@@ -88,6 +91,46 @@ def _sample(
         command_pitch_rate=command[1],
         command_yaw_rate=command[2],
         command_thrust=command[3],
+    )
+
+
+def _post_credit_snapshot(
+    publication: int,
+    *,
+    visible: bool = True,
+    clipping: FrameEdge = FrameEdge.NONE,
+    ambiguous: bool = False,
+    latest_track_publication: int | None = None,
+):
+    token = _token(1_500_000 + publication, publication)
+    track_publication = (
+        publication
+        if latest_track_publication is None
+        else latest_track_publication
+    )
+    latest_track_token = _token(
+        1_500_000 + track_publication,
+        track_publication,
+    )
+    track = SimpleNamespace(
+        track_id=_TRACK,
+        latest_token=latest_track_token,
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        visible=visible,
+        missed_frame_count=0 if visible else 1,
+        ambiguous=ambiguous,
+        clipping=clipping,
+        center_censored=clipping != FrameEdge.NONE,
+        center_norm=(0.60, -0.70),
+        center_velocity_norm_s=(0.30, -0.70),
+    )
+    return SimpleNamespace(
+        latest_camera_token=token,
+        current_gate_index=1,
+        current_track_id=_TRACK,
+        current_track=track,
+        authority_usable=visible and not ambiguous,
     )
 
 
@@ -654,6 +697,124 @@ def test_stale_or_cross_epoch_lineage_is_unsafe(previous, current):
     assert (
         classify_latched_measurement(latch, **facts)
         is LatchedMeasurementMode.UNSAFE
+    )
+
+
+@pytest.mark.parametrize(
+    ("publication", "clipping", "expected"),
+    (
+        (180, FrameEdge.NONE, PostCreditMeasurementMode.CLEAN),
+        (183, FrameEdge.TOP, PostCreditMeasurementMode.ONE_EDGE_CENSORED),
+        (
+            184,
+            FrameEdge.TOP | FrameEdge.RIGHT,
+            PostCreditMeasurementMode.REACQUIRE,
+        ),
+    ),
+)
+def test_post_credit_measurement_modes_are_gate_generic(
+    publication,
+    clipping,
+    expected,
+):
+    assert (
+        classify_post_credit_measurement(
+            _post_credit_snapshot(publication, clipping=clipping),
+            gate_index=1,
+            track_id=_TRACK,
+            previous_camera_token=_token(
+                1_500_000 + publication - 1,
+                publication - 1,
+            ),
+            last_track_token=_token(
+                1_500_000 + publication - 1,
+                publication - 1,
+            ),
+        )
+        is expected
+    )
+
+
+def test_post_credit_retained_loss_rejects_regressed_track_token():
+    previous = _token(1_500_183, 183)
+    retained = _post_credit_snapshot(
+        184,
+        visible=False,
+        clipping=FrameEdge.TOP,
+        latest_track_publication=183,
+    )
+    skipped_camera = _post_credit_snapshot(
+        185,
+        visible=False,
+        clipping=FrameEdge.TOP,
+        latest_track_publication=184,
+    )
+    regressed = _post_credit_snapshot(
+        184,
+        visible=False,
+        clipping=FrameEdge.TOP,
+        latest_track_publication=182,
+    )
+
+    assert (
+        classify_post_credit_measurement(
+            retained,
+            gate_index=1,
+            track_id=_TRACK,
+            previous_camera_token=previous,
+            last_track_token=previous,
+        )
+        is PostCreditMeasurementMode.REACQUIRE
+    )
+    assert (
+        classify_post_credit_measurement(
+            skipped_camera,
+            gate_index=1,
+            track_id=_TRACK,
+            previous_camera_token=previous,
+            last_track_token=previous,
+        )
+        is PostCreditMeasurementMode.REACQUIRE
+    )
+    assert (
+        classify_post_credit_measurement(
+            regressed,
+            gate_index=1,
+            track_id=_TRACK,
+            previous_camera_token=previous,
+            last_track_token=previous,
+        )
+        is PostCreditMeasurementMode.UNSAFE
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("ambiguous", "wrong_gate", "stale_camera", "outside_image"),
+)
+def test_post_credit_unsafe_authority_fails_closed(mutation):
+    snapshot = _post_credit_snapshot(180)
+    previous = _token(1_500_179, 179)
+    if mutation == "ambiguous":
+        snapshot.current_track.ambiguous = True
+    elif mutation == "wrong_gate":
+        snapshot.current_track.authoritative_gate_index = 2
+    elif mutation == "outside_image":
+        snapshot.current_track.clipping = FrameEdge.TOP
+        snapshot.current_track.center_censored = True
+        snapshot.current_track.center_norm = (1.01, -0.70)
+    else:
+        previous = snapshot.latest_camera_token
+
+    assert (
+        classify_post_credit_measurement(
+            snapshot,
+            gate_index=1,
+            track_id=_TRACK,
+            previous_camera_token=previous,
+            last_track_token=previous,
+        )
+        is PostCreditMeasurementMode.UNSAFE
     )
 
 
