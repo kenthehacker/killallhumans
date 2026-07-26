@@ -47,10 +47,10 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
     assert mapping["servo"]["yaw_error_gain"] == 0.30
     assert mapping["servo"]["roll_error_gain"] == 0.10
     assert mapping["servo"]["roll_rate_gain"] == 0.03
-    assert mapping["lifecycle"]["next_gate_blend_max"] == 0.35
+    assert mapping["lifecycle"]["next_gate_blend_max"] == 1.0
     assert config.to_effective_mapping() == mapping
     assert config.effective_config_sha256 == (
-        "c144c4cffeefaa1fd8da04e867819710fbd6f683acb470ad58bb148efb89e938"
+        "9797c28964c54fce954b62028b04991168cfd5607db837b207b7dc3039ee4ff4"
     )
     assert len(config.effective_config_sha256) == 64
     assert canonical_visual_config_sha256(mapping) == (
@@ -73,7 +73,7 @@ def test_config_hash_is_independent_of_json_key_order():
         (("servo", "roll_error_gain"), 0.101),
         (("servo", "advance_thrust"), 0.34),
         (("servo", "yaw_error_gain"), float("nan")),
-        (("lifecycle", "next_gate_blend_max"), 0.36),
+        (("lifecycle", "next_gate_blend_max"), 1.001),
         (("lifecycle", "required_improving_frames"), 2),
         (("lifecycle", "restricted_alignment_duration_s"), 0.900001),
         (("lifecycle", "restricted_alignment_duration_s"), 2.0),

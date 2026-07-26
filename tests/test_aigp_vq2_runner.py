@@ -4067,7 +4067,9 @@ def test_gate0_visual_blend_hard_withdraws_geometry_but_suspends_passage(
         ):
             assert expected_current_track_id == current_track_id
             assert gate_index == 0
-            assert next_gate_blend == pytest.approx(0.35)
+            assert next_gate_blend == pytest.approx(
+                runner.visual_config.lifecycle.next_gate_blend_max
+            )
             self.next_gate_blend = next_gate_blend
             self.calls = 0
 
@@ -4163,8 +4165,8 @@ def test_gate0_visual_blend_hard_withdraws_geometry_but_suspends_passage(
                 next_gate_blend=self.next_gate_blend,
                 horizontal_error=0.02,
                 vertical_error_image_down=-0.04,
-                effective_horizontal_error=0.118,
-                effective_vertical_error_image_down=-0.096,
+                effective_horizontal_error=0.30,
+                effective_vertical_error_image_down=-0.12,
                 effective_horizontal_rate_s=0.0,
                 effective_vertical_rate_down_s=0.0,
                 next_horizontal_error=0.30,
