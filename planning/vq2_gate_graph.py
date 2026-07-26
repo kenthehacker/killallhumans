@@ -33,7 +33,6 @@ _ADJACENT_HANDOFF_MIN_CURRENT_SCALE = 0.95
 _ADJACENT_HANDOFF_MAX_NEXT_SCALE_RATIO = 0.50
 _ADJACENT_HANDOFF_BBOX_EDGE_TOLERANCE = 0.01
 _ADJACENT_HANDOFF_CONFIDENCE_FACTOR = 0.50
-_MAX_POST_CREDIT_PROMOTION_SAMPLES = 1
 _ALL_FRAME_EDGES = (
     FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
 )
@@ -346,12 +345,6 @@ class ConfirmedGateTransition:
             > self.history_length_before_promotion
         ):
             raise ValueError("credit prefix cannot exceed promotion history")
-        if (
-            self.history_length_before_promotion
-            - self.promoted_history_length_at_credit
-            > _MAX_POST_CREDIT_PROMOTION_SAMPLES
-        ):
-            raise ValueError("promotion has too many post-credit samples")
         if (
             len(self.pretransition_frame_tokens)
             > self.promoted_history_length_at_credit
@@ -1293,9 +1286,12 @@ def _promotion_credit_boundary(
 
     ``anchor`` is the global camera watermark and therefore need not be a
     target observation.  For live ingress, the target prefix is maximal by
-    host-monotonic publication time.  A single already-processed observation
-    may follow race receipt; it remains in the full promotion snapshot but can
-    never be relabelled as pre-credit evidence.
+    host-monotonic publication time.  Already-processed observations may
+    follow race receipt; they remain in the tracker's bounded full-history
+    promotion snapshot but can never be relabelled as pre-credit evidence.
+    A frame observed before receipt but published just after it is neutral
+    boundary history: it is neither pre-credit evidence nor post-credit
+    command authority.
     """
 
     history = track.history
@@ -1353,27 +1349,28 @@ def _promotion_credit_boundary(
         raise GateGraphError(
             "legacy capture cannot prove post-credit promotion samples"
         )
-    if len(post_credit_suffix) > _MAX_POST_CREDIT_PROMOTION_SAMPLES:
-        raise GateGraphError(
-            "promotion has more than one post-credit target sample"
-        )
     if is_live:
         assert received_ns is not None
+        observed_strictly_post_credit = False
         for sample in post_credit_suffix:
             assert sample.publication_monotonic_ns is not None
-            if (
-                sample.observation_monotonic_ns <= received_ns
-                or sample.publication_monotonic_ns <= received_ns
-            ):
+            if sample.publication_monotonic_ns <= received_ns:
                 raise GateGraphError(
-                    "post-credit target observation and publication do not "
-                    "strictly postdate race receipt"
+                    "promotion suffix publication does not strictly postdate "
+                    "race receipt"
                 )
             if not _token_strictly_precedes(anchor, sample.token):
                 raise GateGraphError(
                     "post-credit target sample does not follow the camera "
                     "watermark"
                 )
+            if sample.observation_monotonic_ns <= received_ns:
+                if observed_strictly_post_credit:
+                    raise GateGraphError(
+                        "neutral credit-boundary samples are not a prefix"
+                    )
+                continue
+            observed_strictly_post_credit = True
 
     tail = [credit_prefix[-1]]
     for sample in reversed(credit_prefix[:-1]):

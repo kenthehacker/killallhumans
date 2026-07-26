@@ -10127,6 +10127,27 @@ def test_replay_writer_is_aborted_when_async_recorder_construction_fails(
     assert "async replay recorder construction failed" in manifest["abort_reason"]
 
 
+def test_visual_course_replay_envelope_matches_generic_lifecycle():
+    envelope = vq2_module.replay_controller_envelope(
+        vq2_module.VISUAL_COURSE_STAGE
+    )
+    phases = envelope["phase_envelopes"]
+
+    passage = phases["reviewed_gate_passage"]
+    assert passage["allow_advance"] is True
+    assert passage["next_gate_preview"] is True
+    assert passage["next_gate_preview_requires_reviewed_identity"] is True
+    assert passage["next_gate_preview_may_retire_fail_closed"] is True
+
+    recovery = phases["post_credit_recovery"]
+    assert recovery["promoted_history_preserved"] is True
+    assert recovery["same_promoted_identity_required"] is True
+    assert recovery["strictly_post_credit_observation_required"] is True
+    assert recovery["strictly_post_credit_publication_required"] is True
+    assert recovery["neutral_credit_boundary_command_authority"] is False
+    assert "complete_visibility_epoch_admission_required" not in recovery
+
+
 def test_visual_alignment_replay_metadata_declares_phase_envelopes(
     tmp_path,
     monkeypatch,

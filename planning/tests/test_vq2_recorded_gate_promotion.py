@@ -508,8 +508,8 @@ def test_camera_credit_watermark_need_not_be_a_target_observation() -> None:
     assert transition.history_length_before_promotion == len(before.history)
 
 
-def test_live_promotion_rejects_more_than_one_post_credit_target_sample() -> None:
-    tracker, graph, _current_id, next_id = _prime_live_graph(final_sequence=7)
+def test_live_promotion_preserves_multiple_post_credit_30hz_samples() -> None:
+    tracker, graph, current_id, next_id = _prime_live_graph(final_sequence=8)
     camera_token_at_credit = CameraFrameToken(
         generation=9,
         frame_id=40_005,
@@ -519,10 +519,58 @@ def test_live_promotion_rejects_more_than_one_post_credit_target_sample() -> Non
     credit_received_ns = (
         tracker.frame_publish_time_ns(camera_token_at_credit) + 2_000_000
     )
+    before = tracker.track(next_id)
+    assert len(before.history) == 8
+    assert before.history[4].token == camera_token_at_credit
+    assert all(
+        sample.observation_monotonic_ns > credit_received_ns
+        and sample.publication_monotonic_ns > credit_received_ns
+        and sample.token.publication_sequence > 5
+        for sample in before.history[5:]
+    )
+
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=_live_race(
+            sequence=11,
+            boot_ms=5_250,
+            gate_index=1,
+            received_ns=credit_received_ns,
+        ),
+        camera_token_at_credit=camera_token_at_credit,
+        promoted_track_id=next_id,
+    )
+
+    assert transition.retired_track_id == current_id
+    assert transition.promoted_track_id == next_id
+    assert transition.promoted_history_length_at_credit == 5
+    assert transition.promoted_latest_token_before_credit == (
+        camera_token_at_credit
+    )
+    assert transition.promoted_latest_token_at_promotion == before.history[-1].token
+    assert transition.history_length_before_promotion == len(before.history)
+    assert transition.history_length_after_promotion == len(before.history)
+    assert transition.promoted_history_sha256 == visual_track_history_sha256(
+        before.history
+    )
+    assert tracker.track(next_id).history == before.history
+    assert tracker.track(current_id).role is VisualTrackRole.RETIRED
+    assert tracker.track(next_id).role is VisualTrackRole.CURRENT
+
+
+def test_live_promotion_rejects_insufficient_fresh_precredit_next_history() -> None:
+    tracker, graph, current_id, next_id = _prime_live_graph(
+        final_sequence=5,
+        missing_next_sequences=(3,),
+    )
+    camera_token_at_credit = tracker.latest_update.token
+    credit_received_ns = tracker.latest_update.publish_monotonic_ns + 1
+    current_before = tracker.track(current_id)
+    next_before = tracker.track(next_id)
 
     with pytest.raises(
         GateGraphError,
-        match="more than one post-credit target sample",
+        match="no stable pretracked next gate is promotable",
     ):
         graph.confirm_transition(
             tracker,
@@ -536,9 +584,102 @@ def test_live_promotion_rejects_more_than_one_post_credit_target_sample() -> Non
             promoted_track_id=next_id,
         )
 
+    assert tracker.track(current_id) == current_before
+    assert tracker.track(next_id) == next_before
+    assert graph.latest_snapshot.current_track_id == current_id
 
-def test_live_promotion_rejects_precredit_observation_published_after_credit() -> None:
-    tracker, graph, _current_id, next_id = _prime_live_graph(final_sequence=5)
+
+def test_live_promotion_rejects_ambiguous_stable_next_candidates() -> None:
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    current_id = ""
+    next_ids: tuple[str, ...] = ()
+    for sequence in range(1, 6):
+        base = _live_frame(sequence)
+        mirrored_next = _live_detection(
+            2,
+            -0.52 - 0.004 * sequence,
+            -0.56 - 0.003 * sequence,
+            0.13 + 0.003 * sequence,
+            0.15 + 0.003 * sequence,
+        )
+        update = tracker.update(
+            replace(
+                base,
+                detections=base.detections + (mirrored_next,),
+            )
+        )
+        if sequence == 1:
+            current_id = update.visible_track_ids[0]
+            next_ids = update.visible_track_ids[1:]
+            assert len(next_ids) == 2
+        if sequence == 3:
+            graph.bind_initial_current(
+                tracker,
+                track_id=current_id,
+                race_status=_live_race(
+                    sequence=10,
+                    boot_ms=5_000,
+                    gate_index=0,
+                    received_ns=update.publish_monotonic_ns + 1,
+                ),
+            )
+        elif sequence > 3:
+            graph.observe(tracker)
+
+    camera_token_at_credit = tracker.latest_update.token
+    credit_received_ns = tracker.latest_update.publish_monotonic_ns + 1
+    tracks_before = tracker.tracks()
+
+    with pytest.raises(
+        GateGraphError,
+        match="multiple next-gate tracks have indistinguishable authority",
+    ):
+        graph.confirm_transition(
+            tracker,
+            race_status=_live_race(
+                sequence=11,
+                boot_ms=5_250,
+                gate_index=1,
+                received_ns=credit_received_ns,
+            ),
+            camera_token_at_credit=camera_token_at_credit,
+            promoted_track_id=next_ids[0],
+        )
+
+    assert tracker.tracks() == tracks_before
+    assert graph.latest_snapshot.current_track_id == current_id
+
+
+def test_live_promotion_rejects_race_status_from_a_different_reset_epoch() -> None:
+    tracker, graph, current_id, next_id = _prime_live_graph(final_sequence=5)
+    camera_token_at_credit = tracker.latest_update.token
+    credit_received_ns = tracker.latest_update.publish_monotonic_ns + 1
+    tracks_before = tracker.tracks()
+    stale_epoch_race = replace(
+        _live_race(
+            sequence=11,
+            boot_ms=5_250,
+            gate_index=1,
+            received_ns=credit_received_ns,
+        ),
+        reset_epoch=10,
+    )
+
+    with pytest.raises(GateGraphError, match="crossed its proved epoch"):
+        graph.confirm_transition(
+            tracker,
+            race_status=stale_epoch_race,
+            camera_token_at_credit=camera_token_at_credit,
+            promoted_track_id=next_id,
+        )
+
+    assert tracker.tracks() == tracks_before
+    assert graph.latest_snapshot.current_track_id == current_id
+
+
+def test_live_promotion_preserves_neutral_credit_boundary_sample() -> None:
+    tracker, graph, current_id, next_id = _prime_live_graph(final_sequence=5)
     camera_token_at_credit = tracker.latest_update.token
     credit_received_ns = tracker.latest_update.publish_monotonic_ns + 2_000_000
     late_frame = replace(
@@ -548,19 +689,23 @@ def test_live_promotion_rejects_precredit_observation_published_after_credit() -
     )
     tracker.update(late_frame)
     graph.observe(tracker)
+    before = tracker.track(next_id)
 
-    with pytest.raises(
-        GateGraphError,
-        match="observation and publication do not strictly postdate",
-    ):
-        graph.confirm_transition(
-            tracker,
-            race_status=_live_race(
-                sequence=11,
-                boot_ms=5_250,
-                gate_index=1,
-                received_ns=credit_received_ns,
-            ),
-            camera_token_at_credit=camera_token_at_credit,
-            promoted_track_id=next_id,
-        )
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=_live_race(
+            sequence=11,
+            boot_ms=5_250,
+            gate_index=1,
+            received_ns=credit_received_ns,
+        ),
+        camera_token_at_credit=camera_token_at_credit,
+        promoted_track_id=next_id,
+    )
+
+    assert transition.retired_track_id == current_id
+    assert transition.promoted_track_id == next_id
+    assert transition.promoted_history_length_at_credit == len(before.history) - 1
+    assert transition.promoted_latest_token_before_credit == camera_token_at_credit
+    assert transition.promoted_latest_token_at_promotion == late_frame.token
+    assert tracker.track(next_id).history == before.history

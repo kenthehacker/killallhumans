@@ -24,16 +24,23 @@ from competition.adapter import (
 )
 from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import (
-    AssociationEvidence,
     CameraFrameToken,
-    FrameProvenanceBasis,
     VisualTrackRole,
-    VisualTrackSample,
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
     GateGraphError,
     RaceStatusProvenanceBasis,
+)
+from planning.vq2_course_lifecycle import (
+    CourseLifecycle,
+    LatchedMeasurementMode,
+    NearPlaneEvidence,
+    NearPlaneLatch,
+    NearPlaneWireSample,
+    advance_near_plane_evidence,
+    classify_latched_measurement,
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
@@ -42,13 +49,6 @@ from planning.vq2_visual_approach import (
     VisualApproachPassageAdmission,
     VisualApproachPassageSafetyUnavailable,
     VisualApproachRefusal,
-)
-from planning.vq2_visual_recovery import (
-    RECOVERY_HISTORY_SAMPLE_COUNT,
-    RECOVERY_MAX_START_DELAY_AFTER_CREDIT_S,
-    VisualRecoveryRefusal,
-    require_recovery_continuation,
-    require_transition_recovery_admission,
 )
 from planning.vq2_visual_servo import (
     MAX_NEXT_GATE_BLEND,
@@ -59,9 +59,6 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_TARGET_PITCH_RAD,
     MIN_VISUAL_THRUST,
-    PREPASS_CURRENT_MAX_APPARENT_SCALE,
-    VisualServoOutput,
-    VisualTarget,
 )
 from scripts.aigp_vq2_yaw_profile import (
     DEFAULT_YAW_CALIBRATION_PROFILE_PATH,
@@ -109,41 +106,8 @@ GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA = 0.012
 GATE0_PROVED_NEXT_PREVIEW_BASIS = (
     "proved-gate0-reviewed-next-preview-collective-v1"
 )
-CURRENT_ADVANCE_CROSSING_BASIS = "current-advance-corridor-v1"
-RETAINED_ADVANCE_CROSSING_BASIS = (
-    "retained-advance-close-alignment-dwell-v1"
-)
-RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS = (
-    "retained-advance-wire-projected-close-alignment-dwell-v1"
-)
-RETAINED_ADJACENT_SCALE_JUMP_CROSSING_BASIS = (
-    "retained-adjacent-scale-threshold-crossing-v1"
-)
-# Attempts 21 and 22 sampled the same clean Gate-0 contour expansion after a
-# completed retained-safe dwell.  The previous admitted state projected across
-# the unchanged crossing plane before the exact adjacent observation, while
-# the tracker rate update itself was intentionally too discontinuous for the
-# ordinary retained rule.  Keep this exception narrower than either history:
-# it is one-publication-only, association-bounded, and adds no command
-# authority.
-ADJACENT_SCALE_JUMP_MIN_PREDECESSOR_LOG_SCALE = -0.85
-ADJACENT_SCALE_JUMP_MAX_LOG_DELTA = 0.18
-ADJACENT_SCALE_JUMP_MAX_OBSERVATION_GAP_S = 0.036
-ADJACENT_SCALE_JUMP_MIN_DETECTION_CONFIDENCE = 0.90
-ADJACENT_SCALE_JUMP_MIN_ASSOCIATION_CONFIDENCE = 0.75
-ADJACENT_SCALE_JUMP_MAX_ASSOCIATION_COST = 0.21
-ADJACENT_SCALE_JUMP_MIN_BBOX_IOU = 0.70
-ADJACENT_SCALE_JUMP_MAX_CENTER_RESIDUAL_NORM = 0.09
-ADJACENT_SCALE_JUMP_MAX_ABS_LOG_WIDTH_CHANGE = 0.29
-ADJACENT_SCALE_JUMP_MAX_ABS_LOG_HEIGHT_CHANGE = 0.06
-ADJACENT_SCALE_JUMP_MAX_ABS_LOG_AREA_RESIDUAL = 0.26
-ADJACENT_SCALE_JUMP_MAX_ABS_CURRENT_HORIZONTAL_RATE_S = 1.50
-ADJACENT_SCALE_JUMP_MAX_CURRENT_LOG_SCALE_RATE_S = 3.40
 CENSORED_PASSAGE_COAST_BASIS = (
     "latched-clean-attitude-close-censored-passage-v1"
-)
-CENSORED_PASSAGE_BOTTOM_TRANSITION_BASIS = (
-    "latched-clean-attitude-bottom-transition-v1"
 )
 APPROACH_PREVIEW_REQUALIFICATION_BASIS = (
     "fresh-current-corridor-sealed-next-identity-v1"
@@ -394,7 +358,12 @@ class _AcceptedVisualCommand:
     command: AttitudeRateCommand
     yaw_soft_stop_zeroed: bool
     observation_monotonic_ns: int
+    publication_monotonic_ns: int
     wire_start_monotonic_ns: int
+    wire_return_monotonic_ns: int
+    wire_camera_token: CameraFrameToken
+    wire_race_gate_index: int
+    publication_pinned_through_transport_return: bool
     target_roll_rad: float
     target_pitch_rad: float
     next_preview_collective_delta: float
@@ -429,46 +398,16 @@ class _CensoredPassageCoastAuthority:
 
 
 @dataclass(frozen=True, slots=True)
-class _RetainedCrossingWireProjection:
-    target: Any
-    observation_monotonic_ns: int
-    wire_start_monotonic_ns: int
-    observation_to_wire_ns: int
-    observation_to_wire_s: float
-    projected_log_scale: float
-    projected_normalized_x: float
-    projected_normalized_y_down: float
+class _FreshPostCreditHandoff:
+    """A graph-promoted current track ready for the ordinary next segment."""
 
-
-@dataclass(frozen=True, slots=True)
-class _RetainedCrossingCandidate:
-    """One accepted retained-safe command sealed for its exact successor."""
-
-    gate_index: int
     track_id: str
-    camera_token: CameraFrameToken
-    tracker_frame_sequence: int
-    target: VisualTarget
-    output: VisualServoOutput
-    accepted: _AcceptedVisualCommand
-    wire_projection: _RetainedCrossingWireProjection
-    retained_crossing_dwell_frames: int
-    advance_command_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class _AdjacentScaleJumpCrossingProof:
-    """Exact evidence for one authority-reducing near-plane contour jump."""
-
-    predecessor: _RetainedCrossingCandidate
-    current_wire_projection: _RetainedCrossingWireProjection
-    association: AssociationEvidence
-    observation_gap_ns: int
-    publication_gap_ns: int
-    log_scale_delta: float
-    predecessor_projected_log_scale: float
-    predecessor_projected_normalized_x: float
-    predecessor_projected_normalized_y_down: float
+    frame_token: CameraFrameToken
+    promotion_identity_sha256: str
+    promotion_identity_basis: str
+    cross_gap_identity_claimed: bool
+    retained_history_frame_count: int
+    retained_history_span_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,16 +436,6 @@ class VisualCourseStageLimits:
     min_thrust: float = MIN_VISUAL_THRUST
     max_thrust: float = MAX_VISUAL_THRUST
     crossing_arm_min_log_scale: float = -0.80
-    # The last clean retained observations in attempts 10 and 11 were
-    # -0.801151 and -0.827087.  Projection may refine command-wire timing,
-    # but may never expand authority beyond this independently replayed floor.
-    retained_crossing_projection_min_log_scale: float = -0.83
-    # Attempt 17's last centered, stable retained observation reached the
-    # command wire in 0.0334435 s.  Keep this exact projection below one
-    # 30-Hz camera period plus the reviewed transport allowance.
-    retained_crossing_max_observation_to_wire_s: float = 0.035
-    crossing_arm_min_log_scale_rate_s: float = 0.0
-    crossing_arm_min_advance_commands: int = 3
     max_gate_segments: int = 64
 
     def __post_init__(self) -> None:
@@ -530,9 +459,6 @@ class VisualCourseStageLimits:
             self.min_thrust,
             self.max_thrust,
             self.crossing_arm_min_log_scale,
-            self.retained_crossing_projection_min_log_scale,
-            self.retained_crossing_max_observation_to_wire_s,
-            self.crossing_arm_min_log_scale_rate_s,
         )
         if not all(
             type(value) in {int, float} and math.isfinite(float(value))
@@ -622,28 +548,8 @@ class VisualCourseStageLimits:
             raise ValueError("visual-course thrust bounds are invalid")
         if not -1.50 <= self.crossing_arm_min_log_scale <= -0.20:
             raise ValueError("visual-course crossing scale is outside bounds")
-        if not (
-            -0.83
-            <= self.retained_crossing_projection_min_log_scale
-            <= self.crossing_arm_min_log_scale
-        ):
-            raise ValueError(
-                "visual-course retained projection scale is outside bounds"
-            )
-        if not (
-            0.032
-            <= self.retained_crossing_max_observation_to_wire_s
-            <= 0.035
-        ):
-            raise ValueError(
-                "visual-course retained projection timing is outside bounds"
-            )
-        if not 0.0 <= self.crossing_arm_min_log_scale_rate_s <= 1.0:
-            raise ValueError("visual-course crossing scale rate is invalid")
         if (
-            type(self.crossing_arm_min_advance_commands) is not int
-            or not 2 <= self.crossing_arm_min_advance_commands <= 8
-            or type(self.censored_passage_coast_max_fresh_frames) is not int
+            type(self.censored_passage_coast_max_fresh_frames) is not int
             or not 4
             <= self.censored_passage_coast_max_fresh_frames
             <= 8
@@ -850,12 +756,6 @@ class VisualCourseStageRuntime:
     validate_command: Callable[[AttitudeRateCommand], None]
     yaw_profile: Optional[VisualCourseYawProfile]
     expected_yaw_profile_sha256: Optional[str]
-    transition_recovery_admission: Callable[..., Any] = (
-        require_transition_recovery_admission
-    )
-    recovery_continuation_admission: Callable[..., Any] = (
-        require_recovery_continuation
-    )
     limits: VisualCourseStageLimits = DEFAULT_VISUAL_COURSE_LIMITS
     servo_factory: Callable[..., Any] = RollingVisualApproachServo
 
@@ -907,8 +807,6 @@ class VisualCourseStageRuntime:
             "attitude_rate_command",
             "limit_command_rates",
             "validate_command",
-            "transition_recovery_admission",
-            "recovery_continuation_admission",
             "servo_factory",
         ):
             if not callable(getattr(self, name)):
@@ -1137,227 +1035,6 @@ def _limit_calibrated_yaw_request(
     return requested
 
 
-def _retained_crossing_observation_usable(
-    target: Any,
-    output: Any,
-    *,
-    tuning: Any,
-    limits: VisualCourseStageLimits,
-    yaw_soft_stop_zeroed: bool = False,
-) -> bool:
-    """Admit one close-alignment sample to non-advance crossing dwell."""
-
-    return bool(
-        type(yaw_soft_stop_zeroed) is bool
-        and not target.clipped
-        and not target.center_censored
-        and not target.horizontal_geometry_censored
-        and not target.vertical_geometry_censored
-        and not target.ambiguous
-        and abs(float(target.normalized_x)) <= tuning.horizontal_corridor
-        and abs(float(target.normalized_y_down)) <= tuning.vertical_corridor
-        and abs(float(target.normalized_x_rate_s))
-        <= tuning.stable_rate_norm_s
-        and abs(float(target.normalized_y_rate_down_s))
-        <= tuning.stable_rate_norm_s
-        and limits.crossing_arm_min_log_scale_rate_s
-        <= float(target.log_scale_rate_s)
-        < tuning.brake_scale_rate_s
-        and (
-            (
-                not output.advance_enabled
-                and output.brake_reason == "aligning"
-            )
-            or (
-                yaw_soft_stop_zeroed
-                and output.advance_enabled
-                and output.brake_reason is None
-            )
-        )
-        and not output.yaw_envelope_limited
-    )
-
-
-def _retained_crossing_wire_projection(
-    target: Any,
-    *,
-    observation_monotonic_ns: int,
-    wire_start_monotonic_ns: int,
-    tuning: Any,
-    limits: VisualCourseStageLimits,
-    abort_type: type[BaseException],
-) -> Optional[_RetainedCrossingWireProjection]:
-    """Project retained visual scale and center to its accepted wire instant."""
-
-    if type(wire_start_monotonic_ns) is not int or wire_start_monotonic_ns < 0:
-        raise abort_type(
-            "visual-course retained crossing lacks exact wire timing"
-        )
-    if (
-        type(observation_monotonic_ns) is not int
-        or observation_monotonic_ns < 0
-    ):
-        raise abort_type(
-            "visual-course retained crossing lacks exact observation timing"
-        )
-    received_s = float(target.received_monotonic_s)
-    raw_log_scale = float(target.log_scale)
-    log_scale_rate_s = float(target.log_scale_rate_s)
-    normalized_x = float(target.normalized_x)
-    normalized_y_down = float(target.normalized_y_down)
-    normalized_x_rate_s = float(target.normalized_x_rate_s)
-    normalized_y_rate_down_s = float(
-        target.normalized_y_rate_down_s
-    )
-    if not all(
-        math.isfinite(value)
-        for value in (
-            received_s,
-            raw_log_scale,
-            log_scale_rate_s,
-            normalized_x,
-            normalized_y_down,
-            normalized_x_rate_s,
-            normalized_y_rate_down_s,
-        )
-    ) or received_s < 0.0:
-        raise abort_type(
-            "visual-course retained crossing timing is invalid"
-        )
-    if round(received_s * 1_000_000_000) != observation_monotonic_ns:
-        raise abort_type(
-            "visual-course retained crossing observation timing differs "
-            "from its target"
-        )
-    observation_to_wire_ns = (
-        wire_start_monotonic_ns - observation_monotonic_ns
-    )
-    if observation_to_wire_ns < 0:
-        raise abort_type(
-            "visual-course retained crossing wire predates observation"
-        )
-    max_projection_ns = round(
-        limits.retained_crossing_max_observation_to_wire_s
-        * 1_000_000_000
-    )
-    if (
-        observation_to_wire_ns > max_projection_ns
-        or log_scale_rate_s <= 0.0
-    ):
-        return None
-    observation_to_wire_s = observation_to_wire_ns / 1_000_000_000.0
-    projected_log_scale = (
-        raw_log_scale + log_scale_rate_s * observation_to_wire_s
-    )
-    projected_normalized_x = (
-        normalized_x + normalized_x_rate_s * observation_to_wire_s
-    )
-    projected_normalized_y_down = (
-        normalized_y_down
-        + normalized_y_rate_down_s * observation_to_wire_s
-    )
-    if not all(
-        math.isfinite(value)
-        for value in (
-            projected_log_scale,
-            projected_normalized_x,
-            projected_normalized_y_down,
-        )
-    ):
-        raise abort_type(
-            "visual-course retained crossing projection is invalid"
-        )
-    if (
-        abs(projected_normalized_x) > tuning.horizontal_corridor
-        or abs(projected_normalized_y_down) > tuning.vertical_corridor
-    ):
-        return None
-    return _RetainedCrossingWireProjection(
-        target=target,
-        observation_monotonic_ns=observation_monotonic_ns,
-        wire_start_monotonic_ns=wire_start_monotonic_ns,
-        observation_to_wire_ns=observation_to_wire_ns,
-        observation_to_wire_s=observation_to_wire_s,
-        projected_log_scale=projected_log_scale,
-        projected_normalized_x=projected_normalized_x,
-        projected_normalized_y_down=projected_normalized_y_down,
-    )
-
-
-def _retained_crossing_projection_matches_target(
-    target: Any,
-    projection: Any,
-    *,
-    tuning: Any,
-    limits: VisualCourseStageLimits,
-) -> bool:
-    """Recompute a private projection before it may prove crossing."""
-
-    if (
-        type(projection) is not _RetainedCrossingWireProjection
-        or projection.target is not target
-    ):
-        return False
-    observation_ns = round(
-        float(target.received_monotonic_s) * 1_000_000_000
-    )
-    horizon_ns = (
-        projection.wire_start_monotonic_ns - observation_ns
-    )
-    max_horizon_ns = round(
-        limits.retained_crossing_max_observation_to_wire_s
-        * 1_000_000_000
-    )
-    if (
-        projection.observation_monotonic_ns != observation_ns
-        or horizon_ns != projection.observation_to_wire_ns
-        or not 0 <= horizon_ns <= max_horizon_ns
-        or float(target.log_scale_rate_s) <= 0.0
-    ):
-        return False
-    horizon_s = horizon_ns / 1_000_000_000.0
-    expected_log_scale = (
-        float(target.log_scale)
-        + float(target.log_scale_rate_s) * horizon_s
-    )
-    expected_x = (
-        float(target.normalized_x)
-        + float(target.normalized_x_rate_s) * horizon_s
-    )
-    expected_y = (
-        float(target.normalized_y_down)
-        + float(target.normalized_y_rate_down_s) * horizon_s
-    )
-    return bool(
-        math.isclose(
-            projection.observation_to_wire_s,
-            horizon_s,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and math.isclose(
-            projection.projected_log_scale,
-            expected_log_scale,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and math.isclose(
-            projection.projected_normalized_x,
-            expected_x,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and math.isclose(
-            projection.projected_normalized_y_down,
-            expected_y,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and abs(expected_x) <= tuning.horizontal_corridor
-        and abs(expected_y) <= tuning.vertical_corridor
-    )
-
-
 def _current_target_observation_monotonic_ns(
     snapshot: Any,
     target: Any,
@@ -1397,76 +1074,6 @@ def _current_target_observation_monotonic_ns(
             "visual-course target observation provenance is inconsistent"
         )
     return observation_monotonic_ns
-
-
-def _crossing_anchor_basis(
-    target: Any,
-    output: Any,
-    *,
-    passage_admission: Optional[VisualApproachPassageAdmission],
-    current_gate_index: int,
-    current_track_id: str,
-    advance_command_count: int,
-    retained_crossing_dwell_frames: int,
-    tuning: Any,
-    limits: VisualCourseStageLimits,
-    retained_wire_projection: Optional[
-        _RetainedCrossingWireProjection
-    ] = None,
-    yaw_soft_stop_zeroed: bool = False,
-) -> Optional[str]:
-    """Select an exact-frame crossing proof without adding motion authority."""
-
-    if type(yaw_soft_stop_zeroed) is not bool:
-        return None
-    if (
-        advance_command_count
-        < limits.crossing_arm_min_advance_commands
-        or float(target.log_scale_rate_s)
-        < limits.crossing_arm_min_log_scale_rate_s
-        or target.clipped
-        or target.center_censored
-        or target.ambiguous
-    ):
-        return None
-    if (
-        not yaw_soft_stop_zeroed
-        and float(target.log_scale) >= limits.crossing_arm_min_log_scale
-        and output.corridor_frames >= tuning.required_corridor_frames
-        and output.advance_enabled
-    ):
-        return CURRENT_ADVANCE_CROSSING_BASIS
-    if (
-        type(passage_admission) is VisualApproachPassageAdmission
-        and passage_admission.current_gate_index == current_gate_index
-        and passage_admission.current_target.track_id == current_track_id
-        and target.track_id == current_track_id
-        and retained_crossing_dwell_frames
-        >= tuning.required_corridor_frames
-        and _retained_crossing_observation_usable(
-            target,
-            output,
-            tuning=tuning,
-            limits=limits,
-            yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
-        )
-    ):
-        if float(target.log_scale) >= limits.crossing_arm_min_log_scale:
-            return RETAINED_ADVANCE_CROSSING_BASIS
-        if (
-            float(target.log_scale)
-            >= limits.retained_crossing_projection_min_log_scale
-            and _retained_crossing_projection_matches_target(
-                target,
-                retained_wire_projection,
-                tuning=tuning,
-                limits=limits,
-            )
-            and retained_wire_projection.projected_log_scale
-            >= limits.crossing_arm_min_log_scale
-        ):
-            return RETAINED_ADVANCE_WIRE_PROJECTED_CROSSING_BASIS
-    return None
 
 
 def _race_relation(
@@ -1514,1162 +1121,65 @@ def _token_strictly_newer(
     )
 
 
-def _tokens_are_adjacent_camera_publications(
-    current: CameraFrameToken,
-    previous: CameraFrameToken,
-) -> bool:
-    return bool(
-        type(current) is CameraFrameToken
-        and type(previous) is CameraFrameToken
-        and type(current.stream_id) is str
-        and current.stream_id
-        and current.stream_id == previous.stream_id
-        and type(current.generation) is int
-        and current.generation == previous.generation
-        and type(current.frame_id) is int
-        and type(previous.frame_id) is int
-        and current.frame_id == previous.frame_id + 1
-        and type(current.publication_sequence) is int
-        and type(previous.publication_sequence) is int
-        and current.publication_sequence
-        == previous.publication_sequence + 1
-    )
-
-
-def _adjacent_scale_jump_crossing_proof(
-    snapshot: Any,
-    target: Any,
-    output: Any,
-    accepted: Any,
-    *,
-    predecessor: Optional[_RetainedCrossingCandidate],
-    passage_admission: Optional[VisualApproachPassageAdmission],
-    current_gate_index: int,
-    current_track_id: str,
-    advance_command_count: int,
-    next_preview_retired: bool,
-    tuning: Any,
-    limits: VisualCourseStageLimits,
-    abort_type: type[BaseException],
-) -> Optional[_AdjacentScaleJumpCrossingProof]:
-    """Prove one exact adjacent contour jump without extending authority.
-
-    A retained-safe accepted predecessor must have completed the ordinary
-    corridor dwell.  Its already-admitted image rates must project across the
-    unchanged crossing plane at the successor observation.  The successor
-    itself must then be an accepted, current-only scale-rate brake with clean
-    raw and command-wire geometry.  The proof is intentionally consumed by
-    this exact successor and never carries across a skipped publication.
-    """
-
-    if (
-        type(predecessor) is not _RetainedCrossingCandidate
-        or type(target) is not VisualTarget
-        or type(output) is not VisualServoOutput
-        or type(accepted) is not _AcceptedVisualCommand
-        or type(passage_admission) is not VisualApproachPassageAdmission
-        or type(next_preview_retired) is not bool
-        or next_preview_retired is not True
-        or type(current_gate_index) is not int
-        or type(current_track_id) is not str
-        or not current_track_id
-        or type(advance_command_count) is not int
-    ):
-        return None
-
-    token = getattr(snapshot, "latest_camera_token", None)
-    track = getattr(snapshot, "current_track", None)
-    history = getattr(track, "history", None)
-    predecessor_target = predecessor.target
-    predecessor_output = predecessor.output
-    predecessor_accepted = predecessor.accepted
-    predecessor_projection = predecessor.wire_projection
-    predecessor_command = predecessor_accepted.command
-    command = accepted.command
-    predecessor_command_values = (
-        getattr(predecessor_command, "roll_rate", math.nan),
-        getattr(predecessor_command, "pitch_rate", math.nan),
-        getattr(predecessor_command, "yaw_rate", math.nan),
-        getattr(predecessor_command, "thrust", math.nan),
-        predecessor_accepted.target_roll_rad,
-        predecessor_accepted.target_pitch_rad,
-        predecessor_accepted.next_preview_collective_delta,
-    )
-    command_values = (
-        getattr(command, "roll_rate", math.nan),
-        getattr(command, "pitch_rate", math.nan),
-        getattr(command, "yaw_rate", math.nan),
-        getattr(command, "thrust", math.nan),
-        accepted.target_roll_rad,
-        accepted.target_pitch_rad,
-        accepted.next_preview_collective_delta,
-    )
-    if (
-        predecessor.gate_index != current_gate_index
-        or predecessor.track_id != current_track_id
-        or predecessor_target.track_id != current_track_id
-        or target.track_id != current_track_id
-        or type(predecessor_output) is not VisualServoOutput
-        or passage_admission.current_gate_index != current_gate_index
-        or passage_admission.current_target.track_id != current_track_id
-        or predecessor.advance_command_count
-        < limits.crossing_arm_min_advance_commands
-        or advance_command_count != predecessor.advance_command_count
-        or predecessor.retained_crossing_dwell_frames
-        < tuning.required_corridor_frames
-        or type(predecessor.tracker_frame_sequence) is not int
-        or predecessor.tracker_frame_sequence < 0
-        or type(predecessor.camera_token) is not CameraFrameToken
-        or not _servo_token_matches_camera(
-            predecessor_target.frame_token,
-            predecessor.camera_token,
-        )
-        or type(predecessor_accepted) is not _AcceptedVisualCommand
-        or type(predecessor_command) is not AttitudeRateCommand
-        or not all(
-            type(value) in {int, float} and math.isfinite(float(value))
-            for value in predecessor_command_values
-        )
-        or not 0.0
-        <= float(predecessor_accepted.next_preview_collective_delta)
-        <= GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA
-        or not limits.min_thrust
-        <= (
-            float(predecessor_command.thrust)
-            - float(predecessor_accepted.next_preview_collective_delta)
-        )
-        <= limits.max_thrust
-        or max(
-            abs(float(predecessor_command.roll_rate)),
-            abs(float(predecessor_command.pitch_rate)),
-        )
-        > limits.max_command_rate_rad_s + 1e-12
-        or float(predecessor_command.yaw_rate) != 0.0
-        or not limits.min_thrust
-        <= float(predecessor_command.thrust)
-        <= limits.max_thrust
-        or abs(float(predecessor_accepted.target_roll_rad))
-        > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
-        or float(predecessor_accepted.target_pitch_rad)
-        < MIN_VISUAL_TARGET_PITCH_RAD - 1e-12
-        or float(predecessor_accepted.target_pitch_rad)
-        > MAX_VISUAL_TARGET_PITCH_RAD + 1e-12
-        or not math.isclose(
-            float(predecessor_accepted.target_roll_rad),
-            float(predecessor_output.target_roll_rad),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(predecessor_accepted.target_pitch_rad),
-            float(predecessor_output.target_pitch_rad),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or predecessor_accepted.yaw_soft_stop_zeroed is not True
-        or predecessor_output.advance_enabled is not True
-        or predecessor_output.brake_reason is not None
-        or float(predecessor_output.yaw_rate_rad_s) == 0.0
-        or predecessor_output.passage_preview_retired is not False
-        or type(predecessor_projection)
-        is not _RetainedCrossingWireProjection
-        or predecessor_projection.wire_start_monotonic_ns
-        != predecessor_accepted.wire_start_monotonic_ns
-        or predecessor_projection.observation_monotonic_ns
-        != predecessor_accepted.observation_monotonic_ns
-        or not _retained_crossing_projection_matches_target(
-            predecessor_target,
-            predecessor_projection,
-            tuning=tuning,
-            limits=limits,
-        )
-        or predecessor_projection.projected_log_scale
-        >= limits.crossing_arm_min_log_scale
-        or not _retained_crossing_observation_usable(
-            predecessor_target,
-            predecessor_output,
-            tuning=tuning,
-            limits=limits,
-            yaw_soft_stop_zeroed=(
-                predecessor_accepted.yaw_soft_stop_zeroed
-            ),
-        )
-        or not (
-            ADJACENT_SCALE_JUMP_MIN_PREDECESSOR_LOG_SCALE
-            <= float(predecessor_target.log_scale)
-            < limits.crossing_arm_min_log_scale
-        )
-        or type(token) is not CameraFrameToken
-        or not _tokens_are_adjacent_camera_publications(
-            token,
-            predecessor.camera_token,
-        )
-        or not _servo_token_matches_camera(target.frame_token, token)
-        or getattr(snapshot, "current_gate_index", None)
-        != current_gate_index
-        or getattr(snapshot, "current_track_id", None)
-        != current_track_id
-        or getattr(snapshot, "authority_usable", False) is not True
-        or getattr(snapshot, "race_finished", False) is not False
-        or track is None
-        or getattr(track, "track_id", None) != current_track_id
-        or getattr(track, "latest_token", None) != token
-        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
-        or getattr(track, "visible", False) is not True
-        or getattr(track, "missed_frame_count", 1) != 0
-        or getattr(track, "ambiguous", True) is not False
-        or getattr(track, "clipping", None) is not FrameEdge.NONE
-        or getattr(track, "center_censored", True) is not False
-        or type(history) is not tuple
-        or len(history) < 2
-        or type(getattr(track, "consecutive_frame_count", None)) is not int
-        or track.consecutive_frame_count < 2
-        or type(getattr(snapshot, "tracker_frame_sequence", None)) is not int
-        or type(command) is not AttitudeRateCommand
-        or not all(
-            type(value) in {int, float} and math.isfinite(float(value))
-            for value in command_values
-        )
-        or max(abs(float(command.roll_rate)), abs(float(command.pitch_rate)))
-        > limits.max_command_rate_rad_s + 1e-12
-        or float(command.yaw_rate) != 0.0
-        or not limits.min_thrust
-        <= float(command.thrust)
-        <= limits.max_thrust
-        or abs(float(accepted.target_roll_rad))
-        > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
-        or float(accepted.target_pitch_rad)
-        < MIN_VISUAL_TARGET_PITCH_RAD - 1e-12
-        or float(accepted.target_pitch_rad)
-        > MAX_VISUAL_TARGET_PITCH_RAD + 1e-12
-        or not math.isclose(
-            float(accepted.target_roll_rad),
-            float(output.target_roll_rad),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(accepted.target_pitch_rad),
-            float(output.target_pitch_rad),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or accepted.yaw_soft_stop_zeroed is not True
-        or float(output.yaw_rate_rad_s) == 0.0
-        or output.yaw_envelope_limited is not False
-        or output.advance_enabled is not False
-        or output.brake_reason != "scale_rate"
-        or output.passage_preview_retired is not True
-        or float(output.next_gate_blend) != 0.0
-        or float(accepted.next_preview_collective_delta) != 0.0
-        or target.clipped
-        or target.center_censored
-        or target.horizontal_geometry_censored
-        or target.vertical_geometry_censored
-        or target.ambiguous
-        or abs(float(target.normalized_x)) > tuning.horizontal_corridor
-        or abs(float(target.normalized_y_down)) > tuning.vertical_corridor
-        or abs(float(target.normalized_y_rate_down_s))
-        > tuning.stable_rate_norm_s
-        or abs(float(target.normalized_x_rate_s))
-        > ADJACENT_SCALE_JUMP_MAX_ABS_CURRENT_HORIZONTAL_RATE_S
-        or float(target.log_scale_rate_s) < tuning.brake_scale_rate_s
-        or float(target.log_scale_rate_s)
-        > ADJACENT_SCALE_JUMP_MAX_CURRENT_LOG_SCALE_RATE_S
-        or float(target.log_scale) < limits.crossing_arm_min_log_scale
-    ):
-        return None
-
-    previous = history[-2]
-    current = history[-1]
-    if (
-        type(previous) is not VisualTrackSample
-        or type(current) is not VisualTrackSample
-        or previous.token != predecessor.camera_token
-        or current.token != token
-        or previous.provenance_basis
-        is not FrameProvenanceBasis.RECEIVER_TIMING_V1
-        or current.provenance_basis
-        is not FrameProvenanceBasis.RECEIVER_TIMING_V1
-        or previous.tracker_frame_sequence
-        != predecessor.tracker_frame_sequence
-        or current.tracker_frame_sequence
-        != predecessor.tracker_frame_sequence + 1
-        or snapshot.tracker_frame_sequence
-        != current.tracker_frame_sequence
-        or previous.clipping is not FrameEdge.NONE
-        or current.clipping is not FrameEdge.NONE
-        or previous.center_censored
-        or current.center_censored
-        or type(previous.observation_monotonic_ns) is not int
-        or type(current.observation_monotonic_ns) is not int
-        or type(previous.publication_monotonic_ns) is not int
-        or type(current.publication_monotonic_ns) is not int
-        or not (
-            previous.observation_monotonic_ns
-            < previous.publication_monotonic_ns
-            <= predecessor_accepted.wire_start_monotonic_ns
-        )
-        or not (
-            current.observation_monotonic_ns
-            < current.publication_monotonic_ns
-            <= accepted.wire_start_monotonic_ns
-        )
-        or predecessor_accepted.observation_monotonic_ns
-        != previous.observation_monotonic_ns
-        or accepted.observation_monotonic_ns
-        != current.observation_monotonic_ns
-        or round(
-            float(predecessor_target.received_monotonic_s)
-            * 1_000_000_000
-        )
-        != previous.observation_monotonic_ns
-        or round(float(target.received_monotonic_s) * 1_000_000_000)
-        != current.observation_monotonic_ns
-        or not all(
-            type(center) is tuple
-            and len(center) == 2
-            and all(
-                type(value) in {int, float}
-                and math.isfinite(float(value))
-                for value in center
-            )
-            for center in (previous.center_norm, current.center_norm)
-        )
-        or not math.isclose(
-            float(previous.center_norm[0]),
-            float(predecessor_target.normalized_x),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(previous.center_norm[1]),
-            float(predecessor_target.normalized_y_down),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            math.log(float(previous.apparent_scale)),
-            float(predecessor_target.log_scale),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(current.center_norm[0]),
-            float(target.normalized_x),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(current.center_norm[1]),
-            float(target.normalized_y_down),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            math.log(float(current.apparent_scale)),
-            float(target.log_scale),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(getattr(track, "apparent_scale", math.nan)),
-            float(current.apparent_scale),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(getattr(track, "center_norm", (math.nan, math.nan))[0]),
-            float(current.center_norm[0]),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(getattr(track, "center_norm", (math.nan, math.nan))[1]),
-            float(current.center_norm[1]),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(getattr(track, "center_velocity_norm_s", (math.nan,))[0]),
-            float(target.normalized_x_rate_s),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(
-                getattr(
-                    track,
-                    "center_velocity_norm_s",
-                    (math.nan, math.nan),
-                )[1]
-            ),
-            float(target.normalized_y_rate_down_s),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(getattr(track, "log_scale_rate_s", math.nan)),
-            float(target.log_scale_rate_s),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or getattr(track, "consecutive_frame_count", None)
-        != target.consecutive_frames
-    ):
-        return None
-
-    predecessor_association = previous.accepted_association
-    association = current.accepted_association
-    if (
-        type(predecessor_association) is not AssociationEvidence
-        or predecessor_association.track_id != current_track_id
-        or predecessor_association.current_token != previous.token
-        or predecessor_association.detection_source_index
-        != previous.source_index
-        or predecessor_association.missed_frame_count_before_association
-        != 0
-        or predecessor_association.ambiguous
-        or predecessor_association.track_ambiguous_before_association
-        or float(predecessor_association.confidence)
-        < ADJACENT_SCALE_JUMP_MIN_ASSOCIATION_CONFIDENCE
-        or type(association) is not AssociationEvidence
-        or association.track_id != current_track_id
-        or association.previous_token != previous.token
-        or association.current_token != current.token
-        or association.detection_source_index != current.source_index
-        or association.missed_frame_count_before_association != 0
-        or association.ambiguous
-        or association.track_ambiguous_before_association
-    ):
-        return None
-
-    observation_gap_ns = (
-        current.observation_monotonic_ns
-        - previous.observation_monotonic_ns
-    )
-    publication_gap_ns = (
-        current.publication_monotonic_ns
-        - previous.publication_monotonic_ns
-    )
-    maximum_gap_ns = round(
-        ADJACENT_SCALE_JUMP_MAX_OBSERVATION_GAP_S * 1_000_000_000
-    )
-    association_values = (
-        association.cost,
-        association.confidence,
-        association.predicted_center_residual_norm,
-        association.bbox_iou,
-        association.log_width_change,
-        association.log_height_change,
-        association.log_area_residual,
-        association.clipping_continuity,
-        association.temporal_consistency,
-        previous.confidence,
-        previous.association_confidence,
-        current.confidence,
-        current.association_confidence,
-        getattr(track, "confidence", math.nan),
-        getattr(track, "association_confidence", math.nan),
-        target.confidence,
-        target.association_confidence,
-    )
-    if (
-        observation_gap_ns <= 0
-        or observation_gap_ns > maximum_gap_ns
-        or publication_gap_ns <= 0
-        or publication_gap_ns > maximum_gap_ns
-        or association.observation_gap_ns != observation_gap_ns
-        or association.publication_gap_ns != publication_gap_ns
-        or not all(
-            type(value) in {int, float} and math.isfinite(float(value))
-            for value in association_values
-        )
-        or float(association.cost)
-        > ADJACENT_SCALE_JUMP_MAX_ASSOCIATION_COST
-        or float(association.confidence)
-        < ADJACENT_SCALE_JUMP_MIN_ASSOCIATION_CONFIDENCE
-        or float(association.bbox_iou)
-        < ADJACENT_SCALE_JUMP_MIN_BBOX_IOU
-        or float(association.predicted_center_residual_norm)
-        > ADJACENT_SCALE_JUMP_MAX_CENTER_RESIDUAL_NORM
-        or abs(float(association.log_width_change))
-        > ADJACENT_SCALE_JUMP_MAX_ABS_LOG_WIDTH_CHANGE
-        or abs(float(association.log_height_change))
-        > ADJACENT_SCALE_JUMP_MAX_ABS_LOG_HEIGHT_CHANGE
-        or abs(float(association.log_area_residual))
-        > ADJACENT_SCALE_JUMP_MAX_ABS_LOG_AREA_RESIDUAL
-        or not math.isclose(
-            float(association.clipping_continuity),
-            1.0,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(association.temporal_consistency),
-            1.0,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or min(float(previous.confidence), float(current.confidence))
-        < ADJACENT_SCALE_JUMP_MIN_DETECTION_CONFIDENCE
-        or min(
-            float(previous.association_confidence),
-            float(current.association_confidence),
-            float(track.association_confidence),
-            float(target.association_confidence),
-        )
-        < ADJACENT_SCALE_JUMP_MIN_ASSOCIATION_CONFIDENCE
-        or min(float(track.confidence), float(target.confidence))
-        < ADJACENT_SCALE_JUMP_MIN_DETECTION_CONFIDENCE
-        or not math.isclose(
-            float(current.association_confidence),
-            float(association.confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(track.association_confidence),
-            float(association.confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(target.association_confidence),
-            float(association.confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(target.confidence),
-            float(track.confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-    ):
-        return None
-
-    gap_s = observation_gap_ns / 1_000_000_000.0
-    predecessor_projected_x = (
-        float(predecessor_target.normalized_x)
-        + float(predecessor_target.normalized_x_rate_s) * gap_s
-    )
-    predecessor_projected_y = (
-        float(predecessor_target.normalized_y_down)
-        + float(predecessor_target.normalized_y_rate_down_s) * gap_s
-    )
-    predecessor_projected_log_scale = (
-        float(predecessor_target.log_scale)
-        + float(predecessor_target.log_scale_rate_s) * gap_s
-    )
-    log_scale_delta = (
-        float(target.log_scale) - float(predecessor_target.log_scale)
-    )
-    previous_width = float(previous.bbox_norm[2]) - float(
-        previous.bbox_norm[0]
-    )
-    previous_height = float(previous.bbox_norm[3]) - float(
-        previous.bbox_norm[1]
-    )
-    current_width = float(current.bbox_norm[2]) - float(
-        current.bbox_norm[0]
-    )
-    current_height = float(current.bbox_norm[3]) - float(
-        current.bbox_norm[1]
-    )
-    predicted_center_residual = math.hypot(
-        float(current.center_norm[0]) - predecessor_projected_x,
-        float(current.center_norm[1]) - predecessor_projected_y,
-    )
-    expected_log_area_residual = 2.0 * (
-        float(target.log_scale) - predecessor_projected_log_scale
-    )
-    if (
-        not all(
-            math.isfinite(value)
-            for value in (
-                predecessor_projected_x,
-                predecessor_projected_y,
-                predecessor_projected_log_scale,
-                log_scale_delta,
-                previous_width,
-                previous_height,
-                current_width,
-                current_height,
-                predicted_center_residual,
-                expected_log_area_residual,
-            )
-        )
-        or min(
-            previous_width,
-            previous_height,
-            current_width,
-            current_height,
-        )
-        <= 0.0
-        or not 0.0 < log_scale_delta <= ADJACENT_SCALE_JUMP_MAX_LOG_DELTA
-        or predecessor_projected_log_scale
-        < limits.crossing_arm_min_log_scale
-        or float(target.log_scale) < predecessor_projected_log_scale
-        or abs(predecessor_projected_x) > tuning.horizontal_corridor
-        or abs(predecessor_projected_y) > tuning.vertical_corridor
-        or not math.isclose(
-            float(association.predicted_center_residual_norm),
-            predicted_center_residual,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(association.log_width_change),
-            math.log(current_width / previous_width),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(association.log_height_change),
-            math.log(current_height / previous_height),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        or not math.isclose(
-            float(association.log_area_residual),
-            expected_log_area_residual,
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-    ):
-        return None
-
-    current_wire_projection = _retained_crossing_wire_projection(
-        target,
-        observation_monotonic_ns=accepted.observation_monotonic_ns,
-        wire_start_monotonic_ns=accepted.wire_start_monotonic_ns,
-        tuning=tuning,
-        limits=limits,
-        abort_type=abort_type,
-    )
-    if (
-        current_wire_projection is None
-        or not _retained_crossing_projection_matches_target(
-            target,
-            current_wire_projection,
-            tuning=tuning,
-            limits=limits,
-        )
-        or current_wire_projection.projected_log_scale
-        < limits.crossing_arm_min_log_scale
-    ):
-        return None
-
-    return _AdjacentScaleJumpCrossingProof(
-        predecessor=predecessor,
-        current_wire_projection=current_wire_projection,
-        association=association,
-        observation_gap_ns=observation_gap_ns,
-        publication_gap_ns=publication_gap_ns,
-        log_scale_delta=log_scale_delta,
-        predecessor_projected_log_scale=(
-            predecessor_projected_log_scale
-        ),
-        predecessor_projected_normalized_x=predecessor_projected_x,
-        predecessor_projected_normalized_y_down=predecessor_projected_y,
-    )
-
-
-def _retained_crossing_supersession_usable(
-    target: Any,
-    output: Any,
-    supersession: _SupersededVisualProposal,
-    *,
-    last_accepted_camera_token: Optional[CameraFrameToken],
-    current_track_id: str,
-    retained_crossing_dwell_frames: int,
-    tuning: Any,
-    limits: VisualCourseStageLimits,
-) -> bool:
-    """Preserve, but never extend, one completed safe retained dwell."""
-
-    target_token = getattr(target, "frame_token", None)
-    maximum_hold_s = (
-        limits.control_period_s + limits.max_validation_to_wire_delay_s
-    )
-    return bool(
-        type(supersession) is _SupersededVisualProposal
-        and supersession.consecutive_count == 1
-        and type(last_accepted_camera_token) is CameraFrameToken
-        and _tokens_are_adjacent_camera_publications(
-            supersession.expected_camera_token,
-            last_accepted_camera_token,
-        )
-        and _tokens_are_adjacent_camera_publications(
-            supersession.receiver_camera_token,
-            supersession.expected_camera_token,
-        )
-        and type(supersession.held_previous_command_s) is float
-        and math.isfinite(supersession.held_previous_command_s)
-        and 0.0 <= supersession.held_previous_command_s <= maximum_hold_s
-        and type(current_track_id) is str
-        and current_track_id
-        and getattr(target, "track_id", None) == current_track_id
-        and getattr(target_token, "stream_id", None)
-        == supersession.expected_camera_token.stream_id
-        and getattr(target_token, "generation", None)
-        == supersession.expected_camera_token.generation
-        and getattr(target_token, "frame_id", None)
-        == supersession.expected_camera_token.frame_id
-        and getattr(target_token, "publication_sequence", None)
-        == supersession.expected_camera_token.publication_sequence
-        and type(retained_crossing_dwell_frames) is int
-        and retained_crossing_dwell_frames
-        >= tuning.required_corridor_frames
-        and _retained_crossing_observation_usable(
-            target,
-            output,
-            tuning=tuning,
-            limits=limits,
-            yaw_soft_stop_zeroed=False,
-        )
-    )
-
-
-def _censored_passage_visibility_suffix_usable(
-    track: Any,
-    *,
-    previous_visible_token: CameraFrameToken,
-    current_token: CameraFrameToken,
-    previous_apparent_scale: Optional[float],
-    minimum_apparent_scale: float,
-) -> bool:
-    """Prove one uninterrupted near-plane visibility epoch through history."""
-
-    history = getattr(track, "history", None)
-    consecutive_frames = getattr(track, "consecutive_frame_count", None)
-    if (
-        type(history) is not tuple
-        or len(history) < 2
-        or type(consecutive_frames) is not int
-        or consecutive_frames < 2
-        or type(previous_visible_token) is not CameraFrameToken
-        or type(current_token) is not CameraFrameToken
-        or type(minimum_apparent_scale) not in {int, float}
-        or not math.isfinite(float(minimum_apparent_scale))
-        or (
-            previous_apparent_scale is not None
-            and (
-                type(previous_apparent_scale) not in {int, float}
-                or not math.isfinite(float(previous_apparent_scale))
-            )
-        )
-    ):
-        return False
-
-    retained_epoch_length = min(consecutive_frames, len(history))
-    visibility_epoch = history[len(history) - retained_epoch_length :]
-    if any(type(sample) is not VisualTrackSample for sample in visibility_epoch):
-        return False
-    previous_indices = [
-        index
-        for index, sample in enumerate(visibility_epoch)
-        if sample.token == previous_visible_token
-    ]
-    if len(previous_indices) != 1:
-        return False
-    suffix = visibility_epoch[previous_indices[0] :]
-    if len(suffix) < 2 or suffix[-1].token != current_token:
-        return False
-
-    previous = suffix[0]
-    previous_scale = previous.apparent_scale
-    if (
-        type(previous_scale) not in {int, float}
-        or not math.isfinite(float(previous_scale))
-        or (
-            previous_apparent_scale is not None
-            and not math.isclose(
-                float(previous_scale),
-                float(previous_apparent_scale),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-        )
-    ):
-        return False
-
-    vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
-    for sample in suffix[1:]:
-        evidence = sample.accepted_association
-        sample_scale = sample.apparent_scale
-        sample_confidence = sample.confidence
-        sample_association_confidence = sample.association_confidence
-        evidence_confidence = getattr(evidence, "confidence", None)
-        if (
-            type(evidence) is not AssociationEvidence
-            or type(sample.token) is not CameraFrameToken
-            or type(previous.token) is not CameraFrameToken
-            or type(sample.tracker_frame_sequence) is not int
-            or type(previous.tracker_frame_sequence) is not int
-            or type(sample.observation_monotonic_ns) is not int
-            or type(previous.observation_monotonic_ns) is not int
-            or type(sample.publication_monotonic_ns) is not int
-            or type(previous.publication_monotonic_ns) is not int
-            or evidence.track_id != getattr(track, "track_id", None)
-            or evidence.previous_token != previous.token
-            or evidence.current_token != sample.token
-            or evidence.detection_source_index != sample.source_index
-            or type(evidence.missed_frame_count_before_association) is not int
-            or evidence.missed_frame_count_before_association != 0
-            or type(evidence.ambiguous) is not bool
-            or evidence.ambiguous
-            or type(evidence.track_ambiguous_before_association) is not bool
-            or evidence.track_ambiguous_before_association
-            or type(sample_confidence) not in {int, float}
-            or not math.isfinite(float(sample_confidence))
-            or not 0.0 <= float(sample_confidence) <= 1.0
-            or type(sample_association_confidence) not in {int, float}
-            or not math.isfinite(float(sample_association_confidence))
-            or not 0.10 <= float(sample_association_confidence) <= 1.0
-            or type(evidence_confidence) not in {int, float}
-            or not math.isfinite(float(evidence_confidence))
-            or not math.isclose(
-                float(sample_association_confidence),
-                float(evidence_confidence),
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-            or sample.token.stream_id != previous.token.stream_id
-            or sample.token.generation != previous.token.generation
-            or sample.tracker_frame_sequence
-            - previous.tracker_frame_sequence
-            != 1
-            or sample.token.publication_sequence is None
-            or previous.token.publication_sequence is None
-            or sample.token.publication_sequence
-            - previous.token.publication_sequence
-            != 1
-            or sample.observation_monotonic_ns
-            - previous.observation_monotonic_ns
-            != evidence.observation_gap_ns
-            or sample.publication_monotonic_ns
-            - previous.publication_monotonic_ns
-            != evidence.publication_gap_ns
-            or type(sample.clipping) is not FrameEdge
-            or sample.clipping & vertical_edges != vertical_edges
-            or sample.center_censored is not True
-            or type(sample_scale) not in {int, float}
-            or not math.isfinite(float(sample_scale))
-            or float(sample_scale) < minimum_apparent_scale
-            or float(sample_scale) < float(previous_scale)
-        ):
-            return False
-        previous = sample
-        previous_scale = sample_scale
-
-    latest = suffix[-1]
-    track_scale = getattr(track, "apparent_scale", None)
-    track_confidence = getattr(track, "confidence", None)
-    track_association_confidence = getattr(
-        track,
-        "association_confidence",
-        None,
-    )
-    return bool(
-        latest.clipping == getattr(track, "clipping", None)
-        and latest.center_censored
-        == getattr(track, "center_censored", None)
-        and type(track_confidence) in {int, float}
-        and math.isfinite(float(track_confidence))
-        and 0.10 <= float(track_confidence) <= 1.0
-        and type(track_association_confidence) in {int, float}
-        and math.isfinite(float(track_association_confidence))
-        and 0.10 <= float(track_association_confidence) <= 1.0
-        and math.isclose(
-            float(latest.association_confidence),
-            float(track_association_confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and type(track_scale) in {int, float}
-        and math.isfinite(float(track_scale))
-        and math.isclose(
-            float(latest.apparent_scale),
-            float(track_scale),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-    )
-
-
-def _censored_passage_coast_eligible(
-    snapshot: Any,
-    *,
-    current_gate_index: int,
-    current_track_id: str,
-    crossing_anchor_token: CameraFrameToken,
-    authority: _CensoredPassageCoastAuthority,
-    previous_visible_token: CameraFrameToken,
-    previous_apparent_scale: Optional[float],
-    minimum_apparent_scale: float,
-) -> bool:
-    """Admit only the exact near-plane censor pattern seen before target loss."""
-
-    token = getattr(snapshot, "latest_camera_token", None)
-    track = getattr(snapshot, "current_track", None)
-    clipping = getattr(track, "clipping", None)
-    apparent_scale = getattr(track, "apparent_scale", None)
-    vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
-    return bool(
-        type(authority) is _CensoredPassageCoastAuthority
-        and authority.gate_index == current_gate_index
-        and authority.track_id == current_track_id
-        and authority.anchor_camera_token == crossing_anchor_token
-        and type(token) is CameraFrameToken
-        and type(crossing_anchor_token) is CameraFrameToken
-        and _token_strictly_newer(token, crossing_anchor_token)
-        and type(previous_visible_token) is CameraFrameToken
-        and _token_strictly_newer(token, previous_visible_token)
-        and token.publication_sequence
-        - previous_visible_token.publication_sequence
-        <= 2
-        and getattr(snapshot, "current_gate_index", None)
-        == current_gate_index
-        and getattr(snapshot, "current_track_id", None)
-        == current_track_id
-        and getattr(snapshot, "authority_usable", False) is True
-        and getattr(snapshot, "race_finished", False) is False
-        and track is not None
-        and getattr(track, "track_id", None) == current_track_id
-        and getattr(track, "latest_token", None) == token
-        and getattr(track, "role", None) is VisualTrackRole.CURRENT
-        and getattr(track, "visible", False) is True
-        and getattr(track, "missed_frame_count", 1) == 0
-        and getattr(track, "ambiguous", True) is False
-        and type(clipping) is FrameEdge
-        and clipping & vertical_edges == vertical_edges
-        and getattr(track, "center_censored", False) is True
-        and type(apparent_scale) in {int, float}
-        and math.isfinite(float(apparent_scale))
-        and float(apparent_scale) >= minimum_apparent_scale
-        and (
-            previous_apparent_scale is None
-            or float(apparent_scale) >= float(previous_apparent_scale)
-        )
-        and _censored_passage_visibility_suffix_usable(
-            track,
-            previous_visible_token=previous_visible_token,
-            current_token=token,
-            previous_apparent_scale=previous_apparent_scale,
-            minimum_apparent_scale=minimum_apparent_scale,
-        )
-    )
-
-
-def _bottom_censored_passage_transition_eligible(
-    snapshot: Any,
-    *,
-    current_gate_index: int,
-    current_track_id: str,
-    crossing_anchor_token: CameraFrameToken,
-    authority: _CensoredPassageCoastAuthority,
-    previous_visible_token: CameraFrameToken,
-    previous_apparent_scale: Optional[float],
-    minimum_apparent_scale: float,
-    passage_admission: VisualApproachPassageAdmission,
-    next_preview_retired: bool,
-    tuning: Any,
-) -> bool:
-    """Admit one exact bottom-edge sample before full vertical censorship."""
-
-    token = getattr(snapshot, "latest_camera_token", None)
-    track = getattr(snapshot, "current_track", None)
-    history = getattr(track, "history", None)
-    if (
-        type(authority) is not _CensoredPassageCoastAuthority
-        or authority.gate_index != current_gate_index
-        or authority.track_id != current_track_id
-        or authority.anchor_camera_token != crossing_anchor_token
-        or type(token) is not CameraFrameToken
-        or type(previous_visible_token) is not CameraFrameToken
-        or not (
-            previous_visible_token == crossing_anchor_token
-            or _token_strictly_newer(
-                previous_visible_token,
-                crossing_anchor_token,
-            )
-        )
-        or not _tokens_are_adjacent_camera_publications(
-            token,
-            previous_visible_token,
-        )
-        or type(passage_admission) is not VisualApproachPassageAdmission
-        or passage_admission.current_gate_index != current_gate_index
-        or passage_admission.current_target.track_id != current_track_id
-        or type(next_preview_retired) is not bool
-        or (
-            passage_admission.preview_track_id is not None
-            and not next_preview_retired
-        )
-        or getattr(snapshot, "current_gate_index", None)
-        != current_gate_index
-        or getattr(snapshot, "current_track_id", None)
-        != current_track_id
-        or getattr(snapshot, "authority_usable", False) is not True
-        or getattr(snapshot, "race_finished", False) is not False
-        or track is None
-        or getattr(track, "track_id", None) != current_track_id
-        or getattr(track, "latest_token", None) != token
-        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
-        or getattr(track, "visible", False) is not True
-        or getattr(track, "missed_frame_count", 1) != 0
-        or getattr(track, "ambiguous", True) is not False
-        or getattr(track, "clipping", None) != FrameEdge.BOTTOM
-        or getattr(track, "center_censored", False) is not True
-        or type(history) is not tuple
-        or len(history) < 2
-        or type(getattr(track, "consecutive_frame_count", None)) is not int
-        or track.consecutive_frame_count < 2
-    ):
-        return False
-
-    previous = history[-2]
-    current = history[-1]
-    if (
-        type(previous) is not VisualTrackSample
-        or type(current) is not VisualTrackSample
-        or previous.token != previous_visible_token
-        or current.token != token
-        or type(previous.tracker_frame_sequence) is not int
-        or type(current.tracker_frame_sequence) is not int
-        or current.tracker_frame_sequence
-        != previous.tracker_frame_sequence + 1
-        or getattr(snapshot, "tracker_frame_sequence", None)
-        != current.tracker_frame_sequence
-        or previous.clipping is not FrameEdge.NONE
-        or previous.center_censored
-        or current.clipping != FrameEdge.BOTTOM
-        or current.center_censored is not True
-    ):
-        return False
-
-    association = current.accepted_association
-    if (
-        type(association) is not AssociationEvidence
-        or association.track_id != current_track_id
-        or association.previous_token != previous.token
-        or association.current_token != current.token
-        or association.detection_source_index != current.source_index
-        or type(association.missed_frame_count_before_association) is not int
-        or association.missed_frame_count_before_association != 0
-        or type(association.ambiguous) is not bool
-        or association.ambiguous
-        or type(association.track_ambiguous_before_association) is not bool
-        or association.track_ambiguous_before_association
-        or type(previous.observation_monotonic_ns) is not int
-        or type(current.observation_monotonic_ns) is not int
-        or current.observation_monotonic_ns
-        - previous.observation_monotonic_ns
-        != association.observation_gap_ns
-        or type(previous.publication_monotonic_ns) is not int
-        or type(current.publication_monotonic_ns) is not int
-        or current.publication_monotonic_ns
-        - previous.publication_monotonic_ns
-        != association.publication_gap_ns
-    ):
-        return False
-
-    previous_center = previous.center_norm
-    previous_scale = previous.apparent_scale
-    current_scale = current.apparent_scale
-    track_scale = getattr(track, "apparent_scale", None)
-    sample_confidence = current.confidence
-    sample_association_confidence = current.association_confidence
-    association_confidence = association.confidence
-    track_confidence = getattr(track, "confidence", None)
-    track_association_confidence = getattr(
-        track,
-        "association_confidence",
-        None,
-    )
-    return bool(
-        type(previous_center) is tuple
-        and len(previous_center) == 2
-        and all(
-            type(value) in {int, float} and math.isfinite(float(value))
-            for value in previous_center
-        )
-        and abs(float(previous_center[0])) <= tuning.horizontal_corridor
-        and abs(float(previous_center[1])) <= tuning.vertical_corridor
-        and type(previous_scale) in {int, float}
-        and math.isfinite(float(previous_scale))
-        and type(previous_apparent_scale) in {int, float}
-        and math.isfinite(float(previous_apparent_scale))
-        and math.isclose(
-            float(previous_scale),
-            float(previous_apparent_scale),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and float(previous_scale) > PREPASS_CURRENT_MAX_APPARENT_SCALE
-        and float(previous_scale) >= minimum_apparent_scale
-        and type(current_scale) in {int, float}
-        and math.isfinite(float(current_scale))
-        and float(current_scale) > float(previous_scale)
-        and float(current_scale) >= minimum_apparent_scale
-        and type(track_scale) in {int, float}
-        and math.isfinite(float(track_scale))
-        and math.isclose(
-            float(track_scale),
-            float(current_scale),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and all(
-            type(value) in {int, float}
-            and math.isfinite(float(value))
-            and 0.10 <= float(value) <= 1.0
-            for value in (
-                sample_confidence,
-                sample_association_confidence,
-                association_confidence,
-                track_confidence,
-                track_association_confidence,
-            )
-        )
-        and math.isclose(
-            float(sample_association_confidence),
-            float(association_confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and math.isclose(
-            float(sample_association_confidence),
-            float(track_association_confidence),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-    )
-
-
 def _current_snapshot_ready(
     snapshot: Any,
     *,
     gate_index: int,
     track_id: str,
     newer_than: Optional[CameraFrameToken] = None,
+    observed_after_ns: Optional[int] = None,
 ) -> bool:
     track = getattr(snapshot, "current_track", None)
     token = getattr(snapshot, "latest_camera_token", None)
     if newer_than is not None and not _token_strictly_newer(token, newer_than):
         return False
+    if observed_after_ns is not None:
+        history = getattr(track, "history", None)
+        if (
+            type(observed_after_ns) is not int
+            or observed_after_ns < 0
+            or type(history) is not tuple
+            or not history
+        ):
+            return False
+        latest = history[-1]
+        if (
+            getattr(latest, "token", None) != token
+            or type(
+                getattr(latest, "observation_monotonic_ns", None)
+            )
+            is not int
+            or type(
+                getattr(latest, "publication_monotonic_ns", None)
+            )
+            is not int
+            or latest.observation_monotonic_ns <= observed_after_ns
+            or latest.publication_monotonic_ns <= observed_after_ns
+            or latest.publication_monotonic_ns
+            < latest.observation_monotonic_ns
+        ):
+            return False
     return bool(
-        getattr(snapshot, "current_gate_index", None) == gate_index
+        type(token) is CameraFrameToken
+        and getattr(snapshot, "current_gate_index", None) == gate_index
         and getattr(snapshot, "current_track_id", None) == track_id
         and getattr(snapshot, "authority_usable", False) is True
         and getattr(snapshot, "race_finished", False) is False
         and track is not None
         and getattr(track, "track_id", None) == track_id
+        and getattr(track, "latest_token", None) == token
+        and getattr(track, "role", None) is VisualTrackRole.CURRENT
+        and getattr(
+            track,
+            "authoritative_gate_index",
+            gate_index,
+        )
+        == gate_index
         and getattr(track, "visible", False) is True
         and getattr(track, "ambiguous", True) is False
         and getattr(track, "missed_frame_count", 1) == 0
+        and getattr(track, "clipping", FrameEdge.NONE) == FrameEdge.NONE
+        and getattr(track, "center_censored", True) is False
     )
 
 
@@ -2687,50 +1197,6 @@ def _servo_token_matches_camera(
         == camera_token.frame_id
         and getattr(servo_token, "publication_sequence", None)
         == camera_token.publication_sequence
-    )
-
-
-def _recovery_identity_matches_transition(
-    admission: Any,
-    transition: Any,
-) -> bool:
-    visibility_tokens = getattr(
-        admission,
-        "visibility_epoch_tokens",
-        None,
-    )
-    visibility_sequences = getattr(
-        admission,
-        "visibility_epoch_tracker_frame_sequences",
-        None,
-    )
-    frame_count = getattr(
-        admission,
-        "visibility_epoch_frame_count",
-        None,
-    )
-    return bool(
-        getattr(admission, "track_id", None)
-        == transition.promoted_track_id
-        and getattr(admission, "promotion_identity_sha256", None)
-        == transition.promoted_history_sha256
-        and isinstance(
-            getattr(admission, "promotion_identity_basis", None),
-            str,
-        )
-        and type(
-            getattr(admission, "cross_gap_identity_claimed", None)
-        )
-        is bool
-        and type(visibility_tokens) is tuple
-        and type(visibility_sequences) is tuple
-        and type(frame_count) is int
-        and frame_count >= RECOVERY_HISTORY_SAMPLE_COUNT
-        and len(visibility_tokens) == frame_count
-        and len(visibility_sequences) == frame_count
-        and all(type(token) is CameraFrameToken for token in visibility_tokens)
-        and visibility_tokens[-1]
-        == transition.promoted_latest_token_at_promotion
     )
 
 
@@ -3052,6 +1518,27 @@ async def _run_visual_course_stage_impl(
                 abort_type=abort_type,
             )
         )
+        current_history = getattr(
+            getattr(snapshot, "current_track", None),
+            "history",
+            None,
+        )
+        publication_monotonic_ns = (
+            None
+            if type(current_history) is not tuple or not current_history
+            else getattr(
+                current_history[-1],
+                "publication_monotonic_ns",
+                None,
+            )
+        )
+        if (
+            type(publication_monotonic_ns) is not int
+            or publication_monotonic_ns < observation_monotonic_ns
+        ):
+            raise abort_type(
+                "visual-course target lacks exact publication provenance"
+            )
         requested_yaw = float(output.yaw_rate_rad_s)
         if requested_yaw != 0.0:
             profile = runtime.yaw_profile
@@ -3348,6 +1835,9 @@ async def _run_visual_course_stage_impl(
         wire_start_monotonic_ns = visual_wire_authority.get(
             "call_start_monotonic_ns"
         )
+        wire_return_monotonic_ns = visual_wire_authority.get(
+            "transport_return_monotonic_ns"
+        )
         top_level_wire_start_ns = receipt.get("call_start_monotonic_ns")
         wire_frame_token = visual_wire_authority.get("frame_token")
         if (
@@ -3355,6 +1845,8 @@ async def _run_visual_course_stage_impl(
             != "aigp-vq2-visual-wire-authority/1"
             or type(wire_start_monotonic_ns) is not int
             or wire_start_monotonic_ns < 0
+            or type(wire_return_monotonic_ns) is not int
+            or wire_return_monotonic_ns < wire_start_monotonic_ns
             or top_level_wire_start_ns != wire_start_monotonic_ns
             or host._last_flight_command_started_ns
             != wire_start_monotonic_ns
@@ -3466,7 +1958,12 @@ async def _run_visual_course_stage_impl(
             command=command,
             yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
             observation_monotonic_ns=observation_monotonic_ns,
+            publication_monotonic_ns=publication_monotonic_ns,
             wire_start_monotonic_ns=wire_start_monotonic_ns,
+            wire_return_monotonic_ns=wire_return_monotonic_ns,
+            wire_camera_token=snapshot.latest_camera_token,
+            wire_race_gate_index=current_gate_index,
+            publication_pinned_through_transport_return=True,
             target_roll_rad=target_roll_rad,
             target_pitch_rad=target_pitch_rad,
             next_preview_collective_delta=(
@@ -3837,6 +2334,7 @@ async def _run_visual_course_stage_impl(
             ),
         )
         mode = VisualApproachMode.APPROACH
+        lifecycle = CourseLifecycle.APPROACH
         passage_admission: Optional[VisualApproachPassageAdmission] = None
         passage_started_s: Optional[float] = None
         passage_command_count = 0
@@ -3847,29 +2345,18 @@ async def _run_visual_course_stage_impl(
         next_preview_requalification_used = False
         next_preview_requalification: Optional[Dict[str, Any]] = None
         crossing_anchor: Optional[Dict[str, Any]] = None
+        near_plane_evidence = NearPlaneEvidence()
+        near_plane_latch: Optional[NearPlaneLatch] = None
         crossing_coast_authority: Optional[
             _CensoredPassageCoastAuthority
         ] = None
         last_clean_passage_token: Optional[CameraFrameToken] = None
-        last_clean_passage_scale: Optional[float] = None
         censored_passage_coast_started_s: Optional[float] = None
         censored_passage_coast_last_observed_token: Optional[
             CameraFrameToken
         ] = None
-        censored_passage_coast_last_observed_scale: Optional[float] = None
         censored_passage_coast_fresh_frame_count = 0
         censored_passage_coast_command_count = 0
-        bottom_censored_transition_pending_token: Optional[
-            CameraFrameToken
-        ] = None
-        bottom_censored_transition_used = False
-        retained_crossing_dwell_frames = 0
-        retained_crossing_supersession: Optional[
-            _SupersededVisualProposal
-        ] = None
-        retained_crossing_candidate: Optional[
-            _RetainedCrossingCandidate
-        ] = None
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
@@ -3891,20 +2378,17 @@ async def _run_visual_course_stage_impl(
             "next_preview_requalification": None,
             "yaw_soft_stop_zero_command_count": 0,
             "passage_admission_yaw_soft_stop_withheld_count": 0,
-            "retained_crossing_dwell_frames": 0,
-            "max_retained_crossing_dwell_frames": 0,
-            "retained_crossing_supersession_hold_count": 0,
-            "retained_crossing_supersession_hold": None,
-            "adjacent_scale_jump_crossing_count": 0,
             "crossing_wait_zero_command_count": 0,
             "censored_passage_coast_fresh_frame_count": 0,
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
-            "bottom_censored_transition_count": 0,
-            "bottom_censored_transition": None,
             "post_credit_zero_command_count": 0,
             "passage_authority_enabled": False,
             "passage_admission": None,
+            "lifecycle": lifecycle.value,
+            "near_plane_evidence_frame_count": 0,
+            "near_plane_latch": None,
+            "near_plane_measurement_mode": None,
             "crossing_anchor": None,
             "outcome": "running",
             "launch_bootstrap": {
@@ -3988,38 +2472,6 @@ async def _run_visual_course_stage_impl(
 
         credited_race: Optional[AuthoritativeRaceStatusRef] = None
 
-        def accept_bottom_transition_credit() -> None:
-            nonlocal bottom_censored_transition_pending_token
-
-            if bottom_censored_transition_pending_token is None:
-                return
-            transition_evidence = segment[
-                "bottom_censored_transition"
-            ]
-            coast_evidence = segment["censored_passage_coast"]
-            if (
-                not isinstance(transition_evidence, dict)
-                or not isinstance(coast_evidence, dict)
-            ):
-                raise abort_type(
-                    "visual-course bottom-censored transition lost its "
-                    "credit evidence"
-                )
-            transition_evidence["outcome"] = (
-                "authoritative_credit_before_full_censorship"
-            )
-            coast_evidence["bottom_transition_pending"] = False
-            bottom_censored_transition_pending_token = None
-            host.recorder.emit(
-                "visual_course_bottom_censored_transition_credited",
-                gate_index=current_gate_index,
-                stage=(
-                    f"{VISUAL_COURSE_STAGE}/gate"
-                    f"{current_gate_index}/censored-passage"
-                ),
-                **transition_evidence,
-            )
-
         def accept_no_wire_race_boundary(
             exc: RaceActiveBoundaryChangedBeforeWire,
         ) -> AuthoritativeRaceStatusRef:
@@ -4057,7 +2509,6 @@ async def _run_visual_course_stage_impl(
             crossing_started_s = (
                 crossing_started_s or float(runtime.monotonic())
             )
-            accept_bottom_transition_credit()
             return refused_race
 
         def current_only_replan(
@@ -4229,7 +2680,6 @@ async def _run_visual_course_stage_impl(
                         "visual-course race credit arrived without credible "
                         "passage evidence"
                     )
-                accept_bottom_transition_credit()
                 credited_race = race
                 last_race = race
                 crossing_started_s = crossing_started_s or now
@@ -4247,9 +2697,12 @@ async def _run_visual_course_stage_impl(
                     + limits.censored_passage_coast_max_duration_s
                 )
             ):
-                raise abort_type(
-                    "visual-course censored passage coast expired"
-                )
+                crossing_started_s = crossing_started_s or now
+                if crossing_baseline_race is None:
+                    raise abort_type(
+                        "visual-course bounded coast lacks a race baseline"
+                    )
+                break
 
             snapshot = host.visual_gate_graph.latest_snapshot
             token = getattr(snapshot, "latest_camera_token", None)
@@ -4330,38 +2783,6 @@ async def _run_visual_course_stage_impl(
                     )
             if last_planned_token is not None and token == last_planned_token:
                 continue
-            if bottom_censored_transition_pending_token is not None:
-                pending_track = getattr(snapshot, "current_track", None)
-                vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
-                if (
-                    not _tokens_are_adjacent_camera_publications(
-                        token,
-                        bottom_censored_transition_pending_token,
-                    )
-                    or pending_track is None
-                    or getattr(pending_track, "track_id", None)
-                    != current_track_id
-                    or getattr(pending_track, "latest_token", None) != token
-                    or getattr(pending_track, "visible", False) is not True
-                    or getattr(pending_track, "missed_frame_count", 1) != 0
-                    or getattr(pending_track, "ambiguous", True) is not False
-                    or type(getattr(pending_track, "clipping", None))
-                    is not FrameEdge
-                    or pending_track.clipping & vertical_edges
-                    != vertical_edges
-                    or getattr(
-                        pending_track,
-                        "center_censored",
-                        False,
-                    )
-                    is not True
-                ):
-                    raise abort_type(
-                        "visual-course bottom-censored transition did not "
-                        "become full vertical censorship on its exact "
-                        "successor"
-                    )
-
             preview_requalification_wire_candidate = False
             try:
                 proposal = planner.observe(
@@ -4614,6 +3035,159 @@ async def _run_visual_course_stage_impl(
                     censored_passage_coast_last_observed_token
                     or last_clean_passage_token
                 )
+                measurement_mode: Optional[
+                    LatchedMeasurementMode
+                ] = None
+                if (
+                    near_plane_latch is not None
+                    and previous_visible_token is not None
+                ):
+                    center = getattr(track, "center_norm", None)
+                    velocity = getattr(
+                        track,
+                        "center_velocity_norm_s",
+                        None,
+                    )
+                    graph_config = getattr(
+                        host.visual_gate_graph,
+                        "config",
+                        DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
+                    )
+                    measurement_mode = classify_latched_measurement(
+                        near_plane_latch,
+                        previous_camera_token=previous_visible_token,
+                        camera_token=token,
+                        current_gate_index=getattr(
+                            snapshot,
+                            "current_gate_index",
+                            None,
+                        ),
+                        current_track_id=getattr(
+                            snapshot,
+                            "current_track_id",
+                            None,
+                        ),
+                        track_latest_camera_token=getattr(
+                            track,
+                            "latest_token",
+                            None,
+                        ),
+                        track_role=getattr(track, "role", None),
+                        track_authoritative_gate_index=getattr(
+                            track,
+                            "authoritative_gate_index",
+                            current_gate_index,
+                        ),
+                        visible=bool(
+                            getattr(track, "visible", False)
+                        ),
+                        missed_frame_count=getattr(
+                            track,
+                            "missed_frame_count",
+                            -1,
+                        ),
+                        ambiguous=bool(
+                            getattr(track, "ambiguous", True)
+                        ),
+                        clipping=getattr(
+                            track,
+                            "clipping",
+                            FrameEdge.NONE,
+                        ),
+                        center_censored=bool(
+                            getattr(
+                                track,
+                                "center_censored",
+                                False,
+                            )
+                        ),
+                        normalized_x=(
+                            None
+                            if type(center) is not tuple
+                            or len(center) != 2
+                            else center[0]
+                        ),
+                        normalized_y_down=(
+                            None
+                            if type(center) is not tuple
+                            or len(center) != 2
+                            else center[1]
+                        ),
+                        normalized_x_rate_s=(
+                            None
+                            if type(velocity) is not tuple
+                            or len(velocity) != 2
+                            else velocity[0]
+                        ),
+                        normalized_y_rate_down_s=(
+                            None
+                            if type(velocity) is not tuple
+                            or len(velocity) != 2
+                            else velocity[1]
+                        ),
+                        apparent_scale=getattr(
+                            track,
+                            "apparent_scale",
+                            None,
+                        ),
+                        confidence=getattr(
+                            track,
+                            "confidence",
+                            None,
+                        ),
+                        association_confidence=getattr(
+                            track,
+                            "association_confidence",
+                            None,
+                        ),
+                        min_track_confidence=(
+                            graph_config.min_track_confidence
+                        ),
+                        min_association_confidence=(
+                            graph_config.min_association_confidence
+                        ),
+                        race_finished=bool(
+                            getattr(
+                                snapshot,
+                                "race_finished",
+                                False,
+                            )
+                        ),
+                    )
+                    if (
+                        measurement_mode
+                        is LatchedMeasurementMode.CREDIT_WAIT
+                    ):
+                        lifecycle = CourseLifecycle.CREDIT_WAIT
+                        segment["lifecycle"] = lifecycle.value
+                        segment["near_plane_measurement_mode"] = (
+                            measurement_mode.value
+                        )
+                        crossing_started_s = (
+                            crossing_started_s or now
+                        )
+                        if crossing_baseline_race is None:
+                            raise abort_type(
+                                "visual-course credit wait lacks a race "
+                                "baseline"
+                            ) from exc
+                        if (
+                            segment["censored_passage_coast"]
+                            is not None
+                        ):
+                            segment["censored_passage_coast"][
+                                "loss_camera_token"
+                            ] = asdict(token)
+                        last_planned_token = token
+                        break
+                    if (
+                        measurement_mode
+                        is LatchedMeasurementMode.UNSAFE
+                    ):
+                        raise abort_type(
+                            "visual-course latched near-plane measurement "
+                            "became unsafe"
+                        ) from exc
                 censored_coast_eligible = bool(
                     type(exc)
                     is VisualApproachCurrentGeometryUnavailable
@@ -4623,197 +3197,13 @@ async def _run_visual_course_stage_impl(
                     and crossing_anchor is not None
                     and crossing_coast_authority is not None
                     and previous_visible_token is not None
-                    and _censored_passage_coast_eligible(
-                        snapshot,
-                        current_gate_index=current_gate_index,
-                        current_track_id=current_track_id,
-                        crossing_anchor_token=(
-                            crossing_anchor["camera_token"]
-                        ),
-                        authority=crossing_coast_authority,
-                        previous_visible_token=previous_visible_token,
-                        previous_apparent_scale=(
-                            censored_passage_coast_last_observed_scale
-                            if (
-                                censored_passage_coast_last_observed_scale
-                                is not None
-                            )
-                            else last_clean_passage_scale
-                        ),
-                        minimum_apparent_scale=math.exp(
-                            limits.crossing_arm_min_log_scale
-                        ),
-                    )
+                    and measurement_mode
+                    is LatchedMeasurementMode.COAST
                 )
-                bottom_transition_eligible = bool(
-                    type(exc)
-                    is VisualApproachCurrentGeometryUnavailable
-                    and mode is VisualApproachMode.PASSAGE
-                    and type(passage_admission)
-                    is VisualApproachPassageAdmission
-                    and crossing_anchor is not None
-                    and crossing_coast_authority is not None
-                    and censored_passage_coast_started_s is None
-                    and not bottom_censored_transition_used
-                    and bottom_censored_transition_pending_token is None
-                    and previous_visible_token is not None
-                    and _bottom_censored_passage_transition_eligible(
-                        snapshot,
-                        current_gate_index=current_gate_index,
-                        current_track_id=current_track_id,
-                        crossing_anchor_token=(
-                            crossing_anchor["camera_token"]
-                        ),
-                        authority=crossing_coast_authority,
-                        previous_visible_token=previous_visible_token,
-                        previous_apparent_scale=last_clean_passage_scale,
-                        minimum_apparent_scale=math.exp(
-                            limits.crossing_arm_min_log_scale
-                        ),
-                        passage_admission=passage_admission,
-                        next_preview_retired=next_preview_retired,
-                        tuning=host.visual_config.servo,
-                    )
-                )
-                if bottom_transition_eligible:
-                    bottom_censored_transition_used = True
-                    bottom_censored_transition_pending_token = token
-                    censored_passage_coast_started_s = now
-                    censored_passage_coast_last_observed_token = token
-                    censored_passage_coast_last_observed_scale = float(
-                        track.apparent_scale
-                    )
-                    censored_passage_coast_fresh_frame_count = 1
-                    transition_evidence = {
-                        "basis": (
-                            CENSORED_PASSAGE_BOTTOM_TRANSITION_BASIS
-                        ),
-                        "outcome": "awaiting_full_vertical_censorship",
-                        "anchor_camera_token": asdict(
-                            crossing_coast_authority.anchor_camera_token
-                        ),
-                        "previous_clean_camera_token": asdict(
-                            previous_visible_token
-                        ),
-                        "bottom_censored_camera_token": asdict(token),
-                        "full_vertical_censor_camera_token": None,
-                        "previous_apparent_scale": (
-                            last_clean_passage_scale
-                        ),
-                        "bottom_censored_apparent_scale": float(
-                            track.apparent_scale
-                        ),
-                    }
-                    segment["bottom_censored_transition_count"] = 1
-                    segment["bottom_censored_transition"] = (
-                        transition_evidence
-                    )
-                    segment["censored_passage_coast"] = {
-                        "basis": (
-                            CENSORED_PASSAGE_BOTTOM_TRANSITION_BASIS
-                        ),
-                        "anchor_camera_token": asdict(
-                            crossing_coast_authority.anchor_camera_token
-                        ),
-                        "first_censored_camera_token": asdict(token),
-                        "last_censored_camera_token": asdict(token),
-                        "loss_camera_token": None,
-                        "target_roll_rad": (
-                            crossing_coast_authority.target_roll_rad
-                        ),
-                        "target_pitch_rad": (
-                            crossing_coast_authority.target_pitch_rad
-                        ),
-                        "thrust": crossing_coast_authority.thrust,
-                        "max_duration_s": (
-                            limits.censored_passage_coast_max_duration_s
-                        ),
-                        "max_fresh_frames": (
-                            limits
-                            .censored_passage_coast_max_fresh_frames
-                        ),
-                        "elapsed_s": 0.0,
-                        "bottom_transition_pending": True,
-                    }
-                    segment[
-                        "censored_passage_coast_fresh_frame_count"
-                    ] = censored_passage_coast_fresh_frame_count
-                    last_planned_token = token
-                    host.recorder.emit(
-                        "visual_course_bottom_censored_transition_started",
-                        gate_index=current_gate_index,
-                        stage=(
-                            f"{VISUAL_COURSE_STAGE}/gate"
-                            f"{current_gate_index}/censored-passage"
-                        ),
-                        **transition_evidence,
-                    )
-                    refresh_live_summary()
-                    try:
-                        coast_command = (
-                            await send_censored_passage_coast(
-                                snapshot=snapshot,
-                                authority=crossing_coast_authority,
-                                yaw_reference_rad=yaw_reference_rad,
-                                segment_started_s=segment_started_s,
-                                stage=(
-                                    f"{VISUAL_COURSE_STAGE}/gate"
-                                    f"{current_gate_index}/"
-                                    "censored-passage"
-                                ),
-                            )
-                        )
-                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
-                        credited_race = accept_no_wire_race_boundary(
-                            race_exc
-                        )
-                        break
-                    if coast_command is None:
-                        continue
-                    censored_passage_coast_command_count += 1
-                    passage_command_count += 1
-                    segment["passage_command_count"] = (
-                        passage_command_count
-                    )
-                    segment[
-                        "censored_passage_coast_command_count"
-                    ] = censored_passage_coast_command_count
-                    continue
                 if censored_coast_eligible:
-                    if bottom_censored_transition_pending_token is not None:
-                        bottom_censored_transition_pending_token = None
-                        transition_evidence = segment[
-                            "bottom_censored_transition"
-                        ]
-                        if not isinstance(transition_evidence, dict):
-                            raise abort_type(
-                                "visual-course bottom-censored transition "
-                                "lost its evidence"
-                            )
-                        transition_evidence["outcome"] = (
-                            "full_vertical_censorship_confirmed"
-                        )
-                        transition_evidence[
-                            "full_vertical_censor_camera_token"
-                        ] = asdict(token)
-                        coast_evidence = segment[
-                            "censored_passage_coast"
-                        ]
-                        if not isinstance(coast_evidence, dict):
-                            raise abort_type(
-                                "visual-course bottom-censored transition "
-                                "lost its coast evidence"
-                            )
-                        coast_evidence["bottom_transition_pending"] = False
-                        host.recorder.emit(
-                            "visual_course_bottom_censored_transition_confirmed",
-                            gate_index=current_gate_index,
-                            stage=(
-                                f"{VISUAL_COURSE_STAGE}/gate"
-                                f"{current_gate_index}/censored-passage"
-                            ),
-                            **transition_evidence,
-                        )
+                    segment["near_plane_measurement_mode"] = (
+                        LatchedMeasurementMode.COAST.value
+                    )
                     if censored_passage_coast_started_s is None:
                         censored_passage_coast_started_s = now
                         segment["censored_passage_coast"] = {
@@ -4863,13 +3253,14 @@ async def _run_visual_course_stage_impl(
                             .censored_passage_coast_max_fresh_frames
                         )
                     ):
-                        raise abort_type(
-                            "visual-course censored passage coast expired"
-                        ) from exc
+                        crossing_started_s = now
+                        if crossing_baseline_race is None:
+                            raise abort_type(
+                                "visual-course bounded coast lacks a race "
+                                "baseline"
+                            ) from exc
+                        break
                     censored_passage_coast_last_observed_token = token
-                    censored_passage_coast_last_observed_scale = float(
-                        track.apparent_scale
-                    )
                     censored_passage_coast_fresh_frame_count += 1
                     segment[
                         "censored_passage_coast_fresh_frame_count"
@@ -4912,11 +3303,6 @@ async def _run_visual_course_stage_impl(
                     ] = censored_passage_coast_command_count
                     continue
 
-                if bottom_censored_transition_pending_token is not None:
-                    raise abort_type(
-                        "visual-course bottom-censored transition lacked "
-                        "full vertical censorship on its exact successor"
-                    ) from exc
                 credible_loss = bool(
                     mode is VisualApproachMode.PASSAGE
                     and crossing_anchor is not None
@@ -4945,7 +3331,7 @@ async def _run_visual_course_stage_impl(
                     )
                     and token.publication_sequence
                     - previous_visible_token.publication_sequence
-                    == track.missed_frame_count
+                    >= track.missed_frame_count
                     and type(getattr(track, "history", None)) is tuple
                     and bool(track.history)
                     and getattr(track.history[-1], "token", None)
@@ -4956,7 +3342,7 @@ async def _run_visual_course_stage_impl(
                         "visual-course visual authority refused: "
                         f"{exc}"
                     ) from exc
-                crossing_started_s = now
+                crossing_started_s = crossing_started_s or now
                 if crossing_baseline_race is None:
                     raise abort_type(
                         "visual-course crossing lacks a race baseline"
@@ -5418,8 +3804,10 @@ async def _run_visual_course_stage_impl(
                     if launch_ready:
                         passage_admission = proposal.passage_admission
                         mode = VisualApproachMode.PASSAGE
+                        lifecycle = CourseLifecycle.PASSAGE_ARMED
                         passage_started_s = float(runtime.monotonic())
                         segment["passage_authority_enabled"] = True
+                        segment["lifecycle"] = lifecycle.value
                         segment["passage_admission"] = asdict(
                             passage_admission
                         )
@@ -5453,129 +3841,15 @@ async def _run_visual_course_stage_impl(
                 credited_race = accept_no_wire_race_boundary(exc)
                 break
             if type(accepted) is _SupersededVisualProposal:
-                # A scale-jump proof is exact-successor-only.  Receiver
-                # supersession may preserve the ordinary completed dwell
-                # through its separate proof, but it can never carry this
-                # sealed command candidate across an unaccepted publication.
-                retained_crossing_candidate = None
-                if (
-                    retained_crossing_supersession is None
-                    and _retained_crossing_supersession_usable(
-                        proposal.current_target,
-                        proposal.servo_output,
-                        accepted,
-                        last_accepted_camera_token=(
-                            last_clean_passage_token
-                        ),
-                        current_track_id=current_track_id,
-                        retained_crossing_dwell_frames=(
-                            retained_crossing_dwell_frames
-                        ),
-                        tuning=host.visual_config.servo,
-                        limits=limits,
-                    )
-                ):
-                    retained_crossing_supersession = accepted
-                    hold_evidence = {
-                        "basis": (
-                            "completed-retained-dwell-adjacent-"
-                            "supersession-v1"
-                        ),
-                        "outcome": "awaiting_exact_receiver_successor",
-                        "previous_accepted_camera_token": asdict(
-                            last_clean_passage_token
-                        ),
-                        "superseded_camera_token": asdict(
-                            accepted.expected_camera_token
-                        ),
-                        "receiver_camera_token": asdict(
-                            accepted.receiver_camera_token
-                        ),
-                        "held_previous_command_s": (
-                            accepted.held_previous_command_s
-                        ),
-                        "retained_crossing_dwell_frames": (
-                            retained_crossing_dwell_frames
-                        ),
-                        "track_id": proposal.current_target.track_id,
-                        "normalized_x": (
-                            proposal.current_target.normalized_x
-                        ),
-                        "normalized_y_down": (
-                            proposal.current_target.normalized_y_down
-                        ),
-                        "normalized_x_rate_s": (
-                            proposal.current_target.normalized_x_rate_s
-                        ),
-                        "normalized_y_rate_down_s": (
-                            proposal.current_target
-                            .normalized_y_rate_down_s
-                        ),
-                        "log_scale": proposal.current_target.log_scale,
-                        "log_scale_rate_s": (
-                            proposal.current_target.log_scale_rate_s
-                        ),
-                    }
-                    segment[
-                        "retained_crossing_supersession_hold_count"
-                    ] = int(
-                        segment[
-                            "retained_crossing_supersession_hold_count"
-                        ]
-                    ) + 1
-                    segment[
-                        "retained_crossing_supersession_hold"
-                    ] = hold_evidence
-                    host.recorder.emit(
-                        "visual_course_retained_crossing_supersession_held",
-                        gate_index=current_gate_index,
-                        stage=(
-                            f"{VISUAL_COURSE_STAGE}/gate"
-                            f"{current_gate_index}/passage"
-                        ),
-                        **hold_evidence,
-                    )
-                else:
-                    retained_crossing_supersession = None
-                    retained_crossing_dwell_frames = 0
-                segment["retained_crossing_dwell_frames"] = (
-                    retained_crossing_dwell_frames
-                )
                 refresh_live_summary()
                 continue
             if type(accepted) is not _AcceptedVisualCommand:
                 raise abort_type(
                     "visual-course passage command outcome is invalid"
                 )
-            adjacent_predecessor = retained_crossing_candidate
-            # Consume the opportunity before inspecting this publication.
-            # A newly eligible current command may seal a fresh candidate for
-            # its own exact successor below.
-            retained_crossing_candidate = None
-            if retained_crossing_supersession is not None:
-                exact_successor = bool(
-                    token
-                    == retained_crossing_supersession.receiver_camera_token
-                )
-                hold_evidence = segment[
-                    "retained_crossing_supersession_hold"
-                ]
-                if not exact_successor:
-                    retained_crossing_dwell_frames = 0
-                if isinstance(hold_evidence, dict):
-                    hold_evidence["outcome"] = (
-                        "exact_receiver_successor_accepted"
-                        if exact_successor
-                        else "receiver_successor_changed"
-                    )
-                    hold_evidence["accepted_successor_camera_token"] = (
-                        asdict(token)
-                    )
-                retained_crossing_supersession = None
             command = accepted.command
             target = proposal.current_target
             last_clean_passage_token = token
-            last_clean_passage_scale = math.exp(float(target.log_scale))
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
             if proposal.servo_output.next_gate_blend > 0.0:
@@ -5583,12 +3857,9 @@ async def _run_visual_course_stage_impl(
                 segment[
                     "passage_next_preview_command_count"
                 ] = passage_next_preview_command_count
-            # The calibrated yaw limiter owns only the yaw channel.  Keep the
-            # already sealed, same-identity preview alive so its independently
-            # bounded pitch/collective corrections remain fresh.  This frame
-            # still cannot count as advance or arm current-advance crossing
-            # below, and every later publication must independently re-pass
-            # the yaw limiter.
+            # The calibrated yaw limiter owns only the yaw channel.  Every
+            # publication must independently re-pass it; advance remains a
+            # diagnostic count and never supplies near-plane authority.
             refresh_live_summary()
             if (
                 proposal.servo_output.advance_enabled
@@ -5596,333 +3867,168 @@ async def _run_visual_course_stage_impl(
             ):
                 advance_command_count += 1
                 segment["advance_command_count"] = advance_command_count
-            target_observation_monotonic_ns = (
-                accepted.observation_monotonic_ns
-            )
-            retained_wire_projection: Optional[
-                _RetainedCrossingWireProjection
-            ] = None
-            retained_observation_usable = (
-                _retained_crossing_observation_usable(
-                    target,
-                    proposal.servo_output,
-                    tuning=host.visual_config.servo,
-                    limits=limits,
-                    yaw_soft_stop_zeroed=(
-                        accepted.yaw_soft_stop_zeroed
-                    ),
-                )
-            )
-            if retained_observation_usable:
-                retained_crossing_dwell_frames += 1
-                if (
-                    ADJACENT_SCALE_JUMP_MIN_PREDECESSOR_LOG_SCALE
-                    <= float(target.log_scale)
-                    < limits.crossing_arm_min_log_scale
-                ):
-                    retained_wire_projection = (
-                        _retained_crossing_wire_projection(
-                            target,
-                            observation_monotonic_ns=(
-                                target_observation_monotonic_ns
-                            ),
-                            wire_start_monotonic_ns=(
-                                accepted.wire_start_monotonic_ns
-                            ),
-                            tuning=host.visual_config.servo,
-                            limits=limits,
-                            abort_type=abort_type,
-                        )
-                    )
-            else:
-                retained_crossing_dwell_frames = 0
-            if (
-                retained_observation_usable
-                and retained_crossing_dwell_frames
-                >= host.visual_config.servo.required_corridor_frames
-                and retained_wire_projection is not None
-            ):
-                retained_crossing_candidate = _RetainedCrossingCandidate(
-                    gate_index=current_gate_index,
-                    track_id=current_track_id,
-                    camera_token=token,
-                    tracker_frame_sequence=(
-                        snapshot.tracker_frame_sequence
-                    ),
-                    target=target,
-                    output=proposal.servo_output,
-                    accepted=accepted,
-                    wire_projection=retained_wire_projection,
-                    retained_crossing_dwell_frames=(
-                        retained_crossing_dwell_frames
-                    ),
-                    advance_command_count=advance_command_count,
-                )
-            segment["retained_crossing_dwell_frames"] = (
-                retained_crossing_dwell_frames
-            )
-            segment["max_retained_crossing_dwell_frames"] = max(
-                int(segment["max_retained_crossing_dwell_frames"]),
-                retained_crossing_dwell_frames,
-            )
-            crossing_basis = _crossing_anchor_basis(
-                target,
-                proposal.servo_output,
-                passage_admission=passage_admission,
-                current_gate_index=current_gate_index,
-                current_track_id=current_track_id,
-                advance_command_count=advance_command_count,
-                retained_crossing_dwell_frames=(
-                    retained_crossing_dwell_frames
-                ),
-                tuning=host.visual_config.servo,
-                limits=limits,
-                retained_wire_projection=retained_wire_projection,
-                yaw_soft_stop_zeroed=accepted.yaw_soft_stop_zeroed,
-            )
-            adjacent_scale_jump_proof: Optional[
-                _AdjacentScaleJumpCrossingProof
-            ] = None
-            if crossing_basis is None:
-                adjacent_scale_jump_proof = (
-                    _adjacent_scale_jump_crossing_proof(
-                        snapshot,
-                        target,
-                        proposal.servo_output,
-                        accepted,
-                        predecessor=adjacent_predecessor,
-                        passage_admission=passage_admission,
-                        current_gate_index=current_gate_index,
-                        current_track_id=current_track_id,
-                        advance_command_count=advance_command_count,
-                        next_preview_retired=next_preview_retired,
-                        tuning=host.visual_config.servo,
-                        limits=limits,
-                        abort_type=abort_type,
-                    )
-                )
-                if adjacent_scale_jump_proof is not None:
-                    crossing_basis = (
-                        RETAINED_ADJACENT_SCALE_JUMP_CROSSING_BASIS
-                    )
-                    retained_wire_projection = (
-                        adjacent_scale_jump_proof
-                        .current_wire_projection
-                    )
-            if crossing_basis is not None:
-                anchor_retained_crossing_dwell_frames = (
-                    retained_crossing_dwell_frames
-                    if adjacent_scale_jump_proof is None
-                    else (
-                        adjacent_scale_jump_proof.predecessor
-                        .retained_crossing_dwell_frames
-                    )
-                )
-                adjacent_scale_jump_evidence = None
-                if adjacent_scale_jump_proof is not None:
-                    proof = adjacent_scale_jump_proof
-                    predecessor = proof.predecessor
-                    association = proof.association
-                    adjacent_scale_jump_evidence = {
-                        "basis": (
-                            RETAINED_ADJACENT_SCALE_JUMP_CROSSING_BASIS
-                        ),
-                        "predecessor_camera_token": asdict(
-                            predecessor.camera_token
-                        ),
-                        "predecessor_tracker_frame_sequence": (
-                            predecessor.tracker_frame_sequence
-                        ),
-                        "predecessor_retained_crossing_dwell_frames": (
-                            predecessor.retained_crossing_dwell_frames
-                        ),
-                        "predecessor_log_scale": (
-                            predecessor.target.log_scale
-                        ),
-                        "predecessor_normalized_x": (
-                            predecessor.target.normalized_x
-                        ),
-                        "predecessor_normalized_y_down": (
-                            predecessor.target.normalized_y_down
-                        ),
-                        "predecessor_normalized_x_rate_s": (
-                            predecessor.target.normalized_x_rate_s
-                        ),
-                        "predecessor_normalized_y_rate_down_s": (
-                            predecessor.target.normalized_y_rate_down_s
-                        ),
-                        "predecessor_log_scale_rate_s": (
-                            predecessor.target.log_scale_rate_s
-                        ),
-                        "predecessor_wire_projected_log_scale": (
-                            predecessor.wire_projection
-                            .projected_log_scale
-                        ),
-                        "predecessor_to_current_observation_gap_ns": (
-                            proof.observation_gap_ns
-                        ),
-                        "predecessor_to_current_publication_gap_ns": (
-                            proof.publication_gap_ns
-                        ),
-                        "predecessor_projected_log_scale_at_current": (
-                            proof.predecessor_projected_log_scale
-                        ),
-                        "predecessor_projected_normalized_x_at_current": (
-                            proof
-                            .predecessor_projected_normalized_x
-                        ),
-                        "predecessor_projected_normalized_y_down_at_current": (
-                            proof
-                            .predecessor_projected_normalized_y_down
-                        ),
-                        "current_log_scale_delta": (
-                            proof.log_scale_delta
-                        ),
-                        "association_confidence": (
-                            association.confidence
-                        ),
-                        "association_cost": association.cost,
-                        "association_bbox_iou": association.bbox_iou,
-                        "association_predicted_center_residual_norm": (
-                            association.predicted_center_residual_norm
-                        ),
-                        "association_log_width_change": (
-                            association.log_width_change
-                        ),
-                        "association_log_height_change": (
-                            association.log_height_change
-                        ),
-                        "association_log_area_residual": (
-                            association.log_area_residual
-                        ),
-                    }
-                    segment[
-                        "adjacent_scale_jump_crossing_count"
-                    ] = int(
-                        segment[
-                            "adjacent_scale_jump_crossing_count"
-                        ]
-                    ) + 1
-                crossing_coast_thrust = (
-                    float(command.thrust)
-                    - accepted.next_preview_collective_delta
-                )
-                if (
-                    not math.isfinite(crossing_coast_thrust)
-                    or crossing_coast_thrust
-                    < limits.min_thrust - 1e-12
-                    or crossing_coast_thrust
-                    > limits.max_thrust + 1e-12
-                ):
+            if near_plane_latch is None:
+                track = getattr(snapshot, "current_track", None)
+                clipping = getattr(track, "clipping", None)
+                if type(clipping) is not FrameEdge:
                     raise abort_type(
-                        "visual-course current-only crossing coast thrust "
-                        "escaped its fixed envelope"
+                        "visual-course near-plane evidence lacks exact "
+                        "clipping state"
                     )
-                crossing_anchor = {
-                    "basis": crossing_basis,
-                    "camera_token": token,
-                    "tracker_frame_sequence": (
-                        snapshot.tracker_frame_sequence
+                wire_sample = NearPlaneWireSample(
+                    gate_index=current_gate_index,
+                    track_id=target.track_id,
+                    camera_token=token,
+                    wire_camera_token=accepted.wire_camera_token,
+                    observation_monotonic_ns=(
+                        accepted.observation_monotonic_ns
                     ),
-                    "track_id": target.track_id,
-                    "log_scale": target.log_scale,
-                    "observation_log_scale": target.log_scale,
-                    "log_scale_rate_s": target.log_scale_rate_s,
-                    "observation_monotonic_ns": (
-                        target_observation_monotonic_ns
+                    publication_monotonic_ns=(
+                        accepted.publication_monotonic_ns
                     ),
-                    "wire_start_monotonic_ns": (
+                    wire_start_monotonic_ns=(
                         accepted.wire_start_monotonic_ns
                     ),
-                    "observation_to_wire_s": (
-                        None
-                        if retained_wire_projection is None
-                        else (
-                            retained_wire_projection
-                            .observation_to_wire_s
-                        )
+                    wire_return_monotonic_ns=(
+                        accepted.wire_return_monotonic_ns
                     ),
-                    "observation_to_wire_ns": (
-                        None
-                        if retained_wire_projection is None
-                        else (
-                            retained_wire_projection
-                            .observation_to_wire_ns
-                        )
+                    wire_race_gate_index=(
+                        accepted.wire_race_gate_index
                     ),
-                    "wire_projected_log_scale": (
-                        None
-                        if retained_wire_projection is None
-                        else (
-                            retained_wire_projection.projected_log_scale
-                        )
+                    publication_pinned_through_transport_return=(
+                        accepted
+                        .publication_pinned_through_transport_return
                     ),
-                    "wire_projected_normalized_x": (
-                        None
-                        if retained_wire_projection is None
-                        else (
-                            retained_wire_projection
-                            .projected_normalized_x
-                        )
-                    ),
-                    "wire_projected_normalized_y_down": (
-                        None
-                        if retained_wire_projection is None
-                        else (
-                            retained_wire_projection
-                            .projected_normalized_y_down
-                        )
-                    ),
-                    "corridor_frames": (
-                        proposal.servo_output.corridor_frames
-                    ),
-                    "retained_crossing_dwell_frames": (
-                        anchor_retained_crossing_dwell_frames
-                    ),
-                    "advance_command_count": advance_command_count,
-                    "current_advance_enabled": (
-                        proposal.servo_output.advance_enabled
-                    ),
-                    "yaw_soft_stop_zeroed": (
-                        accepted.yaw_soft_stop_zeroed
-                    ),
-                    "normalized_x": target.normalized_x,
-                    "normalized_y_down": target.normalized_y_down,
-                    "normalized_x_rate_s": target.normalized_x_rate_s,
-                    "normalized_y_rate_down_s": (
+                    normalized_x=target.normalized_x,
+                    normalized_y_down=target.normalized_y_down,
+                    normalized_x_rate_s=target.normalized_x_rate_s,
+                    normalized_y_rate_down_s=(
                         target.normalized_y_rate_down_s
                     ),
-                    "command": asdict(command),
-                    "next_preview_collective_delta": (
-                        accepted.next_preview_collective_delta
+                    log_scale=target.log_scale,
+                    log_scale_rate_s=target.log_scale_rate_s,
+                    confidence=target.confidence,
+                    association_confidence=(
+                        target.association_confidence
                     ),
-                    "current_only_crossing_coast_thrust": (
-                        crossing_coast_thrust
-                    ),
-                    "adjacent_scale_jump_evidence": (
-                        adjacent_scale_jump_evidence
-                    ),
-                }
-                crossing_coast_authority = (
-                    _CensoredPassageCoastAuthority(
-                        gate_index=current_gate_index,
-                        track_id=current_track_id,
-                        anchor_camera_token=token,
-                        target_roll_rad=accepted.target_roll_rad,
-                        target_pitch_rad=accepted.target_pitch_rad,
-                        # Optional next-preview authority retires with the
-                        # live preview.  The existing censored-passage coast
-                        # remains current-aperture-only and therefore latches
-                        # the proved base rather than reintroducing a retired
-                        # preview delta after a visibility gap.
-                        thrust=crossing_coast_thrust,
+                    clipping=clipping,
+                    center_censored=target.center_censored,
+                    ambiguous=target.ambiguous,
+                    command_roll_rate=command.roll_rate,
+                    command_pitch_rate=command.pitch_rate,
+                    command_yaw_rate=command.yaw_rate,
+                    command_thrust=command.thrust,
+                )
+                graph_config = getattr(
+                    host.visual_gate_graph,
+                    "config",
+                    DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
+                )
+                near_plane_evidence, candidate_latch = (
+                    advance_near_plane_evidence(
+                        near_plane_evidence,
+                        wire_sample,
+                        required_corridor_frames=(
+                            host.visual_config.servo
+                            .required_corridor_frames
+                        ),
+                        crossing_min_log_scale=(
+                            limits.crossing_arm_min_log_scale
+                        ),
+                        min_track_confidence=(
+                            graph_config.min_track_confidence
+                        ),
+                        min_association_confidence=(
+                            graph_config.min_association_confidence
+                        ),
                     )
                 )
-                segment["crossing_anchor"] = {
-                    **crossing_anchor,
-                    "camera_token": asdict(token),
-                }
-
+                segment["near_plane_evidence_frame_count"] = len(
+                    near_plane_evidence.samples
+                )
+                if candidate_latch is not None:
+                    near_plane_latch = candidate_latch
+                    lifecycle = CourseLifecycle.NEAR_PLANE_LATCHED
+                    crossing_coast_thrust = (
+                        float(command.thrust)
+                        - accepted.next_preview_collective_delta
+                    )
+                    if (
+                        not math.isfinite(crossing_coast_thrust)
+                        or crossing_coast_thrust
+                        < limits.min_thrust - 1e-12
+                        or crossing_coast_thrust
+                        > limits.max_thrust + 1e-12
+                    ):
+                        raise abort_type(
+                            "visual-course near-plane coast thrust escaped "
+                            "its fixed envelope"
+                        )
+                    crossing_coast_authority = (
+                        _CensoredPassageCoastAuthority(
+                            gate_index=current_gate_index,
+                            track_id=current_track_id,
+                            anchor_camera_token=(
+                                candidate_latch.anchor_camera_token
+                            ),
+                            target_roll_rad=accepted.target_roll_rad,
+                            target_pitch_rad=accepted.target_pitch_rad,
+                            thrust=crossing_coast_thrust,
+                        )
+                    )
+                    crossing_anchor = {
+                        "basis": candidate_latch.basis,
+                        "camera_token": (
+                            candidate_latch.anchor_camera_token
+                        ),
+                        "track_id": candidate_latch.track_id,
+                        "gate_index": candidate_latch.gate_index,
+                        "accepted_wire_frame_count": len(
+                            candidate_latch.evidence.samples
+                        ),
+                        "advance_command_count": (
+                            advance_command_count
+                        ),
+                        "log_scale": target.log_scale,
+                        "log_scale_rate_s": (
+                            target.log_scale_rate_s
+                        ),
+                        "normalized_x": target.normalized_x,
+                        "normalized_y_down": (
+                            target.normalized_y_down
+                        ),
+                        "normalized_x_rate_s": (
+                            target.normalized_x_rate_s
+                        ),
+                        "normalized_y_rate_down_s": (
+                            target.normalized_y_rate_down_s
+                        ),
+                        "command": asdict(command),
+                        "current_only_crossing_coast_thrust": (
+                            crossing_coast_thrust
+                        ),
+                    }
+                    segment["lifecycle"] = lifecycle.value
+                    segment["near_plane_latch"] = {
+                        **crossing_anchor,
+                        "camera_token": asdict(
+                            candidate_latch.anchor_camera_token
+                        ),
+                    }
+                    # Preserve the compact legacy key for downstream evidence
+                    # readers while making its generic physical basis explicit.
+                    segment["crossing_anchor"] = dict(
+                        segment["near_plane_latch"]
+                    )
+                    host.recorder.emit(
+                        "visual_course_near_plane_latched",
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/passage"
+                        ),
+                        **segment["near_plane_latch"],
+                    )
+            continue
         if crossing_started_s is None:
             crossing_started_s = float(runtime.monotonic())
         if crossing_baseline_race is None:
@@ -6051,6 +4157,8 @@ async def _run_visual_course_stage_impl(
             host._visual_course_summary = dict(summary)
             return summary
 
+        lifecycle = CourseLifecycle.PROMOTE_REACQUIRE
+        segment["lifecycle"] = lifecycle.value
         transition_summary: Dict[str, Any] = {
             "from_gate_index": current_gate_index,
             "to_gate_index": int(credited_race.active_gate_index),
@@ -6136,10 +4244,10 @@ async def _run_visual_course_stage_impl(
                 "retired_track_id": transition.retired_track_id,
                 "promoted_track_id": transition.promoted_track_id,
                 "history_length_before_promotion": (
-                transition.history_length_before_promotion
+                    transition.history_length_before_promotion
                 ),
                 "history_length_after_promotion": (
-                transition.history_length_after_promotion
+                    transition.history_length_after_promotion
                 ),
             }
         )
@@ -6154,11 +4262,6 @@ async def _run_visual_course_stage_impl(
             float(runtime.monotonic())
             + limits.post_credit_fresh_frame_timeout_s,
         )
-        recovery_started_ns = runtime.perf_counter_ns()
-        if type(recovery_started_ns) is not int or recovery_started_ns < 0:
-            raise abort_type(
-                "visual-course recovery clock is invalid at transition"
-            )
         recovery_admission: Any = None
         recovery_admission_kind: Optional[str] = None
         admitted_recovery_token: Optional[CameraFrameToken] = None
@@ -6173,139 +4276,73 @@ async def _run_visual_course_stage_impl(
             recovery_admission = None
             recovery_admission_kind = None
             admitted_recovery_token = None
-            if not _current_snapshot_ready(
+            if _current_snapshot_ready(
                 snapshot,
                 gate_index=current_gate_index,
                 track_id=current_track_id,
+                newer_than=transition.camera_token_at_credit,
+                observed_after_ns=(
+                    transition.race_status.received_monotonic_ns
+                ),
             ):
-                latest_recovery_refusal = (
-                    "promoted track is not currently visible and unambiguous"
-                )
-                return False
-            token = getattr(snapshot, "latest_camera_token", None)
-            if type(token) is not CameraFrameToken:
-                raise abort_type(
-                    "visual-course recovery snapshot lacks an exact token"
-                )
-            try:
+                token = snapshot.latest_camera_token
                 promoted_track = host.visual_tracker.track(
                     current_track_id
                 )
-                if getattr(promoted_track, "latest_token", None) != token:
-                    raise abort_type(
-                        "visual-course recovery track does not end at the "
-                        "ready snapshot token"
-                    )
-                _roll, measured_pitch, _yaw, _rates = _attitude_state(
-                    host,
-                    abort_type,
-                )
-                now_ns = runtime.perf_counter_ns()
-                if type(now_ns) is not int or now_ns < recovery_started_ns:
-                    raise abort_type(
-                        "visual-course recovery clock regressed"
-                    )
+                history = getattr(promoted_track, "history", None)
                 if (
-                    token
-                    == transition.promoted_latest_token_at_promotion
+                    getattr(promoted_track, "latest_token", None) != token
+                    or type(history) is not tuple
+                    or not history
                 ):
-                    candidate = runtime.transition_recovery_admission(
-                        promoted_track,
-                        transition,
-                        tracker_time_basis_id=(
-                            host.visual_tracker.time_basis_id
-                        ),
-                        measured_pitch_rad=measured_pitch,
-                        now_monotonic_ns=now_ns,
+                    raise abort_type(
+                        "visual-course fresh promoted current is not bound "
+                        "to the ready graph snapshot"
                     )
-                    history_tokens = getattr(
-                        candidate,
-                        "history_tokens",
-                        None,
-                    )
-                    transition_race = transition.race_status
-                    if (
-                        not _recovery_identity_matches_transition(
-                            candidate,
-                            transition,
-                        )
-                        or getattr(
-                            candidate,
-                            "promotion_anchor_token",
-                            None,
-                        )
-                        != token
-                        or type(history_tokens) is not tuple
-                        or not history_tokens
-                        or history_tokens[-1] != token
-                        or getattr(
-                            candidate,
-                            "race_status_sequence",
-                            None,
-                        )
-                        != transition_race.race_status_sequence
-                        or getattr(
-                            candidate,
-                            "race_received_monotonic_ns",
-                            None,
-                        )
-                        != transition_race.received_monotonic_ns
-                    ):
-                        raise abort_type(
-                            "visual-course transition recovery admission is "
-                            "not bound to its exact anchor"
-                        )
-                    kind = "transition_anchor"
-                else:
-                    candidate = runtime.recovery_continuation_admission(
-                        promoted_track,
-                        transition,
-                        previous_token=(
-                            transition.promoted_latest_token_at_promotion
-                        ),
-                        tracker_time_basis_id=(
-                            host.visual_tracker.time_basis_id
-                        ),
-                        measured_pitch_rad=measured_pitch,
-                        recovery_started_monotonic_ns=(
-                            recovery_started_ns
-                        ),
-                        now_monotonic_ns=now_ns,
-                    )
-                    capture = getattr(candidate, "capture", None)
-                    if (
-                        not _recovery_identity_matches_transition(
-                            candidate,
-                            transition,
-                        )
-                        or getattr(candidate, "previous_token", None)
-                        != transition.promoted_latest_token_at_promotion
-                        or getattr(candidate, "frame_token", None) != token
-                        or not _servo_token_matches_camera(
-                            getattr(capture, "frame_token", None),
-                            token,
-                        )
-                    ):
-                        raise abort_type(
-                            "visual-course recovery continuation is not "
-                            "bound to its exact frame"
-                        )
-                    kind = "exact_next_continuation"
-            except VisualRecoveryRefusal as exc:
-                latest_recovery_refusal = str(exc)
-                return False
-            if not _token_strictly_newer(
-                token,
-                transition.camera_token_at_credit,
-            ):
-                latest_recovery_refusal = (
-                    "recovery admission is not newer than race credit"
+                first_observation_ns = getattr(
+                    history[0],
+                    "observation_monotonic_ns",
+                    None,
                 )
-                return False
-            recovery_admission = candidate
-            recovery_admission_kind = kind
-            admitted_recovery_token = token
-            return True
+                last_observation_ns = getattr(
+                    history[-1],
+                    "observation_monotonic_ns",
+                    None,
+                )
+                if (
+                    type(first_observation_ns) is not int
+                    or type(last_observation_ns) is not int
+                    or last_observation_ns < first_observation_ns
+                ):
+                    raise abort_type(
+                        "visual-course fresh promoted current lacks exact "
+                        "history timing"
+                    )
+                recovery_admission = _FreshPostCreditHandoff(
+                    track_id=current_track_id,
+                    frame_token=token,
+                    promotion_identity_sha256=(
+                        transition.promoted_history_sha256
+                    ),
+                    promotion_identity_basis=(
+                        "rolling-graph-atomic-promotion-fresh-current-v1"
+                    ),
+                    cross_gap_identity_claimed=False,
+                    retained_history_frame_count=len(history),
+                    retained_history_span_s=(
+                        last_observation_ns - first_observation_ns
+                    )
+                    / 1_000_000_000.0,
+                )
+                recovery_admission_kind = "fresh_promoted_current"
+                admitted_recovery_token = token
+                latest_recovery_refusal = None
+                return True
+            latest_recovery_refusal = (
+                "promoted current lacks a strictly newer clean, visible, "
+                "unambiguous frame"
+            )
+            return False
 
         while True:
             _assert_course_attitude_state(
@@ -6387,11 +4424,11 @@ async def _run_visual_course_stage_impl(
             "cross_gap_identity_claimed": (
                 recovery_admission.cross_gap_identity_claimed
             ),
-            "visibility_epoch_frame_count": (
-                recovery_admission.visibility_epoch_frame_count
+            "retained_history_frame_count": (
+                recovery_admission.retained_history_frame_count
             ),
-            "visibility_epoch_span_s": (
-                recovery_admission.visibility_epoch_span_s
+            "retained_history_span_s": (
+                recovery_admission.retained_history_span_s
             ),
         }
 

@@ -6278,7 +6278,9 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                 },
                 "reviewed_gate_passage": {
                     "allow_advance": True,
-                    "next_gate_preview": False,
+                    "next_gate_preview": True,
+                    "next_gate_preview_requires_reviewed_identity": True,
+                    "next_gate_preview_may_retire_fail_closed": True,
                     "passage_hard_duration_s": (
                         limits.passage_hard_duration_s
                     ),
@@ -6299,8 +6301,11 @@ def replay_controller_envelope(stage: str) -> Dict[str, Any]:
                     "max_wait_s": (
                         limits.post_credit_fresh_frame_timeout_s
                     ),
-                    "complete_visibility_epoch_admission_required": True,
                     "promoted_history_preserved": True,
+                    "same_promoted_identity_required": True,
+                    "strictly_post_credit_observation_required": True,
+                    "strictly_post_credit_publication_required": True,
+                    "neutral_credit_boundary_command_authority": False,
                 },
                 "terminal": {
                     "authoritative_race_finished_required": True,
@@ -12745,13 +12750,6 @@ class VQ2Runner:
             > transition.history_length_before_promotion
             or transition.history_length_before_promotion
             != transition.history_length_after_promotion
-            or (
-                transition.history_length_before_promotion
-                - transition.promoted_history_length_at_credit
-            )
-            not in range(
-                RECOVERY_MAX_POSTCREDIT_PROMOTION_SAMPLES + 1
-            )
         ):
             raise SafetyAbort(
                 "visual gate promotion proof is incomplete or reset history"

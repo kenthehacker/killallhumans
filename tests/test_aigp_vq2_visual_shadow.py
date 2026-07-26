@@ -505,7 +505,7 @@ def test_race_credit_camera_watermark_includes_detectionless_frame():
     )
 
 
-def test_transition_uses_captured_credit_when_newer_same_gate_status_arrives():
+def test_transition_preserves_multiple_samples_after_captured_credit():
     adapter = _Adapter()
     runner = vq2_module.VQ2Runner(adapter, _Vision())
     _context, current_id, promoted_id = _prime_bound_gate_graph(
@@ -521,23 +521,28 @@ def test_transition_uses_captured_credit_when_newer_same_gate_status_arrives():
     )
     captured_credit = runner._visual_race_status_ref()
 
-    _update_visual(
-        runner,
-        _frame(
-            105,
-            [
-                _detection(280, 140, 80, 80, confidence=0.95),
-                _detection(465, 65, 50, 60, confidence=0.90),
-            ],
-            final_packet_ns=320_000_000,
-        ),
-    )
+    for frame_id, final_packet_ns in (
+        (105, 320_000_000),
+        (106, 353_000_000),
+        (107, 386_000_000),
+    ):
+        _update_visual(
+            runner,
+            _frame(
+                frame_id,
+                [
+                    _detection(280, 140, 80, 80, confidence=0.95),
+                    _detection(465, 65, 50, 60, confidence=0.90),
+                ],
+                final_packet_ns=final_packet_ns,
+            ),
+        )
     _set_race(
         adapter,
         gate_index=1,
         boot_ms=1_350,
         sequence=12,
-        received_ns=340_000_000,
+        received_ns=400_000_000,
     )
 
     transition = runner._confirm_visual_transition(
@@ -551,7 +556,11 @@ def test_transition_uses_captured_credit_when_newer_same_gate_status_arrives():
     assert transition.race_status == captured_credit
     assert transition.race_status.race_status_sequence == 11
     assert transition.camera_token_at_credit.frame_id == 104
-    assert transition.promoted_latest_token_at_promotion.frame_id == 105
+    assert transition.promoted_latest_token_at_promotion.frame_id == 107
+    assert (
+        transition.history_length_before_promotion
+        - transition.promoted_history_length_at_credit
+    ) == 3
     assert runner._visual_race_status_ref().race_status_sequence == 12
 
 
