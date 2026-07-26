@@ -431,6 +431,47 @@ def test_generic_gate_seven_passage_retains_admitted_preview() -> None:
         _observe(approach, snapshot, tracker)
 
 
+def test_passage_rapid_expansion_brakes_without_refusing_sealed_heading() -> None:
+    tracker, graph, snapshot, current_id, next_id, sequence = (
+        _build_bound_graph(current_gate_index=7)
+    )
+    assert next_id is not None
+    approach = _approach(current_id, current_gate_index=7)
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(approach, snapshot, tracker)
+    admission = proposal.passage_admission
+    assert type(admission) is VisualApproachPassageAdmission
+    assert admission.preview_track_id == next_id
+
+    sequence += 1
+    snapshot = _advance(
+        tracker,
+        graph,
+        sequence,
+        current_width=0.38,
+        current_height=0.404,
+    )
+    passage = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+
+    assert passage.next_target is not None
+    assert passage.next_target.track_id == next_id
+    assert passage.current_target.log_scale_rate_s > 2.0
+    assert passage.servo_output.next_gate_blend == 0.0
+    assert passage.servo_output.next_horizontal_error is not None
+    assert passage.servo_output.yaw_rate_rad_s != 0.0
+    assert passage.servo_output.advance_enabled is False
+    assert passage.servo_output.brake_reason == "scale_rate"
+
+
 def test_passage_forward_closure_authority_requires_exact_bool() -> None:
     tracker, _, snapshot, current_id, _, _ = _build_bound_graph()
     approach = _approach(current_id)

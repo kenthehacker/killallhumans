@@ -1026,17 +1026,11 @@ class RollingVisualApproachServo:
             raise VisualApproachRefusal(
                 "passage next-preview blend exceeded its requested authority"
             )
-        if (
-            mode is VisualApproachMode.PASSAGE
-            and output.next_gate_blend == 0.0
-            and (
-                output.next_horizontal_error is not None
-                or output.next_vertical_error_image_down is not None
-            )
-        ):
-            raise VisualApproachRefusal(
-                "passage retained next-preview geometry without authority"
-            )
+        # Rapid expansion can continuously taper the reported translation
+        # blend to zero while the servo retains the sealed successor's
+        # corridor-bounded heading for yaw/bank and brakes forward closure.
+        # The next-error fields preserve that exact same-frame observation;
+        # they are not an independent grant of advance authority.
         reviewed_next_track_id = output.reviewed_next_track_id
         if reviewed_next_track_id is not None:
             if (
