@@ -21,7 +21,6 @@ from typing import Optional
 from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import CameraFrameToken, VisualTrackRole
 from planning.vq2_visual_servo import (
-    PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S,
     PREPASS_CURRENT_MAX_ABS_X_NORM,
     PREPASS_CURRENT_MAX_ABS_Y_NORM,
     PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S,
@@ -352,6 +351,23 @@ class NearPlaneLatch:
         return self.evidence.samples[-1].command
 
 
+def _observable_axis_unsafe(
+    *,
+    value: float,
+    rate: float,
+    maximum_abs_value: float,
+) -> bool:
+    """Bound the observed center now and at the fixed control horizon."""
+
+    return bool(
+        abs(value) > maximum_abs_value
+        or abs(
+            value + rate * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        )
+        > maximum_abs_value
+    )
+
+
 def _wire_sample_usable(
     sample: NearPlaneWireSample,
     *,
@@ -362,7 +378,6 @@ def _wire_sample_usable(
     y = float(sample.normalized_y_down)
     x_rate = float(sample.normalized_x_rate_s)
     y_rate = float(sample.normalized_y_rate_down_s)
-    projection = PREPASS_CURRENT_PROJECTION_HORIZON_S
     scale_rate = float(sample.log_scale_rate_s)
     return bool(
         sample.clipping == FrameEdge.NONE
@@ -371,14 +386,16 @@ def _wire_sample_usable(
         and float(sample.confidence) >= min_track_confidence
         and float(sample.association_confidence)
         >= min_association_confidence
-        and abs(x) <= PREPASS_CURRENT_MAX_ABS_X_NORM
-        and abs(y) <= PREPASS_CURRENT_MAX_ABS_Y_NORM
-        and abs(x_rate) <= PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
-        and abs(y_rate) <= PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
-        and abs(x + x_rate * projection)
-        <= PREPASS_CURRENT_MAX_ABS_X_NORM
-        and abs(y + y_rate * projection)
-        <= PREPASS_CURRENT_MAX_ABS_Y_NORM
+        and not _observable_axis_unsafe(
+            value=x,
+            rate=x_rate,
+            maximum_abs_value=PREPASS_CURRENT_MAX_ABS_X_NORM,
+        )
+        and not _observable_axis_unsafe(
+            value=y,
+            rate=y_rate,
+            maximum_abs_value=PREPASS_CURRENT_MAX_ABS_Y_NORM,
+        )
         and PREPASS_CURRENT_MIN_LOG_SCALE_RATE_S <= scale_rate
         and scale_rate <= PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
         and scale_rate > 0.0
@@ -476,22 +493,6 @@ def advance_near_plane_evidence(
         crossing_min_log_scale=float(crossing_min_log_scale),
     )
     return advanced, latch
-
-
-def _observable_axis_unsafe(
-    *,
-    value: float,
-    rate: float,
-    maximum_abs_value: float,
-) -> bool:
-    return bool(
-        abs(value) > maximum_abs_value
-        or abs(rate) > PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
-        or abs(
-            value + rate * PREPASS_CURRENT_PROJECTION_HORIZON_S
-        )
-        > maximum_abs_value
-    )
 
 
 def classify_latched_measurement(

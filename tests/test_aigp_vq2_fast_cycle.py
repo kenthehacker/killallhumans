@@ -60,6 +60,10 @@ def test_visual_course_manifest_binds_reviewed_yaw_profile():
         in fast_cycle._RUNTIME_SOURCE_PATHS
     )
     assert (
+        "planning/vq2_course_lifecycle.py"
+        in fast_cycle._RUNTIME_SOURCE_PATHS
+    )
+    assert (
         "scripts/aigp_vq2_yaw_profile.py"
         in fast_cycle._RUNTIME_SOURCE_PATHS
     )

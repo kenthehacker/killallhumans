@@ -1,7 +1,7 @@
 """Regress the course lifecycle against compact build-3385 live facts.
 
 This is an exact logged tracker/graph/IMU/race/wire-state replay.  It is not
-JPEG replay, detector replay, or full receiver replay: both source manifests
+JPEG replay, detector replay, or full receiver replay: the source manifests
 explicitly recorded ``replay_bundle: null``.  The tracked constants below are
 the smallest state excerpts needed to exercise the pure lifecycle decisions.
 """
@@ -27,7 +27,14 @@ from planning.vq2_course_lifecycle import (
     classify_latched_measurement,
 )
 from planning.vq2_gate_graph import DEFAULT_ROLLING_GATE_GRAPH_CONFIG
-from planning.vq2_visual_servo import VisualServoTuning
+from planning.vq2_visual_servo import (
+    PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S,
+    PREPASS_CURRENT_MAX_ABS_X_NORM,
+    PREPASS_CURRENT_MAX_ABS_Y_NORM,
+    PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S,
+    PREPASS_CURRENT_PROJECTION_HORIZON_S,
+    VisualServoTuning,
+)
 from scripts.aigp_vq2_visual_course_stage import (
     VisualCourseStageLimits,
     _current_snapshot_ready,
@@ -60,6 +67,20 @@ _SOURCES = (
         ),
         "result_sha256": (
             "a1cf685dfb7358dbaac4583d66241eb588f47c43a8f22ff0c5f9a52b7ddafe90"
+        ),
+        "replay_bundle": None,
+    },
+    {
+        "run_id": "20260726T035026Z-visual-course-5630e810",
+        "commit": "4e12c8e874b2dc3bf3f938345144400cacb716ff",
+        "configuration_sha256": (
+            "ca07ccf0b60840e77db43137e9c5e2f33449d23bb6f7933994695e62fbb93e11"
+        ),
+        "trace_sha256": (
+            "6202ea6765b380b06d6c072821cdfc817a714d820833b623301c00ec696fdb04"
+        ),
+        "result_sha256": (
+            "ea7e679ecad8ee6c1b077595757c87fe13e133ef3b2e893008c3960485cad005"
         ),
         "replay_bundle": None,
     },
@@ -158,6 +179,160 @@ _LATEST_NEAR_PLANE_ROWS = (
         ),
     },
 )
+
+# Exact accepted-wire publications 159--164 and the following tracker-only
+# bottom-censored publication 165 from:
+# C:\Users\John\aigp-evidence\fast-flight-cycles\
+# 20260726T035026Z-visual-course-5630e810\session.jsonl.gz
+#
+# This is a tracker/graph/wire boundary replay.  The source manifest has no
+# replay bundle, so these facts do not claim JPEG, detector, UDP, or complete
+# receiver replay.
+_ATTEMPT4_NEAR_PLANE_ROWS = (
+    {
+        "sequence": 159,
+        "frame_id": 1_463_132,
+        "observation_ns": 170_676_898_922_800,
+        "publication_ns": 170_676_899_987_000,
+        "wire_start_ns": 170_676_920_939_600,
+        "wire_return_ns": 170_676_921_004_300,
+        "x": 0.07499999999999996,
+        "y": -0.033333333333333326,
+        "x_rate": 1.3670281359508214,
+        "y_rate": 0.34718036440944966,
+        "scale": 0.5295192394993783,
+        "scale_rate": 3.4055413450667666,
+        "confidence": 0.9367381488700184,
+        "association": 0.761315303114898,
+        "command": (
+            -0.0006574963399372036,
+            0.03594935938874102,
+            0.0,
+            0.23374933587420715,
+        ),
+    },
+    {
+        "sequence": 160,
+        "frame_id": 1_463_133,
+        "observation_ns": 170_676_935_927_800,
+        "publication_ns": 170_676_936_994_000,
+        "wire_start_ns": 170_676_952_630_100,
+        "wire_return_ns": 170_676_952_710_900,
+        "x": 0.06875000000000009,
+        "y": -0.011111111111111072,
+        "x_rate": 0.5222698088606171,
+        "y_rate": 0.48651686111226855,
+        "scale": 0.55263730068745,
+        "scale_rate": 2.167619291582423,
+        "confidence": 0.9216282182441906,
+        "association": 0.8487041451779588,
+        "command": (
+            -0.000592990098805232,
+            0.027438026370037723,
+            0.0,
+            0.22085971615220473,
+        ),
+    },
+    {
+        "sequence": 161,
+        "frame_id": 1_463_134,
+        "observation_ns": 170_676_968_534_900,
+        "publication_ns": 170_676_969_550_000,
+        "wire_start_ns": 170_676_984_170_600,
+        "wire_return_ns": 170_676_984_254_000,
+        "x": 0.05624999999999991,
+        "y": 0.005555555555555536,
+        "x_rate": 0.024177763371304534,
+        "y_rate": 0.5000574549884801,
+        "scale": 0.5825366583600841,
+        "scale_rate": 1.8641803072048202,
+        "confidence": 0.9214867304679504,
+        "association": 0.8929918451264776,
+        "command": (
+            -0.0006210429609931206,
+            0.01710802157008043,
+            0.0,
+            0.21624549026662657,
+        ),
+    },
+    {
+        "sequence": 162,
+        "frame_id": 1_463_135,
+        "observation_ns": 170_677_003_017_700,
+        "publication_ns": 170_677_004_032_300,
+        "wire_start_ns": 170_677_016_533_400,
+        "wire_return_ns": 170_677_016_583_300,
+        "x": 0.04062499999999991,
+        "y": 0.02777777777777768,
+        "x_rate": -0.23833845742077187,
+        "y_rate": 0.5794698738564363,
+        "scale": 0.6186202164674399,
+        "scale_rate": 1.7974658079441244,
+        "confidence": 0.9269723994970945,
+        "association": 0.9057259744103434,
+        "command": (
+            -0.0005933535075613167,
+            0.02581454535164186,
+            0.0,
+            0.21,
+        ),
+    },
+    {
+        "sequence": 163,
+        "frame_id": 1_463_136,
+        "observation_ns": 170_677_031_177_700,
+        "publication_ns": 170_677_032_117_900,
+        "wire_start_ns": 170_677_048_192_500,
+        "wire_return_ns": 170_677_048_268_300,
+        "x": 0.03125,
+        "y": 0.050000000000000044,
+        "x_rate": -0.29035777458934564,
+        "y_rate": 0.694789221013177,
+        "scale": 0.6492784456610277,
+        "scale_rate": 1.7535885583754687,
+        "confidence": 0.9333213253567314,
+        "association": 0.9228193169681045,
+        "command": (
+            -0.000523756693300895,
+            0.0225629183223547,
+            0.0007875221106270983,
+            0.21,
+        ),
+    },
+    {
+        "sequence": 164,
+        "frame_id": 1_463_137,
+        "observation_ns": 170_677_065_321_400,
+        "publication_ns": 170_677_066_354_700,
+        "wire_start_ns": 170_677_079_012_900,
+        "wire_return_ns": 170_677_079_067_500,
+        "x": 0.009374999999999911,
+        "y": 0.061111111111111116,
+        "x_rate": -0.48303200697964366,
+        "y_rate": 0.49163724896802374,
+        "scale": 0.6970921746799343,
+        "scale_rate": 1.9337122824651742,
+        "confidence": 0.9439139512492389,
+        "association": 0.8979388920100646,
+        "command": (
+            -0.000521126996433585,
+            0.01727273064623086,
+            0.014093620244287558,
+            0.21,
+        ),
+    },
+)
+_ATTEMPT4_BOTTOM_CENSOR = {
+    "sequence": 165,
+    "frame_id": 1_463_138,
+    "x": -0.0031250000000000444,
+    "y": 0.06666666666666665,
+    "x_rate": -0.41389685600878345,
+    "y_rate": 0.3085845188658079,
+    "scale": 0.7560864148142504,
+    "confidence": 0.9471791885099187,
+    "association": 0.827260665014193,
+}
 
 # The credited comparison latched at publication 158.  Publications 165, 166,
 # 171, and 172 then supply the exact BOTTOM -> TOP|BOTTOM -> full-frame -> loss
@@ -446,6 +621,95 @@ def test_latest_run_latches_before_censor_despite_two_advance_commands():
     assert latch.accepted_command == pytest.approx(
         _LATEST_NEAR_PLANE_ROWS[-1]["command"]
     )
+
+
+def test_attempt4_contour_union_frames_cannot_contribute() -> None:
+    publication_159 = _wire_sample(_ATTEMPT4_NEAR_PLANE_ROWS[0])
+    publication_160 = _wire_sample(_ATTEMPT4_NEAR_PLANE_ROWS[1])
+
+    assert abs(
+        publication_159.normalized_x
+        + publication_159.normalized_x_rate_s
+        * PREPASS_CURRENT_PROJECTION_HORIZON_S
+    ) > PREPASS_CURRENT_MAX_ABS_X_NORM
+    assert (
+        publication_159.log_scale_rate_s
+        > PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+    )
+    assert (
+        publication_160.log_scale_rate_s
+        > PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S
+    )
+
+    evidence = NearPlaneEvidence()
+    for sample in (publication_159, publication_160):
+        evidence, latch = advance_near_plane_evidence(
+            evidence,
+            sample,
+            **_REDUCER_KWARGS,
+        )
+        assert evidence.samples == ()
+        assert latch is None
+
+
+def test_attempt4_projected_corridor_latches_before_bottom_censor() -> None:
+    samples = tuple(
+        _wire_sample(row)
+        for row in _ATTEMPT4_NEAR_PLANE_ROWS[2:5]
+    )
+    terminal = samples[-1]
+
+    assert (
+        abs(terminal.normalized_y_rate_down_s)
+        > PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S
+    )
+    for sample in samples:
+        assert abs(
+            sample.normalized_x
+            + sample.normalized_x_rate_s
+            * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        ) <= PREPASS_CURRENT_MAX_ABS_X_NORM
+        assert abs(
+            sample.normalized_y_down
+            + sample.normalized_y_rate_down_s
+            * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        ) <= PREPASS_CURRENT_MAX_ABS_Y_NORM
+
+    evidence = NearPlaneEvidence()
+    latch = None
+    for sample in samples:
+        evidence, latch = advance_near_plane_evidence(
+            evidence,
+            sample,
+            **_REDUCER_KWARGS,
+        )
+
+    assert latch is not None
+    assert [
+        sample.camera_token.publication_sequence
+        for sample in latch.evidence.samples
+    ] == [161, 162, 163]
+    assert latch.anchor_camera_token == _camera_token(163, 1_463_136)
+
+    last_clean = _ATTEMPT4_NEAR_PLANE_ROWS[-1]
+    censored = _ATTEMPT4_BOTTOM_CENSOR
+    mode = _classify(
+        latch,
+        previous_sequence=int(last_clean["sequence"]),
+        previous_frame_id=int(last_clean["frame_id"]),
+        sequence=int(censored["sequence"]),
+        frame_id=int(censored["frame_id"]),
+        clipping=FrameEdge.BOTTOM,
+        x=float(censored["x"]),
+        y=float(censored["y"]),
+        x_rate=float(censored["x_rate"]),
+        y_rate=float(censored["y_rate"]),
+        scale=float(censored["scale"]),
+        confidence=float(censored["confidence"]),
+        association=float(censored["association"]),
+    )
+
+    assert mode is LatchedMeasurementMode.COAST
 
 
 def test_credited_censor_fragment_and_loss_are_one_generic_measurement_mode():

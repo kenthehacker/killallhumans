@@ -374,6 +374,111 @@ def test_observable_axis_projection_divergence_is_unsafe():
     )
 
 
+def test_high_raw_center_rate_inside_projected_corridor_latches_and_coasts():
+    high_rate_samples = tuple(
+        replace(
+            sample,
+            normalized_x=-0.10,
+            normalized_y_down=-0.07,
+            normalized_x_rate_s=1.00,
+            normalized_y_rate_down_s=0.70,
+        )
+        for sample in _LATEST_NEAR_PLANE
+    )
+
+    evidence, latch = _advance(high_rate_samples)
+
+    assert len(evidence.samples) == _REQUIRED_FRAMES
+    assert all(
+        sample.normalized_x_rate_s > 0.60
+        and sample.normalized_y_rate_down_s > 0.60
+        and abs(
+            sample.normalized_x
+            + sample.normalized_x_rate_s * 0.10
+        )
+        <= 0.20
+        and abs(
+            sample.normalized_y_down
+            + sample.normalized_y_rate_down_s * 0.10
+        )
+        <= 0.28
+        for sample in evidence.samples
+    )
+
+    facts = _latest_censored_kwargs(latch)
+    facts.update(
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        normalized_x=-0.10,
+        normalized_y_down=-0.07,
+        normalized_x_rate_s=1.00,
+        normalized_y_rate_down_s=0.70,
+    )
+
+    assert (
+        classify_latched_measurement(latch, **facts)
+        is LatchedMeasurementMode.COAST
+    )
+
+
+def test_high_raw_center_rate_outside_projected_corridor_resets_and_is_unsafe():
+    evidence = NearPlaneEvidence()
+    latch = None
+    for sample in _LATEST_NEAR_PLANE[:2]:
+        evidence, latch = advance_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+        assert latch is None
+    assert len(evidence.samples) == 2
+
+    projected_outside = replace(
+        _LATEST_NEAR_PLANE[2],
+        normalized_x=0.15,
+        normalized_y_down=-0.07,
+        normalized_x_rate_s=1.00,
+        normalized_y_rate_down_s=0.70,
+    )
+    assert projected_outside.normalized_x_rate_s > 0.60
+    assert (
+        projected_outside.normalized_x
+        + projected_outside.normalized_x_rate_s * 0.10
+        > 0.20
+    )
+
+    evidence, latch = advance_near_plane_evidence(
+        evidence,
+        projected_outside,
+        required_corridor_frames=_REQUIRED_FRAMES,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+
+    assert evidence.samples == ()
+    assert latch is None
+
+    _evidence, safe_latch = _advance(_LATEST_NEAR_PLANE)
+    facts = _latest_censored_kwargs(safe_latch)
+    facts.update(
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        normalized_x=projected_outside.normalized_x,
+        normalized_y_down=projected_outside.normalized_y_down,
+        normalized_x_rate_s=projected_outside.normalized_x_rate_s,
+        normalized_y_rate_down_s=projected_outside.normalized_y_rate_down_s,
+    )
+
+    assert (
+        classify_latched_measurement(safe_latch, **facts)
+        is LatchedMeasurementMode.UNSAFE
+    )
+
+
 @pytest.mark.parametrize(
     "updates",
     (
