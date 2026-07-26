@@ -204,8 +204,8 @@ def test_horizontal_bearing_uses_calibrated_yaw_image_sign():
     assert left.yaw_rate_rad_s == pytest.approx(
         MAX_VISUAL_YAW_RATE_RAD_S
     )
-    assert right.target_roll_rad == 0.0
-    assert left.target_roll_rad == 0.0
+    assert right.target_roll_rad == pytest.approx(0.07)
+    assert left.target_roll_rad == pytest.approx(-0.07)
 
 
 def test_vertical_image_error_drives_pitch_in_both_directions():

@@ -187,12 +187,12 @@ class VisualServoTuning:
     # separately immutable yaw-rate and course-turn heading envelopes.
     yaw_error_gain: float = 0.30
     yaw_rate_gain: float = 0.035
-    # Roll authority remains zero in schema /1.  Existing live evidence has a
-    # sign conflict between Gate-0 centering and the later Gate-1 recovery
-    # lineage; enable it only in a future version after an isolated response
-    # calibration resolves that conflict.
-    roll_error_gain: float = 0.0
-    roll_rate_gain: float = 0.0
+    # Gate-1 live recovery reached the calibrated yaw ceiling on every wire
+    # command while horizontal error still grew from 0.55 to 0.69.  Use the
+    # existing bounded lateral channel as well as yaw; the immutable roll
+    # attitude and body-rate envelopes remain independently enforced live.
+    roll_error_gain: float = 0.10
+    roll_rate_gain: float = 0.03
     vertical_error_gain: float = 0.16
     vertical_rate_gain: float = 0.035
     collective_error_gain: float = 0.060
@@ -238,10 +238,6 @@ class VisualServoTuning:
             raise VisualServoRefusal("roll error gain is outside bounds")
         if not 0.0 <= self.roll_rate_gain <= 0.03:
             raise VisualServoRefusal("roll rate gain is outside bounds")
-        if self.roll_error_gain != 0.0 or self.roll_rate_gain != 0.0:
-            raise VisualServoRefusal(
-                "visual-servo config/1 keeps lateral roll authority disabled"
-            )
         if not 0.05 <= self.vertical_error_gain <= 0.30:
             raise VisualServoRefusal("vertical error gain is outside bounds")
         if not 0.0 <= self.vertical_rate_gain <= 0.08:

@@ -173,6 +173,11 @@ async def run_visual_alignment_stage(
 
     limits = runtime.limits
     abort_type = runtime.safety_abort_type
+    alignment_servo_tuning = replace(
+        host.visual_config.servo,
+        roll_error_gain=0.0,
+        roll_rate_gain=0.0,
+    )
     if not host._visual_tracking_enabled:
         raise abort_type(
             "visual alignment tracker was not enabled before reset"
@@ -1053,7 +1058,7 @@ async def run_visual_alignment_stage(
             summary["postpromotion_recovery"]["anchor_admission"] = (
                 asdict(recovery_admission)
             )
-            recovery_servo = ImageVisualServo(host.visual_config.servo)
+            recovery_servo = ImageVisualServo(alignment_servo_tuning)
             _anchor_probe, anchor_excursion = (
                 runtime.visual_alignment_yaw_rate(
                     requested_rate_rad_s=0.0,
@@ -1534,7 +1539,7 @@ async def run_visual_alignment_stage(
                 "nonnegative braking target inside its envelope"
             )
 
-        servo = ImageVisualServo(host.visual_config.servo)
+        servo = ImageVisualServo(alignment_servo_tuning)
         monitor = RestrictedAlignmentMonitor(
             track_id=promoted_track_id,
             required_improving_frames=(
