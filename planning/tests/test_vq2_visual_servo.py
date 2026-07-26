@@ -345,6 +345,29 @@ def _latch_passage_blend(
     assert output.next_gate_blend == pytest.approx(requested_blend)
 
 
+def test_full_successor_steering_unloads_forward_pitch_without_losing_advance():
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    output = step(
+        servo,
+        target(5),
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=0.30,
+        ),
+        requested_next_blend=1.0,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert output.next_gate_blend == 1.0
+    assert output.advance_enabled
+    assert output.target_pitch_rad == 0.0
+    assert output.thrust == servo.tuning.advance_thrust
+
+
 def _assert_approach_preview_withheld_current_only(
     output,
     *,
