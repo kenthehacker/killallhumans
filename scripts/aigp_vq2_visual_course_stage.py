@@ -2053,8 +2053,9 @@ async def _run_visual_course_stage_impl(
         segment_started_s: float,
         stage: str,
         command_deadline_s: float,
+        count_as_navigation: bool = True,
     ) -> Optional[AttitudeRateCommand]:
-        """Reissue frozen attitude and retained heading on a fresh frame."""
+        """Send a bounded attitude/thrust hold on one exact fresh frame."""
 
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -2290,10 +2291,11 @@ async def _run_visual_course_stage_impl(
             float(runtime.monotonic()) - segment_started_s,
             command,
         )
-        total_navigation_commands += 1
+        if count_as_navigation:
+            total_navigation_commands += 1
         last_command_send_s = float(runtime.monotonic())
         consecutive_superseded_proposals = 0
-        if segment["launch_bootstrap"]["enabled"]:
+        if count_as_navigation and segment["launch_bootstrap"]["enabled"]:
             launch = segment["launch_bootstrap"]
             launch["command_count"] = int(launch["command_count"]) + 1
             launch["last_elapsed_s"] = (
@@ -2303,6 +2305,8 @@ async def _run_visual_course_stage_impl(
             launch["last_thrust"] = authority.thrust
             launch["last_thrust_phase"] = CENSORED_PASSAGE_COAST_BASIS
         if (
+            count_as_navigation
+            and
             transitions
             and transitions[-1]["to_gate_index"] == current_gate_index
         ):
@@ -2323,6 +2327,7 @@ async def _run_visual_course_stage_impl(
             target_pitch_rad=authority.target_pitch_rad,
             requested_yaw_rate_rad_s=authority.yaw_rate_rad_s,
             thrust=authority.thrust,
+            counted_as_navigation=count_as_navigation,
             command=asdict(command),
         )
         refresh_live_summary()
@@ -2517,6 +2522,7 @@ async def _run_visual_course_stage_impl(
             "recovery_clean_command_count": 0,
             "recovery_one_edge_command_count": 0,
             "recovery_zero_command_count": 0,
+            "recovery_support_command_count": 0,
             "passage_authority_enabled": False,
             "passage_admission": None,
             "lifecycle": lifecycle.value,
@@ -2856,24 +2862,50 @@ async def _run_visual_course_stage_impl(
                     recovery_measurement_mode
                     is PostCreditMeasurementMode.REACQUIRE
                 ):
+                    assert recovery_deadline_s is not None
+                    servo_tuning = host.visual_config.servo
                     last_planned_token = token
-                    await send_zero(
-                        (
-                            f"{VISUAL_COURSE_STAGE}/gate"
-                            f"{current_gate_index}/recovery-zero"
-                        ),
-                        now - segment_started_s,
-                        yaw_reference_rad=yaw_reference_rad,
-                    )
-                    segment["recovery_zero_command_count"] = int(
-                        segment["recovery_zero_command_count"]
-                    ) + 1
-                    transitions[-1][
-                        "post_transition_zero_command_count"
-                    ] = int(
-                        transitions[-1][
-                            "post_transition_zero_command_count"
-                        ]
+                    try:
+                        support_command = (
+                            await send_censored_passage_coast(
+                                snapshot=snapshot,
+                                authority=_CensoredPassageCoastAuthority(
+                                    gate_index=current_gate_index,
+                                    track_id=current_track_id,
+                                    anchor_camera_token=(
+                                        post_credit_recovery
+                                        .admitted_camera_token
+                                    ),
+                                    target_roll_rad=0.0,
+                                    target_pitch_rad=float(
+                                        servo_tuning.brake_pitch_rad
+                                    ),
+                                    yaw_rate_rad_s=0.0,
+                                    thrust=float(
+                                        servo_tuning.brake_thrust
+                                    ),
+                                ),
+                                yaw_reference_rad=yaw_reference_rad,
+                                segment_started_s=segment_started_s,
+                                stage=(
+                                    f"{VISUAL_COURSE_STAGE}/gate"
+                                    f"{current_gate_index}/"
+                                    "recovery-support"
+                                ),
+                                command_deadline_s=recovery_deadline_s,
+                                count_as_navigation=False,
+                            )
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as exc:
+                        raise abort_type(
+                            "visual-course race boundary changed during "
+                            "post-credit support"
+                        ) from exc
+                    if support_command is None:
+                        recovery_refresh_receiver_snapshot = True
+                        continue
+                    segment["recovery_support_command_count"] = int(
+                        segment["recovery_support_command_count"]
                     ) + 1
                     continue
             passage_forward_closure_authorized = bool(

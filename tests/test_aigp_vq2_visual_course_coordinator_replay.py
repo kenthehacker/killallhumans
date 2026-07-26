@@ -706,10 +706,14 @@ def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
 
     candidate_wires = [
         (kwargs["wire_visual_token"].publication_sequence, command)
-        for command, kwargs, gate_index in host.commands
+        for (
+            (command, kwargs, gate_index),
+            (stage, _elapsed_s, _recorded_command),
+        ) in zip(host.commands, host.ticks)
         if (
             gate_index == 4
             and kwargs.get("wire_visual_token") is not None
+            and not stage.endswith("recovery-support")
         )
     ]
     assert [sequence for sequence, _command in candidate_wires] == [
@@ -742,9 +746,26 @@ def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
     assert recovery["recovery_clean_command_count"] == 3
     assert recovery["recovery_one_edge_command_count"] == 1
     # The accepted TOP-censored brake wire retains the last clean collective
-    # and renews the existing 50 ms publication-gap bound; the following
-    # losses therefore receive two zero-only ticks before the bounded timeout.
-    assert recovery["recovery_zero_command_count"] == 2
+    # and renews the existing 50 ms publication-gap bound. The following
+    # losses retain measured flight support while the bounded timeout runs.
+    support_commands = [
+        command
+        for (
+            (command, _kwargs, gate_index),
+            (stage, _elapsed_s, _recorded_command),
+        ) in zip(host.commands, host.ticks)
+        if gate_index == 4 and stage.endswith("recovery-support")
+    ]
+    assert recovery["recovery_zero_command_count"] == 0
+    assert recovery["recovery_support_command_count"] == 2
+    assert len(support_commands) == 2
+    assert all(
+        command.roll_rate == 0.0
+        and command.pitch_rate == pytest.approx(0.035)
+        and command.yaw_rate == 0.0
+        and command.thrust == pytest.approx(0.275)
+        for command in support_commands
+    )
 
 
 class _Attempt5OutsideImageHost(_Attempt5RecoveryHost):
