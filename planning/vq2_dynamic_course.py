@@ -459,6 +459,7 @@ class DynamicCourseConfig:
     maximum_ttc_s: float = 8.0
     prediction_horizon_s: float = 2.0
     passage_margin_norm: float = 0.09
+    passage_arm_min_log_scale: float = -0.80
     passage_successor_bias: float = 0.55
     successor_minimum_weight: float = 0.18
     successor_full_weight_ttc_s: float = 0.55
@@ -531,6 +532,7 @@ class DynamicCourseConfig:
             "roll_guidance_sign",
             "pitch_to_expansion_accel",
             "thrust_to_vertical_bearing_accel",
+            "passage_arm_min_log_scale",
         ):
             object.__setattr__(self, name, _finite(getattr(self, name), name))
         advance = _finite(self.advance_pitch_rad, "advance_pitch_rad")

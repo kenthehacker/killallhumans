@@ -637,6 +637,22 @@ class DynamicVisualCourseSession:
                     "expansion_rate_s": (
                         course.current.expansion_rate_s
                     ),
+                    "current_log_scale": course.current.log_scale,
+                    "current_log_scale_std": course.current.log_scale_std,
+                    "passage_scale_lower_bound": (
+                        course.current.log_scale
+                        - 2.0 * course.current.log_scale_std
+                    ),
+                    "passage_scale_ready": bool(
+                        course.current.visible
+                        and not course.current.ambiguous
+                        and not any(course.current.censored_axes)
+                        and (
+                            course.current.log_scale
+                            - 2.0 * course.current.log_scale_std
+                        )
+                        >= self.core.config.passage_arm_min_log_scale
+                    ),
                     "promotion_count": course.promotion_count,
                 }
             )
@@ -779,10 +795,11 @@ class _DynamicImageServo:
             thrust = decision.command.thrust
             passage_error = decision.passage_error_norm
             course_state = self.session.core.course_state()
+            current_dynamic = course_state.current
             effective_rate = (
-                course_state.current.residual_translational_rate_rad_s[0]
+                current_dynamic.residual_translational_rate_rad_s[0]
                 / self.session.core.config.horizontal_angle_scale_rad,
-                course_state.current.residual_translational_rate_rad_s[1]
+                current_dynamic.residual_translational_rate_rad_s[1]
                 / self.session.core.config.vertical_angle_scale_rad,
             )
             braking = decision.braking
@@ -795,9 +812,21 @@ class _DynamicImageServo:
                 / self.session.core.config.vertical_angle_scale_rad,
             )
 
+        passage_plane_ready = bool(
+            decision is not None
+            and current_dynamic.visible
+            and not current_dynamic.ambiguous
+            and not any(current_dynamic.censored_axes)
+            and (
+                current_dynamic.log_scale
+                - 2.0 * current_dynamic.log_scale_std
+            )
+            >= self.session.core.config.passage_arm_min_log_scale
+        )
         within_corridor = bool(
             decision is not None
             and not braking
+            and passage_plane_ready
             and abs(passage_error[0]) + 2.0 * bearing_std_norm[0]
             <= self.tuning.horizontal_corridor
             and abs(passage_error[1]) + 2.0 * bearing_std_norm[1]
@@ -885,7 +914,11 @@ class _DynamicImageServo:
             brake_reason=(
                 "aligning"
                 if within_corridor
-                else dynamic_brake_reason or "dynamic_intercept"
+                else (
+                    "dynamic_plane_not_ready"
+                    if not passage_plane_ready and not braking
+                    else dynamic_brake_reason or "dynamic_intercept"
+                )
             ),
             yaw_envelope_limited=False,
             reviewed_next_track_id=reviewed_next_track_id,
