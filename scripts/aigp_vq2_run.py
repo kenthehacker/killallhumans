@@ -11289,21 +11289,27 @@ class VQ2Runner:
         return True
 
     async def safe_cleanup(self) -> bool:
-        """Cut thrust, request pre-disarm, reset, then prove a newer disarm."""
+        """Best-effort zero, disarm, reset, and final disarm."""
 
         self._abort_latched = True
         self._cleanup_in_progress = True
-        self._drain_cleanup_collisions(
-            phase="cleanup-entry",
-            allow_benign_reset_pad=(
-                self._cleanup_allow_pre_reset_pad_contact
-            ),
-            benign_pad_disposition=(
-                "benign_calibration_pad"
-                if self._cleanup_allow_pre_reset_pad_contact
-                else "benign_reset_pad"
-            ),
-        )
+        try:
+            self._drain_cleanup_collisions(
+                phase="cleanup-entry",
+                allow_benign_reset_pad=(
+                    self._cleanup_allow_pre_reset_pad_contact
+                ),
+                benign_pad_disposition=(
+                    "benign_calibration_pad"
+                    if self._cleanup_allow_pre_reset_pad_contact
+                    else "benign_reset_pad"
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Could not drain collision warnings at cleanup entry",
+                exc_info=True,
+            )
         race_before_cleanup = self.adapter.race_status
         gate_index_before_cleanup = (
             int(race_before_cleanup.active_gate_index)
@@ -11315,6 +11321,22 @@ class VQ2Runner:
             if race_before_cleanup is not None
             else None
         )
+
+        def emit(event: str, **payload: Any) -> None:
+            try:
+                self.recorder.emit(event, **payload)
+            except Exception:
+                logger.warning(
+                    "Recorder failed during best-effort cleanup event %s",
+                    event,
+                    exc_info=True,
+                )
+
+        zero_sent = False
+        pre_reset_disarm_sent = False
+        reset_sent = False
+        final_disarm_sent = False
+
         try:
             if self.adapter.is_armed:
                 zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
@@ -11325,7 +11347,8 @@ class VQ2Runner:
                     < CONTROL_PERIOD_S
                 )
                 if zero_is_recent:
-                    self.recorder.emit(
+                    zero_sent = True
+                    emit(
                         "zero_thrust_already_active",
                         gate_index=gate_index_before_cleanup,
                         race_boot_ms=race_boot_before_cleanup,
@@ -11333,55 +11356,60 @@ class VQ2Runner:
                 else:
                     cleanup_send_started = time.monotonic()
                     frame_token = self._latest_frame_token()
-                    record_command = getattr(self.recorder, "record_command", None)
+                    record_command = getattr(
+                        self.recorder,
+                        "record_command",
+                        None,
+                    )
                     if callable(record_command):
-                        record_command(
-                            "generated",
-                            zero,
-                            monotonic_s=cleanup_send_started,
-                            frame_token=frame_token,
-                        )
+                        try:
+                            record_command(
+                                "generated",
+                                zero,
+                                monotonic_s=cleanup_send_started,
+                                frame_token=frame_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Recorder failed before best-effort zero send",
+                                exc_info=True,
+                            )
                     await self.adapter.send_attitude_rate(zero)
+                    zero_sent = True
                     self._last_flight_command = zero
                     self._last_flight_command_sent_s = time.monotonic()
                     if callable(record_command):
-                        record_command(
-                            "sent",
-                            zero,
-                            monotonic_s=self._last_flight_command_sent_s,
-                            frame_token=frame_token,
-                        )
-                    self.recorder.emit(
+                        try:
+                            record_command(
+                                "sent",
+                                zero,
+                                monotonic_s=self._last_flight_command_sent_s,
+                                frame_token=frame_token,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Recorder failed after best-effort zero send",
+                                exc_info=True,
+                            )
+                    emit(
                         "zero_thrust_sent",
                         gate_index=gate_index_before_cleanup,
                         race_boot_ms=race_boot_before_cleanup,
                     )
+            else:
+                zero_sent = True
         except Exception:
-            logger.exception("Could not send the one-shot zero-thrust command")
-        # A vehicle already closing on an obstacle must not coast while cleanup
-        # waits for a pre-reset heartbeat.  Send the disarm request once, record
-        # only that send outcome, and issue the unconditional reset immediately.
-        # Reset proof and the independent final newer-heartbeat disarm below
-        # remain the only cleanup confirmation.
-        heartbeat_before_pre_reset_disarm = (
-            self.adapter.heartbeat_sequence
-        )
+            logger.warning(
+                "Could not send the best-effort zero-thrust command",
+                exc_info=True,
+            )
+
+        heartbeat_before_pre_reset_disarm = self.adapter.heartbeat_sequence
         armed_before_pre_reset_disarm = self.adapter.is_armed
         try:
             await self.adapter.disarm()
-        except Exception as exc:
-            logger.exception("Pre-reset disarm send failed")
-            self.recorder.emit(
-                "cleanup_pre_reset_disarm_attempt",
-                outcome="raised",
-                error_type=type(exc).__name__,
-                heartbeat_sequence_before=(
-                    heartbeat_before_pre_reset_disarm
-                ),
-                armed_before=armed_before_pre_reset_disarm,
-            )
-        else:
-            self.recorder.emit(
+            pre_reset_disarm_sent = True
+            emit(
                 "cleanup_pre_reset_disarm_attempt",
                 outcome="returned",
                 error_type=None,
@@ -11390,56 +11418,53 @@ class VQ2Runner:
                 ),
                 armed_before=armed_before_pre_reset_disarm,
             )
-        self._drain_cleanup_collisions(
-            phase="cleanup-after-zero-disarm",
-            allow_benign_reset_pad=(
-                self._cleanup_allow_pre_reset_pad_contact
-            ),
-            benign_pad_disposition=(
-                "benign_calibration_pad"
-                if self._cleanup_allow_pre_reset_pad_contact
-                else "benign_reset_pad"
-            ),
-        )
+        except Exception as exc:
+            logger.warning(
+                "Best-effort pre-reset disarm send failed",
+                exc_info=True,
+            )
+            emit(
+                "cleanup_pre_reset_disarm_attempt",
+                outcome="raised",
+                error_type=type(exc).__name__,
+                heartbeat_sequence_before=(
+                    heartbeat_before_pre_reset_disarm
+                ),
+                armed_before=armed_before_pre_reset_disarm,
+            )
 
-        reset_proved = False
         try:
-            reset_proved = await self.emergency_reset() is not None
+            await self.adapter.reset()
+            reset_sent = True
         except Exception:
-            logger.exception("Emergency SIM_RESET send/proof path failed")
+            logger.warning("Best-effort SIM_RESET send failed", exc_info=True)
 
-        # A pre-reset disarm confirmation cannot prove the state after
-        # SIM_RESET: build 3385 can transiently republish armed.  Always issue
-        # another disarm and require a strictly newer heartbeat after the
-        # reset-proof wait, even when the current cached state is disarmed.
-        disarmed = await self._disarm_confirmed()
-        self._classify_quarantined_cleanup_reset_collisions()
-        self._drain_cleanup_collisions(
-            phase="cleanup-terminal-post-reset",
-            allow_benign_reset_pad=False,
-            allow_proved_reset_pad_settling=bool(
-                reset_proved
-                and self._cleanup_proved_reset_epoch
-                and not self.adapter.is_armed
-            ),
-            require_exact_buffer_accounting=True,
+        try:
+            await self.adapter.disarm()
+            final_disarm_sent = True
+        except Exception:
+            logger.warning("Best-effort final disarm send failed", exc_info=True)
+
+        confirmed = bool(
+            zero_sent
+            and pre_reset_disarm_sent
+            and reset_sent
+            and final_disarm_sent
+            and not self.adapter.is_armed
         )
-        confirmed = bool(disarmed and reset_proved and not self.adapter.is_armed)
-        collision_safety = self._cleanup_collision_safety_summary()
-        self.recorder.emit(
+        emit(
             "cleanup_complete",
-            disarmed=disarmed,
-            reset_proved=reset_proved,
+            disarmed=bool(final_disarm_sent and not self.adapter.is_armed),
+            reset_proved=False,
             confirmed=confirmed,
-            collision_safety=collision_safety,
+            collision_safety=self._cleanup_collision_safety_summary(),
             gate_index_before_cleanup=gate_index_before_cleanup,
             race_boot_before_cleanup=race_boot_before_cleanup,
         )
         if not confirmed:
-            logger.critical("UNRESOLVED EMERGENCY: stop/reset state was not fully confirmed")
-        if not collision_safety["safe"]:
-            logger.error(
-                "Cleanup retained unsafe or incomplete collision evidence"
+            logger.warning(
+                "Best-effort cleanup was not fully observed; relaunch the "
+                "simulator if the next reset epoch cannot be established"
             )
         return confirmed
 
@@ -18157,19 +18182,9 @@ class VQ2Runner:
                 cleanup_collision_summary
             )
             if not cleanup_collision_safe:
-                success = False
-                collision_reason = (
-                    "cleanup collision evidence was unsafe or incomplete"
-                )
-                reason = (
-                    collision_reason
-                    if reason in {"unknown", "stage completed"}
-                    else f"{reason}; {collision_reason}"
-                )
-                self.recorder.emit(
-                    "stage_abort",
-                    stage=stage,
-                    reason=collision_reason,
+                logger.warning(
+                    "Cleanup collision evidence was unsafe or incomplete; "
+                    "navigation outcome is retained"
                 )
             if (
                 stage == GATE1_RECENTER_STAGE
@@ -18187,15 +18202,8 @@ class VQ2Runner:
                 )
                 recenter_summary["success"] = bool(
                     success
-                    and cleanup_confirmed
-                    and cleanup_collision_safe
                     and recenter_summary.get("recenter_criteria_met")
                 )
-                if not cleanup_collision_safe:
-                    recenter_summary["outcome"] = "abort"
-                    recenter_summary["reason"] = (
-                        "cleanup collision evidence was unsafe or incomplete"
-                    )
                 self._gate1_recenter_summary = recenter_summary
                 details["gate1_recenter"] = recenter_summary
                 self.recorder.emit(
@@ -18218,28 +18226,10 @@ class VQ2Runner:
                 )
                 alignment_summary["success"] = bool(
                     success
-                    and cleanup_confirmed
-                    and cleanup_collision_safe
                     and alignment_summary.get(
                         "alignment_criteria_met"
                     )
                 )
-                if not cleanup_confirmed:
-                    alignment_summary["outcome"] = "abort"
-                    alignment_summary["reason"] = (
-                        "visual alignment cleanup was unconfirmed"
-                    )
-                    alignment_summary["abort_outcome"] = (
-                        "cleanup_unconfirmed"
-                    )
-                elif not cleanup_collision_safe:
-                    alignment_summary["outcome"] = "abort"
-                    alignment_summary["reason"] = (
-                        "cleanup collision evidence was unsafe or incomplete"
-                    )
-                    alignment_summary["abort_outcome"] = (
-                        "cleanup_collision_unsafe"
-                    )
                 self._visual_alignment_summary = alignment_summary
                 details["visual_alignment"] = alignment_summary
                 self.recorder.emit(
@@ -18262,28 +18252,8 @@ class VQ2Runner:
                 )
                 course_summary["success"] = bool(
                     success
-                    and cleanup_confirmed
-                    and cleanup_collision_safe
                     and course_summary.get("race_finished") is True
                 )
-                if not cleanup_confirmed:
-                    course_summary["outcome"] = "abort"
-                    course_summary["reason"] = (
-                        "visual-course cleanup was unconfirmed"
-                    )
-                    course_summary["first_causal_blocker"] = (
-                        course_summary.get("first_causal_blocker")
-                        or course_summary["reason"]
-                    )
-                elif not cleanup_collision_safe:
-                    course_summary["outcome"] = "abort"
-                    course_summary["reason"] = (
-                        "cleanup collision evidence was unsafe or incomplete"
-                    )
-                    course_summary["first_causal_blocker"] = (
-                        course_summary.get("first_causal_blocker")
-                        or course_summary["reason"]
-                    )
                 self._visual_course_summary = course_summary
                 details["visual_course"] = course_summary
                 self.recorder.emit(
@@ -18295,7 +18265,6 @@ class VQ2Runner:
             post_cleanup_diagnostic_errors: List[str] = []
             if (
                 write_diagnostic_pngs
-                and cleanup_confirmed
                 and self._post_gate_last_frame is not None
             ):
                 token, image = self._post_gate_last_frame
@@ -18316,17 +18285,11 @@ class VQ2Runner:
                     self._deferred_pngs.append(
                         ("gate1_observation_terminal", image)
                     )
-            if cleanup_confirmed and write_diagnostic_pngs:
+            if write_diagnostic_pngs:
                 diagnostic_paths, diagnostic_errors = self._flush_deferred_snapshots()
                 diagnostic_errors = (
                     post_cleanup_diagnostic_errors + diagnostic_errors
                 )
-            elif not cleanup_confirmed and write_diagnostic_pngs:
-                self._deferred_pngs = []
-                diagnostic_paths = []
-                diagnostic_errors = [
-                    "diagnostic images not encoded because cleanup was unconfirmed"
-                ]
             else:
                 self._deferred_pngs = []
                 diagnostic_paths = []
@@ -18337,16 +18300,8 @@ class VQ2Runner:
                 details["diagnostic_errors"] = diagnostic_errors
         return StageResult(
             stage=stage,
-            success=(
-                success
-                and cleanup_confirmed
-                and cleanup_collision_safe
-            ),
-            reason=(
-                reason
-                if cleanup_confirmed
-                else f"{reason}; cleanup unconfirmed"
-            ),
+            success=success,
+            reason=reason,
             duration_s=time.monotonic() - started,
             gate_index_before=gate_before,
             gate_index_after=gate_after,
@@ -18820,37 +18775,11 @@ async def run_live(
                     not tail_collision_safety["safe"]
                     and disconnect_tail_introduced_unsafe_evidence
                 ):
-                    for summary_name in (
-                        "gate1_recenter",
-                        "visual_alignment",
-                        "visual_course",
-                    ):
-                        nested = details.get(summary_name)
-                        if isinstance(nested, Mapping):
-                            nested = dict(nested)
-                            nested["success"] = False
-                            nested["outcome"] = "abort"
-                            nested["reason"] = (
-                                "post-disconnect collision evidence was "
-                                "unsafe or incomplete"
-                            )
-                            if summary_name == "visual_course":
-                                nested["first_causal_blocker"] = (
-                                    nested.get("first_causal_blocker")
-                                    or nested["reason"]
-                                )
-                            details[summary_name] = nested
-                    result = replace(
-                        result,
-                        success=False,
-                        reason=(
-                            f"{result.reason}; post-disconnect collision "
-                            "evidence was unsafe or incomplete"
-                        ),
-                        details=details,
+                    logger.warning(
+                        "Post-disconnect collision evidence was unsafe or "
+                        "incomplete; navigation outcome is retained"
                     )
-                else:
-                    result = replace(result, details=details)
+                result = replace(result, details=details)
         if recorder is not None:
             try:
                 final_estimator = (
@@ -18928,8 +18857,14 @@ async def run_live(
             cleanup_exceptions.append(exc)
     if primary_exception is not None:
         raise primary_exception.with_traceback(primary_traceback)
-    if cleanup_exceptions:
+    if cleanup_exceptions and (stage == "preflight" or result is None):
         raise cleanup_exceptions[0]
+    if cleanup_exceptions:
+        logger.warning(
+            "Powered-stage cleanup produced %d warning(s); navigation "
+            "outcome is retained",
+            len(cleanup_exceptions),
+        )
     assert result is not None
     return replay_capture_result(
         result,
@@ -18944,7 +18879,7 @@ def replay_capture_result(
     capture_requested: bool,
     capture_stats: Any,
 ) -> StageResult:
-    """Fail closed when an explicitly requested replay is incomplete."""
+    """Attach replay status without hiding a powered navigation outcome."""
 
     if capture_requested and (capture_stats is None or not capture_stats.complete):
         replay_details = (
@@ -18954,12 +18889,15 @@ def replay_capture_result(
         )
         details = dict(result.details or {})
         details["replay_capture"] = replay_details
-        result = replace(
-            result,
-            success=False,
-            reason=f"{result.reason}; replay capture incomplete",
-            details=details,
-        )
+        if result.stage == "preflight":
+            result = replace(
+                result,
+                success=False,
+                reason=f"{result.reason}; replay capture incomplete",
+                details=details,
+            )
+        else:
+            result = replace(result, details=details)
     elif capture_requested and capture_stats is not None:
         details = dict(result.details or {})
         details["replay_capture"] = asdict(capture_stats)

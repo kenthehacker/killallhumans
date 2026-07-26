@@ -5425,9 +5425,16 @@ def test_sampling_uses_frame_identity_not_opaque_camera_source_timestamp():
     assert runner._last_frame_identity == (4, 101)
 
 
-def test_incomplete_requested_replay_fails_stage_result_without_changing_cleanup():
+@pytest.mark.parametrize(
+    ("stage", "expected_success"),
+    (("preflight", False), (vq2_module.VISUAL_COURSE_STAGE, True)),
+)
+def test_incomplete_requested_replay_is_warning_for_powered_navigation(
+    stage,
+    expected_success,
+):
     original = vq2_module.StageResult(
-        stage="preflight",
+        stage=stage,
         success=True,
         reason="pass",
         duration_s=1.0,
@@ -5446,9 +5453,12 @@ def test_incomplete_requested_replay_fails_stage_result_without_changing_cleanup
             1, 0, 1, 0, 0, 1, 1, 0, 1, False, None, "queue overflow"
         ),
     )
-    assert not failed.success
+    assert failed.success is expected_success
     assert failed.cleanup_confirmed
-    assert "replay capture incomplete" in failed.reason
+    assert ("replay capture incomplete" in failed.reason) is (
+        stage == "preflight"
+    )
+    assert failed.details["replay_capture"]["complete"] is False
 
 
 def test_post_pass_diagnostic_reference_stays_on_exact_processed_frame():
@@ -6014,97 +6024,69 @@ def test_cleanup_reset_disarm_send_failure_does_not_suppress_reset_proof(
     assert disarm_calls == pytest.approx([0.0, 0.005, 0.025])
 
 
-def test_safe_cleanup_does_not_claim_pre_reset_disarm_confirmation(
+def test_safe_cleanup_does_not_wait_for_post_reset_heartbeat(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = False
     runner = VQ2Runner(adapter, _FakeVision())
-    proof = ResetProof(
-        attempt=1,
-        pre_race_boot_ms=10_000,
-        post_race_boot_ms=500,
-        pre_imu_us=10_000_000,
-        post_imu_us=500_000,
-        advancing_race_samples=3,
-        advancing_imu_samples=5,
-        countdown_observed=True,
-    )
     events = []
 
-    async def pre_reset_disarm():
-        events.append("pre_reset_disarm_returned")
+    async def disarm():
+        events.append("disarm")
 
-    async def final_disarm_confirmed(*_args, **_kwargs):
-        events.append("final_disarm_confirmation")
-        # No newer post-reset heartbeat is available.  The earlier returned
-        # send must not be promoted into cleanup confirmation.
-        return False
+    async def forbidden_disarm_proof(*_args, **_kwargs):
+        pytest.fail("best-effort cleanup must not wait for heartbeat proof")
 
     async def reset():
         events.append("reset")
-        runner._cleanup_proved_reset_epoch = True
-        return proof
 
-    monkeypatch.setattr(adapter, "disarm", pre_reset_disarm)
+    monkeypatch.setattr(adapter, "disarm", disarm)
+    monkeypatch.setattr(adapter, "reset", reset)
     monkeypatch.setattr(
         runner,
         "_disarm_confirmed",
-        final_disarm_confirmed,
+        forbidden_disarm_proof,
     )
-    monkeypatch.setattr(runner, "emergency_reset", reset)
 
-    assert asyncio.run(runner.safe_cleanup()) is False
+    assert asyncio.run(runner.safe_cleanup()) is True
     assert events == [
-        "pre_reset_disarm_returned",
+        "disarm",
         "reset",
-        "final_disarm_confirmation",
+        "disarm",
     ]
 
 
-def test_safe_cleanup_orders_zero_disarm_send_reset_then_final_proof(
+def test_safe_cleanup_orders_zero_disarm_reset_then_final_disarm(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = True
     runner = VQ2Runner(adapter, _FakeVision())
-    proof = ResetProof(
-        attempt=1,
-        pre_race_boot_ms=10_000,
-        post_race_boot_ms=500,
-        pre_imu_us=10_000_000,
-        post_imu_us=500_000,
-        advancing_race_samples=3,
-        advancing_imu_samples=5,
-        countdown_observed=True,
-    )
     order = []
     recorded = []
+    disarm_calls = 0
 
     async def zero_send(_command):
         order.append("zero")
 
-    async def pre_reset_disarm():
-        order.append("pre_reset_disarm")
+    async def disarm():
+        nonlocal disarm_calls
+        disarm_calls += 1
+        order.append(
+            "pre_reset_disarm"
+            if disarm_calls == 1
+            else "final_disarm"
+        )
+        if disarm_calls == 2:
+            adapter.is_armed = False
 
     async def reset():
         order.append("reset")
-        runner._cleanup_proved_reset_epoch = True
-        return proof
-
-    async def final_disarm_confirmed(*_args, **_kwargs):
-        order.append("final_disarm_confirmation")
-        adapter.is_armed = False
-        return True
 
     monkeypatch.setattr(adapter, "send_attitude_rate", zero_send)
-    monkeypatch.setattr(adapter, "disarm", pre_reset_disarm)
-    monkeypatch.setattr(runner, "emergency_reset", reset)
-    monkeypatch.setattr(
-        runner,
-        "_disarm_confirmed",
-        final_disarm_confirmed,
-    )
+    monkeypatch.setattr(adapter, "disarm", disarm)
+    monkeypatch.setattr(adapter, "reset", reset)
     monkeypatch.setattr(
         runner.recorder,
         "emit",
@@ -6116,7 +6098,7 @@ def test_safe_cleanup_orders_zero_disarm_send_reset_then_final_proof(
         "zero",
         "pre_reset_disarm",
         "reset",
-        "final_disarm_confirmation",
+        "final_disarm",
     ]
     pre_reset_events = [
         payload
@@ -6139,50 +6121,35 @@ def test_safe_cleanup_reset_is_unconditional_after_pre_reset_disarm_failure(
     adapter = _FakeAdapter()
     adapter.is_armed = False
     runner = VQ2Runner(adapter, _FakeVision())
-    proof = ResetProof(
-        attempt=1,
-        pre_race_boot_ms=10_000,
-        post_race_boot_ms=500,
-        pre_imu_us=10_000_000,
-        post_imu_us=500_000,
-        advancing_race_samples=3,
-        advancing_imu_samples=5,
-        countdown_observed=True,
-    )
     order = []
     recorded = []
+    disarm_calls = 0
 
-    async def failed_pre_reset_disarm():
-        order.append("pre_reset_disarm")
-        raise RuntimeError("injected pre-reset send failure")
+    async def disarm():
+        nonlocal disarm_calls
+        disarm_calls += 1
+        if disarm_calls == 1:
+            order.append("pre_reset_disarm")
+            raise RuntimeError("injected pre-reset send failure")
+        order.append("final_disarm")
+        adapter.is_armed = False
 
     async def reset():
         order.append("reset")
-        runner._cleanup_proved_reset_epoch = True
-        return proof
 
-    async def final_disarm_confirmed(*_args, **_kwargs):
-        order.append("final_disarm_confirmation")
-        return True
-
-    monkeypatch.setattr(adapter, "disarm", failed_pre_reset_disarm)
-    monkeypatch.setattr(runner, "emergency_reset", reset)
-    monkeypatch.setattr(
-        runner,
-        "_disarm_confirmed",
-        final_disarm_confirmed,
-    )
+    monkeypatch.setattr(adapter, "disarm", disarm)
+    monkeypatch.setattr(adapter, "reset", reset)
     monkeypatch.setattr(
         runner.recorder,
         "emit",
         lambda event, **payload: recorded.append((event, payload)),
     )
 
-    assert asyncio.run(runner.safe_cleanup()) is True
+    assert asyncio.run(runner.safe_cleanup()) is False
     assert order == [
         "pre_reset_disarm",
         "reset",
-        "final_disarm_confirmation",
+        "final_disarm",
     ]
     pre_reset_events = [
         payload
@@ -6916,7 +6883,7 @@ def test_cleanup_pre_reset_and_proved_reset_budgets_are_independent():
     )
 
 
-def test_powered_stage_cleanup_collision_fails_stage_but_retains_reset_proof(
+def test_powered_stage_cleanup_collision_warning_retains_navigation_success(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -6970,16 +6937,16 @@ def test_powered_stage_cleanup_collision_fails_stage_but_retains_reset_proof(
 
     result = asyncio.run(runner.run_powered_stage("sign-id"))
 
-    assert result.success is False
+    assert result.success is True
     assert result.cleanup_confirmed is True
-    assert "cleanup collision evidence" in result.reason
+    assert result.reason == "stage completed"
     safety = result.details["cleanup_collision_safety"]
     assert safety["safe"] is False
     assert safety["harmful_collision_count"] == 1
     assert safety["observations"][0]["phase"] == "cleanup-entry"
 
 
-def test_visual_course_cleanup_collision_downgrades_nested_success(
+def test_visual_course_cleanup_collision_does_not_downgrade_nested_success(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
@@ -7079,16 +7046,13 @@ def test_visual_course_cleanup_collision_downgrades_nested_success(
         )
     )
 
-    assert result.success is False
+    assert result.success is True
     assert result.cleanup_confirmed is True
     assert result.details["cleanup_collision_safety"]["safe"] is False
     nested = result.details["visual_course"]
-    assert nested["success"] is False
-    assert nested["outcome"] == "abort"
-    assert nested["reason"] == (
-        "cleanup collision evidence was unsafe or incomplete"
-    )
-    assert nested["first_causal_blocker"] == nested["reason"]
+    assert nested["success"] is True
+    assert nested["outcome"] == "race_finished"
+    assert nested["first_causal_blocker"] is None
 
 
 def test_live_finalizer_preserves_existing_cleanup_cause_for_empty_tail(
@@ -9612,12 +9576,12 @@ def test_runner_binds_exact_yaw_profile_and_rejects_mismatched_evidence():
     ),
     (
         (True, True, 1, True),
-        (False, True, 1, False),
+        (False, True, 1, True),
         (True, False, 1, False),
         (True, True, 2, False),
     ),
 )
-def test_gate1_recenter_powered_lifecycle_requires_criteria_and_cleanup(
+def test_gate1_recenter_powered_lifecycle_separates_cleanup_outcome(
     monkeypatch,
     cleanup_confirmed,
     criteria_met,

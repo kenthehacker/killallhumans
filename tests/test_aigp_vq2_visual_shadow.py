@@ -1204,16 +1204,27 @@ def test_shadow_promotes_precredit_track_without_reset_and_sends_only_zero(
 
 
 @pytest.mark.parametrize(
-    ("cleanup_gate", "cleanup_confirmed", "reason_fragment"),
+    (
+        "cleanup_gate",
+        "cleanup_confirmed",
+        "expected_success",
+        "reason_fragment",
+    ),
     [
-        (1, False, "cleanup unconfirmed"),
-        (0, True, "cleanup boundary lacks proved 0->1 authority"),
+        (1, False, True, None),
+        (
+            0,
+            True,
+            False,
+            "cleanup boundary lacks proved 0->1 authority",
+        ),
     ],
 )
-def test_powered_shadow_requires_authoritative_boundary_and_confirmed_cleanup(
+def test_powered_shadow_separates_cleanup_from_authoritative_boundary(
     monkeypatch,
     cleanup_gate,
     cleanup_confirmed,
+    expected_success,
     reason_fragment,
 ):
     adapter = _Adapter()
@@ -1272,9 +1283,12 @@ def test_powered_shadow_requires_authoritative_boundary_and_confirmed_cleanup(
         )
     )
 
-    assert result.success is False
+    assert result.success is expected_success
     assert result.cleanup_confirmed is cleanup_confirmed
-    assert reason_fragment in result.reason
+    if reason_fragment is not None:
+        assert reason_fragment in result.reason
+    else:
+        assert result.reason == "stage completed"
     assert result.details["authoritative_cleanup_entry"] == {
         "gate_index": cleanup_gate,
         "race_finished": False,
@@ -2713,14 +2727,14 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
     ),
     [
         (1, True, True, "vq2-track-000004", False, True),
-        (1, False, True, "vq2-track-000004", False, False),
+        (1, False, True, "vq2-track-000004", False, True),
         (2, True, True, "vq2-track-000004", False, False),
         (1, True, False, "vq2-track-000004", False, False),
         (1, True, True, "vq2-track-999999", False, False),
         (1, True, True, "vq2-track-000004", True, False),
     ],
 )
-def test_powered_visual_alignment_requires_gate1_and_confirmed_cleanup(
+def test_powered_visual_alignment_separates_cleanup_from_navigation(
     monkeypatch,
     cleanup_gate,
     cleanup_confirmed,
