@@ -1296,8 +1296,10 @@ def test_censored_near_plane_passage_transfers_to_successor_coast():
                 and segments[-1].get("near_plane_latch") is not None
             ):
                 track = self.visual_gate_graph.latest_snapshot.current_track
-                track.clipping = FrameEdge.BOTTOM
+                track.clipping = FrameEdge.TOP | FrameEdge.BOTTOM
                 track.center_censored = True
+                track.center_norm = (-0.196875, 0.0)
+                track.center_velocity_norm_s = (-0.5354, 0.0)
 
         async def _send_flight_command(self, command, **kwargs):
             if (

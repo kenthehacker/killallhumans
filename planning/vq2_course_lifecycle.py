@@ -742,16 +742,16 @@ def classify_latched_measurement(
     if horizontal_censored and vertical_censored:
         return LatchedMeasurementMode.CREDIT_WAIT
 
-    if not horizontal_censored and _observable_axis_unsafe(
-        value=float(normalized_x),
-        rate=float(normalized_x_rate_s),
-        maximum_abs_value=PREPASS_CURRENT_MAX_ABS_X_NORM,
+    if (
+        not horizontal_censored
+        and abs(float(normalized_x))
+        > PREPASS_CURRENT_MAX_ABS_X_NORM
     ):
         return LatchedMeasurementMode.UNSAFE
-    if not vertical_censored and _observable_axis_unsafe(
-        value=float(normalized_y_down),
-        rate=float(normalized_y_rate_down_s),
-        maximum_abs_value=PREPASS_CURRENT_MAX_ABS_Y_NORM,
+    if (
+        not vertical_censored
+        and abs(float(normalized_y_down))
+        > PREPASS_CURRENT_MAX_ABS_Y_NORM
     ):
         return LatchedMeasurementMode.UNSAFE
     return LatchedMeasurementMode.COAST

@@ -401,19 +401,23 @@ def test_observable_axis_offcenter_after_latch_is_unsafe():
     )
 
 
-def test_observable_axis_projection_divergence_is_unsafe():
+def test_post_latch_projection_divergence_remains_bounded_coast():
     _evidence, latch = _advance(_LATEST_NEAR_PLANE)
     facts = _latest_censored_kwargs(latch)
     facts.update(
-        clipping=FrameEdge.NONE,
-        center_censored=False,
-        normalized_x=0.19,
-        normalized_x_rate_s=0.20,
+        clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+        center_censored=True,
+        normalized_x=-0.196875,
+        normalized_x_rate_s=-0.5354,
     )
+    assert abs(facts["normalized_x"]) < 0.20
+    assert abs(
+        facts["normalized_x"] + facts["normalized_x_rate_s"] * 0.10
+    ) > 0.20
 
     assert (
         classify_latched_measurement(latch, **facts)
-        is LatchedMeasurementMode.UNSAFE
+        is LatchedMeasurementMode.COAST
     )
 
 
@@ -464,7 +468,7 @@ def test_high_raw_center_rate_inside_projected_corridor_latches_and_coasts():
     )
 
 
-def test_high_raw_center_rate_outside_projected_corridor_resets_and_is_unsafe():
+def test_projected_divergence_cannot_latch_but_does_not_revoke_safe_latch():
     evidence = NearPlaneEvidence()
     latch = None
     for sample in _LATEST_NEAR_PLANE[:2]:
@@ -518,7 +522,7 @@ def test_high_raw_center_rate_outside_projected_corridor_resets_and_is_unsafe():
 
     assert (
         classify_latched_measurement(safe_latch, **facts)
-        is LatchedMeasurementMode.UNSAFE
+        is LatchedMeasurementMode.COAST
     )
 
 
