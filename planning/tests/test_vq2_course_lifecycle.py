@@ -390,14 +390,42 @@ def test_censored_axis_never_creates_fake_offcenter_evidence():
     )
 
 
-def test_observable_axis_offcenter_after_latch_is_unsafe():
+def test_clean_offcenter_after_latch_is_unsafe():
     _evidence, latch = _advance(_LATEST_NEAR_PLANE)
     facts = _latest_censored_kwargs(latch)
-    facts["normalized_x"] = 0.21
+    facts.update(
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        normalized_x=0.21,
+    )
 
     assert (
         classify_latched_measurement(latch, **facts)
         is LatchedMeasurementMode.UNSAFE
+    )
+
+
+def test_run_9401_vertical_censor_keeps_bounded_successor_coast():
+    _evidence, latch = _advance(_LATEST_NEAR_PLANE)
+    facts = _latest_censored_kwargs(latch)
+    facts.update(
+        previous_camera_token=_token(3_274_981, 165),
+        camera_token=_token(3_274_982, 166),
+        track_latest_camera_token=_token(3_274_982, 166),
+        clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+        center_censored=True,
+        normalized_x=-0.228125,
+        normalized_y_down=0.0,
+        normalized_x_rate_s=-1.014,
+        normalized_y_rate_down_s=0.103,
+        apparent_scale=0.85055,
+        confidence=0.925,
+        association_confidence=0.919,
+    )
+
+    assert (
+        classify_latched_measurement(latch, **facts)
+        is LatchedMeasurementMode.COAST
     )
 
 

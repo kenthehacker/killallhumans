@@ -846,7 +846,7 @@ def test_unsafe_or_discontinuous_near_plane_sequences_do_not_latch(mutation):
     assert latch is None
 
 
-def test_observable_off_center_and_ambiguous_censor_are_unsafe():
+def test_clean_off_center_and_ambiguous_censor_are_unsafe():
     latch = _latch(_CREDITED_NEAR_PLANE_ROWS)
 
     off_center = _classify(
@@ -855,7 +855,7 @@ def test_observable_off_center_and_ambiguous_censor_are_unsafe():
         previous_frame_id=659080,
         sequence=165,
         frame_id=659087,
-        clipping=FrameEdge.BOTTOM,
+        clipping=FrameEdge.NONE,
         x=0.21,
         y=0.0,
         x_rate=0.0,

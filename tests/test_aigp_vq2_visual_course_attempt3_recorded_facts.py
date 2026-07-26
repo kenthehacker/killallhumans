@@ -233,7 +233,12 @@ def test_attempt3_nonexpansion_and_off_center_mutations_stay_fail_closed():
 
     latch = _exact_latch()
     assert (
-        _classify_pub164(latch, normalized_x=0.50)
+        _classify_pub164(
+            latch,
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            normalized_x=0.50,
+        )
         is LatchedMeasurementMode.UNSAFE
     )
     assert (

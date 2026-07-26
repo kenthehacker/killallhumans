@@ -892,16 +892,22 @@ def classify_latched_measurement(
     if horizontal_censored and vertical_censored:
         return LatchedMeasurementMode.CREDIT_WAIT
 
+    # The clean pre-pass center corridor has already done its job once the
+    # near plane is latched.  During the expected one-/two-edge passage
+    # sequence, the remaining bbox center is an asymmetric, censored
+    # measurement and can move away from zero as control transfers toward the
+    # successor.  Keep the short bounded coast under lineage, confidence,
+    # attitude/rate, collision, and timeout authority; do not reinterpret the
+    # old clean-center corridor as a post-latch collision boundary.
+    if horizontal_censored or vertical_censored:
+        return LatchedMeasurementMode.COAST
+
     if (
-        not horizontal_censored
-        and abs(float(normalized_x))
-        > PREPASS_CURRENT_MAX_ABS_X_NORM
+        abs(float(normalized_x)) > PREPASS_CURRENT_MAX_ABS_X_NORM
     ):
         return LatchedMeasurementMode.UNSAFE
     if (
-        not vertical_censored
-        and abs(float(normalized_y_down))
-        > PREPASS_CURRENT_MAX_ABS_Y_NORM
+        abs(float(normalized_y_down)) > PREPASS_CURRENT_MAX_ABS_Y_NORM
     ):
         return LatchedMeasurementMode.UNSAFE
     return LatchedMeasurementMode.COAST
