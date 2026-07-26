@@ -8060,7 +8060,11 @@ def attitude_rate_command(
         estimate.orientation,
         desired,
         omega=estimate.body_rates,
-        kp=(1.0, 0.5, 0.0),
+        # The live full-preview run reached the requested +0.10 rad braking
+        # target too slowly: measured pitch remained below zero until impact.
+        # Match the existing bounded roll proportional response so vertical
+        # image/braking authority reaches its already-clamped target sooner.
+        kp=(1.0, 1.0, 0.0),
         kd=(0.4, 0.2, 0.0),
         max_rate=(MAX_COMMAND_RATE_RAD_S,) * 3,
     )

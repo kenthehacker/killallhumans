@@ -1308,12 +1308,7 @@ class ImageVisualServo:
             * vertical_rate
         )
         if advance_enabled:
-            # Do not combine full successor steering with full forward
-            # acceleration.  The same convex preview authority that turns
-            # toward the next aperture continuously unloads nose-down pitch,
-            # reaching neutral at full look-ahead without adding a phase
-            # threshold or changing the fixed pitch envelope.
-            pitch_basis = self.tuning.advance_pitch_rad * (1.0 - blend)
+            pitch_basis = self.tuning.advance_pitch_rad
             thrust_basis = self.tuning.advance_thrust
         elif (
             edge_risk
