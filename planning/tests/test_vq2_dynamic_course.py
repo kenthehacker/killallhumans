@@ -305,6 +305,34 @@ def test_off_axis_successor_and_rapid_closure_brake_before_advancing() -> None:
     assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
 
 
+def test_successor_heading_cannot_reverse_roll_away_from_passage_intercept() -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            roll_guidance_sign=1.0,
+            roll_gain=0.18,
+            lateral_rate_gain=0.045,
+        )
+    )
+    core.record_applied_command(_command(0.90))
+    _imu(core, 1.0)
+    core.observe_track(_observation("gate-a", 1, 1.0, x=0.40))
+    core.observe_track(_observation("gate-b", 1, 1.0, x=-1.40))
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.01)
+
+    decision = core.guide(1_010_000_000)
+
+    assert decision.predicted_successor_bearing_rad is not None
+    assert decision.predicted_successor_bearing_rad[0] < 0.0
+    assert decision.passage_error_norm[0] > 0.0
+    assert decision.proposed_command.target_roll_rad > 0.0
+
+
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     _imu(core, 1.0)

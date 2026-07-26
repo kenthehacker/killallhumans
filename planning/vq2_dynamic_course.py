@@ -1843,11 +1843,12 @@ class DynamicCourseCore:
             (1.0 - successor_weight) * current_bearing[0]
             + successor_weight * successor_bearing[0]
         )
-        lateral_error = (
-            current_bearing[0]
-            + passage_bearing[0]
-            + successor_weight * successor_bearing[0]
-        )
+        # The passage point already carries the bounded successor bias inside
+        # the current aperture.  Adding the successor bearing again here can
+        # reverse roll away from a still-positive passage error near the
+        # crossing plane.  Keep the independent successor look-ahead in yaw;
+        # roll owns the physical intercept through the selected passage point.
+        lateral_error = current_bearing[0] + passage_bearing[0]
         roll = self.config.roll_guidance_sign * (
             self.config.roll_gain * lateral_error
             + self.config.lateral_rate_gain
