@@ -1974,6 +1974,50 @@ def test_top_clip_retains_last_vertical_observable_collective():
     assert top.yaw_rate_rad_s < 0.0
 
 
+def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
+    rows = (
+        (174, 0.538, -0.556, 0.205, -0.227, 0.163, 0.52),
+        (175, 0.547, -0.567, 0.241, -0.278, 0.169, 0.73),
+        (176, 0.559, -0.583, 0.306, -0.389, 0.172, 0.62),
+        (177, 0.569, -0.594, 0.285, -0.350, 0.177, 0.75),
+        (178, 0.578, -0.606, 0.318, -0.382, 0.182, 0.92),
+        (179, 0.587, -0.617, 0.289, -0.345, 0.187, 0.85),
+    )
+    servo = ImageVisualServo()
+    outputs = [
+        step(
+            servo,
+            target(
+                sequence,
+                track_id="vq2-track-000003",
+                x=x,
+                y=y,
+                x_rate=x_rate,
+                y_rate=y_rate,
+                log_scale=math.log(scale),
+                scale_rate=scale_rate,
+                consecutive=sequence - 171,
+            ),
+            allow_advance=False,
+        )
+        for (
+            sequence,
+            x,
+            y,
+            x_rate,
+            y_rate,
+            scale,
+            scale_rate,
+        ) in rows
+    ]
+
+    assert all(not output.advance_enabled for output in outputs)
+    assert all(output.next_gate_blend == 0.0 for output in outputs)
+    assert all(output.yaw_rate_rad_s == -0.08 for output in outputs)
+    assert outputs[0].target_pitch_rad > 0.08
+    assert outputs[0].thrust == pytest.approx(0.26152)
+
+
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():
     servo = ImageVisualServo()
     output = step(

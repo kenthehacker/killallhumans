@@ -50,6 +50,7 @@ from planning.vq2_course_lifecycle import (
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
+    VisualApproachAdjacentUnavailable,
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
     VisualApproachPassageAdmission,
@@ -1027,16 +1028,16 @@ def _limit_calibrated_yaw_request(
     return requested
 
 
-def _current_target_observation_monotonic_ns(
+def _target_observation_monotonic_ns(
     snapshot: Any,
     target: Any,
+    track: Any,
     *,
     abort_type: type[BaseException],
 ) -> int:
     """Bind the proposal to the exact latest receiver observation QPC."""
 
     token = getattr(snapshot, "latest_camera_token", None)
-    track = getattr(snapshot, "current_track", None)
     history = getattr(track, "history", None)
     if (
         type(token) is not CameraFrameToken
@@ -1066,6 +1067,22 @@ def _current_target_observation_monotonic_ns(
             "visual-course target observation provenance is inconsistent"
         )
     return observation_monotonic_ns
+
+
+def _current_target_observation_monotonic_ns(
+    snapshot: Any,
+    target: Any,
+    *,
+    abort_type: type[BaseException],
+) -> int:
+    """Compatibility wrapper for an authoritative current-track proposal."""
+
+    return _target_observation_monotonic_ns(
+        snapshot,
+        target,
+        getattr(snapshot, "current_track", None),
+        abort_type=abort_type,
+    )
 
 
 def _race_relation(
@@ -1393,6 +1410,8 @@ async def _run_visual_course_stage_impl(
     pending_post_credit_recovery: Optional[
         _PendingPostCreditRecovery
     ] = None
+    pending_post_credit_planner: Optional[Any] = None
+    pending_post_credit_yaw_reference_rad: Optional[float] = None
     host._visual_course_summary.update(
         {
             "outcome": "running",
@@ -1522,6 +1541,9 @@ async def _run_visual_course_stage_impl(
         yaw_reference_rad: float,
         segment_started_s: float,
         stage: str,
+        target_track: Any = None,
+        apply_launch_bootstrap: bool = True,
+        command_deadline_s: Optional[float] = None,
     ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -1587,16 +1609,36 @@ async def _run_visual_course_stage_impl(
                 consecutive_count=consecutive_superseded_proposals,
             )
 
+        if type(apply_launch_bootstrap) is not bool:
+            raise abort_type(
+                "visual-course launch-bootstrap selection is invalid"
+            )
+        if (
+            command_deadline_s is not None
+            and (
+                type(command_deadline_s) not in {int, float}
+                or not math.isfinite(float(command_deadline_s))
+            )
+        ):
+            raise abort_type(
+                "visual-course command deadline is invalid"
+            )
         output = proposal.servo_output
+        target_track = (
+            getattr(snapshot, "current_track", None)
+            if target_track is None
+            else target_track
+        )
         observation_monotonic_ns = (
-            _current_target_observation_monotonic_ns(
+            _target_observation_monotonic_ns(
                 snapshot,
                 proposal.current_target,
+                target_track,
                 abort_type=abort_type,
             )
         )
         current_history = getattr(
-            getattr(snapshot, "current_track", None),
+            target_track,
             "history",
             None,
         )
@@ -1641,7 +1683,7 @@ async def _run_visual_course_stage_impl(
             )
         launch = segment["launch_bootstrap"]
         launch_evidence: Optional[Dict[str, Any]] = None
-        if launch["enabled"]:
+        if launch["enabled"] and apply_launch_bootstrap:
             assert launch_spawn_pitch_rad is not None
             launch_elapsed_s = max(
                 0.0,
@@ -1761,6 +1803,12 @@ async def _run_visual_course_stage_impl(
             return drop_superseded_proposal(exc)
         if receiver_token != snapshot.latest_camera_token:
             raise abort_type("visual-course receiver watermark changed")
+        if (
+            command_deadline_s is not None
+            and float(runtime.monotonic())
+            >= float(command_deadline_s)
+        ):
+            raise abort_type("visual-course command deadline expired")
         send_race = host._visual_race_status_ref()
         if (
             send_race.race_finished
@@ -1827,6 +1875,11 @@ async def _run_visual_course_stage_impl(
         deadline_ns = validation_ns + round(
             limits.max_validation_to_wire_delay_s * 1_000_000_000
         )
+        if command_deadline_s is not None:
+            deadline_ns = min(
+                deadline_ns,
+                round(float(command_deadline_s) * 1_000_000_000),
+            )
         if consecutive_superseded_proposals > 0:
             hold_checked_s = float(runtime.monotonic())
             if (
@@ -2325,7 +2378,7 @@ async def _run_visual_course_stage_impl(
             course_deadline_s,
             segment_started_s + limits.segment_hard_duration_s,
         )
-        _roll, _pitch, yaw_reference_rad, _rates = _attitude_state(
+        _roll, _pitch, observed_yaw_reference_rad, _rates = _attitude_state(
             host,
             abort_type,
         )
@@ -2336,6 +2389,12 @@ async def _run_visual_course_stage_impl(
         )
         post_credit_recovery = pending_post_credit_recovery
         pending_post_credit_recovery = None
+        carried_post_credit_planner = pending_post_credit_planner
+        pending_post_credit_planner = None
+        carried_post_credit_yaw_reference_rad = (
+            pending_post_credit_yaw_reference_rad
+        )
+        pending_post_credit_yaw_reference_rad = None
         if post_credit_recovery is not None and (
             segment_number <= 0
             or post_credit_recovery.to_gate_index
@@ -2354,6 +2413,27 @@ async def _run_visual_course_stage_impl(
                 "visual-course pending post-credit recovery is invalid "
                 "or expired"
             )
+        if (
+            (carried_post_credit_planner is None)
+            != (carried_post_credit_yaw_reference_rad is None)
+            or (
+                carried_post_credit_planner is not None
+                and (
+                    post_credit_recovery is None
+                    or not math.isfinite(
+                        carried_post_credit_yaw_reference_rad
+                    )
+                )
+            )
+        ):
+            raise abort_type(
+                "visual-course carried planner/yaw authority is invalid"
+            )
+        yaw_reference_rad = (
+            observed_yaw_reference_rad
+            if carried_post_credit_yaw_reference_rad is None
+            else carried_post_credit_yaw_reference_rad
+        )
         launch_collective_state = (
             _Gate0ProvedCollectiveState()
             if launch_enabled
@@ -2362,6 +2442,8 @@ async def _run_visual_course_stage_impl(
 
         def make_planner(
             *,
+            track_id: str,
+            gate_index: int,
             next_gate_blend: float,
         ) -> Any:
             kwargs = {
@@ -2376,16 +2458,22 @@ async def _run_visual_course_stage_impl(
                 ),
             }
             return runtime.servo_factory(
-                current_track_id,
-                current_gate_index,
+                track_id,
+                gate_index,
                 host.visual_config.servo,
                 **kwargs,
             )
 
-        planner = make_planner(
-            next_gate_blend=(
-                host.visual_config.lifecycle.next_gate_blend_max
-            ),
+        planner = (
+            carried_post_credit_planner
+            if carried_post_credit_planner is not None
+            else make_planner(
+                track_id=current_track_id,
+                gate_index=current_gate_index,
+                next_gate_blend=(
+                    host.visual_config.lifecycle.next_gate_blend_max
+                ),
+            )
         )
         mode = (
             VisualApproachMode.PROMOTE_REACQUIRE
@@ -2439,6 +2527,9 @@ async def _run_visual_course_stage_impl(
         censored_passage_coast_fresh_frame_count = 0
         censored_passage_coast_command_count = 0
         crossing_wait_coast_command_count = 0
+        crossing_wait_adjacent_command_count = 0
+        credit_wait_adjacent_planner: Optional[Any] = None
+        credit_wait_adjacent_track_id: Optional[str] = None
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
@@ -2460,6 +2551,7 @@ async def _run_visual_course_stage_impl(
             "passage_admission_yaw_soft_stop_withheld_count": 0,
             "crossing_wait_zero_command_count": 0,
             "crossing_wait_coast_command_count": 0,
+            "crossing_wait_adjacent_command_count": 0,
             "censored_passage_coast_fresh_frame_count": 0,
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
@@ -3705,6 +3797,131 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course credit-wait measurement became unsafe"
                 )
+
+            promotable_candidates = tuple(
+                candidate
+                for candidate in getattr(snapshot, "next_candidates", ())
+                if getattr(candidate, "promotable", False) is True
+            )
+            if (
+                credit_wait_adjacent_planner is None
+                and getattr(
+                    snapshot,
+                    "next_selection_ambiguous",
+                    True,
+                )
+                is False
+                and not getattr(snapshot, "provisional_track_ids", ())
+                and len(promotable_candidates) == 1
+                and promotable_candidates[0].latest_token == token
+                and type(promotable_candidates[0].track_id) is str
+                and promotable_candidates[0].track_id
+            ):
+                credit_wait_adjacent_track_id = (
+                    promotable_candidates[0].track_id
+                )
+                credit_wait_adjacent_planner = make_planner(
+                    track_id=credit_wait_adjacent_track_id,
+                    gate_index=current_gate_index + 1,
+                    next_gate_blend=(
+                        host.visual_config.lifecycle
+                        .next_gate_blend_max
+                    ),
+                )
+                if not callable(
+                    getattr(
+                        credit_wait_adjacent_planner,
+                        "observe_promotable_adjacent",
+                        None,
+                    )
+                ):
+                    raise abort_type(
+                        "visual-course adjacent planner lacks bounded "
+                        "recenter authority"
+                    )
+
+            adjacent_proposal: Optional[Any] = None
+            adjacent_track: Optional[Any] = None
+            adjacent_yaw_reference_rad = yaw_reference_rad
+            if credit_wait_adjacent_planner is not None:
+                if crossing_wait_adjacent_command_count == 0:
+                    (
+                        _roll,
+                        _pitch,
+                        adjacent_yaw_reference_rad,
+                        _rates,
+                    ) = _attitude_state(host, abort_type)
+                adjacent_excursion, _rates, _euler_yaw_rate = (
+                    _assert_course_attitude_state(
+                        host,
+                        yaw_reference_rad=adjacent_yaw_reference_rad,
+                        limits=limits,
+                        yaw_profile=runtime.yaw_profile,
+                        abort_type=abort_type,
+                        phase=(
+                            f"gate {current_gate_index} credit-wait "
+                            "adjacent recenter"
+                        ),
+                    )
+                )
+                try:
+                    assert credit_wait_adjacent_track_id is not None
+                    adjacent_track = host.visual_tracker.track(
+                        credit_wait_adjacent_track_id
+                    )
+                    adjacent_proposal = (
+                        credit_wait_adjacent_planner
+                        .observe_promotable_adjacent(
+                            snapshot,
+                            host.visual_tracker,
+                            runtime.perf_counter_ns()
+                            / 1_000_000_000.0,
+                            now - segment_started_s,
+                            adjacent_excursion,
+                        )
+                    )
+                except (KeyError, VisualApproachAdjacentUnavailable):
+                    adjacent_track = None
+                    adjacent_proposal = None
+            if adjacent_proposal is not None:
+                assert credit_wait_adjacent_track_id is not None
+                assert adjacent_track is not None
+                try:
+                    accepted_adjacent = await send_visual(
+                        proposal=adjacent_proposal,
+                        snapshot=snapshot,
+                        target_track=adjacent_track,
+                        apply_launch_bootstrap=False,
+                        command_deadline_s=min(
+                            course_deadline_s,
+                            crossing_deadline_s,
+                        ),
+                        yaw_reference_rad=adjacent_yaw_reference_rad,
+                        segment_started_s=segment_started_s,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/credit-wait-adjacent"
+                        ),
+                    )
+                except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                    credited_race = accept_no_wire_race_boundary(
+                        race_exc
+                    )
+                    break
+                if type(accepted_adjacent) is _SupersededVisualProposal:
+                    continue
+                if type(accepted_adjacent) is not _AcceptedVisualCommand:
+                    raise abort_type(
+                        "visual-course adjacent command outcome is invalid"
+                    )
+                yaw_reference_rad = adjacent_yaw_reference_rad
+                last_planned_token = token
+                crossing_wait_adjacent_command_count += 1
+                segment["crossing_wait_adjacent_command_count"] = (
+                    crossing_wait_adjacent_command_count
+                )
+                continue
+
             try:
                 coast_command = await send_censored_passage_coast(
                     snapshot=snapshot,
@@ -3764,6 +3981,7 @@ async def _run_visual_course_stage_impl(
                 approach_command_count
                 + passage_command_count
                 + crossing_wait_coast_command_count
+                + crossing_wait_adjacent_command_count
             ),
             "pre_transition_approach_command_count": (
                 approach_command_count
@@ -3779,6 +3997,9 @@ async def _run_visual_course_stage_impl(
             ),
             "crossing_wait_coast_command_count": int(
                 segment["crossing_wait_coast_command_count"]
+            ),
+            "crossing_wait_adjacent_command_count": int(
+                segment["crossing_wait_adjacent_command_count"]
             ),
             "post_transition_zero_command_count": 0,
             "post_transition_navigation_command_count": 0,
@@ -4165,6 +4386,21 @@ async def _run_visual_course_stage_impl(
             ),
             admitted_camera_token=admitted_recovery_token,
             deadline_s=fresh_deadline_s,
+        )
+        carry_adjacent_planner = bool(
+            crossing_wait_adjacent_command_count > 0
+            and credit_wait_adjacent_track_id
+            == course_handoff.promoted_track_id
+        )
+        pending_post_credit_planner = (
+            credit_wait_adjacent_planner
+            if carry_adjacent_planner
+            else None
+        )
+        pending_post_credit_yaw_reference_rad = (
+            yaw_reference_rad
+            if carry_adjacent_planner
+            else None
         )
 
     raise abort_type("visual-course exceeded its gate-segment bound")

@@ -67,7 +67,9 @@ Any powered FlightSim stage requires the user's explicit authorization. Never
 put `sign-id`, `hover`, `gate0`, `gate0-observe`, or a future powered stage in a
 generic test command. Powered work must preserve the proved reset epoch,
 countdown/GO, fresh-stream checks, watchdogs, command bounds, disarm/reset, and
-cleanup confirmation in the VQ2 handoff. A cleanup failure is a failed stage.
+cleanup confirmation in the VQ2 handoff. For promotion or submission evidence,
+a cleanup failure is a failed stage. During explicitly authorized rapid
+Training-mode course iteration, use the standing policy below instead.
 
 For rapid simulator iteration, a direct user instruction to run or continually
 iterate a specific powered stage is the authorization for that scoped work. Do
@@ -89,11 +91,53 @@ capture before returning. Do not add those gates back unless the user asks for
 a forensic or promotion workflow. A failure before simulator contact does not
 require a new F-number or poisoned attempt.
 
-The fast path still must retain the same reset/GO/freshness/watchdog/bounds and
-cleanup invariants above. Training mode is not machine-readable in build 3385;
-record it as configured session state without claiming a fresh visual proof.
-The command takes the existing nonblocking host-wide FlightSim live lease and
-refuses immediately if any legacy or fast live workflow owns it.
+## Standing rapid-course iteration policy
+
+This is the standing policy for every remaining build-3385 Training-mode
+`visual-course` development iteration until authoritative `race_finished` or
+the user explicitly revokes it. It applies after context compaction and in new
+sessions. It overrides broader per-candidate validation, repeated-review, and
+cleanup-promotion workflows for these rapid simulator iterations; it does not
+relax final promotion or submission requirements.
+
+Iteration speed and completing the course are the priority. A failed simulator
+attempt is acceptable and useful evidence. For each diagnosed candidate:
+
+1. Run directly affected tests.
+2. Run `test-vq2` once.
+3. If green, commit and push the exact clean candidate.
+4. Run one bounded `visual-course` attempt.
+5. Analyze its first causal navigation blocker and iterate.
+
+Target roughly 15-25 minutes from a diagnosed live failure to the next powered
+attempt. Do not run `test-fast`, `test-unit`, promotion, benchmark, or broad
+matrices before every flight; reserve them for meaningful course milestones
+or final promotion. Once directly affected tests are green, do not add another
+review round, replay, abstraction, proof layer, or test-fidelity enhancement
+before `test-vq2` and flight unless it exposes a hard blocker involving:
+
+- nonfinite or out-of-envelope commands;
+- wrong authoritative race-gate ownership;
+- stale control inputs;
+- the in-flight collision watchdog;
+- live-lease concurrency;
+- or failure to establish a usable simulator state for the next run.
+
+Keep bounded commands, fresh-stream checks, the hard attempt timeout,
+collision abort, and the host-wide live lease. Cleanup is best-effort zero,
+disarm, reset, and final disarm from a `finally` path. Report navigation and
+cleanup outcomes separately. Recorder/diagnostic failures, evidence
+completeness, exact post-wire heartbeat proofs, and post-reset pad-contact
+classification must not erase achieved navigation milestones or block the next
+development iteration. If cleanup cannot establish a usable next-run state,
+relaunch FlightSim before continuing.
+
+The fast path still must retain reset/GO/freshness/watchdog/command-bound
+invariants and the best-effort cleanup actions above. Training mode is not
+machine-readable in build 3385; record it as configured session state without
+claiming a fresh visual proof. The command takes the existing nonblocking
+host-wide FlightSim live lease and refuses immediately if any legacy or fast
+live workflow owns it.
 
 The parameterized Windows launcher is:
 

@@ -73,6 +73,10 @@ class VisualApproachRefusal(ValueError):
     """The graph/tracker pair cannot safely authorize an approach proposal."""
 
 
+class VisualApproachAdjacentUnavailable(VisualApproachRefusal):
+    """One publication lacks optional, graph-vetted adjacent authority."""
+
+
 class VisualApproachCurrentGeometryUnavailable(VisualApproachRefusal):
     """The optional visual blend must withdraw from a clipped current gate."""
 
@@ -402,6 +406,7 @@ class VisualApproachMode(Enum):
 
     APPROACH = "approach"
     PASSAGE = "passage"
+    ADJACENT_RECENTER = "adjacent_recenter"
     PROMOTE_REACQUIRE = "promote_reacquire"
 
 
@@ -583,6 +588,153 @@ class RollingVisualApproachServo:
             - self.next_gate_blend_start_log_scale
         )
         return self.next_gate_blend * max(0.0, min(1.0, fraction))
+
+    def observe_promotable_adjacent(
+        self,
+        snapshot: GateGraphSnapshot,
+        tracker: MultiTargetVisualTracker,
+        now_monotonic_s: float,
+        segment_elapsed_s: float,
+        segment_yaw_excursion_rad: float,
+    ) -> VisualApproachProposal:
+        """Recenter on one graph-vetted successor without passage authority."""
+
+        if type(snapshot) is not GateGraphSnapshot:
+            raise TypeError("snapshot must be an exact GateGraphSnapshot")
+        if type(tracker) is not MultiTargetVisualTracker:
+            raise TypeError("tracker must be an exact MultiTargetVisualTracker")
+        for name, value in (
+            ("now_monotonic_s", now_monotonic_s),
+            ("segment_elapsed_s", segment_elapsed_s),
+            ("segment_yaw_excursion_rad", segment_yaw_excursion_rad),
+        ):
+            if type(value) not in {int, float} or not math.isfinite(
+                float(value)
+            ):
+                raise VisualApproachRefusal(f"{name} must be finite")
+
+        update = tracker.latest_update
+        race = snapshot.latest_race_status
+        if update is None:
+            raise VisualApproachAdjacentUnavailable(
+                "credit-wait adjacent tracker publication is unavailable"
+            )
+        if (
+            tracker.time_basis_id != _QPC_TIME_BASIS_ID
+            or update.provenance_basis
+            is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+            or race is None
+            or race.provenance_basis
+            is not RaceStatusProvenanceBasis.LIVE_INGRESS
+            or race.host_clock_id != _QPC_TIME_BASIS_ID
+        ):
+            raise VisualApproachRefusal(
+                "credit-wait adjacent provenance authority is invalid"
+            )
+        candidates = tuple(
+            candidate
+            for candidate in snapshot.next_candidates
+            if candidate.promotable
+        )
+        if (
+            snapshot.latest_camera_token != update.token
+            or snapshot.tracker_frame_sequence
+            != update.tracker_frame_sequence
+            or snapshot.race_finished
+            or snapshot.current_gate_index
+            != self.expected_gate_index - 1
+            or snapshot.current_track_id is None
+            or snapshot.current_track_id
+            == self.expected_current_track_id
+            or snapshot.next_selection_ambiguous
+            or snapshot.provisional_track_ids
+            or len(candidates) != 1
+            or candidates[0].track_id
+            != self.expected_current_track_id
+            or race.race_finished
+            or race.active_gate_index
+            != self.expected_gate_index - 1
+        ):
+            raise VisualApproachAdjacentUnavailable(
+                "credit-wait adjacent authority is unavailable"
+            )
+
+        candidate = candidates[0]
+        try:
+            track = tracker.track(candidate.track_id)
+        except KeyError as exc:
+            raise VisualApproachAdjacentUnavailable(
+                "credit-wait adjacent candidate is absent from tracker"
+            ) from exc
+        if (
+            candidate.stable_frame_count < _REQUIRED_NEXT_FRAMES
+            or candidate.latest_token != snapshot.latest_camera_token
+            or track.role is not VisualTrackRole.NEXT
+            or track.authoritative_gate_index is not None
+            or not track.visible
+            or track.missed_frame_count != 0
+            or track.ambiguous
+            or track.consecutive_frame_count < _REQUIRED_NEXT_FRAMES
+            or track.latest_token != snapshot.latest_camera_token
+            or track.clipping is not FrameEdge.NONE
+            or track.center_censored
+        ):
+            raise VisualApproachAdjacentUnavailable(
+                "credit-wait adjacent candidate is not clean and stable"
+            )
+
+        self._validate_publication_advance(snapshot)
+        target = self._target(
+            track,
+            now_monotonic_s=float(now_monotonic_s),
+            require_current_authority=False,
+        )
+        try:
+            output = self._servo.step(
+                target,
+                now_monotonic_s=float(now_monotonic_s),
+                segment_elapsed_s=float(segment_elapsed_s),
+                segment_yaw_excursion_rad=float(
+                    segment_yaw_excursion_rad
+                ),
+                requested_next_blend=0.0,
+                allow_advance=False,
+                allow_passage_safe_next_blend=False,
+            )
+        except VisualServoRefusal as exc:
+            raise VisualApproachRefusal(
+                "credit-wait adjacent servo refused authority: "
+                f"{exc}"
+            ) from exc
+        if (
+            output.advance_enabled
+            or output.next_gate_blend != 0.0
+            or output.reviewed_next_track_id is not None
+        ):
+            raise VisualApproachRefusal(
+                "credit-wait adjacent proposal escaped no-advance authority"
+            )
+
+        self._last_camera_token = snapshot.latest_camera_token
+        self._last_tracker_frame_sequence = (
+            snapshot.tracker_frame_sequence
+        )
+        return VisualApproachProposal(
+            current_target=target,
+            next_target=None,
+            servo_output=output,
+            candidate_track_ids=(candidate.track_id,),
+            provisional_track_ids=(),
+            withholding_reason=None,
+            relationship_basis=(
+                None
+                if candidate.relationship is None
+                else candidate.relationship.basis
+            ),
+            latched_next_track_id=None,
+            mode=VisualApproachMode.ADJACENT_RECENTER,
+            passage_admission=None,
+        )
 
     def observe(
         self,
@@ -1291,6 +1443,7 @@ __all__ = [
     "MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES",
     "RollingVisualApproachServo",
     "VISUAL_PASSAGE_ADMISSION_BASIS",
+    "VisualApproachAdjacentUnavailable",
     "VisualApproachCurrentGeometryUnavailable",
     "VisualApproachMode",
     "VisualApproachPassageAdmission",

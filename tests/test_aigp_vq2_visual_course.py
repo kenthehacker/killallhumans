@@ -259,6 +259,13 @@ class _Tracker:
         self.host = host
 
     def track(self, track_id):
+        adjacent = getattr(self.host, "adjacent_track", None)
+        if (
+            track_id != self.host.current_track_id
+            and adjacent is not None
+            and adjacent.track_id == track_id
+        ):
+            return adjacent
         assert track_id == self.host.current_track_id
         return self.host.visual_gate_graph.latest_snapshot.current_track
 
@@ -334,6 +341,66 @@ class _Servo:
     def retire_passage_preview(self, expected_track_id):
         assert expected_track_id == self.preview_track_id
         self.passage_preview_retired = True
+
+    def observe_promotable_adjacent(
+        self,
+        snapshot,
+        tracker,
+        now_monotonic_s,
+        segment_elapsed_s,
+        segment_yaw_excursion_rad,
+    ):
+        del tracker, now_monotonic_s, segment_yaw_excursion_rad
+        self.calls.append(
+            (
+                self.gate_index,
+                VisualApproachMode.ADJACENT_RECENTER,
+                None,
+                False,
+                segment_elapsed_s,
+            )
+        )
+        target = replace(
+            _target(snapshot, self.track_id),
+            normalized_x=0.55,
+            normalized_y_down=-0.55,
+            normalized_x_rate_s=0.20,
+            normalized_y_rate_down_s=-0.20,
+            log_scale=-1.70,
+        )
+        output = VisualServoOutput(
+            target_roll_rad=0.0,
+            target_pitch_rad=0.08,
+            yaw_rate_rad_s=self.yaw_rate,
+            thrust=0.27,
+            corridor_frames=0,
+            advance_enabled=False,
+            next_gate_blend=0.0,
+            horizontal_error=0.55,
+            vertical_error_image_down=-0.55,
+            effective_horizontal_error=0.55,
+            effective_vertical_error_image_down=-0.55,
+            effective_horizontal_rate_s=0.20,
+            effective_vertical_rate_down_s=-0.20,
+            next_horizontal_error=None,
+            next_vertical_error_image_down=None,
+            horizontal_abs_error_delta=0.0,
+            vertical_abs_error_delta=0.0,
+            brake_reason="target_edge_or_clipping",
+            yaw_envelope_limited=False,
+        )
+        return SimpleNamespace(
+            current_target=target,
+            next_target=None,
+            servo_output=output,
+            candidate_track_ids=(self.track_id,),
+            provisional_track_ids=(),
+            withholding_reason=None,
+            relationship_basis=None,
+            latched_next_track_id=None,
+            mode=VisualApproachMode.ADJACENT_RECENTER,
+            passage_admission=None,
+        )
 
     def observe(
         self,
@@ -2709,6 +2776,98 @@ def test_crossing_hold_aborts_new_observable_axis_divergence():
 
     assert host.crossing_hold_count == 1
     assert not any(command.thrust == 0.0 for command, _kwargs, _gate in host.commands)
+
+
+def test_credit_wait_uses_one_promotable_adjacent_without_advance():
+    class AdjacentCreditWaitHost(_Host):
+        def __init__(self):
+            super().__init__(
+                initial_gate=6,
+                finish_gate=7,
+                lose_before_credit=True,
+            )
+            self.adjacent_track = None
+            self.adjacent_stable_frames = 0
+            self.adjacent_command_count = 0
+
+        def _sample(self):
+            super()._sample()
+            snapshot = self.visual_gate_graph.latest_snapshot
+            snapshot.next_candidates = ()
+            snapshot.next_selection_ambiguous = False
+            snapshot.provisional_track_ids = ()
+            if (
+                self.current_gate == 6
+                and not snapshot.current_track.visible
+            ):
+                self.adjacent_stable_frames += 1
+                token = snapshot.latest_camera_token
+                adjacent = _track(
+                    "track-7",
+                    gate_index=7,
+                    token=token,
+                )
+                adjacent.role = VisualTrackRole.NEXT
+                adjacent.authoritative_gate_index = None
+                adjacent.center_norm = (0.55, -0.55)
+                adjacent.center_velocity_norm_s = (0.20, -0.20)
+                self.adjacent_track = adjacent
+                if self.adjacent_stable_frames >= 3:
+                    snapshot.next_candidates = (
+                        SimpleNamespace(
+                            track_id=adjacent.track_id,
+                            latest_token=token,
+                            promotable=True,
+                        ),
+                    )
+
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(
+                command,
+                **kwargs,
+            )
+            if self.current_gate == 6 and command.thrust == 0.27:
+                self.adjacent_command_count += 1
+                if self.adjacent_command_count >= 2:
+                    self._advance_race()
+            return receipt
+
+    host = AdjacentCreditWaitHost()
+    runtime, calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    transition = result["authoritative_transitions"][0]
+    assert transition["from_gate_index"] == 6
+    assert transition["to_gate_index"] == 7
+    assert transition["crossing_wait_coast_command_count"] == 1
+    assert transition["crossing_wait_adjacent_command_count"] == 2
+    assert transition["crossing_wait_zero_command_count"] == 0
+    adjacent_tick_indexes = [
+        index
+        for index, (stage, _elapsed, _command) in enumerate(host.ticks)
+        if stage == "visual-course/gate6/credit-wait-adjacent"
+    ]
+    assert len(adjacent_tick_indexes) == 2
+    assert all(
+        host.commands[index][2] == 6
+        and host.commands[index][0].thrust == 0.27
+        for index in adjacent_tick_indexes
+    )
+    assert any(
+        gate_index == 7
+        and mode is VisualApproachMode.ADJACENT_RECENTER
+        for gate_index, mode, *_rest in calls
+    )
+    assert any(
+        gate_index == 7
+        and mode is VisualApproachMode.PROMOTE_REACQUIRE
+        for gate_index, mode, *_rest in calls
+    )
 
 
 def test_post_credit_wait_checks_attitude_before_sending_zero():

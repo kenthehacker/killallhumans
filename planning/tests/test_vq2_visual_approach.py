@@ -14,6 +14,8 @@ from competition.vq2_visual_tracker import (
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    ConfirmedGateReacquisition,
+    CreditedUnboundGateAdvance,
     GateRelationshipBasis,
     GateGraphSnapshot,
     RollingVisualGateGraph,
@@ -26,6 +28,7 @@ from planning.vq2_visual_approach import (
     MAX_PASSAGE_SUSPENSION_TOTAL_FRESH_FRAMES,
     RollingVisualApproachServo,
     VISUAL_PASSAGE_ADMISSION_BASIS,
+    VisualApproachAdjacentUnavailable,
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
     VisualApproachPassageAdmission,
@@ -1501,6 +1504,272 @@ def test_recovery_mode_rejects_multi_edge_current(clipping) -> None:
             tracker,
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
         )
+
+
+def test_promotable_adjacent_recenter_is_fresh_and_never_advances() -> None:
+    tracker, graph, snapshot, _current_id, next_id, sequence = (
+        _build_bound_graph()
+    )
+    assert next_id is not None
+    assert [
+        candidate.track_id
+        for candidate in snapshot.next_candidates
+        if candidate.promotable
+    ] == [next_id]
+    adjacent = RollingVisualApproachServo(
+        next_id,
+        1,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+    )
+
+    first = adjacent.observe_promotable_adjacent(
+        snapshot,
+        tracker,
+        now_monotonic_s=_now_s(tracker),
+        segment_elapsed_s=0.5,
+        segment_yaw_excursion_rad=0.0,
+    )
+
+    assert first.mode is VisualApproachMode.ADJACENT_RECENTER
+    assert first.current_target.track_id == next_id
+    assert first.next_target is None
+    assert first.servo_output.advance_enabled is False
+    assert first.servo_output.next_gate_blend == 0.0
+    assert first.servo_output.yaw_rate_rad_s < 0.0
+
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="publication order",
+    ):
+        adjacent.observe_promotable_adjacent(
+            snapshot,
+            tracker,
+            now_monotonic_s=_now_s(tracker),
+            segment_elapsed_s=0.52,
+            segment_yaw_excursion_rad=0.0,
+        )
+
+    snapshot = _advance(tracker, graph, sequence + 1)
+    second = adjacent.observe_promotable_adjacent(
+        snapshot,
+        tracker,
+        now_monotonic_s=_now_s(tracker),
+        segment_elapsed_s=0.54,
+        segment_yaw_excursion_rad=0.0,
+    )
+    assert (
+        second.current_target.frame_token.publication_sequence
+        > first.current_target.frame_token.publication_sequence
+    )
+
+
+def test_promotable_adjacent_recenter_rejects_ambiguous_selection() -> None:
+    tracker, _, snapshot, _, next_id, _ = _build_bound_graph()
+    assert next_id is not None
+    adjacent = RollingVisualApproachServo(
+        next_id,
+        1,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+    )
+
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="adjacent authority is unavailable",
+    ):
+        adjacent.observe_promotable_adjacent(
+            replace(snapshot, next_selection_ambiguous=True),
+            tracker,
+            now_monotonic_s=_now_s(tracker),
+            segment_elapsed_s=0.5,
+            segment_yaw_excursion_rad=0.0,
+        )
+
+
+def test_run7_logged_state_carries_adjacent_planner_across_cross_id_credit():
+    """Replay logged tracker facts, not JPEGs or detector output.
+
+    The successor geometry is the exact publication 172-180 sequence from
+    run ``20260726T081239Z-visual-course-be62e589``.  The production 30 Hz
+    tracker, rolling graph, and planner consume those rows.  The originally
+    reviewed preview is retired, so the authoritative 250 ms race boundary
+    exercises the real bounded cross-ID reacquisition used by that run.
+    """
+
+    tracker = MultiTargetVisualTracker()
+    graph = RollingVisualGateGraph()
+    current_id = preview_id = ""
+    for sequence in range(1, 4):
+        update = tracker.update(
+            _frame(
+                sequence,
+                (
+                    _current_detection(),
+                    _next_detection(),
+                ),
+            )
+        )
+        if sequence == 1:
+            current_id, preview_id = update.visible_track_ids
+        if sequence == 3:
+            assert update.publish_monotonic_ns is not None
+            graph.bind_initial_current(
+                tracker,
+                track_id=current_id,
+                race_status=_race(
+                    update.publish_monotonic_ns + 1,
+                ),
+            )
+    tracker.retire_track(preview_id)
+
+    # (x, y-down, bbox width, bbox height), exact logged pubs 172-180.
+    rows = (
+        (0.521875, -0.5388888888888889, 0.121875, 0.20277777777777778),
+        (0.528125, -0.5444444444444445, 0.1234375, 0.20555555555555555),
+        (0.5375, -0.5555555555555556, 0.128125, 0.20833333333333334),
+        (0.546875, -0.5666666666666667, 0.1328125, 0.2138888888888889),
+        (0.559375, -0.5833333333333333, 0.134375, 0.21944444444444444),
+        (0.56875, -0.5944444444444444, 0.1390625, 0.225),
+        (0.578125, -0.6055555555555556, 0.14375, 0.23055555555555557),
+        (0.5875, -0.6166666666666667, 0.1484375, 0.2361111111111111),
+        (0.6, -0.6277777777777778, 0.1546875, 0.24444444444444444),
+    )
+    planner = None
+    precredit = []
+    credit_token = None
+    credit_race = None
+    for sequence, (x, y, width, height) in enumerate(rows, 4):
+        if sequence == 12:
+            assert credit_token is not None
+            credit_received_ns = (
+                tracker.frame_publish_time_ns(credit_token)
+                + 10_000_000
+            )
+            credit_race = AuthoritativeRaceStatusRef.live(
+                session_id="visual-approach-test",
+                reset_epoch=1,
+                race_generation=1,
+                race_status_sequence=2,
+                race_status_boot_ms=5_250,
+                active_gate_index=1,
+                received_monotonic_ns=credit_received_ns,
+                host_clock_id=_HOST_CLOCK_ID,
+            )
+        detections = (_detection(1, x, y, width, height),)
+        if sequence == 4:
+            # One simultaneous current/adjacent publication seeds the exact
+            # image-space relationship before normal passage loss.
+            detections = (_current_detection(),) + detections
+        tracker.update(_frame(sequence, detections))
+        snapshot = graph.observe(tracker)
+
+        if planner is None:
+            promotable = tuple(
+                candidate
+                for candidate in snapshot.next_candidates
+                if candidate.promotable
+            )
+            if promotable:
+                assert len(promotable) == 1
+                planner = RollingVisualApproachServo(
+                    promotable[0].track_id,
+                    1,
+                    next_gate_blend=0.35,
+                    next_gate_blend_start_log_scale=-1.8,
+                    next_gate_blend_full_log_scale=-0.5,
+                )
+        if planner is not None and sequence <= 11:
+            precredit.append(
+                planner.observe_promotable_adjacent(
+                    snapshot,
+                    tracker,
+                    now_monotonic_s=_now_s(tracker),
+                    segment_elapsed_s=0.5 + 0.033 * (sequence - 4),
+                    segment_yaw_excursion_rad=0.0,
+                )
+            )
+        if sequence == 11:
+            credit_token = snapshot.latest_camera_token
+
+    assert planner is not None
+    assert len(precredit) == 6
+    assert all(
+        proposal.mode is VisualApproachMode.ADJACENT_RECENTER
+        and not proposal.servo_output.advance_enabled
+        and proposal.servo_output.next_gate_blend == 0.0
+        and proposal.servo_output.yaw_rate_rad_s == -0.08
+        for proposal in precredit
+    )
+    assert precredit[0].servo_output.target_pitch_rad > 0.09
+    assert precredit[0].servo_output.thrust == pytest.approx(
+        0.26148148156933343
+    )
+
+    assert credit_token is not None
+    assert credit_race is not None
+    advance = graph.confirm_reviewed_advance(
+        tracker,
+        race_status=credit_race,
+        camera_token_at_credit=credit_token,
+        reviewed_track_id=preview_id,
+    )
+    assert type(advance) is CreditedUnboundGateAdvance
+    assert advance.alternative_reacquisition_track_ids_at_credit == (
+        precredit[-1].current_target.track_id,
+    )
+    reacquisition = graph.try_confirm_reacquired_current(
+        tracker,
+        credited_advance=advance,
+        camera_token_at_binding=snapshot.latest_camera_token,
+    )
+    assert type(reacquisition) is ConfirmedGateReacquisition
+    assert reacquisition.cross_gap_identity_claimed is False
+
+    postcredit = planner.observe(
+        graph.latest_snapshot,
+        tracker,
+        now_monotonic_s=_now_s(tracker),
+        segment_elapsed_s=0.8,
+        segment_yaw_excursion_rad=0.0,
+        mode=VisualApproachMode.PROMOTE_REACQUIRE,
+        passage_admission=None,
+    )
+    assert postcredit.current_target.track_id == (
+        precredit[-1].current_target.track_id
+    )
+    assert (
+        postcredit.current_target.frame_token.publication_sequence
+        > credit_token.publication_sequence
+    )
+    assert postcredit.servo_output.horizontal_abs_error_delta is not None
+    assert postcredit.servo_output.yaw_rate_rad_s == -0.08
+    assert postcredit.servo_output.advance_enabled is False
+
+
+def test_adjacent_structural_provenance_refusal_is_not_soft_unavailable():
+    tracker, _, snapshot, _, next_id, _ = _build_bound_graph()
+    assert next_id is not None
+    adjacent = RollingVisualApproachServo(
+        next_id,
+        1,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+    )
+    bad_race = replace(
+        snapshot.latest_race_status,
+        host_clock_id="wrong-clock",
+    )
+
+    with pytest.raises(VisualApproachRefusal) as caught:
+        adjacent.observe_promotable_adjacent(
+            replace(snapshot, latest_race_status=bad_race),
+            tracker,
+            now_monotonic_s=_now_s(tracker),
+            segment_elapsed_s=0.5,
+            segment_yaw_excursion_rad=0.0,
+        )
+    assert not isinstance(
+        caught.value,
+        VisualApproachAdjacentUnavailable,
+    )
 
 
 def test_latched_next_identity_conflict_withholds_without_switching() -> None:
