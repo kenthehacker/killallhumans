@@ -619,6 +619,77 @@ def test_run_8c5e_transients_do_not_require_exact_adjacent_latch_frames():
     assert latch is None
 
 
+def test_run_14e9_uses_noncounting_close_scale_anchor():
+    qualified = tuple(
+        replace(
+            sample,
+            log_scale=math.log(scale),
+        )
+        for sample, scale in zip(
+            _LATEST_NEAR_PLANE,
+            (0.3791, 0.3999, 0.4176),
+            strict=True,
+        )
+    )
+    evidence = NearPlaneEvidence()
+    latch = None
+    for sample in qualified:
+        evidence, latch = advance_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+    assert len(evidence.samples) == 3
+    assert latch is None
+
+    previous = qualified[-1]
+    anchor_token = _token(3_266_127, 160)
+    anchor = replace(
+        previous,
+        camera_token=anchor_token,
+        wire_camera_token=anchor_token,
+        observation_monotonic_ns=(
+            previous.observation_monotonic_ns + 33_000_000
+        ),
+        publication_monotonic_ns=(
+            previous.publication_monotonic_ns + 33_000_000
+        ),
+        wire_start_monotonic_ns=(
+            previous.wire_start_monotonic_ns + 33_000_000
+        ),
+        wire_return_monotonic_ns=(
+            previous.wire_return_monotonic_ns + 33_000_000
+        ),
+        normalized_x=-0.20,
+        normalized_x_rate_s=-0.1373,
+        log_scale=math.log(0.4905),
+        log_scale_rate_s=1.578,
+        command_yaw_rate=0.15,
+    )
+    assert abs(
+        anchor.normalized_x
+        + anchor.normalized_x_rate_s * 0.10
+    ) > 0.20
+
+    evidence, latch = advance_near_plane_evidence(
+        evidence,
+        anchor,
+        required_corridor_frames=_REQUIRED_FRAMES,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+
+    assert latch is not None
+    assert latch.evidence.samples == qualified
+    assert latch.anchor_sample == anchor
+    assert latch.anchor_camera_token == anchor_token
+    assert latch.accepted_command == anchor.command
+
+
 @pytest.mark.parametrize(
     "updates",
     (

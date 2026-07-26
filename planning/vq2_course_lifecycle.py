@@ -449,6 +449,7 @@ class NearPlaneLatch:
     """Immutable multi-frame authority preceding predictable censorship."""
 
     evidence: NearPlaneEvidence
+    anchor_sample: NearPlaneWireSample
     required_corridor_frames: int
     crossing_min_log_scale: float
     basis: str = NEAR_PLANE_LATCH_BASIS
@@ -456,6 +457,8 @@ class NearPlaneLatch:
     def __post_init__(self) -> None:
         if type(self.evidence) is not NearPlaneEvidence:
             raise TypeError("near-plane latch evidence must be exact")
+        if type(self.anchor_sample) is not NearPlaneWireSample:
+            raise TypeError("near-plane latch anchor must be an exact sample")
         if (
             type(self.required_corridor_frames) is not int
             or self.required_corridor_frames <= 0
@@ -466,8 +469,39 @@ class NearPlaneLatch:
             )
         if not _finite(self.crossing_min_log_scale):
             raise ValueError("near-plane close-scale bound must be finite")
+        final_qualified = self.evidence.samples[-1]
         if (
-            float(self.evidence.samples[-1].log_scale)
+            self.evidence.last_observed_sample != self.anchor_sample
+            or self.anchor_sample.gate_index != final_qualified.gate_index
+            or self.anchor_sample.track_id != final_qualified.track_id
+            or not _same_camera_epoch(
+                self.anchor_sample.camera_token,
+                final_qualified.camera_token,
+            )
+            or (
+                self.anchor_sample != final_qualified
+                and (
+                    not _token_strictly_newer(
+                        self.anchor_sample.camera_token,
+                        final_qualified.camera_token,
+                    )
+                    or self.anchor_sample.observation_monotonic_ns
+                    <= final_qualified.observation_monotonic_ns
+                    or self.anchor_sample.publication_monotonic_ns
+                    <= final_qualified.publication_monotonic_ns
+                    or self.anchor_sample.wire_start_monotonic_ns
+                    <= final_qualified.wire_start_monotonic_ns
+                    or self.anchor_sample.wire_return_monotonic_ns
+                    <= final_qualified.wire_return_monotonic_ns
+                    or float(self.anchor_sample.log_scale_rate_s) <= 0.0
+                    or float(self.anchor_sample.log_scale)
+                    <= float(final_qualified.log_scale)
+                )
+            )
+        ):
+            raise ValueError("near-plane latch anchor is discontinuous")
+        if (
+            float(self.anchor_sample.log_scale)
             < float(self.crossing_min_log_scale)
         ):
             raise ValueError("near-plane latch has not reached close scale")
@@ -490,11 +524,11 @@ class NearPlaneLatch:
 
     @property
     def anchor_camera_token(self) -> CameraFrameToken:
-        return self.evidence.samples[-1].camera_token
+        return self.anchor_sample.camera_token
 
     @property
     def accepted_command(self) -> tuple[float, float, float, float]:
-        return self.evidence.samples[-1].command
+        return self.anchor_sample.command
 
 
 def _observable_axis_unsafe(
@@ -657,10 +691,24 @@ def advance_near_plane_evidence(
             # while the same hard-safe aperture continues to expand.  This
             # permits a later qualified 30 Hz publication to complete the
             # multi-frame latch without pretending the transient was clean.
-            return NearPlaneEvidence(
+            bridged = NearPlaneEvidence(
                 samples=evidence.samples,
                 last_observed_sample=sample,
-            ), None
+            )
+            if (
+                len(bridged.samples) >= required_corridor_frames
+                and float(sample.log_scale)
+                >= float(crossing_min_log_scale)
+            ):
+                return bridged, NearPlaneLatch(
+                    evidence=bridged,
+                    anchor_sample=sample,
+                    required_corridor_frames=required_corridor_frames,
+                    crossing_min_log_scale=float(
+                        crossing_min_log_scale
+                    ),
+                )
+            return bridged, None
         return NearPlaneEvidence(), None
 
     retained: tuple[NearPlaneWireSample, ...]
@@ -686,6 +734,7 @@ def advance_near_plane_evidence(
         return advanced, None
     latch = NearPlaneLatch(
         evidence=advanced,
+        anchor_sample=sample,
         required_corridor_frames=required_corridor_frames,
         crossing_min_log_scale=float(crossing_min_log_scale),
     )
