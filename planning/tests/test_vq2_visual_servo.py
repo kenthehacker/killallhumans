@@ -1406,6 +1406,43 @@ def test_passage_retains_heading_through_vertical_scale_degradation() -> None:
     assert not recovered.passage_preview_retired
 
 
+def test_live_passage_margin_tapers_successor_yaw_without_reversing() -> None:
+    """Regress publication 155 from run 20260726T174536Z."""
+
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    output = step(
+        servo,
+        target(
+            155,
+            x=-0.096875,
+            y=-0.1444444444444445,
+            x_rate=-0.1525009244685644,
+            y_rate=0.2851080482436885,
+            log_scale=math.log(0.42041542781449454),
+            scale_rate=1.622599080008312,
+        ),
+        next_target=target(
+            155,
+            track_id="vq2-track-000002",
+            x=0.328125,
+            y=-0.48888888888888893,
+            x_rate=0.1450844041912014,
+            y_rate=-0.2580609878950182,
+            log_scale=math.log(0.11133657679906157),
+            scale_rate=0.5904640930065196,
+        ),
+        requested_next_blend=0.25,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert output.next_gate_blend > 0.0
+    assert -MAX_VISUAL_YAW_RATE_RAD_S < output.yaw_rate_rad_s < 0.0
+    assert not output.passage_preview_retired
+
+
 def test_unusable_optional_passage_preview_is_current_only() -> None:
     missing_servo = ImageVisualServo()
     clipped_servo = ImageVisualServo()
