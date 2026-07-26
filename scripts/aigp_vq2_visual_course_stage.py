@@ -1729,14 +1729,19 @@ async def _run_visual_course_stage_impl(
                 1.0,
                 launch_elapsed_s / pitch_blend_s,
             )
-            # The launch schedule may soften a later forward-progress target,
-            # but it must not preserve spawn nose-down pitch while the visual
-            # controller has already allocated bounded braking.  Keep the
-            # handoff monotonic so a falling steering request cannot restore
-            # forward closure after an accepted brake command.
+            # Visual braking advances the existing launch handoff instead of
+            # jumping its pitch reference directly to the brake target.  The
+            # scheduled fraction gates that extra authority, so zero visual
+            # authority is the original schedule and full authority follows
+            # the smooth s*(2-s) curve.  Keep the accepted handoff monotonic.
+            requested_pitch_blend = (
+                scheduled_pitch_blend
+                + (1.0 - scheduled_pitch_blend)
+                * continuous_pitch_response_authority
+                * scheduled_pitch_blend
+            )
             pitch_blend = max(
-                scheduled_pitch_blend,
-                continuous_pitch_response_authority,
+                requested_pitch_blend,
                 float(launch.get("last_pitch_blend", 0.0)),
             )
             target_pitch_rad = (

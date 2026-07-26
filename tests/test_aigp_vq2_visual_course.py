@@ -1725,24 +1725,47 @@ def test_visual_brake_authority_advances_launch_pitch_handoff():
 
     initial = host._visual_course_summary["segments"][0]
     launch = initial["launch_bootstrap"]
-    navigation = [
-        command
-        for command, _kwargs, gate_index in host.commands
-        if gate_index == 0 and command.thrust > 0.0
+    navigation_ticks = [
+        (elapsed_s, command)
+        for stage, elapsed_s, command in host.ticks
+        if stage.startswith("visual-course/gate0/")
+        and command.thrust > 0.0
     ]
-    assert navigation
-    assert navigation[0].pitch_rate == pytest.approx(
-        course_stage.MAX_VISUAL_TARGET_PITCH_RAD
-    )
+    assert navigation_ticks
     assert launch["first_target_pitch_rad"] == pytest.approx(
-        course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+        _context().spawn_pitch_rad
     )
-    assert launch["last_pitch_blend"] == 1.0
-    assert navigation[0].thrust == 0.26
+    early_brake_targets = []
+    for elapsed_s, command in navigation_ticks:
+        scheduled_blend = min(
+            1.0,
+            elapsed_s
+            / host.visual_config.lifecycle.launch_pitch_blend_s,
+        )
+        scheduled_target = (
+            (1.0 - scheduled_blend) * _context().spawn_pitch_rad
+            + scheduled_blend
+            * course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+        )
+        if 0.0 < scheduled_blend < 1.0:
+            early_brake_targets.append(command.pitch_rate)
+            assert command.pitch_rate > scheduled_target
+            assert (
+                command.pitch_rate
+                < course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+            )
+    assert early_brake_targets
+    assert early_brake_targets == sorted(early_brake_targets)
+    assert launch["last_pitch_blend"] > min(
+        1.0,
+        launch["last_elapsed_s"]
+        / host.visual_config.lifecycle.launch_pitch_blend_s,
+    )
+    assert navigation_ticks[0][1].thrust == 0.26
     assert any(
         command.thrust
         == host.visual_config.lifecycle.launch_boost_thrust
-        for command in navigation
+        for _elapsed_s, command in navigation_ticks
     )
 
 
