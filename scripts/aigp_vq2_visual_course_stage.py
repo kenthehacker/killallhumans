@@ -368,6 +368,7 @@ class _CensoredPassageCoastAuthority:
     anchor_camera_token: CameraFrameToken
     target_roll_rad: float
     target_pitch_rad: float
+    yaw_rate_rad_s: float
     thrust: float
 
 
@@ -1997,7 +1998,7 @@ async def _run_visual_course_stage_impl(
         stage: str,
         command_deadline_s: float,
     ) -> Optional[AttitudeRateCommand]:
-        """Reissue one frozen clean attitude target on a fresh frame."""
+        """Reissue one frozen clean attitude/heading target on a fresh frame."""
 
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -2047,6 +2048,7 @@ async def _run_visual_course_stage_impl(
         values = (
             authority.target_roll_rad,
             authority.target_pitch_rad,
+            authority.yaw_rate_rad_s,
             authority.thrust,
             command_deadline_s,
         )
@@ -2060,6 +2062,8 @@ async def _run_visual_course_stage_impl(
             < MIN_VISUAL_TARGET_PITCH_RAD - 1e-12
             or authority.target_pitch_rad
             > MAX_VISUAL_TARGET_PITCH_RAD + 1e-12
+            or abs(authority.yaw_rate_rad_s)
+            > limits.max_yaw_rate_rad_s + 1e-12
             or not limits.min_thrust
             <= authority.thrust
             <= limits.max_thrust
@@ -2093,7 +2097,7 @@ async def _run_visual_course_stage_impl(
                 "visual-course race boundary changed before navigation send"
             )
         coast_deadline_s = float(command_deadline_s)
-        _assert_course_attitude_state(
+        excursion, _rates, euler_yaw_rate = _assert_course_attitude_state(
             host,
             yaw_reference_rad=yaw_reference_rad,
             limits=limits,
@@ -2101,6 +2105,17 @@ async def _run_visual_course_stage_impl(
             abort_type=abort_type,
             phase=f"{stage} pre-send",
         )
+        bounded_yaw = authority.yaw_rate_rad_s
+        if bounded_yaw != 0.0:
+            assert runtime.yaw_profile is not None
+            bounded_yaw = _limit_calibrated_yaw_request(
+                bounded_yaw,
+                excursion_rad=excursion,
+                measured_euler_yaw_rate_rad_s=euler_yaw_rate,
+                limits=limits,
+                profile=runtime.yaw_profile,
+                abort_type=abort_type,
+            )
         if float(runtime.monotonic()) >= coast_deadline_s:
             raise abort_type(
                 "visual-course censored passage coast expired"
@@ -2118,14 +2133,15 @@ async def _run_visual_course_stage_impl(
         command = AttitudeRateCommand(
             roll_rate=float(limited.roll_rate),
             pitch_rate=float(limited.pitch_rate),
-            yaw_rate=0.0,
+            yaw_rate=bounded_yaw,
             thrust=float(limited.thrust),
         )
         runtime.validate_command(command)
         if (
             max(abs(command.roll_rate), abs(command.pitch_rate))
             > limits.max_command_rate_rad_s + 1e-12
-            or command.yaw_rate != 0.0
+            or abs(command.yaw_rate)
+            > limits.max_yaw_rate_rad_s + 1e-12
             or command.thrust != authority.thrust
             or not limits.min_thrust <= command.thrust <= limits.max_thrust
         ):
@@ -3476,6 +3492,7 @@ async def _run_visual_course_stage_impl(
                             ),
                             target_roll_rad=accepted.target_roll_rad,
                             target_pitch_rad=accepted.target_pitch_rad,
+                            yaw_rate_rad_s=command.yaw_rate,
                             thrust=crossing_coast_thrust,
                         )
                     )

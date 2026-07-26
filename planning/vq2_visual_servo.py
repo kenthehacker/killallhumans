@@ -1339,15 +1339,28 @@ class ImageVisualServo:
         advance_enabled = forward_authority > 0.0
 
         # An adjacent preview is useful early, but it must not build lateral
-        # gate-frame momentum as the current aperture rapidly expands.  Taper
-        # only the preview contribution with the same continuous expansion
-        # and proximity authority used for closure.  Current-aperture error
-        # retains full yaw/roll authority, including after promotion.
+        # gate-frame momentum as the current aperture rapidly expands.  Bank
+        # therefore uses the full expansion/proximity taper, while heading
+        # uses its square root so the vehicle can begin turning before the
+        # physical occlusion.  Current-aperture error retains full yaw/roll
+        # authority, including after promotion.
+        yaw_horizontal = horizontal
+        yaw_horizontal_rate = horizontal_rate
         if blend > 0.0:
             assert next_target is not None
             preview_steering_authority = (
                 expansion_authority * proximity_authority
             )
+            yaw_blend = blend * math.sqrt(preview_steering_authority)
+            if next_horizontal is not None:
+                yaw_horizontal = (
+                    (1.0 - yaw_blend) * raw_horizontal
+                    + yaw_blend * next_horizontal
+                )
+                yaw_horizontal_rate = (
+                    (1.0 - yaw_blend) * raw_horizontal_rate
+                    + yaw_blend * float(next_target.normalized_x_rate_s)
+                )
             blend *= preview_steering_authority
             if next_horizontal is not None:
                 horizontal = (
@@ -1389,8 +1402,8 @@ class ImageVisualServo:
             brake_reason = "aligning"
 
         yaw_rate = _clamp(
-            -self.tuning.yaw_error_gain * horizontal
-            - self.tuning.yaw_rate_gain * horizontal_rate,
+            -self.tuning.yaw_error_gain * yaw_horizontal
+            - self.tuning.yaw_rate_gain * yaw_horizontal_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,
             MAX_VISUAL_YAW_RATE_RAD_S,
         )

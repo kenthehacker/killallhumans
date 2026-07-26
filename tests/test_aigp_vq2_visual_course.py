@@ -1143,6 +1143,7 @@ def test_crossing_loss_latches_only_after_credible_passage_and_holds():
     assert len(gate6_crossing_indices) == 2
     assert all(
         host.commands[index][0].thrust > 0.0
+        and host.commands[index][0].yaw_rate == pytest.approx(0.02)
         and host.commands[index][1].get("wire_visual_token") is not None
         for index in gate6_crossing_indices
     )
