@@ -328,6 +328,7 @@ class NearPlaneEvidence:
     """A homogeneous, strictly advancing expansion history."""
 
     samples: tuple[NearPlaneWireSample, ...] = ()
+    last_observed_sample: Optional[NearPlaneWireSample] = None
 
     def __post_init__(self) -> None:
         if type(self.samples) is not tuple:
@@ -336,7 +337,18 @@ class NearPlaneEvidence:
             raise TypeError(
                 "near-plane evidence must contain exact wire samples"
             )
+        if (
+            self.last_observed_sample is not None
+            and type(self.last_observed_sample) is not NearPlaneWireSample
+        ):
+            raise TypeError(
+                "near-plane continuity must contain an exact wire sample"
+            )
         if not self.samples:
+            if self.last_observed_sample is not None:
+                raise ValueError(
+                    "near-plane continuity lacks qualified evidence"
+                )
             return
         first = self.samples[0]
         previous = first
@@ -376,6 +388,44 @@ class NearPlaneEvidence:
                     "near-plane evidence lost its expansion trend"
                 )
             previous = sample
+        observed = self.last_observed_sample
+        if observed is None or observed == previous:
+            return
+        if (
+            observed.gate_index != first.gate_index
+            or observed.track_id != first.track_id
+            or not _same_camera_epoch(
+                observed.camera_token,
+                first.camera_token,
+            )
+        ):
+            raise ValueError(
+                "near-plane continuity crossed its gate, track, or epoch"
+            )
+        if (
+            not _token_strictly_newer(
+                observed.camera_token,
+                previous.camera_token,
+            )
+            or observed.observation_monotonic_ns
+            <= previous.observation_monotonic_ns
+            or observed.publication_monotonic_ns
+            <= previous.publication_monotonic_ns
+            or observed.wire_start_monotonic_ns
+            <= previous.wire_start_monotonic_ns
+            or observed.wire_return_monotonic_ns
+            <= previous.wire_return_monotonic_ns
+        ):
+            raise ValueError(
+                "near-plane continuity did not strictly advance"
+            )
+        if (
+            float(observed.log_scale_rate_s) <= 0.0
+            or float(observed.log_scale) <= float(previous.log_scale)
+        ):
+            raise ValueError(
+                "near-plane continuity lost its expansion trend"
+            )
 
     @property
     def gate_index(self) -> Optional[int]:
@@ -464,6 +514,26 @@ def _observable_axis_unsafe(
     )
 
 
+def _wire_sample_hard_safe(
+    sample: NearPlaneWireSample,
+    *,
+    min_track_confidence: float,
+    min_association_confidence: float,
+) -> bool:
+    x = float(sample.normalized_x)
+    y = float(sample.normalized_y_down)
+    return bool(
+        sample.clipping == FrameEdge.NONE
+        and not sample.center_censored
+        and not sample.ambiguous
+        and float(sample.confidence) >= min_track_confidence
+        and float(sample.association_confidence)
+        >= min_association_confidence
+        and abs(x) <= PREPASS_CURRENT_MAX_ABS_X_NORM
+        and abs(y) <= PREPASS_CURRENT_MAX_ABS_Y_NORM
+    )
+
+
 def _wire_sample_usable(
     sample: NearPlaneWireSample,
     *,
@@ -476,12 +546,11 @@ def _wire_sample_usable(
     y_rate = float(sample.normalized_y_rate_down_s)
     scale_rate = float(sample.log_scale_rate_s)
     return bool(
-        sample.clipping == FrameEdge.NONE
-        and not sample.center_censored
-        and not sample.ambiguous
-        and float(sample.confidence) >= min_track_confidence
-        and float(sample.association_confidence)
-        >= min_association_confidence
+        _wire_sample_hard_safe(
+            sample,
+            min_track_confidence=min_track_confidence,
+            min_association_confidence=min_association_confidence,
+        )
         and not _observable_axis_unsafe(
             value=x,
             rate=x_rate,
@@ -533,18 +602,12 @@ def advance_near_plane_evidence(
         min_association_confidence,
         "minimum association confidence",
     )
-    if not _wire_sample_usable(
-        sample,
-        min_track_confidence=track_floor,
-        min_association_confidence=association_floor,
-    ):
-        return NearPlaneEvidence(), None
-
-    retained: tuple[NearPlaneWireSample, ...]
-    if not evidence.samples:
-        retained = (sample,)
-    else:
-        previous = evidence.samples[-1]
+    previous: Optional[NearPlaneWireSample] = None
+    if evidence.samples:
+        previous = (
+            evidence.last_observed_sample
+            or evidence.samples[-1]
+        )
         same_lineage = bool(
             sample.gate_index == previous.gate_index
             and sample.track_id == previous.track_id
@@ -569,6 +632,41 @@ def advance_near_plane_evidence(
         )
         if not same_lineage or not strictly_advancing:
             return NearPlaneEvidence(), None
+
+    hard_safe = _wire_sample_hard_safe(
+        sample,
+        min_track_confidence=track_floor,
+        min_association_confidence=association_floor,
+    )
+    if not hard_safe:
+        return NearPlaneEvidence(), None
+
+    usable = _wire_sample_usable(
+        sample,
+        min_track_confidence=track_floor,
+        min_association_confidence=association_floor,
+    )
+    if not usable:
+        if (
+            previous is not None
+            and float(sample.log_scale_rate_s) > 0.0
+            and float(sample.log_scale) > float(previous.log_scale)
+        ):
+            # A high-rate or projected-center transient is not itself latch
+            # evidence, but it also does not erase prior accepted samples
+            # while the same hard-safe aperture continues to expand.  This
+            # permits a later qualified 30 Hz publication to complete the
+            # multi-frame latch without pretending the transient was clean.
+            return NearPlaneEvidence(
+                samples=evidence.samples,
+                last_observed_sample=sample,
+            ), None
+        return NearPlaneEvidence(), None
+
+    retained: tuple[NearPlaneWireSample, ...]
+    if previous is None:
+        retained = (sample,)
+    else:
         if float(sample.log_scale) <= float(previous.log_scale):
             retained = (sample,)
         else:
@@ -576,7 +674,10 @@ def advance_near_plane_evidence(
 
     if len(retained) > required_corridor_frames:
         retained = retained[-required_corridor_frames:]
-    advanced = NearPlaneEvidence(samples=retained)
+    advanced = NearPlaneEvidence(
+        samples=retained,
+        last_observed_sample=sample,
+    )
     if (
         len(advanced.samples) < required_corridor_frames
         or float(advanced.samples[-1].log_scale)

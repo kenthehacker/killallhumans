@@ -468,7 +468,7 @@ def test_high_raw_center_rate_inside_projected_corridor_latches_and_coasts():
     )
 
 
-def test_projected_divergence_cannot_latch_but_does_not_revoke_safe_latch():
+def test_projected_divergence_does_not_count_or_erase_safe_evidence():
     evidence = NearPlaneEvidence()
     latch = None
     for sample in _LATEST_NEAR_PLANE[:2]:
@@ -506,7 +506,7 @@ def test_projected_divergence_cannot_latch_but_does_not_revoke_safe_latch():
         min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
     )
 
-    assert evidence.samples == ()
+    assert evidence.samples == _LATEST_NEAR_PLANE[:2]
     assert latch is None
 
     _evidence, safe_latch = _advance(_LATEST_NEAR_PLANE)
@@ -524,6 +524,99 @@ def test_projected_divergence_cannot_latch_but_does_not_revoke_safe_latch():
         classify_latched_measurement(safe_latch, **facts)
         is LatchedMeasurementMode.COAST
     )
+
+
+def test_run_8c5e_transients_do_not_require_exact_adjacent_latch_frames():
+    rows = (
+        (-0.18125, -0.105556, -0.0213, 0.3203, 0.4218, 1.225),
+        (-0.1875, -0.088889, -0.1095, 0.4105, 0.4458, 1.435),
+        (-0.190625, -0.066667, -0.0989367, 0.538, 0.4739, 1.618),
+        (-0.103125, -0.055556, 1.6805, 0.4611, 0.5462, 3.527),
+        (-0.103125, -0.038889, 0.7562, 0.4723, 0.5767, 2.451),
+        (-0.1125, -0.022222, 0.1909, 0.4782, 0.6074, 1.930),
+    )
+    samples = tuple(
+        _sample(
+            frame_id=3_244_380 + index,
+            publication=157 + index,
+            observation_ns=1_000_000_000 + index * 33_000_000,
+            publication_ns=1_001_000_000 + index * 33_000_000,
+            wire_start_ns=1_020_000_000 + index * 33_000_000,
+            wire_return_ns=1_021_000_000 + index * 33_000_000,
+            x=row[0],
+            y=row[1],
+            x_rate=row[2],
+            y_rate=row[3],
+            apparent_scale=row[4],
+            log_scale_rate=row[5],
+            confidence=0.95,
+            association_confidence=0.85,
+            command=(0.0, 0.035, 0.15, 0.25),
+        )
+        for index, row in enumerate(rows)
+    )
+    assert abs(
+        samples[2].normalized_x
+        + samples[2].normalized_x_rate_s * 0.10
+    ) > 0.20
+    assert samples[3].log_scale_rate_s > 2.0
+    assert samples[4].log_scale_rate_s > 2.0
+
+    evidence = NearPlaneEvidence()
+    latch = None
+    retained_counts = []
+    continuity_publications = []
+    for sample in samples:
+        evidence, latch = advance_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+        retained_counts.append(len(evidence.samples))
+        continuity_publications.append(
+            None
+            if evidence.last_observed_sample is None
+            else (
+                evidence.last_observed_sample
+                .camera_token.publication_sequence
+            )
+        )
+
+    assert retained_counts == [1, 2, 2, 2, 2, 3]
+    assert continuity_publications == [157, 158, 159, 160, 161, 162]
+    assert latch is not None
+    assert [
+        sample.camera_token.publication_sequence
+        for sample in latch.evidence.samples
+    ] == [157, 158, 162]
+
+    evidence = NearPlaneEvidence()
+    for sample in samples[:3]:
+        evidence, _latch = advance_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+    regressed_scale = replace(
+        samples[3],
+        log_scale=samples[2].log_scale - 0.01,
+    )
+    evidence, latch = advance_near_plane_evidence(
+        evidence,
+        regressed_scale,
+        required_corridor_frames=_REQUIRED_FRAMES,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+    assert evidence.samples == ()
+    assert latch is None
 
 
 @pytest.mark.parametrize(
@@ -852,15 +945,15 @@ def test_duplicate_wire_publication_does_not_count_twice():
         {"clipping": FrameEdge.BOTTOM, "center_censored": True},
         {"ambiguous": True},
         {"confidence": 0.19},
-        {"log_scale_rate_s": 2.01},
         {"normalized_x": 0.21},
     ),
 )
-def test_unusable_clean_wire_fact_cannot_advance_latch(changed):
-    sample = replace(_LATEST_NEAR_PLANE[0], **changed)
+def test_hard_unsafe_wire_fact_clears_prior_latch_evidence(changed):
+    evidence = NearPlaneEvidence(samples=_LATEST_NEAR_PLANE[:2])
+    sample = replace(_LATEST_NEAR_PLANE[2], **changed)
 
     evidence, latch = advance_near_plane_evidence(
-        NearPlaneEvidence(),
+        evidence,
         sample,
         required_corridor_frames=_REQUIRED_FRAMES,
         crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
