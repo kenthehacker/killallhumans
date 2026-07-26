@@ -58,6 +58,7 @@ from planning.vq2_visual_approach import (
 )
 from planning.vq2_visual_servo import (
     MAX_NEXT_GATE_BLEND,
+    MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_TARGET_ROLL_RAD,
     MAX_VISUAL_SEGMENT_DURATION_S,
@@ -421,7 +422,7 @@ class VisualCourseStageLimits:
     max_measured_pitch_rad: float = 0.15
     max_abs_measured_body_rate_rad_s: float = 0.50
     max_segment_yaw_excursion_rad: float = (
-        YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD
+        MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD
     )
     max_measured_yaw_rate_rad_s: float = 0.50
     min_thrust: float = MIN_VISUAL_THRUST
@@ -518,7 +519,7 @@ class VisualCourseStageLimits:
                 "visual-course measured body-rate bound is invalid"
             )
         if not 0.01 <= self.max_segment_yaw_excursion_rad <= (
-            YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD
+            MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD
         ):
             raise ValueError("visual-course yaw excursion bound is invalid")
         if not 0.0 < self.max_measured_yaw_rate_rad_s <= 0.50:
@@ -782,8 +783,6 @@ class VisualCourseStageRuntime:
         if self.yaw_profile is not None and (
             self.limits.max_yaw_rate_rad_s
             > self.yaw_profile.max_abs_yaw_rate_command_rad_s
-            or self.limits.max_segment_yaw_excursion_rad
-            > self.yaw_profile.max_attitude_excursion_rad
             or self.limits.max_measured_yaw_rate_rad_s
             > self.yaw_profile.max_abs_measured_yaw_rate_rad_s
         ):
@@ -992,10 +991,12 @@ def _limit_calibrated_yaw_request(
     response_reserve_rad = (
         observed_peak_rate * profile.control_hold_horizon_s
     )
-    hard_boundary_rad = min(
-        limits.max_segment_yaw_excursion_rad,
-        profile.max_attitude_excursion_rad,
-    )
+    # The tracked profile identifies yaw sign, command rate, response delay,
+    # and measured rate.  Its 0.05-rad excursion bounded the pad-loaded
+    # calibration experiment; it is not a free-flight course-heading limit.
+    # Course heading remains independently bounded by the visual controller's
+    # immutable per-segment envelope.
+    hard_boundary_rad = limits.max_segment_yaw_excursion_rad
     soft_boundary_rad = hard_boundary_rad - response_reserve_rad
     if (
         not math.isfinite(soft_boundary_rad)

@@ -32,6 +32,7 @@ from planning.vq2_visual_approach import (
 )
 from planning.vq2_visual_servo import (
     ImageVisualServo,
+    MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     PassageSafetyViolation,
     PassageSafetyViolationDetail,
     ServoFrameToken,
@@ -2396,6 +2397,10 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
     assert profile.plan_sha256 == YAW_CALIBRATION_PLAN_SHA256
     assert profile.max_attitude_excursion_rad == 0.05
     assert profile.max_abs_measured_yaw_rate_rad_s == 0.5
+    assert (
+        VisualCourseStageLimits().max_segment_yaw_excursion_rad
+        == MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD
+    )
     with pytest.raises(TypeError, match="tracked loader"):
         VisualCourseYawProfile(
             issuer=object(),
@@ -2423,6 +2428,11 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
             "discrete bounds",
         ),
         ("post_credit_fresh_frame_timeout_s", 0.21, "fresh-frame"),
+        (
+            "max_segment_yaw_excursion_rad",
+            MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD + 0.001,
+            "yaw excursion",
+        ),
     ),
 )
 def test_course_limits_refuse_widened_safety_envelopes(
@@ -2496,9 +2506,9 @@ def test_yaw_delayed_projection_at_soft_boundary_zeroes_outward(direction):
     soft_boundary = (
         limits.max_segment_yaw_excursion_rad - response_reserve
     )
-    excursion = direction * 0.005
+    excursion = direction * (soft_boundary - 0.01)
     rate_to_boundary = direction * (
-        (soft_boundary - abs(excursion)) / profile.max_gyro_response_delay_s
+        0.01 / profile.max_gyro_response_delay_s
         + 1e-9
     )
 
@@ -2529,9 +2539,9 @@ def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
     soft_boundary = (
         limits.max_segment_yaw_excursion_rad - response_reserve
     )
-    excursion = 0.005
+    excursion = soft_boundary - 0.01
     rate_to_soft_stop = (
-        (soft_boundary - excursion) / profile.max_gyro_response_delay_s
+        0.01 / profile.max_gyro_response_delay_s
         + 1e-6
     )
 
@@ -2586,16 +2596,20 @@ def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
 
 
 @pytest.mark.parametrize(
-    ("excursion", "yaw_rate"),
+    ("direction", "yaw_rate"),
     (
-        (0.024, 0.22243007003911772),
-        (0.001, -0.50),
+        (1.0, 0.22243007003911772),
+        (-1.0, -0.50),
     ),
 )
 def test_measured_yaw_momentum_projects_outside_hard_boundary(
-    excursion,
+    direction,
     yaw_rate,
 ):
+    limits = VisualCourseStageLimits()
+    excursion = direction * (
+        limits.max_segment_yaw_excursion_rad - 0.01
+    )
     host = _Host()
     _set_attitude(host, yaw=excursion, rates=(0.0, 0.0, yaw_rate))
 
@@ -2603,7 +2617,7 @@ def test_measured_yaw_momentum_projects_outside_hard_boundary(
         course_stage._assert_course_attitude_state(
             host,
             yaw_reference_rad=0.0,
-            limits=VisualCourseStageLimits(),
+            limits=limits,
             yaw_profile=_yaw_profile(),
             abort_type=SafetyAbort,
             phase="regression",
@@ -2611,12 +2625,13 @@ def test_measured_yaw_momentum_projects_outside_hard_boundary(
 
 
 def test_cross_axis_body_rates_use_exact_euler_yaw_kinematics():
+    limits = VisualCourseStageLimits()
     host = _Host()
     _set_attitude(
         host,
         roll=0.18,
         pitch=-0.35,
-        yaw=0.02,
+        yaw=-(limits.max_segment_yaw_excursion_rad - 0.01),
         rates=(0.0, -0.5, -0.5),
     )
 
@@ -2624,7 +2639,7 @@ def test_cross_axis_body_rates_use_exact_euler_yaw_kinematics():
         course_stage._assert_course_attitude_state(
             host,
             yaw_reference_rad=0.0,
-            limits=VisualCourseStageLimits(),
+            limits=limits,
             yaw_profile=_yaw_profile(),
             abort_type=SafetyAbort,
             phase="cross-axis-regression",
@@ -2682,20 +2697,25 @@ def test_repeated_same_sign_yaw_requests_zero_before_hard_boundary():
             profile.observed_max_abs_measured_yaw_rate_rad_s
             * limits.control_period_s
         )
-        assert admitted < 20
+        assert admitted < 200
 
     assert admitted > 0
     assert excursion < limits.max_segment_yaw_excursion_rad
 
 
 def test_duplicate_camera_frame_cannot_hide_new_unsafe_attitude():
+    limits = VisualCourseStageLimits()
+
     class DuplicateUnsafeHost(_Host):
         sample_count = 0
 
         def _sample(self):
             self.sample_count += 1
             if self.sample_count == 2:
-                _set_attitude(self, yaw=0.050001)
+                _set_attitude(
+                    self,
+                    yaw=limits.max_segment_yaw_excursion_rad + 0.000001,
+                )
                 return
             super()._sample()
 
@@ -2924,10 +2944,15 @@ def test_command_slot_wait_cannot_invalidate_attitude_guard():
 
 
 def test_terminal_race_finish_checks_attitude_before_success_return():
+    limits = VisualCourseStageLimits()
+
     class TerminalUnsafeHost(_Host):
         def _visual_race_status_ref(self):
             if self.race.race_finished:
-                _set_attitude(self, yaw=-0.050001)
+                _set_attitude(
+                    self,
+                    yaw=-(limits.max_segment_yaw_excursion_rad + 0.000001),
+                )
             return self.race
 
     host = TerminalUnsafeHost(initial_gate=4, finish_gate=4)

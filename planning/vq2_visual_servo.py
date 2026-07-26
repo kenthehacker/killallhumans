@@ -184,7 +184,7 @@ class VisualServoTuning:
     # behind a 0.25 bearing blend produced only about 0.012 rad/s of preview
     # yaw and left the promoted track moving outward at 0.304-0.349 norm/s.
     # Use the reviewed tuning ceiling so the generic servo can exploit the
-    # separately immutable 0.08 rad/s rate and 0.18 rad excursion envelopes.
+    # separately immutable yaw-rate and course-turn heading envelopes.
     yaw_error_gain: float = 0.30
     yaw_rate_gain: float = 0.035
     # Roll authority remains zero in schema /1.  Existing live evidence has a
