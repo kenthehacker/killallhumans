@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping
 
 
 YAW_CAPABILITY_PLAN_SCHEMA = "aigp-vq2-yaw-capability-plan/1"
-YAW_CAPABILITY_PLAN_ID = "vq2-build3385-training-free-flight-yaw-sweep-v1"
+YAW_CAPABILITY_PLAN_ID = "vq2-build3385-training-free-flight-yaw-sweep-v2"
 YAW_CAPABILITY_CONTROL_PERIOD_NS = 20_000_000
 YAW_CAPABILITY_TICK_COUNT = 45
 YAW_CAPABILITY_NOMINAL_END_OFFSET_NS = 900_000_000
@@ -23,7 +23,7 @@ YAW_CAPABILITY_HARD_EXPIRY_OFFSET_NS = 1_000_000_000
 YAW_CAPABILITY_TARGET_ROLL_RAD = 0.0
 YAW_CAPABILITY_TARGET_PITCH_RAD = 0.05
 YAW_CAPABILITY_THRUST = 0.285
-YAW_CAPABILITY_LEVELS_RAD_S = (0.10,)
+YAW_CAPABILITY_LEVELS_RAD_S = (0.12,)
 
 
 class YawCapabilityPlanError(ValueError):
@@ -51,10 +51,10 @@ _PLAN_LITERAL: dict[str, Any] = {
             "yaw_rate_rad_s": 0.0,
         },
         {
-            "segment_id": "yaw-positive-0p10",
+            "segment_id": "yaw-positive-0p12",
             "first_tick": 12,
             "last_tick": 22,
-            "yaw_rate_rad_s": 0.10,
+            "yaw_rate_rad_s": 0.12,
         },
         {
             "segment_id": "neutral-reversal",
@@ -63,10 +63,10 @@ _PLAN_LITERAL: dict[str, Any] = {
             "yaw_rate_rad_s": 0.0,
         },
         {
-            "segment_id": "yaw-negative-0p10",
+            "segment_id": "yaw-negative-0p12",
             "first_tick": 29,
             "last_tick": 39,
-            "yaw_rate_rad_s": -0.10,
+            "yaw_rate_rad_s": -0.12,
         },
         {
             "segment_id": "neutral-terminal",
@@ -80,7 +80,7 @@ _PLAN_LITERAL: dict[str, Any] = {
 # SHA-256 of the canonical JSON object above.  A plan edit must update this
 # literal so every compact live manifest binds the exact waveform.
 YAW_CAPABILITY_PLAN_SHA256 = (
-    "1e813cf4acd8ceb5b4c3e7491e5c4b6a8837544d126d3ad9397a7c9b9c3c4d41"
+    "06903f918dd89ddd41f684eb68280631efefedfe8bf0a22a320650cccc93d48d"
 )
 
 

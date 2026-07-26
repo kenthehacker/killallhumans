@@ -66,7 +66,7 @@ free-flight tier leaves production visual-course authority unchanged.  It:
 1. uses a `0.80 s` lift and the existing `+0.10 rad` braking-attitude ceiling
    to leave the pad without carrying the rejected closure into Gate 0;
 2. holds zero roll, `+0.05 rad` pitch, and `0.285` collective;
-3. sends one symmetric `+/-0.10 rad/s` yaw pair with neutral dwells and exact
+3. sends one symmetric `+/-0.12 rad/s` yaw pair with neutral dwells and exact
    50 Hz pacing;
 4. records exact controller and wire commands, body rates, attitude, target
    motion, response delay, gain, and roll/pitch coupling;
@@ -80,6 +80,14 @@ coupling, target motion, collision, and cleanup result.  A successful series
 may justify a new conservative yaw profile below the largest clean,
 responsive level. The same method then characterizes roll, pitch, and thrust
 before those historical stage caps are treated as production capability.
+
+The preceding `+/-0.10 rad/s` tier completed at
+`20260726T105833Z-calibration-excite-d7293c29`: all 45 slots were sent,
+absolute peak body yaw was `+0.280/-0.275 rad/s`, yaw image motion was about
+`+9/-8 px` over the pulse windows, roll-rate coupling stayed below
+`0.0046 rad/s`, and no collision or broad-watchdog limit occurred. The
+`+/-0.12` tier above is conditional follow-up evidence; it still does not
+widen production visual-course authority by itself.
 
 ## Continuous authority-allocation target
 

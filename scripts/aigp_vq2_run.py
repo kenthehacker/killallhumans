@@ -12816,11 +12816,16 @@ class VQ2Runner:
             command_yaw = float(row["command_yaw_rate_rad_s"])
             direction = 1.0 if command_yaw > 0.0 else -1.0
             samples = list(row["samples"])
+            local_baseline_yaw_rate = (
+                float(samples[0]["body_rates_rad_s"][2])
+                if samples
+                else baseline_yaw_rate
+            )
             signed_responses = [
                 direction
                 * (
                     float(sample["body_rates_rad_s"][2])
-                    - baseline_yaw_rate
+                    - local_baseline_yaw_rate
                 )
                 for sample in samples
             ]
@@ -12839,6 +12844,8 @@ class VQ2Runner:
                         first_sample["imu_received_monotonic_ns"]
                     )
                     is int
+                    and first_sample["imu_received_monotonic_ns"]
+                    >= first_wire_ns
                 ):
                     response_delay_s = max(
                         0.0,
@@ -12853,6 +12860,9 @@ class VQ2Runner:
                 {
                     "segment_id": segment_id,
                     "command_yaw_rate_rad_s": command_yaw,
+                    "local_baseline_yaw_rate_rad_s": (
+                        local_baseline_yaw_rate
+                    ),
                     "wire_yaw_rate_rad_s": statistics.fmean(
                         row["wire_yaw_rates_rad_s"]
                     ),
