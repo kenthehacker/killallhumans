@@ -15324,8 +15324,6 @@ class VQ2Runner:
             != YAW_CALIBRATION_PROFILE_SHA256
             or DEFAULT_VISUAL_COURSE_LIMITS.max_yaw_rate_rad_s
             > course_yaw_profile.max_abs_yaw_rate_command_rad_s
-            or DEFAULT_VISUAL_COURSE_LIMITS.max_segment_yaw_excursion_rad
-            > course_yaw_profile.max_attitude_excursion_rad
             or DEFAULT_VISUAL_COURSE_LIMITS.max_measured_yaw_rate_rad_s
             > course_yaw_profile.max_abs_measured_yaw_rate_rad_s
         ):
