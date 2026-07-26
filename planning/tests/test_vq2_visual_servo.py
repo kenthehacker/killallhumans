@@ -369,8 +369,8 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
         requested_next_blend=0.3,
     )
     assert blended.next_gate_blend == pytest.approx(0.3)
-    assert blended.yaw_rate_rad_s < -0.05
-    assert blended.target_roll_rad > 0.03
+    assert blended.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
+    assert 0.0 < blended.target_roll_rad < 0.03
     assert blended.target_pitch_rad > servo.tuning.advance_pitch_rad
     assert blended.thrust < servo.tuning.advance_thrust
 
@@ -1335,7 +1335,7 @@ def test_broad_passage_preview_cannot_gain_forward_authority() -> None:
     assert output.target_pitch_rad >= 0.0
 
 
-def test_passage_retains_lateral_preview_through_vertical_scale_degradation() -> None:
+def test_passage_retains_heading_through_vertical_scale_degradation() -> None:
     servo = ImageVisualServo()
     _latch_passage_blend(servo)
 
@@ -1364,8 +1364,8 @@ def test_passage_retains_lateral_preview_through_vertical_scale_degradation() ->
     assert output.next_gate_blend == 0.0
     assert output.next_horizontal_error == pytest.approx(0.31875)
     assert output.next_vertical_error_image_down is None
-    assert output.yaw_rate_rad_s < 0.0
-    assert output.target_roll_rad > 0.04
+    assert output.yaw_rate_rad_s < -0.05
+    assert abs(output.target_roll_rad) < 0.02
     assert not output.advance_enabled
     assert not output.passage_preview_retired
     assert output.passage_preview_retirement_violations == ()

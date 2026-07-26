@@ -1236,40 +1236,53 @@ class ImageVisualServo:
             # Passage admission has already established one exact, stable
             # successor identity.  Allocate its heading authority from the
             # current aperture's horizontal margin rather than multiplying
-            # the scale ramp twice.  Yaw keeps the conservative 0.35 share;
-            # bank uses all remaining projected corridor so lateral
-            # interception starts early and unwinds before the current edge.
+            # the scale ramp twice.  Two independent current-gate barriers
+            # make yaw unwind before either measured or projected position
+            # spends the aperture.  Bank builds the early spatial intercept
+            # and then returns continuously to current-only as passage scale
+            # progress approaches the near plane.
             projected_current_horizontal = (
                 raw_horizontal
                 + raw_horizontal_rate
                 * PREPASS_CURRENT_PROJECTION_HORIZON_S
             )
-            heading_authority = _clamp(
-                MAX_NEXT_GATE_BLEND
-                * (
-                    1.0
-                    - abs(projected_current_horizontal)
-                    / self.tuning.horizontal_corridor
-                ),
+            current_position_authority = _clamp(
+                1.0
+                - abs(raw_horizontal)
+                / self.tuning.horizontal_corridor,
                 0.0,
-                MAX_NEXT_GATE_BLEND,
+                1.0,
             )
-            assert next_target is not None
-            heading_horizontal = (
-                (1.0 - heading_authority) * raw_horizontal
-                + heading_authority * next_horizontal
-            )
-            heading_horizontal_rate = (
-                (1.0 - heading_authority) * raw_horizontal_rate
-                + heading_authority
-                * float(next_target.normalized_x_rate_s)
-            )
-            bank_authority = _clamp(
+            current_projection_authority = _clamp(
                 1.0
                 - abs(projected_current_horizontal)
                 / self.tuning.horizontal_corridor,
                 0.0,
                 1.0,
+            )
+            current_barrier_authority = (
+                current_position_authority
+                * current_projection_authority
+            )
+            assert next_target is not None
+            heading_horizontal = (
+                (1.0 - current_barrier_authority) * raw_horizontal
+                + current_barrier_authority * next_horizontal
+            )
+            heading_horizontal_rate = (
+                (1.0 - current_barrier_authority)
+                * raw_horizontal_rate
+                + current_barrier_authority
+                * float(next_target.normalized_x_rate_s)
+            )
+            passage_scale_progress = _clamp(
+                blend / MAX_NEXT_GATE_BLEND,
+                0.0,
+                1.0,
+            )
+            bank_authority = (
+                current_barrier_authority
+                * (1.0 - passage_scale_progress)
             )
             bank_horizontal = (
                 (1.0 - bank_authority) * raw_horizontal
