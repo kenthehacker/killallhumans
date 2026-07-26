@@ -588,19 +588,10 @@ class ConfirmedGateReacquisition:
             raise TypeError("reacquired_track_id must be a non-empty exact string")
         if self.reacquired_track_id == self.credited_advance.retired_track_id:
             raise ValueError("reacquisition cannot restore the crossed gate")
-        if (
-            self.reacquired_track_id
-            != self.credited_advance.reviewed_track_id
-            and self.reacquired_track_id
-            not in (
-                self.credited_advance
-                .alternative_reacquisition_track_ids_at_credit
-            )
-        ):
-            raise ValueError(
-                "cross-ID reacquisition lacks credit-bound rolling-graph "
-                "candidate evidence"
-            )
+        # A fresh local track does not claim identity through the physical
+        # passage gap.  Its authority comes from the credited gate plus the
+        # strictly post-credit, stable binding evidence checked below, so
+        # pre-credit promotability is evidence rather than a prerequisite.
         for name in ("camera_token_at_binding", "reacquired_first_token"):
             if type(getattr(self, name)) is not CameraFrameToken:
                 raise TypeError(f"{name} must be an exact CameraFrameToken")

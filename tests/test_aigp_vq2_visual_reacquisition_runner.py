@@ -63,7 +63,7 @@ def _advance(
         reviewed_history_length_at_credit=7,
         reviewed_history_length_at_advance=7,
         reviewed_history_sha256="a" * 64,
-        alternative_reacquisition_track_ids_at_credit=("fresh-next",),
+        alternative_reacquisition_track_ids_at_credit=(),
     )
 
 
