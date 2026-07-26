@@ -1220,11 +1220,14 @@ class ImageVisualServo:
                 * PREPASS_CURRENT_PROJECTION_HORIZON_S
             )
             heading_authority = _clamp(
-                1.0
-                - abs(projected_current_horizontal)
-                / self.tuning.horizontal_corridor,
+                MAX_NEXT_GATE_BLEND
+                * (
+                    1.0
+                    - abs(projected_current_horizontal)
+                    / self.tuning.horizontal_corridor
+                ),
                 0.0,
-                1.0,
+                MAX_NEXT_GATE_BLEND,
             )
             assert next_target is not None
             heading_horizontal = (

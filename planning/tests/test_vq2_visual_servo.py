@@ -369,8 +369,8 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
         requested_next_blend=0.3,
     )
     assert blended.next_gate_blend == pytest.approx(0.3)
-    assert blended.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
-    assert blended.target_pitch_rad > 0.0
+    assert blended.yaw_rate_rad_s < -0.05
+    assert blended.target_pitch_rad > servo.tuning.advance_pitch_rad
     assert blended.thrust < servo.tuning.advance_thrust
 
     servo.reset_segment()
@@ -1825,7 +1825,7 @@ def test_default_gain_uses_more_heading_authority_on_latest_live_prepass_frame()
 
     assert output.next_gate_blend == pytest.approx(0.35)
     assert output.effective_horizontal_error == pytest.approx(0.1128125)
-    assert output.yaw_rate_rad_s < -0.095
+    assert -MAX_VISUAL_YAW_RATE_RAD_S <= output.yaw_rate_rad_s < -0.03
     assert output.target_pitch_rad >= 0.0
     assert output.advance_enabled is False
 
