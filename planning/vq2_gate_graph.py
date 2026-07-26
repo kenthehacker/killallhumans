@@ -1279,7 +1279,7 @@ class RollingVisualGateGraph:
             tuple[VisualTrack, tuple[VisualTrackSample, ...]]
         ] = []
         for track in update.tracks:
-            stable_tail = _reacquisition_stable_tail(
+            stable_tail = _reacquisition_observable_tail(
                 track,
                 camera_token_at_binding=camera_token_at_binding,
                 required_frames=self.config.min_current_binding_frames,
@@ -1295,7 +1295,7 @@ class RollingVisualGateGraph:
                 local_candidates.append((track, stable_tail))
         if not local_candidates:
             raise GateReacquisitionNotReadyError(
-                "no unique clean local successor is ready for reacquisition"
+                "no unique observable local successor is ready for reacquisition"
             )
         if len(local_candidates) > 1:
             raise AmbiguousGateReacquisitionError(
@@ -2316,7 +2316,7 @@ def _pretracked_candidate_evidence(
     )
 
 
-def _reacquisition_stable_tail(
+def _reacquisition_observable_tail(
     track: VisualTrack,
     *,
     camera_token_at_binding: CameraFrameToken,
@@ -2324,7 +2324,7 @@ def _reacquisition_stable_tail(
     min_track_confidence: float,
     min_association_confidence: float,
 ) -> Optional[tuple[VisualTrackSample, ...]]:
-    """Return the exact local-ID tail eligible for credited reacquisition."""
+    """Return a clean or single-edge local tail eligible for reacquisition."""
 
     if (
         track.role is VisualTrackRole.RETIRED
@@ -2333,20 +2333,47 @@ def _reacquisition_stable_tail(
         or track.ambiguous
         or track.missed_frame_count != 0
         or track.latest_token != camera_token_at_binding
-        or track.clipping != FrameEdge.NONE
-        or track.center_censored
+        or track.clipping
+        not in {
+            FrameEdge.NONE,
+            FrameEdge.LEFT,
+            FrameEdge.TOP,
+            FrameEdge.RIGHT,
+            FrameEdge.BOTTOM,
+        }
+        or (
+            track.clipping == FrameEdge.NONE
+            and track.center_censored
+        )
         or track.consecutive_frame_count < required_frames
         or track.confidence < min_track_confidence
         or track.association_confidence < min_association_confidence
         or len(track.history) < required_frames
     ):
         return None
+    if track.clipping != FrameEdge.NONE:
+        observable_axis = (
+            0
+            if track.clipping in {FrameEdge.TOP, FrameEdge.BOTTOM}
+            else 1
+        )
+        if (
+            not math.isfinite(float(track.center_norm[observable_axis]))
+            or abs(float(track.center_norm[observable_axis])) > 1.0
+            or not math.isfinite(
+                float(track.center_velocity_norm_s[observable_axis])
+            )
+        ):
+            return None
     tail = track.history[-required_frames:]
     if tail[-1].token != camera_token_at_binding:
         return None
     if any(
-        sample.clipping != FrameEdge.NONE
-        or sample.center_censored
+        sample.clipping not in {FrameEdge.NONE, track.clipping}
+        or (
+            sample.clipping == FrameEdge.NONE
+            and sample.center_censored
+        )
         or sample.confidence < min_track_confidence
         or sample.association_confidence < min_association_confidence
         or (

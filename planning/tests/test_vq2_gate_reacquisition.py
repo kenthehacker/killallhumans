@@ -490,14 +490,40 @@ def test_reacquisition_rejects_newer_token_not_observed_after_race_receipt() -> 
     )
 
 
-def test_reacquisition_rejects_censored_sample_inside_stable_tail() -> None:
+def test_reacquisition_accepts_clean_to_one_edge_observable_tail() -> None:
     state = _prepare_cross_id_credited_unbound()
     for sequence in range(22, 25):
         detection = _successor_detection(sequence)
-        if sequence == 22:
+        if sequence == 24:
             detection = replace(
                 detection,
                 clipping=FrameEdge.TOP,
+                center_censored=True,
+            )
+        binding_frame = _frame(sequence, (detection,))
+        state.tracker.update(binding_frame)
+        state.graph.observe(state.tracker)
+
+    outcome = state.graph.confirm_reacquired_current(
+        state.tracker,
+        credited_advance=state.advance,
+        camera_token_at_binding=binding_frame.token,
+    )
+
+    assert type(outcome) is ConfirmedGateReacquisition
+    assert outcome.reacquired_track_id == state.successor_track_ids[0]
+    assert outcome.stable_frame_tokens[-1] == binding_frame.token
+    assert not outcome.cross_gap_identity_claimed
+
+
+def test_reacquisition_rejects_multi_edge_censored_tail() -> None:
+    state = _prepare_cross_id_credited_unbound()
+    for sequence in range(22, 25):
+        detection = _successor_detection(sequence)
+        if sequence == 24:
+            detection = replace(
+                detection,
+                clipping=FrameEdge.TOP | FrameEdge.RIGHT,
                 center_censored=True,
             )
         binding_frame = _frame(sequence, (detection,))
@@ -514,7 +540,7 @@ def test_reacquisition_rejects_censored_sample_inside_stable_tail() -> None:
 
     assert type(outcome) is GateReacquisitionPending
     assert not outcome.ambiguous
-    assert "no unique clean local successor" in outcome.reason
+    assert "no unique observable local successor" in outcome.reason
     assert state.tracker.tracks() == tracks_before
     assert state.graph.latest_snapshot == snapshot_before
 

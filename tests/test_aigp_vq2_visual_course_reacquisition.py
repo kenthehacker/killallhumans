@@ -55,8 +55,10 @@ def _clean_current_snapshot(
     gate_index: int,
     track_id: str,
     sequence: int,
+    *,
+    clipping: FrameEdge = FrameEdge.NONE,
 ) -> SimpleNamespace:
-    """Build three locally associated clean samples for one fresh identity."""
+    """Build a stable local tail with a clean or one-edge latest sample."""
 
     tokens = tuple(_token(sequence - offset) for offset in (2, 1, 0))
     history = (
@@ -70,6 +72,8 @@ def _clean_current_snapshot(
             track_id,
             tokens[2],
             previous_token=tokens[1],
+            clipping=clipping,
+            center_censored=clipping != FrameEdge.NONE,
         ),
     )
     track = SimpleNamespace(
@@ -81,8 +85,10 @@ def _clean_current_snapshot(
         consecutive_frame_count=len(history),
         confidence=0.90,
         association_confidence=0.80,
-        clipping=FrameEdge.NONE,
-        center_censored=False,
+        clipping=clipping,
+        center_censored=clipping != FrameEdge.NONE,
+        center_norm=history[-1].center_norm,
+        center_velocity_norm_s=(0.20, -0.20),
         apparent_scale=history[-1].apparent_scale,
         role=VisualTrackRole.CURRENT,
         authoritative_gate_index=gate_index,
@@ -111,6 +117,7 @@ class _CreditedUnboundCoordinatorHost(_CoordinatorHost):
         ambiguous_reacquisition: bool = False,
         same_reviewed_identity: bool = False,
         finish_during_unbound_after_samples: int | None = None,
+        binding_clipping: FrameEdge = FrameEdge.NONE,
     ) -> None:
         super().__init__(
             initial_gate=initial_gate,
@@ -122,6 +129,7 @@ class _CreditedUnboundCoordinatorHost(_CoordinatorHost):
         self.finish_during_unbound_after_samples = (
             finish_during_unbound_after_samples
         )
+        self.binding_clipping = binding_clipping
         self.unbound_advance: CreditedUnboundGateAdvance | None = None
         self.reacquisition: ConfirmedGateReacquisition | None = None
         self.unbound_sample_count = 0
@@ -234,6 +242,7 @@ class _CreditedUnboundCoordinatorHost(_CoordinatorHost):
             self.current_gate,
             reacquired_track_id,
             self.sequence,
+            clipping=self.binding_clipping,
         )
         stable_tokens = tuple(
             sample.token for sample in snapshot.current_track.history
@@ -351,6 +360,35 @@ def test_credited_unbound_gate0_waits_zero_then_commands_fresh_gate1():
         result,
         from_gate_index=0,
     )
+
+
+def test_credited_unbound_one_edge_successor_commands_observable_axis():
+    host = _CreditedUnboundCoordinatorHost(
+        initial_gate=0,
+        finish_gate=1,
+        binding_clipping=FrameEdge.TOP,
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(
+            host,
+            _context(),
+            runtime=_runtime(host)[0],
+        )
+    )
+
+    _assert_successful_reacquisition(
+        host,
+        result,
+        from_gate_index=0,
+    )
+    gate1 = next(
+        segment for segment in result["segments"]
+        if segment["gate_index"] == 1
+    )
+    assert gate1["recovery_one_edge_command_count"] >= 1
+    first_command = _navigation_commands(host, 1)[0][1]
+    assert first_command.yaw_rate != 0.0
 
 
 def test_credited_unbound_same_reviewed_identity_rebinds_without_seam():

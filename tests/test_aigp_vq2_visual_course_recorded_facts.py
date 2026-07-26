@@ -981,6 +981,40 @@ def test_credit_boundary_straddle_is_history_only_not_command_authority():
     )
 
 
+def test_first_fresh_one_edge_current_retains_observable_axis_authority():
+    credit_watermark = _camera_token(179, 659101)
+    snapshot = _promoted_snapshot(
+        sequence=181,
+        frame_id=659103,
+        x=0.628125,
+        y=-0.7944444444444445,
+        scale=0.1897,
+        confidence=0.648,
+        association=0.897,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        observation_ns=143_875_676_881_600,
+        publication_ns=143_875_677_668_400,
+    )
+    snapshot.current_track.center_velocity_norm_s = (0.373, -0.637)
+
+    assert not _current_snapshot_ready(
+        snapshot,
+        gate_index=1,
+        track_id=_PROMOTED_TRACK,
+        newer_than=credit_watermark,
+        observed_after_ns=_CREDITED_RACE_RECEIVED_NS,
+    )
+    assert _current_snapshot_ready(
+        snapshot,
+        gate_index=1,
+        track_id=_PROMOTED_TRACK,
+        newer_than=credit_watermark,
+        observed_after_ns=_CREDITED_RACE_RECEIVED_NS,
+        allow_one_edge_censored=True,
+    )
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

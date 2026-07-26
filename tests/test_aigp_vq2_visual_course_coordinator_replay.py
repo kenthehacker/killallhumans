@@ -49,10 +49,26 @@ class _CadencedCoordinatorServo(_CoordinatorServo):
 
     def observe(self, snapshot, *args, **kwargs):
         track = snapshot.current_track
+        one_edge_recovery = bool(
+            kwargs.get("mode") is VisualApproachMode.PROMOTE_REACQUIRE
+            and track.clipping
+            in {
+                FrameEdge.LEFT,
+                FrameEdge.TOP,
+                FrameEdge.RIGHT,
+                FrameEdge.BOTTOM,
+            }
+        )
         if (
             not track.visible
-            or track.clipping != FrameEdge.NONE
-            or track.center_censored
+            or (
+                track.clipping != FrameEdge.NONE
+                and not one_edge_recovery
+            )
+            or (
+                track.center_censored
+                and not one_edge_recovery
+            )
         ):
             raise VisualApproachCurrentGeometryUnavailable(
                 "logged near-plane geometry is censored or unavailable"
@@ -70,6 +86,14 @@ class _CadencedCoordinatorServo(_CoordinatorServo):
             normalized_y_rate_down_s=track.center_velocity_norm_s[1],
             confidence=track.confidence,
             association_confidence=track.association_confidence,
+            clipped=track.clipping != FrameEdge.NONE,
+            center_censored=track.center_censored,
+            horizontal_censored=bool(
+                track.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+            ),
+            vertical_censored=bool(
+                track.clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+            ),
             ambiguous=track.ambiguous,
         )
         proposal.current_target = target
@@ -324,7 +348,7 @@ class _CadencedCoordinatorHost(_CoordinatorHost):
         return transition
 
 
-def _cadenced_runtime(host, *, limits=None):
+def _cadenced_runtime(host, *, limits=None, yaw_rate=0.0):
     runtime, _calls = _runtime(host, limits=limits)
     servo_calls = []
 
@@ -333,7 +357,7 @@ def _cadenced_runtime(host, *, limits=None):
             *args,
             **kwargs,
             calls=servo_calls,
-            yaw_rate=0.0,
+            yaw_rate=yaw_rate,
         )
 
     return replace(runtime, servo_factory=servo_factory)
@@ -855,11 +879,16 @@ def test_recovery_replans_when_receiver_replaces_candidate_in_wire_slot():
 
 
 class _RecoveryClippedReplacementHost(_RecoverySlotReplacementHost):
-    """Keep every replacement publication TOP-censored before first wire."""
+    """Keep replacement publications TOP-censored until the first wire."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.one_edge_wire_sent = False
 
     def _censor_recovery_current(self):
         if (
-            not self.recovery_slot_replacement_injected
+            self.one_edge_wire_sent
+            or not self.recovery_slot_replacement_injected
             or self.current_gate != 2
             or self.after_promotion_samples is None
         ):
@@ -867,6 +896,15 @@ class _RecoveryClippedReplacementHost(_RecoverySlotReplacementHost):
         snapshot = self.visual_gate_graph.latest_snapshot
         snapshot.current_track.clipping = FrameEdge.TOP
         snapshot.current_track.center_censored = True
+
+    async def _send_flight_command(self, command, **kwargs):
+        receipt = await super()._send_flight_command(command, **kwargs)
+        if (
+            self.current_gate == 2
+            and kwargs.get("wire_visual_token") is not None
+        ):
+            self.one_edge_wire_sent = True
+        return receipt
 
     def _sample(self):
         super()._sample()
@@ -878,24 +916,41 @@ class _RecoveryClippedReplacementHost(_RecoverySlotReplacementHost):
         return ready
 
 
-def test_recovery_one_edge_cannot_anchor_before_a_clean_wire():
+def test_recovery_one_edge_commands_before_a_clean_wire():
     host = _RecoveryClippedReplacementHost()
 
-    with pytest.raises(SafetyAbort, match="post-credit recovery timed out"):
-        asyncio.run(
-            run_visual_course_stage(
-                host,
-                _context(),
-                runtime=_cadenced_runtime(host),
-            )
+    result = asyncio.run(
+        run_visual_course_stage(
+            host,
+            _context(),
+            runtime=_cadenced_runtime(host, yaw_rate=-0.08),
         )
+    )
 
+    assert result["race_finished"] is True
     assert host.recovery_slot_replacement_injected
-    assert not [
+    recovery_wires = [
         wire
         for wire in host.navigation_wires
         if wire["gate_index"] == 2
     ]
+    assert recovery_wires
+    assert recovery_wires[0]["command"].yaw_rate != 0.0
     recovery = host._visual_course_summary["segments"][1]
-    assert recovery["recovery_navigation_command_count"] == 0
-    assert recovery["recovery_zero_command_count"] > 0
+    assert recovery["recovery_navigation_command_count"] == (
+        recovery["recovery_one_edge_command_count"]
+        + recovery["recovery_clean_command_count"]
+    )
+    assert recovery["recovery_one_edge_command_count"] >= 1
+    assert recovery["recovery_clean_command_count"] >= 1
+    transition = host._visual_course_summary[
+        "authoritative_transitions"
+    ][0]
+    assert transition["recovery_admission"]["wire_frame_token"] == {
+        "stream_id": recovery_wires[0]["token"].stream_id,
+        "generation": recovery_wires[0]["token"].generation,
+        "frame_id": recovery_wires[0]["token"].frame_id,
+        "publication_sequence": (
+            recovery_wires[0]["token"].publication_sequence
+        ),
+    }

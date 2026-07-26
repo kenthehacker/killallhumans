@@ -1207,6 +1207,7 @@ def _current_snapshot_ready(
     track_id: str,
     newer_than: Optional[CameraFrameToken] = None,
     observed_after_ns: Optional[int] = None,
+    allow_one_edge_censored: bool = False,
 ) -> bool:
     track = getattr(snapshot, "current_track", None)
     token = getattr(snapshot, "latest_camera_token", None)
@@ -1238,6 +1239,48 @@ def _current_snapshot_ready(
             < latest.observation_monotonic_ns
         ):
             return False
+    clipping = getattr(track, "clipping", None)
+    center_censored = getattr(track, "center_censored", True)
+    center = getattr(track, "center_norm", None)
+    velocity = getattr(track, "center_velocity_norm_s", None)
+    measurement_ready = bool(
+        (
+            clipping == FrameEdge.NONE
+            and center_censored is False
+        )
+        or (
+            allow_one_edge_censored
+            and clipping
+            in {
+                FrameEdge.LEFT,
+                FrameEdge.TOP,
+                FrameEdge.RIGHT,
+                FrameEdge.BOTTOM,
+            }
+            and type(center) is tuple
+            and len(center) == 2
+            and type(velocity) is tuple
+            and len(velocity) == 2
+            and (
+                (
+                    clipping in {FrameEdge.TOP, FrameEdge.BOTTOM}
+                    and type(center[0]) in {int, float}
+                    and math.isfinite(float(center[0]))
+                    and abs(float(center[0])) <= 1.0
+                    and type(velocity[0]) in {int, float}
+                    and math.isfinite(float(velocity[0]))
+                )
+                or (
+                    clipping in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                    and type(center[1]) in {int, float}
+                    and math.isfinite(float(center[1]))
+                    and abs(float(center[1])) <= 1.0
+                    and type(velocity[1]) in {int, float}
+                    and math.isfinite(float(velocity[1]))
+                )
+            )
+        )
+    )
     return bool(
         type(token) is CameraFrameToken
         and getattr(snapshot, "current_gate_index", None) == gate_index
@@ -1257,8 +1300,7 @@ def _current_snapshot_ready(
         and getattr(track, "visible", False) is True
         and getattr(track, "ambiguous", True) is False
         and getattr(track, "missed_frame_count", 1) == 0
-        and getattr(track, "clipping", FrameEdge.NONE) == FrameEdge.NONE
-        and getattr(track, "center_censored", True) is False
+        and measurement_ready
     )
 
 
@@ -2777,11 +2819,6 @@ async def _run_visual_course_stage_impl(
                 if (
                     recovery_measurement_mode
                     is PostCreditMeasurementMode.REACQUIRE
-                    or (
-                        recovery_measurement_mode
-                        is PostCreditMeasurementMode.ONE_EDGE_CENSORED
-                        and recovery_first_clean_wire_token is None
-                    )
                 ):
                     last_planned_token = token
                     await send_zero(
@@ -3200,13 +3237,24 @@ async def _run_visual_course_stage_impl(
                 segment["recovery_navigation_command_count"] = int(
                     segment["recovery_navigation_command_count"]
                 ) + 1
-                if recovery_first_clean_wire_token is None:
-                    admission_evidence = transitions[-1].get(
-                        "recovery_admission"
+                admission_evidence = transitions[-1].get(
+                    "recovery_admission"
+                )
+                if (
+                    not isinstance(admission_evidence, dict)
+                    or "wire_frame_token" not in admission_evidence
+                ):
+                    raise abort_type(
+                        "visual-course recovery wire lacks its exact "
+                        "candidate evidence"
                     )
+                if admission_evidence["wire_frame_token"] is None:
                     if (
-                        not isinstance(admission_evidence, dict)
-                        or admission_evidence.get("wire_frame_token")
+                        admission_evidence.get("wire_start_monotonic_ns")
+                        is not None
+                        or admission_evidence.get(
+                            "wire_return_monotonic_ns"
+                        )
                         is not None
                     ):
                         raise abort_type(
@@ -4149,12 +4197,13 @@ async def _run_visual_course_stage_impl(
                 observed_after_ns=(
                     course_handoff.race_status.received_monotonic_ns
                 ),
+                allow_one_edge_censored=True,
             ):
                 admitted_recovery_token = snapshot.latest_camera_token
                 latest_recovery_refusal = None
                 return True
             latest_recovery_refusal = (
-                "promoted current lacks a strictly newer clean, visible, "
+                "promoted current lacks a strictly newer observable, visible, "
                 "unambiguous frame"
             )
             return False
