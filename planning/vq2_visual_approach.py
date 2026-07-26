@@ -995,17 +995,17 @@ class RollingVisualApproachServo:
             )
         if (
             mode is VisualApproachMode.APPROACH
-            and output.next_gate_blend not in {0.0, requested_blend}
+            and not 0.0 <= output.next_gate_blend <= requested_blend
         ):
             raise VisualApproachRefusal(
-                "visual approach produced an unexpected blend magnitude"
+                "visual approach blend exceeded its requested authority"
             )
         if (
             mode is VisualApproachMode.PASSAGE
-            and output.next_gate_blend not in {0.0, requested_blend}
+            and not 0.0 <= output.next_gate_blend <= requested_blend
         ):
             raise VisualApproachRefusal(
-                "passage produced an unexpected next-preview blend magnitude"
+                "passage next-preview blend exceeded its requested authority"
             )
         if (
             mode is VisualApproachMode.PASSAGE

@@ -553,6 +553,51 @@ def test_passage_preview_ramp_grows_with_current_apparent_scale() -> None:
     assert passage.next_target.track_id == admission.preview_track_id
 
 
+def test_passage_preview_accepts_continuous_expansion_taper() -> None:
+    tracker, graph, snapshot, current_id, next_id, sequence = (
+        _build_bound_graph(current_gate_index=6)
+    )
+    assert next_id is not None
+    approach = RollingVisualApproachServo(
+        current_id,
+        6,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+    )
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(approach, snapshot, tracker)
+    admission = proposal.passage_admission
+    assert type(admission) is VisualApproachPassageAdmission
+
+    sequence += 1
+    snapshot = _advance(
+        tracker,
+        graph,
+        sequence,
+        current_width=0.36,
+        current_height=0.38,
+    )
+    passage = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    requested = approach._requested_next_gate_blend(
+        passage.current_target.log_scale
+    )
+
+    assert 0.0 < passage.servo_output.next_gate_blend < requested
+    assert passage.servo_output.advance_enabled
+    assert passage.next_target is not None
+    assert passage.next_target.track_id == admission.preview_track_id
+
+
 def test_zero_blend_admission_seals_identity_then_grows_in_passage() -> None:
     tracker, graph, snapshot, current_id, next_id, sequence = (
         _build_bound_graph(current_gate_index=5)
