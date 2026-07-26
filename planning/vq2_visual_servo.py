@@ -1339,6 +1339,38 @@ class ImageVisualServo:
             )
         advance_enabled = forward_authority > 0.0
 
+        # An adjacent preview is useful early, but it must not build lateral
+        # gate-frame momentum as the current aperture rapidly expands.  Taper
+        # only the preview contribution with the same continuous expansion
+        # and proximity authority used for closure.  Current-aperture error
+        # retains full yaw/roll authority, including after promotion.
+        if blend > 0.0:
+            assert next_target is not None
+            preview_steering_authority = (
+                expansion_authority * proximity_authority
+            )
+            blend *= preview_steering_authority
+            if next_horizontal is not None:
+                horizontal = (
+                    (1.0 - blend) * raw_horizontal
+                    + blend * next_horizontal
+                )
+                horizontal_rate = (
+                    (1.0 - blend) * raw_horizontal_rate
+                    + blend * float(next_target.normalized_x_rate_s)
+                )
+            if next_vertical is not None:
+                vertical = (
+                    (1.0 - 0.5 * blend) * raw_vertical
+                    + 0.5 * blend * next_vertical
+                )
+                vertical_rate = (
+                    (1.0 - 0.5 * blend) * raw_vertical_rate
+                    + 0.5
+                    * blend
+                    * float(next_target.normalized_y_rate_down_s)
+                )
+
         brake_reason: Optional[str] = None
         if current_edge_risk:
             brake_reason = "target_edge_or_clipping"

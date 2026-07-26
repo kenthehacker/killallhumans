@@ -538,7 +538,9 @@ def test_passage_blend_requires_narrow_start_then_broad_continuation() -> None:
     assert abs(next_gate.normalized_x_rate_s) > (
         servo.tuning.stable_rate_norm_s
     )
-    assert continued.next_gate_blend == pytest.approx(0.3)
+    assert continued.next_gate_blend == pytest.approx(
+        0.3 * (2.0 - 1.59) / (2.0 - 1.10)
+    )
     assert continued.effective_horizontal_error > current.normalized_x
     assert continued.effective_vertical_error_image_down < (
         current.normalized_y_down
@@ -1026,7 +1028,17 @@ def test_recorded_prepass_116_158_withholds_preview_without_aborting() -> None:
             )
             preview_withheld_publications.append(publication)
         else:
-            assert output.next_gate_blend == pytest.approx(0.35)
+            expected_preview_authority = max(
+                0.0,
+                min(
+                    1.0,
+                    (2.0 - current_scale_rate)
+                    / (2.0 - 1.10),
+                ),
+            )
+            assert output.next_gate_blend == pytest.approx(
+                0.35 * expected_preview_authority
+            )
             assert output.next_horizontal_error == pytest.approx(
                 next_gate.normalized_x
             )
@@ -1192,6 +1204,43 @@ def test_passage_safe_next_blend_can_retain_advance_authority() -> None:
     assert output.advance_enabled
 
 
+def test_rapid_expansion_tapers_only_successor_preview_steering() -> None:
+    stable_servo = ImageVisualServo()
+    expanding_servo = ImageVisualServo()
+    _latch_passage_blend(stable_servo)
+    _latch_passage_blend(expanding_servo)
+    next_gate = target(
+        5,
+        track_id="vq2-track-000002",
+        x=0.30,
+    )
+
+    stable = step(
+        stable_servo,
+        target(5),
+        next_target=next_gate,
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    expanding = step(
+        expanding_servo,
+        target(5, scale_rate=1.7),
+        next_target=next_gate,
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+
+    assert stable.next_gate_blend == pytest.approx(0.3)
+    assert expanding.next_gate_blend == pytest.approx(0.1)
+    assert stable.effective_horizontal_error == pytest.approx(0.09)
+    assert expanding.effective_horizontal_error == pytest.approx(0.03)
+    assert abs(expanding.yaw_rate_rad_s) < abs(stable.yaw_rate_rad_s)
+    assert abs(expanding.target_roll_rad) < abs(stable.target_roll_rad)
+    assert expanding.advance_enabled is True
+
+
 def test_advance_passage_preview_requires_an_existing_latch() -> None:
     servo = ImageVisualServo()
 
@@ -1270,7 +1319,9 @@ def test_broad_passage_preview_cannot_gain_forward_authority() -> None:
         allow_passage_safe_next_blend=True,
     )
 
-    assert output.next_gate_blend == pytest.approx(0.3)
+    assert output.next_gate_blend == pytest.approx(
+        0.3 * (2.0 - 1.20) / (2.0 - 1.10)
+    )
     assert not output.advance_enabled
     assert output.target_pitch_rad >= 0.0
 
@@ -1415,9 +1466,8 @@ def test_attempt14_late_passage_preview_retires_at_first_hard_violation() -> Non
 
     assert publication_156.next_gate_blend == pytest.approx(
         requested_blend_156
-    )
-    assert publication_156.next_gate_blend == pytest.approx(
-        0.2664089079230311
+        * (2.0 - 1.456276983534964)
+        / (2.0 - 1.10)
     )
     assert not publication_156.advance_enabled
 
