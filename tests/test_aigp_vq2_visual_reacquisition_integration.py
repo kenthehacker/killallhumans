@@ -502,6 +502,11 @@ class _DerivedStateCourseRunner(VQ2Runner):
                 self._next_sequence += 1
                 return
 
+    def _sample_control_ingress(self) -> None:
+        # Camera/race timing is explicitly synthesized by _sample(); this
+        # fixture has no independent IMU/actuator receiver queue to drain.
+        return
+
     def _watchdog(self, **kwargs) -> None:
         # Physical dynamics and stream transport are outside this regression;
         # still fail the fixture if its fixed safety state is not benign.

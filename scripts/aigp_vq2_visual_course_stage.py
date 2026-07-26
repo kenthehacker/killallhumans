@@ -816,6 +816,8 @@ class VisualCourseStageHost(Protocol):
 
     def _sample(self) -> None: ...
 
+    def _sample_control_ingress(self) -> None: ...
+
     def _watchdog(self, **kwargs: Any) -> None: ...
 
     async def _wait_for_next_flight_command_slot(self) -> float: ...
@@ -1568,6 +1570,7 @@ async def _run_visual_course_stage_impl(
         target_track: Any = None,
         apply_launch_bootstrap: bool = True,
         command_deadline_s: Optional[float] = None,
+        refresh_ingress_after_slot: bool = False,
     ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -1770,6 +1773,15 @@ async def _run_visual_course_stage_impl(
             }
 
         await host._wait_for_next_flight_command_slot()
+        if refresh_ingress_after_slot:
+            # The first post-credit iteration deliberately reuses its
+            # already-admitted graph snapshot and therefore skipped the
+            # outer sample.  Consume IMU/race/actuator ingress that arrived
+            # during the slot wait before the pre-wire watchdog without
+            # replacing the admitted graph.  A newer receiver camera
+            # publication remains a no-wire supersession through the exact
+            # token check below.
+            host._sample_control_ingress()
         pad_contact = initial_pad_contact_authority()
         host._watchdog(
             require_target=False,
@@ -3238,6 +3250,7 @@ async def _run_visual_course_stage_impl(
                         snapshot=snapshot,
                         yaw_reference_rad=yaw_reference_rad,
                         segment_started_s=segment_started_s,
+                        refresh_ingress_after_slot=reuse_recovery_graph,
                         stage=(
                             f"{VISUAL_COURSE_STAGE}/gate"
                             f"{current_gate_index}/"

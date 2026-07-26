@@ -573,6 +573,7 @@ class _Host:
         self.wire_receipts_by_command_index = []
         self.ticks = []
         self.watchdogs = 0
+        self.control_ingress_samples = 0
         self.credit_token = None
         self.confirmed_race_statuses = []
         self.promotion_tokens = []
@@ -629,6 +630,9 @@ class _Host:
             self.sequence,
             visible=visible,
         )
+
+    def _sample_control_ingress(self):
+        self.control_ingress_samples += 1
 
     def _watchdog(self, **kwargs):
         assert kwargs["enforce_benign_pad_budget"] is True
@@ -713,11 +717,17 @@ class _Host:
         return None
 
     def _assert_visual_receiver_token_current(self, expected_token):
-        assert (
-            expected_token
-            == self.visual_gate_graph.latest_snapshot.latest_camera_token
+        receiver_token = (
+            self.visual_gate_graph.latest_snapshot.latest_camera_token
         )
-        return expected_token
+        if expected_token != receiver_token:
+            exc = SafetyAbort(
+                course_stage.VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON
+            )
+            exc.expected_visual_token = expected_token
+            exc.receiver_visual_token = receiver_token
+            raise exc
+        return receiver_token
 
     def _visual_race_status_ref(self):
         return self.race
@@ -928,6 +938,7 @@ def test_generic_course_repeats_lifecycle_from_nonzero_gate_until_finish():
     assert result["initial_gate_index"] == 3
     assert result["maximum_authoritative_gate_index"] == 4
     assert result["final_gate_index"] == 4
+    assert host.control_ingress_samples == 1
     assert [
         (item["from_gate_index"], item["to_gate_index"])
         for item in result["authoritative_transitions"]

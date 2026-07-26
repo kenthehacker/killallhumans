@@ -186,6 +186,7 @@ from planning.vq2_visual_servo import (
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_OBSERVATION_AGE_S,
     MAX_VISUAL_TARGET_PITCH_RAD,
+    MAX_VISUAL_TARGET_ROLL_RAD,
     MAX_VISUAL_THRUST,
     MAX_VISUAL_YAW_RATE_RAD_S,
     PREPASS_CURRENT_MAX_ABS_Y_NORM,
@@ -441,6 +442,15 @@ MAX_PITCH_RAD = math.radians(10.0)
 MAX_BODY_RATE_RAD_S = 2.0
 IMMEDIATE_MAX_BODY_RATE_RAD_S = 3.0
 MAX_COMMAND_RATE_RAD_S = 0.25
+# Map the largest admitted visual bank target to the existing body-rate
+# command envelope in the small-angle limit.  Live Gate-1 evidence at
+# 46b5003 reached only 0.084 rad of the requested 0.16 rad bank before the
+# clean target diverged, while the 0.25 rad/s command and broad 0.50 rad/s
+# measured-rate watchdog remained unbound.  This changes loop response, not
+# any target, wire-command, or watchdog bound.
+VISUAL_ATTITUDE_ROLL_KP = (
+    MAX_COMMAND_RATE_RAD_S / MAX_VISUAL_TARGET_ROLL_RAD
+)
 CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD = 0.025
 
 RESET_RACE_DROP_MS = 500
@@ -8061,7 +8071,7 @@ def attitude_rate_command(
         estimate.orientation,
         desired,
         omega=estimate.body_rates,
-        kp=(1.0, 0.5, 0.0),
+        kp=(VISUAL_ATTITUDE_ROLL_KP, 0.5, 0.0),
         kd=(0.4, 0.2, 0.0),
         max_rate=(MAX_COMMAND_RATE_RAD_S,) * 3,
     )
@@ -8975,7 +8985,12 @@ class VQ2Runner:
                 received_sample=received_sample,
             )
 
-    def _sample(self) -> None:
+    def _sample_control_ingress(self) -> None:
+        """Consume fresh non-camera ingress without replacing visual state."""
+
+        self._sample(consume_vision=False)
+
+    def _sample(self, *, consume_vision: bool = True) -> None:
         now = time.monotonic()
         telemetry = self.adapter.latest_telemetry
         drain_received_ingress = getattr(
@@ -9067,6 +9082,9 @@ class VQ2Runner:
                     record_race(race, now)
             elif boot < self._last_race_boot_ms:
                 self._race_regressed = True
+
+        if not consume_vision:
+            return
 
         capture_enabled = bool(
             getattr(self.recorder, "capture_enabled", False)
