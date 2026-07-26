@@ -1953,17 +1953,17 @@ def test_attitude_loop_is_finite_clamped_and_never_commands_yaw():
     assert math.isfinite(command.thrust)
 
 
-def test_attitude_loop_uses_existing_rate_envelope_for_full_visual_bank():
+def test_attitude_loop_reaches_intercept_braking_pitch_sooner():
     command = attitude_rate_command(
         _estimate(roll=0.0, pitch=0.0),
-        target_roll_rad=vq2_module.MAX_VISUAL_TARGET_ROLL_RAD,
-        target_pitch_rad=0.0,
+        target_roll_rad=0.0,
+        target_pitch_rad=vq2_module.MAX_VISUAL_TARGET_PITCH_RAD,
         thrust=0.27,
-        roll_response_authority=1.0,
+        intercept_response_authority=1.0,
     )
 
-    assert 0.24 < command.roll_rate <= vq2_module.MAX_COMMAND_RATE_RAD_S
-    assert command.pitch_rate == pytest.approx(0.0, abs=1e-12)
+    assert command.roll_rate == pytest.approx(0.0, abs=1e-12)
+    assert 0.14 < command.pitch_rate <= vq2_module.MAX_COMMAND_RATE_RAD_S
     assert command.yaw_rate == 0.0
 
 

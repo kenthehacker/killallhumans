@@ -1571,7 +1571,7 @@ async def _run_visual_course_stage_impl(
         apply_launch_bootstrap: bool = True,
         command_deadline_s: Optional[float] = None,
         refresh_ingress_after_slot: bool = False,
-        roll_response_authority: float = 0.0,
+        intercept_response_authority: float = 0.0,
     ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -1838,7 +1838,7 @@ async def _run_visual_course_stage_impl(
             target_roll_rad=target_roll_rad,
             target_pitch_rad=target_pitch_rad,
             thrust=command_thrust,
-            roll_response_authority=roll_response_authority,
+            intercept_response_authority=intercept_response_authority,
         )
         limited = runtime.limit_command_rates(
             base,
@@ -3253,11 +3253,11 @@ async def _run_visual_course_stage_impl(
                         yaw_reference_rad=yaw_reference_rad,
                         segment_started_s=segment_started_s,
                         refresh_ingress_after_slot=reuse_recovery_graph,
-                        # High roll response belongs to the generic
-                        # successor-intercept lifecycle.  Current-aperture
+                        # Faster braking response belongs to the generic
+                        # successor-intercept lifecycle. Current-aperture
                         # approach, passage, and crossing retain their proved
-                        # baseline loop.
-                        roll_response_authority=1.0,
+                        # baseline roll/pitch loop.
+                        intercept_response_authority=1.0,
                         stage=(
                             f"{VISUAL_COURSE_STAGE}/gate"
                             f"{current_gate_index}/"
