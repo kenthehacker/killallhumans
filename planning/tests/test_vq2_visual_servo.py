@@ -1335,23 +1335,26 @@ def test_broad_passage_preview_cannot_gain_forward_authority() -> None:
     assert output.target_pitch_rad >= 0.0
 
 
-def test_advance_passage_withdraws_preview_outside_blend_scale_envelope() -> None:
+def test_passage_retains_lateral_preview_through_vertical_scale_degradation() -> None:
     servo = ImageVisualServo()
     _latch_passage_blend(servo)
 
     output = step(
         servo,
         target(
-            5,
-            log_scale=math.log(
-                PREPASS_CURRENT_MAX_APPARENT_SCALE + 0.01
-            ),
+            124,
+            x=-0.025,
+            y=-0.1111111111111111,
+            x_rate=-0.00456222891438857,
+            y_rate=-1.03370659731062,
+            log_scale=math.log(0.171340709957934),
+            scale_rate=2.39406892894344,
         ),
         next_target=target(
-            5,
+            124,
             track_id="vq2-track-000002",
-            x=0.30,
-            y=-0.20,
+            x=0.31875,
+            y=-0.244444444444444,
         ),
         requested_next_blend=0.3,
         allow_advance=True,
@@ -1359,52 +1362,38 @@ def test_advance_passage_withdraws_preview_outside_blend_scale_envelope() -> Non
     )
 
     assert output.next_gate_blend == 0.0
-    assert output.next_horizontal_error is None
+    assert output.next_horizontal_error == pytest.approx(0.31875)
     assert output.next_vertical_error_image_down is None
-    assert output.effective_horizontal_error == 0.0
-    assert output.effective_vertical_error_image_down == 0.0
-    assert output.advance_enabled
-    assert output.passage_preview_retired
-    assert [
-        detail.violation
-        for detail in output.passage_preview_retirement_violations
-    ] == [PassageSafetyViolation.CURRENT_APPARENT_SCALE]
+    assert output.yaw_rate_rad_s < 0.0
+    assert output.target_roll_rad > 0.04
+    assert not output.advance_enabled
+    assert not output.passage_preview_retired
+    assert output.passage_preview_retirement_violations == ()
 
-    retired = step(
+    recovered = step(
         servo,
-        target(6),
+        target(
+            128,
+            x=-0.021875,
+            y=-0.205555555555556,
+            x_rate=0.00424390377519777,
+            y_rate=-0.393759905693026,
+            log_scale=math.log(0.194788881441763),
+            scale_rate=0.481916483947092,
+        ),
         next_target=target(
-            6,
+            128,
             track_id="vq2-track-000002",
-            x=0.30,
-            y=-0.20,
+            x=0.325,
+            y=-0.3,
         ),
         requested_next_blend=0.3,
         allow_advance=True,
         allow_passage_safe_next_blend=True,
     )
-    assert retired.next_gate_blend == 0.0
-    assert retired.next_horizontal_error is None
-    assert retired.next_vertical_error_image_down is None
-    assert retired.advance_enabled
-    assert retired.passage_preview_retired
-    assert retired.passage_preview_retirement_violations == ()
-
-    no_advance_revival = step(
-        servo,
-        target(7),
-        next_target=target(
-            7,
-            track_id="vq2-track-000002",
-            x=0.30,
-            y=-0.20,
-        ),
-        requested_next_blend=0.3,
-        allow_advance=False,
-        allow_passage_safe_next_blend=True,
-    )
-    assert no_advance_revival.next_gate_blend == 0.0
-    assert no_advance_revival.passage_preview_retired
+    assert recovered.next_gate_blend > 0.0
+    assert recovered.next_horizontal_error == pytest.approx(0.325)
+    assert not recovered.passage_preview_retired
 
 
 def test_unusable_optional_passage_preview_is_current_only() -> None:

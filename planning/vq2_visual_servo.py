@@ -844,12 +844,7 @@ class ImageVisualServo:
         )
         passage_violations = []
         if passage_continuation:
-            if (
-                horizontal_censored
-                or vertical_censored
-                or current.clipped
-                or current.center_censored
-            ):
+            if horizontal_censored:
                 passage_violations.append(
                     _passage_violation_detail(
                         PassageSafetyViolation.CURRENT_GEOMETRY_CENSORED,
@@ -974,8 +969,31 @@ class ImageVisualServo:
                         limit=PREPASS_CURRENT_MAX_APPARENT_SCALE,
                     )
                 )
+        lateral_passage_violations = tuple(
+            detail
+            for detail in passage_violations
+            if detail.violation
+            in {
+                PassageSafetyViolation.CURRENT_GEOMETRY_CENSORED,
+                PassageSafetyViolation.CURRENT_HORIZONTAL_POSITION,
+                PassageSafetyViolation.CURRENT_HORIZONTAL_RATE,
+                PassageSafetyViolation.CURRENT_PROJECTED_HORIZONTAL,
+            }
+        )
+        vertical_preview_degraded = bool(
+            vertical_censored
+            or any(
+                detail.violation
+                in {
+                    PassageSafetyViolation.CURRENT_VERTICAL_POSITION,
+                    PassageSafetyViolation.CURRENT_VERTICAL_RATE,
+                    PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,
+                }
+                for detail in passage_violations
+            )
+        )
         passage_safe_current = bool(
-            passage_continuation and not passage_violations
+            passage_continuation and not lateral_passage_violations
         )
         if passage_violations:
             if not allow_advance:
@@ -985,14 +1003,14 @@ class ImageVisualServo:
                 # and lets the ordinary current-only safety logic below decide
                 # whether a command remains available.
                 next_preview_withheld_for_current_envelope = True
-            else:
-                # A hard current-envelope failure permanently retires only the
-                # optional next preview during passage.  The ordinary
-                # current-gate passage controller remains independently
-                # safety-gated below.
+            elif lateral_passage_violations:
+                # Only loss of the current aperture's observable horizontal
+                # corridor permanently retires lateral successor authority.
+                # Vertical and scale degradation instead remove forward and
+                # vertical preview authority while bounded yaw/bank continue.
                 self._advance_passage_preview_retired = True
-                passage_preview_retirement_violations = tuple(
-                    passage_violations
+                passage_preview_retirement_violations = (
+                    lateral_passage_violations
                 )
         passage_safe_start = bool(
             allow_passage_safe_next_blend
@@ -1134,7 +1152,13 @@ class ImageVisualServo:
                 # Preserve more vertical authority for the current aperture;
                 # early heading blend is useful, but a clipped next gate must
                 # not pull the vehicle out of the current vertical corridor.
-                if not next_vertical_censored:
+                if (
+                    not next_vertical_censored
+                    and not (
+                        passage_continuation
+                        and vertical_preview_degraded
+                    )
+                ):
                     next_vertical = float(next_target.normalized_y_down)
                     vertical = (
                         (1.0 - 0.5 * blend) * vertical
@@ -1147,13 +1171,13 @@ class ImageVisualServo:
                         * float(next_target.normalized_y_rate_down_s)
                     )
                 if passage_continuation:
-                    correction_violations = []
+                    horizontal_correction_violation = None
                     if (
                         abs(raw_horizontal)
                         > self.tuning.horizontal_corridor
                         and raw_horizontal * horizontal < 0.0
                     ):
-                        correction_violations.append(
+                        horizontal_correction_violation = (
                             _passage_violation_detail(
                                 PassageSafetyViolation
                                 .CURRENT_HORIZONTAL_CORRECTION_REVERSAL,
@@ -1166,20 +1190,19 @@ class ImageVisualServo:
                         > self.tuning.vertical_corridor
                         and raw_vertical * vertical < 0.0
                     ):
-                        correction_violations.append(
-                            _passage_violation_detail(
-                                PassageSafetyViolation
-                                .CURRENT_VERTICAL_CORRECTION_REVERSAL,
-                                observed=-(raw_vertical * vertical),
-                                limit=0.0,
-                            )
+                        next_vertical = None
+                        vertical = (
+                            0.0 if vertical_censored else raw_vertical
                         )
-                    if correction_violations:
+                        vertical_rate = (
+                            0.0 if vertical_censored else raw_vertical_rate
+                        )
+                    if horizontal_correction_violation is not None:
                         # A next preview that would reverse current-aperture
                         # correction loses all command authority for this
-                        # publication.  Approach simply continues current-only;
-                        # passage additionally retires the already-sealed
-                        # preview as before.
+                        # publication and retires the lateral preview.  A
+                        # vertical reversal above merely drops the optional
+                        # vertical preview component.
                         blend = 0.0
                         next_horizontal = None
                         next_vertical = None
@@ -1201,19 +1224,21 @@ class ImageVisualServo:
                                 self._latched_next_blend_track_id = None
                         else:
                             self._advance_passage_preview_retired = True
-                            passage_preview_retirement_violations = tuple(
-                                correction_violations
+                            passage_preview_retirement_violations = (
+                                horizontal_correction_violation,
                             )
 
         heading_horizontal = horizontal
         heading_horizontal_rate = horizontal_rate
+        bank_horizontal = horizontal
+        bank_horizontal_rate = horizontal_rate
         if blend > 0.0 and next_horizontal is not None:
             # Passage admission has already established one exact, stable
             # successor identity.  Allocate its heading authority from the
             # current aperture's horizontal margin rather than multiplying
-            # the scale ramp twice.  Roll remains on the conservative blend
-            # below, and this authority falls continuously to current-only as
-            # the current gate approaches its horizontal corridor boundary.
+            # the scale ramp twice.  Yaw keeps the conservative 0.35 share;
+            # bank uses all remaining projected corridor so lateral
+            # interception starts early and unwinds before the current edge.
             projected_current_horizontal = (
                 raw_horizontal
                 + raw_horizontal_rate
@@ -1237,6 +1262,22 @@ class ImageVisualServo:
             heading_horizontal_rate = (
                 (1.0 - heading_authority) * raw_horizontal_rate
                 + heading_authority
+                * float(next_target.normalized_x_rate_s)
+            )
+            bank_authority = _clamp(
+                1.0
+                - abs(projected_current_horizontal)
+                / self.tuning.horizontal_corridor,
+                0.0,
+                1.0,
+            )
+            bank_horizontal = (
+                (1.0 - bank_authority) * raw_horizontal
+                + bank_authority * next_horizontal
+            )
+            bank_horizontal_rate = (
+                (1.0 - bank_authority) * raw_horizontal_rate
+                + bank_authority
                 * float(next_target.normalized_x_rate_s)
             )
 
@@ -1329,16 +1370,24 @@ class ImageVisualServo:
             0.0,
             1.0,
         )
-        heading_forward_authority = _clamp(
+        projected_bank_horizontal = (
+            bank_horizontal
+            + bank_horizontal_rate
+            * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        )
+        maneuver_forward_authority = _clamp(
             1.0
-            - abs(projected_heading_horizontal)
+            - max(
+                abs(projected_heading_horizontal),
+                abs(projected_bank_horizontal),
+            )
             / self.tuning.edge_brake_x,
             0.0,
             1.0,
         )
         center_authority = min(
             center_authority,
-            heading_forward_authority,
+            maneuver_forward_authority,
         )
         expansion_authority = _clamp(
             (
@@ -1458,8 +1507,8 @@ class ImageVisualServo:
             brake_reason = "segment_yaw_outward_soft_stop"
 
         target_roll = _clamp(
-            self.tuning.roll_error_gain * heading_horizontal
-            + self.tuning.roll_rate_gain * heading_horizontal_rate,
+            self.tuning.roll_error_gain * bank_horizontal
+            + self.tuning.roll_rate_gain * bank_horizontal_rate,
             -MAX_VISUAL_TARGET_ROLL_RAD,
             MAX_VISUAL_TARGET_ROLL_RAD,
         )
@@ -1498,7 +1547,7 @@ class ImageVisualServo:
             thrust_basis = self.tuning.brake_thrust
         else:
             maneuver_brake_authority = max(
-                1.0 - heading_forward_authority,
+                1.0 - maneuver_forward_authority,
                 1.0 - expansion_authority,
                 1.0 - proximity_authority,
             )
