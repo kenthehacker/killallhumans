@@ -595,6 +595,7 @@ class RollingVisualApproachServo:
         passage_admission: Optional[
             VisualApproachPassageAdmission
         ] = None,
+        passage_forward_closure_authorized: bool = True,
     ) -> VisualApproachProposal:
         """Produce one current-only or current/next visual-servo proposal.
 
@@ -606,13 +607,19 @@ class RollingVisualApproachServo:
         module-issued admission from the latest safe approach dwell and may
         retain only its exact latched preview identity while current-gate
         advance remains independently safety-gated.  It cannot transition back
-        to approach without an explicit segment reset.
+        to approach without an explicit segment reset.  Forward-closure
+        authorization may inhibit advance without erasing that sealed passage
+        lifecycle.
         """
 
         if type(snapshot) is not GateGraphSnapshot:
             raise TypeError("snapshot must be an exact GateGraphSnapshot")
         if type(tracker) is not MultiTargetVisualTracker:
             raise TypeError("tracker must be an exact MultiTargetVisualTracker")
+        if type(passage_forward_closure_authorized) is not bool:
+            raise TypeError(
+                "passage_forward_closure_authorized must be an exact bool"
+            )
         self._validate_mode_request(mode, passage_admission)
         starting_passage = bool(
             mode is VisualApproachMode.PASSAGE
@@ -791,7 +798,10 @@ class RollingVisualApproachServo:
                 ),
                 next_target=next_target,
                 requested_next_blend=requested_blend,
-                allow_advance=mode is VisualApproachMode.PASSAGE,
+                allow_advance=bool(
+                    mode is VisualApproachMode.PASSAGE
+                    and passage_forward_closure_authorized
+                ),
                 allow_passage_safe_next_blend=(
                     mode is VisualApproachMode.APPROACH
                     or (

@@ -340,10 +340,19 @@ class _Servo:
         *,
         mode,
         passage_admission,
+        passage_forward_closure_authorized=True,
     ):
-        del tracker, now_monotonic_s, segment_elapsed_s
+        del tracker, now_monotonic_s
         del segment_yaw_excursion_rad
-        self.calls.append((self.gate_index, mode, passage_admission))
+        self.calls.append(
+            (
+                self.gate_index,
+                mode,
+                passage_admission,
+                passage_forward_closure_authorized,
+                segment_elapsed_s,
+            )
+        )
         if not snapshot.current_track.visible:
             raise VisualApproachRefusal("current identity is no longer visible")
         target = _target(snapshot, self.track_id)
@@ -359,6 +368,7 @@ class _Servo:
         advance = bool(
             mode is VisualApproachMode.PASSAGE
             and self.passage_advances
+            and passage_forward_closure_authorized
         )
         retirement_details = ()
         if (
@@ -1402,7 +1412,7 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         finish_gate=1,
         fresh_after_samples=1,
     )
-    runtime, _calls = _runtime(host)
+    runtime, calls = _runtime(host)
 
     result = asyncio.run(
         run_visual_course_stage(host, _context(), runtime=runtime)
@@ -1442,8 +1452,24 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["pitch_blend_s"] == (
         host.visual_config.lifecycle.launch_pitch_blend_s
     )
-    assert launch["passage_admission_withheld_count"] > 0
+    assert "passage_admission_withheld_count" not in launch
     assert later["launch_bootstrap"]["enabled"] is False
+    gate0_passage_calls = [
+        call
+        for call in calls
+        if call[0] == 0 and call[1] is VisualApproachMode.PASSAGE
+    ]
+    assert gate0_passage_calls
+    assert any(not call[3] for call in gate0_passage_calls)
+    assert any(call[3] for call in gate0_passage_calls)
+    assert all(
+        call[3]
+        is (
+            call[4]
+            >= host.visual_config.lifecycle.launch_pitch_blend_s
+        )
+        for call in gate0_passage_calls
+    )
 
     gate0_commands = [
         (command, kwargs)
@@ -1502,12 +1528,158 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         if stage == "visual-course/gate1/passage"
     ]
     assert gate0_passage
-    assert all(
-        command.thrust == pytest.approx(0.2726)
+    assert any(command.thrust == 0.26 for command in gate0_passage)
+    assert any(
+        command.thrust
+        == host.visual_config.lifecycle.launch_boost_thrust
         for command in gate0_passage
     )
+    assert gate0_passage[-1].thrust == pytest.approx(0.2726)
     assert gate1_passage
     assert all(command.thrust == 0.295 for command in gate1_passage)
+
+
+def test_initial_gate_arms_from_finite_preblend_admission_window():
+    """Keep the exact attempt-3 admission window independent of launch shaping."""
+
+    admission_window = (0.172, 0.797)
+    planners = []
+
+    class FiniteAdmissionWindowServo(_Servo):
+        def observe(
+            self,
+            snapshot,
+            tracker,
+            now_monotonic_s,
+            segment_elapsed_s,
+            segment_yaw_excursion_rad,
+            **kwargs,
+        ):
+            proposal = super().observe(
+                snapshot,
+                tracker,
+                now_monotonic_s,
+                segment_elapsed_s,
+                segment_yaw_excursion_rad,
+                **kwargs,
+            )
+            if (
+                kwargs["mode"] is VisualApproachMode.APPROACH
+                and not (
+                    admission_window[0]
+                    <= segment_elapsed_s
+                    <= admission_window[1]
+                )
+            ):
+                proposal.passage_admission = None
+            return proposal
+
+    def servo_factory(*args, **kwargs):
+        planner = FiniteAdmissionWindowServo(
+            *args,
+            **kwargs,
+            calls=calls,
+        )
+        planners.append(planner)
+        return planner
+
+    host = _Host(initial_gate=0, finish_gate=0, fresh_after_samples=1)
+    runtime, calls = _runtime(host)
+    runtime = replace(runtime, servo_factory=servo_factory)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    assert len(planners) == 1
+    segment = result["segments"][0]
+    assert segment["passage_authority_enabled"] is True
+    assert segment["lifecycle"] in {
+        "near_plane_latched",
+        "credit_wait",
+    }
+    assert segment["passage_admission"] is not None
+    assert "passage_admission_withheld_count" not in (
+        segment["launch_bootstrap"]
+    )
+
+    approach_calls = [
+        call
+        for call in calls
+        if call[1] is VisualApproachMode.APPROACH
+    ]
+    passage_calls = [
+        call
+        for call in calls
+        if call[1] is VisualApproachMode.PASSAGE
+    ]
+    assert approach_calls
+    assert admission_window[0] <= approach_calls[-1][4] <= admission_window[1]
+    assert passage_calls
+    assert passage_calls[0][2] is not None
+    assert passage_calls[0][3] is False
+    assert any(call[3] for call in passage_calls)
+    assert segment["advance_command_count"] >= 3
+
+
+@pytest.mark.parametrize(
+    ("unsafe_advance", "unsafe_target_pitch"),
+    (
+        (True, 0.0),
+        (False, -0.105),
+        (0, 0.0),
+    ),
+)
+def test_initial_gate_rejects_planner_that_escapes_closure_inhibit(
+    unsafe_advance,
+    unsafe_target_pitch,
+):
+    calls = []
+
+    class UnsafeClosureServo(_Servo):
+        def observe(self, *args, **kwargs):
+            proposal = super().observe(*args, **kwargs)
+            if (
+                kwargs["mode"] is VisualApproachMode.PASSAGE
+                and not kwargs["passage_forward_closure_authorized"]
+            ):
+                proposal.servo_output = replace(
+                    proposal.servo_output,
+                    target_pitch_rad=unsafe_target_pitch,
+                    thrust=0.295,
+                    advance_enabled=unsafe_advance,
+                    brake_reason=None,
+                )
+            return proposal
+
+    def servo_factory(*args, **kwargs):
+        return UnsafeClosureServo(*args, **kwargs, calls=calls)
+
+    host = _Host(initial_gate=0, finish_gate=0, fresh_after_samples=1)
+    runtime, _unused_calls = _runtime(host)
+    runtime = replace(runtime, servo_factory=servo_factory)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="escaped its launch forward-closure inhibit",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert [call[1] for call in calls] == [
+        VisualApproachMode.APPROACH,
+        VisualApproachMode.PASSAGE,
+    ]
+    navigation = [
+        command
+        for command, kwargs, _gate_index in host.commands
+        if kwargs.get("require_wire_receipt")
+    ]
+    assert len(navigation) == 1
+    assert navigation[0].pitch_rate != -0.105
 
 
 def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():

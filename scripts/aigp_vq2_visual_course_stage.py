@@ -2633,6 +2633,13 @@ async def _run_visual_course_stage_impl(
                 raise abort_type("visual-course graph lacks exact camera token")
             if last_planned_token is not None and token == last_planned_token:
                 continue
+            passage_forward_closure_authorized = bool(
+                not segment["launch_bootstrap"]["enabled"]
+                or now - course_started_s
+                >= float(
+                    host.visual_config.lifecycle.launch_pitch_blend_s
+                )
+            )
             try:
                 proposal = planner.observe(
                     snapshot,
@@ -2645,6 +2652,9 @@ async def _run_visual_course_stage_impl(
                         passage_admission
                         if mode is VisualApproachMode.PASSAGE
                         else None
+                    ),
+                    passage_forward_closure_authorized=(
+                        passage_forward_closure_authorized
                     ),
                 )
             except (
@@ -2979,6 +2989,30 @@ async def _run_visual_course_stage_impl(
                     "visual-course censored passage coast returned to "
                     "uncensored geometry"
                 )
+            if (
+                mode is VisualApproachMode.PASSAGE
+                and not passage_forward_closure_authorized
+            ):
+                inhibited_advance = (
+                    proposal.servo_output.advance_enabled
+                )
+                inhibited_target_pitch = (
+                    proposal.servo_output.target_pitch_rad
+                )
+                if (
+                    type(inhibited_advance) is not bool
+                    or inhibited_advance
+                    or type(inhibited_target_pitch)
+                    not in {int, float}
+                    or not math.isfinite(
+                        float(inhibited_target_pitch)
+                    )
+                    or float(inhibited_target_pitch) < -1e-12
+                ):
+                    raise abort_type(
+                        "visual-course passage escaped its launch "
+                        "forward-closure inhibit"
+                    )
             last_planned_token = token
             if (
                 proposal.servo_output.passage_preview_retired
@@ -3071,35 +3105,15 @@ async def _run_visual_course_stage_impl(
                             ]
                         ) + 1
                         continue
-                    launch_ready = bool(
-                        not segment["launch_bootstrap"]["enabled"]
-                        or float(runtime.monotonic()) - course_started_s
-                        >= float(
-                            host.visual_config.lifecycle
-                            .launch_pitch_blend_s
-                        )
+                    passage_admission = proposal.passage_admission
+                    mode = VisualApproachMode.PASSAGE
+                    lifecycle = CourseLifecycle.PASSAGE_ARMED
+                    passage_started_s = float(runtime.monotonic())
+                    segment["passage_authority_enabled"] = True
+                    segment["lifecycle"] = lifecycle.value
+                    segment["passage_admission"] = asdict(
+                        passage_admission
                     )
-                    if launch_ready:
-                        passage_admission = proposal.passage_admission
-                        mode = VisualApproachMode.PASSAGE
-                        lifecycle = CourseLifecycle.PASSAGE_ARMED
-                        passage_started_s = float(runtime.monotonic())
-                        segment["passage_authority_enabled"] = True
-                        segment["lifecycle"] = lifecycle.value
-                        segment["passage_admission"] = asdict(
-                            passage_admission
-                        )
-                    else:
-                        launch = segment["launch_bootstrap"]
-                        launch["passage_admission_withheld_count"] = (
-                            int(
-                                launch.get(
-                                    "passage_admission_withheld_count",
-                                    0,
-                                )
-                            )
-                            + 1
-                        )
                 continue
 
             if proposal.mode is not VisualApproachMode.PASSAGE:

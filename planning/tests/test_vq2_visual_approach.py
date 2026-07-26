@@ -230,6 +230,7 @@ def _observe(
     *,
     mode: VisualApproachMode = VisualApproachMode.APPROACH,
     passage_admission: VisualApproachPassageAdmission | None = None,
+    passage_forward_closure_authorized: bool = True,
 ):
     return approach.observe(
         snapshot,
@@ -239,6 +240,9 @@ def _observe(
         segment_yaw_excursion_rad=0.0,
         mode=mode,
         passage_admission=passage_admission,
+        passage_forward_closure_authorized=(
+            passage_forward_closure_authorized
+        ),
     )
 
 
@@ -422,6 +426,83 @@ def test_generic_gate_seven_passage_retains_admitted_preview() -> None:
 
     with pytest.raises(VisualApproachRefusal, match="cannot return"):
         _observe(approach, snapshot, tracker)
+
+
+def test_passage_forward_closure_authority_requires_exact_bool() -> None:
+    tracker, _, snapshot, current_id, _, _ = _build_bound_graph()
+    approach = _approach(current_id)
+
+    with pytest.raises(
+        TypeError,
+        match="passage_forward_closure_authorized must be an exact bool",
+    ):
+        approach.observe(
+            snapshot,
+            tracker,
+            now_monotonic_s=_now_s(tracker),
+            segment_elapsed_s=0.5,
+            segment_yaw_excursion_rad=0.0,
+            passage_forward_closure_authorized=1,
+        )
+
+
+def test_sealed_passage_waits_for_fresh_forward_closure_authority() -> None:
+    tracker, graph, snapshot, current_id, next_id, sequence = (
+        _build_bound_graph(current_gate_index=3)
+    )
+    assert next_id is not None
+    approach = _approach(current_id, current_gate_index=3)
+
+    proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(tracker, graph, sequence)
+        proposal = _observe(approach, snapshot, tracker)
+    admission = proposal.passage_admission
+    assert type(admission) is VisualApproachPassageAdmission
+    assert admission.preview_track_id == next_id
+
+    sequence += 1
+    snapshot = _advance(tracker, graph, sequence)
+    waiting = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+        passage_forward_closure_authorized=False,
+    )
+
+    assert waiting.mode is VisualApproachMode.PASSAGE
+    assert not waiting.servo_output.advance_enabled
+    assert waiting.servo_output.brake_reason == "aligning"
+    assert waiting.passage_admission is admission
+    assert waiting.latched_next_track_id == next_id
+    assert approach.latched_next_track_id == next_id
+    assert waiting.next_target is not None
+    assert waiting.next_target.track_id == next_id
+
+    sequence += 1
+    snapshot = _advance(tracker, graph, sequence)
+    advancing = _observe(
+        approach,
+        snapshot,
+        tracker,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+        passage_forward_closure_authorized=True,
+    )
+
+    assert advancing.mode is VisualApproachMode.PASSAGE
+    assert (
+        advancing.current_target.frame_token
+        != waiting.current_target.frame_token
+    )
+    assert advancing.servo_output.advance_enabled
+    assert advancing.servo_output.brake_reason is None
+    assert advancing.passage_admission is admission
+    assert advancing.latched_next_track_id == next_id
+    assert advancing.next_target is not None
+    assert advancing.next_target.track_id == next_id
 
 
 def test_passage_preview_ramp_grows_with_current_apparent_scale() -> None:

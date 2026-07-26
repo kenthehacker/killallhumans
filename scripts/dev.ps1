@@ -148,6 +148,7 @@ interactive confirmation.
                 'tests/test_aigp_vq2_runner.py',
                 'tests/test_aigp_vq2_visual_config.py',
                 'tests/test_aigp_vq2_visual_course.py',
+                'tests/test_aigp_vq2_visual_course_attempt3_recorded_facts.py',
                 'tests/test_aigp_vq2_visual_course_coordinator_replay.py',
                 'tests/test_aigp_vq2_visual_course_preview_recorded_facts.py',
                 'tests/test_aigp_vq2_visual_course_reacquisition.py',
