@@ -3425,7 +3425,12 @@ async def _run_visual_course_stage_impl(
             last_clean_passage_token = token
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
-            if proposal.servo_output.next_gate_blend > 0.0:
+            if proposal.servo_output.passage_preview_retired:
+                # A hard preview retirement ends successor command authority.
+                # Never replay a pre-retirement yaw through a later unrelated
+                # near-plane loss.
+                last_passage_preview_yaw_rate_rad_s = None
+            elif proposal.servo_output.next_gate_blend > 0.0:
                 passage_next_preview_command_count += 1
                 last_passage_preview_yaw_rate_rad_s = (
                     accepted.command.yaw_rate

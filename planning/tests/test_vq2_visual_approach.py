@@ -501,10 +501,7 @@ def test_sealed_passage_waits_for_fresh_forward_closure_authority() -> None:
         != waiting.current_target.frame_token
     )
     assert advancing.servo_output.advance_enabled
-    assert (
-        advancing.servo_output.brake_reason
-        == "steering_or_closure"
-    )
+    assert advancing.servo_output.brake_reason is None
     assert advancing.servo_output.target_pitch_rad > (
         approach._servo.tuning.advance_pitch_rad
     )

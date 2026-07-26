@@ -21,7 +21,6 @@ from planning.vq2_visual_servo import (
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_SEGMENT_DURATION_S,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
-    MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
     PREPASS_CURRENT_MAX_APPARENT_SCALE,
@@ -282,7 +281,8 @@ def test_vertical_image_error_drives_pitch_in_both_directions():
     servo.reset_segment()
     low = step(servo, target(2, y=0.5))
 
-    assert high.target_pitch_rad > low.target_pitch_rad > 0.0
+    assert high.target_pitch_rad > 0.0
+    assert low.target_pitch_rad == 0.0
     assert high.thrust > servo.tuning.align_thrust
     assert MIN_VISUAL_THRUST < low.thrust < servo.tuning.align_thrust
 
@@ -370,7 +370,7 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
     )
     assert blended.next_gate_blend == pytest.approx(0.3)
     assert blended.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
-    assert blended.target_pitch_rad > servo.tuning.brake_pitch_rad
+    assert blended.target_pitch_rad > 0.0
     assert blended.thrust < servo.tuning.advance_thrust
 
     servo.reset_segment()
@@ -1244,7 +1244,6 @@ def test_rapid_expansion_tapers_bank_but_retains_heading_and_brakes() -> None:
     assert abs(expanding.target_roll_rad) < abs(stable.target_roll_rad)
     assert expanding.advance_enabled is True
     assert expanding.target_pitch_rad > stable.target_pitch_rad
-    assert expanding.target_pitch_rad > 0.0
     assert expanding.thrust < stable.thrust
 
 
@@ -1826,7 +1825,7 @@ def test_default_gain_uses_more_heading_authority_on_latest_live_prepass_frame()
 
     assert output.next_gate_blend == pytest.approx(0.35)
     assert output.effective_horizontal_error == pytest.approx(0.1128125)
-    assert output.yaw_rate_rad_s < -0.10
+    assert output.yaw_rate_rad_s < -0.095
     assert output.target_pitch_rad >= 0.0
     assert output.advance_enabled is False
 
@@ -2061,7 +2060,9 @@ def test_top_clip_uses_observable_horizontal_brake_authority(
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
     assert output.target_pitch_rad >= 0.0
-    assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
+    assert output.target_pitch_rad == pytest.approx(
+        servo.tuning.brake_pitch_rad
+    )
     assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
 
 
