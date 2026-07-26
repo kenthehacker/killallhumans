@@ -1700,9 +1700,7 @@ def test_run7_logged_state_carries_adjacent_planner_across_cross_id_credit():
         for proposal in precredit
     )
     assert precredit[0].servo_output.target_pitch_rad > 0.09
-    assert precredit[0].servo_output.thrust == pytest.approx(
-        0.26148148156933343
-    )
+    assert precredit[0].servo_output.thrust == pytest.approx(0.32)
 
     assert credit_token is not None
     assert credit_race is not None

@@ -199,13 +199,14 @@ class VisualServoTuning:
     collective_rate_gain: float = 0.080
     advance_pitch_rad: float = -0.105
     brake_pitch_rad: float = 0.035
-    # No-advance modes start at the immutable minimum collective.  The
-    # image-space collective corrections below remain available for vertical
-    # alignment, but an uncorrected alignment/brake command must not retain
-    # the failed 0.275 forward-closure collective.
-    align_thrust: float = MIN_VISUAL_THRUST
+    # Repeated credited Gate-0 runs establish 0.275 as the generic
+    # flight-support collective basis.  Forward closure is allocated through
+    # pitch and the small continuous interpolation toward advance collective;
+    # cutting airborne alignment to the 0.21 envelope minimum caused measured
+    # vertical image divergence and top censorship.
+    align_thrust: float = 0.275
     advance_thrust: float = 0.295
-    brake_thrust: float = MIN_VISUAL_THRUST
+    brake_thrust: float = 0.275
     required_corridor_frames: int = 3
 
     def __post_init__(self) -> None:
@@ -1429,10 +1430,11 @@ class ImageVisualServo:
         # This retains the live-proved Gate-0 vertical pixel-space collective
         # law on top of the selected basis: a gate high in the image requests
         # more collective, while image motion toward the desired row damps it.
-        # The default alignment and brake bases are MIN_VISUAL_THRUST.  When
-        # the vertical axis remains observable they provide the normal
-        # braking basis; a censored vertical axis retains the last bounded
-        # observable-axis collective below.
+        # The measured flight-support alignment and brake bases preserve
+        # altitude while pitch owns forward braking.  When the vertical axis
+        # remains observable they provide the normal basis; a censored
+        # vertical axis retains the last bounded observable-axis collective
+        # below.
         measured_thrust = _clamp(
             thrust_basis
             - self.tuning.collective_error_gain * vertical

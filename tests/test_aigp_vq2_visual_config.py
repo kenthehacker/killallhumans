@@ -41,8 +41,8 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
 
     assert mapping["schema"] == VISUAL_CONFIG_SCHEMA
     assert mapping["controller_family"] == VISUAL_CONTROLLER_FAMILY
-    assert mapping["servo"]["align_thrust"] == MIN_VISUAL_THRUST
-    assert mapping["servo"]["brake_thrust"] == MIN_VISUAL_THRUST
+    assert mapping["servo"]["align_thrust"] == 0.275
+    assert mapping["servo"]["brake_thrust"] == 0.275
     assert mapping["servo"]["advance_thrust"] == 0.295
     assert mapping["servo"]["yaw_error_gain"] == 0.30
     assert mapping["servo"]["roll_error_gain"] == 0.16
@@ -50,7 +50,7 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
     assert mapping["lifecycle"]["next_gate_blend_max"] == 0.35
     assert config.to_effective_mapping() == mapping
     assert config.effective_config_sha256 == (
-        "302f1ee8f6b442102d912603c2b512c2ed15fc5255d57dee6fb3b1eb68e9ac9f"
+        "2e725c0100aba746d567ecc12b5e97db087301c25457e60053ee5aa003d7fb88"
     )
     assert len(config.effective_config_sha256) == 64
     assert canonical_visual_config_sha256(mapping) == (
