@@ -877,7 +877,15 @@ def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
     def next_deadline(previous, now, period):
         return max(previous + period, now + period)
 
-    def attitude_rate(_estimate, *, target_roll_rad, target_pitch_rad, thrust):
+    def attitude_rate(
+        _estimate,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        thrust,
+        roll_response_authority=0.0,
+    ):
+        assert roll_response_authority in {0.0, 1.0}
         return AttitudeRateCommand(
             target_roll_rad,
             target_pitch_rad,

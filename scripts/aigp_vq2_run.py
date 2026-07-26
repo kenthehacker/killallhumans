@@ -443,11 +443,11 @@ MAX_BODY_RATE_RAD_S = 2.0
 IMMEDIATE_MAX_BODY_RATE_RAD_S = 3.0
 MAX_COMMAND_RATE_RAD_S = 0.25
 # Map the largest admitted visual bank target to the existing body-rate
-# command envelope in the small-angle limit.  Live Gate-1 evidence at
+# command envelope in the small-angle limit.  This extra response is allocated
+# only by the generic post-credit intercept lifecycle: live Gate-1 evidence at
 # 46b5003 reached only 0.084 rad of the requested 0.16 rad bank before the
 # clean target diverged, while the 0.25 rad/s command and broad 0.50 rad/s
-# measured-rate watchdog remained unbound.  This changes loop response, not
-# any target, wire-command, or watchdog bound.
+# measured-rate watchdog remained unbound.
 VISUAL_ATTITUDE_ROLL_KP = (
     MAX_COMMAND_RATE_RAD_S / MAX_VISUAL_TARGET_ROLL_RAD
 )
@@ -8056,11 +8056,22 @@ def attitude_rate_command(
     target_roll_rad: float,
     target_pitch_rad: float,
     thrust: float,
+    roll_response_authority: float = 0.0,
 ) -> AttitudeRateCommand:
     """Conservative roll/pitch attitude loop with yaw deliberately disabled."""
 
     if _attitude_error_body_rates is None:
         _load_live_transport_dependencies()
+    if (
+        isinstance(roll_response_authority, bool)
+        or not isinstance(roll_response_authority, (int, float))
+        or not math.isfinite(float(roll_response_authority))
+        or not 0.0 <= float(roll_response_authority) <= 1.0
+    ):
+        raise ValueError("roll response authority must be finite in [0, 1]")
+    roll_kp = 1.0 + float(roll_response_authority) * (
+        VISUAL_ATTITUDE_ROLL_KP - 1.0
+    )
 
     desired = Quaternion.from_euler(
         float(target_roll_rad),
@@ -8071,7 +8082,7 @@ def attitude_rate_command(
         estimate.orientation,
         desired,
         omega=estimate.body_rates,
-        kp=(VISUAL_ATTITUDE_ROLL_KP, 0.5, 0.0),
+        kp=(roll_kp, 0.5, 0.0),
         kd=(0.4, 0.2, 0.0),
         max_rate=(MAX_COMMAND_RATE_RAD_S,) * 3,
     )

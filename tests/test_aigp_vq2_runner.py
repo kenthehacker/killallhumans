@@ -1959,6 +1959,7 @@ def test_attitude_loop_uses_existing_rate_envelope_for_full_visual_bank():
         target_roll_rad=vq2_module.MAX_VISUAL_TARGET_ROLL_RAD,
         target_pitch_rad=0.0,
         thrust=0.27,
+        roll_response_authority=1.0,
     )
 
     assert 0.24 < command.roll_rate <= vq2_module.MAX_COMMAND_RATE_RAD_S
