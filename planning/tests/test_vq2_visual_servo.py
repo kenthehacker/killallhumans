@@ -16,10 +16,6 @@ from competition.vq2_visual_tracker import (
     VisualTrackRole,
     VisualTrackSample,
 )
-from planning.vq2_visual_approach import (
-    VisualApproachPassageLease,
-    VisualApproachPassageSafetyUnavailable,
-)
 from planning.vq2_visual_servo import (
     ImageVisualServo,
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
@@ -36,7 +32,6 @@ from planning.vq2_visual_servo import (
     PassageSafetyViolation,
     ServoFrameToken,
     VISUAL_SEGMENT_YAW_SOFT_STOP_RAD,
-    VisualServoPassageSafetyUnavailable,
     VisualServoRefusal,
     VisualServoTuning,
     VisualTarget,
@@ -350,6 +345,67 @@ def _latch_passage_blend(
     assert output.next_gate_blend == pytest.approx(requested_blend)
 
 
+def _assert_approach_preview_withheld_current_only(
+    output,
+    *,
+    current: VisualTarget,
+    servo: ImageVisualServo,
+) -> None:
+    assert output.next_gate_blend == 0.0
+    assert output.next_horizontal_error is None
+    assert output.next_vertical_error_image_down is None
+    assert output.reviewed_next_track_id is None
+    assert not output.advance_enabled
+    assert not output.passage_preview_retired
+    assert output.passage_preview_retirement_violations == ()
+    assert output.effective_horizontal_error == pytest.approx(
+        current.normalized_x
+    )
+    assert output.effective_vertical_error_image_down == pytest.approx(
+        current.normalized_y_down
+    )
+    assert output.effective_horizontal_rate_s == pytest.approx(
+        current.normalized_x_rate_s
+    )
+    assert output.effective_vertical_rate_down_s == pytest.approx(
+        current.normalized_y_rate_down_s
+    )
+    assert all(
+        math.isfinite(value)
+        for value in (
+            output.target_roll_rad,
+            output.target_pitch_rad,
+            output.yaw_rate_rad_s,
+            output.thrust,
+        )
+    )
+    assert abs(output.yaw_rate_rad_s) <= MAX_VISUAL_YAW_RATE_RAD_S
+    assert output.thrust >= MIN_VISUAL_THRUST
+    assert servo.latched_next_track_id == "vq2-track-000002"
+
+
+def _assert_approach_preview_reenters(
+    servo: ImageVisualServo,
+    *,
+    frame_id: int,
+    requested_blend: float = 0.3,
+) -> None:
+    reentered = step(
+        servo,
+        target(frame_id),
+        next_target=target(frame_id, track_id="vq2-track-000002"),
+        requested_next_blend=requested_blend,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
+    )
+    assert reentered.next_gate_blend == pytest.approx(requested_blend)
+    assert reentered.next_horizontal_error == 0.0
+    assert reentered.next_vertical_error_image_down == 0.0
+    assert not reentered.advance_enabled
+    assert not reentered.passage_preview_retired
+    assert servo.latched_next_track_id == "vq2-track-000002"
+
+
 def test_passage_blend_requires_narrow_start_then_broad_continuation() -> None:
     servo = ImageVisualServo()
     outside_narrow = target(
@@ -462,46 +518,31 @@ def test_exact_latch_frame_must_itself_be_stable_and_passage_safe() -> None:
 
 
 @pytest.mark.parametrize(
-    ("current", "expected_violation"),
+    "current",
     (
-        (
-            target(
-                5,
-                x=PREPASS_CURRENT_MAX_ABS_X_NORM - 0.01,
-                x_rate=0.20,
-                log_scale=-1.0,
+        target(
+            5,
+            x=PREPASS_CURRENT_MAX_ABS_X_NORM - 0.01,
+            x_rate=0.20,
+            log_scale=-1.0,
+        ),
+        target(
+            5,
+            y=-(PREPASS_CURRENT_MAX_ABS_Y_NORM - 0.011),
+            y_rate=-0.20,
+            log_scale=-1.0,
+        ),
+        target(
+            5,
+            x_rate=(
+                PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S + 1e-4
             ),
-            PassageSafetyViolation.CURRENT_PROJECTED_HORIZONTAL,
         ),
-        (
-            target(
-                5,
-                y=-(PREPASS_CURRENT_MAX_ABS_Y_NORM - 0.011),
-                y_rate=-0.20,
-                log_scale=-1.0,
-            ),
-            PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,
+        target(
+            5,
+            scale_rate=PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S + 1e-4,
         ),
-        (
-            target(
-                5,
-                x_rate=(
-                    PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S + 1e-4
-                ),
-            ),
-            PassageSafetyViolation.CURRENT_HORIZONTAL_RATE,
-        ),
-        (
-            target(
-                5,
-                scale_rate=PREPASS_CURRENT_MAX_LOG_SCALE_RATE_S + 1e-4,
-            ),
-            PassageSafetyViolation.CURRENT_LOG_SCALE_RATE,
-        ),
-        (
-            target(5, log_scale=-0.50),
-            PassageSafetyViolation.CURRENT_APPARENT_SCALE,
-        ),
+        target(5, log_scale=-0.50),
     ),
     ids=(
         "projected-horizontal-edge",
@@ -511,40 +552,29 @@ def test_exact_latch_frame_must_itself_be_stable_and_passage_safe() -> None:
         "close-scale",
     ),
 )
-def test_latched_passage_corridor_retires_unsafe_current(
+def test_approach_passage_envelope_violation_withholds_optional_preview(
     current: VisualTarget,
-    expected_violation: PassageSafetyViolation,
 ) -> None:
     servo = ImageVisualServo()
     _latch_passage_blend(servo)
 
-    with pytest.raises(
-        VisualServoPassageSafetyUnavailable,
-        match="left its passage corridor",
-    ) as exc_info:
-        step(
-            servo,
-            current,
-            next_target=target(
-                5,
-                track_id="vq2-track-000002",
-            ),
-            requested_next_blend=0.3,
-            allow_advance=False,
-            allow_passage_safe_next_blend=True,
-        )
-    assert expected_violation in exc_info.value.violations
-    assert (
-        exc_info.value.transient_projection_only
-        is (
-            expected_violation
-            is PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL
-        )
+    withheld = step(
+        servo,
+        current,
+        next_target=target(5, track_id="vq2-track-000002"),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
     )
-    assert all(detail.excess > 0.0 for detail in exc_info.value.details)
+    _assert_approach_preview_withheld_current_only(
+        withheld,
+        current=current,
+        servo=servo,
+    )
+    _assert_approach_preview_reenters(servo, frame_id=6)
 
 
-def test_projected_vertical_excursion_above_transient_margin_is_hard() -> None:
+def test_large_projected_vertical_excursion_only_withholds_approach_preview() -> None:
     servo = ImageVisualServo()
     _latch_passage_blend(servo)
     vertical_rate = -(
@@ -554,51 +584,42 @@ def test_projected_vertical_excursion_above_transient_margin_is_hard() -> None:
         - 0.27
     ) / 0.10
 
-    with pytest.raises(VisualServoPassageSafetyUnavailable) as exc_info:
-        step(
-            servo,
-            target(5, y=-0.27, y_rate=vertical_rate),
-            next_target=target(5, track_id="vq2-track-000002"),
-            requested_next_blend=0.3,
-            allow_advance=False,
-            allow_passage_safe_next_blend=True,
-        )
-
-    refusal = exc_info.value
-    assert refusal.violations == (
-        PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,
+    current = target(5, y=-0.27, y_rate=vertical_rate)
+    withheld = step(
+        servo,
+        current,
+        next_target=target(5, track_id="vq2-track-000002"),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
     )
-    assert not refusal.transient_projection_only
-    assert refusal.details[0].excess == pytest.approx(
-        MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM + 0.0001
+    _assert_approach_preview_withheld_current_only(
+        withheld,
+        current=current,
+        servo=servo,
     )
+    _assert_approach_preview_reenters(servo, frame_id=6)
 
 
-def test_positive_projected_vertical_excursion_is_not_transient() -> None:
+def test_positive_projected_vertical_excursion_only_withholds_preview() -> None:
     servo = ImageVisualServo()
     _latch_passage_blend(servo)
 
-    with pytest.raises(VisualServoPassageSafetyUnavailable) as exc_info:
-        step(
-            servo,
-            target(5, y=0.269, y_rate=0.20),
-            next_target=target(5, track_id="vq2-track-000002"),
-            requested_next_blend=0.3,
-            allow_advance=False,
-            allow_passage_safe_next_blend=True,
-        )
-
-    refusal = exc_info.value
-    assert refusal.violations == (
-        PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,
+    current = target(5, y=0.269, y_rate=0.20)
+    withheld = step(
+        servo,
+        current,
+        next_target=target(5, track_id="vq2-track-000002"),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
     )
-    assert refusal.details[0].observed > 0.0
-    assert not refusal.transient_projection_only
-    wrapped = VisualApproachPassageSafetyUnavailable.from_servo_refusal(
-        refusal,
-        camera_observation_monotonic_s=10.05,
+    _assert_approach_preview_withheld_current_only(
+        withheld,
+        current=current,
+        servo=servo,
     )
-    assert not wrapped.transient_eligible
+    _assert_approach_preview_reenters(servo, frame_id=6)
 
 
 def test_latest_live_predictive_excursion_reenters_without_servo_reset() -> None:
@@ -665,7 +686,7 @@ def test_latest_live_predictive_excursion_reenters_without_servo_reset() -> None
     )
     assert before.next_gate_blend == pytest.approx(0.35)
 
-    refused = (
+    preview_withheld = (
         (
             live_target(
                 2_426_869,
@@ -715,26 +736,19 @@ def test_latest_live_predictive_excursion_reenters_without_servo_reset() -> None
             ),
         ),
     )
-    for current, successor in refused:
-        with pytest.raises(
-            VisualServoPassageSafetyUnavailable,
-            match="left its passage corridor",
-        ) as exc_info:
-            step(
-                servo,
-                current,
-                next_target=successor,
-                requested_next_blend=0.35,
-                allow_advance=False,
-                allow_passage_safe_next_blend=True,
-            )
-        assert exc_info.value.transient_projection_only
-        assert exc_info.value.violations == (
-            PassageSafetyViolation.CURRENT_PROJECTED_VERTICAL,
+    for current, successor in preview_withheld:
+        output = step(
+            servo,
+            current,
+            next_target=successor,
+            requested_next_blend=0.35,
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
         )
-        assert (
-            exc_info.value.details[0].excess
-            <= MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM
+        _assert_approach_preview_withheld_current_only(
+            output,
+            current=current,
+            servo=servo,
         )
 
     current_119 = live_target(
@@ -776,12 +790,20 @@ def test_latest_live_predictive_excursion_reenters_without_servo_reset() -> None
         < PREPASS_CURRENT_MAX_ABS_Y_NORM
     )
     assert resumed.next_gate_blend == pytest.approx(0.35)
+    assert resumed.next_horizontal_error == pytest.approx(
+        next_119.normalized_x
+    )
+    assert resumed.next_vertical_error_image_down == pytest.approx(
+        next_119.normalized_y_down
+    )
+    assert servo.latched_next_track_id == "vq2-track-000002"
+    assert not resumed.passage_preview_retired
     assert resumed.yaw_rate_rad_s < 0.0
     assert resumed.target_pitch_rad > 0.0
     assert not resumed.advance_enabled
 
 
-def test_recorded_prepass_116_158_composes_servo_and_suspension_lease() -> None:
+def test_recorded_prepass_116_158_withholds_preview_without_aborting() -> None:
     """Replay the selected live trace's scalar track evidence as one path.
 
     Source: 20260725T025905Z-visual-align-375d9622, trace SHA-256
@@ -846,12 +868,9 @@ def test_recorded_prepass_116_158_composes_servo_and_suspension_lease() -> None:
 
     servo = ImageVisualServo()
     _latch_passage_blend(servo, requested_blend=0.35)
-    lease = VisualApproachPassageLease()
-    suspended_publications = []
-    resumed_blend_publications = []
-    post_retirement_publications = []
-    hard_refusal = None
-    last_lease_state = None
+    preview_withheld_publications = []
+    blended_publications = []
+    missing_next_current_only_publications = []
 
     for row in rows:
         (
@@ -873,9 +892,6 @@ def test_recorded_prepass_116_158_composes_servo_and_suspension_lease() -> None:
             current_clipping_value,
         ) = row
         publication = int(publication_value)
-        if hard_refusal is not None:
-            post_retirement_publications.append(publication)
-            continue
         frame_id = 2_426_752 + publication
         current = target(
             frame_id,
@@ -907,74 +923,66 @@ def test_recorded_prepass_116_158_composes_servo_and_suspension_lease() -> None:
             if bool(next_visible_value)
             else None
         )
-        camera_token = CameraFrameToken(
-            stream_id="vq2-camera-udp-5600",
-            generation=7,
-            frame_id=frame_id,
-            publication_sequence=publication,
+        output = step(
+            servo,
+            current,
+            next_target=next_gate,
+            requested_next_blend=0.35,
+            allow_advance=False,
+            allow_passage_safe_next_blend=True,
         )
-        try:
-            output = step(
-                servo,
-                current,
-                next_target=next_gate,
-                requested_next_blend=0.35,
-                allow_advance=False,
-                allow_passage_safe_next_blend=True,
-            )
-        except VisualServoPassageSafetyUnavailable as refusal:
-            wrapped = (
-                VisualApproachPassageSafetyUnavailable.from_servo_refusal(
-                    refusal,
-                    camera_observation_monotonic_s=observation_s,
+        assert not output.advance_enabled
+        assert not output.passage_preview_retired
+        assert servo.latched_next_track_id == "vq2-track-000002"
+        if next_gate is None:
+            assert output.next_gate_blend == 0.0
+            assert output.next_horizontal_error is None
+            assert output.next_vertical_error_image_down is None
+            assert output.reviewed_next_track_id is None
+            assert all(
+                math.isfinite(value)
+                for value in (
+                    output.target_roll_rad,
+                    output.target_pitch_rad,
+                    output.yaw_rate_rad_s,
+                    output.thrust,
                 )
             )
-            if not wrapped.transient_eligible:
-                hard_refusal = (publication, wrapped)
-                continue
-            last_lease_state = lease.observe(
-                camera_token,
-                observation_monotonic_s=observation_s,
-                passage_safe=False,
-                blend_active=False,
+            missing_next_current_only_publications.append(publication)
+        elif output.next_gate_blend == 0.0:
+            _assert_approach_preview_withheld_current_only(
+                output,
+                current=current,
+                servo=servo,
             )
-            suspended_publications.append(publication)
+            preview_withheld_publications.append(publication)
         else:
-            blend_active = output.next_gate_blend > 0.0
-            last_lease_state = lease.observe(
-                camera_token,
-                observation_monotonic_s=observation_s,
-                passage_safe=True,
-                blend_active=blend_active,
+            assert output.next_gate_blend == pytest.approx(0.35)
+            assert output.next_horizontal_error == pytest.approx(
+                next_gate.normalized_x
             )
-            if publication >= 119 and blend_active:
-                resumed_blend_publications.append(publication)
+            assert output.next_vertical_error_image_down == pytest.approx(
+                next_gate.normalized_y_down
+            )
+            blended_publications.append(publication)
 
-    assert suspended_publications == [117, 118, 122, 124]
-    assert resumed_blend_publications == (
-        list(range(119, 122))
+    assert preview_withheld_publications == [117, 118, 122, 124]
+    assert blended_publications == (
+        [116]
+        + list(range(119, 122))
         + [123]
         + list(range(125, 143))
         + list(range(144, 153))
     )
-    assert len(resumed_blend_publications) == 31
-    assert last_lease_state is not None
-    assert last_lease_state.total_suspended_fresh_frames == 4
-    assert last_lease_state.suspension_epoch_count == 3
-    assert last_lease_state.resume_count == 3
-    assert last_lease_state.total_suspension_duration_s == pytest.approx(
-        0.125
-    )
-    assert hard_refusal is not None
-    hard_publication, hard = hard_refusal
-    assert hard_publication == 153
-    assert not hard.transient_eligible
-    assert set(hard.violation_codes) == {
-        "current_horizontal_rate",
-        "current_log_scale_rate",
-        "current_apparent_scale",
-    }
-    assert post_retirement_publications == [154, 155, 156, 157, 158]
+    assert len(blended_publications) == 32
+    assert missing_next_current_only_publications == [
+        153,
+        154,
+        155,
+        156,
+        157,
+        158,
+    ]
     assert int(rows[-1][-1]) == int(FrameEdge.TOP)
 
 
@@ -1019,30 +1027,76 @@ def test_latched_passage_never_reuses_stale_next_geometry() -> None:
     assert too_fast.next_gate_blend == 0.0
 
 
-def test_passage_blend_cannot_reverse_current_aperture_correction() -> None:
+def test_approach_correction_reversal_withholds_preview_and_reenters() -> None:
     servo = ImageVisualServo()
     _latch_passage_blend(servo)
 
-    with pytest.raises(
-        VisualServoPassageSafetyUnavailable,
-        match="reversed current-aperture correction",
-    ) as exc_info:
-        step(
-            servo,
-            target(5, x=-0.17),
-            next_target=target(
-                5,
-                track_id="vq2-track-000002",
-                x=1.0,
-            ),
-            requested_next_blend=0.3,
-            allow_advance=False,
-            allow_passage_safe_next_blend=True,
-        )
-    assert not exc_info.value.transient_projection_only
-    assert exc_info.value.violations == (
-        PassageSafetyViolation.CURRENT_HORIZONTAL_CORRECTION_REVERSAL,
+    current = target(5, x=-0.17)
+    withheld = step(
+        servo,
+        current,
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=1.0,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=False,
+        allow_passage_safe_next_blend=True,
     )
+    _assert_approach_preview_withheld_current_only(
+        withheld,
+        current=current,
+        servo=servo,
+    )
+    _assert_approach_preview_reenters(servo, frame_id=6)
+
+
+def test_passage_correction_reversal_still_retires_preview() -> None:
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    current = target(5, x=-0.17)
+    retired = step(
+        servo,
+        current,
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=1.0,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert retired.next_gate_blend == 0.0
+    assert retired.next_horizontal_error is None
+    assert retired.next_vertical_error_image_down is None
+    assert retired.reviewed_next_track_id is None
+    assert not retired.advance_enabled
+    assert retired.passage_preview_retired
+    assert [
+        detail.violation
+        for detail in retired.passage_preview_retirement_violations
+    ] == [PassageSafetyViolation.CURRENT_HORIZONTAL_CORRECTION_REVERSAL]
+    assert retired.effective_horizontal_error == pytest.approx(
+        current.normalized_x
+    )
+    assert servo.latched_next_track_id == "vq2-track-000002"
+
+    remains_retired = step(
+        servo,
+        target(6),
+        next_target=target(6, track_id="vq2-track-000002"),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert remains_retired.next_gate_blend == 0.0
+    assert remains_retired.next_horizontal_error is None
+    assert remains_retired.next_vertical_error_image_down is None
+    assert remains_retired.passage_preview_retired
+    assert remains_retired.passage_preview_retirement_violations == ()
 
 
 def test_passage_safe_next_blend_can_retain_advance_authority() -> None:

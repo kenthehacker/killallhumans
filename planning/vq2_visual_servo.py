@@ -721,6 +721,8 @@ class ImageVisualServo:
             ...,
         ] = ()
         reviewed_next_track_id: Optional[str] = None
+        next_preview_withheld_for_current_envelope = False
+        latched_next_track_this_frame = False
         if not all(
             type(value) in {int, float} and math.isfinite(float(value))
             for value in scalars
@@ -980,18 +982,21 @@ class ImageVisualServo:
         )
         if passage_violations:
             if not allow_advance:
-                raise VisualServoPassageSafetyUnavailable(
-                    "latched pre-pass current aperture left its passage "
-                    "corridor",
-                    details=tuple(passage_violations),
+                # These predicates bound optional look-ahead authority, not
+                # the independently validated current-aperture controller.
+                # Approach therefore withholds preview for this publication
+                # and lets the ordinary current-only safety logic below decide
+                # whether a command remains available.
+                next_preview_withheld_for_current_envelope = True
+            else:
+                # A hard current-envelope failure permanently retires only the
+                # optional next preview during passage.  The ordinary
+                # current-gate passage controller remains independently
+                # safety-gated below.
+                self._advance_passage_preview_retired = True
+                passage_preview_retirement_violations = tuple(
+                    passage_violations
                 )
-            # A hard current-envelope failure permanently retires only the
-            # optional next preview.  The ordinary current-gate passage
-            # controller remains independently safety-gated below.
-            self._advance_passage_preview_retired = True
-            passage_preview_retirement_violations = tuple(
-                passage_violations
-            )
         passage_safe_start = bool(
             allow_passage_safe_next_blend
             and not self._advance_passage_preview_retired
@@ -1088,6 +1093,7 @@ class ImageVisualServo:
             )
             identity_latch_ready = bool(
                 next_usable
+                and not next_preview_withheld_for_current_envelope
                 and passage_safe_start
                 and self._corridor_frames + 1
                 >= self.tuning.required_corridor_frames
@@ -1097,11 +1103,13 @@ class ImageVisualServo:
                 and self._latched_next_blend_track_id is None
             ):
                 self._latched_next_blend_track_id = next_target.track_id
+                latched_next_track_this_frame = True
             if identity_latch_ready:
                 reviewed_next_track_id = next_target.track_id
             if (
                 float(requested_next_blend) > 0.0
                 and next_usable
+                and not next_preview_withheld_for_current_envelope
                 and (
                     passage_safe_current
                     or (
@@ -1169,17 +1177,12 @@ class ImageVisualServo:
                                 limit=0.0,
                             )
                         )
-                    if correction_violations and not allow_advance:
-                        raise VisualServoPassageSafetyUnavailable(
-                            "next-gate blend reversed current-aperture correction",
-                            details=tuple(correction_violations),
-                        )
                     if correction_violations:
-                        # Passage advance is independently governed by the
-                        # current aperture.  A next preview that would reverse
-                        # its correction loses all command authority for this
-                        # publication; never let optional preview geometry
-                        # abort or replace a still-valid current-only command.
+                        # A next preview that would reverse current-aperture
+                        # correction loses all command authority for this
+                        # publication.  Approach simply continues current-only;
+                        # passage additionally retires the already-sealed
+                        # preview as before.
                         blend = 0.0
                         next_horizontal = None
                         next_vertical = None
@@ -1195,10 +1198,15 @@ class ImageVisualServo:
                         vertical_rate = (
                             0.0 if vertical_censored else raw_vertical_rate
                         )
-                        self._advance_passage_preview_retired = True
-                        passage_preview_retirement_violations = tuple(
-                            correction_violations
-                        )
+                        if not allow_advance:
+                            reviewed_next_track_id = None
+                            if latched_next_track_this_frame:
+                                self._latched_next_blend_track_id = None
+                        else:
+                            self._advance_passage_preview_retired = True
+                            passage_preview_retirement_violations = tuple(
+                                correction_violations
+                            )
 
         self._last_abs_error = (
             None if horizontal_censored else abs(raw_horizontal),

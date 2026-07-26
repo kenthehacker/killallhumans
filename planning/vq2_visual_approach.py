@@ -446,7 +446,6 @@ class RollingVisualApproachServo:
         next_gate_blend: float,
         next_gate_blend_start_log_scale: Optional[float] = None,
         next_gate_blend_full_log_scale: Optional[float] = None,
-        required_next_track_id: Optional[str] = None,
     ) -> None:
         if (
             type(expected_current_track_id) is not str
@@ -475,18 +474,6 @@ class RollingVisualApproachServo:
         ):
             raise VisualApproachRefusal(
                 "next_gate_blend must stay inside its immutable ceiling"
-            )
-        if (
-            required_next_track_id is not None
-            and (
-                type(required_next_track_id) is not str
-                or not required_next_track_id
-                or len(required_next_track_id) > 128
-                or required_next_track_id == expected_current_track_id
-            )
-        ):
-            raise VisualApproachRefusal(
-                "required next track id must be a different bounded string"
             )
         ramp_values = (
             next_gate_blend_start_log_scale,
@@ -523,7 +510,6 @@ class RollingVisualApproachServo:
             if next_gate_blend_full_log_scale is None
             else float(next_gate_blend_full_log_scale)
         )
-        self.required_next_track_id = required_next_track_id
         self._servo = ImageVisualServo(tuning)
         self._last_camera_token: Optional[CameraFrameToken] = None
         self._last_tracker_frame_sequence: Optional[int] = None
@@ -684,41 +670,10 @@ class RollingVisualApproachServo:
         next_identity_ambiguous = bool(
             snapshot.next_selection_ambiguous or visible_ambiguous
         )
-        if (
-            mode is VisualApproachMode.APPROACH
-            and next_identity_ambiguous
-        ):
-            raise VisualApproachRefusal(
-                "next-gate visual identity is ambiguous"
-            )
-
         visible_stable = self._visible_stable_candidates(
             snapshot,
             tracker,
         )
-        if (
-            self.required_next_track_id is not None
-            and mode is VisualApproachMode.APPROACH
-        ):
-            required_candidates = tuple(
-                (candidate, track)
-                for candidate, track in visible_stable
-                if candidate.track_id == self.required_next_track_id
-            )
-            different_stable_ids = tuple(
-                candidate.track_id
-                for candidate, _track in visible_stable
-                if candidate.track_id != self.required_next_track_id
-            )
-            if different_stable_ids:
-                raise VisualApproachRefusal(
-                    "a different stable next-gate identity contended with "
-                    "the required identity"
-                )
-            if len(required_candidates) != 1:
-                raise VisualApproachRefusal(
-                    "required next-gate identity is not continuously visible"
-                )
         eligible = tuple(
             (candidate, track)
             for candidate, track in visible_stable
@@ -728,40 +683,21 @@ class RollingVisualApproachServo:
                 snapshot,
             )
         )
-        if self.required_next_track_id is not None:
-            eligible = tuple(
-                (candidate, track)
-                for candidate, track in eligible
-                if candidate.track_id == self.required_next_track_id
-            )
-        if provisional_ids:
+        if provisional_ids or next_identity_ambiguous:
             # A new one-frame contour is not yet evidence that the stable
-            # incumbent identity changed.  It is nevertheless unresolved
-            # geometry, so remove all next-gate blend authority for this exact
-            # publication.  If it matures into a competing stable candidate,
-            # the checks below refuse instead of silently keeping the latch.
+            # incumbent identity changed, and ambiguous geometry is not a
+            # review of any exact identity.  Both remove only optional
+            # next-gate authority for this publication.  The independently
+            # valid current-aperture proposal remains available.
             eligible = ()
         competing_next_identities = bool(
             len(visible_stable) > 1 or len(eligible) > 1
         )
-        if (
-            mode is VisualApproachMode.APPROACH
-            and competing_next_identities
-        ):
-            raise VisualApproachRefusal(
-                "competing stable next-gate identities are present"
-            )
-        if (
-            mode is VisualApproachMode.PASSAGE
-            and (
-                next_identity_ambiguous
-                or competing_next_identities
-            )
-        ):
-            # Passage has already consumed a reviewed current-gate admission.
-            # Ambiguous next geometry loses all optional blend authority, but
-            # it cannot replace or interrupt the independently safe
-            # current-aperture controller.
+        if next_identity_ambiguous or competing_next_identities:
+            # Next-only uncertainty cannot veto current-gate navigation in
+            # either mode.  Passage still consumes only its sealed reviewed
+            # identity below, while approach can earn a new admission only
+            # after a later fresh, unambiguous review.
             eligible = ()
         if mode is VisualApproachMode.PASSAGE:
             assert passage_admission is not None
@@ -788,15 +724,13 @@ class RollingVisualApproachServo:
                 self._latched_next_track_id is not None
                 and eligible_id != self._latched_next_track_id
             ):
-                if mode is VisualApproachMode.APPROACH:
-                    raise VisualApproachRefusal(
-                        "next-gate identity changed after blend latch"
-                    )
                 eligible = ()
                 eligible_id = None
             if not eligible:
                 withholding_reason = (
                     "passage_next_identity_withheld"
+                    if mode is VisualApproachMode.PASSAGE
+                    else "latched_next_identity_conflict"
                 )
             else:
                 next_target = self._target(
@@ -826,22 +760,20 @@ class RollingVisualApproachServo:
                     and track.visible
                 )
             )
-            if different_visible:
-                if mode is VisualApproachMode.APPROACH:
-                    raise VisualApproachRefusal(
-                        "a different stable next-gate identity replaced the latch"
-                    )
-                withholding_reason = "passage_next_identity_withheld"
-            elif (
-                mode is VisualApproachMode.PASSAGE
-                and (
-                    next_identity_ambiguous
-                    or competing_next_identities
-                )
-            ):
-                withholding_reason = "passage_next_identity_withheld"
-            elif provisional_ids:
+            if provisional_ids:
                 withholding_reason = "provisional_next_identity_unresolved"
+            elif next_identity_ambiguous or competing_next_identities:
+                withholding_reason = (
+                    "passage_next_identity_withheld"
+                    if mode is VisualApproachMode.PASSAGE
+                    else "next_identity_unresolved"
+                )
+            elif different_visible:
+                withholding_reason = (
+                    "passage_next_identity_withheld"
+                    if mode is VisualApproachMode.PASSAGE
+                    else "latched_next_identity_conflict"
+                )
             elif self._latched_next_track_id is not None:
                 withholding_reason = "latched_next_track_unavailable"
             elif candidate_ids:
@@ -1080,7 +1012,9 @@ class RollingVisualApproachServo:
         ):
             # Once an exact next identity is latched, a later frame with no
             # fresh same-identity review cannot overwrite the pending passage
-            # evidence with an identity-less admission.
+            # evidence with an identity-less admission.  With no latch, the
+            # caller may still consume current-only admission for a terminal
+            # gate that has no adjacent visual target.
             return None
         if (
             reviewed_preview_id is not None

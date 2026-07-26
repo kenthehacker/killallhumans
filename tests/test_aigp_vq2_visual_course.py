@@ -293,7 +293,6 @@ class _Servo:
         next_gate_blend,
         next_gate_blend_start_log_scale=None,
         next_gate_blend_full_log_scale=None,
-        required_next_track_id=None,
         yaw_rate=0.02,
         passage_advances=True,
         preview_track_id=None,
@@ -311,7 +310,6 @@ class _Servo:
         self.next_gate_blend_full_log_scale = (
             next_gate_blend_full_log_scale
         )
-        self.required_next_track_id = required_next_track_id
         self.yaw_rate = yaw_rate
         self.passage_advances = passage_advances
         self.preview_track_id = (
@@ -968,6 +966,23 @@ def test_nonterminal_transition_refuses_without_reviewed_preview_identity():
     assert transition["promotion_confirmed"] is False
 
 
+def test_terminal_transition_completes_without_next_preview_identity():
+    host = _Host(initial_gate=3, finish_gate=3, fresh_after_samples=1)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={"preview_track_id": ""},
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    assert result["maximum_authoritative_gate_index"] == 3
+    assert host.requested_promotion_track_ids == []
+
+
 def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
     host = _Host(
         initial_gate=6,
@@ -1518,6 +1533,7 @@ def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():
         == host.visual_config.lifecycle.next_gate_blend_start_log_scale
         and call["next_gate_blend_full_log_scale"]
         == host.visual_config.lifecycle.next_gate_blend_full_log_scale
+        and "required_next_track_id" not in call
         for call in factory_calls
     )
 
@@ -1557,7 +1573,9 @@ def test_passage_safety_refusal_after_entry_remains_fatal():
 
     with pytest.raises(
         SafetyAbort,
-        match="after preview retirement or passage entry",
+        match=(
+            "visual authority refused: passage authority left its corridor"
+        ),
     ):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)

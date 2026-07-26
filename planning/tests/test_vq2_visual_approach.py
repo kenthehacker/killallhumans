@@ -30,7 +30,6 @@ from planning.vq2_visual_approach import (
     VisualApproachMode,
     VisualApproachPassageAdmission,
     VisualApproachPassageLease,
-    VisualApproachPassageSafetyUnavailable,
     VisualApproachRefusal,
 )
 
@@ -778,7 +777,7 @@ def test_latched_next_continues_through_broader_passage_corridor() -> None:
     assert not proposal.servo_output.advance_enabled
 
 
-def test_latched_current_passage_violation_is_specialized_refusal() -> None:
+def test_latched_preview_envelope_violation_continues_current_only() -> None:
     tracker, graph, snapshot, current_id, _, sequence = (
         _build_bound_graph()
     )
@@ -795,27 +794,26 @@ def test_latched_current_passage_violation_is_specialized_refusal() -> None:
         sequence + 1,
         current_center_y=-0.27,
     )
-    with pytest.raises(
-        VisualApproachPassageSafetyUnavailable,
-        match="retired passage authority",
-    ) as caught:
-        _observe(approach, snapshot, tracker)
-    assert caught.value.latched_next_track_id == (
+    current_only = _observe(approach, snapshot, tracker)
+
+    assert current_only.current_target.track_id == current_id
+    assert current_only.servo_output.next_gate_blend == 0.0
+    assert current_only.servo_output.next_horizontal_error is None
+    assert current_only.servo_output.next_vertical_error_image_down is None
+    assert not current_only.servo_output.advance_enabled
+    assert not current_only.servo_output.passage_preview_retired
+    assert current_only.passage_admission is None
+    assert current_only.latched_next_track_id == (
         proposal.latched_next_track_id
     )
 
 
-def test_required_next_identity_must_remain_exact_and_continuously_visible():
+def test_passage_uses_reviewed_latch_but_survives_missing_optional_preview():
     tracker, graph, snapshot, current_id, next_id, sequence = (
         _build_bound_graph()
     )
     assert next_id is not None
-    approach = RollingVisualApproachServo(
-        current_id,
-        0,
-        next_gate_blend=_CONFIGURED_NEXT_BLEND,
-        required_next_track_id=next_id,
-    )
+    approach = _approach(current_id)
 
     proposal = _observe(approach, snapshot, tracker)
     for sequence in range(sequence + 1, sequence + 4):
@@ -846,38 +844,6 @@ def test_required_next_identity_must_remain_exact_and_continuously_visible():
     assert passage.servo_output.advance_enabled
     assert passage.servo_output.next_gate_blend == 0.0
     assert passage.latched_next_track_id == next_id
-
-    missing = RollingVisualApproachServo(
-        current_id,
-        0,
-        next_gate_blend=_CONFIGURED_NEXT_BLEND,
-        required_next_track_id="vq2-track-does-not-exist",
-    )
-    with pytest.raises(
-        VisualApproachRefusal,
-        match="required.*identity",
-    ):
-        _observe(missing, snapshot_without_preview, tracker)
-
-    for sequence in range(sequence + 1, sequence + 5):
-        replacement_only = _advance(
-            tracker,
-            graph,
-            sequence,
-            include_next=False,
-            include_competing_next=True,
-        )
-    contender = RollingVisualApproachServo(
-        current_id,
-        0,
-        next_gate_blend=_CONFIGURED_NEXT_BLEND,
-        required_next_track_id=next_id,
-    )
-    with pytest.raises(
-        VisualApproachRefusal,
-        match="required.*identity",
-    ):
-        _observe(contender, replacement_only, tracker)
 
 
 def test_passage_lease_resumes_exact_latest_two_frame_excursion() -> None:
@@ -1229,19 +1195,25 @@ def test_next_blend_scale_ramp_is_bounded_and_complete(start, full):
         )
 
 
-def test_graph_next_identity_ambiguity_refuses_authority() -> None:
+def test_graph_next_identity_ambiguity_continues_current_only() -> None:
     tracker, _, snapshot, current_id, _, _ = _build_bound_graph()
     approach = _approach(current_id)
 
-    with pytest.raises(VisualApproachRefusal, match="ambiguous"):
-        _observe(
-            approach,
-            replace(snapshot, next_selection_ambiguous=True),
-            tracker,
-        )
+    proposal = _observe(
+        approach,
+        replace(snapshot, next_selection_ambiguous=True),
+        tracker,
+    )
+
+    assert proposal.current_target.track_id == current_id
+    assert proposal.next_target is None
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert not proposal.servo_output.advance_enabled
+    assert proposal.passage_admission is None
+    assert proposal.withholding_reason == "next_identity_unresolved"
 
 
-def test_zero_blend_identity_review_refuses_next_ambiguity():
+def test_zero_blend_identity_ambiguity_withholds_review_only():
     tracker, _, snapshot, current_id, _, _ = _build_bound_graph()
     approach = RollingVisualApproachServo(
         current_id,
@@ -1251,15 +1223,21 @@ def test_zero_blend_identity_review_refuses_next_ambiguity():
         next_gate_blend_full_log_scale=-0.50,
     )
 
-    with pytest.raises(VisualApproachRefusal, match="ambiguous"):
-        _observe(
-            approach,
-            replace(snapshot, next_selection_ambiguous=True),
-            tracker,
-        )
+    proposal = _observe(
+        approach,
+        replace(snapshot, next_selection_ambiguous=True),
+        tracker,
+    )
+
+    assert proposal.current_target.track_id == current_id
+    assert proposal.next_target is None
+    assert proposal.servo_output.reviewed_next_track_id is None
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.passage_admission is None
+    assert proposal.withholding_reason == "next_identity_unresolved"
 
 
-def test_zero_blend_identity_review_refuses_competing_stable_tracks():
+def test_zero_blend_competing_stable_tracks_withhold_review_only():
     tracker, graph, snapshot, current_id, _, sequence = _build_bound_graph()
     approach = RollingVisualApproachServo(
         current_id,
@@ -1276,11 +1254,14 @@ def test_zero_blend_identity_review_refuses_competing_stable_tracks():
             include_competing_next=True,
         )
 
-    with pytest.raises(
-        VisualApproachRefusal,
-        match="ambiguous|competing",
-    ):
-        _observe(approach, snapshot, tracker)
+    proposal = _observe(approach, snapshot, tracker)
+
+    assert proposal.current_target.track_id == current_id
+    assert proposal.next_target is None
+    assert proposal.servo_output.reviewed_next_track_id is None
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.passage_admission is None
+    assert proposal.withholding_reason == "next_identity_unresolved"
 
 
 def test_provisional_contour_withholds_blend_without_changing_latch() -> None:
@@ -1355,7 +1336,7 @@ def test_clipped_or_censored_current_aperture_refuses_authority() -> None:
         _observe(approach, snapshot, tracker)
 
 
-def test_latched_next_identity_cannot_silently_switch() -> None:
+def test_latched_next_identity_conflict_withholds_without_switching() -> None:
     tracker, graph, snapshot, current_id, next_id, sequence = (
         _build_bound_graph()
     )
@@ -1389,8 +1370,16 @@ def test_latched_next_identity_cannot_silently_switch() -> None:
         if candidate.promotable and tracker.track(candidate.track_id).visible
     ) == (replacement_id,)
 
-    with pytest.raises(VisualApproachRefusal, match="identity changed"):
-        _observe(approach, snapshot, tracker)
+    proposal = _observe(approach, snapshot, tracker)
+
+    assert proposal.current_target.track_id == current_id
+    assert proposal.next_target is None
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.servo_output.reviewed_next_track_id is None
+    assert not proposal.servo_output.advance_enabled
+    assert proposal.passage_admission is None
+    assert proposal.latched_next_track_id == next_id
+    assert proposal.withholding_reason == "latched_next_identity_conflict"
 
 
 def test_latched_next_loss_withdraws_blend_without_changing_identity() -> None:
@@ -1421,12 +1410,20 @@ def test_latched_next_loss_withdraws_blend_without_changing_identity() -> None:
 
 
 def test_no_next_candidate_remains_current_only_and_never_advances() -> None:
-    tracker, _, snapshot, current_id, _, _ = _build_bound_graph(
+    tracker, graph, snapshot, current_id, _, sequence = _build_bound_graph(
         include_next=False
     )
     approach = _approach(current_id)
 
     proposal = _observe(approach, snapshot, tracker)
+    for sequence in range(sequence + 1, sequence + 4):
+        snapshot = _advance(
+            tracker,
+            graph,
+            sequence,
+            include_next=False,
+        )
+        proposal = _observe(approach, snapshot, tracker)
 
     assert proposal.current_target.track_id == current_id
     assert proposal.next_target is None
@@ -1434,5 +1431,7 @@ def test_no_next_candidate_remains_current_only_and_never_advances() -> None:
     assert proposal.provisional_track_ids == ()
     assert proposal.servo_output.next_gate_blend == 0.0
     assert not proposal.servo_output.advance_enabled
+    assert type(proposal.passage_admission) is VisualApproachPassageAdmission
+    assert proposal.passage_admission.preview_track_id is None
     assert proposal.withholding_reason == "no_next_candidate"
     assert proposal.latched_next_track_id is None
