@@ -2074,7 +2074,7 @@ def test_top_clip_uses_observable_horizontal_brake_authority(
     assert output.effective_horizontal_error == pytest.approx(x)
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
-    assert output.target_roll_rad == 0.0
+    assert output.target_roll_rad < 0.0
     assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
     assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
 
@@ -2110,7 +2110,7 @@ def test_top_clip_retains_last_vertical_observable_collective():
     assert top.effective_vertical_error_image_down == 0.0
     assert top.effective_vertical_rate_down_s == 0.0
     assert top.yaw_rate_rad_s < 0.0
-    assert top.target_roll_rad == 0.0
+    assert top.target_roll_rad < 0.0
     assert top.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
 
 
@@ -2154,7 +2154,7 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
     assert all(not output.advance_enabled for output in outputs)
     assert all(output.next_gate_blend == 0.0 for output in outputs)
     assert all(output.yaw_rate_rad_s == -0.15 for output in outputs)
-    assert all(output.target_roll_rad == 0.0 for output in outputs)
+    assert all(output.target_roll_rad < 0.0 for output in outputs)
     assert all(
         output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
         for output in outputs

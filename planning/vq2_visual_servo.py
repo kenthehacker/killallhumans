@@ -1560,12 +1560,13 @@ class ImageVisualServo:
             steering_load == 1.0
             and heading_horizontal * heading_horizontal_rate > 0.0
         ):
-            # Four free-flight Gate-1 cohorts show that sustained same-sign
-            # bank accompanies outward image motion even while calibrated yaw
-            # is saturated and responding.  Do not guess an opposite lateral
-            # sign: unload to level roll whenever the observable bearing is
-            # still moving outward, leaving yaw and closure braking in charge.
-            target_roll = 0.0
+            # Sustained same-sign bank worsened four free-flight successor
+            # cohorts.  A following level-roll flight reduced that motion but
+            # still moved outward while calibrated yaw saturated and
+            # responded.  Allocate the existing bounded bank demand in the
+            # counter direction only during that measured condition; yaw and
+            # closure braking remain fully active.
+            target_roll = -base_target_roll
         vertical_correction = (
             -self.tuning.vertical_error_gain * vertical
             - self.tuning.vertical_rate_gain
