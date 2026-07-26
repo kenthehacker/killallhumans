@@ -2164,7 +2164,10 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
         output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
         for output in outputs
     )
-    assert outputs[0].thrust == pytest.approx(0.32)
+    assert all(
+        output.thrust == pytest.approx(servo.tuning.brake_thrust)
+        for output in outputs
+    )
 
 
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():

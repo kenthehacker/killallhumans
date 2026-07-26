@@ -1640,6 +1640,21 @@ class ImageVisualServo:
             MIN_VISUAL_THRUST,
             MAX_VISUAL_THRUST,
         )
+        steering_thrust_ceiling = (
+            MAX_VISUAL_THRUST
+            - steering_load
+            * (MAX_VISUAL_THRUST - self.tuning.brake_thrust)
+        )
+        if not advance_enabled:
+            # Transfer collective authority continuously toward the measured
+            # flight-support/brake basis while heading correction consumes
+            # the yaw envelope.  This keeps a large off-axis successor from
+            # receiving maximum collective at the same time as saturated
+            # steering, without adding a gate-specific mode or threshold.
+            measured_thrust = min(
+                measured_thrust,
+                steering_thrust_ceiling,
+            )
         if (
             vertical_censored
             and self._last_vertical_observable_thrust is not None
@@ -1653,6 +1668,11 @@ class ImageVisualServo:
             thrust = measured_thrust
             if not vertical_censored:
                 self._last_vertical_observable_thrust = thrust
+        if not advance_enabled:
+            # If steering load increased after the last vertically observable
+            # frame, censorship cannot preserve a collective above the
+            # current steering allocation.
+            thrust = min(thrust, steering_thrust_ceiling)
 
         return VisualServoOutput(
             target_roll_rad=target_roll,
