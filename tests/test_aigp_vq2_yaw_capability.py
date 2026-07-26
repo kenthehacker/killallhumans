@@ -31,7 +31,7 @@ def test_progressive_yaw_capability_plan_is_exact_and_symmetric():
         for level in capability.YAW_CAPABILITY_LEVELS_RAD_S
         for value in (level, -level)
     ]
-    assert pulses == [0.12, -0.12]
+    assert pulses == [0.15, -0.15]
     assert capability.canonical_yaw_capability_plan_sha256(plan) == (
         capability.YAW_CAPABILITY_PLAN_SHA256
     )
