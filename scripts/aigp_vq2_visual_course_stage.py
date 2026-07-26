@@ -3750,11 +3750,33 @@ async def _run_visual_course_stage_impl(
                     "visual-course credit-wait measurement became unsafe"
                 )
 
-            promotable_candidates = tuple(
+            adjacent_candidates = tuple(
                 candidate
                 for candidate in getattr(snapshot, "next_candidates", ())
-                if getattr(candidate, "promotable", False) is True
+                if (
+                    getattr(candidate, "promotable", False) is True
+                    or (
+                        measurement_mode
+                        is LatchedMeasurementMode.CREDIT_WAIT
+                        and getattr(candidate, "relationship", None) is None
+                        and getattr(candidate, "stable_frame_count", 0)
+                        >= graph_config.min_next_candidate_frames
+                        and getattr(candidate, "confidence", -1.0)
+                        >= graph_config.min_track_confidence
+                        and getattr(
+                            candidate,
+                            "association_confidence",
+                            -1.0,
+                        )
+                        >= graph_config.min_association_confidence
+                    )
+                )
             )
+            # Across the physical gate-plane occlusion, a clean successor can
+            # lack only the simultaneous-image relationship needed for
+            # promotion.  That specific gap may receive fresh no-advance
+            # guidance; low-confidence or contended relationship failures do
+            # not gain command authority.
             if (
                 credit_wait_adjacent_planner is None
                 and getattr(
@@ -3764,13 +3786,13 @@ async def _run_visual_course_stage_impl(
                 )
                 is False
                 and not getattr(snapshot, "provisional_track_ids", ())
-                and len(promotable_candidates) == 1
-                and promotable_candidates[0].latest_token == token
-                and type(promotable_candidates[0].track_id) is str
-                and promotable_candidates[0].track_id
+                and len(adjacent_candidates) == 1
+                and adjacent_candidates[0].latest_token == token
+                and type(adjacent_candidates[0].track_id) is str
+                and adjacent_candidates[0].track_id
             ):
                 credit_wait_adjacent_track_id = (
-                    promotable_candidates[0].track_id
+                    adjacent_candidates[0].track_id
                 )
                 credit_wait_adjacent_planner = make_planner(
                     track_id=credit_wait_adjacent_track_id,

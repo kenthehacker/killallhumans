@@ -30,6 +30,7 @@ from competition.vq2_visual_tracker import (
     VisualTrackerUpdate,
 )
 from planning.vq2_gate_graph import (
+    DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
     GateGraphSnapshot,
     GateRelationshipBasis,
     NextGateCandidate,
@@ -597,7 +598,13 @@ class RollingVisualApproachServo:
         segment_elapsed_s: float,
         segment_yaw_excursion_rad: float,
     ) -> VisualApproachProposal:
-        """Recenter on one graph-vetted successor without passage authority."""
+        """Recenter on one graph-vetted successor without passage authority.
+
+        Promotion may require a simultaneous-image relationship that is
+        unobservable across the gate plane.  This path instead requires the
+        graph's sole clean, stable NEXT role and never advances or promotes
+        it; authoritative race credit remains the only passage authority.
+        """
 
         if type(snapshot) is not GateGraphSnapshot:
             raise TypeError("snapshot must be an exact GateGraphSnapshot")
@@ -631,10 +638,22 @@ class RollingVisualApproachServo:
             raise VisualApproachRefusal(
                 "credit-wait adjacent provenance authority is invalid"
             )
+        graph_config = DEFAULT_ROLLING_GATE_GRAPH_CONFIG
         candidates = tuple(
             candidate
             for candidate in snapshot.next_candidates
-            if candidate.promotable
+            if (
+                candidate.promotable
+                or (
+                    candidate.relationship is None
+                    and candidate.stable_frame_count
+                    >= graph_config.min_next_candidate_frames
+                    and candidate.confidence
+                    >= graph_config.min_track_confidence
+                    and candidate.association_confidence
+                    >= graph_config.min_association_confidence
+                )
+            )
         )
         if (
             snapshot.latest_camera_token != update.token

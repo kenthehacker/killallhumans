@@ -2608,7 +2608,7 @@ def test_crossing_hold_aborts_new_observable_axis_divergence():
     assert not any(command.thrust == 0.0 for command, _kwargs, _gate in host.commands)
 
 
-def test_credit_wait_uses_one_promotable_adjacent_without_advance():
+def test_credit_wait_uses_one_stable_adjacent_without_advance():
     class AdjacentCreditWaitHost(_Host):
         def __init__(self):
             super().__init__(
@@ -2647,7 +2647,11 @@ def test_credit_wait_uses_one_promotable_adjacent_without_advance():
                         SimpleNamespace(
                             track_id=adjacent.track_id,
                             latest_token=token,
-                            promotable=True,
+                            promotable=False,
+                            stable_frame_count=3,
+                            confidence=0.80,
+                            association_confidence=0.80,
+                            relationship=None,
                         ),
                     )
 

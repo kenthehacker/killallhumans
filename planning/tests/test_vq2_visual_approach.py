@@ -1554,7 +1554,7 @@ def test_recovery_mode_rejects_multi_edge_current(clipping) -> None:
         )
 
 
-def test_promotable_adjacent_recenter_is_fresh_and_never_advances() -> None:
+def test_stable_adjacent_recenter_is_fresh_and_never_advances() -> None:
     tracker, graph, snapshot, _current_id, next_id, sequence = (
         _build_bound_graph()
     )
@@ -1564,6 +1564,17 @@ def test_promotable_adjacent_recenter_is_fresh_and_never_advances() -> None:
         for candidate in snapshot.next_candidates
         if candidate.promotable
     ] == [next_id]
+    snapshot = replace(
+        snapshot,
+        next_candidates=tuple(
+            replace(
+                candidate,
+                promotable=False,
+                relationship=None,
+            )
+            for candidate in snapshot.next_candidates
+        ),
+    )
     adjacent = RollingVisualApproachServo(
         next_id,
         1,
@@ -1609,6 +1620,35 @@ def test_promotable_adjacent_recenter_is_fresh_and_never_advances() -> None:
         second.current_target.frame_token.publication_sequence
         > first.current_target.frame_token.publication_sequence
     )
+
+
+def test_nonpromotable_adjacent_with_relationship_is_unavailable() -> None:
+    tracker, _, snapshot, _, next_id, _ = _build_bound_graph()
+    assert next_id is not None
+    snapshot = replace(
+        snapshot,
+        next_candidates=tuple(
+            replace(candidate, promotable=False)
+            for candidate in snapshot.next_candidates
+        ),
+    )
+    adjacent = RollingVisualApproachServo(
+        next_id,
+        1,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+    )
+
+    with pytest.raises(
+        VisualApproachAdjacentUnavailable,
+        match="adjacent authority is unavailable",
+    ):
+        adjacent.observe_promotable_adjacent(
+            snapshot,
+            tracker,
+            now_monotonic_s=_now_s(tracker),
+            segment_elapsed_s=0.5,
+            segment_yaw_excursion_rad=0.0,
+        )
 
 
 def test_promotable_adjacent_recenter_rejects_ambiguous_selection() -> None:
