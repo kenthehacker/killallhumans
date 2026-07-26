@@ -1686,7 +1686,6 @@ async def _run_visual_course_stage_impl(
         target_roll_rad = float(output.target_roll_rad)
         target_pitch_rad = float(output.target_pitch_rad)
         command_thrust = float(output.thrust)
-        visual_command_thrust = command_thrust
         if (
             not all(
                 math.isfinite(value)
@@ -1726,30 +1725,7 @@ async def _run_visual_course_stage_impl(
             pitch_blend_s = float(
                 host.visual_config.lifecycle.launch_pitch_blend_s
             )
-            scheduled_pitch_blend = min(
-                1.0,
-                launch_elapsed_s / pitch_blend_s,
-            )
-            pitch_blend = scheduled_pitch_blend
-            vertical_launch_margin = max(
-                0.0,
-                min(
-                    1.0,
-                    1.0
-                    + float(
-                        proposal.current_target.normalized_y_down
-                    )
-                    / host.visual_config.servo.vertical_corridor,
-                ),
-            )
-            launch_steering_unload_authority = (
-                min(
-                    1.0,
-                    abs(requested_yaw)
-                    / limits.max_yaw_rate_rad_s,
-                )
-                * vertical_launch_margin
-            )
+            pitch_blend = min(1.0, launch_elapsed_s / pitch_blend_s)
             target_pitch_rad = (
                 (1.0 - pitch_blend) * launch_spawn_pitch_rad
                 + pitch_blend * target_pitch_rad
@@ -1769,21 +1745,8 @@ async def _run_visual_course_stage_impl(
             elif launch_elapsed_s < float(
                 host.visual_config.lifecycle.launch_boost_duration_s
             ):
-                launch_boost_thrust = float(
+                command_thrust = float(
                     host.visual_config.lifecycle.launch_boost_thrust
-                )
-                # A saturated heading correction must not receive the full
-                # nose-down launch acceleration at the same time.  Allocate
-                # boost continuously toward the servo's measured support
-                # thrust while the current aperture retains vertical margin;
-                # loss of that margin restores launch support automatically.
-                command_thrust = (
-                    launch_boost_thrust
-                    + launch_steering_unload_authority
-                    * (
-                        visual_command_thrust
-                        - launch_boost_thrust
-                    )
                 )
                 thrust_phase = "boost"
             else:

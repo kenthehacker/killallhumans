@@ -193,6 +193,9 @@ class VisualServoTuning:
     # separately enforced 0.18-rad measured stage corridor.
     roll_error_gain: float = 0.20
     roll_rate_gain: float = 0.05
+    # Retained in the serialized v1 configuration for manifest compatibility.
+    # Vertical image feedback is no longer applied to pitch; collective is its
+    # single control owner.
     vertical_error_gain: float = 0.16
     vertical_rate_gain: float = 0.035
     collective_error_gain: float = 0.060
@@ -239,10 +242,6 @@ class VisualServoTuning:
             raise VisualServoRefusal("roll error gain is outside bounds")
         if not 0.0 <= self.roll_rate_gain <= 0.05:
             raise VisualServoRefusal("roll rate gain is outside bounds")
-        if not 0.05 <= self.vertical_error_gain <= 0.30:
-            raise VisualServoRefusal("vertical error gain is outside bounds")
-        if not 0.0 <= self.vertical_rate_gain <= 0.08:
-            raise VisualServoRefusal("vertical rate gain is outside bounds")
         if not 0.0 <= self.collective_error_gain <= 0.08:
             raise VisualServoRefusal("collective error gain is outside bounds")
         if not 0.0 <= self.collective_rate_gain <= 0.13:
@@ -1617,11 +1616,6 @@ class ImageVisualServo:
             # and closure braking without asserting an unmeasured lateral
             # response sign.
             target_roll *= 1.0 - outward_bearing_authority
-        vertical_correction = (
-            -self.tuning.vertical_error_gain * vertical
-            - self.tuning.vertical_rate_gain
-            * vertical_rate
-        )
         if advance_enabled:
             pitch_basis = (
                 self.tuning.brake_pitch_rad
@@ -1668,18 +1662,13 @@ class ImageVisualServo:
                     - self.tuning.align_thrust
                 )
             )
-        raw_target_pitch = pitch_basis + vertical_correction
+        raw_target_pitch = pitch_basis
         if not advance_enabled:
-            # Normalized collective owns vertical alignment until the target
-            # is in-corridor.  A low target must never turn alignment/braking
-            # into a nose-down forward-closure command.  Retain positive
-            # braking continuously with lateral steering load, including
-            # while the vertical measurement is censored.
-            raw_target_pitch = max(
-                0.0,
-                steering_load * MAX_VISUAL_TARGET_PITCH_RAD,
-                raw_target_pitch,
-            )
+            # Collective owns vertical image-space alignment.  Pitch owns
+            # closure and cannot become a nose-down closure command while
+            # alignment is withheld.  In particular, vertical displacement
+            # and saturated yaw do not manufacture cross-axis pitch demand.
+            raw_target_pitch = max(0.0, raw_target_pitch)
         target_pitch = _clamp(
             raw_target_pitch,
             MIN_VISUAL_TARGET_PITCH_RAD,

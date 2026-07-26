@@ -308,8 +308,6 @@ class _Servo:
         next_gate_blend_full_log_scale=None,
         yaw_rate=0.02,
         passage_advances=True,
-        aligning_pitch_rad=0.0,
-        aligning_thrust=0.21,
         preview_track_id=None,
         passage_preview_blend=0.0,
         passage_preview_retire_once=False,
@@ -327,8 +325,6 @@ class _Servo:
         )
         self.yaw_rate = yaw_rate
         self.passage_advances = passage_advances
-        self.aligning_pitch_rad = aligning_pitch_rad
-        self.aligning_thrust = aligning_thrust
         self.preview_track_id = (
             preview_track_id
             if preview_track_id is not None
@@ -472,11 +468,9 @@ class _Servo:
         )
         output = VisualServoOutput(
             target_roll_rad=0.0,
-            target_pitch_rad=(
-                -0.105 if advance else self.aligning_pitch_rad
-            ),
+            target_pitch_rad=-0.105 if advance else 0.0,
             yaw_rate_rad_s=self.yaw_rate,
-            thrust=0.295 if advance else self.aligning_thrust,
+            thrust=0.295 if advance else 0.21,
             corridor_frames=5,
             advance_enabled=advance,
             next_gate_blend=(
@@ -1640,25 +1634,10 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["first_target_pitch_rad"] == pytest.approx(-0.31)
     assert gate0_commands[0][0].pitch_rate == pytest.approx(-0.25)
     assert gate0_commands[0][0].thrust == 0.26
-    launch_boost_commands = [
-        command
-        for stage, elapsed_s, command in host.ticks
-        if stage.startswith("visual-course/gate0/")
-        and 0.15
-        <= elapsed_s
-        < host.visual_config.lifecycle.launch_boost_duration_s
-    ]
-    assert launch_boost_commands
-    assert all(
-        0.21
-        <= command.thrust
-        <= host.visual_config.lifecycle.launch_boost_thrust
-        for command in launch_boost_commands
-    )
     assert any(
         command.thrust
-        < host.visual_config.lifecycle.launch_boost_thrust
-        for command in launch_boost_commands
+        == host.visual_config.lifecycle.launch_boost_thrust
+        for command, _kwargs in gate0_commands
     )
     assert launch["last_thrust_phase"] == "generic-visual-servo"
     assert launch["last_thrust"] == pytest.approx(0.295)
@@ -1704,90 +1683,13 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert gate0_passage
     assert any(command.thrust == 0.26 for command in gate0_passage)
     assert any(
-        0.21
-        < command.thrust
-        < host.visual_config.lifecycle.launch_boost_thrust
+        command.thrust
+        == host.visual_config.lifecycle.launch_boost_thrust
         for command in gate0_passage
     )
     assert gate0_passage[-1].thrust == pytest.approx(0.295)
     assert gate1_passage
     assert all(command.thrust == 0.295 for command in gate1_passage)
-
-
-def test_visual_steering_unloads_launch_boost_not_pitch_handoff():
-    host = _Host(
-        initial_gate=0,
-        finish_gate=0,
-        disable_credit=True,
-    )
-    limits = replace(
-        VisualCourseStageLimits(),
-        passage_hard_duration_s=0.40,
-    )
-    runtime, _calls = _runtime(
-        host,
-        servo_options={
-            "passage_advances": False,
-            "yaw_rate": (
-                course_stage.MAX_VISUAL_YAW_RATE_RAD_S
-            ),
-            "aligning_pitch_rad": (
-                course_stage.MAX_VISUAL_TARGET_PITCH_RAD
-            ),
-            "aligning_thrust": 0.275,
-        },
-        limits=limits,
-    )
-
-    with pytest.raises(SafetyAbort, match="passage expired"):
-        asyncio.run(
-            run_visual_course_stage(host, _context(), runtime=runtime)
-        )
-
-    initial = host._visual_course_summary["segments"][0]
-    launch = initial["launch_bootstrap"]
-    navigation_ticks = [
-        (elapsed_s, command)
-        for stage, elapsed_s, command in host.ticks
-        if stage.startswith("visual-course/gate0/")
-        and command.thrust > 0.0
-    ]
-    assert navigation_ticks
-    assert launch["first_target_pitch_rad"] == pytest.approx(
-        _context().spawn_pitch_rad
-    )
-    for elapsed_s, command in navigation_ticks:
-        scheduled_blend = min(
-            1.0,
-            elapsed_s
-            / host.visual_config.lifecycle.launch_pitch_blend_s,
-        )
-        scheduled_target = (
-            (1.0 - scheduled_blend) * _context().spawn_pitch_rad
-            + scheduled_blend
-            * course_stage.MAX_VISUAL_TARGET_PITCH_RAD
-        )
-        expected_command_pitch = max(
-            -limits.max_command_rate_rad_s,
-            min(
-                limits.max_command_rate_rad_s,
-                scheduled_target,
-            ),
-        )
-        assert command.pitch_rate == pytest.approx(
-            expected_command_pitch
-        )
-    assert launch["last_pitch_blend"] == pytest.approx(min(
-        1.0,
-        launch["last_elapsed_s"]
-        / host.visual_config.lifecycle.launch_pitch_blend_s,
-    ))
-    assert navigation_ticks[0][1].thrust == 0.26
-    assert any(
-        command.thrust == pytest.approx(0.275)
-        for _elapsed_s, command in navigation_ticks
-        if 0.15 <= _elapsed_s < 0.45
-    )
 
 
 def test_initial_gate_arms_from_finite_preblend_admission_window():
