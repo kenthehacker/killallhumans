@@ -663,6 +663,7 @@ class ImageVisualServo:
         self._segment_track_id: Optional[str] = None
         self._latched_next_blend_track_id: Optional[str] = None
         self._advance_passage_preview_retired = False
+        self._passage_successor_yaw_direction: Optional[float] = None
         self._last_abs_error: Optional[
             Tuple[Optional[float], Optional[float]]
         ] = None
@@ -678,7 +679,7 @@ class ImageVisualServo:
         return self._latched_next_blend_track_id
 
     def retire_advance_passage_preview(self) -> None:
-        """Permanently remove optional next-preview authority for this segment."""
+        """Retire successor position/vertical blend and bank authority."""
 
         if self._latched_next_blend_track_id is None:
             raise VisualServoRefusal(
@@ -1004,10 +1005,12 @@ class ImageVisualServo:
                 # whether a command remains available.
                 next_preview_withheld_for_current_envelope = True
             elif lateral_passage_violations:
-                # Only loss of the current aperture's observable horizontal
-                # corridor permanently retires lateral successor authority.
-                # Vertical and scale degradation instead remove forward and
-                # vertical preview authority while bounded yaw/bank continue.
+                # Loss of the current aperture's observable horizontal
+                # corridor permanently retires successor position/vertical
+                # blending and bank.  A fresh observation of the sealed
+                # successor may still own attenuated yaw while closure brakes.
+                # Vertical and scale degradation remove forward and vertical
+                # preview authority while bounded yaw/bank continue.
                 self._advance_passage_preview_retired = True
                 passage_preview_retirement_violations = (
                     lateral_passage_violations
@@ -1037,6 +1040,8 @@ class ImageVisualServo:
         blend = 0.0
         next_horizontal: Optional[float] = None
         next_vertical: Optional[float] = None
+        retained_successor_horizontal: Optional[float] = None
+        retained_successor_horizontal_rate = 0.0
         next_edge_risk = False
         next_ambiguity_risk = False
         if next_target is not None:
@@ -1106,6 +1111,35 @@ class ImageVisualServo:
                 and same_frame
                 and next_target.track_id != current.track_id
             )
+            if (
+                next_usable
+                and allow_passage_safe_next_blend
+                and self._latched_next_blend_track_id
+                == next_target.track_id
+                and not next_horizontal_censored
+            ):
+                observed_successor_horizontal = float(
+                    next_target.normalized_x
+                )
+                if observed_successor_horizontal != 0.0:
+                    self._passage_successor_yaw_direction = (
+                        -math.copysign(
+                            1.0,
+                            observed_successor_horizontal,
+                        )
+                    )
+                if self._advance_passage_preview_retired:
+                    # Retirement removes optional position/vertical blending
+                    # and bank authority, but an exact fresh observation of
+                    # the already sealed identity still owns heading.  This
+                    # prevents current-gate feedback from undoing the course
+                    # turn after passage commitment.
+                    retained_successor_horizontal = (
+                        observed_successor_horizontal
+                    )
+                    retained_successor_horizontal_rate = float(
+                        next_target.normalized_x_rate_s
+                    )
             identity_latch_ready = bool(
                 next_usable
                 and not next_preview_withheld_for_current_envelope
@@ -1199,10 +1233,11 @@ class ImageVisualServo:
                         )
                     if horizontal_correction_violation is not None:
                         # A next preview that would reverse current-aperture
-                        # correction loses all command authority for this
-                        # publication and retires the lateral preview.  A
-                        # vertical reversal above merely drops the optional
-                        # vertical preview component.
+                        # position correction loses translation/bank authority
+                        # for this publication and retires those preview
+                        # channels.  The fresh sealed identity may still own
+                        # attenuated yaw.  A vertical reversal above merely
+                        # drops the optional vertical preview component.
                         blend = 0.0
                         next_horizontal = None
                         next_vertical = None
@@ -1232,22 +1267,71 @@ class ImageVisualServo:
         heading_horizontal_rate = horizontal_rate
         bank_horizontal = horizontal
         bank_horizontal_rate = horizontal_rate
-        if blend > 0.0 and next_horizontal is not None:
-            # Passage admission has already established one exact, stable
-            # successor identity.  Yaw consumes the worse of measured and
-            # projected current-aperture margin once.  Multiplying those two
-            # margins made the controller unwind a physically effective turn
-            # while both observations still remained inside the corridor.
-            # Current geometry attenuates successor yaw but does not
-            # algebraically cancel it with the opposite current-gate bearing.
-            # The independently conservative bank product returns
-            # continuously to current-only as passage scale approaches the
-            # near plane.
-            projected_current_horizontal = (
-                raw_horizontal
-                + raw_horizontal_rate
-                * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        successor_heading_horizontal = (
+            next_horizontal
+            if blend > 0.0 and next_horizontal is not None
+            else retained_successor_horizontal
+        )
+        successor_heading_horizontal_rate = (
+            float(next_target.normalized_x_rate_s)
+            if blend > 0.0
+            and next_horizontal is not None
+            and next_target is not None
+            else retained_successor_horizontal_rate
+        )
+        projected_current_horizontal = (
+            raw_horizontal
+            + raw_horizontal_rate
+            * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        )
+        successor_heading_authority = (
+            0.0
+            if horizontal_censored
+            else min(
+                _clamp(
+                    1.0
+                    - abs(raw_horizontal)
+                    / PREPASS_CURRENT_MAX_ABS_X_NORM,
+                    0.0,
+                    1.0,
+                ),
+                _clamp(
+                    1.0
+                    - abs(projected_current_horizontal)
+                    / PREPASS_CURRENT_MAX_ABS_X_NORM,
+                    0.0,
+                    1.0,
+                ),
             )
+        )
+        passage_margin_brake_authority = (
+            1.0 - successor_heading_authority
+            if (
+                allow_advance
+                or self._advance_passage_preview_retired
+            )
+            and self._latched_next_blend_track_id is not None
+            else 0.0
+        )
+        if successor_heading_horizontal is not None:
+            # Passage admission has already established one exact, stable
+            # successor identity.  Yaw consumes the worse remaining measured
+            # and projected passage-corridor margin once.  Current geometry
+            # attenuates successor yaw but cannot algebraically cancel it with
+            # the opposite current-gate bearing.
+            heading_horizontal = (
+                successor_heading_authority
+                * successor_heading_horizontal
+            )
+            heading_horizontal_rate = (
+                successor_heading_authority
+                * successor_heading_horizontal_rate
+            )
+        if blend > 0.0 and next_horizontal is not None:
+            # Bank remains independently conservative and returns
+            # continuously to current-only as passage scale approaches the
+            # near plane.  Retired preview observations never regain bank or
+            # position-blend authority.
             current_position_authority = _clamp(
                 1.0
                 - abs(raw_horizontal)
@@ -1265,18 +1349,6 @@ class ImageVisualServo:
             current_barrier_authority = (
                 current_position_authority
                 * current_projection_authority
-            )
-            successor_heading_authority = min(
-                current_position_authority,
-                current_projection_authority,
-            )
-            assert next_target is not None
-            heading_horizontal = (
-                successor_heading_authority * next_horizontal
-            )
-            heading_horizontal_rate = (
-                successor_heading_authority
-                * float(next_target.normalized_x_rate_s)
             )
             passage_scale_progress = _clamp(
                 blend / MAX_NEXT_GATE_BLEND,
@@ -1527,6 +1599,17 @@ class ImageVisualServo:
             bearing_yaw_rate
             - self.tuning.yaw_rate_gain * heading_horizontal_rate
         )
+        if (
+            self._advance_passage_preview_retired
+            and self._passage_successor_yaw_direction is not None
+            and unconstrained_yaw_rate
+            * self._passage_successor_yaw_direction
+            < 0.0
+        ):
+            # A missing or retired optional preview can remove successor
+            # steering, but current-aperture feedback cannot reverse the
+            # already established course-turn direction before promotion.
+            unconstrained_yaw_rate = 0.0
         yaw_rate = _clamp(
             unconstrained_yaw_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,
@@ -1646,6 +1729,12 @@ class ImageVisualServo:
                 )
             )
         raw_target_pitch = pitch_basis
+        if passage_margin_brake_authority > 0.0:
+            raw_target_pitch = max(
+                raw_target_pitch,
+                passage_margin_brake_authority
+                * MAX_VISUAL_TARGET_PITCH_RAD,
+            )
         if not advance_enabled:
             # Collective owns vertical image-space alignment.  Pitch owns
             # closure and cannot become a nose-down closure command while

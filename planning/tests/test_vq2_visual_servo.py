@@ -1179,6 +1179,7 @@ def test_passage_correction_reversal_still_retires_preview() -> None:
     assert retired.effective_horizontal_error == pytest.approx(
         current.normalized_x
     )
+    assert retired.yaw_rate_rad_s == 0.0
     assert servo.latched_next_track_id == "vq2-track-000002"
 
     remains_retired = step(
@@ -1194,6 +1195,70 @@ def test_passage_correction_reversal_still_retires_preview() -> None:
     assert remains_retired.next_vertical_error_image_down is None
     assert remains_retired.passage_preview_retired
     assert remains_retired.passage_preview_retirement_violations == ()
+
+
+def test_retired_passage_retains_successor_heading_and_brakes_margin() -> None:
+    """Regress publications 151-157 from run 20260726T193429Z."""
+
+    servo = ImageVisualServo()
+    _latch_passage_blend(servo)
+
+    retired = step(
+        servo,
+        target(5, x=-0.169, x_rate=-0.32),
+        next_target=target(
+            5,
+            track_id="vq2-track-000002",
+            x=0.250,
+            x_rate=0.082,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert retired.passage_preview_retired
+    assert retired.next_gate_blend == 0.0
+    assert retired.next_horizontal_error is None
+    assert retired.yaw_rate_rad_s == 0.0
+    assert retired.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
+
+    fresh_successor = step(
+        servo,
+        target(6, x=-0.150, x_rate=0.173),
+        next_target=target(
+            6,
+            track_id="vq2-track-000002",
+            x=0.253,
+            x_rate=0.090,
+        ),
+        requested_next_blend=0.3,
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert fresh_successor.passage_preview_retired
+    assert fresh_successor.next_gate_blend == 0.0
+    assert fresh_successor.next_horizontal_error is None
+    assert fresh_successor.yaw_rate_rad_s < 0.0
+    assert (
+        servo.tuning.brake_pitch_rad
+        < fresh_successor.target_pitch_rad
+        < MAX_VISUAL_TARGET_PITCH_RAD
+    )
+
+    missing_successor = step(
+        servo,
+        target(7, x=-0.18),
+        allow_advance=True,
+        allow_passage_safe_next_blend=True,
+    )
+    assert missing_successor.passage_preview_retired
+    assert missing_successor.next_gate_blend == 0.0
+    assert missing_successor.yaw_rate_rad_s == 0.0
+    assert (
+        servo.tuning.brake_pitch_rad
+        < missing_successor.target_pitch_rad
+        < MAX_VISUAL_TARGET_PITCH_RAD
+    )
 
 
 def test_passage_safe_next_blend_can_retain_advance_authority() -> None:
