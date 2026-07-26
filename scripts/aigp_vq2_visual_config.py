@@ -49,11 +49,9 @@ class VisualConfigError(ValueError):
 
 @dataclass(frozen=True)
 class VisualLifecycleTuning:
-    # The bounded 0.35-preview flight accumulated only 0.042 rad of heading
-    # before Gate 1 appeared at x=0.56 and diverged on every commanded frame.
-    # Ramp to the full observed successor while the current aperture remains
-    # inside its independently enforced passage envelope.
-    next_gate_blend_max: float = 1.0
+    # Retain the known-stable pre-credit preview while plant capability is
+    # characterized independently of the visual-course lifecycle.
+    next_gate_blend_max: float = 0.35
     next_gate_blend_start_log_scale: float = -1.80
     next_gate_blend_full_log_scale: float = -0.50
     restricted_alignment_duration_s: float = 0.90

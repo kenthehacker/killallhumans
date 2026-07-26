@@ -76,6 +76,7 @@ _RUNTIME_SOURCE_PATHS = (
     "scripts/aigp_vq2_visual_config.py",
     "scripts/aigp_vq2_visual_alignment_stage.py",
     "scripts/aigp_vq2_visual_course_stage.py",
+    "scripts/aigp_vq2_yaw_capability.py",
     "scripts/aigp_vq2_yaw_calibration.py",
     "scripts/aigp_vq2_yaw_profile.py",
     "scripts/aigp_vq2_fast_cycle.py",
@@ -249,14 +250,23 @@ def _git_snapshot(repo_root: Path) -> dict[str, Any]:
 def _excitation_plan_identity(stage: str) -> Mapping[str, Any] | None:
     if stage not in {"sign-id", "calibration-excite"}:
         return None
-    from scripts import aigp_vq2_yaw_calibration as contract
+    if stage == "calibration-excite":
+        from scripts import aigp_vq2_yaw_capability as contract
 
-    plan = contract.validate_yaw_calibration_plan(
-        contract.yaw_calibration_plan()
-    )
+        plan = contract.validate_yaw_capability_plan(
+            contract.yaw_capability_plan()
+        )
+        plan_sha256 = contract.YAW_CAPABILITY_PLAN_SHA256
+    else:
+        from scripts import aigp_vq2_yaw_calibration as contract
+
+        plan = contract.validate_yaw_calibration_plan(
+            contract.yaw_calibration_plan()
+        )
+        plan_sha256 = contract.YAW_CALIBRATION_PLAN_SHA256
     return {
         "plan_id": plan["plan_id"],
-        "sha256": contract.YAW_CALIBRATION_PLAN_SHA256,
+        "sha256": plan_sha256,
         "tick_count": plan["tick_count"],
         "control_period_ns": plan["control_period_ns"],
     }

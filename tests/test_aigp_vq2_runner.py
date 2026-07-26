@@ -4067,9 +4067,7 @@ def test_gate0_visual_blend_hard_withdraws_geometry_but_suspends_passage(
         ):
             assert expected_current_track_id == current_track_id
             assert gate_index == 0
-            assert next_gate_blend == pytest.approx(
-                runner.visual_config.lifecycle.next_gate_blend_max
-            )
+            assert next_gate_blend == pytest.approx(0.35)
             self.next_gate_blend = next_gate_blend
             self.calls = 0
 
@@ -4165,8 +4163,8 @@ def test_gate0_visual_blend_hard_withdraws_geometry_but_suspends_passage(
                 next_gate_blend=self.next_gate_blend,
                 horizontal_error=0.02,
                 vertical_error_image_down=-0.04,
-                effective_horizontal_error=0.30,
-                effective_vertical_error_image_down=-0.12,
+                effective_horizontal_error=0.118,
+                effective_vertical_error_image_down=-0.096,
                 effective_horizontal_rate_s=0.0,
                 effective_vertical_rate_down_s=0.0,
                 next_horizontal_error=0.30,
@@ -7893,38 +7891,85 @@ def test_sign_id_powered_dispatch_excites_only_yaw(monkeypatch):
     ]
 
 
-def test_calibration_excite_delegates_only_to_bounded_yaw_plan(
+def test_calibration_excite_runs_exact_progressive_free_flight_yaw_plan(
     monkeypatch,
 ):
-    runner, _adapter, context = _fast_calibration_runner()
-    calls = []
+    from scripts import aigp_vq2_yaw_capability as capability
 
-    async def sign_id(*, calibration_context):
-        from scripts import aigp_vq2_yaw_calibration as yaw_contract
+    runner, adapter, context = _fast_calibration_runner()
+    clock_ns = [1_000_000_000]
+    commands = []
 
-        calls.append(calibration_context)
+    async def hover(value):
+        assert value == context
+        return {"free_flight": True}
+
+    async def wait_slot():
+        return clock_ns[0] / 1_000_000_000.0
+
+    def wait_release(deadline_ns):
+        clock_ns[0] = max(clock_ns[0], int(deadline_ns))
+
+    def sample():
+        runner._last_imu_received_monotonic_ns = clock_ns[0]
+
+    async def send(command, **kwargs):
+        clock_ns[0] = max(
+            clock_ns[0],
+            int(kwargs["wire_start_not_before_ns"]),
+        )
+        commands.append(command)
         return {
-            "calibration_kind": "yaw-sign-authority-delay",
-            "plan_id": "yaw-plan",
-            "plan_sha256": "a" * 64,
-            "ticks_sent": yaw_contract.YAW_CALIBRATION_TICK_COUNT,
-            "ticks_expected": yaw_contract.YAW_CALIBRATION_TICK_COUNT,
+            "call_start_monotonic_ns": clock_ns[0],
+            "call_end_monotonic_ns": clock_ns[0],
+            "wire": {
+                "type_mask": 128,
+                "body_rates_rad_s": [
+                    -command.roll_rate,
+                    -command.pitch_rate,
+                    -command.yaw_rate,
+                ],
+                "thrust": command.thrust,
+            },
         }
 
-    monkeypatch.setattr(runner, "_run_sign_id", sign_id)
+    monkeypatch.setattr(runner, "_run_hover", hover)
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_next_flight_command_slot",
+        wait_slot,
+    )
+    monkeypatch.setattr(runner, "_wait_for_calibration_release", wait_release)
+    monkeypatch.setattr(runner, "_sample", sample)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", send)
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    monkeypatch.setattr(
+        vq2_module.time,
+        "perf_counter_ns",
+        lambda: clock_ns[0],
+    )
 
     details = asyncio.run(runner._run_calibration_excite(context))
 
-    assert calls == [context]
+    assert len(commands) == capability.YAW_CAPABILITY_TICK_COUNT
+    assert [command.yaw_rate for command in commands if command.yaw_rate] == [
+        value
+        for level in capability.YAW_CAPABILITY_LEVELS_RAD_S
+        for value in [level] * 5 + [-level] * 5
+    ]
     assert details["stage"] == "calibration-excite"
     assert details["calibration_scope"] == (
-        "yaw-only-sign-authority-delay-build3385"
+        "free-flight-progressive-yaw-capability-build3385"
     )
-    from scripts import aigp_vq2_yaw_calibration as yaw_contract
-
     assert details["ticks_sent"] == details["ticks_expected"] == (
-        yaw_contract.YAW_CALIBRATION_TICK_COUNT
+        capability.YAW_CAPABILITY_TICK_COUNT
     )
+    assert details["authority_effect"] == (
+        "characterization-only-no-visual-course-envelope-change"
+    )
+    assert details["free_flight_hover"] == {"free_flight": True}
+    assert adapter.race_status.active_gate_index == 0
 
 
 def test_delayed_pre_reset_clocks_cannot_unlock_go():
@@ -8424,11 +8469,11 @@ def test_fast_calibration_stage_retains_reset_go_arm_and_cleanup(monkeypatch):
         calls.append("arm_confirmed")
 
     async def excite(value):
-        from scripts import aigp_vq2_yaw_calibration as yaw_contract
+        from scripts import aigp_vq2_yaw_capability as yaw_contract
 
         assert value == context
         calls.append("calibration-excite")
-        return {"ticks_sent": yaw_contract.YAW_CALIBRATION_TICK_COUNT}
+        return {"ticks_sent": yaw_contract.YAW_CAPABILITY_TICK_COUNT}
 
     async def cleanup():
         calls.append("cleanup")

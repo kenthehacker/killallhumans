@@ -8060,11 +8060,7 @@ def attitude_rate_command(
         estimate.orientation,
         desired,
         omega=estimate.body_rates,
-        # The live full-preview run reached the requested +0.10 rad braking
-        # target too slowly: measured pitch remained below zero until impact.
-        # Match the existing bounded roll proportional response so vertical
-        # image/braking authority reaches its already-clamped target sooner.
-        kp=(1.0, 1.0, 0.0),
+        kp=(1.0, 0.5, 0.0),
         kd=(0.4, 0.2, 0.0),
         max_rate=(MAX_COMMAND_RATE_RAD_S,) * 3,
     )
@@ -12420,18 +12416,393 @@ class VQ2Runner:
         self,
         context: StartContext,
     ) -> Dict[str, Any]:
-        """Measure bounded yaw sign, authority, and exact response delay."""
+        """Characterize progressively larger yaw authority in free flight."""
 
-        details = await self._run_sign_id(
-            calibration_context=context,
+        from scripts.aigp_vq2_yaw_capability import (
+            YAW_CAPABILITY_CONTROL_PERIOD_NS,
+            YAW_CAPABILITY_HARD_EXPIRY_OFFSET_NS,
+            YAW_CAPABILITY_LEVELS_RAD_S,
+            YAW_CAPABILITY_PLAN_ID,
+            YAW_CAPABILITY_PLAN_SHA256,
+            iter_yaw_capability_ticks,
+            validate_yaw_capability_plan,
+            yaw_capability_plan,
         )
-        return {
-            **details,
+
+        plan = validate_yaw_capability_plan(yaw_capability_plan())
+        if (
+            YAW_CAPABILITY_CONTROL_PERIOD_NS
+            != round(CONTROL_PERIOD_S * 1_000_000_000)
+            or max(YAW_CAPABILITY_LEVELS_RAD_S) > MAX_COMMAND_RATE_RAD_S
+        ):
+            raise SafetyAbort(
+                "yaw capability plan escaped the existing command envelope"
+            )
+
+        # The accepted +/-0.08 profile was pad-loaded.  Reuse the proved
+        # bounded hover launch so this sweep measures the free-flight plant.
+        hover_details = await self._run_hover(context)
+        self._sample()
+        self._watchdog(
+            allow_benign_pad_contact=False,
+            enforce_benign_pad_budget=True,
+        )
+        assert self.estimate is not None
+        reference_rpy = tuple(
+            float(value) for value in self.estimate.orientation.to_euler()
+        )
+        baseline_rates: List[float] = []
+        pulse_rows: Dict[str, Dict[str, Any]] = {}
+        max_attitude_excursion = 0.0
+        max_abs_body_rate = 0.0
+        max_abs_transverse_rate = 0.0
+        previous_wire_start_ns = self._last_flight_command_started_ns
+
+        await self._wait_for_next_flight_command_slot()
+        flight_start_ns = time.perf_counter_ns()
+        hard_deadline_ns = (
+            flight_start_ns + YAW_CAPABILITY_HARD_EXPIRY_OFFSET_NS
+        )
+        self.recorder.emit(
+            "yaw_capability_plan_start",
+            plan_id=YAW_CAPABILITY_PLAN_ID,
+            plan_sha256=YAW_CAPABILITY_PLAN_SHA256,
+            tick_count=plan["tick_count"],
+            levels_rad_s=list(YAW_CAPABILITY_LEVELS_RAD_S),
+            free_flight_hover=hover_details,
+            flight_start_monotonic_ns=flight_start_ns,
+            hard_deadline_monotonic_ns=hard_deadline_ns,
+            watchdog={
+                "max_abs_roll_rad": MAX_ROLL_RAD,
+                "min_pitch_rad": MIN_PITCH_RAD,
+                "max_pitch_rad": MAX_PITCH_RAD,
+                "max_sustained_body_rate_rad_s": MAX_BODY_RATE_RAD_S,
+                "max_immediate_body_rate_rad_s": (
+                    IMMEDIATE_MAX_BODY_RATE_RAD_S
+                ),
+                "max_command_rate_rad_s": MAX_COMMAND_RATE_RAD_S,
+            },
+        )
+
+        def wrapped_delta(value: float, reference: float) -> float:
+            delta = float(value) - float(reference)
+            return math.atan2(math.sin(delta), math.cos(delta))
+
+        def validate_wire(
+            receipt: Optional[Mapping[str, Any]],
+            command: AttitudeRateCommand,
+        ) -> tuple[int, float]:
+            if not isinstance(receipt, Mapping):
+                raise SafetyAbort(
+                    "yaw capability sweep lacks an outbound wire receipt"
+                )
+            wire = receipt.get("wire")
+            call_start_ns = receipt.get("call_start_monotonic_ns")
+            if (
+                not isinstance(wire, Mapping)
+                or type(call_start_ns) is not int
+                or wire.get("type_mask") != 128
+            ):
+                raise SafetyAbort(
+                    "yaw capability sweep wire receipt is malformed"
+                )
+            body_rates = wire.get("body_rates_rad_s")
+            if (
+                not isinstance(body_rates, Sequence)
+                or len(body_rates) != 3
+                or tuple(float(value) for value in body_rates)
+                != (
+                    -float(command.roll_rate),
+                    -float(command.pitch_rate),
+                    -float(command.yaw_rate),
+                )
+                or float(wire.get("thrust", math.nan))
+                != float(command.thrust)
+            ):
+                raise SafetyAbort(
+                    "yaw capability sweep wire mapping is invalid"
+                )
+            return call_start_ns, float(body_rates[2])
+
+        ticks_sent = 0
+        for planned_tick in iter_yaw_capability_ticks(
+            anchor_monotonic_ns=flight_start_ns,
+        ):
+            nominal_release_ns = int(planned_tick["release_monotonic_ns"])
+            slot_end_ns = int(planned_tick["end_monotonic_ns"])
+            now_ns = time.perf_counter_ns()
+            if now_ns < nominal_release_ns:
+                self._wait_for_calibration_release(nominal_release_ns)
+            now_ns = time.perf_counter_ns()
+            if now_ns >= slot_end_ns or now_ns >= hard_deadline_ns:
+                raise SafetyAbort(
+                    "yaw capability sweep missed a 50 Hz slot"
+                )
+
+            self._sample()
+            self._watchdog(
+                allow_benign_pad_contact=False,
+                enforce_benign_pad_budget=True,
+            )
+            race = self.adapter.race_status
+            if race is None or int(race.active_gate_index) != 0:
+                raise SafetyAbort(
+                    "yaw capability active gate changed from gate 0"
+                )
+            assert self.estimate is not None
+            rpy = tuple(
+                float(value) for value in self.estimate.orientation.to_euler()
+            )
+            rates = tuple(float(value) for value in self.estimate.body_rates)
+            if not all(math.isfinite(value) for value in (*rpy, *rates)):
+                raise SafetyAbort(
+                    "yaw capability state became non-finite"
+                )
+            excursions = (
+                wrapped_delta(rpy[0], reference_rpy[0]),
+                wrapped_delta(rpy[1], reference_rpy[1]),
+                wrapped_delta(rpy[2], reference_rpy[2]),
+            )
+            max_attitude_excursion = max(
+                max_attitude_excursion,
+                *(abs(value) for value in excursions),
+            )
+            max_abs_body_rate = max(
+                max_abs_body_rate,
+                *(abs(value) for value in rates),
+            )
+            max_abs_transverse_rate = max(
+                max_abs_transverse_rate,
+                abs(rates[0]),
+                abs(rates[1]),
+            )
+
+            command_value = planned_tick["command"]
+            segment_id = str(planned_tick["segment_id"])
+            requested_yaw = float(command_value["yaw_rate_rad_s"])
+            if segment_id == "neutral-initial":
+                baseline_rates.append(rates[2])
+            if requested_yaw != 0.0:
+                row = pulse_rows.setdefault(
+                    segment_id,
+                    {
+                        "command_yaw_rate_rad_s": requested_yaw,
+                        "wire_yaw_rates_rad_s": [],
+                        "samples": [],
+                        "first_wire_start_monotonic_ns": None,
+                    },
+                )
+                row["samples"].append(
+                    {
+                        "imu_received_monotonic_ns": (
+                            self._last_imu_received_monotonic_ns
+                        ),
+                        "body_rates_rad_s": list(rates),
+                        "attitude_excursion_rad": list(excursions),
+                    }
+                )
+
+            base = attitude_rate_command(
+                self.estimate,
+                target_roll_rad=float(
+                    command_value["target_roll_rad"]
+                ),
+                target_pitch_rad=float(
+                    command_value["target_pitch_rad"]
+                ),
+                thrust=float(command_value["thrust"]),
+            )
+            command = AttitudeRateCommand(
+                roll_rate=float(base.roll_rate),
+                pitch_rate=float(base.pitch_rate),
+                yaw_rate=requested_yaw,
+                thrust=float(base.thrust),
+            )
+            validate_command(command)
+
+            earliest_send_ns = nominal_release_ns
+            if previous_wire_start_ns is not None:
+                earliest_send_ns = max(
+                    earliest_send_ns,
+                    previous_wire_start_ns
+                    + YAW_CAPABILITY_CONTROL_PERIOD_NS,
+                )
+            checked_ns = time.perf_counter_ns()
+            if checked_ns < earliest_send_ns:
+                self._wait_for_calibration_release(earliest_send_ns)
+                checked_ns = time.perf_counter_ns()
+            if (
+                checked_ns >= slot_end_ns
+                or checked_ns >= hard_deadline_ns
+            ):
+                raise SafetyAbort(
+                    "yaw capability sweep slot expired before send"
+                )
+            receipt = await self._send_flight_command(
+                command,
+                require_wire_receipt=True,
+                wire_start_not_before_ns=earliest_send_ns,
+                wire_start_deadline_ns=min(
+                    slot_end_ns,
+                    hard_deadline_ns,
+                ),
+            )
+            call_start_ns, wire_yaw = validate_wire(receipt, command)
+            if (
+                previous_wire_start_ns is not None
+                and call_start_ns - previous_wire_start_ns
+                < YAW_CAPABILITY_CONTROL_PERIOD_NS
+            ):
+                raise SafetyAbort(
+                    "yaw capability wire dispatch exceeded 50 Hz"
+                )
+            previous_wire_start_ns = call_start_ns
+            if requested_yaw != 0.0:
+                row = pulse_rows[segment_id]
+                if row["first_wire_start_monotonic_ns"] is None:
+                    row["first_wire_start_monotonic_ns"] = call_start_ns
+                row["wire_yaw_rates_rad_s"].append(wire_yaw)
+            ticks_sent += 1
+            self._record_tick(
+                f"capability/yaw/{segment_id}",
+                (call_start_ns - flight_start_ns) / 1_000_000_000.0,
+                command,
+            )
+            self.recorder.emit(
+                "yaw_capability_sample",
+                plan_id=YAW_CAPABILITY_PLAN_ID,
+                absolute_tick=planned_tick["absolute_tick"],
+                segment_id=segment_id,
+                command={
+                    "roll_rate_rad_s": command.roll_rate,
+                    "pitch_rate_rad_s": command.pitch_rate,
+                    "yaw_rate_rad_s": command.yaw_rate,
+                    "thrust": command.thrust,
+                },
+                wire_yaw_rate_rad_s=wire_yaw,
+                body_rates_rad_s=list(rates),
+                attitude_rpy_rad=list(rpy),
+                attitude_excursion_rad=list(excursions),
+                imu_received_monotonic_ns=(
+                    self._last_imu_received_monotonic_ns
+                ),
+                wire_start_monotonic_ns=call_start_ns,
+            )
+
+        if (
+            ticks_sent != int(plan["tick_count"])
+            or time.perf_counter_ns() >= hard_deadline_ns
+        ):
+            raise SafetyAbort(
+                "yaw capability sweep did not complete its exact plan"
+            )
+        baseline_yaw_rate = (
+            statistics.median(baseline_rates)
+            if baseline_rates
+            else 0.0
+        )
+        pulse_summaries: List[Dict[str, Any]] = []
+        for segment_id, row in pulse_rows.items():
+            command_yaw = float(row["command_yaw_rate_rad_s"])
+            direction = 1.0 if command_yaw > 0.0 else -1.0
+            samples = list(row["samples"])
+            signed_responses = [
+                direction
+                * (
+                    float(sample["body_rates_rad_s"][2])
+                    - baseline_yaw_rate
+                )
+                for sample in samples
+            ]
+            peak_response = max(signed_responses, default=0.0)
+            first_wire_ns = row["first_wire_start_monotonic_ns"]
+            response_delay_s: Optional[float] = None
+            for index in range(max(0, len(samples) - 1)):
+                first_sample = samples[index]
+                second_sample = samples[index + 1]
+                if (
+                    signed_responses[index] >= SIGN_ID_MIN_RESPONSE_RAD_S
+                    and signed_responses[index + 1]
+                    >= SIGN_ID_MIN_RESPONSE_RAD_S
+                    and type(first_wire_ns) is int
+                    and type(
+                        first_sample["imu_received_monotonic_ns"]
+                    )
+                    is int
+                ):
+                    response_delay_s = max(
+                        0.0,
+                        (
+                            first_sample["imu_received_monotonic_ns"]
+                            - first_wire_ns
+                        )
+                        / 1_000_000_000.0,
+                    )
+                    break
+            pulse_summaries.append(
+                {
+                    "segment_id": segment_id,
+                    "command_yaw_rate_rad_s": command_yaw,
+                    "wire_yaw_rate_rad_s": statistics.fmean(
+                        row["wire_yaw_rates_rad_s"]
+                    ),
+                    "peak_corrected_yaw_rate_rad_s": peak_response,
+                    "peak_command_to_body_rate_gain": (
+                        peak_response / abs(command_yaw)
+                    ),
+                    "response_delay_upper_bound_s": response_delay_s,
+                    "max_abs_roll_rate_coupling_rad_s": max(
+                        (
+                            abs(float(sample["body_rates_rad_s"][0]))
+                            for sample in samples
+                        ),
+                        default=0.0,
+                    ),
+                    "max_abs_pitch_rate_coupling_rad_s": max(
+                        (
+                            abs(float(sample["body_rates_rad_s"][1]))
+                            for sample in samples
+                        ),
+                        default=0.0,
+                    ),
+                    "max_abs_attitude_excursion_rad": max(
+                        (
+                            abs(float(value))
+                            for sample in samples
+                            for value in sample["attitude_excursion_rad"]
+                        ),
+                        default=0.0,
+                    ),
+                }
+            )
+
+        details = {
             "stage": CALIBRATION_STAGE,
             "calibration_scope": (
-                "yaw-only-sign-authority-delay-build3385"
+                "free-flight-progressive-yaw-capability-build3385"
             ),
+            "authority_effect": (
+                "characterization-only-no-visual-course-envelope-change"
+            ),
+            "plan_id": YAW_CAPABILITY_PLAN_ID,
+            "plan_sha256": YAW_CAPABILITY_PLAN_SHA256,
+            "ticks_sent": ticks_sent,
+            "ticks_expected": int(plan["tick_count"]),
+            "free_flight_hover": hover_details,
+            "baseline_yaw_rate_rad_s": baseline_yaw_rate,
+            "pulse_summaries": pulse_summaries,
+            "max_attitude_excursion_rad": max_attitude_excursion,
+            "max_abs_body_rate_rad_s": max_abs_body_rate,
+            "max_abs_transverse_body_rate_rad_s": (
+                max_abs_transverse_rate
+            ),
+            "broad_watchdog_unchanged": True,
         }
+        self.recorder.emit(
+            "yaw_capability_plan_complete",
+            **details,
+        )
+        return details
 
     async def _run_legacy_roll_pitch_calibration_waveform(
         self,
@@ -12439,9 +12810,10 @@ class VQ2Runner:
     ) -> Dict[str, Any]:
         """Retain the historical reviewed roll/pitch waveform for replay tests.
 
-        The live ``calibration-excite`` stage now uses the shorter yaw-only
-        plan above.  This helper remains non-dispatched so historical exact
-        waveform contracts stay reviewable without widening live authority.
+        The live ``calibration-excite`` stage now uses the progressive
+        free-flight yaw plan above.  This helper remains non-dispatched so
+        historical exact waveform contracts stay reviewable without widening
+        live authority.
         """
 
         from scripts import aigp_vq2_powered_attempt as calibration_contract

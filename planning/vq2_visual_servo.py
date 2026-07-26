@@ -44,7 +44,7 @@ MAX_VISUAL_TARGET_PITCH_RAD = 0.10
 MIN_VISUAL_THRUST = 0.21
 MAX_VISUAL_THRUST = 0.32
 MAX_VISUAL_OBSERVATION_AGE_S = 0.10
-MAX_NEXT_GATE_BLEND = 1.0
+MAX_NEXT_GATE_BLEND = 0.35
 # A pre-pass orientation may continue inside a broader current-aperture
 # corridor only after the next identity has first completed the ordinary
 # tight-corridor dwell.  Passage may retain this bounded preview while

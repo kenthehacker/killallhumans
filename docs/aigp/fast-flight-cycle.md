@@ -41,6 +41,17 @@ records controller-to-body and controller-to-image signs plus paired gyro and
 image-rate gains. Only an independently reviewed, fixed-hash yaw profile may
 grant bounded authority to `visual-course`.
 
+`calibration-excite` is now a separate characterization-only free-flight yaw
+sweep. It first reuses the proved 2.5-second hover launch, then holds zero
+roll/pitch target and `0.285` collective while applying symmetric five-slot
+pairs at `+/-0.08`, `+/-0.12`, `+/-0.16`, and `+/-0.20 rad/s`, separated by
+neutral dwells. The exact 81-slot sweep lasts `1.62 s` with a `1.75 s` hard
+expiry. It records exact controller/wire commands, IMU response, attitude
+excursion, response delay, gain, and transverse coupling. It uses the broad
+runtime attitude/rate watchdog and remains below the existing
+`+/-0.25 rad/s` command clamp. Its result is evidence only and cannot change
+the fixed-hash `visual-course` yaw profile.
+
 `gate1-recenter` is a user-authorized bounded no-passage diagnostic. Its
 horizontal pixel-rate gain remains exactly zero pending M2 recorded-replay and
 tracker-isolation acceptance; the current diagnostic combines horizontal
@@ -111,10 +122,11 @@ object `1002`, threat at most 2, at most 96 contacts, at most `1.10` impulse
 per contact and `5.0` cumulative impulse, with exact collision-buffer
 accounting and a newer disarmed heartbeat. Any violated bound fails cleanup.
 
-The compact yaw-calibration waveform is a balanced 45-slot, 0.90-second
-system-ID burst with a 1.00-second hard expiry. Its values and safety limits
-are code-owned and cannot be changed through the manifest. Both `sign-id` and
-`calibration-excite` bind this exact plan identity into the run manifest.
+The compact `sign-id` waveform is a balanced 45-slot, 0.90-second system-ID
+burst with a 1.00-second hard expiry. The `calibration-excite` free-flight
+capability sweep is the distinct 81-slot plan above. Both plans are code-owned,
+cannot be changed through the manifest, and are bound by their own exact
+identity in every run manifest.
 
 ## Evidence and failures
 

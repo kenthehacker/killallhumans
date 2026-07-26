@@ -14,6 +14,7 @@ import pytest
 from scripts import aigp_vq2_fast_cycle as fast_cycle
 from scripts import aigp_vq2_controller_config as controller_config
 from scripts import aigp_vq2_visual_config as visual_config
+from scripts import aigp_vq2_yaw_capability as yaw_capability
 from scripts import aigp_vq2_yaw_calibration as yaw_calibration
 from scripts import aigp_vq2_yaw_profile as yaw_profile
 
@@ -21,8 +22,16 @@ from scripts import aigp_vq2_yaw_profile as yaw_profile
 UTC = datetime(2026, 7, 22, 20, 0, tzinfo=timezone.utc)
 
 
-def test_calibration_manifest_binds_exact_yaw_plan():
-    expected = {
+def test_calibration_manifest_binds_exact_stage_specific_yaw_plan():
+    calibration_expected = {
+        "plan_id": yaw_capability.YAW_CAPABILITY_PLAN_ID,
+        "sha256": yaw_capability.YAW_CAPABILITY_PLAN_SHA256,
+        "tick_count": yaw_capability.YAW_CAPABILITY_TICK_COUNT,
+        "control_period_ns": (
+            yaw_capability.YAW_CAPABILITY_CONTROL_PERIOD_NS
+        ),
+    }
+    sign_expected = {
         "plan_id": yaw_calibration.YAW_CALIBRATION_PLAN_ID,
         "sha256": yaw_calibration.YAW_CALIBRATION_PLAN_SHA256,
         "tick_count": yaw_calibration.YAW_CALIBRATION_TICK_COUNT,
@@ -32,11 +41,15 @@ def test_calibration_manifest_binds_exact_yaw_plan():
     }
     assert fast_cycle._excitation_plan_identity(
         "calibration-excite"
-    ) == expected
-    assert fast_cycle._excitation_plan_identity("sign-id") == expected
+    ) == calibration_expected
+    assert fast_cycle._excitation_plan_identity("sign-id") == sign_expected
     assert fast_cycle._excitation_plan_identity("hover") is None
     assert (
         "scripts/aigp_vq2_yaw_calibration.py"
+        in fast_cycle._RUNTIME_SOURCE_PATHS
+    )
+    assert (
+        "scripts/aigp_vq2_yaw_capability.py"
         in fast_cycle._RUNTIME_SOURCE_PATHS
     )
 
@@ -343,7 +356,11 @@ def test_fast_cycle_runs_once_without_separate_preflight_or_prompt(
             gate_index_after=0,
             cleanup_confirmed=True,
             details={
-                "ticks_sent": yaw_calibration.YAW_CALIBRATION_TICK_COUNT
+                "ticks_sent": (
+                    yaw_capability.YAW_CAPABILITY_TICK_COUNT
+                    if requested_stage == "calibration-excite"
+                    else yaw_calibration.YAW_CALIBRATION_TICK_COUNT
+                )
             },
             controller=evidence,
         )

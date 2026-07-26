@@ -1242,7 +1242,7 @@ def test_passage_lease_rejects_partial_live_provenance(
 
 @pytest.mark.parametrize(
     "value",
-    (True, float("nan"), -0.01, 1.001),
+    (True, float("nan"), -0.01, 0.36),
 )
 def test_next_blend_configuration_is_bounded_and_exact(value: object) -> None:
     with pytest.raises(
