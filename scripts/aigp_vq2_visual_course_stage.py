@@ -1681,14 +1681,15 @@ async def _run_visual_course_stage_impl(
             yaw_rate=bounded_yaw,
             thrust=float(limited.thrust),
         )
+        yaw_safety_override = bool(
+            requested_yaw != 0.0 and bounded_yaw == 0.0
+        )
         try:
             command = dynamic_controller.govern_wire_command(
                 command,
                 proposal_monotonic_ns=proposal_ns,
                 launch_thrust_override=True,
-                yaw_safety_override=bool(
-                    requested_yaw != 0.0 and bounded_yaw == 0.0
-                ),
+                yaw_safety_override=yaw_safety_override,
             )
         except (TypeError, ValueError) as exc:
             raise abort_type(
@@ -1731,6 +1732,8 @@ async def _run_visual_course_stage_impl(
                     thrust=float(command.thrust),
                     wire_command=command,
                     wire_start_monotonic_ns=call_start,
+                    thrust_slew_override=True,
+                    yaw_slew_override=yaw_safety_override,
                 )
             )
         except (TypeError, ValueError) as exc:
@@ -2081,15 +2084,15 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course dynamic governor clock is invalid"
                 )
+            launch_thrust_override = bool(
+                launch_evidence is not None
+                and launch_evidence["thrust_phase"] in {"preload", "boost"}
+            )
             try:
                 command = dynamic_controller.govern_wire_command(
                     command,
                     proposal_monotonic_ns=governor_proposal_ns,
-                    launch_thrust_override=bool(
-                        launch_evidence is not None
-                        and launch_evidence["thrust_phase"]
-                        in {"preload", "boost"}
-                    ),
+                    launch_thrust_override=launch_thrust_override,
                     yaw_safety_override=yaw_soft_stop_zeroed,
                 )
             except (TypeError, ValueError) as exc:
@@ -2270,6 +2273,8 @@ async def _run_visual_course_stage_impl(
                         wire_start_monotonic_ns=(
                             wire_start_monotonic_ns
                         ),
+                        thrust_slew_override=launch_thrust_override,
+                        yaw_slew_override=yaw_soft_stop_zeroed,
                     )
                 )
             except (TypeError, ValueError) as exc:
@@ -2493,6 +2498,10 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course dynamic governor clock is invalid"
                 )
+            yaw_safety_override = bool(
+                authority.yaw_rate_rad_s != 0.0
+                and bounded_yaw == 0.0
+            )
             try:
                 command = dynamic_controller.govern_wire_command(
                     command,
@@ -2500,10 +2509,7 @@ async def _run_visual_course_stage_impl(
                     # The coast authority already owns its exact bounded
                     # support thrust; do not synthesize a different one.
                     launch_thrust_override=True,
-                    yaw_safety_override=bool(
-                        authority.yaw_rate_rad_s != 0.0
-                        and bounded_yaw == 0.0
-                    ),
+                    yaw_safety_override=yaw_safety_override,
                 )
             except (TypeError, ValueError) as exc:
                 raise abort_type(
@@ -2612,6 +2618,8 @@ async def _run_visual_course_stage_impl(
                         wire_start_monotonic_ns=(
                             wire_start_monotonic_ns
                         ),
+                        thrust_slew_override=True,
+                        yaw_slew_override=yaw_safety_override,
                     )
                 )
             except (TypeError, ValueError) as exc:

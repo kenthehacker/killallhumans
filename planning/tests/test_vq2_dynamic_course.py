@@ -424,6 +424,27 @@ def test_governor_preview_does_not_consume_budget_and_sustained_reversal_crosses
     assert max(abs(value) for value in values) <= 0.16
 
 
+def test_governor_does_not_extrapolate_an_overridden_thrust_step() -> None:
+    governor = CommandGovernor()
+    first_ns = NS
+    governor.commit(
+        DynamicCourseCommand(0.0, 0.0, 0.0, 0.26),
+        first_ns,
+    )
+    governor.commit(
+        DynamicCourseCommand(0.0, 0.0, 0.0, 0.32),
+        first_ns + 30_000_000,
+        discontinuity_axes=(3,),
+    )
+
+    resumed = governor.preview(
+        DynamicCourseCommand(0.0, 0.0, 0.0, SUPPORT_THRUST),
+        first_ns + 60_000_000,
+    )
+
+    assert SUPPORT_THRUST <= resumed.thrust <= 0.32
+
+
 def test_excess_capture_timing_uncertainty_withholds_derotation() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     _imu(core, 1.0)

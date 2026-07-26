@@ -190,11 +190,23 @@ class _WireCommandGovernor:
         monotonic_ns: int,
         *,
         discontinuity: bool = False,
+        discontinuity_axes: tuple[int, ...] = (),
     ) -> None:
         if type(monotonic_ns) is not int or monotonic_ns < 0:
             raise DynamicCourseError("wire-governor commit time is invalid")
         if self._last_ns is not None and monotonic_ns <= self._last_ns:
             raise DynamicCourseError("wire-governor commit did not advance")
+        if any(
+            type(axis) is not int or axis < 0 or axis > 3
+            for axis in discontinuity_axes
+        ):
+            raise DynamicCourseError(
+                "wire-governor discontinuity axis is invalid"
+            )
+        if len(set(discontinuity_axes)) != len(discontinuity_axes):
+            raise DynamicCourseError(
+                "wire-governor discontinuity axes must be unique"
+            )
         if self._last is None or discontinuity:
             slews = (0.0, 0.0, 0.0, 0.0)
         else:
@@ -206,6 +218,11 @@ class _WireCommandGovernor:
                 (current[index] - previous[index]) / dt
                 for index in range(4)
             )
+            if discontinuity_axes:
+                slews = tuple(
+                    0.0 if index in discontinuity_axes else slew
+                    for index, slew in enumerate(slews)
+                )
         self._last = command
         self._last_ns = monotonic_ns
         self._slews = slews
@@ -500,7 +517,13 @@ class DynamicVisualCourseSession:
         thrust: float,
         wire_command: AttitudeRateCommand,
         wire_start_monotonic_ns: int,
+        thrust_slew_override: bool = False,
+        yaw_slew_override: bool = False,
     ) -> Mapping[str, Any]:
+        discontinuity_axes = (
+            ((2,) if yaw_slew_override else ())
+            + ((3,) if thrust_slew_override else ())
+        )
         applied_sample = AppliedCommandSample(
             monotonic_ns=wire_start_monotonic_ns,
             target_roll_rad=target_roll_rad,
@@ -511,10 +534,14 @@ class DynamicVisualCourseSession:
             pitch_rate_rad_s=float(wire_command.pitch_rate),
             host_clock_id=_HOST_CLOCK_ID,
         )
-        self.core.record_applied_command(applied_sample)
+        self.core.record_applied_command(
+            applied_sample,
+            governor_discontinuity_axes=discontinuity_axes,
+        )
         self._wire_governor.commit(
             wire_command,
             wire_start_monotonic_ns,
+            discontinuity_axes=discontinuity_axes,
         )
         self._last_applied_sample = applied_sample
         self._applied_command_count += 1

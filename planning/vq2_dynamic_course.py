@@ -772,17 +772,28 @@ class CommandGovernor:
         monotonic_ns: int,
         *,
         discontinuity: bool = False,
+        discontinuity_axes: tuple[int, ...] = (),
     ) -> None:
         """Synchronise to the command actually accepted by the wire.
 
         ``discontinuity`` is reserved for an outer safety/cleanup bypass.  It
         synchronises the governor without pretending the emergency jump obeyed
-        normal slew limits.
+        normal slew limits.  ``discontinuity_axes`` does the same for a bounded
+        per-axis override while preserving continuity state on the other axes.
         """
 
         _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
         if self._last_ns is not None and monotonic_ns <= self._last_ns:
             raise DynamicCourseError("governor commit time must advance")
+        if any(
+            type(axis) is not int or axis < 0 or axis > 3
+            for axis in discontinuity_axes
+        ):
+            raise DynamicCourseError("governor discontinuity axis is invalid")
+        if len(set(discontinuity_axes)) != len(discontinuity_axes):
+            raise DynamicCourseError(
+                "governor discontinuity axes must be unique"
+            )
         if self._last is None or discontinuity:
             rates = (0.0, 0.0, 0.0, 0.0)
         else:
@@ -803,6 +814,11 @@ class CommandGovernor:
             rates = tuple(
                 (current[index] - previous[index]) / dt for index in range(4)
             )
+            if discontinuity_axes:
+                rates = tuple(
+                    0.0 if index in discontinuity_axes else rate
+                    for index, rate in enumerate(rates)
+                )
         self._last = command
         self._last_ns = monotonic_ns
         self._rates = rates
@@ -849,7 +865,12 @@ class DynamicCourseCore:
         self._imu.append(sample)
         self._trim(self._imu)
 
-    def record_applied_command(self, sample: AppliedCommandSample) -> None:
+    def record_applied_command(
+        self,
+        sample: AppliedCommandSample,
+        *,
+        governor_discontinuity_axes: tuple[int, ...] = (),
+    ) -> None:
         if self._commands and sample.monotonic_ns <= self._commands[-1].monotonic_ns:
             raise DynamicCourseError("command samples must advance monotonically")
         self._commands.append(sample)
@@ -862,6 +883,7 @@ class DynamicCourseCore:
                 thrust=sample.thrust,
             ),
             sample.monotonic_ns,
+            discontinuity_axes=governor_discontinuity_axes,
         )
 
     def _trim(self, values: list[object]) -> None:

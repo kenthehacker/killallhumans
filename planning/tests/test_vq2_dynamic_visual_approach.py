@@ -225,6 +225,38 @@ def test_final_wire_governor_cannot_reverse_roll_in_one_frame():
     assert first_ns + 20_000_000 > first_ns
 
 
+def test_launch_thrust_override_does_not_seed_an_outward_slew():
+    session = _session()
+    first_ns = _BASE_NS
+    session.record_wire_acceptance(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=0.0,
+        thrust=0.26,
+        wire_command=AttitudeRateCommand(0.0, 0.0, 0.0, 0.26),
+        wire_start_monotonic_ns=first_ns,
+        thrust_slew_override=True,
+    )
+    session.record_wire_acceptance(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=0.0,
+        thrust=0.32,
+        wire_command=AttitudeRateCommand(0.0, 0.0, 0.0, 0.32),
+        wire_start_monotonic_ns=first_ns + 30_000_000,
+        thrust_slew_override=True,
+    )
+
+    resumed = session.govern_wire_command(
+        AttitudeRateCommand(0.0, 0.0, 0.0, 0.275),
+        proposal_monotonic_ns=first_ns + 60_000_000,
+        launch_thrust_override=False,
+        yaw_safety_override=False,
+    )
+
+    assert 0.275 <= resumed.thrust <= 0.32
+
+
 def test_continuity_hold_is_fresh_bounded_and_uses_last_wire_target():
     session = _session()
     wire_ns = _BASE_NS
