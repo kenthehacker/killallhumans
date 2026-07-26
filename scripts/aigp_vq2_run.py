@@ -364,7 +364,7 @@ VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
 VISUAL_ALIGN_HARD_DURATION_S = 0.90
 VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S = 0.12
 VISUAL_ALIGN_RESPONSE_GRACE_S = 0.12
-VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.08
+VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.10
 VISUAL_ALIGN_YAW_SOFT_STOP_RAD = 0.16
 VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD = 0.18
 VISUAL_ALIGN_YAW_HOLD_HORIZON_S = 0.12
@@ -7704,9 +7704,9 @@ def visual_alignment_yaw_rate(
 ) -> Tuple[float, float]:
     """Apply the immutable restricted-segment yaw envelope prospectively.
 
-    The successful sign-ID calibration proves the command sign and the
-    ``0.08 rad/s`` rate magnitude, but its ``0.05 rad`` experiment excursion
-    was not a course-turn limit.  This stage owns a separately reviewed
+    The accepted build-3385 profile proves command sign and measured
+    free-flight authority through ``0.12 rad/s``.  This alignment stage uses
+    the derated ``0.10 rad/s`` production cap and owns a separately reviewed
     ``0.16 rad`` soft stop and ``0.18 rad`` hard stop.  Inward recovery is
     always retained; an outward command that has exhausted the soft envelope
     aborts while the target remains outside the horizontal corridor.
@@ -12615,8 +12615,8 @@ class VQ2Runner:
                 "yaw capability plan escaped the existing command envelope"
             )
 
-        # The accepted +/-0.08 profile was pad-loaded.  Enter free flight
-        # without the failed 2.5-second hover trajectory that reached Gate 0.
+        # Enter the bounded free-flight characterization directly, without
+        # the failed 2.5-second hover trajectory that reached Gate 0.
         entry_details = await self._run_yaw_capability_entry(context)
         self._sample()
         self._watchdog(

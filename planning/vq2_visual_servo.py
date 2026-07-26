@@ -30,11 +30,11 @@ from competition.vq2_visual_tracker import (
 )
 
 
-# These are code-owned controller authority ceilings.  The yaw-rate value is
-# the exact magnitude exercised by the successful paired build-3385 sign-ID
-# calibration.  The excursion is a separate per-segment course-turn envelope,
-# not the retired 0.05 rad calibration-experiment limit.
-MAX_VISUAL_YAW_RATE_RAD_S = 0.08
+# These are code-owned controller authority ceilings.  The production yaw
+# value is deliberately derated from the clean paired-polarity 0.12 rad/s
+# build-3385 capability tier.  The excursion is a separate per-segment
+# course-turn envelope, not a calibration-experiment limit.
+MAX_VISUAL_YAW_RATE_RAD_S = 0.10
 MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = 0.65
 VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = 0.60
 MAX_VISUAL_SEGMENT_DURATION_S = 8.0
@@ -191,8 +191,8 @@ class VisualServoTuning:
     # command while horizontal error still grew from 0.55 to 0.69.  Use the
     # existing bounded lateral channel as well as yaw; the immutable roll
     # attitude and body-rate envelopes remain independently enforced live.
-    roll_error_gain: float = 0.10
-    roll_rate_gain: float = 0.03
+    roll_error_gain: float = 0.16
+    roll_rate_gain: float = 0.05
     vertical_error_gain: float = 0.16
     vertical_rate_gain: float = 0.035
     collective_error_gain: float = 0.060
@@ -234,9 +234,9 @@ class VisualServoTuning:
             raise VisualServoRefusal("yaw error gain is outside bounds")
         if not 0.0 <= self.yaw_rate_gain <= 0.08:
             raise VisualServoRefusal("yaw rate gain is outside bounds")
-        if not 0.0 <= self.roll_error_gain <= 0.10:
+        if not 0.0 <= self.roll_error_gain <= 0.16:
             raise VisualServoRefusal("roll error gain is outside bounds")
-        if not 0.0 <= self.roll_rate_gain <= 0.03:
+        if not 0.0 <= self.roll_rate_gain <= 0.05:
             raise VisualServoRefusal("roll rate gain is outside bounds")
         if not 0.05 <= self.vertical_error_gain <= 0.30:
             raise VisualServoRefusal("vertical error gain is outside bounds")
@@ -1213,7 +1213,15 @@ class ImageVisualServo:
 
         if inside_corridor:
             self._corridor_frames += 1
-        else:
+        elif not (
+            allow_advance
+            and self._corridor_frames
+            >= self.tuning.required_corridor_frames
+        ):
+            # Passage permission is an explicit course-FSM decision.  Once
+            # granted, normal perspective-driven scale/rate changes must not
+            # erase the clean approach dwell that earned it.  Current
+            # geometry still continuously controls closure authority below.
             self._corridor_frames = 0
         current_edge_risk = bool(
             abs(raw_horizontal) >= self.tuning.edge_brake_x
@@ -1250,7 +1258,69 @@ class ImageVisualServo:
             float(current.log_scale) >= VISUAL_CLOSE_SCALE_BRAKE_LOG
         )
 
-        advance_enabled = bool(
+        confidence_authority = _clamp(
+            (
+                min(
+                    float(current.confidence),
+                    float(current.association_confidence),
+                )
+                - 0.10
+            )
+            / 0.90,
+            0.0,
+            1.0,
+        )
+        projected_horizontal = (
+            horizontal
+            + horizontal_rate * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        )
+        projected_vertical = (
+            vertical
+            + vertical_rate * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        )
+        center_authority = _clamp(
+            1.0
+            - max(
+                abs(projected_horizontal)
+                / self.tuning.horizontal_corridor,
+                abs(projected_vertical)
+                / self.tuning.vertical_corridor,
+            ),
+            0.0,
+            1.0,
+        )
+        expansion_authority = _clamp(
+            (
+                self.tuning.brake_scale_rate_s
+                - float(current.log_scale_rate_s)
+            )
+            / (
+                self.tuning.brake_scale_rate_s
+                - self.tuning.stable_scale_rate_s
+            ),
+            0.0,
+            1.0,
+        )
+        close_apparent_scale = math.exp(VISUAL_CLOSE_SCALE_BRAKE_LOG)
+        apparent_scale = math.exp(
+            min(
+                float(current.log_scale),
+                VISUAL_CLOSE_SCALE_BRAKE_LOG,
+            )
+        )
+        proximity_authority = _clamp(
+            (
+                close_apparent_scale - apparent_scale
+            )
+            / (
+                close_apparent_scale
+                - PREPASS_CURRENT_MAX_APPARENT_SCALE
+            ),
+            0.0,
+            1.0,
+        )
+        forward_authority = 0.0
+        if (
             allow_advance
             and self._corridor_frames >= self.tuning.required_corridor_frames
             and not edge_risk
@@ -1259,7 +1329,14 @@ class ImageVisualServo:
             and not scale_retreat
             and not close_scale_brake
             and not worsening
-        )
+        ):
+            forward_authority = min(
+                confidence_authority,
+                center_authority,
+                expansion_authority,
+                proximity_authority,
+            )
+        advance_enabled = forward_authority > 0.0
 
         brake_reason: Optional[str] = None
         if current_edge_risk:
@@ -1281,8 +1358,7 @@ class ImageVisualServo:
 
         yaw_rate = _clamp(
             -self.tuning.yaw_error_gain * horizontal
-            - self.tuning.yaw_rate_gain
-            * horizontal_rate,
+            - self.tuning.yaw_rate_gain * horizontal_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,
             MAX_VISUAL_YAW_RATE_RAD_S,
         )
@@ -1293,6 +1369,7 @@ class ImageVisualServo:
         )
         if yaw_envelope_limited:
             yaw_rate = 0.0
+            forward_authority = 0.0
             advance_enabled = False
             brake_reason = "segment_yaw_outward_soft_stop"
 
@@ -1308,8 +1385,22 @@ class ImageVisualServo:
             * vertical_rate
         )
         if advance_enabled:
-            pitch_basis = self.tuning.advance_pitch_rad
-            thrust_basis = self.tuning.advance_thrust
+            pitch_basis = (
+                self.tuning.brake_pitch_rad
+                + forward_authority
+                * (
+                    self.tuning.advance_pitch_rad
+                    - self.tuning.brake_pitch_rad
+                )
+            )
+            thrust_basis = (
+                self.tuning.brake_thrust
+                + forward_authority
+                * (
+                    self.tuning.advance_thrust
+                    - self.tuning.brake_thrust
+                )
+            )
         elif (
             edge_risk
             or effective_next_ambiguity_risk

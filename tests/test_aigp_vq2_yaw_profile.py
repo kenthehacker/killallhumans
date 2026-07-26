@@ -22,9 +22,9 @@ def _set_path(document: dict, path: tuple[object, ...], value: object) -> None:
 def test_default_profile_loads_with_exact_identity_and_authority():
     profile = _profile()
 
-    assert profile["schema"] == "aigp-vq2-yaw-calibration-profile/1"
+    assert profile["schema"] == "aigp-vq2-yaw-calibration-profile/2"
     assert profile["profile_id"] == (
-        "vq2-build3385-training-yaw-authority-v1"
+        "vq2-build3385-training-yaw-authority-v2"
     )
     assert profile["simulator"] == {
         "build": 3385,
@@ -45,10 +45,10 @@ def test_default_profile_loads_with_exact_identity_and_authority():
     assert profile["authority"] == {
         "controller_to_body_sign": 1,
         "controller_to_image_sign": 1,
-        "max_abs_yaw_rate_command_rad_s": 0.08,
+        "max_abs_yaw_rate_command_rad_s": 0.12,
         "max_gyro_response_delay_s": 0.08,
         "max_first_image_observation_delay_s": 0.09,
-        "max_attitude_excursion_rad": 0.05,
+        "max_attitude_excursion_rad": 0.10,
         "max_abs_measured_yaw_rate_rad_s": 0.5,
         "control_hold_horizon_s": 0.12,
     }
@@ -57,7 +57,7 @@ def test_default_profile_loads_with_exact_identity_and_authority():
 def test_profile_hash_is_frozen_and_independent_of_key_order():
     profile = _profile()
     assert profile_module.YAW_CALIBRATION_PROFILE_SHA256 == (
-        "9497417108749d9ccf395a042a450297d3f8643bd0acb76178171fcc02ec3dd5"
+        "2e36a6f26a7ae63b7b0e8b94cd130349be2ac76543b9bb53adccb7141b8010e3"
     )
     assert profile_module.canonical_yaw_calibration_profile_sha256(profile) == (
         profile_module.YAW_CALIBRATION_PROFILE_SHA256
@@ -165,6 +165,36 @@ def test_three_unique_clean_rows_bind_all_compact_artifact_hashes():
     }
 
 
+def test_clean_free_flight_capability_binds_the_wider_authority():
+    capability = _profile()["capability"]
+
+    assert capability["run_id"] == (
+        "20260726T112358Z-calibration-excite-d924d7ba"
+    )
+    assert capability["stage_success"] is True
+    assert capability["cleanup_confirmed"] is True
+    assert capability["unsafe_collision_count"] == 0
+    assert capability["watchdog_violation_count"] == 0
+    assert capability["command_rate_abs_rad_s"] == 0.12
+    assert capability["max_abs_body_rate_rad_s"] == (
+        0.33705789829662536
+    )
+    assert capability["artifacts_sha256"] == {
+        "result": (
+            "5dba5e7eae3f4017a07ffb8489affcf5b43333837b43f10818febf1a05b628aa"
+        ),
+        "manifest": (
+            "01f21d29359decb3fba454dd81282ca9e32e503a6f5517a1c44e818ac55c98c4"
+        ),
+        "trace": (
+            "213d2e69ee010af46e26370fb6607f190385758eff9716da455acb791c94a9f2"
+        ),
+        "live_lease": (
+            "952bc4ace94b985b32afe636229524430419f1d3c9be91ba07cfd546f2e0b59d"
+        ),
+    }
+
+
 def test_observed_ranges_are_exact_row_extrema_and_inside_authority():
     profile = _profile()
     rows = profile["evidence"]
@@ -259,6 +289,7 @@ def test_validation_and_loading_return_defensive_copies():
             "hold",
         ),
         (("evidence", 0, "stage_success"), False, "stage_success"),
+        (("capability", "cleanup_confirmed"), False, "capability"),
         (("evidence", 0, "cleanup_confirmed"), False, "cleanup"),
         (("evidence", 0, "unsafe_collision_count"), 1, "unsafe_collision"),
         (
@@ -298,7 +329,7 @@ def test_validation_and_loading_return_defensive_copies():
         ),
         (
             ("evidence", 0, "max_attitude_excursion_rad"),
-            0.050001,
+            0.100001,
             "attitude excursion",
         ),
         (

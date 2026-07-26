@@ -663,7 +663,7 @@ class VisualCourseYawProfile:
         cls,
         path: Any = DEFAULT_YAW_CALIBRATION_PROFILE_PATH,
     ) -> "VisualCourseYawProfile":
-        """Load and fully validate the sole tracked multi-run authority."""
+        """Load and validate the tracked sign-plus-capability authority."""
 
         profile = load_yaw_calibration_profile(path)
         evidence = yaw_calibration_profile_evidence(profile)
@@ -696,9 +696,7 @@ class VisualCourseYawProfile:
                 "max_abs_measured_yaw_rate_rad_s"
             ],
             observed_max_abs_measured_yaw_rate_rad_s=(
-                profile["observed_ranges"][
-                    "max_abs_measured_yaw_rate_rad_s"
-                ]["max"]
+                profile["capability"]["max_abs_body_rate_rad_s"]
             ),
             control_hold_horizon_s=authority["control_hold_horizon_s"],
         )
@@ -994,10 +992,9 @@ def _limit_calibrated_yaw_request(
         observed_peak_rate * profile.control_hold_horizon_s
     )
     # The tracked profile identifies yaw sign, command rate, response delay,
-    # and measured rate.  Its 0.05-rad excursion bounded the pad-loaded
-    # calibration experiment; it is not a free-flight course-heading limit.
-    # Course heading remains independently bounded by the visual controller's
-    # immutable per-segment envelope.
+    # and measured free-flight rate.  Its calibration attitude excursion is
+    # not a course-heading limit.  Course heading remains independently
+    # bounded by the visual controller's immutable per-segment envelope.
     hard_boundary_rad = limits.max_segment_yaw_excursion_rad
     soft_boundary_rad = hard_boundary_rad - response_reserve_rad
     if (
@@ -1702,7 +1699,7 @@ async def _run_visual_course_stage_impl(
             )
             assert launch_collective_state is not None
             (
-                proved_collective,
+                _proved_collective,
                 proved_filtered_vertical_rate,
             ) = launch_collective_state.observe(
                 proposal.current_target
@@ -1720,41 +1717,10 @@ async def _run_visual_course_stage_impl(
                 )
                 thrust_phase = "boost"
             else:
-                # Preserve the already live-proved Gate-0 vertical collective
-                # after the fixed launch boost.  The generic minimum-
-                # collective approach output lost vertical authority in the
-                # exact attempt-7 history and drove a centered aperture into
-                # the top edge.  This remains Gate-0 launch-only and inside
-                # the unchanged controller thrust envelope.
-                try:
-                    (
-                        command_thrust,
-                        next_preview_collective_delta,
-                    ) = _gate0_proved_collective_with_exact_next_preview(
-                        proved_collective=proved_collective,
-                        current_target=proposal.current_target,
-                        next_target=getattr(
-                            proposal,
-                            "next_target",
-                            None,
-                        ),
-                        latched_next_track_id=getattr(
-                            proposal,
-                            "latched_next_track_id",
-                            None,
-                        ),
-                        servo_output=output,
-                    )
-                except (AttributeError, TypeError, ValueError) as exc:
-                    raise abort_type(
-                        "visual-course Gate-0 next-preview collective "
-                        f"refused exact authority: {exc}"
-                    ) from exc
-                if next_preview_collective_delta > 0.0:
-                    next_preview_collective_track_id = str(
-                        proposal.next_target.track_id
-                    )
-                thrust_phase = GATE0_PROVED_COLLECTIVE_BASIS
+                # Preload and boost are launch-only plant handling.  Once
+                # airborne, the same continuous generic servo owns collective
+                # for Gate 0 and every successor gate.
+                thrust_phase = "generic-visual-servo"
             if (
                 target_pitch_rad < limits.min_measured_pitch_rad
                 or target_pitch_rad > limits.max_measured_pitch_rad
@@ -2576,55 +2542,19 @@ async def _run_visual_course_stage_impl(
                 "preload_duration_s": INITIAL_PAD_PRELOAD_DURATION_S,
                 "preload_thrust": INITIAL_PAD_PRELOAD_THRUST,
                 "post_boost_collective_basis": (
-                    GATE0_PROVED_COLLECTIVE_BASIS
+                    "generic-visual-servo"
                     if launch_enabled
                     else None
                 ),
-                "post_boost_collective_base": (
-                    GATE0_PROVED_COLLECTIVE_BASE
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_collective_error_gain": (
-                    GATE0_PROVED_COLLECTIVE_ERROR_GAIN
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_collective_rate_gain": (
-                    GATE0_PROVED_COLLECTIVE_RATE_GAIN
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_collective_max_abs_error": (
-                    GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_collective_max_abs_rate": (
-                    GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_collective_rate_filter_alpha": (
-                    GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_next_preview_collective_basis": (
-                    GATE0_PROVED_NEXT_PREVIEW_BASIS
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_next_preview_collective_error_gain": (
-                    GATE0_PROVED_NEXT_PREVIEW_ERROR_GAIN
-                    if launch_enabled
-                    else None
-                ),
-                "post_boost_next_preview_collective_max_thrust_delta": (
-                    GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA
-                    if launch_enabled
-                    else None
-                ),
+                "post_boost_collective_base": None,
+                "post_boost_collective_error_gain": None,
+                "post_boost_collective_rate_gain": None,
+                "post_boost_collective_max_abs_error": None,
+                "post_boost_collective_max_abs_rate": None,
+                "post_boost_collective_rate_filter_alpha": None,
+                "post_boost_next_preview_collective_basis": None,
+                "post_boost_next_preview_collective_error_gain": None,
+                "post_boost_next_preview_collective_max_thrust_delta": None,
                 "boost_duration_s": float(
                     host.visual_config.lifecycle.launch_boost_duration_s
                 ),

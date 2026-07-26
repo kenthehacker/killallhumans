@@ -1558,26 +1558,20 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["boost_thrust"] == (
         host.visual_config.lifecycle.launch_boost_thrust
     )
-    assert launch["post_boost_collective_basis"] == (
-        course_stage.GATE0_PROVED_COLLECTIVE_BASIS
-    )
-    assert launch["post_boost_collective_base"] == 0.275
-    assert launch["post_boost_collective_error_gain"] == 0.080
-    assert launch["post_boost_collective_rate_gain"] == 0.126
-    assert launch["post_boost_collective_max_abs_error"] == 0.50
-    assert launch["post_boost_collective_max_abs_rate"] == pytest.approx(
-        5.0 / 3.0
-    )
-    assert launch["post_boost_collective_rate_filter_alpha"] == 0.35
-    assert launch["post_boost_next_preview_collective_basis"] == (
-        course_stage.GATE0_PROVED_NEXT_PREVIEW_BASIS
-    )
+    assert launch["post_boost_collective_basis"] == "generic-visual-servo"
+    assert launch["post_boost_collective_base"] is None
+    assert launch["post_boost_collective_error_gain"] is None
+    assert launch["post_boost_collective_rate_gain"] is None
+    assert launch["post_boost_collective_max_abs_error"] is None
+    assert launch["post_boost_collective_max_abs_rate"] is None
+    assert launch["post_boost_collective_rate_filter_alpha"] is None
+    assert launch["post_boost_next_preview_collective_basis"] is None
     assert launch[
         "post_boost_next_preview_collective_error_gain"
-    ] == 0.080
+    ] is None
     assert launch[
         "post_boost_next_preview_collective_max_thrust_delta"
-    ] == 0.012
+    ] is None
     assert launch["pitch_blend_s"] == (
         host.visual_config.lifecycle.launch_pitch_blend_s
     )
@@ -1613,10 +1607,8 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         == host.visual_config.lifecycle.launch_boost_thrust
         for command, _kwargs in gate0_commands
     )
-    assert launch["last_thrust_phase"] == (
-        course_stage.GATE0_PROVED_COLLECTIVE_BASIS
-    )
-    assert launch["last_thrust"] == pytest.approx(0.2726)
+    assert launch["last_thrust_phase"] == "generic-visual-servo"
+    assert launch["last_thrust"] == pytest.approx(0.295)
     assert launch["last_current_vertical_error_image_down"] == 0.03
     assert launch["last_current_vertical_rate_down_s"] == 0.0
     assert launch["last_proved_filtered_vertical_rate_down_s"] == 0.0
@@ -1625,7 +1617,7 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["last_next_preview_collective_delta"] == 0.0
     assert launch["last_next_preview_collective_track_id"] is None
     assert any(
-        command.thrust == pytest.approx(0.2726)
+        command.thrust == pytest.approx(0.295)
         for command, _kwargs in gate0_commands
     )
     assert all(
@@ -1663,7 +1655,7 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         == host.visual_config.lifecycle.launch_boost_thrust
         for command in gate0_passage
     )
-    assert gate0_passage[-1].thrust == pytest.approx(0.2726)
+    assert gate0_passage[-1].thrust == pytest.approx(0.295)
     assert gate1_passage
     assert all(command.thrust == 0.295 for command in gate1_passage)
 
@@ -2403,8 +2395,17 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
     assert profile.source_commit == YAW_CALIBRATION_SOURCE_COMMIT
     assert profile.plan_id == YAW_CALIBRATION_PLAN_ID
     assert profile.plan_sha256 == YAW_CALIBRATION_PLAN_SHA256
-    assert profile.max_attitude_excursion_rad == 0.05
+    assert profile.max_abs_yaw_rate_command_rad_s == 0.12
+    assert profile.max_attitude_excursion_rad == 0.10
     assert profile.max_abs_measured_yaw_rate_rad_s == 0.5
+    assert profile.observed_max_abs_measured_yaw_rate_rad_s == (
+        0.33705789829662536
+    )
+    assert VisualCourseStageLimits().max_yaw_rate_rad_s == 0.10
+    assert (
+        VisualCourseStageLimits().max_yaw_rate_rad_s
+        < profile.max_abs_yaw_rate_command_rad_s
+    )
     assert (
         VisualCourseStageLimits().max_segment_yaw_excursion_rad
         == MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD
@@ -2606,7 +2607,7 @@ def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
 @pytest.mark.parametrize(
     ("direction", "yaw_rate"),
     (
-        (1.0, 0.22243007003911772),
+        (1.0, 0.33705789829662536),
         (-1.0, -0.50),
     ),
 )

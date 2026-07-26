@@ -1,8 +1,8 @@
 """Code-owned progressive yaw-capability sweep for FlightSim build 3385.
 
 This plan is characterization evidence only.  It is deliberately distinct
-from the accepted ``+/-0.08`` production yaw profile and cannot authorize a
-visual-course command envelope by itself.
+from the accepted composite yaw profile and cannot authorize a visual-course
+command envelope by itself.
 """
 
 from __future__ import annotations

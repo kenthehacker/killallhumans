@@ -1,6 +1,6 @@
 {
-  "schema": "aigp-vq2-yaw-calibration-profile/1",
-  "profile_id": "vq2-build3385-training-yaw-authority-v1",
+  "schema": "aigp-vq2-yaw-calibration-profile/2",
+  "profile_id": "vq2-build3385-training-yaw-authority-v2",
   "simulator": {
     "build": 3385,
     "mode": "Training",
@@ -18,12 +18,59 @@
   "authority": {
     "controller_to_body_sign": 1,
     "controller_to_image_sign": 1,
-    "max_abs_yaw_rate_command_rad_s": 0.08,
+    "max_abs_yaw_rate_command_rad_s": 0.12,
     "max_gyro_response_delay_s": 0.08,
     "max_first_image_observation_delay_s": 0.09,
-    "max_attitude_excursion_rad": 0.05,
+    "max_attitude_excursion_rad": 0.10,
     "max_abs_measured_yaw_rate_rad_s": 0.5,
     "control_hold_horizon_s": 0.12
+  },
+  "capability": {
+    "run_id": "20260726T112358Z-calibration-excite-d924d7ba",
+    "source_commit": "484639ad2afbe7f12b5867b09a6b325f48b50a65",
+    "stage": "calibration-excite",
+    "worktree_state": "clean",
+    "plan_id": "vq2-build3385-training-free-flight-yaw-sweep-v2",
+    "plan_sha256": "06903f918dd89ddd41f684eb68280631efefedfe8bf0a22a320650cccc93d48d",
+    "stage_success": true,
+    "cleanup_confirmed": true,
+    "unsafe_collision_count": 0,
+    "watchdog_violation_count": 0,
+    "broad_watchdog_unchanged": true,
+    "command_rate_abs_rad_s": 0.12,
+    "max_abs_body_rate_rad_s": 0.33705789829662536,
+    "max_abs_transverse_body_rate_rad_s": 0.1764800993958488,
+    "max_attitude_excursion_rad": 0.08203914784204658,
+    "pulse_summaries": [
+      {
+        "segment_id": "yaw-positive-0p12",
+        "command_yaw_rate_rad_s": 0.12,
+        "wire_yaw_rate_rad_s": -0.11999999999999998,
+        "peak_corrected_yaw_rate_rad_s": 0.33705764822661877,
+        "peak_command_to_body_rate_gain": 2.808813735221823,
+        "response_delay_upper_bound_s": 0.0137579,
+        "max_abs_roll_rate_coupling_rad_s": 0.004132414849009365,
+        "max_abs_pitch_rate_coupling_rad_s": 0.10778260959777981,
+        "max_abs_attitude_excursion_rad": 0.048139997756133354
+      },
+      {
+        "segment_id": "yaw-negative-0p12",
+        "command_yaw_rate_rad_s": -0.12,
+        "wire_yaw_rate_rad_s": 0.11999999999999998,
+        "peak_corrected_yaw_rate_rad_s": 0.30904239416122437,
+        "peak_command_to_body_rate_gain": 2.57535328467687,
+        "response_delay_upper_bound_s": 0.0286906,
+        "max_abs_roll_rate_coupling_rad_s": 0.006056087703909725,
+        "max_abs_pitch_rate_coupling_rad_s": 0.0811865626135841,
+        "max_abs_attitude_excursion_rad": 0.07567239622606728
+      }
+    ],
+    "artifacts_sha256": {
+      "result": "5dba5e7eae3f4017a07ffb8489affcf5b43333837b43f10818febf1a05b628aa",
+      "manifest": "01f21d29359decb3fba454dd81282ca9e32e503a6f5517a1c44e818ac55c98c4",
+      "trace": "213d2e69ee010af46e26370fb6607f190385758eff9716da455acb791c94a9f2",
+      "live_lease": "952bc4ace94b985b32afe636229524430419f1d3c9be91ba07cfd546f2e0b59d"
+    }
   },
   "observed_ranges": {
     "gyro_rate_gain": {

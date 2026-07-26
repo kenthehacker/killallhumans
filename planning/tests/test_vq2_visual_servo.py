@@ -189,7 +189,11 @@ def test_aligns_before_enabling_forward_closure():
     assert [item.corridor_frames for item in outputs] == [1, 2, 3]
     assert outputs[-1].advance_enabled is True
     assert outputs[-1].target_pitch_rad < 0.0
-    assert outputs[-1].thrust > servo.tuning.advance_thrust
+    assert (
+        servo.tuning.brake_thrust
+        < outputs[-1].thrust
+        < servo.tuning.advance_thrust
+    )
 
 
 def test_horizontal_bearing_uses_calibrated_yaw_image_sign():
@@ -204,8 +208,57 @@ def test_horizontal_bearing_uses_calibrated_yaw_image_sign():
     assert left.yaw_rate_rad_s == pytest.approx(
         MAX_VISUAL_YAW_RATE_RAD_S
     )
-    assert right.target_roll_rad == pytest.approx(0.07)
-    assert left.target_roll_rad == pytest.approx(-0.07)
+    assert right.target_roll_rad == pytest.approx(0.112)
+    assert left.target_roll_rad == pytest.approx(-0.112)
+
+
+def test_passage_continuously_reduces_closure_as_expansion_increases():
+    servo = ImageVisualServo()
+    for frame in (1, 2, 3):
+        step(
+            servo,
+            target(frame, x=0.01, y=0.01),
+            allow_advance=False,
+        )
+
+    stable = step(
+        servo,
+        target(4, x=0.01, y=0.01, scale_rate=0.8),
+        allow_advance=True,
+    )
+    expanding = step(
+        servo,
+        target(5, x=0.01, y=0.01, scale_rate=1.7),
+        allow_advance=True,
+    )
+
+    assert stable.advance_enabled is True
+    assert expanding.advance_enabled is True
+    assert expanding.corridor_frames == stable.corridor_frames
+    assert stable.target_pitch_rad < expanding.target_pitch_rad
+    assert stable.thrust > expanding.thrust
+
+
+def test_worsening_error_brakes_closure_but_retains_coordinated_steering():
+    servo = ImageVisualServo()
+    for frame in (1, 2, 3):
+        step(
+            servo,
+            target(frame, x=0.01, y=0.01),
+            allow_advance=False,
+        )
+
+    output = step(
+        servo,
+        target(4, x=0.08, y=0.01, x_rate=0.20),
+        allow_advance=True,
+    )
+
+    assert output.advance_enabled is False
+    assert output.brake_reason == "alignment_error_increasing"
+    assert output.target_pitch_rad > 0.0
+    assert output.yaw_rate_rad_s < 0.0
+    assert output.target_roll_rad > 0.0
 
 
 def test_vertical_image_error_drives_pitch_in_both_directions():
@@ -2013,7 +2066,7 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
 
     assert all(not output.advance_enabled for output in outputs)
     assert all(output.next_gate_blend == 0.0 for output in outputs)
-    assert all(output.yaw_rate_rad_s == -0.08 for output in outputs)
+    assert all(output.yaw_rate_rad_s == -0.10 for output in outputs)
     assert outputs[0].target_pitch_rad > 0.08
     assert outputs[0].thrust == pytest.approx(0.26152)
 

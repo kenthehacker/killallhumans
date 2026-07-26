@@ -45,12 +45,12 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
     assert mapping["servo"]["brake_thrust"] == MIN_VISUAL_THRUST
     assert mapping["servo"]["advance_thrust"] == 0.295
     assert mapping["servo"]["yaw_error_gain"] == 0.30
-    assert mapping["servo"]["roll_error_gain"] == 0.10
-    assert mapping["servo"]["roll_rate_gain"] == 0.03
+    assert mapping["servo"]["roll_error_gain"] == 0.16
+    assert mapping["servo"]["roll_rate_gain"] == 0.05
     assert mapping["lifecycle"]["next_gate_blend_max"] == 0.35
     assert config.to_effective_mapping() == mapping
     assert config.effective_config_sha256 == (
-        "c144c4cffeefaa1fd8da04e867819710fbd6f683acb470ad58bb148efb89e938"
+        "302f1ee8f6b442102d912603c2b512c2ed15fc5255d57dee6fb3b1eb68e9ac9f"
     )
     assert len(config.effective_config_sha256) == 64
     assert canonical_visual_config_sha256(mapping) == (
@@ -70,7 +70,7 @@ def test_config_hash_is_independent_of_json_key_order():
     ("path", "value"),
     [
         (("servo", "required_corridor_frames"), True),
-        (("servo", "roll_error_gain"), 0.101),
+        (("servo", "roll_error_gain"), 0.161),
         (("servo", "advance_thrust"), 0.34),
         (("servo", "yaw_error_gain"), float("nan")),
         (("lifecycle", "next_gate_blend_max"), 0.36),
@@ -134,7 +134,7 @@ def test_immutable_safety_envelopes_are_not_configuration_fields():
     ):
         assert forbidden not in serialized
 
-    assert MAX_VISUAL_YAW_RATE_RAD_S == 0.08
+    assert MAX_VISUAL_YAW_RATE_RAD_S == 0.10
     assert MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD > 0.05
     assert MAX_VISUAL_SEGMENT_DURATION_S == 8.0
     assert PREPASS_CURRENT_MAX_ABS_X_NORM == 0.20

@@ -1696,7 +1696,7 @@ def test_run7_logged_state_carries_adjacent_planner_across_cross_id_credit():
         proposal.mode is VisualApproachMode.ADJACENT_RECENTER
         and not proposal.servo_output.advance_enabled
         and proposal.servo_output.next_gate_blend == 0.0
-        and proposal.servo_output.yaw_rate_rad_s == -0.08
+        and proposal.servo_output.yaw_rate_rad_s == -0.10
         for proposal in precredit
     )
     assert precredit[0].servo_output.target_pitch_rad > 0.09
@@ -1741,7 +1741,7 @@ def test_run7_logged_state_carries_adjacent_planner_across_cross_id_credit():
         > credit_token.publication_sequence
     )
     assert postcredit.servo_output.horizontal_abs_error_delta is not None
-    assert postcredit.servo_output.yaw_rate_rad_s == -0.08
+    assert postcredit.servo_output.yaw_rate_rad_s == -0.10
     assert postcredit.servo_output.advance_enabled is False
 
 

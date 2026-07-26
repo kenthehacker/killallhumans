@@ -1,9 +1,9 @@
 """Strict checked yaw-authority profile for FlightSim build 3385.
 
-The tracked profile records three independent clean ``calibration-excite``
-runs.  It grants no authority beyond the conservative envelope that was
-already enforced during collection.  Private artifacts are identified by
-digest but are deliberately not required at runtime.
+Three independent paired-polarity runs retain the image/body sign contract.
+One clean free-flight paired-polarity run adds measured ``+/-0.12 rad/s``
+rate authority.  Private artifacts are identified by digest but are
+deliberately not required at runtime.
 """
 
 from __future__ import annotations
@@ -16,13 +16,13 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
-YAW_CALIBRATION_PROFILE_SCHEMA = "aigp-vq2-yaw-calibration-profile/1"
-YAW_CALIBRATION_PROFILE_ID = "vq2-build3385-training-yaw-authority-v1"
+YAW_CALIBRATION_PROFILE_SCHEMA = "aigp-vq2-yaw-calibration-profile/2"
+YAW_CALIBRATION_PROFILE_ID = "vq2-build3385-training-yaw-authority-v2"
 YAW_CALIBRATION_SOURCE_COMMIT = (
     "f4eecd6afbca6ff69cf84b0a69339ed66238cfa0"
 )
 YAW_CALIBRATION_PROFILE_SHA256 = (
-    "9497417108749d9ccf395a042a450297d3f8643bd0acb76178171fcc02ec3dd5"
+    "2e36a6f26a7ae63b7b0e8b94cd130349be2ac76543b9bb53adccb7141b8010e3"
 )
 YAW_CALIBRATION_PLAN_ID = "vq2-build3385-training-yaw-calibration-v1"
 YAW_CALIBRATION_PLAN_SHA256 = (
@@ -37,13 +37,14 @@ DEFAULT_YAW_CALIBRATION_PROFILE_PATH = (
 
 YAW_CONTROLLER_TO_BODY_SIGN = 1
 YAW_CONTROLLER_TO_IMAGE_SIGN = 1
-YAW_MAX_COMMAND_RATE_RAD_S = 0.08
+YAW_MAX_COMMAND_RATE_RAD_S = 0.12
 YAW_MAX_GYRO_RESPONSE_DELAY_S = 0.08
 YAW_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S = 0.09
-YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD = 0.05
+YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD = 0.10
 YAW_MAX_CALIBRATION_MEASURED_RATE_RAD_S = 0.5
-YAW_OBSERVED_MAX_MEASURED_RATE_RAD_S = 0.22243007003911772
+YAW_OBSERVED_MAX_MEASURED_RATE_RAD_S = 0.33705789829662536
 YAW_CONTROL_HOLD_HORIZON_S = 0.12
+YAW_SIGN_EVIDENCE_COMMAND_RATE_RAD_S = 0.08
 
 _EXPECTED_RUN_IDS = frozenset(
     {
@@ -65,6 +66,73 @@ _EXPECTED_BENIGN_PAD_EVIDENCE = {
         76,
         0.20585722976829857,
     ),
+}
+_CAPABILITY_EVIDENCE = {
+    "run_id": "20260726T112358Z-calibration-excite-d924d7ba",
+    "source_commit": "484639ad2afbe7f12b5867b09a6b325f48b50a65",
+    "stage": "calibration-excite",
+    "worktree_state": "clean",
+    "plan_id": "vq2-build3385-training-free-flight-yaw-sweep-v2",
+    "plan_sha256": (
+        "06903f918dd89ddd41f684eb68280631efefedfe8bf0a22a320650cccc93d48d"
+    ),
+    "stage_success": True,
+    "cleanup_confirmed": True,
+    "unsafe_collision_count": 0,
+    "watchdog_violation_count": 0,
+    "broad_watchdog_unchanged": True,
+    "command_rate_abs_rad_s": 0.12,
+    "max_abs_body_rate_rad_s": 0.33705789829662536,
+    "max_abs_transverse_body_rate_rad_s": 0.1764800993958488,
+    "max_attitude_excursion_rad": 0.08203914784204658,
+    "pulse_summaries": [
+        {
+            "segment_id": "yaw-positive-0p12",
+            "command_yaw_rate_rad_s": 0.12,
+            "wire_yaw_rate_rad_s": -0.11999999999999998,
+            "peak_corrected_yaw_rate_rad_s": 0.33705764822661877,
+            "peak_command_to_body_rate_gain": 2.808813735221823,
+            "response_delay_upper_bound_s": 0.0137579,
+            "max_abs_roll_rate_coupling_rad_s": (
+                0.004132414849009365
+            ),
+            "max_abs_pitch_rate_coupling_rad_s": (
+                0.10778260959777981
+            ),
+            "max_abs_attitude_excursion_rad": (
+                0.048139997756133354
+            ),
+        },
+        {
+            "segment_id": "yaw-negative-0p12",
+            "command_yaw_rate_rad_s": -0.12,
+            "wire_yaw_rate_rad_s": 0.11999999999999998,
+            "peak_corrected_yaw_rate_rad_s": 0.30904239416122437,
+            "peak_command_to_body_rate_gain": 2.57535328467687,
+            "response_delay_upper_bound_s": 0.0286906,
+            "max_abs_roll_rate_coupling_rad_s": (
+                0.006056087703909725
+            ),
+            "max_abs_pitch_rate_coupling_rad_s": (
+                0.0811865626135841
+            ),
+            "max_abs_attitude_excursion_rad": 0.07567239622606728,
+        },
+    ],
+    "artifacts_sha256": {
+        "result": (
+            "5dba5e7eae3f4017a07ffb8489affcf5b43333837b43f10818febf1a05b628aa"
+        ),
+        "manifest": (
+            "01f21d29359decb3fba454dd81282ca9e32e503a6f5517a1c44e818ac55c98c4"
+        ),
+        "trace": (
+            "213d2e69ee010af46e26370fb6607f190385758eff9716da455acb791c94a9f2"
+        ),
+        "live_lease": (
+            "952bc4ace94b985b32afe636229524430419f1d3c9be91ba07cfd546f2e0b59d"
+        ),
+    },
 }
 _RANGE_TO_ROW_FIELD = {
     "gyro_rate_gain": "gyro_rate_gain",
@@ -377,7 +445,7 @@ def _validate_evidence(
         )
         _expect(
             row["command_rate_abs_rad_s"],
-            authority["max_abs_yaw_rate_command_rad_s"],
+            YAW_SIGN_EVIDENCE_COMMAND_RATE_RAD_S,
             f"{path}.command_rate_abs_rad_s",
         )
         _expect(
@@ -457,6 +525,33 @@ def _validate_observed_ranges(
             _fail(path, "must exactly summarize the three evidence rows")
 
 
+def _validate_capability(
+    value: Any,
+    authority: Mapping[str, Any],
+) -> None:
+    _expect(value, _CAPABILITY_EVIDENCE, "$profile.capability")
+    _expect(
+        value["command_rate_abs_rad_s"],
+        authority["max_abs_yaw_rate_command_rad_s"],
+        "$profile.capability.command_rate_abs_rad_s",
+    )
+    if (
+        value["max_abs_body_rate_rad_s"]
+        > authority["max_abs_measured_yaw_rate_rad_s"]
+        or value["max_attitude_excursion_rad"]
+        > authority["max_attitude_excursion_rad"]
+        or max(
+            pulse["response_delay_upper_bound_s"]
+            for pulse in value["pulse_summaries"]
+        )
+        > authority["max_gyro_response_delay_s"]
+    ):
+        _fail(
+            "$profile.capability",
+            "measured response exceeds accepted authority",
+        )
+
+
 def validate_yaw_calibration_profile(
     value: Any,
     *,
@@ -473,6 +568,7 @@ def validate_yaw_calibration_profile(
             "source",
             "plan",
             "authority",
+            "capability",
             "observed_ranges",
             "evidence",
         },
@@ -492,6 +588,7 @@ def validate_yaw_calibration_profile(
     _validate_source(profile["source"])
     _validate_plan(profile["plan"])
     authority = _validate_authority(profile["authority"])
+    _validate_capability(profile["capability"], authority)
     rows = _validate_evidence(profile["evidence"], authority)
     _validate_observed_ranges(profile["observed_ranges"], rows)
 
