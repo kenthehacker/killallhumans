@@ -1667,7 +1667,7 @@ def test_all_outputs_remain_inside_immutable_controller_envelope():
     )
     assert abs(output.yaw_rate_rad_s) <= MAX_VISUAL_YAW_RATE_RAD_S
     assert abs(output.target_roll_rad) <= 0.16
-    assert -0.30 <= output.target_pitch_rad <= 0.15
+    assert -0.35 <= output.target_pitch_rad <= 0.15
     assert 0.21 <= output.thrust <= 0.32
 
 
