@@ -1503,8 +1503,26 @@ class ImageVisualServo:
         elif not advance_enabled:
             brake_reason = "aligning"
 
+        maneuver_yaw_authority = _clamp(
+            abs(heading_horizontal) / self.tuning.horizontal_corridor,
+            0.0,
+            1.0,
+        )
+        corridor_yaw_rate = (
+            -MAX_VISUAL_YAW_RATE_RAD_S
+            * _clamp(
+                heading_horizontal / self.tuning.horizontal_corridor,
+                -1.0,
+                1.0,
+            )
+        )
+        bearing_yaw_rate = (
+            (1.0 - maneuver_yaw_authority)
+            * (-self.tuning.yaw_error_gain * heading_horizontal)
+            + maneuver_yaw_authority * corridor_yaw_rate
+        )
         unconstrained_yaw_rate = (
-            -self.tuning.yaw_error_gain * heading_horizontal
+            bearing_yaw_rate
             - self.tuning.yaw_rate_gain * heading_horizontal_rate
         )
         yaw_rate = _clamp(
@@ -1572,15 +1590,13 @@ class ImageVisualServo:
             )
         )
         if outward_bearing_authority > 0.0:
-            # Sustained same-sign bank worsened four free-flight successor
-            # cohorts.  A following level-roll flight reduced that motion but
-            # still moved outward while calibrated yaw responded.  Transfer
-            # the existing bounded bank demand continuously through level and
-            # into counter-bank as steering load and outward image rate grow;
-            # yaw and closure braking remain fully active.
-            target_roll = (
-                1.0 - 2.0 * outward_bearing_authority
-            ) * base_target_roll
+            # Same-sign bank and a later counter-bank both failed to center
+            # free-flight successors, while counter-bank consumed most of the
+            # measured body-rate envelope.  Smoothly unload bank as saturated
+            # yaw and outward image motion grow.  This retains calibrated yaw
+            # and closure braking without asserting an unmeasured lateral
+            # response sign.
+            target_roll *= 1.0 - outward_bearing_authority
         vertical_correction = (
             -self.tuning.vertical_error_gain * vertical
             - self.tuning.vertical_rate_gain
