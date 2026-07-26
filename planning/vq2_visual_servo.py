@@ -670,6 +670,7 @@ class ImageVisualServo:
         self._last_abs_error: Optional[
             Tuple[Optional[float], Optional[float]]
         ] = None
+        self._last_vertical_observable_thrust: Optional[float] = None
         self._corridor_frames = 0
 
     @property
@@ -1341,10 +1342,11 @@ class ImageVisualServo:
         # This retains the live-proved Gate-0 vertical pixel-space collective
         # law on top of the selected basis: a gate high in the image requests
         # more collective, while image motion toward the desired row damps it.
-        # The default alignment and brake bases are MIN_VISUAL_THRUST, so a
-        # clipped/censored target with no safe vertical correction falls back
-        # to minimum collective rather than holding forward-closure thrust.
-        thrust = _clamp(
+        # The default alignment and brake bases are MIN_VISUAL_THRUST.  When
+        # the vertical axis remains observable they provide the normal
+        # braking basis; a censored vertical axis retains the last bounded
+        # observable-axis collective below.
+        measured_thrust = _clamp(
             thrust_basis
             - self.tuning.collective_error_gain * vertical
             - self.tuning.collective_rate_gain
@@ -1352,6 +1354,19 @@ class ImageVisualServo:
             MIN_VISUAL_THRUST,
             MAX_VISUAL_THRUST,
         )
+        if (
+            vertical_censored
+            and self._last_vertical_observable_thrust is not None
+        ):
+            # The missing vertical axis cannot authorize a new collective.
+            # Retain the most recent bounded collective derived while that
+            # axis was observable instead of treating censorship as zero
+            # error and cutting to minimum thrust.
+            thrust = self._last_vertical_observable_thrust
+        else:
+            thrust = measured_thrust
+            if not vertical_censored:
+                self._last_vertical_observable_thrust = thrust
 
         return VisualServoOutput(
             target_roll_rad=target_roll,

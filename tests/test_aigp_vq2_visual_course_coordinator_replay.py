@@ -377,7 +377,8 @@ def test_coordinator_replay_crosses_censor_gap_promotes_and_commands_next_gate()
     assert first_segment["near_plane_measurement_mode"] == "credit_wait"
     assert first_segment["lifecycle"] == "promote_reacquire"
     assert first_segment["censored_passage_coast_command_count"] >= 2
-    assert first_segment["crossing_wait_zero_command_count"] >= 1
+    assert first_segment["crossing_wait_zero_command_count"] == 0
+    assert first_segment["crossing_wait_coast_command_count"] >= 1
     assert transition["post_transition_navigation_command_count"] >= 1
 
     first_next_navigation = next(
@@ -437,7 +438,7 @@ def test_coordinator_replay_crosses_censor_gap_promotes_and_commands_next_gate()
     assert any(gap >= 0.06 for gap in control_gaps)
 
 
-def test_coordinator_replay_no_credit_times_out_on_zero_authority():
+def test_coordinator_replay_no_credit_times_out_on_bounded_hold():
     limits = replace(
         VisualCourseStageLimits(),
         crossing_status_timeout_s=0.08,
@@ -459,7 +460,8 @@ def test_coordinator_replay_no_credit_times_out_on_zero_authority():
     segment = host._visual_course_summary["segments"][0]
     assert segment["near_plane_latch"] is not None
     assert segment["near_plane_measurement_mode"] == "credit_wait"
-    assert segment["crossing_wait_zero_command_count"] >= 1
+    assert segment["crossing_wait_zero_command_count"] == 0
+    assert segment["crossing_wait_coast_command_count"] >= 1
     assert host.requested_promotion_track_ids == []
     assert host.credit_publish_times == {}
 
@@ -487,6 +489,7 @@ def test_coordinator_replay_off_center_censor_aborts_before_coast_or_credit():
     assert segment["near_plane_latch"] is not None
     assert segment["censored_passage_coast_command_count"] == 0
     assert segment["crossing_wait_zero_command_count"] == 0
+    assert segment["crossing_wait_coast_command_count"] == 0
     assert host.requested_promotion_track_ids == []
 
 
@@ -620,13 +623,20 @@ class _Attempt5RecoveryServo(_CoordinatorServo):
             ),
         )
         one_edge = clipping != FrameEdge.NONE
+        if not one_edge:
+            self._last_vertical_observable_thrust = 0.29
+        retained_thrust = getattr(
+            self,
+            "_last_vertical_observable_thrust",
+            proposal.servo_output.thrust,
+        )
         proposal.current_target = target
         proposal.passage_admission = None
         proposal.servo_output = replace(
             proposal.servo_output,
             target_pitch_rad=0.035 if one_edge else 0.08,
             yaw_rate_rad_s=-0.08,
-            thrust=0.21 if one_edge else 0.29,
+            thrust=retained_thrust,
             corridor_frames=0,
             advance_enabled=False,
             next_gate_blend=0.0,
@@ -687,7 +697,10 @@ def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
     top_command = candidate_wires[-1][1]
     assert top_command.pitch_rate >= 0.0
     assert top_command.yaw_rate < 0.0
-    assert top_command.thrust == pytest.approx(0.21)
+    assert top_command.thrust == pytest.approx(
+        candidate_wires[-2][1].thrust
+    )
+    assert top_command.thrust > 0.21
 
     transition = host._visual_course_summary[
         "authoritative_transitions"
@@ -704,9 +717,9 @@ def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
     assert recovery["lifecycle"] == "promote_reacquire"
     assert recovery["recovery_clean_command_count"] == 3
     assert recovery["recovery_one_edge_command_count"] == 1
-    # The accepted TOP-censored brake wire renews the existing 50 ms
-    # publication-gap bound; the following losses therefore receive two
-    # zero-only ticks before the bounded timeout.
+    # The accepted TOP-censored brake wire retains the last clean collective
+    # and renews the existing 50 ms publication-gap bound; the following
+    # losses therefore receive two zero-only ticks before the bounded timeout.
     assert recovery["recovery_zero_command_count"] == 2
 
 

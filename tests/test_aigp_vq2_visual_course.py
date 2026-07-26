@@ -500,6 +500,7 @@ class _Host:
         self.passage_counts = {}
         self.after_promotion_samples = None
         self.crossing_zero_count = 0
+        self.crossing_hold_count = 0
         self.commands = []
         self.wire_receipts_by_command_index = []
         self.ticks = []
@@ -591,6 +592,16 @@ class _Host:
             self.passage_counts[self.current_gate] = (
                 self.passage_counts.get(self.current_gate, 0) + 1
             )
+            if (
+                self.lose_before_credit
+                and not (
+                    self.visual_gate_graph.latest_snapshot
+                    .current_track.visible
+                )
+            ):
+                self.crossing_hold_count += 1
+                if self.crossing_hold_count >= 2:
+                    self._advance_race()
             if (
                 self.passage_counts[self.current_gate] >= 3
                 and not self.lose_before_credit
@@ -1026,7 +1037,7 @@ def test_terminal_transition_completes_without_next_preview_identity():
     assert host.requested_promotion_track_ids == []
 
 
-def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
+def test_crossing_loss_latches_only_after_credible_passage_and_holds():
     host = _Host(
         initial_gate=6,
         finish_gate=7,
@@ -1041,16 +1052,17 @@ def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
 
     assert result["race_finished"] is True
     assert result["segments"][0]["crossing_anchor"] is not None
-    assert (
-        result["segments"][0]["crossing_wait_zero_command_count"]
-        == 2
-    )
-    phase_receipts = _assert_course_zero_receipts(host)
+    assert result["segments"][0][
+        "crossing_wait_zero_command_count"
+    ] == 0
+    assert result["segments"][0][
+        "crossing_wait_coast_command_count"
+    ] == 2
     gate6_crossing_indices = [
         command_index
         for command_index, (stage, _elapsed, _command)
         in enumerate(host.ticks)
-        if stage == "visual-course/gate6/crossing-zero"
+        if stage == "visual-course/gate6/credit-wait"
     ]
     first_gate7_navigation_index = next(
         command_index
@@ -1061,7 +1073,11 @@ def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
         and kwargs.get("wire_visual_token") is not None
     )
     assert len(gate6_crossing_indices) == 2
-    assert phase_receipts["crossing-zero"]
+    assert all(
+        host.commands[index][0].thrust > 0.0
+        and host.commands[index][1].get("wire_visual_token") is not None
+        for index in gate6_crossing_indices
+    )
     assert all(
         command_index < first_gate7_navigation_index
         for command_index in gate6_crossing_indices
@@ -1114,7 +1130,8 @@ def test_latched_crossing_without_authoritative_credit_times_out_bounded():
 
     segment = host._visual_course_summary["segments"][0]
     assert segment["near_plane_latch"] is not None
-    assert 1 <= segment["crossing_wait_zero_command_count"] <= 20
+    assert segment["crossing_wait_zero_command_count"] == 0
+    assert 1 <= segment["crossing_wait_coast_command_count"] <= 20
     assert host.race.active_gate_index == 6
     assert host.race.race_finished is False
 
@@ -1276,12 +1293,12 @@ def test_crossing_wait_accepts_newer_same_gate_status_before_credit():
                 **kwargs,
             )
             if (
-                command.roll_rate
-                == command.pitch_rate
-                == command.yaw_rate
-                == command.thrust
-                == 0.0
-                and self.crossing_zero_count == 1
+                self.crossing_hold_count == 1
+                and command.thrust > 0.0
+                and not (
+                    self.visual_gate_graph.latest_snapshot
+                    .current_track.visible
+                )
             ):
                 self.race = AuthoritativeRaceStatusRef.live(
                     session_id=self.race.session_id,
@@ -1317,6 +1334,9 @@ def test_crossing_wait_accepts_newer_same_gate_status_before_credit():
     assert result["race_finished"] is True
     assert result["segments"][0][
         "crossing_wait_zero_command_count"
+    ] == 0
+    assert result["segments"][0][
+        "crossing_wait_coast_command_count"
     ] == 2
 
 
@@ -2624,7 +2644,7 @@ def test_duplicate_camera_frame_cannot_hide_new_unsafe_attitude():
     assert host._visual_course_summary["success"] is False
 
 
-def test_crossing_zero_wait_checks_attitude_before_sending_zero():
+def test_crossing_hold_checks_attitude_before_sending():
     class CrossingUnsafeHost(_Host):
         crossing_loss_observed = False
 
@@ -2656,6 +2676,38 @@ def test_crossing_zero_wait_checks_attitude_before_sending_zero():
         )
 
     assert len(host.commands) == 4
+    assert not any(command.thrust == 0.0 for command, _kwargs, _gate in host.commands)
+
+
+def test_crossing_hold_aborts_new_observable_axis_divergence():
+    class CrossingDivergentHost(_Host):
+        def _sample(self):
+            super()._sample()
+            if self.crossing_hold_count >= 1:
+                snapshot = self.visual_gate_graph.latest_snapshot
+                track = snapshot.current_track
+                track.visible = True
+                track.missed_frame_count = 0
+                track.latest_token = snapshot.latest_camera_token
+                track.center_norm = (1.0, 0.0)
+                snapshot.authority_usable = True
+
+    host = CrossingDivergentHost(
+        initial_gate=6,
+        finish_gate=6,
+        lose_before_credit=True,
+    )
+    runtime, _calls = _runtime(host)
+
+    with pytest.raises(
+        SafetyAbort,
+        match="credit-wait measurement became unsafe",
+    ):
+        asyncio.run(
+            run_visual_course_stage(host, _context(), runtime=runtime)
+        )
+
+    assert host.crossing_hold_count == 1
     assert not any(command.thrust == 0.0 for command, _kwargs, _gate in host.commands)
 
 

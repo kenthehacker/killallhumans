@@ -1113,6 +1113,78 @@ def _token_strictly_newer(
     )
 
 
+def _classify_latched_snapshot(
+    latch: NearPlaneLatch,
+    *,
+    previous_camera_token: CameraFrameToken,
+    camera_token: CameraFrameToken,
+    snapshot: Any,
+    current_gate_index: int,
+    min_track_confidence: float,
+    min_association_confidence: float,
+) -> LatchedMeasurementMode:
+    """Classify one graph snapshot against an existing near-plane latch."""
+
+    track = getattr(snapshot, "current_track", None)
+    center = getattr(track, "center_norm", None)
+    velocity = getattr(track, "center_velocity_norm_s", None)
+    return classify_latched_measurement(
+        latch,
+        previous_camera_token=previous_camera_token,
+        camera_token=camera_token,
+        current_gate_index=getattr(
+            snapshot,
+            "current_gate_index",
+            None,
+        ),
+        current_track_id=getattr(snapshot, "current_track_id", None),
+        track_latest_camera_token=getattr(track, "latest_token", None),
+        track_role=getattr(track, "role", None),
+        track_authoritative_gate_index=getattr(
+            track,
+            "authoritative_gate_index",
+            current_gate_index,
+        ),
+        visible=bool(getattr(track, "visible", False)),
+        missed_frame_count=getattr(track, "missed_frame_count", -1),
+        ambiguous=bool(getattr(track, "ambiguous", True)),
+        clipping=getattr(track, "clipping", FrameEdge.NONE),
+        center_censored=bool(
+            getattr(track, "center_censored", False)
+        ),
+        normalized_x=(
+            None
+            if type(center) is not tuple or len(center) != 2
+            else center[0]
+        ),
+        normalized_y_down=(
+            None
+            if type(center) is not tuple or len(center) != 2
+            else center[1]
+        ),
+        normalized_x_rate_s=(
+            None
+            if type(velocity) is not tuple or len(velocity) != 2
+            else velocity[0]
+        ),
+        normalized_y_rate_down_s=(
+            None
+            if type(velocity) is not tuple or len(velocity) != 2
+            else velocity[1]
+        ),
+        apparent_scale=getattr(track, "apparent_scale", None),
+        confidence=getattr(track, "confidence", None),
+        association_confidence=getattr(
+            track,
+            "association_confidence",
+            None,
+        ),
+        min_track_confidence=min_track_confidence,
+        min_association_confidence=min_association_confidence,
+        race_finished=bool(getattr(snapshot, "race_finished", False)),
+    )
+
+
 def _current_snapshot_ready(
     snapshot: Any,
     *,
@@ -1954,8 +2026,9 @@ async def _run_visual_course_stage_impl(
         yaw_reference_rad: float,
         segment_started_s: float,
         stage: str,
+        command_deadline_s: float,
     ) -> Optional[AttitudeRateCommand]:
-        """Reissue one frozen clean attitude target on an exact censored frame."""
+        """Reissue one frozen clean attitude target on a fresh frame."""
 
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -2016,6 +2089,7 @@ async def _run_visual_course_stage_impl(
             authority.target_roll_rad,
             authority.target_pitch_rad,
             authority.thrust,
+            command_deadline_s,
         )
         if (
             authority.gate_index != current_gate_index
@@ -2060,14 +2134,7 @@ async def _run_visual_course_stage_impl(
             raise RaceActiveBoundaryChangedBeforeWire(
                 "visual-course race boundary changed before navigation send"
             )
-        if censored_passage_coast_started_s is None:
-            raise abort_type(
-                "visual-course censored passage coast lacks a start time"
-            )
-        coast_deadline_s = (
-            censored_passage_coast_started_s
-            + limits.censored_passage_coast_max_duration_s
-        )
+        coast_deadline_s = float(command_deadline_s)
         _assert_course_attitude_state(
             host,
             yaw_reference_rad=yaw_reference_rad,
@@ -2371,6 +2438,7 @@ async def _run_visual_course_stage_impl(
         ] = None
         censored_passage_coast_fresh_frame_count = 0
         censored_passage_coast_command_count = 0
+        crossing_wait_coast_command_count = 0
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
@@ -2391,6 +2459,7 @@ async def _run_visual_course_stage_impl(
             "yaw_soft_stop_zero_command_count": 0,
             "passage_admission_yaw_soft_stop_withheld_count": 0,
             "crossing_wait_zero_command_count": 0,
+            "crossing_wait_coast_command_count": 0,
             "censored_passage_coast_fresh_frame_count": 0,
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
@@ -2831,7 +2900,6 @@ async def _run_visual_course_stage_impl(
                 VisualApproachCurrentGeometryUnavailable,
                 VisualApproachRefusal,
             ) as exc:
-                track = getattr(snapshot, "current_track", None)
                 previous_visible_token = (
                     censored_passage_coast_last_observed_token
                     or last_clean_passage_token
@@ -2843,116 +2911,22 @@ async def _run_visual_course_stage_impl(
                     near_plane_latch is not None
                     and previous_visible_token is not None
                 ):
-                    center = getattr(track, "center_norm", None)
-                    velocity = getattr(
-                        track,
-                        "center_velocity_norm_s",
-                        None,
-                    )
                     graph_config = getattr(
                         host.visual_gate_graph,
                         "config",
                         DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
                     )
-                    measurement_mode = classify_latched_measurement(
+                    measurement_mode = _classify_latched_snapshot(
                         near_plane_latch,
                         previous_camera_token=previous_visible_token,
                         camera_token=token,
-                        current_gate_index=getattr(
-                            snapshot,
-                            "current_gate_index",
-                            None,
-                        ),
-                        current_track_id=getattr(
-                            snapshot,
-                            "current_track_id",
-                            None,
-                        ),
-                        track_latest_camera_token=getattr(
-                            track,
-                            "latest_token",
-                            None,
-                        ),
-                        track_role=getattr(track, "role", None),
-                        track_authoritative_gate_index=getattr(
-                            track,
-                            "authoritative_gate_index",
-                            current_gate_index,
-                        ),
-                        visible=bool(
-                            getattr(track, "visible", False)
-                        ),
-                        missed_frame_count=getattr(
-                            track,
-                            "missed_frame_count",
-                            -1,
-                        ),
-                        ambiguous=bool(
-                            getattr(track, "ambiguous", True)
-                        ),
-                        clipping=getattr(
-                            track,
-                            "clipping",
-                            FrameEdge.NONE,
-                        ),
-                        center_censored=bool(
-                            getattr(
-                                track,
-                                "center_censored",
-                                False,
-                            )
-                        ),
-                        normalized_x=(
-                            None
-                            if type(center) is not tuple
-                            or len(center) != 2
-                            else center[0]
-                        ),
-                        normalized_y_down=(
-                            None
-                            if type(center) is not tuple
-                            or len(center) != 2
-                            else center[1]
-                        ),
-                        normalized_x_rate_s=(
-                            None
-                            if type(velocity) is not tuple
-                            or len(velocity) != 2
-                            else velocity[0]
-                        ),
-                        normalized_y_rate_down_s=(
-                            None
-                            if type(velocity) is not tuple
-                            or len(velocity) != 2
-                            else velocity[1]
-                        ),
-                        apparent_scale=getattr(
-                            track,
-                            "apparent_scale",
-                            None,
-                        ),
-                        confidence=getattr(
-                            track,
-                            "confidence",
-                            None,
-                        ),
-                        association_confidence=getattr(
-                            track,
-                            "association_confidence",
-                            None,
-                        ),
+                        snapshot=snapshot,
+                        current_gate_index=current_gate_index,
                         min_track_confidence=(
                             graph_config.min_track_confidence
                         ),
                         min_association_confidence=(
                             graph_config.min_association_confidence
-                        ),
-                        race_finished=bool(
-                            getattr(
-                                snapshot,
-                                "race_finished",
-                                False,
-                            )
                         ),
                     )
                     if (
@@ -3085,6 +3059,11 @@ async def _run_visual_course_stage_impl(
                                     f"{current_gate_index}/"
                                     "censored-passage"
                                 ),
+                                command_deadline_s=(
+                                    censored_passage_coast_started_s
+                                    + limits
+                                    .censored_passage_coast_max_duration_s
+                                ),
                             )
                         )
                     except RaceActiveBoundaryChangedBeforeWire as race_exc:
@@ -3104,6 +3083,7 @@ async def _run_visual_course_stage_impl(
                     ] = censored_passage_coast_command_count
                     continue
 
+                track = getattr(snapshot, "current_track", None)
                 credible_loss = bool(
                     mode is VisualApproachMode.PASSAGE
                     and crossing_anchor is not None
@@ -3669,24 +3649,87 @@ async def _run_visual_course_stage_impl(
                     # Race status is slower than the control loop.  A newer
                     # same-gate ingress is an authoritative pending-credit
                     # heartbeat, not a refusal.  Advance the exact baseline
-                    # and retain zero authority until credit or timeout.
+                    # and retain the bounded latched coast until credit or
+                    # timeout.
                     crossing_baseline_race = race
                     last_race = race
                 else:
                     raise abort_type(
                         "visual-course crossing produced an invalid gate index"
                     )
-            await send_zero(
-                (
-                    f"{VISUAL_COURSE_STAGE}/gate"
-                    f"{current_gate_index}/crossing-zero"
-                ),
-                now - segment_started_s,
-                yaw_reference_rad=yaw_reference_rad,
+            if (
+                crossing_coast_authority is None
+                or near_plane_latch is None
+            ):
+                raise abort_type(
+                    "visual-course credit wait lacks latched coast authority"
+                )
+            snapshot = host.visual_gate_graph.latest_snapshot
+            token = getattr(snapshot, "latest_camera_token", None)
+            if type(token) is not CameraFrameToken:
+                raise abort_type(
+                    "visual-course credit wait lacks a fresh camera token"
+                )
+            if last_planned_token is None:
+                raise abort_type(
+                    "visual-course credit wait lacks prior camera lineage"
+                )
+            if token == last_planned_token:
+                continue
+            if not _token_strictly_newer(token, last_planned_token):
+                raise abort_type(
+                    "visual-course credit wait camera lineage regressed"
+                )
+            graph_config = getattr(
+                host.visual_gate_graph,
+                "config",
+                DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
             )
-            segment["crossing_wait_zero_command_count"] = int(
-                segment["crossing_wait_zero_command_count"]
-            ) + 1
+            measurement_mode = _classify_latched_snapshot(
+                near_plane_latch,
+                previous_camera_token=last_planned_token,
+                camera_token=token,
+                snapshot=snapshot,
+                current_gate_index=current_gate_index,
+                min_track_confidence=(
+                    graph_config.min_track_confidence
+                ),
+                min_association_confidence=(
+                    graph_config.min_association_confidence
+                ),
+            )
+            segment["near_plane_measurement_mode"] = (
+                measurement_mode.value
+            )
+            if measurement_mode is LatchedMeasurementMode.UNSAFE:
+                raise abort_type(
+                    "visual-course credit-wait measurement became unsafe"
+                )
+            try:
+                coast_command = await send_censored_passage_coast(
+                    snapshot=snapshot,
+                    authority=crossing_coast_authority,
+                    yaw_reference_rad=yaw_reference_rad,
+                    segment_started_s=segment_started_s,
+                    stage=(
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/credit-wait"
+                    ),
+                    command_deadline_s=min(
+                        course_deadline_s,
+                        crossing_deadline_s,
+                    ),
+                )
+            except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                credited_race = accept_no_wire_race_boundary(race_exc)
+                break
+            if coast_command is None:
+                continue
+            last_planned_token = token
+            crossing_wait_coast_command_count += 1
+            segment["crossing_wait_coast_command_count"] = (
+                crossing_wait_coast_command_count
+            )
 
         assert credited_race is not None
         latest_authoritative_gate_index = int(
@@ -3718,7 +3761,9 @@ async def _run_visual_course_stage_impl(
             "retired_track_id": current_track_id,
             "promoted_track_id": None,
             "pre_transition_navigation_command_count": (
-                approach_command_count + passage_command_count
+                approach_command_count
+                + passage_command_count
+                + crossing_wait_coast_command_count
             ),
             "pre_transition_approach_command_count": (
                 approach_command_count
@@ -3731,6 +3776,9 @@ async def _run_visual_course_stage_impl(
             ),
             "crossing_wait_zero_command_count": int(
                 segment["crossing_wait_zero_command_count"]
+            ),
+            "crossing_wait_coast_command_count": int(
+                segment["crossing_wait_coast_command_count"]
             ),
             "post_transition_zero_command_count": 0,
             "post_transition_navigation_command_count": 0,

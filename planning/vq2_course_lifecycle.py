@@ -622,7 +622,7 @@ def classify_latched_measurement(
     The function creates no command authority.  ``COAST`` only says that the
     caller may use its separately bounded command lease.  ``CREDIT_WAIT`` means
     the measurement is unavailable and therefore permits only the caller's
-    zero/cut-and-authoritative-credit path.
+    separately bounded latched coast or cut-and-authoritative-credit path.
     """
 
     if type(latch) is not NearPlaneLatch:

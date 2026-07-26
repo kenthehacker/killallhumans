@@ -140,7 +140,8 @@ def test_attempt4_safe_projected_rate_latches_then_coasts_to_credit_wait():
     ] == pytest.approx(third["y_rate"])
     assert segment["near_plane_measurement_mode"] == "credit_wait"
     assert segment["censored_passage_coast_command_count"] >= 1
-    assert segment["crossing_wait_zero_command_count"] >= 1
+    assert segment["crossing_wait_zero_command_count"] == 0
+    assert segment["crossing_wait_coast_command_count"] >= 1
     assert _state_suffix(host, 1) == [
         "bottom",
         "top_bottom",

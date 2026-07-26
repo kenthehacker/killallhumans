@@ -1941,6 +1941,39 @@ def test_top_clip_uses_observable_horizontal_brake_authority(
     assert output.thrust == pytest.approx(MIN_VISUAL_THRUST)
 
 
+def test_top_clip_retains_last_vertical_observable_collective():
+    servo = ImageVisualServo()
+    clean = step(
+        servo,
+        target(
+            1,
+            x=0.60,
+            y=-0.68,
+            x_rate=0.32,
+            y_rate=-0.60,
+        ),
+    )
+    top = step(
+        servo,
+        target(
+            2,
+            x=0.62,
+            y=-0.72,
+            x_rate=0.24,
+            y_rate=-0.89,
+            clipped=True,
+            center_censored=True,
+            vertical_censored=True,
+        ),
+    )
+
+    assert clean.thrust > MIN_VISUAL_THRUST
+    assert top.thrust == pytest.approx(clean.thrust)
+    assert top.effective_vertical_error_image_down == 0.0
+    assert top.effective_vertical_rate_down_s == 0.0
+    assert top.yaw_rate_rad_s < 0.0
+
+
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():
     servo = ImageVisualServo()
     output = step(
