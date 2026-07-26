@@ -886,7 +886,7 @@ def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
         thrust,
         intercept_response_authority=0.0,
     ):
-        assert intercept_response_authority in {0.0, 1.0}
+        assert 0.0 <= intercept_response_authority <= 1.0
         host.intercept_response_authorities.append(
             intercept_response_authority
         )

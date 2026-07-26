@@ -1439,11 +1439,7 @@ def test_live_passage_margin_tapers_successor_yaw_without_reversing() -> None:
     )
 
     assert output.next_gate_blend > 0.0
-    assert (
-        -MAX_VISUAL_YAW_RATE_RAD_S
-        < output.yaw_rate_rad_s
-        < -0.05
-    )
+    assert -MAX_VISUAL_YAW_RATE_RAD_S < output.yaw_rate_rad_s < 0.0
     assert not output.passage_preview_retired
 
 

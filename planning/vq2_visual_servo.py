@@ -1231,6 +1231,7 @@ class ImageVisualServo:
 
         heading_horizontal = horizontal
         heading_horizontal_rate = horizontal_rate
+        successor_yaw_direction: Optional[float] = None
         bank_horizontal = horizontal
         bank_horizontal_rate = horizontal_rate
         if blend > 0.0 and next_horizontal is not None:
@@ -1239,10 +1240,10 @@ class ImageVisualServo:
             # projected current-aperture margin once.  Multiplying those two
             # margins made the controller unwind a physically effective turn
             # while both observations still remained inside the corridor.
-            # The retained successor alone defines yaw direction; current
-            # geometry attenuates that authority and independently owns bank.
-            # Bank retains the conservative product and returns continuously
-            # to current-only as passage scale approaches the near plane.
+            # Current geometry tapers the retained successor turn to zero but
+            # cannot reverse it; the independently conservative bank product
+            # returns continuously to current-only as passage scale approaches
+            # the near plane.
             projected_current_horizontal = (
                 raw_horizontal
                 + raw_horizontal_rate
@@ -1272,12 +1273,20 @@ class ImageVisualServo:
             )
             assert next_target is not None
             heading_horizontal = (
-                successor_heading_authority * next_horizontal
+                (1.0 - successor_heading_authority) * raw_horizontal
+                + successor_heading_authority * next_horizontal
             )
             heading_horizontal_rate = (
-                successor_heading_authority
+                (1.0 - successor_heading_authority)
+                * raw_horizontal_rate
+                + successor_heading_authority
                 * float(next_target.normalized_x_rate_s)
             )
+            if next_horizontal != 0.0:
+                successor_yaw_direction = -math.copysign(
+                    1.0,
+                    next_horizontal,
+                )
             passage_scale_progress = _clamp(
                 blend / MAX_NEXT_GATE_BLEND,
                 0.0,
@@ -1527,6 +1536,15 @@ class ImageVisualServo:
             bearing_yaw_rate
             - self.tuning.yaw_rate_gain * heading_horizontal_rate
         )
+        if (
+            successor_yaw_direction is not None
+            and unconstrained_yaw_rate * successor_yaw_direction < 0.0
+        ):
+            # Current-aperture feedback may taper a sealed successor turn to
+            # zero at the corridor boundary, but it cannot reverse that turn.
+            # A retired preview immediately restores ordinary current-only
+            # control on the same generic path.
+            unconstrained_yaw_rate = 0.0
         yaw_rate = _clamp(
             unconstrained_yaw_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,

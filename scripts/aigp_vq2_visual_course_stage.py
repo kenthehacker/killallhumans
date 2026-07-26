@@ -1699,6 +1699,21 @@ async def _run_visual_course_stage_impl(
                 "visual-course servo target attitude escaped its fixed "
                 "passage envelope"
             )
+        # The visual target expresses how urgently closure must unload even
+        # while the launch attitude is still blending away from spawn pitch.
+        # Allocate the already proved 0.5-to-1.0 pitch response continuously
+        # from that bounded brake target; the effective target below remains
+        # inside the unchanged launch and attitude envelopes.
+        continuous_pitch_response_authority = max(
+            float(intercept_response_authority),
+            max(
+                0.0,
+                min(
+                    1.0,
+                    target_pitch_rad / MAX_VISUAL_TARGET_PITCH_RAD,
+                ),
+            ),
+        )
         launch = segment["launch_bootstrap"]
         launch_evidence: Optional[Dict[str, Any]] = None
         if launch["enabled"] and apply_launch_bootstrap:
@@ -1838,7 +1853,9 @@ async def _run_visual_course_stage_impl(
             target_roll_rad=target_roll_rad,
             target_pitch_rad=target_pitch_rad,
             thrust=command_thrust,
-            intercept_response_authority=intercept_response_authority,
+            intercept_response_authority=(
+                continuous_pitch_response_authority
+            ),
         )
         limited = runtime.limit_command_rates(
             base,
