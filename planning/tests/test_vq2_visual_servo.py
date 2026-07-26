@@ -369,7 +369,8 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
         requested_next_blend=0.3,
     )
     assert blended.next_gate_blend == pytest.approx(0.3)
-    assert blended.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
+    assert blended.yaw_rate_rad_s == pytest.approx(-0.1438125)
+    assert abs(blended.yaw_rate_rad_s) < MAX_VISUAL_YAW_RATE_RAD_S
     assert 0.0 < blended.target_roll_rad < 0.03
     assert blended.target_pitch_rad > servo.tuning.advance_pitch_rad
     assert blended.thrust < servo.tuning.advance_thrust
@@ -2130,7 +2131,7 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
 
     assert all(not output.advance_enabled for output in outputs)
     assert all(output.next_gate_blend == 0.0 for output in outputs)
-    assert all(output.yaw_rate_rad_s == -0.12 for output in outputs)
+    assert all(output.yaw_rate_rad_s == -0.15 for output in outputs)
     assert outputs[0].target_pitch_rad > 0.08
     assert outputs[0].thrust == pytest.approx(0.32)
 

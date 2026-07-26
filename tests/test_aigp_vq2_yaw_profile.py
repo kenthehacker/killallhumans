@@ -24,7 +24,7 @@ def test_default_profile_loads_with_exact_identity_and_authority():
 
     assert profile["schema"] == "aigp-vq2-yaw-calibration-profile/2"
     assert profile["profile_id"] == (
-        "vq2-build3385-training-yaw-authority-v2"
+        "vq2-build3385-training-yaw-authority-v3"
     )
     assert profile["simulator"] == {
         "build": 3385,
@@ -45,7 +45,7 @@ def test_default_profile_loads_with_exact_identity_and_authority():
     assert profile["authority"] == {
         "controller_to_body_sign": 1,
         "controller_to_image_sign": 1,
-        "max_abs_yaw_rate_command_rad_s": 0.12,
+        "max_abs_yaw_rate_command_rad_s": 0.15,
         "max_gyro_response_delay_s": 0.08,
         "max_first_image_observation_delay_s": 0.09,
         "max_attitude_excursion_rad": 0.10,
@@ -57,7 +57,7 @@ def test_default_profile_loads_with_exact_identity_and_authority():
 def test_profile_hash_is_frozen_and_independent_of_key_order():
     profile = _profile()
     assert profile_module.YAW_CALIBRATION_PROFILE_SHA256 == (
-        "2e36a6f26a7ae63b7b0e8b94cd130349be2ac76543b9bb53adccb7141b8010e3"
+        "c544eb9e1b7d6e1e0590027e168a7b46e156b7557b98567653a3f1b518dca3a5"
     )
     assert profile_module.canonical_yaw_calibration_profile_sha256(profile) == (
         profile_module.YAW_CALIBRATION_PROFILE_SHA256
@@ -169,28 +169,28 @@ def test_clean_free_flight_capability_binds_the_wider_authority():
     capability = _profile()["capability"]
 
     assert capability["run_id"] == (
-        "20260726T112358Z-calibration-excite-d924d7ba"
+        "20260726T152438Z-calibration-excite-4a45eba7"
     )
     assert capability["stage_success"] is True
     assert capability["cleanup_confirmed"] is True
     assert capability["unsafe_collision_count"] == 0
     assert capability["watchdog_violation_count"] == 0
-    assert capability["command_rate_abs_rad_s"] == 0.12
+    assert capability["command_rate_abs_rad_s"] == 0.15
     assert capability["max_abs_body_rate_rad_s"] == (
-        0.33705789829662536
+        0.4234286031848751
     )
     assert capability["artifacts_sha256"] == {
         "result": (
-            "5dba5e7eae3f4017a07ffb8489affcf5b43333837b43f10818febf1a05b628aa"
+            "37c1e3ee688a1482c91d41ee2c6fd35559e33cb97b0559d3b8d28bf49ddbe3d2"
         ),
         "manifest": (
-            "01f21d29359decb3fba454dd81282ca9e32e503a6f5517a1c44e818ac55c98c4"
+            "5457aac7672f760a80ab418773995beacf9b2ccec63ff0e10d507ceded570351"
         ),
         "trace": (
-            "213d2e69ee010af46e26370fb6607f190385758eff9716da455acb791c94a9f2"
+            "22cb10fc72d9b01d2e933c9b3908b243742c96f85bbf8af06def600005bdfc40"
         ),
         "live_lease": (
-            "952bc4ace94b985b32afe636229524430419f1d3c9be91ba07cfd546f2e0b59d"
+            "166de062b0045b5d683195ef8ff60dfc21c8a94af03fef8f578f94df3ff11cfb"
         ),
     }
 

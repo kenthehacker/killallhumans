@@ -10498,7 +10498,7 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
         "target_roll_rad": 0.0,
         "minimum_target_pitch_rad": 0.0,
         "max_roll_pitch_command_rate_rad_s": 0.12,
-            "yaw_rate_rad_s": 0.12,
+            "yaw_rate_rad_s": 0.15,
         "max_thrust": 0.285,
         "max_start_delay_after_credit_s": 0.06,
         "hard_duration_s": 0.16,
@@ -10509,7 +10509,7 @@ def test_visual_alignment_replay_metadata_declares_phase_envelopes(
     }
     assert phases["restricted_post_promotion_alignment"] == {
         "max_roll_pitch_command_rate_rad_s": 0.12,
-            "yaw_rate_rad_s": 0.12,
+            "yaw_rate_rad_s": 0.15,
         "max_thrust": 0.30,
         "hard_duration_s": 0.90,
     }

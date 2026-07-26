@@ -1,9 +1,11 @@
 """Strict checked yaw-authority profile for FlightSim build 3385.
 
 Three independent paired-polarity runs retain the image/body sign contract.
-One clean free-flight paired-polarity run adds measured ``+/-0.12 rad/s``
-rate authority.  Private artifacts are identified by digest but are
-deliberately not required at runtime.
+One collision-free free-flight paired-polarity run with confirmed
+reset/disarm adds measured ``+/-0.15 rad/s`` rate authority.  Its separate
+post-reset pad-contact warning remains in the compact live result.  Private
+artifacts are identified by digest but are deliberately not required at
+runtime.
 """
 
 from __future__ import annotations
@@ -17,12 +19,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 YAW_CALIBRATION_PROFILE_SCHEMA = "aigp-vq2-yaw-calibration-profile/2"
-YAW_CALIBRATION_PROFILE_ID = "vq2-build3385-training-yaw-authority-v2"
+YAW_CALIBRATION_PROFILE_ID = "vq2-build3385-training-yaw-authority-v3"
 YAW_CALIBRATION_SOURCE_COMMIT = (
     "f4eecd6afbca6ff69cf84b0a69339ed66238cfa0"
 )
 YAW_CALIBRATION_PROFILE_SHA256 = (
-    "2e36a6f26a7ae63b7b0e8b94cd130349be2ac76543b9bb53adccb7141b8010e3"
+    "c544eb9e1b7d6e1e0590027e168a7b46e156b7557b98567653a3f1b518dca3a5"
 )
 YAW_CALIBRATION_PLAN_ID = "vq2-build3385-training-yaw-calibration-v1"
 YAW_CALIBRATION_PLAN_SHA256 = (
@@ -37,12 +39,12 @@ DEFAULT_YAW_CALIBRATION_PROFILE_PATH = (
 
 YAW_CONTROLLER_TO_BODY_SIGN = 1
 YAW_CONTROLLER_TO_IMAGE_SIGN = 1
-YAW_MAX_COMMAND_RATE_RAD_S = 0.12
+YAW_MAX_COMMAND_RATE_RAD_S = 0.15
 YAW_MAX_GYRO_RESPONSE_DELAY_S = 0.08
 YAW_MAX_FIRST_IMAGE_OBSERVATION_DELAY_S = 0.09
 YAW_MAX_CALIBRATION_ATTITUDE_EXCURSION_RAD = 0.10
 YAW_MAX_CALIBRATION_MEASURED_RATE_RAD_S = 0.5
-YAW_OBSERVED_MAX_MEASURED_RATE_RAD_S = 0.33705789829662536
+YAW_OBSERVED_MAX_MEASURED_RATE_RAD_S = 0.4234286031848751
 YAW_CONTROL_HOLD_HORIZON_S = 0.12
 YAW_SIGN_EVIDENCE_COMMAND_RATE_RAD_S = 0.08
 
@@ -68,69 +70,69 @@ _EXPECTED_BENIGN_PAD_EVIDENCE = {
     ),
 }
 _CAPABILITY_EVIDENCE = {
-    "run_id": "20260726T112358Z-calibration-excite-d924d7ba",
-    "source_commit": "484639ad2afbe7f12b5867b09a6b325f48b50a65",
+    "run_id": "20260726T152438Z-calibration-excite-4a45eba7",
+    "source_commit": "f19e66db789eed488c009d4b9a0846c0b75cad2f",
     "stage": "calibration-excite",
     "worktree_state": "clean",
-    "plan_id": "vq2-build3385-training-free-flight-yaw-sweep-v2",
+    "plan_id": "vq2-build3385-training-free-flight-yaw-sweep-v3",
     "plan_sha256": (
-        "06903f918dd89ddd41f684eb68280631efefedfe8bf0a22a320650cccc93d48d"
+        "742ab05e9ed02263981f03120be93c545f3dc9cb0637693488106f019960300a"
     ),
     "stage_success": True,
     "cleanup_confirmed": True,
     "unsafe_collision_count": 0,
     "watchdog_violation_count": 0,
     "broad_watchdog_unchanged": True,
-    "command_rate_abs_rad_s": 0.12,
-    "max_abs_body_rate_rad_s": 0.33705789829662536,
-    "max_abs_transverse_body_rate_rad_s": 0.1764800993958488,
-    "max_attitude_excursion_rad": 0.08203914784204658,
+    "command_rate_abs_rad_s": 0.15,
+    "max_abs_body_rate_rad_s": 0.4234286031848751,
+    "max_abs_transverse_body_rate_rad_s": 0.1977540485188365,
+    "max_attitude_excursion_rad": 0.0753933678364203,
     "pulse_summaries": [
         {
-            "segment_id": "yaw-positive-0p12",
-            "command_yaw_rate_rad_s": 0.12,
-            "wire_yaw_rate_rad_s": -0.11999999999999998,
-            "peak_corrected_yaw_rate_rad_s": 0.33705764822661877,
-            "peak_command_to_body_rate_gain": 2.808813735221823,
-            "response_delay_upper_bound_s": 0.0137579,
+            "segment_id": "yaw-positive-0p15",
+            "command_yaw_rate_rad_s": 0.15,
+            "wire_yaw_rate_rad_s": -0.15,
+            "peak_corrected_yaw_rate_rad_s": 0.42343512922525406,
+            "peak_command_to_body_rate_gain": 2.8229008615016937,
+            "response_delay_upper_bound_s": 0.0137509,
             "max_abs_roll_rate_coupling_rad_s": (
-                0.004132414849009365
+                0.0031109408382326365
             ),
             "max_abs_pitch_rate_coupling_rad_s": (
-                0.10778260959777981
+                0.09257508140057326
             ),
             "max_abs_attitude_excursion_rad": (
-                0.048139997756133354
+                0.057868230468247246
             ),
         },
         {
-            "segment_id": "yaw-negative-0p12",
-            "command_yaw_rate_rad_s": -0.12,
-            "wire_yaw_rate_rad_s": 0.11999999999999998,
-            "peak_corrected_yaw_rate_rad_s": 0.30904239416122437,
-            "peak_command_to_body_rate_gain": 2.57535328467687,
-            "response_delay_upper_bound_s": 0.0286906,
+            "segment_id": "yaw-negative-0p15",
+            "command_yaw_rate_rad_s": -0.15,
+            "wire_yaw_rate_rad_s": 0.15,
+            "peak_corrected_yaw_rate_rad_s": 0.4098572116345167,
+            "peak_command_to_body_rate_gain": 2.732381410896778,
+            "response_delay_upper_bound_s": 0.0301872,
             "max_abs_roll_rate_coupling_rad_s": (
-                0.006056087703909725
+                0.004017784530296922
             ),
             "max_abs_pitch_rate_coupling_rad_s": (
-                0.0811865626135841
+                0.06834130059927702
             ),
-            "max_abs_attitude_excursion_rad": 0.07567239622606728,
+            "max_abs_attitude_excursion_rad": 0.07166281246523945,
         },
     ],
     "artifacts_sha256": {
         "result": (
-            "5dba5e7eae3f4017a07ffb8489affcf5b43333837b43f10818febf1a05b628aa"
+            "37c1e3ee688a1482c91d41ee2c6fd35559e33cb97b0559d3b8d28bf49ddbe3d2"
         ),
         "manifest": (
-            "01f21d29359decb3fba454dd81282ca9e32e503a6f5517a1c44e818ac55c98c4"
+            "5457aac7672f760a80ab418773995beacf9b2ccec63ff0e10d507ceded570351"
         ),
         "trace": (
-            "213d2e69ee010af46e26370fb6607f190385758eff9716da455acb791c94a9f2"
+            "22cb10fc72d9b01d2e933c9b3908b243742c96f85bbf8af06def600005bdfc40"
         ),
         "live_lease": (
-            "952bc4ace94b985b32afe636229524430419f1d3c9be91ba07cfd546f2e0b59d"
+            "166de062b0045b5d683195ef8ff60dfc21c8a94af03fef8f578f94df3ff11cfb"
         ),
     },
 }

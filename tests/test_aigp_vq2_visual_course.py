@@ -1116,7 +1116,7 @@ def test_crossing_loss_latches_only_after_credible_passage_and_holds():
         host,
         servo_options={
             "passage_preview_blend": 0.30,
-            "yaw_rate": -0.12,
+            "yaw_rate": -0.15,
         },
     )
 
@@ -1151,7 +1151,7 @@ def test_crossing_loss_latches_only_after_credible_passage_and_holds():
         host.commands[index][0].thrust > 0.0
         and host.commands[index][0].pitch_rate
         == pytest.approx(host.visual_config.servo.brake_pitch_rad)
-        and host.commands[index][0].yaw_rate == pytest.approx(-0.12)
+        and host.commands[index][0].yaw_rate == pytest.approx(-0.15)
         and host.commands[index][1].get("wire_visual_token") is not None
         for index in gate6_crossing_indices
     )
@@ -2196,13 +2196,13 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
     assert profile.source_commit == YAW_CALIBRATION_SOURCE_COMMIT
     assert profile.plan_id == YAW_CALIBRATION_PLAN_ID
     assert profile.plan_sha256 == YAW_CALIBRATION_PLAN_SHA256
-    assert profile.max_abs_yaw_rate_command_rad_s == 0.12
+    assert profile.max_abs_yaw_rate_command_rad_s == 0.15
     assert profile.max_attitude_excursion_rad == 0.10
     assert profile.max_abs_measured_yaw_rate_rad_s == 0.5
     assert profile.observed_max_abs_measured_yaw_rate_rad_s == (
-        0.33705789829662536
+        0.4234286031848751
     )
-    assert VisualCourseStageLimits().max_yaw_rate_rad_s == 0.12
+    assert VisualCourseStageLimits().max_yaw_rate_rad_s == 0.15
     assert (
         VisualCourseStageLimits().max_yaw_rate_rad_s
         == profile.max_abs_yaw_rate_command_rad_s
@@ -2408,7 +2408,7 @@ def test_course_wires_exact_zero_at_yaw_soft_stop_and_keeps_hard_guards():
 @pytest.mark.parametrize(
     ("direction", "yaw_rate"),
     (
-        (1.0, 0.33705789829662536),
+        (1.0, 0.4234286031848751),
         (-1.0, -0.50),
     ),
 )

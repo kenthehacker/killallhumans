@@ -31,10 +31,11 @@ from competition.vq2_visual_tracker import (
 
 
 # These are code-owned controller authority ceilings.  Repeated saturated
-# 0.10-rad/s Gate-1 corrections continued outward, so production consumes the
-# clean paired-polarity 0.12-rad/s build-3385 capability tier.  The excursion
-# is a separate per-segment course-turn envelope, not a calibration limit.
-MAX_VISUAL_YAW_RATE_RAD_S = 0.12
+# 0.12-rad/s successor corrections continued outward, so production consumes
+# the collision-free paired-polarity 0.15-rad/s build-3385 capability tier.
+# The excursion is a separate per-segment course-turn envelope, not a
+# calibration limit.
+MAX_VISUAL_YAW_RATE_RAD_S = 0.15
 MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = 0.65
 VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = 0.60
 MAX_VISUAL_SEGMENT_DURATION_S = 8.0

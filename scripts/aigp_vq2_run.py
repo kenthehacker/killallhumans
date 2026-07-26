@@ -364,11 +364,11 @@ VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
 VISUAL_ALIGN_HARD_DURATION_S = 0.90
 VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S = 0.12
 VISUAL_ALIGN_RESPONSE_GRACE_S = 0.12
-VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.12
+VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.15
 VISUAL_ALIGN_YAW_SOFT_STOP_RAD = 0.16
 VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD = 0.18
 VISUAL_ALIGN_YAW_HOLD_HORIZON_S = 0.12
-VISUAL_ALIGN_MAX_MEASURED_YAW_RATE_RAD_S = 0.35
+VISUAL_ALIGN_MAX_MEASURED_YAW_RATE_RAD_S = 0.50
 VISUAL_ALIGN_MAX_COMMAND_RATE_RAD_S = 0.12
 VISUAL_ALIGN_MAX_ABS_ROLL_RAD = 0.12
 VISUAL_ALIGN_MIN_PITCH_RAD = -0.20
@@ -7705,7 +7705,7 @@ def visual_alignment_yaw_rate(
     """Apply the immutable restricted-segment yaw envelope prospectively.
 
     The accepted build-3385 profile proves command sign and measured
-    free-flight authority through ``0.12 rad/s``.  This alignment stage uses
+    free-flight authority through ``0.15 rad/s``.  This alignment stage uses
     that measured production cap and owns a separately reviewed
     ``0.16 rad`` soft stop and ``0.18 rad`` hard stop.  Inward recovery is
     always retained; an outward command that has exhausted the soft envelope
