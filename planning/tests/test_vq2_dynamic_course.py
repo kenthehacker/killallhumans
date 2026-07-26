@@ -237,36 +237,62 @@ def test_noisy_alternating_detections_do_not_reverse_roll_each_frame() -> None:
 def test_successor_steering_and_state_are_continuous_through_promotion() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     core.record_applied_command(_command(0.90))
-    _imu(core, 1.0)
-    core.observe_track(_observation("gate-a", 1, 1.0, x=0.00, log_scale=0.20))
-    successor_before = core.observe_track(
-        _observation("gate-b", 1, 1.0, x=0.42, log_scale=-0.15)
-    )
-    core.observe_track(_observation("gate-c", 1, 1.0, x=0.68, log_scale=-0.40))
+    successor_before = None
+    for sequence in range(1, 7):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=0.00,
+                log_scale=0.05 + sequence * 0.05,
+            )
+        )
+        successor_before = core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.12,
+                log_scale=-0.15,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-c",
+                sequence,
+                observation_time,
+                x=0.24,
+                log_scale=-0.40,
+            )
+        )
+    assert successor_before is not None
     core.bind(
         current_gate_index=0,
         current_track_id="gate-a",
         successor_track_id="gate-b",
     )
 
-    _imu(core, 1.01)
-    precredit = core.guide(1_010_000_000)
+    _imu(core, 1.21)
+    precredit = core.guide(1_210_000_000)
     assert precredit.successor_weight > 0.0
     assert precredit.command.yaw_rate_rad_s < 0.0
-    _commit_decision(core, 1.01, precredit.command)
+    _commit_decision(core, 1.21, precredit.command)
 
     promoted = core.promote_authoritative(
         from_gate_index=0,
         to_gate_index=1,
         promoted_track_id="gate-b",
         next_successor_track_id="gate-c",
-        monotonic_ns=1_015_000_000,
+        monotonic_ns=1_215_000_000,
     )
     assert promoted.current == successor_before
     assert promoted.last_governed_command == precredit.command
 
-    _imu(core, 1.04)
-    postcredit = core.guide(1_040_000_000)
+    _imu(core, 1.24)
+    postcredit = core.guide(1_240_000_000)
     assert postcredit.current_track_id == "gate-b"
     assert postcredit.successor_track_id == "gate-c"
     assert postcredit.command.yaw_rate_rad_s < 0.0
@@ -333,6 +359,456 @@ def test_successor_heading_cannot_reverse_roll_away_from_passage_intercept() -> 
     assert decision.proposed_command.target_roll_rad > 0.0
 
 
+def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    anchors = (
+        (1.00, 0.006, 0.322, 0.000, -1.789),
+        (1.32, -0.034, 0.291, -0.050, -1.755),
+        (1.57, -0.097, 0.238, -0.109, -1.690),
+        (1.82, -0.116, 0.228, -0.118, -1.669),
+        (2.07, -0.059, 0.297, -0.054, -1.496),
+        (2.13, -0.041, 0.322, -0.033, -1.462),
+        (2.38, 0.041, 0.444, 0.056, -1.313),
+        (2.63, 0.156, 0.647, 0.166, -0.971),
+        (2.85, 0.256, 0.834, 0.239, -0.579),
+    )
+    def interpolate(
+        observation_time: float,
+    ) -> tuple[float, float, float, float, float]:
+        for left, right in zip(anchors, anchors[1:]):
+            if observation_time <= right[0]:
+                fraction = (
+                    observation_time - left[0]
+                ) / (right[0] - left[0])
+                return (
+                    observation_time,
+                    *(
+                        left[index]
+                        + fraction * (right[index] - left[index])
+                        for index in range(1, 5)
+                    ),
+                )
+        return anchors[-1]
+
+    samples = tuple(
+        interpolate(
+            anchors[0][0]
+            + sample_index
+            * (anchors[-1][0] - anchors[0][0])
+            / 64.0
+        )
+        for sample_index in range(65)
+    )
+    decisions = []
+    for sequence, (
+        observation_time,
+        current_x,
+        successor_x,
+        yaw,
+        log_scale,
+    ) in enumerate(samples, 1):
+        _imu(core, observation_time, yaw_rad=yaw)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=current_x,
+                log_scale=log_scale,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=successor_x,
+                log_scale=log_scale - 0.35,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time, yaw_rad=yaw)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
+
+    assert all(
+        decision.predicted_successor_bearing_rad is not None
+        and decision.predicted_successor_bearing_rad[0] > 0.0
+        for decision in decisions
+    )
+    assert all(
+        decision.successor_prediction_horizon_s
+        <= core.config.successor_prediction_max_horizon_s
+        for decision in decisions
+    )
+    legacy_predictions = (0.47, -0.77, 1.08, -1.38)
+    assert sum(
+        left * right < 0.0
+        for left, right in zip(
+            legacy_predictions,
+            legacy_predictions[1:],
+        )
+    ) == 3
+    active = [
+        decision
+        for decision in decisions
+        if abs(decision.successor_yaw_contribution_rad) > 1e-8
+    ]
+    assert len(active) >= 8
+    assert any(decision.current_yaw_release == 0.0 for decision in active)
+    assert all(
+        0.0 < decision.successor_yaw_contribution_rad
+        <= core.config.successor_max_yaw_contribution_rad
+        for decision in active
+    )
+    assert all(
+        left.successor_yaw_contribution_rad
+        * right.successor_yaw_contribution_rad
+        >= 0.0
+        for left, right in zip(active, active[1:])
+    )
+    for decision in active:
+        camera_bearing = math.atan(
+            decision.camera_current_center_norm[0]
+            * core.config.horizontal_angle_scale_rad
+        )
+        current_heading = (
+            (1.0 - decision.current_yaw_release) * camera_bearing
+        )
+        combined_heading = (
+            current_heading
+            + decision.successor_yaw_contribution_rad
+        )
+        # Before near-plane release, even a coherent successor can only damp
+        # current-gate recentering.  It cannot reverse or saturate yaw.
+        if decision.current_yaw_release < 1.0:
+            assert combined_heading * current_heading >= 0.0
+            assert abs(combined_heading) <= abs(current_heading) + 1e-12
+        assert (
+            abs(decision.proposed_command.yaw_rate_rad_s)
+            <= MAX_YAW_RATE_RAD_S
+        )
+    # Once the near-plane scale is reliable, the stale body-camera centering
+    # term is released rather than reinstating the observed low-frequency hunt.
+    assert decisions[-1].current_yaw_release > 0.65
+    assert abs(decisions[-1].proposed_command.yaw_rate_rad_s) < (
+        0.35 * core.config.yaw_gain
+        * abs(
+            math.atan(
+                decisions[-1].camera_current_center_norm[0]
+                * core.config.horizontal_angle_scale_rad
+            )
+        )
+    )
+    assert all(decision.braking for decision in decisions[-3:])
+
+
+def test_successor_prediction_cannot_tangent_wrap_across_optical_axis() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    successor = None
+    for sequence in range(1, 8):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        stable_bearing = 0.15 * sequence
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=0.0,
+                log_scale=-1.40 + sequence * 0.18,
+            )
+        )
+        successor = core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=(
+                    math.tan(stable_bearing)
+                    / core.config.horizontal_angle_scale_rad
+                ),
+                log_scale=-1.75,
+            )
+        )
+    assert successor is not None
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.25)
+
+    decision = core.guide(1_250_000_000)
+
+    assert decision.successor_prediction_confidence > 0.75
+    assert decision.successor_prediction_horizon_s > 0.0
+    assert decision.successor_rate_rad_s is not None
+    assert (
+        successor.bearing_rad[0]
+        + decision.successor_rate_rad_s[0]
+        * decision.successor_prediction_horizon_s
+        > math.pi / 2.0
+    )
+    assert decision.predicted_successor_bearing_rad is not None
+    assert decision.measured_successor_bearing_rad is not None
+    assert decision.predicted_successor_bearing_rad[0] > 0.0
+    assert (
+        decision.predicted_successor_bearing_rad[0]
+        - decision.measured_successor_bearing_rad[0]
+        <= core.config.successor_prediction_max_extrapolation_rad
+        + 1e-12
+    )
+
+
+def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    for sequence in range(1, 8):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=-0.35,
+                log_scale=-0.30,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.80,
+                log_scale=-1.0,
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.25)
+
+    decision = core.guide(1_250_000_000)
+
+    assert decision.current_center_norm[0] < 0.0
+    assert abs(decision.passage_error_norm[0]) < 0.04
+    assert decision.current_yaw_release > 0.99
+    assert decision.passage_yaw_authority > 0.9
+    assert decision.successor_prediction_confidence > 0.75
+    assert decision.current_time_to_contact_s is None
+    assert decision.successor_weight > 0.0
+    assert decision.successor_yaw_contribution_rad > 0.0
+    assert decision.proposed_command.yaw_rate_rad_s < 0.0
+    assert (
+        abs(decision.successor_yaw_contribution_rad)
+        <= core.config.successor_max_yaw_contribution_rad
+    )
+
+
+def test_body_yaw_cannot_change_stable_passage_or_roll_authority() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    for sequence in range(1, 8):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=-0.20,
+                log_scale=-0.30,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.30,
+                log_scale=-1.00,
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.25)
+    before = core.guide(1_250_000_000)
+
+    # Change attitude only.  No camera observation or translation occurred.
+    _imu(core, 1.30, yaw_rad=0.25)
+    after = core.guide(1_300_000_000)
+
+    assert after.current_center_norm == pytest.approx(
+        before.current_center_norm
+    )
+    assert after.current_aperture_half_size_norm == pytest.approx(
+        before.current_aperture_half_size_norm
+    )
+    assert after.passage_point_norm == pytest.approx(
+        before.passage_point_norm
+    )
+    assert after.passage_error_norm == pytest.approx(
+        before.passage_error_norm
+    )
+    assert after.aperture_margin_norm == pytest.approx(
+        before.aperture_margin_norm
+    )
+    assert after.current_yaw_release == pytest.approx(
+        before.current_yaw_release
+    )
+    assert after.passage_yaw_authority == pytest.approx(
+        before.passage_yaw_authority
+    )
+    assert after.successor_weight == pytest.approx(before.successor_weight)
+    assert after.proposed_command.target_roll_rad == pytest.approx(
+        before.proposed_command.target_roll_rad
+    )
+    assert after.camera_current_center_norm != pytest.approx(
+        before.camera_current_center_norm
+    )
+    assert after.proposed_command.yaw_rate_rad_s != pytest.approx(
+        before.proposed_command.yaw_rate_rad_s
+    )
+
+
+def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    for sequence in range(1, 6):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=-0.06,
+                log_scale=-0.55 + sequence * 0.05,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.12,
+                log_scale=-0.90,
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.17)
+    stable = core.guide(1_170_000_000)
+    assert stable.successor_prediction_confidence > 0.0
+    assert stable.passage_point_norm[0] > 0.0
+    _commit_decision(core, 1.17, stable.command)
+
+    _imu(core, 1.20)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            6,
+            1.20,
+            x=-0.06,
+            log_scale=-0.20,
+        )
+    )
+    core.observe_track(
+        _observation("gate-b", 6, 1.20, visible=False)
+    )
+    _imu(core, 1.21)
+    dropped = core.guide(1_210_000_000)
+    assert dropped.successor_prediction_confidence == 0.0
+    assert dropped.successor_transition_held
+    assert dropped.passage_point_norm == pytest.approx(
+        stable.passage_point_norm
+    )
+    assert dropped.passage_yaw_authority == 0.0
+    assert dropped.successor_weight == 0.0
+    assert dropped.successor_yaw_contribution_rad == 0.0
+    assert (
+        dropped.proposed_command.yaw_rate_rad_s
+        * stable.proposed_command.yaw_rate_rad_s
+        >= 0.0
+    )
+    assert (
+        dropped.command.yaw_rate_rad_s
+        * stable.command.yaw_rate_rad_s
+        >= 0.0
+    )
+    _commit_decision(core, 1.21, dropped.command)
+
+    _imu(core, 1.24)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            7,
+            1.24,
+            x=-0.06,
+            log_scale=-0.15,
+        )
+    )
+    core.observe_track(
+        _observation(
+            "gate-b",
+            7,
+            1.24,
+            x=0.12,
+            log_scale=-0.85,
+        )
+    )
+    _imu(core, 1.25)
+    reacquired = core.guide(1_250_000_000)
+
+    assert reacquired.successor_prediction_confidence == 0.0
+    assert not reacquired.successor_transition_held
+    assert reacquired.passage_point_norm == pytest.approx(
+        stable.passage_point_norm
+    )
+    assert reacquired.passage_yaw_authority == 0.0
+    assert reacquired.successor_weight == 0.0
+    assert reacquired.successor_yaw_contribution_rad == 0.0
+
+    _imu(core, 1.40)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            8,
+            1.40,
+            x=-0.06,
+            log_scale=-0.10,
+        )
+    )
+    core.observe_track(
+        _observation("gate-b", 8, 1.40, visible=False)
+    )
+    _imu(core, 1.41)
+    expired = core.guide(1_410_000_000)
+
+    assert not expired.successor_transition_held
+    assert expired.passage_point_norm == (0.0, 0.0)
+    assert expired.current_yaw_release == 0.0
+
+
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     _imu(core, 1.0)
@@ -393,22 +869,24 @@ def test_current_and_successor_references_project_into_one_decision_frame() -> N
 
     # B is first observed after a +0.20 rad body yaw.  A world bearing of
     # +0.40 rad therefore appears at +0.20 rad in this later camera.
-    _imu(core, 1.1, yaw_rad=0.20)
-    core.observe_track(
-        _observation(
-            "gate-b",
-            1,
-            1.1,
-            x=math.tan(0.20) / config.horizontal_angle_scale_rad,
+    for sequence in range(1, 5):
+        observation_time = 1.1 + (sequence - 1) * 0.03
+        _imu(core, observation_time, yaw_rad=0.20)
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=math.tan(0.20) / config.horizontal_angle_scale_rad,
+            )
         )
-    )
     core.bind(
         current_gate_index=0,
         current_track_id="gate-a",
         successor_track_id="gate-b",
     )
-    _imu(core, 1.2, yaw_rad=0.10)
-    decision = core.guide(1_200_000_000)
+    _imu(core, 1.22, yaw_rad=0.10)
+    decision = core.guide(1_220_000_000)
 
     assert decision.predicted_successor_bearing_rad is not None
     assert decision.predicted_successor_bearing_rad[0] == pytest.approx(

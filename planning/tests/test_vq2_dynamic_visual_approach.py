@@ -234,7 +234,7 @@ def _accept_proposal(
     )
 
 
-def test_dynamic_graph_adapter_seeds_then_brakes_and_turns_to_successor():
+def test_dynamic_graph_adapter_biases_passage_before_successor_yaw():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -265,9 +265,22 @@ def test_dynamic_graph_adapter_seeds_then_brakes_and_turns_to_successor():
     update = tracker.update(_frame(6))
     snapshot = graph.observe(tracker)
     proposal = _observe(planner, snapshot, tracker)
+    assert proposal.servo_output.target_roll_rad == 0.0
+    assert proposal.servo_output.yaw_rate_rad_s == 0.0
+    assert session.last_decision is not None
+    assert session.last_decision.passage_point_norm == (0.0, 0.0)
+    assert session.last_decision.successor_prediction_confidence == 0.0
+    _accept_proposal(session, tracker, proposal)
+
+    for sequence in (7, 8):
+        tracker.update(_frame(sequence))
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        if sequence == 7:
+            _accept_proposal(session, tracker, proposal)
 
     assert proposal.servo_output.target_roll_rad > 0.0
-    assert proposal.servo_output.yaw_rate_rad_s < 0.0
+    assert proposal.servo_output.yaw_rate_rad_s == 0.0
     assert proposal.servo_output.target_pitch_rad > 0.0
     assert proposal.servo_output.brake_reason in {
         "off_axis_successor_intercept",
@@ -277,6 +290,10 @@ def test_dynamic_graph_adapter_seeds_then_brakes_and_turns_to_successor():
     assert session.last_decision is not None
     assert session.last_decision.current_gate_index == 0
     assert session.last_decision.successor_track_id is not None
+    assert session.last_decision.passage_point_norm[0] > 0.0
+    assert session.last_decision.successor_weight == 0.0
+    assert session.last_decision.passage_yaw_authority == 0.0
+    assert session.last_decision.successor_yaw_contribution_rad == 0.0
     assert session.evidence_summary()["controller_family"] == (
         DYNAMIC_CONTROLLER_FAMILY
     )
@@ -324,6 +341,50 @@ def test_dynamic_passage_admission_requires_scale_with_uncertainty(
         assert proposal.servo_output.brake_reason == (
             "dynamic_plane_not_ready"
         )
+
+
+def test_unit_bbox_full_size_maps_to_signed_center_half_aperture() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+
+    seed = _observe(planner, snapshot, tracker)
+    state = next(
+        state
+        for state in session.core.track_states
+        if state.track_id == current_id
+    )
+    assert state.aperture_half_size_norm == pytest.approx((0.34, 0.36))
+    _accept_proposal(session, tracker, seed)
+
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.34,
+            current_height=0.36,
+            include_successor=False,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    _observe(planner, snapshot, tracker)
+
+    assert session.last_decision is not None
+    assert session.last_decision.current_aperture_half_size_norm == (
+        pytest.approx((0.34, 0.36))
+    )
+    assert session.last_decision.aperture_margin_norm == pytest.approx(
+        (0.25, 0.27)
+    )
 
 
 def test_final_wire_governor_cannot_reverse_roll_in_one_frame():

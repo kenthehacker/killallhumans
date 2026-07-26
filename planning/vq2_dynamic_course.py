@@ -17,6 +17,7 @@ from __future__ import annotations
 import bisect
 import math
 import re
+import statistics
 from dataclasses import dataclass, field
 
 from competition.vq2_contracts import FrameEdge
@@ -457,11 +458,13 @@ class DynamicCourseConfig:
     thrust_to_vertical_bearing_accel: float = 1.5
     minimum_ttc_s: float = 0.15
     maximum_ttc_s: float = 8.0
-    prediction_horizon_s: float = 2.0
     passage_margin_norm: float = 0.09
     passage_arm_min_log_scale: float = -0.80
     passage_successor_bias: float = 0.55
-    successor_minimum_weight: float = 0.18
+    successor_prediction_max_horizon_s: float = 0.40
+    successor_prediction_max_extrapolation_rad: float = 0.18
+    successor_maximum_weight: float = 0.45
+    successor_max_yaw_contribution_rad: float = 0.10
     successor_full_weight_ttc_s: float = 0.55
     successor_lookahead_ttc_s: float = 2.2
     yaw_gain: float = 1.25
@@ -500,8 +503,10 @@ class DynamicCourseConfig:
             "clipping_uncertainty_multiplier",
             "minimum_ttc_s",
             "maximum_ttc_s",
-            "prediction_horizon_s",
             "passage_margin_norm",
+            "successor_prediction_max_horizon_s",
+            "successor_prediction_max_extrapolation_rad",
+            "successor_max_yaw_contribution_rad",
             "successor_full_weight_ttc_s",
             "successor_lookahead_ttc_s",
             "yaw_gain",
@@ -521,7 +526,7 @@ class DynamicCourseConfig:
             "scale_beta",
             "residual_alpha",
             "passage_successor_bias",
-            "successor_minimum_weight",
+            "successor_maximum_weight",
         ):
             value = _finite(getattr(self, name), name)
             if not 0.0 < value <= 1.0:
@@ -639,6 +644,7 @@ class GuidanceDecision:
     current_track_id: str
     successor_track_id: str | None
     current_center_norm: Vector2
+    camera_current_center_norm: Vector2
     current_aperture_half_size_norm: Vector2 | None
     passage_point_norm: Vector2
     passage_error_norm: Vector2
@@ -647,6 +653,14 @@ class GuidanceDecision:
     successor_bearing_std_rad: Vector2 | None
     successor_weight: float
     predicted_successor_bearing_rad: Vector2 | None
+    measured_successor_bearing_rad: Vector2 | None
+    successor_rate_rad_s: Vector2 | None
+    successor_prediction_horizon_s: float
+    successor_prediction_confidence: float
+    current_yaw_release: float
+    passage_yaw_authority: float
+    successor_yaw_contribution_rad: float
+    successor_transition_held: bool
     current_time_to_contact_s: float | None
     braking: bool
     brake_reason: str | None
@@ -677,6 +691,16 @@ class _TrackEstimate:
     last_measurement_camera_to_world: Quaternion
     last_measured_center_norm: Vector2
     last_measured_aperture_half_size_norm: Vector2 | None
+    measured_bearing_history: list[tuple[int, Vector2]]
+
+
+@dataclass(frozen=True, slots=True)
+class _SuccessorPrediction:
+    bearing_rad: Vector2
+    measured_bearing_rad: Vector2
+    robust_rate_rad_s: Vector2
+    horizon_s: float
+    confidence: float
 
 
 class CommandGovernor:
@@ -1022,6 +1046,7 @@ class DynamicCourseCore:
         if not observation.visible:
             if existing is None:
                 raise DynamicCourseError("an invisible observation cannot initialise a track")
+            existing.measured_bearing_history.clear()
             return self._coast_track(
                 existing,
                 observation,
@@ -1067,6 +1092,14 @@ class DynamicCourseCore:
                 last_measured_aperture_half_size_norm=(
                     observation.aperture_half_size_norm
                 ),
+                measured_bearing_history=(
+                    [(capture_ns, measured_bearing)]
+                    if (
+                        not observation.ambiguous
+                        and not observation.censored_axes[0]
+                    )
+                    else []
+                ),
             )
             return state
         rotational_rate, residual_rate = self._split_image_rate(
@@ -1095,6 +1128,18 @@ class DynamicCourseCore:
             existing.last_measured_aperture_half_size_norm = (
                 observation.aperture_half_size_norm
             )
+        if observation.ambiguous or observation.censored_axes[0]:
+            existing.measured_bearing_history.clear()
+        else:
+            existing.measured_bearing_history.append(
+                (capture_ns, measured_bearing)
+            )
+            history_start_ns = capture_ns - 500_000_000
+            existing.measured_bearing_history[:] = [
+                sample
+                for sample in existing.measured_bearing_history[-12:]
+                if sample[0] >= history_start_ns
+            ]
         return state
 
     def _initial_state(
@@ -1584,16 +1629,44 @@ class DynamicCourseCore:
         successor = state.successor
         if monotonic_ns < current.state_monotonic_ns:
             raise DynamicCourseError("guidance time cannot precede the current state")
-        current_center, current_aperture = self._decision_geometry(
+        camera_current_center, _ = self._decision_geometry(
             current.track_id,
             monotonic_ns,
         )
-        successor_center: Vector2 | None = None
-        if successor is not None:
-            successor_center, _ = self._decision_geometry(
-                successor.track_id,
-                monotonic_ns,
+        successor_prediction = self._predicted_successor(
+            current,
+            successor,
+            monotonic_ns,
+        )
+        successor_transition_held = self._successor_transition_hold(
+            successor,
+            monotonic_ns,
+        )
+        successor_passage_ready = (
+            successor is not None
+            and successor.sample_count >= 4
+            and (
+                successor_transition_held
+                or (
+                    successor.visible
+                    and not successor.ambiguous
+                    and not successor.censored_axes[0]
+                )
             )
+        )
+        passage_successor_track_id = (
+            None
+            if not successor_passage_ready
+            else successor.track_id
+        )
+        (
+            current_center,
+            current_aperture,
+            successor_center,
+        ) = self._stable_passage_geometry(
+            current.track_id,
+            passage_successor_track_id,
+        )
         held = False
         if self._governor.last_command is not None:
             age_s = (
@@ -1605,19 +1678,35 @@ class DynamicCourseCore:
             current_center,
             successor_center,
         )
-        successor_weight = self._successor_weight(current, successor)
-        predicted_successor = self._predicted_successor(
-            current,
-            successor,
-            monotonic_ns,
+        passage_error = (
+            current_center[0] + passage[0],
+            current_center[1] + passage[1],
         )
-        proposal, braking, reason = self._propose_command(
+        current_yaw_release = self._current_yaw_release(
+            current,
+            successor_passage_ready,
+        )
+        passage_yaw_authority = self._passage_yaw_authority(
+            current,
+            passage_error,
+            margins,
+            successor_prediction,
+        )
+        successor_weight = self._successor_weight(
             current,
             successor,
-            current_center,
-            passage,
+            successor_prediction,
+            passage_yaw_authority,
+            current_yaw_release,
+        )
+        proposal, braking, reason, yaw_contribution = self._propose_command(
+            current,
+            successor,
+            camera_current_center,
+            passage_error,
+            current_yaw_release,
             successor_weight,
-            predicted_successor,
+            successor_prediction,
         )
         command = self._governor.preview(proposal, monotonic_ns, hold=held)
         return GuidanceDecision(
@@ -1626,19 +1715,45 @@ class DynamicCourseCore:
             current_track_id=current.track_id,
             successor_track_id=None if successor is None else successor.track_id,
             current_center_norm=current_center,
+            camera_current_center_norm=camera_current_center,
             current_aperture_half_size_norm=current_aperture,
             passage_point_norm=passage,
-            passage_error_norm=(
-                current_center[0] + passage[0],
-                current_center[1] + passage[1],
-            ),
+            passage_error_norm=passage_error,
             aperture_margin_norm=margins,
             current_bearing_std_rad=current.bearing_std_rad,
             successor_bearing_std_rad=(
                 None if successor is None else successor.bearing_std_rad
             ),
             successor_weight=successor_weight,
-            predicted_successor_bearing_rad=predicted_successor,
+            predicted_successor_bearing_rad=(
+                None
+                if successor_prediction is None
+                else successor_prediction.bearing_rad
+            ),
+            measured_successor_bearing_rad=(
+                None
+                if successor_prediction is None
+                else successor_prediction.measured_bearing_rad
+            ),
+            successor_rate_rad_s=(
+                None
+                if successor_prediction is None
+                else successor_prediction.robust_rate_rad_s
+            ),
+            successor_prediction_horizon_s=(
+                0.0
+                if successor_prediction is None
+                else successor_prediction.horizon_s
+            ),
+            successor_prediction_confidence=(
+                0.0
+                if successor_prediction is None
+                else successor_prediction.confidence
+            ),
+            current_yaw_release=current_yaw_release,
+            passage_yaw_authority=passage_yaw_authority,
+            successor_yaw_contribution_rad=yaw_contribution,
+            successor_transition_held=successor_transition_held,
             current_time_to_contact_s=current.time_to_contact_s,
             braking=braking,
             brake_reason=reason,
@@ -1647,30 +1762,25 @@ class DynamicCourseCore:
             command=command,
         )
 
-    def _decision_geometry(
+    def _geometry_in_orientation(
         self,
         track_id: str,
-        monotonic_ns: int,
+        target_camera_to_world: Quaternion,
     ) -> tuple[Vector2, Vector2 | None]:
         estimate = self._tracks[track_id]
-        aligned = self._aligned_imu(monotonic_ns)
-        decision_camera_to_world = _quat_multiply(
-            aligned.body_to_reference_wxyz,
-            self.config.camera_to_body_wxyz,
-        )
 
         def project_stable_ray(stable_ray: Vector3) -> Vector2:
             world_ray = _quat_rotate(
                 estimate.reference_camera_to_world,
                 stable_ray,
             )
-            decision_ray = _quat_rotate(
-                _quat_conjugate(decision_camera_to_world),
+            target_ray = _quat_rotate(
+                _quat_conjugate(target_camera_to_world),
                 world_ray,
             )
-            if decision_ray[0] <= 1e-6:
-                raise DynamicCourseError("gate ray is behind the decision camera")
-            bearing = _ray_bearing(decision_ray)
+            if target_ray[0] <= 1e-6:
+                raise DynamicCourseError("gate ray is behind the target orientation")
+            bearing = _ray_bearing(target_ray)
             return (
                 math.tan(bearing[0]) / self.config.horizontal_angle_scale_rad,
                 math.tan(bearing[1]) / self.config.vertical_angle_scale_rad,
@@ -1691,13 +1801,15 @@ class DynamicCourseCore:
                 estimate.last_measurement_camera_to_world,
                 ray,
             )
-            decision_ray = _quat_rotate(
-                _quat_conjugate(decision_camera_to_world),
+            target_ray = _quat_rotate(
+                _quat_conjugate(target_camera_to_world),
                 world_ray,
             )
-            if decision_ray[0] <= 1e-6:
-                raise DynamicCourseError("gate aperture is behind the decision camera")
-            bearing = _ray_bearing(decision_ray)
+            if target_ray[0] <= 1e-6:
+                raise DynamicCourseError(
+                    "gate aperture is behind the target orientation"
+                )
+            bearing = _ray_bearing(target_ray)
             return (
                 math.tan(bearing[0]) / self.config.horizontal_angle_scale_rad,
                 math.tan(bearing[1]) / self.config.vertical_angle_scale_rad,
@@ -1721,6 +1833,42 @@ class DynamicCourseCore:
             0.5 * abs(bottom[1] - top[1]),
         )
         return center, projected_aperture
+
+    def _decision_geometry(
+        self,
+        track_id: str,
+        monotonic_ns: int,
+    ) -> tuple[Vector2, Vector2 | None]:
+        aligned = self._aligned_imu(monotonic_ns)
+        decision_camera_to_world = _quat_multiply(
+            aligned.body_to_reference_wxyz,
+            self.config.camera_to_body_wxyz,
+        )
+        return self._geometry_in_orientation(
+            track_id,
+            decision_camera_to_world,
+        )
+
+    def _stable_passage_geometry(
+        self,
+        current_track_id: str,
+        successor_track_id: str | None,
+    ) -> tuple[Vector2, Vector2 | None, Vector2 | None]:
+        current_estimate = self._tracks[current_track_id]
+        stable_orientation = current_estimate.reference_camera_to_world
+        current_center, current_aperture = self._geometry_in_orientation(
+            current_track_id,
+            stable_orientation,
+        )
+        successor_center = (
+            None
+            if successor_track_id is None
+            else self._geometry_in_orientation(
+                successor_track_id,
+                stable_orientation,
+            )[0]
+        )
+        return current_center, current_aperture, successor_center
 
     def _passage_point(
         self,
@@ -1754,25 +1902,194 @@ class DynamicCourseCore:
         )
         return passage, remaining  # type: ignore[return-value]
 
+    def _current_yaw_release(
+        self,
+        current: TrackDynamicState,
+        successor_passage_ready: bool,
+    ) -> float:
+        if (
+            not successor_passage_ready
+            or not current.visible
+            or current.ambiguous
+            or any(current.censored_axes)
+        ):
+            return 0.0
+        scale_lower_bound = current.log_scale - 2.0 * current.log_scale_std
+        scale_start = self.config.passage_arm_min_log_scale - 0.25
+        return _clamp(
+            (
+                scale_lower_bound - scale_start
+            )
+            / (self.config.passage_arm_min_log_scale - scale_start),
+            0.0,
+            1.0,
+        )
+
+    def _successor_transition_hold(
+        self,
+        successor: TrackDynamicState | None,
+        monotonic_ns: int,
+    ) -> bool:
+        if (
+            successor is None
+            or successor.visible
+            or successor.ambiguous
+            or successor.sample_count < 4
+        ):
+            return False
+        age_s = (
+            monotonic_ns - successor.last_measurement_monotonic_ns
+        ) / _NS_PER_SECOND
+        return 0.0 <= age_s <= self.config.dropout_hold_s
+
+    def _passage_yaw_authority(
+        self,
+        current: TrackDynamicState,
+        passage_error_norm: Vector2,
+        aperture_remaining_norm: Vector2,
+        prediction: _SuccessorPrediction | None,
+    ) -> float:
+        if (
+            prediction is None
+            or not current.visible
+            or current.ambiguous
+            or any(current.censored_axes)
+        ):
+            return 0.0
+        current_std_norm = (
+            current.bearing_std_rad[0]
+            / self.config.horizontal_angle_scale_rad,
+            current.bearing_std_rad[1]
+            / self.config.vertical_angle_scale_rad,
+        )
+        passage_alignment = min(
+            _clamp(
+                (
+                    self.config.passage_margin_norm
+                    + aperture_remaining_norm[axis]
+                    - (
+                        abs(passage_error_norm[axis])
+                        + 2.0 * current_std_norm[axis]
+                    )
+                )
+                / (0.5 * self.config.passage_margin_norm),
+                0.0,
+                1.0,
+            )
+            for axis in range(2)
+        )
+        return passage_alignment * prediction.confidence
+
     def _successor_weight(
         self,
         current: TrackDynamicState,
         successor: TrackDynamicState | None,
+        prediction: _SuccessorPrediction | None,
+        passage_yaw_authority: float,
+        current_yaw_release: float,
     ) -> float:
-        if successor is None:
+        if successor is None or prediction is None:
+            return 0.0
+        if (
+            not current.visible
+            or current.ambiguous
+            or any(current.censored_axes)
+            or not successor.visible
+            or successor.ambiguous
+            or successor.censored_axes[0]
+        ):
             return 0.0
         ttc = current.time_to_contact_s
-        if ttc is None:
-            return self.config.successor_minimum_weight
-        fraction = (
-            self.config.successor_lookahead_ttc_s - ttc
-        ) / (
-            self.config.successor_lookahead_ttc_s
-            - self.config.successor_full_weight_ttc_s
+        ttc_progress = (
+            current_yaw_release
+            if ttc is None
+            else _clamp(
+                (
+                    self.config.successor_lookahead_ttc_s - ttc
+                )
+                / (
+                    self.config.successor_lookahead_ttc_s
+                    - self.config.successor_full_weight_ttc_s
+                ),
+                0.0,
+                1.0,
+            )
         )
-        return max(
-            self.config.successor_minimum_weight,
-            _clamp(fraction, 0.0, 1.0),
+        return (
+            self.config.successor_maximum_weight
+            * passage_yaw_authority
+            * ttc_progress
+        )
+
+    @staticmethod
+    def _robust_history_rate(
+        history: list[tuple[int, Vector2]],
+        axis: int,
+    ) -> tuple[float, float]:
+        if len(history) < 4:
+            return 0.0, 0.0
+        pairwise_rates: list[float] = []
+        for left_index, left in enumerate(history):
+            for right in history[left_index + 1 :]:
+                elapsed_s = (right[0] - left[0]) / _NS_PER_SECOND
+                if elapsed_s >= 0.020:
+                    pairwise_rates.append(
+                        (right[1][axis] - left[1][axis]) / elapsed_s
+                    )
+        if not pairwise_rates:
+            return 0.0, 0.0
+        rate = float(statistics.median(pairwise_rates))
+        latest_time_ns, latest_bearing = history[-1]
+        residuals = [
+            abs(
+                sample_bearing[axis]
+                - (
+                    latest_bearing[axis]
+                    + rate
+                    * (
+                        sample_time_ns - latest_time_ns
+                    )
+                    / _NS_PER_SECOND
+                )
+            )
+            for sample_time_ns, sample_bearing in history
+        ]
+        residual_median = float(statistics.median(residuals))
+        position_consistency = _clamp(
+            1.0 - residual_median / 0.060,
+            0.0,
+            1.0,
+        )
+        local_rates = [
+            (
+                newer[1][axis] - older[1][axis]
+            )
+            / ((newer[0] - older[0]) / _NS_PER_SECOND)
+            for older, newer in zip(history, history[1:])
+            if newer[0] - older[0] >= 20_000_000
+        ]
+        directional_rates = [
+            value for value in local_rates if abs(value) >= 0.08
+        ]
+        if abs(rate) < 0.08 or not directional_rates:
+            direction_consistency = 1.0
+        else:
+            agreeing = sum(value * rate > 0.0 for value in directional_rates)
+            direction_consistency = _clamp(
+                (agreeing / len(directional_rates) - 0.5) * 2.0,
+                0.0,
+                1.0,
+            )
+        sample_confidence = _clamp(
+            (len(history) - 3) / 4.0,
+            0.0,
+            1.0,
+        )
+        return (
+            rate,
+            sample_confidence
+            * position_consistency
+            * direction_consistency,
         )
 
     def _predicted_successor(
@@ -1780,75 +2097,210 @@ class DynamicCourseCore:
         current: TrackDynamicState,
         successor: TrackDynamicState | None,
         monotonic_ns: int,
-    ) -> Vector2 | None:
+    ) -> _SuccessorPrediction | None:
         if successor is None:
             return None
-        horizon = min(
-            current.time_to_contact_s or self.config.prediction_horizon_s,
-            self.config.prediction_horizon_s,
-        )
-        future_bearing = (
-            successor.bearing_rad[0] + successor.bearing_rate_rad_s[0] * horizon,
-            successor.bearing_rad[1] + successor.bearing_rate_rad_s[1] * horizon,
-        )
         estimate = self._tracks[successor.track_id]
+        history = estimate.measured_bearing_history
+        rates_and_confidence = tuple(
+            self._robust_history_rate(history, axis)
+            for axis in range(2)
+        )
+        observation_confidence = (
+            float(successor.confidence)
+            * _clamp(
+                1.0
+                - successor.bearing_std_rad[0]
+                / self.config.max_bearing_innovation_rad,
+                0.0,
+                1.0,
+            )
+        )
+        temporal_confidence = rates_and_confidence[0][1]
+        confidence = (
+            0.0
+            if (
+                not successor.visible
+                or successor.ambiguous
+                or successor.censored_axes[0]
+            )
+            else observation_confidence * temporal_confidence
+        )
+        base_horizon = min(
+            current.time_to_contact_s or 0.0,
+            self.config.successor_prediction_max_horizon_s,
+        )
+        horizon = base_horizon * confidence
+        future_bearing = tuple(
+            _clamp(
+                successor.bearing_rad[axis]
+                + rates_and_confidence[axis][0] * horizon,
+                -self.config.max_abs_bearing_rad,
+                self.config.max_abs_bearing_rad,
+            )
+            for axis in range(2)
+        )
         aligned = self._aligned_imu(monotonic_ns)
         decision_camera_to_world = _quat_multiply(
             aligned.body_to_reference_wxyz,
             self.config.camera_to_body_wxyz,
         )
-        world_ray = _quat_rotate(
-            estimate.reference_camera_to_world,
-            _bearing_ray(future_bearing),
-        )
-        decision_ray = _quat_rotate(
-            _quat_conjugate(decision_camera_to_world),
-            world_ray,
-        )
-        if decision_ray[0] <= 1e-6:
+        def project(stable_bearing: Vector2) -> Vector2 | None:
+            world_ray = _quat_rotate(
+                estimate.reference_camera_to_world,
+                _bearing_ray(stable_bearing),
+            )
+            decision_ray = _quat_rotate(
+                _quat_conjugate(decision_camera_to_world),
+                world_ray,
+            )
+            if decision_ray[0] <= 1e-6:
+                return None
+            return _ray_bearing(decision_ray)
+
+        measured = project(successor.bearing_rad)
+        predicted = project(future_bearing)
+        if measured is None or predicted is None:
             return None
-        bearing = _ray_bearing(decision_ray)
-        return tuple(
-            _clamp(
-                bearing[axis],
-                -self.config.max_abs_bearing_rad,
-                self.config.max_abs_bearing_rad,
+        bounded_prediction = tuple(
+            measured[axis]
+            + _clamp(
+                predicted[axis] - measured[axis],
+                -self.config.successor_prediction_max_extrapolation_rad,
+                self.config.successor_prediction_max_extrapolation_rad,
             )
             for axis in range(2)
-        )  # type: ignore[return-value]
+        )
+        # A low-confidence rate estimate may not extrapolate through the
+        # optical axis.  The measured successor can still be used once the
+        # near-plane/visibility gates admit it, but noisy rate sign changes
+        # cannot manufacture an opposite-side heading target.
+        if (
+            confidence < 0.75
+            and measured[0] * bounded_prediction[0] < 0.0
+        ):
+            bounded_prediction = (
+                measured[0],
+                bounded_prediction[1],
+            )
+        return _SuccessorPrediction(
+            bearing_rad=bounded_prediction,
+            measured_bearing_rad=measured,
+            robust_rate_rad_s=(
+                rates_and_confidence[0][0],
+                rates_and_confidence[1][0],
+            ),
+            horizon_s=horizon,
+            confidence=confidence,
+        )
 
     def _propose_command(
         self,
         current: TrackDynamicState,
         successor: TrackDynamicState | None,
-        current_center_norm: Vector2,
-        passage: Vector2,
+        camera_current_center_norm: Vector2,
+        stable_passage_error_norm: Vector2,
+        current_yaw_release: float,
         successor_weight: float,
-        predicted_successor: Vector2 | None,
-    ) -> tuple[DynamicCourseCommand, bool, str | None]:
-        current_bearing = (
+        successor_prediction: _SuccessorPrediction | None,
+    ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
+        camera_current_bearing = (
             math.atan(
-                current_center_norm[0] * self.config.horizontal_angle_scale_rad
+                camera_current_center_norm[0]
+                * self.config.horizontal_angle_scale_rad
             ),
             math.atan(
-                current_center_norm[1] * self.config.vertical_angle_scale_rad
+                camera_current_center_norm[1]
+                * self.config.vertical_angle_scale_rad
             ),
         )
-        passage_bearing = (
-            math.atan(passage[0] * self.config.horizontal_angle_scale_rad),
-            math.atan(passage[1] * self.config.vertical_angle_scale_rad),
+        stable_passage_bearing = (
+            math.atan(
+                stable_passage_error_norm[0]
+                * self.config.horizontal_angle_scale_rad
+            ),
+            math.atan(
+                stable_passage_error_norm[1]
+                * self.config.vertical_angle_scale_rad
+            ),
         )
-        successor_bearing = predicted_successor or current_bearing
-        heading_error = (
-            (1.0 - successor_weight) * current_bearing[0]
-            + successor_weight * successor_bearing[0]
+        successor_bearing = (
+            camera_current_bearing
+            if successor_prediction is None
+            else successor_prediction.bearing_rad
         )
-        # The passage point already carries the bounded successor bias inside
-        # the current aperture.  Adding the successor bearing again here can
-        # reverse roll away from a still-positive passage error near the
-        # crossing plane.  Keep the independent successor look-ahead in yaw;
-        # roll owns the physical intercept through the selected passage point.
-        lateral_error = current_bearing[0] + passage_bearing[0]
+        # Early in the approach the current gate owns camera heading.  Once a
+        # near-plane passage is both geometrically safe and temporally
+        # supported, progressively release that recentering term so successor
+        # lookahead can turn the camera without masquerading as passage error.
+        current_gate_heading = (
+            (1.0 - current_yaw_release)
+            * camera_current_bearing[0]
+        )
+        successor_contribution = _clamp(
+            successor_weight
+            * (successor_bearing[0] - current_gate_heading),
+            -self.config.successor_max_yaw_contribution_rad,
+            self.config.successor_max_yaw_contribution_rad,
+        )
+        prediction_confidence = (
+            0.0
+            if successor_prediction is None
+            else successor_prediction.confidence
+        )
+        if (
+            current_yaw_release <= _EPSILON
+            and abs(current_gate_heading) <= _EPSILON
+        ):
+            successor_contribution = 0.0
+        if (
+            prediction_confidence < 0.75
+            and successor_contribution * current_gate_heading < 0.0
+        ):
+            successor_contribution = math.copysign(
+                min(
+                    abs(successor_contribution),
+                    0.5 * abs(current_gate_heading),
+                ),
+                successor_contribution,
+            )
+        if (
+            current_yaw_release < 1.0
+            and successor_contribution * current_gate_heading < 0.0
+        ):
+            successor_contribution = math.copysign(
+                min(
+                    abs(successor_contribution),
+                    (
+                        0.5 + 0.5 * current_yaw_release
+                    )
+                    * abs(current_gate_heading),
+                ),
+                successor_contribution,
+            )
+        heading_limit = MAX_YAW_RATE_RAD_S / self.config.yaw_gain
+        contribution_heading_limit = (
+            0.90 * heading_limit
+            if prediction_confidence < 0.75
+            else heading_limit
+        )
+        if successor_contribution * current_gate_heading > 0.0:
+            successor_contribution = math.copysign(
+                min(
+                    abs(successor_contribution),
+                    max(
+                        0.0,
+                        contribution_heading_limit
+                        - abs(current_gate_heading),
+                    ),
+                ),
+                successor_contribution,
+            )
+        heading_error = current_gate_heading + successor_contribution
+        # Passage and residual translation are expressed in the current
+        # gate's fixed reference.  Intentional body yaw therefore cannot
+        # manufacture a lateral intercept error or reverse roll.
+        lateral_error = stable_passage_bearing[0]
         roll = self.config.roll_guidance_sign * (
             self.config.roll_gain * lateral_error
             + self.config.lateral_rate_gain
@@ -1856,7 +2308,7 @@ class DynamicCourseCore:
         )
         yaw = -self.config.yaw_gain * heading_error
         off_axis = max(
-            abs(current_bearing[0] + passage_bearing[0]),
+            abs(stable_passage_bearing[0]),
             abs(successor_bearing[0]) if successor is not None else 0.0,
         )
         rapid_closure = (
@@ -1911,6 +2363,7 @@ class DynamicCourseCore:
             ),
             braking,
             reason,
+            successor_contribution,
         )
 
 

@@ -309,6 +309,9 @@ class DynamicVisualCourseSession:
                     "graph track and tracker observation are not co-timed"
                 )
             left, top, right, bottom = sample.bbox_norm
+            # bbox_norm is a full extent in unit [0, 1] coordinates, while
+            # center_norm spans signed [-1, 1].  Its unit-coordinate width is
+            # therefore exactly the half extent in signed center coordinates.
             aperture = (right - left, bottom - top)
             confidence = min(
                 float(track.confidence),
@@ -607,6 +610,9 @@ class DynamicVisualCourseSession:
                     "current_center_norm": list(
                         decision.current_center_norm
                     ),
+                    "camera_current_center_norm": list(
+                        decision.camera_current_center_norm
+                    ),
                     "passage_point_norm": list(
                         decision.passage_point_norm
                     ),
@@ -632,6 +638,36 @@ class DynamicVisualCourseSession:
                         else list(
                             decision.predicted_successor_bearing_rad
                         )
+                    ),
+                    "measured_successor_bearing_rad": (
+                        None
+                        if decision.measured_successor_bearing_rad is None
+                        else list(
+                            decision.measured_successor_bearing_rad
+                        )
+                    ),
+                    "successor_rate_rad_s": (
+                        None
+                        if decision.successor_rate_rad_s is None
+                        else list(decision.successor_rate_rad_s)
+                    ),
+                    "successor_prediction_horizon_s": (
+                        decision.successor_prediction_horizon_s
+                    ),
+                    "successor_prediction_confidence": (
+                        decision.successor_prediction_confidence
+                    ),
+                    "current_yaw_release": (
+                        decision.current_yaw_release
+                    ),
+                    "passage_yaw_authority": (
+                        decision.passage_yaw_authority
+                    ),
+                    "successor_yaw_contribution_rad": (
+                        decision.successor_yaw_contribution_rad
+                    ),
+                    "successor_transition_held": (
+                        decision.successor_transition_held
                     ),
                     "time_to_contact_s": (
                         decision.current_time_to_contact_s
