@@ -21,6 +21,7 @@ from planning.vq2_visual_servo import (
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_SEGMENT_DURATION_S,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
+    MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
     PREPASS_CURRENT_MAX_APPARENT_SCALE,
@@ -281,8 +282,7 @@ def test_vertical_image_error_drives_pitch_in_both_directions():
     servo.reset_segment()
     low = step(servo, target(2, y=0.5))
 
-    assert high.target_pitch_rad > 0.0
-    assert low.target_pitch_rad == 0.0
+    assert high.target_pitch_rad > low.target_pitch_rad > 0.0
     assert high.thrust > servo.tuning.align_thrust
     assert MIN_VISUAL_THRUST < low.thrust < servo.tuning.align_thrust
 
@@ -369,7 +369,9 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
         requested_next_blend=0.3,
     )
     assert blended.next_gate_blend == pytest.approx(0.3)
-    assert blended.yaw_rate_rad_s < 0.0
+    assert blended.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
+    assert blended.target_pitch_rad > servo.tuning.brake_pitch_rad
+    assert blended.thrust < servo.tuning.advance_thrust
 
     servo.reset_segment()
     stale_token = replace(
@@ -1204,7 +1206,7 @@ def test_passage_safe_next_blend_can_retain_advance_authority() -> None:
     assert output.advance_enabled
 
 
-def test_rapid_expansion_tapers_only_successor_preview_steering() -> None:
+def test_rapid_expansion_tapers_bank_but_retains_heading_and_brakes() -> None:
     stable_servo = ImageVisualServo()
     expanding_servo = ImageVisualServo()
     _latch_passage_blend(stable_servo)
@@ -1236,9 +1238,14 @@ def test_rapid_expansion_tapers_only_successor_preview_steering() -> None:
     assert expanding.next_gate_blend == pytest.approx(0.1)
     assert stable.effective_horizontal_error == pytest.approx(0.09)
     assert expanding.effective_horizontal_error == pytest.approx(0.03)
-    assert abs(expanding.yaw_rate_rad_s) < abs(stable.yaw_rate_rad_s)
+    assert expanding.yaw_rate_rad_s == pytest.approx(
+        stable.yaw_rate_rad_s
+    )
     assert abs(expanding.target_roll_rad) < abs(stable.target_roll_rad)
     assert expanding.advance_enabled is True
+    assert expanding.target_pitch_rad > stable.target_pitch_rad
+    assert expanding.target_pitch_rad > 0.0
+    assert expanding.thrust < stable.thrust
 
 
 def test_advance_passage_preview_requires_an_existing_latch() -> None:
@@ -1819,7 +1826,7 @@ def test_default_gain_uses_more_heading_authority_on_latest_live_prepass_frame()
 
     assert output.next_gate_blend == pytest.approx(0.35)
     assert output.effective_horizontal_error == pytest.approx(0.1128125)
-    assert output.yaw_rate_rad_s == pytest.approx(-0.03449451600548799)
+    assert output.yaw_rate_rad_s < -0.10
     assert output.target_pitch_rad >= 0.0
     assert output.advance_enabled is False
 
@@ -2054,9 +2061,7 @@ def test_top_clip_uses_observable_horizontal_brake_authority(
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
     assert output.target_pitch_rad >= 0.0
-    assert output.target_pitch_rad == pytest.approx(
-        servo.tuning.brake_pitch_rad
-    )
+    assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
     assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
 
 

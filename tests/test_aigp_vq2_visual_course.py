@@ -1112,7 +1112,13 @@ def test_crossing_loss_latches_only_after_credible_passage_and_holds():
         fresh_after_samples=1,
         lose_before_credit=True,
     )
-    runtime, _calls = _runtime(host)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={
+            "passage_preview_blend": 0.30,
+            "yaw_rate": -0.12,
+        },
+    )
 
     result = asyncio.run(
         run_visual_course_stage(host, _context(), runtime=runtime)
@@ -1145,6 +1151,7 @@ def test_crossing_loss_latches_only_after_credible_passage_and_holds():
         host.commands[index][0].thrust > 0.0
         and host.commands[index][0].pitch_rate
         == pytest.approx(host.visual_config.servo.brake_pitch_rad)
+        and host.commands[index][0].yaw_rate == pytest.approx(-0.12)
         and host.commands[index][1].get("wire_visual_token") is not None
         for index in gate6_crossing_indices
     )

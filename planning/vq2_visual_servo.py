@@ -1205,6 +1205,29 @@ class ImageVisualServo:
                                 correction_violations
                             )
 
+        heading_horizontal = horizontal
+        heading_horizontal_rate = horizontal_rate
+        if blend > 0.0 and next_horizontal is not None:
+            # The scale-ramped preview blend is an authority fraction for
+            # heading, not a second small bearing weight.  This lets yaw begin
+            # turning toward a large successor error while current-aperture
+            # roll remains governed by the more conservative blend below.
+            heading_authority = _clamp(
+                blend / MAX_NEXT_GATE_BLEND,
+                0.0,
+                1.0,
+            )
+            assert next_target is not None
+            heading_horizontal = (
+                (1.0 - heading_authority) * raw_horizontal
+                + heading_authority * next_horizontal
+            )
+            heading_horizontal_rate = (
+                (1.0 - heading_authority) * raw_horizontal_rate
+                + heading_authority
+                * float(next_target.normalized_x_rate_s)
+            )
+
         self._last_abs_error = (
             None if horizontal_censored else abs(raw_horizontal),
             None if vertical_censored else abs(raw_vertical),
@@ -1274,6 +1297,11 @@ class ImageVisualServo:
             horizontal
             + horizontal_rate * PREPASS_CURRENT_PROJECTION_HORIZON_S
         )
+        projected_heading_horizontal = (
+            heading_horizontal
+            + heading_horizontal_rate
+            * PREPASS_CURRENT_PROJECTION_HORIZON_S
+        )
         projected_vertical = (
             vertical
             + vertical_rate * PREPASS_CURRENT_PROJECTION_HORIZON_S
@@ -1288,6 +1316,22 @@ class ImageVisualServo:
             ),
             0.0,
             1.0,
+        )
+        heading_forward_authority = _clamp(
+            (
+                self.tuning.edge_brake_x
+                - abs(projected_heading_horizontal)
+            )
+            / (
+                self.tuning.edge_brake_x
+                - self.tuning.horizontal_corridor
+            ),
+            0.0,
+            1.0,
+        )
+        center_authority = min(
+            center_authority,
+            heading_forward_authority,
         )
         expansion_authority = _clamp(
             (
@@ -1370,6 +1414,49 @@ class ImageVisualServo:
                     * float(next_target.normalized_y_rate_down_s)
                 )
 
+        closure_brake_authority = max(
+            1.0 - expansion_authority,
+            1.0 - proximity_authority,
+        )
+        horizontal_brake_authority = _clamp(
+            (
+                abs(heading_horizontal)
+                - self.tuning.horizontal_corridor
+            )
+            / (
+                self.tuning.edge_brake_x
+                - self.tuning.horizontal_corridor
+            ),
+            0.0,
+            1.0,
+        )
+        vertical_brake_authority = _clamp(
+            (
+                abs(vertical)
+                - self.tuning.vertical_corridor
+            )
+            / (
+                self.tuning.edge_brake_y
+                - self.tuning.vertical_corridor
+            ),
+            0.0,
+            1.0,
+        )
+        uncertainty_brake_authority = (
+            1.0
+            if (
+                horizontal_censored
+                or vertical_censored
+                or effective_next_ambiguity_risk
+            )
+            else 0.0
+        )
+        steering_brake_authority = max(
+            closure_brake_authority,
+            horizontal_brake_authority,
+            vertical_brake_authority,
+            uncertainty_brake_authority,
+        )
         brake_reason: Optional[str] = None
         if current_edge_risk:
             brake_reason = "target_edge_or_clipping"
@@ -1385,12 +1472,14 @@ class ImageVisualServo:
             brake_reason = "close_scale"
         elif worsening:
             brake_reason = "alignment_error_increasing"
+        elif steering_brake_authority > 0.0 and advance_enabled:
+            brake_reason = "steering_or_closure"
         elif not advance_enabled:
             brake_reason = "aligning"
 
         yaw_rate = _clamp(
-            -self.tuning.yaw_error_gain * horizontal
-            - self.tuning.yaw_rate_gain * horizontal_rate,
+            -self.tuning.yaw_error_gain * heading_horizontal
+            - self.tuning.yaw_rate_gain * heading_horizontal_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,
             MAX_VISUAL_YAW_RATE_RAD_S,
         )
@@ -1424,6 +1513,11 @@ class ImageVisualServo:
                     self.tuning.advance_pitch_rad
                     - self.tuning.brake_pitch_rad
                 )
+                + steering_brake_authority
+                * (
+                    MAX_VISUAL_TARGET_PITCH_RAD
+                    - self.tuning.brake_pitch_rad
+                )
             )
             thrust_basis = (
                 self.tuning.brake_thrust
@@ -1441,8 +1535,16 @@ class ImageVisualServo:
             or close_scale_brake
             or worsening
             or yaw_envelope_limited
+            or steering_brake_authority > 0.0
         ):
-            pitch_basis = self.tuning.brake_pitch_rad
+            pitch_basis = (
+                self.tuning.brake_pitch_rad
+                + steering_brake_authority
+                * (
+                    MAX_VISUAL_TARGET_PITCH_RAD
+                    - self.tuning.brake_pitch_rad
+                )
+            )
             thrust_basis = self.tuning.brake_thrust
         else:
             pitch_basis = 0.0
