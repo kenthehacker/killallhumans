@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import deque
 import gzip
 import hashlib
 import inspect
@@ -111,6 +112,12 @@ from planning.vq2_gate_graph import (
     GateGraphSnapshot,
     GateReacquisitionPending,
     RollingVisualGateGraph,
+)
+from planning.vq2_dynamic_course import ImuAttitudeSample
+from planning.vq2_dynamic_visual_approach import (
+    DynamicRollingVisualApproachServo,
+    DynamicVisualCourseSession,
+    production_dynamic_course_config,
 )
 from planning.vq2_visual_approach import (
     MAX_PASSAGE_SUSPENSION_EPOCH_DURATION_S,
@@ -8568,6 +8575,12 @@ class VQ2Runner:
         self._last_imu_advance_s = 0.0
         self._last_imu_received_monotonic_ns: Optional[int] = None
         self._last_imu_receipt_exact = False
+        self._dynamic_attitude_history: deque[
+            ImuAttitudeSample
+        ] = deque(maxlen=512)
+        self._dynamic_course_session: Optional[
+            DynamicVisualCourseSession
+        ] = None
         self._last_race_boot_ms: Optional[int] = None
         self._last_race_advance_s = 0.0
         self._last_frame_identity: Optional[Tuple[int, int]] = None
@@ -8881,6 +8894,8 @@ class VQ2Runner:
         self._last_imu_advance_s = 0.0
         self._last_imu_received_monotonic_ns = None
         self._last_imu_receipt_exact = False
+        self._dynamic_attitude_history.clear()
+        self._dynamic_course_session = None
         self._last_race_boot_ms = None
         self._last_race_advance_s = 0.0
         self._last_frame_identity = None
@@ -8982,6 +8997,36 @@ class VQ2Runner:
                     self._estimator_failure_reason = (
                         estimate.reason or "unhealthy estimate"
                     )
+                if (
+                    self._last_imu_receipt_exact
+                    and self._last_imu_received_monotonic_ns is not None
+                ):
+                    attitude_sample = ImuAttitudeSample(
+                        monotonic_ns=(
+                            self._last_imu_received_monotonic_ns
+                        ),
+                        body_to_reference_wxyz=(
+                            float(estimate.orientation.w),
+                            float(estimate.orientation.x),
+                            float(estimate.orientation.y),
+                            float(estimate.orientation.z),
+                        ),
+                        body_rates_rad_s=tuple(
+                            float(value)
+                            for value in estimate.body_rates
+                        ),
+                        attitude_uncertainty_rad=0.01,
+                        source_timestamp_us=int(
+                            estimate.timestamp_us
+                        ),
+                        host_clock_id=HOST_PERF_COUNTER_CLOCK_ID,
+                    )
+                    self._dynamic_attitude_history.append(
+                        attitude_sample
+                    )
+                    dynamic_session = self._dynamic_course_session
+                    if dynamic_session is not None:
+                        dynamic_session.record_imu(attitude_sample)
         elif stamp < self._last_imu_us:
             self._imu_regressed = True
         record_imu = getattr(self.recorder, "record_imu", None)
@@ -15919,6 +15964,18 @@ class VQ2Runner:
                 "visual-course runtime limits differ from calibrated yaw "
                 "authority"
             )
+        dynamic_session = DynamicVisualCourseSession(
+            production_dynamic_course_config()
+        )
+        attitude_history = tuple(self._dynamic_attitude_history)
+        if len(attitude_history) < 2:
+            raise SafetyAbort(
+                "visual-course dynamic controller lacks timestamped IMU "
+                "history"
+            )
+        for sample in attitude_history:
+            dynamic_session.record_imu(sample)
+        self._dynamic_course_session = dynamic_session
         try:
             summary = await run_visual_course_stage(
                 self,
@@ -15938,6 +15995,11 @@ class VQ2Runner:
                         self.yaw_calibration_profile_evidence["sha256"]
                     ),
                     limits=DEFAULT_VISUAL_COURSE_LIMITS,
+                    servo_factory=partial(
+                        DynamicRollingVisualApproachServo,
+                        session=dynamic_session,
+                    ),
+                    dynamic_controller=dynamic_session,
                 ),
             )
             if not isinstance(summary, Mapping):

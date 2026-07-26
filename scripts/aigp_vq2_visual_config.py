@@ -23,7 +23,7 @@ from planning.vq2_visual_servo import (
 
 
 VISUAL_CONFIG_SCHEMA = "aigp-vq2-visual-navigation-config/1"
-VISUAL_CONTROLLER_FAMILY = "aigp-vq2-multigate-visual-servo/1"
+VISUAL_CONTROLLER_FAMILY = "aigp-vq2-dynamic-image-course/1"
 
 _TOP_LEVEL_FIELDS = frozenset(
     {"schema", "controller_family", "servo", "lifecycle"}

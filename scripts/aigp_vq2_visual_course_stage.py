@@ -750,6 +750,7 @@ class VisualCourseStageRuntime:
     expected_yaw_profile_sha256: Optional[str]
     limits: VisualCourseStageLimits = DEFAULT_VISUAL_COURSE_LIMITS
     servo_factory: Callable[..., Any] = RollingVisualApproachServo
+    dynamic_controller: Optional[Any] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.safety_abort_type, type) or not issubclass(
@@ -801,6 +802,20 @@ class VisualCourseStageRuntime:
         ):
             if not callable(getattr(self, name)):
                 raise TypeError(f"visual-course runtime {name} is not callable")
+        if self.dynamic_controller is not None:
+            for name in (
+                "govern_wire_command",
+                "record_wire_acceptance",
+                "continuity_hold_authority",
+                "evidence_summary",
+            ):
+                if not callable(
+                    getattr(self.dynamic_controller, name, None)
+                ):
+                    raise TypeError(
+                        "visual-course dynamic controller lacks "
+                        f"{name}"
+                    )
 
 
 class VisualCourseStageHost(Protocol):
@@ -1509,6 +1524,13 @@ async def _run_visual_course_stage_impl(
                 "course_elapsed_s": (
                     float(runtime.monotonic()) - course_started_s
                 ),
+                "dynamic_controller": (
+                    None
+                    if runtime.dynamic_controller is None
+                    else dict(
+                        runtime.dynamic_controller.evidence_summary()
+                    )
+                ),
             }
         )
 
@@ -1576,6 +1598,170 @@ async def _run_visual_course_stage_impl(
         total_zero_commands += 1
         last_command_send_s = float(runtime.monotonic())
         consecutive_superseded_proposals = 0
+        refresh_live_summary()
+
+    async def send_continuity_hold(
+        stage: str,
+        elapsed_s: float,
+        *,
+        yaw_reference_rad: float,
+    ) -> None:
+        """Hold the last dynamic target across one bounded handoff gap."""
+
+        nonlocal last_command_send_s
+        nonlocal consecutive_superseded_proposals
+
+        dynamic_controller = runtime.dynamic_controller
+        profile = runtime.yaw_profile
+        if dynamic_controller is None or profile is None:
+            raise abort_type(
+                "visual-course continuity hold lacks dynamic/yaw authority"
+            )
+        await host._wait_for_next_flight_command_slot()
+        pad_contact = initial_pad_contact_authority()
+        host._watchdog(
+            require_target=False,
+            allow_benign_pad_contact=pad_contact,
+            enforce_benign_pad_budget=True,
+            count_rate_sample=False,
+        )
+        excursion, _rates, euler_yaw_rate = _assert_course_attitude_state(
+            host,
+            yaw_reference_rad=yaw_reference_rad,
+            limits=limits,
+            yaw_profile=profile,
+            abort_type=abort_type,
+            phase=f"{stage} pre-send",
+        )
+        proposal_ns = runtime.perf_counter_ns()
+        if type(proposal_ns) is not int or proposal_ns < 0:
+            raise abort_type(
+                "visual-course continuity-hold clock is invalid"
+            )
+        try:
+            authority = dynamic_controller.continuity_hold_authority(
+                now_monotonic_ns=proposal_ns,
+                maximum_age_s=profile.control_hold_horizon_s,
+            )
+        except (TypeError, ValueError) as exc:
+            raise abort_type(
+                f"visual-course continuity hold expired: {exc}"
+            ) from exc
+        if not isinstance(authority, Mapping):
+            raise abort_type(
+                "visual-course continuity hold authority is invalid"
+            )
+        target_roll_rad = float(authority["target_roll_rad"])
+        target_pitch_rad = float(authority["target_pitch_rad"])
+        requested_yaw = float(authority["yaw_rate_rad_s"])
+        thrust = float(authority["thrust"])
+        bounded_yaw = requested_yaw
+        if requested_yaw != 0.0:
+            bounded_yaw = _limit_calibrated_yaw_request(
+                requested_yaw,
+                excursion_rad=excursion,
+                measured_euler_yaw_rate_rad_s=euler_yaw_rate,
+                limits=limits,
+                profile=profile,
+                abort_type=abort_type,
+            )
+        base = runtime.attitude_rate_command(
+            host.estimate,
+            target_roll_rad=target_roll_rad,
+            target_pitch_rad=target_pitch_rad,
+            thrust=thrust,
+        )
+        limited = runtime.limit_command_rates(
+            base,
+            limits.max_command_rate_rad_s,
+        )
+        command = AttitudeRateCommand(
+            roll_rate=float(limited.roll_rate),
+            pitch_rate=float(limited.pitch_rate),
+            yaw_rate=bounded_yaw,
+            thrust=float(limited.thrust),
+        )
+        try:
+            command = dynamic_controller.govern_wire_command(
+                command,
+                proposal_monotonic_ns=proposal_ns,
+                launch_thrust_override=True,
+                yaw_safety_override=bool(
+                    requested_yaw != 0.0 and bounded_yaw == 0.0
+                ),
+            )
+        except (TypeError, ValueError) as exc:
+            raise abort_type(
+                f"visual-course continuity governor refused: {exc}"
+            ) from exc
+        runtime.validate_command(command)
+        if (
+            max(abs(command.roll_rate), abs(command.pitch_rate))
+            > limits.max_command_rate_rad_s + 1e-12
+            or abs(command.yaw_rate)
+            > limits.max_yaw_rate_rad_s + 1e-12
+            or command.thrust != thrust
+        ):
+            raise abort_type(
+                "visual-course continuity hold escaped its envelope"
+            )
+        receipt = await host._send_flight_command(
+            command,
+            require_wire_receipt=True,
+        )
+        call_start = (
+            receipt.get("call_start_monotonic_ns")
+            if isinstance(receipt, Mapping)
+            else None
+        )
+        if (
+            type(call_start) is not int
+            or call_start < proposal_ns
+            or host._last_flight_command_started_ns != call_start
+        ):
+            raise abort_type(
+                "visual-course continuity hold lacks exact wire timing"
+            )
+        try:
+            dynamic_evidence = (
+                dynamic_controller.record_wire_acceptance(
+                    target_roll_rad=target_roll_rad,
+                    target_pitch_rad=target_pitch_rad,
+                    yaw_rate_rad_s=float(command.yaw_rate),
+                    thrust=float(command.thrust),
+                    wire_command=command,
+                    wire_start_monotonic_ns=call_start,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise abort_type(
+                "visual-course continuity hold could not commit: "
+                f"{exc}"
+            ) from exc
+        if not isinstance(dynamic_evidence, Mapping):
+            raise abort_type(
+                "visual-course continuity hold evidence is invalid"
+            )
+        host.recorder.emit(
+            "visual_course_dynamic_command",
+            **dict(dynamic_evidence),
+        )
+        host.recorder.emit(
+            "visual_course_dynamic_handoff_hold",
+            gate_index=current_gate_index,
+            stage=stage,
+            source_wire_start_monotonic_ns=authority[
+                "source_wire_start_monotonic_ns"
+            ],
+            wire_start_monotonic_ns=call_start,
+            command=asdict(command),
+        )
+        host._record_tick(stage, elapsed_s, command)
+        last_command_send_s = float(runtime.monotonic())
+        consecutive_superseded_proposals = 0
+        segment["dynamic_controller"] = dict(
+            dynamic_controller.evidence_summary()
+        )
         refresh_live_summary()
 
     async def send_visual(
@@ -1885,6 +2071,36 @@ async def _run_visual_course_stage_impl(
             yaw_rate=bounded_yaw,
             thrust=float(limited.thrust),
         )
+        dynamic_controller = runtime.dynamic_controller
+        if dynamic_controller is not None:
+            governor_proposal_ns = runtime.perf_counter_ns()
+            if (
+                type(governor_proposal_ns) is not int
+                or governor_proposal_ns < 0
+            ):
+                raise abort_type(
+                    "visual-course dynamic governor clock is invalid"
+                )
+            try:
+                command = dynamic_controller.govern_wire_command(
+                    command,
+                    proposal_monotonic_ns=governor_proposal_ns,
+                    launch_thrust_override=bool(
+                        launch_evidence is not None
+                        and launch_evidence["thrust_phase"]
+                        in {"preload", "boost"}
+                    ),
+                    yaw_safety_override=yaw_soft_stop_zeroed,
+                )
+            except (TypeError, ValueError) as exc:
+                raise abort_type(
+                    f"visual-course dynamic wire governor refused: {exc}"
+                ) from exc
+            if type(command) is not AttitudeRateCommand:
+                raise abort_type(
+                    "visual-course dynamic wire governor returned an "
+                    "invalid command"
+                )
         runtime.validate_command(command)
         if (
             max(abs(command.roll_rate), abs(command.pitch_rate))
@@ -2042,6 +2258,36 @@ async def _run_visual_course_stage_impl(
                         "next_preview_collective_track_id"
                     ]
                 )
+        if dynamic_controller is not None:
+            try:
+                dynamic_evidence = (
+                    dynamic_controller.record_wire_acceptance(
+                        target_roll_rad=target_roll_rad,
+                        target_pitch_rad=target_pitch_rad,
+                        yaw_rate_rad_s=float(command.yaw_rate),
+                        thrust=float(command.thrust),
+                        wire_command=command,
+                        wire_start_monotonic_ns=(
+                            wire_start_monotonic_ns
+                        ),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise abort_type(
+                    "visual-course dynamic controller could not commit "
+                    f"the accepted wire command: {exc}"
+                ) from exc
+            if not isinstance(dynamic_evidence, Mapping):
+                raise abort_type(
+                    "visual-course dynamic command evidence is invalid"
+                )
+            host.recorder.emit(
+                "visual_course_dynamic_command",
+                **dict(dynamic_evidence),
+            )
+            segment["dynamic_controller"] = dict(
+                dynamic_controller.evidence_summary()
+            )
         host._record_tick(
             stage,
             float(runtime.monotonic()) - segment_started_s,
@@ -2237,6 +2483,33 @@ async def _run_visual_course_stage_impl(
             yaw_rate=bounded_yaw,
             thrust=float(limited.thrust),
         )
+        dynamic_controller = runtime.dynamic_controller
+        if dynamic_controller is not None:
+            governor_proposal_ns = runtime.perf_counter_ns()
+            if (
+                type(governor_proposal_ns) is not int
+                or governor_proposal_ns < 0
+            ):
+                raise abort_type(
+                    "visual-course dynamic governor clock is invalid"
+                )
+            try:
+                command = dynamic_controller.govern_wire_command(
+                    command,
+                    proposal_monotonic_ns=governor_proposal_ns,
+                    # The coast authority already owns its exact bounded
+                    # support thrust; do not synthesize a different one.
+                    launch_thrust_override=True,
+                    yaw_safety_override=bool(
+                        authority.yaw_rate_rad_s != 0.0
+                        and bounded_yaw == 0.0
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise abort_type(
+                    "visual-course dynamic coast governor refused: "
+                    f"{exc}"
+                ) from exc
         runtime.validate_command(command)
         if (
             max(abs(command.roll_rate), abs(command.pitch_rate))
@@ -2326,6 +2599,36 @@ async def _run_visual_course_stage_impl(
             raise abort_type(
                 "visual-course censored passage send lacks exact visual "
                 "wire timing"
+            )
+        if dynamic_controller is not None:
+            try:
+                dynamic_evidence = (
+                    dynamic_controller.record_wire_acceptance(
+                        target_roll_rad=authority.target_roll_rad,
+                        target_pitch_rad=authority.target_pitch_rad,
+                        yaw_rate_rad_s=float(command.yaw_rate),
+                        thrust=float(command.thrust),
+                        wire_command=command,
+                        wire_start_monotonic_ns=(
+                            wire_start_monotonic_ns
+                        ),
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise abort_type(
+                    "visual-course dynamic controller could not commit "
+                    f"the coast command: {exc}"
+                ) from exc
+            if not isinstance(dynamic_evidence, Mapping):
+                raise abort_type(
+                    "visual-course dynamic coast evidence is invalid"
+                )
+            host.recorder.emit(
+                "visual_course_dynamic_command",
+                **dict(dynamic_evidence),
+            )
+            segment["dynamic_controller"] = dict(
+                dynamic_controller.evidence_summary()
             )
 
         host._record_tick(
@@ -2561,6 +2864,7 @@ async def _run_visual_course_stage_impl(
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
             "post_credit_zero_command_count": 0,
+            "post_credit_hold_command_count": 0,
             "recovery_navigation_command_count": 0,
             "recovery_clean_command_count": 0,
             "recovery_one_edge_command_count": 0,
@@ -4093,6 +4397,7 @@ async def _run_visual_course_stage_impl(
                 segment["crossing_wait_adjacent_command_count"]
             ),
             "post_transition_zero_command_count": 0,
+            "post_transition_hold_command_count": 0,
             "post_transition_navigation_command_count": 0,
             "passage_authority_enabled": bool(
                 segment["passage_authority_enabled"]
@@ -4216,25 +4521,46 @@ async def _run_visual_course_stage_impl(
                         "visual-course race boundary changed during "
                         "credited-unbound reacquisition"
                     )
-                await send_zero(
-                    (
-                        f"{VISUAL_COURSE_STAGE}/gate"
-                        f"{unbound_advance.to_gate_index}/"
-                        "credited-unbound-zero"
-                    ),
-                    float(runtime.monotonic()) - segment_started_s,
-                    yaw_reference_rad=yaw_reference_rad,
-                )
-                segment["post_credit_zero_command_count"] = int(
-                    segment["post_credit_zero_command_count"]
-                ) + 1
-                transition_summary[
-                    "post_transition_zero_command_count"
-                ] = int(
+                if runtime.dynamic_controller is not None:
+                    await send_continuity_hold(
+                        (
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{unbound_advance.to_gate_index}/"
+                            "credited-unbound-hold"
+                        ),
+                        float(runtime.monotonic()) - segment_started_s,
+                        yaw_reference_rad=yaw_reference_rad,
+                    )
+                    segment["post_credit_hold_command_count"] = int(
+                        segment["post_credit_hold_command_count"]
+                    ) + 1
+                    transition_summary[
+                        "post_transition_hold_command_count"
+                    ] = int(
+                        transition_summary[
+                            "post_transition_hold_command_count"
+                        ]
+                    ) + 1
+                else:
+                    await send_zero(
+                        (
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{unbound_advance.to_gate_index}/"
+                            "credited-unbound-zero"
+                        ),
+                        float(runtime.monotonic()) - segment_started_s,
+                        yaw_reference_rad=yaw_reference_rad,
+                    )
+                    segment["post_credit_zero_command_count"] = int(
+                        segment["post_credit_zero_command_count"]
+                    ) + 1
                     transition_summary[
                         "post_transition_zero_command_count"
-                    ]
-                ) + 1
+                    ] = int(
+                        transition_summary[
+                            "post_transition_zero_command_count"
+                        ]
+                    ) + 1
 
             assert reacquisition is not None
             if (
@@ -4437,20 +4763,44 @@ async def _run_visual_course_stage_impl(
             snapshot = host.visual_gate_graph.latest_snapshot
             if evaluate_recovery_candidate(snapshot):
                 break
-            await send_zero(
-                (
-                    f"{VISUAL_COURSE_STAGE}/gate"
-                    f"{current_gate_index}/post-credit-zero"
-                ),
-                float(runtime.monotonic()) - segment_started_s,
-                yaw_reference_rad=yaw_reference_rad,
-            )
-            segment["post_credit_zero_command_count"] = int(
-                segment["post_credit_zero_command_count"]
-            ) + 1
-            transition_summary["post_transition_zero_command_count"] = int(
-                transition_summary["post_transition_zero_command_count"]
-            ) + 1
+            if runtime.dynamic_controller is not None:
+                await send_continuity_hold(
+                    (
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/post-credit-hold"
+                    ),
+                    float(runtime.monotonic()) - segment_started_s,
+                    yaw_reference_rad=yaw_reference_rad,
+                )
+                segment["post_credit_hold_command_count"] = int(
+                    segment["post_credit_hold_command_count"]
+                ) + 1
+                transition_summary[
+                    "post_transition_hold_command_count"
+                ] = int(
+                    transition_summary[
+                        "post_transition_hold_command_count"
+                    ]
+                ) + 1
+            else:
+                await send_zero(
+                    (
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/post-credit-zero"
+                    ),
+                    float(runtime.monotonic()) - segment_started_s,
+                    yaw_reference_rad=yaw_reference_rad,
+                )
+                segment["post_credit_zero_command_count"] = int(
+                    segment["post_credit_zero_command_count"]
+                ) + 1
+                transition_summary[
+                    "post_transition_zero_command_count"
+                ] = int(
+                    transition_summary[
+                        "post_transition_zero_command_count"
+                    ]
+                ) + 1
         assert admitted_recovery_token is not None
         transition_summary["recovery_admission"] = {
             "admission_kind": "fresh_promoted_current",

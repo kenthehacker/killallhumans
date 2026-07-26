@@ -50,7 +50,7 @@ def test_default_visual_config_is_versioned_and_canonically_hashed():
     assert mapping["lifecycle"]["next_gate_blend_max"] == 0.35
     assert config.to_effective_mapping() == mapping
     assert config.effective_config_sha256 == (
-        "39da22a06d39e00c4168820d7828cde4bdb194d5c49e4d376adcce7ea53de615"
+        "5595b87c130b29847f270086e566bb4c0b13f533cbc63e8227b42bc9884921cc"
     )
     assert len(config.effective_config_sha256) == 64
     assert canonical_visual_config_sha256(mapping) == (

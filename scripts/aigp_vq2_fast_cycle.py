@@ -95,6 +95,8 @@ _RUNTIME_SOURCE_PATHS = (
     "gate_detection/src/gate_detector.py",
     "gate_detection/src/vq2_detector.py",
     "planning/vq2_course_lifecycle.py",
+    "planning/vq2_dynamic_course.py",
+    "planning/vq2_dynamic_visual_approach.py",
     "planning/vq2_gate_graph.py",
     "planning/vq2_visual_approach.py",
     "planning/vq2_visual_alignment.py",
