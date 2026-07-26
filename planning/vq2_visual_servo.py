@@ -1556,17 +1556,31 @@ class ImageVisualServo:
                     coordinated_roll_floor,
                     base_target_roll,
                 )
-        if (
-            steering_load == 1.0
-            and heading_horizontal * heading_horizontal_rate > 0.0
-        ):
+        outward_bearing_authority = (
+            steering_load
+            * _clamp(
+                (
+                    heading_horizontal
+                    * heading_horizontal_rate
+                )
+                / (
+                    self.tuning.horizontal_corridor
+                    * self.tuning.stable_rate_norm_s
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        if outward_bearing_authority > 0.0:
             # Sustained same-sign bank worsened four free-flight successor
             # cohorts.  A following level-roll flight reduced that motion but
-            # still moved outward while calibrated yaw saturated and
-            # responded.  Allocate the existing bounded bank demand in the
-            # counter direction only during that measured condition; yaw and
-            # closure braking remain fully active.
-            target_roll = -base_target_roll
+            # still moved outward while calibrated yaw responded.  Transfer
+            # the existing bounded bank demand continuously through level and
+            # into counter-bank as steering load and outward image rate grow;
+            # yaw and closure braking remain fully active.
+            target_roll = (
+                1.0 - 2.0 * outward_bearing_authority
+            ) * base_target_roll
         vertical_correction = (
             -self.tuning.vertical_error_gain * vertical
             - self.tuning.vertical_rate_gain

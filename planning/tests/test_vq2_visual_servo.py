@@ -2165,6 +2165,32 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
     )
 
 
+def test_outward_bank_allocation_is_continuous_before_yaw_saturation():
+    servo = ImageVisualServo()
+    output = step(
+        servo,
+        target(
+            174,
+            x=0.45625,
+            y=-0.60,
+            x_rate=0.21851,
+            y_rate=-0.21950,
+            log_scale=math.log(0.1643),
+            scale_rate=0.757,
+        ),
+        allow_advance=False,
+    )
+
+    assert -0.15 < output.yaw_rate_rad_s < 0.0
+    assert output.target_roll_rad < 0.0
+    assert abs(output.target_roll_rad) < MAX_VISUAL_TARGET_ROLL_RAD
+    assert (
+        servo.tuning.brake_pitch_rad
+        < output.target_pitch_rad
+        < MAX_VISUAL_TARGET_PITCH_RAD
+    )
+
+
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():
     servo = ImageVisualServo()
     output = step(
