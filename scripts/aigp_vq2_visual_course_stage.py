@@ -1686,6 +1686,7 @@ async def _run_visual_course_stage_impl(
         target_roll_rad = float(output.target_roll_rad)
         target_pitch_rad = float(output.target_pitch_rad)
         command_thrust = float(output.thrust)
+        visual_command_thrust = command_thrust
         if (
             not all(
                 math.isfinite(value)
@@ -1729,20 +1730,25 @@ async def _run_visual_course_stage_impl(
                 1.0,
                 launch_elapsed_s / pitch_blend_s,
             )
-            # Visual braking advances the existing launch handoff instead of
-            # jumping its pitch reference directly to the brake target.  The
-            # scheduled fraction gates that extra authority, so zero visual
-            # authority is the original schedule and full authority follows
-            # the smooth s*(2-s) curve.  Keep the accepted handoff monotonic.
-            requested_pitch_blend = (
-                scheduled_pitch_blend
-                + (1.0 - scheduled_pitch_blend)
-                * continuous_pitch_response_authority
-                * scheduled_pitch_blend
+            pitch_blend = scheduled_pitch_blend
+            vertical_launch_margin = max(
+                0.0,
+                min(
+                    1.0,
+                    1.0
+                    + float(
+                        proposal.current_target.normalized_y_down
+                    )
+                    / host.visual_config.servo.vertical_corridor,
+                ),
             )
-            pitch_blend = max(
-                requested_pitch_blend,
-                float(launch.get("last_pitch_blend", 0.0)),
+            launch_steering_unload_authority = (
+                min(
+                    1.0,
+                    abs(requested_yaw)
+                    / limits.max_yaw_rate_rad_s,
+                )
+                * vertical_launch_margin
             )
             target_pitch_rad = (
                 (1.0 - pitch_blend) * launch_spawn_pitch_rad
@@ -1763,8 +1769,21 @@ async def _run_visual_course_stage_impl(
             elif launch_elapsed_s < float(
                 host.visual_config.lifecycle.launch_boost_duration_s
             ):
-                command_thrust = float(
+                launch_boost_thrust = float(
                     host.visual_config.lifecycle.launch_boost_thrust
+                )
+                # A saturated heading correction must not receive the full
+                # nose-down launch acceleration at the same time.  Allocate
+                # boost continuously toward the servo's measured support
+                # thrust while the current aperture retains vertical margin;
+                # loss of that margin restores launch support automatically.
+                command_thrust = (
+                    launch_boost_thrust
+                    + launch_steering_unload_authority
+                    * (
+                        visual_command_thrust
+                        - launch_boost_thrust
+                    )
                 )
                 thrust_phase = "boost"
             else:
