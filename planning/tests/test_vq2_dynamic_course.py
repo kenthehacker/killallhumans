@@ -169,6 +169,18 @@ def test_delayed_command_history_is_right_continuous_at_channel_delays() -> None
     assert at_yaw.yaw_source_monotonic_ns == 1_100_000_000
 
 
+def test_applied_command_accepts_existing_live_spawn_pitch_envelope() -> None:
+    sample = AppliedCommandSample(
+        monotonic_ns=1,
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.31,
+        yaw_rate_rad_s=0.0,
+        thrust=0.26,
+    )
+
+    assert sample.target_pitch_rad == -0.31
+
+
 def test_noisy_alternating_detections_do_not_reverse_roll_each_frame() -> None:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,

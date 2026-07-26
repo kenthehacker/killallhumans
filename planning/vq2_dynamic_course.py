@@ -27,7 +27,7 @@ Vector2 = tuple[float, float]
 Vector3 = tuple[float, float, float]
 
 MAX_TARGET_ROLL_RAD = 0.16
-MIN_TARGET_PITCH_RAD = -0.30
+MIN_TARGET_PITCH_RAD = -0.35
 MAX_TARGET_PITCH_RAD = 0.15
 MAX_YAW_RATE_RAD_S = 0.15
 MIN_THRUST = 0.21
