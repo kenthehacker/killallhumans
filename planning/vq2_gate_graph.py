@@ -1275,45 +1275,35 @@ class RollingVisualGateGraph:
             raise GateGraphError(
                 "reacquisition graph does not match the binding frame"
             )
-        if snapshot.next_selection_ambiguous:
-            raise AmbiguousGateReacquisitionError(
-                "post-credit visual target selection is ambiguous"
+        local_candidates: list[
+            tuple[VisualTrack, tuple[VisualTrackSample, ...]]
+        ] = []
+        for track in update.tracks:
+            stable_tail = _reacquisition_stable_tail(
+                track,
+                camera_token_at_binding=camera_token_at_binding,
+                required_frames=self.config.min_current_binding_frames,
+                min_track_confidence=self.config.min_track_confidence,
+                min_association_confidence=(
+                    self.config.min_association_confidence
+                ),
             )
-
-        reviewed = next(
-            (
-                track
-                for track in update.tracks
-                if track.track_id == credited_advance.reviewed_track_id
-            ),
-            None,
-        )
-        selected_id: Optional[str] = None
-        if snapshot.next_candidates:
-            selected_id = snapshot.next_candidates[0].track_id
-        elif (
-            reviewed is not None
-            and reviewed.visible
-            and reviewed.role is not VisualTrackRole.RETIRED
-            and reviewed.authoritative_gate_index is None
-            and not reviewed.ambiguous
-        ):
-            selected_id = reviewed.track_id
-        if selected_id is None:
+            if (
+                stable_tail is not None
+                and track.track_id != credited_advance.retired_track_id
+            ):
+                local_candidates.append((track, stable_tail))
+        if not local_candidates:
             raise GateReacquisitionNotReadyError(
-                "no rolling-graph successor is ready for local reacquisition"
+                "no unique clean local successor is ready for reacquisition"
             )
-        selected = next(
-            (
-                track
-                for track in update.tracks
-                if track.track_id == selected_id
-            ),
-            None,
-        )
+        if len(local_candidates) > 1:
+            raise AmbiguousGateReacquisitionError(
+                "post-credit local successor selection is ambiguous"
+            )
+        selected, stable_tail = local_candidates[0]
         if (
-            selected is None
-            or not selected.visible
+            not selected.visible
             or selected.role is VisualTrackRole.RETIRED
             or selected.authoritative_gate_index is not None
             or selected.track_id == credited_advance.retired_track_id
@@ -1321,19 +1311,6 @@ class RollingVisualGateGraph:
         ):
             raise GateReacquisitionNotReadyError(
                 "rolling-graph successor is not a visible unbound local target"
-            )
-        stable_tail = _reacquisition_stable_tail(
-            selected,
-            camera_token_at_binding=camera_token_at_binding,
-            required_frames=self.config.min_current_binding_frames,
-            min_track_confidence=self.config.min_track_confidence,
-            min_association_confidence=(
-                self.config.min_association_confidence
-            ),
-        )
-        if stable_tail is None:
-            raise GateReacquisitionNotReadyError(
-                "sole post-credit target lacks clean stable local evidence"
             )
         latest_sample = stable_tail[-1]
         if (

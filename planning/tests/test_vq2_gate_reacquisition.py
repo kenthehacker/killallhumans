@@ -218,6 +218,7 @@ def _prepare_cross_id_credited_unbound(
     *,
     from_gate_index: int = 0,
     successor_count: int = 1,
+    precredit_successor_frames: int = 3,
     credit_receive_delay_ns: int = 2_000_000,
 ) -> _CrossIdReplayState:
     tracker, graph, current_track_id, reviewed_track_id = (
@@ -236,14 +237,17 @@ def _prepare_cross_id_credited_unbound(
         graph.observe(tracker)
     assert tracker.track(reviewed_track_id).role is VisualTrackRole.RETIRED
 
-    successor_ids: tuple[str, ...] = ()
+    assert 1 <= precredit_successor_frames <= 3
+    successor_ids_list: list[str] = []
     credit_frame: VisualDetectionFrame | None = None
     for sequence in range(19, 22):
-        successor_detections = [_successor_detection(sequence)]
-        if successor_count == 2:
-            successor_detections.append(
-                _second_compatible_successor(sequence)
-            )
+        successor_detections = []
+        if sequence >= 22 - precredit_successor_frames:
+            successor_detections.append(_successor_detection(sequence))
+            if successor_count == 2:
+                successor_detections.append(
+                    _second_compatible_successor(sequence)
+                )
         credit_frame = _frame(
             sequence,
             (
@@ -253,13 +257,13 @@ def _prepare_cross_id_credited_unbound(
         )
         update = tracker.update(credit_frame)
         graph.observe(tracker)
-        if sequence == 19:
-            successor_ids = tuple(
-                track_id
-                for track_id in update.created_track_ids
-                if track_id != current_track_id
-            )
+        successor_ids_list.extend(
+            track_id
+            for track_id in update.created_track_ids
+            if track_id != current_track_id
+        )
     assert credit_frame is not None
+    successor_ids = tuple(successor_ids_list)
     assert len(successor_ids) == successor_count
 
     credit_race = _race(
@@ -510,46 +514,42 @@ def test_reacquisition_rejects_censored_sample_inside_stable_tail() -> None:
 
     assert type(outcome) is GateReacquisitionPending
     assert not outcome.ambiguous
-    assert "lacks clean stable local evidence" in outcome.reason
+    assert "no unique clean local successor" in outcome.reason
     assert state.tracker.tracks() == tracks_before
     assert state.graph.latest_snapshot == snapshot_before
 
 
-def test_persistent_postcredit_distractor_without_credit_relation_refuses() -> None:
-    state = _prepare_cross_id_credited_unbound()
-    for sequence in range(22, 25):
-        distractor_frame = _frame(
-            sequence,
-            (
-                _detection(
-                    0,
-                    -0.75,
-                    0.65,
-                    0.08,
-                    0.10,
-                ),
-            ),
-        )
-        state.tracker.update(distractor_frame)
-        state.graph.observe(state.tracker)
-    tracks_before = state.tracker.tracks()
-    snapshot_before = state.graph.latest_snapshot
+def test_successor_maturing_on_first_postcredit_frame_reacquires() -> None:
+    state = _prepare_cross_id_credited_unbound(
+        precredit_successor_frames=2,
+    )
+    successor_id = state.successor_track_ids[0]
+    assert (
+        state.advance.alternative_reacquisition_track_ids_at_credit
+        == ()
+    )
+    assert state.tracker.track(successor_id).consecutive_frame_count == 2
+    postcredit_frame = _frame(
+        22,
+        (_successor_detection(22),),
+    )
+    state.tracker.update(postcredit_frame)
+    state.graph.observe(state.tracker)
 
-    outcome = state.graph.try_confirm_reacquired_current(
+    outcome = state.graph.confirm_reacquired_current(
         state.tracker,
         credited_advance=state.advance,
-        camera_token_at_binding=distractor_frame.token,
+        camera_token_at_binding=postcredit_frame.token,
     )
 
-    assert type(outcome) is GateReacquisitionPending
-    assert not outcome.ambiguous
-    assert "no rolling-graph successor" in outcome.reason
-    assert state.tracker.tracks() == tracks_before
-    assert state.graph.latest_snapshot == snapshot_before
-    assert (
-        state.graph.latest_snapshot.pending_unbound_advance
-        == state.advance
-    )
+    assert type(outcome) is ConfirmedGateReacquisition
+    assert outcome.reacquired_track_id == successor_id
+    assert outcome.identity_basis == "fresh-unique-local-track"
+    assert not outcome.cross_gap_identity_claimed
+    assert outcome.stable_frame_tokens[-1] == postcredit_frame.token
+    assert state.graph.latest_snapshot is not None
+    assert state.graph.latest_snapshot.current_track_id == successor_id
+    assert state.graph.latest_snapshot.authority_usable
 
 
 def test_multiple_compatible_successors_refuse_ambiguously_without_mutation() -> None:
