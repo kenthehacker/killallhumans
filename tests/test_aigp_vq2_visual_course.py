@@ -33,6 +33,7 @@ from planning.vq2_visual_approach import (
 from planning.vq2_visual_servo import (
     ImageVisualServo,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
+    MAX_VISUAL_YAW_RATE_RAD_S,
     PassageSafetyViolation,
     PassageSafetyViolationDetail,
     ServoFrameToken,
@@ -527,6 +528,19 @@ class _Servo:
             )
         return SimpleNamespace(
             current_target=target,
+            next_target=(
+                replace(
+                    target,
+                    track_id=self.preview_track_id,
+                    normalized_x=0.30,
+                    normalized_x_rate_s=0.10,
+                )
+                if (
+                    mode is VisualApproachMode.PASSAGE
+                    and active_preview_blend > 0.0
+                )
+                else None
+            ),
             servo_output=output,
             passage_admission=admission,
             mode=mode,
@@ -1259,6 +1273,51 @@ def test_latched_crossing_without_authoritative_credit_times_out_bounded():
     )
     assert host.race.active_gate_index == 6
     assert host.race.race_finished is False
+
+
+def test_clean_near_plane_latch_transfers_to_successor_coast():
+    class CoastBeforeCreditHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.allow_credit = False
+            self.near_plane_coast_seen = False
+
+        def _advance_race(self):
+            if self.allow_credit:
+                super()._advance_race()
+
+        async def _send_flight_command(self, command, **kwargs):
+            if (
+                self.passage_counts.get(self.current_gate, 0) >= 3
+                and command.pitch_rate > 0.0
+                and command.yaw_rate
+                == -MAX_VISUAL_YAW_RATE_RAD_S
+            ):
+                self.near_plane_coast_seen = True
+                self.allow_credit = True
+            return await super()._send_flight_command(command, **kwargs)
+
+    host = CoastBeforeCreditHost(initial_gate=6, finish_gate=6)
+    runtime, _calls = _runtime(
+        host,
+        servo_options={"passage_preview_blend": 0.3},
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    assert host.near_plane_coast_seen
+    coast_commands = [
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage.endswith("/near-plane-coast")
+    ]
+    assert len(coast_commands) == 1
+    assert coast_commands[0].yaw_rate == -MAX_VISUAL_YAW_RATE_RAD_S
+    assert coast_commands[0].pitch_rate > 0.0
 
 
 @pytest.mark.parametrize("case", ("stale", "ambiguous", "off_center"))

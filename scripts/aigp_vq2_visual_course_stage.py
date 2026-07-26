@@ -66,6 +66,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_TARGET_PITCH_RAD,
     MIN_VISUAL_THRUST,
+    visual_bearing_yaw_rate,
 )
 from scripts.aigp_vq2_yaw_profile import (
     DEFAULT_YAW_CALIBRATION_PROFILE_PATH,
@@ -2513,7 +2514,8 @@ async def _run_visual_course_stage_impl(
         passage_started_s: Optional[float] = None
         passage_command_count = 0
         passage_next_preview_command_count = 0
-        last_passage_preview_yaw_rate_rad_s: Optional[float] = None
+        last_passage_successor_horizontal: Optional[float] = None
+        last_passage_successor_horizontal_rate: Optional[float] = None
         advance_command_count = 0
         approach_command_count = 0
         crossing_anchor: Optional[Dict[str, Any]] = None
@@ -2948,6 +2950,97 @@ async def _run_visual_course_stage_impl(
                     segment["recovery_support_command_count"] = int(
                         segment["recovery_support_command_count"]
                     ) + 1
+                    continue
+            if (
+                near_plane_latch is not None
+                and mode is VisualApproachMode.PASSAGE
+                and crossing_coast_authority is not None
+                and last_clean_passage_token is not None
+                and last_passage_successor_horizontal is not None
+                and last_passage_successor_horizontal_rate is not None
+            ):
+                graph_config = getattr(
+                    host.visual_gate_graph,
+                    "config",
+                    DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
+                )
+                latched_measurement_mode = _classify_latched_snapshot(
+                    near_plane_latch,
+                    previous_camera_token=last_clean_passage_token,
+                    camera_token=token,
+                    snapshot=snapshot,
+                    current_gate_index=current_gate_index,
+                    min_track_confidence=(
+                        graph_config.min_track_confidence
+                    ),
+                    min_association_confidence=(
+                        graph_config.min_association_confidence
+                    ),
+                )
+                if (
+                    latched_measurement_mode
+                    is LatchedMeasurementMode.UNSAFE
+                ):
+                    raise abort_type(
+                        "visual-course latched near-plane measurement "
+                        "became unsafe"
+                    )
+                if (
+                    latched_measurement_mode
+                    is LatchedMeasurementMode.CREDIT_WAIT
+                ):
+                    lifecycle = CourseLifecycle.CREDIT_WAIT
+                    segment["lifecycle"] = lifecycle.value
+                    segment["near_plane_measurement_mode"] = (
+                        latched_measurement_mode.value
+                    )
+                    crossing_started_s = crossing_started_s or now
+                    if crossing_baseline_race is None:
+                        raise abort_type(
+                            "visual-course credit wait lacks a race baseline"
+                        )
+                    last_planned_token = token
+                    break
+                track = getattr(snapshot, "current_track", None)
+                if (
+                    getattr(track, "clipping", None) is FrameEdge.NONE
+                    and getattr(track, "center_censored", True) is False
+                ):
+                    segment["near_plane_measurement_mode"] = (
+                        latched_measurement_mode.value
+                    )
+                    last_planned_token = token
+                    try:
+                        coast_command = (
+                            await send_censored_passage_coast(
+                                snapshot=snapshot,
+                                authority=crossing_coast_authority,
+                                yaw_reference_rad=yaw_reference_rad,
+                                segment_started_s=segment_started_s,
+                                stage=(
+                                    f"{VISUAL_COURSE_STAGE}/gate"
+                                    f"{current_gate_index}/"
+                                    "near-plane-coast"
+                                ),
+                                command_deadline_s=min(
+                                    course_deadline_s,
+                                    segment_deadline_s,
+                                ),
+                            )
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc
+                        )
+                        break
+                    if coast_command is None:
+                        continue
+                    passage_command_count += 1
+                    segment["passage_command_count"] = (
+                        passage_command_count
+                    )
+                    last_clean_passage_token = token
+                    refresh_live_summary()
                     continue
             passage_forward_closure_authorized = bool(
                 not segment["launch_bootstrap"]["enabled"]
@@ -3518,16 +3611,22 @@ async def _run_visual_course_stage_impl(
             last_clean_passage_token = token
             passage_command_count += 1
             segment["passage_command_count"] = passage_command_count
-            if proposal.servo_output.passage_preview_retired:
-                # Retirement ends carried/replayed preview authority.  The
-                # servo may still consume a fresh exact sealed-successor
-                # observation for attenuated heading, but no old yaw may be
-                # replayed through a later unrelated near-plane loss.
-                last_passage_preview_yaw_rate_rad_s = None
-            elif proposal.servo_output.next_gate_blend > 0.0:
+            if proposal.servo_output.next_gate_blend > 0.0:
                 passage_next_preview_command_count += 1
-                last_passage_preview_yaw_rate_rad_s = (
-                    accepted.command.yaw_rate
+                next_target = proposal.next_target
+                if (
+                    next_target is None
+                    or proposal.servo_output.next_horizontal_error is None
+                ):
+                    raise abort_type(
+                        "visual-course accepted preview lacks successor "
+                        "geometry"
+                    )
+                last_passage_successor_horizontal = float(
+                    proposal.servo_output.next_horizontal_error
+                )
+                last_passage_successor_horizontal_rate = float(
+                    next_target.normalized_x_rate_s
                 )
                 segment[
                     "passage_next_preview_command_count"
@@ -3669,6 +3768,19 @@ async def _run_visual_course_stage_impl(
                             - float(servo_tuning.brake_pitch_rad)
                         ),
                     )
+                    crossing_successor_yaw_rate = 0.0
+                    if (
+                        last_passage_successor_horizontal is not None
+                        and last_passage_successor_horizontal_rate
+                        is not None
+                    ):
+                        crossing_successor_yaw_rate = (
+                            visual_bearing_yaw_rate(
+                                last_passage_successor_horizontal,
+                                last_passage_successor_horizontal_rate,
+                                servo_tuning,
+                            )
+                        )
                     crossing_coast_authority = (
                         _CensoredPassageCoastAuthority(
                             gate_index=current_gate_index,
@@ -3678,11 +3790,7 @@ async def _run_visual_course_stage_impl(
                             ),
                             target_roll_rad=accepted.target_roll_rad,
                             target_pitch_rad=crossing_coast_target_pitch,
-                            yaw_rate_rad_s=(
-                                0.0
-                                if last_passage_preview_yaw_rate_rad_s is None
-                                else last_passage_preview_yaw_rate_rad_s
-                            ),
+                            yaw_rate_rad_s=crossing_successor_yaw_rate,
                             thrust=crossing_coast_thrust,
                         )
                     )
