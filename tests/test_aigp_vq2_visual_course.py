@@ -90,6 +90,39 @@ def _token(sequence: int) -> CameraFrameToken:
     )
 
 
+def test_dynamic_continuity_seed_is_not_crossing_evidence():
+    token = _token(1)
+    accepted = course_stage._AcceptedVisualCommand(
+        command=AttitudeRateCommand(0.0, 0.0, 0.0, 0.26),
+        yaw_soft_stop_zeroed=False,
+        observation_monotonic_ns=1_000,
+        publication_monotonic_ns=2_000,
+        wire_start_monotonic_ns=3_000,
+        wire_return_monotonic_ns=4_000,
+        wire_camera_token=token,
+        wire_race_gate_index=0,
+        publication_pinned_through_transport_return=True,
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        next_preview_collective_delta=0.0,
+        dynamic_evidence={
+            "schema": "aigp-vq2-dynamic-command/1",
+            "dynamic_command_count": 0,
+        },
+    )
+
+    assert (
+        course_stage._dynamic_near_plane_wire_sample(
+            accepted,
+            gate_index=0,
+            track_id="vq2-track-000001",
+            target=SimpleNamespace(),
+            clipping=FrameEdge.NONE,
+        )
+        is None
+    )
+
+
 def _history_sample(
     track_id: str,
     token: CameraFrameToken,

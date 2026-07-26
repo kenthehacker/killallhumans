@@ -372,6 +372,12 @@ def _dynamic_near_plane_wire_sample(
     if evidence is None:
         return None
     if (
+        evidence.get("gate_index") is None
+        and evidence.get("current_track_id") is None
+        and evidence.get("dynamic_command_count") == 0
+    ):
+        return None
+    if (
         evidence.get("schema") != "aigp-vq2-dynamic-command/1"
         or evidence.get("gate_index") != gate_index
         or evidence.get("current_track_id") != track_id
@@ -3903,37 +3909,40 @@ async def _run_visual_course_stage_impl(
                                 clipping=clipping,
                             )
                         )
-                        assert dynamic_sample is not None
-                        (
-                            near_plane_evidence,
-                            candidate_latch,
-                        ) = advance_dynamic_near_plane_evidence(
-                            near_plane_evidence,
-                            dynamic_sample,
-                            required_corridor_frames=(
-                                host.visual_config.servo
-                                .required_corridor_frames
-                            ),
-                            crossing_min_log_scale=(
-                                limits.crossing_arm_min_log_scale
-                            ),
-                            horizontal_corridor=(
-                                host.visual_config.servo
-                                .horizontal_corridor
-                            ),
-                            vertical_corridor=(
-                                host.visual_config.servo
-                                .vertical_corridor
-                            ),
-                            min_track_confidence=(
-                                DEFAULT_ROLLING_GATE_GRAPH_CONFIG
-                                .min_track_confidence
-                            ),
-                            min_association_confidence=(
-                                DEFAULT_ROLLING_GATE_GRAPH_CONFIG
-                                .min_association_confidence
-                            ),
-                        )
+                        if dynamic_sample is None:
+                            near_plane_evidence = NearPlaneEvidence()
+                            candidate_latch = None
+                        else:
+                            (
+                                near_plane_evidence,
+                                candidate_latch,
+                            ) = advance_dynamic_near_plane_evidence(
+                                near_plane_evidence,
+                                dynamic_sample,
+                                required_corridor_frames=(
+                                    host.visual_config.servo
+                                    .required_corridor_frames
+                                ),
+                                crossing_min_log_scale=(
+                                    limits.crossing_arm_min_log_scale
+                                ),
+                                horizontal_corridor=(
+                                    host.visual_config.servo
+                                    .horizontal_corridor
+                                ),
+                                vertical_corridor=(
+                                    host.visual_config.servo
+                                    .vertical_corridor
+                                ),
+                                min_track_confidence=(
+                                    DEFAULT_ROLLING_GATE_GRAPH_CONFIG
+                                    .min_track_confidence
+                                ),
+                                min_association_confidence=(
+                                    DEFAULT_ROLLING_GATE_GRAPH_CONFIG
+                                    .min_association_confidence
+                                ),
+                            )
                     except (TypeError, ValueError) as exc:
                         raise abort_type(
                             "visual-course dynamic crossing evidence is "
