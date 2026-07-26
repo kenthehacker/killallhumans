@@ -364,7 +364,7 @@ VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES = 3
 VISUAL_ALIGN_HARD_DURATION_S = 0.90
 VISUAL_ALIGN_POST_CREDIT_FRAME_TIMEOUT_S = 0.12
 VISUAL_ALIGN_RESPONSE_GRACE_S = 0.12
-VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.10
+VISUAL_ALIGN_MAX_YAW_RATE_RAD_S = 0.12
 VISUAL_ALIGN_YAW_SOFT_STOP_RAD = 0.16
 VISUAL_ALIGN_MAX_YAW_EXCURSION_RAD = 0.18
 VISUAL_ALIGN_YAW_HOLD_HORIZON_S = 0.12
@@ -7706,7 +7706,7 @@ def visual_alignment_yaw_rate(
 
     The accepted build-3385 profile proves command sign and measured
     free-flight authority through ``0.12 rad/s``.  This alignment stage uses
-    the derated ``0.10 rad/s`` production cap and owns a separately reviewed
+    that measured production cap and owns a separately reviewed
     ``0.16 rad`` soft stop and ``0.18 rad`` hard stop.  Inward recovery is
     always retained; an outward command that has exhausted the soft envelope
     aborts while the target remains outside the horizontal corridor.

@@ -2401,10 +2401,10 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
     assert profile.observed_max_abs_measured_yaw_rate_rad_s == (
         0.33705789829662536
     )
-    assert VisualCourseStageLimits().max_yaw_rate_rad_s == 0.10
+    assert VisualCourseStageLimits().max_yaw_rate_rad_s == 0.12
     assert (
         VisualCourseStageLimits().max_yaw_rate_rad_s
-        < profile.max_abs_yaw_rate_command_rad_s
+        == profile.max_abs_yaw_rate_command_rad_s
     )
     assert (
         VisualCourseStageLimits().max_segment_yaw_excursion_rad

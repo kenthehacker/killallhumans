@@ -1323,7 +1323,7 @@ def _alignment_estimate():
     ),
     [
         (
-            0.10,
+            0.12,
             0.159,
             0.0,
             0.0,
@@ -1334,14 +1334,14 @@ def _alignment_estimate():
             )
             / vq2_module.VISUAL_ALIGN_YAW_HOLD_HORIZON_S,
         ),
-        (-0.10, 0.161, 0.0, 0.0, 0.5, -0.10),
+        (-0.12, 0.161, 0.0, 0.0, 0.5, -0.12),
         (
-            -0.10,
+            -0.12,
             -math.pi + 0.01,
             math.pi - 0.01,
             0.0,
             -0.5,
-            -0.10,
+            -0.12,
         ),
     ],
 )
@@ -1372,7 +1372,7 @@ def test_visual_alignment_yaw_envelope_aborts_exhausted_outward_authority():
         match="authority exhausted",
     ):
         vq2_module.visual_alignment_yaw_rate(
-            requested_rate_rad_s=0.10,
+            requested_rate_rad_s=0.12,
             measured_yaw_rad=0.161,
             reference_yaw_rad=0.0,
             measured_yaw_rate_rad_s=0.0,
@@ -1387,7 +1387,7 @@ def test_visual_alignment_yaw_envelope_aborts_outward_measured_momentum():
         match="outward yaw momentum",
     ):
         vq2_module.visual_alignment_yaw_rate(
-            requested_rate_rad_s=-0.10,
+            requested_rate_rad_s=-0.12,
             measured_yaw_rad=0.159,
             reference_yaw_rad=0.0,
             measured_yaw_rate_rad_s=0.20,

@@ -30,8 +30,10 @@ admission thresholds are navigation policy, not plant capability.
 | Spawn attitude | July-18 handoff | Pitch is approximately `-0.31 rad`, so pad-loaded yaw calibration does not by itself identify the free-flight coupled plant |
 
 The composite accepted evidence establishes sign at `+/-0.08 rad/s` and clean
-free-flight capability through `+/-0.12 rad/s`. Production is derated to
-`+/-0.10 rad/s`; `0.12` is not a demonstrated plant maximum.
+free-flight capability through `+/-0.12 rad/s`. The initial
+`+/-0.10 rad/s` production derating saturated throughout clean Gate-1
+recovery while error worsened, so production consumes the measured
+`+/-0.12 rad/s` tier. It is not a demonstrated plant maximum.
 
 ## Inherited bounded-experiment limits
 
@@ -39,13 +41,13 @@ free-flight capability through `+/-0.12 rad/s`. Production is derated to
 | --- | ---: | --- |
 | Generic runner command-rate clamp | `+/-0.25 rad/s` | Conservative development clamp, not a MAVLink or measured plant maximum; retain as the ceiling for the first progressive sweep, then reassess from evidence |
 | Generic runner thrust clamp | `[0, 0.35]` | Conservative development envelope, not protocol capability; retain until thrust characterization |
-| Visual-course yaw command cap | `+/-0.10 rad/s` | Production derating inside the accepted `+/-0.12 rad/s` v2 measured capability; neither value is a protocol or plant maximum |
-| Visual target roll | `+/-0.12 rad` | Controller experiment limit; not a demonstrated bank capability |
-| Visual target pitch | `[-0.30, +0.10] rad` | Controller experiment/trajectory range; not the outer safety envelope |
+| Visual-course yaw command cap | `+/-0.12 rad/s` | Accepted v2 measured capability consumed after the `0.10` derating saturated with worsening error; not a protocol or plant maximum |
+| Visual target roll | `+/-0.16 rad` | Material coordinated-bank authority inside the separately enforced `+/-0.18 rad` measured stage corridor; not a plant maximum |
+| Visual target pitch | `[-0.30, +0.15] rad` | Controller trajectory/braking range inside the broad outer watchdog; not a plant maximum |
 | Visual thrust | `[0.21, 0.32]` | Stage tuning range; not the plant thrust envelope |
 | Visual measured roll/pitch/rate | roll `+/-0.18`, pitch `[-0.35,+0.15]`, rate `0.50` | Narrow stage corridor duplicated inside the broad watchdog |
 | Visual segment yaw excursion/soft stop | `0.65/0.60 rad` | Course-turn policy without direct calibration support; it must not be confused with a plant limit |
-| Legacy alignment/recovery caps | rate `0.12`, yaw now derated to `0.10`, thrust `0.285-0.30`, several `0.05-0.18 rad` attitude deltas | Historical stage experiment limits except for the accepted production yaw cap; they are not generic plant maxima |
+| Legacy alignment/recovery caps | rate `0.12`, yaw `0.12`, thrust `0.285-0.30`, several `0.05-0.18 rad` attitude deltas | Historical stage experiment limits except for the accepted production yaw cap; they are not generic plant maxima |
 | Corridor dwell, bbox/rate/scale/censor bounds, exact transition timers | Trace-derived navigation confidence | Keep only where causally needed for observation validity or crossing safety; never use them as actuator capability |
 
 The controller currently applies several of these narrow limits in series:
@@ -75,7 +77,7 @@ free-flight tier:
 
 The sweep never jumped to MAVLink limits and remained below the existing
 `+/-0.25 rad/s` conservative command clamp.  The clean final tier justifies
-the composite v2 profile and its derated production cap; no broader channel
+the composite v2 profile and its measured production cap; no broader channel
 campaign is required before returning to the course.
 
 The preceding `+/-0.10 rad/s` tier completed at
@@ -90,8 +92,10 @@ The final `+/-0.12 rad/s` tier
 `20260726T112358Z-calibration-excite-d924d7ba` sent all 45 planned slots,
 measured the response summarized above, had no collision, and completed with
 `cleanup_confirmed=true`. The user's review adopts it as the v2 measured
-capability, adopts `+/-0.10 rad/s` for production, ends characterization, and
-returns development to the course.
+capability and initially adopted `+/-0.10 rad/s` for production. Live Gate-1
+recovery then proved that derating causal and binding, so production now uses
+the already measured `+/-0.12 rad/s` tier without another characterization
+flight.
 
 ## Continuous authority-allocation target
 

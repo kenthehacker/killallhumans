@@ -208,8 +208,8 @@ def test_horizontal_bearing_uses_calibrated_yaw_image_sign():
     assert left.yaw_rate_rad_s == pytest.approx(
         MAX_VISUAL_YAW_RATE_RAD_S
     )
-    assert right.target_roll_rad == pytest.approx(0.112)
-    assert left.target_roll_rad == pytest.approx(-0.112)
+    assert right.target_roll_rad == pytest.approx(0.14)
+    assert left.target_roll_rad == pytest.approx(-0.14)
 
 
 def test_passage_continuously_reduces_closure_as_expansion_increases():
@@ -1608,8 +1608,8 @@ def test_all_outputs_remain_inside_immutable_controller_envelope():
         ),
     )
     assert abs(output.yaw_rate_rad_s) <= MAX_VISUAL_YAW_RATE_RAD_S
-    assert abs(output.target_roll_rad) <= 0.12
-    assert -0.30 <= output.target_pitch_rad <= 0.10
+    assert abs(output.target_roll_rad) <= 0.16
+    assert -0.30 <= output.target_pitch_rad <= 0.15
     assert 0.21 <= output.thrust <= 0.32
 
 
@@ -2132,7 +2132,7 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
 
     assert all(not output.advance_enabled for output in outputs)
     assert all(output.next_gate_blend == 0.0 for output in outputs)
-    assert all(output.yaw_rate_rad_s == -0.10 for output in outputs)
+    assert all(output.yaw_rate_rad_s == -0.12 for output in outputs)
     assert outputs[0].target_pitch_rad > 0.08
     assert outputs[0].thrust == pytest.approx(0.32)
 

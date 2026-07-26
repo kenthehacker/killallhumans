@@ -30,17 +30,17 @@ from competition.vq2_visual_tracker import (
 )
 
 
-# These are code-owned controller authority ceilings.  The production yaw
-# value is deliberately derated from the clean paired-polarity 0.12 rad/s
-# build-3385 capability tier.  The excursion is a separate per-segment
-# course-turn envelope, not a calibration-experiment limit.
-MAX_VISUAL_YAW_RATE_RAD_S = 0.10
+# These are code-owned controller authority ceilings.  Repeated saturated
+# 0.10-rad/s Gate-1 corrections continued outward, so production consumes the
+# clean paired-polarity 0.12-rad/s build-3385 capability tier.  The excursion
+# is a separate per-segment course-turn envelope, not a calibration limit.
+MAX_VISUAL_YAW_RATE_RAD_S = 0.12
 MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = 0.65
 VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = 0.60
 MAX_VISUAL_SEGMENT_DURATION_S = 8.0
-MAX_VISUAL_TARGET_ROLL_RAD = 0.12
+MAX_VISUAL_TARGET_ROLL_RAD = 0.16
 MIN_VISUAL_TARGET_PITCH_RAD = -0.30
-MAX_VISUAL_TARGET_PITCH_RAD = 0.10
+MAX_VISUAL_TARGET_PITCH_RAD = 0.15
 MIN_VISUAL_THRUST = 0.21
 MAX_VISUAL_THRUST = 0.32
 MAX_VISUAL_OBSERVATION_AGE_S = 0.10
@@ -187,11 +187,10 @@ class VisualServoTuning:
     # separately immutable yaw-rate and course-turn heading envelopes.
     yaw_error_gain: float = 0.30
     yaw_rate_gain: float = 0.035
-    # Gate-1 live recovery reached the calibrated yaw ceiling on every wire
-    # command while horizontal error still grew from 0.55 to 0.69.  Use the
-    # existing bounded lateral channel as well as yaw; the immutable roll
-    # attitude and body-rate envelopes remain independently enforced live.
-    roll_error_gain: float = 0.16
+    # Gate-1 live recovery saturated yaw while horizontal error grew from
+    # 0.625 to 0.750.  Use materially stronger coordinated bank inside the
+    # separately enforced 0.18-rad measured stage corridor.
+    roll_error_gain: float = 0.20
     roll_rate_gain: float = 0.05
     vertical_error_gain: float = 0.16
     vertical_rate_gain: float = 0.035
@@ -235,7 +234,7 @@ class VisualServoTuning:
             raise VisualServoRefusal("yaw error gain is outside bounds")
         if not 0.0 <= self.yaw_rate_gain <= 0.08:
             raise VisualServoRefusal("yaw rate gain is outside bounds")
-        if not 0.0 <= self.roll_error_gain <= 0.16:
+        if not 0.0 <= self.roll_error_gain <= 0.20:
             raise VisualServoRefusal("roll error gain is outside bounds")
         if not 0.0 <= self.roll_rate_gain <= 0.05:
             raise VisualServoRefusal("roll rate gain is outside bounds")
