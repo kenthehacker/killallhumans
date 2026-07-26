@@ -543,7 +543,7 @@ def test_persistent_postcredit_distractor_without_credit_relation_refuses() -> N
 
     assert type(outcome) is GateReacquisitionPending
     assert not outcome.ambiguous
-    assert "lacks credit-bound rolling-graph" in outcome.reason
+    assert "no rolling-graph successor" in outcome.reason
     assert state.tracker.tracks() == tracks_before
     assert state.graph.latest_snapshot == snapshot_before
     assert (
