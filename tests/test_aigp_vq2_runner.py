@@ -7891,6 +7891,51 @@ def test_sign_id_powered_dispatch_excites_only_yaw(monkeypatch):
     ]
 
 
+def test_yaw_capability_entry_is_short_braked_and_bounded(monkeypatch):
+    runner, _adapter, context = _fast_calibration_runner()
+    clock = [0.0]
+    commands = []
+
+    async def wait_slot():
+        return clock[0]
+
+    async def sleep(seconds):
+        clock[0] += max(0.0, float(seconds))
+
+    async def send(command, **_kwargs):
+        commands.append(command)
+
+    monkeypatch.setattr(
+        runner,
+        "_wait_for_next_flight_command_slot",
+        wait_slot,
+    )
+    monkeypatch.setattr(runner, "_sample", lambda: None)
+    monkeypatch.setattr(runner, "_watchdog", lambda **_kwargs: None)
+    monkeypatch.setattr(runner, "_send_flight_command", send)
+    monkeypatch.setattr(runner, "_record_tick", lambda *_args: None)
+    monkeypatch.setattr(vq2_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vq2_module.asyncio, "sleep", sleep)
+
+    details = asyncio.run(runner._run_yaw_capability_entry(context))
+
+    assert 39 <= len(commands) <= 41
+    assert all(command.yaw_rate == 0.0 for command in commands)
+    assert all(
+        abs(command.roll_rate) <= vq2_module.MAX_COMMAND_RATE_RAD_S
+        and abs(command.pitch_rate) <= vq2_module.MAX_COMMAND_RATE_RAD_S
+        for command in commands
+    )
+    assert commands[0].thrust == 0.26
+    assert any(command.thrust == 0.32 for command in commands)
+    assert commands[-1].thrust == 0.285
+    assert details["duration_s"] == 0.80
+    assert details["target_pitch_rad"] == (
+        vq2_module.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert details["command_count"] == len(commands)
+
+
 def test_calibration_excite_runs_exact_progressive_free_flight_yaw_plan(
     monkeypatch,
 ):
@@ -7900,7 +7945,7 @@ def test_calibration_excite_runs_exact_progressive_free_flight_yaw_plan(
     clock_ns = [1_000_000_000]
     commands = []
 
-    async def hover(value):
+    async def entry(value):
         assert value == context
         return {"free_flight": True}
 
@@ -7933,7 +7978,7 @@ def test_calibration_excite_runs_exact_progressive_free_flight_yaw_plan(
             },
         }
 
-    monkeypatch.setattr(runner, "_run_hover", hover)
+    monkeypatch.setattr(runner, "_run_yaw_capability_entry", entry)
     monkeypatch.setattr(
         runner,
         "_wait_for_next_flight_command_slot",
@@ -7956,7 +8001,7 @@ def test_calibration_excite_runs_exact_progressive_free_flight_yaw_plan(
     assert [command.yaw_rate for command in commands if command.yaw_rate] == [
         value
         for level in capability.YAW_CAPABILITY_LEVELS_RAD_S
-        for value in [level] * 5 + [-level] * 5
+        for value in [level] * 11 + [-level] * 11
     ]
     assert details["stage"] == "calibration-excite"
     assert details["calibration_scope"] == (
@@ -7968,7 +8013,7 @@ def test_calibration_excite_runs_exact_progressive_free_flight_yaw_plan(
     assert details["authority_effect"] == (
         "characterization-only-no-visual-course-envelope-change"
     )
-    assert details["free_flight_hover"] == {"free_flight": True}
+    assert details["free_flight_entry"] == {"free_flight": True}
     assert adapter.race_status.active_gate_index == 0
 
 

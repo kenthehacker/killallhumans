@@ -58,23 +58,28 @@ protocol invariants.
 
 ## First capability characterization
 
-The first code-owned free-flight sweep leaves production visual-course
-authority unchanged.  It:
+The first multi-tier entry was rejected before yaw excitation because its
+2.5-second hover trajectory reached Gate 0: the aperture expanded from
+`80x81` to `481x299` pixels before impact.  The corrected first code-owned
+free-flight tier leaves production visual-course authority unchanged.  It:
 
-1. uses the proved hover launch to leave the pad and level the vehicle;
-2. holds zero roll/pitch attitude target and `0.285` collective;
-3. sends symmetric yaw pairs at `+/-0.08`, `+/-0.12`, `+/-0.16`, and
-   `+/-0.20 rad/s`, with neutral dwells and exact 50 Hz pacing;
+1. uses a `0.80 s` lift and the existing `+0.10 rad` braking-attitude ceiling
+   to leave the pad without carrying the rejected closure into Gate 0;
+2. holds zero roll, `+0.05 rad` pitch, and `0.285` collective;
+3. sends one symmetric `+/-0.10 rad/s` yaw pair with neutral dwells and exact
+   50 Hz pacing;
 4. records exact controller and wire commands, body rates, attitude, target
    motion, response delay, gain, and roll/pitch coupling;
 5. aborts on the unchanged broad watchdog, collision, race change, stale
    stream/target, non-finite command, lease loss, or hard deadline.
 
 The sweep never jumps to MAVLink limits and remains below the existing
-`+/-0.25 rad/s` conservative command clamp.  A successful result may justify
-a new conservative yaw profile below the largest clean, responsive level.
-The same method then characterizes roll, pitch, and thrust before those
-historical stage caps are treated as production capability.
+`+/-0.25 rad/s` conservative command clamp.  A higher yaw tier is a separate
+candidate conditioned on the preceding tier's gain, delay, attitude,
+coupling, target motion, collision, and cleanup result.  A successful series
+may justify a new conservative yaw profile below the largest clean,
+responsive level. The same method then characterizes roll, pitch, and thrust
+before those historical stage caps are treated as production capability.
 
 ## Continuous authority-allocation target
 

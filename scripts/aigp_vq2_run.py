@@ -185,6 +185,7 @@ from planning.vq2_visual_recovery import (
 from planning.vq2_visual_servo import (
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_OBSERVATION_AGE_S,
+    MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_THRUST,
     MAX_VISUAL_YAW_RATE_RAD_S,
     PREPASS_CURRENT_MAX_ABS_Y_NORM,
@@ -12412,6 +12413,89 @@ class VQ2Runner:
                 pass
             return
 
+    async def _run_yaw_capability_entry(
+        self,
+        context: StartContext,
+    ) -> Dict[str, Any]:
+        """Lift and brake before the short free-flight yaw pulse pair."""
+
+        assert self.estimate is not None
+        entry_start = await self._wait_for_next_flight_command_slot()
+        next_tick = entry_start
+        command_count = 0
+        max_abs_body_rate = 0.0
+        max_target_width_px = float(context.initial_gate_area) ** 0.5
+        while True:
+            now = time.monotonic()
+            elapsed = now - entry_start
+            if elapsed >= 0.80:
+                break
+            self._sample()
+            self._watchdog(
+                allow_benign_pad_contact=elapsed < 0.35,
+                enforce_benign_pad_budget=True,
+            )
+            assert self.estimate is not None
+            if elapsed < 0.15:
+                thrust = 0.26
+            elif elapsed < 0.60:
+                thrust = 0.32
+            else:
+                thrust = 0.285
+            command = attitude_rate_command(
+                self.estimate,
+                target_roll_rad=0.0,
+                # The failed 2.5-second hover still carried nose-down closure
+                # into Gate 0.  Use the already admitted braking-attitude
+                # ceiling immediately, then begin the short pulse pair before
+                # the observed 2.4-second gate contact.
+                target_pitch_rad=MAX_VISUAL_TARGET_PITCH_RAD,
+                thrust=thrust,
+            )
+            await self._send_flight_command(command)
+            command_count += 1
+            max_abs_body_rate = max(
+                max_abs_body_rate,
+                *(abs(float(value)) for value in self.estimate.body_rates),
+            )
+            target = self.tracker.target
+            if target is not None:
+                max_target_width_px = max(
+                    max_target_width_px,
+                    float(target.bbox[2]),
+                )
+            self._record_tick(
+                "capability/yaw-entry",
+                elapsed,
+                command,
+            )
+            next_tick = next_control_deadline(
+                next_tick,
+                time.monotonic(),
+            )
+            await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+
+        self._sample()
+        self._watchdog(
+            allow_benign_pad_contact=False,
+            enforce_benign_pad_budget=True,
+        )
+        assert self.estimate is not None
+        target = self.tracker.target
+        return {
+            "basis": "short-lift-immediate-braking-attitude-v1",
+            "duration_s": 0.80,
+            "command_count": command_count,
+            "target_pitch_rad": MAX_VISUAL_TARGET_PITCH_RAD,
+            "max_abs_body_rate_rad_s": max_abs_body_rate,
+            "max_target_width_px": max_target_width_px,
+            "final_rpy_rad": list(self.estimate.orientation.to_euler()),
+            "final_body_rates_rad_s": list(self.estimate.body_rates),
+            "final_target_bbox": (
+                None if target is None else list(target.bbox)
+            ),
+        }
+
     async def _run_calibration_excite(
         self,
         context: StartContext,
@@ -12439,9 +12523,9 @@ class VQ2Runner:
                 "yaw capability plan escaped the existing command envelope"
             )
 
-        # The accepted +/-0.08 profile was pad-loaded.  Reuse the proved
-        # bounded hover launch so this sweep measures the free-flight plant.
-        hover_details = await self._run_hover(context)
+        # The accepted +/-0.08 profile was pad-loaded.  Enter free flight
+        # without the failed 2.5-second hover trajectory that reached Gate 0.
+        entry_details = await self._run_yaw_capability_entry(context)
         self._sample()
         self._watchdog(
             allow_benign_pad_contact=False,
@@ -12469,7 +12553,7 @@ class VQ2Runner:
             plan_sha256=YAW_CAPABILITY_PLAN_SHA256,
             tick_count=plan["tick_count"],
             levels_rad_s=list(YAW_CAPABILITY_LEVELS_RAD_S),
-            free_flight_hover=hover_details,
+            free_flight_entry=entry_details,
             flight_start_monotonic_ns=flight_start_ns,
             hard_deadline_monotonic_ns=hard_deadline_ns,
             watchdog={
@@ -12788,7 +12872,7 @@ class VQ2Runner:
             "plan_sha256": YAW_CAPABILITY_PLAN_SHA256,
             "ticks_sent": ticks_sent,
             "ticks_expected": int(plan["tick_count"]),
-            "free_flight_hover": hover_details,
+            "free_flight_entry": entry_details,
             "baseline_yaw_rate_rad_s": baseline_yaw_rate,
             "pulse_summaries": pulse_summaries,
             "max_attitude_excursion_rad": max_attitude_excursion,

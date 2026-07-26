@@ -17,13 +17,13 @@ from typing import Any, Iterable, Mapping
 YAW_CAPABILITY_PLAN_SCHEMA = "aigp-vq2-yaw-capability-plan/1"
 YAW_CAPABILITY_PLAN_ID = "vq2-build3385-training-free-flight-yaw-sweep-v1"
 YAW_CAPABILITY_CONTROL_PERIOD_NS = 20_000_000
-YAW_CAPABILITY_TICK_COUNT = 81
-YAW_CAPABILITY_NOMINAL_END_OFFSET_NS = 1_620_000_000
-YAW_CAPABILITY_HARD_EXPIRY_OFFSET_NS = 1_750_000_000
+YAW_CAPABILITY_TICK_COUNT = 45
+YAW_CAPABILITY_NOMINAL_END_OFFSET_NS = 900_000_000
+YAW_CAPABILITY_HARD_EXPIRY_OFFSET_NS = 1_000_000_000
 YAW_CAPABILITY_TARGET_ROLL_RAD = 0.0
-YAW_CAPABILITY_TARGET_PITCH_RAD = 0.0
+YAW_CAPABILITY_TARGET_PITCH_RAD = 0.05
 YAW_CAPABILITY_THRUST = 0.285
-YAW_CAPABILITY_LEVELS_RAD_S = (0.08, 0.12, 0.16, 0.20)
+YAW_CAPABILITY_LEVELS_RAD_S = (0.10,)
 
 
 class YawCapabilityPlanError(ValueError):
@@ -47,103 +47,31 @@ _PLAN_LITERAL: dict[str, Any] = {
         {
             "segment_id": "neutral-initial",
             "first_tick": 0,
-            "last_tick": 4,
+            "last_tick": 11,
             "yaw_rate_rad_s": 0.0,
         },
         {
-            "segment_id": "yaw-positive-0p08",
-            "first_tick": 5,
-            "last_tick": 9,
-            "yaw_rate_rad_s": 0.08,
-        },
-        {
-            "segment_id": "neutral-01",
-            "first_tick": 10,
-            "last_tick": 13,
-            "yaw_rate_rad_s": 0.0,
-        },
-        {
-            "segment_id": "yaw-negative-0p08",
-            "first_tick": 14,
-            "last_tick": 18,
-            "yaw_rate_rad_s": -0.08,
-        },
-        {
-            "segment_id": "neutral-02",
-            "first_tick": 19,
+            "segment_id": "yaw-positive-0p10",
+            "first_tick": 12,
             "last_tick": 22,
-            "yaw_rate_rad_s": 0.0,
+            "yaw_rate_rad_s": 0.10,
         },
         {
-            "segment_id": "yaw-positive-0p12",
+            "segment_id": "neutral-reversal",
             "first_tick": 23,
-            "last_tick": 27,
-            "yaw_rate_rad_s": 0.12,
-        },
-        {
-            "segment_id": "neutral-03",
-            "first_tick": 28,
-            "last_tick": 31,
+            "last_tick": 28,
             "yaw_rate_rad_s": 0.0,
         },
         {
-            "segment_id": "yaw-negative-0p12",
-            "first_tick": 32,
-            "last_tick": 36,
-            "yaw_rate_rad_s": -0.12,
-        },
-        {
-            "segment_id": "neutral-04",
-            "first_tick": 37,
-            "last_tick": 40,
-            "yaw_rate_rad_s": 0.0,
-        },
-        {
-            "segment_id": "yaw-positive-0p16",
-            "first_tick": 41,
-            "last_tick": 45,
-            "yaw_rate_rad_s": 0.16,
-        },
-        {
-            "segment_id": "neutral-05",
-            "first_tick": 46,
-            "last_tick": 49,
-            "yaw_rate_rad_s": 0.0,
-        },
-        {
-            "segment_id": "yaw-negative-0p16",
-            "first_tick": 50,
-            "last_tick": 54,
-            "yaw_rate_rad_s": -0.16,
-        },
-        {
-            "segment_id": "neutral-06",
-            "first_tick": 55,
-            "last_tick": 58,
-            "yaw_rate_rad_s": 0.0,
-        },
-        {
-            "segment_id": "yaw-positive-0p20",
-            "first_tick": 59,
-            "last_tick": 63,
-            "yaw_rate_rad_s": 0.20,
-        },
-        {
-            "segment_id": "neutral-07",
-            "first_tick": 64,
-            "last_tick": 67,
-            "yaw_rate_rad_s": 0.0,
-        },
-        {
-            "segment_id": "yaw-negative-0p20",
-            "first_tick": 68,
-            "last_tick": 72,
-            "yaw_rate_rad_s": -0.20,
+            "segment_id": "yaw-negative-0p10",
+            "first_tick": 29,
+            "last_tick": 39,
+            "yaw_rate_rad_s": -0.10,
         },
         {
             "segment_id": "neutral-terminal",
-            "first_tick": 73,
-            "last_tick": 80,
+            "first_tick": 40,
+            "last_tick": 44,
             "yaw_rate_rad_s": 0.0,
         },
     ],
@@ -152,7 +80,7 @@ _PLAN_LITERAL: dict[str, Any] = {
 # SHA-256 of the canonical JSON object above.  A plan edit must update this
 # literal so every compact live manifest binds the exact waveform.
 YAW_CAPABILITY_PLAN_SHA256 = (
-    "8ec6d12625bed7947682f2ddcdd104ce826c3baadd13ffc8d50dfcdaf6c7531b"
+    "1e813cf4acd8ceb5b4c3e7491e5c4b6a8837544d126d3ad9397a7c9b9c3c4d41"
 )
 
 

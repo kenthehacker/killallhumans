@@ -42,15 +42,16 @@ image-rate gains. Only an independently reviewed, fixed-hash yaw profile may
 grant bounded authority to `visual-course`.
 
 `calibration-excite` is now a separate characterization-only free-flight yaw
-sweep. It first reuses the proved 2.5-second hover launch, then holds zero
-roll/pitch target and `0.285` collective while applying symmetric five-slot
-pairs at `+/-0.08`, `+/-0.12`, `+/-0.16`, and `+/-0.20 rad/s`, separated by
-neutral dwells. The exact 81-slot sweep lasts `1.62 s` with a `1.75 s` hard
-expiry. It records exact controller/wire commands, IMU response, attitude
-excursion, response delay, gain, and transverse coupling. It uses the broad
-runtime attitude/rate watchdog and remains below the existing
-`+/-0.25 rad/s` command clamp. Its result is evidence only and cannot change
-the fixed-hash `visual-course` yaw profile.
+sweep. It first uses a `0.80 s` lift with the existing `+0.10 rad` braking
+attitude so the vehicle does not repeat the rejected 2.5-second trajectory
+into Gate 0. It then holds zero roll, `+0.05 rad` pitch, and `0.285`
+collective while applying one symmetric `+/-0.10 rad/s` pair. The exact
+45-slot sweep lasts `0.90 s` with a `1.00 s` hard expiry. It records exact
+controller/wire commands, IMU response, attitude excursion, response delay,
+gain, and transverse coupling. It uses the broad runtime attitude/rate
+watchdog and remains below the existing `+/-0.25 rad/s` command clamp. Its
+result is evidence only and cannot change the fixed-hash `visual-course` yaw
+profile. Higher tiers require a new exact candidate after analyzing this one.
 
 `gate1-recenter` is a user-authorized bounded no-passage diagnostic. Its
 horizontal pixel-rate gain remains exactly zero pending M2 recorded-replay and
@@ -124,9 +125,9 @@ accounting and a newer disarmed heartbeat. Any violated bound fails cleanup.
 
 The compact `sign-id` waveform is a balanced 45-slot, 0.90-second system-ID
 burst with a 1.00-second hard expiry. The `calibration-excite` free-flight
-capability sweep is the distinct 81-slot plan above. Both plans are code-owned,
-cannot be changed through the manifest, and are bound by their own exact
-identity in every run manifest.
+capability sweep is the distinct 45-slot `+/-0.10` plan above. Both plans are
+code-owned, cannot be changed through the manifest, and are bound by their
+own exact identity in every run manifest.
 
 ## Evidence and failures
 
