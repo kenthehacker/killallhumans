@@ -380,7 +380,7 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
     assert blended.yaw_rate_rad_s == pytest.approx(-0.1438125)
     assert abs(blended.yaw_rate_rad_s) < MAX_VISUAL_YAW_RATE_RAD_S
     assert blended.target_roll_rad == pytest.approx(
-        0.08209296874999998
+        0.15339999999999998
     )
     assert blended.target_pitch_rad == pytest.approx(0.1438125)
     assert blended.thrust < servo.tuning.advance_thrust
@@ -1376,9 +1376,10 @@ def test_passage_retains_heading_through_vertical_scale_degradation() -> None:
     assert output.next_horizontal_error == pytest.approx(0.31875)
     assert output.next_vertical_error_image_down is None
     assert output.yaw_rate_rad_s < -0.05
-    # The current-aperture projected demand is small, so successor yaw cannot
-    # import full successor bank through the passage barrier.
-    assert abs(output.target_roll_rad) < 0.02
+    # Vertical/scale degradation brakes closure, but it does not erase the
+    # laterally safe successor intercept while both current-aperture barriers
+    # still retain margin.
+    assert output.target_roll_rad > 0.04
     assert not output.advance_enabled
     assert not output.passage_preview_retired
     assert output.passage_preview_retirement_violations == ()
