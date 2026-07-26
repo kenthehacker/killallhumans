@@ -616,6 +616,15 @@ class DynamicVisualCourseSession:
                     "aperture_margin_norm": list(
                         decision.aperture_margin_norm
                     ),
+                    "current_bearing_std_rad": list(
+                        decision.current_bearing_std_rad
+                    ),
+                    "current_bearing_std_norm": [
+                        decision.current_bearing_std_rad[0]
+                        / self.core.config.horizontal_angle_scale_rad,
+                        decision.current_bearing_std_rad[1]
+                        / self.core.config.vertical_angle_scale_rad,
+                    ],
                     "successor_weight": decision.successor_weight,
                     "predicted_successor_bearing_rad": (
                         None
@@ -634,6 +643,12 @@ class DynamicVisualCourseSession:
                         course.current
                         .residual_translational_rate_rad_s
                     ),
+                    "residual_translation_rate_norm_s": [
+                        course.current.residual_translational_rate_rad_s[0]
+                        / self.core.config.horizontal_angle_scale_rad,
+                        course.current.residual_translational_rate_rad_s[1]
+                        / self.core.config.vertical_angle_scale_rad,
+                    ],
                     "expansion_rate_s": (
                         course.current.expansion_rate_s
                     ),
@@ -653,6 +668,12 @@ class DynamicVisualCourseSession:
                         )
                         >= self.core.config.passage_arm_min_log_scale
                     ),
+                    "current_visible": course.current.visible,
+                    "current_ambiguous": course.current.ambiguous,
+                    "current_censored_axes": list(
+                        course.current.censored_axes
+                    ),
+                    "current_confidence": course.current.confidence,
                     "promotion_count": course.promotion_count,
                 }
             )

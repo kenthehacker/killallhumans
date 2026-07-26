@@ -30,6 +30,13 @@ from planning.vq2_visual_servo import (
 
 
 NEAR_PLANE_LATCH_BASIS = "centered-expanding-accepted-wire-history-v1"
+DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS = (
+    "imu-derotated-passage-state-with-uncertainty-v1"
+)
+DYNAMIC_NEAR_PLANE_LATCH_BASIS = (
+    "imu-derotated-passage-accepted-wire-history-v1"
+)
+RAW_NEAR_PLANE_GEOMETRY_BASIS = "raw-image-current-aperture-v1"
 
 
 class CourseLifecycle(str, Enum):
@@ -234,6 +241,10 @@ class NearPlaneWireSample:
     command_pitch_rate: float
     command_yaw_rate: float
     command_thrust: float
+    geometry_basis: str = RAW_NEAR_PLANE_GEOMETRY_BASIS
+    normalized_x_std: float = 0.0
+    normalized_y_std: float = 0.0
+    log_scale_std: float = 0.0
 
     def __post_init__(self) -> None:
         if type(self.gate_index) is not int or self.gate_index < 0:
@@ -306,6 +317,21 @@ class NearPlaneWireSample:
             raise TypeError(
                 "near-plane censoring and ambiguity flags must be exact"
             )
+        if self.geometry_basis not in {
+            RAW_NEAR_PLANE_GEOMETRY_BASIS,
+            DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+        }:
+            raise ValueError("near-plane sample geometry basis is invalid")
+        for name in (
+            "normalized_x_std",
+            "normalized_y_std",
+            "log_scale_std",
+        ):
+            value = getattr(self, name)
+            if not _finite(value) or float(value) < 0.0:
+                raise ValueError(
+                    f"near-plane sample {name} must be finite and nonnegative"
+                )
 
     @property
     def apparent_scale(self) -> float:
@@ -358,6 +384,7 @@ class NearPlaneEvidence:
             if (
                 sample.gate_index != first.gate_index
                 or sample.track_id != first.track_id
+                or sample.geometry_basis != first.geometry_basis
                 or not _same_camera_epoch(sample.camera_token, first.camera_token)
             ):
                 raise ValueError(
@@ -394,6 +421,7 @@ class NearPlaneEvidence:
         if (
             observed.gate_index != first.gate_index
             or observed.track_id != first.track_id
+            or observed.geometry_basis != first.geometry_basis
             or not _same_camera_epoch(
                 observed.camera_token,
                 first.camera_token,
@@ -505,7 +533,13 @@ class NearPlaneLatch:
             < float(self.crossing_min_log_scale)
         ):
             raise ValueError("near-plane latch has not reached close scale")
-        if self.basis != NEAR_PLANE_LATCH_BASIS:
+        expected_basis = (
+            DYNAMIC_NEAR_PLANE_LATCH_BASIS
+            if final_qualified.geometry_basis
+            == DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS
+            else NEAR_PLANE_LATCH_BASIS
+        )
+        if self.basis != expected_basis:
             raise ValueError("near-plane latch basis is invalid")
 
     @property
@@ -601,6 +635,125 @@ def _wire_sample_usable(
     )
 
 
+def advance_dynamic_near_plane_evidence(
+    evidence: NearPlaneEvidence,
+    sample: NearPlaneWireSample,
+    *,
+    required_corridor_frames: int,
+    crossing_min_log_scale: float,
+    horizontal_corridor: float,
+    vertical_corridor: float,
+    min_track_confidence: float,
+    min_association_confidence: float,
+) -> tuple[NearPlaneEvidence, Optional[NearPlaneLatch]]:
+    """Advance exact-wire passage evidence in IMU-derotated coordinates."""
+
+    if type(evidence) is not NearPlaneEvidence:
+        raise TypeError("dynamic near-plane reducer evidence must be exact")
+    if type(sample) is not NearPlaneWireSample:
+        raise TypeError("dynamic near-plane reducer sample must be exact")
+    if sample.geometry_basis != DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS:
+        raise ValueError("dynamic near-plane sample has the wrong geometry basis")
+    if (
+        type(required_corridor_frames) is not int
+        or required_corridor_frames <= 0
+    ):
+        raise ValueError("required corridor frames must be positive")
+    for name, value in (
+        ("crossing minimum log scale", crossing_min_log_scale),
+        ("horizontal corridor", horizontal_corridor),
+        ("vertical corridor", vertical_corridor),
+    ):
+        if not _finite(value):
+            raise ValueError(f"{name} must be finite")
+    if float(horizontal_corridor) <= 0.0 or float(vertical_corridor) <= 0.0:
+        raise ValueError("dynamic passage corridors must be positive")
+    track_floor = _confidence_threshold(
+        min_track_confidence,
+        "minimum track confidence",
+    )
+    association_floor = _confidence_threshold(
+        min_association_confidence,
+        "minimum association confidence",
+    )
+
+    previous = (
+        evidence.last_observed_sample
+        if evidence.last_observed_sample is not None
+        else (evidence.samples[-1] if evidence.samples else None)
+    )
+    if previous is not None:
+        same_lineage = bool(
+            sample.gate_index == previous.gate_index
+            and sample.track_id == previous.track_id
+            and sample.geometry_basis == previous.geometry_basis
+            and _same_camera_epoch(
+                sample.camera_token,
+                previous.camera_token,
+            )
+        )
+        strictly_advancing = bool(
+            _token_strictly_newer(
+                sample.camera_token,
+                previous.camera_token,
+            )
+            and sample.observation_monotonic_ns
+            > previous.observation_monotonic_ns
+            and sample.publication_monotonic_ns
+            > previous.publication_monotonic_ns
+            and sample.wire_start_monotonic_ns
+            > previous.wire_start_monotonic_ns
+            and sample.wire_return_monotonic_ns
+            > previous.wire_return_monotonic_ns
+        )
+        if not same_lineage or not strictly_advancing:
+            return NearPlaneEvidence(), None
+
+    scale_lower_bound = float(sample.log_scale) - 2.0 * float(
+        sample.log_scale_std
+    )
+    qualified = bool(
+        sample.clipping == FrameEdge.NONE
+        and not sample.center_censored
+        and not sample.ambiguous
+        and float(sample.confidence) >= track_floor
+        and float(sample.association_confidence) >= association_floor
+        and abs(float(sample.normalized_x))
+        + 2.0 * float(sample.normalized_x_std)
+        <= float(horizontal_corridor)
+        and abs(float(sample.normalized_y_down))
+        + 2.0 * float(sample.normalized_y_std)
+        <= float(vertical_corridor)
+        and scale_lower_bound >= float(crossing_min_log_scale)
+        and float(sample.log_scale_rate_s) > 0.0
+    )
+    if not qualified:
+        return NearPlaneEvidence(), None
+
+    if (
+        previous is None
+        or float(sample.log_scale) <= float(previous.log_scale)
+    ):
+        retained = (sample,)
+    else:
+        retained = evidence.samples + (sample,)
+    if len(retained) > required_corridor_frames:
+        retained = retained[-required_corridor_frames:]
+    advanced = NearPlaneEvidence(
+        samples=retained,
+        last_observed_sample=sample,
+    )
+    if len(retained) < required_corridor_frames:
+        return advanced, None
+    return advanced, NearPlaneLatch(
+        evidence=advanced,
+        anchor_sample=sample,
+        required_corridor_frames=required_corridor_frames,
+        crossing_min_log_scale=float(crossing_min_log_scale),
+        basis=DYNAMIC_NEAR_PLANE_LATCH_BASIS,
+    )
+
+
 def advance_near_plane_evidence(
     evidence: NearPlaneEvidence,
     sample: NearPlaneWireSample,
@@ -645,6 +798,7 @@ def advance_near_plane_evidence(
         same_lineage = bool(
             sample.gate_index == previous.gate_index
             and sample.track_id == previous.track_id
+            and sample.geometry_basis == previous.geometry_basis
             and _same_camera_epoch(
                 sample.camera_token,
                 previous.camera_token,
@@ -891,6 +1045,18 @@ def classify_latched_measurement(
         vertical_censored = True
     if horizontal_censored and vertical_censored:
         return LatchedMeasurementMode.CREDIT_WAIT
+    if latch.basis == DYNAMIC_NEAR_PLANE_LATCH_BASIS:
+        if (
+            not horizontal_censored
+            and abs(float(normalized_x)) > 1.0
+        ):
+            return LatchedMeasurementMode.UNSAFE
+        if (
+            not vertical_censored
+            and abs(float(normalized_y_down)) > 1.0
+        ):
+            return LatchedMeasurementMode.UNSAFE
+        return LatchedMeasurementMode.COAST
 
     if (
         not horizontal_censored
@@ -909,12 +1075,16 @@ def classify_latched_measurement(
 
 __all__ = [
     "CourseLifecycle",
+    "DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS",
+    "DYNAMIC_NEAR_PLANE_LATCH_BASIS",
     "LatchedMeasurementMode",
     "NEAR_PLANE_LATCH_BASIS",
     "NearPlaneEvidence",
     "NearPlaneLatch",
     "NearPlaneWireSample",
     "PostCreditMeasurementMode",
+    "RAW_NEAR_PLANE_GEOMETRY_BASIS",
+    "advance_dynamic_near_plane_evidence",
     "advance_near_plane_evidence",
     "classify_post_credit_measurement",
     "classify_latched_measurement",

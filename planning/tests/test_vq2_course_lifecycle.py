@@ -18,11 +18,14 @@ from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import CameraFrameToken, VisualTrackRole
 from planning.vq2_course_lifecycle import (
     CourseLifecycle,
+    DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+    DYNAMIC_NEAR_PLANE_LATCH_BASIS,
     LatchedMeasurementMode,
     NearPlaneEvidence,
     NearPlaneLatch,
     NearPlaneWireSample,
     PostCreditMeasurementMode,
+    advance_dynamic_near_plane_evidence,
     advance_near_plane_evidence,
     classify_post_credit_measurement,
     classify_latched_measurement,
@@ -361,6 +364,51 @@ def test_latest_failure_wire_facts_latch_without_advance_command_count():
     assert latch.anchor_camera_token == _token(860511, 159)
     assert all(sample.log_scale_rate_s > 0.0 for sample in evidence.samples)
     assert evidence.samples[-1].log_scale >= _CROSSING_MIN_LOG_SCALE
+
+
+def test_dynamic_derotated_history_latches_and_allows_bounded_raw_motion():
+    dynamic_samples = tuple(
+        replace(
+            sample,
+            normalized_x=-0.04,
+            normalized_y_down=-0.08,
+            normalized_x_rate_s=-0.70,
+            normalized_y_rate_down_s=0.20,
+            log_scale=math.log(scale),
+            log_scale_rate_s=expansion,
+            geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+            normalized_x_std=0.015,
+            normalized_y_std=0.015,
+            log_scale_std=0.02,
+        )
+        for sample, scale, expansion in zip(
+            _CREDITED_NEAR_PLANE,
+            (0.50, 0.55, 0.60),
+            (1.64, 1.74, 1.86),
+        )
+    )
+    evidence = NearPlaneEvidence()
+    latch = None
+    for sample in dynamic_samples:
+        evidence, latch = advance_dynamic_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            horizontal_corridor=0.16,
+            vertical_corridor=0.18,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+
+    assert latch is not None
+    assert latch.basis == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+    facts = _latest_censored_kwargs(latch)
+    facts["normalized_x"] = -0.40
+    assert (
+        classify_latched_measurement(latch, **facts)
+        is LatchedMeasurementMode.COAST
+    )
 
 
 def test_latest_bottom_censor_is_safe_coast_across_skipped_publications():

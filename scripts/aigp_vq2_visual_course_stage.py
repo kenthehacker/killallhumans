@@ -39,11 +39,14 @@ from planning.vq2_gate_graph import (
 )
 from planning.vq2_course_lifecycle import (
     CourseLifecycle,
+    DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+    DYNAMIC_NEAR_PLANE_LATCH_BASIS,
     LatchedMeasurementMode,
     NearPlaneEvidence,
     NearPlaneLatch,
     NearPlaneWireSample,
     PostCreditMeasurementMode,
+    advance_dynamic_near_plane_evidence,
     advance_near_plane_evidence,
     classify_post_credit_measurement,
     classify_latched_measurement,
@@ -352,6 +355,94 @@ class _AcceptedVisualCommand:
     target_roll_rad: float
     target_pitch_rad: float
     next_preview_collective_delta: float
+    dynamic_evidence: Optional[Dict[str, Any]]
+
+
+def _dynamic_near_plane_wire_sample(
+    accepted: _AcceptedVisualCommand,
+    *,
+    gate_index: int,
+    track_id: str,
+    target: Any,
+    clipping: FrameEdge,
+) -> Optional[NearPlaneWireSample]:
+    """Adapt one accepted dynamic decision into derotated crossing evidence."""
+
+    evidence = accepted.dynamic_evidence
+    if evidence is None:
+        return None
+    if (
+        evidence.get("schema") != "aigp-vq2-dynamic-command/1"
+        or evidence.get("gate_index") != gate_index
+        or evidence.get("current_track_id") != track_id
+    ):
+        raise ValueError("dynamic near-plane evidence identity is invalid")
+
+    def pair(name: str) -> tuple[float, float]:
+        value = evidence.get(name)
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) != 2
+            or any(
+                type(item) not in {int, float}
+                or not math.isfinite(float(item))
+                for item in value
+            )
+        ):
+            raise ValueError(
+                f"dynamic near-plane evidence {name} is invalid"
+            )
+        return float(value[0]), float(value[1])
+
+    passage_error = pair("passage_error_norm")
+    bearing_std = pair("current_bearing_std_norm")
+    residual_rate = pair("residual_translation_rate_norm_s")
+    current_censored = evidence.get("current_censored_axes")
+    if (
+        not isinstance(current_censored, (list, tuple))
+        or len(current_censored) != 2
+        or any(type(value) is not bool for value in current_censored)
+    ):
+        raise ValueError(
+            "dynamic near-plane censorship evidence is invalid"
+        )
+    return NearPlaneWireSample(
+        gate_index=gate_index,
+        track_id=track_id,
+        camera_token=accepted.wire_camera_token,
+        wire_camera_token=accepted.wire_camera_token,
+        observation_monotonic_ns=accepted.observation_monotonic_ns,
+        publication_monotonic_ns=accepted.publication_monotonic_ns,
+        wire_start_monotonic_ns=accepted.wire_start_monotonic_ns,
+        wire_return_monotonic_ns=accepted.wire_return_monotonic_ns,
+        wire_race_gate_index=accepted.wire_race_gate_index,
+        publication_pinned_through_transport_return=(
+            accepted.publication_pinned_through_transport_return
+        ),
+        normalized_x=passage_error[0],
+        normalized_y_down=passage_error[1],
+        normalized_x_rate_s=residual_rate[0],
+        normalized_y_rate_down_s=residual_rate[1],
+        log_scale=float(evidence["current_log_scale"]),
+        log_scale_rate_s=float(evidence["expansion_rate_s"]),
+        confidence=float(evidence["current_confidence"]),
+        association_confidence=float(target.association_confidence),
+        clipping=clipping,
+        center_censored=bool(target.center_censored),
+        ambiguous=bool(
+            evidence["current_ambiguous"]
+            or evidence["dropout_held"]
+            or not evidence["current_visible"]
+        ),
+        command_roll_rate=accepted.command.roll_rate,
+        command_pitch_rate=accepted.command.pitch_rate,
+        command_yaw_rate=accepted.command.yaw_rate,
+        command_thrust=accepted.command.thrust,
+        geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+        normalized_x_std=bearing_std[0],
+        normalized_y_std=bearing_std[1],
+        log_scale_std=float(evidence["current_log_scale_std"]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -2075,6 +2166,7 @@ async def _run_visual_course_stage_impl(
             thrust=float(limited.thrust),
         )
         dynamic_controller = runtime.dynamic_controller
+        accepted_dynamic_evidence: Optional[Dict[str, Any]] = None
         if dynamic_controller is not None:
             governor_proposal_ns = runtime.perf_counter_ns()
             if (
@@ -2286,9 +2378,10 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course dynamic command evidence is invalid"
                 )
+            accepted_dynamic_evidence = dict(dynamic_evidence)
             host.recorder.emit(
                 "visual_course_dynamic_command",
-                **dict(dynamic_evidence),
+                **accepted_dynamic_evidence,
             )
             segment["dynamic_controller"] = dict(
                 dynamic_controller.evidence_summary()
@@ -2334,6 +2427,7 @@ async def _run_visual_course_stage_impl(
                     ]
                 )
             ),
+            dynamic_evidence=accepted_dynamic_evidence,
         )
 
     async def send_censored_passage_coast(
@@ -3783,6 +3877,73 @@ async def _run_visual_course_stage_impl(
                     )
                 approach_command_count += 1
                 segment["approach_command_count"] = approach_command_count
+                if accepted.dynamic_evidence is not None:
+                    current_track = getattr(
+                        snapshot,
+                        "current_track",
+                        None,
+                    )
+                    clipping = getattr(
+                        current_track,
+                        "clipping",
+                        None,
+                    )
+                    if type(clipping) is not FrameEdge:
+                        raise abort_type(
+                            "visual-course dynamic crossing evidence lacks "
+                            "exact clipping state"
+                        )
+                    try:
+                        dynamic_sample = (
+                            _dynamic_near_plane_wire_sample(
+                                accepted,
+                                gate_index=current_gate_index,
+                                track_id=current_track_id,
+                                target=proposal.current_target,
+                                clipping=clipping,
+                            )
+                        )
+                        assert dynamic_sample is not None
+                        (
+                            near_plane_evidence,
+                            candidate_latch,
+                        ) = advance_dynamic_near_plane_evidence(
+                            near_plane_evidence,
+                            dynamic_sample,
+                            required_corridor_frames=(
+                                host.visual_config.servo
+                                .required_corridor_frames
+                            ),
+                            crossing_min_log_scale=(
+                                limits.crossing_arm_min_log_scale
+                            ),
+                            horizontal_corridor=(
+                                host.visual_config.servo
+                                .horizontal_corridor
+                            ),
+                            vertical_corridor=(
+                                host.visual_config.servo
+                                .vertical_corridor
+                            ),
+                            min_track_confidence=(
+                                DEFAULT_ROLLING_GATE_GRAPH_CONFIG
+                                .min_track_confidence
+                            ),
+                            min_association_confidence=(
+                                DEFAULT_ROLLING_GATE_GRAPH_CONFIG
+                                .min_association_confidence
+                            ),
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise abort_type(
+                            "visual-course dynamic crossing evidence is "
+                            f"invalid: {exc}"
+                        ) from exc
+                    segment["near_plane_evidence_frame_count"] = len(
+                        near_plane_evidence.samples
+                    )
+                    if candidate_latch is not None:
+                        near_plane_latch = candidate_latch
                 if proposal.passage_admission is not None:
                     if accepted.yaw_soft_stop_zeroed:
                         segment[
@@ -3793,15 +3954,126 @@ async def _run_visual_course_stage_impl(
                             ]
                         ) + 1
                         continue
+                    if (
+                        accepted.dynamic_evidence is not None
+                        and (
+                            near_plane_latch is None
+                            or near_plane_latch.basis
+                            != DYNAMIC_NEAR_PLANE_LATCH_BASIS
+                        )
+                    ):
+                        continue
                     passage_admission = proposal.passage_admission
                     mode = VisualApproachMode.PASSAGE
-                    lifecycle = CourseLifecycle.PASSAGE_ARMED
+                    lifecycle = (
+                        CourseLifecycle.NEAR_PLANE_LATCHED
+                        if near_plane_latch is not None
+                        else CourseLifecycle.PASSAGE_ARMED
+                    )
                     passage_started_s = float(runtime.monotonic())
                     segment["passage_authority_enabled"] = True
                     segment["lifecycle"] = lifecycle.value
                     segment["passage_admission"] = asdict(
                         passage_admission
                     )
+                    if (
+                        near_plane_latch is not None
+                        and near_plane_latch.basis
+                        == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+                    ):
+                        command = accepted.command
+                        coast_thrust = (
+                            float(command.thrust)
+                            - accepted.next_preview_collective_delta
+                        )
+                        if not (
+                            limits.min_thrust - 1e-12
+                            <= coast_thrust
+                            <= limits.max_thrust + 1e-12
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic crossing coast thrust "
+                                "escaped its fixed envelope"
+                            )
+                        crossing_coast_authority = (
+                            _CensoredPassageCoastAuthority(
+                                gate_index=current_gate_index,
+                                track_id=current_track_id,
+                                anchor_camera_token=(
+                                    near_plane_latch.anchor_camera_token
+                                ),
+                                target_roll_rad=accepted.target_roll_rad,
+                                target_pitch_rad=max(
+                                    accepted.target_pitch_rad,
+                                    float(
+                                        host.visual_config.servo
+                                        .brake_pitch_rad
+                                    ),
+                                ),
+                                yaw_rate_rad_s=command.yaw_rate,
+                                thrust=coast_thrust,
+                            )
+                        )
+                        anchor = near_plane_latch.anchor_sample
+                        crossing_anchor = {
+                            "basis": near_plane_latch.basis,
+                            "camera_token": (
+                                near_plane_latch.anchor_camera_token
+                            ),
+                            "track_id": near_plane_latch.track_id,
+                            "gate_index": near_plane_latch.gate_index,
+                            "accepted_wire_frame_count": len(
+                                near_plane_latch.evidence.samples
+                            ),
+                            "advance_command_count": (
+                                advance_command_count
+                            ),
+                            "log_scale": anchor.log_scale,
+                            "log_scale_rate_s": (
+                                anchor.log_scale_rate_s
+                            ),
+                            "normalized_x": anchor.normalized_x,
+                            "normalized_y_down": (
+                                anchor.normalized_y_down
+                            ),
+                            "normalized_x_rate_s": (
+                                anchor.normalized_x_rate_s
+                            ),
+                            "normalized_y_rate_down_s": (
+                                anchor.normalized_y_rate_down_s
+                            ),
+                            "normalized_x_std": (
+                                anchor.normalized_x_std
+                            ),
+                            "normalized_y_std": (
+                                anchor.normalized_y_std
+                            ),
+                            "log_scale_std": anchor.log_scale_std,
+                            "command": asdict(command),
+                            "current_only_crossing_coast_thrust": (
+                                coast_thrust
+                            ),
+                        }
+                        last_clean_passage_token = (
+                            near_plane_latch.anchor_camera_token
+                        )
+                        segment["near_plane_latch"] = {
+                            **crossing_anchor,
+                            "camera_token": asdict(
+                                near_plane_latch.anchor_camera_token
+                            ),
+                        }
+                        segment["crossing_anchor"] = dict(
+                            segment["near_plane_latch"]
+                        )
+                        host.recorder.emit(
+                            "visual_course_near_plane_latched",
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/approach"
+                            ),
+                            **segment["near_plane_latch"],
+                        )
                 continue
 
             if proposal.mode is not VisualApproachMode.PASSAGE:
