@@ -1725,7 +1725,20 @@ async def _run_visual_course_stage_impl(
             pitch_blend_s = float(
                 host.visual_config.lifecycle.launch_pitch_blend_s
             )
-            pitch_blend = min(1.0, launch_elapsed_s / pitch_blend_s)
+            scheduled_pitch_blend = min(
+                1.0,
+                launch_elapsed_s / pitch_blend_s,
+            )
+            # The launch schedule may soften a later forward-progress target,
+            # but it must not preserve spawn nose-down pitch while the visual
+            # controller has already allocated bounded braking.  Keep the
+            # handoff monotonic so a falling steering request cannot restore
+            # forward closure after an accepted brake command.
+            pitch_blend = max(
+                scheduled_pitch_blend,
+                continuous_pitch_response_authority,
+                float(launch.get("last_pitch_blend", 0.0)),
+            )
             target_pitch_rad = (
                 (1.0 - pitch_blend) * launch_spawn_pitch_rad
                 + pitch_blend * target_pitch_rad
