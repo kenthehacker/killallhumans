@@ -738,10 +738,16 @@ class CommandGovernor:
             self.config.max_yaw_accel_rad_s3,
             self.config.max_thrust_accel_s2,
         )
+        bounds = (
+            (-MAX_TARGET_ROLL_RAD, MAX_TARGET_ROLL_RAD),
+            (MIN_TARGET_PITCH_RAD, MAX_TARGET_PITCH_RAD),
+            (-MAX_YAW_RATE_RAD_S, MAX_YAW_RATE_RAD_S),
+            (MIN_THRUST, MAX_THRUST),
+        )
         advanced: list[float] = []
         rates: list[float] = []
-        for index, (value, target, slew, acceleration) in enumerate(
-            zip(values, targets, slews, accelerations)
+        for index, (value, target, slew, acceleration, bound) in enumerate(
+            zip(values, targets, slews, accelerations, bounds)
         ):
             desired_rate = _clamp((target - value) / dt, -slew, slew)
             rate = _move_toward(
@@ -756,6 +762,10 @@ class CommandGovernor:
             if index == 0 and value * next_value < 0.0:
                 next_value = 0.0
                 rate = -value / dt
+            bounded_value = _clamp(next_value, bound[0], bound[1])
+            if bounded_value != next_value:
+                next_value = bounded_value
+                rate = (next_value - value) / dt
             advanced.append(next_value)
             rates.append(rate)
         command = DynamicCourseCommand(

@@ -27,6 +27,9 @@ from planning.vq2_dynamic_course import (
     GateObservation,
     GuidanceDecision,
     ImuAttitudeSample,
+    MAX_THRUST,
+    MAX_YAW_RATE_RAD_S,
+    MIN_THRUST,
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
@@ -77,6 +80,7 @@ class _StagedContext:
 
 @dataclass(frozen=True, slots=True)
 class _WireGovernorConfig:
+    max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
     max_pitch_slew_rad_s2: float = 2.0
     max_yaw_slew_rad_s2: float = 0.75
@@ -145,13 +149,32 @@ class _WireCommandGovernor:
             self.config.max_yaw_accel_rad_s3,
             self.config.max_thrust_accel_s2,
         )
+        bounds = (
+            (
+                -self.config.max_roll_pitch_rate_rad_s,
+                self.config.max_roll_pitch_rate_rad_s,
+            ),
+            (
+                -self.config.max_roll_pitch_rate_rad_s,
+                self.config.max_roll_pitch_rate_rad_s,
+            ),
+            (-MAX_YAW_RATE_RAD_S, MAX_YAW_RATE_RAD_S),
+            (MIN_THRUST, MAX_THRUST),
+        )
         values: list[float] = []
-        for axis, (old, target, maximum_slew, maximum_accel) in enumerate(
+        for axis, (
+            old,
+            target,
+            maximum_slew,
+            maximum_accel,
+            bound,
+        ) in enumerate(
             zip(
                 previous,
                 targets,
                 maximum_slews,
                 maximum_accelerations,
+                bounds,
             )
         ):
             if (axis == 3 and launch_thrust_override) or (
@@ -176,6 +199,7 @@ class _WireCommandGovernor:
                 value = target
             if axis == 0 and old * value < 0.0:
                 value = 0.0
+            value = max(bound[0], min(bound[1], value))
             values.append(value)
         return AttitudeRateCommand(
             roll_rate=values[0],

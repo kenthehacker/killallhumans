@@ -445,6 +445,26 @@ def test_governor_does_not_extrapolate_an_overridden_thrust_step() -> None:
     assert SUPPORT_THRUST <= resumed.thrust <= 0.32
 
 
+def test_governor_projects_slew_history_into_the_command_envelope() -> None:
+    governor = CommandGovernor()
+    first_ns = NS
+    governor.commit(
+        DynamicCourseCommand(0.0, 0.0, -0.138, SUPPORT_THRUST),
+        first_ns,
+    )
+    governor.commit(
+        DynamicCourseCommand(0.0, 0.0, -0.148, SUPPORT_THRUST),
+        first_ns + 30_000_000,
+    )
+
+    saturated = governor.preview(
+        DynamicCourseCommand(0.0, 0.0, -0.140, SUPPORT_THRUST),
+        first_ns + 60_000_000,
+    )
+
+    assert -MAX_YAW_RATE_RAD_S <= saturated.yaw_rate_rad_s <= 0.0
+
+
 def test_excess_capture_timing_uncertainty_withholds_derotation() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     _imu(core, 1.0)
