@@ -1503,11 +1503,19 @@ class ImageVisualServo:
         elif not advance_enabled:
             brake_reason = "aligning"
 
-        yaw_rate = _clamp(
+        unconstrained_yaw_rate = (
             -self.tuning.yaw_error_gain * heading_horizontal
-            - self.tuning.yaw_rate_gain * heading_horizontal_rate,
+            - self.tuning.yaw_rate_gain * heading_horizontal_rate
+        )
+        yaw_rate = _clamp(
+            unconstrained_yaw_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,
             MAX_VISUAL_YAW_RATE_RAD_S,
+        )
+        steering_load = _clamp(
+            abs(unconstrained_yaw_rate) / MAX_VISUAL_YAW_RATE_RAD_S,
+            0.0,
+            1.0,
         )
         yaw_envelope_limited = bool(
             abs(float(segment_yaw_excursion_rad))
@@ -1516,16 +1524,38 @@ class ImageVisualServo:
         )
         if yaw_envelope_limited:
             yaw_rate = 0.0
+            steering_load = 0.0
             forward_authority = 0.0
             advance_enabled = False
             brake_reason = "segment_yaw_outward_soft_stop"
 
-        target_roll = _clamp(
+        base_target_roll = _clamp(
             self.tuning.roll_error_gain * bank_horizontal
             + self.tuning.roll_rate_gain * bank_horizontal_rate,
             -MAX_VISUAL_TARGET_ROLL_RAD,
             MAX_VISUAL_TARGET_ROLL_RAD,
         )
+        target_roll = base_target_roll
+        # A large bearing demand that consumes yaw authority also needs
+        # lateral translation.  Continuously transfer that load into the
+        # already measured bank envelope only when the current-aperture bank
+        # and yaw requests are coordinated.  An opposite or zero bank retains
+        # the passage barrier instead of importing successor bank through it.
+        if base_target_roll * unconstrained_yaw_rate < 0.0:
+            bank_steering_load = steering_load * _clamp(
+                abs(projected_bank_horizontal)
+                / self.tuning.horizontal_corridor,
+                0.0,
+                1.0,
+            )
+            coordinated_roll_floor = (
+                bank_steering_load * MAX_VISUAL_TARGET_ROLL_RAD
+            )
+            if abs(base_target_roll) < coordinated_roll_floor:
+                target_roll = math.copysign(
+                    coordinated_roll_floor,
+                    base_target_roll,
+                )
         vertical_correction = (
             -self.tuning.vertical_error_gain * vertical
             - self.tuning.vertical_rate_gain
@@ -1579,10 +1609,16 @@ class ImageVisualServo:
             )
         raw_target_pitch = pitch_basis + vertical_correction
         if not advance_enabled:
-            # Normalized collective owns vertical alignment until the target is
-            # in-corridor.  A low target must never turn alignment/braking into
-            # a nose-down forward-closure command.
-            raw_target_pitch = max(0.0, raw_target_pitch)
+            # Normalized collective owns vertical alignment until the target
+            # is in-corridor.  A low target must never turn alignment/braking
+            # into a nose-down forward-closure command.  Retain positive
+            # braking continuously with lateral steering load, including
+            # while the vertical measurement is censored.
+            raw_target_pitch = max(
+                0.0,
+                steering_load * MAX_VISUAL_TARGET_PITCH_RAD,
+                raw_target_pitch,
+            )
         target_pitch = _clamp(
             raw_target_pitch,
             MIN_VISUAL_TARGET_PITCH_RAD,

@@ -21,6 +21,8 @@ from planning.vq2_visual_servo import (
     MAX_TRANSIENT_PROJECTED_VERTICAL_EXCESS_NORM,
     MAX_VISUAL_SEGMENT_DURATION_S,
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
+    MAX_VISUAL_TARGET_PITCH_RAD,
+    MAX_VISUAL_TARGET_ROLL_RAD,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
     PREPASS_CURRENT_MAX_APPARENT_SCALE,
@@ -208,8 +210,14 @@ def test_horizontal_bearing_uses_calibrated_yaw_image_sign():
     assert left.yaw_rate_rad_s == pytest.approx(
         MAX_VISUAL_YAW_RATE_RAD_S
     )
-    assert right.target_roll_rad == pytest.approx(0.14)
-    assert left.target_roll_rad == pytest.approx(-0.14)
+    assert right.target_roll_rad == pytest.approx(
+        MAX_VISUAL_TARGET_ROLL_RAD
+    )
+    assert left.target_roll_rad == pytest.approx(
+        -MAX_VISUAL_TARGET_ROLL_RAD
+    )
+    assert right.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
+    assert left.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
 
 
 def test_passage_continuously_reduces_closure_as_expansion_increases():
@@ -371,8 +379,10 @@ def test_next_gate_blend_requires_current_corridor_and_same_fresh_frame():
     assert blended.next_gate_blend == pytest.approx(0.3)
     assert blended.yaw_rate_rad_s == pytest.approx(-0.1438125)
     assert abs(blended.yaw_rate_rad_s) < MAX_VISUAL_YAW_RATE_RAD_S
-    assert 0.0 < blended.target_roll_rad < 0.03
-    assert blended.target_pitch_rad > servo.tuning.advance_pitch_rad
+    assert blended.target_roll_rad == pytest.approx(
+        0.08209296874999998
+    )
+    assert blended.target_pitch_rad == pytest.approx(0.1438125)
     assert blended.thrust < servo.tuning.advance_thrust
 
     servo.reset_segment()
@@ -1366,6 +1376,8 @@ def test_passage_retains_heading_through_vertical_scale_degradation() -> None:
     assert output.next_horizontal_error == pytest.approx(0.31875)
     assert output.next_vertical_error_image_down is None
     assert output.yaw_rate_rad_s < -0.05
+    # The current-aperture projected demand is small, so successor yaw cannot
+    # import full successor bank through the passage barrier.
     assert abs(output.target_roll_rad) < 0.02
     assert not output.advance_enabled
     assert not output.passage_preview_retired
@@ -1572,6 +1584,10 @@ def test_yaw_soft_stop_does_not_reuse_calibration_excursion():
     assert output.yaw_rate_rad_s == 0.0
     assert output.advance_enabled is False
     assert output.brake_reason == "segment_yaw_outward_soft_stop"
+    assert abs(output.target_roll_rad) < MAX_VISUAL_TARGET_ROLL_RAD
+    assert output.target_pitch_rad == pytest.approx(
+        servo.tuning.brake_pitch_rad
+    )
 
 
 def test_hard_yaw_and_duration_envelopes_refuse_authority():
@@ -1721,6 +1737,10 @@ def test_yaw_soft_stop_allows_corrective_return_command():
     )
     assert outward.yaw_envelope_limited is True
     assert outward.yaw_rate_rad_s == 0.0
+    assert abs(outward.target_roll_rad) < MAX_VISUAL_TARGET_ROLL_RAD
+    assert outward.target_pitch_rad == pytest.approx(
+        servo.tuning.brake_pitch_rad
+    )
 
     servo.reset_segment()
     # The opposite image error asks for negative yaw back toward reference.
@@ -1731,6 +1751,8 @@ def test_yaw_soft_stop_allows_corrective_return_command():
     )
     assert inward.yaw_envelope_limited is False
     assert inward.yaw_rate_rad_s < 0.0
+    assert inward.target_roll_rad == MAX_VISUAL_TARGET_ROLL_RAD
+    assert inward.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
 
 
 def test_output_distinguishes_raw_next_and_effective_blended_errors():
@@ -2052,10 +2074,10 @@ def test_top_clip_uses_observable_horizontal_brake_authority(
     assert output.effective_horizontal_error == pytest.approx(x)
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
-    assert output.target_pitch_rad >= 0.0
-    assert output.target_pitch_rad == pytest.approx(
-        servo.tuning.brake_pitch_rad
+    assert output.target_roll_rad == pytest.approx(
+        MAX_VISUAL_TARGET_ROLL_RAD
     )
+    assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
     assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
 
 
@@ -2090,6 +2112,8 @@ def test_top_clip_retains_last_vertical_observable_collective():
     assert top.effective_vertical_error_image_down == 0.0
     assert top.effective_vertical_rate_down_s == 0.0
     assert top.yaw_rate_rad_s < 0.0
+    assert top.target_roll_rad == MAX_VISUAL_TARGET_ROLL_RAD
+    assert top.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
 
 
 def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
@@ -2132,7 +2156,14 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
     assert all(not output.advance_enabled for output in outputs)
     assert all(output.next_gate_blend == 0.0 for output in outputs)
     assert all(output.yaw_rate_rad_s == -0.15 for output in outputs)
-    assert outputs[0].target_pitch_rad > 0.08
+    assert all(
+        output.target_roll_rad == MAX_VISUAL_TARGET_ROLL_RAD
+        for output in outputs
+    )
+    assert all(
+        output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
+        for output in outputs
+    )
     assert outputs[0].thrust == pytest.approx(0.32)
 
 
