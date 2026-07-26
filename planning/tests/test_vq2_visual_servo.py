@@ -23,6 +23,7 @@ from planning.vq2_visual_servo import (
     MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD,
     MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_TARGET_ROLL_RAD,
+    MAX_VISUAL_THRUST,
     MAX_VISUAL_YAW_RATE_RAD_S,
     MIN_VISUAL_THRUST,
     PREPASS_CURRENT_MAX_APPARENT_SCALE,
@@ -180,7 +181,7 @@ def test_aligns_before_enabling_forward_closure():
     assert servo.tuning.advance_thrust == 0.295
     assert first.advance_enabled is False
     assert first.brake_reason == "aligning"
-    assert first.thrust == servo.tuning.brake_thrust
+    assert servo.tuning.brake_thrust < first.thrust <= MAX_VISUAL_THRUST
     assert 0.0 < first.target_pitch_rad < servo.tuning.brake_pitch_rad
     assert first.yaw_rate_rad_s < 0.0
 
@@ -1443,7 +1444,11 @@ def test_live_passage_margin_tapers_successor_yaw_without_reversing() -> None:
     )
 
     assert output.next_gate_blend > 0.0
-    assert -MAX_VISUAL_YAW_RATE_RAD_S < output.yaw_rate_rad_s < 0.0
+    assert (
+        -MAX_VISUAL_YAW_RATE_RAD_S
+        < output.yaw_rate_rad_s
+        < -0.05
+    )
     assert not output.passage_preview_retired
 
 
@@ -2113,9 +2118,7 @@ def test_top_clip_uses_observable_horizontal_brake_authority(
     assert output.effective_vertical_error_image_down == 0.0
     assert output.effective_vertical_rate_down_s == 0.0
     assert output.target_roll_rad == pytest.approx(0.0)
-    assert output.target_pitch_rad == pytest.approx(
-        servo.tuning.brake_pitch_rad
-    )
+    assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
     assert output.thrust == pytest.approx(servo.tuning.brake_thrust)
 
 
@@ -2145,15 +2148,13 @@ def test_top_clip_retains_last_vertical_observable_collective():
         ),
     )
 
-    assert clean.thrust > MIN_VISUAL_THRUST
+    assert clean.thrust == MAX_VISUAL_THRUST
     assert top.thrust == pytest.approx(clean.thrust)
     assert top.effective_vertical_error_image_down == 0.0
     assert top.effective_vertical_rate_down_s == 0.0
     assert top.yaw_rate_rad_s < 0.0
     assert top.target_roll_rad == pytest.approx(0.0)
-    assert top.target_pitch_rad == pytest.approx(
-        servo.tuning.brake_pitch_rad
-    )
+    assert top.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
 
 
 def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
@@ -2201,11 +2202,11 @@ def test_run7_precredit_successor_rows_produce_bounded_no_advance_recenter():
         for output in outputs
     )
     assert all(
-        0.0 < output.target_pitch_rad <= servo.tuning.brake_pitch_rad
+        output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
         for output in outputs
     )
     assert all(
-        output.thrust == pytest.approx(servo.tuning.brake_thrust)
+        output.thrust == pytest.approx(MAX_VISUAL_THRUST)
         for output in outputs
     )
 
@@ -2228,7 +2229,7 @@ def test_large_outward_bearing_uses_measured_yaw_and_unloads_bank():
 
     assert output.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
     assert output.target_roll_rad == pytest.approx(0.0)
-    assert 0.0 < output.target_pitch_rad < servo.tuning.brake_pitch_rad
+    assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
 
 
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():

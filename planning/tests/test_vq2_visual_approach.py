@@ -35,7 +35,10 @@ from planning.vq2_visual_approach import (
     VisualApproachPassageLease,
     VisualApproachRefusal,
 )
-from planning.vq2_visual_servo import VisualServoTuning
+from planning.vq2_visual_servo import (
+    MAX_VISUAL_TARGET_PITCH_RAD,
+    MAX_VISUAL_THRUST,
+)
 
 
 _FRAME_PERIOD_NS = 33_000_000
@@ -1830,11 +1833,12 @@ def test_run7_logged_state_carries_adjacent_planner_across_cross_id_credit():
         for proposal in precredit
     )
     assert (
-        0.0
-        < precredit[0].servo_output.target_pitch_rad
-        <= VisualServoTuning().brake_pitch_rad
+        precredit[0].servo_output.target_pitch_rad
+        == MAX_VISUAL_TARGET_PITCH_RAD
     )
-    assert precredit[0].servo_output.thrust == pytest.approx(0.275)
+    assert precredit[0].servo_output.thrust == pytest.approx(
+        MAX_VISUAL_THRUST
+    )
 
     assert credit_token is not None
     assert credit_race is not None

@@ -934,6 +934,23 @@ def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
     return runtime, calls
 
 
+def test_command_deadline_conversion_preserves_remaining_budget_across_clocks():
+    validation_ns = 225_761_902_017_200
+
+    deadline_ns = course_stage._perf_counter_deadline_from_monotonic(
+        deadline_monotonic_s=71_313.75,
+        now_monotonic_s=71_313.625,
+        validation_perf_counter_ns=validation_ns,
+    )
+
+    assert deadline_ns == validation_ns + 125_000_000
+    assert course_stage._perf_counter_deadline_from_monotonic(
+        deadline_monotonic_s=71_313.50,
+        now_monotonic_s=71_313.625,
+        validation_perf_counter_ns=validation_ns,
+    ) == validation_ns
+
+
 def test_generic_course_repeats_lifecycle_from_nonzero_gate_until_finish():
     host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
     runtime, calls = _runtime(host)

@@ -866,6 +866,23 @@ def _wrapped_delta(value: float, reference: float) -> float:
     )
 
 
+def _perf_counter_deadline_from_monotonic(
+    *,
+    deadline_monotonic_s: float,
+    now_monotonic_s: float,
+    validation_perf_counter_ns: int,
+) -> int:
+    """Translate a monotonic deadline by duration, never by clock epoch."""
+
+    remaining_s = max(
+        0.0,
+        float(deadline_monotonic_s) - float(now_monotonic_s),
+    )
+    return int(validation_perf_counter_ns) + math.floor(
+        remaining_s * 1_000_000_000
+    )
+
+
 def _attitude_state(
     host: VisualCourseStageHost,
     abort_type: type[BaseException],
@@ -1888,9 +1905,14 @@ async def _run_visual_course_stage_impl(
             limits.max_validation_to_wire_delay_s * 1_000_000_000
         )
         if command_deadline_s is not None:
+            deadline_now_s = float(runtime.monotonic())
             deadline_ns = min(
                 deadline_ns,
-                round(float(command_deadline_s) * 1_000_000_000),
+                _perf_counter_deadline_from_monotonic(
+                    deadline_monotonic_s=float(command_deadline_s),
+                    now_monotonic_s=deadline_now_s,
+                    validation_perf_counter_ns=validation_ns,
+                ),
             )
         if (
             deadline_ns <= validation_ns
@@ -2239,8 +2261,10 @@ async def _run_visual_course_stage_impl(
         deadline_ns = validation_ns + round(
             limits.max_validation_to_wire_delay_s * 1_000_000_000
         )
-        coast_deadline_ns = round(
-            coast_deadline_s * 1_000_000_000
+        coast_deadline_ns = _perf_counter_deadline_from_monotonic(
+            deadline_monotonic_s=coast_deadline_s,
+            now_monotonic_s=float(runtime.monotonic()),
+            validation_perf_counter_ns=validation_ns,
         )
         deadline_ns = min(deadline_ns, coast_deadline_ns)
         if (

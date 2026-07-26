@@ -1230,7 +1230,6 @@ class ImageVisualServo:
 
         heading_horizontal = horizontal
         heading_horizontal_rate = horizontal_rate
-        successor_yaw_direction: Optional[float] = None
         bank_horizontal = horizontal
         bank_horizontal_rate = horizontal_rate
         if blend > 0.0 and next_horizontal is not None:
@@ -1239,10 +1238,11 @@ class ImageVisualServo:
             # projected current-aperture margin once.  Multiplying those two
             # margins made the controller unwind a physically effective turn
             # while both observations still remained inside the corridor.
-            # Current geometry tapers the retained successor turn to zero but
-            # cannot reverse it; the independently conservative bank product
-            # returns continuously to current-only as passage scale approaches
-            # the near plane.
+            # Current geometry attenuates successor yaw but does not
+            # algebraically cancel it with the opposite current-gate bearing.
+            # The independently conservative bank product returns
+            # continuously to current-only as passage scale approaches the
+            # near plane.
             projected_current_horizontal = (
                 raw_horizontal
                 + raw_horizontal_rate
@@ -1272,20 +1272,12 @@ class ImageVisualServo:
             )
             assert next_target is not None
             heading_horizontal = (
-                (1.0 - successor_heading_authority) * raw_horizontal
-                + successor_heading_authority * next_horizontal
+                successor_heading_authority * next_horizontal
             )
             heading_horizontal_rate = (
-                (1.0 - successor_heading_authority)
-                * raw_horizontal_rate
-                + successor_heading_authority
+                successor_heading_authority
                 * float(next_target.normalized_x_rate_s)
             )
-            if next_horizontal != 0.0:
-                successor_yaw_direction = -math.copysign(
-                    1.0,
-                    next_horizontal,
-                )
             passage_scale_progress = _clamp(
                 blend / MAX_NEXT_GATE_BLEND,
                 0.0,
@@ -1535,15 +1527,6 @@ class ImageVisualServo:
             bearing_yaw_rate
             - self.tuning.yaw_rate_gain * heading_horizontal_rate
         )
-        if (
-            successor_yaw_direction is not None
-            and unconstrained_yaw_rate * successor_yaw_direction < 0.0
-        ):
-            # Current-aperture feedback may taper a sealed successor turn to
-            # zero at the corridor boundary, but it cannot reverse that turn.
-            # A retired preview immediately restores ordinary current-only
-            # control on the same generic path.
-            unconstrained_yaw_rate = 0.0
         yaw_rate = _clamp(
             unconstrained_yaw_rate,
             -MAX_VISUAL_YAW_RATE_RAD_S,
@@ -1666,9 +1649,16 @@ class ImageVisualServo:
         if not advance_enabled:
             # Collective owns vertical image-space alignment.  Pitch owns
             # closure and cannot become a nose-down closure command while
-            # alignment is withheld.  In particular, vertical displacement
-            # and saturated yaw do not manufacture cross-axis pitch demand.
-            raw_target_pitch = max(0.0, raw_target_pitch)
+            # alignment is withheld.  Allocate additional braking only when
+            # observable horizontal error is moving farther outward under
+            # steering load; saturated yaw alone does not manufacture
+            # cross-axis pitch demand.
+            raw_target_pitch = max(
+                0.0,
+                outward_bearing_authority
+                * MAX_VISUAL_TARGET_PITCH_RAD,
+                raw_target_pitch,
+            )
         target_pitch = _clamp(
             raw_target_pitch,
             MIN_VISUAL_TARGET_PITCH_RAD,
@@ -1690,21 +1680,6 @@ class ImageVisualServo:
             MIN_VISUAL_THRUST,
             MAX_VISUAL_THRUST,
         )
-        steering_thrust_ceiling = (
-            MAX_VISUAL_THRUST
-            - steering_load
-            * (MAX_VISUAL_THRUST - self.tuning.brake_thrust)
-        )
-        if not advance_enabled:
-            # Transfer collective authority continuously toward the measured
-            # flight-support/brake basis while heading correction consumes
-            # the yaw envelope.  This keeps a large off-axis successor from
-            # receiving maximum collective at the same time as saturated
-            # steering, without adding a gate-specific mode or threshold.
-            measured_thrust = min(
-                measured_thrust,
-                steering_thrust_ceiling,
-            )
         if (
             vertical_censored
             and self._last_vertical_observable_thrust is not None
@@ -1718,11 +1693,6 @@ class ImageVisualServo:
             thrust = measured_thrust
             if not vertical_censored:
                 self._last_vertical_observable_thrust = thrust
-        if not advance_enabled:
-            # If steering load increased after the last vertically observable
-            # frame, censorship cannot preserve a collective above the
-            # current steering allocation.
-            thrust = min(thrust, steering_thrust_ceiling)
 
         return VisualServoOutput(
             target_roll_rad=target_roll,
