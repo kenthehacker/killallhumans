@@ -1207,24 +1207,21 @@ def test_shadow_promotes_precredit_track_without_reset_and_sends_only_zero(
     (
         "cleanup_gate",
         "cleanup_confirmed",
-        "expected_success",
         "reason_fragment",
     ),
     [
-        (1, False, True, None),
+        (1, False, "cleanup unconfirmed"),
         (
             0,
             True,
-            False,
             "cleanup boundary lacks proved 0->1 authority",
         ),
     ],
 )
-def test_powered_shadow_separates_cleanup_from_authoritative_boundary(
+def test_powered_shadow_requires_authoritative_boundary_and_confirmed_cleanup(
     monkeypatch,
     cleanup_gate,
     cleanup_confirmed,
-    expected_success,
     reason_fragment,
 ):
     adapter = _Adapter()
@@ -1283,12 +1280,9 @@ def test_powered_shadow_separates_cleanup_from_authoritative_boundary(
         )
     )
 
-    assert result.success is expected_success
+    assert result.success is False
     assert result.cleanup_confirmed is cleanup_confirmed
-    if reason_fragment is not None:
-        assert reason_fragment in result.reason
-    else:
-        assert result.reason == "stage completed"
+    assert reason_fragment in result.reason
     assert result.details["authoritative_cleanup_entry"] == {
         "gate_index": cleanup_gate,
         "race_finished": False,
@@ -2734,7 +2728,7 @@ def test_visual_alignment_uncertain_dispatch_reserves_cleanup_slot(
         (1, True, True, "vq2-track-000004", True, False),
     ],
 )
-def test_powered_visual_alignment_separates_cleanup_from_navigation(
+def test_powered_visual_alignment_preserves_navigation_but_requires_cleanup(
     monkeypatch,
     cleanup_gate,
     cleanup_confirmed,
@@ -2818,7 +2812,7 @@ def test_powered_visual_alignment_separates_cleanup_from_navigation(
         )
     )
 
-    assert result.success is expected_success
+    assert result.success is bool(expected_success and cleanup_confirmed)
     assert result.cleanup_confirmed is cleanup_confirmed
     assert result.details["visual_alignment"]["cleanup_confirmed"] is (
         cleanup_confirmed
@@ -2826,3 +2820,5 @@ def test_powered_visual_alignment_separates_cleanup_from_navigation(
     assert result.details["visual_alignment"]["outcome"] == (
         "success" if expected_success else "abort"
     )
+    if not cleanup_confirmed:
+        assert "cleanup unconfirmed" in result.reason

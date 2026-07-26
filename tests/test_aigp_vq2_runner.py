@@ -6024,69 +6024,127 @@ def test_cleanup_reset_disarm_send_failure_does_not_suppress_reset_proof(
     assert disarm_calls == pytest.approx([0.0, 0.005, 0.025])
 
 
-def test_safe_cleanup_does_not_wait_for_post_reset_heartbeat(
+def test_safe_cleanup_does_not_claim_pre_reset_disarm_confirmation(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = False
+    adapter.race_status = RaceStatus(10_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = SimpleNamespace(
+        imu=SimpleNamespace(timestamp_us=10_000_000)
+    )
     runner = VQ2Runner(adapter, _FakeVision())
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
     events = []
 
-    async def disarm():
-        events.append("disarm")
+    async def pre_reset_disarm():
+        events.append("pre_reset_disarm_returned")
 
-    async def forbidden_disarm_proof(*_args, **_kwargs):
-        pytest.fail("best-effort cleanup must not wait for heartbeat proof")
+    async def final_disarm_confirmed(*_args, **_kwargs):
+        events.append("final_disarm_confirmation")
+        return False
 
     async def reset():
         events.append("reset")
 
-    monkeypatch.setattr(adapter, "disarm", disarm)
-    monkeypatch.setattr(adapter, "reset", reset)
+    async def observe_reset(**_kwargs):
+        return proof
+
+    monkeypatch.setattr(adapter, "disarm", pre_reset_disarm)
     monkeypatch.setattr(
         runner,
         "_disarm_confirmed",
-        forbidden_disarm_proof,
+        final_disarm_confirmed,
     )
+    monkeypatch.setattr(adapter, "reset", reset)
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe_reset)
 
-    assert asyncio.run(runner.safe_cleanup()) is True
+    assert asyncio.run(runner.safe_cleanup()) is False
     assert events == [
-        "disarm",
+        "pre_reset_disarm_returned",
         "reset",
-        "disarm",
+        "final_disarm_confirmation",
     ]
 
 
-def test_safe_cleanup_orders_zero_disarm_reset_then_final_disarm(
+def test_disarm_confirmation_is_not_erased_by_recorder_failure(
     monkeypatch,
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = True
     runner = VQ2Runner(adapter, _FakeVision())
+
+    async def disarm():
+        adapter.heartbeat_sequence += 1
+        adapter.is_armed = False
+
+    def recorder_failure(*_args, **_kwargs):
+        raise RuntimeError("injected recorder failure")
+
+    monkeypatch.setattr(adapter, "disarm", disarm)
+    monkeypatch.setattr(runner.recorder, "emit", recorder_failure)
+
+    assert asyncio.run(runner._disarm_confirmed()) is True
+
+
+def test_safe_cleanup_orders_zero_disarm_send_reset_then_final_proof(
+    monkeypatch,
+):
+    adapter = _FakeAdapter()
+    adapter.is_armed = True
+    adapter.race_status = RaceStatus(10_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = SimpleNamespace(
+        imu=SimpleNamespace(timestamp_us=10_000_000)
+    )
+    runner = VQ2Runner(adapter, _FakeVision())
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
     order = []
     recorded = []
-    disarm_calls = 0
 
     async def zero_send(_command):
         order.append("zero")
 
-    async def disarm():
-        nonlocal disarm_calls
-        disarm_calls += 1
-        order.append(
-            "pre_reset_disarm"
-            if disarm_calls == 1
-            else "final_disarm"
-        )
-        if disarm_calls == 2:
-            adapter.is_armed = False
+    async def pre_reset_disarm():
+        order.append("pre_reset_disarm")
 
     async def reset():
         order.append("reset")
 
+    async def observe_reset(**_kwargs):
+        return proof
+
+    async def final_disarm_confirmed(*_args, **_kwargs):
+        order.append("final_disarm_confirmation")
+        adapter.is_armed = False
+        return True
+
     monkeypatch.setattr(adapter, "send_attitude_rate", zero_send)
-    monkeypatch.setattr(adapter, "disarm", disarm)
+    monkeypatch.setattr(adapter, "disarm", pre_reset_disarm)
     monkeypatch.setattr(adapter, "reset", reset)
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe_reset)
+    monkeypatch.setattr(
+        runner,
+        "_disarm_confirmed",
+        final_disarm_confirmed,
+    )
     monkeypatch.setattr(
         runner.recorder,
         "emit",
@@ -6094,11 +6152,12 @@ def test_safe_cleanup_orders_zero_disarm_reset_then_final_disarm(
     )
 
     assert asyncio.run(runner.safe_cleanup()) is True
+    assert runner._cleanup_proved_reset_epoch is True
     assert order == [
         "zero",
         "pre_reset_disarm",
         "reset",
-        "final_disarm",
+        "final_disarm_confirmation",
     ]
     pre_reset_events = [
         payload
@@ -6120,36 +6179,57 @@ def test_safe_cleanup_reset_is_unconditional_after_pre_reset_disarm_failure(
 ):
     adapter = _FakeAdapter()
     adapter.is_armed = False
+    adapter.race_status = RaceStatus(10_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = SimpleNamespace(
+        imu=SimpleNamespace(timestamp_us=10_000_000)
+    )
     runner = VQ2Runner(adapter, _FakeVision())
+    proof = ResetProof(
+        attempt=1,
+        pre_race_boot_ms=10_000,
+        post_race_boot_ms=500,
+        pre_imu_us=10_000_000,
+        post_imu_us=500_000,
+        advancing_race_samples=3,
+        advancing_imu_samples=5,
+        countdown_observed=True,
+    )
     order = []
     recorded = []
-    disarm_calls = 0
 
-    async def disarm():
-        nonlocal disarm_calls
-        disarm_calls += 1
-        if disarm_calls == 1:
-            order.append("pre_reset_disarm")
-            raise RuntimeError("injected pre-reset send failure")
-        order.append("final_disarm")
-        adapter.is_armed = False
+    async def failed_pre_reset_disarm():
+        order.append("pre_reset_disarm")
+        raise RuntimeError("injected pre-reset send failure")
 
     async def reset():
         order.append("reset")
 
-    monkeypatch.setattr(adapter, "disarm", disarm)
+    async def observe_reset(**_kwargs):
+        return proof
+
+    async def final_disarm_confirmed(*_args, **_kwargs):
+        order.append("final_disarm_confirmation")
+        return True
+
+    monkeypatch.setattr(adapter, "disarm", failed_pre_reset_disarm)
     monkeypatch.setattr(adapter, "reset", reset)
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe_reset)
+    monkeypatch.setattr(
+        runner,
+        "_disarm_confirmed",
+        final_disarm_confirmed,
+    )
     monkeypatch.setattr(
         runner.recorder,
         "emit",
         lambda event, **payload: recorded.append((event, payload)),
     )
 
-    assert asyncio.run(runner.safe_cleanup()) is False
+    assert asyncio.run(runner.safe_cleanup()) is True
     assert order == [
         "pre_reset_disarm",
         "reset",
-        "final_disarm",
+        "final_disarm_confirmation",
     ]
     pre_reset_events = [
         payload
@@ -6888,6 +6968,9 @@ def test_powered_stage_cleanup_collision_warning_retains_navigation_success(
 ):
     adapter = _FakeAdapter()
     adapter.race_status = RaceStatus(1_000, 0, -1, 0, -1)
+    adapter.latest_telemetry = SimpleNamespace(
+        imu=SimpleNamespace(timestamp_us=10_000_000)
+    )
     runner = VQ2Runner(adapter, _FakeVision())
     context = vq2_module.StartContext(
         0.0,
@@ -6915,7 +6998,7 @@ def test_powered_stage_cleanup_collision_warning_retains_navigation_success(
         adapter.is_armed = False
         return True
 
-    async def reset():
+    async def observe_reset(**_kwargs):
         return ResetProof(
             attempt=1,
             pre_race_boot_ms=10_000,
@@ -6933,7 +7016,7 @@ def test_powered_stage_cleanup_collision_warning_retains_navigation_success(
     monkeypatch.setattr(runner, "arm_confirmed", no_op)
     monkeypatch.setattr(runner, "_run_sign_id", stage_body)
     monkeypatch.setattr(runner, "_disarm_confirmed", disarm)
-    monkeypatch.setattr(runner, "emergency_reset", reset)
+    monkeypatch.setattr(runner, "_observe_reset_proof", observe_reset)
 
     result = asyncio.run(runner.run_powered_stage("sign-id"))
 
@@ -8508,7 +8591,11 @@ def test_powered_readiness_requires_20fps_and_exact_dimensions():
     assert any("640x360" in failure for failure in failures)
 
 
-def test_fast_calibration_stage_retains_reset_go_arm_and_cleanup(monkeypatch):
+@pytest.mark.parametrize("cleanup_confirmed", (True, False))
+def test_fast_calibration_stage_requires_confirmed_cleanup_for_run_success(
+    monkeypatch,
+    cleanup_confirmed,
+):
     runner, adapter, context = _fast_calibration_runner()
     calls = []
 
@@ -8535,7 +8622,7 @@ def test_fast_calibration_stage_retains_reset_go_arm_and_cleanup(monkeypatch):
     async def cleanup():
         calls.append("cleanup")
         adapter.is_armed = False
-        return True
+        return cleanup_confirmed
 
     monkeypatch.setattr(runner, "establish_reset_epoch", reset_epoch)
     monkeypatch.setattr(runner, "normalize_disarmed", normalize_disarmed)
@@ -8546,8 +8633,11 @@ def test_fast_calibration_stage_retains_reset_go_arm_and_cleanup(monkeypatch):
 
     result = asyncio.run(runner.run_powered_stage("calibration-excite"))
 
-    assert result.success is True
-    assert result.cleanup_confirmed is True
+    assert result.success is cleanup_confirmed
+    assert result.cleanup_confirmed is cleanup_confirmed
+    assert result.details["ticks_sent"] > 0
+    if not cleanup_confirmed:
+        assert "cleanup unconfirmed" in result.reason
     assert calls == [
         ("reset_epoch", True),
         "normalize_disarmed",
@@ -9685,7 +9775,7 @@ def test_runner_binds_exact_yaw_profile_and_rejects_mismatched_evidence():
         (True, True, 2, False),
     ),
 )
-def test_gate1_recenter_powered_lifecycle_separates_cleanup_outcome(
+def test_gate1_recenter_preserves_navigation_but_requires_cleanup_for_run(
     monkeypatch,
     cleanup_confirmed,
     criteria_met,
@@ -9751,12 +9841,14 @@ def test_gate1_recenter_powered_lifecycle_separates_cleanup_outcome(
         )
     )
 
-    assert result.success is expected_success
+    assert result.success is bool(expected_success and cleanup_confirmed)
     assert result.cleanup_confirmed is cleanup_confirmed
     assert result.details["gate1_recenter"]["cleanup_confirmed"] is (
         cleanup_confirmed
     )
     assert result.details["gate1_recenter"]["success"] is expected_success
+    if not cleanup_confirmed:
+        assert "cleanup unconfirmed" in result.reason
     if not criteria_met:
         assert "without satisfying its criteria" in result.reason
     if cleanup_entry_gate_index != 1:

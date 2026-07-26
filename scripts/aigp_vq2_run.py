@@ -11227,10 +11227,16 @@ class VQ2Runner:
             confirm_deadline = min(deadline, time.monotonic() + 0.25)
             while time.monotonic() < confirm_deadline:
                 if self.adapter.heartbeat_sequence > token and not self.adapter.is_armed:
-                    self.recorder.emit(
-                        "disarm_confirmed",
-                        heartbeat_sequence=self.adapter.heartbeat_sequence,
-                    )
+                    try:
+                        self.recorder.emit(
+                            "disarm_confirmed",
+                            heartbeat_sequence=self.adapter.heartbeat_sequence,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Recorder failed after disarm was confirmed",
+                            exc_info=True,
+                        )
                     return True
                 await asyncio.sleep(0.01)
         return False
@@ -11262,12 +11268,24 @@ class VQ2Runner:
             raise ValueError("post-reset disarm trigger is invalid")
         heartbeat_before = self.adapter.heartbeat_sequence
         armed_before = self.adapter.is_armed
+
+        def emit(**payload: Any) -> None:
+            try:
+                self.recorder.emit(
+                    "cleanup_post_reset_disarm_attempt",
+                    **payload,
+                )
+            except Exception:
+                logger.warning(
+                    "Recorder failed during reactive cleanup disarm",
+                    exc_info=True,
+                )
+
         try:
             await self.adapter.disarm()
         except Exception as exc:
             logger.exception("Reactive post-reset disarm send failed")
-            self.recorder.emit(
-                "cleanup_post_reset_disarm_attempt",
+            emit(
                 attempt=attempt,
                 outcome="raised",
                 error_type=type(exc).__name__,
@@ -11277,8 +11295,7 @@ class VQ2Runner:
                 armed_before=armed_before,
             )
             return False
-        self.recorder.emit(
-            "cleanup_post_reset_disarm_attempt",
+        emit(
             attempt=attempt,
             outcome="returned",
             error_type=None,
@@ -11290,7 +11307,7 @@ class VQ2Runner:
         return True
 
     async def safe_cleanup(self) -> bool:
-        """Best-effort zero, disarm, reset, and final disarm."""
+        """Best-effort zero/pre-disarm, then prove reset and final disarm."""
 
         self._abort_latched = True
         self._cleanup_in_progress = True
@@ -11333,11 +11350,6 @@ class VQ2Runner:
                     exc_info=True,
                 )
 
-        zero_sent = False
-        pre_reset_disarm_sent = False
-        reset_sent = False
-        final_disarm_sent = False
-
         try:
             if self.adapter.is_armed:
                 zero = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
@@ -11348,7 +11360,6 @@ class VQ2Runner:
                     < CONTROL_PERIOD_S
                 )
                 if zero_is_recent:
-                    zero_sent = True
                     emit(
                         "zero_thrust_already_active",
                         gate_index=gate_index_before_cleanup,
@@ -11376,7 +11387,6 @@ class VQ2Runner:
                                 exc_info=True,
                             )
                     await self.adapter.send_attitude_rate(zero)
-                    zero_sent = True
                     self._last_flight_command = zero
                     self._last_flight_command_sent_s = time.monotonic()
                     if callable(record_command):
@@ -11397,8 +11407,6 @@ class VQ2Runner:
                         gate_index=gate_index_before_cleanup,
                         race_boot_ms=race_boot_before_cleanup,
                     )
-            else:
-                zero_sent = True
         except Exception:
             logger.warning(
                 "Could not send the best-effort zero-thrust command",
@@ -11409,7 +11417,6 @@ class VQ2Runner:
         armed_before_pre_reset_disarm = self.adapter.is_armed
         try:
             await self.adapter.disarm()
-            pre_reset_disarm_sent = True
             emit(
                 "cleanup_pre_reset_disarm_attempt",
                 outcome="returned",
@@ -11434,38 +11441,97 @@ class VQ2Runner:
                 armed_before=armed_before_pre_reset_disarm,
             )
 
+        telemetry_before_reset = self.adapter.latest_telemetry
+        imu_before_reset = (
+            telemetry_before_reset.imu
+            if telemetry_before_reset is not None
+            else None
+        )
+        pre_imu_us = (
+            int(imu_before_reset.timestamp_us)
+            if imu_before_reset is not None
+            else None
+        )
+        reset_heartbeat_anchor = self.adapter.heartbeat_sequence
+        emit(
+            "reset_sent",
+            attempt=1,
+            emergency=True,
+            pre_race_boot_ms=race_boot_before_cleanup,
+            pre_gate_index=gate_index_before_cleanup,
+            pre_imu_us=pre_imu_us,
+        )
+        reset_returned = False
         try:
             await self.adapter.reset()
-            reset_sent = True
+            reset_returned = True
         except Exception:
-            logger.warning("Best-effort SIM_RESET send failed", exc_info=True)
+            logger.warning(
+                "Best-effort cleanup SIM_RESET send failed",
+                exc_info=True,
+            )
 
+        reset_proof: Optional[ResetProof] = None
+        reset_proved = False
+        if (
+            reset_returned
+            and race_boot_before_cleanup is not None
+            and pre_imu_us is not None
+        ):
+            try:
+                reset_proof = await self._observe_reset_proof(
+                    attempt=1,
+                    pre_race=race_boot_before_cleanup,
+                    pre_imu=pre_imu_us,
+                    cleanup_disarm_heartbeat_anchor=(
+                        reset_heartbeat_anchor
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "Cleanup reset proof observation failed",
+                    exc_info=True,
+                )
+            reset_proved = reset_proof is not None
+            if reset_proof is not None:
+                try:
+                    self._accept_reset_proof(
+                        reset_proof,
+                        restart_vision=False,
+                    )
+                except Exception:
+                    self._cleanup_proved_reset_epoch = True
+                    logger.warning(
+                        "Cleanup reset was proved but epoch bookkeeping "
+                        "produced a warning",
+                        exc_info=True,
+                    )
+
+        disarmed = False
         try:
-            await self.adapter.disarm()
-            final_disarm_sent = True
+            disarmed = await self._disarm_confirmed()
         except Exception:
-            logger.warning("Best-effort final disarm send failed", exc_info=True)
+            logger.warning(
+                "Final post-reset disarm confirmation failed",
+                exc_info=True,
+            )
 
         confirmed = bool(
-            zero_sent
-            and pre_reset_disarm_sent
-            and reset_sent
-            and final_disarm_sent
-            and not self.adapter.is_armed
+            disarmed and reset_proved and not self.adapter.is_armed
         )
         emit(
             "cleanup_complete",
-            disarmed=bool(final_disarm_sent and not self.adapter.is_armed),
-            reset_proved=False,
+            disarmed=disarmed,
+            reset_proved=reset_proved,
             confirmed=confirmed,
             collision_safety=self._cleanup_collision_safety_summary(),
             gate_index_before_cleanup=gate_index_before_cleanup,
             race_boot_before_cleanup=race_boot_before_cleanup,
         )
         if not confirmed:
-            logger.warning(
-                "Best-effort cleanup was not fully observed; relaunch the "
-                "simulator if the next reset epoch cannot be established"
+            logger.critical(
+                "UNRESOLVED EMERGENCY: reset/disarmed state was not fully "
+                "confirmed; relaunch before another powered attempt"
             )
         return confirmed
 
@@ -18794,8 +18860,12 @@ class VQ2Runner:
                 details["diagnostic_errors"] = diagnostic_errors
         return StageResult(
             stage=stage,
-            success=success,
-            reason=reason,
+            success=bool(success and cleanup_confirmed),
+            reason=(
+                reason
+                if cleanup_confirmed
+                else f"{reason}; cleanup unconfirmed"
+            ),
             duration_s=time.monotonic() - started,
             gate_index_before=gate_before,
             gate_index_after=gate_after,

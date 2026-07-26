@@ -3023,10 +3023,10 @@ class _RunnerVision:
         (True, True, True, True),
         (False, True, True, False),
         (True, False, True, False),
-        (True, True, False, True),
+        (True, True, False, False),
     ),
 )
-def test_runner_course_boundary_separates_cleanup_from_finish_chain(
+def test_runner_course_boundary_requires_finish_chain_and_cleanup(
     monkeypatch,
     race_finished,
     ordered_transitions,
@@ -3165,4 +3165,4 @@ def test_runner_course_boundary_separates_cleanup_from_finish_chain(
     if not race_finished or not ordered_transitions:
         assert "race_finished/ordered rolling-graph proof" in result.reason
     if not cleanup_confirmed:
-        assert "cleanup unconfirmed" not in result.reason
+        assert "cleanup unconfirmed" in result.reason
