@@ -25,6 +25,7 @@ from planning.vq2_gate_graph import (
     ConfirmedGateTransition,
 )
 from planning.vq2_visual_approach import (
+    VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
     VisualApproachPassageAdmission,
     VisualApproachPassageSafetyUnavailable,
@@ -1275,7 +1276,7 @@ def test_latched_crossing_without_authoritative_credit_times_out_bounded():
     assert host.race.race_finished is False
 
 
-def test_clean_near_plane_latch_transfers_to_successor_coast():
+def test_censored_near_plane_passage_transfers_to_successor_coast():
     class CoastBeforeCreditHost(_Host):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
@@ -1285,6 +1286,18 @@ def test_clean_near_plane_latch_transfers_to_successor_coast():
         def _advance_race(self):
             if self.allow_credit:
                 super()._advance_race()
+
+        def _sample(self):
+            super()._sample()
+            summary = getattr(self, "_visual_course_summary", {})
+            segments = summary.get("segments", ())
+            if (
+                segments
+                and segments[-1].get("near_plane_latch") is not None
+            ):
+                track = self.visual_gate_graph.latest_snapshot.current_track
+                track.clipping = FrameEdge.BOTTOM
+                track.center_censored = True
 
         async def _send_flight_command(self, command, **kwargs):
             if (
@@ -1297,10 +1310,27 @@ def test_clean_near_plane_latch_transfers_to_successor_coast():
                 self.allow_credit = True
             return await super()._send_flight_command(command, **kwargs)
 
+    class RefuseCensoredCurrentServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            if snapshot.current_track.clipping is not FrameEdge.NONE:
+                raise VisualApproachCurrentGeometryUnavailable(
+                    "current aperture entered expected passage censorship"
+                )
+            return super().observe(snapshot, *args, **kwargs)
+
     host = CoastBeforeCreditHost(initial_gate=6, finish_gate=6)
-    runtime, _calls = _runtime(
+    runtime, calls = _runtime(
         host,
         servo_options={"passage_preview_blend": 0.3},
+    )
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: RefuseCensoredCurrentServo(
+            *args,
+            **kwargs,
+            calls=calls,
+            passage_preview_blend=0.3,
+        ),
     )
 
     result = asyncio.run(
@@ -1313,7 +1343,7 @@ def test_clean_near_plane_latch_transfers_to_successor_coast():
     coast_commands = [
         command
         for stage, _elapsed, command in host.ticks
-        if stage.endswith("/near-plane-coast")
+        if stage.endswith("/censored-passage")
     ]
     assert len(coast_commands) == 1
     assert coast_commands[0].yaw_rate == -MAX_VISUAL_YAW_RATE_RAD_S
