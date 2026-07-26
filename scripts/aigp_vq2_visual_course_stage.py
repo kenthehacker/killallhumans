@@ -93,8 +93,6 @@ VISUAL_COURSE_STAGE = "visual-course"
 VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON = (
     "visual receiver advanced beyond the admitted command target"
 )
-MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S = 0.10
-MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS = 4
 VISUAL_COURSE_YAW_PROFILE_SCHEMA = YAW_CALIBRATION_PROFILE_SCHEMA
 INITIAL_PAD_PRELOAD_DURATION_S = 0.15
 INITIAL_PAD_PRELOAD_THRUST = 0.26
@@ -1517,23 +1515,6 @@ async def _run_visual_course_stage_impl(
         consecutive_superseded_proposals = 0
         refresh_live_summary()
 
-    def assert_pending_supersession_hold(phase: str) -> None:
-        if consecutive_superseded_proposals <= 0:
-            return
-        now_s = float(runtime.monotonic())
-        if not math.isfinite(now_s) or now_s < last_command_send_s:
-            raise abort_type(
-                "visual-course supersession clock regressed"
-            )
-        if (
-            now_s - last_command_send_s
-            >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-        ):
-            raise abort_type(
-                "visual-course receiver supersession held prior command "
-                f"beyond its bound during {phase}"
-            )
-
     async def send_visual(
         *,
         proposal: Any,
@@ -1592,16 +1573,6 @@ async def _run_visual_course_stage_impl(
                 held_previous_command_s=hold_s,
             )
             refresh_live_summary()
-            if (
-                consecutive_superseded_proposals
-                > MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS
-                or hold_s
-                >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-            ):
-                raise abort_type(
-                    "visual-course receiver repeatedly superseded command "
-                    "authority"
-                ) from exc
             return _SupersededVisualProposal(
                 expected_camera_token=expected_token,
                 receiver_camera_token=receiver_token,
@@ -1756,7 +1727,6 @@ async def _run_visual_course_stage_impl(
             }
 
         await host._wait_for_next_flight_command_slot()
-        assert_pending_supersession_hold("command-slot wait")
         pad_contact = initial_pad_contact_authority()
         host._watchdog(
             require_target=False,
@@ -1831,7 +1801,6 @@ async def _run_visual_course_stage_impl(
             or not limits.min_thrust <= command.thrust <= limits.max_thrust
         ):
             raise abort_type("visual-course command escaped its fixed envelope")
-        assert_pending_supersession_hold("pre-wire validation")
         validation_ns = runtime.perf_counter_ns()
         if type(validation_ns) is not int or validation_ns < 0:
             raise abort_type("visual-course wire clock is invalid")
@@ -1849,28 +1818,6 @@ async def _run_visual_course_stage_impl(
                 deadline_ns,
                 round(float(command_deadline_s) * 1_000_000_000),
             )
-        if consecutive_superseded_proposals > 0:
-            hold_checked_s = float(runtime.monotonic())
-            if (
-                not math.isfinite(hold_checked_s)
-                or hold_checked_s < last_command_send_s
-            ):
-                raise abort_type(
-                    "visual-course supersession clock regressed"
-                )
-            hold_remaining_s = (
-                MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-                - (hold_checked_s - last_command_send_s)
-            )
-            if hold_remaining_s <= 0.0:
-                raise abort_type(
-                    "visual-course receiver supersession held prior command "
-                    "beyond its bound during wire deadline admission"
-                )
-            hold_deadline_ns = validation_ns + math.floor(
-                hold_remaining_s * 1_000_000_000
-            )
-            deadline_ns = min(deadline_ns, hold_deadline_ns)
         if (
             deadline_ns <= validation_ns
             or (
@@ -2095,16 +2042,6 @@ async def _run_visual_course_stage_impl(
                 held_previous_command_s=hold_s,
             )
             refresh_live_summary()
-            if (
-                consecutive_superseded_proposals
-                > MAX_CONSECUTIVE_VISUAL_PROPOSAL_SUPERSESSIONS
-                or hold_s
-                >= MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-            ):
-                raise abort_type(
-                    "visual-course receiver repeatedly superseded command "
-                    "authority"
-                ) from exc
             return None
 
         values = (
@@ -2132,7 +2069,6 @@ async def _run_visual_course_stage_impl(
             )
 
         await host._wait_for_next_flight_command_slot()
-        assert_pending_supersession_hold("censored coast command-slot wait")
         pad_contact = initial_pad_contact_authority()
         host._watchdog(
             require_target=False,
@@ -2197,9 +2133,6 @@ async def _run_visual_course_stage_impl(
                 "visual-course censored passage command escaped its fixed "
                 "envelope"
             )
-        assert_pending_supersession_hold(
-            "censored coast pre-wire validation"
-        )
         validation_ns = runtime.perf_counter_ns()
         if type(validation_ns) is not int or validation_ns < 0:
             raise abort_type("visual-course wire clock is invalid")
@@ -2216,29 +2149,6 @@ async def _run_visual_course_stage_impl(
             coast_deadline_s * 1_000_000_000
         )
         deadline_ns = min(deadline_ns, coast_deadline_ns)
-        if consecutive_superseded_proposals > 0:
-            hold_checked_s = float(runtime.monotonic())
-            if (
-                not math.isfinite(hold_checked_s)
-                or hold_checked_s < last_command_send_s
-            ):
-                raise abort_type(
-                    "visual-course supersession clock regressed"
-                )
-            hold_remaining_s = (
-                MAX_VISUAL_PROPOSAL_SUPERSESSION_HOLD_S
-                - (hold_checked_s - last_command_send_s)
-            )
-            if hold_remaining_s <= 0.0:
-                raise abort_type(
-                    "visual-course receiver supersession held prior command "
-                    "beyond its bound during wire deadline admission"
-                )
-            deadline_ns = min(
-                deadline_ns,
-                validation_ns
-                + math.floor(hold_remaining_s * 1_000_000_000),
-            )
         if (
             deadline_ns <= validation_ns
             or (
@@ -2700,12 +2610,8 @@ async def _run_visual_course_stage_impl(
                     raise abort_type(
                         "visual-course recovery clock is invalid"
                     )
-                assert_pending_supersession_hold(
-                    "admitted recovery control tick"
-                )
             else:
                 now = await pace_tick()
-                assert_pending_supersession_hold("paced control tick")
             if now >= course_deadline_s:
                 raise abort_type("visual-course hard duration expired")
             if now >= segment_deadline_s:
