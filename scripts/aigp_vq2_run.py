@@ -104,9 +104,12 @@ from gate_detection.src.gate_detector import GateDetection
 from gate_detection.src.vq2_detector import VQ2GateDetector
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    ConfirmedGateReacquisition,
     ConfirmedGateTransition,
+    CreditedUnboundGateAdvance,
     GateGraphError,
     GateGraphSnapshot,
+    GateReacquisitionPending,
     RollingVisualGateGraph,
 )
 from planning.vq2_visual_approach import (
@@ -8598,7 +8601,12 @@ class VQ2Runner:
         self.visual_gate_graph = RollingVisualGateGraph()
         self._visual_latest_tracker_update: Any = None
         self._visual_latest_graph_snapshot: Optional[GateGraphSnapshot] = None
-        self._visual_transition: Optional[ConfirmedGateTransition] = None
+        self._visual_transition: Optional[
+            ConfirmedGateTransition | ConfirmedGateReacquisition
+        ] = None
+        self._visual_unbound_advance: Optional[
+            CreditedUnboundGateAdvance
+        ] = None
         self._visual_shadow_summary: Optional[Dict[str, Any]] = None
         self._visual_alignment_summary: Optional[Dict[str, Any]] = None
         self._visual_course_summary: Optional[Dict[str, Any]] = None
@@ -8821,6 +8829,29 @@ class VQ2Runner:
             "confirmed_transition_count": len(
                 snapshot.confirmed_transitions
             ),
+            "phase": snapshot.phase.value,
+            "pending_unbound_advance": (
+                None
+                if snapshot.pending_unbound_advance is None
+                else {
+                    "from_gate_index": (
+                        snapshot.pending_unbound_advance.from_gate_index
+                    ),
+                    "to_gate_index": (
+                        snapshot.pending_unbound_advance.to_gate_index
+                    ),
+                    "retired_track_id": (
+                        snapshot.pending_unbound_advance.retired_track_id
+                    ),
+                    "reviewed_track_id": (
+                        snapshot.pending_unbound_advance.reviewed_track_id
+                    ),
+                    "alternative_reacquisition_track_ids_at_credit": list(
+                        snapshot.pending_unbound_advance
+                        .alternative_reacquisition_track_ids_at_credit
+                    ),
+                }
+            ),
             "race_finished": snapshot.race_finished,
         }
 
@@ -8876,6 +8907,7 @@ class VQ2Runner:
             self._visual_latest_tracker_update = None
             self._visual_latest_graph_snapshot = None
             self._visual_transition = None
+            self._visual_unbound_advance = None
 
     def _consume_imu_sample(
         self,
@@ -12740,8 +12772,24 @@ class VQ2Runner:
             raise SafetyAbort(
                 f"visual gate promotion refused: {exc}"
             ) from exc
+        return self._accept_visual_retained_transition(
+            transition,
+            from_gate_index=from_gate_index,
+            to_gate_index=to_gate_index,
+        )
+
+    def _accept_visual_retained_transition(
+        self,
+        transition: ConfirmedGateTransition,
+        *,
+        from_gate_index: int,
+        to_gate_index: int,
+    ) -> ConfirmedGateTransition:
+        """Record one already graph-validated retained-track promotion."""
+
         if (
-            transition.from_gate_index != from_gate_index
+            type(transition) is not ConfirmedGateTransition
+            or transition.from_gate_index != from_gate_index
             or transition.to_gate_index != to_gate_index
             or len(transition.pretransition_frame_tokens)
             < VISUAL_SHADOW_REQUIRED_PRETRANSITION_FRAMES
@@ -12800,6 +12848,200 @@ class VQ2Runner:
             ),
         )
         return transition
+
+    def _confirm_visual_course_advance(
+        self,
+        *,
+        from_gate_index: int,
+        to_gate_index: int,
+        race_status: AuthoritativeRaceStatusRef,
+        reviewed_track_id: str,
+    ) -> ConfirmedGateTransition | CreditedUnboundGateAdvance:
+        """Consume credit once as retained promotion or credited-unbound."""
+
+        if (
+            type(race_status) is not AuthoritativeRaceStatusRef
+            or type(reviewed_track_id) is not str
+            or not reviewed_track_id
+            or race_status.race_finished
+            or race_status.active_gate_index != to_gate_index
+            or to_gate_index != from_gate_index + 1
+        ):
+            raise SafetyAbort(
+                "visual course advance lacks exact sequential "
+                "race/review authority"
+            )
+        camera_token = self._visual_camera_token_at_race_credit(
+            race_status
+        )
+        try:
+            outcome = self.visual_gate_graph.confirm_reviewed_advance(
+                self.visual_tracker,
+                race_status=race_status,
+                camera_token_at_credit=camera_token,
+                reviewed_track_id=reviewed_track_id,
+            )
+        except GateGraphError as exc:
+            raise SafetyAbort(
+                f"visual course advance refused: {exc}"
+            ) from exc
+
+        if type(outcome) is ConfirmedGateTransition:
+            if outcome.promoted_track_id != reviewed_track_id:
+                raise SafetyAbort(
+                    "visual course retained promotion changed reviewed identity"
+                )
+            return self._accept_visual_retained_transition(
+                outcome,
+                from_gate_index=from_gate_index,
+                to_gate_index=to_gate_index,
+            )
+        if type(outcome) is CreditedUnboundGateAdvance:
+            return self._accept_visual_unbound_advance(
+                outcome,
+                from_gate_index=from_gate_index,
+                to_gate_index=to_gate_index,
+                race_status=race_status,
+                reviewed_track_id=reviewed_track_id,
+                camera_token=camera_token,
+            )
+        raise SafetyAbort(
+            "visual course advance returned an invalid lifecycle outcome"
+        )
+
+    def _accept_visual_unbound_advance(
+        self,
+        advance: CreditedUnboundGateAdvance,
+        *,
+        from_gate_index: int,
+        to_gate_index: int,
+        race_status: AuthoritativeRaceStatusRef,
+        reviewed_track_id: str,
+        camera_token: VisualCameraFrameToken,
+    ) -> CreditedUnboundGateAdvance:
+        """Record one graph-validated credited-unbound lifecycle outcome."""
+
+        if (
+            type(advance) is not CreditedUnboundGateAdvance
+            or advance.from_gate_index != from_gate_index
+            or advance.to_gate_index != to_gate_index
+            or advance.reviewed_track_id != reviewed_track_id
+            or advance.race_status != race_status
+            or advance.camera_token_at_credit != camera_token
+        ):
+            raise SafetyAbort(
+                "visual credited-unbound advance proof is incomplete"
+            )
+        self._visual_unbound_advance = advance
+        self._visual_latest_graph_snapshot = (
+            self.visual_gate_graph.latest_snapshot
+        )
+        self.recorder.emit(
+            "visual_gate_credited_unbound",
+            from_gate_index=advance.from_gate_index,
+            to_gate_index=advance.to_gate_index,
+            retired_track_id=advance.retired_track_id,
+            reviewed_track_id=advance.reviewed_track_id,
+            race_status=asdict(advance.race_status),
+            camera_token_at_credit=list(
+                advance.camera_token_at_credit.live_identity_tuple
+                or advance.camera_token_at_credit.exact_tuple
+            ),
+            reviewed_latest_token_before_credit=list(
+                advance.reviewed_latest_token_before_credit.live_identity_tuple
+                or advance.reviewed_latest_token_before_credit.exact_tuple
+            ),
+            reviewed_history_length_at_credit=(
+                advance.reviewed_history_length_at_credit
+            ),
+            reviewed_history_length_at_advance=(
+                advance.reviewed_history_length_at_advance
+            ),
+            reviewed_history_sha256=advance.reviewed_history_sha256,
+            alternative_reacquisition_track_ids_at_credit=list(
+                advance.alternative_reacquisition_track_ids_at_credit
+            ),
+            cross_gap_identity_claimed=False,
+            graph=self._visual_graph_summary(
+                self._visual_latest_graph_snapshot
+            ),
+        )
+        return advance
+
+    def _try_visual_reacquired_current(
+        self,
+    ) -> ConfirmedGateReacquisition | GateReacquisitionPending:
+        """Return a local bind or an explicit soft-pending lifecycle outcome."""
+
+        advance = self._visual_unbound_advance
+        update = self.visual_tracker.latest_update
+        if advance is None:
+            raise SafetyAbort(
+                "visual reacquisition lacks a pending credited advance"
+            )
+        if update is None:
+            return GateReacquisitionPending(
+                reason="visual reacquisition lacks a processed camera frame",
+                ambiguous=False,
+            )
+        try:
+            outcome = (
+                self.visual_gate_graph.try_confirm_reacquired_current(
+                    self.visual_tracker,
+                    credited_advance=advance,
+                    camera_token_at_binding=update.token,
+                )
+            )
+        except GateGraphError as exc:
+            raise SafetyAbort(
+                f"visual gate reacquisition refused: {exc}"
+            ) from exc
+        if type(outcome) is GateReacquisitionPending:
+            return outcome
+        reacquisition = outcome
+        if (
+            type(reacquisition) is not ConfirmedGateReacquisition
+            or reacquisition.credited_advance != advance
+            or reacquisition.gate_index != advance.to_gate_index
+            or reacquisition.cross_gap_identity_claimed
+            or reacquisition.history_length_at_binding <= 0
+        ):
+            raise SafetyAbort(
+                "visual gate reacquisition proof is incomplete"
+            )
+        self._visual_transition = reacquisition
+        self._visual_unbound_advance = None
+        self._visual_latest_graph_snapshot = (
+            self.visual_gate_graph.latest_snapshot
+        )
+        self.recorder.emit(
+            "visual_gate_reacquired",
+            from_gate_index=advance.from_gate_index,
+            to_gate_index=advance.to_gate_index,
+            retired_track_id=advance.retired_track_id,
+            reviewed_track_id=advance.reviewed_track_id,
+            reacquired_track_id=reacquisition.reacquired_track_id,
+            camera_token_at_binding=list(
+                reacquisition.camera_token_at_binding.live_identity_tuple
+                or reacquisition.camera_token_at_binding.exact_tuple
+            ),
+            stable_frame_tokens=[
+                list(token.live_identity_tuple or token.exact_tuple)
+                for token in reacquisition.stable_frame_tokens
+            ],
+            history_length_at_binding=(
+                reacquisition.history_length_at_binding
+            ),
+            history_sha256=reacquisition.history_sha256,
+            identity_basis=reacquisition.identity_basis,
+            cross_gap_identity_claimed=(
+                reacquisition.cross_gap_identity_claimed
+            ),
+            graph=self._visual_graph_summary(
+                self._visual_latest_graph_snapshot
+            ),
+        )
+        return reacquisition
 
     def _complete_gate0_pass(
         self,

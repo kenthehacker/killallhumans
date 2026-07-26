@@ -53,6 +53,41 @@ class AmbiguousGatePromotionError(GateGraphError):
     """Race credit cannot uniquely identify a pretracked next gate."""
 
 
+class RequestedGatePromotionUnavailableError(GateGraphError):
+    """The caller's reviewed next-track identity is no longer promotable."""
+
+
+class GateReacquisitionNotReadyError(GateGraphError):
+    """A credited-unbound gate has no compatible command-safe successor yet."""
+
+
+class AmbiguousGateReacquisitionError(GateReacquisitionNotReadyError):
+    """More than one compatible successor prevents fail-closed reacquisition."""
+
+
+class GateGraphPhase(str, Enum):
+    """Explicit visual-authority phase for the rolling graph."""
+
+    INITIAL_UNBOUND = "initial_unbound"
+    CURRENT_BOUND = "current_bound"
+    CREDITED_UNBOUND = "credited_unbound"
+    RACE_FINISHED = "race_finished"
+
+
+@dataclass(frozen=True, slots=True)
+class GateReacquisitionPending:
+    """A soft navigation outcome with no visual command authority."""
+
+    reason: str
+    ambiguous: bool
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not str or not self.reason:
+            raise TypeError("pending reacquisition reason must be non-empty")
+        if type(self.ambiguous) is not bool:
+            raise TypeError("pending ambiguity flag must be an exact bool")
+
+
 class GateRelationshipBasis(str, Enum):
     """Exact observation basis for one rolling current-to-next relationship."""
 
@@ -414,6 +449,196 @@ class ConfirmedGateTransition:
 
 
 @dataclass(frozen=True, slots=True)
+class CreditedUnboundGateAdvance:
+    """Authoritative gate credit recorded without asserting a successor ID.
+
+    The reviewed pre-gap identity is retained as evidence, but the graph is
+    deliberately left without a command-authoritative current track.
+    """
+
+    from_gate_index: int
+    to_gate_index: int
+    retired_track_id: str
+    reviewed_track_id: str
+    race_status: AuthoritativeRaceStatusRef
+    camera_token_at_credit: CameraFrameToken
+    reviewed_first_token: CameraFrameToken
+    reviewed_latest_token_before_credit: CameraFrameToken
+    reviewed_history_length_at_credit: int
+    reviewed_history_length_at_advance: int
+    reviewed_history_sha256: str
+    alternative_reacquisition_track_ids_at_credit: tuple[str, ...] = ()
+
+    @property
+    def promoted_track_id(self) -> None:
+        """No visual identity was promoted at this authoritative boundary."""
+
+        return None
+
+    def __post_init__(self) -> None:
+        _nonnegative_int(self.from_gate_index, "from_gate_index")
+        _nonnegative_int(self.to_gate_index, "to_gate_index")
+        if self.to_gate_index != self.from_gate_index + 1:
+            raise ValueError("credited unbound advance must move exactly one gate")
+        for name in ("retired_track_id", "reviewed_track_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise TypeError(f"{name} must be a non-empty exact string")
+        if self.retired_track_id == self.reviewed_track_id:
+            raise ValueError("reviewed successor must differ from retired current")
+        if type(self.race_status) is not AuthoritativeRaceStatusRef:
+            raise TypeError(
+                "race_status must be an exact AuthoritativeRaceStatusRef"
+            )
+        if (
+            self.race_status.race_finished
+            or self.race_status.active_gate_index != self.to_gate_index
+        ):
+            raise ValueError("race status does not prove this unbound advance")
+        for name in (
+            "camera_token_at_credit",
+            "reviewed_first_token",
+            "reviewed_latest_token_before_credit",
+        ):
+            if type(getattr(self, name)) is not CameraFrameToken:
+                raise TypeError(f"{name} must be an exact CameraFrameToken")
+        for name in (
+            "reviewed_history_length_at_credit",
+            "reviewed_history_length_at_advance",
+        ):
+            _positive_int(getattr(self, name), name)
+        if (
+            self.reviewed_history_length_at_credit
+            > self.reviewed_history_length_at_advance
+        ):
+            raise ValueError("reviewed credit prefix exceeds retained history")
+        if not _token_precedes_or_equals(
+            self.reviewed_first_token,
+            self.reviewed_latest_token_before_credit,
+        ):
+            raise ValueError("reviewed credit history is reversed")
+        if not _token_precedes_or_equals(
+            self.reviewed_latest_token_before_credit,
+            self.camera_token_at_credit,
+        ):
+            raise ValueError("reviewed credit history postdates camera watermark")
+        _history_digest(self.reviewed_history_sha256, "reviewed_history_sha256")
+        alternatives = self.alternative_reacquisition_track_ids_at_credit
+        if (
+            type(alternatives) is not tuple
+            or any(type(track_id) is not str or not track_id for track_id in alternatives)
+            or len(set(alternatives)) != len(alternatives)
+            or self.retired_track_id in alternatives
+            or self.reviewed_track_id in alternatives
+        ):
+            raise TypeError(
+                "alternative reacquisition identities must be a unique exact "
+                "track-id tuple excluding the crossed and reviewed identities"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedGateReacquisition:
+    """A locally stable successor bound after an authoritative unbound advance."""
+
+    credited_advance: CreditedUnboundGateAdvance
+    gate_index: int
+    reacquired_track_id: str
+    camera_token_at_binding: CameraFrameToken
+    reacquired_first_token: CameraFrameToken
+    stable_frame_tokens: tuple[CameraFrameToken, ...]
+    history_length_at_binding: int
+    history_sha256: str
+    cross_gap_identity_claimed: bool = False
+
+    @property
+    def from_gate_index(self) -> int:
+        return self.credited_advance.from_gate_index
+
+    @property
+    def to_gate_index(self) -> int:
+        return self.credited_advance.to_gate_index
+
+    @property
+    def retired_track_id(self) -> str:
+        return self.credited_advance.retired_track_id
+
+    @property
+    def promoted_track_id(self) -> str:
+        return self.reacquired_track_id
+
+    @property
+    def identity_basis(self) -> str:
+        if (
+            self.reacquired_track_id
+            == self.credited_advance.reviewed_track_id
+        ):
+            return "retained-reviewed-local-track"
+        return "fresh-unique-local-track"
+
+    def __post_init__(self) -> None:
+        if type(self.credited_advance) is not CreditedUnboundGateAdvance:
+            raise TypeError(
+                "credited_advance must be an exact CreditedUnboundGateAdvance"
+            )
+        _nonnegative_int(self.gate_index, "gate_index")
+        if self.gate_index != self.credited_advance.to_gate_index:
+            raise ValueError("reacquisition gate index differs from credited gate")
+        if type(self.reacquired_track_id) is not str or not self.reacquired_track_id:
+            raise TypeError("reacquired_track_id must be a non-empty exact string")
+        if self.reacquired_track_id == self.credited_advance.retired_track_id:
+            raise ValueError("reacquisition cannot restore the crossed gate")
+        if (
+            self.reacquired_track_id
+            != self.credited_advance.reviewed_track_id
+            and self.reacquired_track_id
+            not in (
+                self.credited_advance
+                .alternative_reacquisition_track_ids_at_credit
+            )
+        ):
+            raise ValueError(
+                "cross-ID reacquisition lacks credit-bound rolling-graph "
+                "candidate evidence"
+            )
+        for name in ("camera_token_at_binding", "reacquired_first_token"):
+            if type(getattr(self, name)) is not CameraFrameToken:
+                raise TypeError(f"{name} must be an exact CameraFrameToken")
+        if (
+            type(self.stable_frame_tokens) is not tuple
+            or not self.stable_frame_tokens
+            or any(
+                type(token) is not CameraFrameToken
+                for token in self.stable_frame_tokens
+            )
+        ):
+            raise TypeError(
+                "stable_frame_tokens must be a non-empty exact token tuple"
+            )
+        if self.stable_frame_tokens[-1] != self.camera_token_at_binding:
+            raise ValueError("stable reacquisition tail must end at binding token")
+        for predecessor, successor in zip(
+            self.stable_frame_tokens,
+            self.stable_frame_tokens[1:],
+        ):
+            if not _token_strictly_precedes(predecessor, successor):
+                raise ValueError("stable reacquisition tokens must strictly advance")
+        if not _token_precedes_or_equals(
+            self.reacquired_first_token,
+            self.stable_frame_tokens[0],
+        ):
+            raise ValueError("stable reacquisition tail predates track creation")
+        _positive_int(self.history_length_at_binding, "history_length_at_binding")
+        if len(self.stable_frame_tokens) > self.history_length_at_binding:
+            raise ValueError("stable tail exceeds reacquired local history")
+        _history_digest(self.history_sha256, "history_sha256")
+        if type(self.cross_gap_identity_claimed) is not bool:
+            raise TypeError("cross_gap_identity_claimed must be an exact bool")
+        if self.cross_gap_identity_claimed:
+            raise ValueError("fresh reacquisition cannot claim cross-gap identity")
+
+
+@dataclass(frozen=True, slots=True)
 class GateGraphSnapshot:
     tracker_frame_sequence: int
     latest_camera_token: CameraFrameToken
@@ -423,12 +648,19 @@ class GateGraphSnapshot:
     next_candidates: tuple[NextGateCandidate, ...]
     provisional_track_ids: tuple[str, ...]
     relationships: tuple[ObservedGateRelationship, ...]
-    confirmed_transitions: tuple[ConfirmedGateTransition, ...]
+    confirmed_transitions: tuple[
+        ConfirmedGateTransition
+        | ConfirmedGateReacquisition
+        | CreditedUnboundGateAdvance,
+        ...,
+    ]
     next_selection_ambiguous: bool
     authority_usable: bool
     withholding_reason: Optional[str]
     race_finished: bool
     latest_race_status: Optional[AuthoritativeRaceStatusRef]
+    phase: GateGraphPhase = GateGraphPhase.INITIAL_UNBOUND
+    pending_unbound_advance: Optional[CreditedUnboundGateAdvance] = None
 
 
 @dataclass(slots=True)
@@ -485,10 +717,18 @@ class RollingVisualGateGraph:
         if type(config) is not RollingGateGraphConfig:
             raise TypeError("config must be an exact RollingGateGraphConfig")
         self.config = config
+        self._phase = GateGraphPhase.INITIAL_UNBOUND
         self._current_track_id: Optional[str] = None
         self._current_gate_index: Optional[int] = None
+        self._pending_unbound_advance: Optional[
+            CreditedUnboundGateAdvance
+        ] = None
         self._relationships: dict[tuple[str, str], _RelationshipState] = {}
-        self._transitions: list[ConfirmedGateTransition] = []
+        self._transitions: list[
+            ConfirmedGateTransition
+            | ConfirmedGateReacquisition
+            | CreditedUnboundGateAdvance
+        ] = []
         self._last_race_status: Optional[AuthoritativeRaceStatusRef] = None
         self._last_relationship_frame_sequence: Optional[int] = None
         self._race_finished = False
@@ -514,7 +754,12 @@ class RollingVisualGateGraph:
 
         self._tracker(tracker)
         self._race_ref(race_status)
-        if self._current_track_id is not None:
+        if (
+            self._phase is not GateGraphPhase.INITIAL_UNBOUND
+            or self._current_track_id is not None
+            or self._current_gate_index is not None
+            or self._pending_unbound_advance is not None
+        ):
             raise GateGraphError("initial current gate is already bound")
         if race_status.race_finished:
             raise GateGraphError("cannot bind a current gate after race finish")
@@ -535,6 +780,7 @@ class RollingVisualGateGraph:
         self._current_track_id = track_id
         self._current_gate_index = race_status.active_gate_index
         self._last_race_status = race_status
+        self._phase = GateGraphPhase.CURRENT_BOUND
         return self.observe(tracker)
 
     def observe(self, tracker: MultiTargetVisualTracker) -> GateGraphSnapshot:
@@ -655,7 +901,12 @@ class RollingVisualGateGraph:
             raise TypeError("camera_token_at_credit must be an exact CameraFrameToken")
         if self._race_finished:
             raise GateGraphError("cannot promote a gate after race finish")
-        if self._current_track_id is None or self._current_gate_index is None:
+        if (
+            self._phase is not GateGraphPhase.CURRENT_BOUND
+            or self._pending_unbound_advance is not None
+            or self._current_track_id is None
+            or self._current_gate_index is None
+        ):
             raise GateGraphError("current gate is not bound")
         if race_status.race_finished:
             raise GateGraphError(
@@ -680,6 +931,11 @@ class RollingVisualGateGraph:
                 "multiple next-gate tracks have indistinguishable authority"
             )
         if not promotable:
+            if promoted_track_id is not None:
+                raise RequestedGatePromotionUnavailableError(
+                    "no stable pretracked next gate is promotable; "
+                    "requested promotion track is unavailable"
+                )
             raise GateGraphError("no stable pretracked next gate is promotable")
         selected: Optional[NextGateCandidate] = None
         if promoted_track_id is not None:
@@ -692,7 +948,9 @@ class RollingVisualGateGraph:
                 None,
             )
             if selected is None:
-                raise GateGraphError("requested promotion track is not promotable")
+                raise RequestedGatePromotionUnavailableError(
+                    "requested promotion track is not promotable"
+                )
         else:
             selected = promotable[0]
         competing = tuple(
@@ -780,8 +1038,344 @@ class RollingVisualGateGraph:
         self._current_track_id = selected.track_id
         self._current_gate_index = race_status.active_gate_index
         self._last_race_status = race_status
+        self._phase = GateGraphPhase.CURRENT_BOUND
         self.observe(tracker)
         return transition
+
+    def confirm_unbound_advance(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        race_status: AuthoritativeRaceStatusRef,
+        camera_token_at_credit: CameraFrameToken,
+        reviewed_track_id: str,
+    ) -> CreditedUnboundGateAdvance:
+        """Consume exact race credit while withholding successor authority.
+
+        This path is for a reviewed pre-gap next identity that cannot be
+        safely promoted at credit.  It retires the crossed current gate but
+        never relabels another track or claims identity across the visual gap.
+        """
+
+        self._tracker(tracker)
+        self._race_ref(race_status)
+        if type(camera_token_at_credit) is not CameraFrameToken:
+            raise TypeError(
+                "camera_token_at_credit must be an exact CameraFrameToken"
+            )
+        if type(reviewed_track_id) is not str or not reviewed_track_id:
+            raise TypeError("reviewed_track_id must be a non-empty exact string")
+        if self._race_finished:
+            raise GateGraphError("cannot advance an unbound gate after race finish")
+        if (
+            self._phase is not GateGraphPhase.CURRENT_BOUND
+            or self._pending_unbound_advance is not None
+            or self._current_track_id is None
+            or self._current_gate_index is None
+        ):
+            raise GateGraphError("current gate is not bound")
+        if reviewed_track_id == self._current_track_id:
+            raise GateGraphError("reviewed successor equals the current gate")
+        if race_status.race_finished:
+            raise GateGraphError(
+                "race_finished is terminal; use confirm_race_finished"
+            )
+        self._validate_race_advance(race_status)
+        if race_status.active_gate_index != self._current_gate_index + 1:
+            raise GateGraphError("authoritative gate index did not advance by one")
+        if not tracker.has_processed_token(camera_token_at_credit):
+            raise GateGraphError("credit references an unprocessed camera token")
+        self._validate_camera_precedes_race(
+            tracker,
+            camera_token_at_credit,
+            race_status,
+        )
+        try:
+            reviewed_track = tracker.track(reviewed_track_id)
+        except KeyError as exc:
+            raise GateGraphError(
+                "reviewed successor is absent from tracker history"
+            ) from exc
+        snapshot = self.observe(tracker)
+        reviewed_candidate = next(
+            (
+                candidate
+                for candidate in snapshot.next_candidates
+                if candidate.track_id == reviewed_track_id
+            ),
+            None,
+        )
+        if (
+            reviewed_candidate is not None
+            and reviewed_candidate.promotable
+            and not snapshot.next_selection_ambiguous
+        ):
+            raise GateGraphError(
+                "reviewed successor remains directly promotable"
+            )
+        reviewed_boundary = _promotion_credit_boundary(
+            reviewed_track,
+            camera_token_at_credit,
+            race_status,
+        )
+        retired_track_id = self._current_track_id
+        advance = CreditedUnboundGateAdvance(
+            from_gate_index=self._current_gate_index,
+            to_gate_index=race_status.active_gate_index,
+            retired_track_id=retired_track_id,
+            reviewed_track_id=reviewed_track_id,
+            race_status=race_status,
+            camera_token_at_credit=camera_token_at_credit,
+            reviewed_first_token=reviewed_track.first_token,
+            reviewed_latest_token_before_credit=(
+                reviewed_boundary.credit_prefix[-1].token
+            ),
+            reviewed_history_length_at_credit=len(
+                reviewed_boundary.credit_prefix
+            ),
+            reviewed_history_length_at_advance=len(reviewed_track.history),
+            reviewed_history_sha256=visual_track_history_sha256(
+                reviewed_track.history
+            ),
+            alternative_reacquisition_track_ids_at_credit=tuple(
+                sorted(
+                    candidate.track_id
+                    for candidate in snapshot.next_candidates
+                    if (
+                        candidate.promotable
+                        and candidate.track_id != reviewed_track_id
+                    )
+                )
+            ),
+        )
+
+        # Every operation that can reject caller evidence has completed.
+        # Retiring one known track is the only tracker mutation in this commit.
+        tracker.retire_track(retired_track_id)
+        self._current_track_id = None
+        self._current_gate_index = race_status.active_gate_index
+        self._last_race_status = race_status
+        self._pending_unbound_advance = advance
+        self._phase = GateGraphPhase.CREDITED_UNBOUND
+        self.observe(tracker)
+        return advance
+
+    def confirm_reviewed_advance(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        race_status: AuthoritativeRaceStatusRef,
+        camera_token_at_credit: CameraFrameToken,
+        reviewed_track_id: str,
+    ) -> ConfirmedGateTransition | CreditedUnboundGateAdvance:
+        """Atomically consume credit as retained promotion or explicit unbound."""
+
+        try:
+            return self.confirm_transition(
+                tracker,
+                race_status=race_status,
+                camera_token_at_credit=camera_token_at_credit,
+                promoted_track_id=reviewed_track_id,
+            )
+        except (
+            RequestedGatePromotionUnavailableError,
+            AmbiguousGatePromotionError,
+        ):
+            return self.confirm_unbound_advance(
+                tracker,
+                race_status=race_status,
+                camera_token_at_credit=camera_token_at_credit,
+                reviewed_track_id=reviewed_track_id,
+            )
+
+    def try_confirm_reacquired_current(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        credited_advance: CreditedUnboundGateAdvance,
+        camera_token_at_binding: CameraFrameToken,
+    ) -> ConfirmedGateReacquisition | GateReacquisitionPending:
+        """Return soft readiness explicitly; reserve exceptions for hard faults."""
+
+        try:
+            return self.confirm_reacquired_current(
+                tracker,
+                credited_advance=credited_advance,
+                camera_token_at_binding=camera_token_at_binding,
+            )
+        except AmbiguousGateReacquisitionError as exc:
+            return GateReacquisitionPending(
+                reason=str(exc),
+                ambiguous=True,
+            )
+        except GateReacquisitionNotReadyError as exc:
+            return GateReacquisitionPending(
+                reason=str(exc),
+                ambiguous=False,
+            )
+
+    def confirm_reacquired_current(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        credited_advance: CreditedUnboundGateAdvance,
+        camera_token_at_binding: CameraFrameToken,
+    ) -> ConfirmedGateReacquisition:
+        """Bind one unique clean successor on a strictly post-credit frame."""
+
+        self._tracker(tracker)
+        if type(credited_advance) is not CreditedUnboundGateAdvance:
+            raise TypeError(
+                "credited_advance must be an exact CreditedUnboundGateAdvance"
+            )
+        if type(camera_token_at_binding) is not CameraFrameToken:
+            raise TypeError(
+                "camera_token_at_binding must be an exact CameraFrameToken"
+            )
+        if (
+            self._phase is not GateGraphPhase.CREDITED_UNBOUND
+            or self._pending_unbound_advance is None
+            or credited_advance != self._pending_unbound_advance
+            or self._current_track_id is not None
+            or self._current_gate_index != credited_advance.to_gate_index
+            or self._last_race_status != credited_advance.race_status
+        ):
+            raise GateGraphError("credited-unbound advance is not pending")
+        update = tracker.latest_update
+        if (
+            update is None
+            or update.token != camera_token_at_binding
+            or not tracker.has_processed_token(camera_token_at_binding)
+        ):
+            raise GateGraphError(
+                "reacquisition binding token is not the latest processed frame"
+            )
+        if not _token_strictly_precedes(
+            credited_advance.camera_token_at_credit,
+            camera_token_at_binding,
+        ):
+            raise GateReacquisitionNotReadyError(
+                "reacquisition frame does not strictly follow race credit"
+            )
+        race_received_ns = credited_advance.race_status.received_monotonic_ns
+        if (
+            credited_advance.race_status.provenance_basis
+            is not RaceStatusProvenanceBasis.LIVE_INGRESS
+            or race_received_ns is None
+            or update.provenance_basis
+            is not FrameProvenanceBasis.RECEIVER_TIMING_V1
+            or tracker.time_basis_id
+            != credited_advance.race_status.host_clock_id
+            or update.observation_monotonic_ns <= race_received_ns
+            or update.publish_monotonic_ns is None
+            or update.publish_monotonic_ns <= race_received_ns
+            or update.publish_monotonic_ns < update.observation_monotonic_ns
+        ):
+            raise GateReacquisitionNotReadyError(
+                "reacquisition frame is not exact fresh post-credit evidence"
+            )
+
+        visible_candidates = tuple(
+            track
+            for track in update.tracks
+            if (
+                track.visible
+                and track.role is not VisualTrackRole.RETIRED
+                and track.authoritative_gate_index is None
+                and track.track_id != credited_advance.retired_track_id
+            )
+        )
+        if not visible_candidates:
+            raise GateReacquisitionNotReadyError(
+                "no visible post-credit target is ready for local reacquisition"
+            )
+        if (
+            len(visible_candidates) > 1
+            or visible_candidates[0].ambiguous
+        ):
+            raise AmbiguousGateReacquisitionError(
+                "post-credit visual target selection is ambiguous"
+            )
+
+        selected = visible_candidates[0]
+        if (
+            selected.track_id != credited_advance.reviewed_track_id
+            and selected.track_id
+            not in (
+                credited_advance
+                .alternative_reacquisition_track_ids_at_credit
+            )
+        ):
+            raise GateReacquisitionNotReadyError(
+                "sole post-credit target lacks credit-bound rolling-graph "
+                "candidate evidence"
+            )
+        stable_tail = _reacquisition_stable_tail(
+            selected,
+            camera_token_at_binding=camera_token_at_binding,
+            required_frames=self.config.min_current_binding_frames,
+            min_track_confidence=self.config.min_track_confidence,
+            min_association_confidence=(
+                self.config.min_association_confidence
+            ),
+        )
+        if stable_tail is None:
+            raise GateReacquisitionNotReadyError(
+                "sole post-credit target lacks clean stable local evidence"
+            )
+        latest_sample = stable_tail[-1]
+        if (
+            latest_sample.observation_monotonic_ns <= race_received_ns
+            or latest_sample.publication_monotonic_ns is None
+            or latest_sample.publication_monotonic_ns <= race_received_ns
+            or latest_sample.publication_monotonic_ns
+            < latest_sample.observation_monotonic_ns
+        ):
+            raise GateReacquisitionNotReadyError(
+                "compatible successor latest sample is not strictly post-credit"
+            )
+        history_before = selected.history
+        reacquisition = ConfirmedGateReacquisition(
+            credited_advance=credited_advance,
+            gate_index=credited_advance.to_gate_index,
+            reacquired_track_id=selected.track_id,
+            camera_token_at_binding=camera_token_at_binding,
+            reacquired_first_token=selected.first_token,
+            stable_frame_tokens=tuple(
+                sample.token for sample in stable_tail
+            ),
+            history_length_at_binding=len(history_before),
+            history_sha256=visual_track_history_sha256(history_before),
+            cross_gap_identity_claimed=False,
+        )
+
+        # Selection, freshness, and proof construction are complete before
+        # the bounded role/authority commit.
+        tracker.assign_role(selected.track_id, VisualTrackRole.CURRENT)
+        tracker.confirm_authoritative_gate(
+            selected.track_id,
+            gate_index=credited_advance.to_gate_index,
+            race_status_sequence=(
+                credited_advance.race_status.race_status_sequence
+            ),
+            race_status_boot_ms=(
+                credited_advance.race_status.race_status_boot_ms
+            ),
+        )
+        bound = tracker.track(selected.track_id)
+        if bound.history != history_before:
+            raise RuntimeError("reacquisition reset or rewrote local history")
+        self._transitions.append(reacquisition)
+        if len(self._transitions) > self.config.relationship_history_limit:
+            del self._transitions[
+                : len(self._transitions) - self.config.relationship_history_limit
+            ]
+        self._current_track_id = selected.track_id
+        self._current_gate_index = credited_advance.to_gate_index
+        self._pending_unbound_advance = None
+        self._phase = GateGraphPhase.CURRENT_BOUND
+        self.observe(tracker)
+        return reacquisition
 
     def confirm_race_finished(
         self,
@@ -798,6 +1392,8 @@ class RollingVisualGateGraph:
             raise GateGraphError("race status does not assert race_finished")
         if self._race_finished:
             raise GateGraphError("race_finished was already confirmed")
+        if self._phase is GateGraphPhase.INITIAL_UNBOUND:
+            raise GateGraphError("race finish lacks an authoritative gate baseline")
         self._validate_race_advance(race_status, allow_same_gate=True)
         if not tracker.has_processed_token(camera_token_at_finish):
             raise GateGraphError("finish references an unprocessed camera token")
@@ -806,8 +1402,18 @@ class RollingVisualGateGraph:
             camera_token_at_finish,
             race_status,
         )
+        if self._phase is GateGraphPhase.CREDITED_UNBOUND:
+            assert self._pending_unbound_advance is not None
+            self._transitions.append(self._pending_unbound_advance)
+            if len(self._transitions) > self.config.relationship_history_limit:
+                del self._transitions[
+                    : len(self._transitions)
+                    - self.config.relationship_history_limit
+                ]
+            self._pending_unbound_advance = None
         self._race_finished = True
         self._last_race_status = race_status
+        self._phase = GateGraphPhase.RACE_FINISHED
         return self.observe(tracker)
 
     def _update_relationship(
@@ -1035,10 +1641,17 @@ class RollingVisualGateGraph:
             if self._current_track_id is None
             else tracks.get(self._current_track_id)
         )
-        relationships = tuple(
-            self._relationship(key, state)
-            for key, state in sorted(self._relationships.items())
-            if self._current_track_id is None or key[0] == self._current_track_id
+        relationships = (
+            ()
+            if self._pending_unbound_advance is not None
+            else tuple(
+                self._relationship(key, state)
+                for key, state in sorted(self._relationships.items())
+                if (
+                    self._current_track_id is None
+                    or key[0] == self._current_track_id
+                )
+            )
         )
         relationship_by_next = {
             relationship.next_track_id: relationship
@@ -1132,6 +1745,9 @@ class RollingVisualGateGraph:
         if self._race_finished:
             usable = False
             reason = "race_finished"
+        elif self._phase is GateGraphPhase.CREDITED_UNBOUND:
+            usable = False
+            reason = "credited_gate_unbound"
         elif current is None:
             usable = False
             reason = "current_gate_unbound"
@@ -1159,6 +1775,8 @@ class RollingVisualGateGraph:
             withholding_reason=reason,
             race_finished=self._race_finished,
             latest_race_status=self._last_race_status,
+            phase=self._phase,
+            pending_unbound_advance=self._pending_unbound_advance,
         )
 
     @staticmethod
@@ -1709,6 +2327,59 @@ def _pretracked_candidate_evidence(
     )
 
 
+def _reacquisition_stable_tail(
+    track: VisualTrack,
+    *,
+    camera_token_at_binding: CameraFrameToken,
+    required_frames: int,
+    min_track_confidence: float,
+    min_association_confidence: float,
+) -> Optional[tuple[VisualTrackSample, ...]]:
+    """Return the exact local-ID tail eligible for credited reacquisition."""
+
+    if (
+        track.role is VisualTrackRole.RETIRED
+        or track.authoritative_gate_index is not None
+        or not track.visible
+        or track.ambiguous
+        or track.missed_frame_count != 0
+        or track.latest_token != camera_token_at_binding
+        or track.clipping != FrameEdge.NONE
+        or track.center_censored
+        or track.consecutive_frame_count < required_frames
+        or track.confidence < min_track_confidence
+        or track.association_confidence < min_association_confidence
+        or len(track.history) < required_frames
+    ):
+        return None
+    tail = track.history[-required_frames:]
+    if tail[-1].token != camera_token_at_binding:
+        return None
+    if any(
+        sample.clipping != FrameEdge.NONE
+        or sample.center_censored
+        or sample.confidence < min_track_confidence
+        or sample.association_confidence < min_association_confidence
+        or (
+            sample.accepted_association is not None
+            and sample.accepted_association.ambiguous
+        )
+        for sample in tail
+    ):
+        return None
+    for predecessor, successor in zip(tail, tail[1:]):
+        if (
+            successor.tracker_frame_sequence
+            != predecessor.tracker_frame_sequence + 1
+            or not _token_strictly_precedes(
+                predecessor.token,
+                successor.token,
+            )
+        ):
+            return None
+    return tail
+
+
 def _token_precedes_or_equals(
     sample: CameraFrameToken,
     anchor: CameraFrameToken,
@@ -1803,6 +2474,16 @@ def _positive_int(value: object, label: str) -> int:
     if result == 0:
         raise ValueError(f"{label} must be positive")
     return result
+
+
+def _history_digest(value: object, label: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise TypeError(f"{label} must be a lowercase SHA-256 hex string")
+    return value
 
 
 DEFAULT_ROLLING_GATE_GRAPH_CONFIG = RollingGateGraphConfig()

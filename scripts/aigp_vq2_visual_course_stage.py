@@ -29,8 +29,12 @@ from competition.vq2_visual_tracker import (
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    ConfirmedGateReacquisition,
+    ConfirmedGateTransition,
+    CreditedUnboundGateAdvance,
     DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
     GateGraphError,
+    GateReacquisitionPending,
     RaceStatusProvenanceBasis,
 )
 from planning.vq2_course_lifecycle import (
@@ -408,6 +412,23 @@ class _FreshPostCreditHandoff:
     cross_gap_identity_claimed: bool
     retained_history_frame_count: int
     retained_history_span_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfirmedCourseHandoff:
+    """Common command boundary for retained promotion or fresh reacquisition."""
+
+    from_gate_index: int
+    to_gate_index: int
+    retired_track_id: str
+    promoted_track_id: str
+    race_status: AuthoritativeRaceStatusRef
+    camera_token_at_credit: CameraFrameToken
+    promoted_history_sha256: str
+    history_length_before_promotion: int
+    history_length_after_promotion: int
+    promotion_identity_basis: str
+    cross_gap_identity_claimed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -849,14 +870,16 @@ class VisualCourseStageHost(Protocol):
         race_status: AuthoritativeRaceStatusRef,
     ) -> CameraFrameToken: ...
 
-    def _confirm_visual_transition(
+    def _confirm_visual_course_advance(
         self,
         *,
         from_gate_index: int,
         to_gate_index: int,
         race_status: AuthoritativeRaceStatusRef,
-        promoted_track_id: Optional[str] = None,
+        reviewed_track_id: str,
     ) -> Any: ...
+
+    def _try_visual_reacquired_current(self) -> Any: ...
 
     def _record_tick(
         self,
@@ -1415,7 +1438,14 @@ async def _run_visual_course_stage_impl(
         )
         command = AttitudeRateCommand(0.0, 0.0, 0.0, 0.0)
         runtime.validate_command(command)
-        await host._send_flight_command(command)
+        receipt = await host._send_flight_command(
+            command,
+            require_wire_receipt=True,
+        )
+        if not isinstance(receipt, Mapping):
+            raise abort_type(
+                f"{stage} zero command lacks exact outbound receipt"
+            )
         host._record_tick(stage, elapsed_s, command)
         total_zero_commands += 1
         refresh_live_summary()
@@ -2470,6 +2500,72 @@ async def _run_visual_course_stage_impl(
         segments.append(segment)
         refresh_live_summary()
 
+        def finish_from_authoritative_status(
+            race_status: AuthoritativeRaceStatusRef,
+            *,
+            phase: str,
+        ) -> Dict[str, Any]:
+            nonlocal last_race
+            nonlocal latest_authoritative_gate_index
+            nonlocal max_gate_index
+
+            if not race_status.race_finished:
+                raise abort_type(
+                    "visual-course terminal helper lacks race_finished"
+                )
+            _assert_course_attitude_state(
+                host,
+                yaw_reference_rad=yaw_reference_rad,
+                limits=limits,
+                yaw_profile=runtime.yaw_profile,
+                abort_type=abort_type,
+                phase=phase,
+            )
+            finish_token = host._visual_camera_token_at_race_credit(
+                race_status
+            )
+            try:
+                finished_snapshot = (
+                    host.visual_gate_graph.confirm_race_finished(
+                        host.visual_tracker,
+                        race_status=race_status,
+                        camera_token_at_finish=finish_token,
+                    )
+                )
+            except GateGraphError as exc:
+                raise abort_type(
+                    f"visual-course race-finish proof refused: {exc}"
+                ) from exc
+            if not getattr(finished_snapshot, "race_finished", False):
+                raise abort_type("visual-course race finish did not latch")
+            last_race = race_status
+            latest_authoritative_gate_index = int(
+                race_status.active_gate_index
+            )
+            max_gate_index = max(
+                max_gate_index,
+                latest_authoritative_gate_index,
+            )
+            segment["outcome"] = "race_finished"
+            refresh_live_summary()
+            summary = dict(host._visual_course_summary)
+            summary.update(
+                {
+                    "stage": VISUAL_COURSE_STAGE,
+                    "success": True,
+                    "race_finished": True,
+                    "outcome": "race_finished",
+                    "first_causal_blocker": None,
+                    "maximum_authoritative_gate_index": max_gate_index,
+                    "final_gate_index": (
+                        latest_authoritative_gate_index
+                    ),
+                }
+            )
+            host.recorder.emit("visual_course_complete", **summary)
+            host._visual_course_summary = dict(summary)
+            return summary
+
         credited_race: Optional[AuthoritativeRaceStatusRef] = None
 
         def accept_no_wire_race_boundary(
@@ -2667,10 +2763,19 @@ async def _run_visual_course_stage_impl(
                     last_race = race
                 if crossing_started_s is None:
                     crossing_baseline_race = race
-            elif (
-                race.race_finished
-                or race.active_gate_index == current_gate_index + 1
-            ):
+            elif race.race_finished:
+                if relation <= 0:
+                    raise abort_type(
+                        "visual-course transition lacks newer race ingress"
+                    )
+                return finish_from_authoritative_status(
+                    race,
+                    phase=(
+                        f"gate {current_gate_index} delayed terminal "
+                        "acceptance"
+                    ),
+                )
+            elif race.active_gate_index == current_gate_index + 1:
                 if relation <= 0:
                     raise abort_type(
                         "visual-course transition lacks newer race ingress"
@@ -4106,56 +4211,10 @@ async def _run_visual_course_stage_impl(
         )
         refresh_live_summary()
         if credited_race.race_finished:
-            _assert_course_attitude_state(
-                host,
-                yaw_reference_rad=yaw_reference_rad,
-                limits=limits,
-                yaw_profile=runtime.yaw_profile,
-                abort_type=abort_type,
+            return finish_from_authoritative_status(
+                credited_race,
                 phase=f"gate {current_gate_index} terminal acceptance",
             )
-            finish_token = host._visual_camera_token_at_race_credit(
-                credited_race
-            )
-            try:
-                finished_snapshot = (
-                    host.visual_gate_graph.confirm_race_finished(
-                        host.visual_tracker,
-                        race_status=credited_race,
-                        camera_token_at_finish=finish_token,
-                    )
-                )
-            except GateGraphError as exc:
-                raise abort_type(
-                    f"visual-course race-finish proof refused: {exc}"
-                ) from exc
-            if not getattr(finished_snapshot, "race_finished", False):
-                raise abort_type("visual-course race finish did not latch")
-            _assert_course_attitude_state(
-                host,
-                yaw_reference_rad=yaw_reference_rad,
-                limits=limits,
-                yaw_profile=runtime.yaw_profile,
-                abort_type=abort_type,
-                phase=f"gate {current_gate_index} terminal return",
-            )
-            segment["outcome"] = "race_finished"
-            refresh_live_summary()
-            summary = dict(host._visual_course_summary)
-            summary.update(
-                {
-                    "stage": VISUAL_COURSE_STAGE,
-                    "success": True,
-                    "race_finished": True,
-                    "outcome": "race_finished",
-                    "first_causal_blocker": None,
-                    "maximum_authoritative_gate_index": max_gate_index,
-                    "final_gate_index": latest_authoritative_gate_index,
-                }
-            )
-            host.recorder.emit("visual_course_complete", **summary)
-            host._visual_course_summary = dict(summary)
-            return summary
 
         lifecycle = CourseLifecycle.PROMOTE_REACQUIRE
         segment["lifecycle"] = lifecycle.value
@@ -4212,56 +4271,243 @@ async def _run_visual_course_stage_impl(
                 "next-track identity"
             )
         requested_promoted_track_id = passage_admission.preview_track_id
-        transition = host._confirm_visual_transition(
-            from_gate_index=current_gate_index,
-            to_gate_index=current_gate_index + 1,
-            race_status=credited_race,
-            promoted_track_id=requested_promoted_track_id,
-        )
-        if (
-            requested_promoted_track_id is not None
-            and transition.promoted_track_id
-            != requested_promoted_track_id
-        ):
-            raise abort_type(
-                "visual-course transition replaced its reviewed "
-                "next-track identity"
-            )
-        if (
-            transition.from_gate_index != current_gate_index
-            or transition.to_gate_index != current_gate_index + 1
-            or transition.retired_track_id != current_track_id
-            or transition.promoted_track_id == current_track_id
-            or transition.history_length_before_promotion
-            != transition.history_length_after_promotion
-        ):
-            raise abort_type(
-                "visual-course transition promotion is incomplete"
-            )
-        transition_summary.update(
-            {
-                "promotion_confirmed": True,
-                "retired_track_id": transition.retired_track_id,
-                "promoted_track_id": transition.promoted_track_id,
-                "history_length_before_promotion": (
-                    transition.history_length_before_promotion
-                ),
-                "history_length_after_promotion": (
-                    transition.history_length_after_promotion
-                ),
-            }
-        )
-        segment["outcome"] = "transition_confirmed"
-
-        current_gate_index = transition.to_gate_index
-        current_track_id = transition.promoted_track_id
-        max_gate_index = max(max_gate_index, current_gate_index)
-        refresh_live_summary()
         fresh_deadline_s = min(
             course_deadline_s,
             float(runtime.monotonic())
             + limits.post_credit_fresh_frame_timeout_s,
         )
+        course_handoff: _ConfirmedCourseHandoff
+        advance_outcome = host._confirm_visual_course_advance(
+            from_gate_index=current_gate_index,
+            to_gate_index=current_gate_index + 1,
+            race_status=credited_race,
+            reviewed_track_id=requested_promoted_track_id,
+        )
+        if type(advance_outcome) is CreditedUnboundGateAdvance:
+            unbound_advance = advance_outcome
+            if (
+                unbound_advance.from_gate_index
+                != current_gate_index
+                or unbound_advance.to_gate_index
+                != current_gate_index + 1
+                or unbound_advance.retired_track_id
+                != current_track_id
+                or unbound_advance.reviewed_track_id
+                != requested_promoted_track_id
+                or unbound_advance.race_status != credited_race
+            ):
+                raise abort_type(
+                    "visual-course credited-unbound transition is incomplete"
+                )
+            transition_summary.update(
+                {
+                    "promotion_mode": "credited_unbound",
+                    "reviewed_track_id": requested_promoted_track_id,
+                    "credit_consumed_without_visual_current": True,
+                }
+            )
+            segment["outcome"] = "credited_unbound"
+            refresh_live_summary()
+            latest_reacquisition_refusal: Optional[str] = None
+            reacquisition: Optional[ConfirmedGateReacquisition] = None
+
+            while reacquisition is None:
+                _assert_course_attitude_state(
+                    host,
+                    yaw_reference_rad=yaw_reference_rad,
+                    limits=limits,
+                    yaw_profile=runtime.yaw_profile,
+                    abort_type=abort_type,
+                    phase=(
+                        f"gate {unbound_advance.to_gate_index} "
+                        "credited-unbound reacquisition"
+                    ),
+                )
+                candidate = host._try_visual_reacquired_current()
+                if type(candidate) is ConfirmedGateReacquisition:
+                    reacquisition = candidate
+                    break
+                if type(candidate) is not GateReacquisitionPending:
+                    raise abort_type(
+                        "visual-course reacquisition returned an invalid "
+                        "lifecycle outcome"
+                    )
+                latest_reacquisition_refusal = candidate.reason
+
+                now = await pace_tick()
+                if now >= fresh_deadline_s:
+                    raise abort_type(
+                        "visual-course credited gate lacks a bounded fresh "
+                        "visual reacquisition"
+                        + (
+                            ""
+                            if latest_reacquisition_refusal is None
+                            else f": {latest_reacquisition_refusal}"
+                        )
+                    )
+                host._sample()
+                pad_contact = initial_pad_contact_authority()
+                host._watchdog(
+                    require_target=False,
+                    allow_benign_pad_contact=pad_contact,
+                    enforce_benign_pad_budget=True,
+                )
+                race = host._visual_race_status_ref()
+                if race.race_finished:
+                    return finish_from_authoritative_status(
+                        race,
+                        phase=(
+                            f"gate {unbound_advance.to_gate_index} "
+                            "credited-unbound terminal acceptance"
+                        ),
+                    )
+                if (
+                    race.active_gate_index
+                    != unbound_advance.to_gate_index
+                ):
+                    raise abort_type(
+                        "visual-course race boundary changed during "
+                        "credited-unbound reacquisition"
+                    )
+                await send_zero(
+                    (
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{unbound_advance.to_gate_index}/"
+                        "credited-unbound-zero"
+                    ),
+                    float(runtime.monotonic()) - segment_started_s,
+                    yaw_reference_rad=yaw_reference_rad,
+                )
+                segment["post_credit_zero_command_count"] = int(
+                    segment["post_credit_zero_command_count"]
+                ) + 1
+                transition_summary[
+                    "post_transition_zero_command_count"
+                ] = int(
+                    transition_summary[
+                        "post_transition_zero_command_count"
+                    ]
+                ) + 1
+
+            assert reacquisition is not None
+            if (
+                reacquisition.credited_advance != unbound_advance
+                or reacquisition.gate_index
+                != unbound_advance.to_gate_index
+                or reacquisition.reacquired_track_id == current_track_id
+                or reacquisition.cross_gap_identity_claimed
+                or reacquisition.history_length_at_binding <= 0
+            ):
+                raise abort_type(
+                    "visual-course fresh reacquisition proof is incomplete"
+                )
+            course_handoff = _ConfirmedCourseHandoff(
+                from_gate_index=unbound_advance.from_gate_index,
+                to_gate_index=unbound_advance.to_gate_index,
+                retired_track_id=unbound_advance.retired_track_id,
+                promoted_track_id=reacquisition.reacquired_track_id,
+                race_status=unbound_advance.race_status,
+                camera_token_at_credit=(
+                    unbound_advance.camera_token_at_credit
+                ),
+                promoted_history_sha256=reacquisition.history_sha256,
+                history_length_before_promotion=(
+                    reacquisition.history_length_at_binding
+                ),
+                history_length_after_promotion=(
+                    reacquisition.history_length_at_binding
+                ),
+                promotion_identity_basis=(
+                    "rolling-graph-retained-reviewed-fresh-rebind-v1"
+                    if reacquisition.reacquired_track_id
+                    == requested_promoted_track_id
+                    else "rolling-graph-fresh-cross-id-reacquisition-v1"
+                ),
+                cross_gap_identity_claimed=False,
+            )
+            transition_summary.update(
+                {
+                    "promotion_mode": "fresh_reacquisition",
+                    "reacquisition_camera_token": asdict(
+                        reacquisition.camera_token_at_binding
+                    ),
+                    "reacquisition_identity_basis": (
+                        reacquisition.identity_basis
+                    ),
+                }
+            )
+        elif type(advance_outcome) is ConfirmedGateTransition:
+            retained_transition = advance_outcome
+            if (
+                retained_transition.promoted_track_id
+                != requested_promoted_track_id
+                or retained_transition.from_gate_index
+                != current_gate_index
+                or retained_transition.to_gate_index
+                != current_gate_index + 1
+                or retained_transition.retired_track_id
+                != current_track_id
+                or retained_transition.promoted_track_id
+                == current_track_id
+                or retained_transition.history_length_before_promotion
+                != retained_transition.history_length_after_promotion
+            ):
+                raise abort_type(
+                    "visual-course retained transition promotion is incomplete"
+                )
+            course_handoff = _ConfirmedCourseHandoff(
+                from_gate_index=retained_transition.from_gate_index,
+                to_gate_index=retained_transition.to_gate_index,
+                retired_track_id=retained_transition.retired_track_id,
+                promoted_track_id=retained_transition.promoted_track_id,
+                race_status=retained_transition.race_status,
+                camera_token_at_credit=(
+                    retained_transition.camera_token_at_credit
+                ),
+                promoted_history_sha256=(
+                    retained_transition.promoted_history_sha256
+                ),
+                history_length_before_promotion=(
+                    retained_transition.history_length_before_promotion
+                ),
+                history_length_after_promotion=(
+                    retained_transition.history_length_after_promotion
+                ),
+                promotion_identity_basis=(
+                    "rolling-graph-retained-reviewed-identity-v1"
+                ),
+                cross_gap_identity_claimed=False,
+            )
+            transition_summary.update(
+                {
+                    "promotion_mode": "retained_reviewed_identity",
+                    "reviewed_track_id": requested_promoted_track_id,
+                    "credit_consumed_without_visual_current": False,
+                }
+            )
+        else:
+            raise abort_type(
+                "visual-course advance returned an invalid lifecycle outcome"
+            )
+        transition_summary.update(
+            {
+                "promotion_confirmed": True,
+                "retired_track_id": course_handoff.retired_track_id,
+                "promoted_track_id": course_handoff.promoted_track_id,
+                "history_length_before_promotion": (
+                    course_handoff.history_length_before_promotion
+                ),
+                "history_length_after_promotion": (
+                    course_handoff.history_length_after_promotion
+                ),
+            }
+        )
+        segment["outcome"] = "transition_confirmed"
+
+        current_gate_index = course_handoff.to_gate_index
+        current_track_id = course_handoff.promoted_track_id
+        max_gate_index = max(max_gate_index, current_gate_index)
+        refresh_live_summary()
         recovery_admission: Any = None
         recovery_admission_kind: Optional[str] = None
         admitted_recovery_token: Optional[CameraFrameToken] = None
@@ -4280,9 +4526,9 @@ async def _run_visual_course_stage_impl(
                 snapshot,
                 gate_index=current_gate_index,
                 track_id=current_track_id,
-                newer_than=transition.camera_token_at_credit,
+                newer_than=course_handoff.camera_token_at_credit,
                 observed_after_ns=(
-                    transition.race_status.received_monotonic_ns
+                    course_handoff.race_status.received_monotonic_ns
                 ),
             ):
                 token = snapshot.latest_camera_token
@@ -4322,12 +4568,14 @@ async def _run_visual_course_stage_impl(
                     track_id=current_track_id,
                     frame_token=token,
                     promotion_identity_sha256=(
-                        transition.promoted_history_sha256
+                        course_handoff.promoted_history_sha256
                     ),
                     promotion_identity_basis=(
-                        "rolling-graph-atomic-promotion-fresh-current-v1"
+                        course_handoff.promotion_identity_basis
                     ),
-                    cross_gap_identity_claimed=False,
+                    cross_gap_identity_claimed=(
+                        course_handoff.cross_gap_identity_claimed
+                    ),
                     retained_history_frame_count=len(history),
                     retained_history_span_s=(
                         last_observation_ns - first_observation_ns
@@ -4383,10 +4631,15 @@ async def _run_visual_course_stage_impl(
                 phase=f"gate {current_gate_index} post-credit wait",
             )
             race = host._visual_race_status_ref()
-            if (
-                race.race_finished
-                or race.active_gate_index != current_gate_index
-            ):
+            if race.race_finished:
+                return finish_from_authoritative_status(
+                    race,
+                    phase=(
+                        f"gate {current_gate_index} post-credit "
+                        "terminal acceptance"
+                    ),
+                )
+            if race.active_gate_index != current_gate_index:
                 raise abort_type(
                     "visual-course race boundary changed during fresh-frame "
                     "handoff"

@@ -20,7 +20,10 @@ from competition.vq2_visual_tracker import (
     VisualTrackRole,
     VisualTrackSample,
 )
-from planning.vq2_gate_graph import AuthoritativeRaceStatusRef
+from planning.vq2_gate_graph import (
+    AuthoritativeRaceStatusRef,
+    ConfirmedGateTransition,
+)
 from planning.vq2_visual_approach import (
     VisualApproachMode,
     VisualApproachPassageAdmission,
@@ -485,6 +488,7 @@ class _Host:
         self.after_promotion_samples = None
         self.crossing_zero_count = 0
         self.commands = []
+        self.wire_receipts_by_command_index = []
         self.ticks = []
         self.watchdogs = 0
         self.credit_token = None
@@ -592,12 +596,14 @@ class _Host:
             if self.lose_before_credit and self.crossing_zero_count >= 2:
                 self._advance_race()
         if kwargs.get("require_wire_receipt"):
-            token = kwargs["wire_visual_token"]
-            return {
+            receipt = {
                 "call_start_monotonic_ns": (
                     self._last_flight_command_started_ns
                 ),
-                "visual_receiver_authority": {
+            }
+            token = kwargs.get("wire_visual_token")
+            if token is not None:
+                receipt["visual_receiver_authority"] = {
                     "schema": "aigp-vq2-visual-wire-authority/1",
                     "frame_token": asdict(token),
                     "call_start_monotonic_ns": (
@@ -608,7 +614,10 @@ class _Host:
                     ),
                     "publication_pinned_through_transport_return": True,
                 }
-            }
+            self.wire_receipts_by_command_index.append(
+                (len(self.commands) - 1, receipt)
+            )
+            return receipt
         return None
 
     def _assert_visual_receiver_token_current(self, expected_token):
@@ -644,17 +653,39 @@ class _Host:
             self.visual_gate_graph.latest_snapshot.latest_camera_token
         )
         self.promotion_tokens.append(promotion_token)
-        transition = SimpleNamespace(
+        credit_token = self.credit_token
+        assert credit_token is not None
+        credit_sequence = credit_token.publication_sequence
+        promotion_sequence = promotion_token.publication_sequence
+        assert credit_sequence is not None
+        assert promotion_sequence is not None
+        history_length = 17
+        history_length_at_credit = (
+            history_length
+            if promotion_sequence == credit_sequence
+            else history_length - 1
+        )
+        transition = ConfirmedGateTransition(
             from_gate_index=from_gate_index,
             to_gate_index=to_gate_index,
             retired_track_id=retired,
             promoted_track_id=promoted,
-            history_length_before_promotion=17,
-            history_length_after_promotion=17,
-            promoted_history_sha256="a" * 64,
-            camera_token_at_credit=self.credit_token,
-            promoted_latest_token_at_promotion=promotion_token,
             race_status=race_status,
+            camera_token_at_credit=credit_token,
+            promoted_first_token=_token(1),
+            promoted_latest_token_before_credit=credit_token,
+            promoted_history_length_at_credit=history_length_at_credit,
+            promoted_latest_token_at_promotion=promotion_token,
+            pretransition_frame_tokens=tuple(
+                _token(sequence)
+                for sequence in range(
+                    credit_sequence - 2,
+                    credit_sequence + 1,
+                )
+            ),
+            history_length_before_promotion=history_length,
+            history_length_after_promotion=history_length,
+            promoted_history_sha256="a" * 64,
         )
         self.current_gate = to_gate_index
         self.current_track_id = promoted
@@ -667,6 +698,12 @@ class _Host:
         )
         return transition
 
+    def _confirm_visual_course_advance(self, **kwargs):
+        """Return the typed course boundary used by the generic coordinator."""
+
+        kwargs["promoted_track_id"] = kwargs.pop("reviewed_track_id")
+        return self._confirm_visual_transition(**kwargs)
+
     def _record_tick(self, stage, elapsed_s, command):
         self.ticks.append((stage, elapsed_s, command))
 
@@ -677,6 +714,51 @@ def _yaw_profile():
 
 def _context():
     return SimpleNamespace(spawn_pitch_rad=-0.31)
+
+
+def _assert_course_zero_receipts(
+    host: _Host,
+) -> dict[str, list[int]]:
+    """Prove each coordinator handoff zero had one outbound receipt."""
+
+    assert len(host.commands) == len(host.ticks)
+    receipt_indices = [
+        command_index
+        for command_index, receipt
+        in host.wire_receipts_by_command_index
+        if isinstance(receipt, dict)
+    ]
+    by_phase = {
+        "crossing-zero": [],
+        "post-credit-zero": [],
+        "credited-unbound-zero": [],
+    }
+    for command_index, (
+        (command, kwargs, _gate_index),
+        (stage, _elapsed_s, recorded_command),
+    ) in enumerate(zip(host.commands, host.ticks)):
+        matched_phase = next(
+            (
+                phase
+                for phase in by_phase
+                if stage.endswith(phase)
+            ),
+            None,
+        )
+        if matched_phase is None:
+            continue
+        assert recorded_command == command
+        assert (
+            command.roll_rate
+            == command.pitch_rate
+            == command.yaw_rate
+            == command.thrust
+            == 0.0
+        )
+        assert kwargs.get("require_wire_receipt") is True
+        assert receipt_indices.count(command_index) == 1
+        by_phase[matched_phase].append(command_index)
+    return by_phase
 
 
 def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
@@ -889,7 +971,8 @@ def test_nonterminal_transition_refuses_without_reviewed_preview_identity():
 def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
     host = _Host(
         initial_gate=6,
-        finish_gate=6,
+        finish_gate=7,
+        fresh_after_samples=1,
         lose_before_credit=True,
     )
     runtime, _calls = _runtime(host)
@@ -904,19 +987,56 @@ def test_crossing_loss_latches_only_after_credible_passage_and_sends_zeros():
         result["segments"][0]["crossing_wait_zero_command_count"]
         == 2
     )
-    crossing = [
-        command
-        for command, _kwargs, _gate in host.commands
-        if command.thrust == 0.0
+    phase_receipts = _assert_course_zero_receipts(host)
+    gate6_crossing_indices = [
+        command_index
+        for command_index, (stage, _elapsed, _command)
+        in enumerate(host.ticks)
+        if stage == "visual-course/gate6/crossing-zero"
     ]
-    assert len(crossing) == 2
+    first_gate7_navigation_index = next(
+        command_index
+        for command_index, (command, kwargs, gate_index)
+        in enumerate(host.commands)
+        if gate_index == 7
+        and command.thrust > 0.0
+        and kwargs.get("wire_visual_token") is not None
+    )
+    assert len(gate6_crossing_indices) == 2
+    assert phase_receipts["crossing-zero"]
     assert all(
-        command.roll_rate
-        == command.pitch_rate
-        == command.yaw_rate
-        == command.thrust
-        == 0.0
-        for command in crossing
+        command_index < first_gate7_navigation_index
+        for command_index in gate6_crossing_indices
+    )
+
+
+def test_post_credit_zero_is_receipted_before_promoted_gate_navigation():
+    host = _Host(
+        initial_gate=3,
+        finish_gate=4,
+        fresh_after_samples=2,
+    )
+    runtime, _calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    phase_receipts = _assert_course_zero_receipts(host)
+    post_credit_indices = phase_receipts["post-credit-zero"]
+    first_gate4_navigation_index = next(
+        command_index
+        for command_index, (command, kwargs, gate_index)
+        in enumerate(host.commands)
+        if gate_index == 4
+        and command.thrust > 0.0
+        and kwargs.get("wire_visual_token") is not None
+    )
+    assert post_credit_indices
+    assert all(
+        command_index < first_gate4_navigation_index
+        for command_index in post_credit_indices
     )
 
 
