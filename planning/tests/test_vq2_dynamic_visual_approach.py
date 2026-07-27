@@ -2190,6 +2190,20 @@ def test_rehydrated_inner_lineage_guides_multiedge_clip_without_passage() -> Non
     assert rehydrated.aperture_propagated
     assert not rehydrated.aperture_dynamics_qualified
     assert corrected_proposal.passage_admission is None
+    deadline_ns = rehydrated.aperture_prediction_deadline_monotonic_ns
+    assert deadline_ns is not None
+    current_track = tracker.track(current_id)
+    fresh_outer_fallback = planner._target(
+        current_track,
+        now_monotonic_s=(deadline_ns + 1) / 1_000_000_000.0,
+        require_current_authority=True,
+    )
+    assert fresh_outer_fallback.normalized_x == pytest.approx(
+        current_track.center_norm[0]
+    )
+    assert fresh_outer_fallback.normalized_y_down == pytest.approx(
+        current_track.center_norm[1]
+    )
     _accept_proposal(session, tracker, corrected_proposal)
 
     tracker.update(

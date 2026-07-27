@@ -3101,6 +3101,16 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 or now_ns
                 > state.aperture_prediction_deadline_monotonic_ns
             ):
+                # A state may be valid at camera capture and expire before the
+                # later control decision.  If the exact current outer center
+                # is still fully observable, fall back to that fresh steering
+                # measurement so post-credit recovery can use its independent
+                # bounded lease.  Clipped/censored geometry remains refused.
+                if (
+                    track.clipping == FrameEdge.NONE
+                    and not track.center_censored
+                ):
+                    return target
                 raise VisualApproachCurrentGeometryUnavailable(
                     "propagated current-gate state expired"
                 )
