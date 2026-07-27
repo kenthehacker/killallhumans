@@ -192,6 +192,7 @@ class _StagedContext:
 class _PostCreditSuccessorSteering:
     """Exact race-owned handoff with optional bounded steering authority."""
 
+    authority_basis: str
     race_status: AuthoritativeRaceStatusRef
     from_gate_index: int
     to_gate_index: int
@@ -626,13 +627,14 @@ class DynamicVisualCourseSession:
     ) -> Mapping[str, Any]:
         return {
             "basis": (
-                "authoritative-post-credit-propagated-successor-steering-v1"
+                lease.authority_basis
                 if lease.steering_available
                 else "authoritative-post-credit-expired-successor-handoff-v1"
             ),
             "from_gate_index": lease.from_gate_index,
             "to_gate_index": lease.to_gate_index,
             "reviewed_track_id": lease.reviewed_track_id,
+            "steering_track_id": lease.reviewed_track_id,
             "stream_generation": lease.stream_generation,
             "race_status_sequence": (
                 lease.race_status.race_status_sequence
@@ -805,6 +807,9 @@ class DynamicVisualCourseSession:
             monotonic_ns=activation_monotonic_ns,
         )
         lease = _PostCreditSuccessorSteering(
+            authority_basis=(
+                "authoritative-post-credit-propagated-successor-steering-v1"
+            ),
             race_status=race_status,
             from_gate_index=from_gate_index,
             to_gate_index=to_gate_index,
@@ -1217,6 +1222,8 @@ class DynamicVisualCourseSession:
                 "dynamic fresh rebind track is absent"
             ) from exc
         if (
+            not track.history
+            or
             track.latest_token != reacquisition.camera_token_at_binding
             or track.first_token != reacquisition.reacquired_first_token
             or not track.visible
@@ -1228,6 +1235,18 @@ class DynamicVisualCourseSession:
         ):
             raise DynamicCourseError(
                 "dynamic fresh rebind track lacks graph current authority"
+            )
+        binding_publication_ns = (
+            track.history[-1].publication_monotonic_ns
+        )
+        if (
+            type(binding_publication_ns) is not int
+            or type(update.publish_monotonic_ns) is not int
+            or binding_publication_ns != update.publish_monotonic_ns
+            or binding_publication_ns < update.observation_monotonic_ns
+        ):
+            raise DynamicCourseError(
+                "dynamic fresh rebind publication clock is invalid"
             )
         known_track_ids = {
             state.track_id for state in self.core.track_states
@@ -1258,10 +1277,66 @@ class DynamicVisualCourseSession:
             current_track_id=track.track_id,
             successor_track_id=None,
         )
-        self._post_credit_successor_steering = None
+        current = rebound.current
+        activation_monotonic_ns = max(
+            lease.activation_monotonic_ns,
+            binding_publication_ns,
+        )
+        expires_monotonic_ns = (
+            current.state_monotonic_ns
+            + round(
+                self.core.config
+                .successor_prediction_max_horizon_s
+                * 1_000_000_000.0
+            )
+        )
+        fresh_state_available = bool(
+            current.track_id == track.track_id
+            and current.stream_generation == update.token.generation
+            and current.frame_sequence == update.tracker_frame_sequence
+            and current.last_measurement_monotonic_ns
+            == current.state_monotonic_ns
+            and current.visible
+            and not current.ambiguous
+            and current.missed_count == 0
+            and not any(current.censored_axes)
+            and all(
+                value
+                <= (
+                    self.core.config
+                    .successor_prediction_max_extrapolation_rad
+                )
+                + 1e-12
+                for value in current.bearing_std_rad
+            )
+            and activation_monotonic_ns <= expires_monotonic_ns
+        )
+        rebound_lease = replace(
+            lease,
+            authority_basis=(
+                "authoritative-post-credit-fresh-reacquisition-steering-v1"
+            ),
+            reviewed_track_id=track.track_id,
+            stream_generation=update.token.generation,
+            last_measurement_monotonic_ns=(
+                current.last_measurement_monotonic_ns
+            ),
+            last_correction_monotonic_ns=current.state_monotonic_ns,
+            activation_monotonic_ns=activation_monotonic_ns,
+            expires_monotonic_ns=expires_monotonic_ns,
+            steering_available=fresh_state_available,
+            steering_unavailable_reason=(
+                None
+                if fresh_state_available
+                else "fresh_reacquisition_state_unavailable"
+            ),
+            promotion_count=rebound.promotion_count,
+            vertical_target_pitch_ceiling_rad=None,
+        )
+        self._post_credit_successor_steering = rebound_lease
         self._staged = None
         self._last_decision = None
-        return {
+        evidence = {
             "basis": "graph-proven-fresh-post-credit-dynamic-rebind-v1",
             "from_gate_index": lease.from_gate_index,
             "to_gate_index": lease.to_gate_index,
@@ -1273,7 +1348,15 @@ class DynamicVisualCourseSession:
             "stream_generation": update.token.generation,
             "promotion_count": rebound.promotion_count,
             "cross_gap_identity_claimed": False,
+            "steering_available": fresh_state_available,
+            "steering_only": fresh_state_available,
+            "passage_authority": False,
+            "advance_authority": False,
+            "recovery_steering": dict(
+                self._post_credit_lease_evidence(rebound_lease)
+            ),
         }
+        return evidence
 
     def _prepare_roles(
         self,

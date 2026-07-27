@@ -8740,8 +8740,30 @@ async def _run_visual_course_stage_impl(
                         "visual-course dynamic reacquisition evidence is "
                         "invalid"
                     )
-                post_credit_successor_steering_active = False
-                post_credit_dynamic_handoff_active = False
+                rebound_steering_available = dynamic_rebind.get(
+                    "steering_available"
+                )
+                if type(rebound_steering_available) is not bool:
+                    raise abort_type(
+                        "visual-course dynamic reacquisition steering "
+                        "availability is invalid"
+                    )
+                if (
+                    dynamic_rebind.get("steering_only")
+                    is not rebound_steering_available
+                    or dynamic_rebind.get("passage_authority") is not False
+                    or dynamic_rebind.get("advance_authority") is not False
+                ):
+                    raise abort_type(
+                        "visual-course dynamic reacquisition exceeded "
+                        "steering-only authority"
+                    )
+                post_credit_successor_steering_active = (
+                    rebound_steering_available
+                )
+                post_credit_dynamic_handoff_active = (
+                    rebound_steering_available
+                )
                 transition_summary["successor_steering_rebind"] = dict(
                     dynamic_rebind
                 )

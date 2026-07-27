@@ -15,6 +15,8 @@ from competition.vq2_visual_tracker import (
     VisualDetectionFrame,
     VisualInnerApertureGeometry,
     VisualTrack,
+    VisualTrackRole,
+    visual_track_history_sha256,
 )
 from planning.vq2_dynamic_course import (
     DynamicCourseConfig,
@@ -38,6 +40,8 @@ from planning.vq2_dynamic_visual_approach import (
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    ConfirmedGateReacquisition,
+    CreditedUnboundGateAdvance,
     RollingVisualGateGraph,
 )
 from planning.vq2_visual_approach import (
@@ -2483,6 +2487,273 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     )
     assert release["basis"] == (
         "clean-current-post-credit-recovery-release-v1"
+    )
+    assert release["passage_authority"] is False
+    assert release["advance_authority"] is False
+    assert session.post_credit_successor_steering_active is False
+
+
+def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
+    tracker, _graph_state, snapshot, current_id = _graph()
+    session = _session()
+    for monotonic_ns in range(
+        _BASE_NS + 700_000_000,
+        _BASE_NS + 1_000_000_000,
+        10_000_000,
+    ):
+        session.record_imu(
+            ImuAttitudeSample(
+                monotonic_ns=monotonic_ns,
+                body_to_reference_wxyz=(1.0, 0.0, 0.0, 0.0),
+                body_rates_rad_s=(0.0, 0.0, 0.0),
+                source_timestamp_us=monotonic_ns // 1_000,
+                host_clock_id="host-perf-counter",
+            )
+        )
+    reviewed_id = snapshot.next_candidates[0].track_id
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+    for sequence in range(6, 10):
+        tracker.update(_frame(sequence))
+        snapshot = _graph_state.observe(tracker)
+        session.stage_snapshot(
+            snapshot,
+            tracker,
+            expected_gate_index=0,
+            expected_current_track_id=current_id,
+            adjacent_precredit=False,
+        )
+    session.core.bind(
+        current_gate_index=0,
+        current_track_id=current_id,
+        successor_track_id=reviewed_id,
+    )
+    reviewed_state = session.core.course_state().successor
+    assert reviewed_state is not None
+    race_status = _credited_race(
+        reviewed_state.state_monotonic_ns - 1_000_000
+    )
+    horizon_ns = round(
+        session.core.config.successor_prediction_max_horizon_s
+        * 1_000_000_000.0
+    )
+    old_expiry_ns = min(
+        race_status.received_monotonic_ns + horizon_ns,
+        reviewed_state.last_measurement_monotonic_ns + horizon_ns,
+    )
+    wire_ns = reviewed_state.state_monotonic_ns + 2_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.05,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=-0.04,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(
+            0.03,
+            0.02,
+            -0.04,
+            0.275,
+        ),
+        wire_start_monotonic_ns=wire_ns,
+    )
+    expired = session.activate_post_credit_successor_steering(
+        race_status,
+        from_gate_index=0,
+        reviewed_track_id=reviewed_id,
+        activation_monotonic_ns=old_expiry_ns + 1,
+    )
+    assert expired["steering_available"] is False
+    assert expired["steering_unavailable_reason"] == "expired_prediction"
+
+    reviewed_track = tracker.track(reviewed_id)
+    credited_advance = CreditedUnboundGateAdvance(
+        from_gate_index=0,
+        to_gate_index=1,
+        retired_track_id=current_id,
+        reviewed_track_id=reviewed_id,
+        race_status=race_status,
+        camera_token_at_credit=reviewed_track.latest_token,
+        reviewed_first_token=reviewed_track.first_token,
+        reviewed_latest_token_before_credit=reviewed_track.latest_token,
+        reviewed_history_length_at_credit=len(reviewed_track.history),
+        reviewed_history_length_at_advance=len(reviewed_track.history),
+        reviewed_history_sha256=visual_track_history_sha256(
+            reviewed_track.history
+        ),
+    )
+
+    def fresh_frame(
+        sequence: int,
+        *,
+        center_y: float = -0.70,
+        clipping: FrameEdge = FrameEdge.NONE,
+        center_censored: bool = False,
+    ) -> VisualDetectionFrame:
+        base = _frame(sequence)
+        fresh = _detection(
+            2,
+            0.60,
+            center_y=center_y,
+            width=0.16,
+            height=0.24,
+            clipping=clipping,
+            center_censored=center_censored,
+        )
+        return replace(
+            base,
+            detections=(*base.detections, fresh),
+        )
+
+    fresh_id = ""
+    for sequence in range(10, 23):
+        update = tracker.update(fresh_frame(sequence))
+        candidates = tuple(
+            track_id
+            for track_id in update.created_track_ids
+            if track_id not in {current_id, reviewed_id}
+        )
+        if candidates:
+            assert not fresh_id
+            assert len(candidates) == 1
+            fresh_id = candidates[0]
+    assert fresh_id
+    fresh_track = tracker.track(fresh_id)
+    tracker.assign_role(fresh_id, VisualTrackRole.CURRENT)
+    tracker.confirm_authoritative_gate(
+        fresh_id,
+        gate_index=1,
+        race_status_sequence=race_status.race_status_sequence,
+        race_status_boot_ms=race_status.race_status_boot_ms,
+    )
+    fresh_track = tracker.track(fresh_id)
+    reacquisition = ConfirmedGateReacquisition(
+        credited_advance=credited_advance,
+        gate_index=1,
+        reacquired_track_id=fresh_id,
+        camera_token_at_binding=fresh_track.latest_token,
+        reacquired_first_token=fresh_track.first_token,
+        stable_frame_tokens=tuple(
+            sample.token for sample in fresh_track.history[-3:]
+        ),
+        history_length_at_binding=len(fresh_track.history),
+        history_sha256=visual_track_history_sha256(
+            fresh_track.history
+        ),
+        cross_gap_identity_claimed=False,
+    )
+
+    rebound = session.rebind_confirmed_reacquisition(
+        reacquisition,
+        tracker,
+    )
+    rebound_state = session.core.course_state().current
+
+    assert rebound["reviewed_track_id"] == reviewed_id
+    assert rebound["reacquired_track_id"] == fresh_id
+    assert rebound["steering_available"] is True
+    assert rebound["steering_only"] is True
+    assert rebound["passage_authority"] is False
+    assert rebound["advance_authority"] is False
+    assert rebound["recovery_steering"]["steering_track_id"] == fresh_id
+    assert rebound_state.track_id == fresh_id
+    assert rebound_state.visible
+    assert not any(rebound_state.censored_axes)
+    assert rebound["recovery_steering"]["expires_monotonic_ns"] == (
+        rebound_state.state_monotonic_ns + horizon_ns
+    )
+    assert (
+        rebound["recovery_steering"]["expires_monotonic_ns"]
+        > old_expiry_ns
+    )
+
+    clipped_update = tracker.update(
+        fresh_frame(
+            23,
+            center_y=-0.76,
+            clipping=FrameEdge.TOP,
+            center_censored=True,
+        )
+    )
+    clipped_snapshot = replace(
+        snapshot,
+        latest_camera_token=clipped_update.token,
+        tracker_frame_sequence=clipped_update.tracker_frame_sequence,
+        current_track_id=fresh_id,
+        current_gate_index=1,
+        current_track=tracker.track(fresh_id),
+        next_candidates=(),
+    )
+    session.stage_snapshot(
+        clipped_snapshot,
+        tracker,
+        expected_gate_index=1,
+        expected_current_track_id=fresh_id,
+        adjacent_precredit=False,
+    )
+    clipped_state = session.core.course_state().current
+    authority = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=(
+            clipped_update.publish_monotonic_ns + 2_000_000
+        ),
+    )
+
+    assert clipped_state.censored_axes == (False, True)
+    assert clipped_state.aperture_propagated is True
+    assert authority["basis"] == (
+        "authoritative-post-credit-fresh-reacquisition-steering-v1"
+    )
+    assert authority["steering_track_id"] == fresh_id
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+    assert all(
+        math.isfinite(float(authority[name]))
+        for name in (
+            "target_roll_rad",
+            "target_pitch_rad",
+            "yaw_rate_rad_s",
+            "thrust",
+        )
+    )
+    assert (
+        abs(float(authority["target_roll_rad"]))
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= float(authority["target_pitch_rad"])
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert (
+        abs(float(authority["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
+    assert (
+        MIN_THRUST
+        <= float(authority["thrust"])
+        <= MAX_THRUST
+    )
+
+    clean_update = tracker.update(fresh_frame(24))
+    clean_snapshot = replace(
+        clipped_snapshot,
+        latest_camera_token=clean_update.token,
+        tracker_frame_sequence=clean_update.tracker_frame_sequence,
+        current_track=tracker.track(fresh_id),
+    )
+    session.stage_snapshot(
+        clean_snapshot,
+        tracker,
+        expected_gate_index=1,
+        expected_current_track_id=fresh_id,
+        adjacent_precredit=False,
+    )
+    release = session.complete_post_credit_recovery(
+        camera_token=clean_update.token,
     )
     assert release["passage_authority"] is False
     assert release["advance_authority"] is False
