@@ -2900,7 +2900,7 @@ def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():
     )
 
 
-def test_top_fov_outer_fallback_refuses_clipped_or_censored_support():
+def test_top_fov_outer_fallback_refuses_vertically_censored_support():
     sample = SimpleNamespace(
         bbox_norm=(0.10, 0.05, 0.90, 0.95),
         confidence=0.90,
@@ -2911,6 +2911,38 @@ def test_top_fov_outer_fallback_refuses_clipped_or_censored_support():
 
     with pytest.raises(ValueError, match="clean outer fallback"):
         course_stage._top_fov_raw_edge(sample)
+
+
+def test_top_fov_outer_fallback_uses_horizontal_clipping_vertical_extent():
+    sample = SimpleNamespace(
+        # Live Gate-1 publication 211: the right boundary is censored while
+        # both vertical bbox edges remain measured.
+        bbox_norm=(0.8546875, 0.09444444444444444, 1.0, 0.4166666666666667),
+        confidence=0.7817790451255797,
+        clipping=FrameEdge.RIGHT,
+        center_censored=True,
+        inner_aperture=None,
+    )
+
+    edge = course_stage._top_fov_raw_edge(sample)
+    proposal = course_stage._propose_top_fov_pitch_reference(
+        capture_pitch_rad=-0.041220861849587696,
+        raw_top_edge_image_down=edge.top_edge_image_down,
+        raw_top_edge_rate_down_s=None,
+        requested_target_pitch_rad=0.120,
+        prior_target_pitch_rad=-0.1702850432351415,
+        vertical_angle_scale_rad=0.55,
+        active_before=True,
+    )
+
+    assert edge.basis == course_stage.TOP_FOV_OUTER_EDGE_FALLBACK_BASIS
+    assert edge.top_edge_image_down == pytest.approx(-0.8111111111111111)
+    assert proposal.protected_target_pitch_rad <= -0.1702850432351415
+    assert proposal.predicted_protected_top_edge_image_down >= (
+        proposal.predicted_requested_top_edge_image_down
+    )
+    assert proposal.active_after is True
+    assert proposal.limited is True
 
 
 def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():

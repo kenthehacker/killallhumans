@@ -314,9 +314,19 @@ def _top_fov_raw_edge(sample: Any) -> _TopFovRawEdge:
         )
 
     outer_top = _raw_bbox_top_image_down(sample.bbox_norm)
+    clipping = getattr(sample, "clipping", None)
+    center_censored = getattr(sample, "center_censored", None)
+    horizontal_edges = FrameEdge.LEFT | FrameEdge.RIGHT
+    horizontal_only = bool(
+        clipping is not None
+        and clipping != FrameEdge.NONE
+        and clipping & ~horizontal_edges == FrameEdge.NONE
+    )
     if (
-        getattr(sample, "clipping", None) != FrameEdge.NONE
-        or getattr(sample, "center_censored", None) is not False
+        clipping is None
+        or bool(clipping & (FrameEdge.TOP | FrameEdge.BOTTOM))
+        or center_censored is not False
+        and not horizontal_only
     ):
         raise ValueError(
             "complete raw inner aperture and clean outer fallback are "
