@@ -244,7 +244,7 @@ def _accept_proposal(
     )
 
 
-def test_dynamic_graph_adapter_biases_passage_without_unadmitted_successor_yaw():
+def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -272,7 +272,9 @@ def test_dynamic_graph_adapter_biases_passage_without_unadmitted_successor_yaw()
         wire_start_monotonic_ns=wire_ns,
     )
 
-    update = tracker.update(_frame(6))
+    update = tracker.update(
+        _frame(6, current_width=0.355, current_height=0.375)
+    )
     snapshot = graph.observe(tracker)
     proposal = _observe(planner, snapshot, tracker)
     assert proposal.servo_output.target_roll_rad == 0.0
@@ -282,28 +284,46 @@ def test_dynamic_graph_adapter_biases_passage_without_unadmitted_successor_yaw()
     assert session.last_decision.successor_prediction_confidence == 0.0
     _accept_proposal(session, tracker, proposal)
 
-    for sequence in (7, 8):
-        tracker.update(_frame(sequence))
+    for sequence in range(7, 19):
+        growth = 0.015 * (sequence - 5)
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=0.34 + growth,
+                current_height=0.36 + growth,
+            )
+        )
         snapshot = graph.observe(tracker)
         proposal = _observe(planner, snapshot, tracker)
-        if sequence == 7:
-            _accept_proposal(session, tracker, proposal)
+        _accept_proposal(session, tracker, proposal)
 
     assert proposal.servo_output.target_roll_rad > 0.0
-    assert proposal.servo_output.yaw_rate_rad_s == 0.0
     assert proposal.servo_output.target_pitch_rad <= 0.12
-    assert proposal.servo_output.brake_reason == "dynamic_plane_not_ready"
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
     assert session.last_decision.current_gate_index == 0
     assert session.last_decision.successor_track_id is not None
+    assert all(
+        clearance > 0.0
+        for clearance in (
+            session.last_decision.centered_crossing_clearance_norm
+        )
+    )
+    assert session.last_decision.successor_clearance_dwell_s > (
+        session.core.config.successor_clearance_dwell_s
+    )
+    assert session.last_decision.successor_clearance_authority > 0.0
     assert session.last_decision.passage_point_norm[0] > 0.0
-    assert session.last_decision.successor_weight == 0.0
+    assert session.last_decision.successor_weight > 0.0
     assert session.last_decision.passage_yaw_authority > 0.0
-    assert session.last_decision.successor_yaw_contribution_rad == 0.0
-    assert session.last_decision.proposed_command.target_pitch_rad < 0.0
-    assert 0.0 < session.last_decision.successor_passage_authority < 0.15
-    assert not session.last_decision.braking
+    assert session.last_decision.successor_yaw_contribution_rad > 0.0
+    assert session.last_decision.successor_passage_authority > 0.0
+    assert all(
+        clearance > 0.0
+        for clearance in (
+            session.last_decision.predicted_crossing_clearance_norm
+        )
+    )
     assert session.evidence_summary()["controller_family"] == (
         DYNAMIC_CONTROLLER_FAMILY
     )
