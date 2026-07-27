@@ -2621,6 +2621,23 @@ def _approach_propagated_visibility_gap_authority(
         | FrameEdge.BOTTOM
     )
     vertical_clipping_edges = int(FrameEdge.TOP | FrameEdge.BOTTOM)
+    last_fov_token = fov_summary.get("last_camera_token")
+    direct_outer_token_lineage = bool(
+        isinstance(last_fov_token, Mapping)
+        and isinstance(last_visible, Mapping)
+        and last_fov_token.get("stream_id")
+        == last_visible.get("stream_id")
+        and last_fov_token.get("generation")
+        == last_visible.get("generation")
+        and type(last_fov_token.get("publication_sequence")) is int
+        and type(last_visible.get("publication_sequence")) is int
+        and 0
+        <= (
+            int(last_visible["publication_sequence"])
+            - int(last_fov_token["publication_sequence"])
+        )
+        <= 1
+    )
     propagated_fov_lineage = bool(
         isinstance(last_handoff, Mapping)
         and last_handoff.get("basis")
@@ -2659,6 +2676,11 @@ def _approach_propagated_visibility_gap_authority(
         and last_visible_clipping & vertical_clipping_edges == 0
         and fov_summary.get("last_raw_top_edge_basis")
         == TOP_FOV_OUTER_EDGE_FALLBACK_BASIS
+        # A visible proposal can be superseded by the first missing
+        # publication before its raw FOV summary reaches the wire.  For a
+        # horizontal-only loss, retain the last accepted outer-edge pitch
+        # authority across exactly that one-publication race.
+        and direct_outer_token_lineage
     )
     if (
         not isinstance(evidence, Mapping)
@@ -2696,7 +2718,10 @@ def _approach_propagated_visibility_gap_authority(
             and not direct_outer_fov_lineage
         )
         or fov_summary.get("last_track_id") != track_id
-        or fov_summary.get("last_camera_token") != dict(last_visible)
+        or (
+            fov_summary.get("last_camera_token") != dict(last_visible)
+            and not direct_outer_fov_lineage
+        )
         or not (
             propagated_fov_lineage
             or retained_raw_fov_lineage

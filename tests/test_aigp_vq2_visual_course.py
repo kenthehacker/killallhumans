@@ -3130,6 +3130,10 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert authority.evidence["steering_only"] is True
     assert authority.evidence["passage_authority"] is False
     assert authority.evidence["advance_authority"] is False
+    last_visible_publication = (
+        last_visible_token.publication_sequence
+    )
+    assert last_visible_publication is not None
 
     # Safe top clearance leaves the pitch limiter inactive.  That must not
     # block exact local-state steering through a horizontal-only loss.
@@ -3148,6 +3152,54 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     )
     assert inactive_horizontal.evidence["steering_only"] is True
     fov_summary["active"] = True
+
+    # The first missing publication may supersede one final visible proposal.
+    # The prior accepted outer-edge pitch remains bounded authority for that
+    # horizontal-only race, but no older or cross-stream anchor does.
+    one_publication_prior = replace(
+        last_visible_token,
+        publication_sequence=last_visible_publication - 1,
+    )
+    fov_summary["last_camera_token"] = asdict(one_publication_prior)
+    superseded_horizontal = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    )
+    assert superseded_horizontal.command.target_pitch_rad == pytest.approx(
+        -0.35
+    )
+    for stale_token in (
+        replace(
+            last_visible_token,
+            publication_sequence=last_visible_publication - 2,
+        ),
+        replace(
+            one_publication_prior,
+            stream_id="other-camera-stream",
+        ),
+        replace(
+            one_publication_prior,
+            generation=one_publication_prior.generation + 1,
+        ),
+    ):
+        fov_summary["last_camera_token"] = asdict(stale_token)
+        with pytest.raises(
+            ValueError,
+            match="exact propagated/FOV authority",
+        ):
+            course_stage._approach_propagated_visibility_gap_authority(
+                evidence,
+                snapshot=snapshot,
+                gate_index=0,
+                track_id="track-0",
+                fov_summary=fov_summary,
+            )
+    fov_summary["last_camera_token"] = asdict(last_visible_token)
 
     snapshot.current_track.clipping = FrameEdge.TOP
     vertical_evidence = {
@@ -3192,10 +3244,6 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
         )
     fov_summary["active"] = True
 
-    last_visible_publication = (
-        last_visible_token.publication_sequence
-    )
-    assert last_visible_publication is not None
     fov_summary["last_inner_camera_token"] = asdict(
         replace(
             last_visible_token,
