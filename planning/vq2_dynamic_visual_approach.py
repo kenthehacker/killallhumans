@@ -621,6 +621,9 @@ class DynamicVisualCourseSession:
                     "passage_point_norm": list(
                         decision.passage_point_norm
                     ),
+                    "successor_passage_authority": (
+                        decision.successor_passage_authority
+                    ),
                     "passage_error_norm": list(
                         decision.passage_error_norm
                     ),

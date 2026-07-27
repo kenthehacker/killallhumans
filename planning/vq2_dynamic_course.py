@@ -467,6 +467,8 @@ class DynamicCourseConfig:
     vertical_settled_rate_norm_s: float = 0.30
     passage_arm_min_log_scale: float = -0.80
     passage_successor_bias: float = 0.55
+    successor_passage_far_authority: float = 0.25
+    successor_passage_full_confidence: float = 0.50
     crossing_prediction_max_horizon_s: float = 1.20
     successor_prediction_max_horizon_s: float = 0.40
     successor_prediction_max_extrapolation_rad: float = 0.18
@@ -550,6 +552,8 @@ class DynamicCourseConfig:
             "scale_beta",
             "residual_alpha",
             "passage_successor_bias",
+            "successor_passage_far_authority",
+            "successor_passage_full_confidence",
             "successor_maximum_weight",
         ):
             value = _finite(getattr(self, name), name)
@@ -684,6 +688,7 @@ class GuidanceDecision:
     camera_current_center_norm: Vector2
     current_aperture_half_size_norm: Vector2 | None
     passage_point_norm: Vector2
+    successor_passage_authority: float
     passage_error_norm: Vector2
     aperture_margin_norm: Vector2
     crossing_prediction_horizon_s: float
@@ -1043,6 +1048,9 @@ class DynamicCourseCore:
         self._successor_track_id: str | None = None
         self._promotion_count = 0
         self._last_promotion_ns: int | None = None
+        self._successor_passage_track_id: str | None = None
+        self._successor_passage_authority = 0.0
+        self._successor_passage_authority_ns: int | None = None
         self._governor = CommandGovernor(self.config.governor)
 
     @property
@@ -1833,6 +1841,14 @@ class DynamicCourseCore:
             successor,
             monotonic_ns,
         )
+        successor_passage_authority = (
+            self._successor_passage_bias_authority(
+                current,
+                successor,
+                successor_prediction,
+                monotonic_ns,
+            )
+        )
         successor_passage_ready = (
             successor is not None
             and successor.sample_count >= 4
@@ -1868,6 +1884,7 @@ class DynamicCourseCore:
             current_aperture,
             current_center,
             successor_center,
+            successor_passage_authority,
         )
         passage_error = (
             current_center[0] + passage[0],
@@ -1986,6 +2003,9 @@ class DynamicCourseCore:
             camera_current_center_norm=camera_current_center,
             current_aperture_half_size_norm=current_aperture,
             passage_point_norm=passage,
+            successor_passage_authority=(
+                successor_passage_authority
+            ),
             passage_error_norm=passage_error,
             aperture_margin_norm=margins,
             crossing_prediction_horizon_s=(
@@ -2159,6 +2179,7 @@ class DynamicCourseCore:
         aperture_half_size_norm: Vector2 | None,
         current_center_norm: Vector2,
         successor_center_norm: Vector2 | None,
+        successor_authority: float,
     ) -> tuple[Vector2, Vector2]:
         aperture = aperture_half_size_norm or (0.42, 0.32)
         available = (
@@ -2169,13 +2190,20 @@ class DynamicCourseCore:
             successor_center_norm is None
         ):
             return (0.0, 0.0), available
+        successor_authority = _clamp(
+            successor_authority,
+            0.0,
+            1.0,
+        )
         offset = (
             successor_center_norm[0] - current_center_norm[0],
             successor_center_norm[1] - current_center_norm[1],
         )
         passage = tuple(
             _clamp(
-                self.config.passage_successor_bias * offset[axis],
+                self.config.passage_successor_bias
+                * successor_authority
+                * offset[axis],
                 -available[axis],
                 available[axis],
             )
@@ -2185,6 +2213,93 @@ class DynamicCourseCore:
             max(0.0, available[axis] - abs(passage[axis])) for axis in range(2)
         )
         return passage, remaining  # type: ignore[return-value]
+
+    def _successor_passage_bias_authority(
+        self,
+        current: TrackDynamicState,
+        successor: TrackDynamicState | None,
+        prediction: _SuccessorPrediction | None,
+        monotonic_ns: int,
+    ) -> float:
+        """Admit successor passage bias continuously, never at sample four."""
+
+        if successor is None:
+            self._successor_passage_track_id = None
+            self._successor_passage_authority = 0.0
+            self._successor_passage_authority_ns = None
+            return 0.0
+        if self._successor_passage_track_id != successor.track_id:
+            self._successor_passage_track_id = successor.track_id
+            self._successor_passage_authority = 0.0
+            self._successor_passage_authority_ns = None
+        clean_prediction = bool(
+            prediction is not None
+            and prediction.confidence > 0.0
+            and current.visible
+            and not current.ambiguous
+            and not any(current.censored_axes)
+            and successor.visible
+            and not successor.ambiguous
+            and not successor.censored_axes[0]
+        )
+        if clean_prediction:
+            ttc = current.time_to_contact_s
+            ttc_progress = (
+                0.0
+                if ttc is None
+                else _clamp(
+                    (
+                        self.config.successor_lookahead_ttc_s - ttc
+                    )
+                    / (
+                        self.config.successor_lookahead_ttc_s
+                        - self.config.successor_full_weight_ttc_s
+                    ),
+                    0.0,
+                    1.0,
+                )
+            )
+            scale_lower_bound = (
+                current.log_scale - 2.0 * current.log_scale_std
+            )
+            scale_start = self.config.passage_arm_min_log_scale - 0.25
+            scale_progress = _clamp(
+                (
+                    scale_lower_bound - scale_start
+                )
+                / (self.config.passage_arm_min_log_scale - scale_start),
+                0.0,
+                1.0,
+            )
+            closure_progress = max(ttc_progress, scale_progress)
+            closure_authority = (
+                self.config.successor_passage_far_authority
+                + (
+                    1.0
+                    - self.config.successor_passage_far_authority
+                )
+                * closure_progress
+            )
+            self._successor_passage_authority = _clamp(
+                (
+                    prediction.confidence
+                    / self.config.successor_passage_full_confidence
+                )
+                * closure_authority,
+                0.0,
+                1.0,
+            )
+            self._successor_passage_authority_ns = monotonic_ns
+            return self._successor_passage_authority
+        if self._successor_passage_authority_ns is not None:
+            age_s = (
+                monotonic_ns - self._successor_passage_authority_ns
+            ) / _NS_PER_SECOND
+            if 0.0 <= age_s <= self.config.dropout_hold_s:
+                return self._successor_passage_authority
+        self._successor_passage_authority = 0.0
+        self._successor_passage_authority_ns = None
+        return 0.0
 
     def _current_yaw_release(
         self,
@@ -2285,7 +2400,7 @@ class DynamicCourseCore:
             return 0.0
         ttc = current.time_to_contact_s
         ttc_progress = (
-            current_yaw_release
+            1.0
             if ttc is None
             else _clamp(
                 (
@@ -2302,6 +2417,7 @@ class DynamicCourseCore:
         return (
             self.config.successor_maximum_weight
             * passage_yaw_authority
+            * current_yaw_release
             * ttc_progress
         )
 
@@ -2523,11 +2639,15 @@ class DynamicCourseCore:
             (1.0 - current_yaw_release)
             * camera_current_bearing[0]
         )
+        progressive_successor_limit = (
+            self.config.successor_max_yaw_contribution_rad
+            * current_yaw_release
+        )
         successor_contribution = _clamp(
             successor_weight
             * (successor_bearing[0] - current_gate_heading),
-            -self.config.successor_max_yaw_contribution_rad,
-            self.config.successor_max_yaw_contribution_rad,
+            -progressive_successor_limit,
+            progressive_successor_limit,
         )
         prediction_confidence = (
             0.0

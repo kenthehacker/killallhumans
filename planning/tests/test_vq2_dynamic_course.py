@@ -166,6 +166,7 @@ def _observation(
     aperture: tuple[float, float] = (0.42, 0.34),
     clipping: FrameEdge = FrameEdge.NONE,
     visible: bool = True,
+    confidence: float = 0.95,
 ) -> GateObservation:
     timestamp = round(time_s * NS)
     return GateObservation(
@@ -180,7 +181,7 @@ def _observation(
         aperture_half_size_norm=aperture if visible else None,
         clipping=clipping,
         visible=visible,
-        confidence=0.95,
+        confidence=confidence,
         measurement_std=(0.005, 0.005, 0.01),
     )
 
@@ -436,6 +437,60 @@ def test_8319198e_unadmitted_successor_cannot_force_gate0_braking() -> None:
     assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
 
 
+def test_1c2ec48a_four_sample_successor_cannot_step_passage_bias() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90, pitch=-0.02))
+    for sequence in range(1, 5):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=0.00625,
+                y=-0.033333333333333326,
+                log_scale=-1.79,
+                aperture=(0.125, 0.2222222222222222),
+                confidence=0.85,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.321875,
+                y=-0.11111111111111116,
+                log_scale=-2.62,
+                confidence=0.42,
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.13)
+    decision = core.guide(1_130_000_000)
+    full_step_vertical = (
+        core.config.passage_successor_bias
+        * (
+            -0.11111111111111116
+            - -0.033333333333333326
+        )
+    )
+
+    assert decision.successor_weight == 0.0
+    assert 0.0 < decision.successor_passage_authority < 0.10
+    assert abs(decision.passage_point_norm[1]) < 0.005
+    assert abs(decision.passage_point_norm[1]) < (
+        0.10 * abs(full_step_vertical)
+    )
+    assert decision.predicted_crossing_clearance_norm[1] > 0.0
+    assert decision.braking is False
+
+
 def test_admitted_off_axis_successor_still_brakes_before_intercept() -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -633,41 +688,14 @@ def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
             legacy_predictions[1:],
         )
     ) == 3
-    active = [
-        decision
+    # This replay never establishes a horizontally safe current-aperture
+    # passage.  Successor prediction therefore remains lookahead evidence,
+    # but it gets no yaw leverage with which to recreate the observed hunt.
+    assert all(
+        decision.successor_yaw_contribution_rad == 0.0
         for decision in decisions
-        if abs(decision.successor_yaw_contribution_rad) > 1e-8
-    ]
-    assert len(active) >= 8
-    assert any(decision.current_yaw_release == 0.0 for decision in active)
-    assert all(
-        0.0 < decision.successor_yaw_contribution_rad
-        <= core.config.successor_max_yaw_contribution_rad
-        for decision in active
     )
-    assert all(
-        left.successor_yaw_contribution_rad
-        * right.successor_yaw_contribution_rad
-        >= 0.0
-        for left, right in zip(active, active[1:])
-    )
-    for decision in active:
-        camera_bearing = math.atan(
-            decision.camera_current_center_norm[0]
-            * core.config.horizontal_angle_scale_rad
-        )
-        current_heading = (
-            (1.0 - decision.current_yaw_release) * camera_bearing
-        )
-        combined_heading = (
-            current_heading
-            + decision.successor_yaw_contribution_rad
-        )
-        # Before near-plane release, even a coherent successor can only damp
-        # current-gate recentering.  It cannot reverse or saturate yaw.
-        if decision.current_yaw_release < 1.0:
-            assert combined_heading * current_heading >= 0.0
-            assert abs(combined_heading) <= abs(current_heading) + 1e-12
+    for decision in decisions:
         assert (
             abs(decision.proposed_command.yaw_rate_rad_s)
             <= MAX_YAW_RATE_RAD_S
