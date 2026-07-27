@@ -25,6 +25,11 @@ from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateTransition,
 )
+from planning.vq2_course_lifecycle import (
+    LatchedMeasurementMode,
+    NearPlaneEvidence,
+    NearPlaneLatch,
+)
 from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
@@ -234,6 +239,52 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.crossing_x_q_rate_s == pytest.approx(0.30)
     assert sample.crossing_y_q_rate_s == pytest.approx(-0.40)
     assert sample.post_governor_contact_budget_s == pytest.approx(0.25)
+
+
+def test_superseded_observation_bridges_latched_current_loss() -> None:
+    sample = _dynamic_near_plane_sample(
+        _valid_dynamic_near_plane_evidence()
+    )
+    assert sample is not None
+    latch = NearPlaneLatch(
+        evidence=NearPlaneEvidence(
+            samples=(sample,),
+            last_observed_sample=sample,
+        ),
+        anchor_sample=sample,
+        required_corridor_frames=1,
+        crossing_min_log_scale=-1.0,
+        basis=course_stage.DYNAMIC_NEAR_PLANE_LATCH_BASIS,
+    )
+    planned_token = _token(3)
+    loss_token = _token(4)
+    snapshot = _snapshot(
+        0,
+        "vq2-track-000001",
+        4,
+        visible=False,
+    )
+
+    previous_observation = (
+        course_stage._latest_latched_observation_token(
+            None,
+            planned_token,
+            sample.camera_token,
+        )
+    )
+    mode = course_stage._classify_latched_snapshot(
+        latch,
+        previous_camera_token=previous_observation,
+        camera_token=loss_token,
+        snapshot=snapshot,
+        current_gate_index=0,
+        min_track_confidence=0.5,
+        min_association_confidence=0.5,
+    )
+
+    assert previous_observation == planned_token
+    assert snapshot.current_track.latest_token == planned_token
+    assert mode is LatchedMeasurementMode.CREDIT_WAIT
 
 
 def test_qualified_propagated_aperture_preserves_clipped_wire_provenance():

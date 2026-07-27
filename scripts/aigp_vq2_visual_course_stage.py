@@ -3214,6 +3214,34 @@ def _token_strictly_newer(
     )
 
 
+def _latest_latched_observation_token(
+    *tokens: Optional[CameraFrameToken],
+) -> Optional[CameraFrameToken]:
+    """Return the latest compatible tracker observation consumed by guidance.
+
+    A proposal replaced before its wire slot still advances visual-state
+    lineage, but it never supplies command or passage authority.  Returning
+    ``None`` for crossed camera epochs keeps the subsequent latch classifier
+    fail-closed.
+    """
+
+    latest: Optional[CameraFrameToken] = None
+    for token in tokens:
+        if token is None:
+            continue
+        if type(token) is not CameraFrameToken:
+            return None
+        if latest is None or token == latest:
+            latest = token
+            continue
+        if _token_strictly_newer(token, latest):
+            latest = token
+            continue
+        if not _token_strictly_newer(latest, token):
+            return None
+    return latest
+
+
 def _classify_latched_snapshot(
     latch: NearPlaneLatch,
     *,
@@ -6927,8 +6955,11 @@ async def _run_visual_course_stage_impl(
                     continue
 
                 previous_visible_token = (
-                    censored_passage_coast_last_observed_token
-                    or last_clean_passage_token
+                    _latest_latched_observation_token(
+                        censored_passage_coast_last_observed_token,
+                        last_planned_token,
+                        last_clean_passage_token,
+                    )
                 )
                 measurement_mode: Optional[
                     LatchedMeasurementMode
