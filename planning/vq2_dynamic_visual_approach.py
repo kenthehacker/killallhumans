@@ -69,6 +69,10 @@ _HOST_CLOCK_ID = "host-perf-counter"
 BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ = (0.0, 1.0, 0.0, 0.0)
 
 
+class PostCreditSuccessorSteeringUnavailable(DynamicCourseError):
+    """Optional predicted steering ended while race-owned handoff remains."""
+
+
 def _complete_current_inner_geometry(
     track: VisualTrack,
 ) -> VisualInnerApertureGeometry | None:
@@ -127,7 +131,7 @@ class _StagedContext:
 
 @dataclass(frozen=True, slots=True)
 class _PostCreditSuccessorSteering:
-    """Exact bounded lease for the successor already retained at race credit."""
+    """Exact race-owned handoff with optional bounded steering authority."""
 
     race_status: AuthoritativeRaceStatusRef
     from_gate_index: int
@@ -137,6 +141,8 @@ class _PostCreditSuccessorSteering:
     last_measurement_monotonic_ns: int
     activation_monotonic_ns: int
     expires_monotonic_ns: int
+    steering_available: bool
+    steering_unavailable_reason: str | None
     promotion_count: int
 
 
@@ -351,7 +357,8 @@ class DynamicVisualCourseSession:
 
     @property
     def post_credit_successor_steering_active(self) -> bool:
-        return self._post_credit_successor_steering is not None
+        lease = self._post_credit_successor_steering
+        return bool(lease is not None and lease.steering_available)
 
     def record_imu(self, sample: ImuAttitudeSample) -> None:
         self.core.record_imu(sample)
@@ -550,6 +557,8 @@ class DynamicVisualCourseSession:
         return {
             "basis": (
                 "authoritative-post-credit-propagated-successor-steering-v1"
+                if lease.steering_available
+                else "authoritative-post-credit-expired-successor-handoff-v1"
             ),
             "from_gate_index": lease.from_gate_index,
             "to_gate_index": lease.to_gate_index,
@@ -567,7 +576,11 @@ class DynamicVisualCourseSession:
             "activation_monotonic_ns": lease.activation_monotonic_ns,
             "expires_monotonic_ns": lease.expires_monotonic_ns,
             "promotion_count": lease.promotion_count,
-            "steering_only": True,
+            "steering_available": lease.steering_available,
+            "steering_unavailable_reason": (
+                lease.steering_unavailable_reason
+            ),
+            "steering_only": lease.steering_available,
             "passage_authority": False,
             "advance_authority": False,
         }
@@ -580,11 +593,13 @@ class DynamicVisualCourseSession:
         reviewed_track_id: str,
         activation_monotonic_ns: int,
     ) -> Mapping[str, Any]:
-        """Promote an already-bound successor for one bounded steering lease.
+        """Promote a reviewed successor and expose steering only while valid.
 
         The authoritative race status supplies gate ownership.  This method
         changes only the dynamic controller's current/successor roles; rolling
         graph promotion remains exclusively owned by the graph coordinator.
+        An expired prediction still records the race-owned handoff needed for
+        an exact graph-proven reacquisition, but grants no command authority.
         """
 
         if type(race_status) is not AuthoritativeRaceStatusRef:
@@ -656,8 +671,6 @@ class DynamicVisualCourseSession:
             or successor.track_id != reviewed_track_id
             or successor.stream_generation
             != state.current.stream_generation
-            or successor.sample_count < 4
-            or successor.ambiguous
         ):
             raise DynamicCourseError(
                 "post-credit steering lacks the reviewed bound successor"
@@ -677,11 +690,28 @@ class DynamicVisualCourseSession:
             activation_monotonic_ns < received_ns
             or activation_monotonic_ns
             < successor.state_monotonic_ns
-            or activation_monotonic_ns > expires_ns
         ):
             raise DynamicCourseError(
                 "post-credit activation is outside its causal bounded horizon"
             )
+        steering_available = bool(
+            successor.sample_count >= 4
+            and not successor.ambiguous
+            and activation_monotonic_ns <= expires_ns
+        )
+        steering_unavailable_reason = (
+            None
+            if steering_available
+            else (
+                "ambiguous_reviewed_state"
+                if successor.ambiguous
+                else (
+                    "insufficient_reviewed_state"
+                    if successor.sample_count < 4
+                    else "expired_prediction"
+                )
+            )
+        )
         applied = self._last_applied_sample
         if (
             applied is None
@@ -707,6 +737,8 @@ class DynamicVisualCourseSession:
             last_measurement_monotonic_ns=last_measurement_ns,
             activation_monotonic_ns=activation_monotonic_ns,
             expires_monotonic_ns=expires_ns,
+            steering_available=steering_available,
+            steering_unavailable_reason=steering_unavailable_reason,
             promotion_count=promoted.promotion_count,
         )
         self._post_credit_successor_steering = lease
@@ -730,12 +762,21 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "post-credit successor steering is not active"
             )
-        if (
-            now_monotonic_ns < lease.activation_monotonic_ns
-            or now_monotonic_ns > lease.expires_monotonic_ns
-        ):
-            self._post_credit_successor_steering = None
+        if not lease.steering_available:
+            raise PostCreditSuccessorSteeringUnavailable(
+                "post-credit successor handoff has no steering authority"
+            )
+        if now_monotonic_ns < lease.activation_monotonic_ns:
             raise DynamicCourseError(
+                "post-credit successor steering precedes activation"
+            )
+        if now_monotonic_ns > lease.expires_monotonic_ns:
+            self._post_credit_successor_steering = replace(
+                lease,
+                steering_available=False,
+                steering_unavailable_reason="expired_prediction",
+            )
+            raise PostCreditSuccessorSteeringUnavailable(
                 "post-credit successor steering expired"
             )
         state = self.core.course_state()
@@ -756,13 +797,22 @@ class DynamicVisualCourseSession:
             prediction.stream_generation != lease.stream_generation
             or prediction.last_measurement_monotonic_ns
             != lease.last_measurement_monotonic_ns
-            or prediction.measurement_age_s
+        ):
+            raise DynamicCourseError(
+                "post-credit successor steering prediction differs from "
+                "the credited state"
+            )
+        if (
+            prediction.measurement_age_s
             > self.core.config.successor_prediction_max_horizon_s + 1e-12
         ):
-            self._post_credit_successor_steering = None
-            raise DynamicCourseError(
-                "post-credit successor steering prediction is no longer "
-                "the credited bounded state"
+            self._post_credit_successor_steering = replace(
+                lease,
+                steering_available=False,
+                steering_unavailable_reason="expired_prediction",
+            )
+            raise PostCreditSuccessorSteeringUnavailable(
+                "post-credit successor steering prediction expired"
             )
 
         target_roll = self.core.config.roll_guidance_sign * (
@@ -2255,5 +2305,6 @@ __all__ = [
     "DYNAMIC_TIMING_BASIS",
     "DynamicRollingVisualApproachServo",
     "DynamicVisualCourseSession",
+    "PostCreditSuccessorSteeringUnavailable",
     "production_dynamic_course_config",
 ]

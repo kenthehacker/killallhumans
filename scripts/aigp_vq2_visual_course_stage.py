@@ -57,6 +57,7 @@ from planning.vq2_dynamic_visual_approach import (
     BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ,
     DYNAMIC_CROSSING_COORDINATE_BASIS,
     DynamicVisualCourseSession,
+    PostCreditSuccessorSteeringUnavailable,
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
@@ -3382,7 +3383,7 @@ async def _run_visual_course_stage_impl(
         *,
         yaw_reference_rad: float,
         successor_steering: bool = False,
-    ) -> None:
+    ) -> bool:
         """Bridge one bounded handoff gap with retained dynamic authority."""
 
         nonlocal last_command_send_s
@@ -3416,13 +3417,13 @@ async def _run_visual_course_stage_impl(
             raise abort_type(
                 "visual-course continuity-hold clock is invalid"
             )
+        actual_successor_steering = successor_steering
         try:
             authority = (
-                dynamic_controller
-                .post_credit_successor_steering_authority(
+                dynamic_controller.post_credit_successor_steering_authority(
                     now_monotonic_ns=proposal_ns,
                 )
-                if successor_steering
+                if actual_successor_steering
                 and type(dynamic_controller)
                 is DynamicVisualCourseSession
                 else dynamic_controller.continuity_hold_authority(
@@ -3430,12 +3431,24 @@ async def _run_visual_course_stage_impl(
                     maximum_age_s=profile.control_hold_horizon_s,
                 )
             )
+        except PostCreditSuccessorSteeringUnavailable:
+            actual_successor_steering = False
+            try:
+                authority = dynamic_controller.continuity_hold_authority(
+                    now_monotonic_ns=proposal_ns,
+                    maximum_age_s=profile.control_hold_horizon_s,
+                )
+            except (TypeError, ValueError) as exc:
+                raise abort_type(
+                    "visual-course continuity hold expired after "
+                    f"successor steering ended: {exc}"
+                ) from exc
         except (TypeError, ValueError) as exc:
             raise abort_type(
                 "visual-course "
                 + (
                     "post-credit successor steering"
-                    if successor_steering
+                    if actual_successor_steering
                     else "continuity hold"
                 )
                 + f" expired: {exc}"
@@ -3481,7 +3494,7 @@ async def _run_visual_course_stage_impl(
             command = dynamic_controller.govern_wire_command(
                 command,
                 proposal_monotonic_ns=proposal_ns,
-                launch_thrust_override=not successor_steering,
+                launch_thrust_override=not actual_successor_steering,
                 yaw_safety_override=yaw_safety_override,
             )
         except (TypeError, ValueError) as exc:
@@ -3495,7 +3508,10 @@ async def _run_visual_course_stage_impl(
             or abs(command.yaw_rate)
             > limits.max_yaw_rate_rad_s + 1e-12
             or not limits.min_thrust <= command.thrust <= limits.max_thrust
-            or (not successor_steering and command.thrust != thrust)
+            or (
+                not actual_successor_steering
+                and command.thrust != thrust
+            )
         ):
             raise abort_type(
                 "visual-course continuity hold escaped its envelope"
@@ -3527,7 +3543,7 @@ async def _run_visual_course_stage_impl(
                     wire_command=command,
                     wire_start_monotonic_ns=call_start,
                     requested_thrust=thrust,
-                    thrust_slew_override=not successor_steering,
+                    thrust_slew_override=not actual_successor_steering,
                     yaw_slew_override=yaw_safety_override,
                 )
             )
@@ -3544,7 +3560,7 @@ async def _run_visual_course_stage_impl(
             "visual_course_dynamic_command",
             **dict(dynamic_evidence),
         )
-        if successor_steering:
+        if actual_successor_steering:
             steering_evidence = {
                 key: (
                     asdict(value)
@@ -3580,6 +3596,7 @@ async def _run_visual_course_stage_impl(
             dynamic_controller.evidence_summary()
         )
         refresh_live_summary()
+        return actual_successor_steering
 
     async def send_visual(
         *,
@@ -7663,6 +7680,7 @@ async def _run_visual_course_stage_impl(
             reviewed_track_id=requested_promoted_track_id,
         )
         post_credit_successor_steering_active = False
+        post_credit_dynamic_handoff_active = False
         if type(advance_outcome) is CreditedUnboundGateAdvance:
             unbound_advance = advance_outcome
             if (
@@ -7709,12 +7727,38 @@ async def _run_visual_course_stage_impl(
                         "visual-course successor-steering activation evidence "
                         "is invalid"
                     )
-                post_credit_successor_steering_active = True
-                transition_summary["successor_steering_activation"] = dict(
+                post_credit_dynamic_handoff_active = True
+                steering_available = steering_activation.get(
+                    "steering_available"
+                )
+                if (
+                    type(steering_available) is not bool
+                    or steering_activation.get("passage_authority")
+                    is not False
+                    or steering_activation.get("advance_authority")
+                    is not False
+                ):
+                    raise abort_type(
+                        "visual-course successor handoff evidence grants "
+                        "invalid authority"
+                    )
+                post_credit_successor_steering_active = steering_available
+                transition_summary["successor_handoff_activation"] = dict(
                     steering_activation
                 )
+                if post_credit_successor_steering_active:
+                    transition_summary[
+                        "successor_steering_activation"
+                    ] = dict(steering_activation)
                 host.recorder.emit(
-                    "visual_course_dynamic_successor_steering_activated",
+                    (
+                        "visual_course_dynamic_successor_steering_activated"
+                        if post_credit_successor_steering_active
+                        else (
+                            "visual_course_dynamic_successor_steering_"
+                            "unavailable"
+                        )
+                    ),
                     **dict(steering_activation),
                 )
             transition_summary.update(
@@ -7788,7 +7832,8 @@ async def _run_visual_course_stage_impl(
                         "credited-unbound reacquisition"
                     )
                 if runtime.dynamic_controller is not None:
-                    await send_continuity_hold(
+                    post_credit_successor_steering_active = (
+                        await send_continuity_hold(
                         (
                             f"{VISUAL_COURSE_STAGE}/gate"
                             f"{unbound_advance.to_gate_index}/"
@@ -7799,6 +7844,7 @@ async def _run_visual_course_stage_impl(
                         successor_steering=(
                             post_credit_successor_steering_active
                         ),
+                        )
                     )
                     segment["post_credit_hold_command_count"] = int(
                         segment["post_credit_hold_command_count"]
@@ -7866,7 +7912,7 @@ async def _run_visual_course_stage_impl(
                     "visual-course fresh reacquisition proof is incomplete"
                 )
             if (
-                post_credit_successor_steering_active
+                post_credit_dynamic_handoff_active
                 and reacquisition.reacquired_track_id
                 != requested_promoted_track_id
             ):
@@ -7893,6 +7939,7 @@ async def _run_visual_course_stage_impl(
                         "invalid"
                     )
                 post_credit_successor_steering_active = False
+                post_credit_dynamic_handoff_active = False
                 transition_summary["successor_steering_rebind"] = dict(
                     dynamic_rebind
                 )
@@ -7984,12 +8031,38 @@ async def _run_visual_course_stage_impl(
                         "visual-course successor-steering activation evidence "
                         "is invalid"
                     )
-                post_credit_successor_steering_active = True
-                transition_summary["successor_steering_activation"] = dict(
+                post_credit_dynamic_handoff_active = True
+                steering_available = steering_activation.get(
+                    "steering_available"
+                )
+                if (
+                    type(steering_available) is not bool
+                    or steering_activation.get("passage_authority")
+                    is not False
+                    or steering_activation.get("advance_authority")
+                    is not False
+                ):
+                    raise abort_type(
+                        "visual-course successor handoff evidence grants "
+                        "invalid authority"
+                    )
+                post_credit_successor_steering_active = steering_available
+                transition_summary["successor_handoff_activation"] = dict(
                     steering_activation
                 )
+                if post_credit_successor_steering_active:
+                    transition_summary[
+                        "successor_steering_activation"
+                    ] = dict(steering_activation)
                 host.recorder.emit(
-                    "visual_course_dynamic_successor_steering_activated",
+                    (
+                        "visual_course_dynamic_successor_steering_activated"
+                        if post_credit_successor_steering_active
+                        else (
+                            "visual_course_dynamic_successor_steering_"
+                            "unavailable"
+                        )
+                    ),
                     **dict(steering_activation),
                 )
             course_handoff = _ConfirmedCourseHandoff(
@@ -8142,7 +8215,8 @@ async def _run_visual_course_stage_impl(
             if evaluate_recovery_candidate(snapshot):
                 break
             if runtime.dynamic_controller is not None:
-                await send_continuity_hold(
+                post_credit_successor_steering_active = (
+                    await send_continuity_hold(
                     (
                         f"{VISUAL_COURSE_STAGE}/gate"
                         f"{current_gate_index}/post-credit-hold"
@@ -8152,6 +8226,7 @@ async def _run_visual_course_stage_impl(
                     successor_steering=(
                         post_credit_successor_steering_active
                     ),
+                    )
                 )
                 segment["post_credit_hold_command_count"] = int(
                     segment["post_credit_hold_command_count"]

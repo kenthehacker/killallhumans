@@ -25,6 +25,7 @@ from planning.vq2_dynamic_visual_approach import (
     DYNAMIC_CONTROLLER_FAMILY,
     DynamicRollingVisualApproachServo,
     DynamicVisualCourseSession,
+    PostCreditSuccessorSteeringUnavailable,
     production_dynamic_course_config,
 )
 from planning.vq2_gate_graph import (
@@ -1808,9 +1809,71 @@ def test_post_credit_activation_latency_never_extends_prediction_expiry():
         now_monotonic_ns=expected_expiry_ns,
     )
     with pytest.raises(
-        DynamicCourseError,
+        PostCreditSuccessorSteeringUnavailable,
         match="post-credit successor steering expired",
     ):
         session.post_credit_successor_steering_authority(
             now_monotonic_ns=expected_expiry_ns + 1,
+        )
+    assert session.post_credit_successor_steering_active is False
+    downgraded = session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    assert downgraded["steering_available"] is False
+    assert downgraded["steering_unavailable_reason"] == "expired_prediction"
+
+
+def test_expired_successor_prediction_retains_handoff_without_steering():
+    session, successor_id = _bound_post_credit_successor()
+    successor = session.core.course_state().successor
+    assert successor is not None
+    horizon_ns = round(
+        session.core.config.successor_prediction_max_horizon_s
+        * 1_000_000_000.0
+    )
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    expected_expiry_ns = min(
+        race_received_ns + horizon_ns,
+        successor.last_measurement_monotonic_ns + horizon_ns,
+    )
+    activation_ns = expected_expiry_ns + 1
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.04,
+        target_pitch_rad=0.06,
+        yaw_rate_rad_s=-0.03,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(
+            0.02,
+            0.03,
+            -0.03,
+            0.275,
+        ),
+        wire_start_monotonic_ns=wire_ns,
+    )
+
+    evidence = session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+
+    assert evidence["steering_available"] is False
+    assert evidence["steering_unavailable_reason"] == "expired_prediction"
+    assert evidence["steering_only"] is False
+    assert evidence["passage_authority"] is False
+    assert evidence["advance_authority"] is False
+    assert session.post_credit_successor_steering_active is False
+    assert session.core.course_state().current_gate_index == 1
+    assert session.core.course_state().current_track_id == successor_id
+    with pytest.raises(
+        PostCreditSuccessorSteeringUnavailable,
+        match="handoff has no steering authority",
+    ):
+        session.post_credit_successor_steering_authority(
+            now_monotonic_ns=activation_ns,
         )
