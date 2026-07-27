@@ -2219,6 +2219,7 @@ def test_054358af_expansion_q_rate_cannot_unload_collective():
 
     decision = SimpleNamespace(
         passage_error_norm=(0.0, -1.111),
+        current_ownership_control_error_norm=(0.0, -1.111),
         current_aperture_half_size_norm=(
             0.10,
             0.198,
@@ -2269,6 +2270,32 @@ def test_054358af_expansion_q_rate_cannot_unload_collective():
     )
     assert proposal.requested_thrust == pytest.approx(0.32)
     assert proposal.requested_thrust > falsified_expansion_request
+
+
+def test_predicted_crossing_position_owns_collective_p_not_q_rate():
+    decision = SimpleNamespace(
+        passage_error_norm=(0.0, -0.10),
+        current_ownership_control_error_norm=(0.0, -0.42),
+        crossing_rate_q_s=(0.0, 2.80),
+    )
+    current = SimpleNamespace(
+        residual_translational_rate_rad_s=(0.0, -0.11),
+    )
+
+    error, translation_rate_down_s, basis = (
+        course_stage._dynamic_current_aperture_collective_inputs(
+            decision,
+            current,
+            vertical_angle_scale_rad=0.55,
+        )
+    )
+
+    assert error == pytest.approx(-0.42)
+    assert translation_rate_down_s == pytest.approx(-0.20)
+    assert translation_rate_down_s != pytest.approx(
+        decision.crossing_rate_q_s[1]
+    )
+    assert basis == course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
 
 
 def test_current_aperture_collective_holds_through_censorship_and_dropout():
