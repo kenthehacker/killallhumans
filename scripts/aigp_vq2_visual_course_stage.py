@@ -370,21 +370,16 @@ def _top_fov_edge_recovery_rate_down_s(
     previous: _TopFovRawEdge,
     elapsed_s: float,
 ) -> Optional[float]:
-    """Return a same-source two-sigma lower bound on top-edge recovery."""
+    """Return the motion of the same-source conservative top edge."""
 
     elapsed = float(elapsed_s)
     if not math.isfinite(elapsed) or elapsed <= 0.0:
         raise ValueError("top-FOV edge-rate interval is invalid")
     if current.basis != previous.basis:
         return None
-    combined_edge_std = math.sqrt(
-        current.top_edge_std_image_down**2
-        + previous.top_edge_std_image_down**2
-    )
     rate = (
-        current.nominal_top_edge_image_down
-        - previous.nominal_top_edge_image_down
-        - TOP_FOV_INNER_EDGE_SIGMA * combined_edge_std
+        current.top_edge_image_down
+        - previous.top_edge_image_down
     ) / elapsed
     if not math.isfinite(rate):
         raise ValueError("top-FOV edge recovery rate is nonfinite")

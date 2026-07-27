@@ -3606,7 +3606,7 @@ def test_top_fov_uses_fresh_temporally_associated_tracking_geometry():
     assert edge.top_edge_image_down < inner.center_norm[1]
 
 
-def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():
+def test_top_fov_recovery_uses_same_source_conservative_edge_motion():
     previous = course_stage._top_fov_raw_edge(
         SimpleNamespace(
             bbox_norm=(0.10, 0.10, 0.90, 0.90),
@@ -3621,7 +3621,7 @@ def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():
             ),
         )
     )
-    noisy_nominal_recovery = course_stage._top_fov_raw_edge(
+    recovering_bound = course_stage._top_fov_raw_edge(
         SimpleNamespace(
             bbox_norm=(0.10, 0.10, 0.90, 0.90),
             confidence=0.90,
@@ -3635,11 +3635,19 @@ def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():
             ),
         )
     )
-    proved_recovery = replace(
-        noisy_nominal_recovery,
-        nominal_top_edge_image_down=(
-            previous.nominal_top_edge_image_down + 0.08
-        ),
+    widening_uncertainty = course_stage._top_fov_raw_edge(
+        SimpleNamespace(
+            bbox_norm=(0.10, 0.10, 0.90, 0.90),
+            confidence=0.90,
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            inner_aperture=_inner_aperture(
+                center_y=-0.18,
+                half_y=0.30,
+                std_y=0.05,
+                std_log_scale=0.12,
+            ),
+        )
     )
     outer_source = course_stage._TopFovRawEdge(
         top_edge_image_down=-0.40,
@@ -3651,19 +3659,19 @@ def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():
 
     assert (
         course_stage._top_fov_edge_recovery_rate_down_s(
-            current=noisy_nominal_recovery,
-            previous=previous,
-            elapsed_s=0.05,
-        )
-        < 0.0
-    )
-    assert (
-        course_stage._top_fov_edge_recovery_rate_down_s(
-            current=proved_recovery,
+            current=recovering_bound,
             previous=previous,
             elapsed_s=0.05,
         )
         > 0.0
+    )
+    assert (
+        course_stage._top_fov_edge_recovery_rate_down_s(
+            current=widening_uncertainty,
+            previous=previous,
+            elapsed_s=0.05,
+        )
+        < 0.0
     )
     assert (
         course_stage._top_fov_edge_recovery_rate_down_s(
