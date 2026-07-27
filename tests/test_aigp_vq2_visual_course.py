@@ -2185,7 +2185,7 @@ def test_live_top_fov_geometry_holds_nose_up_before_outer_extent_clips():
         raw_top_edge_image_down=raw_top,
         raw_top_edge_rate_down_s=-0.10,
         requested_target_pitch_rad=0.120,
-        prior_target_pitch_rad=capture_pitch,
+        prior_target_pitch_rad=-0.101,
         vertical_angle_scale_rad=0.55,
         active_before=False,
     )
@@ -2208,6 +2208,9 @@ def test_live_top_fov_geometry_holds_nose_up_before_outer_extent_clips():
     assert proposal.predicted_requested_top_edge_image_down < -1.0
     assert proposal.protected_target_pitch_rad == pytest.approx(
         capture_pitch
+    )
+    assert proposal.predicted_protected_top_edge_image_down == pytest.approx(
+        raw_top
     )
     assert (
         proposal.predicted_protected_top_edge_image_down

@@ -324,7 +324,7 @@ def _propose_top_fov_pitch_reference(
         protected = min(
             requested,
             maximum_observable,
-            maximum_observable if recovering else prior,
+            maximum_observable if recovering else capture,
         )
         active_after = True
     predicted_requested = _project_raw_vertical_edge_for_pitch_reference(
