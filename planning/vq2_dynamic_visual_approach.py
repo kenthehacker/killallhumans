@@ -613,10 +613,7 @@ class DynamicVisualCourseSession:
             pitch_rate_rad_s=float(wire_command.pitch_rate),
             host_clock_id=_HOST_CLOCK_ID,
         )
-        self.core.record_applied_command(
-            applied_sample,
-            governor_discontinuity_axes=discontinuity_axes,
-        )
+        self.core.record_applied_command(applied_sample)
         self._wire_governor.commit(
             wire_command,
             wire_start_monotonic_ns,

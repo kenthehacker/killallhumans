@@ -955,15 +955,16 @@ def test_rejected_inner_geometry_predicts_instead_of_using_outer_support() -> No
     assert proposal.passage_admission is None
 
 
-def test_final_wire_governor_cannot_reverse_roll_in_one_frame():
+def test_opposite_valid_demand_reduces_applied_roll_on_next_wire_tick():
     session = _session()
     first_ns = _BASE_NS
+    accepted = AttitudeRateCommand(0.12, 0.0, 0.0, 0.275)
     session.record_wire_acceptance(
         target_roll_rad=0.08,
         target_pitch_rad=0.0,
         yaw_rate_rad_s=0.0,
         thrust=0.275,
-        wire_command=AttitudeRateCommand(0.12, 0.0, 0.0, 0.275),
+        wire_command=accepted,
         wire_start_monotonic_ns=first_ns,
     )
     proposed = session.govern_wire_command(
@@ -973,8 +974,35 @@ def test_final_wire_governor_cannot_reverse_roll_in_one_frame():
         yaw_safety_override=False,
     )
 
-    assert proposed.roll_rate >= 0.0
-    assert first_ns + 20_000_000 > first_ns
+    assert proposed.roll_rate < accepted.roll_rate
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposed.roll_rate,
+            proposed.pitch_rate,
+            proposed.yaw_rate,
+            proposed.thrust,
+        )
+    )
+    assert abs(proposed.roll_rate) <= 0.25
+    assert abs(proposed.pitch_rate) <= 0.25
+    assert abs(proposed.yaw_rate) <= 0.15
+    assert 0.21 <= proposed.thrust <= 0.32
+
+    next_ns = first_ns + 20_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=-0.08,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=0.0,
+        thrust=0.275,
+        wire_command=proposed,
+        wire_start_monotonic_ns=next_ns,
+    )
+    authority = session.continuity_hold_authority(
+        now_monotonic_ns=next_ns,
+        maximum_age_s=0.12,
+    )
+    assert authority["wire_command"] == proposed
 
 
 def test_launch_thrust_override_does_not_seed_an_outward_slew():

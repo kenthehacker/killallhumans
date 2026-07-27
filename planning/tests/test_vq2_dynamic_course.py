@@ -7,15 +7,18 @@ import pytest
 from competition.vq2_contracts import FrameEdge
 from planning.vq2_dynamic_course import (
     AppliedCommandSample,
-    CommandGovernor,
-    CommandGovernorConfig,
     DynamicCourseCommand,
     DynamicCourseConfig,
     DynamicCourseCore,
     DynamicCourseError,
     GateObservation,
     ImuAttitudeSample,
+    MAX_TARGET_PITCH_RAD,
+    MAX_TARGET_ROLL_RAD,
+    MAX_THRUST,
     MAX_YAW_RATE_RAD_S,
+    MIN_TARGET_PITCH_RAD,
+    MIN_THRUST,
     SUPPORT_THRUST,
     predict_aperture_relative_crossing,
 )
@@ -472,30 +475,44 @@ def test_5f132788_single_aperture_collapse_is_not_crossing_geometry() -> None:
     assert abs(after.expansion_rate_s) < 0.10
 
 
-def test_vertical_uncertainty_uses_bounded_brake_establishment_slew() -> None:
-    config = CommandGovernorConfig()
-    governor = CommandGovernor(config)
-    seed = DynamicCourseCommand(0.0, -0.31, 0.0, SUPPORT_THRUST)
-    brake = DynamicCourseCommand(0.0, 0.12, 0.0, SUPPORT_THRUST)
-    governor.commit(seed, 0)
-    previous = seed
-
-    for step in range(1, 17):
-        monotonic_ns = step * 40_000_000
-        command = governor.preview(
-            brake,
-            monotonic_ns,
-            establish_pitch_brake=True,
+def test_vertical_uncertainty_emits_a_responsive_bounded_brake_demand() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90, pitch=-0.31))
+    _imu(core, 1.0)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            1,
+            1.0,
         )
-        assert command.target_pitch_rad >= previous.target_pitch_rad
-        assert (
-            command.target_pitch_rad - previous.target_pitch_rad
-            <= config.max_brake_pitch_slew_rad_s * 0.040 + 1e-12
-        )
-        governor.commit(command, monotonic_ns)
-        previous = command
+    )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id=None,
+    )
+    _imu(core, 1.01)
 
-    assert previous.target_pitch_rad > 0.0
+    decision = core.guide(1_010_000_000)
+    values = (
+        decision.command.target_roll_rad,
+        decision.command.target_pitch_rad,
+        decision.command.yaw_rate_rad_s,
+        decision.command.thrust,
+    )
+
+    assert decision.braking
+    assert decision.command == decision.proposed_command
+    assert decision.command.target_pitch_rad > 0.0
+    assert all(math.isfinite(value) for value in values)
+    assert abs(decision.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= decision.command.target_pitch_rad
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert abs(decision.command.yaw_rate_rad_s) <= MAX_YAW_RATE_RAD_S
+    assert MIN_THRUST <= decision.command.thrust <= MAX_THRUST
 
 
 def test_delayed_command_history_is_right_continuous_at_channel_delays() -> None:
@@ -535,22 +552,17 @@ def test_applied_command_accepts_existing_live_spawn_pitch_envelope() -> None:
     assert sample.target_pitch_rad == -0.31
 
 
-def test_noisy_alternating_detections_do_not_reverse_roll_each_frame() -> None:
+def test_noisy_alternating_detections_emit_responsive_bounded_demands() -> None:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,
         roll_guidance_sign=1.0,
         roll_gain=0.65,
         bearing_alpha=0.95,
         bearing_beta=0.25,
-        governor=CommandGovernorConfig(
-            max_roll_slew_rad_s=0.35,
-            max_roll_accel_rad_s2=1.2,
-        ),
     )
     core = DynamicCourseCore(config)
     core.record_applied_command(_command(0.90))
     outputs: list[float] = []
-    decision_times: list[float] = []
     for index, image_x in enumerate((0.50, -0.50, 0.50, -0.50, 0.50, -0.50)):
         observation_time = 1.0 + index * 0.040
         decision_time = observation_time + 0.010
@@ -572,20 +584,28 @@ def test_noisy_alternating_detections_do_not_reverse_roll_each_frame() -> None:
         _imu(core, decision_time)
         decision = core.guide(round(decision_time * NS))
         outputs.append(decision.command.target_roll_rad)
-        decision_times.append(decision_time)
+        assert decision.command == decision.proposed_command
+        assert all(
+            math.isfinite(value)
+            for value in (
+                decision.command.target_roll_rad,
+                decision.command.target_pitch_rad,
+                decision.command.yaw_rate_rad_s,
+                decision.command.thrust,
+            )
+        )
+        assert abs(decision.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+        assert (
+            MIN_TARGET_PITCH_RAD
+            <= decision.command.target_pitch_rad
+            <= MAX_TARGET_PITCH_RAD
+        )
+        assert abs(decision.command.yaw_rate_rad_s) <= MAX_YAW_RATE_RAD_S
+        assert MIN_THRUST <= decision.command.thrust <= MAX_THRUST
         _commit_decision(core, decision_time, decision.command)
 
     assert any(abs(value) > 1e-5 for value in outputs)
-    assert all(
-        left * right >= 0.0
-        for left, right in zip(outputs, outputs[1:])
-        if abs(left) > 1e-9 and abs(right) > 1e-9
-    )
-    for index in range(1, len(outputs)):
-        dt = decision_times[index] - decision_times[index - 1]
-        assert abs(outputs[index] - outputs[index - 1]) <= (
-            config.governor.max_roll_slew_rad_s * dt + 1e-12
-        )
+    assert len({round(value, 8) for value in outputs}) > 1
 
 
 def test_successor_steering_and_state_are_continuous_through_promotion() -> None:
@@ -653,7 +673,7 @@ def test_successor_steering_and_state_are_continuous_through_promotion() -> None
         monotonic_ns=1_215_000_000,
     )
     assert promoted.current == successor_before
-    assert promoted.last_governed_command == precredit.command
+    assert promoted.last_applied_command == precredit.command
 
     _imu(core, 1.24)
     postcredit = core.guide(1_240_000_000)
@@ -662,11 +682,13 @@ def test_successor_steering_and_state_are_continuous_through_promotion() -> None
     assert postcredit.successor_clearance_authority == 0.0
     assert postcredit.successor_passage_authority == 0.0
     assert postcredit.passage_point_norm == (0.0, 0.0)
+    assert postcredit.command == postcredit.proposed_command
     assert postcredit.command.yaw_rate_rad_s != 0.0
-    assert abs(
-        postcredit.command.yaw_rate_rad_s
-        - precredit.command.yaw_rate_rad_s
-    ) <= core.config.governor.max_yaw_slew_rad_s2 * 0.035 + 1e-12
+    assert math.isfinite(postcredit.command.yaw_rate_rad_s)
+    assert (
+        abs(postcredit.command.yaw_rate_rad_s)
+        <= MAX_YAW_RATE_RAD_S
+    )
 
 
 def test_8319198e_unadmitted_successor_cannot_force_gate0_braking() -> None:
@@ -1638,81 +1660,6 @@ def test_current_and_successor_references_project_into_one_decision_frame() -> N
     )
     assert decision.passage_point_norm == (0.0, 0.0)
     assert decision.successor_clearance_authority == 0.0
-
-
-def test_governor_preview_does_not_consume_budget_and_sustained_reversal_crosses_zero() -> None:
-    governor = CommandGovernor(
-        CommandGovernorConfig(
-            max_roll_slew_rad_s=0.40,
-            max_roll_accel_rad_s2=4.0,
-        )
-    )
-    neutral = DynamicCourseCommand(0.0, 0.0, 0.0, SUPPORT_THRUST)
-    governor.commit(neutral, 1_000_000_000)
-    positive = DynamicCourseCommand(0.16, 0.0, 0.0, SUPPORT_THRUST)
-    first = governor.preview(positive, 1_031_000_000)
-    duplicate = governor.preview(positive, 1_031_000_000)
-    assert first == duplicate
-    assert governor.last_command == neutral
-    governor.commit(first, 1_031_000_000)
-
-    negative = DynamicCourseCommand(-0.16, 0.0, 0.0, SUPPORT_THRUST)
-    values = [first.target_roll_rad]
-    for step in range(2, 20):
-        timestamp = 1_000_000_000 + step * 31_000_000
-        command = governor.preview(negative, timestamp)
-        values.append(command.target_roll_rad)
-        governor.commit(command, timestamp)
-
-    assert any(value == pytest.approx(0.0, abs=1e-12) for value in values)
-    assert values[-1] < 0.0
-    assert all(
-        left * right >= 0.0
-        for left, right in zip(values, values[1:])
-        if abs(left) > 1e-12 and abs(right) > 1e-12
-    )
-    assert max(abs(value) for value in values) <= 0.16
-
-
-def test_governor_does_not_extrapolate_an_overridden_thrust_step() -> None:
-    governor = CommandGovernor()
-    first_ns = NS
-    governor.commit(
-        DynamicCourseCommand(0.0, 0.0, 0.0, 0.26),
-        first_ns,
-    )
-    governor.commit(
-        DynamicCourseCommand(0.0, 0.0, 0.0, 0.32),
-        first_ns + 30_000_000,
-        discontinuity_axes=(3,),
-    )
-
-    resumed = governor.preview(
-        DynamicCourseCommand(0.0, 0.0, 0.0, SUPPORT_THRUST),
-        first_ns + 60_000_000,
-    )
-
-    assert SUPPORT_THRUST <= resumed.thrust <= 0.32
-
-
-def test_governor_projects_slew_history_into_the_command_envelope() -> None:
-    governor = CommandGovernor()
-    first_ns = NS
-    governor.commit(
-        DynamicCourseCommand(0.0, 0.0, -0.138, SUPPORT_THRUST),
-        first_ns,
-    )
-    governor.commit(
-        DynamicCourseCommand(0.0, 0.0, -0.148, SUPPORT_THRUST),
-        first_ns + 30_000_000,
-    )
-
-    saturated = governor.preview(
-        DynamicCourseCommand(0.0, 0.0, -0.140, SUPPORT_THRUST),
-        first_ns + 60_000_000,
-    )
-
-    assert -MAX_YAW_RATE_RAD_S <= saturated.yaw_rate_rad_s <= 0.0
 
 
 def test_excess_capture_timing_uncertainty_withholds_derotation() -> None:

@@ -18,7 +18,7 @@ import bisect
 import math
 import re
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from competition.vq2_contracts import FrameEdge
 
@@ -125,10 +125,6 @@ def _unit_quaternion(value: object, label: str) -> Quaternion:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, value))
-
-
-def _move_toward(value: float, target: float, maximum_delta: float) -> float:
-    return value + _clamp(target - value, -maximum_delta, maximum_delta)
 
 
 def _quat_conjugate(value: Quaternion) -> Quaternion:
@@ -406,38 +402,6 @@ class GateObservation:
 
 
 @dataclass(frozen=True, slots=True)
-class CommandGovernorConfig:
-    max_roll_slew_rad_s: float = 0.45
-    max_pitch_slew_rad_s: float = 0.45
-    # Identified pitch/body response is effectively zero-delay and the wire
-    # rate remains capped independently.  Unsafe closure may therefore
-    # establish a brake target faster than ordinary guidance while preserving
-    # continuous target attitude, slew, acceleration, and wire envelopes.
-    max_brake_pitch_slew_rad_s: float = 0.60
-    max_yaw_slew_rad_s2: float = 0.45
-    max_thrust_slew_s: float = 0.10
-    max_roll_accel_rad_s2: float = 2.0
-    max_pitch_accel_rad_s2: float = 2.0
-    max_brake_pitch_accel_rad_s2: float = 2.5
-    max_yaw_accel_rad_s3: float = 2.0
-    max_thrust_accel_s2: float = 0.50
-    max_step_s: float = 0.100
-
-    def __post_init__(self) -> None:
-        for name in self.__dataclass_fields__:
-            object.__setattr__(self, name, _positive(getattr(self, name), name))
-        if (
-            self.max_brake_pitch_slew_rad_s
-            < self.max_pitch_slew_rad_s
-            or self.max_brake_pitch_accel_rad_s2
-            < self.max_pitch_accel_rad_s2
-        ):
-            raise DynamicCourseError(
-                "brake pitch limits must cover ordinary pitch continuity"
-            )
-
-
-@dataclass(frozen=True, slots=True)
 class DynamicCourseConfig:
     """Small identified-model and guidance tuning surface."""
 
@@ -515,8 +479,6 @@ class DynamicCourseConfig:
     # successor identity survives the longer, expected near-plane occlusion.
     successor_lineage_hold_s: float = 0.350
     max_history_samples: int = 256
-    governor: CommandGovernorConfig = field(default_factory=CommandGovernorConfig)
-
     def __post_init__(self) -> None:
         nonnegative = (
             "camera_delay_s",
@@ -906,7 +868,7 @@ class CourseDynamicState:
     current: TrackDynamicState
     successor: TrackDynamicState | None
     recent_commands: tuple[AppliedCommandSample, ...]
-    last_governed_command: DynamicCourseCommand | None
+    last_applied_command: DynamicCourseCommand | None
     promotion_count: int
 
 
@@ -937,195 +899,6 @@ class _SuccessorPrediction:
     confidence: float
 
 
-class CommandGovernor:
-    """Slew- and acceleration-bounded command continuity.
-
-    ``preview`` is side-effect free.  Only ``commit`` consumes continuity
-    budget, so a dropped or superseded proposal cannot alter later commands.
-    """
-
-    def __init__(self, config: CommandGovernorConfig | None = None) -> None:
-        self.config = config or CommandGovernorConfig()
-        self._last_ns: int | None = None
-        self._last: DynamicCourseCommand | None = None
-        self._rates = (0.0, 0.0, 0.0, 0.0)
-
-    @property
-    def last_command(self) -> DynamicCourseCommand | None:
-        return self._last
-
-    def preview(
-        self,
-        proposal: DynamicCourseCommand,
-        monotonic_ns: int,
-        *,
-        hold: bool = False,
-        establish_pitch_brake: bool = False,
-    ) -> DynamicCourseCommand:
-        _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
-        if type(establish_pitch_brake) is not bool:
-            raise TypeError("establish_pitch_brake must be an exact bool")
-        if self._last_ns is not None and monotonic_ns <= self._last_ns:
-            raise DynamicCourseError("governor time must advance")
-        if self._last is None:
-            return proposal
-        assert self._last_ns is not None and self._last is not None
-        if hold:
-            return self._last
-        dt = min(
-            (monotonic_ns - self._last_ns) / _NS_PER_SECOND,
-            self.config.max_step_s,
-        )
-        previous = self._last
-        targets = (
-            proposal.target_roll_rad,
-            proposal.target_pitch_rad,
-            proposal.yaw_rate_rad_s,
-            proposal.thrust,
-        )
-        values = (
-            previous.target_roll_rad,
-            previous.target_pitch_rad,
-            previous.yaw_rate_rad_s,
-            previous.thrust,
-        )
-        slews = (
-            self.config.max_roll_slew_rad_s,
-            (
-                self.config.max_brake_pitch_slew_rad_s
-                if (
-                    establish_pitch_brake
-                    and proposal.target_pitch_rad
-                    > previous.target_pitch_rad
-                )
-                else self.config.max_pitch_slew_rad_s
-            ),
-            self.config.max_yaw_slew_rad_s2,
-            self.config.max_thrust_slew_s,
-        )
-        accelerations = (
-            self.config.max_roll_accel_rad_s2,
-            (
-                self.config.max_brake_pitch_accel_rad_s2
-                if (
-                    establish_pitch_brake
-                    and proposal.target_pitch_rad
-                    > previous.target_pitch_rad
-                )
-                else self.config.max_pitch_accel_rad_s2
-            ),
-            self.config.max_yaw_accel_rad_s3,
-            self.config.max_thrust_accel_s2,
-        )
-        bounds = (
-            (-MAX_TARGET_ROLL_RAD, MAX_TARGET_ROLL_RAD),
-            (MIN_TARGET_PITCH_RAD, MAX_TARGET_PITCH_RAD),
-            (-MAX_YAW_RATE_RAD_S, MAX_YAW_RATE_RAD_S),
-            (MIN_THRUST, MAX_THRUST),
-        )
-        advanced: list[float] = []
-        rates: list[float] = []
-        for index, (value, target, slew, acceleration, bound) in enumerate(
-            zip(values, targets, slews, accelerations, bounds)
-        ):
-            desired_rate = _clamp((target - value) / dt, -slew, slew)
-            rate = _move_toward(
-                self._rates[index],
-                desired_rate,
-                acceleration * dt,
-            )
-            next_value = value + rate * dt
-            if (target - value) * (target - next_value) <= 0.0:
-                next_value = target
-                rate = (next_value - value) / dt
-            if index == 0 and value * next_value < 0.0:
-                next_value = 0.0
-                rate = -value / dt
-            bounded_value = _clamp(next_value, bound[0], bound[1])
-            if bounded_value != next_value:
-                next_value = bounded_value
-                rate = (next_value - value) / dt
-            advanced.append(next_value)
-            rates.append(rate)
-        command = DynamicCourseCommand(
-            target_roll_rad=advanced[0],
-            target_pitch_rad=advanced[1],
-            yaw_rate_rad_s=advanced[2],
-            thrust=advanced[3],
-        )
-        return command
-
-    def commit(
-        self,
-        command: DynamicCourseCommand,
-        monotonic_ns: int,
-        *,
-        discontinuity: bool = False,
-        discontinuity_axes: tuple[int, ...] = (),
-    ) -> None:
-        """Synchronise to the command actually accepted by the wire.
-
-        ``discontinuity`` is reserved for an outer safety/cleanup bypass.  It
-        synchronises the governor without pretending the emergency jump obeyed
-        normal slew limits.  ``discontinuity_axes`` does the same for a bounded
-        per-axis override while preserving continuity state on the other axes.
-        """
-
-        _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
-        if self._last_ns is not None and monotonic_ns <= self._last_ns:
-            raise DynamicCourseError("governor commit time must advance")
-        if any(
-            type(axis) is not int or axis < 0 or axis > 3
-            for axis in discontinuity_axes
-        ):
-            raise DynamicCourseError("governor discontinuity axis is invalid")
-        if len(set(discontinuity_axes)) != len(discontinuity_axes):
-            raise DynamicCourseError(
-                "governor discontinuity axes must be unique"
-            )
-        if self._last is None or discontinuity:
-            rates = (0.0, 0.0, 0.0, 0.0)
-        else:
-            assert self._last_ns is not None
-            dt = (monotonic_ns - self._last_ns) / _NS_PER_SECOND
-            previous = (
-                self._last.target_roll_rad,
-                self._last.target_pitch_rad,
-                self._last.yaw_rate_rad_s,
-                self._last.thrust,
-            )
-            current = (
-                command.target_roll_rad,
-                command.target_pitch_rad,
-                command.yaw_rate_rad_s,
-                command.thrust,
-            )
-            rates = tuple(
-                (current[index] - previous[index]) / dt for index in range(4)
-            )
-            if discontinuity_axes:
-                rates = tuple(
-                    0.0 if index in discontinuity_axes else rate
-                    for index, rate in enumerate(rates)
-                )
-        self._last = command
-        self._last_ns = monotonic_ns
-        self._rates = rates
-
-    def apply(
-        self,
-        proposal: DynamicCourseCommand,
-        monotonic_ns: int,
-        *,
-        hold: bool = False,
-    ) -> DynamicCourseCommand:
-        """Preview and commit convenience for isolated tests."""
-
-        command = self.preview(proposal, monotonic_ns, hold=hold)
-        self.commit(command, monotonic_ns)
-        return command
-
-
 class DynamicCourseCore:
     """Per-track estimator plus an authority-neutral rolling course lifecycle."""
 
@@ -1146,7 +919,7 @@ class DynamicCourseCore:
             tuple[int, str, str | None] | None
         ) = None
         self._successor_clearance_positive_since_ns: int | None = None
-        self._governor = CommandGovernor(self.config.governor)
+        self._last_applied_command: DynamicCourseCommand | None = None
 
     @property
     def track_states(self) -> tuple[TrackDynamicState, ...]:
@@ -1164,22 +937,16 @@ class DynamicCourseCore:
     def record_applied_command(
         self,
         sample: AppliedCommandSample,
-        *,
-        governor_discontinuity_axes: tuple[int, ...] = (),
     ) -> None:
         if self._commands and sample.monotonic_ns <= self._commands[-1].monotonic_ns:
             raise DynamicCourseError("command samples must advance monotonically")
         self._commands.append(sample)
         self._trim(self._commands)
-        self._governor.commit(
-            DynamicCourseCommand(
-                target_roll_rad=sample.target_roll_rad,
-                target_pitch_rad=sample.target_pitch_rad,
-                yaw_rate_rad_s=sample.yaw_rate_rad_s,
-                thrust=sample.thrust,
-            ),
-            sample.monotonic_ns,
-            discontinuity_axes=governor_discontinuity_axes,
+        self._last_applied_command = DynamicCourseCommand(
+            target_roll_rad=sample.target_roll_rad,
+            target_pitch_rad=sample.target_pitch_rad,
+            yaw_rate_rad_s=sample.yaw_rate_rad_s,
+            thrust=sample.thrust,
         )
 
     def _trim(self, values: list[object]) -> None:
@@ -2070,7 +1837,7 @@ class DynamicCourseCore:
             current=current,
             successor=successor,
             recent_commands=tuple(self._commands),
-            last_governed_command=self._governor.last_command,
+            last_applied_command=self._last_applied_command,
             promotion_count=self._promotion_count,
         )
 
@@ -2148,9 +1915,9 @@ class DynamicCourseCore:
 
     def guide(self, monotonic_ns: int) -> GuidanceDecision:
         _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
-        if self._governor.last_command is None:
+        if self._last_applied_command is None:
             raise DynamicCourseError(
-                "guidance requires a confirmed applied command to seed continuity"
+                "guidance requires a confirmed applied command"
             )
         state = self.course_state()
         current = state.current
@@ -2195,12 +1962,10 @@ class DynamicCourseCore:
             current.track_id,
             passage_successor_track_id,
         )
-        held = False
-        if self._governor.last_command is not None:
-            age_s = (
-                monotonic_ns - current.last_measurement_monotonic_ns
-            ) / _NS_PER_SECOND
-            held = not current.visible and age_s <= self.config.dropout_hold_s
+        age_s = (
+            monotonic_ns - current.last_measurement_monotonic_ns
+        ) / _NS_PER_SECOND
+        held = not current.visible and age_s <= self.config.dropout_hold_s
         crossing_prediction_horizon_s = (
             0.0
             if current.time_to_contact_s is None
@@ -2457,12 +2222,6 @@ class DynamicCourseCore:
             ),
             vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
-        command = self._governor.preview(
-            proposal,
-            monotonic_ns,
-            hold=held,
-            establish_pitch_brake=current_alignment_unsettled,
-        )
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
             current_gate_index=state.current_gate_index,
@@ -2547,7 +2306,7 @@ class DynamicCourseCore:
             brake_reason=reason,
             dropout_held=held,
             proposed_command=proposal,
-            command=command,
+            command=proposal,
         )
 
     def _geometry_in_orientation(
@@ -3370,8 +3129,6 @@ class DynamicCourseCore:
 
 __all__ = [
     "AppliedCommandSample",
-    "CommandGovernor",
-    "CommandGovernorConfig",
     "CourseDynamicState",
     "CrossingQuotientPrediction",
     "DelayedCommandView",

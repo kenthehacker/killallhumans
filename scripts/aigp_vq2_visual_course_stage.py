@@ -165,10 +165,11 @@ def _allocate_launch_pitch_target(
     ):
         raise ValueError("launch pitch allocation inputs are invalid")
     if dynamic_governor_owns_target:
-        # The dynamic target governor was seeded from the exact accepted spawn
-        # target and already enforces bounded slew/acceleration.  Reapplying
-        # the legacy time blend here caused the ec7fc1b8 vertical brake to
-        # remain nose-down until the aperture was nearly censored.
+        # Dynamic guidance emits an already bounded target and the final wire
+        # governor is the sole command-continuity authority.  Reapplying the
+        # legacy time blend here would recreate a second temporal governor;
+        # it previously kept the ec7fc1b8 vertical brake nose-down until the
+        # aperture was nearly censored.
         return values[1], 1.0
     blend = min(1.0, values[2] / values[3])
     return (
