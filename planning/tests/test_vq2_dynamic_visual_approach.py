@@ -591,6 +591,183 @@ def _bound_post_credit_successor() -> tuple[
     return session, successor_id
 
 
+def _activated_committed_roll_handoff(
+    *,
+    retained_roll_rad: float = 0.13,
+) -> tuple[DynamicVisualCourseSession, object, str]:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    successor_id = snapshot.next_candidates[0].track_id
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+    for sequence in range(6, 10):
+        tracker.update(_frame(sequence))
+        snapshot = graph.observe(tracker)
+        session.stage_snapshot(
+            snapshot,
+            tracker,
+            expected_gate_index=0,
+            expected_current_track_id=current_id,
+            adjacent_precredit=False,
+        )
+    session.core.bind(
+        current_gate_index=0,
+        current_track_id=current_id,
+        successor_track_id=successor_id,
+    )
+    successor = session.core.course_state().successor
+    assert successor is not None
+    seed_wire_ns = successor.state_monotonic_ns + 1_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=0.0,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(0.0, 0.0, 0.0, 0.275),
+        wire_start_monotonic_ns=seed_wire_ns,
+    )
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+        passage_committed=True,
+    )
+    decision_ns = seed_wire_ns + 1_000_000
+    decision = session.guide(
+        current_track_id=current_id,
+        successor_track_id=successor_id,
+        monotonic_ns=decision_ns,
+    )
+    assert decision is not None
+    retained_command = replace(
+        decision.command,
+        target_roll_rad=retained_roll_rad,
+    )
+    committed = replace(
+        decision,
+        passage_committed=True,
+        committed_successor_roll_authority=1.0,
+        committed_successor_target_roll_rad=retained_roll_rad,
+        proposed_command=retained_command,
+        command=retained_command,
+    )
+    session._last_decision = committed  # noqa: SLF001 - exact handoff seam
+    accepted_ns = decision_ns + 1_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=retained_roll_rad,
+        target_pitch_rad=retained_command.target_pitch_rad,
+        yaw_rate_rad_s=retained_command.yaw_rate_rad_s,
+        thrust=retained_command.thrust,
+        wire_command=AttitudeRateCommand(
+            0.02,
+            0.01,
+            retained_command.yaw_rate_rad_s,
+            retained_command.thrust,
+        ),
+        wire_start_monotonic_ns=accepted_ns,
+    )
+    race_received_ns = accepted_ns + 1_000_000
+    session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=race_received_ns + 1_000_000,
+    )
+    assert session.post_credit_roll_reference_handoff_active
+    return session, committed, successor_id
+
+
+def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
+    session, source, successor_id = _activated_committed_roll_handoff()
+    estimate = session.core._tracks[successor_id]  # noqa: SLF001
+    estimate.state = replace(
+        estimate.state,
+        residual_translational_rate_rad_s=(0.25, 0.0),
+        bearing_rate_qualified=(True, True),
+        bearing_std_rad=(0.02, 0.02),
+        ambiguous=False,
+    )
+    normal_command = replace(
+        source.command,
+        target_roll_rad=0.08,
+    )
+    fresh = replace(
+        source,
+        current_gate_index=1,
+        current_track_id=successor_id,
+        successor_track_id=None,
+        current_center_norm=(0.30, 0.0),
+        proposed_command=normal_command,
+        command=normal_command,
+    )
+
+    constrained = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        fresh
+    )
+
+    assert constrained.proposed_command.target_roll_rad == pytest.approx(
+        0.08
+    )
+    assert constrained.command.target_roll_rad == pytest.approx(0.13)
+    assert math.isfinite(constrained.command.target_roll_rad)
+    assert (
+        abs(constrained.command.target_roll_rad)
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert session.post_credit_roll_reference_handoff_active
+
+
+@pytest.mark.parametrize(
+    ("normal_roll_rad", "residual_rate_rad_s"),
+    ((-0.04, 0.25), (0.04, -0.05)),
+)
+def test_opposite_or_recovering_geometry_releases_roll_handoff_immediately(
+    normal_roll_rad: float,
+    residual_rate_rad_s: float,
+):
+    session, source, successor_id = _activated_committed_roll_handoff()
+    estimate = session.core._tracks[successor_id]  # noqa: SLF001
+    estimate.state = replace(
+        estimate.state,
+        residual_translational_rate_rad_s=(
+            residual_rate_rad_s,
+            0.0,
+        ),
+        bearing_rate_qualified=(True, True),
+        bearing_std_rad=(0.02, 0.02),
+        ambiguous=False,
+    )
+    normal_command = replace(
+        source.command,
+        target_roll_rad=normal_roll_rad,
+    )
+    fresh = replace(
+        source,
+        current_gate_index=1,
+        current_track_id=successor_id,
+        successor_track_id=None,
+        current_center_norm=(0.30, 0.0),
+        proposed_command=normal_command,
+        command=normal_command,
+    )
+
+    released = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        fresh
+    )
+
+    assert released.command.target_roll_rad == pytest.approx(
+        normal_roll_rad
+    )
+    assert session.post_credit_roll_reference_handoff_active is False
+
+
 def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()

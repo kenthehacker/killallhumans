@@ -178,6 +178,20 @@ class _PostCreditSuccessorSteering:
 
 
 @dataclass(frozen=True, slots=True)
+class _PostCreditRollReferenceHandoff:
+    """One bounded successor reference retained across race-owned promotion."""
+
+    authority_basis: str
+    to_gate_index: int
+    track_id: str
+    stream_generation: int
+    promotion_count: int
+    retained_target_roll_rad: float
+    source_decision_monotonic_ns: int
+    source_wire_start_monotonic_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _WireGovernorConfig:
     max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
@@ -377,6 +391,9 @@ class DynamicVisualCourseSession:
         self._post_credit_successor_steering: Optional[
             _PostCreditSuccessorSteering
         ] = None
+        self._post_credit_roll_reference_handoff: Optional[
+            _PostCreditRollReferenceHandoff
+        ] = None
 
     @property
     def has_applied_command(self) -> bool:
@@ -390,6 +407,10 @@ class DynamicVisualCourseSession:
     def post_credit_successor_steering_active(self) -> bool:
         lease = self._post_credit_successor_steering
         return bool(lease is not None and lease.steering_available)
+
+    @property
+    def post_credit_roll_reference_handoff_active(self) -> bool:
+        return self._post_credit_roll_reference_handoff is not None
 
     def record_imu(self, sample: ImuAttitudeSample) -> None:
         self.core.record_imu(sample)
@@ -781,6 +802,41 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "post-credit steering lacks causal accepted-command memory"
             )
+        retained_roll: float | None = None
+        retained_source_decision_ns: int | None = None
+        prior = self._last_decision
+        if (
+            prior is not None
+            and prior.current_gate_index == from_gate_index
+            and prior.current_track_id == state.current_track_id
+            and prior.successor_track_id == reviewed_track_id
+            and prior.passage_committed
+            and prior.committed_successor_roll_authority == 1.0
+            and prior.committed_successor_target_roll_rad is not None
+            and prior.monotonic_ns <= applied.monotonic_ns
+            and applied.monotonic_ns <= activation_monotonic_ns
+        ):
+            candidate = float(
+                prior.committed_successor_target_roll_rad
+            )
+            if (
+                math.isfinite(candidate)
+                and 0.0 < abs(candidate) <= MAX_TARGET_ROLL_RAD
+                and math.isclose(
+                    prior.command.target_roll_rad,
+                    candidate,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+                and math.isclose(
+                    applied.target_roll_rad,
+                    candidate,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                retained_roll = candidate
+                retained_source_decision_ns = prior.monotonic_ns
         promoted = self.core.promote_authoritative(
             from_gate_index=from_gate_index,
             to_gate_index=to_gate_index,
@@ -810,6 +866,27 @@ class DynamicVisualCourseSession:
             vertical_target_pitch_ceiling_rad=None,
         )
         self._post_credit_successor_steering = lease
+        self._post_credit_roll_reference_handoff = (
+            None
+            if (
+                retained_roll is None
+                or retained_source_decision_ns is None
+            )
+            else _PostCreditRollReferenceHandoff(
+                authority_basis=(
+                    "race-promoted-committed-successor-roll-reference-v1"
+                ),
+                to_gate_index=to_gate_index,
+                track_id=reviewed_track_id,
+                stream_generation=successor.stream_generation,
+                promotion_count=promoted.promotion_count,
+                retained_target_roll_rad=retained_roll,
+                source_decision_monotonic_ns=(
+                    retained_source_decision_ns
+                ),
+                source_wire_start_monotonic_ns=applied.monotonic_ns,
+            )
+        )
         self._staged = None
         self._last_decision = None
         return self._post_credit_lease_evidence(lease)
@@ -1306,6 +1383,24 @@ class DynamicVisualCourseSession:
             vertical_target_pitch_ceiling_rad=None,
         )
         self._post_credit_successor_steering = rebound_lease
+        roll_handoff = self._post_credit_roll_reference_handoff
+        if roll_handoff is not None:
+            if (
+                roll_handoff.to_gate_index == lease.to_gate_index
+                and roll_handoff.track_id == lease.reviewed_track_id
+                and roll_handoff.stream_generation
+                == lease.stream_generation
+                and roll_handoff.promotion_count
+                == lease.promotion_count
+            ):
+                self._post_credit_roll_reference_handoff = replace(
+                    roll_handoff,
+                    track_id=track.track_id,
+                    stream_generation=update.token.generation,
+                    promotion_count=rebound.promotion_count,
+                )
+            else:
+                self._post_credit_roll_reference_handoff = None
         self._staged = None
         self._last_decision = None
         evidence = {
@@ -1625,8 +1720,105 @@ class DynamicVisualCourseSession:
             monotonic_ns,
             passage_committed=staged.passage_committed,
         )
+        decision = self._apply_post_credit_roll_reference_handoff(
+            decision
+        )
         self._last_decision = decision
         return decision
+
+    def _apply_post_credit_roll_reference_handoff(
+        self,
+        decision: GuidanceDecision,
+    ) -> GuidanceDecision:
+        """Prevent an outward promotion from unwinding helpful successor bank.
+
+        This is a gate-relative reference constraint, not a command slew.  It
+        retains one already accepted, bounded successor attitude target only
+        while the promoted current error and residual translation still move
+        outward in the same corrective direction.  Fresh guidance catches up
+        or recovering/opposite geometry releases the reference immediately.
+        """
+
+        handoff = self._post_credit_roll_reference_handoff
+        if handoff is None:
+            return decision
+        state = self.core.course_state()
+        current = state.current
+        normal_roll = float(decision.command.target_roll_rad)
+        retained_roll = float(handoff.retained_target_roll_rad)
+        residual_rate = float(
+            current.residual_translational_rate_rad_s[0]
+        )
+        stable_error = float(decision.current_center_norm[0])
+        guidance_sign = float(self.core.config.roll_guidance_sign)
+        lineage_matches = bool(
+            decision.current_gate_index == handoff.to_gate_index
+            and decision.current_track_id == handoff.track_id
+            and state.current_gate_index == handoff.to_gate_index
+            and state.current_track_id == handoff.track_id
+            and current.track_id == handoff.track_id
+            and current.stream_generation == handoff.stream_generation
+            and state.promotion_count == handoff.promotion_count
+        )
+        values = (
+            normal_roll,
+            retained_roll,
+            residual_rate,
+            stable_error,
+            guidance_sign,
+        )
+        bounded_state = bool(
+            lineage_matches
+            and all(math.isfinite(value) for value in values)
+            and 0.0 < abs(retained_roll) <= MAX_TARGET_ROLL_RAD
+            and current.bearing_rate_qualified[0]
+            and not current.ambiguous
+            and current.bearing_std_rad[0]
+            <= (
+                self.core.config
+                .successor_prediction_max_extrapolation_rad
+            )
+            + 1e-12
+            and abs(guidance_sign) > 1e-12
+        )
+        direction = 1.0 if retained_roll > 0.0 else -1.0
+        same_corrective_demand = bool(
+            direction * normal_roll > 1e-12
+        )
+        still_moving_outward = bool(
+            direction * guidance_sign * stable_error > 1e-12
+            and direction * guidance_sign * residual_rate > 1e-12
+        )
+        demand_caught_up = bool(
+            same_corrective_demand
+            and abs(normal_roll) + 1e-12 >= abs(retained_roll)
+        )
+        if (
+            not bounded_state
+            or not same_corrective_demand
+            or not still_moving_outward
+            or demand_caught_up
+        ):
+            self._post_credit_roll_reference_handoff = None
+            return decision
+        constrained = math.copysign(
+            max(abs(normal_roll), abs(retained_roll)),
+            retained_roll,
+        )
+        if (
+            not math.isfinite(constrained)
+            or abs(constrained) > MAX_TARGET_ROLL_RAD + 1e-12
+        ):
+            raise DynamicCourseError(
+                "post-credit roll reference left the bounded envelope"
+            )
+        return replace(
+            decision,
+            command=replace(
+                decision.command,
+                target_roll_rad=constrained,
+            ),
+        )
 
     def propagated_current_fov_gap_authority(
         self,
@@ -2218,6 +2410,7 @@ class DynamicVisualCourseSession:
         }
         if decision is not None:
             course = self.core.course_state()
+            roll_handoff = self._post_credit_roll_reference_handoff
             thrust_settle_s = (
                 abs(
                     float(wire_command.thrust)
@@ -2239,6 +2432,40 @@ class DynamicVisualCourseSession:
                     "gate_index": decision.current_gate_index,
                     "current_track_id": decision.current_track_id,
                     "successor_track_id": decision.successor_track_id,
+                    "unconstrained_target_roll_rad": (
+                        decision.proposed_command.target_roll_rad
+                    ),
+                    "post_credit_roll_reference_handoff": (
+                        None
+                        if roll_handoff is None
+                        else {
+                            "basis": roll_handoff.authority_basis,
+                            "to_gate_index": (
+                                roll_handoff.to_gate_index
+                            ),
+                            "track_id": roll_handoff.track_id,
+                            "stream_generation": (
+                                roll_handoff.stream_generation
+                            ),
+                            "promotion_count": (
+                                roll_handoff.promotion_count
+                            ),
+                            "retained_target_roll_rad": (
+                                roll_handoff.retained_target_roll_rad
+                            ),
+                            "source_decision_monotonic_ns": (
+                                roll_handoff
+                                .source_decision_monotonic_ns
+                            ),
+                            "source_wire_start_monotonic_ns": (
+                                roll_handoff
+                                .source_wire_start_monotonic_ns
+                            ),
+                            "steering_only": True,
+                            "passage_authority": False,
+                            "advance_authority": False,
+                        }
+                    ),
                     "current_center_norm": list(
                         decision.current_center_norm
                     ),
