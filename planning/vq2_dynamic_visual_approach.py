@@ -1909,15 +1909,16 @@ class DynamicVisualCourseSession:
         camera_token: CameraFrameToken,
         now_monotonic_ns: int,
     ) -> Mapping[str, Any]:
-        """Guide one exact missed publication from the retained local state.
+        """Guide exact successive misses from the retained local state.
 
         The rolling graph keeps authoritative identity while independently
         withholding visual-measurement authority.  This method admits only an
         exact clipped-edge loss and propagates the last measured bearing/rate
         with IMU and accepted-command history.  A still-live local aperture
-        lease may bound that propagation beyond the short bearing-only
-        fallback; it remains steering-only and cannot supply passage or race
-        authority.  Race status remains the sole advance source.
+        lease may extend the same absolute local-state horizon.  Missing
+        publications never renew either seed.  Bearing uncertainty remains an
+        independent hard bound, and this authority is steering-only: it
+        cannot supply passage, race, or advance authority.
         """
 
         if type(track) is not VisualTrack:
@@ -1989,6 +1990,19 @@ class DynamicVisualCourseSession:
                 self.core.config.dropout_hold_s * 1_000_000_000.0
             )
         )
+        bearing_prediction_seed_ns = current.last_measurement_monotonic_ns
+        # Reuse the calibrated post-credit current-state horizon that owns the
+        # same rolling bearing/IMU/accepted-wire estimate during reacquisition.
+        # Anchoring it to the last measurement, rather than the latest coast
+        # frame or wire command, prevents a sliding lease through blindness.
+        bearing_prediction_deadline_ns = (
+            bearing_prediction_seed_ns
+            + round(
+                self.core.config
+                .post_credit_current_prediction_max_horizon_s
+                * 1_000_000_000.0
+            )
+        )
         aperture_steering_deadline_ns = (
             current.aperture_prediction_deadline_monotonic_ns
             if (
@@ -2003,6 +2017,7 @@ class DynamicVisualCourseSession:
         )
         steering_deadline_ns = max(
             fallback_steering_deadline_ns,
+            bearing_prediction_deadline_ns,
             (
                 fallback_steering_deadline_ns
                 if aperture_steering_deadline_ns is None
@@ -2014,9 +2029,9 @@ class DynamicVisualCourseSession:
             if (
                 aperture_steering_deadline_ns is not None
                 and aperture_steering_deadline_ns
-                > fallback_steering_deadline_ns
+                > bearing_prediction_deadline_ns
             )
-            else "clipped-bearing-fallback-v1"
+            else "propagated-local-bearing-state-v1"
         )
         if (
             state.current_gate_index != staged.expected_gate_index
@@ -2110,6 +2125,12 @@ class DynamicVisualCourseSession:
             ),
             "fallback_steering_deadline_monotonic_ns": (
                 fallback_steering_deadline_ns
+            ),
+            "bearing_prediction_seed_monotonic_ns": (
+                bearing_prediction_seed_ns
+            ),
+            "bearing_prediction_deadline_monotonic_ns": (
+                bearing_prediction_deadline_ns
             ),
             "aperture_prediction_deadline_monotonic_ns": (
                 aperture_steering_deadline_ns

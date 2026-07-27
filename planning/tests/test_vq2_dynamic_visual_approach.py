@@ -1673,46 +1673,102 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
     ):
         _observe(planner, snapshot, tracker)
 
-    now_ns = update.observation_monotonic_ns + 5_000_000
-    authority = session.propagated_current_visibility_gap_authority(
-        track=tracker.track(current_id),
-        camera_token=update.token,
-        now_monotonic_ns=now_ns,
-    )
-    state = session.core.course_state().current
+    authorities = []
+    bearing_seed_ns = None
+    bearing_deadline_ns = None
+    last_measurement_ns = None
+    for sequence in range(8, 12):
+        if sequence != 8:
+            update = tracker.update(
+                replace(
+                    _frame(sequence, include_successor=False),
+                    detections=(),
+                )
+            )
+            snapshot = graph.observe(tracker)
+            with pytest.raises(
+                VisualApproachRefusal,
+                match="withheld authoritative current-gate identity",
+            ):
+                _observe(planner, snapshot, tracker)
+        now_ns = update.observation_monotonic_ns + 5_000_000
+        authority = session.propagated_current_visibility_gap_authority(
+            track=tracker.track(current_id),
+            camera_token=update.token,
+            now_monotonic_ns=now_ns,
+        )
+        state = session.core.course_state().current
+        authorities.append(authority)
 
-    assert state.frame_sequence == update.tracker_frame_sequence
-    assert state.visible is False
-    assert state.missed_count == 1
-    assert state.aperture_prediction_deadline_monotonic_ns is not None
-    assert state.aperture_prediction_deadline_monotonic_ns < now_ns
+        assert state.frame_sequence == update.tracker_frame_sequence
+        assert state.visible is False
+        assert state.missed_count == sequence - 7
+        assert (
+            state.aperture_prediction_deadline_monotonic_ns is None
+            or state.aperture_prediction_deadline_monotonic_ns < now_ns
+        )
+        assert authority["camera_token"] == asdict(update.token)
+        assert authority["missed_frame_count"] == sequence - 7
+        assert authority["steering_prediction_horizon_remaining_s"] > 0.0
+        assert authority["current_aperture_half_size_norm"] is None
+        assert all(
+            math.isfinite(value)
+            for value in (
+                *authority["current_center_norm"],
+                *authority["current_bearing_std_rad"],
+                *authority["command"].values(),
+            )
+        )
+        assert (
+            -MAX_TARGET_ROLL_RAD
+            <= authority["command"]["target_roll_rad"]
+            < 0.0
+        )
+        assert authority["steering_only"] is True
+        assert authority["passage_authority"] is False
+        assert authority["advance_authority"] is False
+        if bearing_seed_ns is None:
+            bearing_seed_ns = authority[
+                "bearing_prediction_seed_monotonic_ns"
+            ]
+            bearing_deadline_ns = authority[
+                "bearing_prediction_deadline_monotonic_ns"
+            ]
+            last_measurement_ns = authority[
+                "last_measurement_monotonic_ns"
+            ]
+        else:
+            assert authority[
+                "bearing_prediction_seed_monotonic_ns"
+            ] == bearing_seed_ns
+            assert authority[
+                "bearing_prediction_deadline_monotonic_ns"
+            ] == bearing_deadline_ns
+            assert authority[
+                "last_measurement_monotonic_ns"
+            ] == last_measurement_ns
+
+    authority = authorities[-1]
+    now_ns = update.observation_monotonic_ns + 5_000_000
     assert authority["basis"] == (
         "propagated-current-visibility-gap-guidance-v2"
     )
-    assert authority["camera_token"] == asdict(update.token)
     assert authority["last_visible_camera_token"] == asdict(
         tracker.track(current_id).latest_token
     )
     assert authority["last_visible_clipping"] == int(FrameEdge.RIGHT)
-    assert authority["missed_frame_count"] == 1
-    assert authority["steering_prediction_horizon_remaining_s"] > 0.0
-    assert authority["current_aperture_half_size_norm"] is None
-    assert all(
-        math.isfinite(value)
-        for value in (
-            *authority["current_center_norm"],
-            *authority["current_bearing_std_rad"],
-            *authority["command"].values(),
+    assert authority["steering_prediction_deadline_basis"] == (
+        "propagated-local-bearing-state-v1"
+    )
+    assert now_ns > authority["fallback_steering_deadline_monotonic_ns"]
+    assert authority["bearing_prediction_deadline_monotonic_ns"] == (
+        authority["bearing_prediction_seed_monotonic_ns"]
+        + round(
+            session.core.config
+            .post_credit_current_prediction_max_horizon_s
+            * 1_000_000_000.0
         )
     )
-    assert (
-        -MAX_TARGET_ROLL_RAD
-        <= authority["command"]["target_roll_rad"]
-        < 0.0
-    )
-    assert authority["steering_only"] is True
-    assert authority["passage_authority"] is False
-    assert authority["advance_authority"] is False
 
     last_visible = tracker.track(current_id).history[-1]
     unclipped_track = replace(
@@ -1728,9 +1784,7 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
             now_monotonic_ns=now_ns,
         )
 
-    deadline_ns = authority[
-        "steering_prediction_deadline_monotonic_ns"
-    ]
+    deadline_ns = authority["steering_prediction_deadline_monotonic_ns"]
     with pytest.raises(DynamicCourseError, match="fresh local steering"):
         session.propagated_current_visibility_gap_authority(
             track=tracker.track(current_id),
