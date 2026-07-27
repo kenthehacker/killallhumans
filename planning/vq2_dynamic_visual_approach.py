@@ -527,6 +527,7 @@ class DynamicVisualCourseSession:
                 ambiguous=ambiguous,
                 confidence=confidence,
                 measurement_std=measurement_std,
+                inner_scale_measurement_usable=inner_tracking_usable,
                 timing_basis=DYNAMIC_TIMING_BASIS,
                 timing_uncertainty_s=0.020,
                 stream_generation=stream_generation,
@@ -544,6 +545,7 @@ class DynamicVisualCourseSession:
             visible=False,
             ambiguous=bool(track.ambiguous),
             confidence=0.0,
+            inner_scale_measurement_usable=False,
             timing_basis=DYNAMIC_TIMING_BASIS,
             timing_uncertainty_s=0.020,
             stream_generation=stream_generation,
@@ -1533,6 +1535,11 @@ class DynamicVisualCourseSession:
         # NEXT candidate.  Replace the stale pre-clipping image identity in
         # the local successor slot, but retain current gate ownership.
         if state.successor_track_id != track_id:
+            if state.successor_track_id is not None:
+                self.core.handoff_graph_vetted_successor_state(
+                    predecessor_track_id=state.successor_track_id,
+                    replacement_track_id=track_id,
+                )
             state = self.core.bind(
                 current_gate_index=state.current_gate_index,
                 current_track_id=state.current_track_id,
@@ -3078,14 +3085,7 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 and (
                     inner is None
                     or state.raw_center_norm != inner.center_norm
-                    or (
-                        inner.passage_usable
-                        and state.raw_log_scale != inner.log_scale
-                    )
-                    or (
-                        not inner.passage_usable
-                        and state.raw_log_scale is not None
-                    )
+                    or state.raw_log_scale != inner.log_scale
                     or any(state.censored_axes)
                 )
             )
@@ -3160,10 +3160,9 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 state.residual_translational_rate_rad_s[1]
                 / scale.vertical_angle_scale_rad
             ),
-            # A degraded complete fit may correct bearing, but its scale is
-            # deliberately withheld by DynamicCourseCore.  Preserve the
-            # bounded filtered scale instead of reintroducing that rejected
-            # measurement at the servo boundary.
+            # Preserve direct clean-aperture targeting.  A degraded complete
+            # fit may only correct the core's bounded filtered scale; it still
+            # cannot mint aperture, clearance, passage, or race authority.
             log_scale=float(
                 inner.log_scale
                 if inner.passage_usable

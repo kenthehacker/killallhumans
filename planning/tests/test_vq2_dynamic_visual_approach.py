@@ -281,6 +281,9 @@ def _frame(
     successor_height: float = 0.17,
     successor_clipping: FrameEdge = FrameEdge.NONE,
     successor_center_censored: bool = False,
+    successor_inner_aperture: VisualInnerApertureGeometry | None | object = (
+        _AUTO_INNER_APERTURE
+    ),
 ) -> VisualDetectionFrame:
     observation_ns = _BASE_NS + sequence * _PERIOD_NS
     detections = [
@@ -305,6 +308,7 @@ def _frame(
                 height=successor_height,
                 clipping=successor_clipping,
                 center_censored=successor_center_censored,
+                inner_aperture=successor_inner_aperture,
             )
         )
     return VisualDetectionFrame(
@@ -683,17 +687,37 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     _accept_proposal(session, tracker, seed)
     original_successor_id = session.core.course_state().successor_track_id
     assert original_successor_id is not None
+    original_successor = session.core.course_state().successor
+    assert original_successor is not None
+    assert original_successor.aperture_half_size_norm is not None
 
-    # An abrupt, then stable, clean replacement models the successor's
-    # graph-track reinitialization across current-gate plane clipping.
+    # Retire the old image identity during the current-gate crossing while
+    # preserving its short clean-aperture state in the dynamic session.
+    for sequence in range(6, 15):
+        tracker.update(_frame(sequence, include_successor=False))
+        snapshot = graph.observe(tracker)
+        hold = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, hold)
+
+    # A nearby stable degraded-inner replacement supplies graph-vetted
+    # center/scale correction, but no new aperture or passage authority.
     for sequence, successor_center_x in zip(
-        range(6, 10),
-        (0.70, 0.73, 0.76, 0.79),
+        range(15, 19),
+        (0.38, 0.40, 0.42, 0.44),
     ):
+        degraded_inner = _inner_aperture(
+            successor_center_x,
+            0.0,
+            half_width=0.15,
+            half_height=0.17,
+            confidence=0.18,
+            health_reason="aperture_fit_low_confidence",
+        )
         update = tracker.update(
             _frame(
                 sequence,
                 successor_center_x=successor_center_x,
+                successor_inner_aperture=degraded_inner,
             )
         )
         snapshot = graph.observe(tracker)
@@ -728,6 +752,12 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert rebound.current_track_id == current_id
     assert rebound.successor_track_id == replacement.track_id
     assert rebound.promotion_count == 0
+    assert rebound.successor is not None
+    assert rebound.successor.aperture_half_size_norm is not None
+    assert rebound.successor.aperture_propagated
+    assert rebound.successor.aperture_seed_monotonic_ns == (
+        original_successor.aperture_seed_monotonic_ns
+    )
     assert proposal.mode is VisualApproachMode.ADJACENT_RECENTER
     assert proposal.next_target is None
     assert proposal.passage_admission is None
@@ -2079,10 +2109,10 @@ def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> Non
 
     state = session.core.course_state().current
     assert state.raw_center_norm == pytest.approx(degraded.center_norm)
-    assert state.raw_log_scale is None
+    assert state.raw_log_scale == pytest.approx(degraded.log_scale)
     assert state.bearing_rad[0] > prior.bearing_rad[0]
     assert state.bearing_rad[1] < prior.bearing_rad[1]
-    assert state.log_scale == pytest.approx(prior.log_scale)
+    assert state.log_scale != pytest.approx(prior.log_scale)
     assert state.expansion_rate_s == pytest.approx(
         prior.expansion_rate_s
     )
@@ -2154,7 +2184,7 @@ def test_clipped_outer_degraded_inner_steers_without_scale_authority() -> None:
 
     state = session.core.course_state().current
     assert state.raw_center_norm == pytest.approx(degraded.center_norm)
-    assert state.raw_log_scale is None
+    assert state.raw_log_scale == pytest.approx(degraded.log_scale)
     assert state.aperture_half_size_norm is None
     assert state.censored_axes == (False, False)
     assert proposal.current_target.normalized_x == pytest.approx(

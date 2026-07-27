@@ -18,7 +18,7 @@ import bisect
 import math
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from competition.vq2_contracts import FrameEdge
 
@@ -308,6 +308,10 @@ class GateObservation:
     ambiguous: bool = False
     confidence: float = 1.0
     measurement_std: tuple[float, float, float] = (0.02, 0.02, 0.05)
+    # A complete fitted inner opening may correct center/log-scale even when
+    # its degraded fit is not passage-usable.  It still supplies no aperture
+    # size, clearance, passage, or race authority.
+    inner_scale_measurement_usable: bool = False
     capture_monotonic_ns: int | None = None
     timing_basis: str = "final-packet-minus-configured-delay"
     timing_uncertainty_s: float = 0.020
@@ -350,6 +354,10 @@ class GateObservation:
             raise TypeError("visible must be bool")
         if type(self.ambiguous) is not bool:
             raise TypeError("ambiguous must be bool")
+        if type(self.inner_scale_measurement_usable) is not bool:
+            raise TypeError(
+                "inner_scale_measurement_usable must be bool"
+            )
         confidence = _finite(self.confidence, "confidence")
         if not 0.0 <= confidence <= 1.0:
             raise DynamicCourseError("confidence must be in [0, 1]")
@@ -390,6 +398,10 @@ class GateObservation:
         ):
             raise DynamicCourseError(
                 "invisible observations must not fabricate image measurements"
+            )
+        elif self.inner_scale_measurement_usable:
+            raise DynamicCourseError(
+                "invisible observations cannot claim inner-scale authority"
             )
 
     @property
@@ -1280,15 +1292,18 @@ class DynamicCourseCore:
                 else float(statistics.median(history))
             )
         robust_expansion_rate: float | None = None
-        aperture_measurement_usable = bool(
-            observation.aperture_half_size_norm is not None
+        inner_scale_measurement_usable = bool(
+            (
+                observation.aperture_half_size_norm is not None
+                or observation.inner_scale_measurement_usable
+            )
             and not observation.ambiguous
             and not any(observation.censored_axes)
             and observation.clipping == FrameEdge.NONE
         )
         if (
             rate_gap
-            or not aperture_measurement_usable
+            or not inner_scale_measurement_usable
         ):
             existing.measured_log_scale_rate_history.clear()
             existing.scale_rate_reanchor_required = True
@@ -1424,7 +1439,12 @@ class DynamicCourseCore:
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=observation.center_norm,
             raw_log_scale=(
-                observation.log_scale if clean_aperture else None
+                observation.log_scale
+                if (
+                    clean_aperture
+                    or observation.inner_scale_measurement_usable
+                )
+                else None
             ),
             aperture_half_size_norm=(
                 observation.aperture_half_size_norm
@@ -1706,7 +1726,10 @@ class DynamicCourseCore:
                 )
             )
         scale_measurement_usable = bool(
-            observation.aperture_half_size_norm is not None
+            (
+                observation.aperture_half_size_norm is not None
+                or observation.inner_scale_measurement_usable
+            )
             and observation.clipping == FrameEdge.NONE
             and not observation.ambiguous
             and not any(censored)
@@ -1715,15 +1738,19 @@ class DynamicCourseCore:
             scale_measurement_usable
             and measured_expansion_rate is not None
         )
+        scale_measurement_weight = 0.0
         if scale_measurement_usable:
             scale_innovation = _clamp(
                 observation.log_scale - predicted_scale,
                 -self.config.max_log_scale_innovation,
                 self.config.max_log_scale_innovation,
             )
+            scale_measurement_weight = (
+                self.config.scale_alpha * quality
+            )
             log_scale = (
                 predicted_scale
-                + self.config.scale_alpha * quality * scale_innovation
+                + scale_measurement_weight * scale_innovation
             )
             if scale_rate_qualified:
                 assert measured_expansion_rate is not None
@@ -1756,15 +1783,15 @@ class DynamicCourseCore:
             * dt
             if not scale_measurement_usable
             else math.sqrt(
-                max(
-                    1e-10,
-                    (1.0 - self.config.scale_alpha)
+                    max(
+                        1e-10,
+                    (1.0 - scale_measurement_weight)
                     * (
                         previous.log_scale_std
                         + self.config.process_noise_scale_s * dt
                     )
                     ** 2
-                    + self.config.scale_alpha
+                    + scale_measurement_weight
                     * observation.measurement_std[2]
                     ** 2,
                 )
@@ -1856,9 +1883,32 @@ class DynamicCourseCore:
             aperture_deadline_ns = (
                 previous.aperture_prediction_deadline_monotonic_ns
             )
+            if observation.inner_scale_measurement_usable:
+                # A complete fitted inner opening may correct the inherited
+                # scale/rate state without minting a new aperture.  Maintain
+                # only a short rolling lease from that exact correction;
+                # outer support, clipped frames, and blind coast never renew
+                # it.
+                aperture_deadline_ns = max(
+                    aperture_deadline_ns,
+                    capture_ns
+                    + round(
+                        min(
+                            self.config
+                            .post_credit_current_prediction_max_horizon_s,
+                            self.config
+                            .crossing_prediction_max_horizon_s,
+                        )
+                        * _NS_PER_SECOND
+                    ),
+                )
             aperture_propagated = True
-            aperture_dynamics_qualified = (
+            aperture_dynamics_qualified = bool(
                 previous.aperture_dynamics_qualified
+                or (
+                    all(bearing_rate_qualified)
+                    and scale_rate_qualified
+                )
             )
         else:
             aperture = None
@@ -2055,6 +2105,237 @@ class DynamicCourseCore:
             self.config.minimum_ttc_s,
             self.config.maximum_ttc_s,
         )
+
+    def handoff_graph_vetted_successor_state(
+        self,
+        *,
+        predecessor_track_id: str,
+        replacement_track_id: str,
+    ) -> TrackDynamicState | None:
+        """Transfer one bounded local aperture model across a reviewed ID.
+
+        The caller owns graph/topological proof.  This pure estimator method
+        changes neither gate ownership nor promotion state, and returns
+        ``None`` when the source lineage, horizon, or common-camera geometry
+        cannot support a conservative association.
+        """
+
+        _token(predecessor_track_id, "predecessor_track_id")
+        _token(replacement_track_id, "replacement_track_id")
+        if (
+            predecessor_track_id == replacement_track_id
+            or self._successor_track_id != predecessor_track_id
+        ):
+            return None
+        predecessor = self._tracks.get(predecessor_track_id)
+        replacement = self._tracks.get(replacement_track_id)
+        if predecessor is None or replacement is None:
+            return None
+        source = predecessor.state
+        target = replacement.state
+        deadline_ns = source.aperture_prediction_deadline_monotonic_ns
+        if (
+            source.stream_generation != target.stream_generation
+            or source.visible
+            or source.missed_count <= 0
+            or source.ambiguous
+            or target.state_monotonic_ns
+            != source.state_monotonic_ns
+            or not target.visible
+            or target.ambiguous
+            or target.missed_count != 0
+            or target.raw_center_norm is None
+            or target.aperture_half_size_norm is not None
+            or source.aperture_half_size_norm is None
+            or source.aperture_seed_monotonic_ns is None
+            or deadline_ns is None
+            or target.state_monotonic_ns > deadline_ns
+        ):
+            return None
+
+        target_camera_to_world = _quat_multiply(
+            target.body_to_reference_wxyz,
+            self.config.camera_to_body_wxyz,
+        )
+        try:
+            source_center, source_aperture = self._geometry_in_orientation(
+                predecessor_track_id,
+                target_camera_to_world,
+            )
+        except DynamicCourseError:
+            return None
+        if source_aperture is None:
+            return None
+        target_center = target.raw_center_norm
+        angular_innovation = (
+            abs(
+                math.atan(
+                    self.config.horizontal_angle_scale_rad
+                    * target_center[0]
+                )
+                - math.atan(
+                    self.config.horizontal_angle_scale_rad
+                    * source_center[0]
+                )
+            ),
+            abs(
+                math.atan(
+                    self.config.vertical_angle_scale_rad
+                    * target_center[1]
+                )
+                - math.atan(
+                    self.config.vertical_angle_scale_rad
+                    * source_center[1]
+                )
+            ),
+        )
+        innovation_allowance = tuple(
+            min(
+                self.config.successor_prediction_max_extrapolation_rad,
+                3.0
+                * math.hypot(
+                    source.bearing_std_rad[axis],
+                    target.bearing_std_rad[axis],
+                ),
+            )
+            for axis in range(2)
+        )
+        if any(
+            not math.isfinite(value)
+            for value in (
+                *source_center,
+                *source_aperture,
+                *angular_innovation,
+                *innovation_allowance,
+            )
+        ) or any(
+            angular_innovation[axis]
+            > innovation_allowance[axis] + _EPSILON
+            for axis in range(2)
+        ):
+            return None
+
+        corrected_log_scale = source.log_scale
+        if target.raw_log_scale is not None:
+            scale_innovation = target.raw_log_scale - source.log_scale
+            if abs(scale_innovation) > (
+                self.config.max_log_scale_innovation
+                + 2.0
+                * math.hypot(
+                    source.log_scale_std,
+                    target.log_scale_std,
+                )
+            ):
+                return None
+            corrected_log_scale += (
+                self.config.scale_alpha
+                * target.confidence
+                * _clamp(
+                    scale_innovation,
+                    -self.config.max_log_scale_innovation,
+                    self.config.max_log_scale_innovation,
+                )
+            )
+        aperture_scale = math.exp(
+            _clamp(
+                corrected_log_scale - source.log_scale,
+                -1.0,
+                1.0,
+            )
+        )
+        transferred_aperture = tuple(
+            min(2.0, max(1e-6, value * aperture_scale))
+            for value in source.aperture_half_size_norm
+        )
+        transferred_deadline_ns = max(
+            deadline_ns,
+            target.state_monotonic_ns
+            + round(
+                min(
+                    self.config
+                    .post_credit_current_prediction_max_horizon_s,
+                    self.config.crossing_prediction_max_horizon_s,
+                )
+                * _NS_PER_SECOND
+            ),
+        )
+        transferred = replace(
+            target,
+            raw_log_scale=target.raw_log_scale,
+            aperture_half_size_norm=transferred_aperture,
+            aperture_seed_monotonic_ns=(
+                source.aperture_seed_monotonic_ns
+            ),
+            aperture_prediction_deadline_monotonic_ns=(
+                transferred_deadline_ns
+            ),
+            aperture_propagated=True,
+            aperture_dynamics_qualified=(
+                source.aperture_dynamics_qualified
+            ),
+            bearing_rate_rad_s=tuple(
+                (
+                    target.bearing_rate_rad_s[axis]
+                    if target.bearing_rate_qualified[axis]
+                    else source.bearing_rate_rad_s[axis]
+                )
+                for axis in range(2)
+            ),
+            log_scale=corrected_log_scale,
+            expansion_rate_s=source.expansion_rate_s,
+            scale_rate_qualified=source.scale_rate_qualified,
+            residual_translational_rate_rad_s=tuple(
+                (
+                    target.residual_translational_rate_rad_s[axis]
+                    if target.bearing_rate_qualified[axis]
+                    else source.residual_translational_rate_rad_s[axis]
+                )
+                for axis in range(2)
+            ),
+            time_to_contact_s=self._time_to_contact(
+                source.expansion_rate_s
+            ),
+            bearing_std_rad=tuple(
+                max(
+                    source.bearing_std_rad[axis],
+                    target.bearing_std_rad[axis],
+                )
+                for axis in range(2)
+            ),
+            rate_std_rad_s=tuple(
+                max(
+                    source.rate_std_rad_s[axis],
+                    target.rate_std_rad_s[axis],
+                )
+                for axis in range(2)
+            ),
+            log_scale_std=max(
+                source.log_scale_std,
+                target.log_scale_std,
+            ),
+            expansion_rate_std_s=max(
+                source.expansion_rate_std_s,
+                target.expansion_rate_std_s,
+            ),
+            confidence=target.confidence,
+        )
+        replacement.state = transferred
+        replacement.last_measurement_camera_to_world = (
+            predecessor.last_measurement_camera_to_world
+        )
+        replacement.last_measured_center_norm = (
+            predecessor.last_measured_center_norm
+        )
+        replacement.last_measured_aperture_half_size_norm = (
+            predecessor.last_measured_aperture_half_size_norm
+        )
+        for history in replacement.measured_aperture_history:
+            history.clear()
+        replacement.measured_log_scale_rate_history.clear()
+        replacement.scale_rate_reanchor_required = (
+            target.raw_log_scale is None
+        )
+        return transferred
 
     def bind(
         self,

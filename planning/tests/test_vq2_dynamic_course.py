@@ -20,6 +20,7 @@ from planning.vq2_dynamic_course import (
     MIN_TARGET_PITCH_RAD,
     MIN_THRUST,
     SUPPORT_THRUST,
+    TrackDynamicState,
     predict_aperture_relative_crossing,
 )
 
@@ -336,6 +337,7 @@ def _observation(
     visible: bool = True,
     ambiguous: bool = False,
     confidence: float = 0.95,
+    inner_scale_measurement_usable: bool = False,
 ) -> GateObservation:
     timestamp = round(time_s * NS)
     return GateObservation(
@@ -354,6 +356,9 @@ def _observation(
         ambiguous=ambiguous,
         confidence=confidence,
         measurement_std=(0.005, 0.005, 0.01),
+        inner_scale_measurement_usable=(
+            inner_scale_measurement_usable if visible else False
+        ),
     )
 
 
@@ -1612,6 +1617,182 @@ def test_clean_unqualified_aperture_separates_steering_horizon_from_passage(
     assert decision.current_aperture_prediction_horizon_remaining_s > 1.0
     assert decision.current_time_to_contact_s is None
     assert decision.crossing_prediction_horizon_s == 0.0
+
+
+def test_degraded_inner_scale_qualifies_existing_aperture_without_reseeding(
+) -> None:
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        crossing_prediction_max_horizon_s=0.20,
+    )
+
+    def run(*, scale_authority: bool) -> tuple[
+        TrackDynamicState,
+        TrackDynamicState,
+    ]:
+        core = DynamicCourseCore(config)
+        _imu(core, 1.0)
+        clean = core.observe_track(
+            _observation(
+                "gate-a",
+                1,
+                1.0,
+                log_scale=-1.00,
+            )
+        )
+        state = clean
+        for sequence, log_scale in enumerate(
+            (-0.94, -0.88, -0.82),
+            start=2,
+        ):
+            time_s = 1.0 + (sequence - 1) * 0.030
+            _imu(core, time_s)
+            state = core.observe_track(
+                _observation(
+                    "gate-a",
+                    sequence,
+                    time_s,
+                    log_scale=log_scale,
+                    aperture=None,
+                    inner_scale_measurement_usable=scale_authority,
+                )
+            )
+        return clean, state
+
+    clean, corrected = run(scale_authority=True)
+    outer_clean, outer_only = run(scale_authority=False)
+
+    assert corrected.aperture_half_size_norm is not None
+    assert corrected.aperture_propagated
+    assert corrected.scale_rate_qualified
+    assert corrected.aperture_dynamics_qualified
+    assert corrected.expansion_rate_s > 0.0
+    assert corrected.time_to_contact_s is not None
+    assert corrected.aperture_seed_monotonic_ns == (
+        clean.aperture_seed_monotonic_ns
+    )
+    assert corrected.aperture_prediction_deadline_monotonic_ns > (
+        clean.aperture_prediction_deadline_monotonic_ns
+    )
+    assert corrected.log_scale_std <= outer_only.log_scale_std
+
+    assert outer_only.aperture_half_size_norm is not None
+    assert outer_only.aperture_propagated
+    assert not outer_only.scale_rate_qualified
+    assert not outer_only.aperture_dynamics_qualified
+    assert outer_only.aperture_seed_monotonic_ns == (
+        outer_clean.aperture_seed_monotonic_ns
+    )
+    assert outer_only.aperture_prediction_deadline_monotonic_ns == (
+        outer_clean.aperture_prediction_deadline_monotonic_ns
+    )
+
+
+def test_graph_vetted_successor_handoff_preserves_roles_and_bounded_state(
+) -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            crossing_prediction_max_horizon_s=0.20,
+        )
+    )
+    for sequence, log_scale in enumerate(
+        (-1.00, -0.94, -0.88, -0.82),
+        start=1,
+    ):
+        time_s = 1.0 + (sequence - 1) * 0.030
+        _imu(core, time_s)
+        if sequence == 1:
+            core.observe_track(
+                _observation(
+                    "current",
+                    sequence,
+                    time_s,
+                    x=0.0,
+                    y=0.0,
+                )
+            )
+        core.observe_track(
+            _observation(
+                "successor-old",
+                sequence,
+                time_s,
+                x=0.35 + 0.01 * sequence,
+                y=-0.18,
+                log_scale=log_scale,
+                aperture=(0.10, 0.12),
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="current",
+        successor_track_id="successor-old",
+    )
+    source = core.course_state().successor
+    assert source is not None
+    assert source.aperture_dynamics_qualified
+
+    _imu(core, 1.16)
+    core.observe_track(
+        _observation(
+            "successor-old",
+            5,
+            1.16,
+            visible=False,
+        )
+    )
+    replacement = core.observe_track(
+        _observation(
+            "successor-new",
+            1,
+            1.16,
+            x=0.42,
+            y=-0.19,
+            log_scale=-0.74,
+            aperture=None,
+            inner_scale_measurement_usable=True,
+        )
+    )
+    before = core.course_state()
+    transferred = core.handoff_graph_vetted_successor_state(
+        predecessor_track_id="successor-old",
+        replacement_track_id="successor-new",
+    )
+    after_transfer = core.course_state()
+
+    assert transferred is not None
+    assert transferred.track_id == "successor-new"
+    assert transferred.aperture_half_size_norm is not None
+    assert transferred.aperture_propagated
+    assert transferred.aperture_dynamics_qualified
+    assert transferred.aperture_seed_monotonic_ns == (
+        source.aperture_seed_monotonic_ns
+    )
+    assert transferred.aperture_prediction_deadline_monotonic_ns > (
+        source.aperture_prediction_deadline_monotonic_ns
+    )
+    assert all(
+        transferred.bearing_std_rad[axis]
+        >= replacement.bearing_std_rad[axis]
+        for axis in range(2)
+    )
+    assert transferred.log_scale_std >= replacement.log_scale_std
+    assert after_transfer.current_gate_index == before.current_gate_index
+    assert after_transfer.current_track_id == before.current_track_id
+    assert after_transfer.successor_track_id == before.successor_track_id
+    assert after_transfer.promotion_count == before.promotion_count == 0
+
+    rebound = core.bind(
+        current_gate_index=0,
+        current_track_id="current",
+        successor_track_id="successor-new",
+    )
+    assert rebound.current_gate_index == 0
+    assert rebound.current_track_id == "current"
+    assert rebound.successor_track_id == "successor-new"
+    assert rebound.successor is not None
+    assert rebound.successor.aperture_propagated
+    assert rebound.promotion_count == 0
 
 
 def test_local_aperture_is_withdrawn_at_decision_time_expiry() -> None:
