@@ -1061,6 +1061,186 @@ class DynamicVisualCourseSession:
         self._last_decision = decision
         return decision
 
+    def propagated_current_fov_gap_authority(
+        self,
+        *,
+        track: VisualTrack,
+        camera_token: CameraFrameToken,
+        now_monotonic_ns: int,
+    ) -> Mapping[str, Any]:
+        """Prove exact, bounded steering ownership of a vertical FOV gap.
+
+        This is a read-only authority check over the already-staged tracker
+        publication, rolling local state, and latest guidance decision.  It
+        cannot create passage or authoritative gate-advance evidence.
+        """
+
+        if type(track) is not VisualTrack:
+            raise DynamicCourseError(
+                "propagated FOV gap requires an exact visual track"
+            )
+        if type(camera_token) is not CameraFrameToken:
+            raise DynamicCourseError(
+                "propagated FOV gap requires an exact camera token"
+            )
+        if type(now_monotonic_ns) is not int or now_monotonic_ns < 0:
+            raise DynamicCourseError(
+                "propagated FOV gap clock is invalid"
+            )
+        staged = self._staged
+        if staged is None or not track.history:
+            raise DynamicCourseError(
+                "propagated FOV gap lacks exact staged lineage"
+            )
+        sample = track.history[-1]
+        if (
+            staged.expected_current_track_id != track.track_id
+            or staged.camera_token != camera_token
+            or staged.tracker_frame_sequence
+            != sample.tracker_frame_sequence
+            or track.latest_token != camera_token
+            or sample.token != camera_token
+            or type(sample.publication_monotonic_ns) is not int
+            or now_monotonic_ns < sample.observation_monotonic_ns
+            or now_monotonic_ns < sample.publication_monotonic_ns
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap tracker publication differs"
+            )
+
+        try:
+            course = self.core.course_state()
+        except DynamicCourseError as exc:
+            raise DynamicCourseError(
+                "propagated FOV gap lacks current dynamic state"
+            ) from exc
+        current = course.current
+        decision = self._last_decision
+        if (
+            decision is None
+            or decision.monotonic_ns > now_monotonic_ns
+            or decision.current_gate_index != course.current_gate_index
+            or decision.current_track_id != course.current_track_id
+            or decision.current_track_id != track.track_id
+            or staged.expected_gate_index != course.current_gate_index
+            or current.track_id != track.track_id
+            or current.frame_sequence != sample.tracker_frame_sequence
+            or current.stream_generation != camera_token.generation
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap decision and current state differ"
+            )
+
+        aperture = current.aperture_half_size_norm
+        seed_ns = current.aperture_seed_monotonic_ns
+        deadline_ns = current.aperture_prediction_deadline_monotonic_ns
+        if (
+            aperture is None
+            or seed_ns is None
+            or deadline_ns is None
+            or not current.aperture_propagated
+            or not decision.current_aperture_propagated
+            or decision.current_aperture_half_size_norm != aperture
+            or seed_ns > current.state_monotonic_ns
+            or deadline_ns <= seed_ns
+            or any(
+                not math.isfinite(float(value)) or float(value) <= 0.0
+                for value in aperture
+            )
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap lacks a clean propagated aperture"
+            )
+
+        expected_decision_age_s = max(
+            0.0,
+            (decision.monotonic_ns - seed_ns) / 1_000_000_000.0,
+        )
+        expected_decision_horizon_s = max(
+            0.0,
+            (deadline_ns - decision.monotonic_ns) / 1_000_000_000.0,
+        )
+        if (
+            not math.isfinite(
+                decision.current_aperture_prediction_age_s
+            )
+            or not math.isfinite(
+                decision
+                .current_aperture_prediction_horizon_remaining_s
+            )
+            or not math.isclose(
+                decision.current_aperture_prediction_age_s,
+                expected_decision_age_s,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            or not math.isclose(
+                decision
+                .current_aperture_prediction_horizon_remaining_s,
+                expected_decision_horizon_s,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap decision horizon differs"
+            )
+
+        if (
+            not current.visible
+            or current.ambiguous
+            or not track.visible
+            or track.ambiguous
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap current track is not unambiguous"
+            )
+        vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
+        horizontal_edges = FrameEdge.LEFT | FrameEdge.RIGHT
+        if (
+            current.clipping != track.clipping
+            or current.clipping != sample.clipping
+            or not bool(current.clipping & vertical_edges)
+            or bool(current.clipping & horizontal_edges)
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap is not vertical-only clipping"
+            )
+
+        remaining_horizon_s = (
+            deadline_ns - now_monotonic_ns
+        ) / 1_000_000_000.0
+        if (
+            not math.isfinite(remaining_horizon_s)
+            or remaining_horizon_s <= 0.0
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap aperture prediction expired"
+            )
+        return {
+            "basis": "propagated-current-fov-gap-steering-v1",
+            "gate_index": course.current_gate_index,
+            "track_id": track.track_id,
+            "camera_token": asdict(camera_token),
+            "tracker_frame_sequence": sample.tracker_frame_sequence,
+            "publication_monotonic_ns": sample.publication_monotonic_ns,
+            "authority_monotonic_ns": now_monotonic_ns,
+            "stream_generation": current.stream_generation,
+            "aperture_seed_monotonic_ns": seed_ns,
+            "aperture_prediction_deadline_monotonic_ns": deadline_ns,
+            "aperture_prediction_horizon_remaining_s": (
+                remaining_horizon_s
+            ),
+            "aperture_half_size_norm": list(aperture),
+            "clipping": int(current.clipping),
+            "terminal_crossing_clearance_norm": list(
+                decision.terminal_crossing_clearance_norm
+            ),
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        }
+
     def govern_wire_command(
         self,
         command: AttitudeRateCommand,

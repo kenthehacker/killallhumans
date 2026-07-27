@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import pytest
@@ -13,6 +14,7 @@ from competition.vq2_visual_tracker import (
     VisualDetection,
     VisualDetectionFrame,
     VisualInnerApertureGeometry,
+    VisualTrack,
 )
 from planning.vq2_dynamic_course import (
     DynamicCourseError,
@@ -352,6 +354,51 @@ def _accept_proposal(
             output.thrust,
         ),
         wire_start_monotonic_ns=wire_ns,
+    )
+
+
+def _propagated_vertical_fov_gap() -> tuple[
+    DynamicVisualCourseSession,
+    VisualTrack,
+    CameraFrameToken,
+    int,
+]:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+    update = tracker.update(
+        _frame(
+            6,
+            current_width=0.40,
+            current_height=0.44,
+            include_successor=False,
+            current_clipping=FrameEdge.BOTTOM,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    _observe(planner, snapshot, tracker)
+    decision = session.last_decision
+    assert decision is not None
+    assert decision.current_aperture_propagated
+    return (
+        session,
+        tracker.track(current_id),
+        update.token,
+        decision.monotonic_ns,
     )
 
 
@@ -1015,6 +1062,181 @@ def test_low_confidence_inner_steers_from_last_clean_seed_only() -> None:
     )
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None
+
+
+def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> None:
+    session, track, token, now_ns = _propagated_vertical_fov_gap()
+    decision = session.last_decision
+    assert decision is not None
+    # Crossing clearance is deliberately not part of this raw-FOV ownership
+    # proof.  A propagated state may steer through clipping, but it cannot
+    # turn that steering evidence into passage or race-advance authority.
+    session._last_decision = replace(  # noqa: SLF001 - exact contract probe
+        decision,
+        terminal_crossing_clearance_norm=(-0.04, -0.02),
+    )
+
+    authority = session.propagated_current_fov_gap_authority(
+        track=track,
+        camera_token=token,
+        now_monotonic_ns=now_ns,
+    )
+
+    assert authority["track_id"] == track.track_id
+    assert authority["camera_token"] == {
+        "generation": token.generation,
+        "frame_id": token.frame_id,
+        "publication_sequence": token.publication_sequence,
+        "stream_id": token.stream_id,
+    }
+    assert authority["tracker_frame_sequence"] == (
+        track.history[-1].tracker_frame_sequence
+    )
+    assert authority["clipping"] == int(FrameEdge.BOTTOM)
+    assert authority["aperture_prediction_horizon_remaining_s"] > 0.0
+    assert all(
+        math.isfinite(value) and value > 0.0
+        for value in authority["aperture_half_size_norm"]
+    )
+    assert authority["terminal_crossing_clearance_norm"] == [
+        -0.04,
+        -0.02,
+    ]
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+
+def test_propagated_current_fov_gap_refuses_identity_and_frame_mismatch() -> None:
+    session, track, token, now_ns = _propagated_vertical_fov_gap()
+    sample = track.history[-1]
+    wrong_frame_track = replace(
+        track,
+        history=track.history[:-1]
+        + (
+            replace(
+                sample,
+                tracker_frame_sequence=(
+                    sample.tracker_frame_sequence + 1
+                ),
+            ),
+        ),
+    )
+
+    for mismatched_track, mismatched_token in (
+        (replace(track, track_id=f"{track.track_id}-other"), token),
+        (wrong_frame_track, token),
+        (
+            track,
+            replace(
+                token,
+                publication_sequence=token.publication_sequence + 1,
+            ),
+        ),
+    ):
+        with pytest.raises(
+            DynamicCourseError,
+            match="tracker publication",
+        ):
+            session.propagated_current_fov_gap_authority(
+                track=mismatched_track,
+                camera_token=mismatched_token,
+                now_monotonic_ns=now_ns,
+            )
+
+
+def test_propagated_current_fov_gap_refuses_unsafe_geometry_and_expiry() -> None:
+    session, track, token, now_ns = _propagated_vertical_fov_gap()
+    sample = track.history[-1]
+    ambiguous_track = replace(track, ambiguous=True)
+    horizontal_track = replace(
+        track,
+        clipping=FrameEdge.BOTTOM | FrameEdge.LEFT,
+        history=track.history[:-1]
+        + (
+            replace(
+                sample,
+                clipping=FrameEdge.BOTTOM | FrameEdge.LEFT,
+            ),
+        ),
+    )
+
+    with pytest.raises(DynamicCourseError, match="unambiguous"):
+        session.propagated_current_fov_gap_authority(
+            track=ambiguous_track,
+            camera_token=token,
+            now_monotonic_ns=now_ns,
+        )
+    with pytest.raises(DynamicCourseError, match="vertical-only"):
+        session.propagated_current_fov_gap_authority(
+            track=horizontal_track,
+            camera_token=token,
+            now_monotonic_ns=now_ns,
+        )
+
+    deadline_ns = (
+        session.core.course_state()
+        .current.aperture_prediction_deadline_monotonic_ns
+    )
+    assert deadline_ns is not None
+    with pytest.raises(DynamicCourseError, match="expired"):
+        session.propagated_current_fov_gap_authority(
+            track=track,
+            camera_token=token,
+            now_monotonic_ns=deadline_ns + 1,
+        )
+
+
+def test_propagated_current_fov_gap_refuses_clean_or_unseeded_aperture() -> None:
+    for inner_aperture in (
+        _AUTO_INNER_APERTURE,
+        _rejected_inner_aperture(
+            clipping=FrameEdge.NONE,
+            health_reason="no-clean-inner-aperture-seed",
+        ),
+    ):
+        tracker, graph, snapshot, current_id = _single_gate_graph(
+            width=0.34,
+            height=0.36,
+            inner_aperture=inner_aperture,
+        )
+        session = _session()
+        session.record_wire_acceptance(
+            target_roll_rad=0.0,
+            target_pitch_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            thrust=0.275,
+            wire_command=AttitudeRateCommand(
+                0.0,
+                0.0,
+                0.0,
+                0.275,
+            ),
+            wire_start_monotonic_ns=_BASE_NS,
+        )
+        planner = DynamicRollingVisualApproachServo(
+            current_id,
+            0,
+            next_gate_blend=0.35,
+            next_gate_blend_start_log_scale=-1.80,
+            next_gate_blend_full_log_scale=-0.50,
+            session=session,
+        )
+        _observe(planner, snapshot, tracker)
+        update = tracker.latest_update
+        assert update is not None
+        decision = session.last_decision
+        assert decision is not None
+
+        with pytest.raises(
+            DynamicCourseError,
+            match="clean propagated aperture",
+        ):
+            session.propagated_current_fov_gap_authority(
+                track=tracker.track(current_id),
+                camera_token=update.token,
+                now_monotonic_ns=decision.monotonic_ns,
+            )
 
 
 def test_clipped_outer_support_without_clean_seed_still_refuses() -> None:

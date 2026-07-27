@@ -3891,6 +3891,7 @@ async def _run_visual_course_stage_impl(
             }
         top_fov_proposal: Optional[_TopFovPitchProposal] = None
         top_fov_observation: Optional[_TopFovObservation] = None
+        top_fov_propagated_handoff: Optional[Mapping[str, Any]] = None
         top_fov_track_id: Optional[str] = None
         dynamic_controller = runtime.dynamic_controller
         if type(dynamic_controller) is DynamicVisualCourseSession:
@@ -3910,58 +3911,107 @@ async def _run_visual_course_stage_impl(
                         target_track,
                         snapshot.latest_camera_token,
                     )
-                    prior_target_pitch_rad = (
-                        fov_summary["last_protected_target_pitch_rad"]
-                        if fov_summary[
-                            "last_protected_target_pitch_rad"
-                        ]
-                        is not None
-                        else (
-                            top_fov_observation.previous_target_pitch_rad
-                            if (
+                except (AttributeError, TypeError, ValueError) as exc:
+                    handoff_ns = runtime.perf_counter_ns()
+                    if type(handoff_ns) is not int or handoff_ns < 0:
+                        raise abort_type(
+                            "visual-course propagated FOV-handoff clock is "
+                            "invalid"
+                        ) from exc
+                    try:
+                        top_fov_propagated_handoff = (
+                            dynamic_controller
+                            .propagated_current_fov_gap_authority(
+                                track=target_track,
+                                camera_token=(
+                                    snapshot.latest_camera_token
+                                ),
+                                now_monotonic_ns=handoff_ns,
+                            )
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        raise abort_type(
+                            "visual-course top-FOV pitch guidance refused: "
+                            f"{exc}"
+                        ) from exc
+                    if not isinstance(
+                        top_fov_propagated_handoff,
+                        Mapping,
+                    ):
+                        raise abort_type(
+                            "visual-course propagated FOV-handoff evidence "
+                            "is invalid"
+                        )
+                if top_fov_observation is not None:
+                    try:
+                        prior_target_pitch_rad = (
+                            fov_summary["last_protected_target_pitch_rad"]
+                            if fov_summary[
+                                "last_protected_target_pitch_rad"
+                            ]
+                            is not None
+                            else (
                                 top_fov_observation
                                 .previous_target_pitch_rad
-                                is not None
+                                if (
+                                    top_fov_observation
+                                    .previous_target_pitch_rad
+                                    is not None
+                                )
+                                else top_fov_observation.capture_pitch_rad
                             )
-                            else top_fov_observation.capture_pitch_rad
                         )
+                        top_fov_proposal = (
+                            _propose_top_fov_pitch_reference(
+                                capture_pitch_rad=(
+                                    top_fov_observation.capture_pitch_rad
+                                ),
+                                raw_top_edge_image_down=(
+                                    top_fov_observation
+                                    .raw_top_edge_image_down
+                                ),
+                                raw_top_edge_rate_down_s=(
+                                    top_fov_observation
+                                    .raw_top_edge_rate_down_s
+                                ),
+                                requested_target_pitch_rad=(
+                                    target_pitch_rad
+                                ),
+                                prior_target_pitch_rad=(
+                                    prior_target_pitch_rad
+                                ),
+                                vertical_angle_scale_rad=(
+                                    top_fov_observation
+                                    .vertical_angle_scale_rad
+                                ),
+                                active_before=bool(
+                                    fov_summary["active"]
+                                ),
+                                raw_top_edge_nonrotational_angle_rate_rad_s=(
+                                    top_fov_observation
+                                    .raw_top_edge_nonrotational_angle_rate_rad_s
+                                ),
+                                prediction_horizon_s=(
+                                    top_fov_observation
+                                    .pitch_response_delay_s
+                                ),
+                            )
+                        )
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise abort_type(
+                            "visual-course top-FOV pitch guidance refused: "
+                            f"{exc}"
+                        ) from exc
+                    target_pitch_rad = (
+                        top_fov_proposal.protected_target_pitch_rad
                     )
-                    top_fov_proposal = _propose_top_fov_pitch_reference(
-                        capture_pitch_rad=(
-                            top_fov_observation.capture_pitch_rad
-                        ),
-                        raw_top_edge_image_down=(
-                            top_fov_observation.raw_top_edge_image_down
-                        ),
-                        raw_top_edge_rate_down_s=(
-                            top_fov_observation
-                            .raw_top_edge_rate_down_s
-                        ),
-                        requested_target_pitch_rad=target_pitch_rad,
-                        prior_target_pitch_rad=prior_target_pitch_rad,
-                        vertical_angle_scale_rad=(
-                            top_fov_observation.vertical_angle_scale_rad
-                        ),
-                        active_before=bool(fov_summary["active"]),
-                        raw_top_edge_nonrotational_angle_rate_rad_s=(
-                            top_fov_observation
-                            .raw_top_edge_nonrotational_angle_rate_rad_s
-                        ),
-                        prediction_horizon_s=(
-                            top_fov_observation.pitch_response_delay_s
-                        ),
-                    )
-                except (AttributeError, TypeError, ValueError) as exc:
-                    raise abort_type(
-                        "visual-course top-FOV pitch guidance refused: "
-                        f"{exc}"
-                    ) from exc
-                target_pitch_rad = top_fov_proposal.protected_target_pitch_rad
-                if launch_evidence is not None:
-                    launch_evidence["target_pitch_rad_before_top_fov"] = (
-                        launch_evidence["target_pitch_rad"]
-                    )
-                    launch_evidence["target_pitch_rad"] = target_pitch_rad
+                    if launch_evidence is not None:
+                        launch_evidence[
+                            "target_pitch_rad_before_top_fov"
+                        ] = launch_evidence["target_pitch_rad"]
+                        launch_evidence["target_pitch_rad"] = (
+                            target_pitch_rad
+                        )
         # Allocate the static attitude-loop response from the reference that
         # will actually be applied this tick.  Before the old inner governor
         # was removed, its governed output implicitly provided this behavior;
@@ -4377,6 +4427,33 @@ async def _run_visual_course_stage_impl(
                         ),
                         **asdict(top_fov_proposal),
                     }
+                elif top_fov_propagated_handoff is not None:
+                    propagated_handoff = dict(
+                        top_fov_propagated_handoff
+                    )
+                    fov_summary[
+                        "propagated_state_handoff_command_count"
+                    ] = int(
+                        fov_summary[
+                            "propagated_state_handoff_command_count"
+                        ]
+                    ) + 1
+                    fov_summary[
+                        "last_propagated_state_handoff"
+                    ] = propagated_handoff
+                    accepted_dynamic_evidence[
+                        "top_fov_propagated_state_handoff"
+                    ] = propagated_handoff
+                    host.recorder.emit(
+                        "visual_course_dynamic_fov_gap_handoff",
+                        gate_index=current_gate_index,
+                        stage=stage,
+                        camera_token=asdict(
+                            snapshot.latest_camera_token
+                        ),
+                        authority=propagated_handoff,
+                        command=asdict(command),
+                    )
             host.recorder.emit(
                 "visual_course_dynamic_command",
                 **accepted_dynamic_evidence,
@@ -5125,6 +5202,8 @@ async def _run_visual_course_stage_impl(
                     else None
                 ),
                 "limited_command_count": 0,
+                "propagated_state_handoff_command_count": 0,
+                "last_propagated_state_handoff": None,
                 "last_track_id": None,
                 "last_camera_token": None,
                 "last_wire_start_monotonic_ns": None,
