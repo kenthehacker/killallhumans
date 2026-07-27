@@ -769,9 +769,10 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
         update.observation_monotonic_ns + 5_000_000,
     )
     baseline = session._successor_steering_targets(prediction)
-    assert abs(proposal.servo_output.target_roll_rad) < abs(
+    assert proposal.servo_output.target_roll_rad == pytest.approx(
         baseline["target_roll_rad"]
     )
+    assert proposal.servo_output.target_roll_rad > 0.0
     assert all(
         math.isfinite(value)
         for value in (
@@ -805,7 +806,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert promoted.promotion_count == 1
 
 
-def test_dynamic_bank_unload_holds_through_censorship_until_inward_motion():
+def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
     tracker, _graph_state, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -816,46 +817,37 @@ def test_dynamic_bank_unload_holds_through_censorship_until_inward_motion():
         next_gate_blend_full_log_scale=-0.50,
         session=session,
     )
-    servo = planner._servo
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
 
-    outward, outward_authority, outward_ceiling = (
-        servo._apply_outward_bank_unload(
-            target_roll_rad=MAX_TARGET_ROLL_RAD,
-            yaw_rate_rad_s=-MAX_YAW_RATE_RAD_S,
-            horizontal_error_norm=0.65,
-            horizontal_rate_norm_s=0.20,
-            horizontal_censored=False,
+    outputs = []
+    for sequence, center_x in zip(
+        range(6, 10),
+        (0.10, 0.20, 0.30, 0.40),
+    ):
+        tracker.update(
+            _frame(
+                sequence,
+                current_center_x=center_x,
+                successor_center_x=0.52,
+            )
         )
-    )
-    censored, censored_authority, censored_ceiling = (
-        servo._apply_outward_bank_unload(
-            target_roll_rad=MAX_TARGET_ROLL_RAD,
-            yaw_rate_rad_s=-MAX_YAW_RATE_RAD_S,
-            horizontal_error_norm=0.90,
-            horizontal_rate_norm_s=-0.20,
-            horizontal_censored=True,
-        )
-    )
-    recovered, recovered_authority, recovered_ceiling = (
-        servo._apply_outward_bank_unload(
-            target_roll_rad=MAX_TARGET_ROLL_RAD,
-            yaw_rate_rad_s=-MAX_YAW_RATE_RAD_S,
-            horizontal_error_norm=0.60,
-            horizontal_rate_norm_s=-0.20,
-            horizontal_censored=False,
-        )
-    )
+        snapshot = _graph_state.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        outputs.append(proposal.servo_output)
+        _accept_proposal(session, tracker, proposal)
 
-    assert outward_authority > 0.0
-    assert 0.0 <= outward <= MAX_TARGET_ROLL_RAD
-    assert outward_ceiling == pytest.approx(outward)
-    assert censored == pytest.approx(outward)
-    assert censored_authority == 0.0
-    assert censored_ceiling == pytest.approx(outward_ceiling)
-    assert recovered == pytest.approx(MAX_TARGET_ROLL_RAD)
-    assert recovered_authority == 0.0
-    assert recovered_ceiling is None
-    assert snapshot.current_track_id == current_id
+    corrective = tuple(
+        output.target_roll_rad
+        for output in outputs
+        if output.yaw_rate_rad_s < 0.0
+    )
+    assert corrective
+    assert all(
+        math.isfinite(target_roll)
+        and 0.0 < target_roll <= MAX_TARGET_ROLL_RAD
+        for target_roll in corrective
+    )
 
 
 @pytest.mark.parametrize("gate_size", (0.36, 0.90))
