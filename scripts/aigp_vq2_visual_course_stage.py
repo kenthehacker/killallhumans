@@ -117,9 +117,6 @@ GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
 CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS = (
     "imu-derotated-current-center-proved-law-v2"
 )
-CURRENT_APERTURE_Q_COLLECTIVE_BASIS = (
-    "expansion-aware-current-aperture-q-rate-proved-law-v3"
-)
 RAW_CURRENT_APERTURE_COLLECTIVE_BASIS = (
     "raw-camera-current-center-proved-law-v1"
 )
@@ -588,7 +585,13 @@ def _dynamic_current_aperture_collective_inputs(
     *,
     vertical_angle_scale_rad: float,
 ) -> tuple[float, float, str]:
-    """Return current-aperture P/D inputs in normalized image units."""
+    """Return translation-only collective P/D inputs in image units.
+
+    Aperture-relative q-rate deliberately includes aperture expansion.  That
+    is the correct crossing-geometry state, but it is not vertical vehicle
+    motion and must not unload collective while the vehicle is still moving
+    toward an aperture edge.
+    """
 
     passage_error = getattr(
         dynamic_decision,
@@ -615,25 +618,6 @@ def _dynamic_current_aperture_collective_inputs(
         float(residual_rate_rad_s[1]) / vertical_angle_scale_rad
     )
     basis = CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
-    aperture = getattr(
-        dynamic_decision,
-        "current_aperture_half_size_norm",
-        None,
-    )
-    q_rate = getattr(dynamic_decision, "crossing_rate_q_s", None)
-    if (
-        isinstance(aperture, tuple)
-        and len(aperture) == 2
-        and isinstance(q_rate, tuple)
-        and len(q_rate) == 2
-        and current_dynamic.visible
-        and not current_dynamic.ambiguous
-        and not current_dynamic.censored_axes[1]
-        and current_dynamic.bearing_rate_qualified[1]
-        and current_dynamic.scale_rate_qualified
-    ):
-        vertical_rate = float(q_rate[1]) * float(aperture[1])
-        basis = CURRENT_APERTURE_Q_COLLECTIVE_BASIS
     if not all(
         math.isfinite(value)
         for value in (vertical_error, vertical_rate)
