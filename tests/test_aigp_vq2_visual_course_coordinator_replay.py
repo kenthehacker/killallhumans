@@ -691,12 +691,15 @@ def _attempt5_runtime(host):
     return replace(runtime, servo_factory=servo_factory)
 
 
-def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
-    """Recorded tracker rows with candidate output, not recorded flight wires."""
+def test_attempt5_clean_reacquisition_releases_recovery_before_clipping():
+    """Two clean accepted rows restore ordinary current-gate ownership."""
 
     host = _Attempt5RecoveryHost()
 
-    with pytest.raises(SafetyAbort, match="post-credit recovery timed out"):
+    with pytest.raises(
+        SafetyAbort,
+        match="current identity is no longer visible",
+    ):
         asyncio.run(
             run_visual_course_stage(
                 host,
@@ -705,31 +708,27 @@ def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
             )
         )
 
-    candidate_wires = [
-        (kwargs["wire_visual_token"].publication_sequence, command)
+    recovery_wires = [
+        (kwargs["wire_visual_token"].publication_sequence, stage)
         for (
-            (command, kwargs, gate_index),
+            (_command, kwargs, gate_index),
             (stage, _elapsed_s, _recorded_command),
         ) in zip(host.commands, host.ticks)
         if (
             gate_index == 4
             and kwargs.get("wire_visual_token") is not None
-            and not stage.endswith("recovery-support")
+            and "/recovery-" in stage
         )
     ]
-    assert [sequence for sequence, _command in candidate_wires] == [
-        180,
-        181,
-        182,
-        183,
-    ]
-    top_command = candidate_wires[-1][1]
-    assert top_command.pitch_rate >= 0.0
-    assert top_command.yaw_rate < 0.0
-    assert top_command.thrust == pytest.approx(
-        candidate_wires[-2][1].thrust
+    assert [sequence for sequence, _stage in recovery_wires] == [180, 181]
+    assert all(stage.endswith("recovery-clean") for _, stage in recovery_wires)
+    assert any(
+        gate_index == 4 and stage.endswith("/approach")
+        for (
+            (_command, _kwargs, gate_index),
+            (stage, _elapsed_s, _recorded_command),
+        ) in zip(host.commands, host.ticks)
     )
-    assert top_command.thrust > 0.21
 
     transition = host._visual_course_summary[
         "authoritative_transitions"
@@ -743,45 +742,35 @@ def test_counterfactual_attempt5_rows_command_pub180_and_brake_on_pub183():
         "publication_sequence"
     ] == 180
     recovery = host._visual_course_summary["segments"][1]
-    assert recovery["lifecycle"] == "promote_reacquire"
-    assert recovery["recovery_clean_command_count"] == 3
-    assert recovery["recovery_one_edge_command_count"] == 1
-    # The accepted TOP-censored brake wire retains the last clean collective
-    # and renews the existing 50 ms publication-gap bound. The following
-    # losses retain measured flight support while the bounded timeout runs.
-    support_commands = [
-        command
-        for (
-            (command, _kwargs, gate_index),
-            (stage, _elapsed_s, _recorded_command),
-        ) in zip(host.commands, host.ticks)
-        if gate_index == 4 and stage.endswith("recovery-support")
+    assert recovery["lifecycle"] != "promote_reacquire"
+    assert recovery["recovery_clean_command_count"] == 2
+    assert recovery["recovery_one_edge_command_count"] == 0
+    assert recovery["recovery_support_command_count"] == 0
+    completed = [
+        fields
+        for name, fields in host.recorder.events
+        if name == "visual_course_recovery_completed"
     ]
-    assert recovery["recovery_zero_command_count"] == 0
-    assert recovery["recovery_support_command_count"] == 2
-    assert len(support_commands) == 2
-    assert all(
-        command.roll_rate == 0.0
-        and command.pitch_rate == pytest.approx(0.035)
-        and command.yaw_rate == 0.0
-        and command.thrust == pytest.approx(0.275)
-        for command in support_commands
-    )
+    assert len(completed) == 1
+    assert completed[0]["clean_command_count"] == 2
 
 
 class _Attempt5OutsideImageHost(_Attempt5RecoveryHost):
-    """Counterfactual unsafe mutation of the recorded publication 183."""
+    """Counterfactual unsafe mutation before clean recovery is complete."""
 
     def _sample(self):
         super()._sample()
-        if self.after_promotion_samples is not None and self.sequence == 183:
-            self.visual_gate_graph.latest_snapshot.current_track.center_norm = (
+        if self.after_promotion_samples is not None and self.sequence == 181:
+            track = self.visual_gate_graph.latest_snapshot.current_track
+            track.center_norm = (
                 1.01,
-                -0.7222222222222222,
+                -0.6722222222222223,
             )
+            track.clipping = FrameEdge.TOP
+            track.center_censored = True
 
 
-def test_attempt5_outside_observable_axis_aborts_before_pub183_wire():
+def test_recovery_outside_observable_axis_aborts_before_second_clean_wire():
     host = _Attempt5OutsideImageHost()
 
     with pytest.raises(
@@ -800,7 +789,7 @@ def test_attempt5_outside_observable_axis_aborts_before_pub183_wire():
         kwargs["wire_visual_token"].publication_sequence
         for _command, kwargs, gate_index in host.commands
         if gate_index == 4 and kwargs.get("wire_visual_token") is not None
-    ] == [180, 181, 182]
+    ] == [180]
 
 
 class _RecoverySlotReplacementHost(_CadencedCoordinatorHost):

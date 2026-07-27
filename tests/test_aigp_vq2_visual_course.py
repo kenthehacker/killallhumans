@@ -951,6 +951,8 @@ class _Servo:
         preview_track_id=None,
         passage_preview_blend=0.0,
         passage_preview_retire_once=False,
+        recovery_corridor_frames=5,
+        recovery_brake_reason="aligning",
         calls=None,
     ):
         self.track_id = expected_current_track_id
@@ -977,6 +979,8 @@ class _Servo:
         self.passage_preview_retirement_emitted = False
         self.passage_preview_retired = False
         self.generic_passage_sample_count = 0
+        self.recovery_corridor_frames = recovery_corridor_frames
+        self.recovery_brake_reason = recovery_brake_reason
         self.calls = calls if calls is not None else []
 
     def retire_passage_preview(self, expected_track_id):
@@ -1111,7 +1115,11 @@ class _Servo:
             target_pitch_rad=-0.105 if advance else 0.0,
             yaw_rate_rad_s=self.yaw_rate,
             thrust=0.295 if advance else 0.21,
-            corridor_frames=5,
+            corridor_frames=(
+                self.recovery_corridor_frames
+                if mode is VisualApproachMode.PROMOTE_REACQUIRE
+                else 5
+            ),
             advance_enabled=advance,
             next_gate_blend=(
                 active_preview_blend
@@ -1142,7 +1150,11 @@ class _Servo:
             ),
             horizontal_abs_error_delta=0.0,
             vertical_abs_error_delta=0.0,
-            brake_reason=None if advance else "aligning",
+            brake_reason=(
+                self.recovery_brake_reason
+                if mode is VisualApproachMode.PROMOTE_REACQUIRE
+                else (None if advance else "aligning")
+            ),
             yaw_envelope_limited=False,
             passage_preview_retired=self.passage_preview_retired,
             passage_preview_retirement_violations=(
@@ -1678,6 +1690,38 @@ def test_generic_course_repeats_lifecycle_from_nonzero_gate_until_finish():
     )
     assert host.visual_gate_graph.finish_calls
     assert host.recorder.events[-1][0] == "visual_course_complete"
+
+
+def test_recovery_releases_after_two_clean_wires_while_still_off_axis():
+    host = _Host(initial_gate=3, finish_gate=4, fresh_after_samples=1)
+    runtime, calls = _runtime(
+        host,
+        servo_options={
+            "recovery_corridor_frames": 0,
+            "recovery_brake_reason": "target_edge_or_clipping",
+        },
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["race_finished"] is True
+    recovery = result["segments"][1]
+    assert recovery["recovery_clean_command_count"] == 2
+    assert [call[1] for call in calls].count(
+        VisualApproachMode.PROMOTE_REACQUIRE
+    ) == 2
+    assert VisualApproachMode.APPROACH in [
+        call[1] for call in calls
+    ]
+    completed = [
+        fields
+        for name, fields in host.recorder.events
+        if name == "visual_course_recovery_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["clean_command_count"] == 2
 
 
 def test_transition_carries_exact_reviewed_passage_preview_identity():

@@ -7436,12 +7436,6 @@ async def _run_visual_course_stage_impl(
                         accepted.wire_camera_token,
                         recovery_first_clean_wire_token,
                     )
-                    and proposal.servo_output.corridor_frames
-                    >= (
-                        host.visual_config.servo
-                        .required_corridor_frames
-                    )
-                    and proposal.servo_output.brake_reason == "aligning"
                     and not accepted.yaw_soft_stop_zeroed
                 )
                 if recovery_completed:
