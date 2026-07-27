@@ -3124,10 +3124,34 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                     / prediction_span_ns,
                 ),
             )
+            # A one-axis frame-edge clip censors only that image coordinate.
+            # Keep the fresh measured coordinate on the still-observable axis
+            # inside the legacy VisualTarget's raw-image domain; the bounded
+            # local prediction owns only the censored axis.  Fully observable
+            # propagated inner-state corrections and dual-axis clipping keep
+            # the paired decision-time reprojection used by the dynamic core.
+            one_axis_censored = (
+                state.censored_axes[0] != state.censored_axes[1]
+            )
+            measured_shell_center = (
+                target.normalized_x,
+                target.normalized_y_down,
+            )
+            shell_center = tuple(
+                (
+                    camera_center[axis]
+                    if (
+                        not one_axis_censored
+                        or state.censored_axes[axis]
+                    )
+                    else measured_shell_center[axis]
+                )
+                for axis in range(2)
+            )
             return replace(
                 target,
-                normalized_x=float(camera_center[0]),
-                normalized_y_down=float(camera_center[1]),
+                normalized_x=float(shell_center[0]),
+                normalized_y_down=float(shell_center[1]),
                 normalized_x_rate_s=(
                     state.residual_translational_rate_rad_s[0]
                     / scale.horizontal_angle_scale_rad

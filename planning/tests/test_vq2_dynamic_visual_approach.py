@@ -2366,6 +2366,130 @@ def test_rehydrated_inner_lineage_guides_multiedge_clip_without_passage() -> Non
     assert MIN_THRUST <= output.thrust <= MAX_THRUST
 
 
+@pytest.mark.parametrize(
+    (
+        "clipping",
+        "expected_censored_axes",
+        "projected_center",
+        "observable_axis",
+        "propagated_axis",
+    ),
+    (
+        (
+            FrameEdge.RIGHT,
+            (True, False),
+            (0.80, -1.40),
+            1,
+            0,
+        ),
+        (
+            FrameEdge.TOP,
+            (False, True),
+            (1.40, -0.80),
+            0,
+            1,
+        ),
+    ),
+)
+def test_one_axis_clip_keeps_fresh_observable_coordinate(
+    monkeypatch: pytest.MonkeyPatch,
+    clipping: FrameEdge,
+    expected_censored_axes: tuple[bool, bool],
+    projected_center: tuple[float, float],
+    observable_axis: int,
+    propagated_axis: int,
+) -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.36,
+            current_height=0.38,
+            include_successor=False,
+            current_center_x=0.12,
+            current_center_y=0.19,
+            current_clipping=clipping,
+            current_center_censored=True,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    decision_geometry = session.core._decision_geometry
+
+    def off_frame_on_observable_axis(
+        track_id: str,
+        monotonic_ns: int,
+    ):
+        _, aperture = decision_geometry(track_id, monotonic_ns)
+        return projected_center, aperture
+
+    monkeypatch.setattr(
+        session.core,
+        "_decision_geometry",
+        off_frame_on_observable_axis,
+    )
+    proposal = _observe(planner, snapshot, tracker)
+
+    state = session.core.course_state().current
+    raw_center = tracker.track(current_id).center_norm
+    target_center = (
+        proposal.current_target.normalized_x,
+        proposal.current_target.normalized_y_down,
+    )
+    assert state.censored_axes == expected_censored_axes
+    assert abs(projected_center[observable_axis]) > 1.25
+    assert target_center[observable_axis] == pytest.approx(
+        raw_center[observable_axis]
+    )
+    assert target_center[propagated_axis] == pytest.approx(
+        projected_center[propagated_axis]
+    )
+    assert all(abs(value) <= 1.25 for value in target_center)
+    assert session.last_decision is not None
+    assert session.last_decision.camera_current_center_norm == pytest.approx(
+        projected_center
+    )
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposal.servo_output.target_roll_rad,
+            proposal.servo_output.target_pitch_rad,
+            proposal.servo_output.yaw_rate_rad_s,
+            proposal.servo_output.thrust,
+        )
+    )
+    assert (
+        abs(proposal.servo_output.target_roll_rad)
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= proposal.servo_output.target_pitch_rad
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert (
+        abs(proposal.servo_output.yaw_rate_rad_s)
+        <= MAX_YAW_RATE_RAD_S
+    )
+    assert MIN_THRUST <= proposal.servo_output.thrust <= MAX_THRUST
+
+
 def test_clipped_outer_degraded_inner_steers_without_scale_authority() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
