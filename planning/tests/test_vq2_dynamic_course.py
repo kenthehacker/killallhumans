@@ -169,6 +169,57 @@ def test_1cab9da6_separates_unsafe_approach_sweep_from_safe_terminal_window(
     assert current_q[1] * q_rate[1] < 0.0
 
 
+def test_expanding_aperture_projects_uncertainty_to_crossing_scale() -> None:
+    """An inward, expanding gate can be 2-sigma safe at the endpoint."""
+
+    prediction = predict_aperture_relative_crossing(
+        center_offset_norm=(
+            0.01801119772014466,
+            -0.1939082635722633,
+        ),
+        passage_offset_norm=(0.0, 0.0),
+        aperture_half_extent_norm=(
+            0.20974697790325306,
+            0.3538317436193515,
+        ),
+        center_rate_norm_s=(
+            -0.06663773168763444,
+            -0.09887852901171028,
+        ),
+        aperture_expansion_rate_s=(
+            1.6174475604358003,
+            1.6174475604358003,
+        ),
+        center_std_norm=(
+            0.013762345989051085,
+            0.02827581714755323,
+        ),
+        aperture_log_scale_std=0.2731951664167071,
+        capture_timing_uncertainty_s=0.020,
+        horizon_s=0.6182580656466927,
+        allowance_q=(0.50, 0.45),
+    )
+
+    assert all(
+        predicted < current
+        for predicted, current in zip(
+            prediction.predicted_std_q,
+            prediction.current_std_q,
+            strict=True,
+        )
+    )
+    assert all(
+        clearance > 0.0
+        for clearance in prediction.terminal_clearance_q
+    )
+    assert prediction.clearance_q[1] < 0.0
+    assert (
+        prediction.current_error_q[1]
+        * prediction.rate_q_s[1]
+        < 0.0
+    )
+
+
 def test_096f78c4_successor_bias_cannot_hide_unsafe_current_crossing() -> None:
     """The exact terminal q state must be assessed current-center first."""
 

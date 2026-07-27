@@ -862,8 +862,35 @@ def predict_aperture_relative_crossing(
         * scale_std
         for axis in range(2)
     )
+    # Express endpoint uncertainty in the same predicted aperture units as
+    # ``predicted_q``.  Keeping the capture-time center uncertainty divided
+    # by the smaller current aperture made an expanding near-plane gate look
+    # less certain only after it had already crossed the camera boundary.
+    # The mean q dynamics remain the identified first-order model; this
+    # correction only transports its uncertainty to the endpoint scale.
+    endpoint_aperture_growth = tuple(
+        math.exp(
+            _clamp(
+                aperture_expansion[axis] * horizon,
+                -12.0,
+                12.0,
+            )
+        )
+        for axis in range(2)
+    )
+    predicted_center_q = tuple(
+        predicted_q[axis] - passage_q[axis]
+        for axis in range(2)
+    )
     predicted_std_q = tuple(
-        current_std_q[axis] + abs(rate_q[axis]) * timing_std
+        center_std[axis]
+        / (aperture[axis] * endpoint_aperture_growth[axis])
+        + (
+            abs(predicted_center_q[axis])
+            + abs(passage_q[axis])
+        )
+        * scale_std
+        + abs(rate_q[axis]) * timing_std
         for axis in range(2)
     )
     swept_occupancy = tuple(

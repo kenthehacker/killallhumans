@@ -847,7 +847,7 @@ def test_terminal_positive_clearance_commits_before_fixed_scale() -> None:
 
 
 @pytest.mark.parametrize(
-    ("seed_center_y", "terminal_safe", "clipping"),
+    ("seed_center_y", "admission_expected", "clipping"),
     (
         (
             0.10,
@@ -857,12 +857,12 @@ def test_terminal_positive_clearance_commits_before_fixed_scale() -> None:
             | FrameEdge.RIGHT
             | FrameEdge.BOTTOM,
         ),
-        (0.14, False, FrameEdge.TOP | FrameEdge.BOTTOM),
+        (0.30, False, FrameEdge.TOP | FrameEdge.BOTTOM),
     ),
 )
 def test_propagated_aperture_mints_only_safe_passage_admission(
     seed_center_y: float,
-    terminal_safe: bool,
+    admission_expected: bool,
     clipping: FrameEdge,
 ) -> None:
     tracker, graph, snapshot, current_id = _graph()
@@ -959,26 +959,26 @@ def test_propagated_aperture_mints_only_safe_passage_admission(
     assert decision.current_aperture_propagated
     assert decision.current_aperture_dynamics_qualified
     assert decision.current_time_to_contact_s is not None
-    assert (
-        decision.current_time_to_contact_s
-        <= decision.current_aperture_prediction_horizon_remaining_s
-    )
     assert state.expansion_rate_s > 0.0
     assert all(
         allowance > 0.0
         for allowance in decision.crossing_allowance_norm
     )
-    assert (
-        all(
-            clearance >= 0.0
-            for clearance in decision.terminal_crossing_clearance_norm
-        )
-        is terminal_safe
+    within_prediction_horizon = bool(
+        decision.current_time_to_contact_s
+        <= decision.current_aperture_prediction_horizon_remaining_s
     )
-    if terminal_safe:
+    terminal_safe = all(
+        clearance >= 0.0
+        for clearance in decision.terminal_crossing_clearance_norm
+    )
+    if admission_expected:
+        assert within_prediction_horizon
+        assert terminal_safe
         assert propagated.servo_output.corridor_frames >= 3
         assert propagated.passage_admission is not None
     else:
+        assert not within_prediction_horizon or not terminal_safe
         assert propagated.servo_output.corridor_frames == 0
         assert propagated.passage_admission is None
 
