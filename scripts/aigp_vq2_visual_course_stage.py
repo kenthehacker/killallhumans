@@ -742,6 +742,10 @@ def _dynamic_near_plane_wire_sample(
         or evidence.get("current_track_id") != track_id
     ):
         raise ValueError("dynamic near-plane evidence identity is invalid")
+    if evidence.get("time_to_contact_s") is None:
+        # Warm-up decisions cannot define either a crossing window or the
+        # post-governor contact budget required to consume it.
+        return None
 
     def scalar(
         name: str,
@@ -804,6 +808,8 @@ def _dynamic_near_plane_wire_sample(
     passage_error = pair("passage_error_norm")
     bearing_std = pair("current_bearing_std_norm")
     residual_rate = pair("residual_translation_rate_norm_s")
+    current_crossing_q = pair("current_crossing_error_q")
+    crossing_q_rate = pair("crossing_rate_q_s")
     crossing_prediction_horizon_s = scalar(
         "crossing_prediction_horizon_s",
         minimum=0.0,
@@ -826,6 +832,16 @@ def _dynamic_near_plane_wire_sample(
     )
     reported_crossing_clearance = pair(
         "predicted_crossing_clearance_norm",
+    )
+    terminal_crossing_occupancy = pair(
+        "terminal_crossing_occupancy_norm",
+        minimum=0.0,
+    )
+    reported_terminal_clearance = pair(
+        "terminal_crossing_clearance_norm",
+    )
+    post_governor_contact_budget_s = scalar(
+        "post_governor_contact_budget_s",
     )
     if (
         evidence.get("crossing_coordinate_basis")
@@ -851,6 +867,34 @@ def _dynamic_near_plane_wire_sample(
         raise ValueError(
             "dynamic near-plane evidence predicted crossing clearance "
             "is inconsistent"
+        )
+    recomputed_terminal_occupancy = tuple(
+        abs(predicted_crossing_error[axis])
+        + 2.0 * predicted_crossing_std[axis]
+        for axis in range(2)
+    )
+    recomputed_terminal_clearance = tuple(
+        crossing_allowance[axis]
+        - recomputed_terminal_occupancy[axis]
+        for axis in range(2)
+    )
+    if any(
+        not math.isclose(
+            terminal_crossing_occupancy[axis],
+            recomputed_terminal_occupancy[axis],
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            reported_terminal_clearance[axis],
+            recomputed_terminal_clearance[axis],
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        for axis in range(2)
+    ):
+        raise ValueError(
+            "dynamic near-plane terminal crossing window is inconsistent"
         )
     current_censored = evidence.get("current_censored_axes")
     if (
@@ -929,6 +973,13 @@ def _dynamic_near_plane_wire_sample(
         ),
         crossing_swept_y_occupancy_norm=(
             crossing_swept_occupancy[1]
+        ),
+        current_crossing_x_q=current_crossing_q[0],
+        current_crossing_y_q=current_crossing_q[1],
+        crossing_x_q_rate_s=crossing_q_rate[0],
+        crossing_y_q_rate_s=crossing_q_rate[1],
+        post_governor_contact_budget_s=(
+            post_governor_contact_budget_s
         ),
     )
 
@@ -3200,6 +3251,7 @@ async def _run_visual_course_stage_impl(
                         wire_start_monotonic_ns=(
                             wire_start_monotonic_ns
                         ),
+                        requested_thrust=command_thrust,
                         thrust_slew_override=launch_thrust_override,
                         yaw_slew_override=yaw_soft_stop_zeroed,
                     )
@@ -5267,6 +5319,10 @@ async def _run_visual_course_stage_impl(
                                     host.visual_config.servo
                                     .vertical_corridor
                                 ),
+                                minimum_post_governor_contact_budget_s=(
+                                    runtime.dynamic_controller.core.config
+                                    .terminal_min_post_governor_contact_budget_s
+                                ),
                                 min_track_confidence=(
                                     DEFAULT_ROLLING_GATE_GRAPH_CONFIG
                                     .min_track_confidence
@@ -5410,6 +5466,30 @@ async def _run_visual_course_stage_impl(
                                 anchor.crossing_allowance_x_norm,
                                 anchor.crossing_allowance_y_norm,
                             ],
+                            "crossing_swept_occupancy_norm": [
+                                anchor.crossing_swept_x_occupancy_norm,
+                                anchor.crossing_swept_y_occupancy_norm,
+                            ],
+                            "terminal_crossing_occupancy_norm": [
+                                (
+                                    abs(
+                                        anchor
+                                        .predicted_crossing_x_norm
+                                    )
+                                    + 2.0
+                                    * anchor
+                                    .predicted_crossing_x_std_norm
+                                ),
+                                (
+                                    abs(
+                                        anchor
+                                        .predicted_crossing_y_down_norm
+                                    )
+                                    + 2.0
+                                    * anchor
+                                    .predicted_crossing_y_std_norm
+                                ),
+                            ],
                             "predicted_crossing_clearance_norm": [
                                 (
                                     anchor.crossing_allowance_x_norm
@@ -5428,6 +5508,10 @@ async def _run_visual_course_stage_impl(
                                     * anchor.predicted_crossing_y_std_norm
                                 ),
                             ],
+                            "post_governor_contact_budget_s": (
+                                anchor
+                                .post_governor_contact_budget_s
+                            ),
                             "command": asdict(command),
                             "current_only_crossing_coast_thrust": (
                                 coast_thrust

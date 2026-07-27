@@ -549,9 +549,23 @@ class DynamicVisualCourseSession:
         thrust: float,
         wire_command: AttitudeRateCommand,
         wire_start_monotonic_ns: int,
+        requested_thrust: Optional[float] = None,
         thrust_slew_override: bool = False,
         yaw_slew_override: bool = False,
     ) -> Mapping[str, Any]:
+        requested_wire_thrust = (
+            float(thrust)
+            if requested_thrust is None
+            else float(requested_thrust)
+        )
+        if (
+            not math.isfinite(requested_wire_thrust)
+            or requested_wire_thrust < MIN_THRUST
+            or requested_wire_thrust > MAX_THRUST
+        ):
+            raise DynamicCourseError(
+                "requested wire thrust is outside the production envelope"
+            )
         discontinuity_axes = (
             ((2,) if yaw_slew_override else ())
             + ((3,) if thrust_slew_override else ())
@@ -597,6 +611,9 @@ class DynamicVisualCourseSession:
             "dynamic_command_count": self._dynamic_command_count,
             "roll_reversal_count": self._roll_reversal_count,
             "wire_start_monotonic_ns": wire_start_monotonic_ns,
+            "requested_thrust_before_wire_governor": (
+                requested_wire_thrust
+            ),
             "target_attitude_yaw_thrust": [
                 target_roll_rad,
                 target_pitch_rad,
@@ -607,6 +624,22 @@ class DynamicVisualCourseSession:
         }
         if decision is not None:
             course = self.core.course_state()
+            thrust_settle_s = (
+                abs(
+                    float(wire_command.thrust)
+                    - requested_wire_thrust
+                )
+                / self._wire_governor.config.max_thrust_slew_s
+            )
+            post_governor_contact_budget_s = (
+                None
+                if decision.current_time_to_contact_s is None
+                else (
+                    decision.current_time_to_contact_s
+                    - self.core.config.thrust_command_delay_s
+                    - thrust_settle_s
+                )
+            )
             evidence.update(
                 {
                     "gate_index": decision.current_gate_index,
@@ -665,6 +698,16 @@ class DynamicVisualCourseSession:
                     ),
                     "predicted_crossing_clearance_norm": list(
                         decision.predicted_crossing_clearance_norm
+                    ),
+                    "terminal_crossing_occupancy_norm": list(
+                        decision.terminal_crossing_occupancy_norm
+                    ),
+                    "terminal_crossing_clearance_norm": list(
+                        decision.terminal_crossing_clearance_norm
+                    ),
+                    "post_governor_thrust_settle_s": thrust_settle_s,
+                    "post_governor_contact_budget_s": (
+                        post_governor_contact_budget_s
                     ),
                     "current_bearing_std_rad": list(
                         decision.current_bearing_std_rad
@@ -902,6 +945,10 @@ class _DynamicImageServo:
                 -math.inf,
                 -math.inf,
             )
+            terminal_crossing_clearance = (
+                -math.inf,
+                -math.inf,
+            )
             crossing_allowance = (0.0, 0.0)
         else:
             target_roll = decision.command.target_roll_rad
@@ -923,8 +970,47 @@ class _DynamicImageServo:
             predicted_crossing_clearance = (
                 decision.predicted_crossing_clearance_norm
             )
+            terminal_crossing_clearance = (
+                decision.terminal_crossing_clearance_norm
+            )
             crossing_allowance = decision.crossing_allowance_norm
 
+        terminal_history_qualified = bool(
+            decision is not None
+            and current_dynamic.visible
+            and not current_dynamic.ambiguous
+            and not any(current_dynamic.censored_axes)
+            and all(current_dynamic.bearing_rate_qualified)
+            and current_dynamic.scale_rate_qualified
+            and decision.current_time_to_contact_s is not None
+            and decision.current_time_to_contact_s
+            >= (
+                self.session.core.config.thrust_command_delay_s
+                + self.session.core.config
+                .terminal_min_post_governor_contact_budget_s
+            )
+            and crossing_allowance[0] > 0.0
+            and crossing_allowance[1] > 0.0
+            and terminal_crossing_clearance[0] >= 0.0
+            and terminal_crossing_clearance[1] >= 0.0
+            # A full-sweep-unsafe axis may enter the terminal window only
+            # while its qualified q motion is carrying it inward.  Axes whose
+            # complete approach sweep is already safe need no exception.
+            and all(
+                predicted_crossing_clearance[axis] >= 0.0
+                or (
+                    decision.current_crossing_error_q[axis]
+                    * decision.crossing_rate_q_s[axis]
+                    < 0.0
+                )
+                for axis in range(2)
+            )
+            # Negative image-down motion heads toward TOP.  Positive motion,
+            # including the +0.337/s 1cab recovery, must not be rejected by a
+            # symmetric settled-rate test once q is terminal-safe.
+            and float(current.normalized_y_rate_down_s)
+            >= -self.session.core.config.vertical_settled_rate_norm_s
+        )
         passage_plane_ready = bool(
             decision is not None
             and current_dynamic.visible
@@ -939,20 +1025,14 @@ class _DynamicImageServo:
             >= self.session.core.config.passage_arm_min_log_scale
         )
         within_corridor = bool(
-            decision is not None
-            and passage_plane_ready
-            # Image-down motion means the vehicle is moving toward the
-            # aperture's top side.  Do not retire observable collective
-            # authority while either vertical direction is still unsettled.
-            and abs(float(current.normalized_y_rate_down_s))
-            <= self.session.core.config.vertical_settled_rate_norm_s
-            and crossing_allowance[0] > 0.0
-            and crossing_allowance[1] > 0.0
-            and predicted_crossing_clearance[0] >= 0.0
-            and predicted_crossing_clearance[1] >= 0.0
+            passage_plane_ready and terminal_history_qualified
         )
         self._corridor_frames = (
-            self._corridor_frames + 1 if within_corridor else 0
+            (
+                self._corridor_frames + 1
+                if terminal_history_qualified
+                else 0
+            )
         )
         if next_target is not None and requested_next_blend > 0.0:
             if self._latched_next_track_id is None:
@@ -1117,11 +1197,14 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             )
             or any(
                 clearance < 0.0
-                for clearance in decision.predicted_crossing_clearance_norm
+                for clearance in decision.terminal_crossing_clearance_norm
             )
             or snapshot.next_selection_ambiguous
             or snapshot.provisional_track_ids
-            or snapshot.next_candidates
+            or any(
+                candidate.track_id != retained_id
+                for candidate in snapshot.next_candidates
+            )
         ):
             return None
         state = self._dynamic_session.core.course_state()

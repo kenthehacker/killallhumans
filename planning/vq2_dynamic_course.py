@@ -485,6 +485,9 @@ class DynamicCourseConfig:
     crossing_max_occupancy_q: Vector2 = (0.50, 0.45)
     vertical_settled_rate_norm_s: float = 0.30
     passage_arm_min_log_scale: float = -0.80
+    # After the requested current-aperture collective can reach the wire,
+    # retain one bounded contact window before predicted plane crossing.
+    terminal_min_post_governor_contact_budget_s: float = 0.12
     passage_successor_bias: float = 0.55
     successor_passage_far_authority: float = 0.25
     successor_passage_full_confidence: float = 0.50
@@ -541,6 +544,7 @@ class DynamicCourseConfig:
             "maximum_ttc_s",
             "passage_margin_norm",
             "vertical_settled_rate_norm_s",
+            "terminal_min_post_governor_contact_budget_s",
             "successor_clearance_dwell_s",
             "successor_clearance_ramp_s",
             "crossing_prediction_max_horizon_s",
@@ -742,6 +746,8 @@ class GuidanceDecision:
     crossing_allowance_norm: Vector2
     crossing_swept_occupancy_norm: Vector2
     predicted_crossing_clearance_norm: Vector2
+    terminal_crossing_occupancy_norm: Vector2
+    terminal_crossing_clearance_norm: Vector2
     current_bearing_std_rad: Vector2
     successor_bearing_std_rad: Vector2 | None
     successor_weight: float
@@ -778,8 +784,10 @@ class CrossingQuotientPrediction:
     current_std_q: Vector2
     predicted_std_q: Vector2
     swept_occupancy_q: Vector2
+    terminal_occupancy_q: Vector2
     allowance_q: Vector2
     clearance_q: Vector2
+    terminal_clearance_q: Vector2
 
 
 def predict_aperture_relative_crossing(
@@ -795,7 +803,14 @@ def predict_aperture_relative_crossing(
     horizon_s: float,
     allowance_q: Vector2,
 ) -> CrossingQuotientPrediction:
-    """Predict the whole current-to-plane sweep in aperture quotient space."""
+    """Predict approach-sweep and terminal crossing envelopes in q space.
+
+    The full sweep deliberately includes the current state and remains the
+    conservative ownership/braking test.  ``terminal_occupancy_q`` is the
+    robust 2-sigma support at the crossing endpoint.  Its prediction standard
+    deviation already includes capture/contact timing uncertainty, so it is a
+    bounded terminal crossing window rather than a point-time clearance.
+    """
 
     center = _tuple2(center_offset_norm, "center_offset_norm")
     passage = _tuple2(passage_offset_norm, "passage_offset_norm")
@@ -859,8 +874,15 @@ def predict_aperture_relative_crossing(
         )
         for axis in range(2)
     )
+    terminal_occupancy = tuple(
+        abs(predicted_q[axis]) + 2.0 * predicted_std_q[axis]
+        for axis in range(2)
+    )
     clearance = tuple(
         allowance[axis] - swept_occupancy[axis] for axis in range(2)
+    )
+    terminal_clearance = tuple(
+        allowance[axis] - terminal_occupancy[axis] for axis in range(2)
     )
     return CrossingQuotientPrediction(
         current_error_q=error_q,  # type: ignore[arg-type]
@@ -869,8 +891,10 @@ def predict_aperture_relative_crossing(
         current_std_q=current_std_q,  # type: ignore[arg-type]
         predicted_std_q=predicted_std_q,  # type: ignore[arg-type]
         swept_occupancy_q=swept_occupancy,  # type: ignore[arg-type]
+        terminal_occupancy_q=terminal_occupancy,  # type: ignore[arg-type]
         allowance_q=allowance,
         clearance_q=clearance,  # type: ignore[arg-type]
+        terminal_clearance_q=terminal_clearance,  # type: ignore[arg-type]
     )
 
 
@@ -2322,6 +2346,8 @@ class DynamicCourseCore:
             crossing_allowance = (0.0, 0.0)
             crossing_swept_occupancy = (0.0, 0.0)
             predicted_crossing_clearance = (0.0, 0.0)
+            terminal_crossing_occupancy = (0.0, 0.0)
+            terminal_crossing_clearance = (0.0, 0.0)
         else:
             current_crossing_error_q = (
                 crossing_prediction.current_error_q
@@ -2339,6 +2365,12 @@ class DynamicCourseCore:
             )
             predicted_crossing_clearance = (
                 crossing_prediction.clearance_q
+            )
+            terminal_crossing_occupancy = (
+                crossing_prediction.terminal_occupancy_q
+            )
+            terminal_crossing_clearance = (
+                crossing_prediction.terminal_clearance_q
             )
         current_yaw_release = (
             self._current_yaw_release(
@@ -2442,6 +2474,12 @@ class DynamicCourseCore:
             ),
             predicted_crossing_clearance_norm=(
                 predicted_crossing_clearance
+            ),
+            terminal_crossing_occupancy_norm=(
+                terminal_crossing_occupancy
+            ),
+            terminal_crossing_clearance_norm=(
+                terminal_crossing_clearance
             ),
             current_bearing_std_rad=current.bearing_std_rad,
             successor_bearing_std_rad=(

@@ -128,6 +128,44 @@ def test_ea6335c3_top_hit_is_rejected_by_swept_q_envelope() -> None:
     assert prediction.clearance_q[1] < 0.0
 
 
+def test_1cab9da6_separates_unsafe_approach_sweep_from_safe_terminal_window(
+) -> None:
+    """The converging final state is unsafe now but 2-sigma safe at contact."""
+
+    current_q = (0.1573332768127754, -1.3900652360978418)
+    q_rate = (0.12404522007248783, 1.8692942335278362)
+    predicted_std = (0.05534993410482621, 0.14059388915832344)
+    timing_uncertainty_s = 0.020
+    prediction = predict_aperture_relative_crossing(
+        center_offset_norm=current_q,
+        passage_offset_norm=(0.0, 0.0),
+        aperture_half_extent_norm=(1.0, 1.0),
+        center_rate_norm_s=q_rate,
+        aperture_expansion_rate_s=(0.0, 0.0),
+        center_std_norm=tuple(
+            predicted_std[axis]
+            - abs(q_rate[axis]) * timing_uncertainty_s
+            for axis in range(2)
+        ),
+        aperture_log_scale_std=0.0,
+        capture_timing_uncertainty_s=timing_uncertainty_s,
+        horizon_s=0.7710673805867182,
+        allowance_q=(0.50, 0.45),
+    )
+
+    assert prediction.predicted_error_q == pytest.approx(
+        (0.25298049972837156, 0.05128657209432386)
+    )
+    assert prediction.predicted_std_q == pytest.approx(predicted_std)
+    assert prediction.clearance_q == pytest.approx(
+        (0.13631963206197606, -1.1464812450733752)
+    )
+    assert prediction.terminal_clearance_q == pytest.approx(
+        (0.13631963206197606, 0.11752564958902927)
+    )
+    assert current_q[1] * q_rate[1] < 0.0
+
+
 def test_096f78c4_successor_bias_cannot_hide_unsafe_current_crossing() -> None:
     """The exact terminal q state must be assessed current-center first."""
 

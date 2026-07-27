@@ -38,20 +38,22 @@ def _detection(
     source_index: int,
     center_x: float,
     *,
+    center_y: float = 0.0,
     width: float,
     height: float,
     clipping: FrameEdge = FrameEdge.NONE,
     center_censored: bool = False,
 ) -> VisualDetection:
     unit_x = 0.5 * (center_x + 1.0)
+    unit_y = 0.5 * (center_y + 1.0)
     return VisualDetection(
         source_index=source_index,
-        center_norm=(center_x, 0.0),
+        center_norm=(center_x, center_y),
         bbox_norm=(
             unit_x - width / 2.0,
-            0.5 - height / 2.0,
+            unit_y - height / 2.0,
             unit_x + width / 2.0,
-            0.5 + height / 2.0,
+            unit_y + height / 2.0,
         ),
         confidence=0.95,
         clipping=clipping,
@@ -65,6 +67,7 @@ def _frame(
     current_width: float = 0.34,
     current_height: float = 0.36,
     include_successor: bool = True,
+    current_center_y: float = 0.0,
     current_clipping: FrameEdge = FrameEdge.NONE,
     current_center_censored: bool = False,
 ) -> VisualDetectionFrame:
@@ -73,6 +76,7 @@ def _frame(
         _detection(
             0,
             0.0,
+            center_y=current_center_y,
             width=current_width,
             height=current_height,
             clipping=current_clipping,
@@ -330,12 +334,12 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
 
 
 @pytest.mark.parametrize(
-    ("gate_size", "expect_admission"),
+    ("gate_size", "expect_scale_ready"),
     ((0.36, False), (0.90, True)),
 )
-def test_dynamic_passage_admission_requires_scale_with_uncertainty(
+def test_dynamic_passage_admission_requires_scale_and_closure(
     gate_size: float,
-    expect_admission: bool,
+    expect_scale_ready: bool,
 ):
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=gate_size,
@@ -366,11 +370,142 @@ def test_dynamic_passage_admission_requires_scale_with_uncertainty(
         proposal = _observe(planner, snapshot, tracker)
         _accept_proposal(session, tracker, proposal)
 
-    assert (proposal.passage_admission is not None) is expect_admission
-    if not expect_admission:
+    assert proposal.passage_admission is None
+    assert session.last_decision is not None
+    assert session.last_decision.current_time_to_contact_s is None
+    assert all(
+        clearance > 0.0
+        for clearance in (
+            session.last_decision.terminal_crossing_clearance_norm
+        )
+    )
+    state = session.core.course_state().current
+    scale_ready = (
+        state.log_scale - 2.0 * state.log_scale_std
+        >= session.core.config.passage_arm_min_log_scale
+    )
+    assert scale_ready is expect_scale_ready
+    if not scale_ready:
         assert proposal.servo_output.brake_reason == (
             "dynamic_plane_not_ready"
         )
+
+
+def test_1cab_terminal_history_precedes_scale_and_rejects_top_rate() -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    for sequence in (6, 7, 8):
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=0.34,
+                current_height=0.36,
+                include_successor=True,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, proposal)
+
+    assert planner.latched_next_track_id is not None
+    frames = (
+        (9, 0.38, 0.000),
+        (10, 0.43, 0.012),
+        (11, 0.49, 0.024),
+        (12, 0.52, 0.036),
+    )
+    for sequence, gate_size, center_y in frames:
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=gate_size,
+                current_height=gate_size,
+                include_successor=False,
+                current_center_y=center_y,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        decision = session.last_decision
+        assert decision is not None
+        assert all(
+            clearance >= 0.0
+            for clearance in decision.terminal_crossing_clearance_norm
+        )
+        if sequence >= 10:
+            assert proposal.servo_output.corridor_frames == sequence - 9
+            assert (
+                session.core.course_state().current.log_scale
+                - 2.0
+                * session.core.course_state().current.log_scale_std
+                < session.core.config.passage_arm_min_log_scale
+            )
+            assert proposal.servo_output.brake_reason == (
+                "dynamic_plane_not_ready"
+            )
+            assert proposal.passage_admission is None
+        _accept_proposal(session, tracker, proposal)
+
+    assert proposal.current_target.normalized_y_rate_down_s > 0.30
+    assert proposal.servo_output.corridor_frames == 3
+
+    tracker.update(
+        _frame(
+            13,
+            current_width=0.64,
+            current_height=0.64,
+            include_successor=False,
+            current_center_y=0.048,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    assert session.last_decision is not None
+    assert all(
+        clearance >= 0.0
+        for clearance in (
+            session.last_decision.terminal_crossing_clearance_norm
+        )
+    )
+    assert proposal.current_target.normalized_y_rate_down_s > 0.30
+    assert proposal.servo_output.corridor_frames == 4
+    assert proposal.servo_output.brake_reason == "aligning"
+    assert proposal.passage_admission is not None
+    _accept_proposal(session, tracker, proposal)
+
+    tracker.update(
+        _frame(
+            14,
+            current_width=0.68,
+            current_height=0.68,
+            include_successor=False,
+            current_center_y=0.010,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    rejected = _observe(planner, snapshot, tracker)
+    assert session.last_decision is not None
+    assert all(
+        clearance >= 0.0
+        for clearance in (
+            session.last_decision.terminal_crossing_clearance_norm
+        )
+    )
+    assert rejected.current_target.normalized_y_rate_down_s < -0.30
+    assert rejected.servo_output.corridor_frames == 0
+    assert rejected.servo_output.brake_reason != "aligning"
+    assert rejected.passage_admission is None
 
 
 def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
@@ -422,7 +557,7 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
         )
         snapshot = graph.observe(tracker)
         proposal = _observe(planner, snapshot, tracker)
-        if sequence < 14:
+        if sequence < 12:
             assert proposal.passage_admission is None
         _accept_proposal(session, tracker, proposal)
 

@@ -980,7 +980,10 @@ def test_recovery_one_edge_commands_before_a_clean_wire():
 
 class _C25DynamicCore:
     def __init__(self, track_id):
-        self.config = SimpleNamespace(vertical_angle_scale_rad=1.0)
+        self.config = SimpleNamespace(
+            vertical_angle_scale_rad=1.0,
+            terminal_min_post_governor_contact_budget_s=0.12,
+        )
         self._state = SimpleNamespace(
             current_track_id=track_id,
             current=SimpleNamespace(
@@ -1040,9 +1043,14 @@ class _C25DynamicController:
         thrust,
         wire_command,
         wire_start_monotonic_ns,
+        requested_thrust=None,
         thrust_slew_override=False,
         yaw_slew_override=False,
     ):
+        effective_requested_thrust = (
+            thrust if requested_thrust is None else requested_thrust
+        )
+        assert 0.21 <= effective_requested_thrust <= 0.32
         assert thrust_slew_override is False
         assert yaw_slew_override is False
         self.accepted_count += 1
@@ -1118,6 +1126,23 @@ class _C25DynamicController:
                 -1.2258056275019444,
                 -1.8468614309187668,
             ],
+            "terminal_crossing_occupancy_norm": [
+                1.07201383902987,
+                0.4414567012477474,
+            ],
+            "terminal_crossing_clearance_norm": [
+                -0.57201383902987,
+                0.00854329875225257,
+            ],
+            "post_governor_contact_budget_s": (
+                0.7509888689491439
+                - 0.08
+                - abs(
+                    wire_command.thrust
+                    - effective_requested_thrust
+                )
+                / 0.15
+            ),
             "current_bearing_std_norm": [
                 0.018934613171084462,
                 0.024523885374696446,

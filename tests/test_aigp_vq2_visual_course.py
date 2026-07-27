@@ -165,6 +165,7 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
         "passage_error_norm": [0.10, -0.20],
         "current_bearing_std_norm": [0.01, 0.02],
         "residual_translation_rate_norm_s": [0.30, -0.40],
+        "time_to_contact_s": 0.45,
         "crossing_prediction_horizon_s": 0.45,
         "crossing_coordinate_basis": (
             course_stage.DYNAMIC_CROSSING_COORDINATE_BASIS
@@ -176,6 +177,9 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
         "crossing_allowance_norm": [0.50, 0.60],
         "crossing_swept_occupancy_norm": [0.295, 0.46],
         "predicted_crossing_clearance_norm": [0.205, 0.14],
+        "terminal_crossing_occupancy_norm": [0.295, 0.46],
+        "terminal_crossing_clearance_norm": [0.205, 0.14],
+        "post_governor_contact_budget_s": 0.25,
         "current_censored_axes": [False, False],
         "current_bearing_rate_qualified": [True, True],
         "current_scale_rate_qualified": True,
@@ -219,6 +223,74 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.crossing_allowance_y_norm == pytest.approx(0.60)
     assert sample.crossing_swept_x_occupancy_norm == pytest.approx(0.295)
     assert sample.crossing_swept_y_occupancy_norm == pytest.approx(0.46)
+    assert sample.current_crossing_x_q == pytest.approx(0.10)
+    assert sample.current_crossing_y_q == pytest.approx(-0.20)
+    assert sample.crossing_x_q_rate_s == pytest.approx(0.30)
+    assert sample.crossing_y_q_rate_s == pytest.approx(-0.40)
+    assert sample.post_governor_contact_budget_s == pytest.approx(0.25)
+
+
+def test_dynamic_near_plane_wire_sample_maps_1cab_terminal_window():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "time_to_contact_s": 0.7710673805867182,
+            "crossing_prediction_horizon_s": 0.7710673805867182,
+            "current_crossing_error_q": [
+                0.1573332768127754,
+                -1.3900652360978418,
+            ],
+            "crossing_rate_q_s": [
+                0.12404522007248783,
+                1.8692942335278362,
+            ],
+            "predicted_crossing_error_norm": [
+                0.25298049972837156,
+                0.05128657209432386,
+            ],
+            "predicted_crossing_std_norm": [
+                0.05534993410482621,
+                0.14059388915832344,
+            ],
+            "crossing_allowance_norm": [0.50, 0.45],
+            "crossing_swept_occupancy_norm": [
+                0.36368036793802394,
+                1.5964812450733752,
+            ],
+            "predicted_crossing_clearance_norm": [
+                0.13631963206197606,
+                -1.1464812450733752,
+            ],
+            "terminal_crossing_occupancy_norm": [
+                0.36368036793802394,
+                0.33247435041097073,
+            ],
+            "terminal_crossing_clearance_norm": [
+                0.13631963206197606,
+                0.11752564958902928,
+            ],
+            "post_governor_contact_budget_s": 0.4793379571895635,
+        }
+    )
+
+    sample = _dynamic_near_plane_sample(evidence)
+
+    assert sample is not None
+    assert sample.current_crossing_x_q == pytest.approx(
+        0.1573332768127754
+    )
+    assert sample.current_crossing_y_q == pytest.approx(
+        -1.3900652360978418
+    )
+    assert sample.crossing_x_q_rate_s == pytest.approx(
+        0.12404522007248783
+    )
+    assert sample.crossing_y_q_rate_s == pytest.approx(
+        1.8692942335278362
+    )
+    assert sample.post_governor_contact_budget_s == pytest.approx(
+        0.4793379571895635
+    )
 
 
 def test_unqualified_dynamic_rates_cannot_become_crossing_evidence():
@@ -236,11 +308,16 @@ def test_unqualified_dynamic_rates_cannot_become_crossing_evidence():
     "missing_name",
     [
         "crossing_prediction_horizon_s",
+        "current_crossing_error_q",
+        "crossing_rate_q_s",
         "predicted_crossing_error_norm",
         "predicted_crossing_std_norm",
         "crossing_allowance_norm",
         "crossing_swept_occupancy_norm",
         "predicted_crossing_clearance_norm",
+        "terminal_crossing_occupancy_norm",
+        "terminal_crossing_clearance_norm",
+        "post_governor_contact_budget_s",
     ],
 )
 def test_dynamic_near_plane_wire_sample_rejects_missing_crossing_prediction(
@@ -259,9 +336,14 @@ def test_dynamic_near_plane_wire_sample_rejects_missing_crossing_prediction(
         ("crossing_prediction_horizon_s", True),
         ("crossing_prediction_horizon_s", -0.01),
         ("crossing_prediction_horizon_s", 1.21),
+        ("current_crossing_error_q", [0.1, math.nan]),
+        ("crossing_rate_q_s", [0.3, True]),
         ("predicted_crossing_error_norm", [0.1, math.nan]),
         ("predicted_crossing_std_norm", [0.01, -0.01]),
         ("crossing_allowance_norm", [0.50, -0.01]),
+        ("terminal_crossing_occupancy_norm", [0.295, -0.01]),
+        ("terminal_crossing_clearance_norm", [0.205, math.nan]),
+        ("post_governor_contact_budget_s", True),
     ],
 )
 def test_dynamic_near_plane_wire_sample_rejects_malformed_crossing_prediction(
@@ -282,6 +364,8 @@ def test_dynamic_near_plane_wire_sample_accepts_zero_allowance() -> None:
     evidence["predicted_crossing_std_norm"] = [0.03, 0.0]
     evidence["crossing_swept_occupancy_norm"] = [0.295, 0.0]
     evidence["predicted_crossing_clearance_norm"] = [0.205, 0.0]
+    evidence["terminal_crossing_occupancy_norm"] = [0.295, 0.0]
+    evidence["terminal_crossing_clearance_norm"] = [0.205, 0.0]
 
     sample = _dynamic_near_plane_sample(evidence)
 
@@ -440,6 +524,27 @@ def test_dynamic_near_plane_wire_sample_rejects_inconsistent_clearance() -> None
     evidence["predicted_crossing_clearance_norm"] = [0.205, 0.15]
 
     with pytest.raises(ValueError, match="clearance is inconsistent"):
+        _dynamic_near_plane_sample(evidence)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("terminal_crossing_occupancy_norm", [0.295, 0.45]),
+        ("terminal_crossing_clearance_norm", [0.205, 0.15]),
+    ],
+)
+def test_dynamic_near_plane_wire_sample_rejects_inconsistent_terminal_window(
+    name,
+    value,
+) -> None:
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence[name] = value
+
+    with pytest.raises(
+        ValueError,
+        match="terminal crossing window is inconsistent",
+    ):
         _dynamic_near_plane_sample(evidence)
 
 

@@ -255,6 +255,11 @@ class NearPlaneWireSample:
     crossing_allowance_y_norm: Optional[float] = None
     crossing_swept_x_occupancy_norm: Optional[float] = None
     crossing_swept_y_occupancy_norm: Optional[float] = None
+    current_crossing_x_q: Optional[float] = None
+    current_crossing_y_q: Optional[float] = None
+    crossing_x_q_rate_s: Optional[float] = None
+    crossing_y_q_rate_s: Optional[float] = None
+    post_governor_contact_budget_s: Optional[float] = None
 
     def __post_init__(self) -> None:
         if type(self.gate_index) is not int or self.gate_index < 0:
@@ -352,6 +357,11 @@ class NearPlaneWireSample:
             self.crossing_allowance_y_norm,
             self.crossing_swept_x_occupancy_norm,
             self.crossing_swept_y_occupancy_norm,
+            self.current_crossing_x_q,
+            self.current_crossing_y_q,
+            self.crossing_x_q_rate_s,
+            self.crossing_y_q_rate_s,
+            self.post_governor_contact_budget_s,
         )
         if self.geometry_basis == DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS:
             if any(value is None for value in crossing_fields):
@@ -370,6 +380,11 @@ class NearPlaneWireSample:
             for name in (
                 "predicted_crossing_x_norm",
                 "predicted_crossing_y_down_norm",
+                "current_crossing_x_q",
+                "current_crossing_y_q",
+                "crossing_x_q_rate_s",
+                "crossing_y_q_rate_s",
+                "post_governor_contact_budget_s",
             ):
                 if not _finite(getattr(self, name)):
                     raise ValueError(
@@ -704,6 +719,7 @@ def advance_dynamic_near_plane_evidence(
     crossing_min_log_scale: float,
     horizontal_corridor: float,
     vertical_corridor: float,
+    minimum_post_governor_contact_budget_s: float,
     min_track_confidence: float,
     min_association_confidence: float,
 ) -> tuple[NearPlaneEvidence, Optional[NearPlaneLatch]]:
@@ -724,11 +740,21 @@ def advance_dynamic_near_plane_evidence(
         ("crossing minimum log scale", crossing_min_log_scale),
         ("horizontal corridor", horizontal_corridor),
         ("vertical corridor", vertical_corridor),
+        (
+            "minimum post-governor contact budget",
+            minimum_post_governor_contact_budget_s,
+        ),
     ):
         if not _finite(value):
             raise ValueError(f"{name} must be finite")
-    if float(horizontal_corridor) <= 0.0 or float(vertical_corridor) <= 0.0:
-        raise ValueError("dynamic passage corridors must be positive")
+    if (
+        float(horizontal_corridor) <= 0.0
+        or float(vertical_corridor) <= 0.0
+        or float(minimum_post_governor_contact_budget_s) <= 0.0
+    ):
+        raise ValueError(
+            "dynamic passage corridors and contact budget must be positive"
+        )
     track_floor = _confidence_threshold(
         min_track_confidence,
         "minimum track confidence",
@@ -781,13 +807,36 @@ def advance_dynamic_near_plane_evidence(
     assert sample.crossing_allowance_y_norm is not None
     assert sample.crossing_swept_x_occupancy_norm is not None
     assert sample.crossing_swept_y_occupancy_norm is not None
-    predicted_crossing_x_clearance = (
+    assert sample.current_crossing_x_q is not None
+    assert sample.current_crossing_y_q is not None
+    assert sample.crossing_x_q_rate_s is not None
+    assert sample.crossing_y_q_rate_s is not None
+    assert sample.post_governor_contact_budget_s is not None
+    full_sweep_clearance = (
         float(sample.crossing_allowance_x_norm)
-        - float(sample.crossing_swept_x_occupancy_norm)
-    )
-    predicted_crossing_y_clearance = (
+        - float(sample.crossing_swept_x_occupancy_norm),
         float(sample.crossing_allowance_y_norm)
-        - float(sample.crossing_swept_y_occupancy_norm)
+        - float(sample.crossing_swept_y_occupancy_norm),
+    )
+    terminal_occupancy = (
+        abs(float(sample.predicted_crossing_x_norm))
+        + 2.0 * float(sample.predicted_crossing_x_std_norm),
+        abs(float(sample.predicted_crossing_y_down_norm))
+        + 2.0 * float(sample.predicted_crossing_y_std_norm),
+    )
+    terminal_clearance = (
+        float(sample.crossing_allowance_x_norm)
+        - terminal_occupancy[0],
+        float(sample.crossing_allowance_y_norm)
+        - terminal_occupancy[1],
+    )
+    current_q = (
+        float(sample.current_crossing_x_q),
+        float(sample.current_crossing_y_q),
+    )
+    q_rate = (
+        float(sample.crossing_x_q_rate_s),
+        float(sample.crossing_y_q_rate_s),
     )
     qualified = bool(
         sample.clipping == FrameEdge.NONE
@@ -799,9 +848,15 @@ def advance_dynamic_near_plane_evidence(
         # leaves no physical aperture authority and therefore cannot qualify.
         and float(sample.crossing_allowance_x_norm) > 0.0
         and float(sample.crossing_allowance_y_norm) > 0.0
-        and predicted_crossing_x_clearance >= 0.0
-        and predicted_crossing_y_clearance >= 0.0
-        and scale_lower_bound >= float(crossing_min_log_scale)
+        and terminal_clearance[0] >= 0.0
+        and terminal_clearance[1] >= 0.0
+        and all(
+            full_sweep_clearance[axis] >= 0.0
+            or current_q[axis] * q_rate[axis] < 0.0
+            for axis in range(2)
+        )
+        and float(sample.post_governor_contact_budget_s)
+        >= float(minimum_post_governor_contact_budget_s)
         and float(sample.log_scale_rate_s) > 0.0
     )
     if not qualified:
@@ -820,7 +875,10 @@ def advance_dynamic_near_plane_evidence(
         samples=retained,
         last_observed_sample=sample,
     )
-    if len(retained) < required_corridor_frames:
+    if (
+        len(retained) < required_corridor_frames
+        or scale_lower_bound < float(crossing_min_log_scale)
+    ):
         return advanced, None
     return advanced, NearPlaneLatch(
         evidence=advanced,
