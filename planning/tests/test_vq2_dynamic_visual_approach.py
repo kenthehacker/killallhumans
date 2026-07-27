@@ -173,13 +173,18 @@ def _inner_aperture(
     half_width: float,
     half_height: float,
     confidence: float = 0.93,
+    measurement_std: tuple[float, float, float] = (
+        0.012,
+        0.014,
+        0.040,
+    ),
     health_reason: str | None = None,
 ) -> VisualInnerApertureGeometry:
     return VisualInnerApertureGeometry(
         center_norm=(center_x, center_y),
         half_size_norm=(half_width, half_height),
         log_scale=math.log(math.sqrt(half_width * half_height)),
-        measurement_std=(0.012, 0.014, 0.040),
+        measurement_std=measurement_std,
         confidence=confidence,
         clipping=FrameEdge.NONE,
         visible_edges=_ALL_FRAME_EDGES,
@@ -1254,7 +1259,7 @@ def test_inner_aperture_not_outer_support_drives_controller_geometry() -> None:
     )
 
 
-def test_low_confidence_inner_steers_from_last_clean_seed_only() -> None:
+def test_degraded_inner_confidence_bounds_steering_from_clean_seed() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
         height=0.36,
@@ -1277,12 +1282,13 @@ def test_low_confidence_inner_steers_from_last_clean_seed_only() -> None:
     assert clean_state.aperture_prediction_deadline_monotonic_ns is not None
 
     degraded = _inner_aperture(
-        0.07,
-        -0.09,
+        0.70,
+        -0.80,
         half_width=0.27,
         half_height=0.30,
-        confidence=0.20,
-        health_reason="low-confidence-inner-fit",
+        confidence=0.0015,
+        measurement_std=(0.52, 0.93, 8.0),
+        health_reason="outer_support_clipped_tracking_only",
     )
     tracker.update(
         _frame(
@@ -1290,7 +1296,7 @@ def test_low_confidence_inner_steers_from_last_clean_seed_only() -> None:
             current_width=0.36,
             current_height=0.38,
             include_successor=False,
-            current_clipping=FrameEdge.TOP,
+            current_clipping=FrameEdge.RIGHT,
             current_center_censored=True,
             current_inner_aperture=degraded,
         )
@@ -1301,6 +1307,11 @@ def test_low_confidence_inner_steers_from_last_clean_seed_only() -> None:
     state = session.core.course_state().current
     assert state.raw_center_norm == pytest.approx(degraded.center_norm)
     assert state.censored_axes == (False, False)
+    assert all(
+        uncertainty
+        < session.core.config.successor_prediction_max_extrapolation_rad
+        for uncertainty in state.bearing_std_rad
+    )
     assert state.aperture_propagated
     assert state.aperture_half_size_norm is not None
     assert state.aperture_half_size_norm != pytest.approx(

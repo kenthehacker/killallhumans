@@ -1573,7 +1573,11 @@ class DynamicCourseCore:
         predicted_bearing, predicted_rate, predicted_scale, predicted_expansion = (
             self._predict_components(previous, delayed, dt)
         )
-        quality = max(0.10, observation.confidence)
+        # Confidence is already an exact bounded observation property, and
+        # degraded geometry carries correspondingly enlarged covariance.
+        # Do not invent a minimum measurement authority here: doing so can
+        # make one very uncertain fit poison a better propagated local state.
+        quality = observation.confidence
         if observation.ambiguous:
             quality *= 0.55
         alpha = self.config.bearing_alpha * quality
