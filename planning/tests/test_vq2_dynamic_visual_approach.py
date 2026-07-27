@@ -676,6 +676,13 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
             include_successor=False,
             current_clipping=FrameEdge.TOP,
             current_center_censored=True,
+            current_inner_aperture=_inner_aperture(
+                0.0,
+                0.0,
+                half_width=0.38,
+                half_height=0.38,
+                health_reason="outer_support_clipped_tracking_only",
+            ),
         )
     )
     snapshot = graph.observe(tracker)
@@ -806,6 +813,100 @@ def test_inner_aperture_not_outer_support_drives_controller_geometry() -> None:
     assert session.last_decision.camera_current_center_norm == pytest.approx(
         (0.08, -0.06)
     )
+
+
+def test_complete_inner_steers_when_outer_support_reaches_top_edge() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    degraded = _inner_aperture(
+        0.07,
+        -0.09,
+        half_width=0.27,
+        half_height=0.30,
+        confidence=0.20,
+        health_reason="low-confidence-inner-fit",
+    )
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.36,
+            current_height=0.38,
+            include_successor=False,
+            current_clipping=FrameEdge.TOP,
+            current_center_censored=True,
+            current_inner_aperture=degraded,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+
+    state = session.core.course_state().current
+    assert state.raw_center_norm == pytest.approx(degraded.center_norm)
+    assert state.censored_axes == (False, False)
+    assert state.aperture_half_size_norm is None
+    assert proposal.current_target.normalized_x == pytest.approx(0.07)
+    assert proposal.current_target.normalized_y_down == pytest.approx(-0.09)
+    assert proposal.current_target.clipped is False
+    assert proposal.current_target.center_censored is False
+    assert proposal.current_target.confidence == pytest.approx(0.20)
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposal.servo_output.target_roll_rad,
+            proposal.servo_output.target_pitch_rad,
+            proposal.servo_output.yaw_rate_rad_s,
+            proposal.servo_output.thrust,
+        )
+    )
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+
+
+def test_clipped_outer_support_without_complete_inner_still_refuses() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.36,
+            current_height=0.38,
+            include_successor=False,
+            current_clipping=FrameEdge.TOP,
+            current_center_censored=True,
+        )
+    )
+    snapshot = graph.observe(tracker)
+
+    with pytest.raises(VisualApproachCurrentGeometryUnavailable):
+        _observe(planner, snapshot, tracker)
 
 
 def test_rejected_merged_inner_geometry_cannot_manufacture_clearance() -> None:

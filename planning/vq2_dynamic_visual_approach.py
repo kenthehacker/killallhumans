@@ -17,6 +17,7 @@ from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import (
     CameraFrameToken,
     MultiTargetVisualTracker,
+    VisualInnerApertureGeometry,
     VisualTrack,
 )
 from planning.vq2_dynamic_course import (
@@ -34,6 +35,7 @@ from planning.vq2_dynamic_course import (
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
     VISUAL_PASSAGE_ADMISSION_BASIS,
+    VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
     VisualApproachPassageAdmission,
     VisualApproachRefusal,
@@ -55,6 +57,27 @@ DYNAMIC_CROSSING_COORDINATE_BASIS = (
 )
 _HOST_CLOCK_ID = "host-perf-counter"
 BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ = (0.0, 1.0, 0.0, 0.0)
+
+
+def _complete_current_inner_geometry(
+    track: VisualTrack,
+) -> VisualInnerApertureGeometry | None:
+    """Return the co-timed complete aperture fit used by dynamic steering."""
+
+    if type(track) is not VisualTrack or not track.history:
+        return None
+    sample = track.history[-1]
+    inner = sample.inner_aperture
+    if (
+        sample.token != track.latest_token
+        or inner is None
+        or type(inner) is not VisualInnerApertureGeometry
+        or not inner.fitted
+        or inner.clipping != FrameEdge.NONE
+        or not inner.complete_visibility
+    ):
+        return None
+    return inner
 
 
 def production_dynamic_course_config() -> DynamicCourseConfig:
@@ -1202,6 +1225,99 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             expected_current_track_id,
             expected_gate_index,
             self._servo.tuning,
+        )
+
+    def _validate_current(
+        self,
+        snapshot: Any,
+        update: Any,
+        current: VisualTrack,
+        *,
+        mode: VisualApproachMode,
+    ) -> None:
+        """Keep graph identity hard while letting the inner aperture steer."""
+
+        try:
+            super()._validate_current(
+                snapshot,
+                update,
+                current,
+                mode=mode,
+            )
+        except VisualApproachCurrentGeometryUnavailable:
+            # Dynamic stage_snapshot has already admitted this exact tracker
+            # publication.  Outer red support may touch an image edge while
+            # the complete fitted opening remains clean and co-timed.
+            if (
+                mode is not VisualApproachMode.APPROACH
+                or _complete_current_inner_geometry(current) is None
+            ):
+                raise
+
+    def _target(
+        self,
+        track: VisualTrack,
+        *,
+        now_monotonic_s: float,
+        require_current_authority: bool,
+    ) -> VisualTarget:
+        target = super()._target(
+            track,
+            now_monotonic_s=now_monotonic_s,
+            require_current_authority=require_current_authority,
+        )
+        if not require_current_authority:
+            return target
+        inner = _complete_current_inner_geometry(track)
+        if (
+            inner is None
+            or (
+                track.clipping == FrameEdge.NONE
+                and not track.center_censored
+            )
+        ):
+            return target
+        assert inner.center_norm is not None
+        assert inner.log_scale is not None
+        try:
+            state = self._dynamic_session.core.course_state().current
+        except DynamicCourseError:
+            # The first exact publication seeds the graph shell before
+            # _DynamicImageServo.step binds course roles.
+            return target
+        if (
+            state.track_id != track.track_id
+            or state.frame_sequence != track.history[-1].tracker_frame_sequence
+            or state.raw_center_norm != inner.center_norm
+            or state.raw_log_scale != inner.log_scale
+            or any(state.censored_axes)
+        ):
+            raise VisualApproachRefusal(
+                "dynamic current target differs from complete inner geometry"
+            )
+        scale = self._dynamic_session.core.config
+        return replace(
+            target,
+            normalized_x=float(inner.center_norm[0]),
+            normalized_y_down=float(inner.center_norm[1]),
+            normalized_x_rate_s=(
+                state.residual_translational_rate_rad_s[0]
+                / scale.horizontal_angle_scale_rad
+            ),
+            normalized_y_rate_down_s=(
+                state.residual_translational_rate_rad_s[1]
+                / scale.vertical_angle_scale_rad
+            ),
+            log_scale=float(inner.log_scale),
+            confidence=min(
+                float(track.confidence),
+                float(track.association_confidence),
+                float(inner.confidence),
+            ),
+            clipped=False,
+            center_censored=False,
+            horizontal_censored=False,
+            vertical_censored=False,
         )
 
     def _passage_admission_from_approach(

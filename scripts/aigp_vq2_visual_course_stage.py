@@ -340,6 +340,53 @@ def _top_fov_edge_recovery_rate_down_s(
     return rate
 
 
+def _top_fov_nonrotational_angle_rate_rad_s(
+    *,
+    current_top_edge_image_down: float,
+    previous_top_edge_image_down: float,
+    vertical_angle_scale_rad: float,
+    elapsed_s: float,
+    measured_pitch_rate_rad_s: float,
+) -> float:
+    """Remove calibrated pure-pitch image motion from one raw edge rate."""
+
+    current_top, previous_top, scale, elapsed, pitch_rate = map(
+        float,
+        (
+            current_top_edge_image_down,
+            previous_top_edge_image_down,
+            vertical_angle_scale_rad,
+            elapsed_s,
+            measured_pitch_rate_rad_s,
+        ),
+    )
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                current_top,
+                previous_top,
+                scale,
+                elapsed,
+                pitch_rate,
+            )
+        )
+        or not -1.0 <= current_top <= 1.0
+        or not -1.0 <= previous_top <= 1.0
+        or scale <= 0.0
+        or elapsed <= 0.0
+    ):
+        raise ValueError("top-FOV nonrotational edge-rate inputs are invalid")
+    raw_angle_rate = (
+        math.atan(current_top * scale)
+        - math.atan(previous_top * scale)
+    ) / elapsed
+    result = raw_angle_rate + pitch_rate
+    if not math.isfinite(result):
+        raise ValueError("top-FOV nonrotational edge rate is nonfinite")
+    return result
+
+
 def _project_raw_vertical_edge_for_pitch_reference(
     *,
     edge_image_down: float,
@@ -376,6 +423,9 @@ def _project_raw_vertical_edge_for_pitch_reference(
 class _TopFovPitchProposal:
     raw_top_edge_image_down: float
     raw_top_edge_rate_down_s: Optional[float]
+    raw_top_edge_nonrotational_angle_rate_rad_s: Optional[float]
+    prediction_horizon_s: float
+    forecast_top_edge_image_down: float
     capture_pitch_rad: float
     requested_target_pitch_rad: float
     maximum_observable_target_pitch_rad: float
@@ -396,7 +446,10 @@ class _TopFovObservation:
     raw_nominal_top_edge_image_down: float
     raw_top_edge_std_image_down: float
     raw_top_edge_rate_down_s: Optional[float]
+    raw_top_edge_motion_angle_rate_rad_s: Optional[float]
+    raw_top_edge_nonrotational_angle_rate_rad_s: Optional[float]
     vertical_angle_scale_rad: float
+    pitch_response_delay_s: float
     previous_target_pitch_rad: Optional[float]
     raw_top_edge_basis: str
     raw_top_edge_confidence: float
@@ -411,6 +464,8 @@ def _propose_top_fov_pitch_reference(
     prior_target_pitch_rad: float,
     vertical_angle_scale_rad: float,
     active_before: bool,
+    raw_top_edge_nonrotational_angle_rate_rad_s: Optional[float] = None,
+    prediction_horizon_s: float = 0.0,
 ) -> _TopFovPitchProposal:
     """Hold nose-up authority until raw top-edge clearance recovers."""
 
@@ -429,6 +484,12 @@ def _propose_top_fov_pitch_reference(
         if raw_top_edge_rate_down_s is None
         else float(raw_top_edge_rate_down_s)
     )
+    nonrotational_rate = (
+        None
+        if raw_top_edge_nonrotational_angle_rate_rad_s is None
+        else float(raw_top_edge_nonrotational_angle_rate_rad_s)
+    )
+    horizon = float(prediction_horizon_s)
     if (
         not all(
             math.isfinite(value)
@@ -442,6 +503,10 @@ def _propose_top_fov_pitch_reference(
         )
         or rate is not None
         and not math.isfinite(rate)
+        or nonrotational_rate is not None
+        and not math.isfinite(nonrotational_rate)
+        or not math.isfinite(horizon)
+        or horizon < 0.0
         or not -1.0 <= raw_top <= 1.0
         or scale <= 0.0
         or type(active_before) is not bool
@@ -453,9 +518,19 @@ def _propose_top_fov_pitch_reference(
         <= MAX_VISUAL_TARGET_PITCH_RAD
     ):
         raise ValueError("top-FOV pitch guidance inputs are invalid")
+    current_top_angle = math.atan(raw_top * scale)
+    forecast_top_angle = (
+        current_top_angle
+        + min(0.0, nonrotational_rate or 0.0) * horizon
+    )
+    forecast_top_angle = max(
+        math.atan(-scale),
+        min(math.atan(scale), forecast_top_angle),
+    )
+    forecast_top = math.tan(forecast_top_angle) / scale
     maximum_observable = (
         capture
-        + math.atan(raw_top * scale)
+        + math.atan(forecast_top * scale)
         - math.atan(TOP_FOV_SAFE_EDGE_IMAGE_DOWN * scale)
     )
     maximum_observable = min(
@@ -493,13 +568,13 @@ def _propose_top_fov_pitch_reference(
         )
         active_after = True
     predicted_requested = _project_raw_vertical_edge_for_pitch_reference(
-        edge_image_down=raw_top,
+        edge_image_down=forecast_top,
         capture_pitch_rad=capture,
         target_pitch_rad=requested,
         vertical_angle_scale_rad=scale,
     )
     predicted_protected = _project_raw_vertical_edge_for_pitch_reference(
-        edge_image_down=raw_top,
+        edge_image_down=forecast_top,
         capture_pitch_rad=capture,
         target_pitch_rad=protected,
         vertical_angle_scale_rad=scale,
@@ -517,6 +592,9 @@ def _propose_top_fov_pitch_reference(
     return _TopFovPitchProposal(
         raw_top_edge_image_down=raw_top,
         raw_top_edge_rate_down_s=rate,
+        raw_top_edge_nonrotational_angle_rate_rad_s=nonrotational_rate,
+        prediction_horizon_s=horizon,
+        forecast_top_edge_image_down=forecast_top,
         capture_pitch_rad=capture,
         requested_target_pitch_rad=requested,
         maximum_observable_target_pitch_rad=maximum_observable,
@@ -559,7 +637,7 @@ def _top_fov_observation(
         or current.frame_sequence != sample.tracker_frame_sequence
         or getattr(target_track, "clipping", None) != sample.clipping
         or getattr(target_track, "center_censored", None)
-        is not sample.center_censored
+        != sample.center_censored
     ):
         raise ValueError("top-FOV authority lacks exact current raw geometry")
     edge = _top_fov_raw_edge(sample)
@@ -568,6 +646,8 @@ def _top_fov_observation(
     if type(observed_ns) is not int or observed_ns < 0:
         raise ValueError("top-FOV observation clock is invalid")
     top_rate: Optional[float] = None
+    top_motion_angle_rate: Optional[float] = None
+    nonrotational_angle_rate: Optional[float] = None
     if len(history) >= 2:
         previous = history[-2]
         previous_ns = previous.observation_monotonic_ns
@@ -582,13 +662,45 @@ def _top_fov_observation(
         except (AttributeError, TypeError, ValueError):
             previous_edge = None
         if previous_edge is not None and previous_edge.basis == edge.basis:
+            elapsed_s = (
+                (observed_ns - previous_ns) / 1_000_000_000.0
+            )
             top_rate = _top_fov_edge_recovery_rate_down_s(
                 current=edge,
                 previous=previous_edge,
-                elapsed_s=(
-                    (observed_ns - previous_ns) / 1_000_000_000.0
-                ),
+                elapsed_s=elapsed_s,
             )
+            vertical_scale = float(config.vertical_angle_scale_rad)
+            top_motion_angle_rate = (
+                math.atan(edge.top_edge_image_down * vertical_scale)
+                - math.atan(
+                    previous_edge.top_edge_image_down * vertical_scale
+                )
+            ) / elapsed_s
+            body_rates = current.body_rates_rad_s
+            if type(body_rates) is not tuple or len(body_rates) != 3:
+                raise ValueError("top-FOV measured body rates are invalid")
+            pitch_rate = float(body_rates[1])
+            nonrotational_angle_rate = (
+                _top_fov_nonrotational_angle_rate_rad_s(
+                    current_top_edge_image_down=edge.top_edge_image_down,
+                    previous_top_edge_image_down=(
+                        previous_edge.top_edge_image_down
+                    ),
+                    vertical_angle_scale_rad=vertical_scale,
+                    elapsed_s=elapsed_s,
+                    measured_pitch_rate_rad_s=pitch_rate,
+                )
+            )
+            if not all(
+                math.isfinite(value)
+                for value in (
+                    top_motion_angle_rate,
+                    pitch_rate,
+                    nonrotational_angle_rate,
+                )
+            ):
+                raise ValueError("top-FOV edge motion is nonfinite")
     previous_target = (
         None
         if course.last_applied_command is None
@@ -604,7 +716,12 @@ def _top_fov_observation(
         ),
         raw_top_edge_std_image_down=edge.top_edge_std_image_down,
         raw_top_edge_rate_down_s=top_rate,
+        raw_top_edge_motion_angle_rate_rad_s=top_motion_angle_rate,
+        raw_top_edge_nonrotational_angle_rate_rad_s=(
+            nonrotational_angle_rate
+        ),
         vertical_angle_scale_rad=float(config.vertical_angle_scale_rad),
+        pitch_response_delay_s=float(config.pitch_command_delay_s),
         previous_target_pitch_rad=previous_target,
         raw_top_edge_basis=edge.basis,
         raw_top_edge_confidence=edge.confidence,
@@ -3515,6 +3632,13 @@ async def _run_visual_course_stage_impl(
                             top_fov_observation.vertical_angle_scale_rad
                         ),
                         active_before=bool(fov_summary["active"]),
+                        raw_top_edge_nonrotational_angle_rate_rad_s=(
+                            top_fov_observation
+                            .raw_top_edge_nonrotational_angle_rate_rad_s
+                        ),
+                        prediction_horizon_s=(
+                            top_fov_observation.pitch_response_delay_s
+                        ),
                     )
                 except (AttributeError, TypeError, ValueError) as exc:
                     raise abort_type(
@@ -3869,6 +3993,14 @@ async def _run_visual_course_stage_impl(
                                 top_fov_observation
                                 .raw_top_edge_std_image_down
                             ),
+                            "last_forecast_top_edge_image_down": (
+                                top_fov_proposal
+                                .forecast_top_edge_image_down
+                            ),
+                            "last_raw_top_edge_nonrotational_angle_rate_rad_s": (
+                                top_fov_proposal
+                                .raw_top_edge_nonrotational_angle_rate_rad_s
+                            ),
                             "last_protected_target_pitch_rad": (
                                 top_fov_proposal.protected_target_pitch_rad
                             ),
@@ -3894,6 +4026,10 @@ async def _run_visual_course_stage_impl(
                         "raw_top_edge_std_image_down": (
                             top_fov_observation
                             .raw_top_edge_std_image_down
+                        ),
+                        "raw_top_edge_motion_angle_rate_rad_s": (
+                            top_fov_observation
+                            .raw_top_edge_motion_angle_rate_rad_s
                         ),
                         **asdict(top_fov_proposal),
                     }
@@ -4638,6 +4774,8 @@ async def _run_visual_course_stage_impl(
                 "last_raw_top_edge_confidence": None,
                 "last_raw_nominal_top_edge_image_down": None,
                 "last_raw_top_edge_std_image_down": None,
+                "last_forecast_top_edge_image_down": None,
+                "last_raw_top_edge_nonrotational_angle_rate_rad_s": None,
                 "last_protected_target_pitch_rad": None,
                 "active": False,
             },

@@ -56,7 +56,7 @@ from competition.vq2_capture import (
     ReceivedRaceStatusV1,
     TimesyncWireV1,
 )
-from competition.vq2_contracts import FrameIdentityV1, FrameTimingV1
+from competition.vq2_contracts import FrameEdge, FrameIdentityV1, FrameTimingV1
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from competition.vq2_vision import VQ2VisionThread
 from estimation.imu_attitude import (
@@ -195,6 +195,12 @@ def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
     low_confidence = vq2_module._visual_inner_aperture_from_fit(
         replace(_nominal_aperture_fit(), confidence=0.10)
     )
+    outer_support_touch = vq2_module._visual_inner_aperture_from_fit(
+        replace(
+            _nominal_aperture_fit(),
+            clipping=ApertureSide.TOP,
+        )
+    )
     clipped = vq2_module._visual_inner_aperture_from_fit(
         replace(
             _nominal_aperture_fit(),
@@ -227,6 +233,13 @@ def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
         )
     )
     assert low_confidence.health_reason == "aperture_fit_low_confidence"
+    assert outer_support_touch.fitted
+    assert outer_support_touch.complete_visibility
+    assert outer_support_touch.clipping == FrameEdge.NONE
+    assert outer_support_touch.health_reason == (
+        "outer_support_clipped_tracking_only"
+    )
+    assert not outer_support_touch.passage_usable
     assert not clipped.passage_usable
     assert clipped.center_norm is None
     assert clipped.health_reason == "aperture_fit_censored:2"

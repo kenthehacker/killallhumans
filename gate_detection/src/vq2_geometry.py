@@ -982,6 +982,8 @@ def fit_vq2_aperture_bgr(
 
 def _complete_geometry_from_vq2_aperture_fit(
     fit: VQ2ApertureFit,
+    *,
+    allow_outer_support_clipping: bool = False,
 ) -> Optional[VQ2PassageGeometry]:
     """Return an inscribed opening from an exact complete visible fit.
 
@@ -992,6 +994,8 @@ def _complete_geometry_from_vq2_aperture_fit(
 
     if type(fit) is not VQ2ApertureFit:
         raise TypeError("fit must be an exact VQ2ApertureFit")
+    if type(allow_outer_support_clipping) is not bool:
+        raise TypeError("allow_outer_support_clipping must be an exact bool")
     fit_confidence = _finite_confidence(fit.confidence)
     all_sides = (
         ApertureSide.LEFT
@@ -1002,7 +1006,10 @@ def _complete_geometry_from_vq2_aperture_fit(
     if (
         not fit.succeeded
         or fit.rejection_reason is not None
-        or fit.clipping != ApertureSide.NONE
+        or (
+            fit.clipping != ApertureSide.NONE
+            and not allow_outer_support_clipping
+        )
         or fit.visible_edges != all_sides
         or fit.visible_corners != (True, True, True, True)
         or fit.fitted_corners_px is None
@@ -1019,6 +1026,19 @@ def _complete_geometry_from_vq2_aperture_fit(
         return None
 
     width, height = fit.image_size_px
+    if (
+        type(width) is not int
+        or type(height) is not int
+        or width <= 0
+        or height <= 0
+        or any(
+            not all(math.isfinite(float(value)) for value in point)
+            or not 0.0 <= float(point[0]) <= float(width)
+            or not 0.0 <= float(point[1]) <= float(height)
+            for point in fit.fitted_corners_px
+        )
+    ):
+        return None
     corners = tuple(
         (
             2.0 * point[0] / float(width) - 1.0,
@@ -1162,11 +1182,15 @@ def tracking_geometry_from_vq2_aperture_fit(
 ) -> Optional[VQ2PassageGeometry]:
     """Retain exact complete inner geometry, with confidence in uncertainty.
 
-    Clipped, incomplete, rejected, or non-production-model fits remain
+    A clipped detector support box does not censor a complete fitted inner
+    quadrilateral. Incomplete, rejected, or non-production-model fits remain
     unavailable rather than borrowing the detector's outer support geometry.
     """
 
-    return _complete_geometry_from_vq2_aperture_fit(fit)
+    return _complete_geometry_from_vq2_aperture_fit(
+        fit,
+        allow_outer_support_clipping=True,
+    )
 
 
 def passage_geometry_from_vq2_aperture_fit(

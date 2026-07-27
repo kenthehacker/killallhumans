@@ -2254,6 +2254,59 @@ def test_decreasing_top_clearance_cannot_worsen_predicted_clipping():
     assert recovered.limited is False
 
 
+def test_adverse_nonrotational_edge_motion_tightens_pitch_before_clipping():
+    common = {
+        "capture_pitch_rad": -0.27,
+        "raw_top_edge_image_down": -0.61,
+        "raw_top_edge_rate_down_s": -0.20,
+        "requested_target_pitch_rad": 0.12,
+        "prior_target_pitch_rad": -0.20,
+        "vertical_angle_scale_rad": 0.55,
+        "active_before": True,
+        "prediction_horizon_s": 0.10,
+    }
+    stationary = course_stage._propose_top_fov_pitch_reference(
+        raw_top_edge_nonrotational_angle_rate_rad_s=0.0,
+        **common,
+    )
+    closing = course_stage._propose_top_fov_pitch_reference(
+        raw_top_edge_nonrotational_angle_rate_rad_s=-0.60,
+        **common,
+    )
+
+    assert closing.forecast_top_edge_image_down < (
+        stationary.forecast_top_edge_image_down
+    )
+    assert closing.maximum_observable_target_pitch_rad < (
+        stationary.maximum_observable_target_pitch_rad
+    )
+    assert closing.protected_target_pitch_rad < (
+        stationary.protected_target_pitch_rad
+    )
+    assert (
+        closing.predicted_protected_top_edge_image_down
+        >= course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+    )
+
+
+def test_top_fov_nonrotational_rate_is_invariant_under_pure_pitch():
+    previous_top = -0.42
+    scale = 0.55
+    elapsed_s = 0.05
+    pitch_rate = 0.40
+    current_top = math.tan(
+        math.atan(previous_top * scale) - pitch_rate * elapsed_s
+    ) / scale
+
+    assert course_stage._top_fov_nonrotational_angle_rate_rad_s(
+        current_top_edge_image_down=current_top,
+        previous_top_edge_image_down=previous_top,
+        vertical_angle_scale_rad=scale,
+        elapsed_s=elapsed_s,
+        measured_pitch_rate_rad_s=pitch_rate,
+    ) == pytest.approx(0.0, abs=1e-12)
+
+
 def _inner_aperture(
     *,
     center_y: float,

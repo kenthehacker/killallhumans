@@ -447,6 +447,10 @@ def test_low_confidence_or_clipped_fit_cannot_claim_passage_geometry() -> None:
         clipped_detection.bbox,
         detection_confidence=clipped_detection.confidence,
     )
+    outer_support_touch = dataclasses.replace(
+        low_confidence,
+        clipping=ApertureSide.TOP,
+    )
 
     assert low_confidence.succeeded
     assert clipped.succeeded
@@ -459,6 +463,10 @@ def test_low_confidence_or_clipped_fit_cannot_claim_passage_geometry() -> None:
         is None
     )
     assert passage_geometry_from_vq2_aperture_fit(clipped) is None
+    assert (
+        passage_geometry_from_vq2_aperture_fit(outer_support_touch)
+        is None
+    )
     degraded_tracking = tracking_geometry_from_vq2_aperture_fit(
         low_confidence
     )
@@ -480,6 +488,10 @@ def test_low_confidence_or_clipped_fit_cannot_claim_passage_geometry() -> None:
         )
     )
     assert tracking_geometry_from_vq2_aperture_fit(clipped) is None
+    assert (
+        tracking_geometry_from_vq2_aperture_fit(outer_support_touch)
+        is not None
+    )
     assert (
         tracking_geometry_from_vq2_aperture_fit(
             dataclasses.replace(

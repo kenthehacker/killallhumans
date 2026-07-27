@@ -307,20 +307,32 @@ def _visual_inner_aperture_from_fit(
             raise ValueError(
                 "usable visual inner aperture lacks fit model identity"
             )
+        outer_support_clipped_tracking_only = bool(
+            passage_geometry is None
+            and fit.clipping != ApertureSide.NONE
+        )
         return VisualInnerApertureGeometry(
             center_norm=geometry.center_norm,
             half_size_norm=geometry.aperture_half_size_norm,
             log_scale=geometry.log_scale,
             measurement_std=geometry.measurement_std,
             confidence=fit.confidence,
-            clipping=clipping,
+            clipping=(
+                FrameEdge.NONE
+                if outer_support_clipped_tracking_only
+                else clipping
+            ),
             visible_edges=visible_edges,
             geometry_model_id=fit.geometry_model_id,
             covariance_model_id=fit.covariance_model_id,
             health_reason=(
                 None
                 if passage_geometry is not None
-                else "aperture_fit_low_confidence"
+                else (
+                    "outer_support_clipped_tracking_only"
+                    if outer_support_clipped_tracking_only
+                    else "aperture_fit_low_confidence"
+                )
             ),
         )
 
