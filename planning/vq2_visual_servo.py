@@ -567,6 +567,28 @@ class VisualTarget:
         ):
             horizontal_censored = True
             vertical_censored = True
+        raw_log_scale_rate = track.log_scale_rate_s
+        if (
+            type(raw_log_scale_rate) not in {int, float}
+            or not math.isfinite(float(raw_log_scale_rate))
+        ):
+            raise VisualServoRefusal(
+                "visual track scale rate must be finite"
+            )
+        # Apparent scale is derived from both bbox axes.  Any clipped edge
+        # censors that derivative even when the orthogonal center coordinate
+        # remains useful for steering.  Preserve the raw tracker diagnostic,
+        # but give the legacy servo adapter a neutral unavailable derivative;
+        # the dynamic local state independently propagates qualified
+        # expansion and owns closure/passage geometry.
+        scale_geometry_censored = bool(
+            track.clipping != FrameEdge.NONE or track.center_censored
+        )
+        adapted_log_scale_rate = (
+            0.0
+            if scale_geometry_censored
+            else float(raw_log_scale_rate)
+        )
 
         return cls(
             track_id=track.track_id,
@@ -582,7 +604,7 @@ class VisualTarget:
             normalized_x_rate_s=float(velocity[0]),
             normalized_y_rate_down_s=float(velocity[1]),
             log_scale=math.log(float(apparent_scale)),
-            log_scale_rate_s=float(track.log_scale_rate_s),
+            log_scale_rate_s=adapted_log_scale_rate,
             confidence=float(track.confidence),
             association_confidence=float(track.association_confidence),
             consecutive_frames=track.consecutive_frame_count,

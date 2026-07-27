@@ -2307,6 +2307,40 @@ def test_axis_clipping_is_derived_from_exact_tracker_edge_flags():
     assert left.vertical_censored is False
 
 
+@pytest.mark.parametrize("clipping", (FrameEdge.RIGHT, FrameEdge.TOP))
+def test_clipped_track_scale_rate_is_diagnostic_not_servo_authority(
+    clipping,
+):
+    live_outlier = replace(
+        tracker_track(
+            clipping=clipping,
+            center_censored=True,
+        ),
+        log_scale_rate_s=-14.47572981280526,
+    )
+
+    adapted = VisualTarget.from_visual_track(live_outlier)
+    output = step(ImageVisualServo(), adapted)
+
+    assert adapted.log_scale_rate_s == 0.0
+    assert math.isfinite(output.target_pitch_rad)
+    assert output.advance_enabled is False
+    assert output.brake_reason == "target_edge_or_clipping"
+
+
+def test_clean_implausible_scale_rate_remains_fail_closed():
+    clean_outlier = replace(
+        tracker_track(),
+        log_scale_rate_s=-14.47572981280526,
+    )
+
+    with pytest.raises(
+        VisualServoRefusal,
+        match="target scale rate is implausible",
+    ):
+        VisualTarget.from_visual_track(clean_outlier)
+
+
 def test_top_clipped_next_gate_can_blend_heading_but_brakes_closure():
     servo = ImageVisualServo()
     for frame in (1, 2, 3):
