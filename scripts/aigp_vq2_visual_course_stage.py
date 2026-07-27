@@ -1857,6 +1857,15 @@ def _dynamic_near_plane_wire_sample(
         if propagated_aperture
         else None
     )
+    if (
+        propagated_horizon_remaining_s is not None
+        and crossing_prediction_horizon_s
+        > propagated_horizon_remaining_s + 1e-9
+    ):
+        # An otherwise valid local prediction whose bounded lease cannot
+        # reach the crossing plane simply owns no passage evidence.  It is
+        # not malformed navigation state and must not abort the approach.
+        return None
     predicted_crossing_error = pair(
         "predicted_crossing_error_norm",
     )
