@@ -2481,6 +2481,59 @@ def test_propagated_top_fov_gap_accepts_full_frame_near_plane_clipping():
     assert authority["advance_authority"] is False
 
 
+def test_propagated_visibility_gap_uses_state_guidance_without_losing_fov_pitch():
+    snapshot = _snapshot(0, "track-0", 20, visible=False)
+    last_visible_token = snapshot.current_track.latest_token
+    evidence = {
+        "basis": "propagated-current-visibility-gap-guidance-v1",
+        "gate_index": 0,
+        "track_id": "track-0",
+        "camera_token": asdict(snapshot.latest_camera_token),
+        "last_visible_camera_token": asdict(last_visible_token),
+        "missed_frame_count": 1,
+        "aperture_prediction_horizon_remaining_s": 0.55,
+        "command": {
+            "target_roll_rad": 0.14,
+            "target_pitch_rad": 0.12,
+            "yaw_rate_rad_s": -0.10,
+            "thrust": 0.275,
+        },
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+    fov_summary = {
+        "active": True,
+        "last_track_id": "track-0",
+        "last_camera_token": asdict(last_visible_token),
+        "last_protected_target_pitch_rad": -0.35,
+        "last_propagated_state_handoff": {
+            "basis": "propagated-current-fov-gap-steering-v1",
+            "camera_token": asdict(last_visible_token),
+        },
+    }
+
+    authority = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    )
+
+    assert authority.command.anchor_camera_token == last_visible_token
+    assert authority.command.target_roll_rad == pytest.approx(0.14)
+    assert authority.command.target_pitch_rad == pytest.approx(-0.35)
+    assert authority.command.yaw_rate_rad_s == pytest.approx(-0.10)
+    assert authority.command.requested_thrust == pytest.approx(0.275)
+    assert authority.remaining_horizon_s == pytest.approx(0.55)
+    assert authority.evidence["steering_only"] is True
+    assert authority.evidence["passage_authority"] is False
+    assert authority.evidence["advance_authority"] is False
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     (

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 import math
 
 import pytest
@@ -39,6 +39,7 @@ from planning.vq2_gate_graph import (
 from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
+    VisualApproachRefusal,
 )
 
 
@@ -1393,6 +1394,125 @@ def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> No
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
+
+
+def test_qualified_local_state_guides_one_fresh_current_visibility_gap() -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    for sequence in (6, 7, 8):
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=0.34,
+                current_height=0.36,
+                include_successor=False,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, proposal)
+    for sequence, size in ((9, 0.38), (10, 0.43), (11, 0.49)):
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=size,
+                current_height=size,
+                include_successor=False,
+                current_center_y=0.14,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, proposal)
+
+    all_edges = (
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    )
+    tracker.update(
+        _frame(
+            12,
+            current_width=0.55,
+            current_height=0.55,
+            include_successor=False,
+            current_center_y=0.14,
+            current_clipping=all_edges,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    assert session.core.course_state().current.aperture_dynamics_qualified
+
+    missing = replace(
+        _frame(13, include_successor=False),
+        detections=(),
+    )
+    update = tracker.update(missing)
+    snapshot = graph.observe(tracker)
+    assert snapshot.current_track_id == current_id
+    assert snapshot.withholding_reason == "current_track_not_visible"
+    assert snapshot.authority_usable is False
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="withheld authoritative current-gate identity",
+    ):
+        _observe(planner, snapshot, tracker)
+
+    now_ns = update.observation_monotonic_ns + 5_000_000
+    authority = session.propagated_current_visibility_gap_authority(
+        track=tracker.track(current_id),
+        camera_token=update.token,
+        now_monotonic_ns=now_ns,
+    )
+    state = session.core.course_state().current
+
+    assert state.frame_sequence == update.tracker_frame_sequence
+    assert state.visible is False
+    assert state.missed_count == 1
+    assert state.aperture_propagated
+    assert state.aperture_dynamics_qualified
+    assert authority["camera_token"] == asdict(update.token)
+    assert authority["last_visible_camera_token"] == asdict(
+        tracker.track(current_id).latest_token
+    )
+    assert authority["missed_frame_count"] == 1
+    assert authority["aperture_prediction_horizon_remaining_s"] > 0.0
+    assert all(
+        math.isfinite(value)
+        for value in (
+            *authority["current_center_norm"],
+            *authority["current_aperture_half_size_norm"],
+            *authority["current_bearing_std_rad"],
+            *authority["command"].values(),
+        )
+    )
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+    deadline_ns = state.aperture_prediction_deadline_monotonic_ns
+    assert deadline_ns is not None
+    with pytest.raises(DynamicCourseError, match="qualified local state"):
+        session.propagated_current_visibility_gap_authority(
+            track=tracker.track(current_id),
+            camera_token=update.token,
+            now_monotonic_ns=deadline_ns + 1,
+        )
 
 
 def test_propagated_current_fov_gap_refuses_identity_and_frame_mismatch() -> None:

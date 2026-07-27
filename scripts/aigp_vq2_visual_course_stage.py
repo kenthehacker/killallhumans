@@ -138,6 +138,9 @@ APPROACH_TOP_RECOVERY_BASIS = (
 APPROACH_INNER_DROPOUT_HOLD_BASIS = (
     "fresh-top-censored-prior-inner-fov-continuity-v1"
 )
+APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
+    "qualified-local-state-near-plane-visibility-gap-v1"
+)
 APPROACH_INNER_DROPOUT_MAX_DURATION_S = 0.120
 APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
 APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S = 0.25
@@ -2062,6 +2065,128 @@ class _CensoredPassageCoastAuthority:
     target_pitch_rad: float
     yaw_rate_rad_s: float
     requested_thrust: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproachPropagatedVisibilityGapAuthority:
+    """State-propagated steering authority after exact current visual loss."""
+
+    command: _CensoredPassageCoastAuthority
+    missed_frame_count: int
+    remaining_horizon_s: float
+    evidence: Mapping[str, Any]
+
+
+def _approach_propagated_visibility_gap_authority(
+    evidence: Mapping[str, Any],
+    *,
+    snapshot: Any,
+    gate_index: int,
+    track_id: str,
+    fov_summary: Mapping[str, Any],
+) -> _ApproachPropagatedVisibilityGapAuthority:
+    """Bind state guidance to the last FOV-protected visible publication."""
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    last_visible_token = getattr(track, "latest_token", None)
+    command = evidence.get("command") if isinstance(evidence, Mapping) else None
+    last_visible = evidence.get("last_visible_camera_token")
+    last_handoff = fov_summary.get("last_propagated_state_handoff")
+    missed_count = evidence.get("missed_frame_count")
+    remaining_horizon_s = evidence.get(
+        "aperture_prediction_horizon_remaining_s"
+    )
+    protected_pitch = fov_summary.get(
+        "last_protected_target_pitch_rad"
+    )
+    if (
+        not isinstance(evidence, Mapping)
+        or evidence.get("basis")
+        != "propagated-current-visibility-gap-guidance-v1"
+        or evidence.get("steering_only") is not True
+        or evidence.get("passage_authority") is not False
+        or evidence.get("advance_authority") is not False
+        or type(token) is not CameraFrameToken
+        or evidence.get("camera_token") != asdict(token)
+        or evidence.get("gate_index") != gate_index
+        or evidence.get("track_id") != track_id
+        or track is None
+        or getattr(track, "track_id", None) != track_id
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "visible", True) is not False
+        or getattr(track, "ambiguous", True) is not False
+        or type(missed_count) is not int
+        or missed_count <= 0
+        or getattr(track, "missed_frame_count", None) != missed_count
+        or type(last_visible_token) is not CameraFrameToken
+        or not isinstance(last_visible, Mapping)
+        or dict(last_visible) != asdict(last_visible_token)
+        or fov_summary.get("active") is not True
+        or fov_summary.get("last_track_id") != track_id
+        or fov_summary.get("last_camera_token") != dict(last_visible)
+        or not isinstance(last_handoff, Mapping)
+        or last_handoff.get("basis")
+        != "propagated-current-fov-gap-steering-v1"
+        or last_handoff.get("camera_token") != dict(last_visible)
+        or not isinstance(command, Mapping)
+        or type(remaining_horizon_s) not in {int, float}
+        or not math.isfinite(float(remaining_horizon_s))
+        or float(remaining_horizon_s) <= 0.0
+        or type(protected_pitch) not in {int, float}
+        or not math.isfinite(float(protected_pitch))
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= float(protected_pitch)
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+    ):
+        raise ValueError(
+            "approach visibility gap lacks exact propagated/FOV authority"
+        )
+    try:
+        target_roll = float(command["target_roll_rad"])
+        requested_pitch = float(command["target_pitch_rad"])
+        yaw_rate = float(command["yaw_rate_rad_s"])
+        thrust = float(command["thrust"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "approach visibility gap command is malformed"
+        ) from exc
+    target_pitch = min(requested_pitch, float(protected_pitch))
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                target_roll,
+                requested_pitch,
+                target_pitch,
+                yaw_rate,
+                thrust,
+            )
+        )
+        or abs(target_roll) > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= target_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or abs(yaw_rate) > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+        or not MIN_VISUAL_THRUST <= thrust <= MAX_VISUAL_THRUST
+    ):
+        raise ValueError(
+            "approach visibility gap command escaped its envelope"
+        )
+    return _ApproachPropagatedVisibilityGapAuthority(
+        command=_CensoredPassageCoastAuthority(
+            gate_index=gate_index,
+            track_id=track_id,
+            anchor_camera_token=last_visible_token,
+            target_roll_rad=target_roll,
+            target_pitch_rad=target_pitch,
+            yaw_rate_rad_s=yaw_rate,
+            requested_thrust=thrust,
+        ),
+        missed_frame_count=missed_count,
+        remaining_horizon_s=float(remaining_horizon_s),
+        evidence=dict(evidence),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -5006,6 +5131,7 @@ async def _run_visual_course_stage_impl(
                 CENSORED_PASSAGE_COAST_BASIS,
                 APPROACH_TOP_RECOVERY_BASIS,
                 APPROACH_INNER_DROPOUT_HOLD_BASIS,
+                APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS,
             }
             or authority.gate_index != current_gate_index
             or authority.track_id != current_track_id
@@ -5283,7 +5409,12 @@ async def _run_visual_course_stage_impl(
                 "visual_course_approach_inner_dropout_hold_command"
                 if hold_basis
                 == APPROACH_INNER_DROPOUT_HOLD_BASIS
-                else "visual_course_censored_passage_coast_command"
+                else (
+                    "visual_course_approach_propagated_visibility_gap_command"
+                    if hold_basis
+                    == APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+                    else "visual_course_censored_passage_coast_command"
+                )
             )
         )
         host.recorder.emit(
@@ -5501,6 +5632,9 @@ async def _run_visual_course_stage_impl(
             _ApproachInnerDropoutAuthority
         ] = None
         approach_inner_dropout_hold_command_count = 0
+        approach_propagated_visibility_gap_started_s: Optional[float] = None
+        approach_propagated_visibility_gap_fresh_frame_count = 0
+        approach_propagated_visibility_gap_command_count = 0
         crossing_wait_coast_command_count = 0
         crossing_wait_adjacent_command_count = 0
         credit_wait_adjacent_planner: Optional[Any] = None
@@ -5535,6 +5669,9 @@ async def _run_visual_course_stage_impl(
             "approach_top_recovery": None,
             "approach_inner_dropout_hold_command_count": 0,
             "approach_inner_dropout_hold": None,
+            "approach_propagated_visibility_gap_fresh_frame_count": 0,
+            "approach_propagated_visibility_gap_command_count": 0,
+            "approach_propagated_visibility_gap": None,
             "post_credit_zero_command_count": 0,
             "post_credit_hold_command_count": 0,
             "post_credit_successor_steering_command_count": 0,
@@ -6048,6 +6185,190 @@ async def _run_visual_course_stage_impl(
                 VisualApproachCurrentGeometryUnavailable,
                 VisualApproachRefusal,
             ) as exc:
+                visibility_gap_eligible = bool(
+                    type(exc) is VisualApproachRefusal
+                    and str(exc)
+                    == (
+                        "gate graph withheld authoritative "
+                        "current-gate identity"
+                    )
+                    and mode is VisualApproachMode.APPROACH
+                    and lifecycle is CourseLifecycle.APPROACH
+                    and type(runtime.dynamic_controller)
+                    is DynamicVisualCourseSession
+                    and passage_admission is None
+                    and near_plane_latch is None
+                    and crossing_anchor is None
+                    and getattr(snapshot, "current_gate_index", None)
+                    == current_gate_index
+                    and getattr(snapshot, "current_track_id", None)
+                    == current_track_id
+                    and getattr(snapshot, "authority_usable", True)
+                    is False
+                    and getattr(snapshot, "withholding_reason", None)
+                    == "current_track_not_visible"
+                    and getattr(snapshot, "race_finished", True) is False
+                )
+                if visibility_gap_eligible:
+                    dynamic_controller = runtime.dynamic_controller
+                    assert type(dynamic_controller) is DynamicVisualCourseSession
+                    gap_proposal_ns = runtime.perf_counter_ns()
+                    if (
+                        type(gap_proposal_ns) is not int
+                        or gap_proposal_ns < 0
+                    ):
+                        raise abort_type(
+                            "visual-course propagated visibility-gap QPC "
+                            "clock is invalid"
+                        ) from exc
+                    try:
+                        gap_evidence = (
+                            dynamic_controller
+                            .propagated_current_visibility_gap_authority(
+                                track=snapshot.current_track,
+                                camera_token=token,
+                                now_monotonic_ns=gap_proposal_ns,
+                            )
+                        )
+                        gap_authority = (
+                            _approach_propagated_visibility_gap_authority(
+                                gap_evidence,
+                                snapshot=snapshot,
+                                gate_index=current_gate_index,
+                                track_id=current_track_id,
+                                fov_summary=segment[
+                                    "top_fov_pitch_protection"
+                                ],
+                            )
+                        )
+                    except (
+                        AttributeError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as gap_exc:
+                        raise abort_type(
+                            "visual-course propagated visibility-gap "
+                            f"guidance refused: {gap_exc}"
+                        ) from gap_exc
+                    if (
+                        approach_propagated_visibility_gap_started_s
+                        is None
+                    ):
+                        approach_propagated_visibility_gap_started_s = now
+                        approach_propagated_visibility_gap_fresh_frame_count = 0
+                        segment[
+                            "approach_propagated_visibility_gap"
+                        ] = {
+                            "basis": (
+                                APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+                            ),
+                            "anchor_camera_token": asdict(
+                                gap_authority.command.anchor_camera_token
+                            ),
+                            "first_missing_camera_token": asdict(token),
+                            "last_missing_camera_token": None,
+                            "reacquired_camera_token": None,
+                            "maximum_duration_s": (
+                                limits
+                                .censored_passage_coast_max_duration_s
+                            ),
+                            "maximum_fresh_frames": (
+                                limits
+                                .censored_passage_coast_max_fresh_frames
+                            ),
+                            "outcome": "propagating",
+                        }
+                    gap_elapsed_s = (
+                        now
+                        - approach_propagated_visibility_gap_started_s
+                    )
+                    if (
+                        gap_elapsed_s
+                        >= limits.censored_passage_coast_max_duration_s
+                        or approach_propagated_visibility_gap_fresh_frame_count
+                        >= limits.censored_passage_coast_max_fresh_frames
+                        or gap_authority.remaining_horizon_s
+                        <= limits.control_period_s
+                    ):
+                        assert (
+                            segment[
+                                "approach_propagated_visibility_gap"
+                            ]
+                            is not None
+                        )
+                        segment[
+                            "approach_propagated_visibility_gap"
+                        ]["outcome"] = "bounded_horizon_expired"
+                        raise abort_type(
+                            "visual-course propagated visibility-gap "
+                            "horizon expired"
+                        ) from exc
+                    approach_propagated_visibility_gap_fresh_frame_count += 1
+                    segment[
+                        "approach_propagated_visibility_gap_fresh_frame_count"
+                    ] = (
+                        approach_propagated_visibility_gap_fresh_frame_count
+                    )
+                    assert (
+                        segment["approach_propagated_visibility_gap"]
+                        is not None
+                    )
+                    segment["approach_propagated_visibility_gap"].update(
+                        {
+                            "last_missing_camera_token": asdict(token),
+                            "missed_frame_count": (
+                                gap_authority.missed_frame_count
+                            ),
+                            "elapsed_s": gap_elapsed_s,
+                            "remaining_state_horizon_s": (
+                                gap_authority.remaining_horizon_s
+                            ),
+                        }
+                    )
+                    last_planned_token = token
+                    command_deadline_s = min(
+                        (
+                            approach_propagated_visibility_gap_started_s
+                            + limits
+                            .censored_passage_coast_max_duration_s
+                        ),
+                        now + gap_authority.remaining_horizon_s,
+                    )
+                    try:
+                        gap_command = await send_censored_passage_coast(
+                            snapshot=snapshot,
+                            authority=gap_authority.command,
+                            yaw_reference_rad=yaw_reference_rad,
+                            segment_started_s=segment_started_s,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "approach-propagated-visibility-gap"
+                            ),
+                            command_deadline_s=command_deadline_s,
+                            hold_basis=(
+                                APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
+                            ),
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc
+                        )
+                        break
+                    if gap_command is None:
+                        continue
+                    approach_propagated_visibility_gap_command_count += 1
+                    approach_command_count += 1
+                    segment["approach_command_count"] = (
+                        approach_command_count
+                    )
+                    segment[
+                        "approach_propagated_visibility_gap_command_count"
+                    ] = (
+                        approach_propagated_visibility_gap_command_count
+                    )
+                    continue
                 dropout_authority: Optional[
                     _ApproachInnerDropoutAuthority
                 ] = None
@@ -6723,6 +7044,22 @@ async def _run_visual_course_stage_impl(
                     ] = asdict(token)
                 break
 
+            if (
+                approach_propagated_visibility_gap_started_s
+                is not None
+            ):
+                gap_summary = segment[
+                    "approach_propagated_visibility_gap"
+                ]
+                if isinstance(gap_summary, dict):
+                    gap_summary.update(
+                        {
+                            "reacquired_camera_token": asdict(token),
+                            "outcome": "reacquired",
+                        }
+                    )
+                approach_propagated_visibility_gap_started_s = None
+                approach_propagated_visibility_gap_fresh_frame_count = 0
             if approach_inner_dropout_authority is not None:
                 hold_summary = segment[
                     "approach_inner_dropout_hold"
