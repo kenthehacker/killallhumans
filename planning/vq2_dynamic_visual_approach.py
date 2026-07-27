@@ -2694,7 +2694,14 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 and (
                     inner is None
                     or state.raw_center_norm != inner.center_norm
-                    or state.raw_log_scale != inner.log_scale
+                    or (
+                        inner.passage_usable
+                        and state.raw_log_scale != inner.log_scale
+                    )
+                    or (
+                        not inner.passage_usable
+                        and state.raw_log_scale is not None
+                    )
                     or any(state.censored_axes)
                 )
             )
@@ -2769,7 +2776,15 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 state.residual_translational_rate_rad_s[1]
                 / scale.vertical_angle_scale_rad
             ),
-            log_scale=float(inner.log_scale),
+            # A degraded complete fit may correct bearing, but its scale is
+            # deliberately withheld by DynamicCourseCore.  Preserve the
+            # bounded filtered scale instead of reintroducing that rejected
+            # measurement at the servo boundary.
+            log_scale=float(
+                inner.log_scale
+                if inner.passage_usable
+                else state.log_scale
+            ),
             confidence=min(
                 float(track.confidence),
                 float(track.association_confidence),

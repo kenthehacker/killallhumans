@@ -1882,6 +1882,82 @@ def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> Non
     assert proposal.passage_admission is None
 
 
+def test_clipped_outer_degraded_inner_steers_without_scale_authority() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+        inner_aperture=None,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+    prior = session.core.course_state().current
+    assert prior.aperture_half_size_norm is None
+
+    degraded = _inner_aperture(
+        0.15,
+        -0.10,
+        half_width=0.07,
+        half_height=0.05,
+        confidence=0.08,
+        measurement_std=(0.025, 0.044, 0.20),
+        health_reason="outer_support_clipped_tracking_only",
+    )
+    assert not degraded.passage_usable
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.28,
+            current_height=0.30,
+            include_successor=False,
+            current_center_x=0.12,
+            current_center_y=-0.08,
+            current_clipping=FrameEdge.RIGHT,
+            current_center_censored=True,
+            current_inner_aperture=degraded,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+
+    state = session.core.course_state().current
+    assert state.raw_center_norm == pytest.approx(degraded.center_norm)
+    assert state.raw_log_scale is None
+    assert state.aperture_half_size_norm is None
+    assert state.censored_axes == (False, False)
+    assert proposal.current_target.normalized_x == pytest.approx(
+        degraded.center_norm[0]
+    )
+    assert proposal.current_target.normalized_y_down == pytest.approx(
+        degraded.center_norm[1]
+    )
+    assert proposal.current_target.log_scale == pytest.approx(
+        state.log_scale
+    )
+    assert proposal.current_target.log_scale != pytest.approx(
+        degraded.log_scale
+    )
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposal.servo_output.target_roll_rad,
+            proposal.servo_output.target_pitch_rad,
+            proposal.servo_output.yaw_rate_rad_s,
+            proposal.servo_output.thrust,
+        )
+    )
+
+
 def test_rejected_inner_outer_support_corrects_steering_only() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
