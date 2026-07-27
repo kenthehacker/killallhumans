@@ -461,6 +461,7 @@ class DynamicCourseConfig:
     passage_margin_norm: float = 0.09
     passage_arm_min_log_scale: float = -0.80
     passage_successor_bias: float = 0.55
+    crossing_prediction_max_horizon_s: float = 1.20
     successor_prediction_max_horizon_s: float = 0.40
     successor_prediction_max_extrapolation_rad: float = 0.18
     successor_maximum_weight: float = 0.45
@@ -475,6 +476,9 @@ class DynamicCourseConfig:
     off_axis_brake_rad: float = 0.18
     rapid_expansion_rate_s: float = 0.45
     dropout_hold_s: float = 0.120
+    # Geometry/yaw prediction expires quickly, but an already reviewed exact
+    # successor identity survives the longer, expected near-plane occlusion.
+    successor_lineage_hold_s: float = 0.350
     max_history_samples: int = 256
     governor: CommandGovernorConfig = field(default_factory=CommandGovernorConfig)
 
@@ -504,6 +508,7 @@ class DynamicCourseConfig:
             "minimum_ttc_s",
             "maximum_ttc_s",
             "passage_margin_norm",
+            "crossing_prediction_max_horizon_s",
             "successor_prediction_max_horizon_s",
             "successor_prediction_max_extrapolation_rad",
             "successor_max_yaw_contribution_rad",
@@ -516,6 +521,7 @@ class DynamicCourseConfig:
             "off_axis_brake_rad",
             "rapid_expansion_rate_s",
             "dropout_hold_s",
+            "successor_lineage_hold_s",
         )
         for name in positive:
             object.__setattr__(self, name, _positive(getattr(self, name), name))
@@ -547,9 +553,22 @@ class DynamicCourseConfig:
             raise DynamicCourseError("brake_pitch_rad exceeds pitch authority")
         if self.minimum_ttc_s >= self.maximum_ttc_s:
             raise DynamicCourseError("minimum_ttc_s must be below maximum_ttc_s")
+        if self.crossing_prediction_max_horizon_s > 1.20:
+            raise DynamicCourseError(
+                "crossing prediction horizon exceeds its bounded model"
+            )
         if self.successor_full_weight_ttc_s >= self.successor_lookahead_ttc_s:
             raise DynamicCourseError(
                 "successor full-weight TTC must precede lookahead TTC"
+            )
+        if not (
+            self.dropout_hold_s
+            <= self.successor_lineage_hold_s
+            <= 0.50
+        ):
+            raise DynamicCourseError(
+                "successor lineage hold must cover prediction dropout "
+                "without exceeding 0.50 seconds"
             )
         if type(self.max_history_samples) is not int:
             raise TypeError("max_history_samples must be an exact integer")
@@ -649,6 +668,11 @@ class GuidanceDecision:
     passage_point_norm: Vector2
     passage_error_norm: Vector2
     aperture_margin_norm: Vector2
+    crossing_prediction_horizon_s: float
+    predicted_crossing_error_norm: Vector2
+    predicted_crossing_std_norm: Vector2
+    crossing_allowance_norm: Vector2
+    predicted_crossing_clearance_norm: Vector2
     current_bearing_std_rad: Vector2
     successor_bearing_std_rad: Vector2 | None
     successor_weight: float
@@ -1581,6 +1605,40 @@ class DynamicCourseCore:
             promotion_count=self._promotion_count,
         )
 
+    def retains_successor_lineage(
+        self,
+        successor_track_id: str,
+        monotonic_ns: int,
+    ) -> bool:
+        """Retain only an already bound successor identity through occlusion.
+
+        This authority never supplies geometry or yaw.  It exists solely so a
+        near-plane passage can seal the exact successor that was reviewed
+        before expected aperture occlusion.
+        """
+
+        _token(successor_track_id, "successor_track_id")
+        _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
+        state = self.course_state()
+        successor = state.successor
+        if (
+            state.successor_track_id != successor_track_id
+            or successor is None
+            or successor.track_id != successor_track_id
+            or successor.stream_generation
+            != state.current.stream_generation
+            or successor.sample_count < 4
+            or successor.ambiguous
+            or successor.aperture_half_size_norm is None
+        ):
+            return False
+        age_s = (
+            monotonic_ns - successor.last_measurement_monotonic_ns
+        ) / _NS_PER_SECOND
+        return bool(
+            0.0 <= age_s <= self.config.successor_lineage_hold_s
+        )
+
     def promote_authoritative(
         self,
         *,
@@ -1682,6 +1740,47 @@ class DynamicCourseCore:
             current_center[0] + passage[0],
             current_center[1] + passage[1],
         )
+        crossing_prediction_horizon_s = (
+            0.0
+            if current.time_to_contact_s is None
+            else min(
+                self.config.crossing_prediction_max_horizon_s,
+                max(0.0, current.time_to_contact_s),
+            )
+        )
+        residual_rate_norm = (
+            current.residual_translational_rate_rad_s[0]
+            / self.config.horizontal_angle_scale_rad,
+            current.residual_translational_rate_rad_s[1]
+            / self.config.vertical_angle_scale_rad,
+        )
+        predicted_crossing_error = tuple(
+            passage_error[axis]
+            + residual_rate_norm[axis]
+            * crossing_prediction_horizon_s
+            for axis in range(2)
+        )
+        current_std_norm = (
+            current.bearing_std_rad[0]
+            / self.config.horizontal_angle_scale_rad,
+            current.bearing_std_rad[1]
+            / self.config.vertical_angle_scale_rad,
+        )
+        # Capture-time uncertainty projects the already derotated residual
+        # velocity into position uncertainty.  Do not add the raw filter's
+        # very conservative rate covariance a second time here.
+        predicted_crossing_std = tuple(
+            current_std_norm[axis]
+            + abs(residual_rate_norm[axis])
+            * current.capture_timing_uncertainty_s
+            for axis in range(2)
+        )
+        predicted_crossing_clearance = tuple(
+            margins[axis]
+            - abs(predicted_crossing_error[axis])
+            - 2.0 * predicted_crossing_std[axis]
+            for axis in range(2)
+        )
         current_yaw_release = self._current_yaw_release(
             current,
             successor_passage_ready,
@@ -1720,6 +1819,17 @@ class DynamicCourseCore:
             passage_point_norm=passage,
             passage_error_norm=passage_error,
             aperture_margin_norm=margins,
+            crossing_prediction_horizon_s=(
+                crossing_prediction_horizon_s
+            ),
+            predicted_crossing_error_norm=(
+                predicted_crossing_error
+            ),
+            predicted_crossing_std_norm=predicted_crossing_std,
+            crossing_allowance_norm=margins,
+            predicted_crossing_clearance_norm=(
+                predicted_crossing_clearance
+            ),
             current_bearing_std_rad=current.bearing_std_rad,
             successor_bearing_std_rad=(
                 None if successor is None else successor.bearing_std_rad

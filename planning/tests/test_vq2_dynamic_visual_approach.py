@@ -24,6 +24,7 @@ from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     RollingVisualGateGraph,
 )
+from planning.vq2_visual_approach import VisualApproachMode
 
 
 _BASE_NS = 10_000_000_000
@@ -341,6 +342,101 @@ def test_dynamic_passage_admission_requires_scale_with_uncertainty(
         assert proposal.servo_output.brake_reason == (
             "dynamic_plane_not_ready"
         )
+
+
+def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    for sequence in (6, 7, 8):
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=0.34,
+                current_height=0.36,
+                include_successor=True,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, proposal)
+    retained_id = planner.latched_next_track_id
+    assert retained_id is not None
+    assert session.core.course_state().successor.sample_count == 4
+
+    sizes = {
+        9: 0.38,
+        10: 0.43,
+        11: 0.49,
+        12: 0.56,
+        13: 0.64,
+        14: 0.72,
+    }
+    for sequence, gate_size in sizes.items():
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=gate_size,
+                current_height=gate_size,
+                include_successor=False,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        if sequence < 14:
+            assert proposal.passage_admission is None
+        _accept_proposal(session, tracker, proposal)
+
+    admission = proposal.passage_admission
+    successor = session.core.course_state().successor
+    assert successor is not None
+    assert successor.visible is False
+    assert successor.missed_count == 6
+    assert snapshot.next_candidates == ()
+    assert admission is not None
+    assert admission.preview_track_id == retained_id
+    assert admission.preview_blend == 0.0
+    assert proposal.next_target is None
+    assert proposal.servo_output.brake_reason == "aligning"
+    assert proposal.servo_output.corridor_frames >= 3
+
+    tracker.update(
+        _frame(
+            15,
+            current_width=0.80,
+            current_height=0.80,
+            include_successor=False,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    update = tracker.latest_update
+    assert update is not None
+    passage = planner.observe(
+        snapshot,
+        tracker,
+        now_monotonic_s=(
+            update.observation_monotonic_ns + 5_000_000
+        )
+        / 1_000_000_000.0,
+        segment_elapsed_s=0.7,
+        segment_yaw_excursion_rad=0.0,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+
+    assert passage.passage_admission == admission
+    assert passage.next_target is None
+    assert passage.latched_next_track_id == retained_id
 
 
 def test_unit_bbox_full_size_maps_to_signed_center_half_aperture() -> None:

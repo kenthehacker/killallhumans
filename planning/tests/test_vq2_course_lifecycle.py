@@ -380,6 +380,13 @@ def test_dynamic_derotated_history_latches_and_allows_bounded_raw_motion():
             normalized_x_std=0.015,
             normalized_y_std=0.015,
             log_scale_std=0.02,
+            crossing_prediction_horizon_s=0.50,
+            predicted_crossing_x_norm=0.10,
+            predicted_crossing_y_down_norm=-0.12,
+            predicted_crossing_x_std_norm=0.015,
+            predicted_crossing_y_std_norm=0.015,
+            crossing_allowance_x_norm=0.30,
+            crossing_allowance_y_norm=0.30,
         )
         for sample, scale, expansion in zip(
             _CREDITED_NEAR_PLANE,
@@ -409,6 +416,167 @@ def test_dynamic_derotated_history_latches_and_allows_bounded_raw_motion():
         classify_latched_measurement(latch, **facts)
         is LatchedMeasurementMode.COAST
     )
+
+
+def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
+    """Replay the final three clean dynamic states before its bottom clip."""
+
+    replay_facts = (
+        {
+            "normalized_x": 0.08755705173981657,
+            "normalized_y_down": -0.6663688234686937,
+            "normalized_x_rate_s": -0.07266507862197541,
+            "normalized_y_rate_down_s": 0.17732009079152664,
+            "log_scale": -0.4888813534482041,
+            "log_scale_rate_s": 1.8323514969963652,
+            "confidence": 0.9162014714288149,
+            "normalized_x_std": 0.0166015902854566,
+            "normalized_y_std": 0.02192254240992148,
+            "log_scale_std": 0.046214360066108545,
+            "crossing_prediction_horizon_s": 0.545746818576689,
+            "predicted_crossing_x_norm": 0.04790031626024851,
+            "predicted_crossing_y_down_norm": -0.5695969480494885,
+            "predicted_crossing_x_std_norm": 0.01805489185789611,
+            "predicted_crossing_y_std_norm": 0.02546894422575201,
+            "crossing_allowance_x_norm": 0.43144731788958546,
+            "crossing_allowance_y_norm": 0.7585534078076088,
+        },
+        {
+            "normalized_x": 0.07326644915155803,
+            "normalized_y_down": -0.6481111955218952,
+            "normalized_x_rate_s": -0.18452990189829785,
+            "normalized_y_rate_down_s": 0.2734674067961661,
+            "log_scale": -0.4330575882676292,
+            "log_scale_rate_s": 1.7524624980079508,
+            "confidence": 0.9147545431145462,
+            "normalized_x_std": 0.01641192699254262,
+            "normalized_y_std": 0.02166944716677914,
+            "log_scale_std": 0.04583523085268929,
+            "crossing_prediction_horizon_s": 0.5706256203123972,
+            "predicted_crossing_x_norm": -0.03203104058534398,
+            "predicted_crossing_y_down_norm": -0.4920636868836103,
+            "predicted_crossing_x_std_norm": 0.020102525030508578,
+            "predicted_crossing_y_std_norm": 0.02713879530270246,
+            "crossing_allowance_x_norm": 0.4541013180219873,
+            "crossing_allowance_y_norm": 0.8247772155886629,
+        },
+        {
+            "normalized_x": 0.05873231376519952,
+            "normalized_y_down": -0.6256504945104799,
+            "normalized_x_rate_s": -0.1965476878653643,
+            "normalized_y_rate_down_s": 0.3957952406238849,
+            "log_scale": -0.3691951134967805,
+            "log_scale_rate_s": 1.7749301488475058,
+            "confidence": 0.9068386259584491,
+            "normalized_x_std": 0.01647398117883298,
+            "normalized_y_std": 0.021738417343367785,
+            "log_scale_std": 0.046005207747579116,
+            "crossing_prediction_horizon_s": 0.5634024531327715,
+            "predicted_crossing_x_norm": -0.05200313573572099,
+            "predicted_crossing_y_down_norm": -0.40265848500470763,
+            "predicted_crossing_x_std_norm": 0.020404934936140266,
+            "predicted_crossing_y_std_norm": 0.029654322155845483,
+            "crossing_allowance_x_norm": 0.4903944647215772,
+            "crossing_allowance_y_norm": 0.8982225951480185,
+        },
+    )
+    dynamic_samples = tuple(
+        replace(
+            sample,
+            geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+            **facts,
+        )
+        for sample, facts in zip(_LATEST_NEAR_PLANE, replay_facts)
+    )
+
+    evidence = NearPlaneEvidence()
+    latch = None
+    for sample in dynamic_samples:
+        evidence, latch = advance_dynamic_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            # Retained only as a validated compatibility surface.  The first
+            # sample is far outside these obsolete fixed center corridors.
+            horizontal_corridor=0.16,
+            vertical_corridor=0.18,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+
+    assert latch is not None
+    assert latch.basis == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+    assert len(evidence.samples) == _REQUIRED_FRAMES
+    assert all(
+        sample.crossing_allowance_x_norm
+        - abs(sample.predicted_crossing_x_norm)
+        - 2.0 * sample.predicted_crossing_x_std_norm
+        >= 0.0
+        and sample.crossing_allowance_y_norm
+        - abs(sample.predicted_crossing_y_down_norm)
+        - 2.0 * sample.predicted_crossing_y_std_norm
+        >= 0.0
+        for sample in evidence.samples
+    )
+
+
+def test_zero_dynamic_crossing_allowance_is_valid_but_cannot_latch() -> None:
+    sample = replace(
+        _LATEST_NEAR_PLANE[0],
+        geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+        crossing_prediction_horizon_s=0.0,
+        predicted_crossing_x_norm=0.0,
+        predicted_crossing_y_down_norm=0.0,
+        predicted_crossing_x_std_norm=0.0,
+        predicted_crossing_y_std_norm=0.0,
+        crossing_allowance_x_norm=0.0,
+        crossing_allowance_y_norm=0.30,
+    )
+
+    evidence, latch = advance_dynamic_near_plane_evidence(
+        NearPlaneEvidence(),
+        sample,
+        required_corridor_frames=_REQUIRED_FRAMES,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        horizontal_corridor=0.16,
+        vertical_corridor=0.18,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+
+    assert evidence.samples == ()
+    assert latch is None
+
+
+@pytest.mark.parametrize(
+    ("changed", "message"),
+    (
+        ({"crossing_prediction_horizon_s": True}, "horizon"),
+        ({"crossing_prediction_horizon_s": 1.21}, "horizon"),
+        ({"predicted_crossing_x_norm": math.nan}, "crossing_x"),
+        ({"predicted_crossing_y_std_norm": -0.01}, "crossing_y_std"),
+        ({"crossing_allowance_x_norm": -0.01}, "allowance_x"),
+    ),
+)
+def test_dynamic_crossing_sample_rejects_malformed_model_facts(
+    changed,
+    message,
+) -> None:
+    valid = replace(
+        _LATEST_NEAR_PLANE[0],
+        geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+        crossing_prediction_horizon_s=0.50,
+        predicted_crossing_x_norm=0.10,
+        predicted_crossing_y_down_norm=-0.12,
+        predicted_crossing_x_std_norm=0.015,
+        predicted_crossing_y_std_norm=0.015,
+        crossing_allowance_x_norm=0.30,
+        crossing_allowance_y_norm=0.30,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        replace(valid, **changed)
 
 
 def test_latest_bottom_censor_is_safe_coast_across_skipped_publications():

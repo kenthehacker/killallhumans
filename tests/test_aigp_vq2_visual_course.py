@@ -123,6 +123,145 @@ def test_dynamic_continuity_seed_is_not_crossing_evidence():
     )
 
 
+def _accepted_dynamic_near_plane_command(
+    evidence: dict[str, object],
+) -> course_stage._AcceptedVisualCommand:
+    token = _token(2)
+    return course_stage._AcceptedVisualCommand(
+        command=AttitudeRateCommand(0.01, -0.02, 0.03, 0.27),
+        yaw_soft_stop_zeroed=False,
+        observation_monotonic_ns=1_000,
+        publication_monotonic_ns=2_000,
+        wire_start_monotonic_ns=3_000,
+        wire_return_monotonic_ns=4_000,
+        wire_camera_token=token,
+        wire_race_gate_index=0,
+        publication_pinned_through_transport_return=True,
+        target_roll_rad=0.04,
+        target_pitch_rad=-0.05,
+        next_preview_collective_delta=0.0,
+        dynamic_evidence=evidence,
+    )
+
+
+def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
+    return {
+        "schema": "aigp-vq2-dynamic-command/1",
+        "dynamic_command_count": 1,
+        "gate_index": 0,
+        "current_track_id": "vq2-track-000001",
+        "passage_error_norm": [0.10, -0.20],
+        "current_bearing_std_norm": [0.01, 0.02],
+        "residual_translation_rate_norm_s": [0.30, -0.40],
+        "crossing_prediction_horizon_s": 0.45,
+        "predicted_crossing_error_norm": [0.235, -0.38],
+        "predicted_crossing_std_norm": [0.03, 0.04],
+        "crossing_allowance_norm": [0.50, 0.60],
+        "predicted_crossing_clearance_norm": [0.205, 0.14],
+        "current_censored_axes": [False, False],
+        "current_log_scale": -0.50,
+        "expansion_rate_s": 0.75,
+        "current_confidence": 0.90,
+        "current_ambiguous": False,
+        "dropout_held": False,
+        "current_visible": True,
+        "current_log_scale_std": 0.05,
+    }
+
+
+def _dynamic_near_plane_sample(
+    evidence: dict[str, object],
+):
+    return course_stage._dynamic_near_plane_wire_sample(
+        _accepted_dynamic_near_plane_command(evidence),
+        gate_index=0,
+        track_id="vq2-track-000001",
+        target=SimpleNamespace(
+            association_confidence=0.80,
+            center_censored=False,
+        ),
+        clipping=FrameEdge.NONE,
+    )
+
+
+def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
+    sample = _dynamic_near_plane_sample(
+        _valid_dynamic_near_plane_evidence()
+    )
+
+    assert sample is not None
+    assert sample.crossing_prediction_horizon_s == pytest.approx(0.45)
+    assert sample.predicted_crossing_x_norm == pytest.approx(0.235)
+    assert sample.predicted_crossing_y_down_norm == pytest.approx(-0.38)
+    assert sample.predicted_crossing_x_std_norm == pytest.approx(0.03)
+    assert sample.predicted_crossing_y_std_norm == pytest.approx(0.04)
+    assert sample.crossing_allowance_x_norm == pytest.approx(0.50)
+    assert sample.crossing_allowance_y_norm == pytest.approx(0.60)
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    [
+        "crossing_prediction_horizon_s",
+        "predicted_crossing_error_norm",
+        "predicted_crossing_std_norm",
+        "crossing_allowance_norm",
+        "predicted_crossing_clearance_norm",
+    ],
+)
+def test_dynamic_near_plane_wire_sample_rejects_missing_crossing_prediction(
+    missing_name,
+):
+    evidence = _valid_dynamic_near_plane_evidence()
+    del evidence[missing_name]
+
+    with pytest.raises(ValueError, match=missing_name):
+        _dynamic_near_plane_sample(evidence)
+
+
+@pytest.mark.parametrize(
+    ("name", "malformed"),
+    [
+        ("crossing_prediction_horizon_s", True),
+        ("crossing_prediction_horizon_s", -0.01),
+        ("crossing_prediction_horizon_s", 1.21),
+        ("predicted_crossing_error_norm", [0.1, math.nan]),
+        ("predicted_crossing_std_norm", [0.01, -0.01]),
+        ("crossing_allowance_norm", [0.50, -0.01]),
+    ],
+)
+def test_dynamic_near_plane_wire_sample_rejects_malformed_crossing_prediction(
+    name,
+    malformed,
+):
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence[name] = malformed
+
+    with pytest.raises(ValueError, match=name):
+        _dynamic_near_plane_sample(evidence)
+
+
+def test_dynamic_near_plane_wire_sample_accepts_zero_allowance() -> None:
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence["crossing_allowance_norm"] = [0.50, 0.0]
+    evidence["predicted_crossing_error_norm"] = [0.235, 0.0]
+    evidence["predicted_crossing_std_norm"] = [0.03, 0.0]
+    evidence["predicted_crossing_clearance_norm"] = [0.205, 0.0]
+
+    sample = _dynamic_near_plane_sample(evidence)
+
+    assert sample is not None
+    assert sample.crossing_allowance_y_norm == 0.0
+
+
+def test_dynamic_near_plane_wire_sample_rejects_inconsistent_clearance() -> None:
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence["predicted_crossing_clearance_norm"] = [0.205, 0.15]
+
+    with pytest.raises(ValueError, match="clearance is inconsistent"):
+        _dynamic_near_plane_sample(evidence)
+
+
 def _history_sample(
     track_id: str,
     token: CameraFrameToken,

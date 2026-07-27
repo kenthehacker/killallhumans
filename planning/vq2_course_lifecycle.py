@@ -37,6 +37,7 @@ DYNAMIC_NEAR_PLANE_LATCH_BASIS = (
     "imu-derotated-passage-accepted-wire-history-v1"
 )
 RAW_NEAR_PLANE_GEOMETRY_BASIS = "raw-image-current-aperture-v1"
+DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S = 1.20
 
 
 class CourseLifecycle(str, Enum):
@@ -245,6 +246,13 @@ class NearPlaneWireSample:
     normalized_x_std: float = 0.0
     normalized_y_std: float = 0.0
     log_scale_std: float = 0.0
+    crossing_prediction_horizon_s: Optional[float] = None
+    predicted_crossing_x_norm: Optional[float] = None
+    predicted_crossing_y_down_norm: Optional[float] = None
+    predicted_crossing_x_std_norm: Optional[float] = None
+    predicted_crossing_y_std_norm: Optional[float] = None
+    crossing_allowance_x_norm: Optional[float] = None
+    crossing_allowance_y_norm: Optional[float] = None
 
     def __post_init__(self) -> None:
         if type(self.gate_index) is not int or self.gate_index < 0:
@@ -332,6 +340,53 @@ class NearPlaneWireSample:
                 raise ValueError(
                     f"near-plane sample {name} must be finite and nonnegative"
                 )
+        crossing_fields = (
+            self.crossing_prediction_horizon_s,
+            self.predicted_crossing_x_norm,
+            self.predicted_crossing_y_down_norm,
+            self.predicted_crossing_x_std_norm,
+            self.predicted_crossing_y_std_norm,
+            self.crossing_allowance_x_norm,
+            self.crossing_allowance_y_norm,
+        )
+        if self.geometry_basis == DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS:
+            if any(value is None for value in crossing_fields):
+                raise ValueError(
+                    "dynamic near-plane sample lacks crossing prediction"
+                )
+            assert self.crossing_prediction_horizon_s is not None
+            if not _finite(self.crossing_prediction_horizon_s) or not (
+                0.0
+                <= float(self.crossing_prediction_horizon_s)
+                <= DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S
+            ):
+                raise ValueError(
+                    "dynamic near-plane crossing horizon is outside bounds"
+                )
+            for name in (
+                "predicted_crossing_x_norm",
+                "predicted_crossing_y_down_norm",
+            ):
+                if not _finite(getattr(self, name)):
+                    raise ValueError(
+                        f"dynamic near-plane sample {name} must be finite"
+                    )
+            for name in (
+                "predicted_crossing_x_std_norm",
+                "predicted_crossing_y_std_norm",
+                "crossing_allowance_x_norm",
+                "crossing_allowance_y_norm",
+            ):
+                value = getattr(self, name)
+                if not _finite(value) or float(value) < 0.0:
+                    raise ValueError(
+                        f"dynamic near-plane sample {name} must be finite "
+                        "and nonnegative"
+                    )
+        elif any(value is not None for value in crossing_fields):
+            raise ValueError(
+                "raw near-plane sample cannot carry dynamic crossing prediction"
+            )
 
     @property
     def apparent_scale(self) -> float:
@@ -712,18 +767,34 @@ def advance_dynamic_near_plane_evidence(
     scale_lower_bound = float(sample.log_scale) - 2.0 * float(
         sample.log_scale_std
     )
+    assert sample.predicted_crossing_x_norm is not None
+    assert sample.predicted_crossing_y_down_norm is not None
+    assert sample.predicted_crossing_x_std_norm is not None
+    assert sample.predicted_crossing_y_std_norm is not None
+    assert sample.crossing_allowance_x_norm is not None
+    assert sample.crossing_allowance_y_norm is not None
+    predicted_crossing_x_clearance = (
+        float(sample.crossing_allowance_x_norm)
+        - abs(float(sample.predicted_crossing_x_norm))
+        - 2.0 * float(sample.predicted_crossing_x_std_norm)
+    )
+    predicted_crossing_y_clearance = (
+        float(sample.crossing_allowance_y_norm)
+        - abs(float(sample.predicted_crossing_y_down_norm))
+        - 2.0 * float(sample.predicted_crossing_y_std_norm)
+    )
     qualified = bool(
         sample.clipping == FrameEdge.NONE
         and not sample.center_censored
         and not sample.ambiguous
         and float(sample.confidence) >= track_floor
         and float(sample.association_confidence) >= association_floor
-        and abs(float(sample.normalized_x))
-        + 2.0 * float(sample.normalized_x_std)
-        <= float(horizontal_corridor)
-        and abs(float(sample.normalized_y_down))
-        + 2.0 * float(sample.normalized_y_std)
-        <= float(vertical_corridor)
+        # A zero allowance is a valid, early passage-point result, but it
+        # leaves no physical aperture authority and therefore cannot qualify.
+        and float(sample.crossing_allowance_x_norm) > 0.0
+        and float(sample.crossing_allowance_y_norm) > 0.0
+        and predicted_crossing_x_clearance >= 0.0
+        and predicted_crossing_y_clearance >= 0.0
         and scale_lower_bound >= float(crossing_min_log_scale)
         and float(sample.log_scale_rate_s) > 0.0
     )
@@ -1075,6 +1146,7 @@ def classify_latched_measurement(
 
 __all__ = [
     "CourseLifecycle",
+    "DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S",
     "DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS",
     "DYNAMIC_NEAR_PLANE_LATCH_BASIS",
     "LatchedMeasurementMode",

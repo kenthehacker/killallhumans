@@ -39,6 +39,7 @@ from planning.vq2_gate_graph import (
 )
 from planning.vq2_course_lifecycle import (
     CourseLifecycle,
+    DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
     DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
     DYNAMIC_NEAR_PLANE_LATCH_BASIS,
     LatchedMeasurementMode,
@@ -518,7 +519,41 @@ def _dynamic_near_plane_wire_sample(
     ):
         raise ValueError("dynamic near-plane evidence identity is invalid")
 
-    def pair(name: str) -> tuple[float, float]:
+    def scalar(
+        name: str,
+        *,
+        minimum: Optional[float] = None,
+        minimum_inclusive: bool = True,
+        maximum: Optional[float] = None,
+    ) -> float:
+        value = evidence.get(name)
+        if (
+            type(value) not in {int, float}
+            or not math.isfinite(float(value))
+            or (
+                minimum is not None
+                and (
+                    float(value) < minimum
+                    if minimum_inclusive
+                    else float(value) <= minimum
+                )
+            )
+            or (
+                maximum is not None
+                and float(value) > maximum
+            )
+        ):
+            raise ValueError(
+                f"dynamic near-plane evidence {name} is invalid"
+            )
+        return float(value)
+
+    def pair(
+        name: str,
+        *,
+        minimum: Optional[float] = None,
+        minimum_inclusive: bool = True,
+    ) -> tuple[float, float]:
         value = evidence.get(name)
         if (
             not isinstance(value, (list, tuple))
@@ -526,6 +561,14 @@ def _dynamic_near_plane_wire_sample(
             or any(
                 type(item) not in {int, float}
                 or not math.isfinite(float(item))
+                or (
+                    minimum is not None
+                    and (
+                        float(item) < minimum
+                        if minimum_inclusive
+                        else float(item) <= minimum
+                    )
+                )
                 for item in value
             )
         ):
@@ -537,6 +580,44 @@ def _dynamic_near_plane_wire_sample(
     passage_error = pair("passage_error_norm")
     bearing_std = pair("current_bearing_std_norm")
     residual_rate = pair("residual_translation_rate_norm_s")
+    crossing_prediction_horizon_s = scalar(
+        "crossing_prediction_horizon_s",
+        minimum=0.0,
+        maximum=DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
+    )
+    predicted_crossing_error = pair(
+        "predicted_crossing_error_norm",
+    )
+    predicted_crossing_std = pair(
+        "predicted_crossing_std_norm",
+        minimum=0.0,
+    )
+    crossing_allowance = pair(
+        "crossing_allowance_norm",
+        minimum=0.0,
+    )
+    reported_crossing_clearance = pair(
+        "predicted_crossing_clearance_norm",
+    )
+    recomputed_crossing_clearance = tuple(
+        crossing_allowance[axis]
+        - abs(predicted_crossing_error[axis])
+        - 2.0 * predicted_crossing_std[axis]
+        for axis in range(2)
+    )
+    if any(
+        not math.isclose(
+            reported_crossing_clearance[axis],
+            recomputed_crossing_clearance[axis],
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        for axis in range(2)
+    ):
+        raise ValueError(
+            "dynamic near-plane evidence predicted crossing clearance "
+            "is inconsistent"
+        )
     current_censored = evidence.get("current_censored_axes")
     if (
         not isinstance(current_censored, (list, tuple))
@@ -582,6 +663,13 @@ def _dynamic_near_plane_wire_sample(
         normalized_x_std=bearing_std[0],
         normalized_y_std=bearing_std[1],
         log_scale_std=float(evidence["current_log_scale_std"]),
+        crossing_prediction_horizon_s=crossing_prediction_horizon_s,
+        predicted_crossing_x_norm=predicted_crossing_error[0],
+        predicted_crossing_y_down_norm=predicted_crossing_error[1],
+        predicted_crossing_x_std_norm=predicted_crossing_std[0],
+        predicted_crossing_y_std_norm=predicted_crossing_std[1],
+        crossing_allowance_x_norm=crossing_allowance[0],
+        crossing_allowance_y_norm=crossing_allowance[1],
     )
 
 
@@ -4358,6 +4446,39 @@ async def _run_visual_course_stage_impl(
                                 anchor.normalized_y_std
                             ),
                             "log_scale_std": anchor.log_scale_std,
+                            "crossing_prediction_horizon_s": (
+                                anchor.crossing_prediction_horizon_s
+                            ),
+                            "predicted_crossing_error_norm": [
+                                anchor.predicted_crossing_x_norm,
+                                anchor.predicted_crossing_y_down_norm,
+                            ],
+                            "predicted_crossing_std_norm": [
+                                anchor.predicted_crossing_x_std_norm,
+                                anchor.predicted_crossing_y_std_norm,
+                            ],
+                            "crossing_allowance_norm": [
+                                anchor.crossing_allowance_x_norm,
+                                anchor.crossing_allowance_y_norm,
+                            ],
+                            "predicted_crossing_clearance_norm": [
+                                (
+                                    anchor.crossing_allowance_x_norm
+                                    - abs(
+                                        anchor.predicted_crossing_x_norm
+                                    )
+                                    - 2.0
+                                    * anchor.predicted_crossing_x_std_norm
+                                ),
+                                (
+                                    anchor.crossing_allowance_y_norm
+                                    - abs(
+                                        anchor.predicted_crossing_y_down_norm
+                                    )
+                                    - 2.0
+                                    * anchor.predicted_crossing_y_std_norm
+                                ),
+                            ],
                             "command": asdict(command),
                             "current_only_crossing_coast_thrust": (
                                 coast_thrust

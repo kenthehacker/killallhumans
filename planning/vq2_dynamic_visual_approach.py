@@ -33,7 +33,9 @@ from planning.vq2_dynamic_course import (
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
+    VISUAL_PASSAGE_ADMISSION_BASIS,
     VisualApproachMode,
+    VisualApproachPassageAdmission,
     VisualApproachRefusal,
 )
 from planning.vq2_visual_servo import (
@@ -622,6 +624,21 @@ class DynamicVisualCourseSession:
                     "aperture_margin_norm": list(
                         decision.aperture_margin_norm
                     ),
+                    "crossing_prediction_horizon_s": (
+                        decision.crossing_prediction_horizon_s
+                    ),
+                    "predicted_crossing_error_norm": list(
+                        decision.predicted_crossing_error_norm
+                    ),
+                    "predicted_crossing_std_norm": list(
+                        decision.predicted_crossing_std_norm
+                    ),
+                    "crossing_allowance_norm": list(
+                        decision.crossing_allowance_norm
+                    ),
+                    "predicted_crossing_clearance_norm": list(
+                        decision.predicted_crossing_clearance_norm
+                    ),
                     "current_bearing_std_rad": list(
                         decision.current_bearing_std_rad
                     ),
@@ -844,7 +861,11 @@ class _DynamicImageServo:
             braking = True
             dynamic_brake_reason: Optional[str] = "continuity_seed"
             predicted_next: Optional[tuple[float, float]] = None
-            bearing_std_norm = (1.0, 1.0)
+            predicted_crossing_clearance = (
+                -math.inf,
+                -math.inf,
+            )
+            crossing_allowance = (0.0, 0.0)
         else:
             target_roll = decision.command.target_roll_rad
             target_pitch = decision.command.target_pitch_rad
@@ -862,12 +883,10 @@ class _DynamicImageServo:
             braking = decision.braking
             dynamic_brake_reason = decision.brake_reason
             predicted_next = decision.predicted_successor_bearing_rad
-            bearing_std_norm = (
-                decision.current_bearing_std_rad[0]
-                / self.session.core.config.horizontal_angle_scale_rad,
-                decision.current_bearing_std_rad[1]
-                / self.session.core.config.vertical_angle_scale_rad,
+            predicted_crossing_clearance = (
+                decision.predicted_crossing_clearance_norm
             )
+            crossing_allowance = decision.crossing_allowance_norm
 
         passage_plane_ready = bool(
             decision is not None
@@ -882,12 +901,11 @@ class _DynamicImageServo:
         )
         within_corridor = bool(
             decision is not None
-            and not braking
             and passage_plane_ready
-            and abs(passage_error[0]) + 2.0 * bearing_std_norm[0]
-            <= self.tuning.horizontal_corridor
-            and abs(passage_error[1]) + 2.0 * bearing_std_norm[1]
-            <= self.tuning.vertical_corridor
+            and crossing_allowance[0] > 0.0
+            and crossing_allowance[1] > 0.0
+            and predicted_crossing_clearance[0] >= 0.0
+            and predicted_crossing_clearance[1] >= 0.0
         )
         self._corridor_frames = (
             self._corridor_frames + 1 if within_corridor else 0
@@ -915,7 +933,6 @@ class _DynamicImageServo:
         )
         advance_enabled = bool(
             allow_advance
-            and not braking
             and self._corridor_frames
             >= self.tuning.required_corridor_frames
         )
@@ -1020,6 +1037,72 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             expected_current_track_id,
             expected_gate_index,
             self._servo.tuning,
+        )
+
+    def _passage_admission_from_approach(
+        self,
+        snapshot: Any,
+        current_target: VisualTarget,
+        next_target: Optional[VisualTarget],
+        output: VisualServoOutput,
+    ) -> Optional[VisualApproachPassageAdmission]:
+        admission = super()._passage_admission_from_approach(
+            snapshot,
+            current_target,
+            next_target,
+            output,
+        )
+        if admission is not None:
+            return admission
+        retained_id = self._latched_next_track_id
+        decision = self._dynamic_session.last_decision
+        if (
+            next_target is not None
+            or retained_id is None
+            or decision is None
+            or decision.successor_track_id != retained_id
+            or output.corridor_frames
+            < self._servo.tuning.required_corridor_frames
+            or output.brake_reason != "aligning"
+            or output.yaw_envelope_limited
+            or decision.current_time_to_contact_s is None
+            or decision.crossing_prediction_horizon_s <= 0.0
+            or any(
+                allowance <= 0.0
+                for allowance in decision.crossing_allowance_norm
+            )
+            or any(
+                clearance < 0.0
+                for clearance in decision.predicted_crossing_clearance_norm
+            )
+            or snapshot.next_selection_ambiguous
+            or snapshot.provisional_track_ids
+            or snapshot.next_candidates
+        ):
+            return None
+        state = self._dynamic_session.core.course_state()
+        successor = state.successor
+        if (
+            successor is None
+            or successor.visible
+            or successor.missed_count <= 0
+            or not self._dynamic_session.core.retains_successor_lineage(
+                retained_id,
+                decision.monotonic_ns,
+            )
+        ):
+            return None
+        return VisualApproachPassageAdmission(
+            basis=VISUAL_PASSAGE_ADMISSION_BASIS,
+            current_gate_index=self.expected_gate_index,
+            current_target=current_target,
+            camera_token=snapshot.latest_camera_token,
+            tracker_frame_sequence=snapshot.tracker_frame_sequence,
+            corridor_frames=output.corridor_frames,
+            preview_track_id=retained_id,
+            # Occluded successor geometry has no command authority.  The exact
+            # lineage is sealed for post-credit promotion only.
+            preview_blend=0.0,
         )
 
     def observe(

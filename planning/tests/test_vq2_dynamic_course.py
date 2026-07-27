@@ -687,6 +687,46 @@ def test_body_yaw_cannot_change_stable_passage_or_roll_authority() -> None:
     )
 
 
+def test_successor_identity_hold_outlives_geometry_dropout_but_is_bounded() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    for sequence in range(1, 5):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation("gate-a", sequence, observation_time)
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.30,
+                log_scale=-0.80,
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.16)
+    core.observe_track(_observation("gate-a", 5, 1.16))
+    successor = core.observe_track(
+        _observation("gate-b", 5, 1.16, visible=False)
+    )
+
+    assert successor.visible is False
+    assert core.retains_successor_lineage("gate-b", 1_450_000_000)
+    assert not core.retains_successor_lineage(
+        "gate-b",
+        1_480_000_000,
+    )
+    assert not core.retains_successor_lineage(
+        "gate-a",
+        1_200_000_000,
+    )
+
+
 def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     core.record_applied_command(_command(0.90))
