@@ -1434,14 +1434,18 @@ def test_clean_aperture_seed_propagates_through_vertical_censor_and_dropout(
     ) in (nose_down, nose_up):
         assert clean.aperture_half_size_norm == pytest.approx((0.42, 0.34))
         assert clean.aperture_propagated is False
+        assert clean.aperture_dynamics_qualified
         assert clean_decision.current_aperture_propagated is False
+        assert clean_decision.current_aperture_dynamics_qualified
         for state, decision in (
             (censored, censored_decision),
             (dropout, dropout_decision),
         ):
             assert state.aperture_propagated
+            assert state.aperture_dynamics_qualified
             assert state.aperture_half_size_norm is not None
             assert decision.current_aperture_propagated
+            assert decision.current_aperture_dynamics_qualified
             assert decision.current_aperture_half_size_norm is not None
             assert (
                 decision.current_aperture_prediction_horizon_remaining_s
@@ -1546,12 +1550,14 @@ def test_clean_unqualified_aperture_separates_steering_horizon_from_passage(
     decision = core.guide(1_010_000_000)
 
     assert not seeded.scale_rate_qualified
+    assert not seeded.aperture_dynamics_qualified
     assert seeded.time_to_contact_s is None
     assert seeded.aperture_prediction_deadline_monotonic_ns == (
         seeded.state_monotonic_ns
         + round(core.config.crossing_prediction_max_horizon_s * NS)
     )
     assert decision.current_aperture_half_size_norm is not None
+    assert not decision.current_aperture_dynamics_qualified
     assert decision.current_aperture_prediction_horizon_remaining_s > 1.0
     assert decision.current_time_to_contact_s is None
     assert decision.crossing_prediction_horizon_s == 0.0
@@ -1631,6 +1637,7 @@ def test_local_aperture_rejects_unseeded_ambiguous_or_horizontal_censor(
     assert rejected.aperture_seed_monotonic_ns is None
     assert rejected.aperture_prediction_deadline_monotonic_ns is None
     assert rejected.aperture_propagated is False
+    assert rejected.aperture_dynamics_qualified is False
     assert decision.current_aperture_half_size_norm is None
     assert decision.crossing_allowance_norm == (0.0, 0.0)
 

@@ -1485,6 +1485,9 @@ class DynamicVisualCourseSession:
                     "current_aperture_propagated": (
                         decision.current_aperture_propagated
                     ),
+                    "current_aperture_dynamics_qualified": (
+                        decision.current_aperture_dynamics_qualified
+                    ),
                     "current_aperture_prediction_age_s": (
                         decision.current_aperture_prediction_age_s
                     ),
@@ -1875,11 +1878,28 @@ class _DynamicImageServo:
         propagated_commitment = bool(
             decision is not None
             and current_dynamic.aperture_propagated
+            and current_dynamic.aperture_dynamics_qualified
+            and decision.current_aperture_dynamics_qualified
             and decision.current_aperture_half_size_norm is not None
             and decision.current_aperture_prediction_horizon_remaining_s > 0.0
-            and self._corridor_frames
-            >= self.tuning.required_corridor_frames
+            and current_dynamic.visible
+            and not current_dynamic.ambiguous
+            and not bool(
+                current_dynamic.clipping
+                & (FrameEdge.LEFT | FrameEdge.RIGHT)
+            )
             and decision.current_time_to_contact_s is not None
+            and decision.current_time_to_contact_s
+            <= decision.current_aperture_prediction_horizon_remaining_s
+            + 1e-9
+            and decision.crossing_prediction_horizon_s
+            >= decision.current_time_to_contact_s - 1e-9
+            and decision.current_time_to_contact_s
+            >= (
+                self.session.core.config.thrust_command_delay_s
+                + self.session.core.config
+                .terminal_min_post_governor_contact_budget_s
+            )
             and all(
                 allowance > 0.0
                 for allowance in decision.crossing_allowance_norm
@@ -1888,6 +1908,16 @@ class _DynamicImageServo:
                 clearance >= 0.0
                 for clearance in decision.terminal_crossing_clearance_norm
             )
+            and all(
+                decision.predicted_crossing_clearance_norm[axis] >= 0.0
+                or (
+                    decision.current_crossing_error_q[axis]
+                    * decision.crossing_rate_q_s[axis]
+                    < 0.0
+                )
+                for axis in range(2)
+            )
+            and current_dynamic.expansion_rate_s > 0.0
         )
         passage_plane_ready = bool(
             terminal_history_qualified or propagated_commitment
@@ -1902,7 +1932,10 @@ class _DynamicImageServo:
             )
             if terminal_history_qualified
             else (
-                self._corridor_frames
+                max(
+                    self._corridor_frames,
+                    self.tuning.required_corridor_frames,
+                )
                 if propagated_commitment
                 else 0
             )
@@ -2233,14 +2266,6 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
         next_target: Optional[VisualTarget],
         output: VisualServoOutput,
     ) -> Optional[VisualApproachPassageAdmission]:
-        decision = self._dynamic_session.last_decision
-        if (
-            decision is not None
-            and decision.current_aperture_propagated
-        ):
-            # Propagated geometry may consume a clean commitment but cannot
-            # mint a new passage admission on a censored publication.
-            return None
         admission = super()._passage_admission_from_approach(
             snapshot,
             current_target,

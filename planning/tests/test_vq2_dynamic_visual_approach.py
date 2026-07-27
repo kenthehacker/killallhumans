@@ -719,6 +719,132 @@ def test_terminal_positive_clearance_commits_before_fixed_scale() -> None:
     assert rejected.passage_admission is None
 
 
+@pytest.mark.parametrize(
+    ("seed_center_y", "terminal_safe"),
+    ((0.10, True), (0.14, False)),
+)
+def test_propagated_aperture_mints_only_safe_passage_admission(
+    seed_center_y: float,
+    terminal_safe: bool,
+) -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    for sequence in (6, 7, 8):
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=0.34,
+                current_height=0.36,
+                include_successor=True,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, proposal)
+
+    for sequence, gate_size, center_y in (
+        (9, 0.38, 0.000),
+        (10, 0.43, 0.012),
+    ):
+        tracker.update(
+            _frame(
+                sequence,
+                current_width=gate_size,
+                current_height=gate_size,
+                include_successor=False,
+                current_center_y=center_y,
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = _observe(planner, snapshot, tracker)
+        _accept_proposal(session, tracker, proposal)
+
+    assert planner.latched_next_track_id is not None
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+
+    tracker.update(
+        _frame(
+            11,
+            current_width=0.49,
+            current_height=0.49,
+            include_successor=False,
+            current_center_y=seed_center_y,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+    clean_seed = session.core.course_state().current
+    assert not clean_seed.aperture_propagated
+    assert clean_seed.aperture_half_size_norm is not None
+    assert clean_seed.aperture_seed_monotonic_ns is not None
+    assert clean_seed.aperture_dynamics_qualified
+    # Staging the clean predictor seed did not execute the image servo.
+    assert proposal.servo_output.corridor_frames == 0
+
+    tracker.update(
+        _frame(
+            12,
+            current_width=0.55,
+            current_height=0.55,
+            include_successor=False,
+            current_center_y=seed_center_y,
+            current_clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    propagated = _observe(planner, snapshot, tracker)
+    state = session.core.course_state().current
+    decision = session.last_decision
+    assert decision is not None
+    assert state.aperture_propagated
+    assert state.aperture_dynamics_qualified
+    assert decision.current_aperture_propagated
+    assert decision.current_aperture_dynamics_qualified
+    assert decision.current_time_to_contact_s is not None
+    assert (
+        decision.current_time_to_contact_s
+        <= decision.current_aperture_prediction_horizon_remaining_s
+    )
+    assert state.expansion_rate_s > 0.0
+    assert all(
+        allowance > 0.0
+        for allowance in decision.crossing_allowance_norm
+    )
+    assert (
+        all(
+            clearance >= 0.0
+            for clearance in decision.terminal_crossing_clearance_norm
+        )
+        is terminal_safe
+    )
+    if terminal_safe:
+        assert propagated.servo_output.corridor_frames >= 3
+        assert propagated.passage_admission is not None
+    else:
+        assert propagated.servo_output.corridor_frames == 0
+        assert propagated.passage_admission is None
+
+
 def test_passage_retains_clean_seed_through_vertical_occlusion() -> None:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()

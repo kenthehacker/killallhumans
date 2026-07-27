@@ -473,6 +473,98 @@ def test_dynamic_terminal_clearance_can_commit_before_legacy_scale_gate():
     assert latch.evidence == evidence
 
 
+def test_qualified_propagated_vertical_clip_can_mint_local_passage_latch():
+    sample = replace(
+        _CREDITED_NEAR_PLANE[0],
+        normalized_x=0.02,
+        normalized_y_down=-0.25,
+        normalized_x_rate_s=0.20,
+        normalized_y_rate_down_s=-0.06,
+        log_scale=-0.92,
+        log_scale_rate_s=1.64,
+        confidence=0.83,
+        clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+        center_censored=True,
+        geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+        normalized_x_std=0.02,
+        normalized_y_std=0.03,
+        log_scale_std=0.12,
+        crossing_prediction_horizon_s=0.61,
+        predicted_crossing_x_norm=0.33,
+        predicted_crossing_y_down_norm=0.20,
+        predicted_crossing_x_std_norm=0.055,
+        predicted_crossing_y_std_norm=0.065,
+        crossing_allowance_x_norm=0.50,
+        crossing_allowance_y_norm=0.45,
+        crossing_swept_x_occupancy_norm=0.44,
+        crossing_swept_y_occupancy_norm=0.63,
+        current_crossing_x_q=0.08,
+        current_crossing_y_q=-1.39,
+        crossing_x_q_rate_s=0.12,
+        crossing_y_q_rate_s=1.87,
+        post_governor_contact_budget_s=0.53,
+        propagated_state_horizon_remaining_s=0.80,
+        propagated_state_dynamics_qualified=True,
+    )
+
+    evidence, latch = advance_dynamic_near_plane_evidence(
+        NearPlaneEvidence(),
+        sample,
+        required_corridor_frames=1,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        horizontal_corridor=0.16,
+        vertical_corridor=0.18,
+        minimum_post_governor_contact_budget_s=0.12,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+
+    assert latch is not None
+    assert latch.basis == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+    assert latch.evidence == evidence
+    assert latch.anchor_sample.clipping == FrameEdge.TOP | FrameEdge.BOTTOM
+    assert latch.anchor_sample.center_censored is True
+
+    horizontally_clipped = replace(sample, clipping=FrameEdge.LEFT)
+    evidence, latch = advance_dynamic_near_plane_evidence(
+        NearPlaneEvidence(),
+        horizontally_clipped,
+        required_corridor_frames=1,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        horizontal_corridor=0.16,
+        vertical_corridor=0.18,
+        minimum_post_governor_contact_budget_s=0.12,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+    assert evidence.samples == ()
+    assert latch is None
+
+
+def test_propagated_passage_state_must_outlive_crossing_prediction():
+    with pytest.raises(ValueError, match="expires before crossing"):
+        replace(
+            _CREDITED_NEAR_PLANE[0],
+            geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+            crossing_prediction_horizon_s=0.61,
+            predicted_crossing_x_norm=0.10,
+            predicted_crossing_y_down_norm=-0.12,
+            predicted_crossing_x_std_norm=0.015,
+            predicted_crossing_y_std_norm=0.015,
+            crossing_allowance_x_norm=0.30,
+            crossing_allowance_y_norm=0.30,
+            crossing_swept_x_occupancy_norm=0.13,
+            crossing_swept_y_occupancy_norm=0.15,
+            current_crossing_x_q=0.10,
+            current_crossing_y_q=-0.12,
+            crossing_x_q_rate_s=-0.10,
+            crossing_y_q_rate_s=0.10,
+            post_governor_contact_budget_s=0.50,
+            propagated_state_horizon_remaining_s=0.60,
+            propagated_state_dynamics_qualified=True,
+        )
+
+
 def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
     """Replay the final three clean dynamic states before its bottom clip."""
 

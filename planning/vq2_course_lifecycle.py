@@ -271,6 +271,8 @@ class NearPlaneWireSample:
     crossing_x_q_rate_s: Optional[float] = None
     crossing_y_q_rate_s: Optional[float] = None
     post_governor_contact_budget_s: Optional[float] = None
+    propagated_state_horizon_remaining_s: Optional[float] = None
+    propagated_state_dynamics_qualified: bool = False
 
     def __post_init__(self) -> None:
         if type(self.gate_index) is not int or self.gate_index < 0:
@@ -419,6 +421,41 @@ class NearPlaneWireSample:
             raise ValueError(
                 "raw near-plane sample cannot carry dynamic crossing prediction"
             )
+        if type(self.propagated_state_dynamics_qualified) is not bool:
+            raise TypeError(
+                "propagated near-plane dynamics qualification must be exact"
+            )
+        propagated_horizon = self.propagated_state_horizon_remaining_s
+        if propagated_horizon is None:
+            if self.propagated_state_dynamics_qualified:
+                raise ValueError(
+                    "propagated near-plane qualification lacks a horizon"
+                )
+        else:
+            if self.geometry_basis != DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS:
+                raise ValueError(
+                    "raw near-plane sample cannot carry propagated state"
+                )
+            if (
+                not _finite(propagated_horizon)
+                or not 0.0 < float(propagated_horizon)
+                <= DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S
+            ):
+                raise ValueError(
+                    "propagated near-plane horizon is outside bounds"
+                )
+            if not self.propagated_state_dynamics_qualified:
+                raise ValueError(
+                    "propagated near-plane state lacks qualified dynamics"
+                )
+            assert self.crossing_prediction_horizon_s is not None
+            if (
+                float(self.crossing_prediction_horizon_s)
+                > float(propagated_horizon) + 1e-9
+            ):
+                raise ValueError(
+                    "propagated near-plane state expires before crossing"
+                )
 
     @property
     def apparent_scale(self) -> float:
@@ -848,9 +885,19 @@ def advance_dynamic_near_plane_evidence(
         float(sample.crossing_x_q_rate_s),
         float(sample.crossing_y_q_rate_s),
     )
-    qualified = bool(
+    raw_geometry = bool(
         sample.clipping == FrameEdge.NONE
         and not sample.center_censored
+    )
+    propagated_geometry = bool(
+        sample.propagated_state_horizon_remaining_s is not None
+        and sample.propagated_state_dynamics_qualified
+        and not bool(sample.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
+        and float(sample.crossing_prediction_horizon_s)
+        <= float(sample.propagated_state_horizon_remaining_s) + 1e-9
+    )
+    qualified = bool(
+        (raw_geometry or propagated_geometry)
         and not sample.ambiguous
         and float(sample.confidence) >= track_floor
         and float(sample.association_confidence) >= association_floor

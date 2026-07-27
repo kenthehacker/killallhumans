@@ -192,11 +192,15 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
         "current_visible": True,
         "current_log_scale_std": 0.05,
         "current_aperture_propagated": False,
+        "current_aperture_dynamics_qualified": False,
     }
 
 
 def _dynamic_near_plane_sample(
     evidence: dict[str, object],
+    *,
+    clipping: FrameEdge = FrameEdge.NONE,
+    center_censored: bool = False,
 ):
     return course_stage._dynamic_near_plane_wire_sample(
         _accepted_dynamic_near_plane_command(evidence),
@@ -204,9 +208,9 @@ def _dynamic_near_plane_sample(
         track_id="vq2-track-000001",
         target=SimpleNamespace(
             association_confidence=0.80,
-            center_censored=False,
+            center_censored=center_censored,
         ),
-        clipping=FrameEdge.NONE,
+        clipping=clipping,
     )
 
 
@@ -232,9 +236,42 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.post_governor_contact_budget_s == pytest.approx(0.25)
 
 
-def test_propagated_aperture_cannot_mint_dynamic_near_plane_sample():
+def test_qualified_propagated_aperture_preserves_clipped_wire_provenance():
     evidence = _valid_dynamic_near_plane_evidence()
-    evidence["current_aperture_propagated"] = True
+    evidence.update(
+        {
+            "current_aperture_propagated": True,
+            "current_aperture_dynamics_qualified": True,
+            "current_aperture_prediction_horizon_remaining_s": 0.80,
+            "current_censored_axes": [False, True],
+            "current_bearing_rate_qualified": [False, False],
+            "current_scale_rate_qualified": False,
+        }
+    )
+
+    sample = _dynamic_near_plane_sample(
+        evidence,
+        clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+
+    assert sample is not None
+    assert sample.clipping == FrameEdge.TOP | FrameEdge.BOTTOM
+    assert sample.center_censored is True
+    assert sample.ambiguous is False
+    assert sample.propagated_state_horizon_remaining_s == pytest.approx(0.80)
+    assert sample.propagated_state_dynamics_qualified is True
+
+
+def test_unqualified_propagated_aperture_cannot_mint_wire_evidence():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "current_aperture_propagated": True,
+            "current_aperture_dynamics_qualified": False,
+            "current_aperture_prediction_horizon_remaining_s": 0.80,
+        }
+    )
 
     assert _dynamic_near_plane_sample(evidence) is None
 

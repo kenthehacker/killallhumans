@@ -642,6 +642,7 @@ class TrackDynamicState:
     aperture_seed_monotonic_ns: int | None
     aperture_prediction_deadline_monotonic_ns: int | None
     aperture_propagated: bool
+    aperture_dynamics_qualified: bool
     bearing_rad: Vector2
     bearing_rate_rad_s: Vector2
     bearing_rate_qualified: tuple[bool, bool]
@@ -722,6 +723,7 @@ class GuidanceDecision:
     camera_current_center_norm: Vector2
     current_aperture_half_size_norm: Vector2 | None
     current_aperture_propagated: bool
+    current_aperture_dynamics_qualified: bool
     current_aperture_prediction_age_s: float
     current_aperture_prediction_horizon_remaining_s: float
     passage_point_norm: Vector2
@@ -1405,6 +1407,7 @@ class DynamicCourseCore:
                 else None
             ),
             aperture_propagated=False,
+            aperture_dynamics_qualified=False,
             bearing_rad=bearing,
             bearing_rate_rad_s=(0.0, 0.0),
             bearing_rate_qualified=(False, False),
@@ -1775,6 +1778,10 @@ class DynamicCourseCore:
                 ),
             )
             aperture_propagated = False
+            aperture_dynamics_qualified = bool(
+                all(bearing_rate_qualified)
+                and scale_rate_qualified
+            )
         elif (
             previous.aperture_half_size_norm is not None
             and previous.aperture_seed_monotonic_ns is not None
@@ -1799,11 +1806,15 @@ class DynamicCourseCore:
                 previous.aperture_prediction_deadline_monotonic_ns
             )
             aperture_propagated = True
+            aperture_dynamics_qualified = (
+                previous.aperture_dynamics_qualified
+            )
         else:
             aperture = None
             aperture_seed_ns = None
             aperture_deadline_ns = None
             aperture_propagated = False
+            aperture_dynamics_qualified = False
         return TrackDynamicState(
             track_id=observation.track_id,
             stream_generation=observation.stream_generation,
@@ -1824,6 +1835,7 @@ class DynamicCourseCore:
                 aperture_deadline_ns
             ),
             aperture_propagated=aperture_propagated,
+            aperture_dynamics_qualified=aperture_dynamics_qualified,
             bearing_rad=(bearing_values[0], bearing_values[1]),
             bearing_rate_rad_s=(bearing_rates[0], bearing_rates[1]),
             bearing_rate_qualified=(
@@ -1928,6 +1940,10 @@ class DynamicCourseCore:
                 else None
             ),
             aperture_propagated=aperture_prediction_valid,
+            aperture_dynamics_qualified=bool(
+                aperture_prediction_valid
+                and previous.aperture_dynamics_qualified
+            ),
             bearing_rad=bearing,
             bearing_rate_rad_s=rate,
             bearing_rate_qualified=(False, False),
@@ -2637,6 +2653,9 @@ class DynamicCourseCore:
             camera_current_center_norm=camera_current_center,
             current_aperture_half_size_norm=current_aperture,
             current_aperture_propagated=current.aperture_propagated,
+            current_aperture_dynamics_qualified=(
+                current.aperture_dynamics_qualified
+            ),
             current_aperture_prediction_age_s=(
                 0.0
                 if current.aperture_seed_monotonic_ns is None

@@ -1768,9 +1768,15 @@ def _dynamic_near_plane_wire_sample(
         raise ValueError(
             "dynamic near-plane aperture provenance is invalid"
         )
-    if propagated_aperture:
-        # A bounded local prediction may consume a previously clean crossing
-        # commitment, but it cannot create a new passage latch.
+    propagated_dynamics_qualified = evidence.get(
+        "current_aperture_dynamics_qualified",
+        False,
+    )
+    if type(propagated_dynamics_qualified) is not bool:
+        raise ValueError(
+            "dynamic near-plane aperture dynamics provenance is invalid"
+        )
+    if propagated_aperture and not propagated_dynamics_qualified:
         return None
 
     def scalar(
@@ -1840,6 +1846,16 @@ def _dynamic_near_plane_wire_sample(
         "crossing_prediction_horizon_s",
         minimum=0.0,
         maximum=DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
+    )
+    propagated_horizon_remaining_s = (
+        scalar(
+            "current_aperture_prediction_horizon_remaining_s",
+            minimum=0.0,
+            minimum_inclusive=False,
+            maximum=DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
+        )
+        if propagated_aperture
+        else None
     )
     predicted_crossing_error = pair(
         "predicted_crossing_error_norm",
@@ -1976,8 +1992,13 @@ def _dynamic_near_plane_wire_sample(
             evidence["current_ambiguous"]
             or evidence["dropout_held"]
             or not evidence["current_visible"]
-            or not all(bearing_rate_qualified)
-            or not scale_rate_qualified
+            or (
+                not propagated_aperture
+                and (
+                    not all(bearing_rate_qualified)
+                    or not scale_rate_qualified
+                )
+            )
         ),
         command_roll_rate=accepted.command.roll_rate,
         command_pitch_rate=accepted.command.pitch_rate,
@@ -2006,6 +2027,13 @@ def _dynamic_near_plane_wire_sample(
         crossing_y_q_rate_s=crossing_q_rate[1],
         post_governor_contact_budget_s=(
             post_governor_contact_budget_s
+        ),
+        propagated_state_horizon_remaining_s=(
+            propagated_horizon_remaining_s
+        ),
+        propagated_state_dynamics_qualified=bool(
+            propagated_aperture
+            and propagated_dynamics_qualified
         ),
     )
 
