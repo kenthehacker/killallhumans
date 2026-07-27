@@ -12,6 +12,7 @@ from planning.vq2_dynamic_course import (
     DynamicCourseCore,
     DynamicCourseError,
     GateObservation,
+    GuidanceDecision,
     ImuAttitudeSample,
     MAX_TARGET_PITCH_RAD,
     MAX_TARGET_ROLL_RAD,
@@ -1688,6 +1689,114 @@ def test_degraded_inner_scale_qualifies_existing_aperture_without_reseeding(
     )
 
 
+def test_fresh_degraded_inner_rehydrates_expired_clean_lineage_for_steering(
+) -> None:
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        crossing_prediction_max_horizon_s=0.05,
+    )
+
+    def run(*, scale_authority: bool) -> tuple[
+        TrackDynamicState,
+        TrackDynamicState,
+        TrackDynamicState,
+        GuidanceDecision,
+    ]:
+        core = DynamicCourseCore(config)
+        core.record_applied_command(_command(0.90))
+        anchor_log_scale = 0.5 * math.log(0.12 * 0.15)
+        _imu(core, 1.0)
+        clean = core.observe_track(
+            _observation(
+                "gate-a",
+                1,
+                1.0,
+                log_scale=anchor_log_scale,
+                aperture=(0.12, 0.15),
+            )
+        )
+        core.bind(
+            current_gate_index=0,
+            current_track_id="gate-a",
+            successor_track_id=None,
+        )
+        _imu(core, 1.06)
+        expired = core.observe_track(
+            _observation(
+                "gate-a",
+                2,
+                1.06,
+                log_scale=anchor_log_scale + 0.04,
+                aperture=None,
+            )
+        )
+        _imu(core, 1.09)
+        corrected = core.observe_track(
+            _observation(
+                "gate-a",
+                3,
+                1.09,
+                x=0.08,
+                y=-0.06,
+                log_scale=anchor_log_scale + 0.10,
+                aperture=None,
+                confidence=0.20,
+                inner_scale_measurement_usable=scale_authority,
+            )
+        )
+        _imu(core, 1.095)
+        return clean, expired, corrected, core.guide(1_095_000_000)
+
+    clean, expired, rehydrated, decision = run(scale_authority=True)
+    _, outer_expired, outer_only, outer_decision = run(
+        scale_authority=False
+    )
+
+    assert expired.aperture_half_size_norm is None
+    assert outer_expired.aperture_half_size_norm is None
+    assert rehydrated.aperture_half_size_norm is not None
+    assert rehydrated.aperture_half_size_norm == pytest.approx(
+        tuple(
+            value * math.exp(rehydrated.log_scale - clean.log_scale)
+            for value in clean.aperture_half_size_norm or ()
+        )
+    )
+    assert rehydrated.aperture_seed_monotonic_ns == (
+        clean.aperture_seed_monotonic_ns
+    )
+    assert rehydrated.aperture_prediction_deadline_monotonic_ns == (
+        rehydrated.state_monotonic_ns
+        + round(
+            min(
+                config.post_credit_current_prediction_max_horizon_s,
+                config.crossing_prediction_max_horizon_s,
+            )
+            * NS
+        )
+    )
+    assert rehydrated.aperture_propagated
+    assert not rehydrated.aperture_dynamics_qualified
+    assert rehydrated.confidence <= 0.20
+    assert rehydrated.log_scale_std >= expired.log_scale_std
+    assert all(
+        math.isfinite(value) and value > 0.0
+        for value in rehydrated.aperture_half_size_norm
+    )
+    assert decision.current_aperture_half_size_norm is not None
+    assert not decision.current_aperture_dynamics_qualified
+    assert decision.crossing_prediction_horizon_s == 0.0
+    assert all(
+        math.isfinite(value)
+        for value in decision.terminal_crossing_clearance_norm
+    )
+
+    assert outer_only.aperture_half_size_norm is None
+    assert outer_only.aperture_seed_monotonic_ns is None
+    assert outer_only.aperture_prediction_deadline_monotonic_ns is None
+    assert not outer_only.aperture_propagated
+    assert outer_decision.current_aperture_half_size_norm is None
+
+
 def test_graph_vetted_successor_handoff_preserves_roles_and_bounded_state(
 ) -> None:
     core = DynamicCourseCore(
@@ -2006,6 +2115,24 @@ def test_invisible_ambiguity_revokes_aperture_lineage_until_clean_reseed(
     assert degraded.aperture_seed_monotonic_ns is None
     assert degraded.aperture_prediction_deadline_monotonic_ns is None
     assert degraded.aperture_propagated is False
+
+    _imu(core, 1.12)
+    fresh_degraded_inner = core.observe_track(
+        _observation(
+            "gate-a",
+            4,
+            1.12,
+            aperture=None,
+            inner_scale_measurement_usable=True,
+        )
+    )
+    assert fresh_degraded_inner.aperture_half_size_norm is None
+    assert fresh_degraded_inner.aperture_seed_monotonic_ns is None
+    assert (
+        fresh_degraded_inner.aperture_prediction_deadline_monotonic_ns
+        is None
+    )
+    assert not fresh_degraded_inner.aperture_propagated
 
 
 def test_body_yaw_cannot_change_stable_passage_or_roll_authority() -> None:

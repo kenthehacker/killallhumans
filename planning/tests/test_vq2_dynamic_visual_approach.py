@@ -2136,6 +2136,101 @@ def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> Non
     assert proposal.passage_admission is None
 
 
+def test_rehydrated_inner_lineage_guides_multiedge_clip_without_passage() -> None:
+    config = replace(
+        production_dynamic_course_config(),
+        camera_delay_s=0.0,
+        crossing_prediction_max_horizon_s=0.05,
+    )
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session(config=config)
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+    clean = session.core.course_state().current
+    assert clean.aperture_prediction_deadline_monotonic_ns is not None
+
+    degraded = _inner_aperture(
+        0.10,
+        -0.08,
+        half_width=0.36,
+        half_height=0.38,
+        confidence=0.20,
+        health_reason="low-confidence-inner-fit",
+    )
+    update = tracker.update(
+        _frame(
+            8,
+            current_width=0.40,
+            current_height=0.42,
+            include_successor=False,
+            current_center_x=0.10,
+            current_center_y=-0.08,
+            current_inner_aperture=degraded,
+        )
+    )
+    assert (
+        update.observation_monotonic_ns
+        > clean.aperture_prediction_deadline_monotonic_ns
+    )
+    snapshot = graph.observe(tracker)
+    corrected_proposal = _observe(planner, snapshot, tracker)
+    rehydrated = session.core.course_state().current
+    assert rehydrated.aperture_half_size_norm is not None
+    assert rehydrated.aperture_propagated
+    assert not rehydrated.aperture_dynamics_qualified
+    assert corrected_proposal.passage_admission is None
+    _accept_proposal(session, tracker, corrected_proposal)
+
+    tracker.update(
+        _frame(
+            9,
+            current_width=0.42,
+            current_height=0.44,
+            include_successor=False,
+            current_center_x=0.12,
+            current_center_y=-0.10,
+            current_clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    clipped_proposal = _observe(planner, snapshot, tracker)
+    propagated = session.core.course_state().current
+    output = clipped_proposal.servo_output
+
+    assert propagated.censored_axes == (True, True)
+    assert propagated.aperture_half_size_norm is not None
+    assert propagated.aperture_propagated
+    assert clipped_proposal.current_target.horizontal_geometry_censored
+    assert clipped_proposal.current_target.vertical_geometry_censored
+    assert clipped_proposal.passage_admission is None
+    assert all(
+        math.isfinite(value)
+        for value in (
+            output.target_roll_rad,
+            output.target_pitch_rad,
+            output.yaw_rate_rad_s,
+            output.thrust,
+        )
+    )
+    assert abs(output.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+    assert MIN_TARGET_PITCH_RAD <= output.target_pitch_rad <= MAX_TARGET_PITCH_RAD
+    assert abs(output.yaw_rate_rad_s) <= MAX_YAW_RATE_RAD_S
+    assert MIN_THRUST <= output.thrust <= MAX_THRUST
+
+
 def test_clipped_outer_degraded_inner_steers_without_scale_authority() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,

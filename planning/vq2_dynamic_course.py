@@ -959,6 +959,8 @@ class _TrackEstimate:
     last_measurement_camera_to_world: Quaternion
     last_measured_center_norm: Vector2
     last_measured_aperture_half_size_norm: Vector2 | None
+    last_measured_aperture_log_scale: float | None
+    last_measured_aperture_monotonic_ns: int | None
     measured_aperture_history: tuple[list[float], list[float]]
     measured_residual_rate_history: tuple[list[float], list[float]]
     residual_rate_reanchor_required: list[bool]
@@ -1150,6 +1152,12 @@ class DynamicCourseCore:
         if not observation.visible:
             if existing is None:
                 raise DynamicCourseError("an invisible observation cannot initialise a track")
+            if observation.ambiguous:
+                # Identity ambiguity revokes the latent clean-aperture
+                # lineage.  A later degraded fit must not resurrect it.
+                existing.last_measured_aperture_half_size_norm = None
+                existing.last_measured_aperture_log_scale = None
+                existing.last_measured_aperture_monotonic_ns = None
             for history in existing.measured_aperture_history:
                 history.clear()
             for history in existing.measured_residual_rate_history:
@@ -1201,6 +1209,28 @@ class DynamicCourseCore:
                 last_measured_center_norm=observation.center_norm,
                 last_measured_aperture_half_size_norm=(
                     observation.aperture_half_size_norm
+                    if (
+                        observation.aperture_half_size_norm is not None
+                        and not observation.ambiguous
+                        and not any(observation.censored_axes)
+                    )
+                    else None
+                ),
+                last_measured_aperture_log_scale=(
+                    0.5
+                    * math.log(
+                        observation.aperture_half_size_norm[0]
+                        * observation.aperture_half_size_norm[1]
+                    )
+                    if (
+                        observation.aperture_half_size_norm is not None
+                        and not observation.ambiguous
+                        and not any(observation.censored_axes)
+                    )
+                    else None
+                ),
+                last_measured_aperture_monotonic_ns=(
+                    capture_ns
                     if (
                         observation.aperture_half_size_norm is not None
                         and not observation.ambiguous
@@ -1379,6 +1409,9 @@ class DynamicCourseCore:
             (robust_residual_rate[0], robust_residual_rate[1]),
             robust_expansion_rate,
             stabilized_aperture,
+            existing.last_measured_aperture_half_size_norm,
+            existing.last_measured_aperture_log_scale,
+            existing.last_measured_aperture_monotonic_ns,
         )
         existing.state = state
         existing.last_measured_raw_angle = raw_angle
@@ -1397,6 +1430,17 @@ class DynamicCourseCore:
             existing.last_measured_aperture_half_size_norm = (
                 stabilized_aperture
             )
+            existing.last_measured_aperture_log_scale = (
+                0.5
+                * math.log(
+                    stabilized_aperture[0] * stabilized_aperture[1]
+                )
+            )
+            existing.last_measured_aperture_monotonic_ns = capture_ns
+        elif observation.ambiguous:
+            existing.last_measured_aperture_half_size_norm = None
+            existing.last_measured_aperture_log_scale = None
+            existing.last_measured_aperture_monotonic_ns = None
         if observation.ambiguous or observation.censored_axes[0]:
             existing.measured_bearing_history.clear()
         else:
@@ -1618,6 +1662,9 @@ class DynamicCourseCore:
         ],
         measured_expansion_rate: float | None,
         stabilized_aperture: Vector2 | None,
+        latent_aperture: Vector2 | None,
+        latent_aperture_log_scale: float | None,
+        latent_aperture_seed_ns: int | None,
     ) -> TrackDynamicState:
         assert observation.center_norm is not None
         assert observation.log_scale is not None
@@ -1805,6 +1852,7 @@ class DynamicCourseCore:
                 filtered_log_scale_std,
         )
         ttc = self._time_to_contact(expansion)
+        aperture_rehydrated = False
         measured_aperture = (
             stabilized_aperture
             if (
@@ -1910,6 +1958,46 @@ class DynamicCourseCore:
                     and scale_rate_qualified
                 )
             )
+        elif (
+            observation.inner_scale_measurement_usable
+            and latent_aperture is not None
+            and latent_aperture_log_scale is not None
+            and latent_aperture_seed_ns is not None
+            and not observation.ambiguous
+            and observation.clipping == FrameEdge.NONE
+            and not any(censored)
+        ):
+            # Expiry withdraws command and passage authority, but it must not
+            # destroy the last clean aperture lineage.  A later exact,
+            # complete degraded-inner fit may rescale that clean shape and
+            # reopen only a short steering lease.  It cannot itself establish
+            # passage, clearance, or race credit.
+            scale_factor = math.exp(
+                _clamp(
+                    log_scale - latent_aperture_log_scale,
+                    -1.0,
+                    1.0,
+                )
+            )
+            aperture = tuple(
+                min(2.0, max(1e-6, value * scale_factor))
+                for value in latent_aperture
+            )
+            aperture_seed_ns = latent_aperture_seed_ns
+            aperture_deadline_ns = capture_ns + round(
+                min(
+                    self.config
+                    .post_credit_current_prediction_max_horizon_s,
+                    self.config.crossing_prediction_max_horizon_s,
+                )
+                * _NS_PER_SECOND
+            )
+            aperture_propagated = True
+            aperture_rehydrated = True
+            aperture_dynamics_qualified = bool(
+                all(bearing_rate_qualified)
+                and scale_rate_qualified
+            )
         else:
             aperture = None
             aperture_seed_ns = None
@@ -1974,9 +2062,13 @@ class DynamicCourseCore:
             visible=True,
             ambiguous=observation.ambiguous,
             confidence=(
-                previous.confidence
-                if aperture_propagated
-                else observation.confidence
+                min(previous.confidence, observation.confidence)
+                if aperture_rehydrated
+                else (
+                    previous.confidence
+                    if aperture_propagated
+                    else observation.confidence
+                )
             ),
             sample_count=previous.sample_count + 1,
             missed_count=0,
@@ -2328,6 +2420,12 @@ class DynamicCourseCore:
         )
         replacement.last_measured_aperture_half_size_norm = (
             predecessor.last_measured_aperture_half_size_norm
+        )
+        replacement.last_measured_aperture_log_scale = (
+            predecessor.last_measured_aperture_log_scale
+        )
+        replacement.last_measured_aperture_monotonic_ns = (
+            predecessor.last_measured_aperture_monotonic_ns
         )
         for history in replacement.measured_aperture_history:
             history.clear()
