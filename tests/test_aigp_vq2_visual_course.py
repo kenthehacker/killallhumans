@@ -2576,6 +2576,278 @@ def test_propagated_top_fov_gap_accepts_full_frame_near_plane_clipping():
     assert authority["advance_authority"] is False
 
 
+def _retained_raw_top_fov_case(
+    *,
+    anchor_pitch: float = -0.0364479,
+    current_pitch: float = -0.0188348,
+    nonrotational_rate: float | None = -0.109745,
+    rate_std: float = 0.08,
+    pitch_rate: float = 0.2896,
+    timing_uncertainty_s: float = 0.004,
+    process_noise_rate: float = 0.06,
+):
+    anchor_token = _token(183)
+    current_token = _token(184)
+    anchor_observation_ns = 1_000_000_000
+    current_observation_ns = 1_031_507_000
+    anchor = SimpleNamespace(
+        tracker_frame_sequence=183,
+        token=anchor_token,
+        observation_monotonic_ns=anchor_observation_ns,
+        bbox_norm=(0.40, 1.0 / 60.0, 0.80, 0.40),
+        confidence=0.805,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        inner_aperture=None,
+    )
+    clipped = SimpleNamespace(
+        tracker_frame_sequence=184,
+        token=current_token,
+        observation_monotonic_ns=current_observation_ns,
+        bbox_norm=(0.40, 0.0, 0.80, 0.36),
+        confidence=0.804,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        inner_aperture=None,
+    )
+    track = SimpleNamespace(
+        track_id="track-1",
+        latest_token=current_token,
+        role=VisualTrackRole.CURRENT,
+        visible=True,
+        ambiguous=False,
+        missed_frame_count=0,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        history=(anchor, clipped),
+    )
+    quaternion = (
+        math.cos(current_pitch / 2.0),
+        0.0,
+        math.sin(current_pitch / 2.0),
+        0.0,
+    )
+    current = SimpleNamespace(
+        track_id="track-1",
+        frame_sequence=184,
+        stream_generation=current_token.generation,
+        clipping=FrameEdge.TOP,
+        visible=True,
+        ambiguous=False,
+        body_to_reference_wxyz=quaternion,
+        body_rates_rad_s=(0.0, pitch_rate, 0.0),
+        rate_std_rad_s=(0.05, rate_std),
+        capture_timing_uncertainty_s=timing_uncertainty_s,
+    )
+    course = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        current=current,
+    )
+    config = SimpleNamespace(
+        camera_to_body_wxyz=(
+            course_stage.BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
+        ),
+        vertical_angle_scale_rad=0.55,
+        dropout_hold_s=0.120,
+        pitch_command_delay_s=0.100,
+        process_noise_bearing_rad_s=process_noise_rate,
+    )
+    session = SimpleNamespace(
+        core=SimpleNamespace(
+            course_state=lambda: course,
+            config=config,
+        )
+    )
+    edge = course_stage._top_fov_raw_edge(anchor)
+    protected_pitch = -0.168572
+    anchor_wire_ns = 1_010_000_000
+    fov_summary = {
+        "active": True,
+        "exact_raw_anchor": {
+            "basis": course_stage.TOP_FOV_EXACT_RAW_ANCHOR_BASIS,
+            "gate_index": 1,
+            "track_id": "track-1",
+            "camera_token": asdict(anchor_token),
+            "observation_monotonic_ns": anchor_observation_ns,
+            "wire_start_monotonic_ns": anchor_wire_ns,
+            "capture_pitch_rad": anchor_pitch,
+            "raw_top_edge_image_down": edge.top_edge_image_down,
+            "raw_nominal_top_edge_image_down": (
+                edge.nominal_top_edge_image_down
+            ),
+            "raw_top_edge_std_image_down": (
+                edge.top_edge_std_image_down
+            ),
+            "raw_top_edge_basis": edge.basis,
+            "raw_top_edge_nonrotational_angle_rate_rad_s": (
+                nonrotational_rate
+            ),
+            "protected_target_pitch_rad": protected_pitch,
+            "active": True,
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        },
+    }
+    return SimpleNamespace(
+        session=session,
+        track=track,
+        current_token=current_token,
+        fov_summary=fov_summary,
+        now_monotonic_ns=1_043_000_000,
+        anchor_wire_ns=anchor_wire_ns,
+        anchor_top=edge.top_edge_image_down,
+        anchor_pitch=anchor_pitch,
+        current_pitch=current_pitch,
+        protected_pitch=protected_pitch,
+    )
+
+
+def test_retained_raw_top_fov_state_propagates_live_clip_with_uncertainty():
+    case = _retained_raw_top_fov_case()
+
+    observation, proposal, authority = (
+        course_stage._propose_retained_raw_top_fov_pitch_reference(
+            case.session,
+            case.track,
+            case.current_token,
+            fov_summary=case.fov_summary,
+            now_monotonic_ns=case.now_monotonic_ns,
+            requested_target_pitch_rad=0.120,
+        )
+    )
+
+    assert observation.geometry_basis == (
+        course_stage.TOP_FOV_RETAINED_RAW_STATE_BASIS
+    )
+    assert observation.projected_uncertainty_growth_rad > 0.0
+    assert observation.projected_top_edge_image_down <= (
+        observation.projected_nominal_top_edge_image_down
+    )
+    assert math.isfinite(proposal.protected_target_pitch_rad)
+    assert (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+        <= proposal.protected_target_pitch_rad
+        <= course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert proposal.protected_target_pitch_rad <= case.protected_pitch
+    assert proposal.active_after is True
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+    assert authority["anchor_camera_token"] == asdict(_token(183))
+    assert authority["camera_token"] == asdict(case.current_token)
+
+
+def test_retained_raw_top_fov_state_is_pure_pitch_invariant():
+    case = _retained_raw_top_fov_case(
+        anchor_pitch=-0.10,
+        current_pitch=-0.08,
+        nonrotational_rate=0.0,
+        rate_std=0.0,
+        pitch_rate=0.0,
+        timing_uncertainty_s=0.0,
+        process_noise_rate=0.0,
+    )
+    case.track.history[0].bbox_norm = (0.40, 0.29, 0.80, 0.60)
+    edge = course_stage._top_fov_raw_edge(case.track.history[0])
+    case.anchor_top = edge.top_edge_image_down
+    case.fov_summary["exact_raw_anchor"].update(
+        {
+            "raw_top_edge_image_down": edge.top_edge_image_down,
+            "raw_nominal_top_edge_image_down": (
+                edge.nominal_top_edge_image_down
+            ),
+            "raw_top_edge_std_image_down": (
+                edge.top_edge_std_image_down
+            ),
+        }
+    )
+
+    observation, _proposal, _authority = (
+        course_stage._propose_retained_raw_top_fov_pitch_reference(
+            case.session,
+            case.track,
+            case.current_token,
+            fov_summary=case.fov_summary,
+            now_monotonic_ns=case.now_monotonic_ns,
+            requested_target_pitch_rad=0.120,
+        )
+    )
+    scale = observation.vertical_angle_scale_rad
+
+    assert (
+        math.atan(
+            observation.projected_top_edge_image_down * scale
+        )
+        + case.current_pitch
+    ) == pytest.approx(
+        math.atan(case.anchor_top * scale) + case.anchor_pitch,
+        abs=1e-12,
+    )
+
+
+def test_retained_raw_top_fov_state_keeps_fixed_anchor_across_clipped_frames():
+    case = _retained_raw_top_fov_case()
+    next_token = _token(185)
+    next_sample = SimpleNamespace(
+        tracker_frame_sequence=185,
+        token=next_token,
+        observation_monotonic_ns=1_063_000_000,
+        bbox_norm=(0.40, 0.0, 0.80, 0.34),
+        confidence=0.79,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        inner_aperture=None,
+    )
+    case.track.history = (*case.track.history, next_sample)
+    case.track.latest_token = next_token
+    case.session.core.course_state().current.frame_sequence = 185
+    case.session.core.course_state().current.clipping = FrameEdge.TOP
+
+    observation, _proposal, authority = (
+        course_stage._propose_retained_raw_top_fov_pitch_reference(
+            case.session,
+            case.track,
+            next_token,
+            fov_summary=case.fov_summary,
+            now_monotonic_ns=1_074_000_000,
+            requested_target_pitch_rad=0.120,
+        )
+    )
+
+    assert observation.anchor_camera_token == _token(183)
+    assert authority["anchor_wire_start_monotonic_ns"] == (
+        case.anchor_wire_ns
+    )
+    assert observation.observation_age_s == pytest.approx(0.063)
+    assert observation.prediction_horizon_remaining_s < 0.06
+
+
+@pytest.mark.parametrize("failure", ("anchor-token", "ambiguous", "expired"))
+def test_retained_raw_top_fov_state_refuses_bad_lineage_or_expiry(failure):
+    case = _retained_raw_top_fov_case()
+    if failure == "anchor-token":
+        case.fov_summary["exact_raw_anchor"]["camera_token"] = asdict(
+            _token(182)
+        )
+    elif failure == "ambiguous":
+        case.track.ambiguous = True
+    else:
+        case.now_monotonic_ns = case.anchor_wire_ns + 121_000_000
+
+    with pytest.raises(ValueError, match="retained top-FOV"):
+        course_stage._propose_retained_raw_top_fov_pitch_reference(
+            case.session,
+            case.track,
+            case.current_token,
+            fov_summary=case.fov_summary,
+            now_monotonic_ns=case.now_monotonic_ns,
+            requested_target_pitch_rad=0.120,
+        )
+
+
 def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     snapshot = _snapshot(0, "track-0", 20, visible=False)
     snapshot.current_track.clipping = FrameEdge.RIGHT
