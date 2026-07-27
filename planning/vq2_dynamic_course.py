@@ -409,10 +409,16 @@ class GateObservation:
 class CommandGovernorConfig:
     max_roll_slew_rad_s: float = 0.45
     max_pitch_slew_rad_s: float = 0.45
+    # Identified pitch/body response is effectively zero-delay and the wire
+    # rate remains capped independently.  Unsafe closure may therefore
+    # establish a brake target faster than ordinary guidance while preserving
+    # continuous target attitude, slew, acceleration, and wire envelopes.
+    max_brake_pitch_slew_rad_s: float = 0.60
     max_yaw_slew_rad_s2: float = 0.45
     max_thrust_slew_s: float = 0.10
     max_roll_accel_rad_s2: float = 2.0
     max_pitch_accel_rad_s2: float = 2.0
+    max_brake_pitch_accel_rad_s2: float = 2.5
     max_yaw_accel_rad_s3: float = 2.0
     max_thrust_accel_s2: float = 0.50
     max_step_s: float = 0.100
@@ -420,6 +426,15 @@ class CommandGovernorConfig:
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
             object.__setattr__(self, name, _positive(getattr(self, name), name))
+        if (
+            self.max_brake_pitch_slew_rad_s
+            < self.max_pitch_slew_rad_s
+            or self.max_brake_pitch_accel_rad_s2
+            < self.max_pitch_accel_rad_s2
+        ):
+            raise DynamicCourseError(
+                "brake pitch limits must cover ordinary pitch continuity"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -651,8 +666,10 @@ class TrackDynamicState:
     aperture_half_size_norm: Vector2 | None
     bearing_rad: Vector2
     bearing_rate_rad_s: Vector2
+    bearing_rate_qualified: tuple[bool, bool]
     log_scale: float
     expansion_rate_s: float
+    scale_rate_qualified: bool
     predicted_rotational_rate_rad_s: Vector2
     residual_translational_rate_rad_s: Vector2
     time_to_contact_s: float | None
@@ -869,7 +886,11 @@ class _TrackEstimate:
     last_measurement_camera_to_world: Quaternion
     last_measured_center_norm: Vector2
     last_measured_aperture_half_size_norm: Vector2 | None
+    measured_aperture_history: tuple[list[float], list[float]]
     measured_residual_rate_history: tuple[list[float], list[float]]
+    residual_rate_reanchor_required: list[bool]
+    measured_log_scale_rate_history: list[float]
+    scale_rate_reanchor_required: bool
     measured_bearing_history: list[tuple[int, Vector2]]
 
 
@@ -905,8 +926,11 @@ class CommandGovernor:
         monotonic_ns: int,
         *,
         hold: bool = False,
+        establish_pitch_brake: bool = False,
     ) -> DynamicCourseCommand:
         _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
+        if type(establish_pitch_brake) is not bool:
+            raise TypeError("establish_pitch_brake must be an exact bool")
         if self._last_ns is not None and monotonic_ns <= self._last_ns:
             raise DynamicCourseError("governor time must advance")
         if self._last is None:
@@ -933,13 +957,29 @@ class CommandGovernor:
         )
         slews = (
             self.config.max_roll_slew_rad_s,
-            self.config.max_pitch_slew_rad_s,
+            (
+                self.config.max_brake_pitch_slew_rad_s
+                if (
+                    establish_pitch_brake
+                    and proposal.target_pitch_rad
+                    > previous.target_pitch_rad
+                )
+                else self.config.max_pitch_slew_rad_s
+            ),
             self.config.max_yaw_slew_rad_s2,
             self.config.max_thrust_slew_s,
         )
         accelerations = (
             self.config.max_roll_accel_rad_s2,
-            self.config.max_pitch_accel_rad_s2,
+            (
+                self.config.max_brake_pitch_accel_rad_s2
+                if (
+                    establish_pitch_brake
+                    and proposal.target_pitch_rad
+                    > previous.target_pitch_rad
+                )
+                else self.config.max_pitch_accel_rad_s2
+            ),
             self.config.max_yaw_accel_rad_s3,
             self.config.max_thrust_accel_s2,
         )
@@ -1231,6 +1271,9 @@ class DynamicCourseCore:
             existing.measured_bearing_history.clear()
             for history in existing.measured_residual_rate_history:
                 history.clear()
+            existing.residual_rate_reanchor_required[:] = [True, True]
+            existing.measured_log_scale_rate_history.clear()
+            existing.scale_rate_reanchor_required = True
             return self._coast_track(
                 existing,
                 observation,
@@ -1276,7 +1319,39 @@ class DynamicCourseCore:
                 last_measured_aperture_half_size_norm=(
                     observation.aperture_half_size_norm
                 ),
+                measured_aperture_history=(
+                    (
+                        []
+                        if (
+                            observation.aperture_half_size_norm is None
+                            or observation.ambiguous
+                            or observation.censored_axes[0]
+                        )
+                        else [observation.aperture_half_size_norm[0]]
+                    ),
+                    (
+                        []
+                        if (
+                            observation.aperture_half_size_norm is None
+                            or observation.ambiguous
+                            or observation.censored_axes[1]
+                        )
+                        else [observation.aperture_half_size_norm[1]]
+                    ),
+                ),
                 measured_residual_rate_history=([], []),
+                residual_rate_reanchor_required=[
+                    bool(
+                        observation.ambiguous
+                        or observation.censored_axes[axis]
+                    )
+                    for axis in range(2)
+                ],
+                measured_log_scale_rate_history=[],
+                scale_rate_reanchor_required=bool(
+                    observation.ambiguous
+                    or observation.clipping != FrameEdge.NONE
+                ),
                 measured_bearing_history=(
                     [(capture_ns, measured_bearing)]
                     if (
@@ -1293,11 +1368,24 @@ class DynamicCourseCore:
             raw_angle,
             capture_ns,
         )
+        dt = (
+            capture_ns - existing.last_raw_measurement_ns
+        ) / _NS_PER_SECOND
+        rate_gap = dt > self.config.dropout_hold_s
         robust_residual_rate: list[float | None] = []
         for axis in range(2):
             history = existing.measured_residual_rate_history[axis]
-            if observation.ambiguous or observation.censored_axes[axis]:
+            if (
+                rate_gap
+                or observation.ambiguous
+                or observation.censored_axes[axis]
+            ):
                 history.clear()
+                existing.residual_rate_reanchor_required[axis] = True
+                robust_residual_rate.append(None)
+                continue
+            if existing.residual_rate_reanchor_required[axis]:
+                existing.residual_rate_reanchor_required[axis] = False
                 robust_residual_rate.append(None)
                 continue
             history.append(residual_rate[axis])
@@ -1314,6 +1402,69 @@ class DynamicCourseCore:
                 < self.config.residual_rate_median_window
                 else float(statistics.median(history))
             )
+        robust_expansion_rate: float | None = None
+        if (
+            rate_gap
+            or observation.ambiguous
+            or observation.clipping != FrameEdge.NONE
+        ):
+            existing.measured_log_scale_rate_history.clear()
+            existing.scale_rate_reanchor_required = True
+        elif existing.scale_rate_reanchor_required:
+            existing.scale_rate_reanchor_required = False
+        elif existing.state.raw_log_scale is not None:
+            scale_history = existing.measured_log_scale_rate_history
+            scale_history.append(
+                (observation.log_scale - existing.state.raw_log_scale)
+                / dt
+            )
+            del scale_history[
+                : max(
+                    0,
+                    len(scale_history)
+                    - self.config.residual_rate_median_window,
+                )
+            ]
+            if (
+                len(scale_history)
+                >= self.config.residual_rate_median_window
+            ):
+                robust_expansion_rate = float(
+                    statistics.median(scale_history)
+                )
+        stabilized_aperture = (
+            existing.last_measured_aperture_half_size_norm
+        )
+        if rate_gap or observation.ambiguous:
+            for history in existing.measured_aperture_history:
+                history.clear()
+        if observation.aperture_half_size_norm is not None:
+            aperture_values = list(
+                observation.aperture_half_size_norm
+                if stabilized_aperture is None
+                else stabilized_aperture
+            )
+            for axis in range(2):
+                if observation.ambiguous or observation.censored_axes[axis]:
+                    continue
+                aperture_history = existing.measured_aperture_history[axis]
+                aperture_history.append(
+                    observation.aperture_half_size_norm[axis]
+                )
+                del aperture_history[
+                    : max(
+                        0,
+                        len(aperture_history)
+                        - self.config.residual_rate_median_window,
+                    )
+                ]
+                aperture_values[axis] = float(
+                    statistics.median(aperture_history)
+                )
+            stabilized_aperture = (
+                aperture_values[0],
+                aperture_values[1],
+            )
         state = self._update_track(
             existing.state,
             observation,
@@ -1323,6 +1474,8 @@ class DynamicCourseCore:
             measured_bearing,
             rotational_rate,
             (robust_residual_rate[0], robust_residual_rate[1]),
+            robust_expansion_rate,
+            stabilized_aperture,
         )
         existing.state = state
         existing.last_measured_raw_angle = raw_angle
@@ -1330,9 +1483,9 @@ class DynamicCourseCore:
         existing.last_raw_measurement_ns = capture_ns
         existing.last_measurement_camera_to_world = camera_to_world
         existing.last_measured_center_norm = observation.center_norm
-        if observation.aperture_half_size_norm is not None:
+        if stabilized_aperture is not None:
             existing.last_measured_aperture_half_size_norm = (
-                observation.aperture_half_size_norm
+                stabilized_aperture
             )
         if observation.ambiguous or observation.censored_axes[0]:
             existing.measured_bearing_history.clear()
@@ -1374,8 +1527,10 @@ class DynamicCourseCore:
             aperture_half_size_norm=observation.aperture_half_size_norm,
             bearing_rad=bearing,
             bearing_rate_rad_s=(0.0, 0.0),
+            bearing_rate_qualified=(False, False),
             log_scale=observation.log_scale,
             expansion_rate_s=0.0,
+            scale_rate_qualified=False,
             predicted_rotational_rate_rad_s=(0.0, 0.0),
             residual_translational_rate_rad_s=(0.0, 0.0),
             time_to_contact_s=None,
@@ -1519,6 +1674,8 @@ class DynamicCourseCore:
             float | None,
             float | None,
         ],
+        measured_expansion_rate: float | None,
+        stabilized_aperture: Vector2 | None,
     ) -> TrackDynamicState:
         assert observation.center_norm is not None
         assert observation.log_scale is not None
@@ -1534,6 +1691,7 @@ class DynamicCourseCore:
         bearing_values: list[float] = []
         bearing_rates: list[float] = []
         residual_rates: list[float] = []
+        bearing_rate_qualified: list[bool] = []
         bearing_std: list[float] = []
         rate_std: list[float] = []
         measurement_std_rad = (
@@ -1586,6 +1744,7 @@ class DynamicCourseCore:
             bearing_values.append(value)
             bearing_rates.append(rate)
             residual_rates.append(residual)
+            bearing_rate_qualified.append(rate_qualified and not censored[axis])
             predicted_std = previous.bearing_std_rad[axis] + (
                 self.config.process_noise_bearing_rad_s * dt
             )
@@ -1607,29 +1766,66 @@ class DynamicCourseCore:
                     + self.config.process_noise_bearing_rad_s,
                 )
             )
+        scale_rate_qualified = bool(
+            observation.clipping == FrameEdge.NONE
+            and not observation.ambiguous
+            and measured_expansion_rate is not None
+        )
         if observation.clipping == FrameEdge.NONE:
-            scale_rate_qualified = all(
-                value is not None for value in measured_residual_rate
-            )
-            log_scale, expansion = self._robust_update(
-                predicted_scale,
-                predicted_expansion,
-                observation.log_scale,
-                dt,
-                self.config.scale_alpha * quality,
-                (
-                    self.config.scale_beta * quality
-                    if scale_rate_qualified
-                    else 0.0
-                ),
+            scale_innovation = _clamp(
+                observation.log_scale - predicted_scale,
+                -self.config.max_log_scale_innovation,
                 self.config.max_log_scale_innovation,
-                self.config.max_abs_expansion_rate_s,
             )
+            log_scale = (
+                predicted_scale
+                + self.config.scale_alpha * quality * scale_innovation
+            )
+            if scale_rate_qualified:
+                assert measured_expansion_rate is not None
+                expansion = _clamp(
+                    predicted_expansion
+                    + self.config.scale_beta
+                    * quality
+                    * (
+                        _clamp(
+                            measured_expansion_rate,
+                            -self.config.max_abs_expansion_rate_s,
+                            self.config.max_abs_expansion_rate_s,
+                        )
+                        - predicted_expansion
+                    ),
+                    -self.config.max_abs_expansion_rate_s,
+                    self.config.max_abs_expansion_rate_s,
+                )
+            else:
+                expansion = predicted_expansion
             scale_multiplier = 1.0
         else:
             log_scale = predicted_scale
             expansion = predicted_expansion
             scale_multiplier = self.config.clipping_uncertainty_multiplier
+        filtered_log_scale_std = math.sqrt(
+            max(
+                1e-10,
+                (1.0 - self.config.scale_alpha)
+                * (
+                    previous.log_scale_std
+                    + self.config.process_noise_scale_s * dt
+                )
+                ** 2
+                + self.config.scale_alpha
+                * observation.measurement_std[2]
+                ** 2,
+            )
+        )
+        if observation.clipping != FrameEdge.NONE:
+            filtered_log_scale_std *= scale_multiplier
+        elif not scale_rate_qualified:
+            filtered_log_scale_std = max(
+                previous.log_scale_std,
+                filtered_log_scale_std,
+            )
         ttc = self._time_to_contact(expansion)
         return TrackDynamicState(
             track_id=observation.track_id,
@@ -1642,14 +1838,19 @@ class DynamicCourseCore:
             raw_center_norm=observation.center_norm,
             raw_log_scale=observation.log_scale,
             aperture_half_size_norm=(
-                observation.aperture_half_size_norm
-                if observation.aperture_half_size_norm is not None
+                stabilized_aperture
+                if stabilized_aperture is not None
                 else previous.aperture_half_size_norm
             ),
             bearing_rad=(bearing_values[0], bearing_values[1]),
             bearing_rate_rad_s=(bearing_rates[0], bearing_rates[1]),
+            bearing_rate_qualified=(
+                bearing_rate_qualified[0],
+                bearing_rate_qualified[1],
+            ),
             log_scale=log_scale,
             expansion_rate_s=expansion,
+            scale_rate_qualified=scale_rate_qualified,
             predicted_rotational_rate_rad_s=rotational_rate,
             residual_translational_rate_rad_s=(
                 residual_rates[0],
@@ -1662,19 +1863,7 @@ class DynamicCourseCore:
             delayed_command=delayed,
             bearing_std_rad=(bearing_std[0], bearing_std[1]),
             rate_std_rad_s=(rate_std[0], rate_std[1]),
-            log_scale_std=scale_multiplier
-            * math.sqrt(
-                max(
-                    1e-10,
-                    (1.0 - self.config.scale_alpha)
-                    * (
-                        previous.log_scale_std
-                        + self.config.process_noise_scale_s * dt
-                    )
-                    ** 2
-                    + self.config.scale_alpha * observation.measurement_std[2] ** 2,
-                )
-            ),
+            log_scale_std=filtered_log_scale_std,
             expansion_rate_std_s=scale_multiplier
             * min(
                 self.config.max_abs_expansion_rate_s,
@@ -1718,8 +1907,10 @@ class DynamicCourseCore:
             aperture_half_size_norm=previous.aperture_half_size_norm,
             bearing_rad=bearing,
             bearing_rate_rad_s=rate,
+            bearing_rate_qualified=(False, False),
             log_scale=log_scale,
             expansion_rate_s=expansion,
+            scale_rate_qualified=False,
             predicted_rotational_rate_rad_s=previous.predicted_rotational_rate_rad_s,
             residual_translational_rate_rad_s=(
                 previous.residual_translational_rate_rad_s
@@ -2041,6 +2232,14 @@ class DynamicCourseCore:
             passage_yaw_authority,
             current_yaw_release,
         )
+        vertical_alignment_unsettled = bool(
+            not current.bearing_rate_qualified[1]
+            or not current.scale_rate_qualified
+            or crossing_prediction is None
+            or predicted_crossing_clearance[1] < 0.0
+            or abs(residual_rate_norm[1])
+            > self.config.vertical_settled_rate_norm_s
+        )
         proposal, braking, reason, yaw_contribution = self._propose_command(
             current,
             successor,
@@ -2049,14 +2248,14 @@ class DynamicCourseCore:
             current_yaw_release,
             successor_weight,
             successor_prediction,
-            vertical_alignment_unsettled=bool(
-                crossing_prediction is None
-                or predicted_crossing_clearance[1] < 0.0
-                or abs(residual_rate_norm[1])
-                > self.config.vertical_settled_rate_norm_s
-            ),
+            vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
-        command = self._governor.preview(proposal, monotonic_ns, hold=held)
+        command = self._governor.preview(
+            proposal,
+            monotonic_ns,
+            hold=held,
+            establish_pitch_brake=vertical_alignment_unsettled,
+        )
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
             current_gate_index=state.current_gate_index,

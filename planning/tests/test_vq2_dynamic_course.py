@@ -329,6 +329,80 @@ def test_4c42bb77_contour_completion_cannot_seed_collective_rate() -> None:
     ) < 0.08
 
 
+def test_5f132788_single_aperture_collapse_is_not_crossing_geometry() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    states = []
+    for sequence in range(1, 6):
+        time_s = 1.0 + (sequence - 1) * 0.031
+        collapsed = sequence == 5
+        _imu(core, time_s)
+        states.append(
+            core.observe_track(
+                _observation(
+                    "gate-0",
+                    sequence,
+                    time_s,
+                    y=(
+                        0.011111111111111072
+                        if collapsed
+                        else -0.033333333333333326
+                    ),
+                    log_scale=math.log(
+                        0.149071198499986
+                        if collapsed
+                        else 0.1666666666666667
+                    ),
+                    aperture=(
+                        0.125,
+                        (
+                            0.1777777777777777
+                            if collapsed
+                            else 0.2222222222222222
+                        ),
+                    ),
+                    confidence=0.80,
+                )
+            )
+        )
+
+    before = states[-2]
+    after = states[-1]
+    assert before.bearing_rate_qualified == (True, True)
+    assert before.scale_rate_qualified is True
+    assert after.aperture_half_size_norm[1] == pytest.approx(
+        0.2222222222222222
+    )
+    assert after.scale_rate_qualified is True
+    assert abs(after.expansion_rate_s) < 0.10
+
+
+def test_vertical_uncertainty_uses_bounded_brake_establishment_slew() -> None:
+    config = CommandGovernorConfig()
+    governor = CommandGovernor(config)
+    seed = DynamicCourseCommand(0.0, -0.31, 0.0, SUPPORT_THRUST)
+    brake = DynamicCourseCommand(0.0, 0.12, 0.0, SUPPORT_THRUST)
+    governor.commit(seed, 0)
+    previous = seed
+
+    for step in range(1, 17):
+        monotonic_ns = step * 40_000_000
+        command = governor.preview(
+            brake,
+            monotonic_ns,
+            establish_pitch_brake=True,
+        )
+        assert command.target_pitch_rad >= previous.target_pitch_rad
+        assert (
+            command.target_pitch_rad - previous.target_pitch_rad
+            <= config.max_brake_pitch_slew_rad_s * 0.040 + 1e-12
+        )
+        governor.commit(command, monotonic_ns)
+        previous = command
+
+    assert previous.target_pitch_rad > 0.0
+
+
 def test_delayed_command_history_is_right_continuous_at_channel_delays() -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -510,9 +584,13 @@ def test_8319198e_unadmitted_successor_cannot_force_gate0_braking() -> None:
     )
     assert decision.successor_weight == 0.0
     assert decision.successor_yaw_contribution_rad == 0.0
-    assert decision.braking is False
-    assert decision.brake_reason is None
-    assert decision.proposed_command.target_pitch_rad < 0.0
+    assert decision.braking is True
+    assert decision.brake_reason == "vertical_alignment_unsettled"
+    assert decision.proposed_command.target_pitch_rad > 0.0
+    assert core.course_state().current.bearing_rate_qualified == (
+        False,
+        False,
+    )
     assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
 
 

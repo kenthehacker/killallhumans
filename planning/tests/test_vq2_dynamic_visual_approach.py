@@ -291,7 +291,7 @@ def test_dynamic_graph_adapter_biases_passage_without_unadmitted_successor_yaw()
 
     assert proposal.servo_output.target_roll_rad > 0.0
     assert proposal.servo_output.yaw_rate_rad_s == 0.0
-    assert proposal.servo_output.target_pitch_rad < 0.0
+    assert proposal.servo_output.target_pitch_rad <= 0.12
     assert proposal.servo_output.brake_reason == "dynamic_plane_not_ready"
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
@@ -301,6 +301,7 @@ def test_dynamic_graph_adapter_biases_passage_without_unadmitted_successor_yaw()
     assert session.last_decision.successor_weight == 0.0
     assert session.last_decision.passage_yaw_authority > 0.0
     assert session.last_decision.successor_yaw_contribution_rad == 0.0
+    assert session.last_decision.proposed_command.target_pitch_rad < 0.0
     assert 0.0 < session.last_decision.successor_passage_authority < 0.15
     assert not session.last_decision.braking
     assert session.evidence_summary()["controller_family"] == (

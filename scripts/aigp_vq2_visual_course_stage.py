@@ -786,6 +786,24 @@ def _dynamic_near_plane_wire_sample(
         raise ValueError(
             "dynamic near-plane censorship evidence is invalid"
         )
+    bearing_rate_qualified = evidence.get(
+        "current_bearing_rate_qualified"
+    )
+    scale_rate_qualified = evidence.get(
+        "current_scale_rate_qualified"
+    )
+    if (
+        not isinstance(bearing_rate_qualified, (list, tuple))
+        or len(bearing_rate_qualified) != 2
+        or any(
+            type(value) is not bool
+            for value in bearing_rate_qualified
+        )
+        or type(scale_rate_qualified) is not bool
+    ):
+        raise ValueError(
+            "dynamic near-plane rate qualification is invalid"
+        )
     return NearPlaneWireSample(
         gate_index=gate_index,
         track_id=track_id,
@@ -813,6 +831,8 @@ def _dynamic_near_plane_wire_sample(
             evidence["current_ambiguous"]
             or evidence["dropout_held"]
             or not evidence["current_visible"]
+            or not all(bearing_rate_qualified)
+            or not scale_rate_qualified
         ),
         command_roll_rate=accepted.command.roll_rate,
         command_pitch_rate=accepted.command.pitch_rate,

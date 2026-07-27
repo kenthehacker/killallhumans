@@ -720,8 +720,14 @@ class DynamicVisualCourseSession:
                         course.current.residual_translational_rate_rad_s[1]
                         / self.core.config.vertical_angle_scale_rad,
                     ],
+                    "current_bearing_rate_qualified": list(
+                        course.current.bearing_rate_qualified
+                    ),
                     "expansion_rate_s": (
                         course.current.expansion_rate_s
+                    ),
+                    "current_scale_rate_qualified": (
+                        course.current.scale_rate_qualified
                     ),
                     "current_log_scale": course.current.log_scale,
                     "current_log_scale_std": course.current.log_scale_std,
@@ -733,6 +739,10 @@ class DynamicVisualCourseSession:
                         course.current.visible
                         and not course.current.ambiguous
                         and not any(course.current.censored_axes)
+                        and all(
+                            course.current.bearing_rate_qualified
+                        )
+                        and course.current.scale_rate_qualified
                         and (
                             course.current.log_scale
                             - 2.0 * course.current.log_scale_std
@@ -911,6 +921,8 @@ class _DynamicImageServo:
             and current_dynamic.visible
             and not current_dynamic.ambiguous
             and not any(current_dynamic.censored_axes)
+            and all(current_dynamic.bearing_rate_qualified)
+            and current_dynamic.scale_rate_qualified
             and (
                 current_dynamic.log_scale
                 - 2.0 * current_dynamic.log_scale_std

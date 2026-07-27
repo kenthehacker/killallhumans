@@ -165,6 +165,8 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
         "crossing_swept_occupancy_norm": [0.295, 0.46],
         "predicted_crossing_clearance_norm": [0.205, 0.14],
         "current_censored_axes": [False, False],
+        "current_bearing_rate_qualified": [True, True],
+        "current_scale_rate_qualified": True,
         "current_log_scale": -0.50,
         "expansion_rate_s": 0.75,
         "current_confidence": 0.90,
@@ -205,6 +207,17 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.crossing_allowance_y_norm == pytest.approx(0.60)
     assert sample.crossing_swept_x_occupancy_norm == pytest.approx(0.295)
     assert sample.crossing_swept_y_occupancy_norm == pytest.approx(0.46)
+
+
+def test_unqualified_dynamic_rates_cannot_become_crossing_evidence():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence["current_bearing_rate_qualified"] = [True, False]
+    evidence["current_scale_rate_qualified"] = False
+
+    sample = _dynamic_near_plane_sample(evidence)
+
+    assert sample is not None
+    assert sample.ambiguous is True
 
 
 @pytest.mark.parametrize(
