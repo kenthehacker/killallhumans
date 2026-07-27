@@ -185,7 +185,7 @@ def _allocate_launch_collective(
     configured_boost_thrust: float,
     dynamic_collective_owns_post_preload: bool,
 ) -> tuple[float, str]:
-    """Apply bounded launch support, then restore aperture feedback."""
+    """Keep the fixed legacy boost out of dynamic aperture feedback."""
 
     values = (
         float(launch_elapsed_s),
@@ -204,17 +204,14 @@ def _allocate_launch_collective(
         raise ValueError("launch collective allocation inputs are invalid")
     if values[0] < INITIAL_PAD_PRELOAD_DURATION_S:
         return INITIAL_PAD_PRELOAD_THRUST, "preload"
-    if values[0] < values[2]:
-        # The 3935be9a trace handed the dynamic loop authority immediately
-        # after preload.  Its governed thrust did not reach 0.320 until about
-        # 0.45 s, after the aperture had already acquired an unrecoverable
-        # upward residual rate.  The earlier 8319198e A/B retained the gate
-        # 0.44 s longer with this already bounded launch-support phase.
-        # Keep that feed-forward finite and generic; the current-aperture
-        # translation loop resumes at the configured endpoint.
-        return values[3], "boost"
     if dynamic_collective_owns_post_preload:
+        # In 8319198e the restored current-aperture loop requested about
+        # 0.278-0.280 and then lower thrust, but this layer discarded it for
+        # a fixed 0.320 boost.  Hand authority to the generic proved loop as
+        # soon as the established pad preload ends.
         return values[1], "proved-current-aperture"
+    if values[0] < values[2]:
+        return values[3], "boost"
     return values[1], "generic-visual-servo"
 
 
