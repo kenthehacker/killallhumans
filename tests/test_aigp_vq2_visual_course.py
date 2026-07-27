@@ -2902,6 +2902,24 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert authority.evidence["passage_authority"] is False
     assert authority.evidence["advance_authority"] is False
 
+    # Safe top clearance leaves the pitch limiter inactive.  That must not
+    # block exact local-state steering through a horizontal-only loss.
+    fov_summary["active"] = False
+    inactive_horizontal = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    )
+    assert inactive_horizontal.command.target_pitch_rad == pytest.approx(
+        -0.35
+    )
+    assert inactive_horizontal.evidence["steering_only"] is True
+    fov_summary["active"] = True
+
     snapshot.current_track.clipping = FrameEdge.TOP
     vertical_evidence = {
         **evidence,
@@ -2930,6 +2948,20 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
         )
     )
     assert direct_vertical.command.target_pitch_rad == pytest.approx(-0.35)
+
+    fov_summary["active"] = False
+    with pytest.raises(
+        ValueError,
+        match="exact propagated/FOV authority",
+    ):
+        course_stage._approach_propagated_visibility_gap_authority(
+            vertical_evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    fov_summary["active"] = True
 
     last_visible_publication = (
         last_visible_token.publication_sequence

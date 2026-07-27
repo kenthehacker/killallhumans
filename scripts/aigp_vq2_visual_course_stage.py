@@ -2551,7 +2551,14 @@ def _approach_propagated_visibility_gap_authority(
         or last_visible_clipping & ~known_clipping_edges
         or int(getattr(track, "clipping", FrameEdge.NONE))
         != last_visible_clipping
-        or fov_summary.get("active") is not True
+        # A horizontal-only clipped loss does not need an actively limiting
+        # top-FOV envelope.  Its exact outer-edge lineage and the already
+        # finite protected pitch are sufficient; vertical clipping still
+        # requires active inner/propagated FOV ownership.
+        or (
+            fov_summary.get("active") is not True
+            and not direct_outer_fov_lineage
+        )
         or fov_summary.get("last_track_id") != track_id
         or fov_summary.get("last_camera_token") != dict(last_visible)
         or not (
