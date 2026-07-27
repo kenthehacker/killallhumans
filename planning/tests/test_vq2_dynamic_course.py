@@ -407,33 +407,104 @@ def test_successor_steering_and_state_are_continuous_through_promotion() -> None
     ) <= core.config.governor.max_yaw_slew_rad_s2 * 0.030 + 1e-12
 
 
-def test_off_axis_successor_and_rapid_closure_brake_before_advancing() -> None:
+def test_8319198e_unadmitted_successor_cannot_force_gate0_braking() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     core.record_applied_command(_command(0.90, pitch=-0.02))
     _imu(core, 1.0)
-    core.observe_track(_observation("gate-a", 1, 1.0, log_scale=0.00))
-    _imu(core, 1.1)
-    current = core.observe_track(
-        _observation("gate-a", 2, 1.1, x=0.08, log_scale=0.25)
-    )
+    core.observe_track(_observation("gate-a", 1, 1.0))
     core.observe_track(
-        _observation("gate-b", 1, 1.1, x=0.62, log_scale=-0.30)
+        _observation("gate-b", 1, 1.0, x=0.322, log_scale=-0.30)
     )
     core.bind(
         current_gate_index=0,
         current_track_id="gate-a",
         successor_track_id="gate-b",
     )
-    _imu(core, 1.11)
-    decision = core.guide(1_110_000_000)
+    _imu(core, 1.01)
+    decision = core.guide(1_010_000_000)
 
-    assert current.expansion_rate_s >= core.config.rapid_expansion_rate_s
-    assert current.time_to_contact_s is not None
-    assert decision.braking is True
-    assert decision.brake_reason == "off_axis_rapid_closure"
-    assert decision.proposed_command.target_pitch_rad > 0.0
-    assert decision.command.target_pitch_rad > -0.02
+    assert decision.predicted_successor_bearing_rad is not None
+    assert decision.predicted_successor_bearing_rad[0] == pytest.approx(
+        0.473,
+        abs=0.002,
+    )
+    assert decision.successor_weight == 0.0
+    assert decision.successor_yaw_contribution_rad == 0.0
+    assert decision.braking is False
+    assert decision.brake_reason is None
+    assert decision.proposed_command.target_pitch_rad < 0.0
     assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
+
+
+def test_admitted_off_axis_successor_still_brakes_before_intercept() -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            passage_successor_bias=0.01,
+        )
+    )
+    core.record_applied_command(_command(0.90, pitch=-0.02))
+    for sequence in range(1, 8):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation("gate-a", sequence, observation_time)
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.322,
+                log_scale=-0.30,
+            )
+        )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    _imu(core, 1.25)
+    decision = core.guide(1_250_000_000)
+
+    assert decision.current_time_to_contact_s is None
+    assert decision.successor_prediction_confidence > 0.75
+    assert decision.successor_weight > (
+        0.75 * core.config.successor_maximum_weight
+    )
+    assert abs(decision.passage_error_norm[0]) < 0.01
+    assert decision.braking is True
+    assert decision.brake_reason == "off_axis_successor_intercept"
+    assert decision.proposed_command.target_pitch_rad > 0.0
+
+
+def test_unsettled_vertical_crossing_brakes_before_rapid_closure() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90, pitch=-0.02))
+    _imu(core, 1.0)
+    current = core.observe_track(
+        _observation(
+            "gate-a",
+            1,
+            1.0,
+            y=0.24,
+            aperture=(0.42, 0.34),
+        )
+    )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id=None,
+    )
+    _imu(core, 1.01)
+    decision = core.guide(1_010_000_000)
+
+    assert current.time_to_contact_s is None
+    assert current.expansion_rate_s < core.config.rapid_expansion_rate_s
+    assert decision.predicted_crossing_clearance_norm[1] < 0.0
+    assert decision.braking is True
+    assert decision.brake_reason == "vertical_alignment_unsettled"
+    assert decision.proposed_command.target_pitch_rad > 0.0
 
 
 def test_successor_heading_cannot_reverse_roll_away_from_passage_intercept() -> None:

@@ -2593,9 +2593,23 @@ class DynamicCourseCore:
             * current.residual_translational_rate_rad_s[0]
         )
         yaw = -self.config.yaw_gain * heading_error
-        off_axis = max(
-            abs(stable_passage_bearing[0]),
-            abs(successor_bearing[0]) if successor is not None else 0.0,
+        # Successor geometry may only slow the current-gate approach with the
+        # same progressively admitted authority that governs successor yaw.
+        # In particular, a visible but temporally unproved successor must not
+        # force full braking while its yaw contribution is still exactly zero.
+        successor_brake_authority = _clamp(
+            successor_weight / self.config.successor_maximum_weight,
+            0.0,
+            1.0,
+        )
+        successor_off_axis = (
+            successor is not None
+            and successor_brake_authority * abs(successor_bearing[0])
+            >= self.config.off_axis_brake_rad
+        )
+        current_off_axis = (
+            abs(stable_passage_bearing[0])
+            >= self.config.off_axis_brake_rad
         )
         rapid_closure = (
             current.expansion_rate_s >= self.config.rapid_expansion_rate_s
@@ -2610,18 +2624,27 @@ class DynamicCourseCore:
             or current.ambiguous
             or current.bearing_std_rad[0] > 0.16
         )
+        off_axis_braking = (
+            successor is not None
+            and (current_off_axis or successor_off_axis)
+        )
+        uncertain_braking = uncertain and rapid_closure
+        # Unsafe current-aperture vertical geometry owns closure immediately.
+        # Waiting for a second expansion/TTC trigger allowed the fixed launch
+        # acceleration to build momentum before the q-space crossing envelope
+        # had settled.
+        vertical_braking = vertical_alignment_unsettled
         braking = (
-            off_axis >= self.config.off_axis_brake_rad
-            and successor is not None
-        ) or (uncertain and rapid_closure) or (
-            vertical_alignment_unsettled and rapid_closure
+            off_axis_braking
+            or uncertain_braking
+            or vertical_braking
         )
         reason: str | None
-        if braking and vertical_alignment_unsettled:
+        if vertical_braking:
             reason = "vertical_alignment_unsettled"
-        elif braking and uncertain:
+        elif uncertain_braking:
             reason = "uncertain_rapid_closure"
-        elif braking:
+        elif off_axis_braking:
             reason = (
                 "off_axis_rapid_closure"
                 if rapid_closure

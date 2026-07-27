@@ -164,6 +164,44 @@ def _allocate_launch_pitch_target(
     )
 
 
+def _allocate_launch_collective(
+    *,
+    launch_elapsed_s: float,
+    post_preload_thrust: float,
+    configured_boost_duration_s: float,
+    configured_boost_thrust: float,
+    dynamic_collective_owns_post_preload: bool,
+) -> tuple[float, str]:
+    """Keep the fixed legacy boost out of dynamic aperture feedback."""
+
+    values = (
+        float(launch_elapsed_s),
+        float(post_preload_thrust),
+        float(configured_boost_duration_s),
+        float(configured_boost_thrust),
+    )
+    if (
+        not all(math.isfinite(value) for value in values)
+        or values[0] < 0.0
+        or values[2] < INITIAL_PAD_PRELOAD_DURATION_S
+        or not MIN_VISUAL_THRUST <= values[1] <= MAX_VISUAL_THRUST
+        or not MIN_VISUAL_THRUST <= values[3] <= MAX_VISUAL_THRUST
+        or type(dynamic_collective_owns_post_preload) is not bool
+    ):
+        raise ValueError("launch collective allocation inputs are invalid")
+    if values[0] < INITIAL_PAD_PRELOAD_DURATION_S:
+        return INITIAL_PAD_PRELOAD_THRUST, "preload"
+    if dynamic_collective_owns_post_preload:
+        # In 8319198e the restored current-aperture loop requested about
+        # 0.278-0.280 and then lower thrust, but this layer discarded it for
+        # a fixed 0.320 boost.  Hand authority to the generic proved loop as
+        # soon as the established pad preload ends.
+        return values[1], "proved-current-aperture"
+    if values[0] < values[2]:
+        return values[3], "boost"
+    return values[1], "generic-visual-servo"
+
+
 def _gate0_proved_vertical_collective(
     vertical: float,
     filtered_vertical_rate: float,
@@ -2396,25 +2434,19 @@ async def _run_visual_course_stage_impl(
             assert proved_filtered_vertical_rate is not None
             next_preview_collective_delta = 0.0
             next_preview_collective_track_id: Optional[str] = None
-            if launch_elapsed_s < INITIAL_PAD_PRELOAD_DURATION_S:
-                command_thrust = INITIAL_PAD_PRELOAD_THRUST
-                thrust_phase = "preload"
-            elif launch_elapsed_s < float(
-                host.visual_config.lifecycle.launch_boost_duration_s
-            ):
-                command_thrust = float(
+            command_thrust, thrust_phase = _allocate_launch_collective(
+                launch_elapsed_s=launch_elapsed_s,
+                post_preload_thrust=command_thrust,
+                configured_boost_duration_s=float(
+                    host.visual_config.lifecycle.launch_boost_duration_s
+                ),
+                configured_boost_thrust=float(
                     host.visual_config.lifecycle.launch_boost_thrust
-                )
-                thrust_phase = "boost"
-            else:
-                # Preload and boost are launch-only plant handling.  Once
-                # airborne, the proved current-aperture loop owns collective
-                # for Gate 0 and every successor gate in the dynamic stack.
-                thrust_phase = (
-                    "proved-current-aperture"
-                    if runtime.dynamic_controller is not None
-                    else "generic-visual-servo"
-                )
+                ),
+                dynamic_collective_owns_post_preload=bool(
+                    runtime.dynamic_controller is not None
+                ),
+            )
             if (
                 target_pitch_rad < limits.min_measured_pitch_rad
                 or target_pitch_rad > limits.max_measured_pitch_rad

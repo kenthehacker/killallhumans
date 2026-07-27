@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from competition.adapter import AttitudeRateCommand
@@ -244,7 +246,7 @@ def _accept_proposal(
     )
 
 
-def test_dynamic_graph_adapter_biases_passage_before_successor_yaw():
+def test_dynamic_graph_adapter_biases_passage_without_unadmitted_successor_yaw():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -291,11 +293,10 @@ def test_dynamic_graph_adapter_biases_passage_before_successor_yaw():
 
     assert proposal.servo_output.target_roll_rad > 0.0
     assert proposal.servo_output.yaw_rate_rad_s == 0.0
-    assert proposal.servo_output.target_pitch_rad > 0.0
-    assert proposal.servo_output.brake_reason in {
-        "off_axis_successor_intercept",
-        "off_axis_rapid_closure",
-    }
+    assert proposal.servo_output.target_pitch_rad < 0.0
+    assert proposal.servo_output.brake_reason == (
+        "off_axis_successor_intercept"
+    )
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
     assert session.last_decision.current_gate_index == 0
@@ -304,6 +305,13 @@ def test_dynamic_graph_adapter_biases_passage_before_successor_yaw():
     assert session.last_decision.successor_weight == 0.0
     assert session.last_decision.passage_yaw_authority == 0.0
     assert session.last_decision.successor_yaw_contribution_rad == 0.0
+    assert session.last_decision.braking
+    assert abs(
+        math.atan(
+            session.last_decision.passage_error_norm[0]
+            * session.core.config.horizontal_angle_scale_rad
+        )
+    ) >= session.core.config.off_axis_brake_rad
     assert session.evidence_summary()["controller_family"] == (
         DYNAMIC_CONTROLLER_FAMILY
     )

@@ -1840,6 +1840,30 @@ def test_ec7fc1b8_dynamic_brake_is_not_reblended_toward_spawn_pitch():
     assert legacy_target < governed
 
 
+def test_8319198e_dynamic_launch_does_not_discard_proved_collective():
+    thrust, phase = course_stage._allocate_launch_collective(
+        launch_elapsed_s=0.422,
+        post_preload_thrust=0.280,
+        configured_boost_duration_s=0.45,
+        configured_boost_thrust=0.32,
+        dynamic_collective_owns_post_preload=True,
+    )
+    legacy_thrust, legacy_phase = (
+        course_stage._allocate_launch_collective(
+            launch_elapsed_s=0.422,
+            post_preload_thrust=0.280,
+            configured_boost_duration_s=0.45,
+            configured_boost_thrust=0.32,
+            dynamic_collective_owns_post_preload=False,
+        )
+    )
+
+    assert thrust == pytest.approx(0.280)
+    assert phase == "proved-current-aperture"
+    assert legacy_thrust == pytest.approx(0.32)
+    assert legacy_phase == "boost"
+
+
 def test_current_aperture_collective_recreates_new_frame_rate_filter():
     state = course_stage._CurrentApertureProvedCollectiveState()
 
