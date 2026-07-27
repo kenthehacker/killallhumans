@@ -473,7 +473,7 @@ def test_dynamic_terminal_clearance_can_commit_before_legacy_scale_gate():
     assert latch.evidence == evidence
 
 
-def test_qualified_propagated_vertical_clip_can_mint_local_passage_latch():
+def test_qualified_propagated_clip_mints_only_safe_local_passage_latch():
     sample = replace(
         _CREDITED_NEAR_PLANE[0],
         normalized_x=0.02,
@@ -525,10 +525,37 @@ def test_qualified_propagated_vertical_clip_can_mint_local_passage_latch():
     assert latch.anchor_sample.clipping == FrameEdge.TOP | FrameEdge.BOTTOM
     assert latch.anchor_sample.center_censored is True
 
-    horizontally_clipped = replace(sample, clipping=FrameEdge.LEFT)
+    multi_edge_clipped = replace(
+        sample,
+        clipping=(
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM
+        ),
+    )
     evidence, latch = advance_dynamic_near_plane_evidence(
         NearPlaneEvidence(),
-        horizontally_clipped,
+        multi_edge_clipped,
+        required_corridor_frames=1,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        horizontal_corridor=0.16,
+        vertical_corridor=0.18,
+        minimum_post_governor_contact_budget_s=0.12,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+    assert latch is not None
+    assert latch.anchor_sample.clipping == multi_edge_clipped.clipping
+
+    unsafe = replace(
+        multi_edge_clipped,
+        predicted_crossing_y_down_norm=0.40,
+        predicted_crossing_y_std_norm=0.10,
+    )
+    evidence, latch = advance_dynamic_near_plane_evidence(
+        NearPlaneEvidence(),
+        unsafe,
         required_corridor_frames=1,
         crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
         horizontal_corridor=0.16,

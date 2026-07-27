@@ -474,6 +474,7 @@ def _accept_proposal(
 def _propagated_vertical_fov_gap(
     *,
     config: DynamicCourseConfig | None = None,
+    clipping: FrameEdge = FrameEdge.BOTTOM,
 ) -> tuple[
     DynamicVisualCourseSession,
     VisualTrack,
@@ -501,7 +502,7 @@ def _propagated_vertical_fov_gap(
             current_width=0.40,
             current_height=0.44,
             include_successor=False,
-            current_clipping=FrameEdge.BOTTOM,
+            current_clipping=clipping,
             current_center_censored=True,
             current_inner_aperture=None,
         )
@@ -818,12 +819,23 @@ def test_terminal_positive_clearance_commits_before_fixed_scale() -> None:
 
 
 @pytest.mark.parametrize(
-    ("seed_center_y", "terminal_safe"),
-    ((0.10, True), (0.14, False)),
+    ("seed_center_y", "terminal_safe", "clipping"),
+    (
+        (
+            0.10,
+            True,
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM,
+        ),
+        (0.14, False, FrameEdge.TOP | FrameEdge.BOTTOM),
+    ),
 )
 def test_propagated_aperture_mints_only_safe_passage_admission(
     seed_center_y: float,
     terminal_safe: bool,
+    clipping: FrameEdge,
 ) -> None:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
@@ -904,7 +916,7 @@ def test_propagated_aperture_mints_only_safe_passage_admission(
             current_height=0.55,
             include_successor=False,
             current_center_y=seed_center_y,
-            current_clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+            current_clipping=clipping,
             current_center_censored=True,
             current_inner_aperture=None,
         )
@@ -1438,21 +1450,10 @@ def test_propagated_current_fov_gap_requires_calibrated_camera_boundary() -> Non
         )
 
 
-def test_propagated_current_fov_gap_refuses_unsafe_geometry_and_expiry() -> None:
+def test_propagated_fov_gap_accepts_multiedge_and_refuses_ambiguity_expiry(
+) -> None:
     session, track, token, now_ns = _propagated_vertical_fov_gap()
-    sample = track.history[-1]
     ambiguous_track = replace(track, ambiguous=True)
-    horizontal_track = replace(
-        track,
-        clipping=FrameEdge.BOTTOM | FrameEdge.LEFT,
-        history=track.history[:-1]
-        + (
-            replace(
-                sample,
-                clipping=FrameEdge.BOTTOM | FrameEdge.LEFT,
-            ),
-        ),
-    )
 
     with pytest.raises(DynamicCourseError, match="unambiguous"):
         session.propagated_current_fov_gap_authority(
@@ -1460,12 +1461,25 @@ def test_propagated_current_fov_gap_refuses_unsafe_geometry_and_expiry() -> None
             camera_token=token,
             now_monotonic_ns=now_ns,
         )
-    with pytest.raises(DynamicCourseError, match="vertical-only"):
-        session.propagated_current_fov_gap_authority(
-            track=horizontal_track,
-            camera_token=token,
-            now_monotonic_ns=now_ns,
-        )
+
+    all_edges = (
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    )
+    full_session, full_track, full_token, full_now_ns = (
+        _propagated_vertical_fov_gap(clipping=all_edges)
+    )
+    authority = full_session.propagated_current_fov_gap_authority(
+        track=full_track,
+        camera_token=full_token,
+        now_monotonic_ns=full_now_ns,
+    )
+    assert authority["clipping"] == int(all_edges)
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
 
     deadline_ns = (
         session.core.course_state()
@@ -1686,10 +1700,13 @@ def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> Non
 
     state = session.core.course_state().current
     assert state.raw_center_norm == pytest.approx(degraded.center_norm)
-    assert state.raw_log_scale == pytest.approx(degraded.log_scale)
+    assert state.raw_log_scale is None
     assert state.bearing_rad[0] > prior.bearing_rad[0]
     assert state.bearing_rad[1] < prior.bearing_rad[1]
-    assert state.log_scale < prior.log_scale
+    assert state.log_scale == pytest.approx(prior.log_scale)
+    assert state.expansion_rate_s == pytest.approx(
+        prior.expansion_rate_s
+    )
     assert state.censored_axes == (False, False)
     assert state.aperture_propagated
     assert state.aperture_half_size_norm is not None

@@ -892,7 +892,6 @@ def advance_dynamic_near_plane_evidence(
     propagated_geometry = bool(
         sample.propagated_state_horizon_remaining_s is not None
         and sample.propagated_state_dynamics_qualified
-        and not bool(sample.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT))
         and float(sample.crossing_prediction_horizon_s)
         <= float(sample.propagated_state_horizon_remaining_s) + 1e-9
     )

@@ -1248,10 +1248,15 @@ class DynamicCourseCore:
                 else float(statistics.median(history))
             )
         robust_expansion_rate: float | None = None
+        aperture_measurement_usable = bool(
+            observation.aperture_half_size_norm is not None
+            and not observation.ambiguous
+            and not any(observation.censored_axes)
+            and observation.clipping == FrameEdge.NONE
+        )
         if (
             rate_gap
-            or observation.ambiguous
-            or observation.clipping != FrameEdge.NONE
+            or not aperture_measurement_usable
         ):
             existing.measured_log_scale_rate_history.clear()
             existing.scale_rate_reanchor_required = True
@@ -1386,7 +1391,9 @@ class DynamicCourseCore:
             capture_timing_basis=observation.timing_basis,
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=observation.center_norm,
-            raw_log_scale=observation.log_scale,
+            raw_log_scale=(
+                observation.log_scale if clean_aperture else None
+            ),
             aperture_half_size_norm=(
                 observation.aperture_half_size_norm
                 if clean_aperture
@@ -1663,7 +1670,8 @@ class DynamicCourseCore:
                 )
             )
         scale_measurement_usable = bool(
-            observation.clipping == FrameEdge.NONE
+            observation.aperture_half_size_norm is not None
+            and observation.clipping == FrameEdge.NONE
             and not observation.ambiguous
             and not any(censored)
         )
@@ -1779,8 +1787,19 @@ class DynamicCourseCore:
             )
             aperture_propagated = False
             aperture_dynamics_qualified = bool(
-                all(bearing_rate_qualified)
-                and scale_rate_qualified
+                (
+                    all(bearing_rate_qualified)
+                    and scale_rate_qualified
+                )
+                or (
+                    previous.aperture_dynamics_qualified
+                    and previous
+                    .aperture_prediction_deadline_monotonic_ns
+                    is not None
+                    and capture_ns
+                    <= previous
+                    .aperture_prediction_deadline_monotonic_ns
+                )
             )
         elif (
             previous.aperture_half_size_norm is not None
@@ -1789,10 +1808,6 @@ class DynamicCourseCore:
             and capture_ns
             <= previous.aperture_prediction_deadline_monotonic_ns
             and not observation.ambiguous
-            and not bool(
-                observation.clipping
-                & (FrameEdge.LEFT | FrameEdge.RIGHT)
-            )
         ):
             scale_factor = math.exp(
                 _clamp(log_scale - previous.log_scale, -1.0, 1.0)
@@ -1824,7 +1839,11 @@ class DynamicCourseCore:
             capture_timing_basis=observation.timing_basis,
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=observation.center_norm,
-            raw_log_scale=observation.log_scale,
+            raw_log_scale=(
+                observation.log_scale
+                if scale_measurement_usable
+                else None
+            ),
             # One clean passage-usable inner aperture seeds a bounded local
             # gate-relative state.  Subsequent censored publications may
             # propagate it with the identified scale/command model, but they
@@ -1868,7 +1887,11 @@ class DynamicCourseCore:
             censored_axes=censored,
             visible=True,
             ambiguous=observation.ambiguous,
-            confidence=observation.confidence,
+            confidence=(
+                previous.confidence
+                if aperture_propagated
+                else observation.confidence
+            ),
             sample_count=previous.sample_count + 1,
             missed_count=0,
         )

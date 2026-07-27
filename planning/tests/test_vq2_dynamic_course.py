@@ -1345,7 +1345,7 @@ def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
     )
 
 
-def test_clean_aperture_seed_propagates_through_vertical_censor_and_dropout(
+def test_clean_aperture_seed_propagates_through_near_plane_censor_and_dropout(
 ) -> None:
     def propagate(
         *,
@@ -1416,7 +1416,7 @@ def test_clean_aperture_seed_propagates_through_vertical_censor_and_dropout(
     nose_down = propagate(
         pitch=-0.12,
         thrust=MAX_THRUST,
-        clipping=FrameEdge.TOP,
+        clipping=FrameEdge.LEFT | FrameEdge.TOP | FrameEdge.RIGHT,
     )
     nose_up = propagate(
         pitch=0.12,
@@ -1594,10 +1594,9 @@ def test_local_aperture_is_withdrawn_at_decision_time_expiry() -> None:
     (
         (False, FrameEdge.TOP, False),
         (True, FrameEdge.TOP, True),
-        (True, FrameEdge.RIGHT, False),
     ),
 )
-def test_local_aperture_rejects_unseeded_ambiguous_or_horizontal_censor(
+def test_local_aperture_rejects_unseeded_or_ambiguous_censor(
     seed_aperture: bool,
     clipping: FrameEdge,
     ambiguous: bool,
@@ -1640,6 +1639,102 @@ def test_local_aperture_rejects_unseeded_ambiguous_or_horizontal_censor(
     assert rejected.aperture_dynamics_qualified is False
     assert decision.current_aperture_half_size_norm is None
     assert decision.crossing_allowance_norm == (0.0, 0.0)
+
+
+def test_degraded_scale_cannot_erase_qualified_local_aperture_state() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.80))
+    qualified = None
+    for sequence, log_scale in enumerate(
+        (-0.80, -0.72, -0.64, -0.56),
+        start=1,
+    ):
+        observation_time = 1.0 + (sequence - 1) * 0.030
+        _imu(core, observation_time)
+        qualified = core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                log_scale=log_scale,
+            )
+        )
+    assert qualified is not None
+    assert qualified.aperture_dynamics_qualified
+    assert qualified.expansion_rate_s > 0.0
+    assert qualified.time_to_contact_s is not None
+
+    _imu(core, 1.12)
+    degraded = core.observe_track(
+        _observation(
+            "gate-a",
+            5,
+            1.12,
+            x=0.08,
+            y=-0.06,
+            log_scale=0.80,
+            aperture=None,
+            confidence=0.20,
+        )
+    )
+    assert degraded.aperture_propagated
+    assert degraded.aperture_dynamics_qualified
+    assert degraded.raw_log_scale is None
+    assert degraded.log_scale != pytest.approx(0.80)
+    assert degraded.expansion_rate_s > 0.0
+    assert degraded.confidence == pytest.approx(qualified.confidence)
+    assert degraded.aperture_seed_monotonic_ns == (
+        qualified.aperture_seed_monotonic_ns
+    )
+    assert degraded.aperture_prediction_deadline_monotonic_ns == (
+        qualified.aperture_prediction_deadline_monotonic_ns
+    )
+
+    _imu(core, 1.15)
+    corrected = core.observe_track(
+        _observation(
+            "gate-a",
+            6,
+            1.15,
+            x=0.09,
+            y=-0.05,
+            log_scale=-0.48,
+        )
+    )
+    assert not corrected.aperture_propagated
+    assert not corrected.scale_rate_qualified
+    assert corrected.aperture_dynamics_qualified
+    assert corrected.expansion_rate_s > 0.0
+    assert corrected.time_to_contact_s is not None
+
+    _imu(core, 1.18)
+    full_frame = core.observe_track(
+        _observation(
+            "gate-a",
+            7,
+            1.18,
+            x=0.0,
+            y=0.0,
+            log_scale=0.0,
+            aperture=None,
+            clipping=(
+                FrameEdge.LEFT
+                | FrameEdge.TOP
+                | FrameEdge.RIGHT
+                | FrameEdge.BOTTOM
+            ),
+            center_censored=True,
+            confidence=0.0,
+        )
+    )
+    assert full_frame.aperture_propagated
+    assert full_frame.aperture_dynamics_qualified
+    assert full_frame.confidence == pytest.approx(corrected.confidence)
+    assert full_frame.aperture_prediction_deadline_monotonic_ns == (
+        corrected.aperture_prediction_deadline_monotonic_ns
+    )
+    assert full_frame.bearing_std_rad[0] > corrected.bearing_std_rad[0]
+    assert full_frame.bearing_std_rad[1] > corrected.bearing_std_rad[1]
 
 
 def test_invisible_ambiguity_revokes_aperture_lineage_until_clean_reseed(

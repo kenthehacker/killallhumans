@@ -493,8 +493,8 @@ class DynamicVisualCourseSession:
                 # Missing inner geometry censors control measurements, but it
                 # is not itself evidence that the graph-retained track
                 # identity is ambiguous.  The bounded local state may bridge
-                # exact TOP/BOTTOM near-plane clipping without consuming this
-                # outer center or scale.
+                # near-plane clipping without consuming this outer center or
+                # scale.
                 ambiguous = bool(track.ambiguous)
                 measurement_std = (0.05, 0.06, 0.12)
             return GateObservation(
@@ -1192,7 +1192,7 @@ class DynamicVisualCourseSession:
         camera_token: CameraFrameToken,
         now_monotonic_ns: int,
     ) -> Mapping[str, Any]:
-        """Prove exact, bounded steering ownership of a vertical FOV gap.
+        """Prove exact, bounded steering ownership of a clipped FOV gap.
 
         This is a read-only authority check over the already-staged tracker
         publication, rolling local state, and latest guidance decision.  It
@@ -1372,16 +1372,13 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "propagated FOV gap current track is not unambiguous"
             )
-        vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
-        horizontal_edges = FrameEdge.LEFT | FrameEdge.RIGHT
         if (
             current.clipping != track.clipping
             or current.clipping != sample.clipping
-            or not bool(current.clipping & vertical_edges)
-            or bool(current.clipping & horizontal_edges)
+            or current.clipping == FrameEdge.NONE
         ):
             raise DynamicCourseError(
-                "propagated FOV gap is not vertical-only clipping"
+                "propagated FOV gap publication is not clipped"
             )
 
         remaining_horizon_s = (
@@ -1958,10 +1955,6 @@ class _DynamicImageServo:
             and decision.current_aperture_prediction_horizon_remaining_s > 0.0
             and current_dynamic.visible
             and not current_dynamic.ambiguous
-            and not bool(
-                current_dynamic.clipping
-                & (FrameEdge.LEFT | FrameEdge.RIGHT)
-            )
             and decision.current_time_to_contact_s is not None
             and decision.current_time_to_contact_s
             <= decision.current_aperture_prediction_horizon_remaining_s
@@ -2187,14 +2180,10 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             state = self._dynamic_session.core.course_state().current
         except DynamicCourseError:
             return False
-        horizontal_clip = bool(
-            track.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
-        )
         return bool(
             state.track_id == track.track_id
             and track.visible
             and not track.ambiguous
-            and not horizontal_clip
             and state.frame_sequence
             == track.history[-1].tracker_frame_sequence
             and state.aperture_half_size_norm is not None
