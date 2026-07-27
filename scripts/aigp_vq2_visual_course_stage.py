@@ -2222,6 +2222,16 @@ def _dynamic_near_plane_wire_sample(
         minimum=0.0,
         maximum=DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
     )
+    time_to_contact_s = scalar(
+        "time_to_contact_s",
+        minimum=0.0,
+        minimum_inclusive=False,
+    )
+    if crossing_prediction_horizon_s + 1e-9 < time_to_contact_s:
+        # A max-horizon-capped projection does not reach its own estimated
+        # gate plane.  It may steer the approach, but cannot mint a crossing
+        # commitment whose bounded command lease would expire before contact.
+        return None
     propagated_horizon_remaining_s = (
         scalar(
             "current_aperture_prediction_horizon_remaining_s",

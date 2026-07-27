@@ -241,6 +241,27 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.post_governor_contact_budget_s == pytest.approx(0.25)
 
 
+def test_dynamic_near_plane_prediction_must_reach_estimated_contact():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            # Exact first premature-latch relationship from build-3385 run
+            # 20260727T203108Z: terminal clearance alone was positive, but
+            # the capped prediction ended 0.20 seconds before contact.
+            "time_to_contact_s": 1.3996127946686199,
+            "crossing_prediction_horizon_s": 1.2,
+            "post_governor_contact_budget_s": 1.2934063833444058,
+        }
+    )
+
+    assert _dynamic_near_plane_sample(evidence) is None
+
+    evidence["time_to_contact_s"] = 1.0431421899955164
+    evidence["crossing_prediction_horizon_s"] = 1.0431421899955164
+
+    assert _dynamic_near_plane_sample(evidence) is not None
+
+
 def test_superseded_observation_bridges_latched_current_loss() -> None:
     sample = _dynamic_near_plane_sample(
         _valid_dynamic_near_plane_evidence()
