@@ -172,7 +172,10 @@ def production_dynamic_course_config() -> DynamicCourseConfig:
         camera_to_body_wxyz=(
             BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
         ),
-        roll_guidance_sign=1.0,
+        # Rx(pi) maps pixel-right to body-left.  Body-FRD positive roll
+        # accelerates toward body-right, so a positive image/stable-camera
+        # lateral error requires a negative roll attitude demand.
+        roll_guidance_sign=-1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
         roll_to_lateral_bearing_accel=0.0,

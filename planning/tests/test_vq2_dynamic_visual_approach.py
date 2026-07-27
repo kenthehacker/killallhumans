@@ -69,6 +69,9 @@ def test_production_camera_boundary_uses_live_axis_calibration() -> None:
         BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
     )
     assert config.camera_to_body_wxyz == (0.0, 1.0, 0.0, 0.0)
+    # Rx(pi): camera pixel-right is body-left, hence corrective body roll
+    # must have the opposite sign from the camera-chart lateral error.
+    assert config.roll_guidance_sign == -1.0
 
 
 def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
@@ -640,7 +643,7 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
         proposal = _observe(planner, snapshot, tracker)
         _accept_proposal(session, tracker, proposal)
 
-    assert proposal.servo_output.target_roll_rad > 0.0
+    assert proposal.servo_output.target_roll_rad < 0.0
     assert proposal.servo_output.target_pitch_rad <= 0.12
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
@@ -772,7 +775,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert proposal.servo_output.target_roll_rad == pytest.approx(
         baseline["target_roll_rad"]
     )
-    assert proposal.servo_output.target_roll_rad > 0.0
+    assert proposal.servo_output.target_roll_rad < 0.0
     assert all(
         math.isfinite(value)
         for value in (
@@ -845,7 +848,7 @@ def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
     assert corrective
     assert all(
         math.isfinite(target_roll)
-        and 0.0 < target_roll <= MAX_TARGET_ROLL_RAD
+        and -MAX_TARGET_ROLL_RAD <= target_roll < 0.0
         for target_roll in corrective
     )
 
@@ -1702,8 +1705,10 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
             *authority["command"].values(),
         )
     )
-    assert 0.0 < authority["command"]["target_roll_rad"] <= (
-        MAX_TARGET_ROLL_RAD
+    assert (
+        -MAX_TARGET_ROLL_RAD
+        <= authority["command"]["target_roll_rad"]
+        < 0.0
     )
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
