@@ -17,6 +17,7 @@ from competition.vq2_visual_tracker import (
     VisualTrack,
 )
 from planning.vq2_dynamic_course import (
+    DynamicCourseConfig,
     DynamicCourseError,
     ImuAttitudeSample,
 )
@@ -296,18 +297,32 @@ def _single_gate_graph(
     return tracker, graph, snapshot, current_id
 
 
-def _session() -> DynamicVisualCourseSession:
-    session = DynamicVisualCourseSession()
+def _session(
+    *,
+    config: DynamicCourseConfig | None = None,
+    pitch_rate_rad_s: float = 0.0,
+) -> DynamicVisualCourseSession:
+    session = DynamicVisualCourseSession(config)
     for monotonic_ns in range(
         _BASE_NS - 200_000_000,
         _BASE_NS + 700_000_000,
         10_000_000,
     ):
+        pitch_rad = (
+            pitch_rate_rad_s
+            * (monotonic_ns - _BASE_NS)
+            / 1_000_000_000.0
+        )
         session.record_imu(
             ImuAttitudeSample(
                 monotonic_ns=monotonic_ns,
-                body_to_reference_wxyz=(1.0, 0.0, 0.0, 0.0),
-                body_rates_rad_s=(0.0, 0.0, 0.0),
+                body_to_reference_wxyz=(
+                    math.cos(pitch_rad / 2.0),
+                    0.0,
+                    math.sin(pitch_rad / 2.0),
+                    0.0,
+                ),
+                body_rates_rad_s=(0.0, pitch_rate_rad_s, 0.0),
                 source_timestamp_us=monotonic_ns // 1_000,
                 host_clock_id="host-perf-counter",
             )
@@ -358,7 +373,10 @@ def _accept_proposal(
     )
 
 
-def _propagated_vertical_fov_gap() -> tuple[
+def _propagated_vertical_fov_gap(
+    *,
+    config: DynamicCourseConfig | None = None,
+) -> tuple[
     DynamicVisualCourseSession,
     VisualTrack,
     CameraFrameToken,
@@ -368,7 +386,7 @@ def _propagated_vertical_fov_gap() -> tuple[
         width=0.34,
         height=0.36,
     )
-    session = _session()
+    session = _session(config=config, pitch_rate_rad_s=0.40)
     planner = DynamicRollingVisualApproachServo(
         current_id,
         0,
@@ -1069,6 +1087,9 @@ def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> No
     session, track, token, now_ns = _propagated_vertical_fov_gap()
     decision = session.last_decision
     assert decision is not None
+    current = session.core.course_state().current
+    assert current.aperture_half_size_norm is not None
+    assert decision.current_aperture_half_size_norm is not None
     # Crossing clearance is deliberately not part of this raw-FOV ownership
     # proof.  A propagated state may steer through clipping, but it cannot
     # turn that steering evidence into passage or race-advance authority.
@@ -1098,6 +1119,36 @@ def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> No
     assert all(
         math.isfinite(value) and value > 0.0
         for value in authority["aperture_half_size_norm"]
+    )
+    assert authority["aperture_half_size_norm"] == pytest.approx(
+        decision.current_aperture_half_size_norm
+    )
+    assert authority["state_aperture_half_size_norm"] == pytest.approx(
+        current.aperture_half_size_norm
+    )
+    assert all(
+        math.isfinite(value) and value > 0.0
+        for value in authority["camera_aperture_half_size_norm"]
+    )
+    assert any(
+        abs(camera_value - state_value) > 1e-8
+        for camera_value, state_value in zip(
+            authority["camera_aperture_half_size_norm"],
+            authority["state_aperture_half_size_norm"],
+        )
+    )
+    assert all(
+        math.isfinite(value) and value >= 0.0
+        for value in authority["camera_center_std_norm"]
+    )
+    assert authority["aperture_log_scale_std"] >= 0.0
+    assert authority["vertical_angle_scale_rad"] > 0.0
+    assert all(
+        math.isfinite(value)
+        for value in (
+            *authority["camera_center_norm"],
+            *authority["body_to_reference_wxyz"],
+        )
     )
     assert authority["terminal_crossing_clearance_norm"] == [
         -0.04,
@@ -1144,6 +1195,23 @@ def test_propagated_current_fov_gap_refuses_identity_and_frame_mismatch() -> Non
                 camera_token=mismatched_token,
                 now_monotonic_ns=now_ns,
             )
+
+
+def test_propagated_current_fov_gap_requires_calibrated_camera_boundary() -> None:
+    invalid_config = replace(
+        production_dynamic_course_config(),
+        camera_to_body_wxyz=(1.0, 0.0, 0.0, 0.0),
+    )
+    session, track, token, now_ns = _propagated_vertical_fov_gap(
+        config=invalid_config
+    )
+
+    with pytest.raises(DynamicCourseError, match="calibrated camera"):
+        session.propagated_current_fov_gap_authority(
+            track=track,
+            camera_token=token,
+            now_monotonic_ns=now_ns,
+        )
 
 
 def test_propagated_current_fov_gap_refuses_unsafe_geometry_and_expiry() -> None:

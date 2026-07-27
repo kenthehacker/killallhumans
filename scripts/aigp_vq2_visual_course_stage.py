@@ -169,6 +169,9 @@ TOP_FOV_INNER_EDGE_BASIS = (
 TOP_FOV_OUTER_EDGE_FALLBACK_BASIS = (
     "raw-current-bbox-top-fallback-v1"
 )
+TOP_FOV_PROPAGATED_INNER_EDGE_BASIS = (
+    "propagated-current-camera-inner-aperture-top-2sigma-v1"
+)
 _TOP_FOV_INNER_MODEL_PAIRS = frozenset(
     {
         (
@@ -468,6 +471,122 @@ class _TopFovObservation:
     previous_target_pitch_rad: Optional[float]
     raw_top_edge_basis: str
     raw_top_edge_confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class _TopFovPropagatedObservation:
+    capture_pitch_rad: float
+    projected_top_edge_image_down: float
+    projected_nominal_top_edge_image_down: float
+    projected_top_edge_std_image_down: float
+    vertical_angle_scale_rad: float
+    prediction_horizon_remaining_s: float
+    geometry_basis: str
+
+
+def _top_fov_propagated_observation(
+    authority: Mapping[str, Any],
+) -> _TopFovPropagatedObservation:
+    """Recover a conservative current-camera top edge from local gate state."""
+
+    if (
+        not isinstance(authority, Mapping)
+        or authority.get("basis")
+        != "propagated-current-fov-gap-steering-v1"
+        or authority.get("steering_only") is not True
+        or authority.get("passage_authority") is not False
+        or authority.get("advance_authority") is not False
+    ):
+        raise ValueError(
+            "propagated top-FOV authority is not steering-only"
+        )
+    center = authority.get("camera_center_norm")
+    aperture = authority.get("camera_aperture_half_size_norm")
+    center_std = authority.get("camera_center_std_norm")
+    quaternion = authority.get("body_to_reference_wxyz")
+    clipping_value = authority.get("clipping")
+    if (
+        not isinstance(center, (list, tuple))
+        or len(center) != 2
+        or not isinstance(aperture, (list, tuple))
+        or len(aperture) != 2
+        or not isinstance(center_std, (list, tuple))
+        or len(center_std) != 2
+        or not isinstance(quaternion, (list, tuple))
+        or len(quaternion) != 4
+        or type(clipping_value) is not int
+    ):
+        raise ValueError("propagated top-FOV geometry is malformed")
+    center_x, center_y = map(float, center)
+    aperture_x, aperture_y = map(float, aperture)
+    center_std_x, center_std_y = map(float, center_std)
+    log_scale_std = float(authority["aperture_log_scale_std"])
+    vertical_scale = float(authority["vertical_angle_scale_rad"])
+    remaining_horizon_s = float(
+        authority["aperture_prediction_horizon_remaining_s"]
+    )
+    clipping = FrameEdge(clipping_value)
+    vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
+    horizontal_edges = FrameEdge.LEFT | FrameEdge.RIGHT
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                center_x,
+                center_y,
+                aperture_x,
+                aperture_y,
+                center_std_x,
+                center_std_y,
+                log_scale_std,
+                vertical_scale,
+                remaining_horizon_s,
+                *map(float, quaternion),
+            )
+        )
+        or aperture_x <= 0.0
+        or aperture_y <= 0.0
+        or center_std_x < 0.0
+        or center_std_y < 0.0
+        or log_scale_std < 0.0
+        or vertical_scale <= 0.0
+        or remaining_horizon_s <= 0.0
+        or not bool(clipping & vertical_edges)
+        or bool(clipping & horizontal_edges)
+    ):
+        raise ValueError("propagated top-FOV geometry is invalid")
+    nominal_top = center_y - aperture_y
+    top_std = math.sqrt(
+        center_std_y * center_std_y
+        + (aperture_y * log_scale_std) ** 2
+    )
+    conservative_top = max(
+        -1.0,
+        min(
+            1.0,
+            nominal_top - TOP_FOV_INNER_EDGE_SIGMA * top_std,
+        ),
+    )
+    capture_pitch = _body_to_reference_pitch_rad(tuple(map(float, quaternion)))
+    if not all(
+        math.isfinite(value)
+        for value in (
+            nominal_top,
+            top_std,
+            conservative_top,
+            capture_pitch,
+        )
+    ):
+        raise ValueError("propagated top-FOV projection is nonfinite")
+    return _TopFovPropagatedObservation(
+        capture_pitch_rad=capture_pitch,
+        projected_top_edge_image_down=conservative_top,
+        projected_nominal_top_edge_image_down=nominal_top,
+        projected_top_edge_std_image_down=top_std,
+        vertical_angle_scale_rad=vertical_scale,
+        prediction_horizon_remaining_s=remaining_horizon_s,
+        geometry_basis=TOP_FOV_PROPAGATED_INNER_EDGE_BASIS,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -844,6 +963,39 @@ def _propose_top_fov_pitch_reference(
         active_after=active_after,
         limited=protected < requested - 1e-12,
     )
+
+
+def _propose_propagated_top_fov_pitch_reference(
+    authority: Mapping[str, Any],
+    *,
+    requested_target_pitch_rad: float,
+    prior_target_pitch_rad: Optional[float],
+) -> tuple[_TopFovPropagatedObservation, _TopFovPitchProposal]:
+    """Keep the current raw-FOV constraint active through a predicted gap."""
+
+    observation = _top_fov_propagated_observation(authority)
+    prior = (
+        observation.capture_pitch_rad
+        if prior_target_pitch_rad is None
+        else float(prior_target_pitch_rad)
+    )
+    proposal = _propose_top_fov_pitch_reference(
+        capture_pitch_rad=observation.capture_pitch_rad,
+        raw_top_edge_image_down=(
+            observation.projected_top_edge_image_down
+        ),
+        raw_top_edge_rate_down_s=None,
+        requested_target_pitch_rad=requested_target_pitch_rad,
+        prior_target_pitch_rad=prior,
+        vertical_angle_scale_rad=observation.vertical_angle_scale_rad,
+        # A censored local-state projection cannot establish raw clearance
+        # recovery.  Keep the state-dependent ceiling engaged until a raw
+        # observation proves recovery or near-plane passage owns transition.
+        active_before=True,
+        raw_top_edge_nonrotational_angle_rate_rad_s=None,
+        prediction_horizon_s=0.0,
+    )
+    return observation, proposal
 
 
 def _top_fov_observation(
@@ -3948,6 +4100,12 @@ async def _run_visual_course_stage_impl(
         top_fov_proposal: Optional[_TopFovPitchProposal] = None
         top_fov_observation: Optional[_TopFovObservation] = None
         top_fov_propagated_handoff: Optional[Mapping[str, Any]] = None
+        top_fov_propagated_observation: Optional[
+            _TopFovPropagatedObservation
+        ] = None
+        top_fov_propagated_proposal: Optional[
+            _TopFovPitchProposal
+        ] = None
         top_fov_track_id: Optional[str] = None
         dynamic_controller = runtime.dynamic_controller
         if type(dynamic_controller) is DynamicVisualCourseSession:
@@ -3997,6 +4155,35 @@ async def _run_visual_course_stage_impl(
                         raise abort_type(
                             "visual-course propagated FOV-handoff evidence "
                             "is invalid"
+                        )
+                    try:
+                        (
+                            top_fov_propagated_observation,
+                            top_fov_propagated_proposal,
+                        ) = _propose_propagated_top_fov_pitch_reference(
+                            top_fov_propagated_handoff,
+                            requested_target_pitch_rad=target_pitch_rad,
+                            prior_target_pitch_rad=(
+                                fov_summary[
+                                    "last_protected_target_pitch_rad"
+                                ]
+                            ),
+                        )
+                    except (KeyError, TypeError, ValueError) as propagated_exc:
+                        raise abort_type(
+                            "visual-course propagated FOV pitch guidance "
+                            f"refused: {propagated_exc}"
+                        ) from propagated_exc
+                    target_pitch_rad = (
+                        top_fov_propagated_proposal
+                        .protected_target_pitch_rad
+                    )
+                    if launch_evidence is not None:
+                        launch_evidence[
+                            "target_pitch_rad_before_top_fov"
+                        ] = launch_evidence["target_pitch_rad"]
+                        launch_evidence["target_pitch_rad"] = (
+                            target_pitch_rad
                         )
                 if top_fov_observation is not None:
                     try:
@@ -4483,10 +4670,16 @@ async def _run_visual_course_stage_impl(
                         ),
                         **asdict(top_fov_proposal),
                     }
-                elif top_fov_propagated_handoff is not None:
+                elif (
+                    top_fov_propagated_handoff is not None
+                    and top_fov_propagated_observation is not None
+                    and top_fov_propagated_proposal is not None
+                ):
                     propagated_handoff = dict(
                         top_fov_propagated_handoff
                     )
+                    if top_fov_propagated_proposal.limited:
+                        fov_summary["limited_command_count"] += 1
                     fov_summary[
                         "propagated_state_handoff_command_count"
                     ] = int(
@@ -4497,9 +4690,54 @@ async def _run_visual_course_stage_impl(
                     fov_summary[
                         "last_propagated_state_handoff"
                     ] = propagated_handoff
+                    fov_summary.update(
+                        {
+                            "last_track_id": top_fov_track_id,
+                            "last_camera_token": asdict(
+                                snapshot.latest_camera_token
+                            ),
+                            "last_wire_start_monotonic_ns": (
+                                wire_start_monotonic_ns
+                            ),
+                            "last_forecast_top_edge_image_down": (
+                                top_fov_propagated_proposal
+                                .forecast_top_edge_image_down
+                            ),
+                            "last_protected_target_pitch_rad": (
+                                top_fov_propagated_proposal
+                                .protected_target_pitch_rad
+                            ),
+                            "active": (
+                                top_fov_propagated_proposal.active_after
+                            ),
+                        }
+                    )
                     accepted_dynamic_evidence[
                         "top_fov_propagated_state_handoff"
                     ] = propagated_handoff
+                    accepted_dynamic_evidence["top_fov_pitch_guidance"] = {
+                        "basis": TOP_FOV_PITCH_PROTECTION_BASIS,
+                        "track_id": top_fov_track_id,
+                        "safe_top_edge_image_down": (
+                            TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+                        ),
+                        "geometry_basis": (
+                            top_fov_propagated_observation.geometry_basis
+                        ),
+                        "projected_nominal_top_edge_image_down": (
+                            top_fov_propagated_observation
+                            .projected_nominal_top_edge_image_down
+                        ),
+                        "projected_top_edge_std_image_down": (
+                            top_fov_propagated_observation
+                            .projected_top_edge_std_image_down
+                        ),
+                        "prediction_horizon_remaining_s": (
+                            top_fov_propagated_observation
+                            .prediction_horizon_remaining_s
+                        ),
+                        **asdict(top_fov_propagated_proposal),
+                    }
                     host.recorder.emit(
                         "visual_course_dynamic_fov_gap_handoff",
                         gate_index=current_gate_index,
@@ -4508,6 +4746,9 @@ async def _run_visual_course_stage_impl(
                             snapshot.latest_camera_token
                         ),
                         authority=propagated_handoff,
+                        pitch_guidance=accepted_dynamic_evidence[
+                            "top_fov_pitch_guidance"
+                        ],
                         command=asdict(command),
                     )
             host.recorder.emit(

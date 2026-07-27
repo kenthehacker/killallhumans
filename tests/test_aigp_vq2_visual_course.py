@@ -2327,6 +2327,87 @@ def test_decreasing_top_clearance_cannot_worsen_predicted_clipping():
     assert recovered.limited is False
 
 
+def _propagated_top_fov_authority() -> dict[str, object]:
+    pitch = -0.271
+    return {
+        "basis": "propagated-current-fov-gap-steering-v1",
+        "camera_center_norm": [0.01, -0.35],
+        "camera_aperture_half_size_norm": [0.17, 0.30],
+        "camera_center_std_norm": [0.02, 0.02],
+        "aperture_log_scale_std": 0.10,
+        "body_to_reference_wxyz": [
+            math.cos(pitch / 2.0),
+            0.0,
+            math.sin(pitch / 2.0),
+            0.0,
+        ],
+        "vertical_angle_scale_rad": 0.55,
+        "aperture_prediction_horizon_remaining_s": 0.97,
+        "clipping": int(FrameEdge.TOP | FrameEdge.BOTTOM),
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+
+
+def test_propagated_top_fov_gap_keeps_protected_pitch_from_reversing():
+    prior_protected_pitch = -0.333
+    observation, proposal = (
+        course_stage._propose_propagated_top_fov_pitch_reference(
+            _propagated_top_fov_authority(),
+            requested_target_pitch_rad=0.120,
+            prior_target_pitch_rad=prior_protected_pitch,
+        )
+    )
+
+    assert observation.geometry_basis == (
+        course_stage.TOP_FOV_PROPAGATED_INNER_EDGE_BASIS
+    )
+    assert observation.projected_top_edge_image_down < (
+        observation.projected_nominal_top_edge_image_down
+    )
+    assert math.isfinite(proposal.protected_target_pitch_rad)
+    assert (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+        <= proposal.protected_target_pitch_rad
+        <= course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert proposal.protected_target_pitch_rad <= prior_protected_pitch
+    assert proposal.predicted_protected_top_edge_image_down >= (
+        proposal.predicted_requested_top_edge_image_down
+    )
+    assert (
+        proposal.envelope_saturated
+        or proposal.predicted_protected_top_edge_image_down
+        >= course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+    )
+    assert proposal.active_after is True
+    assert proposal.limited is True
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("steering_only", False),
+        ("passage_authority", True),
+        ("advance_authority", True),
+    ),
+)
+def test_propagated_top_fov_gap_cannot_gain_passage_or_advance_authority(
+    field,
+    invalid_value,
+):
+    authority = _propagated_top_fov_authority()
+    authority[field] = invalid_value
+
+    with pytest.raises(ValueError, match="steering-only"):
+        course_stage._propose_propagated_top_fov_pitch_reference(
+            authority,
+            requested_target_pitch_rad=0.120,
+            prior_target_pitch_rad=-0.333,
+        )
+
+
 def test_adverse_nonrotational_edge_motion_tightens_pitch_before_clipping():
     common = {
         "capture_pitch_rad": -0.27,

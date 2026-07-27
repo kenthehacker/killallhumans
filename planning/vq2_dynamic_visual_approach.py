@@ -1137,6 +1137,13 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "propagated FOV gap clock is invalid"
             )
+        if (
+            tuple(self.core.config.camera_to_body_wxyz)
+            != BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap lacks the calibrated camera boundary"
+            )
         staged = self._staged
         if staged is None or not track.history:
             raise DynamicCourseError(
@@ -1181,25 +1188,71 @@ class DynamicVisualCourseSession:
                 "propagated FOV gap decision and current state differ"
             )
 
-        aperture = current.aperture_half_size_norm
+        state_aperture = current.aperture_half_size_norm
+        decision_aperture = decision.current_aperture_half_size_norm
         seed_ns = current.aperture_seed_monotonic_ns
         deadline_ns = current.aperture_prediction_deadline_monotonic_ns
         if (
-            aperture is None
+            state_aperture is None
+            or decision_aperture is None
             or seed_ns is None
             or deadline_ns is None
             or not current.aperture_propagated
             or not decision.current_aperture_propagated
-            or decision.current_aperture_half_size_norm != aperture
             or seed_ns > current.state_monotonic_ns
             or deadline_ns <= seed_ns
             or any(
                 not math.isfinite(float(value)) or float(value) <= 0.0
-                for value in aperture
+                for value in (*state_aperture, *decision_aperture)
             )
         ):
             raise DynamicCourseError(
                 "propagated FOV gap lacks a clean propagated aperture"
+            )
+
+        # The state aperture is retained in the last clean camera orientation,
+        # while the decision aperture is reprojected into the current track's
+        # fixed passage orientation.  They describe the same gate but are not
+        # numerically identical under pitch/roll motion.  Reproject the local
+        # state once more into the current camera orientation for raw-FOV
+        # observability; validate each representation independently rather
+        # than using cross-coordinate tuple equality as authority.
+        camera_center, camera_aperture = self.core._decision_geometry(
+            current.track_id,
+            current.state_monotonic_ns,
+        )
+        config = self.core.config
+        horizontal_scale = float(config.horizontal_angle_scale_rad)
+        vertical_scale = float(config.vertical_angle_scale_rad)
+        camera_center_std_norm = (
+            float(current.bearing_std_rad[0]) / horizontal_scale,
+            float(current.bearing_std_rad[1]) / vertical_scale,
+        )
+        quaternion = current.body_to_reference_wxyz
+        if (
+            camera_aperture is None
+            or type(quaternion) is not tuple
+            or len(quaternion) != 4
+            or not all(
+                math.isfinite(float(value))
+                for value in (
+                    *camera_center,
+                    *camera_aperture,
+                    *camera_center_std_norm,
+                    current.log_scale_std,
+                    *quaternion,
+                    horizontal_scale,
+                    vertical_scale,
+                )
+            )
+            or any(float(value) <= 0.0 for value in camera_aperture)
+            or any(float(value) < 0.0 for value in camera_center_std_norm)
+            or float(current.log_scale_std) < 0.0
+            or horizontal_scale <= 0.0
+            or vertical_scale <= 0.0
+        ):
+            raise DynamicCourseError(
+                "propagated FOV gap camera projection is invalid"
             )
 
         expected_decision_age_s = max(
@@ -1281,7 +1334,15 @@ class DynamicVisualCourseSession:
             "aperture_prediction_horizon_remaining_s": (
                 remaining_horizon_s
             ),
-            "aperture_half_size_norm": list(aperture),
+            "aperture_half_size_norm": list(decision_aperture),
+            "state_aperture_half_size_norm": list(state_aperture),
+            "camera_center_norm": list(camera_center),
+            "camera_aperture_half_size_norm": list(camera_aperture),
+            "camera_center_std_norm": list(camera_center_std_norm),
+            "aperture_log_scale_std": float(current.log_scale_std),
+            "body_to_reference_wxyz": list(quaternion),
+            "horizontal_angle_scale_rad": horizontal_scale,
+            "vertical_angle_scale_rad": vertical_scale,
             "clipping": int(current.clipping),
             "terminal_crossing_clearance_norm": list(
                 decision.terminal_crossing_clearance_norm
