@@ -191,6 +191,7 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
         "dropout_held": False,
         "current_visible": True,
         "current_log_scale_std": 0.05,
+        "current_aperture_propagated": False,
     }
 
 
@@ -229,6 +230,13 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.crossing_x_q_rate_s == pytest.approx(0.30)
     assert sample.crossing_y_q_rate_s == pytest.approx(-0.40)
     assert sample.post_governor_contact_budget_s == pytest.approx(0.25)
+
+
+def test_propagated_aperture_cannot_mint_dynamic_near_plane_sample():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence["current_aperture_propagated"] = True
+
+    assert _dynamic_near_plane_sample(evidence) is None
 
 
 def test_dynamic_near_plane_wire_sample_maps_1cab_terminal_window():

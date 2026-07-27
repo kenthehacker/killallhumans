@@ -19,6 +19,7 @@ from competition.vq2_visual_tracker import (
     MultiTargetVisualTracker,
     VisualInnerApertureGeometry,
     VisualTrack,
+    VisualTrackRole,
 )
 from planning.vq2_dynamic_course import (
     AppliedCommandSample,
@@ -28,9 +29,18 @@ from planning.vq2_dynamic_course import (
     GateObservation,
     GuidanceDecision,
     ImuAttitudeSample,
+    MAX_TARGET_PITCH_RAD,
+    MAX_TARGET_ROLL_RAD,
     MAX_THRUST,
     MAX_YAW_RATE_RAD_S,
+    MIN_TARGET_PITCH_RAD,
     MIN_THRUST,
+    SUPPORT_THRUST,
+)
+from planning.vq2_gate_graph import (
+    AuthoritativeRaceStatusRef,
+    ConfirmedGateReacquisition,
+    RaceStatusProvenanceBasis,
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
@@ -113,6 +123,21 @@ class _StagedContext:
     adjacent_precredit: bool
     camera_token: CameraFrameToken
     tracker_frame_sequence: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PostCreditSuccessorSteering:
+    """Exact bounded lease for the successor already retained at race credit."""
+
+    race_status: AuthoritativeRaceStatusRef
+    from_gate_index: int
+    to_gate_index: int
+    reviewed_track_id: str
+    stream_generation: int
+    last_measurement_monotonic_ns: int
+    activation_monotonic_ns: int
+    expires_monotonic_ns: int
+    promotion_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,6 +337,9 @@ class DynamicVisualCourseSession:
         ] = None
         self._roll_reversal_count = 0
         self._last_nonzero_roll_sign = 0
+        self._post_credit_successor_steering: Optional[
+            _PostCreditSuccessorSteering
+        ] = None
 
     @property
     def has_applied_command(self) -> bool:
@@ -320,6 +348,10 @@ class DynamicVisualCourseSession:
     @property
     def last_decision(self) -> Optional[GuidanceDecision]:
         return self._last_decision
+
+    @property
+    def post_credit_successor_steering_active(self) -> bool:
+        return self._post_credit_successor_steering is not None
 
     def record_imu(self, sample: ImuAttitudeSample) -> None:
         self.core.record_imu(sample)
@@ -392,7 +424,12 @@ class DynamicVisualCourseSession:
                 aperture = None
                 clipping = track.clipping
                 center_censored = True
-                ambiguous = True
+                # Missing inner geometry censors control measurements, but it
+                # is not itself evidence that the graph-retained track
+                # identity is ambiguous.  The bounded local state may bridge
+                # exact TOP/BOTTOM near-plane clipping without consuming this
+                # outer center or scale.
+                ambiguous = bool(track.ambiguous)
                 measurement_std = (0.05, 0.06, 0.12)
             return GateObservation(
                 track_id=track.track_id,
@@ -506,6 +543,426 @@ class DynamicVisualCourseSession:
             tracker_frame_sequence=update.tracker_frame_sequence,
         )
 
+    @staticmethod
+    def _post_credit_lease_evidence(
+        lease: _PostCreditSuccessorSteering,
+    ) -> Mapping[str, Any]:
+        return {
+            "basis": (
+                "authoritative-post-credit-propagated-successor-steering-v1"
+            ),
+            "from_gate_index": lease.from_gate_index,
+            "to_gate_index": lease.to_gate_index,
+            "reviewed_track_id": lease.reviewed_track_id,
+            "stream_generation": lease.stream_generation,
+            "race_status_sequence": (
+                lease.race_status.race_status_sequence
+            ),
+            "credit_received_monotonic_ns": (
+                lease.race_status.received_monotonic_ns
+            ),
+            "last_measurement_monotonic_ns": (
+                lease.last_measurement_monotonic_ns
+            ),
+            "activation_monotonic_ns": lease.activation_monotonic_ns,
+            "expires_monotonic_ns": lease.expires_monotonic_ns,
+            "promotion_count": lease.promotion_count,
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        }
+
+    def activate_post_credit_successor_steering(
+        self,
+        race_status: AuthoritativeRaceStatusRef,
+        *,
+        from_gate_index: int,
+        reviewed_track_id: str,
+        activation_monotonic_ns: int,
+    ) -> Mapping[str, Any]:
+        """Promote an already-bound successor for one bounded steering lease.
+
+        The authoritative race status supplies gate ownership.  This method
+        changes only the dynamic controller's current/successor roles; rolling
+        graph promotion remains exclusively owned by the graph coordinator.
+        """
+
+        if type(race_status) is not AuthoritativeRaceStatusRef:
+            raise DynamicCourseError(
+                "post-credit steering requires exact race status"
+            )
+        if (
+            race_status.provenance_basis
+            is not RaceStatusProvenanceBasis.LIVE_INGRESS
+            or race_status.race_finished
+            or race_status.host_clock_id != _HOST_CLOCK_ID
+            or type(race_status.race_status_sequence) is not int
+            or type(race_status.received_monotonic_ns) is not int
+        ):
+            raise DynamicCourseError(
+                "post-credit steering requires live nonterminal race credit"
+            )
+        if type(from_gate_index) is not int or from_gate_index < 0:
+            raise DynamicCourseError(
+                "post-credit steering source gate is invalid"
+            )
+        if type(reviewed_track_id) is not str or not reviewed_track_id:
+            raise DynamicCourseError(
+                "post-credit steering reviewed identity is invalid"
+            )
+        if (
+            type(activation_monotonic_ns) is not int
+            or activation_monotonic_ns < 0
+        ):
+            raise DynamicCourseError(
+                "post-credit steering activation clock is invalid"
+            )
+        to_gate_index = from_gate_index + 1
+        if race_status.active_gate_index != to_gate_index:
+            raise DynamicCourseError(
+                "post-credit steering race credit is not sequential"
+            )
+
+        active = self._post_credit_successor_steering
+        if active is not None:
+            if (
+                active.race_status == race_status
+                and active.from_gate_index == from_gate_index
+                and active.reviewed_track_id == reviewed_track_id
+                and active.activation_monotonic_ns
+                == activation_monotonic_ns
+            ):
+                state = self.core.course_state()
+                if (
+                    state.current_gate_index != active.to_gate_index
+                    or state.current_track_id != active.reviewed_track_id
+                    or state.promotion_count != active.promotion_count
+                ):
+                    raise DynamicCourseError(
+                        "post-credit steering lease lost dynamic ownership"
+                    )
+                return self._post_credit_lease_evidence(active)
+            raise DynamicCourseError(
+                "a different post-credit steering lease is already active"
+            )
+
+        state = self.core.course_state()
+        successor = state.successor
+        if (
+            state.current_gate_index != from_gate_index
+            or state.current_track_id == reviewed_track_id
+            or state.successor_track_id != reviewed_track_id
+            or successor is None
+            or successor.track_id != reviewed_track_id
+            or successor.stream_generation
+            != state.current.stream_generation
+            or successor.sample_count < 4
+            or successor.ambiguous
+        ):
+            raise DynamicCourseError(
+                "post-credit steering lacks the reviewed bound successor"
+            )
+        received_ns = race_status.received_monotonic_ns
+        assert type(received_ns) is int
+        last_measurement_ns = successor.last_measurement_monotonic_ns
+        horizon_ns = round(
+            self.core.config.successor_prediction_max_horizon_s
+            * 1_000_000_000.0
+        )
+        expires_ns = min(
+            received_ns + horizon_ns,
+            last_measurement_ns + horizon_ns,
+        )
+        if (
+            activation_monotonic_ns < received_ns
+            or activation_monotonic_ns
+            < successor.state_monotonic_ns
+            or activation_monotonic_ns > expires_ns
+        ):
+            raise DynamicCourseError(
+                "post-credit activation is outside its causal bounded horizon"
+            )
+        applied = self._last_applied_sample
+        if (
+            applied is None
+            or self._wire_governor.last_command is None
+            or applied.monotonic_ns > activation_monotonic_ns
+        ):
+            raise DynamicCourseError(
+                "post-credit steering lacks causal accepted-command memory"
+            )
+        promoted = self.core.promote_authoritative(
+            from_gate_index=from_gate_index,
+            to_gate_index=to_gate_index,
+            promoted_track_id=reviewed_track_id,
+            next_successor_track_id=None,
+            monotonic_ns=activation_monotonic_ns,
+        )
+        lease = _PostCreditSuccessorSteering(
+            race_status=race_status,
+            from_gate_index=from_gate_index,
+            to_gate_index=to_gate_index,
+            reviewed_track_id=reviewed_track_id,
+            stream_generation=successor.stream_generation,
+            last_measurement_monotonic_ns=last_measurement_ns,
+            activation_monotonic_ns=activation_monotonic_ns,
+            expires_monotonic_ns=expires_ns,
+            promotion_count=promoted.promotion_count,
+        )
+        self._post_credit_successor_steering = lease
+        self._staged = None
+        self._last_decision = None
+        return self._post_credit_lease_evidence(lease)
+
+    def post_credit_successor_steering_authority(
+        self,
+        *,
+        now_monotonic_ns: int,
+    ) -> Mapping[str, Any]:
+        """Return bounded steering-only authority while successor vision gaps."""
+
+        if type(now_monotonic_ns) is not int or now_monotonic_ns < 0:
+            raise DynamicCourseError(
+                "post-credit steering clock is invalid"
+            )
+        lease = self._post_credit_successor_steering
+        if lease is None:
+            raise DynamicCourseError(
+                "post-credit successor steering is not active"
+            )
+        if (
+            now_monotonic_ns < lease.activation_monotonic_ns
+            or now_monotonic_ns > lease.expires_monotonic_ns
+        ):
+            self._post_credit_successor_steering = None
+            raise DynamicCourseError(
+                "post-credit successor steering expired"
+            )
+        state = self.core.course_state()
+        if (
+            state.current_gate_index != lease.to_gate_index
+            or state.current_track_id != lease.reviewed_track_id
+            or state.current.stream_generation != lease.stream_generation
+            or state.promotion_count != lease.promotion_count
+        ):
+            raise DynamicCourseError(
+                "post-credit successor steering lost dynamic ownership"
+            )
+        prediction = self.core.predict_track_steering(
+            lease.reviewed_track_id,
+            now_monotonic_ns,
+        )
+        if (
+            prediction.stream_generation != lease.stream_generation
+            or prediction.last_measurement_monotonic_ns
+            != lease.last_measurement_monotonic_ns
+            or prediction.measurement_age_s
+            > self.core.config.successor_prediction_max_horizon_s + 1e-12
+        ):
+            self._post_credit_successor_steering = None
+            raise DynamicCourseError(
+                "post-credit successor steering prediction is no longer "
+                "the credited bounded state"
+            )
+
+        target_roll = self.core.config.roll_guidance_sign * (
+            self.core.config.roll_gain
+            * prediction.stable_bearing_rad[0]
+            + self.core.config.lateral_rate_gain
+            * prediction.stable_bearing_rate_rad_s[0]
+        )
+        target_roll = min(
+            MAX_TARGET_ROLL_RAD,
+            max(-MAX_TARGET_ROLL_RAD, target_roll),
+        )
+        target_pitch = min(
+            MAX_TARGET_PITCH_RAD,
+            max(
+                MIN_TARGET_PITCH_RAD,
+                self.core.config.brake_pitch_rad,
+            ),
+        )
+        camera_heading = math.atan(
+            prediction.camera_center_norm[0]
+            * self.core.config.horizontal_angle_scale_rad
+        )
+        yaw_rate = min(
+            MAX_YAW_RATE_RAD_S,
+            max(
+                -MAX_YAW_RATE_RAD_S,
+                -self.core.config.yaw_gain * camera_heading,
+            ),
+        )
+        values = (
+            target_roll,
+            target_pitch,
+            yaw_rate,
+            SUPPORT_THRUST,
+            *prediction.stable_bearing_rad,
+            *prediction.stable_bearing_rate_rad_s,
+            *prediction.camera_center_norm,
+            *prediction.camera_center_rate_norm_s,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise DynamicCourseError(
+                "post-credit successor steering produced non-finite authority"
+            )
+        applied = self._last_applied_sample
+        wire_command = self._wire_governor.last_command
+        if (
+            applied is None
+            or wire_command is None
+            or applied.monotonic_ns > now_monotonic_ns
+        ):
+            raise DynamicCourseError(
+                "post-credit steering lacks accepted wire continuity"
+            )
+        evidence = dict(self._post_credit_lease_evidence(lease))
+        evidence.update(
+            {
+                "target_roll_rad": target_roll,
+                "target_pitch_rad": target_pitch,
+                "yaw_rate_rad_s": yaw_rate,
+                "thrust": SUPPORT_THRUST,
+                "wire_command": wire_command,
+                "source_wire_start_monotonic_ns": (
+                    applied.monotonic_ns
+                ),
+                "authority_monotonic_ns": now_monotonic_ns,
+                "measurement_age_s": prediction.measurement_age_s,
+                "horizon_remaining_s": (
+                    lease.expires_monotonic_ns - now_monotonic_ns
+                )
+                / 1_000_000_000.0,
+                "stable_bearing_rad": list(
+                    prediction.stable_bearing_rad
+                ),
+                "stable_bearing_rate_rad_s": list(
+                    prediction.stable_bearing_rate_rad_s
+                ),
+                "camera_center_norm": list(
+                    prediction.camera_center_norm
+                ),
+                "camera_center_rate_norm_s": list(
+                    prediction.camera_center_rate_norm_s
+                ),
+                "bearing_std_rad": list(
+                    prediction.bearing_std_rad
+                ),
+                "body_rates_rad_s": list(
+                    prediction.body_rates_rad_s
+                ),
+            }
+        )
+        return evidence
+
+    def rebind_confirmed_reacquisition(
+        self,
+        reacquisition: ConfirmedGateReacquisition,
+        tracker: MultiTargetVisualTracker,
+    ) -> Mapping[str, Any]:
+        """Bind a graph-proven fresh post-credit identity into dynamic state."""
+
+        if type(reacquisition) is not ConfirmedGateReacquisition:
+            raise DynamicCourseError(
+                "dynamic fresh rebind requires exact graph proof"
+            )
+        if type(tracker) is not MultiTargetVisualTracker:
+            raise DynamicCourseError(
+                "dynamic fresh rebind requires the exact tracker"
+            )
+        lease = self._post_credit_successor_steering
+        if lease is None:
+            raise DynamicCourseError(
+                "dynamic fresh rebind lacks an active credited lease"
+            )
+        advance = reacquisition.credited_advance
+        if (
+            reacquisition.cross_gap_identity_claimed
+            or advance.race_status != lease.race_status
+            or advance.from_gate_index != lease.from_gate_index
+            or advance.to_gate_index != lease.to_gate_index
+            or advance.reviewed_track_id != lease.reviewed_track_id
+            or reacquisition.gate_index != lease.to_gate_index
+            or reacquisition.reacquired_track_id
+            == lease.reviewed_track_id
+        ):
+            raise DynamicCourseError(
+                "dynamic fresh rebind proof differs from credited ownership"
+            )
+        update = tracker.latest_update
+        if (
+            update is None
+            or update.token != reacquisition.camera_token_at_binding
+        ):
+            raise DynamicCourseError(
+                "dynamic fresh rebind lacks the exact binding publication"
+            )
+        try:
+            track = tracker.track(reacquisition.reacquired_track_id)
+        except KeyError as exc:
+            raise DynamicCourseError(
+                "dynamic fresh rebind track is absent"
+            ) from exc
+        if (
+            track.latest_token != reacquisition.camera_token_at_binding
+            or track.first_token != reacquisition.reacquired_first_token
+            or not track.visible
+            or track.ambiguous
+            or track.role is not VisualTrackRole.CURRENT
+            or track.authoritative_gate_index != lease.to_gate_index
+            or track.authority_race_status_sequence
+            != lease.race_status.race_status_sequence
+        ):
+            raise DynamicCourseError(
+                "dynamic fresh rebind track lacks graph current authority"
+            )
+        known_track_ids = {
+            state.track_id for state in self.core.track_states
+        }
+        if (
+            self._last_frame_by_track.get(track.track_id)
+            != update.tracker_frame_sequence
+        ):
+            self.core.observe_track(
+                self._track_observation(
+                    track,
+                    tracker_frame_sequence=update.tracker_frame_sequence,
+                    observation_monotonic_ns=(
+                        update.observation_monotonic_ns
+                    ),
+                    stream_generation=update.token.generation,
+                )
+            )
+            self._last_frame_by_track[track.track_id] = (
+                update.tracker_frame_sequence
+            )
+        elif track.track_id not in known_track_ids:
+            raise DynamicCourseError(
+                "dynamic fresh rebind publication was consumed without state"
+            )
+        rebound = self.core.bind(
+            current_gate_index=lease.to_gate_index,
+            current_track_id=track.track_id,
+            successor_track_id=None,
+        )
+        self._post_credit_successor_steering = None
+        self._staged = None
+        self._last_decision = None
+        return {
+            "basis": "graph-proven-fresh-post-credit-dynamic-rebind-v1",
+            "from_gate_index": lease.from_gate_index,
+            "to_gate_index": lease.to_gate_index,
+            "reviewed_track_id": lease.reviewed_track_id,
+            "reacquired_track_id": track.track_id,
+            "binding_camera_token": asdict(
+                reacquisition.camera_token_at_binding
+            ),
+            "stream_generation": update.token.generation,
+            "promotion_count": rebound.promotion_count,
+            "cross_gap_identity_claimed": False,
+        }
+
     def _prepare_roles(
         self,
         *,
@@ -545,6 +1002,18 @@ class DynamicVisualCourseSession:
                 raise DynamicCourseError(
                     "same-gate dynamic current identity changed"
                 )
+            active = self._post_credit_successor_steering
+            if active is not None:
+                if (
+                    active.to_gate_index
+                    != staged.expected_gate_index
+                    or active.reviewed_track_id != current_track_id
+                    or active.promotion_count != state.promotion_count
+                ):
+                    raise DynamicCourseError(
+                        "same-gate recovery differs from post-credit ownership"
+                    )
+                self._post_credit_successor_steering = None
             retained_successor = (
                 successor_track_id
                 if successor_track_id is not None
@@ -715,6 +1184,23 @@ class DynamicVisualCourseSession:
                     "camera_current_center_norm": list(
                         decision.camera_current_center_norm
                     ),
+                    "current_aperture_half_size_norm": (
+                        None
+                        if decision.current_aperture_half_size_norm is None
+                        else list(
+                            decision.current_aperture_half_size_norm
+                        )
+                    ),
+                    "current_aperture_propagated": (
+                        decision.current_aperture_propagated
+                    ),
+                    "current_aperture_prediction_age_s": (
+                        decision.current_aperture_prediction_age_s
+                    ),
+                    "current_aperture_prediction_horizon_remaining_s": (
+                        decision
+                        .current_aperture_prediction_horizon_remaining_s
+                    ),
                     "passage_point_norm": list(
                         decision.passage_point_norm
                     ),
@@ -855,15 +1341,32 @@ class DynamicVisualCourseSession:
                         course.current.visible
                         and not course.current.ambiguous
                         and not any(course.current.censored_axes)
+                        and not course.current.aperture_propagated
                         and all(
                             course.current.bearing_rate_qualified
                         )
                         and course.current.scale_rate_qualified
-                        and (
-                            course.current.log_scale
-                            - 2.0 * course.current.log_scale_std
+                        and decision.current_time_to_contact_s is not None
+                        and decision.crossing_prediction_horizon_s
+                        >= decision.current_time_to_contact_s - 1e-9
+                        and all(
+                            allowance > 0.0
+                            for allowance in (
+                                decision.crossing_allowance_norm
+                            )
                         )
-                        >= self.core.config.passage_arm_min_log_scale
+                        and all(
+                            clearance >= 0.0
+                            for clearance in (
+                                decision.terminal_crossing_clearance_norm
+                            )
+                        )
+                        and (
+                            post_governor_contact_budget_s is not None
+                            and post_governor_contact_budget_s
+                            >= self.core.config
+                            .terminal_min_post_governor_contact_budget_s
+                        )
                     ),
                     "current_visible": course.current.visible,
                     "current_ambiguous": course.current.ambiguous,
@@ -1044,9 +1547,12 @@ class _DynamicImageServo:
             and current_dynamic.visible
             and not current_dynamic.ambiguous
             and not any(current_dynamic.censored_axes)
+            and not current_dynamic.aperture_propagated
             and all(current_dynamic.bearing_rate_qualified)
             and current_dynamic.scale_rate_qualified
             and decision.current_time_to_contact_s is not None
+            and decision.crossing_prediction_horizon_s
+            >= decision.current_time_to_contact_s - 1e-9
             and decision.current_time_to_contact_s
             >= (
                 self.session.core.config.thrust_command_delay_s
@@ -1075,26 +1581,38 @@ class _DynamicImageServo:
             and float(current.normalized_y_rate_down_s)
             >= -self.session.core.config.vertical_settled_rate_norm_s
         )
-        passage_plane_ready = bool(
+        propagated_commitment = bool(
             decision is not None
-            and current_dynamic.visible
-            and not current_dynamic.ambiguous
-            and not any(current_dynamic.censored_axes)
-            and all(current_dynamic.bearing_rate_qualified)
-            and current_dynamic.scale_rate_qualified
-            and (
-                current_dynamic.log_scale
-                - 2.0 * current_dynamic.log_scale_std
+            and current_dynamic.aperture_propagated
+            and decision.current_aperture_half_size_norm is not None
+            and decision.current_aperture_prediction_horizon_remaining_s > 0.0
+            and self._corridor_frames
+            >= self.tuning.required_corridor_frames
+            and decision.current_time_to_contact_s is not None
+            and all(
+                allowance > 0.0
+                for allowance in decision.crossing_allowance_norm
             )
-            >= self.session.core.config.passage_arm_min_log_scale
+            and all(
+                clearance >= 0.0
+                for clearance in decision.terminal_crossing_clearance_norm
+            )
+        )
+        passage_plane_ready = bool(
+            terminal_history_qualified or propagated_commitment
         )
         within_corridor = bool(
-            passage_plane_ready and terminal_history_qualified
+            terminal_history_qualified or propagated_commitment
         )
         self._corridor_frames = (
-            (
-                self._corridor_frames + 1
-                if terminal_history_qualified
+            max(
+                self._corridor_frames + 1,
+                self.tuning.required_corridor_frames,
+            )
+            if terminal_history_qualified
+            else (
+                self._corridor_frames
+                if propagated_commitment
                 else 0
             )
         )
@@ -1249,10 +1767,45 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             # publication.  Outer red support may touch an image edge while
             # the complete fitted opening remains clean and co-timed.
             if (
-                mode is not VisualApproachMode.APPROACH
-                or _complete_current_inner_geometry(current) is None
+                mode
+                not in {
+                    VisualApproachMode.APPROACH,
+                    VisualApproachMode.PASSAGE,
+                }
+                or (
+                    _complete_current_inner_geometry(current) is None
+                    and not self._has_exact_propagated_current_state(
+                        current
+                    )
+                )
             ):
                 raise
+
+    def _has_exact_propagated_current_state(
+        self,
+        track: VisualTrack,
+    ) -> bool:
+        try:
+            state = self._dynamic_session.core.course_state().current
+        except DynamicCourseError:
+            return False
+        horizontal_clip = bool(
+            track.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+        )
+        return bool(
+            state.track_id == track.track_id
+            and track.visible
+            and not track.ambiguous
+            and not horizontal_clip
+            and state.frame_sequence
+            == track.history[-1].tracker_frame_sequence
+            and state.aperture_half_size_norm is not None
+            and state.aperture_propagated
+            and state.aperture_seed_monotonic_ns is not None
+            and state.aperture_prediction_deadline_monotonic_ns is not None
+            and state.state_monotonic_ns
+            <= state.aperture_prediction_deadline_monotonic_ns
+        )
 
     def _target(
         self,
@@ -1269,16 +1822,18 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
         if not require_current_authority:
             return target
         inner = _complete_current_inner_geometry(track)
+        propagated = self._has_exact_propagated_current_state(track)
         if (
-            inner is None
-            or (
+            not propagated
+            and (
+                inner is None
+                or (
                 track.clipping == FrameEdge.NONE
                 and not track.center_censored
+                )
             )
         ):
             return target
-        assert inner.center_norm is not None
-        assert inner.log_scale is not None
         try:
             state = self._dynamic_session.core.course_state().current
         except DynamicCourseError:
@@ -1288,14 +1843,74 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
         if (
             state.track_id != track.track_id
             or state.frame_sequence != track.history[-1].tracker_frame_sequence
-            or state.raw_center_norm != inner.center_norm
-            or state.raw_log_scale != inner.log_scale
-            or any(state.censored_axes)
+            or (
+                not propagated
+                and (
+                    inner is None
+                    or state.raw_center_norm != inner.center_norm
+                    or state.raw_log_scale != inner.log_scale
+                    or any(state.censored_axes)
+                )
+            )
         ):
             raise VisualApproachRefusal(
                 "dynamic current target differs from complete inner geometry"
             )
         scale = self._dynamic_session.core.config
+        if propagated:
+            now_ns = round(float(now_monotonic_s) * 1_000_000_000.0)
+            if (
+                state.aperture_prediction_deadline_monotonic_ns is None
+                or now_ns
+                > state.aperture_prediction_deadline_monotonic_ns
+            ):
+                raise VisualApproachCurrentGeometryUnavailable(
+                    "propagated current-gate state expired"
+                )
+            camera_center, _ = (
+                self._dynamic_session.core._decision_geometry(
+                    track.track_id,
+                    now_ns,
+                )
+            )
+            prediction_span_ns = (
+                state.aperture_prediction_deadline_monotonic_ns
+                - state.aperture_seed_monotonic_ns
+            )
+            assert prediction_span_ns > 0
+            remaining_fraction = max(
+                0.0,
+                min(
+                    1.0,
+                    (
+                        state.aperture_prediction_deadline_monotonic_ns
+                        - now_ns
+                    )
+                    / prediction_span_ns,
+                ),
+            )
+            return replace(
+                target,
+                normalized_x=float(camera_center[0]),
+                normalized_y_down=float(camera_center[1]),
+                normalized_x_rate_s=(
+                    state.residual_translational_rate_rad_s[0]
+                    / scale.horizontal_angle_scale_rad
+                ),
+                normalized_y_rate_down_s=(
+                    state.residual_translational_rate_rad_s[1]
+                    / scale.vertical_angle_scale_rad
+                ),
+                log_scale=float(state.log_scale),
+                confidence=min(
+                    float(track.confidence),
+                    float(track.association_confidence),
+                )
+                * remaining_fraction,
+            )
+        assert inner is not None
+        assert inner.center_norm is not None
+        assert inner.log_scale is not None
         return replace(
             target,
             normalized_x=float(inner.center_norm[0]),
@@ -1327,6 +1942,14 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
         next_target: Optional[VisualTarget],
         output: VisualServoOutput,
     ) -> Optional[VisualApproachPassageAdmission]:
+        decision = self._dynamic_session.last_decision
+        if (
+            decision is not None
+            and decision.current_aperture_propagated
+        ):
+            # Propagated geometry may consume a clean commitment but cannot
+            # mint a new passage admission on a censored publication.
+            return None
         admission = super()._passage_admission_from_approach(
             snapshot,
             current_target,

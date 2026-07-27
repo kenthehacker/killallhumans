@@ -616,7 +616,9 @@ class NearPlaneLatch:
         ):
             raise ValueError("near-plane latch anchor is discontinuous")
         if (
-            float(self.anchor_sample.log_scale)
+            self.anchor_sample.geometry_basis
+            != DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS
+            and float(self.anchor_sample.log_scale)
             < float(self.crossing_min_log_scale)
         ):
             raise ValueError("near-plane latch has not reached close scale")
@@ -807,9 +809,6 @@ def advance_dynamic_near_plane_evidence(
         if not same_lineage or not strictly_advancing:
             return NearPlaneEvidence(), None
 
-    scale_lower_bound = float(sample.log_scale) - 2.0 * float(
-        sample.log_scale_std
-    )
     assert sample.predicted_crossing_x_norm is not None
     assert sample.predicted_crossing_y_down_norm is not None
     assert sample.predicted_crossing_x_std_norm is not None
@@ -886,7 +885,6 @@ def advance_dynamic_near_plane_evidence(
     )
     if (
         len(retained) < required_corridor_frames
-        or scale_lower_bound < float(crossing_min_log_scale)
         # Contact budget describes the command that can be acted on now.  A
         # historical sample's older wire/request gap cannot invalidate an
         # otherwise continuous terminal-geometry corridor.

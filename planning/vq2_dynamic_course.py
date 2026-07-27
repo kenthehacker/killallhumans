@@ -639,6 +639,9 @@ class TrackDynamicState:
     raw_center_norm: Vector2 | None
     raw_log_scale: float | None
     aperture_half_size_norm: Vector2 | None
+    aperture_seed_monotonic_ns: int | None
+    aperture_prediction_deadline_monotonic_ns: int | None
+    aperture_propagated: bool
     bearing_rad: Vector2
     bearing_rate_rad_s: Vector2
     bearing_rate_qualified: tuple[bool, bool]
@@ -663,6 +666,29 @@ class TrackDynamicState:
     confidence: float
     sample_count: int
     missed_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrackSteeringPrediction:
+    """Bounded image-space track prediction at one control instant.
+
+    This is a local camera/attitude projection, not a pose or world-position
+    estimate.  Accepted commands propagate the stable bearing while current
+    IMU attitude and body rates project its center and rate into the camera.
+    """
+
+    track_id: str
+    stream_generation: int
+    monotonic_ns: int
+    source_state_monotonic_ns: int
+    last_measurement_monotonic_ns: int
+    measurement_age_s: float
+    stable_bearing_rad: Vector2
+    stable_bearing_rate_rad_s: Vector2
+    camera_center_norm: Vector2
+    camera_center_rate_norm_s: Vector2
+    bearing_std_rad: Vector2
+    body_rates_rad_s: Vector3
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +721,9 @@ class GuidanceDecision:
     current_center_norm: Vector2
     camera_current_center_norm: Vector2
     current_aperture_half_size_norm: Vector2 | None
+    current_aperture_propagated: bool
+    current_aperture_prediction_age_s: float
+    current_aperture_prediction_horizon_remaining_s: float
     passage_point_norm: Vector2
     successor_passage_authority: float
     centered_crossing_clearance_norm: Vector2
@@ -1075,10 +1104,8 @@ class DynamicCourseCore:
         if not observation.visible:
             if existing is None:
                 raise DynamicCourseError("an invisible observation cannot initialise a track")
-            existing.measured_bearing_history.clear()
             for history in existing.measured_aperture_history:
                 history.clear()
-            existing.last_measured_aperture_half_size_norm = None
             for history in existing.measured_residual_rate_history:
                 history.clear()
             existing.residual_rate_reanchor_required[:] = [True, True]
@@ -1128,6 +1155,12 @@ class DynamicCourseCore:
                 last_measured_center_norm=observation.center_norm,
                 last_measured_aperture_half_size_norm=(
                     observation.aperture_half_size_norm
+                    if (
+                        observation.aperture_half_size_norm is not None
+                        and not observation.ambiguous
+                        and not any(observation.censored_axes)
+                    )
+                    else None
                 ),
                 measured_aperture_history=(
                     (
@@ -1250,7 +1283,11 @@ class DynamicCourseCore:
         if rate_gap or observation.ambiguous:
             for history in existing.measured_aperture_history:
                 history.clear()
-        if observation.aperture_half_size_norm is not None:
+        if (
+            observation.aperture_half_size_norm is not None
+            and not observation.ambiguous
+            and not any(observation.censored_axes)
+        ):
             aperture_values = list(
                 observation.aperture_half_size_norm
                 if stabilized_aperture is None
@@ -1293,11 +1330,19 @@ class DynamicCourseCore:
         existing.last_measured_raw_angle = raw_angle
         existing.last_measured_stable_ray = stable_ray
         existing.last_raw_measurement_ns = capture_ns
-        existing.last_measurement_camera_to_world = camera_to_world
-        existing.last_measured_center_norm = observation.center_norm
-        existing.last_measured_aperture_half_size_norm = (
-            stabilized_aperture
-        )
+        if (
+            observation.aperture_half_size_norm is not None
+            and not observation.ambiguous
+            and not any(observation.censored_axes)
+        ):
+            # These fields are one coherent aperture anchor.  Outer-support
+            # fallback publications may update bearing/rates, but cannot move
+            # the aperture seed independently of its measured corners.
+            existing.last_measurement_camera_to_world = camera_to_world
+            existing.last_measured_center_norm = observation.center_norm
+            existing.last_measured_aperture_half_size_norm = (
+                stabilized_aperture
+            )
         if observation.ambiguous or observation.censored_axes[0]:
             existing.measured_bearing_history.clear()
         else:
@@ -1323,6 +1368,11 @@ class DynamicCourseCore:
     ) -> TrackDynamicState:
         assert observation.center_norm is not None
         assert observation.log_scale is not None
+        clean_aperture = bool(
+            observation.aperture_half_size_norm is not None
+            and not observation.ambiguous
+            and not any(observation.censored_axes)
+        )
         std_x = observation.measurement_std[0] * self.config.horizontal_angle_scale_rad
         std_y = observation.measurement_std[1] * self.config.vertical_angle_scale_rad
         return TrackDynamicState(
@@ -1335,7 +1385,23 @@ class DynamicCourseCore:
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=observation.center_norm,
             raw_log_scale=observation.log_scale,
-            aperture_half_size_norm=observation.aperture_half_size_norm,
+            aperture_half_size_norm=(
+                observation.aperture_half_size_norm
+                if clean_aperture
+                else None
+            ),
+            aperture_seed_monotonic_ns=(
+                capture_ns
+                if clean_aperture
+                else None
+            ),
+            aperture_prediction_deadline_monotonic_ns=(
+                capture_ns
+                + round(self.config.dropout_hold_s * _NS_PER_SECOND)
+                if clean_aperture
+                else None
+            ),
+            aperture_propagated=False,
             bearing_rad=bearing,
             bearing_rate_rad_s=(0.0, 0.0),
             bearing_rate_qualified=(False, False),
@@ -1593,6 +1659,7 @@ class DynamicCourseCore:
         scale_measurement_usable = bool(
             observation.clipping == FrameEdge.NONE
             and not observation.ambiguous
+            and not any(censored)
         )
         scale_rate_qualified = bool(
             scale_measurement_usable
@@ -1659,8 +1726,66 @@ class DynamicCourseCore:
             filtered_log_scale_std = max(
                 previous.log_scale_std,
                 filtered_log_scale_std,
-            )
+        )
         ttc = self._time_to_contact(expansion)
+        measured_aperture = (
+            stabilized_aperture
+            if (
+                observation.aperture_half_size_norm is not None
+                and not observation.ambiguous
+                and not any(censored)
+            )
+            else None
+        )
+        if measured_aperture is not None:
+            prediction_horizon_s = (
+                self.config.dropout_hold_s
+                if not scale_rate_qualified or ttc is None
+                else min(
+                    self.config.crossing_prediction_max_horizon_s,
+                    max(
+                        self.config.dropout_hold_s,
+                        ttc
+                        + self.config
+                        .terminal_min_post_governor_contact_budget_s,
+                    ),
+                )
+            )
+            aperture = measured_aperture
+            aperture_seed_ns = capture_ns
+            aperture_deadline_ns = capture_ns + round(
+                prediction_horizon_s * _NS_PER_SECOND
+            )
+            aperture_propagated = False
+        elif (
+            previous.aperture_half_size_norm is not None
+            and previous.aperture_seed_monotonic_ns is not None
+            and previous.aperture_prediction_deadline_monotonic_ns is not None
+            and capture_ns
+            <= previous.aperture_prediction_deadline_monotonic_ns
+            and not observation.ambiguous
+            and not bool(
+                observation.clipping
+                & (FrameEdge.LEFT | FrameEdge.RIGHT)
+            )
+        ):
+            scale_factor = math.exp(
+                _clamp(log_scale - previous.log_scale, -1.0, 1.0)
+            )
+            aperture = tuple(
+                min(2.0, max(1e-6, value * scale_factor))
+                for value in previous.aperture_half_size_norm
+            )
+            aperture_seed_ns = previous.aperture_seed_monotonic_ns
+            aperture_deadline_ns = (
+                previous.aperture_prediction_deadline_monotonic_ns
+            )
+            aperture_propagated = True
+        else:
+            aperture = None
+            aperture_seed_ns = None
+            aperture_deadline_ns = None
+            aperture_propagated = False
         return TrackDynamicState(
             track_id=observation.track_id,
             stream_generation=observation.stream_generation,
@@ -1671,10 +1796,16 @@ class DynamicCourseCore:
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=observation.center_norm,
             raw_log_scale=observation.log_scale,
-            # Passage geometry is measurement evidence, not a coasting state.
-            # Once this publication lacks a usable inner-aperture fit, keep
-            # identity/bearing prediction but withdraw all clearance authority.
-            aperture_half_size_norm=stabilized_aperture,
+            # One clean passage-usable inner aperture seeds a bounded local
+            # gate-relative state.  Subsequent censored publications may
+            # propagate it with the identified scale/command model, but they
+            # cannot renew its deadline or create race/passage credit.
+            aperture_half_size_norm=aperture,
+            aperture_seed_monotonic_ns=aperture_seed_ns,
+            aperture_prediction_deadline_monotonic_ns=(
+                aperture_deadline_ns
+            ),
+            aperture_propagated=aperture_propagated,
             bearing_rad=(bearing_values[0], bearing_values[1]),
             bearing_rate_rad_s=(bearing_rates[0], bearing_rates[1]),
             bearing_rate_qualified=(
@@ -1727,6 +1858,36 @@ class DynamicCourseCore:
             delayed,
             dt,
         )
+        aperture_prediction_valid = bool(
+            previous.aperture_half_size_norm is not None
+            and previous.aperture_seed_monotonic_ns is not None
+            and previous.aperture_prediction_deadline_monotonic_ns is not None
+            and capture_ns
+            <= previous.aperture_prediction_deadline_monotonic_ns
+            and not observation.ambiguous
+        )
+        aperture = (
+            tuple(
+                min(
+                    2.0,
+                    max(
+                        1e-6,
+                        value
+                        * math.exp(
+                            _clamp(
+                                log_scale - previous.log_scale,
+                                -1.0,
+                                1.0,
+                            )
+                        ),
+                    ),
+                )
+                for value in previous.aperture_half_size_norm
+            )
+            if aperture_prediction_valid
+            and previous.aperture_half_size_norm is not None
+            else None
+        )
         state = TrackDynamicState(
             track_id=previous.track_id,
             stream_generation=previous.stream_generation,
@@ -1737,9 +1898,18 @@ class DynamicCourseCore:
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=None,
             raw_log_scale=None,
-            # A coast may retain bearing lineage, but it cannot mint current
-            # passage clearance from stale aperture geometry.
-            aperture_half_size_norm=None,
+            aperture_half_size_norm=aperture,
+            aperture_seed_monotonic_ns=(
+                previous.aperture_seed_monotonic_ns
+                if aperture_prediction_valid
+                else None
+            ),
+            aperture_prediction_deadline_monotonic_ns=(
+                previous.aperture_prediction_deadline_monotonic_ns
+                if aperture_prediction_valid
+                else None
+            ),
+            aperture_propagated=aperture_prediction_valid,
             bearing_rad=bearing,
             bearing_rate_rad_s=rate,
             bearing_rate_qualified=(False, False),
@@ -1841,6 +2011,216 @@ class DynamicCourseCore:
             recent_commands=tuple(self._commands),
             last_applied_command=self._last_applied_command,
             promotion_count=self._promotion_count,
+        )
+
+    def predict_track_steering(
+        self,
+        track_id: str,
+        monotonic_ns: int,
+    ) -> TrackSteeringPrediction:
+        """Predict one known track without advancing estimator ownership.
+
+        The stable bearing is integrated piecewise across the accepted-command
+        delay boundaries.  It is then projected into the current camera using
+        the aligned IMU attitude.  The returned image rate also includes the
+        instantaneous rotational flow implied by measured body rates.
+        """
+
+        _token(track_id, "track_id")
+        _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
+        try:
+            estimate = self._tracks[track_id]
+        except KeyError as exc:
+            raise DynamicCourseError(
+                "steering prediction track has no dynamic state"
+            ) from exc
+        source = estimate.state
+        if monotonic_ns < source.state_monotonic_ns:
+            raise DynamicCourseError(
+                "steering prediction precedes the track state"
+            )
+
+        bearing = source.bearing_rad
+        rate = source.bearing_rate_rad_s
+        cursor_ns = source.state_monotonic_ns
+        boundaries = {monotonic_ns}
+        for command in self._commands:
+            for delay_s in (
+                self.config.roll_command_delay_s,
+                self.config.thrust_command_delay_s,
+            ):
+                boundary_ns = command.monotonic_ns + round(
+                    delay_s * _NS_PER_SECOND
+                )
+                if cursor_ns < boundary_ns < monotonic_ns:
+                    boundaries.add(boundary_ns)
+        for boundary_ns in sorted(boundaries):
+            dt = (boundary_ns - cursor_ns) / _NS_PER_SECOND
+            if dt <= 0.0:
+                cursor_ns = boundary_ns
+                continue
+            delayed = self.delayed_command_view(cursor_ns)
+            acceleration = (
+                self.config.roll_to_lateral_bearing_accel
+                * delayed.target_roll_rad,
+                self.config.thrust_to_vertical_bearing_accel
+                * (delayed.thrust - SUPPORT_THRUST),
+            )
+            bearing = tuple(
+                _clamp(
+                    bearing[axis]
+                    + rate[axis] * dt
+                    + 0.5 * acceleration[axis] * dt * dt,
+                    -self.config.max_abs_bearing_rad,
+                    self.config.max_abs_bearing_rad,
+                )
+                for axis in range(2)
+            )
+            rate = tuple(
+                _clamp(
+                    rate[axis] + acceleration[axis] * dt,
+                    -self.config.max_abs_bearing_rate_rad_s,
+                    self.config.max_abs_bearing_rate_rad_s,
+                )
+                for axis in range(2)
+            )
+            cursor_ns = boundary_ns
+
+        aligned = self._aligned_imu(monotonic_ns)
+        decision_camera_to_world = _quat_multiply(
+            aligned.body_to_reference_wxyz,
+            self.config.camera_to_body_wxyz,
+        )
+        stable_ray = (
+            1.0,
+            math.tan(bearing[0]),
+            math.tan(bearing[1]),
+        )
+        stable_ray_rate = (
+            0.0,
+            rate[0] / max(math.cos(bearing[0]) ** 2, _EPSILON),
+            rate[1] / max(math.cos(bearing[1]) ** 2, _EPSILON),
+        )
+        world_ray = _quat_rotate(
+            estimate.reference_camera_to_world,
+            stable_ray,
+        )
+        world_ray_rate = _quat_rotate(
+            estimate.reference_camera_to_world,
+            stable_ray_rate,
+        )
+        world_to_camera = _quat_conjugate(
+            decision_camera_to_world
+        )
+        camera_ray = _quat_rotate(world_to_camera, world_ray)
+        translational_camera_ray_rate = _quat_rotate(
+            world_to_camera,
+            world_ray_rate,
+        )
+        camera_body_rates = _quat_rotate(
+            _quat_conjugate(self.config.camera_to_body_wxyz),
+            aligned.body_rates_rad_s,
+        )
+        rotational_cross = (
+            camera_body_rates[1] * camera_ray[2]
+            - camera_body_rates[2] * camera_ray[1],
+            camera_body_rates[2] * camera_ray[0]
+            - camera_body_rates[0] * camera_ray[2],
+            camera_body_rates[0] * camera_ray[1]
+            - camera_body_rates[1] * camera_ray[0],
+        )
+        camera_ray_rate = tuple(
+            translational_camera_ray_rate[axis]
+            - rotational_cross[axis]
+            for axis in range(3)
+        )
+        forward = camera_ray[0]
+        if forward <= 1e-6:
+            raise DynamicCourseError(
+                "steering prediction gate ray is behind the camera"
+            )
+        horizontal_ratio = camera_ray[1] / forward
+        vertical_ratio = camera_ray[2] / forward
+        camera_center = (
+            horizontal_ratio
+            / self.config.horizontal_angle_scale_rad,
+            vertical_ratio / self.config.vertical_angle_scale_rad,
+        )
+        forward_squared = forward * forward
+        camera_rate = (
+            (
+                camera_ray_rate[1] * forward
+                - camera_ray[1] * camera_ray_rate[0]
+            )
+            / forward_squared
+            / self.config.horizontal_angle_scale_rad,
+            (
+                camera_ray_rate[2] * forward
+                - camera_ray[2] * camera_ray_rate[0]
+            )
+            / forward_squared
+            / self.config.vertical_angle_scale_rad,
+        )
+        maximum_camera_rate = (
+            self.config.max_abs_bearing_rate_rad_s
+            / self.config.horizontal_angle_scale_rad,
+            self.config.max_abs_bearing_rate_rad_s
+            / self.config.vertical_angle_scale_rad,
+        )
+        camera_rate = tuple(
+            _clamp(
+                camera_rate[axis],
+                -maximum_camera_rate[axis],
+                maximum_camera_rate[axis],
+            )
+            for axis in range(2)
+        )
+        elapsed_s = (
+            monotonic_ns - source.state_monotonic_ns
+        ) / _NS_PER_SECOND
+        measurement_age_s = (
+            monotonic_ns - source.last_measurement_monotonic_ns
+        ) / _NS_PER_SECOND
+        bearing_std = tuple(
+            min(
+                self.config.max_abs_bearing_rad,
+                source.bearing_std_rad[axis]
+                + self.config.process_noise_bearing_rad_s * elapsed_s,
+            )
+            for axis in range(2)
+        )
+        values = (
+            *bearing,
+            *rate,
+            *camera_center,
+            *camera_rate,
+            *bearing_std,
+            *aligned.body_rates_rad_s,
+            measurement_age_s,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise DynamicCourseError(
+                "steering prediction produced non-finite state"
+            )
+        if measurement_age_s < 0.0:
+            raise DynamicCourseError(
+                "steering prediction precedes the last measurement"
+            )
+        return TrackSteeringPrediction(
+            track_id=track_id,
+            stream_generation=source.stream_generation,
+            monotonic_ns=monotonic_ns,
+            source_state_monotonic_ns=source.state_monotonic_ns,
+            last_measurement_monotonic_ns=(
+                source.last_measurement_monotonic_ns
+            ),
+            measurement_age_s=measurement_age_s,
+            stable_bearing_rad=bearing,  # type: ignore[arg-type]
+            stable_bearing_rate_rad_s=rate,  # type: ignore[arg-type]
+            camera_center_norm=camera_center,
+            camera_center_rate_norm_s=camera_rate,  # type: ignore[arg-type]
+            bearing_std_rad=bearing_std,  # type: ignore[arg-type]
+            body_rates_rad_s=aligned.body_rates_rad_s,
         )
 
     def retains_successor_lineage(
@@ -1964,6 +2344,12 @@ class DynamicCourseCore:
             current.track_id,
             passage_successor_track_id,
         )
+        if (
+            current.aperture_prediction_deadline_monotonic_ns is None
+            or monotonic_ns
+            > current.aperture_prediction_deadline_monotonic_ns
+        ):
+            current_aperture = None
         age_s = (
             monotonic_ns - current.last_measurement_monotonic_ns
         ) / _NS_PER_SECOND
@@ -2232,6 +2618,34 @@ class DynamicCourseCore:
             current_center_norm=current_center,
             camera_current_center_norm=camera_current_center,
             current_aperture_half_size_norm=current_aperture,
+            current_aperture_propagated=current.aperture_propagated,
+            current_aperture_prediction_age_s=(
+                0.0
+                if current.aperture_seed_monotonic_ns is None
+                else max(
+                    0.0,
+                    (
+                        monotonic_ns
+                        - current.aperture_seed_monotonic_ns
+                    )
+                    / _NS_PER_SECOND,
+                )
+            ),
+            current_aperture_prediction_horizon_remaining_s=(
+                0.0
+                if (
+                    current.aperture_prediction_deadline_monotonic_ns
+                    is None
+                )
+                else max(
+                    0.0,
+                    (
+                        current.aperture_prediction_deadline_monotonic_ns
+                        - monotonic_ns
+                    )
+                    / _NS_PER_SECOND,
+                )
+            ),
             passage_point_norm=passage,
             successor_passage_authority=(
                 successor_passage_authority
@@ -2336,8 +2750,9 @@ class DynamicCourseCore:
             )
 
         center = project_stable_ray(_bearing_ray(estimate.state.bearing_rad))
-        aperture = estimate.last_measured_aperture_half_size_norm
-        if aperture is None:
+        aperture = estimate.state.aperture_half_size_norm
+        measured_aperture = estimate.last_measured_aperture_half_size_norm
+        if aperture is None or measured_aperture is None:
             return center, None
 
         def reproject_last(raw_center: Vector2) -> Vector2:
@@ -2366,20 +2781,38 @@ class DynamicCourseCore:
 
         measured_center = estimate.last_measured_center_norm
         left = reproject_last(
-            (measured_center[0] - aperture[0], measured_center[1])
+            (
+                measured_center[0] - measured_aperture[0],
+                measured_center[1],
+            )
         )
         right = reproject_last(
-            (measured_center[0] + aperture[0], measured_center[1])
+            (
+                measured_center[0] + measured_aperture[0],
+                measured_center[1],
+            )
         )
         top = reproject_last(
-            (measured_center[0], measured_center[1] - aperture[1])
+            (
+                measured_center[0],
+                measured_center[1] - measured_aperture[1],
+            )
         )
         bottom = reproject_last(
-            (measured_center[0], measured_center[1] + aperture[1])
+            (
+                measured_center[0],
+                measured_center[1] + measured_aperture[1],
+            )
         )
-        projected_aperture = (
+        measured_projected_aperture = (
             0.5 * abs(right[0] - left[0]),
             0.5 * abs(bottom[1] - top[1]),
+        )
+        projected_aperture = tuple(
+            measured_projected_aperture[axis]
+            * aperture[axis]
+            / measured_aperture[axis]
+            for axis in range(2)
         )
         return center, projected_aperture
 
@@ -3149,5 +3582,6 @@ __all__ = [
     "MIN_THRUST",
     "SUPPORT_THRUST",
     "TrackDynamicState",
+    "TrackSteeringPrediction",
     "predict_aperture_relative_crossing",
 ]

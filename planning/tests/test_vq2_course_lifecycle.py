@@ -426,6 +426,53 @@ def test_dynamic_derotated_history_latches_and_allows_bounded_raw_motion():
     )
 
 
+def test_dynamic_terminal_clearance_can_commit_before_legacy_scale_gate():
+    sample = replace(
+        _CREDITED_NEAR_PLANE[0],
+        normalized_x=0.01,
+        normalized_y_down=-0.17,
+        normalized_x_rate_s=0.03,
+        normalized_y_rate_down_s=-0.02,
+        log_scale=-1.47,
+        log_scale_rate_s=0.89,
+        geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+        normalized_x_std=0.01,
+        normalized_y_std=0.01,
+        log_scale_std=0.03,
+        crossing_prediction_horizon_s=1.12,
+        predicted_crossing_x_norm=0.20,
+        predicted_crossing_y_down_norm=-0.08,
+        predicted_crossing_x_std_norm=0.047,
+        predicted_crossing_y_std_norm=0.083,
+        crossing_allowance_x_norm=0.50,
+        crossing_allowance_y_norm=0.45,
+        crossing_swept_x_occupancy_norm=0.30,
+        crossing_swept_y_occupancy_norm=0.40,
+        current_crossing_x_q=0.04,
+        current_crossing_y_q=-0.57,
+        crossing_x_q_rate_s=0.15,
+        crossing_y_q_rate_s=0.43,
+        post_governor_contact_budget_s=1.02,
+    )
+
+    evidence, latch = advance_dynamic_near_plane_evidence(
+        NearPlaneEvidence(),
+        sample,
+        required_corridor_frames=1,
+        crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+        horizontal_corridor=0.16,
+        vertical_corridor=0.18,
+        minimum_post_governor_contact_budget_s=0.12,
+        min_track_confidence=_MIN_TRACK_CONFIDENCE,
+        min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+    )
+
+    assert sample.log_scale < _CROSSING_MIN_LOG_SCALE
+    assert latch is not None
+    assert latch.basis == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+    assert latch.evidence == evidence
+
+
 def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
     """Replay the final three clean dynamic states before its bottom clip."""
 

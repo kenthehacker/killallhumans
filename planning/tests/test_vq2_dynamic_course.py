@@ -1345,95 +1345,267 @@ def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
     )
 
 
-def test_missing_inner_aperture_clears_stale_crossing_geometry() -> None:
-    core = DynamicCourseCore(
-        DynamicCourseConfig(
-            camera_delay_s=0.0,
-            successor_clearance_dwell_s=0.04,
-            successor_clearance_ramp_s=0.04,
+def test_clean_aperture_seed_propagates_through_vertical_censor_and_dropout(
+) -> None:
+    def propagate(
+        *,
+        pitch: float,
+        thrust: float,
+        clipping: FrameEdge,
+    ):
+        core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+        core.record_applied_command(
+            _command(0.80, pitch=pitch, thrust=thrust)
         )
-    )
-    core.record_applied_command(_command(0.90))
-    prior = None
-    for sequence in range(1, 9):
-        observation_time = 1.0 + (sequence - 1) * 0.040
-        _imu(core, observation_time)
-        core.observe_track(
+        clean = None
+        for sequence in range(1, 5):
+            observation_time = 1.0 + (sequence - 1) * 0.030
+            _imu(core, observation_time)
+            clean = core.observe_track(
+                _observation(
+                    "gate-a",
+                    sequence,
+                    observation_time,
+                    x=0.04,
+                    y=-0.08,
+                    log_scale=-0.45,
+                )
+            )
+        assert clean is not None
+        core.bind(
+            current_gate_index=0,
+            current_track_id="gate-a",
+            successor_track_id=None,
+        )
+        _imu(core, 1.095)
+        clean_decision = core.guide(1_095_000_000)
+
+        _imu(core, 1.12)
+        censored = core.observe_track(
             _observation(
                 "gate-a",
-                sequence,
-                observation_time,
-                x=-0.05,
-                log_scale=-0.68 + sequence * 0.05,
+                5,
+                1.12,
+                x=0.90,
+                y=-0.95,
+                log_scale=0.70,
+                aperture=None,
+                clipping=clipping,
+                center_censored=True,
+                ambiguous=False,
             )
         )
-        core.observe_track(
-            _observation(
-                "gate-b",
-                sequence,
-                observation_time,
-                x=0.80,
-                log_scale=-1.0,
+        _imu(core, 1.125)
+        censored_decision = core.guide(1_125_000_000)
+
+        _imu(core, 1.15)
+        dropout = core.observe_track(
+            _observation("gate-a", 6, 1.15, visible=False)
+        )
+        _imu(core, 1.155)
+        dropout_decision = core.guide(1_155_000_000)
+        return (
+            clean,
+            clean_decision,
+            censored,
+            censored_decision,
+            dropout,
+            dropout_decision,
+        )
+
+    nose_down = propagate(
+        pitch=-0.12,
+        thrust=MAX_THRUST,
+        clipping=FrameEdge.TOP,
+    )
+    nose_up = propagate(
+        pitch=0.12,
+        thrust=MIN_THRUST,
+        clipping=FrameEdge.BOTTOM,
+    )
+
+    for (
+        clean,
+        clean_decision,
+        censored,
+        censored_decision,
+        dropout,
+        dropout_decision,
+    ) in (nose_down, nose_up):
+        assert clean.aperture_half_size_norm == pytest.approx((0.42, 0.34))
+        assert clean.aperture_propagated is False
+        assert clean_decision.current_aperture_propagated is False
+        for state, decision in (
+            (censored, censored_decision),
+            (dropout, dropout_decision),
+        ):
+            assert state.aperture_propagated
+            assert state.aperture_half_size_norm is not None
+            assert decision.current_aperture_propagated
+            assert decision.current_aperture_half_size_norm is not None
+            assert (
+                decision.current_aperture_prediction_horizon_remaining_s
+                > 0.0
             )
-        )
-        if sequence == 1:
-            core.bind(
-                current_gate_index=0,
-                current_track_id="gate-a",
-                successor_track_id="gate-b",
+            assert all(
+                math.isfinite(value)
+                for value in (
+                    *state.bearing_rad,
+                    *state.aperture_half_size_norm,
+                    state.log_scale,
+                    *decision.current_crossing_error_q,
+                    *decision.crossing_rate_q_s,
+                    decision.command.target_roll_rad,
+                    decision.command.target_pitch_rad,
+                    decision.command.yaw_rate_rad_s,
+                    decision.command.thrust,
+                )
             )
-        decision_time = observation_time + 0.005
-        _imu(core, decision_time)
-        prior = core.guide(round(decision_time * NS))
-        _commit_decision(core, decision_time, prior.command)
-
-    assert prior is not None
-    assert prior.current_aperture_half_size_norm == pytest.approx(
-        (0.42, 0.34)
-    )
-    assert prior.successor_clearance_authority > 0.0
-    assert prior.successor_passage_authority > 0.0
-
-    _imu(core, 1.32)
-    censored = core.observe_track(
-        _observation(
-            "gate-a",
-            9,
-            1.32,
-            x=-0.05,
-            log_scale=-0.23,
-            aperture=None,
-            center_censored=True,
-            ambiguous=True,
+        assert all(
+            censored.bearing_std_rad[axis]
+            > clean.bearing_std_rad[axis]
+            for axis in range(2)
         )
-    )
-    core.observe_track(
-        _observation(
-            "gate-b",
-            9,
-            1.32,
-            x=0.80,
-            log_scale=-1.0,
+        assert all(
+            dropout.bearing_std_rad[axis]
+            > censored.bearing_std_rad[axis]
+            for axis in range(2)
         )
-    )
-    _imu(core, 1.325)
-    decision = core.guide(1_325_000_000)
+        assert censored.log_scale_std > clean.log_scale_std
+        assert dropout.log_scale_std > censored.log_scale_std
 
-    assert censored.visible
-    assert censored.ambiguous
-    assert censored.aperture_half_size_norm is None
+    nose_down_clean, _, nose_down_censored, *_ = nose_down
+    nose_up_clean, _, nose_up_censored, *_ = nose_up
+    assert nose_down_clean.aperture_half_size_norm == pytest.approx(
+        nose_up_clean.aperture_half_size_norm
+    )
+    assert nose_down_censored.log_scale > nose_up_censored.log_scale
+    assert (
+        nose_down_censored.aperture_half_size_norm[0]
+        / nose_down_clean.aperture_half_size_norm[0]
+        > nose_up_censored.aperture_half_size_norm[0]
+        / nose_up_clean.aperture_half_size_norm[0]
+    )
+    assert nose_down_censored.bearing_rad[1] > (
+        nose_up_censored.bearing_rad[1]
+    )
+
+
+def test_local_aperture_is_withdrawn_at_decision_time_expiry() -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    _imu(core, 1.0)
+    seeded = core.observe_track(_observation("gate-a", 1, 1.0))
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id=None,
+    )
+    assert seeded.aperture_prediction_deadline_monotonic_ns is not None
+    expired_ns = (
+        seeded.aperture_prediction_deadline_monotonic_ns + 1_000_000
+    )
+    _imu(core, expired_ns / NS)
+    decision = core.guide(expired_ns)
+
+    assert seeded.aperture_half_size_norm is not None
     assert decision.current_aperture_half_size_norm is None
+    assert decision.current_aperture_prediction_horizon_remaining_s == 0.0
     assert decision.crossing_allowance_norm == (0.0, 0.0)
     assert decision.centered_crossing_clearance_norm == (0.0, 0.0)
     assert decision.predicted_crossing_clearance_norm == (0.0, 0.0)
     assert decision.terminal_crossing_clearance_norm == (0.0, 0.0)
-    assert decision.successor_clearance_authority == 0.0
-    assert decision.successor_passage_authority == 0.0
-    assert decision.passage_point_norm == (0.0, 0.0)
-    assert decision.current_yaw_release == 0.0
-    assert decision.passage_yaw_authority == 0.0
-    assert decision.successor_weight == 0.0
-    assert decision.successor_yaw_contribution_rad == 0.0
+
+
+@pytest.mark.parametrize(
+    ("seed_aperture", "clipping", "ambiguous"),
+    (
+        (False, FrameEdge.TOP, False),
+        (True, FrameEdge.TOP, True),
+        (True, FrameEdge.RIGHT, False),
+    ),
+)
+def test_local_aperture_rejects_unseeded_ambiguous_or_horizontal_censor(
+    seed_aperture: bool,
+    clipping: FrameEdge,
+    ambiguous: bool,
+) -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    _imu(core, 1.0)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            1,
+            1.0,
+            aperture=(0.42, 0.34) if seed_aperture else None,
+        )
+    )
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id=None,
+    )
+    _imu(core, 1.04)
+    rejected = core.observe_track(
+        _observation(
+            "gate-a",
+            2,
+            1.04,
+            aperture=None,
+            clipping=clipping,
+            center_censored=True,
+            ambiguous=ambiguous,
+        )
+    )
+    _imu(core, 1.045)
+    decision = core.guide(1_045_000_000)
+
+    assert rejected.aperture_half_size_norm is None
+    assert rejected.aperture_seed_monotonic_ns is None
+    assert rejected.aperture_prediction_deadline_monotonic_ns is None
+    assert rejected.aperture_propagated is False
+    assert decision.current_aperture_half_size_norm is None
+    assert decision.crossing_allowance_norm == (0.0, 0.0)
+
+
+def test_invisible_ambiguity_revokes_aperture_lineage_until_clean_reseed(
+) -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    _imu(core, 1.0)
+    seeded = core.observe_track(_observation("gate-a", 1, 1.0))
+    assert seeded.aperture_half_size_norm is not None
+
+    _imu(core, 1.04)
+    ambiguous = core.observe_track(
+        _observation(
+            "gate-a",
+            2,
+            1.04,
+            visible=False,
+            ambiguous=True,
+        )
+    )
+    assert ambiguous.aperture_half_size_norm is None
+    assert ambiguous.aperture_seed_monotonic_ns is None
+    assert ambiguous.aperture_prediction_deadline_monotonic_ns is None
+
+    _imu(core, 1.08)
+    degraded = core.observe_track(
+        _observation(
+            "gate-a",
+            3,
+            1.08,
+            aperture=None,
+            clipping=FrameEdge.TOP,
+            center_censored=True,
+        )
+    )
+    assert degraded.aperture_half_size_norm is None
+    assert degraded.aperture_seed_monotonic_ns is None
+    assert degraded.aperture_prediction_deadline_monotonic_ns is None
+    assert degraded.aperture_propagated is False
 
 
 def test_body_yaw_cannot_change_stable_passage_or_roll_authority() -> None:
@@ -1545,7 +1717,8 @@ def test_successor_identity_hold_outlives_geometry_dropout_but_is_bounded() -> N
     )
 
 
-def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
+def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
+) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
             camera_delay_s=0.0,
@@ -1572,7 +1745,7 @@ def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
                 "gate-b",
                 sequence,
                 observation_time,
-                x=0.12,
+                x=0.04 + 0.02 * sequence,
                 log_scale=-0.90,
             )
         )
@@ -1589,6 +1762,8 @@ def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
         _commit_decision(core, decision_time, decision.command)
     stable = decisions[-1]
     assert stable.successor_prediction_confidence > 0.0
+    assert stable.successor_rate_rad_s is not None
+    assert stable.successor_rate_rad_s[0] > 0.0
     assert stable.passage_point_norm[0] > 0.0
 
     _imu(core, 1.20)
@@ -1641,19 +1816,30 @@ def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
             "gate-b",
             7,
             1.24,
-            x=0.12,
+            x=0.16,
             log_scale=-0.85,
         )
     )
     _imu(core, 1.25)
     reacquired = core.guide(1_250_000_000)
 
-    assert reacquired.successor_prediction_confidence == 0.0
+    assert reacquired.successor_prediction_confidence > 0.0
+    assert reacquired.successor_rate_rad_s is not None
+    assert reacquired.successor_rate_rad_s[0] > 0.0
+    assert reacquired.successor_rate_rad_s[0] == pytest.approx(
+        stable.successor_rate_rad_s[0],
+        rel=0.25,
+    )
+    assert reacquired.predicted_successor_bearing_rad is not None
+    assert reacquired.measured_successor_bearing_rad is not None
+    assert reacquired.predicted_successor_bearing_rad[0] >= (
+        reacquired.measured_successor_bearing_rad[0]
+    )
     assert not reacquired.successor_transition_held
+    # Rate memory returns immediately, while passage/yaw ownership must earn
+    # a new clean current-aperture clearance dwell.
     assert reacquired.successor_clearance_authority == 0.0
     assert reacquired.passage_point_norm == (0.0, 0.0)
-    assert reacquired.passage_yaw_authority == 0.0
-    assert reacquired.successor_weight == 0.0
     assert reacquired.successor_yaw_contribution_rad == 0.0
 
     _imu(core, 1.40)
@@ -1805,116 +1991,6 @@ def test_clipped_axis_coasts_without_false_inward_update() -> None:
     assert clipped.bearing_std_rad[0] > first.bearing_std_rad[0]
     assert clipped.censored_axes == (True, False)
     assert clipped.time_to_contact_s is None
-
-
-def test_854d44b_repeated_censorship_has_bounded_additive_uncertainty() -> None:
-    config = DynamicCourseConfig(
-        camera_delay_s=0.0,
-        successor_clearance_dwell_s=0.04,
-        successor_clearance_ramp_s=0.04,
-    )
-    core = DynamicCourseCore(config)
-    core.record_applied_command(_command(0.90))
-    clean = None
-    for sequence in range(1, 9):
-        observation_time = 1.0 + (sequence - 1) * 0.040
-        _imu(core, observation_time)
-        core.observe_track(
-            _observation(
-                "gate-a",
-                sequence,
-                observation_time,
-                x=-0.05,
-                log_scale=-0.68 + sequence * 0.05,
-            )
-        )
-        core.observe_track(
-            _observation(
-                "gate-b",
-                sequence,
-                observation_time,
-                x=0.80,
-                log_scale=-1.0,
-            )
-        )
-        if sequence == 1:
-            core.bind(
-                current_gate_index=0,
-                current_track_id="gate-a",
-                successor_track_id="gate-b",
-            )
-        decision_time = observation_time + 0.005
-        _imu(core, decision_time)
-        clean = core.guide(round(decision_time * NS))
-        _commit_decision(core, decision_time, clean.command)
-
-    assert clean is not None
-    assert clean.successor_clearance_authority > 0.0
-    assert clean.successor_passage_authority > 0.0
-
-    censored_std: list[tuple[float, float]] = []
-    for offset in range(1, 38):
-        sequence = 8 + offset
-        observation_time = 1.28 + offset * 0.040
-        _imu(core, observation_time)
-        current = core.observe_track(
-            _observation(
-                "gate-a",
-                sequence,
-                observation_time,
-                x=-0.05,
-                log_scale=-0.23,
-                aperture=None,
-                clipping=FrameEdge.TOP,
-                center_censored=True,
-                ambiguous=True,
-            )
-        )
-        core.observe_track(
-            _observation(
-                "gate-b",
-                sequence,
-                observation_time,
-                x=0.80,
-                log_scale=-1.0,
-            )
-        )
-        decision_time = observation_time + 0.005
-        _imu(core, decision_time)
-        decision = core.guide(round(decision_time * NS))
-        _commit_decision(core, decision_time, decision.command)
-        censored_std.append(current.bearing_std_rad)
-
-        assert decision.current_aperture_half_size_norm is None
-        assert decision.centered_crossing_clearance_norm == (0.0, 0.0)
-        assert decision.predicted_crossing_clearance_norm == (0.0, 0.0)
-        assert decision.terminal_crossing_clearance_norm == (0.0, 0.0)
-        assert decision.successor_clearance_authority == 0.0
-        assert decision.successor_passage_authority == 0.0
-        assert decision.passage_yaw_authority == 0.0
-
-    frame_dt_s = 0.040
-    additive_budget_rad = (
-        config.clipping_uncertainty_multiplier
-        * config.process_noise_bearing_rad_s
-        * frame_dt_s
-    )
-    for axis in range(2):
-        assert censored_std[0][axis] <= (
-            config.clipping_uncertainty_multiplier
-            * clean.current_bearing_std_rad[axis]
-            + additive_budget_rad
-        )
-        for previous, current in zip(censored_std, censored_std[1:]):
-            assert current[axis] <= (
-                previous[axis] + additive_budget_rad + 1e-12
-            )
-        assert censored_std[-1][axis] <= (
-            censored_std[0][axis]
-            + (len(censored_std) - 1) * additive_budget_rad
-            + 1e-12
-        )
-        assert censored_std[-1][axis] < config.max_abs_bearing_rad
 
 
 def test_measured_yaw_output_never_exceeds_capability_envelope() -> None:

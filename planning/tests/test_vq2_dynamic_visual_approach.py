@@ -207,6 +207,19 @@ def _race(received_ns: int) -> AuthoritativeRaceStatusRef:
     )
 
 
+def _credited_race(received_ns: int) -> AuthoritativeRaceStatusRef:
+    return AuthoritativeRaceStatusRef.live(
+        session_id="dynamic-adapter-test",
+        reset_epoch=1,
+        race_generation=1,
+        race_status_sequence=2,
+        race_status_boot_ms=4_250,
+        active_gate_index=1,
+        received_monotonic_ns=received_ns,
+        host_clock_id="host-perf-counter",
+    )
+
+
 def _graph() -> tuple[
     MultiTargetVisualTracker,
     RollingVisualGateGraph,
@@ -342,6 +355,41 @@ def _accept_proposal(
     )
 
 
+def _bound_post_credit_successor() -> tuple[
+    DynamicVisualCourseSession,
+    str,
+]:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    successor_id = snapshot.next_candidates[0].track_id
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+    for sequence in range(6, 10):
+        tracker.update(_frame(sequence))
+        snapshot = graph.observe(tracker)
+        session.stage_snapshot(
+            snapshot,
+            tracker,
+            expected_gate_index=0,
+            expected_current_track_id=current_id,
+            adjacent_precredit=False,
+        )
+    session.core.bind(
+        current_gate_index=0,
+        current_track_id=current_id,
+        successor_track_id=successor_id,
+    )
+    successor = session.core.course_state().successor
+    assert successor is not None
+    assert successor.sample_count >= 4
+    return session, successor_id
+
+
 def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
@@ -427,13 +475,9 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     )
 
 
-@pytest.mark.parametrize(
-    ("gate_size", "expect_scale_ready"),
-    ((0.36, False), (0.90, True)),
-)
-def test_dynamic_passage_admission_requires_scale_and_closure(
+@pytest.mark.parametrize("gate_size", (0.36, 0.90))
+def test_dynamic_passage_admission_requires_observed_closure(
     gate_size: float,
-    expect_scale_ready: bool,
 ):
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=gate_size,
@@ -473,19 +517,10 @@ def test_dynamic_passage_admission_requires_scale_and_closure(
             session.last_decision.terminal_crossing_clearance_norm
         )
     )
-    state = session.core.course_state().current
-    scale_ready = (
-        state.log_scale - 2.0 * state.log_scale_std
-        >= session.core.config.passage_arm_min_log_scale
-    )
-    assert scale_ready is expect_scale_ready
-    if not scale_ready:
-        assert proposal.servo_output.brake_reason == (
-            "dynamic_plane_not_ready"
-        )
+    assert proposal.servo_output.corridor_frames == 0
 
 
-def test_1cab_terminal_history_precedes_scale_and_rejects_top_rate() -> None:
+def test_terminal_positive_clearance_commits_before_fixed_scale() -> None:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -519,6 +554,7 @@ def test_1cab_terminal_history_precedes_scale_and_rejects_top_rate() -> None:
         (11, 0.49, 0.024),
         (12, 0.52, 0.036),
     )
+    pre_scale_commitment = None
     for sequence, gate_size, center_y in frames:
         tracker.update(
             _frame(
@@ -537,22 +573,38 @@ def test_1cab_terminal_history_precedes_scale_and_rejects_top_rate() -> None:
             clearance >= 0.0
             for clearance in decision.terminal_crossing_clearance_norm
         )
-        if sequence >= 10:
-            assert proposal.servo_output.corridor_frames == sequence - 9
-            assert (
-                session.core.course_state().current.log_scale
-                - 2.0
-                * session.core.course_state().current.log_scale_std
-                < session.core.config.passage_arm_min_log_scale
+        state = session.core.course_state().current
+        scale_lower_bound = (
+            state.log_scale - 2.0 * state.log_scale_std
+        )
+        if (
+            proposal.passage_admission is not None
+            and scale_lower_bound
+            < session.core.config.passage_arm_min_log_scale
+        ):
+            pre_scale_commitment = (
+                proposal,
+                decision,
+                scale_lower_bound,
             )
-            assert proposal.servo_output.brake_reason == (
-                "dynamic_plane_not_ready"
-            )
-            assert proposal.passage_admission is None
         _accept_proposal(session, tracker, proposal)
 
-    assert proposal.current_target.normalized_y_rate_down_s > 0.30
-    assert proposal.servo_output.corridor_frames == 3
+    assert pre_scale_commitment is not None
+    committed, committed_decision, committed_scale_lower_bound = (
+        pre_scale_commitment
+    )
+    assert committed.passage_admission is not None
+    assert committed.servo_output.corridor_frames >= 3
+    assert committed_decision.current_time_to_contact_s is not None
+    assert all(
+        clearance >= 0.0
+        for clearance in (
+            committed_decision.terminal_crossing_clearance_norm
+        )
+    )
+    assert committed_scale_lower_bound < (
+        session.core.config.passage_arm_min_log_scale
+    )
 
     tracker.update(
         _frame(
@@ -572,8 +624,7 @@ def test_1cab_terminal_history_precedes_scale_and_rejects_top_rate() -> None:
             session.last_decision.terminal_crossing_clearance_norm
         )
     )
-    assert proposal.current_target.normalized_y_rate_down_s > 0.30
-    assert proposal.servo_output.corridor_frames == 4
+    assert proposal.current_target.normalized_y_rate_down_s > 0.0
     assert proposal.servo_output.brake_reason == "aligning"
     assert proposal.passage_admission is not None
     _accept_proposal(session, tracker, proposal)
@@ -602,7 +653,7 @@ def test_1cab_terminal_history_precedes_scale_and_rejects_top_rate() -> None:
     assert rejected.passage_admission is None
 
 
-def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
+def test_passage_retains_clean_seed_through_vertical_occlusion() -> None:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -640,6 +691,7 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
         13: 0.64,
         14: 0.72,
     }
+    first_admission = None
     for sequence, gate_size in sizes.items():
         tracker.update(
             _frame(
@@ -651,8 +703,19 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
         )
         snapshot = graph.observe(tracker)
         proposal = _observe(planner, snapshot, tracker)
-        if sequence < 12:
-            assert proposal.passage_admission is None
+        if (
+            first_admission is None
+            and proposal.passage_admission is not None
+        ):
+            first_admission = proposal.passage_admission
+            assert session.last_decision is not None
+            assert all(
+                clearance >= 0.0
+                for clearance in (
+                    session.last_decision
+                    .terminal_crossing_clearance_norm
+                )
+            )
         _accept_proposal(session, tracker, proposal)
 
     admission = proposal.passage_admission
@@ -661,12 +724,19 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
     assert successor.visible is False
     assert successor.missed_count == 6
     assert snapshot.next_candidates == ()
+    assert first_admission is not None
     assert admission is not None
     assert admission.preview_track_id == retained_id
     assert admission.preview_blend == 0.0
     assert proposal.next_target is None
     assert proposal.servo_output.brake_reason == "aligning"
     assert proposal.servo_output.corridor_frames >= 3
+    clean_state = session.core.course_state().current
+    assert clean_state.aperture_half_size_norm is not None
+    assert clean_state.aperture_seed_monotonic_ns is not None
+    assert clean_state.aperture_prediction_deadline_monotonic_ns is not None
+    assert not clean_state.aperture_propagated
+    committed_corridor_frames = proposal.servo_output.corridor_frames
 
     tracker.update(
         _frame(
@@ -688,19 +758,36 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
     snapshot = graph.observe(tracker)
     update = tracker.latest_update
     assert update is not None
-    with pytest.raises(VisualApproachCurrentGeometryUnavailable):
-        planner.observe(
-            snapshot,
-            tracker,
-            now_monotonic_s=(
-                update.observation_monotonic_ns + 5_000_000
-            )
-            / 1_000_000_000.0,
-            segment_elapsed_s=0.7,
-            segment_yaw_excursion_rad=0.0,
-            mode=VisualApproachMode.PASSAGE,
-            passage_admission=admission,
+    top_passage = planner.observe(
+        snapshot,
+        tracker,
+        now_monotonic_s=(
+            update.observation_monotonic_ns + 5_000_000
         )
+        / 1_000_000_000.0,
+        segment_elapsed_s=0.7,
+        segment_yaw_excursion_rad=0.0,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    top_state = session.core.course_state().current
+    top_decision = session.last_decision
+    assert top_decision is not None
+    assert top_passage.passage_admission is admission
+    assert top_passage.servo_output.corridor_frames == (
+        committed_corridor_frames
+    )
+    assert top_state.aperture_propagated
+    assert top_decision.current_aperture_propagated
+    assert top_decision.current_aperture_half_size_norm is not None
+    assert top_decision.current_aperture_prediction_horizon_remaining_s > 0.0
+    assert top_state.aperture_seed_monotonic_ns == (
+        clean_state.aperture_seed_monotonic_ns
+    )
+    assert top_state.aperture_prediction_deadline_monotonic_ns == (
+        clean_state.aperture_prediction_deadline_monotonic_ns
+    )
+    _accept_proposal(session, tracker, top_passage)
 
     tracker.update(
         _frame(
@@ -715,19 +802,45 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
     snapshot = graph.observe(tracker)
     update = tracker.latest_update
     assert update is not None
-    with pytest.raises(VisualApproachCurrentGeometryUnavailable):
-        planner.observe(
-            snapshot,
-            tracker,
-            now_monotonic_s=(
-                update.observation_monotonic_ns + 5_000_000
-            )
-            / 1_000_000_000.0,
-            segment_elapsed_s=0.7,
-            segment_yaw_excursion_rad=0.0,
-            mode=VisualApproachMode.PASSAGE,
-            passage_admission=admission,
+    vertically_censored_passage = planner.observe(
+        snapshot,
+        tracker,
+        now_monotonic_s=(
+            update.observation_monotonic_ns + 5_000_000
         )
+        / 1_000_000_000.0,
+        segment_elapsed_s=0.7,
+        segment_yaw_excursion_rad=0.0,
+        mode=VisualApproachMode.PASSAGE,
+        passage_admission=admission,
+    )
+    vertically_censored_state = session.core.course_state().current
+    vertically_censored_decision = session.last_decision
+    assert vertically_censored_decision is not None
+    assert vertically_censored_passage.passage_admission is admission
+    assert vertically_censored_passage.servo_output.corridor_frames == (
+        committed_corridor_frames
+    )
+    assert vertically_censored_state.aperture_propagated
+    assert vertically_censored_decision.current_aperture_propagated
+    assert (
+        vertically_censored_state.aperture_seed_monotonic_ns
+        == clean_state.aperture_seed_monotonic_ns
+    )
+    assert (
+        vertically_censored_state.aperture_prediction_deadline_monotonic_ns
+        == clean_state.aperture_prediction_deadline_monotonic_ns
+    )
+    assert all(
+        math.isfinite(value)
+        for value in (
+            vertically_censored_passage.servo_output.target_roll_rad,
+            vertically_censored_passage.servo_output.target_pitch_rad,
+            vertically_censored_passage.servo_output.yaw_rate_rad_s,
+            vertically_censored_passage.servo_output.thrust,
+        )
+    )
+    _accept_proposal(session, tracker, vertically_censored_passage)
 
     tracker.update(
         _frame(
@@ -756,6 +869,7 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
     assert passage.passage_admission == admission
     assert passage.next_target is None
     assert passage.latched_next_track_id == retained_id
+    assert not session.core.course_state().current.aperture_propagated
 
 
 def test_inner_aperture_not_outer_support_drives_controller_geometry() -> None:
@@ -815,7 +929,7 @@ def test_inner_aperture_not_outer_support_drives_controller_geometry() -> None:
     )
 
 
-def test_complete_inner_steers_when_outer_support_reaches_top_edge() -> None:
+def test_low_confidence_inner_steers_from_last_clean_seed_only() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
         height=0.36,
@@ -831,6 +945,11 @@ def test_complete_inner_steers_when_outer_support_reaches_top_edge() -> None:
     )
     seed = _observe(planner, snapshot, tracker)
     _accept_proposal(session, tracker, seed)
+    clean_state = session.core.course_state().current
+    assert clean_state.raw_center_norm is not None
+    assert clean_state.aperture_half_size_norm is not None
+    assert clean_state.aperture_seed_monotonic_ns is not None
+    assert clean_state.aperture_prediction_deadline_monotonic_ns is not None
 
     degraded = _inner_aperture(
         0.07,
@@ -857,12 +976,27 @@ def test_complete_inner_steers_when_outer_support_reaches_top_edge() -> None:
     state = session.core.course_state().current
     assert state.raw_center_norm == pytest.approx(degraded.center_norm)
     assert state.censored_axes == (False, False)
-    assert state.aperture_half_size_norm is None
-    assert proposal.current_target.normalized_x == pytest.approx(0.07)
-    assert proposal.current_target.normalized_y_down == pytest.approx(-0.09)
-    assert proposal.current_target.clipped is False
-    assert proposal.current_target.center_censored is False
-    assert proposal.current_target.confidence == pytest.approx(0.20)
+    assert state.aperture_propagated
+    assert state.aperture_half_size_norm is not None
+    assert state.aperture_half_size_norm != pytest.approx(
+        degraded.half_size_norm
+    )
+    assert state.aperture_seed_monotonic_ns == (
+        clean_state.aperture_seed_monotonic_ns
+    )
+    assert state.aperture_prediction_deadline_monotonic_ns == (
+        clean_state.aperture_prediction_deadline_monotonic_ns
+    )
+    assert abs(
+        proposal.current_target.normalized_x
+        - clean_state.raw_center_norm[0]
+    ) < abs(degraded.center_norm[0] - clean_state.raw_center_norm[0])
+    assert abs(
+        proposal.current_target.normalized_y_down
+        - clean_state.raw_center_norm[1]
+    ) < abs(degraded.center_norm[1] - clean_state.raw_center_norm[1])
+    assert proposal.current_target.clipped
+    assert proposal.current_target.center_censored
     assert all(
         math.isfinite(value)
         for value in (
@@ -872,14 +1006,26 @@ def test_complete_inner_steers_when_outer_support_reaches_top_edge() -> None:
             proposal.servo_output.thrust,
         )
     )
+    assert session.last_decision is not None
+    assert session.last_decision.current_aperture_propagated
+    assert (
+        session.last_decision
+        .current_aperture_prediction_horizon_remaining_s
+        > 0.0
+    )
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None
 
 
-def test_clipped_outer_support_without_complete_inner_still_refuses() -> None:
+def test_clipped_outer_support_without_clean_seed_still_refuses() -> None:
+    rejected = _rejected_inner_aperture(
+        clipping=FrameEdge.NONE,
+        health_reason="no-clean-inner-aperture-seed",
+    )
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
         height=0.36,
+        inner_aperture=rejected,
     )
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -892,6 +1038,10 @@ def test_clipped_outer_support_without_complete_inner_still_refuses() -> None:
     )
     seed = _observe(planner, snapshot, tracker)
     _accept_proposal(session, tracker, seed)
+    unseeded = session.core.course_state().current
+    assert unseeded.aperture_half_size_norm is None
+    assert unseeded.aperture_seed_monotonic_ns is None
+    assert unseeded.aperture_prediction_deadline_monotonic_ns is None
 
     tracker.update(
         _frame(
@@ -907,9 +1057,14 @@ def test_clipped_outer_support_without_complete_inner_still_refuses() -> None:
 
     with pytest.raises(VisualApproachCurrentGeometryUnavailable):
         _observe(planner, snapshot, tracker)
+    refused = session.core.course_state().current
+    assert refused.aperture_half_size_norm is None
+    assert refused.aperture_seed_monotonic_ns is None
+    assert refused.aperture_prediction_deadline_monotonic_ns is None
+    assert not refused.aperture_propagated
 
 
-def test_rejected_merged_inner_geometry_cannot_manufacture_clearance() -> None:
+def test_rejected_merged_inner_uses_seed_without_adding_corridor() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
         height=0.36,
@@ -925,6 +1080,8 @@ def test_rejected_merged_inner_geometry_cannot_manufacture_clearance() -> None:
     )
     seed = _observe(planner, snapshot, tracker)
     _accept_proposal(session, tracker, seed)
+    clean_state = session.core.course_state().current
+    assert clean_state.aperture_half_size_norm is not None
 
     rejected = _rejected_inner_aperture(
         clipping=FrameEdge.NONE,
@@ -948,12 +1105,24 @@ def test_rejected_merged_inner_geometry_cannot_manufacture_clearance() -> None:
     assert retained.latest_token == update.token
     assert retained.history[-1].inner_aperture == rejected
     state = session.core.course_state().current
-    assert state.aperture_half_size_norm is None
-    assert state.ambiguous
+    assert state.aperture_propagated
+    assert state.aperture_half_size_norm == pytest.approx(
+        clean_state.aperture_half_size_norm
+    )
+    assert state.aperture_seed_monotonic_ns == (
+        clean_state.aperture_seed_monotonic_ns
+    )
+    assert state.aperture_prediction_deadline_monotonic_ns == (
+        clean_state.aperture_prediction_deadline_monotonic_ns
+    )
+    assert not state.ambiguous
     assert all(state.censored_axes)
     assert session.last_decision is not None
-    assert session.last_decision.current_aperture_half_size_norm is None
-    assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
+    assert session.last_decision.current_aperture_propagated
+    assert (
+        session.last_decision.current_aperture_half_size_norm
+        == pytest.approx(clean_state.aperture_half_size_norm)
+    )
     assert session.last_decision.successor_passage_authority == 0.0
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None
@@ -1007,10 +1176,20 @@ def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> Non
     assert state.bearing_rad[1] < prior.bearing_rad[1]
     assert state.log_scale < prior.log_scale
     assert state.censored_axes == (False, False)
-    assert state.aperture_half_size_norm is None
+    assert state.aperture_propagated
+    assert state.aperture_half_size_norm is not None
+    assert state.aperture_half_size_norm != pytest.approx(
+        degraded.half_size_norm
+    )
+    assert state.aperture_seed_monotonic_ns == (
+        prior.aperture_seed_monotonic_ns
+    )
+    assert state.aperture_prediction_deadline_monotonic_ns == (
+        prior.aperture_prediction_deadline_monotonic_ns
+    )
     assert session.last_decision is not None
-    assert session.last_decision.current_aperture_half_size_norm is None
-    assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
+    assert session.last_decision.current_aperture_propagated
+    assert session.last_decision.current_aperture_half_size_norm is not None
     assert session.last_decision.successor_passage_authority == 0.0
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None
@@ -1060,9 +1239,28 @@ def test_rejected_inner_geometry_predicts_instead_of_using_outer_support() -> No
     assert state.log_scale == pytest.approx(prior.log_scale)
     assert state.censored_axes == (True, True)
     assert not state.scale_rate_qualified
-    assert state.aperture_half_size_norm is None
+    assert state.aperture_propagated
+    assert state.aperture_half_size_norm == pytest.approx(
+        prior.aperture_half_size_norm
+    )
+    assert state.aperture_seed_monotonic_ns == (
+        prior.aperture_seed_monotonic_ns
+    )
+    assert state.aperture_prediction_deadline_monotonic_ns == (
+        prior.aperture_prediction_deadline_monotonic_ns
+    )
     assert session.last_decision is not None
-    assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
+    assert session.last_decision.current_aperture_propagated
+    assert (
+        session.last_decision.current_aperture_half_size_norm
+        == pytest.approx(prior.aperture_half_size_norm)
+    )
+    assert proposal.current_target.normalized_x == pytest.approx(
+        prior.raw_center_norm[0]
+    )
+    assert proposal.current_target.normalized_y_down == pytest.approx(
+        prior.raw_center_norm[1]
+    )
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None
 
@@ -1306,4 +1504,91 @@ def test_continuity_hold_is_fresh_bounded_and_uses_last_wire_target():
         session.continuity_hold_authority(
             now_monotonic_ns=wire_ns + 121_000_000,
             maximum_age_s=0.12,
+        )
+
+
+def test_post_credit_activation_accepts_causal_wire_after_race_ingress():
+    session, successor_id = _bound_post_credit_successor()
+    successor = session.core.course_state().successor
+    assert successor is not None
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    activation_ns = wire_ns + 2_000_000
+    command = AttitudeRateCommand(0.03, 0.02, -0.04, 0.275)
+    session.record_wire_acceptance(
+        target_roll_rad=0.05,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=-0.04,
+        thrust=0.275,
+        wire_command=command,
+        wire_start_monotonic_ns=wire_ns,
+    )
+
+    evidence = session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    authority = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=activation_ns,
+    )
+
+    assert wire_ns > race_received_ns
+    assert evidence["activation_monotonic_ns"] == activation_ns
+    assert session.core.course_state().current_track_id == successor_id
+    assert authority["source_wire_start_monotonic_ns"] == wire_ns
+    assert authority["wire_command"] == command
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+
+def test_post_credit_activation_latency_never_extends_prediction_expiry():
+    session, successor_id = _bound_post_credit_successor()
+    successor = session.core.course_state().successor
+    assert successor is not None
+    horizon_ns = round(
+        session.core.config.successor_prediction_max_horizon_s
+        * 1_000_000_000.0
+    )
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    activation_ns = race_received_ns + 175_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.04,
+        target_pitch_rad=0.06,
+        yaw_rate_rad_s=-0.03,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(
+            0.02,
+            0.03,
+            -0.03,
+            0.275,
+        ),
+        wire_start_monotonic_ns=wire_ns,
+    )
+    expected_expiry_ns = min(
+        race_received_ns + horizon_ns,
+        successor.last_measurement_monotonic_ns + horizon_ns,
+    )
+
+    evidence = session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+
+    assert evidence["expires_monotonic_ns"] == expected_expiry_ns
+    assert expected_expiry_ns < activation_ns + horizon_ns
+    session.post_credit_successor_steering_authority(
+        now_monotonic_ns=expected_expiry_ns,
+    )
+    with pytest.raises(
+        DynamicCourseError,
+        match="post-credit successor steering expired",
+    ):
+        session.post_credit_successor_steering_authority(
+            now_monotonic_ns=expected_expiry_ns + 1,
         )
