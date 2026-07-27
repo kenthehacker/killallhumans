@@ -870,6 +870,11 @@ MAX_PITCH_RAD = math.radians(10.0)
 MAX_BODY_RATE_RAD_S = 2.0
 IMMEDIATE_MAX_BODY_RATE_RAD_S = 3.0
 MAX_COMMAND_RATE_RAD_S = 0.25
+# Gate-1 live traces showed sustained target-roll error while the attitude loop
+# used only about 0.04 rad/s of the calibrated 0.25-rad/s wire authority.  Keep
+# the final wire governor authoritative and increase only the roll error
+# response; the retained derivative term still damps measured body roll.
+VISUAL_ROLL_ATTITUDE_KP = 2.0
 # A prior collision-free Gate-0 course run proved this pitch response while
 # reaching the requested braking attitude sooner.  Generic post-credit
 # intercepts allocate it when saturated steering calls for reduced closure;
@@ -8508,7 +8513,7 @@ def attitude_rate_command(
         estimate.orientation,
         desired,
         omega=estimate.body_rates,
-        kp=(1.0, pitch_kp, 0.0),
+        kp=(VISUAL_ROLL_ATTITUDE_KP, pitch_kp, 0.0),
         kd=(0.4, 0.2, 0.0),
         max_rate=(MAX_COMMAND_RATE_RAD_S,) * 3,
     )

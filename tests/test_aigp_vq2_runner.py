@@ -2232,11 +2232,19 @@ def test_detection_diagnostics_are_strict_json_and_reject_nonfinite_values():
 
 def test_attitude_loop_is_finite_clamped_and_never_commands_yaw():
     command = attitude_rate_command(
-        _estimate(),
-        target_roll_rad=0.08,
-        target_pitch_rad=-0.10,
+        _estimate(roll=-0.08, pitch=-0.31),
+        target_roll_rad=-0.16,
+        target_pitch_rad=-0.31,
         thrust=0.27,
     )
+    opposite = attitude_rate_command(
+        _estimate(roll=-0.08, pitch=-0.31),
+        target_roll_rad=0.08,
+        target_pitch_rad=-0.31,
+        thrust=0.27,
+    )
+    assert -0.25 <= command.roll_rate < -0.10
+    assert 0.10 < opposite.roll_rate <= 0.25
     assert abs(command.roll_rate) <= 0.25
     assert abs(command.pitch_rate) <= 0.25
     assert command.yaw_rate == 0.0
