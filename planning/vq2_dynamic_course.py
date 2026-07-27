@@ -210,8 +210,10 @@ def _bearing_ray(bearing: Vector2) -> Vector3:
 class ImuAttitudeSample:
     """Capture-clock attitude and angular velocity.
 
-    ``body_to_reference_wxyz`` rotates body-FRD vectors into a stable reference
-    frame.  Host monotonic time is the only time domain used by this module.
+    ``body_to_reference_wxyz`` is an active rotation from body FRD into the
+    stable NED-like reference.  Camera rays first pass through the explicit
+    camera-to-body calibration in :class:`DynamicCourseConfig`.  Host
+    monotonic time is the only time domain used by this module.
     """
 
     monotonic_ns: int

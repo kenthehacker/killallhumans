@@ -2091,29 +2091,51 @@ def test_gate0_proved_vertical_collective_rejects_nonfinite_input():
         )
 
 
-def test_ec7fc1b8_dynamic_brake_is_not_reblended_toward_spawn_pitch():
-    governed = -0.296
+@pytest.mark.parametrize(
+    ("elapsed_s", "expected_blend"),
+    ((0.0, 0.0), (0.4, 0.5), (0.8, 1.0), (1.2, 1.0)),
+)
+def test_launch_pitch_reference_is_a_finite_convex_transition(
+    elapsed_s,
+    expected_blend,
+):
+    spawn = -0.3100692828034804
+    responsive = 0.120
     target, blend = course_stage._allocate_launch_pitch_target(
-        spawn_pitch_rad=-0.3100692828034804,
-        governed_target_pitch_rad=governed,
-        launch_elapsed_s=0.578,
-        legacy_blend_duration_s=0.8,
-        dynamic_governor_owns_target=True,
-    )
-    legacy_target, legacy_blend = (
-        course_stage._allocate_launch_pitch_target(
-            spawn_pitch_rad=-0.3100692828034804,
-            governed_target_pitch_rad=governed,
-            launch_elapsed_s=0.578,
-            legacy_blend_duration_s=0.8,
-            dynamic_governor_owns_target=False,
-        )
+        spawn_pitch_rad=spawn,
+        responsive_target_pitch_rad=responsive,
+        launch_elapsed_s=elapsed_s,
+        transition_duration_s=0.8,
     )
 
-    assert target == pytest.approx(governed)
-    assert blend == 1.0
-    assert legacy_blend == pytest.approx(0.7225)
-    assert legacy_target < governed
+    assert blend == pytest.approx(expected_blend)
+    assert target == pytest.approx(
+        spawn + expected_blend * (responsive - spawn)
+    )
+    assert math.isfinite(target)
+    assert spawn <= target <= responsive
+
+
+def test_opposite_launch_demand_changes_reference_on_the_same_tick():
+    common = {
+        "spawn_pitch_rad": -0.3100692828034804,
+        "launch_elapsed_s": 0.4,
+        "transition_duration_s": 0.8,
+    }
+    forward, forward_blend = course_stage._allocate_launch_pitch_target(
+        responsive_target_pitch_rad=-0.120,
+        **common,
+    )
+    brake, brake_blend = course_stage._allocate_launch_pitch_target(
+        responsive_target_pitch_rad=0.120,
+        **common,
+    )
+
+    assert forward_blend == brake_blend == pytest.approx(0.5)
+    assert brake - forward == pytest.approx(
+        brake_blend * (0.120 - (-0.120))
+    )
+    assert brake > forward
 
 
 def test_8319198e_dynamic_launch_does_not_discard_proved_collective():

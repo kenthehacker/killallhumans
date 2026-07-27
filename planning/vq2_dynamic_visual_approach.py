@@ -54,6 +54,7 @@ DYNAMIC_CROSSING_COORDINATE_BASIS = (
     "aperture-relative-q-swept-vehicle-envelope-v1"
 )
 _HOST_CLOCK_ID = "host-perf-counter"
+BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ = (0.0, 1.0, 0.0, 0.0)
 
 
 def production_dynamic_course_config() -> DynamicCourseConfig:
@@ -67,6 +68,14 @@ def production_dynamic_course_config() -> DynamicCourseConfig:
 
     return replace(
         DynamicCourseConfig(),
+        # The decoded camera chart is (forward, pixel-right, pixel-down).
+        # Paired build-3385 pitch and yaw response identifies the effective
+        # camera-to-body map as Rx(pi): forward/right/down -> forward/left/up.
+        # This is a proper rotation at the camera boundary, while the estimator
+        # quaternion remains the active body-FRD-to-NED orientation.
+        camera_to_body_wxyz=(
+            BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
+        ),
         roll_guidance_sign=1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
@@ -1321,6 +1330,7 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
 
 
 __all__ = [
+    "BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ",
     "DYNAMIC_CONTROLLER_FAMILY",
     "DYNAMIC_CROSSING_COORDINATE_BASIS",
     "DYNAMIC_TIMING_BASIS",

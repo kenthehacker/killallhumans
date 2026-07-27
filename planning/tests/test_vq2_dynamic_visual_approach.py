@@ -19,9 +19,11 @@ from planning.vq2_dynamic_course import (
     ImuAttitudeSample,
 )
 from planning.vq2_dynamic_visual_approach import (
+    BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ,
     DYNAMIC_CONTROLLER_FAMILY,
     DynamicRollingVisualApproachServo,
     DynamicVisualCourseSession,
+    production_dynamic_course_config,
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
@@ -42,6 +44,15 @@ _ALL_FRAME_EDGES = (
     | FrameEdge.BOTTOM
 )
 _AUTO_INNER_APERTURE = object()
+
+
+def test_production_camera_boundary_uses_live_axis_calibration() -> None:
+    config = production_dynamic_course_config()
+
+    assert config.camera_to_body_wxyz == (
+        BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
+    )
+    assert config.camera_to_body_wxyz == (0.0, 1.0, 0.0, 0.0)
 
 
 def _inner_aperture(

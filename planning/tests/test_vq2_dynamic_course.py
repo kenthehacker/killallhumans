@@ -222,12 +222,22 @@ def test_096f78c4_successor_bias_cannot_hide_unsafe_current_crossing() -> None:
     assert centered.clearance_q[1] < 0.0
 
 
-def _yaw_quaternion(yaw_rad: float) -> tuple[float, float, float, float]:
+def _euler_quaternion(
+    roll_rad: float,
+    pitch_rad: float,
+    yaw_rad: float,
+) -> tuple[float, float, float, float]:
+    cr = math.cos(roll_rad / 2.0)
+    sr = math.sin(roll_rad / 2.0)
+    cp = math.cos(pitch_rad / 2.0)
+    sp = math.sin(pitch_rad / 2.0)
+    cy = math.cos(yaw_rad / 2.0)
+    sy = math.sin(yaw_rad / 2.0)
     return (
-        math.cos(yaw_rad / 2.0),
-        0.0,
-        0.0,
-        math.sin(yaw_rad / 2.0),
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
     )
 
 
@@ -235,14 +245,26 @@ def _imu(
     core: DynamicCourseCore,
     time_s: float,
     *,
+    roll_rad: float = 0.0,
+    pitch_rad: float = 0.0,
     yaw_rad: float = 0.0,
+    roll_rate_rad_s: float = 0.0,
+    pitch_rate_rad_s: float = 0.0,
     yaw_rate_rad_s: float = 0.0,
 ) -> None:
     core.record_imu(
         ImuAttitudeSample(
             monotonic_ns=round(time_s * NS),
-            body_to_reference_wxyz=_yaw_quaternion(yaw_rad),
-            body_rates_rad_s=(0.0, 0.0, yaw_rate_rad_s),
+            body_to_reference_wxyz=_euler_quaternion(
+                roll_rad,
+                pitch_rad,
+                yaw_rad,
+            ),
+            body_rates_rad_s=(
+                roll_rate_rad_s,
+                pitch_rate_rad_s,
+                yaw_rate_rad_s,
+            ),
             attitude_uncertainty_rad=0.001,
             source_timestamp_us=round(time_s * 1_000_000),
         )
@@ -317,35 +339,116 @@ def _commit_decision(
     )
 
 
-def test_attitude_rotation_alone_derotates_to_zero_translation() -> None:
+@pytest.mark.parametrize("axis", ("roll", "pitch", "yaw"))
+def test_small_body_axis_rotation_preserves_one_stationary_optical_ray(
+    axis,
+) -> None:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,
         horizontal_angle_scale_rad=1.59,
-        vertical_angle_scale_rad=1.10,
+        vertical_angle_scale_rad=0.55,
+        camera_to_body_wxyz=(0.0, 1.0, 0.0, 0.0),
     )
     core = DynamicCourseCore(config)
-    _imu(core, 1.0, yaw_rad=0.0)
-    first = core.observe_track(_observation("gate-a", 1, 1.0))
+    initial_center = (0.12, -0.08)
+    _imu(core, 1.0)
+    first = core.observe_track(
+        _observation(
+            "gate-a",
+            1,
+            1.0,
+            x=initial_center[0],
+            y=initial_center[1],
+        )
+    )
 
-    yaw = 0.18
-    _imu(core, 1.1, yaw_rad=yaw, yaw_rate_rad_s=1.8)
+    angle = 0.08
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    initial_ray = (
+        1.0,
+        initial_center[0] * config.horizontal_angle_scale_rad,
+        initial_center[1] * config.vertical_angle_scale_rad,
+    )
+    forward, right, down = initial_ray
+    if axis == "roll":
+        # camera_to_body=Rx(pi), so body roll keeps its sign while the
+        # stationary ray rotates by the inverse body roll in the camera.
+        raw_ray = (
+            forward,
+            cosine * right + sine * down,
+            -sine * right + cosine * down,
+        )
+    elif axis == "pitch":
+        # Rx(pi) changes the body-pitch sign in the decoded camera chart.
+        raw_ray = (
+            cosine * forward + sine * down,
+            right,
+            -sine * forward + cosine * down,
+        )
+    else:
+        # Rx(pi) also changes the body-yaw sign in the decoded chart.
+        raw_ray = (
+            cosine * forward - sine * right,
+            sine * forward + cosine * right,
+            down,
+        )
+    raw_center = (
+        raw_ray[1]
+        / raw_ray[0]
+        / config.horizontal_angle_scale_rad,
+        raw_ray[2]
+        / raw_ray[0]
+        / config.vertical_angle_scale_rad,
+    )
+    attitude = {f"{axis}_rad": angle}
+    rate = {f"{axis}_rate_rad_s": angle / 0.1}
+    _imu(core, 1.1, **attitude, **rate)
     second = core.observe_track(
         _observation(
             "gate-a",
             2,
             1.1,
-            x=math.tan(-yaw) / config.horizontal_angle_scale_rad,
+            x=raw_center[0],
+            y=raw_center[1],
         )
     )
 
-    assert first.bearing_rad == pytest.approx((0.0, 0.0), abs=1e-12)
-    assert second.bearing_rad == pytest.approx((0.0, 0.0), abs=2e-10)
+    assert second.bearing_rad == pytest.approx(
+        first.bearing_rad,
+        abs=2e-10,
+    )
     assert second.bearing_rate_rad_s == pytest.approx((0.0, 0.0), abs=2e-9)
-    assert second.predicted_rotational_rate_rad_s[0] == pytest.approx(-1.8)
     assert second.residual_translational_rate_rad_s == pytest.approx(
         (0.0, 0.0),
         abs=2e-9,
     )
+
+
+def test_latest_gate0_pitch_and_image_motion_are_optically_invariant() -> None:
+    """Capture the build-3385 relationship before changing vertical control."""
+
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        vertical_angle_scale_rad=0.55,
+        camera_to_body_wxyz=(0.0, 1.0, 0.0, 0.0),
+    )
+    core = DynamicCourseCore(config)
+    _imu(core, 1.0, pitch_rad=-0.310)
+    first = core.observe_track(
+        _observation("gate-a", 1, 1.0, y=-0.025)
+    )
+
+    _imu(core, 2.156, pitch_rad=0.021)
+    second = core.observe_track(
+        _observation("gate-a", 2, 2.156, y=-0.649)
+    )
+
+    assert second.bearing_rad[1] == pytest.approx(
+        first.bearing_rad[1],
+        abs=0.003,
+    )
+    assert abs(second.residual_translational_rate_rad_s[1]) < 0.003
 
 
 def test_4c42bb77_contour_completion_cannot_seed_collective_rate() -> None:

@@ -144,33 +144,29 @@ _YAW_PROFILE_ISSUER = object()
 def _allocate_launch_pitch_target(
     *,
     spawn_pitch_rad: float,
-    governed_target_pitch_rad: float,
+    responsive_target_pitch_rad: float,
     launch_elapsed_s: float,
-    legacy_blend_duration_s: float,
-    dynamic_governor_owns_target: bool,
+    transition_duration_s: float,
 ) -> tuple[float, float]:
-    """Apply the spawn blend once, never on top of dynamic target continuity."""
+    """Generate the initial launch attitude reference from measured spawn.
+
+    The destination remains the current responsive visual demand on every
+    tick.  This launch-only interpolation has no prior-command or slew state;
+    the final wire governor remains the sole command-continuity authority.
+    """
 
     values = (
         float(spawn_pitch_rad),
-        float(governed_target_pitch_rad),
+        float(responsive_target_pitch_rad),
         float(launch_elapsed_s),
-        float(legacy_blend_duration_s),
+        float(transition_duration_s),
     )
     if (
         not all(math.isfinite(value) for value in values)
         or values[2] < 0.0
         or values[3] <= 0.0
-        or type(dynamic_governor_owns_target) is not bool
     ):
         raise ValueError("launch pitch allocation inputs are invalid")
-    if dynamic_governor_owns_target:
-        # Dynamic guidance emits an already bounded target and the final wire
-        # governor is the sole command-continuity authority.  Reapplying the
-        # legacy time blend here would recreate a second temporal governor;
-        # it previously kept the ec7fc1b8 vertical brake nose-down until the
-        # aperture was nearly censored.
-        return values[1], 1.0
     blend = min(1.0, values[2] / values[3])
     return (
         (1.0 - blend) * values[0] + blend * values[1],
@@ -2902,13 +2898,9 @@ async def _run_visual_course_stage_impl(
             target_pitch_rad, pitch_blend = (
                 _allocate_launch_pitch_target(
                     spawn_pitch_rad=launch_spawn_pitch_rad,
-                    governed_target_pitch_rad=target_pitch_rad,
+                    responsive_target_pitch_rad=target_pitch_rad,
                     launch_elapsed_s=launch_elapsed_s,
-                    legacy_blend_duration_s=pitch_blend_s,
-                    dynamic_governor_owns_target=bool(
-                        runtime.dynamic_controller is not None
-                        and output.brake_reason != "continuity_seed"
-                    ),
+                    transition_duration_s=pitch_blend_s,
                 )
             )
             assert proved_collective is not None
