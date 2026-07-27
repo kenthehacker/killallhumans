@@ -438,6 +438,10 @@ class DynamicCourseConfig:
     scale_alpha: float = 0.55
     scale_beta: float = 0.20
     residual_alpha: float = 0.35
+    # A raw two-frame image difference is not a qualified translation rate.
+    # Require a short odd window so a one-frame contour-completion jump cannot
+    # seed collective or crossing guidance before temporal consistency exists.
+    residual_rate_median_window: int = 3
     max_bearing_innovation_rad: float = 0.30
     max_log_scale_innovation: float = 0.45
     max_abs_bearing_rad: float = 1.40
@@ -596,6 +600,18 @@ class DynamicCourseConfig:
             raise TypeError("max_history_samples must be an exact integer")
         if self.max_history_samples < 8:
             raise DynamicCourseError("max_history_samples must be at least 8")
+        if type(self.residual_rate_median_window) is not int:
+            raise TypeError(
+                "residual_rate_median_window must be an exact integer"
+            )
+        if (
+            self.residual_rate_median_window < 3
+            or self.residual_rate_median_window > 7
+            or self.residual_rate_median_window % 2 == 0
+        ):
+            raise DynamicCourseError(
+                "residual_rate_median_window must be an odd integer in [3, 7]"
+            )
         object.__setattr__(
             self,
             "camera_to_body_wxyz",
@@ -853,6 +869,7 @@ class _TrackEstimate:
     last_measurement_camera_to_world: Quaternion
     last_measured_center_norm: Vector2
     last_measured_aperture_half_size_norm: Vector2 | None
+    measured_residual_rate_history: tuple[list[float], list[float]]
     measured_bearing_history: list[tuple[int, Vector2]]
 
 
@@ -1212,6 +1229,8 @@ class DynamicCourseCore:
             if existing is None:
                 raise DynamicCourseError("an invisible observation cannot initialise a track")
             existing.measured_bearing_history.clear()
+            for history in existing.measured_residual_rate_history:
+                history.clear()
             return self._coast_track(
                 existing,
                 observation,
@@ -1257,6 +1276,7 @@ class DynamicCourseCore:
                 last_measured_aperture_half_size_norm=(
                     observation.aperture_half_size_norm
                 ),
+                measured_residual_rate_history=([], []),
                 measured_bearing_history=(
                     [(capture_ns, measured_bearing)]
                     if (
@@ -1273,6 +1293,27 @@ class DynamicCourseCore:
             raw_angle,
             capture_ns,
         )
+        robust_residual_rate: list[float | None] = []
+        for axis in range(2):
+            history = existing.measured_residual_rate_history[axis]
+            if observation.ambiguous or observation.censored_axes[axis]:
+                history.clear()
+                robust_residual_rate.append(None)
+                continue
+            history.append(residual_rate[axis])
+            del history[
+                : max(
+                    0,
+                    len(history)
+                    - self.config.residual_rate_median_window,
+                )
+            ]
+            robust_residual_rate.append(
+                None
+                if len(history)
+                < self.config.residual_rate_median_window
+                else float(statistics.median(history))
+            )
         state = self._update_track(
             existing.state,
             observation,
@@ -1281,7 +1322,7 @@ class DynamicCourseCore:
             delayed,
             measured_bearing,
             rotational_rate,
-            residual_rate,
+            (robust_residual_rate[0], robust_residual_rate[1]),
         )
         existing.state = state
         existing.last_measured_raw_angle = raw_angle
@@ -1474,7 +1515,10 @@ class DynamicCourseCore:
         delayed: DelayedCommandView,
         measured_bearing: Vector2,
         rotational_rate: Vector2,
-        measured_residual_rate: Vector2,
+        measured_residual_rate: tuple[
+            float | None,
+            float | None,
+        ],
     ) -> TrackDynamicState:
         assert observation.center_norm is not None
         assert observation.log_scale is not None
@@ -1486,7 +1530,6 @@ class DynamicCourseCore:
         if observation.ambiguous:
             quality *= 0.55
         alpha = self.config.bearing_alpha * quality
-        beta = self.config.bearing_beta * quality
         censored = observation.censored_axes
         bearing_values: list[float] = []
         bearing_rates: list[float] = []
@@ -1498,6 +1541,8 @@ class DynamicCourseCore:
             observation.measurement_std[1] * self.config.vertical_angle_scale_rad,
         )
         for axis in range(2):
+            qualified_residual_rate = measured_residual_rate[axis]
+            rate_qualified = qualified_residual_rate is not None
             if censored[axis]:
                 value = predicted_bearing[axis]
                 rate = predicted_rate[axis]
@@ -1510,17 +1555,28 @@ class DynamicCourseCore:
                     measured_bearing[axis],
                     dt,
                     alpha,
-                    beta,
+                    (
+                        self.config.bearing_beta * quality
+                        if rate_qualified
+                        else 0.0
+                    ),
                     self.config.max_bearing_innovation_rad,
                     self.config.max_abs_bearing_rate_rad_s,
                 )
-                residual = previous.residual_translational_rate_rad_s[axis] + (
-                    self.config.residual_alpha
-                    * (
-                        measured_residual_rate[axis]
-                        - previous.residual_translational_rate_rad_s[axis]
+                if rate_qualified:
+                    assert qualified_residual_rate is not None
+                    residual = (
+                        previous.residual_translational_rate_rad_s[axis]
+                        + self.config.residual_alpha
+                        * (
+                            qualified_residual_rate
+                            - previous.residual_translational_rate_rad_s[axis]
+                        )
                     )
-                )
+                else:
+                    residual = (
+                        previous.residual_translational_rate_rad_s[axis]
+                    )
                 residual = _clamp(
                     residual,
                     -self.config.max_abs_bearing_rate_rad_s,
@@ -1552,13 +1608,20 @@ class DynamicCourseCore:
                 )
             )
         if observation.clipping == FrameEdge.NONE:
+            scale_rate_qualified = all(
+                value is not None for value in measured_residual_rate
+            )
             log_scale, expansion = self._robust_update(
                 predicted_scale,
                 predicted_expansion,
                 observation.log_scale,
                 dt,
                 self.config.scale_alpha * quality,
-                self.config.scale_beta * quality,
+                (
+                    self.config.scale_beta * quality
+                    if scale_rate_qualified
+                    else 0.0
+                ),
                 self.config.max_log_scale_innovation,
                 self.config.max_abs_expansion_rate_s,
             )

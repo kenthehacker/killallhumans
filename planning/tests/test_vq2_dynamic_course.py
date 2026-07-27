@@ -250,6 +250,85 @@ def test_attitude_rotation_alone_derotates_to_zero_translation() -> None:
     )
 
 
+def test_4c42bb77_contour_completion_cannot_seed_collective_rate() -> None:
+    """Reject the exact one-frame launch contour jump as translation."""
+
+    config = DynamicCourseConfig(camera_delay_s=0.0)
+    core = DynamicCourseCore(config)
+    core.record_applied_command(
+        _command(
+            0.90,
+            pitch=-0.3101673180451623,
+            thrust=0.26,
+        )
+    )
+    samples = (
+        (
+            1.000,
+            0.02777777777777768,
+            0.16388888888888886,
+            0.1431297003109806,
+        ),
+        (
+            1.031,
+            -0.033333333333333326,
+            0.22499999999999998,
+            0.16770509831248426,
+        ),
+        (
+            1.063,
+            -0.02777777777777779,
+            0.2222222222222222,
+            0.1666666666666667,
+        ),
+        (
+            1.094,
+            -0.033333333333333326,
+            0.22499999999999998,
+            0.16770509831248426,
+        ),
+    )
+    states = []
+    for sequence, (time_s, y, aperture_y, scale) in enumerate(
+        samples,
+        start=1,
+    ):
+        _imu(core, time_s)
+        states.append(
+            core.observe_track(
+                _observation(
+                    "gate-0",
+                    sequence,
+                    time_s,
+                    x=0.006250000000000089,
+                    y=y,
+                    log_scale=math.log(scale),
+                    aperture=(0.125, aperture_y),
+                    confidence=0.67,
+                )
+            )
+        )
+
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-0",
+        successor_track_id=None,
+    )
+    decision = core.guide(round(samples[-1][0] * NS))
+    first_contour_update = states[1]
+    qualified = states[-1]
+
+    assert first_contour_update.residual_translational_rate_rad_s[1] == (
+        pytest.approx(0.0, abs=1e-12)
+    )
+    assert first_contour_update.time_to_contact_s is None
+    assert abs(decision.crossing_rate_q_s[1]) < 0.35
+    assert abs(
+        qualified.residual_translational_rate_rad_s[1]
+        / config.vertical_angle_scale_rad
+    ) < 0.08
+
+
 def test_delayed_command_history_is_right_continuous_at_channel_delays() -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
