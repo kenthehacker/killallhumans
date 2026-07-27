@@ -481,7 +481,7 @@ def _derive_approach_inner_dropout_authority(
     fov_summary: Mapping[str, Any],
     existing: Optional[_ApproachInnerDropoutAuthority] = None,
 ) -> Optional[_ApproachInnerDropoutAuthority]:
-    """Bound a TOP-only fit dropout to the last exact inner/FOV authority."""
+    """Bound a vertical-support refusal to the last exact inner authority."""
 
     maximum_age = float(maximum_age_s)
     track = getattr(snapshot, "current_track", None)
@@ -511,7 +511,8 @@ def _derive_approach_inner_dropout_authority(
         or getattr(track, "visible", False) is not True
         or getattr(track, "ambiguous", True) is not False
         or getattr(track, "missed_frame_count", None) != 0
-        or getattr(track, "clipping", None) != FrameEdge.TOP
+        or getattr(track, "clipping", None)
+        not in {FrameEdge.TOP, FrameEdge.BOTTOM}
         or getattr(track, "center_censored", None) is not True
         or type(token) is not CameraFrameToken
         or type(history) is not tuple
@@ -535,7 +536,23 @@ def _derive_approach_inner_dropout_authority(
         return None
 
     if existing is None:
-        anchor_sample = history[-2]
+        anchor_token_value = fov_summary.get(
+            "last_inner_camera_token"
+        )
+        anchor_index = next(
+            (
+                index
+                for index, sample in enumerate(history[:-1])
+                if type(getattr(sample, "token", None))
+                is CameraFrameToken
+                and isinstance(anchor_token_value, Mapping)
+                and asdict(sample.token) == dict(anchor_token_value)
+            ),
+            None,
+        )
+        if anchor_index is None:
+            return None
+        anchor_sample = history[anchor_index]
         anchor_inner = anchor_sample.inner_aperture
         if (
             type(anchor_sample.token) is not CameraFrameToken
@@ -548,25 +565,70 @@ def _derive_approach_inner_dropout_authority(
             or not anchor_inner.fitted
             or anchor_inner.clipping != FrameEdge.NONE
             or not anchor_inner.complete_visibility
-            or fov_summary.get("active") is not True
-            or fov_summary.get("last_track_id") != expected_track_id
-            or fov_summary.get("last_raw_top_edge_basis")
+            or fov_summary.get("last_inner_active") is not True
+            or fov_summary.get("last_inner_track_id")
+            != expected_track_id
+            or fov_summary.get("last_inner_raw_top_edge_basis")
             != TOP_FOV_INNER_EDGE_BASIS
-            or fov_summary.get("last_camera_token")
-            != asdict(anchor_sample.token)
             or type(
-                fov_summary.get("last_wire_start_monotonic_ns")
+                fov_summary.get(
+                    "last_inner_wire_start_monotonic_ns"
+                )
             )
             is not int
         ):
             return None
+        previous_sample = anchor_sample
+        for dropout_sample in history[anchor_index + 1 :]:
+            dropout_inner = dropout_sample.inner_aperture
+            if (
+                type(dropout_sample.token) is not CameraFrameToken
+                or dropout_sample.token.stream_id != token.stream_id
+                or dropout_sample.token.generation != token.generation
+                or not _token_strictly_newer(
+                    dropout_sample.token,
+                    previous_sample.token,
+                )
+                or type(
+                    dropout_sample.observation_monotonic_ns
+                )
+                is not int
+                or dropout_sample.observation_monotonic_ns
+                <= previous_sample.observation_monotonic_ns
+                or dropout_sample.clipping
+                not in {
+                    FrameEdge.NONE,
+                    FrameEdge.TOP,
+                    FrameEdge.BOTTOM,
+                }
+                or (
+                    dropout_sample.clipping == FrameEdge.NONE
+                    and dropout_sample.center_censored
+                )
+                or (
+                    dropout_sample.clipping != FrameEdge.NONE
+                    and not dropout_sample.center_censored
+                )
+                or (
+                    type(dropout_inner)
+                    is VisualInnerApertureGeometry
+                    and dropout_inner.fitted
+                    and dropout_inner.clipping == FrameEdge.NONE
+                    and dropout_inner.complete_visibility
+                )
+            ):
+                return None
+            previous_sample = dropout_sample
         maximum_target_pitch = float(
-            fov_summary.get("last_protected_target_pitch_rad", math.nan)
+            fov_summary.get(
+                "last_inner_protected_target_pitch_rad",
+                math.nan,
+            )
         )
         anchor_token = anchor_sample.token
         anchor_observation_ns = anchor_sample.observation_monotonic_ns
         anchor_wire_start_ns = int(
-            fov_summary["last_wire_start_monotonic_ns"]
+            fov_summary["last_inner_wire_start_monotonic_ns"]
         )
     else:
         if (
@@ -1436,6 +1498,7 @@ def _propose_current_aperture_collective(
     control_vertical_error_image_down: Optional[float] = None,
     control_vertical_rate_down_s: Optional[float] = None,
     control_basis: str = RAW_CURRENT_APERTURE_COLLECTIVE_BASIS,
+    current_aperture_observable: bool = True,
 ) -> _CurrentApertureCollectiveProposal:
     """Allocate collective only from the authoritative current aperture."""
 
@@ -1443,11 +1506,15 @@ def _propose_current_aperture_collective(
         type(authoritative_current_track_id) is not str
         or not authoritative_current_track_id
         or state.track_id != authoritative_current_track_id
+        or type(current_aperture_observable) is not bool
     ):
         raise ValueError(
             "current-aperture collective authority is invalid"
         )
-    if target.track_id == authoritative_current_track_id:
+    if (
+        target.track_id == authoritative_current_track_id
+        and current_aperture_observable
+    ):
         thrust, filtered_rate = state.observe(
             target,
             control_vertical_error_image_down=(
@@ -3571,6 +3638,7 @@ async def _run_visual_course_stage_impl(
             control_vertical_error_image_down: Optional[float] = None
             control_vertical_rate_down_s: Optional[float] = None
             control_basis = RAW_CURRENT_APERTURE_COLLECTIVE_BASIS
+            current_aperture_observable = True
             dynamic_decision = runtime.dynamic_controller.last_decision
             if dynamic_decision is not None:
                 dynamic_course = (
@@ -3586,18 +3654,34 @@ async def _run_visual_course_stage_impl(
                         "current-aperture collective dynamic identity changed"
                     )
                 current_dynamic = dynamic_course.current
-                (
-                    control_vertical_error_image_down,
-                    control_vertical_rate_down_s,
-                    control_basis,
-                ) = _dynamic_current_aperture_collective_inputs(
-                    dynamic_decision,
-                    current_dynamic,
-                    vertical_angle_scale_rad=(
-                        runtime.dynamic_controller.core.config
-                        .vertical_angle_scale_rad
-                    ),
+                current_aperture_observable = bool(
+                    getattr(current_dynamic, "visible", True)
+                    and not getattr(
+                        current_dynamic,
+                        "ambiguous",
+                        False,
+                    )
+                    and not any(
+                        getattr(
+                            current_dynamic,
+                            "censored_axes",
+                            (False, False),
+                        )
+                    )
                 )
+                if current_aperture_observable:
+                    (
+                        control_vertical_error_image_down,
+                        control_vertical_rate_down_s,
+                        control_basis,
+                    ) = _dynamic_current_aperture_collective_inputs(
+                        dynamic_decision,
+                        current_dynamic,
+                        vertical_angle_scale_rad=(
+                            runtime.dynamic_controller.core.config
+                            .vertical_angle_scale_rad
+                        ),
+                    )
             collective_proposal = (
                 _propose_current_aperture_collective(
                     current_aperture_collective_state,
@@ -3610,6 +3694,9 @@ async def _run_visual_course_stage_impl(
                         control_vertical_rate_down_s
                     ),
                     control_basis=control_basis,
+                    current_aperture_observable=(
+                        current_aperture_observable
+                    ),
                 )
             )
             proved_collective = (
@@ -4177,6 +4264,33 @@ async def _run_visual_course_stage_impl(
                             "active": top_fov_proposal.active_after,
                         }
                     )
+                    if (
+                        top_fov_observation.raw_top_edge_basis
+                        == TOP_FOV_INNER_EDGE_BASIS
+                    ):
+                        fov_summary.update(
+                            {
+                                "last_inner_track_id": (
+                                    top_fov_track_id
+                                ),
+                                "last_inner_camera_token": asdict(
+                                    snapshot.latest_camera_token
+                                ),
+                                "last_inner_wire_start_monotonic_ns": (
+                                    wire_start_monotonic_ns
+                                ),
+                                "last_inner_raw_top_edge_basis": (
+                                    TOP_FOV_INNER_EDGE_BASIS
+                                ),
+                                "last_inner_protected_target_pitch_rad": (
+                                    top_fov_proposal
+                                    .protected_target_pitch_rad
+                                ),
+                                "last_inner_active": (
+                                    top_fov_proposal.active_after
+                                ),
+                            }
+                        )
                     accepted_dynamic_evidence["top_fov_pitch_guidance"] = {
                         "basis": TOP_FOV_PITCH_PROTECTION_BASIS,
                         "track_id": top_fov_track_id,
@@ -4953,6 +5067,12 @@ async def _run_visual_course_stage_impl(
                 "last_track_id": None,
                 "last_camera_token": None,
                 "last_wire_start_monotonic_ns": None,
+                "last_inner_track_id": None,
+                "last_inner_camera_token": None,
+                "last_inner_wire_start_monotonic_ns": None,
+                "last_inner_raw_top_edge_basis": None,
+                "last_inner_protected_target_pitch_rad": None,
+                "last_inner_active": False,
                 "last_raw_top_edge_image_down": None,
                 "last_raw_top_edge_basis": None,
                 "last_raw_top_edge_confidence": None,
@@ -5471,14 +5591,12 @@ async def _run_visual_course_stage_impl(
                         ) from hold_exc
                     if (
                         not isinstance(hold, Mapping)
-                        or abs(
-                            float(hold["target_pitch_rad"])
-                            - (
-                                dropout_authority
-                                .maximum_target_pitch_rad
-                            )
+                        or float(hold["target_pitch_rad"])
+                        > (
+                            dropout_authority
+                            .maximum_target_pitch_rad
+                            + 1e-12
                         )
-                        > 1e-12
                         or type(
                             hold.get("source_wire_start_monotonic_ns")
                         )

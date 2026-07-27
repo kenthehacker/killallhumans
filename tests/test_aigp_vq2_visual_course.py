@@ -2512,6 +2512,8 @@ def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
         token=dropout_token,
         observation_monotonic_ns=1_032_000_000,
         inner_aperture=rejected_inner,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
     )
     track = SimpleNamespace(
         track_id="track-0",
@@ -2532,12 +2534,14 @@ def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
         authority_usable=True,
     )
     fov_summary = {
-        "active": True,
-        "last_track_id": "track-0",
-        "last_camera_token": asdict(anchor_token),
-        "last_wire_start_monotonic_ns": 1_010_000_000,
-        "last_raw_top_edge_basis": course_stage.TOP_FOV_INNER_EDGE_BASIS,
-        "last_protected_target_pitch_rad": -0.31,
+        "last_inner_active": True,
+        "last_inner_track_id": "track-0",
+        "last_inner_camera_token": asdict(anchor_token),
+        "last_inner_wire_start_monotonic_ns": 1_010_000_000,
+        "last_inner_raw_top_edge_basis": (
+            course_stage.TOP_FOV_INNER_EDGE_BASIS
+        ),
+        "last_inner_protected_target_pitch_rad": -0.31,
     }
 
     authority = course_stage._derive_approach_inner_dropout_authority(
@@ -2560,7 +2564,9 @@ def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
     )
 
     mismatched_fov_summary = dict(fov_summary)
-    mismatched_fov_summary["last_camera_token"] = asdict(_token(39))
+    mismatched_fov_summary["last_inner_camera_token"] = asdict(
+        _token(39)
+    )
     assert (
         course_stage._derive_approach_inner_dropout_authority(
             snapshot=snapshot,
@@ -2584,16 +2590,53 @@ def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
         is None
     )
 
+    fallback_token = _token(42)
+    fallback = SimpleNamespace(
+        token=fallback_token,
+        observation_monotonic_ns=1_064_000_000,
+        inner_aperture=rejected_inner,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+    )
+    bottom_token = _token(43)
+    bottom = SimpleNamespace(
+        token=bottom_token,
+        observation_monotonic_ns=1_097_000_000,
+        inner_aperture=rejected_inner,
+        clipping=FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    track.latest_token = bottom_token
+    track.clipping = FrameEdge.BOTTOM
+    track.history = (anchor, dropout, fallback, bottom)
+    snapshot.latest_camera_token = bottom_token
+    bridged = course_stage._derive_approach_inner_dropout_authority(
+        snapshot=snapshot,
+        expected_gate_index=0,
+        expected_track_id="track-0",
+        maximum_age_s=0.12,
+        now_monotonic_ns=1_107_000_000,
+        fov_summary=fov_summary,
+    )
+    assert bridged is not None
+    assert bridged.anchor_camera_token == anchor_token
+    assert bridged.last_camera_token == bottom_token
+    assert bridged.age_s == pytest.approx(0.097)
+
     skipped = SimpleNamespace(
         token=_token(42),
         observation_monotonic_ns=1_054_000_000,
         inner_aperture=rejected_inner,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
     )
     after_gap_token = _token(43)
     after_gap = SimpleNamespace(
         token=after_gap_token,
         observation_monotonic_ns=1_076_000_000,
         inner_aperture=rejected_inner,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
     )
     track.latest_token = after_gap_token
     track.history = (anchor, dropout, skipped, after_gap)
@@ -2616,8 +2659,11 @@ def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
         token=expired_token,
         observation_monotonic_ns=1_121_000_000,
         inner_aperture=rejected_inner,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
     )
     track.latest_token = expired_token
+    track.clipping = FrameEdge.TOP
     track.history = (anchor, dropout, expired)
     snapshot.latest_camera_token = expired_token
 
@@ -2863,6 +2909,30 @@ def test_current_aperture_collective_holds_through_censorship_and_dropout():
             authoritative_current_track_id="track-3",
         )
     )
+    fallback = replace(
+        censored,
+        frame_token=replace(
+            censored.frame_token,
+            frame_id=censored.frame_token.frame_id + 1,
+            publication_sequence=(
+                censored.frame_token.publication_sequence + 1
+            ),
+        ),
+        received_monotonic_s=12.06,
+        normalized_y_down=0.75,
+        normalized_y_rate_down_s=4.0,
+        clipped=False,
+        center_censored=False,
+        vertical_censored=False,
+    )
+    fallback_proposal = (
+        course_stage._propose_current_aperture_collective(
+            state,
+            fallback,
+            authoritative_current_track_id="track-3",
+            current_aperture_observable=False,
+        )
+    )
     adjacent = _target(
         _snapshot(4, "track-4", 22),
         "track-4",
@@ -2881,6 +2951,14 @@ def test_current_aperture_collective_holds_through_censorship_and_dropout():
     )
     assert censored_proposal.vertical_censored is True
     assert censored_proposal.held_last_observable_collective is True
+    assert fallback_proposal.requested_thrust == pytest.approx(
+        clean_proposal.requested_thrust
+    )
+    assert fallback_proposal.current_aperture_dropout is True
+    assert fallback_proposal.held_last_observable_collective is True
+    assert fallback_proposal.control_vertical_error_image_down == (
+        clean.normalized_y_down
+    )
     assert dropout_proposal.requested_thrust == pytest.approx(
         clean_proposal.requested_thrust
     )
