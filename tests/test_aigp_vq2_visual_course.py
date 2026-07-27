@@ -2109,64 +2109,6 @@ def test_105f607_terminal_vertical_replay_commands_below_support():
     assert proposal.held_last_observable_collective is False
 
 
-def test_096f78c4_collective_settles_expansion_aware_q_rate():
-    decision = SimpleNamespace(
-        passage_error_norm=(0.05151534397, -1.15050750323),
-        current_aperture_half_size_norm=(
-            0.39233066014,
-            0.78292060212,
-        ),
-        crossing_rate_q_s=(0.174765, 1.975791),
-    )
-    residual_rate_down_s = 0.1295575223822568
-    vertical_angle_scale_rad = 0.55
-    current = SimpleNamespace(
-        residual_translational_rate_rad_s=(
-            0.0,
-            residual_rate_down_s * vertical_angle_scale_rad,
-        ),
-        visible=True,
-        ambiguous=False,
-        censored_axes=(False, False),
-        bearing_rate_qualified=(True, True),
-        scale_rate_qualified=True,
-    )
-    error, q_rate_down_s, basis = (
-        course_stage._dynamic_current_aperture_collective_inputs(
-            decision,
-            current,
-            vertical_angle_scale_rad=vertical_angle_scale_rad,
-        )
-    )
-    state = course_stage._CurrentApertureProvedCollectiveState(
-        track_id="track-0"
-    )
-    target = _target(_snapshot(0, "track-0", 152), "track-0")
-    proposal = course_stage._propose_current_aperture_collective(
-        state,
-        target,
-        authoritative_current_track_id="track-0",
-        control_vertical_error_image_down=error,
-        control_vertical_rate_down_s=q_rate_down_s,
-        control_basis=basis,
-    )
-    falsified_residual_request = (
-        course_stage._gate0_proved_vertical_collective(
-            error,
-            residual_rate_down_s,
-        )
-    )
-
-    assert q_rate_down_s == pytest.approx(1.54688748, abs=2e-8)
-    assert basis == course_stage.CURRENT_APERTURE_Q_COLLECTIVE_BASIS
-    assert falsified_residual_request == pytest.approx(
-        0.2986757522,
-        abs=2e-10,
-    )
-    assert proposal.requested_thrust == pytest.approx(0.21)
-    assert proposal.requested_thrust < falsified_residual_request
-
-
 def test_current_aperture_collective_holds_through_censorship_and_dropout():
     state = course_stage._CurrentApertureProvedCollectiveState(
         track_id="track-3",

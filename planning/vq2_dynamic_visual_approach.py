@@ -624,15 +624,6 @@ class DynamicVisualCourseSession:
                     "successor_passage_authority": (
                         decision.successor_passage_authority
                     ),
-                    "centered_crossing_clearance_norm": list(
-                        decision.centered_crossing_clearance_norm
-                    ),
-                    "successor_clearance_dwell_s": (
-                        decision.successor_clearance_dwell_s
-                    ),
-                    "successor_clearance_authority": (
-                        decision.successor_clearance_authority
-                    ),
                     "passage_error_norm": list(
                         decision.passage_error_norm
                     ),

@@ -488,11 +488,6 @@ class DynamicCourseConfig:
     passage_successor_bias: float = 0.55
     successor_passage_far_authority: float = 0.25
     successor_passage_full_confidence: float = 0.50
-    # Successor guidance cannot accrue while the current aperture is unsafe.
-    # Once both centered crossing clearances remain positive, require a short
-    # fresh-observation dwell and then release authority continuously.
-    successor_clearance_dwell_s: float = 0.12
-    successor_clearance_ramp_s: float = 0.20
     crossing_prediction_max_horizon_s: float = 1.20
     successor_prediction_max_horizon_s: float = 0.40
     successor_prediction_max_extrapolation_rad: float = 0.18
@@ -541,8 +536,6 @@ class DynamicCourseConfig:
             "maximum_ttc_s",
             "passage_margin_norm",
             "vertical_settled_rate_norm_s",
-            "successor_clearance_dwell_s",
-            "successor_clearance_ramp_s",
             "crossing_prediction_max_horizon_s",
             "successor_prediction_max_horizon_s",
             "successor_prediction_max_extrapolation_rad",
@@ -729,9 +722,6 @@ class GuidanceDecision:
     current_aperture_half_size_norm: Vector2 | None
     passage_point_norm: Vector2
     successor_passage_authority: float
-    centered_crossing_clearance_norm: Vector2
-    successor_clearance_dwell_s: float
-    successor_clearance_authority: float
     passage_error_norm: Vector2
     aperture_margin_norm: Vector2
     crossing_prediction_horizon_s: float
@@ -1118,10 +1108,6 @@ class DynamicCourseCore:
         self._successor_passage_track_id: str | None = None
         self._successor_passage_authority = 0.0
         self._successor_passage_authority_ns: int | None = None
-        self._successor_clearance_key: (
-            tuple[int, str, str | None] | None
-        ) = None
-        self._successor_clearance_positive_since_ns: int | None = None
         self._governor = CommandGovernor(self.config.governor)
 
     @property
@@ -1989,16 +1975,8 @@ class DynamicCourseCore:
                 raise DynamicCourseError("current and successor tracks must differ")
             if successor_track_id not in self._tracks:
                 raise DynamicCourseError("successor track has no dynamic state")
-        ownership_key = (
-            current_gate_index,
-            current_track_id,
-            successor_track_id,
-        )
-        if ownership_key != self._successor_clearance_key:
-            self._successor_clearance_key = None
-            self._successor_clearance_positive_since_ns = None
-        self._current_track_id = current_track_id
         self._current_gate_index = current_gate_index
+        self._current_track_id = current_track_id
         self._successor_track_id = successor_track_id
         return self.course_state()
 
@@ -2089,8 +2067,6 @@ class DynamicCourseCore:
         self._current_gate_index = to_gate_index
         self._current_track_id = promoted_track_id
         self._successor_track_id = next_successor_track_id
-        self._successor_clearance_key = None
-        self._successor_clearance_positive_since_ns = None
         self._promotion_count += 1
         self._last_promotion_ns = monotonic_ns
         return self.course_state()
@@ -2119,6 +2095,14 @@ class DynamicCourseCore:
             successor,
             monotonic_ns,
         )
+        successor_passage_authority = (
+            self._successor_passage_bias_authority(
+                current,
+                successor,
+                successor_prediction,
+                monotonic_ns,
+            )
+        )
         successor_passage_ready = (
             successor is not None
             and successor.sample_count >= 4
@@ -2127,7 +2111,7 @@ class DynamicCourseCore:
                 or (
                     successor.visible
                     and not successor.ambiguous
-                    and not any(successor.censored_axes)
+                    and not successor.censored_axes[0]
                 )
             )
         )
@@ -2150,6 +2134,16 @@ class DynamicCourseCore:
                 monotonic_ns - current.last_measurement_monotonic_ns
             ) / _NS_PER_SECOND
             held = not current.visible and age_s <= self.config.dropout_hold_s
+        passage, margins = self._passage_point(
+            current_aperture,
+            current_center,
+            successor_center,
+            successor_passage_authority,
+        )
+        passage_error = (
+            current_center[0] + passage[0],
+            current_center[1] + passage[1],
+        )
         crossing_prediction_horizon_s = (
             0.0
             if current.time_to_contact_s is None
@@ -2170,149 +2164,30 @@ class DynamicCourseCore:
             current.bearing_std_rad[1]
             / self.config.vertical_angle_scale_rad,
         )
-
-        def crossing_for(
-            passage_offset_norm: Vector2,
-        ) -> CrossingQuotientPrediction | None:
-            return (
-                None
-                if current_aperture is None
-                else predict_aperture_relative_crossing(
-                    center_offset_norm=current_center,
-                    passage_offset_norm=passage_offset_norm,
-                    aperture_half_extent_norm=current_aperture,
-                    center_rate_norm_s=residual_rate_norm,
-                    # The robust log-scale filter is the currently identified
-                    # aperture expansion model.  The quotient helper accepts
-                    # per-axis rates so a later clean axis fit can replace this
-                    # shared rate without changing guidance semantics.
-                    aperture_expansion_rate_s=(
-                        current.expansion_rate_s,
-                        current.expansion_rate_s,
-                    ),
-                    center_std_norm=current_std_norm,
-                    aperture_log_scale_std=current.log_scale_std,
-                    capture_timing_uncertainty_s=(
-                        current.capture_timing_uncertainty_s
-                    ),
-                    horizon_s=crossing_prediction_horizon_s,
-                    allowance_q=self.config.crossing_max_occupancy_q,
-                )
-            )
-
-        # Current-gate ownership is evaluated without successor bias.  This
-        # breaks the former circularity in which an unsafe successor-selected
-        # passage point was itself used to decide whether successor guidance
-        # was admissible.
-        centered_crossing_prediction = crossing_for((0.0, 0.0))
-        centered_crossing_clearance = (
-            (0.0, 0.0)
-            if centered_crossing_prediction is None
-            else centered_crossing_prediction.clearance_q
-        )
-        (
-            successor_clearance_authority,
-            successor_clearance_dwell_s,
-        ) = self._successor_clearance_authority(
-            current_gate_index=state.current_gate_index,
-            current=current,
-            successor=successor,
-            prediction=successor_prediction,
-            centered_prediction=centered_crossing_prediction,
-        )
-        candidate_passage_authority = (
-            self._successor_passage_bias_authority(
-                current,
-                successor,
-                successor_prediction,
-                monotonic_ns,
-            )
-            * successor_clearance_authority
-        )
-        if successor_center is None:
-            candidate_passage_authority = 0.0
-
-        def passage_for(
-            authority: float,
-        ) -> tuple[
-            Vector2,
-            Vector2,
-            CrossingQuotientPrediction | None,
-        ]:
-            point, remaining = self._passage_point(
-                current_aperture,
-                current_center,
-                successor_center,
-                authority,
-            )
-            return point, remaining, crossing_for(point)
-
-        successor_passage_authority = candidate_passage_authority
-        passage, margins, crossing_prediction = passage_for(
-            successor_passage_authority
-        )
-        if (
-            successor_passage_authority > 0.0
-            and crossing_prediction is not None
-            and any(
-                clearance <= 0.0
-                for clearance in crossing_prediction.clearance_q
-            )
-        ):
-            # The centered envelope is the ownership proof; the successor
-            # offset may consume only its remaining reserve.  Find the largest
-            # continuously scaled bias that preserves strict clearance on both
-            # axes rather than admitting an unsafe all-or-nothing target.
-            lower = 0.0
-            upper = successor_passage_authority
-            passage, margins, crossing_prediction = passage_for(lower)
-            for _ in range(18):
-                midpoint = 0.5 * (lower + upper)
-                (
-                    candidate_passage,
-                    candidate_margins,
-                    candidate_crossing,
-                ) = passage_for(midpoint)
-                if (
-                    candidate_crossing is not None
-                    and all(
-                        clearance > 0.0
-                        for clearance in candidate_crossing.clearance_q
-                    )
-                ):
-                    lower = midpoint
-                    passage = candidate_passage
-                    margins = candidate_margins
-                    crossing_prediction = candidate_crossing
-                else:
-                    upper = midpoint
-            successor_passage_authority = lower
-        passage_error = (
-            current_center[0] + passage[0],
-            current_center[1] + passage[1],
-        )
-
-        if (
-            centered_crossing_prediction is not None
-            and current_aperture is not None
-            and current.scale_rate_qualified
-        ):
-            aperture_relative_rate_norm = tuple(
-                (
-                    centered_crossing_prediction.rate_q_s[axis]
-                    * current_aperture[axis]
-                    if current.bearing_rate_qualified[axis]
-                    else residual_rate_norm[axis]
-                )
-                for axis in range(2)
-            )
-        else:
-            aperture_relative_rate_norm = residual_rate_norm
-
         crossing_prediction = (
             None
             if current_aperture is None
-            else crossing_prediction
+            else predict_aperture_relative_crossing(
+                center_offset_norm=current_center,
+                passage_offset_norm=passage,
+                aperture_half_extent_norm=current_aperture,
+                center_rate_norm_s=residual_rate_norm,
+                # The robust log-scale filter is the currently identified
+                # aperture expansion model.  The quotient helper accepts
+                # per-axis rates so a later clean axis fit can replace this
+                # shared rate without changing guidance semantics.
+                aperture_expansion_rate_s=(
+                    current.expansion_rate_s,
+                    current.expansion_rate_s,
+                ),
+                center_std_norm=current_std_norm,
+                aperture_log_scale_std=current.log_scale_std,
+                capture_timing_uncertainty_s=(
+                    current.capture_timing_uncertainty_s
+                ),
+                horizon_s=crossing_prediction_horizon_s,
+                allowance_q=self.config.crossing_max_occupancy_q,
+            )
         )
         if crossing_prediction is None:
             current_crossing_error_q = (0.0, 0.0)
@@ -2340,69 +2215,46 @@ class DynamicCourseCore:
             predicted_crossing_clearance = (
                 crossing_prediction.clearance_q
             )
-        current_yaw_release = (
-            self._current_yaw_release(
-                current,
-                successor_passage_ready,
-            )
-            * successor_clearance_authority
+        current_yaw_release = self._current_yaw_release(
+            current,
+            successor_passage_ready,
         )
-        geometric_passage_yaw_authority = self._passage_yaw_authority(
+        passage_yaw_authority = self._passage_yaw_authority(
             current,
             passage_error,
             margins,
             successor_prediction,
         )
-        passage_yaw_authority = (
-            geometric_passage_yaw_authority
-            * successor_clearance_authority
-        )
         successor_weight = self._successor_weight(
             current,
             successor,
             successor_prediction,
-            geometric_passage_yaw_authority,
+            passage_yaw_authority,
             current_yaw_release,
-        )
-        horizontal_alignment_unsettled = bool(
-            not current.bearing_rate_qualified[0]
-            or not current.scale_rate_qualified
-            or centered_crossing_prediction is None
-            or centered_crossing_clearance[0] <= 0.0
-            or abs(aperture_relative_rate_norm[0])
-            > self.config.vertical_settled_rate_norm_s
         )
         vertical_alignment_unsettled = bool(
             not current.bearing_rate_qualified[1]
             or not current.scale_rate_qualified
-            or centered_crossing_prediction is None
-            or centered_crossing_clearance[1] <= 0.0
-            or abs(aperture_relative_rate_norm[1])
+            or crossing_prediction is None
+            or predicted_crossing_clearance[1] < 0.0
+            or abs(residual_rate_norm[1])
             > self.config.vertical_settled_rate_norm_s
-        )
-        current_alignment_unsettled = bool(
-            horizontal_alignment_unsettled
-            or vertical_alignment_unsettled
         )
         proposal, braking, reason, yaw_contribution = self._propose_command(
             current,
             successor,
             camera_current_center,
             passage_error,
-            aperture_relative_rate_norm,
             current_yaw_release,
             successor_weight,
             successor_prediction,
-            horizontal_alignment_unsettled=(
-                horizontal_alignment_unsettled
-            ),
             vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
         command = self._governor.preview(
             proposal,
             monotonic_ns,
             hold=held,
-            establish_pitch_brake=current_alignment_unsettled,
+            establish_pitch_brake=vertical_alignment_unsettled,
         )
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
@@ -2415,15 +2267,6 @@ class DynamicCourseCore:
             passage_point_norm=passage,
             successor_passage_authority=(
                 successor_passage_authority
-            ),
-            centered_crossing_clearance_norm=(
-                centered_crossing_clearance
-            ),
-            successor_clearance_dwell_s=(
-                successor_clearance_dwell_s
-            ),
-            successor_clearance_authority=(
-                successor_clearance_authority
             ),
             passage_error_norm=passage_error,
             aperture_margin_norm=margins,
@@ -2632,83 +2475,6 @@ class DynamicCourseCore:
             max(0.0, available[axis] - abs(passage[axis])) for axis in range(2)
         )
         return passage, remaining  # type: ignore[return-value]
-
-    def _successor_clearance_authority(
-        self,
-        *,
-        current_gate_index: int,
-        current: TrackDynamicState,
-        successor: TrackDynamicState | None,
-        prediction: _SuccessorPrediction | None,
-        centered_prediction: CrossingQuotientPrediction | None,
-    ) -> tuple[float, float]:
-        """Release successor control only after current-centered safety.
-
-        Dwell advances in exact current-observation time, so repeated guide
-        calls cannot manufacture temporal consistency.  The release is then a
-        continuous product of elapsed ramp and the smaller reserved clearance.
-        """
-
-        key = (
-            current_gate_index,
-            current.track_id,
-            None if successor is None else successor.track_id,
-        )
-        if self._successor_clearance_key != key:
-            self._successor_clearance_key = key
-            self._successor_clearance_positive_since_ns = None
-        qualified = bool(
-            successor is not None
-            and prediction is not None
-            and prediction.confidence > 0.0
-            and current.visible
-            and not current.ambiguous
-            and not any(current.censored_axes)
-            and all(current.bearing_rate_qualified)
-            and current.scale_rate_qualified
-            and current.time_to_contact_s is not None
-            and successor.visible
-            and not successor.ambiguous
-            and not any(successor.censored_axes)
-            and successor.sample_count >= 4
-            and centered_prediction is not None
-            and all(
-                clearance > 0.0
-                for clearance in centered_prediction.clearance_q
-            )
-        )
-        if not qualified:
-            self._successor_clearance_positive_since_ns = None
-            return 0.0, 0.0
-        measurement_ns = current.last_measurement_monotonic_ns
-        if self._successor_clearance_positive_since_ns is None:
-            self._successor_clearance_positive_since_ns = measurement_ns
-        elapsed_s = max(
-            0.0,
-            (
-                measurement_ns
-                - self._successor_clearance_positive_since_ns
-            )
-            / _NS_PER_SECOND,
-        )
-        ramp = _clamp(
-            (
-                elapsed_s - self.config.successor_clearance_dwell_s
-            )
-            / self.config.successor_clearance_ramp_s,
-            0.0,
-            1.0,
-        )
-        reserve = min(
-            _clamp(
-                centered_prediction.clearance_q[axis]
-                / centered_prediction.allowance_q[axis],
-                0.0,
-                1.0,
-            )
-            for axis in range(2)
-        )
-        return reserve * ramp, elapsed_s
 
     def _successor_passage_bias_authority(
         self,
@@ -3096,12 +2862,10 @@ class DynamicCourseCore:
         successor: TrackDynamicState | None,
         camera_current_center_norm: Vector2,
         stable_passage_error_norm: Vector2,
-        stable_passage_rate_norm_s: Vector2,
         current_yaw_release: float,
         successor_weight: float,
         successor_prediction: _SuccessorPrediction | None,
         *,
-        horizontal_alignment_unsettled: bool,
         vertical_alignment_unsettled: bool,
     ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
         camera_current_bearing = (
@@ -3208,8 +2972,7 @@ class DynamicCourseCore:
         roll = self.config.roll_guidance_sign * (
             self.config.roll_gain * lateral_error
             + self.config.lateral_rate_gain
-            * stable_passage_rate_norm_s[0]
-            * self.config.horizontal_angle_scale_rad
+            * current.residual_translational_rate_rad_s[0]
         )
         yaw = -self.config.yaw_gain * heading_error
         # Successor geometry may only slow the current-gate approach with the
@@ -3248,23 +3011,19 @@ class DynamicCourseCore:
             and (current_off_axis or successor_off_axis)
         )
         uncertain_braking = uncertain and rapid_closure
-        # Unsafe current-aperture geometry owns closure immediately in either
-        # axis.  Waiting for a second expansion/TTC trigger allowed launch
-        # momentum to grow before the q-space crossing envelope had settled.
-        current_aperture_braking = (
-            horizontal_alignment_unsettled
-            or vertical_alignment_unsettled
-        )
+        # Unsafe current-aperture vertical geometry owns closure immediately.
+        # Waiting for a second expansion/TTC trigger allowed the fixed launch
+        # acceleration to build momentum before the q-space crossing envelope
+        # had settled.
+        vertical_braking = vertical_alignment_unsettled
         braking = (
             off_axis_braking
             or uncertain_braking
-            or current_aperture_braking
+            or vertical_braking
         )
         reason: str | None
-        if vertical_alignment_unsettled:
+        if vertical_braking:
             reason = "vertical_alignment_unsettled"
-        elif horizontal_alignment_unsettled:
-            reason = "horizontal_alignment_unsettled"
         elif uncertain_braking:
             reason = "uncertain_rapid_closure"
         elif off_axis_braking:
