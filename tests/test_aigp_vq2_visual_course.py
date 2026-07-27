@@ -2092,12 +2092,11 @@ def test_gate0_proved_vertical_collective_rejects_nonfinite_input():
 
 
 @pytest.mark.parametrize(
-    ("elapsed_s", "expected_blend"),
-    ((0.0, 0.0), (0.4, 0.5), (0.8, 1.0), (1.2, 1.0)),
+    "elapsed_s",
+    (0.0, 0.12, 0.40, 0.90),
 )
-def test_launch_pitch_reference_is_a_finite_convex_transition(
+def test_launch_pitch_reference_is_finite_convex_and_zero_slope_at_go(
     elapsed_s,
-    expected_blend,
 ):
     spawn = -0.3100692828034804
     responsive = 0.120
@@ -2105,8 +2104,19 @@ def test_launch_pitch_reference_is_a_finite_convex_transition(
         spawn_pitch_rad=spawn,
         responsive_target_pitch_rad=responsive,
         launch_elapsed_s=elapsed_s,
-        transition_duration_s=0.8,
     )
+    acceleration = course_stage.LAUNCH_PITCH_REFERENCE_ACCEL_RAD_S2
+    maximum_rate = course_stage.LAUNCH_PITCH_REFERENCE_MAX_RATE_RAD_S
+    ramp_s = maximum_rate / acceleration
+    traveled = (
+        0.5 * acceleration * elapsed_s * elapsed_s
+        if elapsed_s <= ramp_s
+        else (
+            0.5 * acceleration * ramp_s * ramp_s
+            + maximum_rate * (elapsed_s - ramp_s)
+        )
+    )
+    expected_blend = min(1.0, traveled / (responsive - spawn))
 
     assert blend == pytest.approx(expected_blend)
     assert target == pytest.approx(
@@ -2119,22 +2129,20 @@ def test_launch_pitch_reference_is_a_finite_convex_transition(
 def test_opposite_launch_demand_changes_reference_on_the_same_tick():
     common = {
         "spawn_pitch_rad": -0.3100692828034804,
-        "launch_elapsed_s": 0.4,
-        "transition_duration_s": 0.8,
+        "launch_elapsed_s": 0.10,
     }
-    forward, forward_blend = course_stage._allocate_launch_pitch_target(
-        responsive_target_pitch_rad=-0.120,
+    forward, _forward_blend = course_stage._allocate_launch_pitch_target(
+        responsive_target_pitch_rad=-0.35,
         **common,
     )
-    brake, brake_blend = course_stage._allocate_launch_pitch_target(
+    brake, _brake_blend = course_stage._allocate_launch_pitch_target(
         responsive_target_pitch_rad=0.120,
         **common,
     )
 
-    assert forward_blend == brake_blend == pytest.approx(0.5)
-    assert brake - forward == pytest.approx(
-        brake_blend * (0.120 - (-0.120))
-    )
+    assert math.isfinite(forward)
+    assert math.isfinite(brake)
+    assert -0.35 <= forward < common["spawn_pitch_rad"] < brake <= 0.120
     assert brake > forward
 
 
@@ -2468,6 +2476,11 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["pitch_blend_s"] == (
         host.visual_config.lifecycle.launch_pitch_blend_s
     )
+    assert launch["pitch_reference_basis"] == (
+        course_stage.LAUNCH_PITCH_REFERENCE_BASIS
+    )
+    assert launch["pitch_reference_max_rate_rad_s"] == 0.60
+    assert launch["pitch_reference_accel_rad_s2"] == 2.50
     assert "passage_admission_withheld_count" not in launch
     assert later["launch_bootstrap"]["enabled"] is False
     gate0_passage_calls = [

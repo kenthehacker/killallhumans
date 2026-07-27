@@ -138,6 +138,15 @@ APPROACH_TOP_RECOVERY_MAX_ABS_CAMERA_CENTER_NORM = 0.50
 APPROACH_TOP_RECOVERY_THRUST_SLEW_PER_S = 0.15
 APPROACH_TOP_RECOVERY_MAX_THRUST_SETTLE_S = 0.20
 APPROACH_TOP_RECOVERY_ACTION_DELAY_S = 0.08
+# The last dynamic run to earn authoritative Gate 0 -> 1 used these pitch
+# reference kinematics during launch.  Reproduce that zero-initial-slope
+# trajectory as a pure function of launch time and the current responsive
+# destination; it has no prior-command state and is not a wire governor.
+LAUNCH_PITCH_REFERENCE_MAX_RATE_RAD_S = 0.60
+LAUNCH_PITCH_REFERENCE_ACCEL_RAD_S2 = 2.50
+LAUNCH_PITCH_REFERENCE_BASIS = (
+    "credited-gate0-stateless-accelerating-reference-v1"
+)
 _YAW_PROFILE_ISSUER = object()
 
 
@@ -146,28 +155,48 @@ def _allocate_launch_pitch_target(
     spawn_pitch_rad: float,
     responsive_target_pitch_rad: float,
     launch_elapsed_s: float,
-    transition_duration_s: float,
 ) -> tuple[float, float]:
     """Generate the initial launch attitude reference from measured spawn.
 
     The destination remains the current responsive visual demand on every
-    tick.  This launch-only interpolation has no prior-command or slew state;
-    the final wire governor remains the sole command-continuity authority.
+    tick.  Distance traveled along the reference is determined only by launch
+    elapsed time, with zero initial slope and the live-credited bounded
+    acceleration/rate profile.  There is no prior-command or slew state; the
+    final wire governor remains the sole command-continuity authority.
     """
 
     values = (
         float(spawn_pitch_rad),
         float(responsive_target_pitch_rad),
         float(launch_elapsed_s),
-        float(transition_duration_s),
     )
     if (
         not all(math.isfinite(value) for value in values)
         or values[2] < 0.0
-        or values[3] <= 0.0
     ):
         raise ValueError("launch pitch allocation inputs are invalid")
-    blend = min(1.0, values[2] / values[3])
+    distance = abs(values[1] - values[0])
+    if distance <= 1e-12:
+        return values[1], 1.0
+    acceleration = LAUNCH_PITCH_REFERENCE_ACCEL_RAD_S2
+    maximum_rate = LAUNCH_PITCH_REFERENCE_MAX_RATE_RAD_S
+    acceleration_duration_s = maximum_rate / acceleration
+    acceleration_distance_rad = (
+        0.5
+        * acceleration
+        * acceleration_duration_s
+        * acceleration_duration_s
+    )
+    elapsed_s = values[2]
+    if elapsed_s <= acceleration_duration_s:
+        traveled_rad = 0.5 * acceleration * elapsed_s * elapsed_s
+    else:
+        traveled_rad = (
+            acceleration_distance_rad
+            + maximum_rate
+            * (elapsed_s - acceleration_duration_s)
+        )
+    blend = min(1.0, traveled_rad / distance)
     return (
         (1.0 - blend) * values[0] + blend * values[1],
         blend,
@@ -2892,15 +2921,11 @@ async def _run_visual_course_stage_impl(
                 0.0,
                 float(runtime.monotonic()) - course_started_s,
             )
-            pitch_blend_s = float(
-                host.visual_config.lifecycle.launch_pitch_blend_s
-            )
             target_pitch_rad, pitch_blend = (
                 _allocate_launch_pitch_target(
                     spawn_pitch_rad=launch_spawn_pitch_rad,
                     responsive_target_pitch_rad=target_pitch_rad,
                     launch_elapsed_s=launch_elapsed_s,
-                    transition_duration_s=pitch_blend_s,
                 )
             )
             assert proved_collective is not None
@@ -4031,6 +4056,15 @@ async def _run_visual_course_stage_impl(
                 ),
                 "pitch_blend_s": float(
                     host.visual_config.lifecycle.launch_pitch_blend_s
+                ),
+                "pitch_reference_basis": (
+                    LAUNCH_PITCH_REFERENCE_BASIS
+                ),
+                "pitch_reference_max_rate_rad_s": (
+                    LAUNCH_PITCH_REFERENCE_MAX_RATE_RAD_S
+                ),
+                "pitch_reference_accel_rad_s2": (
+                    LAUNCH_PITCH_REFERENCE_ACCEL_RAD_S2
                 ),
                 "spawn_pitch_rad": (
                     launch_spawn_pitch_rad
