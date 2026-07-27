@@ -2799,7 +2799,18 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
 
     fresh_id = ""
     for sequence in range(10, 23):
-        update = tracker.update(fresh_frame(sequence))
+        update = tracker.update(
+            fresh_frame(
+                sequence,
+                center_y=(-0.76 if sequence == 22 else -0.70),
+                clipping=(
+                    FrameEdge.TOP
+                    if sequence == 22
+                    else FrameEdge.NONE
+                ),
+                center_censored=(sequence == 22),
+            )
+        )
         candidates = tuple(
             track_id
             for track_id in update.created_track_ids
@@ -2850,7 +2861,10 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     assert rebound["recovery_steering"]["steering_track_id"] == fresh_id
     assert rebound_state.track_id == fresh_id
     assert rebound_state.visible
-    assert not any(rebound_state.censored_axes)
+    assert rebound_state.censored_axes == (False, True)
+    assert rebound_state.aperture_half_size_norm is None
+    assert rebound_state.aperture_seed_monotonic_ns is None
+    assert rebound_state.aperture_propagated is False
     assert (
         rebound["recovery_steering"]["prediction_horizon_s"]
         == session.core.config
@@ -2862,6 +2876,27 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     assert (
         rebound["recovery_steering"]["expires_monotonic_ns"]
         > old_expiry_ns
+    )
+    binding_authority = (
+        session.post_credit_successor_steering_authority(
+            now_monotonic_ns=(
+                fresh_track.history[-1].publication_monotonic_ns
+                + 2_000_000
+            ),
+        )
+    )
+    assert binding_authority["vertical_axis_censored"] is True
+    assert binding_authority["steering_only"] is True
+    assert binding_authority["passage_authority"] is False
+    assert binding_authority["advance_authority"] is False
+    assert all(
+        math.isfinite(float(binding_authority[name]))
+        for name in (
+            "target_roll_rad",
+            "target_pitch_rad",
+            "yaw_rate_rad_s",
+            "thrust",
+        )
     )
 
     clipped_update = tracker.update(
@@ -2896,7 +2931,10 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     )
 
     assert clipped_state.censored_axes == (False, True)
-    assert clipped_state.aperture_propagated is True
+    # This fresh identity has never earned aperture authority; steering may
+    # use its observable axis, but clipping cannot fabricate a local aperture.
+    assert clipped_state.aperture_propagated is False
+    assert clipped_state.aperture_half_size_norm is None
     assert authority["basis"] == (
         "authoritative-post-credit-fresh-reacquisition-steering-v1"
     )

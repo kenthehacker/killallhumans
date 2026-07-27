@@ -1311,7 +1311,12 @@ class DynamicVisualCourseSession:
             and current.visible
             and not current.ambiguous
             and current.missed_count == 0
-            and not any(current.censored_axes)
+            # A fresh exact rebind needs at least one observable image axis
+            # for steering, not complete geometry.  The censored axis remains
+            # on bounded prediction and this lease can never create passage
+            # or gate-advance authority; clean geometry is still required to
+            # complete post-credit recovery below.
+            and not all(current.censored_axes)
             and all(
                 value
                 <= (
