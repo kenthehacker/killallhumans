@@ -1608,6 +1608,52 @@ def test_post_credit_retained_loss_rejects_regressed_track_token():
     )
 
 
+def test_8853bd30_retained_ambiguous_loss_uses_bounded_reacquire() -> None:
+    track_id = "vq2-track-000002"
+    previous = _token(538260, 181)
+    snapshot = _post_credit_snapshot(
+        182,
+        visible=False,
+        clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+        latest_track_publication=181,
+    )
+    snapshot.latest_camera_token = _token(538261, 182)
+    snapshot.current_track_id = track_id
+    snapshot.current_track.track_id = track_id
+    snapshot.current_track.latest_token = previous
+    snapshot.current_track.center_norm = (
+        0.7906249999999999,
+        -0.8722222222222222,
+    )
+    snapshot.current_track.role = VisualTrackRole.AMBIGUOUS
+    snapshot.current_track.ambiguous = True
+
+    assert (
+        classify_post_credit_measurement(
+            snapshot,
+            gate_index=1,
+            track_id=track_id,
+            previous_camera_token=previous,
+            last_track_token=previous,
+        )
+        is PostCreditMeasurementMode.REACQUIRE
+    )
+
+    snapshot.current_track.visible = True
+    snapshot.current_track.missed_frame_count = 0
+    snapshot.current_track.latest_token = snapshot.latest_camera_token
+    assert (
+        classify_post_credit_measurement(
+            snapshot,
+            gate_index=1,
+            track_id=track_id,
+            previous_camera_token=previous,
+            last_track_token=previous,
+        )
+        is PostCreditMeasurementMode.UNSAFE
+    )
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("ambiguous", "wrong_gate", "stale_camera", "outside_image"),

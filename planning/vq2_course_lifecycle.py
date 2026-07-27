@@ -80,6 +80,8 @@ def classify_post_credit_measurement(
     token = getattr(snapshot, "latest_camera_token", None)
     track = getattr(snapshot, "current_track", None)
     clipping = getattr(track, "clipping", None)
+    ambiguous = getattr(track, "ambiguous", None)
+    track_role = getattr(track, "role", None)
     if (
         type(gate_index) is not int
         or gate_index < 0
@@ -90,16 +92,23 @@ def classify_post_credit_measurement(
         or getattr(snapshot, "current_track_id", None) != track_id
         or track is None
         or getattr(track, "track_id", None) != track_id
-        or getattr(track, "ambiguous", True)
+        or type(ambiguous) is not bool
         or type(clipping) is not FrameEdge
     ):
         return PostCreditMeasurementMode.UNSAFE
 
     if not getattr(track, "visible", False):
         latest_track_token = getattr(track, "latest_token", None)
+        retained_current_role = bool(
+            (track_role is VisualTrackRole.CURRENT and not ambiguous)
+            or (
+                track_role is VisualTrackRole.AMBIGUOUS
+                and ambiguous
+            )
+        )
         retained_loss = bool(
             getattr(track, "missed_frame_count", 0) > 0
-            and getattr(track, "role", None) is VisualTrackRole.CURRENT
+            and retained_current_role
             and getattr(track, "authoritative_gate_index", None) == gate_index
             and _token_not_older(latest_track_token, last_track_token)
             and _token_not_older(token, latest_track_token)
@@ -110,10 +119,12 @@ def classify_post_credit_measurement(
             else PostCreditMeasurementMode.UNSAFE
         )
 
+    if ambiguous or track_role is VisualTrackRole.AMBIGUOUS:
+        return PostCreditMeasurementMode.UNSAFE
     if (
         getattr(track, "missed_frame_count", -1) != 0
         or getattr(track, "latest_token", None) != token
-        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or track_role is not VisualTrackRole.CURRENT
         or getattr(track, "authoritative_gate_index", None) != gate_index
         or getattr(snapshot, "authority_usable", False) is not True
     ):
