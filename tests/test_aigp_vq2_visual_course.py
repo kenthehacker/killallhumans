@@ -1815,6 +1815,31 @@ def test_gate0_proved_vertical_collective_rejects_nonfinite_input():
         )
 
 
+def test_ec7fc1b8_dynamic_brake_is_not_reblended_toward_spawn_pitch():
+    governed = -0.296
+    target, blend = course_stage._allocate_launch_pitch_target(
+        spawn_pitch_rad=-0.3100692828034804,
+        governed_target_pitch_rad=governed,
+        launch_elapsed_s=0.578,
+        legacy_blend_duration_s=0.8,
+        dynamic_governor_owns_target=True,
+    )
+    legacy_target, legacy_blend = (
+        course_stage._allocate_launch_pitch_target(
+            spawn_pitch_rad=-0.3100692828034804,
+            governed_target_pitch_rad=governed,
+            launch_elapsed_s=0.578,
+            legacy_blend_duration_s=0.8,
+            dynamic_governor_owns_target=False,
+        )
+    )
+
+    assert target == pytest.approx(governed)
+    assert blend == 1.0
+    assert legacy_blend == pytest.approx(0.7225)
+    assert legacy_target < governed
+
+
 def test_current_aperture_collective_recreates_new_frame_rate_filter():
     state = course_stage._CurrentApertureProvedCollectiveState()
 

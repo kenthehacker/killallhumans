@@ -128,6 +128,42 @@ CENSORED_PASSAGE_COAST_BASIS = (
 _YAW_PROFILE_ISSUER = object()
 
 
+def _allocate_launch_pitch_target(
+    *,
+    spawn_pitch_rad: float,
+    governed_target_pitch_rad: float,
+    launch_elapsed_s: float,
+    legacy_blend_duration_s: float,
+    dynamic_governor_owns_target: bool,
+) -> tuple[float, float]:
+    """Apply the spawn blend once, never on top of dynamic target continuity."""
+
+    values = (
+        float(spawn_pitch_rad),
+        float(governed_target_pitch_rad),
+        float(launch_elapsed_s),
+        float(legacy_blend_duration_s),
+    )
+    if (
+        not all(math.isfinite(value) for value in values)
+        or values[2] < 0.0
+        or values[3] <= 0.0
+        or type(dynamic_governor_owns_target) is not bool
+    ):
+        raise ValueError("launch pitch allocation inputs are invalid")
+    if dynamic_governor_owns_target:
+        # The dynamic target governor was seeded from the exact accepted spawn
+        # target and already enforces bounded slew/acceleration.  Reapplying
+        # the legacy time blend here caused the ec7fc1b8 vertical brake to
+        # remain nose-down until the aperture was nearly censored.
+        return values[1], 1.0
+    blend = min(1.0, values[2] / values[3])
+    return (
+        (1.0 - blend) * values[0] + blend * values[1],
+        blend,
+    )
+
+
 def _gate0_proved_vertical_collective(
     vertical: float,
     filtered_vertical_rate: float,
@@ -2344,10 +2380,17 @@ async def _run_visual_course_stage_impl(
             pitch_blend_s = float(
                 host.visual_config.lifecycle.launch_pitch_blend_s
             )
-            pitch_blend = min(1.0, launch_elapsed_s / pitch_blend_s)
-            target_pitch_rad = (
-                (1.0 - pitch_blend) * launch_spawn_pitch_rad
-                + pitch_blend * target_pitch_rad
+            target_pitch_rad, pitch_blend = (
+                _allocate_launch_pitch_target(
+                    spawn_pitch_rad=launch_spawn_pitch_rad,
+                    governed_target_pitch_rad=target_pitch_rad,
+                    launch_elapsed_s=launch_elapsed_s,
+                    legacy_blend_duration_s=pitch_blend_s,
+                    dynamic_governor_owns_target=bool(
+                        runtime.dynamic_controller is not None
+                        and output.brake_reason != "continuity_seed"
+                    ),
+                )
             )
             assert proved_collective is not None
             assert proved_filtered_vertical_rate is not None
