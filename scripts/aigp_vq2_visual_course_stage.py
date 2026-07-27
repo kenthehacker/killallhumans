@@ -9373,28 +9373,6 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course credit-wait measurement became unsafe"
                 )
-            if (
-                crossing_commitment_deadline_s is not None
-                and now >= crossing_commitment_deadline_s
-            ):
-                # The local gate-relative state no longer owns geometry, but
-                # authoritative race ingress still has its independent
-                # bounded cadence window.  Exact zero retires the committed
-                # command without fabricating either passage or promotion.
-                last_planned_token = token
-                await send_zero(
-                    (
-                        f"{VISUAL_COURSE_STAGE}/gate"
-                        f"{current_gate_index}/credit-wait-zero"
-                    ),
-                    now - segment_started_s,
-                    yaw_reference_rad=yaw_reference_rad,
-                )
-                segment["crossing_wait_zero_command_count"] = int(
-                    segment["crossing_wait_zero_command_count"]
-                ) + 1
-                continue
-
             adjacent_candidates = tuple(
                 candidate
                 for candidate in getattr(snapshot, "next_candidates", ())
@@ -9569,6 +9547,30 @@ async def _run_visual_course_stage_impl(
                 segment["crossing_wait_adjacent_command_count"] = (
                     crossing_wait_adjacent_command_count
                 )
+                continue
+
+            if (
+                crossing_commitment_deadline_s is not None
+                and now >= crossing_commitment_deadline_s
+            ):
+                # The expired current-gate state no longer owns geometry.
+                # A fresh, unique, exact-lineage successor above may still
+                # provide steering-only control while authoritative race
+                # ingress catches up.  Exact zero remains the fallback when
+                # that independently bounded authority is unavailable; it
+                # never fabricates passage or promotion.
+                last_planned_token = token
+                await send_zero(
+                    (
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/credit-wait-zero"
+                    ),
+                    now - segment_started_s,
+                    yaw_reference_rad=yaw_reference_rad,
+                )
+                segment["crossing_wait_zero_command_count"] = int(
+                    segment["crossing_wait_zero_command_count"]
+                ) + 1
                 continue
 
             try:

@@ -36,6 +36,7 @@ from tests.test_aigp_vq2_visual_course import (
     _context,
     _runtime,
     _snapshot,
+    _track,
     _token,
 )
 
@@ -1416,6 +1417,76 @@ def test_dynamic_latch_without_admission_atomically_coasts_to_finish():
         for event, _payload in host.recorder.events
         if event == "visual_course_near_plane_latched"
     ] == ["visual_course_near_plane_latched"]
+
+
+class _ExpiredCurrentWithSuccessorHost(_CadencedCoordinatorHost):
+    """Keep one exact successor available beyond the current-state lease."""
+
+    def __init__(self) -> None:
+        self.adjacent_track = None
+        super().__init__(
+            credit_policy="delayed",
+            finish_gate=1,
+            credit_delay_s=1.15,
+        )
+
+    def _install_snapshot(self, **kwargs) -> None:
+        super()._install_snapshot(**kwargs)
+        snapshot = self.visual_gate_graph.latest_snapshot
+        snapshot.next_candidates = ()
+        snapshot.next_selection_ambiguous = False
+        snapshot.provisional_track_ids = ()
+        if self.current_gate != 1 or kwargs["state"] != "lost":
+            return
+        token = kwargs["token"]
+        adjacent = _track("track-2", gate_index=2, token=token)
+        adjacent.role = VisualTrackRole.NEXT
+        adjacent.authoritative_gate_index = None
+        adjacent.center_norm = (0.22, -0.42)
+        adjacent.center_velocity_norm_s = (0.0, 0.0)
+        adjacent.apparent_scale = 0.135
+        self.adjacent_track = adjacent
+        snapshot.next_candidates = (
+            SimpleNamespace(
+                track_id=adjacent.track_id,
+                latest_token=token,
+                promotable=True,
+                stable_frame_count=3,
+                confidence=0.80,
+                association_confidence=0.80,
+                relationship=None,
+            ),
+        )
+
+
+def test_expired_current_state_uses_fresh_successor_before_zero():
+    host = _ExpiredCurrentWithSuccessorHost()
+    runtime = replace(
+        _cadenced_runtime(host),
+        dynamic_controller=_AtomicCrossingDynamicController(
+            host.current_track_id,
+            host.current_gate,
+            safe_clearance=True,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["race_finished"] is True
+    segment = result["segments"][0]
+    assert segment["near_plane_latch"]["commitment_horizon_s"] < (
+        host.credit_delay_s
+    )
+    assert segment["crossing_wait_adjacent_command_count"] > 0
+    assert segment["crossing_wait_adjacent_track_id"] == "track-2"
+    assert segment["crossing_wait_zero_command_count"] == 0
+    assert any(
+        stage == "visual-course/gate1/credit-wait-adjacent"
+        and command.thrust > 0.0
+        for stage, _elapsed, command in host.ticks
+    )
 
 
 def test_dynamic_negative_clearance_without_admission_never_latches():
