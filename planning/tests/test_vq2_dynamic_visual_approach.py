@@ -2399,6 +2399,30 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     dual_authority = session.post_credit_successor_steering_authority(
         now_monotonic_ns=dual_update.publish_monotonic_ns + 2_000_000,
     )
+    for sequence in range(12, 18):
+        dual_update = tracker.update(
+            _frame(
+                sequence,
+                successor_clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+                successor_center_censored=True,
+            )
+        )
+        dual_snapshot = graph.observe(tracker)
+        session.stage_snapshot(
+            dual_snapshot,
+            tracker,
+            expected_gate_index=1,
+            expected_current_track_id=successor_id,
+            adjacent_precredit=False,
+        )
+        dual_state = session.core.course_state().current
+        dual_authority = (
+            session.post_credit_successor_steering_authority(
+                now_monotonic_ns=(
+                    dual_update.publish_monotonic_ns + 2_000_000
+                ),
+            )
+        )
 
     assert top_state.censored_axes == (False, True)
     assert dual_state.censored_axes == (True, True)
@@ -2427,6 +2451,15 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     )
     assert dual_authority["expires_monotonic_ns"] == (
         top_authority["expires_monotonic_ns"]
+    )
+    assert (
+        dual_update.publish_monotonic_ns
+        - top_update.publish_monotonic_ns
+        > 200_000_000
+    )
+    assert (
+        dual_authority["expires_monotonic_ns"]
+        > dual_update.publish_monotonic_ns
     )
     assert dual_authority["last_measurement_monotonic_ns"] > (
         top_authority["last_measurement_monotonic_ns"]
@@ -2473,7 +2506,7 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
             camera_token=dual_update.token,
         )
 
-    clean_update = tracker.update(_frame(12))
+    clean_update = tracker.update(_frame(18))
     clean_snapshot = graph.observe(tracker)
     session.stage_snapshot(
         clean_snapshot,

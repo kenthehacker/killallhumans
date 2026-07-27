@@ -6200,7 +6200,10 @@ async def _run_visual_course_stage_impl(
                             yaw_reference_rad=yaw_reference_rad,
                             successor_steering=True,
                             require_successor_steering=True,
-                            command_deadline_s=recovery_deadline_s,
+                            command_deadline_s=min(
+                                course_deadline_s,
+                                segment_deadline_s,
+                            ),
                         )
                     except RaceActiveBoundaryChangedBeforeWire as exc:
                         raise abort_type(
@@ -6239,6 +6242,12 @@ async def _run_visual_course_stage_impl(
                                 "post_transition_navigation_command_count"
                             ]
                         ) + 1
+                    recovery_deadline_s = min(
+                        course_deadline_s,
+                        segment_deadline_s,
+                        float(runtime.monotonic())
+                        + limits.post_credit_fresh_frame_timeout_s,
+                    )
                     if (
                         recovery_measurement_mode
                         is PostCreditMeasurementMode.ONE_EDGE_CENSORED
@@ -6246,12 +6255,6 @@ async def _run_visual_course_stage_impl(
                         segment["recovery_one_edge_command_count"] = int(
                             segment["recovery_one_edge_command_count"]
                         ) + 1
-                        recovery_deadline_s = min(
-                            course_deadline_s,
-                            segment_deadline_s,
-                            float(runtime.monotonic())
-                            + limits.post_credit_fresh_frame_timeout_s,
-                        )
                     continue
                 if (
                     recovery_measurement_mode
