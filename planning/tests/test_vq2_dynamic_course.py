@@ -1523,12 +1523,38 @@ def test_clean_ttc_dropout_cannot_shorten_an_earned_aperture_deadline(
     assert lost_ttc.aperture_propagated is False
     assert (
         lost_ttc.aperture_prediction_deadline_monotonic_ns
-        == qualified.aperture_prediction_deadline_monotonic_ns
+        >= qualified.aperture_prediction_deadline_monotonic_ns
     )
     assert lost_ttc.aperture_prediction_deadline_monotonic_ns > (
         lost_ttc.state_monotonic_ns
         + round(core.config.dropout_hold_s * NS)
     )
+
+
+def test_clean_unqualified_aperture_separates_steering_horizon_from_passage(
+) -> None:
+    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core.record_applied_command(_command(0.90))
+    _imu(core, 1.0)
+    seeded = core.observe_track(_observation("gate-a", 1, 1.0))
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id=None,
+    )
+    _imu(core, 1.01)
+    decision = core.guide(1_010_000_000)
+
+    assert not seeded.scale_rate_qualified
+    assert seeded.time_to_contact_s is None
+    assert seeded.aperture_prediction_deadline_monotonic_ns == (
+        seeded.state_monotonic_ns
+        + round(core.config.crossing_prediction_max_horizon_s * NS)
+    )
+    assert decision.current_aperture_half_size_norm is not None
+    assert decision.current_aperture_prediction_horizon_remaining_s > 1.0
+    assert decision.current_time_to_contact_s is None
+    assert decision.crossing_prediction_horizon_s == 0.0
 
 
 def test_local_aperture_is_withdrawn_at_decision_time_expiry() -> None:

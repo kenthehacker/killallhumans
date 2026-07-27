@@ -1397,7 +1397,10 @@ class DynamicCourseCore:
             ),
             aperture_prediction_deadline_monotonic_ns=(
                 capture_ns
-                + round(self.config.dropout_hold_s * _NS_PER_SECOND)
+                + round(
+                    self.config.crossing_prediction_max_horizon_s
+                    * _NS_PER_SECOND
+                )
                 if clean_aperture
                 else None
             ),
@@ -1738,18 +1741,12 @@ class DynamicCourseCore:
             else None
         )
         if measured_aperture is not None:
+            # The rolling local state has a fixed short model horizon.
+            # Closure/TTC qualification controls passage commitment, not
+            # whether a clean aperture can support uncertainty-growing
+            # steering through a detector/FOV gap.
             prediction_horizon_s = (
-                self.config.dropout_hold_s
-                if not scale_rate_qualified or ttc is None
-                else min(
-                    self.config.crossing_prediction_max_horizon_s,
-                    max(
-                        self.config.dropout_hold_s,
-                        ttc
-                        + self.config
-                        .terminal_min_post_governor_contact_budget_s,
-                    ),
-                )
+                self.config.crossing_prediction_max_horizon_s
             )
             aperture = measured_aperture
             aperture_seed_ns = capture_ns
