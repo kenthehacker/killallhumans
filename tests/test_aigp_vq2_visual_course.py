@@ -2635,6 +2635,55 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
         **evidence,
         "last_visible_clipping": int(FrameEdge.TOP),
     }
+    fov_summary["last_raw_top_edge_basis"] = (
+        course_stage.TOP_FOV_INNER_EDGE_BASIS
+    )
+    fov_summary.update(
+        {
+            "last_inner_track_id": "track-0",
+            "last_inner_camera_token": asdict(last_visible_token),
+            "last_inner_raw_top_edge_basis": (
+                course_stage.TOP_FOV_INNER_EDGE_BASIS
+            ),
+            "last_inner_active": True,
+        }
+    )
+    direct_vertical = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            vertical_evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    )
+    assert direct_vertical.command.target_pitch_rad == pytest.approx(-0.35)
+
+    last_visible_publication = (
+        last_visible_token.publication_sequence
+    )
+    assert last_visible_publication is not None
+    fov_summary["last_inner_camera_token"] = asdict(
+        replace(
+            last_visible_token,
+            publication_sequence=last_visible_publication - 1,
+        )
+    )
+    with pytest.raises(
+        ValueError,
+        match="exact propagated/FOV authority",
+    ):
+        course_stage._approach_propagated_visibility_gap_authority(
+            vertical_evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    fov_summary["last_inner_camera_token"] = asdict(last_visible_token)
+    fov_summary["last_raw_top_edge_basis"] = (
+        course_stage.TOP_FOV_OUTER_EDGE_FALLBACK_BASIS
+    )
     with pytest.raises(
         ValueError,
         match="exact propagated/FOV authority",

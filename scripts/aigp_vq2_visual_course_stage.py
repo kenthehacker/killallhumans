@@ -2125,15 +2125,26 @@ def _approach_propagated_visibility_gap_authority(
         and isinstance(last_visible, Mapping)
         and last_handoff.get("camera_token") == dict(last_visible)
     )
-    direct_vertical_fov_lineage = bool(
+    direct_inner_fov_lineage = bool(
+        fov_summary.get("last_raw_top_edge_basis")
+        == TOP_FOV_INNER_EDGE_BASIS
+        and fov_summary.get("last_inner_raw_top_edge_basis")
+        == TOP_FOV_INNER_EDGE_BASIS
+        and fov_summary.get("last_inner_track_id") == track_id
+        and fov_summary.get("last_inner_camera_token")
+        == (
+            None
+            if not isinstance(last_visible, Mapping)
+            else dict(last_visible)
+        )
+        and fov_summary.get("last_inner_active") is True
+    )
+    direct_outer_fov_lineage = bool(
         type(last_visible_clipping) is int
         and last_visible_clipping != 0
         and last_visible_clipping & vertical_clipping_edges == 0
         and fov_summary.get("last_raw_top_edge_basis")
-        in {
-            TOP_FOV_INNER_EDGE_BASIS,
-            TOP_FOV_OUTER_EDGE_FALLBACK_BASIS,
-        }
+        == TOP_FOV_OUTER_EDGE_FALLBACK_BASIS
     )
     if (
         not isinstance(evidence, Mapping)
@@ -2167,7 +2178,8 @@ def _approach_propagated_visibility_gap_authority(
         or fov_summary.get("last_camera_token") != dict(last_visible)
         or not (
             propagated_fov_lineage
-            or direct_vertical_fov_lineage
+            or direct_inner_fov_lineage
+            or direct_outer_fov_lineage
         )
         or not isinstance(command, Mapping)
         or type(remaining_horizon_s) not in {int, float}
