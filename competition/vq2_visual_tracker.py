@@ -934,6 +934,16 @@ class _PairScore:
     appearance_distance: Optional[float]
 
 
+@dataclass(frozen=True, slots=True)
+class _AssignmentPlan:
+    active_states: tuple[_TrackState, ...]
+    eligible_detections: tuple[VisualDetection, ...]
+    pair_scores: dict[tuple[int, int], _PairScore]
+    selected_pairs: dict[int, int]
+    ambiguous_track_indexes: frozenset[int]
+    ambiguous_detection_indexes: frozenset[int]
+
+
 class MultiTargetVisualTracker:
     """Stateful deterministic tracker with no I/O or command side effects."""
 
@@ -1057,59 +1067,45 @@ class MultiTargetVisualTracker:
     def time_basis_id(self) -> Optional[str]:
         return self._time_basis_id
 
+    def preview_associations(
+        self,
+        frame: VisualDetectionFrame,
+    ) -> dict[int, VisualTrack]:
+        """Preview exact unambiguous existing-track assignments without mutation.
+
+        Keys retain the detector's source indexes rather than the filtered
+        eligible-detection positions used internally.  New-track detections,
+        unmatched detections, and every near-tied assignment are omitted.
+        Calling :meth:`update` with the same still-unconsumed frame will use
+        the same selected pairs.
+        """
+
+        if type(frame) is not VisualDetectionFrame:
+            raise TypeError("frame must be an exact VisualDetectionFrame")
+        plan = self._plan_assignments(frame)
+        return {
+            plan.eligible_detections[detection_index].source_index: (
+                self._snapshot(plan.active_states[track_index])
+            )
+            for track_index, detection_index in plan.selected_pairs.items()
+            if (
+                track_index not in plan.ambiguous_track_indexes
+                and detection_index not in plan.ambiguous_detection_indexes
+            )
+        }
+
     def update(self, frame: VisualDetectionFrame) -> VisualTrackerUpdate:
         """Consume one fresh frame and update every eligible visual detection."""
 
         if type(frame) is not VisualDetectionFrame:
             raise TypeError("frame must be an exact VisualDetectionFrame")
-        self._validate_frame_advance(frame)
-        eligible = tuple(
-            item
-            for item in frame.detections
-            if item.confidence >= self.config.min_detection_confidence
-        )
-        active_states = tuple(
-            state
-            for state in self._states.values()
-            if not state.retired
-        )
-        pair_scores: dict[tuple[int, int], _PairScore] = {}
-        for track_index, state in enumerate(active_states):
-            for detection_index, detection in enumerate(eligible):
-                score = self._pair_score(
-                    state,
-                    detection,
-                    frame.observation_monotonic_ns,
-                )
-                if score is not None:
-                    pair_scores[(track_index, detection_index)] = score
-
-        assignments = _global_assignments(
-            track_count=len(active_states),
-            detection_count=len(eligible),
-            pair_costs={
-                key: score.cost
-                for key, score in pair_scores.items()
-                if score.cost <= self.config.max_assignment_cost
-            },
-            unmatched_cost=self.config.unmatched_cost,
-        )
-        selected_pairs = {
-            track_index: detection_index
-            for track_index, detection_index in assignments.items()
-            if detection_index is not None
-            and (track_index, detection_index) in pair_scores
-            and pair_scores[(track_index, detection_index)].cost
-            <= self.config.max_assignment_cost
-        }
-        (
-            ambiguous_track_indexes,
-            ambiguous_detection_indexes,
-        ) = self._find_assignment_ambiguity(
-            active_states,
-            pair_scores,
-            selected_pairs,
-        )
+        plan = self._plan_assignments(frame)
+        eligible = plan.eligible_detections
+        active_states = plan.active_states
+        pair_scores = plan.pair_scores
+        selected_pairs = plan.selected_pairs
+        ambiguous_track_indexes = plan.ambiguous_track_indexes
+        ambiguous_detection_indexes = plan.ambiguous_detection_indexes
 
         self._frame_sequence += 1
         associated_ids: list[str] = []
@@ -1261,10 +1257,75 @@ class MultiTargetVisualTracker:
             for state in sorted(self._states.values(), key=lambda item: item.track_id)
         )
 
+    def _plan_assignments(
+        self,
+        frame: VisualDetectionFrame,
+    ) -> _AssignmentPlan:
+        self._validate_frame_advance(frame)
+        eligible = tuple(
+            item
+            for item in frame.detections
+            if item.confidence >= self.config.min_detection_confidence
+        )
+        active_states = tuple(
+            state
+            for state in self._states.values()
+            if not state.retired
+        )
+        pair_scores: dict[tuple[int, int], _PairScore] = {}
+        for track_index, state in enumerate(active_states):
+            for detection_index, detection in enumerate(eligible):
+                score = self._pair_score(
+                    state,
+                    detection,
+                    frame.observation_monotonic_ns,
+                )
+                if score is not None:
+                    pair_scores[(track_index, detection_index)] = score
+
+        assignments = _global_assignments(
+            track_count=len(active_states),
+            detection_count=len(eligible),
+            pair_costs={
+                key: score.cost
+                for key, score in pair_scores.items()
+                if score.cost <= self.config.max_assignment_cost
+            },
+            unmatched_cost=self.config.unmatched_cost,
+        )
+        selected_pairs = {
+            track_index: detection_index
+            for track_index, detection_index in assignments.items()
+            if detection_index is not None
+            and (track_index, detection_index) in pair_scores
+            and pair_scores[(track_index, detection_index)].cost
+            <= self.config.max_assignment_cost
+        }
+        (
+            ambiguous_track_indexes,
+            ambiguous_detection_indexes,
+        ) = self._find_assignment_ambiguity(
+            pair_scores,
+            selected_pairs,
+        )
+        return _AssignmentPlan(
+            active_states=active_states,
+            eligible_detections=eligible,
+            pair_scores=pair_scores,
+            selected_pairs=selected_pairs,
+            ambiguous_track_indexes=frozenset(
+                ambiguous_track_indexes
+            ),
+            ambiguous_detection_indexes=frozenset(
+                ambiguous_detection_indexes
+            ),
+        )
+
     def _validate_frame_advance(self, frame: VisualDetectionFrame) -> None:
-        if self._generation is None:
-            self._generation = frame.token.generation
-        elif frame.token.generation != self._generation:
+        if (
+            self._generation is not None
+            and frame.token.generation != self._generation
+        ):
             if frame.token.generation < self._generation:
                 raise StaleVisualFrameError("camera generation regressed")
             raise StaleVisualFrameError(
@@ -1433,7 +1494,6 @@ class MultiTargetVisualTracker:
 
     def _find_assignment_ambiguity(
         self,
-        active_states: tuple[_TrackState, ...],
         pair_scores: dict[tuple[int, int], _PairScore],
         selected_pairs: dict[int, int],
     ) -> tuple[set[int], set[int]]:
@@ -1463,10 +1523,6 @@ class MultiTargetVisualTracker:
                 if cost - selected_cost < self.config.ambiguity_margin:
                     ambiguous_tracks.update((track_index, other_track))
                     ambiguous_detections.add(detection_index)
-                    if other_track < len(active_states):
-                        # The exact competing visual identity is now explicit.
-                        active_states[other_track].ambiguous = True
-                        active_states[other_track].unambiguous_streak = 0
         return ambiguous_tracks, ambiguous_detections
 
     def _associate(

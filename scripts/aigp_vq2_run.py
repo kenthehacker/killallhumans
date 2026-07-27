@@ -96,6 +96,7 @@ from competition.vq2_visual_tracker import (
     VisualInnerApertureGeometry,
     VisualTrack,
     VisualTrackRole,
+    VisualTrackerUpdate,
 )
 from estimation.imu_attitude import (
     AttitudeEstimate,
@@ -108,6 +109,7 @@ from gate_detection.src.vq2_geometry import (
     ApertureSide,
     VQ2ApertureConfig,
     VQ2ApertureFit,
+    VQ2ApertureTrackingPrior,
     fit_vq2_aperture_mask,
     passage_geometry_from_vq2_aperture_fit,
     tracking_geometry_from_vq2_aperture_fit,
@@ -299,6 +301,12 @@ def _visual_inner_aperture_from_fit(
     )
     clipping = FrameEdge(int(fit.clipping))
     visible_edges = FrameEdge(int(fit.visible_edges))
+    tracking_prior_only = (
+        fit.geometry_model_id
+        == "vq2-temporally-associated-inner-quad-lines-v1"
+        and fit.covariance_model_id
+        == "vq2-temporally-associated-aperture-diagonal-v1"
+    )
     if geometry is not None:
         if (
             fit.geometry_model_id is None
@@ -329,9 +337,13 @@ def _visual_inner_aperture_from_fit(
                 None
                 if passage_geometry is not None
                 else (
-                    "outer_support_clipped_tracking_only"
-                    if outer_support_clipped_tracking_only
-                    else "aperture_fit_low_confidence"
+                    "aperture_fit_tracking_prior_only"
+                    if tracking_prior_only
+                    else (
+                        "outer_support_clipped_tracking_only"
+                        if outer_support_clipped_tracking_only
+                        else "aperture_fit_low_confidence"
+                    )
                 )
             ),
         )
@@ -372,9 +384,29 @@ def _visual_inner_aperture_from_fit(
 def _fit_visual_inner_apertures(
     image: Any,
     detections: Sequence[GateDetection],
+    *,
+    tracking_priors: Optional[
+        Sequence[Optional[VQ2ApertureTrackingPrior]]
+    ] = None,
 ) -> tuple[VisualInnerApertureGeometry, ...]:
     """Threshold once, then fit every same-publication detector support."""
 
+    priors = (
+        tuple(None for _ in detections)
+        if tracking_priors is None
+        else tuple(tracking_priors)
+    )
+    if len(priors) != len(detections):
+        raise ValueError(
+            "tracking_priors must match the number of detections"
+        )
+    if any(
+        prior is not None and type(prior) is not VQ2ApertureTrackingPrior
+        for prior in priors
+    ):
+        raise TypeError(
+            "tracking_priors must contain exact priors or None"
+        )
     mask = vq2_gate_mask_from_bgr(
         image,
         config=_VISUAL_INNER_APERTURE_CONFIG,
@@ -386,10 +418,276 @@ def _fit_visual_inner_apertures(
                 detection.bbox,
                 detection_confidence=detection.confidence,
                 config=_VISUAL_INNER_APERTURE_CONFIG,
+                tracking_prior=priors[index],
             )
         )
-        for detection in detections
+        for index, detection in enumerate(detections)
     )
+
+
+def _visual_aperture_tracking_prior(
+    frame: VisualDetectionFrame,
+    source_index: int,
+    track: VisualTrack,
+    *,
+    max_predicted_center_displacement_norm: float,
+) -> Optional[VQ2ApertureTrackingPrior]:
+    """Propagate one exact current lineage without trusting clipped bbox scale."""
+
+    if type(frame) is not VisualDetectionFrame:
+        raise TypeError("frame must be an exact VisualDetectionFrame")
+    if type(source_index) is not int or source_index < 0:
+        raise TypeError("source_index must be a nonnegative exact int")
+    if type(track) is not VisualTrack:
+        return None
+    if (
+        type(max_predicted_center_displacement_norm) not in {int, float}
+        or not math.isfinite(
+            float(max_predicted_center_displacement_norm)
+        )
+        or float(max_predicted_center_displacement_norm) <= 0.0
+    ):
+        raise ValueError(
+            "max_predicted_center_displacement_norm must be positive finite"
+        )
+    detection = next(
+        (
+            item
+            for item in frame.detections
+            if item.source_index == source_index
+        ),
+        None,
+    )
+    if detection is None:
+        return None
+    if (
+        track.role is not VisualTrackRole.CURRENT
+        or track.ambiguous
+        or not track.visible
+        or track.missed_frame_count != 0
+        or track.latest_token.generation != frame.token.generation
+        or not track.history
+    ):
+        return None
+    latest = track.history[-1]
+    latest_association = latest.accepted_association
+    if (
+        latest.token != track.latest_token
+        or (
+            latest_association is not None
+            and (
+                latest_association.ambiguous
+                or latest_association.track_ambiguous_before_association
+                or latest_association.missed_frame_count_before_association
+                != 0
+            )
+        )
+    ):
+        return None
+    geometry = latest.inner_aperture
+    if (
+        type(geometry) is not VisualInnerApertureGeometry
+        or not geometry.fitted
+        or not geometry.complete_visibility
+        or geometry.clipping != FrameEdge.NONE
+    ):
+        return None
+    assert geometry.center_norm is not None
+    assert geometry.half_size_norm is not None
+    assert geometry.measurement_std is not None
+
+    previous_left, previous_top, previous_right, previous_bottom = (
+        latest.bbox_norm
+    )
+    current_left, current_top, current_right, current_bottom = (
+        detection.bbox_norm
+    )
+    previous_width = previous_right - previous_left
+    previous_height = previous_bottom - previous_top
+    current_width = current_right - current_left
+    current_height = current_bottom - current_top
+    combined_clipping = latest.clipping | detection.clipping
+    scale_candidates: list[float] = []
+    if not bool(
+        combined_clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+    ):
+        scale_candidates.append(current_width / previous_width)
+    if not bool(
+        combined_clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+    ):
+        scale_candidates.append(current_height / previous_height)
+    if not scale_candidates:
+        return None
+    isotropic_scale = math.exp(
+        sum(math.log(value) for value in scale_candidates)
+        / len(scale_candidates)
+    )
+
+    previous_center_unit = (
+        0.5 * (geometry.center_norm[0] + 1.0),
+        0.5 * (geometry.center_norm[1] + 1.0),
+    )
+    previous_half_unit = (
+        0.5 * geometry.half_size_norm[0],
+        0.5 * geometry.half_size_norm[1],
+    )
+    observation_gap_s = (
+        frame.observation_monotonic_ns
+        - latest.observation_monotonic_ns
+    ) / 1_000_000_000.0
+    if not math.isfinite(observation_gap_s) or observation_gap_s <= 0.0:
+        return None
+    displacement_bound = float(
+        max_predicted_center_displacement_norm
+    )
+
+    def propagated_axis_center(
+        previous_center: float,
+        previous_low: float,
+        previous_high: float,
+        current_low: float,
+        current_high: float,
+        leading_edge: FrameEdge,
+        trailing_edge: FrameEdge,
+        velocity_norm_s: float,
+    ) -> float:
+        anchors: list[float] = []
+        if not bool(combined_clipping & leading_edge):
+            anchors.append(
+                current_low
+                + isotropic_scale * (previous_center - previous_low)
+            )
+        if not bool(combined_clipping & trailing_edge):
+            anchors.append(
+                current_high
+                - isotropic_scale * (previous_high - previous_center)
+            )
+        if anchors:
+            return sum(anchors) / len(anchors)
+        predicted_displacement_norm = max(
+            -displacement_bound,
+            min(
+                displacement_bound,
+                velocity_norm_s * observation_gap_s,
+            ),
+        )
+        return previous_center + 0.5 * predicted_displacement_norm
+
+    current_center_unit = (
+        propagated_axis_center(
+            previous_center_unit[0],
+            previous_left,
+            previous_right,
+            current_left,
+            current_right,
+            FrameEdge.LEFT,
+            FrameEdge.RIGHT,
+            track.center_velocity_norm_s[0],
+        ),
+        propagated_axis_center(
+            previous_center_unit[1],
+            previous_top,
+            previous_bottom,
+            current_top,
+            current_bottom,
+            FrameEdge.TOP,
+            FrameEdge.BOTTOM,
+            track.center_velocity_norm_s[1],
+        ),
+    )
+    current_half_unit = (
+        isotropic_scale * previous_half_unit[0],
+        isotropic_scale * previous_half_unit[1],
+    )
+    image_width, image_height = frame.image_size_px
+    center_px = (
+        current_center_unit[0] * image_width,
+        current_center_unit[1] * image_height,
+    )
+    half_size_px = (
+        current_half_unit[0] * image_width,
+        current_half_unit[1] * image_height,
+    )
+    if any(
+        center - half < 0.0 or center + half > bound
+        for center, half, bound in (
+            (center_px[0], half_size_px[0], float(image_width)),
+            (center_px[1], half_size_px[1], float(image_height)),
+        )
+    ):
+        return None
+    maximum_boundary_residual_px = (
+        _VISUAL_INNER_APERTURE_CONFIG.square_prior_relative_sigma
+        * 2.0
+        * min(half_size_px)
+    )
+    return VQ2ApertureTrackingPrior(
+        center_px=center_px,
+        half_size_px=half_size_px,
+        maximum_boundary_residual_px=maximum_boundary_residual_px,
+    )
+
+
+def _visual_aperture_tracking_prior_plan(
+    frame: VisualDetectionFrame,
+    preview_associations: Mapping[int, VisualTrack],
+    *,
+    max_predicted_center_displacement_norm: float,
+) -> tuple[
+    tuple[Optional[VQ2ApertureTrackingPrior], ...],
+    dict[int, str],
+]:
+    """Build detector-ordered priors plus the exact preview lineage ledger."""
+
+    priors: list[Optional[VQ2ApertureTrackingPrior]] = []
+    lineages: dict[int, str] = {}
+    for detection in frame.detections:
+        track = preview_associations.get(detection.source_index)
+        prior = (
+            None
+            if track is None
+            else _visual_aperture_tracking_prior(
+                frame,
+                detection.source_index,
+                track,
+                max_predicted_center_displacement_norm=(
+                    max_predicted_center_displacement_norm
+                ),
+            )
+        )
+        priors.append(prior)
+        if prior is not None:
+            lineages[detection.source_index] = track.track_id
+    return tuple(priors), lineages
+
+
+def _assert_visual_aperture_prior_lineage(
+    update: VisualTrackerUpdate,
+    expected_lineages: Mapping[int, str],
+) -> None:
+    """Prove every geometry prior stayed on its previewed association."""
+
+    if not expected_lineages:
+        return
+    actual: dict[int, str] = {}
+    for association in update.associations:
+        source_index = association.detection_source_index
+        if source_index not in expected_lineages:
+            continue
+        if (
+            association.ambiguous
+            or association.track_ambiguous_before_association
+            or association.missed_frame_count_before_association != 0
+            or source_index in actual
+        ):
+            raise SafetyAbort(
+                "visual aperture prior lost exact unambiguous lineage"
+            )
+        actual[source_index] = association.track_id
+    if actual != dict(expected_lineages):
+        raise SafetyAbort(
+            "visual aperture prior association changed after fitting"
+        )
 
 
 CONTROL_HZ = 50.0
@@ -9365,18 +9663,52 @@ class VQ2Runner:
                     ) / 1_000_000.0
                 self._latest_raw_detections = detections
                 if self._visual_tracking_enabled:
+                    outer_visual_frame = (
+                        VisualDetectionFrame.from_vision_snapshot(
+                            snapshot,
+                            detections,
+                        )
+                    )
+                    preview_associations = (
+                        self.visual_tracker.preview_associations(
+                            outer_visual_frame
+                        )
+                    )
+                    (
+                        aperture_tracking_priors,
+                        aperture_prior_lineages,
+                    ) = _visual_aperture_tracking_prior_plan(
+                        outer_visual_frame,
+                        preview_associations,
+                        max_predicted_center_displacement_norm=(
+                            self.visual_tracker.config
+                            .max_center_residual_norm
+                        ),
+                    )
                     aperture_geometries = (
                         _fit_visual_inner_apertures(
                             image,
                             detections,
+                            tracking_priors=aperture_tracking_priors,
                         )
                     )
-                    visual_frame = VisualDetectionFrame.from_vision_snapshot(
-                        snapshot,
-                        detections,
-                        aperture_geometries=aperture_geometries,
+                    visual_frame = replace(
+                        outer_visual_frame,
+                        detections=tuple(
+                            replace(
+                                detection,
+                                inner_aperture=aperture_geometries[index],
+                            )
+                            for index, detection in enumerate(
+                                outer_visual_frame.detections
+                            )
+                        ),
                     )
                     visual_update = self.visual_tracker.update(visual_frame)
+                    _assert_visual_aperture_prior_lineage(
+                        visual_update,
+                        aperture_prior_lineages,
+                    )
                     self._visual_latest_graph_snapshot = (
                         self.visual_gate_graph.observe(self.visual_tracker)
                     )

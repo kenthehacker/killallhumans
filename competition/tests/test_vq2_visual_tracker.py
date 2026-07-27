@@ -347,6 +347,62 @@ def test_tracks_every_detection_and_does_not_follow_largest_or_input_order() -> 
     assert {item.detection_source_index for item in second.associations} == {0, 1, 2}
 
 
+def test_preview_associations_matches_update_without_mutating_tracker() -> None:
+    tracker = MultiTargetVisualTracker()
+    first = tracker.update(
+        _frame(
+            1,
+            (
+                _detection(10, -0.35, 0.02, 0.22, 0.24),
+                _detection(20, 0.40, -0.03, 0.18, 0.20),
+            ),
+        )
+    )
+    left_id, right_id = first.visible_track_ids
+    pending = _frame(
+        2,
+        (
+            _detection(7, 0.38, -0.02, 0.19, 0.21),
+            _detection(8, -0.32, 0.01, 0.23, 0.25),
+            _detection(9, 0.88, 0.60, 0.08, 0.10),
+        ),
+    )
+    before_update = tracker.latest_update
+    before_tracks = tracker.tracks()
+    before_by_id = {
+        track.track_id: track
+        for track in before_tracks
+    }
+
+    preview = tracker.preview_associations(pending)
+
+    assert {
+        source_index: track.track_id
+        for source_index, track in preview.items()
+    } == {
+        7: right_id,
+        8: left_id,
+    }
+    assert preview[7] == before_by_id[right_id]
+    assert preview[8] == before_by_id[left_id]
+    assert tracker.preview_associations(pending) == preview
+    assert tracker.latest_update is before_update
+    assert tracker.tracks() == before_tracks
+    assert not tracker.has_processed_token(pending.token)
+
+    accepted = tracker.update(pending)
+    accepted_by_source = {
+        evidence.detection_source_index: evidence.track_id
+        for evidence in accepted.associations
+        if not evidence.ambiguous
+    }
+    assert accepted_by_source == {
+        source_index: track.track_id
+        for source_index, track in preview.items()
+    }
+    assert len(accepted.created_track_ids) == 1
+
+
 def test_bounded_aperture_occlusion_preserves_motion_consistent_identity() -> None:
     """Mirror the 461.7 ms build-3385 Gate-0 occlusion without semantic labels."""
 
@@ -524,15 +580,21 @@ def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> N
         )
     )
     assert len(first.visible_track_ids) == 2
-    second = tracker.update(
-        _frame(
-            2,
-            (
-                _detection(0, 0.00, 0.0, 0.18, 0.20),
-                _detection(1, 0.00, 0.0, 0.18, 0.20),
-            ),
-        )
+    ambiguous_frame = _frame(
+        2,
+        (
+            _detection(0, 0.00, 0.0, 0.18, 0.20),
+            _detection(1, 0.00, 0.0, 0.18, 0.20),
+        ),
     )
+    before_tracks = tracker.tracks()
+    before_update = tracker.latest_update
+    assert tracker.preview_associations(ambiguous_frame) == {}
+    assert tracker.tracks() == before_tracks
+    assert tracker.latest_update is before_update
+    assert not tracker.has_processed_token(ambiguous_frame.token)
+
+    second = tracker.update(ambiguous_frame)
     assert set(second.ambiguous_track_ids) == set(first.visible_track_ids)
     assert all(item.ambiguous for item in second.associations)
     evidence_by_track = {
@@ -544,7 +606,7 @@ def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> N
         assert accepted.ambiguous
         assert accepted.missed_frame_count_before_association == 0
         assert accepted.temporal_consistency == 1.0
-        assert accepted.track_ambiguous_before_association
+        assert not accepted.track_ambiguous_before_association
     tracker.assign_role(first.visible_track_ids[0], VisualTrackRole.CURRENT)
     with pytest.raises(ValueError, match="ambiguous"):
         tracker.confirm_authoritative_gate(

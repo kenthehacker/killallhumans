@@ -2314,6 +2314,8 @@ def _inner_aperture(
     std_y: float = 0.01,
     std_log_scale: float = 0.03,
     confidence: float = 0.90,
+    geometry_model_id: str = "vq2-visible-inner-quad-lines-v1",
+    covariance_model_id: str = "vq2-visible-aperture-diagonal-v1",
     visible_edges: FrameEdge = (
         FrameEdge.LEFT
         | FrameEdge.TOP
@@ -2330,8 +2332,8 @@ def _inner_aperture(
         confidence=confidence,
         clipping=FrameEdge.NONE,
         visible_edges=visible_edges,
-        geometry_model_id="vq2-visible-inner-quad-lines-v1",
-        covariance_model_id="vq2-visible-aperture-diagonal-v1",
+        geometry_model_id=geometry_model_id,
+        covariance_model_id=covariance_model_id,
         health_reason=health_reason,
     )
 
@@ -2400,6 +2402,35 @@ def test_top_fov_prefers_complete_low_confidence_inner_aperture_geometry():
     assert edge.top_edge_image_down > (
         course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
     )
+
+
+def test_top_fov_uses_fresh_temporally_associated_tracking_geometry():
+    inner = _inner_aperture(
+        center_y=-0.18,
+        half_y=0.29,
+        std_y=0.04,
+        std_log_scale=0.12,
+        geometry_model_id=(
+            "vq2-temporally-associated-inner-quad-lines-v1"
+        ),
+        covariance_model_id=(
+            "vq2-temporally-associated-aperture-diagonal-v1"
+        ),
+        health_reason="aperture_fit_tracking_prior_only",
+    )
+    sample = SimpleNamespace(
+        bbox_norm=(0.0, 0.0, 1.0, 1.0),
+        confidence=0.90,
+        clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+        center_censored=True,
+        inner_aperture=inner,
+    )
+
+    edge = course_stage._top_fov_raw_edge(sample)
+
+    assert not inner.passage_usable
+    assert edge.basis == course_stage.TOP_FOV_INNER_EDGE_BASIS
+    assert edge.top_edge_image_down < inner.center_norm[1]
 
 
 def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():

@@ -22,6 +22,7 @@ from gate_detection.src.vq2_detector import VQ2GateDetector
 from gate_detection.src.vq2_geometry import (
     ApertureSide,
     VQ2ApertureConfig,
+    VQ2ApertureTrackingPrior,
     fit_vq2_aperture_bgr,
     fit_vq2_aperture_mask,
     passage_geometry_from_vq2_aperture_fit,
@@ -560,6 +561,114 @@ def test_multiple_similar_aperture_gaps_are_rejected_as_ambiguous() -> None:
     assert fit.rejection_reason == "ambiguous_multiple_aperture_gaps"
     assert fit.fitted_corners_px is None
     assert fit.covariance_diagonal is None
+
+
+def test_unique_temporal_gap_association_is_tracking_only() -> None:
+    mask = np.zeros((120, 180), dtype=np.uint8)
+    cv2.rectangle(mask, (20, 20), (160, 100), 255, 8)
+    cv2.rectangle(mask, (86, 20), (94, 100), 255, -1)
+    prior = VQ2ApertureTrackingPrior(
+        center_px=(55.0, 60.0),
+        half_size_px=(30.5, 35.5),
+        maximum_boundary_residual_px=1.0,
+    )
+
+    fit = fit_vq2_aperture_mask(
+        mask,
+        (16, 16, 149, 89),
+        detection_confidence=0.9,
+        tracking_prior=prior,
+    )
+
+    assert fit.succeeded
+    assert fit.rejection_reason is None
+    assert fit.geometry_model_id == (
+        "vq2-temporally-associated-inner-quad-lines-v1"
+    )
+    assert fit.covariance_model_id == (
+        "vq2-temporally-associated-aperture-diagonal-v1"
+    )
+    assert fit.fitted_corners_px is not None
+    assert np.asarray(fit.fitted_corners_px) == pytest.approx(
+        np.asarray(
+            (
+                (24.5, 24.5),
+                (85.5, 24.5),
+                (85.5, 95.5),
+                (24.5, 95.5),
+            )
+        )
+    )
+    assert tracking_geometry_from_vq2_aperture_fit(fit) is not None
+    assert (
+        passage_geometry_from_vq2_aperture_fit(
+            fit,
+            minimum_confidence=0.0,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [
+        VQ2ApertureTrackingPrior(
+            center_px=(90.0, 60.0),
+            half_size_px=(30.5, 35.5),
+            maximum_boundary_residual_px=36.0,
+        ),
+        VQ2ApertureTrackingPrior(
+            center_px=(90.0, 60.0),
+            half_size_px=(30.5, 35.5),
+            maximum_boundary_residual_px=2.0,
+        ),
+    ],
+)
+def test_nonunique_or_incoherent_temporal_gap_prior_fails_closed(
+    prior: VQ2ApertureTrackingPrior,
+) -> None:
+    mask = np.zeros((120, 180), dtype=np.uint8)
+    cv2.rectangle(mask, (20, 20), (160, 100), 255, 8)
+    cv2.rectangle(mask, (86, 20), (94, 100), 255, -1)
+
+    fit = fit_vq2_aperture_mask(
+        mask,
+        (16, 16, 149, 89),
+        detection_confidence=0.9,
+        tracking_prior=prior,
+    )
+
+    assert not fit.succeeded
+    assert fit.rejection_reason == "ambiguous_multiple_aperture_gaps"
+    assert fit.fitted_corners_px is None
+    assert fit.covariance_diagonal is None
+
+
+def test_tracking_prior_does_not_change_an_ordinary_unambiguous_fit() -> None:
+    image = _aperture_scene((70, 50, 130, 110))
+    detection = _aperture_detection(image)
+    ordinary = fit_vq2_aperture_bgr(
+        image,
+        detection.bbox,
+        detection_confidence=detection.confidence,
+    )
+
+    with_irrelevant_prior = fit_vq2_aperture_bgr(
+        image,
+        detection.bbox,
+        detection_confidence=detection.confidence,
+        tracking_prior=VQ2ApertureTrackingPrior(
+            center_px=(10.0, 10.0),
+            half_size_px=(2.0, 2.0),
+            maximum_boundary_residual_px=1.0,
+        ),
+    )
+
+    assert with_irrelevant_prior == ordinary
+    assert ordinary.geometry_model_id == "vq2-visible-inner-quad-lines-v1"
+    assert ordinary.covariance_model_id == (
+        "vq2-visible-aperture-diagonal-v1"
+    )
 
 
 def test_connected_current_successor_union_never_claims_passage_geometry() -> None:

@@ -59,6 +59,11 @@ from competition.vq2_capture import (
 from competition.vq2_contracts import FrameEdge, FrameIdentityV1, FrameTimingV1
 from competition.vq2_passive_timing import CameraFrameTimingObservationV1
 from competition.vq2_vision import VQ2VisionThread
+from competition.vq2_visual_tracker import (
+    MultiTargetVisualTracker,
+    VisualDetectionFrame,
+    VisualTrackRole,
+)
 from estimation.imu_attitude import (
     AttitudeEstimate,
     ImuAttitudeConfig,
@@ -216,6 +221,18 @@ def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
     rejected = vq2_module._visual_inner_aperture_from_fit(
         _rejected_aperture_fit()
     )
+    temporal = vq2_module._visual_inner_aperture_from_fit(
+        replace(
+            _nominal_aperture_fit(),
+            clipping=ApertureSide.BOTTOM,
+            geometry_model_id=(
+                "vq2-temporally-associated-inner-quad-lines-v1"
+            ),
+            covariance_model_id=(
+                "vq2-temporally-associated-aperture-diagonal-v1"
+            ),
+        )
+    )
 
     assert nominal.passage_usable
     assert nominal.center_norm == pytest.approx((0.0, 0.0))
@@ -248,6 +265,11 @@ def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
     assert rejected.health_reason == (
         "aperture_fit_rejected:ambiguous_multiple_aperture_gaps"
     )
+    assert temporal.fitted
+    assert temporal.complete_visibility
+    assert temporal.clipping == FrameEdge.NONE
+    assert not temporal.passage_usable
+    assert temporal.health_reason == "aperture_fit_tracking_prior_only"
 
 
 def test_runner_thresholds_once_for_all_detection_aperture_fits(
@@ -263,11 +285,19 @@ def test_runner_thresholds_once_for_all_detection_aperture_fits(
         calls["mask"] += 1
         return mask
 
-    def fit_mask(received_mask, support_bbox, *, detection_confidence, config):
+    def fit_mask(
+        received_mask,
+        support_bbox,
+        *,
+        detection_confidence,
+        config,
+        tracking_prior,
+    ):
         assert received_mask is mask
         assert support_bbox in {(10, 20, 40, 50), (80, 30, 30, 45)}
         assert detection_confidence == pytest.approx(0.8)
         assert config is vq2_module._VISUAL_INNER_APERTURE_CONFIG
+        assert tracking_prior is None
         calls["fit"] += 1
         return _rejected_aperture_fit()
 
@@ -285,6 +315,107 @@ def test_runner_thresholds_once_for_all_detection_aperture_fits(
     assert len(geometries) == 2
     assert all(not geometry.passage_usable for geometry in geometries)
     assert calls == {"mask": 1, "fit": 2}
+
+
+def _visual_frame(
+    sequence: int,
+    detection: GateDetection,
+    *,
+    inner=None,
+) -> VisualDetectionFrame:
+    return VisualDetectionFrame.from_detector_results(
+        (detection,),
+        generation=4,
+        frame_id=100 + sequence,
+        publication_sequence=sequence,
+        stream_id="runner-prior-test",
+        final_unique_packet_monotonic_ns=(
+            1_000_000_000 + 40_000_000 * sequence
+        ),
+        publish_monotonic_ns=(
+            1_001_000_000 + 40_000_000 * sequence
+        ),
+        time_basis_id="host-perf-counter",
+        image_size_px=(200, 160),
+        aperture_geometries=(inner,),
+        camera_source_time_ns=10_000 + sequence,
+    )
+
+
+@pytest.mark.parametrize(
+    ("current_detection", "expected_center_y_px"),
+    [
+        (_detection(10, 20, 120, 140), 92.0),
+        (_detection(10, 0, 120, 160), 80.0),
+    ],
+)
+def test_runner_propagates_current_inner_prior_without_using_clipped_height(
+    current_detection,
+    expected_center_y_px,
+) -> None:
+    tracker = MultiTargetVisualTracker()
+    inner = vq2_module._visual_inner_aperture_from_fit(
+        _nominal_aperture_fit()
+    )
+    first = tracker.update(
+        _visual_frame(
+            1,
+            _detection(20, 20, 100, 100),
+            inner=inner,
+        )
+    )
+    track_id = first.visible_track_ids[0]
+    tracker.assign_role(track_id, VisualTrackRole.CURRENT)
+    pending = _visual_frame(2, current_detection)
+    preview = tracker.preview_associations(pending)
+
+    priors, lineages = vq2_module._visual_aperture_tracking_prior_plan(
+        pending,
+        preview,
+        max_predicted_center_displacement_norm=(
+            tracker.config.max_center_residual_norm
+        ),
+    )
+
+    assert lineages == {0: track_id}
+    assert len(priors) == 1
+    prior = priors[0]
+    assert prior is not None
+    assert prior.center_px == pytest.approx((106.0, expected_center_y_px))
+    assert prior.half_size_px == pytest.approx((36.6, 36.6))
+    assert prior.maximum_boundary_residual_px == pytest.approx(8.784)
+
+
+def test_runner_withholds_inner_prior_from_noncurrent_lineage() -> None:
+    tracker = MultiTargetVisualTracker()
+    first = tracker.update(
+        _visual_frame(
+            1,
+            _detection(20, 20, 100, 100),
+            inner=vq2_module._visual_inner_aperture_from_fit(
+                _nominal_aperture_fit()
+            ),
+        )
+    )
+    tracker.assign_role(
+        first.visible_track_ids[0],
+        VisualTrackRole.NEXT,
+    )
+    pending = _visual_frame(
+        2,
+        _detection(10, 20, 120, 140),
+    )
+
+    priors, lineages = vq2_module._visual_aperture_tracking_prior_plan(
+        pending,
+        tracker.preview_associations(pending),
+        max_predicted_center_displacement_norm=(
+            tracker.config.max_center_residual_norm
+        ),
+    )
+
+    assert priors == (None,)
+    assert lineages == {}
 
 
 def _estimate(roll=0.0, pitch=-0.31, yaw=0.0):

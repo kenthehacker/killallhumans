@@ -168,6 +168,18 @@ TOP_FOV_INNER_EDGE_BASIS = (
 TOP_FOV_OUTER_EDGE_FALLBACK_BASIS = (
     "raw-current-bbox-top-fallback-v1"
 )
+_TOP_FOV_INNER_MODEL_PAIRS = frozenset(
+    {
+        (
+            "vq2-visible-inner-quad-lines-v1",
+            "vq2-visible-aperture-diagonal-v1",
+        ),
+        (
+            "vq2-temporally-associated-inner-quad-lines-v1",
+            "vq2-temporally-associated-aperture-diagonal-v1",
+        ),
+    }
+)
 _YAW_PROFILE_ISSUER = object()
 
 
@@ -233,11 +245,9 @@ def _conservative_inner_aperture_top_image_down(
     std_y = float(inner.measurement_std[1])
     std_log_scale = float(inner.measurement_std[2])
     if (
-        inner.geometry_model_id
-        != "vq2-visible-inner-quad-lines-v1"
-        or inner.covariance_model_id
-        != "vq2-visible-aperture-diagonal-v1"
-    ):
+        inner.geometry_model_id,
+        inner.covariance_model_id,
+    ) not in _TOP_FOV_INNER_MODEL_PAIRS:
         raise ValueError("inner-aperture top model identity is invalid")
     nominal_top = center_y - half_y
     top_std = math.sqrt(

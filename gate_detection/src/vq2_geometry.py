@@ -42,6 +42,14 @@ _SIDES = (
 )
 _PASSAGE_MINIMUM_CONFIDENCE = 0.25
 _CONFIDENCE_UNCERTAINTY_EPSILON = 1e-6
+_VISIBLE_GEOMETRY_MODEL_ID = "vq2-visible-inner-quad-lines-v1"
+_VISIBLE_COVARIANCE_MODEL_ID = "vq2-visible-aperture-diagonal-v1"
+_TEMPORAL_GEOMETRY_MODEL_ID = (
+    "vq2-temporally-associated-inner-quad-lines-v1"
+)
+_TEMPORAL_COVARIANCE_MODEL_ID = (
+    "vq2-temporally-associated-aperture-diagonal-v1"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +108,86 @@ Quad = tuple[Point, Point, Point, Point]
 
 
 @dataclass(frozen=True, slots=True)
+class VQ2ApertureTrackingPrior:
+    """A current-frame inner-quad prediction used only to resolve ambiguity.
+
+    The caller owns temporal propagation and supplies a conservative maximum
+    boundary residual in pixels.  This prior cannot create an aperture when
+    the ordinary scanline fit is merely absent or underconstrained; it is
+    consulted only after the unchanged competing-gap test declares the frame
+    ambiguous.
+    """
+
+    center_px: Point
+    half_size_px: Point
+    maximum_boundary_residual_px: float
+
+    def __post_init__(self) -> None:
+        normalized: dict[str, Point] = {}
+        for name, point in (
+            ("center_px", self.center_px),
+            ("half_size_px", self.half_size_px),
+        ):
+            if type(point) is not tuple or len(point) != 2:
+                raise TypeError(
+                    f"{name} must be an exact two-tuple"
+                )
+            values: list[float] = []
+            for axis, value in enumerate(point):
+                if (
+                    type(value) not in {int, float}
+                    or not math.isfinite(float(value))
+                ):
+                    raise TypeError(
+                        f"{name}[{axis}] must be finite numeric data"
+                    )
+                values.append(float(value))
+            normalized[name] = (values[0], values[1])
+        if any(value <= 0.0 for value in normalized["half_size_px"]):
+            raise ValueError(
+                "half_size_px values must be positive"
+            )
+        residual = self.maximum_boundary_residual_px
+        if (
+            type(residual) not in {int, float}
+            or not math.isfinite(float(residual))
+        ):
+            raise TypeError(
+                "maximum_boundary_residual_px must be finite numeric data"
+            )
+        if float(residual) <= 0.0:
+            raise ValueError(
+                "maximum_boundary_residual_px must be positive"
+            )
+        object.__setattr__(
+            self,
+            "center_px",
+            normalized["center_px"],
+        )
+        object.__setattr__(
+            self,
+            "half_size_px",
+            normalized["half_size_px"],
+        )
+        object.__setattr__(
+            self,
+            "maximum_boundary_residual_px",
+            float(residual),
+        )
+
+    @property
+    def predicted_corners_px(self) -> Quad:
+        center_x, center_y = self.center_px
+        half_x, half_y = self.half_size_px
+        return (
+            (center_x - half_x, center_y - half_y),
+            (center_x + half_x, center_y - half_y),
+            (center_x + half_x, center_y + half_y),
+            (center_x - half_x, center_y + half_y),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class VQ2ApertureFit:
     """Result of an image-space aperture fit, including rejected diagnostics."""
 
@@ -142,6 +230,19 @@ class _LineFit:
     inlier_points: tuple[Point, ...]
     residual_rms_px: float
     support_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _GapCandidate:
+    width: int
+    before: int
+    after: int
+
+
+@dataclass(frozen=True, slots=True)
+class _AmbiguousGapScanline:
+    offset: int
+    candidates: tuple[_GapCandidate, ...]
 
 
 def _exact_bbox(
@@ -259,23 +360,47 @@ def _runs(indices: np.ndarray) -> list[tuple[int, int]]:
     return [(int(group[0]), int(group[-1])) for group in groups]
 
 
+def _gap_candidates(
+    runs: list[tuple[int, int]],
+    *,
+    minimum: int,
+) -> tuple[_GapCandidate, ...]:
+    gaps = tuple(
+        _GapCandidate(
+            width=following[0] - preceding[1] - 1,
+            before=preceding[1],
+            after=following[0],
+        )
+        for preceding, following in zip(runs, runs[1:])
+        if following[0] - preceding[1] - 1 >= minimum
+    )
+    return tuple(
+        sorted(
+            gaps,
+            key=lambda candidate: (
+                -candidate.width,
+                candidate.before,
+                candidate.after,
+            ),
+        )
+    )
+
+
 def _largest_unambiguous_gap(
     runs: list[tuple[int, int]],
     *,
     minimum: int,
     competing_ratio: float,
 ) -> tuple[Optional[tuple[int, int]], bool]:
-    gaps = [
-        (following[0] - preceding[1] - 1, preceding[1], following[0])
-        for preceding, following in zip(runs, runs[1:])
-        if following[0] - preceding[1] - 1 >= minimum
-    ]
+    gaps = _gap_candidates(runs, minimum=minimum)
     if not gaps:
         return None, False
-    gaps.sort(key=lambda row: (-row[0], row[1], row[2]))
-    if len(gaps) > 1 and gaps[1][0] >= competing_ratio * gaps[0][0]:
+    if (
+        len(gaps) > 1
+        and gaps[1].width >= competing_ratio * gaps[0].width
+    ):
         return None, True
-    return (gaps[0][1], gaps[0][2]), False
+    return (gaps[0].before, gaps[0].after), False
 
 
 def _scanline_pairs(
@@ -285,12 +410,15 @@ def _scanline_pairs(
     horizontal_scan: bool,
     minimum_gap: int,
     competing_ratio: float,
-) -> tuple[dict[ApertureSide, list[Point]], int]:
+) -> tuple[
+    dict[ApertureSide, list[Point]],
+    tuple[_AmbiguousGapScanline, ...],
+]:
     x, y, width, height = bbox
     first_side = ApertureSide.LEFT if horizontal_scan else ApertureSide.TOP
     second_side = ApertureSide.RIGHT if horizontal_scan else ApertureSide.BOTTOM
     points = {first_side: [], second_side: []}
-    ambiguous = 0
+    ambiguous: list[_AmbiguousGapScanline] = []
     scan_count = height if horizontal_scan else width
     for offset in range(scan_count):
         values = (
@@ -299,13 +427,22 @@ def _scanline_pairs(
             else component[y : y + height, x + offset]
         )
         nonzero = np.flatnonzero(values)
+        runs = _runs(nonzero)
         gap, is_ambiguous = _largest_unambiguous_gap(
-            _runs(nonzero),
+            runs,
             minimum=minimum_gap,
             competing_ratio=competing_ratio,
         )
         if is_ambiguous:
-            ambiguous += 1
+            ambiguous.append(
+                _AmbiguousGapScanline(
+                    offset=offset,
+                    candidates=_gap_candidates(
+                        runs,
+                        minimum=minimum_gap,
+                    ),
+                )
+            )
             continue
         if gap is None:
             continue
@@ -318,7 +455,136 @@ def _scanline_pairs(
             column = float(x + offset) + 0.5
             points[first_side].append((column, float(y + before) + 0.5))
             points[second_side].append((column, float(y + after) - 0.5))
-    return points, ambiguous
+    return points, tuple(ambiguous)
+
+
+def _segment_dependent_coordinate(
+    first: Point,
+    second: Point,
+    *,
+    independent_coordinate: float,
+    independent_axis: int,
+) -> Optional[float]:
+    delta = second[independent_axis] - first[independent_axis]
+    if abs(delta) <= 1e-9:
+        return None
+    fraction = (
+        independent_coordinate - first[independent_axis]
+    ) / delta
+    if fraction < 0.0 or fraction > 1.0:
+        return None
+    dependent_axis = 1 - independent_axis
+    value = (
+        first[dependent_axis]
+        + fraction
+        * (second[dependent_axis] - first[dependent_axis])
+    )
+    return float(value) if math.isfinite(value) else None
+
+
+def _temporally_resolved_scanline_pairs(
+    ambiguous: tuple[_AmbiguousGapScanline, ...],
+    bbox: tuple[int, int, int, int],
+    *,
+    horizontal_scan: bool,
+    prior: VQ2ApertureTrackingPrior,
+) -> tuple[dict[ApertureSide, list[Point]], int]:
+    """Select only uniquely prior-coherent gaps from ambiguous scanlines."""
+
+    x, y, _width, _height = bbox
+    corners = prior.predicted_corners_px
+    tolerance = prior.maximum_boundary_residual_px
+    first_side = (
+        ApertureSide.LEFT if horizontal_scan else ApertureSide.TOP
+    )
+    second_side = (
+        ApertureSide.RIGHT if horizontal_scan else ApertureSide.BOTTOM
+    )
+    points = {first_side: [], second_side: []}
+    selected_count = 0
+    for scanline in ambiguous:
+        if horizontal_scan:
+            independent = float(y + scanline.offset) + 0.5
+            expected_first = _segment_dependent_coordinate(
+                corners[0],
+                corners[3],
+                independent_coordinate=independent,
+                independent_axis=1,
+            )
+            expected_second = _segment_dependent_coordinate(
+                corners[1],
+                corners[2],
+                independent_coordinate=independent,
+                independent_axis=1,
+            )
+        else:
+            independent = float(x + scanline.offset) + 0.5
+            expected_first = _segment_dependent_coordinate(
+                corners[0],
+                corners[1],
+                independent_coordinate=independent,
+                independent_axis=0,
+            )
+            expected_second = _segment_dependent_coordinate(
+                corners[3],
+                corners[2],
+                independent_coordinate=independent,
+                independent_axis=0,
+            )
+        if expected_first is None or expected_second is None:
+            continue
+        matches: list[tuple[float, float]] = []
+        for candidate in scanline.candidates:
+            if horizontal_scan:
+                first_boundary = float(x + candidate.before) + 0.5
+                second_boundary = float(x + candidate.after) - 0.5
+            else:
+                first_boundary = float(y + candidate.before) + 0.5
+                second_boundary = float(y + candidate.after) - 0.5
+            if (
+                abs(first_boundary - expected_first) <= tolerance
+                and abs(second_boundary - expected_second) <= tolerance
+            ):
+                matches.append((first_boundary, second_boundary))
+        if len(matches) != 1:
+            continue
+        first_boundary, second_boundary = matches[0]
+        if horizontal_scan:
+            points[first_side].append((first_boundary, independent))
+            points[second_side].append((second_boundary, independent))
+        else:
+            points[first_side].append((independent, first_boundary))
+            points[second_side].append((independent, second_boundary))
+        selected_count += 1
+    return points, selected_count
+
+
+def _quad_coheres_with_tracking_prior(
+    corners: Quad,
+    prior: VQ2ApertureTrackingPrior,
+) -> bool:
+    tolerance = prior.maximum_boundary_residual_px
+    actual_boundaries = (
+        min(point[0] for point in corners),
+        min(point[1] for point in corners),
+        max(point[0] for point in corners),
+        max(point[1] for point in corners),
+    )
+    center_x, center_y = prior.center_px
+    half_x, half_y = prior.half_size_px
+    predicted_boundaries = (
+        center_x - half_x,
+        center_y - half_y,
+        center_x + half_x,
+        center_y + half_y,
+    )
+    return all(
+        abs(actual - predicted) <= tolerance
+        for actual, predicted in zip(
+            actual_boundaries,
+            predicted_boundaries,
+        )
+    )
 
 
 def _interior_interval(
@@ -641,6 +907,7 @@ def _covariance_diagonal(
     residual_rms_px: float,
     inferred_side: Optional[ApertureSide],
     prior_relative_sigma: float,
+    temporal_boundary_sigma_px: Optional[float] = None,
 ) -> tuple[float, float, float, float, float]:
     spans = tuple(_distance(corners[i], corners[(i + 1) % 4]) for i in range(4))
     aperture_span = max(1.0, min(spans))
@@ -659,6 +926,12 @@ def _covariance_diagonal(
             sigma_y_px = max(sigma_y_px, 0.25 * prior_sigma_px)
         scale_sigma = max(scale_sigma, prior_relative_sigma)
         skew_sigma = max(skew_sigma, 2.0 * prior_relative_sigma)
+    if temporal_boundary_sigma_px is not None:
+        sigma_x_px = max(sigma_x_px, temporal_boundary_sigma_px)
+        sigma_y_px = max(sigma_y_px, temporal_boundary_sigma_px)
+        relative_sigma = temporal_boundary_sigma_px / aperture_span
+        scale_sigma = max(scale_sigma, relative_sigma)
+        skew_sigma = max(skew_sigma, 2.0 * relative_sigma)
     values = (
         (2.0 * sigma_x_px / image_width) ** 2,
         (2.0 * sigma_y_px / image_height) ** 2,
@@ -675,11 +948,18 @@ def fit_vq2_aperture_mask(
     *,
     detection_confidence: float,
     config: VQ2ApertureConfig = VQ2ApertureConfig(),
+    tracking_prior: Optional[VQ2ApertureTrackingPrior] = None,
 ) -> VQ2ApertureFit:
     """Fit an inner aperture from a pre-thresholded gate-colour mask."""
 
     if type(config) is not VQ2ApertureConfig:
         raise TypeError("config must be VQ2ApertureConfig")
+    if tracking_prior is not None and (
+        type(tracking_prior) is not VQ2ApertureTrackingPrior
+    ):
+        raise TypeError(
+            "tracking_prior must be an exact VQ2ApertureTrackingPrior or None"
+        )
     if type(mask) is not np.ndarray or mask.ndim != 2:
         raise TypeError("mask must be a two-dimensional NumPy array")
     if mask.shape[0] < 1 or mask.shape[1] < 1:
@@ -774,17 +1054,57 @@ def fit_vq2_aperture_mask(
         minimum_gap=minimum_gap,
         competing_ratio=config.competing_gap_ratio,
     )
-    if (
-        ambiguous_rows >= config.min_line_samples
-        or ambiguous_columns >= config.min_line_samples
-    ):
-        return _rejected(
-            image_size_px=image_size,
-            bbox=bbox,
-            clipping=clipping,
-            reason="ambiguous_multiple_aperture_gaps",
-            support_count=largest_area,
-        )
+    row_ambiguity = len(ambiguous_rows) >= config.min_line_samples
+    column_ambiguity = (
+        len(ambiguous_columns) >= config.min_line_samples
+    )
+    temporally_associated = False
+    if row_ambiguity or column_ambiguity:
+        if tracking_prior is None:
+            return _rejected(
+                image_size_px=image_size,
+                bbox=bbox,
+                clipping=clipping,
+                reason="ambiguous_multiple_aperture_gaps",
+                support_count=largest_area,
+            )
+        if row_ambiguity:
+            resolved, selected_count = (
+                _temporally_resolved_scanline_pairs(
+                    ambiguous_rows,
+                    bbox,
+                    horizontal_scan=True,
+                    prior=tracking_prior,
+                )
+            )
+            if selected_count < config.min_line_samples:
+                return _rejected(
+                    image_size_px=image_size,
+                    bbox=bbox,
+                    clipping=clipping,
+                    reason="ambiguous_multiple_aperture_gaps",
+                    support_count=largest_area,
+                )
+            horizontal = resolved
+        if column_ambiguity:
+            resolved, selected_count = (
+                _temporally_resolved_scanline_pairs(
+                    ambiguous_columns,
+                    bbox,
+                    horizontal_scan=False,
+                    prior=tracking_prior,
+                )
+            )
+            if selected_count < config.min_line_samples:
+                return _rejected(
+                    image_size_px=image_size,
+                    bbox=bbox,
+                    clipping=clipping,
+                    reason="ambiguous_multiple_aperture_gaps",
+                    support_count=largest_area,
+                )
+            vertical = resolved
+        temporally_associated = True
     samples: dict[ApertureSide, list[Point]] = {
         ApertureSide.LEFT: horizontal[ApertureSide.LEFT],
         ApertureSide.TOP: vertical[ApertureSide.TOP],
@@ -830,7 +1150,19 @@ def fit_vq2_aperture_mask(
     inferred_side: Optional[ApertureSide] = None
     if not missing:
         corners = _visible_quad(lines)
-        geometry_model_id = "vq2-visible-inner-quad-lines-v1"
+        geometry_model_id = (
+            _TEMPORAL_GEOMETRY_MODEL_ID
+            if temporally_associated
+            else _VISIBLE_GEOMETRY_MODEL_ID
+        )
+    elif temporally_associated:
+        return _rejected(
+            image_size_px=image_size,
+            bbox=bbox,
+            clipping=clipping,
+            reason="underconstrained_inner_aperture",
+            support_count=sum(len(points) for points in samples.values()),
+        )
     elif len(missing) == 1 and bool(clipping & missing[0]):
         inferred_side = missing[0]
         corners = _infer_one_side(lines, inferred_side)
@@ -851,6 +1183,21 @@ def fit_vq2_aperture_mask(
             bbox=bbox,
             clipping=clipping,
             reason="degenerate_inner_aperture",
+            support_count=sum(len(points) for points in samples.values()),
+        )
+    if (
+        temporally_associated
+        and tracking_prior is not None
+        and not _quad_coheres_with_tracking_prior(
+            corners,
+            tracking_prior,
+        )
+    ):
+        return _rejected(
+            image_size_px=image_size,
+            bbox=bbox,
+            clipping=clipping,
+            reason="ambiguous_multiple_aperture_gaps",
             support_count=sum(len(points) for points in samples.values()),
         )
     clipping |= _outside_clipping(corners, image_width, image_height)
@@ -938,6 +1285,11 @@ def fit_vq2_aperture_mask(
         residual_rms_px=residual_rms,
         inferred_side=inferred_side,
         prior_relative_sigma=config.square_prior_relative_sigma,
+        temporal_boundary_sigma_px=(
+            tracking_prior.maximum_boundary_residual_px
+            if temporally_associated and tracking_prior is not None
+            else None
+        ),
     )
     return VQ2ApertureFit(
         image_size_px=image_size,
@@ -951,7 +1303,11 @@ def fit_vq2_aperture_mask(
         covariance_model_id=(
             "vq2-censored-aperture-diagonal-v1"
             if inferred_side is not None
-            else "vq2-visible-aperture-diagonal-v1"
+            else (
+                _TEMPORAL_COVARIANCE_MODEL_ID
+                if temporally_associated
+                else _VISIBLE_COVARIANCE_MODEL_ID
+            )
         ),
         covariance_diagonal=covariance,
         residual_rms_px=residual_rms,
@@ -968,6 +1324,7 @@ def fit_vq2_aperture_bgr(
     *,
     detection_confidence: float,
     config: VQ2ApertureConfig = VQ2ApertureConfig(),
+    tracking_prior: Optional[VQ2ApertureTrackingPrior] = None,
 ) -> VQ2ApertureFit:
     """Threshold a BGR frame and fit its VQ2 inner aperture."""
 
@@ -977,6 +1334,7 @@ def fit_vq2_aperture_bgr(
         support_bbox_px,
         detection_confidence=detection_confidence,
         config=config,
+        tracking_prior=tracking_prior,
     )
 
 
@@ -984,6 +1342,7 @@ def _complete_geometry_from_vq2_aperture_fit(
     fit: VQ2ApertureFit,
     *,
     allow_outer_support_clipping: bool = False,
+    allow_tracking_only_models: bool = False,
 ) -> Optional[VQ2PassageGeometry]:
     """Return an inscribed opening from an exact complete visible fit.
 
@@ -996,7 +1355,26 @@ def _complete_geometry_from_vq2_aperture_fit(
         raise TypeError("fit must be an exact VQ2ApertureFit")
     if type(allow_outer_support_clipping) is not bool:
         raise TypeError("allow_outer_support_clipping must be an exact bool")
+    if type(allow_tracking_only_models) is not bool:
+        raise TypeError("allow_tracking_only_models must be an exact bool")
     fit_confidence = _finite_confidence(fit.confidence)
+    model_pair = (
+        fit.geometry_model_id,
+        fit.covariance_model_id,
+    )
+    accepted_model_pairs = {
+        (
+            _VISIBLE_GEOMETRY_MODEL_ID,
+            _VISIBLE_COVARIANCE_MODEL_ID,
+        ),
+    }
+    if allow_tracking_only_models:
+        accepted_model_pairs.add(
+            (
+                _TEMPORAL_GEOMETRY_MODEL_ID,
+                _TEMPORAL_COVARIANCE_MODEL_ID,
+            )
+        )
     all_sides = (
         ApertureSide.LEFT
         | ApertureSide.TOP
@@ -1013,10 +1391,7 @@ def _complete_geometry_from_vq2_aperture_fit(
         or fit.visible_edges != all_sides
         or fit.visible_corners != (True, True, True, True)
         or fit.fitted_corners_px is None
-        or fit.geometry_model_id
-        != "vq2-visible-inner-quad-lines-v1"
-        or fit.covariance_model_id
-        != "vq2-visible-aperture-diagonal-v1"
+        or model_pair not in accepted_model_pairs
         or fit.covariance_diagonal is None
         or fit.residual_rms_px is None
         or not math.isfinite(fit.residual_rms_px)
@@ -1190,6 +1565,7 @@ def tracking_geometry_from_vq2_aperture_fit(
     return _complete_geometry_from_vq2_aperture_fit(
         fit,
         allow_outer_support_clipping=True,
+        allow_tracking_only_models=True,
     )
 
 
@@ -1220,6 +1596,7 @@ __all__ = [
     "ApertureSide",
     "VQ2ApertureConfig",
     "VQ2ApertureFit",
+    "VQ2ApertureTrackingPrior",
     "VQ2PassageGeometry",
     "fit_vq2_aperture_bgr",
     "fit_vq2_aperture_mask",
