@@ -807,8 +807,8 @@ class RollingVisualApproachServo:
             # corridor admission even when a later check refuses that frame.
             self._pending_passage_admission = None
         elif starting_passage:
-            # The exact admission is single-use at passage entry.  A refused
-            # entry must earn a new approach admission on a fresh publication.
+            # The exact admission is single-use at passage entry.  Only the
+            # explicitly restored near-plane censorship case below may retry.
             self._pending_passage_admission = None
         for name, value in (
             ("now_monotonic_s", now_monotonic_s),
@@ -825,7 +825,17 @@ class RollingVisualApproachServo:
         self._validate_publication_advance(snapshot)
 
         current = tracker.track(self.expected_current_track_id)
-        self._validate_current(snapshot, update, current, mode=mode)
+        try:
+            self._validate_current(snapshot, update, current, mode=mode)
+        except VisualApproachCurrentGeometryUnavailable:
+            if starting_passage:
+                # The coordinator independently classifies and bounds expected
+                # near-plane censorship.  Restore only the already-validated
+                # exact admission so a repeated censored coast or later clean
+                # publication resumes the same sealed successor identity.
+                assert passage_admission is not None
+                self._pending_passage_admission = passage_admission
+            raise
         current_target = self._target(
             current,
             now_monotonic_s=float(now_monotonic_s),

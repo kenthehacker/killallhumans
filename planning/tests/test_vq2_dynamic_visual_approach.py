@@ -24,7 +24,10 @@ from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     RollingVisualGateGraph,
 )
-from planning.vq2_visual_approach import VisualApproachMode
+from planning.vq2_visual_approach import (
+    VisualApproachCurrentGeometryUnavailable,
+    VisualApproachMode,
+)
 
 
 _BASE_NS = 10_000_000_000
@@ -37,6 +40,8 @@ def _detection(
     *,
     width: float,
     height: float,
+    clipping: FrameEdge = FrameEdge.NONE,
+    center_censored: bool = False,
 ) -> VisualDetection:
     unit_x = 0.5 * (center_x + 1.0)
     return VisualDetection(
@@ -49,8 +54,8 @@ def _detection(
             0.5 + height / 2.0,
         ),
         confidence=0.95,
-        clipping=FrameEdge.NONE,
-        center_censored=False,
+        clipping=clipping,
+        center_censored=center_censored,
     )
 
 
@@ -60,6 +65,8 @@ def _frame(
     current_width: float = 0.34,
     current_height: float = 0.36,
     include_successor: bool = True,
+    current_clipping: FrameEdge = FrameEdge.NONE,
+    current_center_censored: bool = False,
 ) -> VisualDetectionFrame:
     observation_ns = _BASE_NS + sequence * _PERIOD_NS
     detections = [
@@ -68,6 +75,8 @@ def _frame(
             0.0,
             width=current_width,
             height=current_height,
+            clipping=current_clipping,
+            center_censored=current_center_censored,
         )
     ]
     if include_successor:
@@ -177,7 +186,7 @@ def _session() -> DynamicVisualCourseSession:
     session = DynamicVisualCourseSession()
     for monotonic_ns in range(
         _BASE_NS - 200_000_000,
-        _BASE_NS + 500_000_000,
+        _BASE_NS + 700_000_000,
         10_000_000,
     ):
         session.record_imu(
@@ -415,6 +424,60 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
             15,
             current_width=0.80,
             current_height=0.80,
+            include_successor=False,
+            current_clipping=FrameEdge.TOP,
+            current_center_censored=True,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    update = tracker.latest_update
+    assert update is not None
+    with pytest.raises(VisualApproachCurrentGeometryUnavailable):
+        planner.observe(
+            snapshot,
+            tracker,
+            now_monotonic_s=(
+                update.observation_monotonic_ns + 5_000_000
+            )
+            / 1_000_000_000.0,
+            segment_elapsed_s=0.7,
+            segment_yaw_excursion_rad=0.0,
+            mode=VisualApproachMode.PASSAGE,
+            passage_admission=admission,
+        )
+
+    tracker.update(
+        _frame(
+            16,
+            current_width=0.82,
+            current_height=0.82,
+            include_successor=False,
+            current_clipping=FrameEdge.TOP | FrameEdge.BOTTOM,
+            current_center_censored=True,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    update = tracker.latest_update
+    assert update is not None
+    with pytest.raises(VisualApproachCurrentGeometryUnavailable):
+        planner.observe(
+            snapshot,
+            tracker,
+            now_monotonic_s=(
+                update.observation_monotonic_ns + 5_000_000
+            )
+            / 1_000_000_000.0,
+            segment_elapsed_s=0.7,
+            segment_yaw_excursion_rad=0.0,
+            mode=VisualApproachMode.PASSAGE,
+            passage_admission=admission,
+        )
+
+    tracker.update(
+        _frame(
+            17,
+            current_width=0.84,
+            current_height=0.84,
             include_successor=False,
         )
     )
