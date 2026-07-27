@@ -1000,35 +1000,17 @@ class DynamicVisualCourseSession:
                 "post-credit successor steering uncertainty expired"
             )
 
-        target_roll = self.core.config.roll_guidance_sign * (
-            self.core.config.roll_gain
-            * prediction.stable_bearing_rad[0]
-            + self.core.config.lateral_rate_gain
-            * prediction.stable_bearing_rate_rad_s[0]
+        targets = self._successor_steering_targets(prediction)
+        target_roll = float(targets["target_roll_rad"])
+        target_pitch = float(targets["target_pitch_rad"])
+        yaw_rate = float(targets["yaw_rate_rad_s"])
+        camera_elevation = float(
+            targets["camera_elevation_error_rad"]
         )
-        target_roll = min(
-            MAX_TARGET_ROLL_RAD,
-            max(-MAX_TARGET_ROLL_RAD, target_roll),
+        camera_elevation_rate = float(
+            targets["camera_elevation_rate_rad_s"]
         )
-        (
-            target_pitch,
-            camera_elevation,
-            camera_elevation_rate,
-            pitch_delay_lead,
-        ) = _predicted_successor_pitch_reference(
-            camera_center_y_norm=prediction.camera_center_norm[1],
-            camera_center_rate_y_norm_s=(
-                prediction.camera_center_rate_norm_s[1]
-            ),
-            vertical_angle_scale_rad=(
-                self.core.config.vertical_angle_scale_rad
-            ),
-            pitch_command_delay_s=self.core.config.pitch_command_delay_s,
-            maximum_lead_rad=(
-                self.core.config.successor_prediction_max_extrapolation_rad
-            ),
-            baseline_pitch_rad=self.core.config.brake_pitch_rad,
-        )
+        pitch_delay_lead = float(targets["pitch_delay_lead_rad"])
         vertical_axis_censored = bool(
             not state.current.visible
             or state.current.censored_axes[1]
@@ -1057,17 +1039,6 @@ class DynamicVisualCourseSession:
                 ),
             )
             self._post_credit_successor_steering = lease
-        camera_heading = math.atan(
-            prediction.camera_center_norm[0]
-            * self.core.config.horizontal_angle_scale_rad
-        )
-        yaw_rate = min(
-            MAX_YAW_RATE_RAD_S,
-            max(
-                -MAX_YAW_RATE_RAD_S,
-                -self.core.config.yaw_gain * camera_heading,
-            ),
-        )
         values = (
             target_roll,
             target_pitch,
@@ -1456,6 +1427,194 @@ class DynamicVisualCourseSession:
         raise DynamicCourseError(
             "dynamic gate lifecycle is non-sequential"
         )
+
+    def _successor_steering_targets(
+        self,
+        prediction: Any,
+    ) -> Mapping[str, float]:
+        """Map one bounded local successor prediction to steering targets."""
+
+        target_roll = self.core.config.roll_guidance_sign * (
+            self.core.config.roll_gain
+            * prediction.stable_bearing_rad[0]
+            + self.core.config.lateral_rate_gain
+            * prediction.stable_bearing_rate_rad_s[0]
+        )
+        target_roll = min(
+            MAX_TARGET_ROLL_RAD,
+            max(-MAX_TARGET_ROLL_RAD, target_roll),
+        )
+        (
+            target_pitch,
+            camera_elevation,
+            camera_elevation_rate,
+            pitch_delay_lead,
+        ) = _predicted_successor_pitch_reference(
+            camera_center_y_norm=prediction.camera_center_norm[1],
+            camera_center_rate_y_norm_s=(
+                prediction.camera_center_rate_norm_s[1]
+            ),
+            vertical_angle_scale_rad=(
+                self.core.config.vertical_angle_scale_rad
+            ),
+            pitch_command_delay_s=self.core.config.pitch_command_delay_s,
+            maximum_lead_rad=(
+                self.core.config.successor_prediction_max_extrapolation_rad
+            ),
+            baseline_pitch_rad=self.core.config.brake_pitch_rad,
+        )
+        camera_heading = math.atan(
+            prediction.camera_center_norm[0]
+            * self.core.config.horizontal_angle_scale_rad
+        )
+        yaw_rate = min(
+            MAX_YAW_RATE_RAD_S,
+            max(
+                -MAX_YAW_RATE_RAD_S,
+                -self.core.config.yaw_gain * camera_heading,
+            ),
+        )
+        values = (
+            target_roll,
+            target_pitch,
+            yaw_rate,
+            SUPPORT_THRUST,
+            camera_elevation,
+            camera_elevation_rate,
+            pitch_delay_lead,
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise DynamicCourseError(
+                "successor steering produced non-finite authority"
+            )
+        return {
+            "target_roll_rad": target_roll,
+            "target_pitch_rad": target_pitch,
+            "yaw_rate_rad_s": yaw_rate,
+            "thrust": SUPPORT_THRUST,
+            "camera_elevation_error_rad": camera_elevation,
+            "camera_elevation_rate_rad_s": camera_elevation_rate,
+            "pitch_delay_lead_rad": pitch_delay_lead,
+        }
+
+    def adjacent_precredit_successor_steering_authority(
+        self,
+        *,
+        track_id: str,
+        now_monotonic_ns: int,
+    ) -> Mapping[str, Any]:
+        """Steer toward one graph-vetted successor without promoting it."""
+
+        if type(track_id) is not str or not track_id:
+            raise DynamicCourseError(
+                "precredit successor steering track is invalid"
+            )
+        if type(now_monotonic_ns) is not int or now_monotonic_ns < 0:
+            raise DynamicCourseError(
+                "precredit successor steering clock is invalid"
+            )
+        staged = self._staged
+        state = self.core.course_state()
+        if (
+            staged is None
+            or not staged.adjacent_precredit
+            or staged.expected_current_track_id != track_id
+            or staged.expected_gate_index != state.current_gate_index + 1
+            or state.current_track_id == track_id
+            or not self.has_applied_command
+        ):
+            raise DynamicCourseError(
+                "precredit successor steering lacks staged graph authority"
+            )
+
+        # RollingVisualApproachServo invokes this only after validating the
+        # exact latest graph publication as one clean, stable, unambiguous
+        # NEXT candidate.  Replace the stale pre-clipping image identity in
+        # the local successor slot, but retain current gate ownership.
+        if state.successor_track_id != track_id:
+            state = self.core.bind(
+                current_gate_index=state.current_gate_index,
+                current_track_id=state.current_track_id,
+                successor_track_id=track_id,
+            )
+        successor = state.successor
+        if (
+            successor is None
+            or successor.track_id != track_id
+            or successor.stream_generation
+            != staged.camera_token.generation
+            or successor.frame_sequence != staged.tracker_frame_sequence
+            or successor.state_monotonic_ns
+            != successor.last_measurement_monotonic_ns
+            or not successor.visible
+            or successor.ambiguous
+            or successor.missed_count != 0
+            or any(successor.censored_axes)
+        ):
+            raise DynamicCourseError(
+                "precredit successor steering lacks exact clean state"
+            )
+        prediction = self.core.predict_track_steering(
+            track_id,
+            now_monotonic_ns,
+        )
+        if (
+            prediction.stream_generation
+            != successor.stream_generation
+            or prediction.last_measurement_monotonic_ns
+            != successor.last_measurement_monotonic_ns
+            or prediction.measurement_age_s
+            > self.core.config.successor_prediction_max_horizon_s
+            + 1e-12
+            or any(
+                value
+                > (
+                    self.core.config
+                    .successor_prediction_max_extrapolation_rad
+                )
+                + 1e-12
+                for value in prediction.bearing_std_rad
+            )
+        ):
+            raise DynamicCourseError(
+                "precredit successor steering prediction is unavailable"
+            )
+        targets = dict(self._successor_steering_targets(prediction))
+        self._last_decision = None
+        targets.update(
+            {
+                "basis": (
+                    "graph-vetted-precredit-successor-steering-v1"
+                ),
+                "from_gate_index": state.current_gate_index,
+                "to_gate_index": staged.expected_gate_index,
+                "steering_track_id": track_id,
+                "stream_generation": successor.stream_generation,
+                "tracker_frame_sequence": successor.frame_sequence,
+                "last_measurement_monotonic_ns": (
+                    successor.last_measurement_monotonic_ns
+                ),
+                "authority_monotonic_ns": now_monotonic_ns,
+                "measurement_age_s": prediction.measurement_age_s,
+                "stable_bearing_rad": list(
+                    prediction.stable_bearing_rad
+                ),
+                "stable_bearing_rate_rad_s": list(
+                    prediction.stable_bearing_rate_rad_s
+                ),
+                "camera_center_norm": list(
+                    prediction.camera_center_norm
+                ),
+                "camera_center_rate_norm_s": list(
+                    prediction.camera_center_rate_norm_s
+                ),
+                "bearing_std_rad": list(prediction.bearing_std_rad),
+                "steering_only": True,
+                "passage_authority": False,
+                "advance_authority": False,
+            }
+        )
+        return targets
 
     def guide(
         self,
@@ -2310,6 +2469,71 @@ class _DynamicImageServo:
                 "dynamic servo current identity changed"
             )
         now_ns = round(float(now_monotonic_s) * 1_000_000_000.0)
+        staged = self.session._staged
+        if staged is not None and staged.adjacent_precredit:
+            try:
+                authority = (
+                    self.session
+                    .adjacent_precredit_successor_steering_authority(
+                        track_id=current.track_id,
+                        now_monotonic_ns=now_ns,
+                    )
+                )
+            except DynamicCourseError as exc:
+                raise VisualServoRefusal(
+                    "dynamic precredit successor steering refused: "
+                    f"{exc}"
+                ) from exc
+            current_abs = (
+                abs(float(current.normalized_x)),
+                abs(float(current.normalized_y_down)),
+            )
+            horizontal_delta = (
+                None
+                if self._last_abs_error is None
+                else current_abs[0] - self._last_abs_error[0]
+            )
+            vertical_delta = (
+                None
+                if self._last_abs_error is None
+                else current_abs[1] - self._last_abs_error[1]
+            )
+            self._last_abs_error = current_abs
+            self._corridor_frames = 0
+            return VisualServoOutput(
+                target_roll_rad=float(authority["target_roll_rad"]),
+                target_pitch_rad=float(authority["target_pitch_rad"]),
+                yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
+                thrust=float(authority["thrust"]),
+                corridor_frames=0,
+                advance_enabled=False,
+                next_gate_blend=0.0,
+                horizontal_error=float(current.normalized_x),
+                vertical_error_image_down=float(
+                    current.normalized_y_down
+                ),
+                effective_horizontal_error=float(
+                    current.normalized_x
+                ),
+                effective_vertical_error_image_down=float(
+                    current.normalized_y_down
+                ),
+                effective_horizontal_rate_s=float(
+                    current.normalized_x_rate_s
+                ),
+                effective_vertical_rate_down_s=float(
+                    current.normalized_y_rate_down_s
+                ),
+                next_horizontal_error=None,
+                next_vertical_error_image_down=None,
+                horizontal_abs_error_delta=horizontal_delta,
+                vertical_abs_error_delta=vertical_delta,
+                brake_reason="adjacent_recenter",
+                yaw_envelope_limited=False,
+                reviewed_next_track_id=None,
+                passage_preview_retired=False,
+                passage_preview_retirement_violations=(),
+            )
         successor_track_id = (
             None if next_target is None else next_target.track_id
         )

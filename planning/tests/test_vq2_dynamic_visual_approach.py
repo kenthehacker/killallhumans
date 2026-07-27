@@ -668,6 +668,100 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     )
 
 
+def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+    original_successor_id = session.core.course_state().successor_track_id
+    assert original_successor_id is not None
+
+    # An abrupt, then stable, clean replacement models the successor's
+    # graph-track reinitialization across current-gate plane clipping.
+    for sequence in range(6, 10):
+        update = tracker.update(
+            _frame(sequence, successor_center_x=0.78)
+        )
+        snapshot = graph.observe(tracker)
+    assert snapshot.next_selection_ambiguous is False
+    assert snapshot.provisional_track_ids == ()
+    assert len(snapshot.next_candidates) == 1
+    replacement = snapshot.next_candidates[0]
+    assert replacement.promotable
+    assert replacement.track_id != original_successor_id
+
+    adjacent = DynamicRollingVisualApproachServo(
+        replacement.track_id,
+        1,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    proposal = adjacent.observe_promotable_adjacent(
+        snapshot,
+        tracker,
+        now_monotonic_s=(
+            update.observation_monotonic_ns + 5_000_000
+        )
+        / 1_000_000_000.0,
+        segment_elapsed_s=1.0,
+        segment_yaw_excursion_rad=0.0,
+    )
+    rebound = session.core.course_state()
+
+    assert rebound.current_gate_index == 0
+    assert rebound.current_track_id == current_id
+    assert rebound.successor_track_id == replacement.track_id
+    assert rebound.promotion_count == 0
+    assert proposal.mode is VisualApproachMode.ADJACENT_RECENTER
+    assert proposal.next_target is None
+    assert proposal.passage_admission is None
+    assert proposal.servo_output.advance_enabled is False
+    assert proposal.servo_output.next_gate_blend == 0.0
+    assert proposal.servo_output.target_roll_rad > 0.0
+    assert proposal.servo_output.yaw_rate_rad_s < 0.0
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposal.servo_output.target_roll_rad,
+            proposal.servo_output.target_pitch_rad,
+            proposal.servo_output.yaw_rate_rad_s,
+            proposal.servo_output.thrust,
+        )
+    )
+    assert (
+        abs(proposal.servo_output.target_roll_rad)
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        abs(proposal.servo_output.yaw_rate_rad_s)
+        <= MAX_YAW_RATE_RAD_S
+    )
+
+    _accept_proposal(session, tracker, proposal)
+    race_received_ns = update.observation_monotonic_ns + 9_000_000
+    activation_ns = race_received_ns + 1_000_000
+    session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=replacement.track_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    promoted = session.core.course_state()
+    assert promoted.current_gate_index == 1
+    assert promoted.current_track_id == replacement.track_id
+    assert promoted.promotion_count == 1
+
+
 @pytest.mark.parametrize("gate_size", (0.36, 0.90))
 def test_dynamic_passage_admission_requires_observed_closure(
     gate_size: float,

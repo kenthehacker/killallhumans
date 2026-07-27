@@ -5711,6 +5711,7 @@ async def _run_visual_course_stage_impl(
         crossing_wait_adjacent_command_count = 0
         credit_wait_adjacent_planner: Optional[Any] = None
         credit_wait_adjacent_track_id: Optional[str] = None
+        credit_wait_reviewed_track_id: Optional[str] = None
         crossing_started_s: Optional[float] = None
         crossing_baseline_race: Optional[AuthoritativeRaceStatusRef] = None
         last_planned_token: Optional[CameraFrameToken] = None
@@ -5733,6 +5734,7 @@ async def _run_visual_course_stage_impl(
             "crossing_wait_zero_command_count": 0,
             "crossing_wait_coast_command_count": 0,
             "crossing_wait_adjacent_command_count": 0,
+            "crossing_wait_adjacent_track_id": None,
             "censored_passage_coast_fresh_frame_count": 0,
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
@@ -8268,8 +8270,11 @@ async def _run_visual_course_stage_impl(
             # Across the physical gate-plane occlusion, a clean successor can
             # lack only the simultaneous-image relationship needed for
             # promotion.  That specific gap may receive fresh no-advance
-            # guidance; low-confidence or contended relationship failures do
-            # not gain command authority.
+            # guidance.  Its image-track ID may differ from the pre-clipping
+            # preview: uniqueness, stability, confidence, exact publication,
+            # and no provisional contender own this steering-only rebind.
+            # Low-confidence or contended relationship failures do not gain
+            # command authority.
             if (
                 credit_wait_adjacent_planner is None
                 and getattr(
@@ -8285,8 +8290,6 @@ async def _run_visual_course_stage_impl(
                 and adjacent_candidates[0].track_id
                 and type(passage_admission)
                 is VisualApproachPassageAdmission
-                and adjacent_candidates[0].track_id
-                == passage_admission.preview_track_id
             ):
                 credit_wait_adjacent_track_id = (
                     adjacent_candidates[0].track_id
@@ -8357,6 +8360,12 @@ async def _run_visual_course_stage_impl(
             if adjacent_proposal is not None:
                 assert credit_wait_adjacent_track_id is not None
                 assert adjacent_track is not None
+                credit_wait_reviewed_track_id = (
+                    credit_wait_adjacent_track_id
+                )
+                segment["crossing_wait_adjacent_track_id"] = (
+                    credit_wait_reviewed_track_id
+                )
                 try:
                     accepted_adjacent = await send_visual(
                         proposal=adjacent_proposal,
@@ -8479,6 +8488,9 @@ async def _run_visual_course_stage_impl(
             "crossing_wait_adjacent_command_count": int(
                 segment["crossing_wait_adjacent_command_count"]
             ),
+            "crossing_wait_adjacent_track_id": (
+                credit_wait_reviewed_track_id
+            ),
             "post_transition_zero_command_count": 0,
             "post_transition_hold_command_count": 0,
             "post_transition_successor_steering_command_count": 0,
@@ -8506,7 +8518,16 @@ async def _run_visual_course_stage_impl(
                 "visual-course nonterminal transition lacks its reviewed "
                 "next-track identity"
             )
-        requested_promoted_track_id = passage_admission.preview_track_id
+        # A sole graph-vetted adjacent observed during the physical
+        # gate-plane gap is the freshest local successor identity.  It may
+        # replace the pre-clipping preview for the promotion request, but only
+        # after authoritative race credit below; its pre-credit proposal has
+        # steering-only, no-advance authority.
+        requested_promoted_track_id = (
+            credit_wait_reviewed_track_id
+            if credit_wait_reviewed_track_id is not None
+            else passage_admission.preview_track_id
+        )
         fresh_deadline_s = min(
             course_deadline_s,
             float(runtime.monotonic())

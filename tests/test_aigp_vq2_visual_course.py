@@ -4700,8 +4700,8 @@ def test_credit_wait_uses_one_stable_adjacent_without_advance():
     )
 
 
-def test_credit_wait_ignores_unreviewed_replacement_adjacent_identity():
-    class UnreviewedAdjacentHost(_Host):
+def test_credit_wait_uses_unique_graph_vetted_replacement_without_advance():
+    class ReplacementAdjacentHost(_Host):
         def __init__(self):
             super().__init__(
                 initial_gate=6,
@@ -4709,6 +4709,7 @@ def test_credit_wait_ignores_unreviewed_replacement_adjacent_identity():
                 lose_before_credit=True,
             )
             self.adjacent_track = None
+            self.adjacent_command_count = 0
 
         def _sample(self):
             super()._sample()
@@ -4722,7 +4723,7 @@ def test_credit_wait_ignores_unreviewed_replacement_adjacent_identity():
             ):
                 token = snapshot.latest_camera_token
                 adjacent = _track(
-                    "unreviewed-track-8",
+                    "replacement-track-8",
                     gate_index=7,
                     token=token,
                 )
@@ -4741,7 +4742,18 @@ def test_credit_wait_ignores_unreviewed_replacement_adjacent_identity():
                     ),
                 )
 
-    host = UnreviewedAdjacentHost()
+        async def _send_flight_command(self, command, **kwargs):
+            receipt = await super()._send_flight_command(
+                command,
+                **kwargs,
+            )
+            if self.current_gate == 6 and command.thrust == 0.27:
+                self.adjacent_command_count += 1
+                if self.adjacent_command_count >= 2:
+                    self._advance_race()
+            return receipt
+
+    host = ReplacementAdjacentHost()
     runtime, calls = _runtime(host)
 
     result = asyncio.run(
@@ -4750,10 +4762,18 @@ def test_credit_wait_ignores_unreviewed_replacement_adjacent_identity():
 
     assert result["success"] is True
     transition = result["authoritative_transitions"][0]
-    assert transition["promoted_track_id"] == "track-7"
-    assert transition["crossing_wait_adjacent_command_count"] == 0
-    assert transition["crossing_wait_coast_command_count"] >= 2
-    assert not any(
+    assert transition["promoted_track_id"] == "replacement-track-8"
+    assert transition["crossing_wait_adjacent_track_id"] == (
+        "replacement-track-8"
+    )
+    assert transition["crossing_wait_adjacent_command_count"] == 2
+    assert host.requested_promotion_track_ids == ["replacement-track-8"]
+    assert all(
+        gate_index == 6
+        for command, _kwargs, gate_index in host.commands
+        if command.thrust == 0.27
+    )
+    assert any(
         gate_index == 7
         and mode is VisualApproachMode.ADJACENT_RECENTER
         for gate_index, mode, *_rest in calls
