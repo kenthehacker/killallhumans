@@ -711,6 +711,55 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     assert session.post_credit_roll_reference_handoff_active
 
 
+def test_unqualified_post_credit_rate_retains_bank_only_until_expiry():
+    session, source, successor_id, retained = (
+        _activated_committed_roll_handoff()
+    )
+    estimate = session.core._tracks[successor_id]  # noqa: SLF001
+    estimate.state = replace(
+        estimate.state,
+        residual_translational_rate_rad_s=(-0.05, 0.0),
+        bearing_rate_qualified=(False, True),
+        bearing_std_rad=(0.02, 0.02),
+        ambiguous=False,
+    )
+    normal_command = replace(
+        source.command,
+        target_roll_rad=0.60 * retained,
+    )
+    unqualified = replace(
+        source,
+        current_gate_index=1,
+        current_track_id=successor_id,
+        successor_track_id=None,
+        current_center_norm=(0.30, 0.0),
+        proposed_command=normal_command,
+        command=normal_command,
+    )
+
+    constrained = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        unqualified
+    )
+
+    assert constrained.command.target_roll_rad == pytest.approx(retained)
+    assert math.isfinite(constrained.command.target_roll_rad)
+    assert abs(constrained.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+    assert session.post_credit_roll_reference_handoff_active
+
+    handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
+    assert handoff is not None
+    expired = replace(
+        unqualified,
+        monotonic_ns=handoff.expires_monotonic_ns + 1,
+    )
+    released = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        expired
+    )
+
+    assert released.command == normal_command
+    assert not session.post_credit_roll_reference_handoff_active
+
+
 @pytest.mark.parametrize(
     ("normal_roll_rad", "residual_rate_rad_s"),
     ((-0.04, 0.25), (0.04, -0.05)),

@@ -202,6 +202,7 @@ class _PostCreditRollReferenceHandoff:
     retained_target_roll_rad: float
     source_authority_monotonic_ns: int
     source_wire_start_monotonic_ns: int
+    expires_monotonic_ns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -917,6 +918,7 @@ class DynamicVisualCourseSession:
                 retained_roll is None
                 or retained_source_authority_ns is None
                 or retained_source_wire_ns is None
+                or activation_monotonic_ns > expires_ns
             )
             else _PostCreditRollReferenceHandoff(
                 authority_basis=(
@@ -933,6 +935,7 @@ class DynamicVisualCourseSession:
                 source_wire_start_monotonic_ns=(
                     retained_source_wire_ns
                 ),
+                expires_monotonic_ns=expires_ns,
             )
         )
         self._staged = None
@@ -1792,10 +1795,12 @@ class DynamicVisualCourseSession:
         """Prevent an outward promotion from unwinding helpful successor bank.
 
         This is a gate-relative reference constraint, not a command slew.  It
-        retains one already accepted, bounded successor attitude target only
-        while the promoted current error and residual translation still move
-        outward in the same corrective direction.  Fresh guidance catches up
-        or recovering/opposite geometry releases the reference immediately.
+        retains one already accepted, bounded successor attitude target while
+        the promoted current error still requires the same correction.  A
+        short unqualified-rate gap retains that reference only through the
+        reviewed successor horizon; once the rate is qualified, fresh
+        guidance catches up or recovering/opposite geometry releases it
+        immediately.
         """
 
         handoff = self._post_credit_roll_reference_handoff
@@ -1830,7 +1835,6 @@ class DynamicVisualCourseSession:
             lineage_matches
             and all(math.isfinite(value) for value in values)
             and 0.0 < abs(retained_roll) <= MAX_TARGET_ROLL_RAD
-            and current.bearing_rate_qualified[0]
             and not current.ambiguous
             and current.bearing_std_rad[0]
             <= (
@@ -1839,14 +1843,18 @@ class DynamicVisualCourseSession:
             )
             + 1e-12
             and abs(guidance_sign) > 1e-12
+            and decision.monotonic_ns <= handoff.expires_monotonic_ns
         )
         direction = 1.0 if retained_roll > 0.0 else -1.0
         same_corrective_demand = bool(
             direction * normal_roll > 1e-12
         )
-        still_moving_outward = bool(
+        error_still_requires_correction = bool(
             direction * guidance_sign * stable_error > 1e-12
-            and direction * guidance_sign * residual_rate > 1e-12
+        )
+        qualified_recovery = bool(
+            current.bearing_rate_qualified[0]
+            and direction * guidance_sign * residual_rate <= 1e-12
         )
         demand_caught_up = bool(
             same_corrective_demand
@@ -1855,7 +1863,8 @@ class DynamicVisualCourseSession:
         if (
             not bounded_state
             or not same_corrective_demand
-            or not still_moving_outward
+            or not error_still_requires_correction
+            or qualified_recovery
             or demand_caught_up
         ):
             self._post_credit_roll_reference_handoff = None
@@ -2539,6 +2548,9 @@ class DynamicVisualCourseSession:
                             "source_wire_start_monotonic_ns": (
                                 roll_handoff
                                 .source_wire_start_monotonic_ns
+                            ),
+                            "expires_monotonic_ns": (
+                                roll_handoff.expires_monotonic_ns
                             ),
                             "steering_only": True,
                             "passage_authority": False,
