@@ -4395,6 +4395,8 @@ class DynamicCourseCore:
             and current.bearing_rate_qualified[0]
             and current.scale_rate_qualified
             and current.bearing_std_rad[0] <= 0.16
+            and abs(stable_passage_bearing[0])
+            >= self.config.off_axis_brake_rad
             and lateral_error * stable_passage_rate_norm_s[0] > 0.0
             and roll
             * self.config.roll_guidance_sign
@@ -4403,12 +4405,12 @@ class DynamicCourseCore:
         )
         if outward_lateral_arrest:
             # Once qualified crossing geometry says the gate is laterally
-            # unsafe and residual translation is still carrying it outward,
-            # proportional gain must not delay use of already accepted bank
-            # authority.  This is a state-dependent attitude reference, not a
-            # temporal command governor; recovering motion releases it on the
-            # next guidance tick and the final wire governor remains the sole
-            # continuity limiter.
+            # unsafe, meaningfully off axis, and residual translation is still
+            # carrying it outward, proportional gain must not delay use of
+            # already accepted bank authority.  This is a state-dependent
+            # attitude reference, not a temporal command governor; recovering
+            # motion releases it on the next guidance tick and the final wire
+            # governor remains the sole continuity limiter.
             roll = math.copysign(MAX_TARGET_ROLL_RAD, roll)
         yaw = -self.config.yaw_gain * heading_error
         # Successor geometry may only slow the current-gate approach with the

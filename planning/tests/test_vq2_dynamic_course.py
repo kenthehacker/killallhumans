@@ -1239,6 +1239,73 @@ def test_successor_heading_cannot_reverse_roll_away_from_passage_intercept() -> 
     assert decision.proposed_command.target_roll_rad > 0.0
 
 
+def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        bearing_alpha=1.0,
+        bearing_beta=1.0,
+        scale_alpha=1.0,
+        scale_beta=1.0,
+        roll_guidance_sign=1.0,
+        roll_gain=0.18,
+        lateral_rate_gain=0.045,
+    )
+    core = DynamicCourseCore(config)
+    core.record_applied_command(_command(0.90))
+    decision = None
+    current = None
+    for sequence in range(1, 8):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        log_scale = -1.40 + (sequence - 1) * 0.20
+        aperture_scale = math.exp(log_scale + 1.40)
+        _imu(core, observation_time)
+        current = core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=0.004 + (sequence - 1) * 0.001,
+                log_scale=log_scale,
+                aperture=(
+                    0.010 * aperture_scale,
+                    0.008 * aperture_scale,
+                ),
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id=None,
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, decision.command)
+
+    assert current is not None
+    assert decision is not None
+    lateral_rate_norm_s = (
+        current.residual_translational_rate_rad_s[0]
+        / config.horizontal_angle_scale_rad
+    )
+    stable_bearing_rad = math.atan(
+        config.horizontal_angle_scale_rad
+        * decision.passage_error_norm[0]
+    )
+    assert current.bearing_rate_qualified[0]
+    assert current.scale_rate_qualified
+    assert decision.centered_crossing_clearance_norm[0] < 0.0
+    assert decision.passage_error_norm[0] * lateral_rate_norm_s > 0.0
+    assert abs(stable_bearing_rad) < config.off_axis_brake_rad
+    assert (
+        0.0
+        < decision.proposed_command.target_roll_rad
+        < MAX_TARGET_ROLL_RAD
+    )
+    assert math.isfinite(decision.proposed_command.target_roll_rad)
+
+
 def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
 ) -> None:
     core = DynamicCourseCore(
