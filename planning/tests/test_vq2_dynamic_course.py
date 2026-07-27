@@ -128,6 +128,59 @@ def test_ea6335c3_top_hit_is_rejected_by_swept_q_envelope() -> None:
     assert prediction.clearance_q[1] < 0.0
 
 
+def test_096f78c4_successor_bias_cannot_hide_unsafe_current_crossing() -> None:
+    """The exact terminal q state must be assessed current-center first."""
+
+    center = (0.05151534397, -1.15050750323)
+    aperture = (0.39233066014, 0.78292060212)
+    rejected_passage = (0.25379023455, -0.21728137506)
+    q_rate = (0.174765, 1.975791)
+    predicted_std_q = (0.091504, 0.160834)
+    horizon = 0.811743
+    center_rate = tuple(
+        q_rate[axis] * aperture[axis] for axis in range(2)
+    )
+    center_std = tuple(
+        predicted_std_q[axis] * aperture[axis] for axis in range(2)
+    )
+    common = {
+        "center_offset_norm": center,
+        "aperture_half_extent_norm": aperture,
+        "center_rate_norm_s": center_rate,
+        "aperture_expansion_rate_s": (0.0, 0.0),
+        "center_std_norm": center_std,
+        "aperture_log_scale_std": 0.0,
+        "capture_timing_uncertainty_s": 0.0,
+        "horizon_s": horizon,
+        "allowance_q": (0.50, 0.45),
+    }
+    centered = predict_aperture_relative_crossing(
+        passage_offset_norm=(0.0, 0.0),
+        **common,
+    )
+    rejected = predict_aperture_relative_crossing(
+        passage_offset_norm=rejected_passage,
+        **common,
+    )
+
+    assert rejected.predicted_error_q[0] == pytest.approx(
+        0.920048,
+        abs=3e-6,
+    )
+    assert rejected.swept_occupancy_q[0] == pytest.approx(
+        1.74993,
+        abs=2e-5,
+    )
+    assert centered.predicted_error_q[0] == pytest.approx(
+        0.273170,
+        abs=3e-6,
+    )
+    assert centered.clearance_q[0] > 0.0
+    # The current aperture remained vertically unsafe, so positive horizontal
+    # reserve cannot authorize either successor passage or yaw.
+    assert centered.clearance_q[1] < 0.0
+
+
 def _yaw_quaternion(yaw_rad: float) -> tuple[float, float, float, float]:
     return (
         math.cos(yaw_rad / 2.0),
@@ -494,9 +547,16 @@ def test_noisy_alternating_detections_do_not_reverse_roll_each_frame() -> None:
 
 
 def test_successor_steering_and_state_are_continuous_through_promotion() -> None:
-    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            successor_clearance_dwell_s=0.04,
+            successor_clearance_ramp_s=0.04,
+        )
+    )
     core.record_applied_command(_command(0.90))
     successor_before = None
+    decisions = []
     for sequence in range(1, 7):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
@@ -527,22 +587,25 @@ def test_successor_steering_and_state_are_continuous_through_promotion() -> None
                 log_scale=-0.40,
             )
         )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=3,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
     assert successor_before is not None
-    core.bind(
-        current_gate_index=0,
-        current_track_id="gate-a",
-        successor_track_id="gate-b",
-    )
-
-    _imu(core, 1.21)
-    precredit = core.guide(1_210_000_000)
+    precredit = decisions[-1]
     assert precredit.successor_weight > 0.0
     assert precredit.command.yaw_rate_rad_s < 0.0
-    _commit_decision(core, 1.21, precredit.command)
 
     promoted = core.promote_authoritative(
-        from_gate_index=0,
-        to_gate_index=1,
+        from_gate_index=3,
+        to_gate_index=4,
         promoted_track_id="gate-b",
         next_successor_track_id="gate-c",
         monotonic_ns=1_215_000_000,
@@ -554,11 +617,14 @@ def test_successor_steering_and_state_are_continuous_through_promotion() -> None
     postcredit = core.guide(1_240_000_000)
     assert postcredit.current_track_id == "gate-b"
     assert postcredit.successor_track_id == "gate-c"
-    assert postcredit.command.yaw_rate_rad_s < 0.0
+    assert postcredit.successor_clearance_authority == 0.0
+    assert postcredit.successor_passage_authority == 0.0
+    assert postcredit.passage_point_norm == (0.0, 0.0)
     assert postcredit.command.yaw_rate_rad_s != 0.0
     assert abs(
-        postcredit.command.yaw_rate_rad_s - precredit.command.yaw_rate_rad_s
-    ) <= core.config.governor.max_yaw_slew_rad_s2 * 0.030 + 1e-12
+        postcredit.command.yaw_rate_rad_s
+        - precredit.command.yaw_rate_rad_s
+    ) <= core.config.governor.max_yaw_slew_rad_s2 * 0.035 + 1e-12
 
 
 def test_8319198e_unadmitted_successor_cannot_force_gate0_braking() -> None:
@@ -594,10 +660,17 @@ def test_8319198e_unadmitted_successor_cannot_force_gate0_braking() -> None:
     assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
 
 
-def test_1c2ec48a_four_sample_successor_cannot_step_passage_bias() -> None:
-    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+def test_successor_bias_waits_for_fresh_safe_dwell_then_ramps() -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            successor_clearance_dwell_s=0.08,
+            successor_clearance_ramp_s=0.08,
+        )
+    )
     core.record_applied_command(_command(0.90, pitch=-0.02))
-    for sequence in range(1, 5):
+    decisions = []
+    for sequence in range(1, 12):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
         core.observe_track(
@@ -605,10 +678,10 @@ def test_1c2ec48a_four_sample_successor_cannot_step_passage_bias() -> None:
                 "gate-a",
                 sequence,
                 observation_time,
-                x=0.00625,
-                y=-0.033333333333333326,
-                log_scale=-1.79,
-                aperture=(0.125, 0.2222222222222222),
+                x=0.0,
+                y=0.0,
+                log_scale=-0.72 + sequence * 0.035,
+                aperture=(0.42, 0.34),
                 confidence=0.85,
             )
         )
@@ -617,35 +690,121 @@ def test_1c2ec48a_four_sample_successor_cannot_step_passage_bias() -> None:
                 "gate-b",
                 sequence,
                 observation_time,
-                x=0.321875,
-                y=-0.11111111111111116,
-                log_scale=-2.62,
-                confidence=0.42,
+                x=0.20,
+                y=-0.05,
+                log_scale=-1.00,
+                confidence=0.90,
             )
         )
-    core.bind(
-        current_gate_index=0,
-        current_track_id="gate-a",
-        successor_track_id="gate-b",
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
+
+    _imu(core, 1.407)
+    duplicate = core.guide(1_407_000_000)
+    assert duplicate.successor_clearance_dwell_s == pytest.approx(
+        decisions[-1].successor_clearance_dwell_s
     )
-    _imu(core, 1.13)
-    decision = core.guide(1_130_000_000)
-    full_step_vertical = (
-        core.config.passage_successor_bias
-        * (
-            -0.11111111111111116
-            - -0.033333333333333326
-        )
+    assert duplicate.successor_clearance_authority == pytest.approx(
+        decisions[-1].successor_clearance_authority
+    )
+    assert all(
+        decision.successor_passage_authority == 0.0
+        and decision.passage_point_norm == (0.0, 0.0)
+        for decision in decisions
+        if decision.successor_clearance_dwell_s
+        <= core.config.successor_clearance_dwell_s
+    )
+    released = [
+        decision
+        for decision in decisions
+        if decision.successor_clearance_authority > 0.0
+    ]
+    assert released
+    assert released[0].successor_clearance_dwell_s > (
+        core.config.successor_clearance_dwell_s
+    )
+    assert 0.0 < released[0].successor_clearance_authority < 1.0
+    assert released[0].successor_passage_authority > 0.0
+    assert released[0].passage_point_norm[0] > 0.0
+    assert all(
+        clearance > 0.0
+        for clearance in released[0].predicted_crossing_clearance_norm
+    )
+    assert released[-1].successor_clearance_authority > (
+        released[0].successor_clearance_authority
     )
 
-    assert decision.successor_weight == 0.0
-    assert 0.0 < decision.successor_passage_authority < 0.10
-    assert abs(decision.passage_point_norm[1]) < 0.005
-    assert abs(decision.passage_point_norm[1]) < (
-        0.10 * abs(full_step_vertical)
+
+def test_096f78c4_unsafe_current_gate_owns_passage_and_yaw() -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            successor_clearance_dwell_s=0.04,
+            successor_clearance_ramp_s=0.04,
+        )
     )
-    assert decision.predicted_crossing_clearance_norm[1] > 0.0
-    assert decision.braking is False
+    core.record_applied_command(_command(0.90))
+    decisions = []
+    for sequence in range(1, 10):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=0.05,
+                y=-0.82,
+                log_scale=-0.90 + 0.06 * sequence,
+                aperture=(0.39, 0.78),
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.65,
+                y=-0.25,
+                log_scale=-1.10,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=4,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
+
+    qualified = decisions[-1]
+    assert qualified.predicted_successor_bearing_rad is not None
+    assert qualified.successor_prediction_confidence > 0.0
+    assert qualified.centered_crossing_clearance_norm[1] < 0.0
+    assert qualified.successor_clearance_authority == 0.0
+    assert qualified.successor_passage_authority == 0.0
+    assert qualified.passage_point_norm == (0.0, 0.0)
+    assert qualified.passage_error_norm == pytest.approx(
+        qualified.current_center_norm
+    )
+    assert qualified.current_yaw_release == 0.0
+    assert qualified.passage_yaw_authority == 0.0
+    assert qualified.successor_weight == 0.0
+    assert qualified.successor_yaw_contribution_rad == 0.0
+    assert qualified.braking
 
 
 def test_admitted_off_axis_successor_still_brakes_before_intercept() -> None:
@@ -653,14 +812,22 @@ def test_admitted_off_axis_successor_still_brakes_before_intercept() -> None:
         DynamicCourseConfig(
             camera_delay_s=0.0,
             passage_successor_bias=0.01,
+            successor_clearance_dwell_s=0.04,
+            successor_clearance_ramp_s=0.04,
         )
     )
     core.record_applied_command(_command(0.90, pitch=-0.02))
+    decisions = []
     for sequence in range(1, 8):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
         core.observe_track(
-            _observation("gate-a", sequence, observation_time)
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                log_scale=-0.50 + 0.06 * sequence,
+            )
         )
         core.observe_track(
             _observation(
@@ -671,22 +838,25 @@ def test_admitted_off_axis_successor_still_brakes_before_intercept() -> None:
                 log_scale=-0.30,
             )
         )
-    core.bind(
-        current_gate_index=0,
-        current_track_id="gate-a",
-        successor_track_id="gate-b",
-    )
-    _imu(core, 1.25)
-    decision = core.guide(1_250_000_000)
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
+    decision = decisions[-1]
 
-    assert decision.current_time_to_contact_s is None
+    assert decision.current_time_to_contact_s is not None
     assert decision.successor_prediction_confidence > 0.75
-    assert decision.successor_weight > (
-        0.75 * core.config.successor_maximum_weight
-    )
+    assert decision.successor_weight > 0.0
     assert abs(decision.passage_error_norm[0]) < 0.01
     assert decision.braking is True
-    assert decision.brake_reason == "off_axis_successor_intercept"
+    assert decision.brake_reason == "off_axis_rapid_closure"
     assert decision.proposed_command.target_pitch_rad > 0.0
 
 
@@ -849,6 +1019,15 @@ def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
     # passage.  Successor prediction therefore remains lookahead evidence,
     # but it gets no yaw leverage with which to recreate the observed hunt.
     assert all(
+        decision.successor_clearance_authority == 0.0
+        and decision.successor_passage_authority == 0.0
+        and decision.passage_point_norm == (0.0, 0.0)
+        and decision.current_yaw_release == 0.0
+        and decision.passage_yaw_authority == 0.0
+        and decision.successor_weight == 0.0
+        for decision in decisions
+    )
+    assert all(
         decision.successor_yaw_contribution_rad == 0.0
         for decision in decisions
     )
@@ -857,18 +1036,14 @@ def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
             abs(decision.proposed_command.yaw_rate_rad_s)
             <= MAX_YAW_RATE_RAD_S
         )
-    # Once the near-plane scale is reliable, the stale body-camera centering
-    # term is released rather than reinstating the observed low-frequency hunt.
-    assert decisions[-1].current_yaw_release > 0.65
-    assert abs(decisions[-1].proposed_command.yaw_rate_rad_s) < (
-        0.35 * core.config.yaw_gain
-        * abs(
-            math.atan(
-                decisions[-1].camera_current_center_norm[0]
-                * core.config.horizontal_angle_scale_rad
-            )
+    for decision in decisions:
+        current_only = -core.config.yaw_gain * math.atan(
+            decision.camera_current_center_norm[0]
+            * core.config.horizontal_angle_scale_rad
         )
-    )
+        assert decision.proposed_command.yaw_rate_rad_s == pytest.approx(
+            max(-MAX_YAW_RATE_RAD_S, min(MAX_YAW_RATE_RAD_S, current_only))
+        )
     assert all(decision.braking for decision in decisions[-3:])
 
 
@@ -932,9 +1107,16 @@ def test_successor_prediction_cannot_tangent_wrap_across_optical_axis() -> None:
 
 
 def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
-    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            successor_clearance_dwell_s=0.04,
+            successor_clearance_ramp_s=0.04,
+        )
+    )
     core.record_applied_command(_command(0.90))
-    for sequence in range(1, 8):
+    decisions = []
+    for sequence in range(1, 9):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
         core.observe_track(
@@ -942,8 +1124,8 @@ def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
                 "gate-a",
                 sequence,
                 observation_time,
-                x=-0.35,
-                log_scale=-0.30,
+                x=-0.05,
+                log_scale=-0.68 + sequence * 0.05,
             )
         )
         core.observe_track(
@@ -955,24 +1137,41 @@ def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
                 log_scale=-1.0,
             )
         )
-    core.bind(
-        current_gate_index=0,
-        current_track_id="gate-a",
-        successor_track_id="gate-b",
-    )
-    _imu(core, 1.25)
-
-    decision = core.guide(1_250_000_000)
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
+    decision = decisions[-1]
 
     assert decision.current_center_norm[0] < 0.0
-    assert abs(decision.passage_error_norm[0]) < 0.04
-    assert decision.current_yaw_release > 0.99
-    assert decision.passage_yaw_authority > 0.9
+    assert all(
+        clearance > 0.0
+        for clearance in decision.centered_crossing_clearance_norm
+    )
+    assert decision.successor_clearance_authority > 0.0
+    assert decision.current_yaw_release > 0.0
+    assert decision.passage_yaw_authority > 0.0
     assert decision.successor_prediction_confidence > 0.75
-    assert decision.current_time_to_contact_s is None
+    assert decision.current_time_to_contact_s is not None
     assert decision.successor_weight > 0.0
     assert decision.successor_yaw_contribution_rad > 0.0
-    assert decision.proposed_command.yaw_rate_rad_s < 0.0
+    current_gate_heading = (
+        (1.0 - decision.current_yaw_release)
+        * math.atan(
+            decision.camera_current_center_norm[0]
+            * core.config.horizontal_angle_scale_rad
+        )
+    )
+    assert decision.proposed_command.yaw_rate_rad_s < (
+        -core.config.yaw_gain * current_gate_heading
+    )
     assert (
         abs(decision.successor_yaw_contribution_rad)
         <= core.config.successor_max_yaw_contribution_rad
@@ -990,7 +1189,7 @@ def test_body_yaw_cannot_change_stable_passage_or_roll_authority() -> None:
                 "gate-a",
                 sequence,
                 observation_time,
-                x=-0.20,
+                x=-0.03,
                 log_scale=-0.30,
             )
         )
@@ -1089,8 +1288,15 @@ def test_successor_identity_hold_outlives_geometry_dropout_but_is_bounded() -> N
 
 
 def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
-    core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            successor_clearance_dwell_s=0.02,
+            successor_clearance_ramp_s=0.02,
+        )
+    )
     core.record_applied_command(_command(0.90))
+    decisions = []
     for sequence in range(1, 6):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
@@ -1112,16 +1318,20 @@ def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
                 log_scale=-0.90,
             )
         )
-    core.bind(
-        current_gate_index=0,
-        current_track_id="gate-a",
-        successor_track_id="gate-b",
-    )
-    _imu(core, 1.17)
-    stable = core.guide(1_170_000_000)
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        decisions.append(decision)
+        _commit_decision(core, decision_time, decision.command)
+    stable = decisions[-1]
     assert stable.successor_prediction_confidence > 0.0
     assert stable.passage_point_norm[0] > 0.0
-    _commit_decision(core, 1.17, stable.command)
 
     _imu(core, 1.20)
     core.observe_track(
@@ -1140,9 +1350,9 @@ def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
     dropped = core.guide(1_210_000_000)
     assert dropped.successor_prediction_confidence == 0.0
     assert dropped.successor_transition_held
-    assert dropped.passage_point_norm == pytest.approx(
-        stable.passage_point_norm
-    )
+    assert dropped.successor_clearance_authority == 0.0
+    assert dropped.successor_passage_authority == 0.0
+    assert dropped.passage_point_norm == (0.0, 0.0)
     assert dropped.passage_yaw_authority == 0.0
     assert dropped.successor_weight == 0.0
     assert dropped.successor_yaw_contribution_rad == 0.0
@@ -1182,9 +1392,8 @@ def test_successor_dropout_requires_fresh_temporal_consistency() -> None:
 
     assert reacquired.successor_prediction_confidence == 0.0
     assert not reacquired.successor_transition_held
-    assert reacquired.passage_point_norm == pytest.approx(
-        stable.passage_point_norm
-    )
+    assert reacquired.successor_clearance_authority == 0.0
+    assert reacquired.passage_point_norm == (0.0, 0.0)
     assert reacquired.passage_yaw_authority == 0.0
     assert reacquired.successor_weight == 0.0
     assert reacquired.successor_yaw_contribution_rad == 0.0
@@ -1294,7 +1503,8 @@ def test_current_and_successor_references_project_into_one_decision_frame() -> N
         0.30,
         abs=2e-8,
     )
-    assert decision.passage_point_norm[0] > 0.0
+    assert decision.passage_point_norm == (0.0, 0.0)
+    assert decision.successor_clearance_authority == 0.0
 
 
 def test_governor_preview_does_not_consume_budget_and_sustained_reversal_crosses_zero() -> None:

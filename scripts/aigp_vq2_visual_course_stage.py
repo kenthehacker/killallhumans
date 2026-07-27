@@ -117,6 +117,9 @@ GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
 CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS = (
     "imu-derotated-current-center-proved-law-v2"
 )
+CURRENT_APERTURE_Q_COLLECTIVE_BASIS = (
+    "expansion-aware-current-aperture-q-rate-proved-law-v3"
+)
 RAW_CURRENT_APERTURE_COLLECTIVE_BASIS = (
     "raw-camera-current-center-proved-law-v1"
 )
@@ -577,6 +580,68 @@ class _CurrentApertureCollectiveProposal:
     vertical_censored: bool
     current_aperture_dropout: bool
     held_last_observable_collective: bool
+
+
+def _dynamic_current_aperture_collective_inputs(
+    dynamic_decision: Any,
+    current_dynamic: Any,
+    *,
+    vertical_angle_scale_rad: float,
+) -> tuple[float, float, str]:
+    """Return current-aperture P/D inputs in normalized image units."""
+
+    passage_error = getattr(
+        dynamic_decision,
+        "passage_error_norm",
+        None,
+    )
+    if passage_error is None:
+        passage_error = dynamic_decision.current_center_norm
+    residual_rate_rad_s = current_dynamic.residual_translational_rate_rad_s
+    vertical_angle_scale_rad = float(vertical_angle_scale_rad)
+    if (
+        not isinstance(passage_error, tuple)
+        or len(passage_error) != 2
+        or not isinstance(residual_rate_rad_s, tuple)
+        or len(residual_rate_rad_s) != 2
+        or not math.isfinite(vertical_angle_scale_rad)
+        or vertical_angle_scale_rad <= 0.0
+    ):
+        raise ValueError(
+            "dynamic current-aperture collective state is invalid"
+        )
+    vertical_error = float(passage_error[1])
+    vertical_rate = (
+        float(residual_rate_rad_s[1]) / vertical_angle_scale_rad
+    )
+    basis = CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+    aperture = getattr(
+        dynamic_decision,
+        "current_aperture_half_size_norm",
+        None,
+    )
+    q_rate = getattr(dynamic_decision, "crossing_rate_q_s", None)
+    if (
+        isinstance(aperture, tuple)
+        and len(aperture) == 2
+        and isinstance(q_rate, tuple)
+        and len(q_rate) == 2
+        and current_dynamic.visible
+        and not current_dynamic.ambiguous
+        and not current_dynamic.censored_axes[1]
+        and current_dynamic.bearing_rate_qualified[1]
+        and current_dynamic.scale_rate_qualified
+    ):
+        vertical_rate = float(q_rate[1]) * float(aperture[1])
+        basis = CURRENT_APERTURE_Q_COLLECTIVE_BASIS
+    if not all(
+        math.isfinite(value)
+        for value in (vertical_error, vertical_rate)
+    ):
+        raise ValueError(
+            "dynamic current-aperture collective inputs must be finite"
+        )
+    return vertical_error, vertical_rate, basis
 
 
 def _propose_current_aperture_collective(
@@ -2686,17 +2751,18 @@ async def _run_visual_course_stage_impl(
                     raise abort_type(
                         "current-aperture collective dynamic identity changed"
                     )
-                control_vertical_error_image_down = float(
-                    dynamic_decision.current_center_norm[1]
-                )
-                control_vertical_rate_down_s = float(
-                    dynamic_course.current
-                    .residual_translational_rate_rad_s[1]
-                    / runtime.dynamic_controller.core.config
-                    .vertical_angle_scale_rad
-                )
-                control_basis = (
-                    CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+                current_dynamic = dynamic_course.current
+                (
+                    control_vertical_error_image_down,
+                    control_vertical_rate_down_s,
+                    control_basis,
+                ) = _dynamic_current_aperture_collective_inputs(
+                    dynamic_decision,
+                    current_dynamic,
+                    vertical_angle_scale_rad=(
+                        runtime.dynamic_controller.core.config
+                        .vertical_angle_scale_rad
+                    ),
                 )
             collective_proposal = (
                 _propose_current_aperture_collective(
