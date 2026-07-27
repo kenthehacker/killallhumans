@@ -154,9 +154,15 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
         "current_bearing_std_norm": [0.01, 0.02],
         "residual_translation_rate_norm_s": [0.30, -0.40],
         "crossing_prediction_horizon_s": 0.45,
+        "crossing_coordinate_basis": (
+            course_stage.DYNAMIC_CROSSING_COORDINATE_BASIS
+        ),
+        "current_crossing_error_q": [0.10, -0.20],
+        "crossing_rate_q_s": [0.30, -0.40],
         "predicted_crossing_error_norm": [0.235, -0.38],
         "predicted_crossing_std_norm": [0.03, 0.04],
         "crossing_allowance_norm": [0.50, 0.60],
+        "crossing_swept_occupancy_norm": [0.295, 0.46],
         "predicted_crossing_clearance_norm": [0.205, 0.14],
         "current_censored_axes": [False, False],
         "current_log_scale": -0.50,
@@ -197,6 +203,8 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
     assert sample.predicted_crossing_y_std_norm == pytest.approx(0.04)
     assert sample.crossing_allowance_x_norm == pytest.approx(0.50)
     assert sample.crossing_allowance_y_norm == pytest.approx(0.60)
+    assert sample.crossing_swept_x_occupancy_norm == pytest.approx(0.295)
+    assert sample.crossing_swept_y_occupancy_norm == pytest.approx(0.46)
 
 
 @pytest.mark.parametrize(
@@ -206,6 +214,7 @@ def test_dynamic_near_plane_wire_sample_maps_crossing_prediction():
         "predicted_crossing_error_norm",
         "predicted_crossing_std_norm",
         "crossing_allowance_norm",
+        "crossing_swept_occupancy_norm",
         "predicted_crossing_clearance_norm",
     ],
 )
@@ -246,6 +255,7 @@ def test_dynamic_near_plane_wire_sample_accepts_zero_allowance() -> None:
     evidence["crossing_allowance_norm"] = [0.50, 0.0]
     evidence["predicted_crossing_error_norm"] = [0.235, 0.0]
     evidence["predicted_crossing_std_norm"] = [0.03, 0.0]
+    evidence["crossing_swept_occupancy_norm"] = [0.295, 0.0]
     evidence["predicted_crossing_clearance_norm"] = [0.205, 0.0]
 
     sample = _dynamic_near_plane_sample(evidence)

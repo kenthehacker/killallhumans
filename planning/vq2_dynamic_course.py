@@ -459,6 +459,12 @@ class DynamicCourseConfig:
     minimum_ttc_s: float = 0.15
     maximum_ttc_s: float = 8.0
     passage_margin_norm: float = 0.09
+    # The detector bbox is outer contour support, not a measured inner
+    # aperture.  These scale-free occupancy ceilings are an empirical safety
+    # envelope after the 8c31d1f Gate-0 top-frame contact; they deliberately
+    # make no claim about unverified vehicle or gate dimensions.
+    crossing_max_occupancy_q: Vector2 = (0.50, 0.45)
+    vertical_settled_rate_norm_s: float = 0.30
     passage_arm_min_log_scale: float = -0.80
     passage_successor_bias: float = 0.55
     crossing_prediction_max_horizon_s: float = 1.20
@@ -508,6 +514,7 @@ class DynamicCourseConfig:
             "minimum_ttc_s",
             "maximum_ttc_s",
             "passage_margin_norm",
+            "vertical_settled_rate_norm_s",
             "crossing_prediction_max_horizon_s",
             "successor_prediction_max_horizon_s",
             "successor_prediction_max_extrapolation_rad",
@@ -525,6 +532,17 @@ class DynamicCourseConfig:
         )
         for name in positive:
             object.__setattr__(self, name, _positive(getattr(self, name), name))
+        crossing_max_occupancy_q = _tuple2(
+            self.crossing_max_occupancy_q,
+            "crossing_max_occupancy_q",
+            positive=True,
+            bound=1.0,
+        )
+        object.__setattr__(
+            self,
+            "crossing_max_occupancy_q",
+            crossing_max_occupancy_q,
+        )
         for name in (
             "bearing_alpha",
             "bearing_beta",
@@ -669,9 +687,12 @@ class GuidanceDecision:
     passage_error_norm: Vector2
     aperture_margin_norm: Vector2
     crossing_prediction_horizon_s: float
+    current_crossing_error_q: Vector2
+    crossing_rate_q_s: Vector2
     predicted_crossing_error_norm: Vector2
     predicted_crossing_std_norm: Vector2
     crossing_allowance_norm: Vector2
+    crossing_swept_occupancy_norm: Vector2
     predicted_crossing_clearance_norm: Vector2
     current_bearing_std_rad: Vector2
     successor_bearing_std_rad: Vector2 | None
@@ -691,6 +712,118 @@ class GuidanceDecision:
     dropout_held: bool
     proposed_command: DynamicCourseCommand
     command: DynamicCourseCommand
+
+
+@dataclass(frozen=True, slots=True)
+class CrossingQuotientPrediction:
+    """Scale-free current-aperture crossing envelope.
+
+    ``q`` is passage-relative center offset divided by the co-timed outer
+    aperture half extent.  The robust swept occupancy also reserves the
+    successor-biased passage fraction and uncertainty, so its clearance is a
+    conservative vehicle/camera envelope rather than point-camera clearance.
+    """
+
+    current_error_q: Vector2
+    rate_q_s: Vector2
+    predicted_error_q: Vector2
+    current_std_q: Vector2
+    predicted_std_q: Vector2
+    swept_occupancy_q: Vector2
+    allowance_q: Vector2
+    clearance_q: Vector2
+
+
+def predict_aperture_relative_crossing(
+    *,
+    center_offset_norm: Vector2,
+    passage_offset_norm: Vector2,
+    aperture_half_extent_norm: Vector2,
+    center_rate_norm_s: Vector2,
+    aperture_expansion_rate_s: Vector2,
+    center_std_norm: Vector2,
+    aperture_log_scale_std: float,
+    capture_timing_uncertainty_s: float,
+    horizon_s: float,
+    allowance_q: Vector2,
+) -> CrossingQuotientPrediction:
+    """Predict the whole current-to-plane sweep in aperture quotient space."""
+
+    center = _tuple2(center_offset_norm, "center_offset_norm")
+    passage = _tuple2(passage_offset_norm, "passage_offset_norm")
+    aperture = _tuple2(
+        aperture_half_extent_norm,
+        "aperture_half_extent_norm",
+        positive=True,
+    )
+    center_rate = _tuple2(center_rate_norm_s, "center_rate_norm_s")
+    aperture_expansion = _tuple2(
+        aperture_expansion_rate_s,
+        "aperture_expansion_rate_s",
+    )
+    center_std = _tuple2(center_std_norm, "center_std_norm")
+    if any(value < 0.0 for value in center_std):
+        raise DynamicCourseError("center_std_norm must be nonnegative")
+    scale_std = _nonnegative(
+        aperture_log_scale_std,
+        "aperture_log_scale_std",
+    )
+    timing_std = _nonnegative(
+        capture_timing_uncertainty_s,
+        "capture_timing_uncertainty_s",
+    )
+    horizon = _nonnegative(horizon_s, "horizon_s")
+    allowance = _tuple2(allowance_q, "allowance_q", positive=True, bound=1.0)
+
+    center_q = tuple(center[axis] / aperture[axis] for axis in range(2))
+    passage_q = tuple(passage[axis] / aperture[axis] for axis in range(2))
+    error_q = tuple(
+        center_q[axis] + passage_q[axis] for axis in range(2)
+    )
+    # The passage fraction is fixed in the gate aperture.  Expansion acts on
+    # the measured center quotient, not on the deliberately selected passage
+    # offset; applying it to both would manufacture successor-guidance motion.
+    rate_q = tuple(
+        center_rate[axis] / aperture[axis]
+        - aperture_expansion[axis] * center_q[axis]
+        for axis in range(2)
+    )
+    predicted_q = tuple(
+        error_q[axis] + rate_q[axis] * horizon for axis in range(2)
+    )
+    current_std_q = tuple(
+        center_std[axis] / aperture[axis]
+        + (
+            abs(center_q[axis]) + abs(passage_q[axis])
+        )
+        * scale_std
+        for axis in range(2)
+    )
+    predicted_std_q = tuple(
+        current_std_q[axis] + abs(rate_q[axis]) * timing_std
+        for axis in range(2)
+    )
+    swept_occupancy = tuple(
+        abs(passage_q[axis])
+        + max(
+            abs(error_q[axis]) + 2.0 * current_std_q[axis],
+            abs(predicted_q[axis]) + 2.0 * predicted_std_q[axis],
+        )
+        for axis in range(2)
+    )
+    clearance = tuple(
+        allowance[axis] - swept_occupancy[axis] for axis in range(2)
+    )
+    return CrossingQuotientPrediction(
+        current_error_q=error_q,  # type: ignore[arg-type]
+        rate_q_s=rate_q,  # type: ignore[arg-type]
+        predicted_error_q=predicted_q,  # type: ignore[arg-type]
+        current_std_q=current_std_q,  # type: ignore[arg-type]
+        predicted_std_q=predicted_std_q,  # type: ignore[arg-type]
+        swept_occupancy_q=swept_occupancy,  # type: ignore[arg-type]
+        allowance_q=allowance,
+        clearance_q=clearance,  # type: ignore[arg-type]
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1754,33 +1887,63 @@ class DynamicCourseCore:
             current.residual_translational_rate_rad_s[1]
             / self.config.vertical_angle_scale_rad,
         )
-        predicted_crossing_error = tuple(
-            passage_error[axis]
-            + residual_rate_norm[axis]
-            * crossing_prediction_horizon_s
-            for axis in range(2)
-        )
         current_std_norm = (
             current.bearing_std_rad[0]
             / self.config.horizontal_angle_scale_rad,
             current.bearing_std_rad[1]
             / self.config.vertical_angle_scale_rad,
         )
-        # Capture-time uncertainty projects the already derotated residual
-        # velocity into position uncertainty.  Do not add the raw filter's
-        # very conservative rate covariance a second time here.
-        predicted_crossing_std = tuple(
-            current_std_norm[axis]
-            + abs(residual_rate_norm[axis])
-            * current.capture_timing_uncertainty_s
-            for axis in range(2)
+        crossing_prediction = (
+            None
+            if current_aperture is None
+            else predict_aperture_relative_crossing(
+                center_offset_norm=current_center,
+                passage_offset_norm=passage,
+                aperture_half_extent_norm=current_aperture,
+                center_rate_norm_s=residual_rate_norm,
+                # The robust log-scale filter is the currently identified
+                # aperture expansion model.  The quotient helper accepts
+                # per-axis rates so a later clean axis fit can replace this
+                # shared rate without changing guidance semantics.
+                aperture_expansion_rate_s=(
+                    current.expansion_rate_s,
+                    current.expansion_rate_s,
+                ),
+                center_std_norm=current_std_norm,
+                aperture_log_scale_std=current.log_scale_std,
+                capture_timing_uncertainty_s=(
+                    current.capture_timing_uncertainty_s
+                ),
+                horizon_s=crossing_prediction_horizon_s,
+                allowance_q=self.config.crossing_max_occupancy_q,
+            )
         )
-        predicted_crossing_clearance = tuple(
-            margins[axis]
-            - abs(predicted_crossing_error[axis])
-            - 2.0 * predicted_crossing_std[axis]
-            for axis in range(2)
-        )
+        if crossing_prediction is None:
+            current_crossing_error_q = (0.0, 0.0)
+            crossing_rate_q_s = (0.0, 0.0)
+            predicted_crossing_error = (0.0, 0.0)
+            predicted_crossing_std = (0.0, 0.0)
+            crossing_allowance = (0.0, 0.0)
+            crossing_swept_occupancy = (0.0, 0.0)
+            predicted_crossing_clearance = (0.0, 0.0)
+        else:
+            current_crossing_error_q = (
+                crossing_prediction.current_error_q
+            )
+            crossing_rate_q_s = crossing_prediction.rate_q_s
+            predicted_crossing_error = (
+                crossing_prediction.predicted_error_q
+            )
+            predicted_crossing_std = (
+                crossing_prediction.predicted_std_q
+            )
+            crossing_allowance = crossing_prediction.allowance_q
+            crossing_swept_occupancy = (
+                crossing_prediction.swept_occupancy_q
+            )
+            predicted_crossing_clearance = (
+                crossing_prediction.clearance_q
+            )
         current_yaw_release = self._current_yaw_release(
             current,
             successor_passage_ready,
@@ -1806,6 +1969,12 @@ class DynamicCourseCore:
             current_yaw_release,
             successor_weight,
             successor_prediction,
+            vertical_alignment_unsettled=bool(
+                crossing_prediction is None
+                or predicted_crossing_clearance[1] < 0.0
+                or abs(residual_rate_norm[1])
+                > self.config.vertical_settled_rate_norm_s
+            ),
         )
         command = self._governor.preview(proposal, monotonic_ns, hold=held)
         return GuidanceDecision(
@@ -1822,11 +1991,16 @@ class DynamicCourseCore:
             crossing_prediction_horizon_s=(
                 crossing_prediction_horizon_s
             ),
+            current_crossing_error_q=current_crossing_error_q,
+            crossing_rate_q_s=crossing_rate_q_s,
             predicted_crossing_error_norm=(
                 predicted_crossing_error
             ),
             predicted_crossing_std_norm=predicted_crossing_std,
-            crossing_allowance_norm=margins,
+            crossing_allowance_norm=crossing_allowance,
+            crossing_swept_occupancy_norm=(
+                crossing_swept_occupancy
+            ),
             predicted_crossing_clearance_norm=(
                 predicted_crossing_clearance
             ),
@@ -2313,6 +2487,8 @@ class DynamicCourseCore:
         current_yaw_release: float,
         successor_weight: float,
         successor_prediction: _SuccessorPrediction | None,
+        *,
+        vertical_alignment_unsettled: bool,
     ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
         camera_current_bearing = (
             math.atan(
@@ -2437,9 +2613,13 @@ class DynamicCourseCore:
         braking = (
             off_axis >= self.config.off_axis_brake_rad
             and successor is not None
-        ) or (uncertain and rapid_closure)
+        ) or (uncertain and rapid_closure) or (
+            vertical_alignment_unsettled and rapid_closure
+        )
         reason: str | None
-        if braking and uncertain:
+        if braking and vertical_alignment_unsettled:
+            reason = "vertical_alignment_unsettled"
+        elif braking and uncertain:
             reason = "uncertain_rapid_closure"
         elif braking:
             reason = (
@@ -2482,6 +2662,7 @@ __all__ = [
     "CommandGovernor",
     "CommandGovernorConfig",
     "CourseDynamicState",
+    "CrossingQuotientPrediction",
     "DelayedCommandView",
     "DynamicCourseCommand",
     "DynamicCourseConfig",
@@ -2498,4 +2679,5 @@ __all__ = [
     "MIN_THRUST",
     "SUPPORT_THRUST",
     "TrackDynamicState",
+    "predict_aperture_relative_crossing",
 ]

@@ -17,10 +17,115 @@ from planning.vq2_dynamic_course import (
     ImuAttitudeSample,
     MAX_YAW_RATE_RAD_S,
     SUPPORT_THRUST,
+    predict_aperture_relative_crossing,
 )
 
 
 NS = 1_000_000_000
+
+
+def test_aperture_quotient_rate_removes_pure_axial_expansion() -> None:
+    prediction = predict_aperture_relative_crossing(
+        center_offset_norm=(0.20, -0.30),
+        passage_offset_norm=(0.0, 0.0),
+        aperture_half_extent_norm=(0.40, 0.60),
+        center_rate_norm_s=(0.40, -0.60),
+        aperture_expansion_rate_s=(2.0, 2.0),
+        center_std_norm=(0.001, 0.001),
+        aperture_log_scale_std=0.0,
+        capture_timing_uncertainty_s=0.0,
+        horizon_s=0.25,
+        allowance_q=(0.50, 0.45),
+    )
+
+    assert prediction.current_error_q == pytest.approx((0.50, -0.50))
+    assert prediction.rate_q_s == pytest.approx((0.0, 0.0), abs=1e-12)
+    assert prediction.predicted_error_q == pytest.approx(
+        prediction.current_error_q
+    )
+
+
+def test_aperture_quotient_rate_does_not_expand_fixed_passage_bias() -> None:
+    unbiased = predict_aperture_relative_crossing(
+        center_offset_norm=(0.10, 0.0),
+        passage_offset_norm=(0.0, 0.0),
+        aperture_half_extent_norm=(0.50, 0.50),
+        center_rate_norm_s=(0.0, 0.0),
+        aperture_expansion_rate_s=(1.0, 1.0),
+        center_std_norm=(0.001, 0.001),
+        aperture_log_scale_std=0.0,
+        capture_timing_uncertainty_s=0.0,
+        horizon_s=0.20,
+        allowance_q=(0.50, 0.45),
+    )
+    biased = predict_aperture_relative_crossing(
+        center_offset_norm=(0.10, 0.0),
+        passage_offset_norm=(0.10, 0.0),
+        aperture_half_extent_norm=(0.50, 0.50),
+        center_rate_norm_s=(0.0, 0.0),
+        aperture_expansion_rate_s=(1.0, 1.0),
+        center_std_norm=(0.001, 0.001),
+        aperture_log_scale_std=0.0,
+        capture_timing_uncertainty_s=0.0,
+        horizon_s=0.20,
+        allowance_q=(0.50, 0.45),
+    )
+
+    assert biased.rate_q_s == pytest.approx(unbiased.rate_q_s)
+    assert biased.current_error_q[0] - unbiased.current_error_q[0] == (
+        pytest.approx(0.20)
+    )
+
+
+def test_ea6335c3_top_hit_is_rejected_by_swept_q_envelope() -> None:
+    """The exact last clean state may not reproduce its false clearance."""
+
+    center = (0.06616391217790557, -0.567900045493448)
+    aperture = (0.5795765774353157, 0.9644074109630432)
+    center_rate = (-0.1698399706228867, 0.5322577589123005)
+    horizon = 0.5656508691934667
+    prediction = predict_aperture_relative_crossing(
+        center_offset_norm=center,
+        passage_offset_norm=(0.0, 0.0),
+        aperture_half_extent_norm=aperture,
+        center_rate_norm_s=center_rate,
+        aperture_expansion_rate_s=(
+            1.767875141990965,
+            1.767875141990965,
+        ),
+        center_std_norm=(0.01653, 0.02170),
+        aperture_log_scale_std=0.046094,
+        capture_timing_uncertainty_s=0.020,
+        horizon_s=horizon,
+        allowance_q=(0.50, 0.45),
+    )
+    frozen_aperture_vertical = center[1] + center_rate[1] * horizon
+    falsified_old_clearance = (
+        0.8744073625800745
+        - abs(frozen_aperture_vertical)
+        - 2.0 * 0.032343626640302645
+    )
+
+    assert prediction.current_error_q == pytest.approx(
+        (0.114159, -0.588859),
+        abs=2e-6,
+    )
+    assert prediction.rate_q_s == pytest.approx(
+        (-0.49486, 1.59293),
+        abs=2e-5,
+    )
+    assert prediction.predicted_error_q[1] == pytest.approx(
+        0.31218,
+        abs=2e-5,
+    )
+    assert frozen_aperture_vertical < 0.0
+    assert falsified_old_clearance == pytest.approx(
+        0.5428922415214223,
+        abs=2e-7,
+    )
+    assert falsified_old_clearance > 0.0
+    assert prediction.swept_occupancy_q[1] > 0.63
+    assert prediction.clearance_q[1] < 0.0
 
 
 def _yaw_quaternion(yaw_rad: float) -> tuple[float, float, float, float]:

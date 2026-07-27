@@ -50,6 +50,9 @@ DYNAMIC_CONTROLLER_FAMILY = "aigp-vq2-dynamic-image-course/1"
 DYNAMIC_TIMING_BASIS = (
     "receiver-final-packet-proxy-minus-identified-camera-delay"
 )
+DYNAMIC_CROSSING_COORDINATE_BASIS = (
+    "aperture-relative-q-swept-vehicle-envelope-v1"
+)
 _HOST_CLOCK_ID = "host-perf-counter"
 
 
@@ -627,6 +630,15 @@ class DynamicVisualCourseSession:
                     "crossing_prediction_horizon_s": (
                         decision.crossing_prediction_horizon_s
                     ),
+                    "crossing_coordinate_basis": (
+                        DYNAMIC_CROSSING_COORDINATE_BASIS
+                    ),
+                    "current_crossing_error_q": list(
+                        decision.current_crossing_error_q
+                    ),
+                    "crossing_rate_q_s": list(
+                        decision.crossing_rate_q_s
+                    ),
                     "predicted_crossing_error_norm": list(
                         decision.predicted_crossing_error_norm
                     ),
@@ -635,6 +647,9 @@ class DynamicVisualCourseSession:
                     ),
                     "crossing_allowance_norm": list(
                         decision.crossing_allowance_norm
+                    ),
+                    "crossing_swept_occupancy_norm": list(
+                        decision.crossing_swept_occupancy_norm
                     ),
                     "predicted_crossing_clearance_norm": list(
                         decision.predicted_crossing_clearance_norm
@@ -902,6 +917,11 @@ class _DynamicImageServo:
         within_corridor = bool(
             decision is not None
             and passage_plane_ready
+            # Image-down motion means the vehicle is moving toward the
+            # aperture's top side.  Do not retire observable collective
+            # authority while either vertical direction is still unsettled.
+            and abs(float(current.normalized_y_rate_down_s))
+            <= self.session.core.config.vertical_settled_rate_norm_s
             and crossing_allowance[0] > 0.0
             and crossing_allowance[1] > 0.0
             and predicted_crossing_clearance[0] >= 0.0
@@ -1163,6 +1183,7 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
 
 __all__ = [
     "DYNAMIC_CONTROLLER_FAMILY",
+    "DYNAMIC_CROSSING_COORDINATE_BASIS",
     "DYNAMIC_TIMING_BASIS",
     "DynamicRollingVisualApproachServo",
     "DynamicVisualCourseSession",

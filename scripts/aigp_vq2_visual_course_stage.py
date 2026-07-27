@@ -52,6 +52,9 @@ from planning.vq2_course_lifecycle import (
     classify_post_credit_measurement,
     classify_latched_measurement,
 )
+from planning.vq2_dynamic_visual_approach import (
+    DYNAMIC_CROSSING_COORDINATE_BASIS,
+)
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
     VisualApproachAdjacentUnavailable,
@@ -596,13 +599,23 @@ def _dynamic_near_plane_wire_sample(
         "crossing_allowance_norm",
         minimum=0.0,
     )
+    crossing_swept_occupancy = pair(
+        "crossing_swept_occupancy_norm",
+        minimum=0.0,
+    )
     reported_crossing_clearance = pair(
         "predicted_crossing_clearance_norm",
     )
+    if (
+        evidence.get("crossing_coordinate_basis")
+        != DYNAMIC_CROSSING_COORDINATE_BASIS
+    ):
+        raise ValueError(
+            "dynamic near-plane crossing coordinate basis is invalid"
+        )
     recomputed_crossing_clearance = tuple(
         crossing_allowance[axis]
-        - abs(predicted_crossing_error[axis])
-        - 2.0 * predicted_crossing_std[axis]
+        - crossing_swept_occupancy[axis]
         for axis in range(2)
     )
     if any(
@@ -670,6 +683,12 @@ def _dynamic_near_plane_wire_sample(
         predicted_crossing_y_std_norm=predicted_crossing_std[1],
         crossing_allowance_x_norm=crossing_allowance[0],
         crossing_allowance_y_norm=crossing_allowance[1],
+        crossing_swept_x_occupancy_norm=(
+            crossing_swept_occupancy[0]
+        ),
+        crossing_swept_y_occupancy_norm=(
+            crossing_swept_occupancy[1]
+        ),
     )
 
 
@@ -689,7 +708,7 @@ class _CensoredPassageCoastAuthority:
     target_roll_rad: float
     target_pitch_rad: float
     yaw_rate_rad_s: float
-    thrust: float
+    requested_thrust: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -2846,7 +2865,7 @@ async def _run_visual_course_stage_impl(
             authority.target_roll_rad,
             authority.target_pitch_rad,
             authority.yaw_rate_rad_s,
-            authority.thrust,
+            authority.requested_thrust,
             command_deadline_s,
         )
         if (
@@ -2862,7 +2881,7 @@ async def _run_visual_course_stage_impl(
             or abs(authority.yaw_rate_rad_s)
             > limits.max_yaw_rate_rad_s + 1e-12
             or not limits.min_thrust
-            <= authority.thrust
+            <= authority.requested_thrust
             <= limits.max_thrust
             or (
                 authority.yaw_rate_rad_s != 0.0
@@ -2925,7 +2944,7 @@ async def _run_visual_course_stage_impl(
             host.estimate,
             target_roll_rad=authority.target_roll_rad,
             target_pitch_rad=authority.target_pitch_rad,
-            thrust=authority.thrust,
+            thrust=authority.requested_thrust,
         )
         limited = runtime.limit_command_rates(
             base,
@@ -2955,9 +2974,10 @@ async def _run_visual_course_stage_impl(
                 command = dynamic_controller.govern_wire_command(
                     command,
                     proposal_monotonic_ns=governor_proposal_ns,
-                    # The coast authority already owns its exact bounded
-                    # support thrust; do not synthesize a different one.
-                    launch_thrust_override=True,
+                    # Continue the ordinary bounded thrust ramp toward the
+                    # last clean current-aperture request.  Censorship removes
+                    # new geometry, not the retained collective objective.
+                    launch_thrust_override=False,
                     yaw_safety_override=yaw_safety_override,
                 )
             except (TypeError, ValueError) as exc:
@@ -2971,7 +2991,6 @@ async def _run_visual_course_stage_impl(
             > limits.max_command_rate_rad_s + 1e-12
             or abs(command.yaw_rate)
             > limits.max_yaw_rate_rad_s + 1e-12
-            or command.thrust != authority.thrust
             or not limits.min_thrust <= command.thrust <= limits.max_thrust
         ):
             raise abort_type(
@@ -3067,7 +3086,7 @@ async def _run_visual_course_stage_impl(
                         wire_start_monotonic_ns=(
                             wire_start_monotonic_ns
                         ),
-                        thrust_slew_override=True,
+                        thrust_slew_override=False,
                         yaw_slew_override=yaw_safety_override,
                     )
                 )
@@ -3104,7 +3123,7 @@ async def _run_visual_course_stage_impl(
                 float(runtime.monotonic()) - course_started_s
             )
             launch["last_target_pitch_rad"] = authority.target_pitch_rad
-            launch["last_thrust"] = authority.thrust
+            launch["last_thrust"] = command.thrust
             launch["last_thrust_phase"] = CENSORED_PASSAGE_COAST_BASIS
         if (
             count_as_navigation
@@ -3128,7 +3147,8 @@ async def _run_visual_course_stage_impl(
             target_roll_rad=authority.target_roll_rad,
             target_pitch_rad=authority.target_pitch_rad,
             requested_yaw_rate_rad_s=authority.yaw_rate_rad_s,
-            thrust=authority.thrust,
+            requested_thrust=authority.requested_thrust,
+            wire_thrust=command.thrust,
             counted_as_navigation=count_as_navigation,
             command=asdict(command),
         )
@@ -3204,6 +3224,32 @@ async def _run_visual_course_stage_impl(
             if launch_enabled or runtime.dynamic_controller is not None
             else None
         )
+
+        def retained_current_aperture_collective(
+            fallback_wire_thrust: float,
+        ) -> float:
+            """Return the last clean aperture request for bounded coast."""
+
+            fallback = float(fallback_wire_thrust)
+            if runtime.dynamic_controller is None:
+                return fallback
+            state = current_aperture_collective_state
+            if state is None or state.last_observable_thrust is None:
+                raise abort_type(
+                    "visual-course dynamic crossing lacks a retained "
+                    "current-aperture collective"
+                )
+            requested = float(state.last_observable_thrust)
+            if (
+                not math.isfinite(requested)
+                or requested < limits.min_thrust - 1e-12
+                or requested > limits.max_thrust + 1e-12
+            ):
+                raise abort_type(
+                    "visual-course retained current-aperture collective "
+                    "escaped its fixed envelope"
+                )
+            return requested
 
         def make_planner(
             *,
@@ -3724,7 +3770,7 @@ async def _run_visual_course_stage_impl(
                                         servo_tuning.brake_pitch_rad
                                     ),
                                     yaw_rate_rad_s=0.0,
-                                    thrust=float(
+                                    requested_thrust=float(
                                         servo_tuning.brake_thrust
                                     ),
                                 ),
@@ -3875,7 +3921,9 @@ async def _run_visual_course_stage_impl(
                             "target_pitch_rad": (
                                 crossing_coast_authority.target_pitch_rad
                             ),
-                            "thrust": crossing_coast_authority.thrust,
+                            "requested_thrust": (
+                                crossing_coast_authority.requested_thrust
+                            ),
                             "max_duration_s": (
                                 limits
                                 .censored_passage_coast_max_duration_s
@@ -4408,7 +4456,11 @@ async def _run_visual_course_stage_impl(
                                     ),
                                 ),
                                 yaw_rate_rad_s=command.yaw_rate,
-                                thrust=coast_thrust,
+                                requested_thrust=(
+                                    retained_current_aperture_collective(
+                                        coast_thrust
+                                    )
+                                ),
                             )
                         )
                         anchor = near_plane_latch.anchor_sample
@@ -4714,7 +4766,11 @@ async def _run_visual_course_stage_impl(
                             target_roll_rad=accepted.target_roll_rad,
                             target_pitch_rad=crossing_coast_target_pitch,
                             yaw_rate_rad_s=crossing_successor_yaw_rate,
-                            thrust=crossing_coast_thrust,
+                            requested_thrust=(
+                                retained_current_aperture_collective(
+                                    crossing_coast_thrust
+                                )
+                            ),
                         )
                     )
                     crossing_anchor = {

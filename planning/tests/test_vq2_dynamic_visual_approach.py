@@ -634,6 +634,80 @@ def test_proved_collective_descends_through_wire_governor_after_boost():
     assert 0.21 <= accepted.thrust < 0.275
 
 
+def test_ea6335c3_censored_coast_keeps_ramping_to_retained_collective():
+    """Replay the lagging wire state that was frozen before the top hit."""
+
+    session = _session()
+    anchor_ns = _BASE_NS
+    previous_ns = anchor_ns - 31_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.1087756,
+        target_pitch_rad=0.12,
+        yaw_rate_rad_s=-0.0288209,
+        thrust=0.2771589,
+        wire_command=AttitudeRateCommand(
+            0.0338,
+            0.0732,
+            -0.02138,
+            0.2771589,
+        ),
+        wire_start_monotonic_ns=previous_ns,
+    )
+    anchor = AttitudeRateCommand(
+        0.02846,
+        0.07007,
+        -0.0288209,
+        0.2725533560536844,
+    )
+    session.record_wire_acceptance(
+        target_roll_rad=0.1087756,
+        target_pitch_rad=0.12,
+        yaw_rate_rad_s=-0.0288209,
+        thrust=anchor.thrust,
+        wire_command=anchor,
+        wire_start_monotonic_ns=anchor_ns,
+    )
+
+    accepted = anchor
+    thrusts = []
+    for elapsed_ms in (64, 95, 126, 191, 221, 253):
+        wire_ns = anchor_ns + elapsed_ms * 1_000_000
+        accepted = session.govern_wire_command(
+            AttitudeRateCommand(
+                anchor.roll_rate,
+                anchor.pitch_rate,
+                anchor.yaw_rate,
+                0.21,
+            ),
+            proposal_monotonic_ns=wire_ns,
+            launch_thrust_override=False,
+            yaw_safety_override=False,
+        )
+        session.record_wire_acceptance(
+            target_roll_rad=0.1087756,
+            target_pitch_rad=0.12,
+            yaw_rate_rad_s=accepted.yaw_rate,
+            thrust=accepted.thrust,
+            wire_command=accepted,
+            wire_start_monotonic_ns=wire_ns,
+            thrust_slew_override=False,
+        )
+        thrusts.append(accepted.thrust)
+
+    assert thrusts == sorted(thrusts, reverse=True)
+    assert all(
+        later < earlier
+        for earlier, later in zip(
+            (anchor.thrust, *thrusts[:-1]),
+            thrusts,
+        )
+    )
+    assert 0.21 < thrusts[-1] < thrusts[0] < anchor.thrust
+    assert accepted.roll_rate == pytest.approx(anchor.roll_rate)
+    assert accepted.pitch_rate == pytest.approx(anchor.pitch_rate)
+    assert accepted.yaw_rate == pytest.approx(anchor.yaw_rate)
+
+
 def test_final_wire_governor_projects_yaw_momentum_into_measured_envelope():
     session = _session()
     first_ns = _BASE_NS

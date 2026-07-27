@@ -387,6 +387,8 @@ def test_dynamic_derotated_history_latches_and_allows_bounded_raw_motion():
             predicted_crossing_y_std_norm=0.015,
             crossing_allowance_x_norm=0.30,
             crossing_allowance_y_norm=0.30,
+            crossing_swept_x_occupancy_norm=0.13,
+            crossing_swept_y_occupancy_norm=0.15,
         )
         for sample, scale, expansion in zip(
             _CREDITED_NEAR_PLANE,
@@ -440,6 +442,12 @@ def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
             "predicted_crossing_y_std_norm": 0.02546894422575201,
             "crossing_allowance_x_norm": 0.43144731788958546,
             "crossing_allowance_y_norm": 0.7585534078076088,
+            "crossing_swept_x_occupancy_norm": (
+                0.04790031626024851 + 2.0 * 0.01805489185789611
+            ),
+            "crossing_swept_y_occupancy_norm": (
+                0.5695969480494885 + 2.0 * 0.02546894422575201
+            ),
         },
         {
             "normalized_x": 0.07326644915155803,
@@ -459,6 +467,12 @@ def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
             "predicted_crossing_y_std_norm": 0.02713879530270246,
             "crossing_allowance_x_norm": 0.4541013180219873,
             "crossing_allowance_y_norm": 0.8247772155886629,
+            "crossing_swept_x_occupancy_norm": (
+                0.03203104058534398 + 2.0 * 0.020102525030508578
+            ),
+            "crossing_swept_y_occupancy_norm": (
+                0.4920636868836103 + 2.0 * 0.02713879530270246
+            ),
         },
         {
             "normalized_x": 0.05873231376519952,
@@ -478,6 +492,12 @@ def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
             "predicted_crossing_y_std_norm": 0.029654322155845483,
             "crossing_allowance_x_norm": 0.4903944647215772,
             "crossing_allowance_y_norm": 0.8982225951480185,
+            "crossing_swept_x_occupancy_norm": (
+                0.05200313573572099 + 2.0 * 0.020404934936140266
+            ),
+            "crossing_swept_y_occupancy_norm": (
+                0.40265848500470763 + 2.0 * 0.029654322155845483
+            ),
         },
     )
     dynamic_samples = tuple(
@@ -510,12 +530,10 @@ def test_5dffc517_predicted_clearance_latches_while_braking() -> None:
     assert len(evidence.samples) == _REQUIRED_FRAMES
     assert all(
         sample.crossing_allowance_x_norm
-        - abs(sample.predicted_crossing_x_norm)
-        - 2.0 * sample.predicted_crossing_x_std_norm
+        - sample.crossing_swept_x_occupancy_norm
         >= 0.0
         and sample.crossing_allowance_y_norm
-        - abs(sample.predicted_crossing_y_down_norm)
-        - 2.0 * sample.predicted_crossing_y_std_norm
+        - sample.crossing_swept_y_occupancy_norm
         >= 0.0
         for sample in evidence.samples
     )
@@ -532,6 +550,8 @@ def test_zero_dynamic_crossing_allowance_is_valid_but_cannot_latch() -> None:
         predicted_crossing_y_std_norm=0.0,
         crossing_allowance_x_norm=0.0,
         crossing_allowance_y_norm=0.30,
+        crossing_swept_x_occupancy_norm=0.0,
+        crossing_swept_y_occupancy_norm=0.0,
     )
 
     evidence, latch = advance_dynamic_near_plane_evidence(
@@ -573,6 +593,8 @@ def test_dynamic_crossing_sample_rejects_malformed_model_facts(
         predicted_crossing_y_std_norm=0.015,
         crossing_allowance_x_norm=0.30,
         crossing_allowance_y_norm=0.30,
+        crossing_swept_x_occupancy_norm=0.13,
+        crossing_swept_y_occupancy_norm=0.15,
     )
 
     with pytest.raises(ValueError, match=message):

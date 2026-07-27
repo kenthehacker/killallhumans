@@ -31,10 +31,10 @@ from planning.vq2_visual_servo import (
 
 NEAR_PLANE_LATCH_BASIS = "centered-expanding-accepted-wire-history-v1"
 DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS = (
-    "imu-derotated-passage-state-with-uncertainty-v1"
+    "imu-derotated-aperture-quotient-swept-envelope-v2"
 )
 DYNAMIC_NEAR_PLANE_LATCH_BASIS = (
-    "imu-derotated-passage-accepted-wire-history-v1"
+    "imu-derotated-aperture-quotient-accepted-wire-history-v2"
 )
 RAW_NEAR_PLANE_GEOMETRY_BASIS = "raw-image-current-aperture-v1"
 DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S = 1.20
@@ -253,6 +253,8 @@ class NearPlaneWireSample:
     predicted_crossing_y_std_norm: Optional[float] = None
     crossing_allowance_x_norm: Optional[float] = None
     crossing_allowance_y_norm: Optional[float] = None
+    crossing_swept_x_occupancy_norm: Optional[float] = None
+    crossing_swept_y_occupancy_norm: Optional[float] = None
 
     def __post_init__(self) -> None:
         if type(self.gate_index) is not int or self.gate_index < 0:
@@ -348,6 +350,8 @@ class NearPlaneWireSample:
             self.predicted_crossing_y_std_norm,
             self.crossing_allowance_x_norm,
             self.crossing_allowance_y_norm,
+            self.crossing_swept_x_occupancy_norm,
+            self.crossing_swept_y_occupancy_norm,
         )
         if self.geometry_basis == DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS:
             if any(value is None for value in crossing_fields):
@@ -376,6 +380,8 @@ class NearPlaneWireSample:
                 "predicted_crossing_y_std_norm",
                 "crossing_allowance_x_norm",
                 "crossing_allowance_y_norm",
+                "crossing_swept_x_occupancy_norm",
+                "crossing_swept_y_occupancy_norm",
             ):
                 value = getattr(self, name)
                 if not _finite(value) or float(value) < 0.0:
@@ -773,15 +779,15 @@ def advance_dynamic_near_plane_evidence(
     assert sample.predicted_crossing_y_std_norm is not None
     assert sample.crossing_allowance_x_norm is not None
     assert sample.crossing_allowance_y_norm is not None
+    assert sample.crossing_swept_x_occupancy_norm is not None
+    assert sample.crossing_swept_y_occupancy_norm is not None
     predicted_crossing_x_clearance = (
         float(sample.crossing_allowance_x_norm)
-        - abs(float(sample.predicted_crossing_x_norm))
-        - 2.0 * float(sample.predicted_crossing_x_std_norm)
+        - float(sample.crossing_swept_x_occupancy_norm)
     )
     predicted_crossing_y_clearance = (
         float(sample.crossing_allowance_y_norm)
-        - abs(float(sample.predicted_crossing_y_down_norm))
-        - 2.0 * float(sample.predicted_crossing_y_std_norm)
+        - float(sample.crossing_swept_y_occupancy_norm)
     )
     qualified = bool(
         sample.clipping == FrameEdge.NONE
