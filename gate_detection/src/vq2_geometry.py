@@ -458,30 +458,6 @@ def _scanline_pairs(
     return points, tuple(ambiguous)
 
 
-def _segment_dependent_coordinate(
-    first: Point,
-    second: Point,
-    *,
-    independent_coordinate: float,
-    independent_axis: int,
-) -> Optional[float]:
-    delta = second[independent_axis] - first[independent_axis]
-    if abs(delta) <= 1e-9:
-        return None
-    fraction = (
-        independent_coordinate - first[independent_axis]
-    ) / delta
-    if fraction < 0.0 or fraction > 1.0:
-        return None
-    dependent_axis = 1 - independent_axis
-    value = (
-        first[dependent_axis]
-        + fraction
-        * (second[dependent_axis] - first[dependent_axis])
-    )
-    return float(value) if math.isfinite(value) else None
-
-
 def _temporally_resolved_scanline_pairs(
     ambiguous: tuple[_AmbiguousGapScanline, ...],
     bbox: tuple[int, int, int, int],
@@ -489,11 +465,11 @@ def _temporally_resolved_scanline_pairs(
     horizontal_scan: bool,
     prior: VQ2ApertureTrackingPrior,
 ) -> tuple[dict[ApertureSide, list[Point]], int]:
-    """Select only uniquely prior-coherent gaps from ambiguous scanlines."""
+    """Select the unique fresh gap containing the predicted aperture center."""
 
     x, y, _width, _height = bbox
-    corners = prior.predicted_corners_px
-    tolerance = prior.maximum_boundary_residual_px
+    center_x, center_y = prior.center_px
+    half_x, half_y = prior.half_size_px
     first_side = (
         ApertureSide.LEFT if horizontal_scan else ApertureSide.TOP
     )
@@ -505,33 +481,15 @@ def _temporally_resolved_scanline_pairs(
     for scanline in ambiguous:
         if horizontal_scan:
             independent = float(y + scanline.offset) + 0.5
-            expected_first = _segment_dependent_coordinate(
-                corners[0],
-                corners[3],
-                independent_coordinate=independent,
-                independent_axis=1,
-            )
-            expected_second = _segment_dependent_coordinate(
-                corners[1],
-                corners[2],
-                independent_coordinate=independent,
-                independent_axis=1,
-            )
+            orthogonal_lower = center_y - half_y
+            orthogonal_upper = center_y + half_y
+            predicted_center = center_x
         else:
             independent = float(x + scanline.offset) + 0.5
-            expected_first = _segment_dependent_coordinate(
-                corners[0],
-                corners[1],
-                independent_coordinate=independent,
-                independent_axis=0,
-            )
-            expected_second = _segment_dependent_coordinate(
-                corners[3],
-                corners[2],
-                independent_coordinate=independent,
-                independent_axis=0,
-            )
-        if expected_first is None or expected_second is None:
+            orthogonal_lower = center_x - half_x
+            orthogonal_upper = center_x + half_x
+            predicted_center = center_y
+        if not orthogonal_lower <= independent <= orthogonal_upper:
             continue
         matches: list[tuple[float, float]] = []
         for candidate in scanline.candidates:
@@ -541,10 +499,7 @@ def _temporally_resolved_scanline_pairs(
             else:
                 first_boundary = float(y + candidate.before) + 0.5
                 second_boundary = float(y + candidate.after) - 0.5
-            if (
-                abs(first_boundary - expected_first) <= tolerance
-                and abs(second_boundary - expected_second) <= tolerance
-            ):
+            if first_boundary < predicted_center < second_boundary:
                 matches.append((first_boundary, second_boundary))
         if len(matches) != 1:
             continue
@@ -559,53 +514,22 @@ def _temporally_resolved_scanline_pairs(
     return points, selected_count
 
 
-def _quad_coheres_with_tracking_prior(
+def _quad_contains_tracking_prior_center(
     corners: Quad,
     prior: VQ2ApertureTrackingPrior,
 ) -> bool:
-    """Compare like-for-like aperture boundaries at the predicted centerlines."""
+    """Require the fitted fresh opening to contain the predicted center."""
 
-    tolerance = prior.maximum_boundary_residual_px
     center_x, center_y = prior.center_px
-    half_x, half_y = prior.half_size_px
-    actual_boundaries = (
-        _segment_dependent_coordinate(
-            corners[0],
-            corners[3],
-            independent_coordinate=center_y,
-            independent_axis=1,
-        ),
-        _segment_dependent_coordinate(
-            corners[0],
-            corners[1],
-            independent_coordinate=center_x,
-            independent_axis=0,
-        ),
-        _segment_dependent_coordinate(
-            corners[1],
-            corners[2],
-            independent_coordinate=center_y,
-            independent_axis=1,
-        ),
-        _segment_dependent_coordinate(
-            corners[3],
-            corners[2],
-            independent_coordinate=center_x,
-            independent_axis=0,
-        ),
-    )
-    predicted_boundaries = (
-        center_x - half_x,
-        center_y - half_y,
-        center_x + half_x,
-        center_y + half_y,
-    )
     return all(
-        actual is not None
-        and abs(actual - predicted) <= tolerance
-        for actual, predicted in zip(
-            actual_boundaries,
-            predicted_boundaries,
+        (
+            (second[0] - first[0]) * (center_y - first[1])
+            - (second[1] - first[1]) * (center_x - first[0])
+        )
+        > 1e-6
+        for first, second in (
+            (corners[index], corners[(index + 1) % 4])
+            for index in range(4)
         )
     )
 
@@ -1211,7 +1135,7 @@ def fit_vq2_aperture_mask(
     if (
         temporally_associated
         and tracking_prior is not None
-        and not _quad_coheres_with_tracking_prior(
+        and not _quad_contains_tracking_prior_center(
             corners,
             tracking_prior,
         )

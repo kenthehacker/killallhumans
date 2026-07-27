@@ -570,8 +570,10 @@ def test_unique_temporal_gap_association_is_tracking_only() -> None:
     cv2.rectangle(mask, (86, 20), (94, 100), 255, -1)
     prior = VQ2ApertureTrackingPrior(
         center_px=(55.0, 60.0),
-        half_size_px=(30.5, 35.5),
-        maximum_boundary_residual_px=1.0,
+        # Extent is deliberately stale: identity comes from the one fresh gap
+        # containing the predicted center, while current pixels refit extent.
+        half_size_px=(15.0, 20.0),
+        maximum_boundary_residual_px=0.1,
     )
 
     fit = fit_vq2_aperture_mask(
@@ -610,7 +612,7 @@ def test_unique_temporal_gap_association_is_tracking_only() -> None:
     )
 
 
-def test_temporal_prior_compares_perspective_edges_at_centerlines() -> None:
+def test_temporal_prior_requires_fresh_quad_to_contain_predicted_center() -> None:
     prior = VQ2ApertureTrackingPrior(
         center_px=(90.0, 60.0),
         half_size_px=(30.0, 40.0),
@@ -623,7 +625,7 @@ def test_temporal_prior_compares_perspective_edges_at_centerlines() -> None:
         (70.0, 100.0),
     )
 
-    assert vq2_geometry_module._quad_coheres_with_tracking_prior(
+    assert vq2_geometry_module._quad_contains_tracking_prior_center(
         perspective_quad,
         prior,
     )
