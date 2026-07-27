@@ -20,6 +20,8 @@ from planning.vq2_dynamic_course import (
     DynamicCourseConfig,
     DynamicCourseError,
     ImuAttitudeSample,
+    MAX_TARGET_PITCH_RAD,
+    MIN_TARGET_PITCH_RAD,
 )
 from planning.vq2_dynamic_visual_approach import (
     BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ,
@@ -27,6 +29,7 @@ from planning.vq2_dynamic_visual_approach import (
     DynamicRollingVisualApproachServo,
     DynamicVisualCourseSession,
     PostCreditSuccessorSteeringUnavailable,
+    _predicted_successor_pitch_reference,
     production_dynamic_course_config,
 )
 from planning.vq2_gate_graph import (
@@ -57,6 +60,101 @@ def test_production_camera_boundary_uses_live_axis_calibration() -> None:
         BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
     )
     assert config.camera_to_body_wxyz == (0.0, 1.0, 0.0, 0.0)
+
+
+def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
+    config = production_dynamic_course_config()
+
+    top_target, top_error, top_rate, top_lead = (
+        _predicted_successor_pitch_reference(
+            camera_center_y_norm=-0.605,
+            camera_center_rate_y_norm_s=-0.309,
+            vertical_angle_scale_rad=config.vertical_angle_scale_rad,
+            pitch_command_delay_s=config.pitch_command_delay_s,
+            maximum_lead_rad=(
+                config.successor_prediction_max_extrapolation_rad
+            ),
+            baseline_pitch_rad=config.brake_pitch_rad,
+        )
+    )
+    worsening_target, *_ = _predicted_successor_pitch_reference(
+        camera_center_y_norm=-0.696,
+        camera_center_rate_y_norm_s=-0.544,
+        vertical_angle_scale_rad=config.vertical_angle_scale_rad,
+        pitch_command_delay_s=config.pitch_command_delay_s,
+        maximum_lead_rad=(
+            config.successor_prediction_max_extrapolation_rad
+        ),
+        baseline_pitch_rad=config.brake_pitch_rad,
+    )
+    recovering_target, *_ = _predicted_successor_pitch_reference(
+        camera_center_y_norm=-0.605,
+        camera_center_rate_y_norm_s=0.500,
+        vertical_angle_scale_rad=config.vertical_angle_scale_rad,
+        pitch_command_delay_s=config.pitch_command_delay_s,
+        maximum_lead_rad=(
+            config.successor_prediction_max_extrapolation_rad
+        ),
+        baseline_pitch_rad=config.brake_pitch_rad,
+    )
+    recovered_target, recovered_error, recovered_rate, recovered_lead = (
+        _predicted_successor_pitch_reference(
+            camera_center_y_norm=0.0,
+            camera_center_rate_y_norm_s=0.0,
+            vertical_angle_scale_rad=config.vertical_angle_scale_rad,
+            pitch_command_delay_s=config.pitch_command_delay_s,
+            maximum_lead_rad=(
+                config.successor_prediction_max_extrapolation_rad
+            ),
+            baseline_pitch_rad=config.brake_pitch_rad,
+        )
+    )
+    bottom_target, *_ = _predicted_successor_pitch_reference(
+        camera_center_y_norm=0.020,
+        camera_center_rate_y_norm_s=0.0,
+        vertical_angle_scale_rad=config.vertical_angle_scale_rad,
+        pitch_command_delay_s=config.pitch_command_delay_s,
+        maximum_lead_rad=(
+            config.successor_prediction_max_extrapolation_rad
+        ),
+        baseline_pitch_rad=config.brake_pitch_rad,
+    )
+
+    assert all(
+        math.isfinite(value)
+        for value in (
+            top_target,
+            top_error,
+            top_rate,
+            top_lead,
+            worsening_target,
+            recovering_target,
+            recovered_target,
+            recovered_error,
+            recovered_rate,
+            recovered_lead,
+            bottom_target,
+        )
+    )
+    assert all(
+        MIN_TARGET_PITCH_RAD <= target <= MAX_TARGET_PITCH_RAD
+        for target in (
+            worsening_target,
+            top_target,
+            recovering_target,
+            recovered_target,
+            bottom_target,
+        )
+    )
+    assert worsening_target <= top_target < recovering_target < 0.0
+    assert top_error < 0.0
+    assert top_rate < 0.0
+    assert top_lead < 0.0
+    assert recovered_target == pytest.approx(config.brake_pitch_rad)
+    assert bottom_target > recovered_target
+    assert recovered_error == 0.0
+    assert recovered_rate == 0.0
+    assert recovered_lead == 0.0
 
 
 def _inner_aperture(
@@ -1956,6 +2054,68 @@ def test_post_credit_activation_accepts_causal_wire_after_race_ingress():
     assert session.core.course_state().current_track_id == successor_id
     assert authority["source_wire_start_monotonic_ns"] == wire_ns
     assert authority["wire_command"] == command
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+    assert authority["target_pitch_rad"] == pytest.approx(
+        session.core.config.brake_pitch_rad
+    )
+    assert authority["camera_elevation_error_rad"] == pytest.approx(0.0)
+    assert authority["camera_elevation_rate_rad_s"] == pytest.approx(0.0)
+    assert authority["pitch_delay_lead_rad"] == pytest.approx(0.0)
+
+
+def test_post_credit_steering_uses_predicted_camera_elevation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    session, successor_id = _bound_post_credit_successor()
+    successor = session.core.course_state().successor
+    assert successor is not None
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    activation_ns = wire_ns + 2_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.05,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=-0.04,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(0.03, 0.02, -0.04, 0.275),
+        wire_start_monotonic_ns=wire_ns,
+    )
+    session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    predict = session.core.predict_track_steering
+    prediction = predict(successor_id, activation_ns)
+
+    def live_vertical_prediction(track_id: str, monotonic_ns: int):
+        base = predict(track_id, monotonic_ns)
+        return replace(
+            base,
+            camera_center_norm=(base.camera_center_norm[0], -0.605),
+            camera_center_rate_norm_s=(
+                base.camera_center_rate_norm_s[0],
+                -0.309,
+            ),
+        )
+
+    monkeypatch.setattr(
+        session.core,
+        "predict_track_steering",
+        live_vertical_prediction,
+    )
+    authority = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=activation_ns,
+    )
+
+    assert prediction.camera_center_norm[1] == pytest.approx(0.0)
+    assert MIN_TARGET_PITCH_RAD <= authority["target_pitch_rad"] < 0.0
+    assert authority["camera_elevation_error_rad"] < 0.0
+    assert authority["camera_elevation_rate_rad_s"] < 0.0
+    assert authority["pitch_delay_lead_rad"] < 0.0
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False

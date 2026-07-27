@@ -73,6 +73,65 @@ class PostCreditSuccessorSteeringUnavailable(DynamicCourseError):
     """Optional predicted steering ended while race-owned handoff remains."""
 
 
+def _predicted_successor_pitch_reference(
+    *,
+    camera_center_y_norm: float,
+    camera_center_rate_y_norm_s: float,
+    vertical_angle_scale_rad: float,
+    pitch_command_delay_s: float,
+    maximum_lead_rad: float,
+    baseline_pitch_rad: float,
+) -> tuple[float, float, float, float]:
+    """Convert the predicted camera elevation into a bounded pitch reference."""
+
+    values = (
+        camera_center_y_norm,
+        camera_center_rate_y_norm_s,
+        vertical_angle_scale_rad,
+        pitch_command_delay_s,
+        maximum_lead_rad,
+        baseline_pitch_rad,
+    )
+    if (
+        not all(math.isfinite(value) for value in values)
+        or vertical_angle_scale_rad <= 0.0
+        or pitch_command_delay_s < 0.0
+        or maximum_lead_rad < 0.0
+    ):
+        raise DynamicCourseError(
+            "post-credit successor pitch geometry is invalid"
+        )
+    vertical_ratio = camera_center_y_norm * vertical_angle_scale_rad
+    camera_elevation_rad = math.atan(vertical_ratio)
+    camera_elevation_rate_rad_s = (
+        vertical_angle_scale_rad
+        * camera_center_rate_y_norm_s
+        / (1.0 + vertical_ratio * vertical_ratio)
+    )
+    pitch_delay_lead_rad = min(
+        maximum_lead_rad,
+        max(
+            -maximum_lead_rad,
+            pitch_command_delay_s * camera_elevation_rate_rad_s,
+        ),
+    )
+    target_pitch_rad = min(
+        MAX_TARGET_PITCH_RAD,
+        max(
+            MIN_TARGET_PITCH_RAD,
+            baseline_pitch_rad
+            + camera_elevation_rad
+            + pitch_delay_lead_rad,
+        ),
+    )
+    return (
+        target_pitch_rad,
+        camera_elevation_rad,
+        camera_elevation_rate_rad_s,
+        pitch_delay_lead_rad,
+    )
+
+
 def _complete_current_inner_geometry(
     track: VisualTrack,
 ) -> VisualInnerApertureGeometry | None:
@@ -825,12 +884,24 @@ class DynamicVisualCourseSession:
             MAX_TARGET_ROLL_RAD,
             max(-MAX_TARGET_ROLL_RAD, target_roll),
         )
-        target_pitch = min(
-            MAX_TARGET_PITCH_RAD,
-            max(
-                MIN_TARGET_PITCH_RAD,
-                self.core.config.brake_pitch_rad,
+        (
+            target_pitch,
+            camera_elevation,
+            camera_elevation_rate,
+            pitch_delay_lead,
+        ) = _predicted_successor_pitch_reference(
+            camera_center_y_norm=prediction.camera_center_norm[1],
+            camera_center_rate_y_norm_s=(
+                prediction.camera_center_rate_norm_s[1]
             ),
+            vertical_angle_scale_rad=(
+                self.core.config.vertical_angle_scale_rad
+            ),
+            pitch_command_delay_s=self.core.config.pitch_command_delay_s,
+            maximum_lead_rad=(
+                self.core.config.successor_prediction_max_extrapolation_rad
+            ),
+            baseline_pitch_rad=self.core.config.brake_pitch_rad,
         )
         camera_heading = math.atan(
             prediction.camera_center_norm[0]
@@ -896,6 +967,9 @@ class DynamicVisualCourseSession:
                 "camera_center_rate_norm_s": list(
                     prediction.camera_center_rate_norm_s
                 ),
+                "camera_elevation_error_rad": camera_elevation,
+                "camera_elevation_rate_rad_s": camera_elevation_rate,
+                "pitch_delay_lead_rad": pitch_delay_lead,
                 "bearing_std_rad": list(
                     prediction.bearing_std_rad
                 ),
