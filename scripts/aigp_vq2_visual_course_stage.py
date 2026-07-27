@@ -6253,6 +6253,10 @@ async def _run_visual_course_stage_impl(
         crossing_coast_authority: Optional[
             _CensoredPassageCoastAuthority
         ] = None
+        crossing_reviewed_track_id: Optional[str] = None
+        crossing_successor_identity_sealed = False
+        crossing_commitment_deadline_s: Optional[float] = None
+        crossing_predicted_contact_deadline_s: Optional[float] = None
         last_clean_passage_token: Optional[CameraFrameToken] = None
         censored_passage_coast_started_s: Optional[float] = None
         censored_passage_coast_last_observed_token: Optional[
@@ -6329,6 +6333,8 @@ async def _run_visual_course_stage_impl(
             "lifecycle": lifecycle.value,
             "near_plane_evidence_frame_count": 0,
             "near_plane_latch": None,
+            "near_plane_reviewed_track_id": None,
+            "near_plane_successor_identity_sealed": False,
             "near_plane_measurement_mode": None,
             "crossing_anchor": None,
             "outcome": "running",
@@ -6686,8 +6692,12 @@ async def _run_visual_course_stage_impl(
                 censored_passage_coast_started_s is not None
                 and now
                 >= (
-                    censored_passage_coast_started_s
-                    + limits.censored_passage_coast_max_duration_s
+                    crossing_commitment_deadline_s
+                    if crossing_commitment_deadline_s is not None
+                    else (
+                        censored_passage_coast_started_s
+                        + limits.censored_passage_coast_max_duration_s
+                    )
                 )
             ):
                 crossing_started_s = crossing_started_s or now
@@ -7577,6 +7587,14 @@ async def _run_visual_course_stage_impl(
                         measurement_mode
                         is LatchedMeasurementMode.CREDIT_WAIT
                     ):
+                        if (
+                            crossing_anchor is None
+                            or crossing_coast_authority is None
+                        ):
+                            raise abort_type(
+                                "visual-course credit wait lacks an atomic "
+                                "crossing commitment"
+                            ) from exc
                         lifecycle = CourseLifecycle.CREDIT_WAIT
                         segment["lifecycle"] = lifecycle.value
                         segment["near_plane_measurement_mode"] = (
@@ -7610,14 +7628,25 @@ async def _run_visual_course_stage_impl(
                 censored_coast_eligible = bool(
                     type(exc)
                     is VisualApproachCurrentGeometryUnavailable
-                    and mode is VisualApproachMode.PASSAGE
-                    and type(passage_admission)
-                    is VisualApproachPassageAdmission
                     and crossing_anchor is not None
                     and crossing_coast_authority is not None
                     and previous_visible_token is not None
                     and measurement_mode
                     is LatchedMeasurementMode.COAST
+                    and (
+                        (
+                            mode is VisualApproachMode.PASSAGE
+                            and type(passage_admission)
+                            is VisualApproachPassageAdmission
+                        )
+                        or (
+                            near_plane_latch is not None
+                            and near_plane_latch.basis
+                            == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+                            and lifecycle
+                            is CourseLifecycle.NEAR_PLANE_LATCHED
+                        )
+                    )
                 )
                 if censored_coast_eligible:
                     segment["near_plane_measurement_mode"] = (
@@ -7625,6 +7654,11 @@ async def _run_visual_course_stage_impl(
                     )
                     if censored_passage_coast_started_s is None:
                         censored_passage_coast_started_s = now
+                        dynamic_coast_deadline_s = (
+                            None
+                            if crossing_commitment_deadline_s is None
+                            else crossing_commitment_deadline_s
+                        )
                         segment["censored_passage_coast"] = {
                             "basis": CENSORED_PASSAGE_COAST_BASIS,
                             "anchor_camera_token": asdict(
@@ -7644,12 +7678,25 @@ async def _run_visual_course_stage_impl(
                                 crossing_coast_authority.requested_thrust
                             ),
                             "max_duration_s": (
-                                limits
-                                .censored_passage_coast_max_duration_s
+                                (
+                                    dynamic_coast_deadline_s - now
+                                )
+                                if dynamic_coast_deadline_s is not None
+                                else (
+                                    limits
+                                    .censored_passage_coast_max_duration_s
+                                )
                             ),
                             "max_fresh_frames": (
-                                limits
-                                .censored_passage_coast_max_fresh_frames
+                                None
+                                if dynamic_coast_deadline_s is not None
+                                else (
+                                    limits
+                                    .censored_passage_coast_max_fresh_frames
+                                )
+                            ),
+                            "commitment_deadline_monotonic_s": (
+                                crossing_commitment_deadline_s
                             ),
                             "elapsed_s": 0.0,
                         }
@@ -7666,12 +7713,25 @@ async def _run_visual_course_stage_impl(
                         now - censored_passage_coast_started_s
                     )
                     if (
-                        coast_elapsed_s
-                        >= limits.censored_passage_coast_max_duration_s
-                        or censored_passage_coast_fresh_frame_count
-                        >= (
-                            limits
-                            .censored_passage_coast_max_fresh_frames
+                        (
+                            crossing_commitment_deadline_s is not None
+                            and now
+                            >= crossing_commitment_deadline_s
+                        )
+                        or (
+                            crossing_commitment_deadline_s is None
+                            and (
+                                coast_elapsed_s
+                                >= (
+                                    limits
+                                    .censored_passage_coast_max_duration_s
+                                )
+                                or censored_passage_coast_fresh_frame_count
+                                >= (
+                                    limits
+                                    .censored_passage_coast_max_fresh_frames
+                                )
+                            )
                         )
                     ):
                         crossing_started_s = now
@@ -7706,9 +7766,18 @@ async def _run_visual_course_stage_impl(
                                     "censored-passage"
                                 ),
                                 command_deadline_s=(
-                                    censored_passage_coast_started_s
-                                    + limits
-                                    .censored_passage_coast_max_duration_s
+                                    (
+                                        crossing_commitment_deadline_s
+                                    )
+                                    if (
+                                        crossing_commitment_deadline_s
+                                        is not None
+                                    )
+                                    else (
+                                        censored_passage_coast_started_s
+                                        + limits
+                                        .censored_passage_coast_max_duration_s
+                                    )
                                 ),
                             )
                         )
@@ -7809,10 +7878,69 @@ async def _run_visual_course_stage_impl(
                     )
                 approach_inner_dropout_authority = None
             if censored_passage_coast_started_s is not None:
-                raise abort_type(
-                    "visual-course censored passage coast returned to "
-                    "uncensored geometry"
+                if (
+                    crossing_commitment_deadline_s is None
+                    or crossing_coast_authority is None
+                ):
+                    raise abort_type(
+                        "visual-course censored passage coast returned to "
+                        "uncensored geometry"
+                    )
+                if now >= crossing_commitment_deadline_s:
+                    crossing_started_s = crossing_started_s or now
+                    if crossing_baseline_race is None:
+                        raise abort_type(
+                            "visual-course bounded coast lacks a race "
+                            "baseline"
+                        )
+                    break
+                censored_passage_coast_last_observed_token = token
+                censored_passage_coast_fresh_frame_count += 1
+                segment[
+                    "censored_passage_coast_fresh_frame_count"
+                ] = censored_passage_coast_fresh_frame_count
+                segment["near_plane_measurement_mode"] = (
+                    LatchedMeasurementMode.COAST.value
                 )
+                segment["censored_passage_coast"].update(
+                    {
+                        "last_censored_camera_token": asdict(token),
+                        "elapsed_s": (
+                            now - censored_passage_coast_started_s
+                        ),
+                        "geometry_reacquired": True,
+                    }
+                )
+                last_planned_token = token
+                try:
+                    coast_command = await send_censored_passage_coast(
+                        snapshot=snapshot,
+                        authority=crossing_coast_authority,
+                        yaw_reference_rad=yaw_reference_rad,
+                        segment_started_s=segment_started_s,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/censored-passage-"
+                            "reacquired"
+                        ),
+                        command_deadline_s=(
+                            crossing_commitment_deadline_s
+                        ),
+                    )
+                except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                    credited_race = accept_no_wire_race_boundary(
+                        race_exc
+                    )
+                    break
+                if coast_command is None:
+                    continue
+                censored_passage_coast_command_count += 1
+                passage_command_count += 1
+                segment["passage_command_count"] = passage_command_count
+                segment[
+                    "censored_passage_coast_command_count"
+                ] = censored_passage_coast_command_count
+                continue
             if (
                 mode is VisualApproachMode.PASSAGE
                 and not passage_forward_closure_authorized
@@ -8239,45 +8367,20 @@ async def _run_visual_course_stage_impl(
                     segment["near_plane_evidence_frame_count"] = len(
                         near_plane_evidence.samples
                     )
-                    if candidate_latch is not None:
-                        near_plane_latch = candidate_latch
-                if proposal.passage_admission is not None:
-                    if accepted.yaw_soft_stop_zeroed:
-                        segment[
-                            "passage_admission_yaw_soft_stop_withheld_count"
-                        ] = int(
-                            segment[
-                                "passage_admission_yaw_soft_stop_withheld_count"
-                            ]
-                        ) + 1
-                        continue
                     if (
-                        accepted.dynamic_evidence is not None
-                        and (
-                            near_plane_latch is None
-                            or near_plane_latch.basis
+                        candidate_latch is not None
+                        and not accepted.yaw_soft_stop_zeroed
+                        and near_plane_latch is None
+                    ):
+                        if (
+                            candidate_latch.basis
                             != DYNAMIC_NEAR_PLANE_LATCH_BASIS
-                        )
-                    ):
-                        continue
-                    passage_admission = proposal.passage_admission
-                    mode = VisualApproachMode.PASSAGE
-                    lifecycle = (
-                        CourseLifecycle.NEAR_PLANE_LATCHED
-                        if near_plane_latch is not None
-                        else CourseLifecycle.PASSAGE_ARMED
-                    )
-                    passage_started_s = float(runtime.monotonic())
-                    segment["passage_authority_enabled"] = True
-                    segment["lifecycle"] = lifecycle.value
-                    segment["passage_admission"] = asdict(
-                        passage_admission
-                    )
-                    if (
-                        near_plane_latch is not None
-                        and near_plane_latch.basis
-                        == DYNAMIC_NEAR_PLANE_LATCH_BASIS
-                    ):
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic crossing candidate "
+                                "has the wrong authority basis"
+                            )
+                        near_plane_latch = candidate_latch
                         command = accepted.command
                         coast_thrust = (
                             float(command.thrust)
@@ -8315,7 +8418,163 @@ async def _run_visual_course_stage_impl(
                                 ),
                             )
                         )
+                        proposal_reviewed_track_id = getattr(
+                            proposal,
+                            "latched_next_track_id",
+                            None,
+                        )
+                        if (
+                            proposal_reviewed_track_id is not None
+                            and (
+                                type(proposal_reviewed_track_id) is not str
+                                or not proposal_reviewed_track_id
+                            )
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic crossing retained "
+                                "successor identity is invalid"
+                            )
+                        dynamic_successor_track_id = (
+                            accepted.dynamic_evidence.get(
+                                "successor_track_id"
+                            )
+                        )
+                        if (
+                            dynamic_successor_track_id is not None
+                            and (
+                                type(dynamic_successor_track_id) is not str
+                                or not dynamic_successor_track_id
+                            )
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic crossing successor "
+                                "identity is invalid"
+                            )
+                        if (
+                            proposal_reviewed_track_id is not None
+                            and dynamic_successor_track_id is not None
+                            and proposal_reviewed_track_id
+                            != dynamic_successor_track_id
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic crossing successor "
+                                "identities diverged"
+                            )
+                        retained_dynamic_successor_id: Optional[str] = None
+                        if (
+                            type(runtime.dynamic_controller)
+                            is DynamicVisualCourseSession
+                            and dynamic_successor_track_id is not None
+                            and runtime.dynamic_controller.core
+                            .retains_successor_lineage(
+                                dynamic_successor_track_id,
+                                accepted.wire_return_monotonic_ns,
+                            )
+                        ):
+                            retained_dynamic_successor_id = (
+                                dynamic_successor_track_id
+                            )
+                        committed_reviewed_track_id = (
+                            proposal_reviewed_track_id
+                            if proposal_reviewed_track_id is not None
+                            else retained_dynamic_successor_id
+                        )
+                        if (
+                            crossing_reviewed_track_id is not None
+                            and committed_reviewed_track_id is not None
+                            and crossing_reviewed_track_id
+                            != committed_reviewed_track_id
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic crossing changed its "
+                                "reviewed successor identity"
+                            )
+                        if committed_reviewed_track_id is not None:
+                            crossing_reviewed_track_id = (
+                                committed_reviewed_track_id
+                            )
+                            crossing_successor_identity_sealed = True
                         anchor = near_plane_latch.anchor_sample
+                        assert (
+                            anchor.crossing_prediction_horizon_s
+                            is not None
+                        )
+                        # A physical commitment reaches its own predicted
+                        # crossing plus the already-bounded near-plane ingress
+                        # allowance, but never outlives a propagated aperture
+                        # lease.  This is a state-evidence lease, not a second
+                        # command slew governor.
+                        contact_plus_ingress_horizon_s = (
+                            float(
+                                anchor.crossing_prediction_horizon_s
+                            )
+                            + min(
+                                limits
+                                .censored_passage_coast_max_duration_s,
+                                limits.crossing_status_timeout_s,
+                            )
+                        )
+                        commitment_horizon_s = (
+                            min(
+                                DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
+                                contact_plus_ingress_horizon_s,
+                            )
+                            if (
+                                anchor
+                                .propagated_state_horizon_remaining_s
+                                is None
+                            )
+                            else min(
+                                contact_plus_ingress_horizon_s,
+                                float(
+                                    anchor
+                                    .propagated_state_horizon_remaining_s
+                                ),
+                            )
+                        )
+                        commitment_deadline_perf_counter_ns = (
+                            accepted.wire_start_monotonic_ns
+                            + round(
+                                commitment_horizon_s
+                                * 1_000_000_000.0
+                            )
+                        )
+                        predicted_contact_perf_counter_ns = (
+                            accepted.wire_start_monotonic_ns
+                            + round(
+                                float(
+                                    anchor.crossing_prediction_horizon_s
+                                )
+                                * 1_000_000_000.0
+                            )
+                        )
+                        deadline_validation_perf_counter_ns = (
+                            runtime.perf_counter_ns()
+                        )
+                        deadline_validation_monotonic_s = float(
+                            runtime.monotonic()
+                        )
+                        commitment_remaining_s = (
+                            commitment_deadline_perf_counter_ns
+                            - deadline_validation_perf_counter_ns
+                        ) / 1_000_000_000.0
+                        predicted_contact_remaining_s = (
+                            predicted_contact_perf_counter_ns
+                            - deadline_validation_perf_counter_ns
+                        ) / 1_000_000_000.0
+                        if commitment_remaining_s <= 0.0:
+                            raise abort_type(
+                                "visual-course dynamic crossing commitment "
+                                "has no remaining causal horizon"
+                            )
+                        crossing_commitment_deadline_s = (
+                            deadline_validation_monotonic_s
+                            + commitment_remaining_s
+                        )
+                        crossing_predicted_contact_deadline_s = (
+                            deadline_validation_monotonic_s
+                            + max(0.0, predicted_contact_remaining_s)
+                        )
                         crossing_anchor = {
                             "basis": near_plane_latch.basis,
                             "camera_token": (
@@ -8326,13 +8585,12 @@ async def _run_visual_course_stage_impl(
                             "accepted_wire_frame_count": len(
                                 near_plane_latch.evidence.samples
                             ),
-                            "advance_command_count": (
-                                advance_command_count
+                            "advance_command_count": advance_command_count,
+                            "reviewed_successor_track_id": (
+                                crossing_reviewed_track_id
                             ),
                             "log_scale": anchor.log_scale,
-                            "log_scale_rate_s": (
-                                anchor.log_scale_rate_s
-                            ),
+                            "log_scale_rate_s": anchor.log_scale_rate_s,
                             "normalized_x": anchor.normalized_x,
                             "normalized_y_down": (
                                 anchor.normalized_y_down
@@ -8343,12 +8601,8 @@ async def _run_visual_course_stage_impl(
                             "normalized_y_rate_down_s": (
                                 anchor.normalized_y_rate_down_s
                             ),
-                            "normalized_x_std": (
-                                anchor.normalized_x_std
-                            ),
-                            "normalized_y_std": (
-                                anchor.normalized_y_std
-                            ),
+                            "normalized_x_std": anchor.normalized_x_std,
+                            "normalized_y_std": anchor.normalized_y_std,
                             "log_scale_std": anchor.log_scale_std,
                             "crossing_prediction_horizon_s": (
                                 anchor.crossing_prediction_horizon_s
@@ -8396,7 +8650,8 @@ async def _run_visual_course_stage_impl(
                                         anchor.predicted_crossing_x_norm
                                     )
                                     - 2.0
-                                    * anchor.predicted_crossing_x_std_norm
+                                    * anchor
+                                    .predicted_crossing_x_std_norm
                                 ),
                                 (
                                     anchor.crossing_allowance_y_norm
@@ -8408,8 +8663,23 @@ async def _run_visual_course_stage_impl(
                                 ),
                             ],
                             "post_governor_contact_budget_s": (
+                                anchor.post_governor_contact_budget_s
+                            ),
+                            "propagated_state_horizon_remaining_s": (
                                 anchor
-                                .post_governor_contact_budget_s
+                                .propagated_state_horizon_remaining_s
+                            ),
+                            "commitment_horizon_s": (
+                                commitment_horizon_s
+                            ),
+                            "predicted_contact_deadline_perf_counter_ns": (
+                                predicted_contact_perf_counter_ns
+                            ),
+                            "commitment_deadline_perf_counter_ns": (
+                                commitment_deadline_perf_counter_ns
+                            ),
+                            "commitment_deadline_monotonic_s": (
+                                crossing_commitment_deadline_s
                             ),
                             "command": asdict(command),
                             "current_only_crossing_coast_thrust": (
@@ -8419,6 +8689,19 @@ async def _run_visual_course_stage_impl(
                         last_clean_passage_token = (
                             near_plane_latch.anchor_camera_token
                         )
+                        lifecycle = CourseLifecycle.NEAR_PLANE_LATCHED
+                        passage_started_s = (
+                            passage_started_s
+                            or float(runtime.monotonic())
+                        )
+                        segment["passage_authority_enabled"] = True
+                        segment["lifecycle"] = lifecycle.value
+                        segment["near_plane_reviewed_track_id"] = (
+                            crossing_reviewed_track_id
+                        )
+                        segment[
+                            "near_plane_successor_identity_sealed"
+                        ] = crossing_successor_identity_sealed
                         segment["near_plane_latch"] = {
                             **crossing_anchor,
                             "camera_token": asdict(
@@ -8436,6 +8719,65 @@ async def _run_visual_course_stage_impl(
                             ),
                             **segment["near_plane_latch"],
                         )
+                if proposal.passage_admission is not None:
+                    if accepted.yaw_soft_stop_zeroed:
+                        segment[
+                            "passage_admission_yaw_soft_stop_withheld_count"
+                        ] = int(
+                            segment[
+                                "passage_admission_yaw_soft_stop_withheld_count"
+                            ]
+                        ) + 1
+                        continue
+                    if (
+                        accepted.dynamic_evidence is not None
+                        and (
+                            near_plane_latch is None
+                            or near_plane_latch.basis
+                            != DYNAMIC_NEAR_PLANE_LATCH_BASIS
+                        )
+                    ):
+                        continue
+                    passage_admission = proposal.passage_admission
+                    mode = VisualApproachMode.PASSAGE
+                    lifecycle = (
+                        CourseLifecycle.NEAR_PLANE_LATCHED
+                        if near_plane_latch is not None
+                        else CourseLifecycle.PASSAGE_ARMED
+                    )
+                    passage_started_s = float(runtime.monotonic())
+                    segment["passage_authority_enabled"] = True
+                    segment["lifecycle"] = lifecycle.value
+                    segment["passage_admission"] = asdict(
+                        passage_admission
+                    )
+                    if (
+                        passage_admission.preview_track_id is not None
+                    ):
+                        if not (
+                            crossing_reviewed_track_id is None
+                            or crossing_reviewed_track_id
+                            == passage_admission.preview_track_id
+                        ):
+                            raise abort_type(
+                                "visual-course passage admission changed its "
+                                "reviewed successor identity"
+                            )
+                        crossing_reviewed_track_id = (
+                            passage_admission.preview_track_id
+                        )
+                        if (
+                            near_plane_latch is not None
+                            and near_plane_latch.basis
+                            == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+                        ):
+                            crossing_successor_identity_sealed = True
+                        segment["near_plane_reviewed_track_id"] = (
+                            crossing_reviewed_track_id
+                        )
+                        segment[
+                            "near_plane_successor_identity_sealed"
+                        ] = crossing_successor_identity_sealed
                 continue
 
             if proposal.mode is not VisualApproachMode.PASSAGE:
@@ -8717,6 +9059,17 @@ async def _run_visual_course_stage_impl(
         crossing_deadline_s = (
             crossing_started_s + limits.crossing_status_timeout_s
         )
+        if crossing_predicted_contact_deadline_s is not None:
+            # Race ingress is an independent 4 Hz authority.  Its bounded
+            # polling window starts no earlier than predicted physical
+            # contact; the command/state lease below may expire first.
+            crossing_deadline_s = (
+                max(
+                    crossing_started_s,
+                    crossing_predicted_contact_deadline_s,
+                )
+                + limits.crossing_status_timeout_s
+            )
         while credited_race is None:
             now = await pace_tick()
             if now >= min(course_deadline_s, crossing_deadline_s):
@@ -8769,6 +9122,7 @@ async def _run_visual_course_stage_impl(
             if (
                 crossing_coast_authority is None
                 or near_plane_latch is None
+                or crossing_anchor is None
             ):
                 raise abort_type(
                     "visual-course credit wait lacks latched coast authority"
@@ -8814,6 +9168,27 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course credit-wait measurement became unsafe"
                 )
+            if (
+                crossing_commitment_deadline_s is not None
+                and now >= crossing_commitment_deadline_s
+            ):
+                # The local gate-relative state no longer owns geometry, but
+                # authoritative race ingress still has its independent
+                # bounded cadence window.  Exact zero retires the committed
+                # command without fabricating either passage or promotion.
+                last_planned_token = token
+                await send_zero(
+                    (
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/credit-wait-zero"
+                    ),
+                    now - segment_started_s,
+                    yaw_reference_rad=yaw_reference_rad,
+                )
+                segment["crossing_wait_zero_command_count"] = int(
+                    segment["crossing_wait_zero_command_count"]
+                ) + 1
+                continue
 
             adjacent_candidates = tuple(
                 candidate
@@ -8858,8 +9233,20 @@ async def _run_visual_course_stage_impl(
                 and adjacent_candidates[0].latest_token == token
                 and type(adjacent_candidates[0].track_id) is str
                 and adjacent_candidates[0].track_id
-                and type(passage_admission)
-                is VisualApproachPassageAdmission
+                and (
+                    (
+                        crossing_successor_identity_sealed
+                        and
+                        type(crossing_reviewed_track_id) is str
+                        and adjacent_candidates[0].track_id
+                        == crossing_reviewed_track_id
+                    )
+                    or (
+                        not crossing_successor_identity_sealed
+                        and type(passage_admission)
+                        is VisualApproachPassageAdmission
+                    )
+                )
             ):
                 credit_wait_adjacent_track_id = (
                     adjacent_candidates[0].track_id
@@ -9079,10 +9466,24 @@ async def _run_visual_course_stage_impl(
         ]
         refresh_live_summary()
 
+        admission_reviewed_track_id = (
+            passage_admission.preview_track_id
+            if (
+                type(passage_admission)
+                is VisualApproachPassageAdmission
+                and type(passage_admission.preview_track_id) is str
+                and passage_admission.preview_track_id
+            )
+            else None
+        )
+        requested_promoted_track_id = (
+            credit_wait_reviewed_track_id
+            or admission_reviewed_track_id
+            or crossing_reviewed_track_id
+        )
         if (
-            type(passage_admission) is not VisualApproachPassageAdmission
-            or type(passage_admission.preview_track_id) is not str
-            or not passage_admission.preview_track_id
+            type(requested_promoted_track_id) is not str
+            or not requested_promoted_track_id
         ):
             raise abort_type(
                 "visual-course nonterminal transition lacks its reviewed "
@@ -9093,11 +9494,6 @@ async def _run_visual_course_stage_impl(
         # replace the pre-clipping preview for the promotion request, but only
         # after authoritative race credit below; its pre-credit proposal has
         # steering-only, no-advance authority.
-        requested_promoted_track_id = (
-            credit_wait_reviewed_track_id
-            if credit_wait_reviewed_track_id is not None
-            else passage_admission.preview_track_id
-        )
         fresh_deadline_s = min(
             course_deadline_s,
             float(runtime.monotonic())

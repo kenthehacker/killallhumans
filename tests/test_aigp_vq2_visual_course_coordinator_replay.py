@@ -117,6 +117,7 @@ class _CadencedCoordinatorHost(_CoordinatorHost):
         credit_policy: str,
         unsafe_after_latch: bool = False,
         finish_gate: int = 2,
+        credit_delay_s: float = _RACE_STATUS_PERIOD_S,
     ) -> None:
         super().__init__(
             initial_gate=1,
@@ -124,6 +125,7 @@ class _CadencedCoordinatorHost(_CoordinatorHost):
             disable_credit=True,
         )
         self.credit_policy = credit_policy
+        self.credit_delay_s = credit_delay_s
         self.unsafe_after_latch = unsafe_after_latch
         self._next_camera_s = self.clock + _CAMERA_PERIOD_S
         self._track_histories: dict[str, list[SimpleNamespace]] = {}
@@ -293,7 +295,7 @@ class _CadencedCoordinatorHost(_CoordinatorHost):
             anchor_s = float(accepted_wires[-1]["wire_start_s"])
             self.anchor_times[gate_index] = anchor_s
             self.credit_due_times[gate_index] = (
-                anchor_s + _RACE_STATUS_PERIOD_S
+                anchor_s + self.credit_delay_s
             )
             self._censor_step[gate_index] = 0
             if not self._overrun_injected:
@@ -1314,6 +1316,140 @@ def test_c25_top_only_approach_recovery_is_bounded_and_never_latches():
     assert recovery["requested_thrust"] == pytest.approx(
         0.2892416792249238
     )
+    assert not any(
+        event == "visual_course_near_plane_latched"
+        for event, _payload in host.recorder.events
+    )
+
+
+class _AdmissionlessCadencedServo(_CadencedCoordinatorServo):
+    """Expose a safe dynamic crossing without planner admission."""
+
+    def observe(self, *args, **kwargs):
+        proposal = super().observe(*args, **kwargs)
+        proposal.passage_admission = None
+        return proposal
+
+
+class _AtomicCrossingDynamicController(_C25DynamicController):
+    """Emit one internally consistent accepted-wire crossing candidate."""
+
+    def __init__(self, track_id, gate_index, *, safe_clearance):
+        super().__init__(track_id, gate_index)
+        self.safe_clearance = safe_clearance
+
+    def record_wire_acceptance(self, **kwargs):
+        evidence = super().record_wire_acceptance(**kwargs)
+        if self.safe_clearance:
+            evidence.update(
+                {
+                    "predicted_crossing_error_norm": [0.10, 0.10],
+                    "predicted_crossing_std_norm": [0.04, 0.04],
+                    "crossing_swept_occupancy_norm": [0.18, 0.18],
+                    "predicted_crossing_clearance_norm": [0.32, 0.27],
+                    "terminal_crossing_occupancy_norm": [0.18, 0.18],
+                    "terminal_crossing_clearance_norm": [0.32, 0.27],
+                    "post_governor_contact_budget_s": 0.40,
+                    "brake_reason": "aligning",
+                }
+            )
+        return evidence
+
+
+def _atomic_crossing_runtime(host, *, safe_clearance, limits=None):
+    runtime = _cadenced_runtime(host, limits=limits)
+    servo_calls = []
+
+    def servo_factory(*args, **kwargs):
+        return _AdmissionlessCadencedServo(
+            *args,
+            **kwargs,
+            calls=servo_calls,
+            yaw_rate=0.0,
+        )
+
+    return replace(
+        runtime,
+        servo_factory=servo_factory,
+        dynamic_controller=_AtomicCrossingDynamicController(
+            host.current_track_id,
+            host.current_gate,
+            safe_clearance=safe_clearance,
+        ),
+    )
+
+
+def test_dynamic_latch_without_admission_atomically_coasts_to_finish():
+    host = _CadencedCoordinatorHost(
+        credit_policy="delayed",
+        finish_gate=1,
+        # Later than the accepted command/state lease: committed crossing
+        # reaches predicted contact, then exact zero preserves a separate
+        # bounded authoritative-status ingress window.
+        credit_delay_s=1.15,
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(
+            host,
+            _context(),
+            runtime=_atomic_crossing_runtime(
+                host,
+                safe_clearance=True,
+            ),
+        )
+    )
+
+    assert result["race_finished"] is True
+    assert _state_suffix(host, 1) == ["bottom", "top_bottom", "lost"]
+    segment = result["segments"][0]
+    assert segment["passage_admission"] is None
+    assert segment["near_plane_latch"] is not None
+    assert segment["crossing_anchor"] == segment["near_plane_latch"]
+    assert segment["passage_authority_enabled"] is True
+    assert segment["near_plane_latch"]["commitment_horizon_s"] < 1.15
+    assert segment["censored_passage_coast_command_count"] >= 2
+    assert segment["crossing_wait_coast_command_count"] >= 1
+    assert segment["crossing_wait_zero_command_count"] >= 1
+    assert [
+        event
+        for event, _payload in host.recorder.events
+        if event == "visual_course_near_plane_latched"
+    ] == ["visual_course_near_plane_latched"]
+
+
+def test_dynamic_negative_clearance_without_admission_never_latches():
+    limits = replace(
+        VisualCourseStageLimits(),
+        segment_hard_duration_s=0.50,
+        passage_hard_duration_s=0.40,
+    )
+    host = _CadencedCoordinatorHost(
+        credit_policy="none",
+        finish_gate=1,
+    )
+
+    with pytest.raises(
+        SafetyAbort,
+        match="visual-course gate 1 segment expired",
+    ):
+        asyncio.run(
+            run_visual_course_stage(
+                host,
+                _context(),
+                runtime=_atomic_crossing_runtime(
+                    host,
+                    safe_clearance=False,
+                    limits=limits,
+                ),
+            )
+        )
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["passage_admission"] is None
+    assert segment["passage_authority_enabled"] is False
+    assert segment["near_plane_latch"] is None
+    assert segment["crossing_anchor"] is None
     assert not any(
         event == "visual_course_near_plane_latched"
         for event, _payload in host.recorder.events
