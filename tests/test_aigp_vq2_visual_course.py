@@ -17,6 +17,7 @@ from competition.vq2_visual_tracker import (
     AssociationEvidence,
     CameraFrameToken,
     FrameProvenanceBasis,
+    VisualInnerApertureGeometry,
     VisualTrackRole,
     VisualTrackSample,
 )
@@ -2170,7 +2171,7 @@ def test_launch_destination_cannot_raise_gain_before_reference_allocates_it():
     ) == 1.0
 
 
-def test_live_top_fov_geometry_holds_nose_up_before_outer_extent_clips():
+def test_live_top_fov_outer_fallback_holds_nose_up_before_support_clips():
     raw_top = course_stage._raw_bbox_top_image_down(
         (
             282.0 / 640.0,
@@ -2253,12 +2254,41 @@ def test_decreasing_top_clearance_cannot_worsen_predicted_clipping():
     assert recovered.limited is False
 
 
-def test_top_fov_pitch_limit_uses_bbox_extent_not_center_alone():
-    short_top = course_stage._raw_bbox_top_image_down(
-        (0.40, 0.40, 0.60, 0.60)
+def _inner_aperture(
+    *,
+    center_y: float,
+    half_y: float,
+    std_y: float = 0.01,
+    std_log_scale: float = 0.03,
+    confidence: float = 0.90,
+    visible_edges: FrameEdge = (
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    ),
+    health_reason: str | None = None,
+) -> VisualInnerApertureGeometry:
+    return VisualInnerApertureGeometry(
+        center_norm=(0.0, center_y),
+        half_size_norm=(0.20, half_y),
+        log_scale=-1.0,
+        measurement_std=(0.01, std_y, std_log_scale),
+        confidence=confidence,
+        clipping=FrameEdge.NONE,
+        visible_edges=visible_edges,
+        geometry_model_id="vq2-visible-inner-quad-lines-v1",
+        covariance_model_id="vq2-visible-aperture-diagonal-v1",
+        health_reason=health_reason,
     )
-    tall_top = course_stage._raw_bbox_top_image_down(
-        (0.40, 0.30, 0.60, 0.70)
+
+
+def test_top_fov_pitch_limit_uses_fitted_inner_extent_not_center_alone():
+    short_top = course_stage._conservative_inner_aperture_top_image_down(
+        _inner_aperture(center_y=-0.20, half_y=0.10)
+    )
+    tall_top = course_stage._conservative_inner_aperture_top_image_down(
+        _inner_aperture(center_y=-0.20, half_y=0.30)
     )
     common = {
         "capture_pitch_rad": -0.20,
@@ -2286,6 +2316,140 @@ def test_top_fov_pitch_limit_uses_bbox_extent_not_center_alone():
             course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
         )
     )
+
+
+def test_top_fov_prefers_complete_low_confidence_inner_aperture_geometry():
+    inner = _inner_aperture(
+        center_y=-0.195,
+        half_y=0.301,
+        std_y=0.010,
+        std_log_scale=0.030,
+        confidence=0.17,
+        health_reason="aperture_fit_low_confidence",
+    )
+    sample = SimpleNamespace(
+        # The outer support has crossed the reserve, while the complete fitted
+        # inner aperture remains observable.
+        bbox_norm=(0.10, 0.06945, 0.90, 0.95),
+        confidence=0.90,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        inner_aperture=inner,
+    )
+
+    edge = course_stage._top_fov_raw_edge(sample)
+    expected_std = math.sqrt(0.010**2 + (0.301 * 0.030) ** 2)
+    expected = -0.195 - 0.301 - 2.0 * expected_std
+
+    assert edge.basis == course_stage.TOP_FOV_INNER_EDGE_BASIS
+    assert edge.confidence == pytest.approx(0.17)
+    assert edge.top_edge_image_down == pytest.approx(expected)
+    assert edge.top_edge_image_down > (
+        course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+    )
+
+
+def test_top_fov_recovery_requires_same_source_and_exceeds_uncertainty():
+    previous = course_stage._top_fov_raw_edge(
+        SimpleNamespace(
+            bbox_norm=(0.10, 0.10, 0.90, 0.90),
+            confidence=0.90,
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            inner_aperture=_inner_aperture(
+                center_y=-0.20,
+                half_y=0.30,
+                std_y=0.01,
+                std_log_scale=0.03,
+            ),
+        )
+    )
+    noisy_nominal_recovery = course_stage._top_fov_raw_edge(
+        SimpleNamespace(
+            bbox_norm=(0.10, 0.10, 0.90, 0.90),
+            confidence=0.90,
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            inner_aperture=_inner_aperture(
+                center_y=-0.18,
+                half_y=0.30,
+                std_y=0.01,
+                std_log_scale=0.03,
+            ),
+        )
+    )
+    proved_recovery = replace(
+        noisy_nominal_recovery,
+        nominal_top_edge_image_down=(
+            previous.nominal_top_edge_image_down + 0.08
+        ),
+    )
+    outer_source = course_stage._TopFovRawEdge(
+        top_edge_image_down=-0.40,
+        nominal_top_edge_image_down=-0.40,
+        top_edge_std_image_down=0.0,
+        basis=course_stage.TOP_FOV_OUTER_EDGE_FALLBACK_BASIS,
+        confidence=0.90,
+    )
+
+    assert (
+        course_stage._top_fov_edge_recovery_rate_down_s(
+            current=noisy_nominal_recovery,
+            previous=previous,
+            elapsed_s=0.05,
+        )
+        < 0.0
+    )
+    assert (
+        course_stage._top_fov_edge_recovery_rate_down_s(
+            current=proved_recovery,
+            previous=previous,
+            elapsed_s=0.05,
+        )
+        > 0.0
+    )
+    assert (
+        course_stage._top_fov_edge_recovery_rate_down_s(
+            current=outer_source,
+            previous=previous,
+            elapsed_s=0.05,
+        )
+        is None
+    )
+
+
+def test_top_fov_outer_fallback_refuses_clipped_or_censored_support():
+    sample = SimpleNamespace(
+        bbox_norm=(0.10, 0.05, 0.90, 0.95),
+        confidence=0.90,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        inner_aperture=None,
+    )
+
+    with pytest.raises(ValueError, match="clean outer fallback"):
+        course_stage._top_fov_raw_edge(sample)
+
+
+def test_top_fov_uses_full_bounded_pitch_when_reserve_is_infeasible():
+    proposal = course_stage._propose_top_fov_pitch_reference(
+        capture_pitch_rad=-0.284,
+        raw_top_edge_image_down=-0.90,
+        raw_top_edge_rate_down_s=-0.70,
+        requested_target_pitch_rad=0.12,
+        prior_target_pitch_rad=-0.338,
+        vertical_angle_scale_rad=0.55,
+        active_before=True,
+    )
+
+    assert proposal.envelope_saturated is True
+    assert proposal.maximum_observable_target_pitch_rad < (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+    )
+    assert proposal.protected_target_pitch_rad == (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+    )
+    assert proposal.active_after is True
 
 
 def test_top_fov_capture_pitch_uses_active_body_to_reference_quaternion():

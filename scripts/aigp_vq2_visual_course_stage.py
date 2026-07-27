@@ -25,6 +25,7 @@ from competition.adapter import (
 from competition.vq2_contracts import FrameEdge
 from competition.vq2_visual_tracker import (
     CameraFrameToken,
+    VisualInnerApertureGeometry,
     VisualTrackRole,
 )
 from planning.vq2_gate_graph import (
@@ -149,12 +150,19 @@ LAUNCH_PITCH_REFERENCE_ACCEL_RAD_S2 = 2.50
 LAUNCH_PITCH_REFERENCE_BASIS = (
     "credited-gate0-stateless-accelerating-reference-v1"
 )
-# Raw outer-gate geometry owns only camera observability.  This leaves 54 px
-# above the fitted support at 640x360; derotated geometry remains the sole
-# passage/collective input.
+# Raw current-gate geometry owns only camera observability.  This leaves 54 px
+# above the conservative fitted inner-aperture edge at 640x360; derotated
+# geometry remains the sole passage/collective input.
 TOP_FOV_SAFE_EDGE_IMAGE_DOWN = -0.70
+TOP_FOV_INNER_EDGE_SIGMA = 2.0
 TOP_FOV_PITCH_PROTECTION_BASIS = (
-    "raw-current-bbox-top-pure-pitch-observability-v1"
+    "raw-current-inner-top-pure-pitch-observability-v2"
+)
+TOP_FOV_INNER_EDGE_BASIS = (
+    "raw-current-fitted-inner-aperture-top-2sigma-v1"
+)
+TOP_FOV_OUTER_EDGE_FALLBACK_BASIS = (
+    "raw-current-bbox-top-fallback-v1"
 )
 _YAW_PROFILE_ISSUER = object()
 
@@ -190,6 +198,146 @@ def _raw_bbox_top_image_down(
     ):
         raise ValueError("raw current bbox is outside the unit image")
     return 2.0 * top - 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class _TopFovRawEdge:
+    top_edge_image_down: float
+    nominal_top_edge_image_down: float
+    top_edge_std_image_down: float
+    basis: str
+    confidence: float
+
+
+def _conservative_inner_aperture_top_image_down(
+    inner: VisualInnerApertureGeometry,
+) -> float:
+    """Return the raw fitted aperture top including two-sigma uncertainty."""
+
+    if (
+        type(inner) is not VisualInnerApertureGeometry
+        or not inner.fitted
+        or not inner.complete_visibility
+        or inner.clipping != FrameEdge.NONE
+    ):
+        raise ValueError("complete raw inner-aperture geometry is unavailable")
+    assert inner.center_norm is not None
+    assert inner.half_size_norm is not None
+    assert inner.measurement_std is not None
+    center_y = float(inner.center_norm[1])
+    half_y = float(inner.half_size_norm[1])
+    std_y = float(inner.measurement_std[1])
+    std_log_scale = float(inner.measurement_std[2])
+    if (
+        inner.geometry_model_id
+        != "vq2-visible-inner-quad-lines-v1"
+        or inner.covariance_model_id
+        != "vq2-visible-aperture-diagonal-v1"
+    ):
+        raise ValueError("inner-aperture top model identity is invalid")
+    nominal_top = center_y - half_y
+    top_std = math.sqrt(
+        std_y * std_y + (half_y * std_log_scale) ** 2
+    )
+    top = nominal_top - TOP_FOV_INNER_EDGE_SIGMA * top_std
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                center_y,
+                half_y,
+                std_y,
+                std_log_scale,
+                nominal_top,
+                top_std,
+                top,
+            )
+        )
+        or top > 1.0
+    ):
+        raise ValueError("inner-aperture top geometry is invalid")
+    # The uncertainty interval can extend beyond the physical image while the
+    # fitted edge remains visible. Clamp only at that physical boundary.
+    return max(-1.0, top)
+
+
+def _top_fov_raw_edge(sample: Any) -> _TopFovRawEdge:
+    """Select exact raw inner geometry, with an early outer-support fallback."""
+
+    inner = getattr(sample, "inner_aperture", None)
+    if inner is not None and type(inner) is not VisualInnerApertureGeometry:
+        raise ValueError("raw inner-aperture geometry has an invalid type")
+    if (
+        type(inner) is VisualInnerApertureGeometry
+        and inner.fitted
+        and inner.complete_visibility
+        and inner.clipping == FrameEdge.NONE
+    ):
+        conservative_top = _conservative_inner_aperture_top_image_down(inner)
+        assert inner.center_norm is not None
+        assert inner.half_size_norm is not None
+        assert inner.measurement_std is not None
+        half_y = float(inner.half_size_norm[1])
+        top_std = math.sqrt(
+            float(inner.measurement_std[1]) ** 2
+            + (half_y * float(inner.measurement_std[2])) ** 2
+        )
+        return _TopFovRawEdge(
+            top_edge_image_down=conservative_top,
+            nominal_top_edge_image_down=(
+                float(inner.center_norm[1]) - half_y
+            ),
+            top_edge_std_image_down=top_std,
+            basis=TOP_FOV_INNER_EDGE_BASIS,
+            confidence=float(inner.confidence),
+        )
+
+    outer_top = _raw_bbox_top_image_down(sample.bbox_norm)
+    if (
+        getattr(sample, "clipping", None) != FrameEdge.NONE
+        or getattr(sample, "center_censored", None) is not False
+    ):
+        raise ValueError(
+            "complete raw inner aperture and clean outer fallback are "
+            "unavailable"
+        )
+    confidence = float(sample.confidence)
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise ValueError("raw outer-support confidence is invalid")
+    return _TopFovRawEdge(
+        top_edge_image_down=outer_top,
+        nominal_top_edge_image_down=outer_top,
+        top_edge_std_image_down=0.0,
+        basis=TOP_FOV_OUTER_EDGE_FALLBACK_BASIS,
+        confidence=confidence,
+    )
+
+
+def _top_fov_edge_recovery_rate_down_s(
+    *,
+    current: _TopFovRawEdge,
+    previous: _TopFovRawEdge,
+    elapsed_s: float,
+) -> Optional[float]:
+    """Return a same-source two-sigma lower bound on top-edge recovery."""
+
+    elapsed = float(elapsed_s)
+    if not math.isfinite(elapsed) or elapsed <= 0.0:
+        raise ValueError("top-FOV edge-rate interval is invalid")
+    if current.basis != previous.basis:
+        return None
+    combined_edge_std = math.sqrt(
+        current.top_edge_std_image_down**2
+        + previous.top_edge_std_image_down**2
+    )
+    rate = (
+        current.nominal_top_edge_image_down
+        - previous.nominal_top_edge_image_down
+        - TOP_FOV_INNER_EDGE_SIGMA * combined_edge_std
+    ) / elapsed
+    if not math.isfinite(rate):
+        raise ValueError("top-FOV edge recovery rate is nonfinite")
+    return rate
 
 
 def _project_raw_vertical_edge_for_pitch_reference(
@@ -235,9 +383,23 @@ class _TopFovPitchProposal:
     predicted_requested_top_edge_image_down: float
     predicted_protected_top_edge_image_down: float
     clearance_recovering: bool
+    envelope_saturated: bool
     active_before: bool
     active_after: bool
     limited: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TopFovObservation:
+    capture_pitch_rad: float
+    raw_top_edge_image_down: float
+    raw_nominal_top_edge_image_down: float
+    raw_top_edge_std_image_down: float
+    raw_top_edge_rate_down_s: Optional[float]
+    vertical_angle_scale_rad: float
+    previous_target_pitch_rad: Optional[float]
+    raw_top_edge_basis: str
+    raw_top_edge_confidence: float
 
 
 def _propose_top_fov_pitch_reference(
@@ -300,12 +462,15 @@ def _propose_top_fov_pitch_reference(
         MAX_VISUAL_TARGET_PITCH_RAD,
         maximum_observable,
     )
-    if (
-        not math.isfinite(maximum_observable)
-        or maximum_observable
-        < MIN_VISUAL_TARGET_PITCH_RAD
-    ):
-        raise ValueError("no bounded pitch preserves top-FOV authority")
+    if not math.isfinite(maximum_observable):
+        raise ValueError("top-FOV pitch ceiling is nonfinite")
+    envelope_saturated = (
+        maximum_observable < MIN_VISUAL_TARGET_PITCH_RAD
+    )
+    bounded_ceiling = max(
+        MIN_VISUAL_TARGET_PITCH_RAD,
+        maximum_observable,
+    )
     recovering = bool(rate is not None and rate > 0.0)
     exceeds = requested > maximum_observable + 1e-12
     active_after = active_before
@@ -316,15 +481,15 @@ def _propose_top_fov_pitch_reference(
         else:
             protected = min(
                 requested,
-                maximum_observable,
-                maximum_observable if recovering else prior,
+                bounded_ceiling,
+                bounded_ceiling if recovering else prior,
             )
             active_after = True
     elif exceeds:
         protected = min(
             requested,
-            maximum_observable,
-            maximum_observable if recovering else capture,
+            bounded_ceiling,
+            bounded_ceiling if recovering else capture,
         )
         active_after = True
     predicted_requested = _project_raw_vertical_edge_for_pitch_reference(
@@ -344,6 +509,7 @@ def _propose_top_fov_pitch_reference(
         <= protected
         <= MAX_VISUAL_TARGET_PITCH_RAD
         or active_after
+        and not envelope_saturated
         and predicted_protected
         < TOP_FOV_SAFE_EDGE_IMAGE_DOWN - 1e-9
     ):
@@ -358,6 +524,7 @@ def _propose_top_fov_pitch_reference(
         predicted_requested_top_edge_image_down=predicted_requested,
         predicted_protected_top_edge_image_down=predicted_protected,
         clearance_recovering=recovering,
+        envelope_saturated=envelope_saturated,
         active_before=active_before,
         active_after=active_after,
         limited=protected < requested - 1e-12,
@@ -368,7 +535,7 @@ def _top_fov_observation(
     session: DynamicVisualCourseSession,
     target_track: Any,
     camera_token: CameraFrameToken,
-) -> tuple[float, float, Optional[float], float, Optional[float]]:
+) -> _TopFovObservation:
     """Return exact raw-edge/capture-pitch guidance inputs."""
 
     course = session.core.course_state()
@@ -390,13 +557,13 @@ def _top_fov_observation(
         sample.token != camera_token
         or sample.token != getattr(target_track, "latest_token", None)
         or current.frame_sequence != sample.tracker_frame_sequence
-        or getattr(target_track, "clipping", None) != FrameEdge.NONE
-        or sample.clipping != FrameEdge.NONE
-        or getattr(target_track, "center_censored", True)
-        or sample.center_censored
+        or getattr(target_track, "clipping", None) != sample.clipping
+        or getattr(target_track, "center_censored", None)
+        is not sample.center_censored
     ):
-        raise ValueError("top-FOV authority lacks exact clean raw geometry")
-    top = _raw_bbox_top_image_down(sample.bbox_norm)
+        raise ValueError("top-FOV authority lacks exact current raw geometry")
+    edge = _top_fov_raw_edge(sample)
+    top = edge.top_edge_image_down
     observed_ns = sample.observation_monotonic_ns
     if type(observed_ns) is not int or observed_ns < 0:
         raise ValueError("top-FOV observation clock is invalid")
@@ -410,20 +577,37 @@ def _top_fov_observation(
             or previous_ns >= observed_ns
         ):
             raise ValueError("top-FOV bbox history clock did not advance")
-        top_rate = (
-            top - _raw_bbox_top_image_down(previous.bbox_norm)
-        ) / ((observed_ns - previous_ns) / 1_000_000_000.0)
+        try:
+            previous_edge = _top_fov_raw_edge(previous)
+        except (AttributeError, TypeError, ValueError):
+            previous_edge = None
+        if previous_edge is not None and previous_edge.basis == edge.basis:
+            top_rate = _top_fov_edge_recovery_rate_down_s(
+                current=edge,
+                previous=previous_edge,
+                elapsed_s=(
+                    (observed_ns - previous_ns) / 1_000_000_000.0
+                ),
+            )
     previous_target = (
         None
         if course.last_applied_command is None
         else course.last_applied_command.target_pitch_rad
     )
-    return (
-        _body_to_reference_pitch_rad(current.body_to_reference_wxyz),
-        top,
-        top_rate,
-        float(config.vertical_angle_scale_rad),
-        previous_target,
+    return _TopFovObservation(
+        capture_pitch_rad=_body_to_reference_pitch_rad(
+            current.body_to_reference_wxyz
+        ),
+        raw_top_edge_image_down=top,
+        raw_nominal_top_edge_image_down=(
+            edge.nominal_top_edge_image_down
+        ),
+        raw_top_edge_std_image_down=edge.top_edge_std_image_down,
+        raw_top_edge_rate_down_s=top_rate,
+        vertical_angle_scale_rad=float(config.vertical_angle_scale_rad),
+        previous_target_pitch_rad=previous_target,
+        raw_top_edge_basis=edge.basis,
+        raw_top_edge_confidence=edge.confidence,
     )
 
 
@@ -3278,6 +3462,7 @@ async def _run_visual_course_stage_impl(
                 ),
             }
         top_fov_proposal: Optional[_TopFovPitchProposal] = None
+        top_fov_observation: Optional[_TopFovObservation] = None
         top_fov_track_id: Optional[str] = None
         dynamic_controller = runtime.dynamic_controller
         if type(dynamic_controller) is DynamicVisualCourseSession:
@@ -3292,13 +3477,7 @@ async def _run_visual_course_stage_impl(
             fov_summary = segment["top_fov_pitch_protection"]
             if not top_fov_transition_owned:
                 try:
-                    (
-                        capture_pitch_rad,
-                        raw_top,
-                        raw_top_rate_down_s,
-                        vertical_scale_rad,
-                        last_dynamic_target_pitch_rad,
-                    ) = _top_fov_observation(
+                    top_fov_observation = _top_fov_observation(
                         dynamic_controller,
                         target_track,
                         snapshot.latest_camera_token,
@@ -3310,18 +3489,31 @@ async def _run_visual_course_stage_impl(
                         ]
                         is not None
                         else (
-                            last_dynamic_target_pitch_rad
-                            if last_dynamic_target_pitch_rad is not None
-                            else capture_pitch_rad
+                            top_fov_observation.previous_target_pitch_rad
+                            if (
+                                top_fov_observation
+                                .previous_target_pitch_rad
+                                is not None
+                            )
+                            else top_fov_observation.capture_pitch_rad
                         )
                     )
                     top_fov_proposal = _propose_top_fov_pitch_reference(
-                        capture_pitch_rad=capture_pitch_rad,
-                        raw_top_edge_image_down=raw_top,
-                        raw_top_edge_rate_down_s=raw_top_rate_down_s,
+                        capture_pitch_rad=(
+                            top_fov_observation.capture_pitch_rad
+                        ),
+                        raw_top_edge_image_down=(
+                            top_fov_observation.raw_top_edge_image_down
+                        ),
+                        raw_top_edge_rate_down_s=(
+                            top_fov_observation
+                            .raw_top_edge_rate_down_s
+                        ),
                         requested_target_pitch_rad=target_pitch_rad,
                         prior_target_pitch_rad=prior_target_pitch_rad,
-                        vertical_angle_scale_rad=vertical_scale_rad,
+                        vertical_angle_scale_rad=(
+                            top_fov_observation.vertical_angle_scale_rad
+                        ),
                         active_before=bool(fov_summary["active"]),
                     )
                 except (AttributeError, TypeError, ValueError) as exc:
@@ -3653,6 +3845,7 @@ async def _run_visual_course_stage_impl(
             ):
                 fov_summary = segment["top_fov_pitch_protection"]
                 if top_fov_proposal is not None:
+                    assert top_fov_observation is not None
                     if top_fov_proposal.limited:
                         fov_summary["limited_command_count"] += 1
                     fov_summary.update(
@@ -3660,6 +3853,21 @@ async def _run_visual_course_stage_impl(
                             "last_track_id": top_fov_track_id,
                             "last_raw_top_edge_image_down": (
                                 top_fov_proposal.raw_top_edge_image_down
+                            ),
+                            "last_raw_top_edge_basis": (
+                                top_fov_observation.raw_top_edge_basis
+                            ),
+                            "last_raw_top_edge_confidence": (
+                                top_fov_observation
+                                .raw_top_edge_confidence
+                            ),
+                            "last_raw_nominal_top_edge_image_down": (
+                                top_fov_observation
+                                .raw_nominal_top_edge_image_down
+                            ),
+                            "last_raw_top_edge_std_image_down": (
+                                top_fov_observation
+                                .raw_top_edge_std_image_down
                             ),
                             "last_protected_target_pitch_rad": (
                                 top_fov_proposal.protected_target_pitch_rad
@@ -3672,6 +3880,20 @@ async def _run_visual_course_stage_impl(
                         "track_id": top_fov_track_id,
                         "safe_top_edge_image_down": (
                             TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+                        ),
+                        "raw_top_edge_basis": (
+                            top_fov_observation.raw_top_edge_basis
+                        ),
+                        "raw_top_edge_confidence": (
+                            top_fov_observation.raw_top_edge_confidence
+                        ),
+                        "raw_nominal_top_edge_image_down": (
+                            top_fov_observation
+                            .raw_nominal_top_edge_image_down
+                        ),
+                        "raw_top_edge_std_image_down": (
+                            top_fov_observation
+                            .raw_top_edge_std_image_down
                         ),
                         **asdict(top_fov_proposal),
                     }
@@ -4412,6 +4634,10 @@ async def _run_visual_course_stage_impl(
                 "limited_command_count": 0,
                 "last_track_id": None,
                 "last_raw_top_edge_image_down": None,
+                "last_raw_top_edge_basis": None,
+                "last_raw_top_edge_confidence": None,
+                "last_raw_nominal_top_edge_image_down": None,
+                "last_raw_top_edge_std_image_down": None,
                 "last_protected_target_pitch_rad": None,
                 "active": False,
             },
