@@ -105,6 +105,12 @@ def classify_post_credit_measurement(
                 track_role is VisualTrackRole.AMBIGUOUS
                 and ambiguous
             )
+            or (
+                track_role is VisualTrackRole.RETIRED
+                and not ambiguous
+                and getattr(snapshot, "withholding_reason", None)
+                == "current_track_retired"
+            )
         )
         retained_loss = bool(
             getattr(track, "missed_frame_count", 0) > 0

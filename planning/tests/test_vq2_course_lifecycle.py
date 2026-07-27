@@ -134,6 +134,9 @@ def _post_credit_snapshot(
         current_track_id=_TRACK,
         current_track=track,
         authority_usable=visible and not ambiguous,
+        withholding_reason=(
+            None if visible else "current_track_not_visible"
+        ),
     )
 
 
@@ -1772,6 +1775,62 @@ def test_post_credit_retained_loss_rejects_regressed_track_token():
         )
         is PostCreditMeasurementMode.UNSAFE
     )
+
+
+def test_post_credit_exact_retired_current_retains_only_reacquire_authority():
+    previous = _token(1_500_225, 225)
+    retired = _post_credit_snapshot(
+        226,
+        visible=False,
+        clipping=FrameEdge.RIGHT,
+        latest_track_publication=213,
+    )
+    retired.current_track.role = VisualTrackRole.RETIRED
+    retired.current_track.missed_frame_count = 13
+    retired.withholding_reason = "current_track_retired"
+
+    assert (
+        classify_post_credit_measurement(
+            retired,
+            gate_index=1,
+            track_id=_TRACK,
+            previous_camera_token=previous,
+            last_track_token=_token(1_500_213, 213),
+        )
+        is PostCreditMeasurementMode.REACQUIRE
+    )
+
+    for mutation in ("visible", "ambiguous", "wrong_gate", "wrong_reason"):
+        unsafe = _post_credit_snapshot(
+            226,
+            visible=False,
+            clipping=FrameEdge.RIGHT,
+            latest_track_publication=213,
+        )
+        unsafe.current_track.role = VisualTrackRole.RETIRED
+        unsafe.current_track.missed_frame_count = 13
+        unsafe.withholding_reason = "current_track_retired"
+        if mutation == "visible":
+            unsafe.current_track.visible = True
+            unsafe.current_track.missed_frame_count = 0
+            unsafe.current_track.latest_token = unsafe.latest_camera_token
+        elif mutation == "ambiguous":
+            unsafe.current_track.ambiguous = True
+        elif mutation == "wrong_gate":
+            unsafe.current_track.authoritative_gate_index = 2
+        else:
+            unsafe.withholding_reason = "current_track_not_visible"
+
+        assert (
+            classify_post_credit_measurement(
+                unsafe,
+                gate_index=1,
+                track_id=_TRACK,
+                previous_camera_token=previous,
+                last_track_token=_token(1_500_213, 213),
+            )
+            is PostCreditMeasurementMode.UNSAFE
+        )
 
 
 def test_8853bd30_retained_ambiguous_loss_uses_bounded_reacquire() -> None:
