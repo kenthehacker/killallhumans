@@ -9,7 +9,6 @@ from planning.vq2_dynamic_course import (
     AppliedCommandSample,
     CommandGovernor,
     CommandGovernorConfig,
-    CrossingQuotientPrediction,
     DynamicCourseCommand,
     DynamicCourseConfig,
     DynamicCourseCore,
@@ -18,7 +17,6 @@ from planning.vq2_dynamic_course import (
     ImuAttitudeSample,
     MAX_YAW_RATE_RAD_S,
     SUPPORT_THRUST,
-    project_crossing_error_for_control,
     predict_aperture_relative_crossing,
 )
 
@@ -219,98 +217,6 @@ def test_096f78c4_successor_bias_cannot_hide_unsafe_current_crossing() -> None:
     # The current aperture remained vertically unsafe, so positive horizontal
     # reserve cannot authorize either successor passage or yaw.
     assert centered.clearance_q[1] < 0.0
-
-
-def test_f6ab5369_crossing_projection_reverses_before_q_crosses() -> None:
-    """The proved terminal miss must arrest the intercept before center pass."""
-
-    current_center = (
-        0.08415729651312648,
-        -1.034063393325889,
-    )
-    current_q = (
-        0.7806094404995596,
-        -4.67378770571331,
-    )
-    aperture = tuple(
-        current_center[axis] / current_q[axis] for axis in range(2)
-    )
-    prediction = CrossingQuotientPrediction(
-        current_error_q=current_q,
-        rate_q_s=(-2.854932800567001, -0.6245467224220145),
-        predicted_error_q=(
-            -2.6453099201808414,
-            -5.423243772619728,
-        ),
-        current_std_q=(0.10, 0.20),
-        predicted_std_q=(
-            0.4862365240902039,
-            1.0324033812304385,
-        ),
-        swept_occupancy_q=(3.62, 7.49),
-        terminal_occupancy_q=(3.62, 7.49),
-        allowance_q=(0.50, 0.45),
-        clearance_q=(-3.12, -7.04),
-        terminal_clearance_q=(-3.12, -7.04),
-    )
-
-    projection = project_crossing_error_for_control(
-        present_error_norm=current_center,
-        aperture_half_extent_norm=aperture,
-        prediction=prediction,
-        bearing_rate_qualified=(True, True),
-        scale_rate_qualified=True,
-        visible=True,
-        ambiguous=False,
-        censored_axes=(False, False),
-        prediction_horizon_s=1.2,
-        capture_timing_uncertainty_s=0.020,
-        maximum_capture_timing_uncertainty_s=0.050,
-    )
-
-    assert current_center[0] > 0.0
-    assert current_q[0] > 0.0
-    assert prediction.predicted_error_q[0] < 0.0
-    assert projection.error_norm[0] < 0.0
-    assert projection.prediction_authority == (1.0, 1.0)
-    assert projection.active_axes == (True, True)
-    assert projection.error_norm[1] == pytest.approx(
-        prediction.predicted_error_q[1] * aperture[1]
-    )
-
-
-def test_crossing_projection_falls_back_on_unqualified_or_censored_axes() -> None:
-    prediction = CrossingQuotientPrediction(
-        current_error_q=(0.40, -0.20),
-        rate_q_s=(-1.0, 0.5),
-        predicted_error_q=(-0.30, 0.10),
-        current_std_q=(0.10, 0.10),
-        predicted_std_q=(0.20, 0.08),
-        swept_occupancy_q=(0.80, 0.50),
-        terminal_occupancy_q=(0.70, 0.30),
-        allowance_q=(0.50, 0.45),
-        clearance_q=(-0.30, -0.05),
-        terminal_clearance_q=(-0.20, 0.15),
-    )
-    present = (0.12, -0.08)
-
-    projection = project_crossing_error_for_control(
-        present_error_norm=present,
-        aperture_half_extent_norm=(0.30, 0.40),
-        prediction=prediction,
-        bearing_rate_qualified=(False, True),
-        scale_rate_qualified=True,
-        visible=True,
-        ambiguous=False,
-        censored_axes=(False, True),
-        prediction_horizon_s=0.40,
-        capture_timing_uncertainty_s=0.020,
-        maximum_capture_timing_uncertainty_s=0.050,
-    )
-
-    assert projection.error_norm == pytest.approx(present)
-    assert projection.prediction_authority == (0.0, 0.0)
-    assert projection.active_axes == (False, False)
 
 
 def _yaw_quaternion(yaw_rad: float) -> tuple[float, float, float, float]:
@@ -941,60 +847,6 @@ def test_096f78c4_unsafe_current_gate_owns_passage_and_yaw() -> None:
     assert qualified.successor_weight == 0.0
     assert qualified.successor_yaw_contribution_rad == 0.0
     assert qualified.braking
-
-
-def test_predicted_current_intercept_reverses_roll_before_center_crossing() -> None:
-    core = DynamicCourseCore(
-        DynamicCourseConfig(
-            camera_delay_s=0.0,
-            roll_guidance_sign=1.0,
-            roll_gain=0.18,
-            lateral_rate_gain=0.045,
-        )
-    )
-    core.record_applied_command(_command(0.90))
-    decisions = []
-    for sequence in range(1, 10):
-        observation_time = 1.0 + (sequence - 1) * 0.040
-        _imu(core, observation_time)
-        core.observe_track(
-            _observation(
-                "gate-a",
-                sequence,
-                observation_time,
-                x=0.16 - 0.010 * (sequence - 1),
-                y=0.0,
-                log_scale=-1.10 + 0.045 * (sequence - 1),
-                aperture=(0.12, 0.30),
-            )
-        )
-        if sequence == 1:
-            core.bind(
-                current_gate_index=2,
-                current_track_id="gate-a",
-                successor_track_id=None,
-            )
-        decision_time = observation_time + 0.005
-        _imu(core, decision_time)
-        decision = core.guide(round(decision_time * NS))
-        decisions.append(decision)
-        _commit_decision(core, decision_time, decision.command)
-
-    predictive = [
-        decision
-        for decision in decisions
-        if (
-            decision.passage_error_norm[0] > 0.0
-            and decision.current_ownership_control_error_norm[0] < 0.0
-        )
-    ]
-
-    assert predictive
-    assert predictive[0].current_crossing_error_q[0] > 0.0
-    assert predictive[0].predicted_crossing_error_norm[0] < 0.0
-    assert predictive[0].current_ownership_prediction_active_axes[0]
-    assert predictive[0].proposed_command.target_roll_rad < 0.0
-    assert predictive[0].successor_passage_authority == 0.0
 
 
 def test_admitted_off_axis_successor_still_brakes_before_intercept() -> None:

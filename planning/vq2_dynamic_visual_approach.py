@@ -702,15 +702,6 @@ class DynamicVisualCourseSession:
                     "passage_error_norm": list(
                         decision.passage_error_norm
                     ),
-                    "current_ownership_control_error_norm": list(
-                        decision.current_ownership_control_error_norm
-                    ),
-                    "current_ownership_prediction_authority": list(
-                        decision.current_ownership_prediction_authority
-                    ),
-                    "current_ownership_prediction_active_axes": list(
-                        decision.current_ownership_prediction_active_axes
-                    ),
                     "aperture_margin_norm": list(
                         decision.aperture_margin_norm
                     ),

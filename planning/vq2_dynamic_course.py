@@ -737,9 +737,6 @@ class GuidanceDecision:
     successor_clearance_dwell_s: float
     successor_clearance_authority: float
     passage_error_norm: Vector2
-    current_ownership_control_error_norm: Vector2
-    current_ownership_prediction_authority: Vector2
-    current_ownership_prediction_active_axes: tuple[bool, bool]
     aperture_margin_norm: Vector2
     crossing_prediction_horizon_s: float
     current_crossing_error_q: Vector2
@@ -791,21 +788,6 @@ class CrossingQuotientPrediction:
     allowance_q: Vector2
     clearance_q: Vector2
     terminal_clearance_q: Vector2
-
-
-@dataclass(frozen=True, slots=True)
-class CrossingControlProjection:
-    """Bounded current-aperture-equivalent error used by control.
-
-    The projection remains in present normalized-image units so the retained
-    roll and collective gains do not grow merely because the aperture is
-    expanding.  It is a control coordinate, not a claim about the future
-    pixel location of the gate.
-    """
-
-    error_norm: Vector2
-    prediction_authority: Vector2
-    active_axes: tuple[bool, bool]
 
 
 def predict_aperture_relative_crossing(
@@ -913,94 +895,6 @@ def predict_aperture_relative_crossing(
         allowance_q=allowance,
         clearance_q=clearance,  # type: ignore[arg-type]
         terminal_clearance_q=terminal_clearance,  # type: ignore[arg-type]
-    )
-
-
-def project_crossing_error_for_control(
-    *,
-    present_error_norm: Vector2,
-    aperture_half_extent_norm: Vector2 | None,
-    prediction: CrossingQuotientPrediction | None,
-    bearing_rate_qualified: tuple[bool, bool],
-    scale_rate_qualified: bool,
-    visible: bool,
-    ambiguous: bool,
-    censored_axes: tuple[bool, bool],
-    prediction_horizon_s: float,
-    capture_timing_uncertainty_s: float,
-    maximum_capture_timing_uncertainty_s: float,
-) -> CrossingControlProjection:
-    """Project the temporally qualified crossing mean into control units.
-
-    The passage/admission path already carries the complete 2-sigma envelope.
-    Control uses the robust-filtered mean and lets the retained target and
-    wire governors bound command continuity; smearing the mean toward zero
-    would delay a proved intercept reversal.  Unqualified or censored axes
-    retain the present error rather than fabricating geometry.
-    """
-
-    present = _tuple2(present_error_norm, "present_error_norm")
-    if type(bearing_rate_qualified) is not tuple or len(
-        bearing_rate_qualified
-    ) != 2 or any(type(value) is not bool for value in bearing_rate_qualified):
-        raise TypeError("bearing_rate_qualified must be an exact bool pair")
-    if type(scale_rate_qualified) is not bool:
-        raise TypeError("scale_rate_qualified must be bool")
-    if type(visible) is not bool or type(ambiguous) is not bool:
-        raise TypeError("visibility qualifiers must be bool")
-    if type(censored_axes) is not tuple or len(censored_axes) != 2 or any(
-        type(value) is not bool for value in censored_axes
-    ):
-        raise TypeError("censored_axes must be an exact bool pair")
-    horizon = _nonnegative(
-        prediction_horizon_s,
-        "prediction_horizon_s",
-    )
-    timing_uncertainty = _nonnegative(
-        capture_timing_uncertainty_s,
-        "capture_timing_uncertainty_s",
-    )
-    maximum_timing_uncertainty = _nonnegative(
-        maximum_capture_timing_uncertainty_s,
-        "maximum_capture_timing_uncertainty_s",
-    )
-    if aperture_half_extent_norm is None or prediction is None:
-        return CrossingControlProjection(
-            error_norm=present,
-            prediction_authority=(0.0, 0.0),
-            active_axes=(False, False),
-        )
-    aperture = _tuple2(
-        aperture_half_extent_norm,
-        "aperture_half_extent_norm",
-        positive=True,
-    )
-    common_qualified = bool(
-        visible
-        and not ambiguous
-        and scale_rate_qualified
-        and horizon > 0.0
-        and timing_uncertainty <= maximum_timing_uncertainty
-    )
-    projected = list(present)
-    authorities = [0.0, 0.0]
-    active = [False, False]
-    for axis in range(2):
-        if (
-            not common_qualified
-            or not bearing_rate_qualified[axis]
-            or censored_axes[axis]
-        ):
-            continue
-        projected[axis] = (
-            prediction.predicted_error_q[axis] * aperture[axis]
-        )
-        authorities[axis] = 1.0
-        active[axis] = True
-    return CrossingControlProjection(
-        error_norm=(projected[0], projected[1]),
-        prediction_authority=(authorities[0], authorities[1]),
-        active_axes=(active[0], active[1]),
     )
 
 
@@ -2505,23 +2399,6 @@ class DynamicCourseCore:
             terminal_crossing_clearance = (
                 crossing_prediction.terminal_clearance_q
             )
-        crossing_control = project_crossing_error_for_control(
-            present_error_norm=passage_error,
-            aperture_half_extent_norm=current_aperture,
-            prediction=crossing_prediction,
-            bearing_rate_qualified=current.bearing_rate_qualified,
-            scale_rate_qualified=current.scale_rate_qualified,
-            visible=current.visible,
-            ambiguous=current.ambiguous,
-            censored_axes=current.censored_axes,
-            prediction_horizon_s=crossing_prediction_horizon_s,
-            capture_timing_uncertainty_s=(
-                current.capture_timing_uncertainty_s
-            ),
-            maximum_capture_timing_uncertainty_s=(
-                self.config.max_capture_timing_uncertainty_s
-            ),
-        )
         current_yaw_release = (
             self._current_yaw_release(
                 current,
@@ -2571,7 +2448,6 @@ class DynamicCourseCore:
             successor,
             camera_current_center,
             passage_error,
-            crossing_control.error_norm,
             aperture_relative_rate_norm,
             current_yaw_release,
             successor_weight,
@@ -2609,15 +2485,6 @@ class DynamicCourseCore:
                 successor_clearance_authority
             ),
             passage_error_norm=passage_error,
-            current_ownership_control_error_norm=(
-                crossing_control.error_norm
-            ),
-            current_ownership_prediction_authority=(
-                crossing_control.prediction_authority
-            ),
-            current_ownership_prediction_active_axes=(
-                crossing_control.active_axes
-            ),
             aperture_margin_norm=margins,
             crossing_prediction_horizon_s=(
                 crossing_prediction_horizon_s
@@ -3294,7 +3161,6 @@ class DynamicCourseCore:
         successor: TrackDynamicState | None,
         camera_current_center_norm: Vector2,
         stable_passage_error_norm: Vector2,
-        stable_control_error_norm: Vector2,
         stable_passage_rate_norm_s: Vector2,
         current_yaw_release: float,
         successor_weight: float,
@@ -3310,16 +3176,6 @@ class DynamicCourseCore:
             ),
             math.atan(
                 camera_current_center_norm[1]
-                * self.config.vertical_angle_scale_rad
-            ),
-        )
-        stable_control_bearing = (
-            math.atan(
-                stable_control_error_norm[0]
-                * self.config.horizontal_angle_scale_rad
-            ),
-            math.atan(
-                stable_control_error_norm[1]
                 * self.config.vertical_angle_scale_rad
             ),
         )
@@ -3413,7 +3269,7 @@ class DynamicCourseCore:
         # Passage and residual translation are expressed in the current
         # gate's fixed reference.  Intentional body yaw therefore cannot
         # manufacture a lateral intercept error or reverse roll.
-        lateral_error = stable_control_bearing[0]
+        lateral_error = stable_passage_bearing[0]
         roll = self.config.roll_guidance_sign * (
             self.config.roll_gain * lateral_error
             + self.config.lateral_rate_gain

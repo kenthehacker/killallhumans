@@ -595,15 +595,11 @@ def _dynamic_current_aperture_collective_inputs(
 
     passage_error = getattr(
         dynamic_decision,
-        "current_ownership_control_error_norm",
+        "passage_error_norm",
         None,
     )
     if passage_error is None:
-        passage_error = getattr(
-            dynamic_decision,
-            "passage_error_norm",
-            dynamic_decision.current_center_norm,
-        )
+        passage_error = dynamic_decision.current_center_norm
     residual_rate_rad_s = current_dynamic.residual_translational_rate_rad_s
     vertical_angle_scale_rad = float(vertical_angle_scale_rad)
     if (
