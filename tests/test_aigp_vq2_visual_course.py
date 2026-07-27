@@ -4343,6 +4343,66 @@ def test_credit_wait_uses_one_stable_adjacent_without_advance():
     )
 
 
+def test_credit_wait_ignores_unreviewed_replacement_adjacent_identity():
+    class UnreviewedAdjacentHost(_Host):
+        def __init__(self):
+            super().__init__(
+                initial_gate=6,
+                finish_gate=7,
+                lose_before_credit=True,
+            )
+            self.adjacent_track = None
+
+        def _sample(self):
+            super()._sample()
+            snapshot = self.visual_gate_graph.latest_snapshot
+            snapshot.next_candidates = ()
+            snapshot.next_selection_ambiguous = False
+            snapshot.provisional_track_ids = ()
+            if (
+                self.current_gate == 6
+                and not snapshot.current_track.visible
+            ):
+                token = snapshot.latest_camera_token
+                adjacent = _track(
+                    "unreviewed-track-8",
+                    gate_index=7,
+                    token=token,
+                )
+                adjacent.role = VisualTrackRole.NEXT
+                adjacent.authoritative_gate_index = None
+                self.adjacent_track = adjacent
+                snapshot.next_candidates = (
+                    SimpleNamespace(
+                        track_id=adjacent.track_id,
+                        latest_token=token,
+                        promotable=False,
+                        stable_frame_count=3,
+                        confidence=0.80,
+                        association_confidence=0.80,
+                        relationship=None,
+                    ),
+                )
+
+    host = UnreviewedAdjacentHost()
+    runtime, calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    transition = result["authoritative_transitions"][0]
+    assert transition["promoted_track_id"] == "track-7"
+    assert transition["crossing_wait_adjacent_command_count"] == 0
+    assert transition["crossing_wait_coast_command_count"] >= 2
+    assert not any(
+        gate_index == 7
+        and mode is VisualApproachMode.ADJACENT_RECENTER
+        for gate_index, mode, *_rest in calls
+    )
+
+
 def test_post_credit_wait_checks_attitude_before_sending_zero():
     class RecoveryUnsafeHost(_Host):
         def _sample(self):

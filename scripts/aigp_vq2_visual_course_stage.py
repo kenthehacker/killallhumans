@@ -7426,6 +7426,10 @@ async def _run_visual_course_stage_impl(
                 and adjacent_candidates[0].latest_token == token
                 and type(adjacent_candidates[0].track_id) is str
                 and adjacent_candidates[0].track_id
+                and type(passage_admission)
+                is VisualApproachPassageAdmission
+                and adjacent_candidates[0].track_id
+                == passage_admission.preview_track_id
             ):
                 credit_wait_adjacent_track_id = (
                     adjacent_candidates[0].track_id
