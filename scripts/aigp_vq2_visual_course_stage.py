@@ -203,6 +203,38 @@ def _allocate_launch_pitch_target(
     )
 
 
+def _pitch_response_authority(
+    *,
+    allocated_target_pitch_rad: float,
+    intercept_response_authority: float,
+) -> float:
+    """Allocate static attitude-loop response from the applied reference.
+
+    A launch destination that has not yet been allocated cannot silently
+    increase the inner attitude-loop gain.  The reference itself remains
+    responsive, while the final wire governor owns command continuity.
+    """
+
+    target = float(allocated_target_pitch_rad)
+    intercept = float(intercept_response_authority)
+    if (
+        not math.isfinite(target)
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= target
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not math.isfinite(intercept)
+        or not 0.0 <= intercept <= 1.0
+    ):
+        raise ValueError("pitch response authority inputs are invalid")
+    return max(
+        intercept,
+        max(
+            0.0,
+            min(1.0, target / MAX_VISUAL_TARGET_PITCH_RAD),
+        ),
+    )
+
+
 def _allocate_launch_collective(
     *,
     launch_elapsed_s: float,
@@ -2780,21 +2812,6 @@ async def _run_visual_course_stage_impl(
                 "visual-course servo target attitude escaped its fixed "
                 "passage envelope"
             )
-        # The visual target expresses how urgently closure must unload even
-        # while the launch attitude is still blending away from spawn pitch.
-        # Allocate the already proved 0.5-to-1.0 pitch response continuously
-        # from that bounded brake target; the effective target below remains
-        # inside the unchanged launch and attitude envelopes.
-        continuous_pitch_response_authority = max(
-            float(intercept_response_authority),
-            max(
-                0.0,
-                min(
-                    1.0,
-                    target_pitch_rad / MAX_VISUAL_TARGET_PITCH_RAD,
-                ),
-            ),
-        )
         launch = segment["launch_bootstrap"]
         proved_collective: Optional[float] = None
         proved_filtered_vertical_rate: Optional[float] = None
@@ -2978,6 +2995,18 @@ async def _run_visual_course_stage_impl(
                     next_preview_collective_track_id
                 ),
             }
+        # Allocate the static attitude-loop response from the reference that
+        # will actually be applied this tick.  Before the old inner governor
+        # was removed, its governed output implicitly provided this behavior;
+        # using the unallocated +0.12 destination here doubled early launch q.
+        continuous_pitch_response_authority = (
+            _pitch_response_authority(
+                allocated_target_pitch_rad=target_pitch_rad,
+                intercept_response_authority=(
+                    intercept_response_authority
+                ),
+            )
+        )
         if collective_evidence is not None:
             collective_evidence[
                 "allocated_thrust_before_wire_governor"

@@ -2146,6 +2146,30 @@ def test_opposite_launch_demand_changes_reference_on_the_same_tick():
     assert brake > forward
 
 
+def test_launch_destination_cannot_raise_gain_before_reference_allocates_it():
+    target, _blend = course_stage._allocate_launch_pitch_target(
+        spawn_pitch_rad=-0.3100692828034804,
+        responsive_target_pitch_rad=0.120,
+        launch_elapsed_s=0.437,
+    )
+
+    assert target < 0.0
+    assert course_stage._pitch_response_authority(
+        allocated_target_pitch_rad=target,
+        intercept_response_authority=0.0,
+    ) == 0.0
+    assert course_stage._pitch_response_authority(
+        allocated_target_pitch_rad=0.060,
+        intercept_response_authority=0.0,
+    ) == pytest.approx(
+        0.060 / course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert course_stage._pitch_response_authority(
+        allocated_target_pitch_rad=target,
+        intercept_response_authority=1.0,
+    ) == 1.0
+
+
 def test_8319198e_dynamic_launch_does_not_discard_proved_collective():
     thrust, phase = course_stage._allocate_launch_collective(
         launch_elapsed_s=0.422,
