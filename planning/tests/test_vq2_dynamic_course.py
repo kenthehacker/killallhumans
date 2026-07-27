@@ -1491,6 +1491,46 @@ def test_clean_aperture_seed_propagates_through_vertical_censor_and_dropout(
     )
 
 
+def test_clean_ttc_dropout_cannot_shorten_an_earned_aperture_deadline(
+) -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(camera_delay_s=0.0, scale_beta=1.0)
+    )
+    states = []
+    for sequence, log_scale in enumerate(
+        (-1.00, -0.94, -0.88, -0.82, -1.10, -1.20),
+        start=1,
+    ):
+        observation_time = 1.0 + (sequence - 1) * 0.030
+        _imu(core, observation_time)
+        states.append(
+            core.observe_track(
+                _observation(
+                    "gate-a",
+                    sequence,
+                    observation_time,
+                    log_scale=log_scale,
+                )
+            )
+        )
+
+    qualified = states[-2]
+    lost_ttc = states[-1]
+    assert qualified.time_to_contact_s is not None
+    assert qualified.aperture_prediction_deadline_monotonic_ns is not None
+    assert lost_ttc.scale_rate_qualified
+    assert lost_ttc.time_to_contact_s is None
+    assert lost_ttc.aperture_propagated is False
+    assert (
+        lost_ttc.aperture_prediction_deadline_monotonic_ns
+        == qualified.aperture_prediction_deadline_monotonic_ns
+    )
+    assert lost_ttc.aperture_prediction_deadline_monotonic_ns > (
+        lost_ttc.state_monotonic_ns
+        + round(core.config.dropout_hold_s * NS)
+    )
+
+
 def test_local_aperture_is_withdrawn_at_decision_time_expiry() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     core.record_applied_command(_command(0.90))

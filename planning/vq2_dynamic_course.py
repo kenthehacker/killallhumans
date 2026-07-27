@@ -1753,8 +1753,29 @@ class DynamicCourseCore:
             )
             aperture = measured_aperture
             aperture_seed_ns = capture_ns
-            aperture_deadline_ns = capture_ns + round(
+            candidate_deadline_ns = capture_ns + round(
                 prediction_horizon_s * _NS_PER_SECOND
+            )
+            # A later clean aperture corrects geometry and may extend the
+            # bounded lease, but a one-frame loss of qualified closure/TTC
+            # must not erase an already earned longer absolute horizon.
+            # Retaining the prior deadline never grants time beyond the
+            # configured maximum from that earlier clean seed.
+            aperture_deadline_ns = max(
+                candidate_deadline_ns,
+                (
+                    previous.aperture_prediction_deadline_monotonic_ns
+                    if (
+                        previous.aperture_half_size_norm is not None
+                        and previous
+                        .aperture_prediction_deadline_monotonic_ns
+                        is not None
+                        and capture_ns
+                        <= previous
+                        .aperture_prediction_deadline_monotonic_ns
+                    )
+                    else candidate_deadline_ns
+                ),
             )
             aperture_propagated = False
         elif (
