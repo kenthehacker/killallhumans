@@ -53,7 +53,9 @@ from planning.vq2_course_lifecycle import (
     classify_latched_measurement,
 )
 from planning.vq2_dynamic_visual_approach import (
+    BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ,
     DYNAMIC_CROSSING_COORDINATE_BASIS,
+    DynamicVisualCourseSession,
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
@@ -147,7 +149,282 @@ LAUNCH_PITCH_REFERENCE_ACCEL_RAD_S2 = 2.50
 LAUNCH_PITCH_REFERENCE_BASIS = (
     "credited-gate0-stateless-accelerating-reference-v1"
 )
+# Raw outer-gate geometry owns only camera observability.  This leaves 54 px
+# above the fitted support at 640x360; derotated geometry remains the sole
+# passage/collective input.
+TOP_FOV_SAFE_EDGE_IMAGE_DOWN = -0.70
+TOP_FOV_PITCH_PROTECTION_BASIS = (
+    "raw-current-bbox-top-pure-pitch-observability-v1"
+)
 _YAW_PROFILE_ISSUER = object()
+
+
+def _body_to_reference_pitch_rad(
+    body_to_reference_wxyz: tuple[float, float, float, float],
+) -> float:
+    if type(body_to_reference_wxyz) is not tuple or len(
+        body_to_reference_wxyz
+    ) != 4:
+        raise ValueError("body-to-reference quaternion is invalid")
+    w, x, y, z = map(float, body_to_reference_wxyz)
+    if not all(math.isfinite(value) for value in (w, x, y, z)):
+        raise ValueError("body-to-reference quaternion is invalid")
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if abs(norm - 1.0) > 1e-6:
+        raise ValueError("body-to-reference quaternion is not unit length")
+    sin_pitch = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+    return math.asin(max(-1.0, min(1.0, sin_pitch)))
+
+
+def _raw_bbox_top_image_down(
+    bbox_norm_ltrb: tuple[float, float, float, float],
+) -> float:
+    if type(bbox_norm_ltrb) is not tuple or len(bbox_norm_ltrb) != 4:
+        raise ValueError("raw current bbox is invalid")
+    left, top, right, bottom = map(float, bbox_norm_ltrb)
+    if not (
+        all(math.isfinite(value) for value in (left, top, right, bottom))
+        and
+        0.0 <= left < right <= 1.0
+        and 0.0 <= top < bottom <= 1.0
+    ):
+        raise ValueError("raw current bbox is outside the unit image")
+    return 2.0 * top - 1.0
+
+
+def _project_raw_vertical_edge_for_pitch_reference(
+    *,
+    edge_image_down: float,
+    capture_pitch_rad: float,
+    target_pitch_rad: float,
+    vertical_angle_scale_rad: float,
+) -> float:
+    """Project one raw edge using ``alpha_t=alpha_c-(pitch_t-pitch_c)``."""
+
+    edge, capture, target, scale = map(
+        float,
+        (
+            edge_image_down,
+            capture_pitch_rad,
+            target_pitch_rad,
+            vertical_angle_scale_rad,
+        ),
+    )
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (edge, capture, target, scale)
+        )
+        or not -1.0 <= edge <= 1.0
+        or scale <= 0.0
+    ):
+        raise ValueError("raw edge pitch reprojection inputs are invalid")
+    return math.tan(
+        math.atan(edge * scale) - (target - capture)
+    ) / scale
+
+
+@dataclass(frozen=True, slots=True)
+class _TopFovPitchProposal:
+    raw_top_edge_image_down: float
+    raw_top_edge_rate_down_s: Optional[float]
+    capture_pitch_rad: float
+    requested_target_pitch_rad: float
+    maximum_observable_target_pitch_rad: float
+    protected_target_pitch_rad: float
+    predicted_requested_top_edge_image_down: float
+    predicted_protected_top_edge_image_down: float
+    clearance_recovering: bool
+    active_before: bool
+    active_after: bool
+    limited: bool
+
+
+def _propose_top_fov_pitch_reference(
+    *,
+    capture_pitch_rad: float,
+    raw_top_edge_image_down: float,
+    raw_top_edge_rate_down_s: Optional[float],
+    requested_target_pitch_rad: float,
+    prior_target_pitch_rad: float,
+    vertical_angle_scale_rad: float,
+    active_before: bool,
+) -> _TopFovPitchProposal:
+    """Hold nose-up authority until raw top-edge clearance recovers."""
+
+    capture, raw_top, requested, prior, scale = map(
+        float,
+        (
+            capture_pitch_rad,
+            raw_top_edge_image_down,
+            requested_target_pitch_rad,
+            prior_target_pitch_rad,
+            vertical_angle_scale_rad,
+        ),
+    )
+    rate = (
+        None
+        if raw_top_edge_rate_down_s is None
+        else float(raw_top_edge_rate_down_s)
+    )
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                capture,
+                raw_top,
+                requested,
+                prior,
+                scale,
+            )
+        )
+        or rate is not None
+        and not math.isfinite(rate)
+        or not -1.0 <= raw_top <= 1.0
+        or scale <= 0.0
+        or type(active_before) is not bool
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= requested
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= prior
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+    ):
+        raise ValueError("top-FOV pitch guidance inputs are invalid")
+    maximum_observable = (
+        capture
+        + math.atan(raw_top * scale)
+        - math.atan(TOP_FOV_SAFE_EDGE_IMAGE_DOWN * scale)
+    )
+    maximum_observable = min(
+        MAX_VISUAL_TARGET_PITCH_RAD,
+        maximum_observable,
+    )
+    if (
+        not math.isfinite(maximum_observable)
+        or maximum_observable
+        < MIN_VISUAL_TARGET_PITCH_RAD
+    ):
+        raise ValueError("no bounded pitch preserves top-FOV authority")
+    recovering = bool(rate is not None and rate > 0.0)
+    exceeds = requested > maximum_observable + 1e-12
+    active_after = active_before
+    protected = requested
+    if active_before:
+        if recovering and not exceeds:
+            active_after = False
+        else:
+            protected = min(
+                requested,
+                maximum_observable,
+                maximum_observable if recovering else prior,
+            )
+            active_after = True
+    elif exceeds:
+        protected = min(
+            requested,
+            maximum_observable,
+            maximum_observable if recovering else prior,
+        )
+        active_after = True
+    predicted_requested = _project_raw_vertical_edge_for_pitch_reference(
+        edge_image_down=raw_top,
+        capture_pitch_rad=capture,
+        target_pitch_rad=requested,
+        vertical_angle_scale_rad=scale,
+    )
+    predicted_protected = _project_raw_vertical_edge_for_pitch_reference(
+        edge_image_down=raw_top,
+        capture_pitch_rad=capture,
+        target_pitch_rad=protected,
+        vertical_angle_scale_rad=scale,
+    )
+    if (
+        not MIN_VISUAL_TARGET_PITCH_RAD
+        <= protected
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or active_after
+        and predicted_protected
+        < TOP_FOV_SAFE_EDGE_IMAGE_DOWN - 1e-9
+    ):
+        raise ValueError("top-FOV pitch guidance escaped its geometry")
+    return _TopFovPitchProposal(
+        raw_top_edge_image_down=raw_top,
+        raw_top_edge_rate_down_s=rate,
+        capture_pitch_rad=capture,
+        requested_target_pitch_rad=requested,
+        maximum_observable_target_pitch_rad=maximum_observable,
+        protected_target_pitch_rad=protected,
+        predicted_requested_top_edge_image_down=predicted_requested,
+        predicted_protected_top_edge_image_down=predicted_protected,
+        clearance_recovering=recovering,
+        active_before=active_before,
+        active_after=active_after,
+        limited=protected < requested - 1e-12,
+    )
+
+
+def _top_fov_observation(
+    session: DynamicVisualCourseSession,
+    target_track: Any,
+    camera_token: CameraFrameToken,
+) -> tuple[float, float, Optional[float], float, Optional[float]]:
+    """Return exact raw-edge/capture-pitch guidance inputs."""
+
+    course = session.core.course_state()
+    current = course.current
+    config = session.core.config
+    track_id = getattr(target_track, "track_id", None)
+    history = getattr(target_track, "history", None)
+    if (
+        course.current_track_id != track_id
+        or current.track_id != track_id
+        or tuple(config.camera_to_body_wxyz)
+        != BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
+        or type(history) is not tuple
+        or not history
+    ):
+        raise ValueError("top-FOV authority is not the calibrated current")
+    sample = history[-1]
+    if (
+        sample.token != camera_token
+        or sample.token != getattr(target_track, "latest_token", None)
+        or current.frame_sequence != sample.tracker_frame_sequence
+        or getattr(target_track, "clipping", None) != FrameEdge.NONE
+        or sample.clipping != FrameEdge.NONE
+        or getattr(target_track, "center_censored", True)
+        or sample.center_censored
+    ):
+        raise ValueError("top-FOV authority lacks exact clean raw geometry")
+    top = _raw_bbox_top_image_down(sample.bbox_norm)
+    observed_ns = sample.observation_monotonic_ns
+    if type(observed_ns) is not int or observed_ns < 0:
+        raise ValueError("top-FOV observation clock is invalid")
+    top_rate: Optional[float] = None
+    if len(history) >= 2:
+        previous = history[-2]
+        previous_ns = previous.observation_monotonic_ns
+        if (
+            type(previous_ns) is not int
+            or previous_ns < 0
+            or previous_ns >= observed_ns
+        ):
+            raise ValueError("top-FOV bbox history clock did not advance")
+        top_rate = (
+            top - _raw_bbox_top_image_down(previous.bbox_norm)
+        ) / ((observed_ns - previous_ns) / 1_000_000_000.0)
+    previous_target = (
+        None
+        if course.last_applied_command is None
+        else course.last_applied_command.target_pitch_rad
+    )
+    return (
+        _body_to_reference_pitch_rad(current.body_to_reference_wxyz),
+        top,
+        top_rate,
+        float(config.vertical_angle_scale_rad),
+        previous_target,
+    )
 
 
 def _allocate_launch_pitch_target(
@@ -2685,6 +2962,7 @@ async def _run_visual_course_stage_impl(
         command_deadline_s: Optional[float] = None,
         refresh_ingress_after_slot: bool = False,
         intercept_response_authority: float = 0.0,
+        top_fov_transition_owned: bool = False,
     ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -2743,6 +3021,10 @@ async def _run_visual_course_stage_impl(
         if type(apply_launch_bootstrap) is not bool:
             raise abort_type(
                 "visual-course launch-bootstrap selection is invalid"
+            )
+        if type(top_fov_transition_owned) is not bool:
+            raise abort_type(
+                "visual-course top-FOV transition ownership is invalid"
             )
         if (
             command_deadline_s is not None
@@ -2995,6 +3277,64 @@ async def _run_visual_course_stage_impl(
                     next_preview_collective_track_id
                 ),
             }
+        top_fov_proposal: Optional[_TopFovPitchProposal] = None
+        top_fov_track_id: Optional[str] = None
+        dynamic_controller = runtime.dynamic_controller
+        if type(dynamic_controller) is DynamicVisualCourseSession:
+            top_fov_track_id = getattr(target_track, "track_id", None)
+            if (
+                type(top_fov_track_id) is not str
+                or not top_fov_track_id
+            ):
+                raise abort_type(
+                    "visual-course top-FOV target identity is invalid"
+                )
+            fov_summary = segment["top_fov_pitch_protection"]
+            if not top_fov_transition_owned:
+                try:
+                    (
+                        capture_pitch_rad,
+                        raw_top,
+                        raw_top_rate_down_s,
+                        vertical_scale_rad,
+                        last_dynamic_target_pitch_rad,
+                    ) = _top_fov_observation(
+                        dynamic_controller,
+                        target_track,
+                        snapshot.latest_camera_token,
+                    )
+                    prior_target_pitch_rad = (
+                        fov_summary["last_protected_target_pitch_rad"]
+                        if fov_summary[
+                            "last_protected_target_pitch_rad"
+                        ]
+                        is not None
+                        else (
+                            last_dynamic_target_pitch_rad
+                            if last_dynamic_target_pitch_rad is not None
+                            else capture_pitch_rad
+                        )
+                    )
+                    top_fov_proposal = _propose_top_fov_pitch_reference(
+                        capture_pitch_rad=capture_pitch_rad,
+                        raw_top_edge_image_down=raw_top,
+                        raw_top_edge_rate_down_s=raw_top_rate_down_s,
+                        requested_target_pitch_rad=target_pitch_rad,
+                        prior_target_pitch_rad=prior_target_pitch_rad,
+                        vertical_angle_scale_rad=vertical_scale_rad,
+                        active_before=bool(fov_summary["active"]),
+                    )
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise abort_type(
+                        "visual-course top-FOV pitch guidance refused: "
+                        f"{exc}"
+                    ) from exc
+                target_pitch_rad = top_fov_proposal.protected_target_pitch_rad
+                if launch_evidence is not None:
+                    launch_evidence["target_pitch_rad_before_top_fov"] = (
+                        launch_evidence["target_pitch_rad"]
+                    )
+                    launch_evidence["target_pitch_rad"] = target_pitch_rad
         # Allocate the static attitude-loop response from the reference that
         # will actually be applied this tick.  Before the old inner governor
         # was removed, its governed output implicitly provided this behavior;
@@ -3306,6 +3646,35 @@ async def _run_visual_course_stage_impl(
                     "visual-course dynamic command evidence is invalid"
                 )
             accepted_dynamic_evidence = dict(dynamic_evidence)
+            if (
+                type(dynamic_controller)
+                is DynamicVisualCourseSession
+                and top_fov_track_id is not None
+            ):
+                fov_summary = segment["top_fov_pitch_protection"]
+                if top_fov_proposal is not None:
+                    if top_fov_proposal.limited:
+                        fov_summary["limited_command_count"] += 1
+                    fov_summary.update(
+                        {
+                            "last_track_id": top_fov_track_id,
+                            "last_raw_top_edge_image_down": (
+                                top_fov_proposal.raw_top_edge_image_down
+                            ),
+                            "last_protected_target_pitch_rad": (
+                                top_fov_proposal.protected_target_pitch_rad
+                            ),
+                            "active": top_fov_proposal.active_after,
+                        }
+                    )
+                    accepted_dynamic_evidence["top_fov_pitch_guidance"] = {
+                        "basis": TOP_FOV_PITCH_PROTECTION_BASIS,
+                        "track_id": top_fov_track_id,
+                        "safe_top_edge_image_down": (
+                            TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+                        ),
+                        **asdict(top_fov_proposal),
+                    }
             host.recorder.emit(
                 "visual_course_dynamic_command",
                 **accepted_dynamic_evidence,
@@ -4019,6 +4388,33 @@ async def _run_visual_course_stage_impl(
             "near_plane_measurement_mode": None,
             "crossing_anchor": None,
             "outcome": "running",
+            "top_fov_pitch_protection": {
+                "enabled": (
+                    type(runtime.dynamic_controller)
+                    is DynamicVisualCourseSession
+                ),
+                "basis": (
+                    TOP_FOV_PITCH_PROTECTION_BASIS
+                    if (
+                        type(runtime.dynamic_controller)
+                        is DynamicVisualCourseSession
+                    )
+                    else None
+                ),
+                "safe_top_edge_image_down": (
+                    TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+                    if (
+                        type(runtime.dynamic_controller)
+                        is DynamicVisualCourseSession
+                    )
+                    else None
+                ),
+                "limited_command_count": 0,
+                "last_track_id": None,
+                "last_raw_top_edge_image_down": None,
+                "last_protected_target_pitch_rad": None,
+                "active": False,
+            },
             "current_aperture_collective": {
                 "enabled": runtime.dynamic_controller is not None,
                 "basis": (
@@ -5109,6 +5505,11 @@ async def _run_visual_course_stage_impl(
                         # approach, passage, and crossing retain their proved
                         # baseline roll/pitch loop.
                         intercept_response_authority=1.0,
+                        # Authoritative promotion has already retired the
+                        # predecessor aperture.  The bounded recovery
+                        # lifecycle owns observability until the promoted
+                        # current returns through clean geometry.
+                        top_fov_transition_owned=True,
                         stage=(
                             f"{VISUAL_COURSE_STAGE}/gate"
                             f"{current_gate_index}/"
@@ -5596,6 +5997,10 @@ async def _run_visual_course_stage_impl(
                     snapshot=snapshot,
                     yaw_reference_rad=yaw_reference_rad,
                     segment_started_s=segment_started_s,
+                    top_fov_transition_owned=bool(
+                        near_plane_latch is not None
+                        or crossing_anchor is not None
+                    ),
                     stage=(
                         f"{VISUAL_COURSE_STAGE}/gate"
                         f"{current_gate_index}/passage"
@@ -6083,6 +6488,7 @@ async def _run_visual_course_stage_impl(
                         # moves closure control before race-packet latency
                         # without changing roll, yaw, thrust, or any bound.
                         intercept_response_authority=1.0,
+                        top_fov_transition_owned=True,
                         command_deadline_s=min(
                             course_deadline_s,
                             crossing_deadline_s,

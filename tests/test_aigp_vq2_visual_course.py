@@ -2170,6 +2170,135 @@ def test_launch_destination_cannot_raise_gain_before_reference_allocates_it():
     ) == 1.0
 
 
+def test_live_top_fov_geometry_holds_nose_up_before_outer_extent_clips():
+    raw_top = course_stage._raw_bbox_top_image_down(
+        (
+            282.0 / 640.0,
+            134.0 / 360.0,
+            362.0 / 640.0,
+            214.0 / 360.0,
+        )
+    )
+    capture_pitch = -0.3100692828034804
+    proposal = course_stage._propose_top_fov_pitch_reference(
+        capture_pitch_rad=capture_pitch,
+        raw_top_edge_image_down=raw_top,
+        raw_top_edge_rate_down_s=-0.10,
+        requested_target_pitch_rad=0.120,
+        prior_target_pitch_rad=capture_pitch,
+        vertical_angle_scale_rad=0.55,
+        active_before=False,
+    )
+    expected_maximum = (
+        capture_pitch
+        + math.atan(raw_top * 0.55)
+        - math.atan(
+            course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN * 0.55
+        )
+    )
+
+    assert raw_top == pytest.approx(-0.25555555555555554)
+    assert proposal.maximum_observable_target_pitch_rad == pytest.approx(
+        expected_maximum
+    )
+    assert proposal.maximum_observable_target_pitch_rad == pytest.approx(
+        -0.082201,
+        abs=1e-6,
+    )
+    assert proposal.predicted_requested_top_edge_image_down < -1.0
+    assert proposal.protected_target_pitch_rad == pytest.approx(
+        capture_pitch
+    )
+    assert (
+        proposal.predicted_protected_top_edge_image_down
+        >= course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+    )
+    assert proposal.active_after is True
+    assert proposal.limited is True
+
+
+def test_decreasing_top_clearance_cannot_worsen_predicted_clipping():
+    common = {
+        "capture_pitch_rad": -0.20,
+        "raw_top_edge_image_down": -0.20,
+        "requested_target_pitch_rad": 0.0,
+        "prior_target_pitch_rad": -0.15,
+        "vertical_angle_scale_rad": 0.55,
+        "active_before": True,
+    }
+    decreasing = course_stage._propose_top_fov_pitch_reference(
+        raw_top_edge_rate_down_s=-0.10,
+        **common,
+    )
+    recovered = course_stage._propose_top_fov_pitch_reference(
+        raw_top_edge_rate_down_s=0.10,
+        **common,
+    )
+
+    assert decreasing.protected_target_pitch_rad <= common[
+        "prior_target_pitch_rad"
+    ]
+    assert (
+        decreasing.predicted_protected_top_edge_image_down
+        >= decreasing.predicted_requested_top_edge_image_down
+    )
+    assert decreasing.active_after is True
+    assert recovered.protected_target_pitch_rad == pytest.approx(
+        common["requested_target_pitch_rad"]
+    )
+    assert recovered.active_after is False
+    assert recovered.limited is False
+
+
+def test_top_fov_pitch_limit_uses_bbox_extent_not_center_alone():
+    short_top = course_stage._raw_bbox_top_image_down(
+        (0.40, 0.40, 0.60, 0.60)
+    )
+    tall_top = course_stage._raw_bbox_top_image_down(
+        (0.40, 0.30, 0.60, 0.70)
+    )
+    common = {
+        "capture_pitch_rad": -0.20,
+        "raw_top_edge_rate_down_s": 0.10,
+        "requested_target_pitch_rad": 0.12,
+        "prior_target_pitch_rad": -0.20,
+        "vertical_angle_scale_rad": 0.55,
+        "active_before": False,
+    }
+    short = course_stage._propose_top_fov_pitch_reference(
+        raw_top_edge_image_down=short_top,
+        **common,
+    )
+    tall = course_stage._propose_top_fov_pitch_reference(
+        raw_top_edge_image_down=tall_top,
+        **common,
+    )
+
+    assert tall.maximum_observable_target_pitch_rad < (
+        short.maximum_observable_target_pitch_rad
+    )
+    assert (
+        tall.predicted_protected_top_edge_image_down
+        == pytest.approx(
+            course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+        )
+    )
+
+
+def test_top_fov_capture_pitch_uses_active_body_to_reference_quaternion():
+    pitch = 0.23
+    quaternion = (
+        math.cos(pitch / 2.0),
+        0.0,
+        math.sin(pitch / 2.0),
+        0.0,
+    )
+
+    assert course_stage._body_to_reference_pitch_rad(
+        quaternion
+    ) == pytest.approx(pitch)
+
+
 def test_8319198e_dynamic_launch_does_not_discard_proved_collective():
     thrust, phase = course_stage._allocate_launch_collective(
         launch_elapsed_s=0.422,
