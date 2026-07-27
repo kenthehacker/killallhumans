@@ -2196,6 +2196,73 @@ def test_censored_near_plane_passage_transfers_to_successor_coast():
     assert coast_commands[0].pitch_rate > 0.0
 
 
+def test_latched_crossing_coasts_over_rejected_image_rate_until_credit():
+    class RateOutlierAfterLatchHost(_Host):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.allow_credit = False
+            self.rate_coast_seen = False
+
+        def _advance_race(self):
+            if self.allow_credit:
+                super()._advance_race()
+
+        def _sample(self):
+            super()._sample()
+            summary = getattr(self, "_visual_course_summary", {})
+            segments = summary.get("segments", ())
+            if (
+                segments
+                and segments[-1].get("near_plane_latch") is not None
+            ):
+                self.visual_gate_graph.latest_snapshot.current_track.center_velocity_norm_s = (
+                    8.1,
+                    0.0,
+                )
+
+        async def _send_flight_command(self, command, **kwargs):
+            rate = (
+                self.visual_gate_graph.latest_snapshot.current_track
+                .center_velocity_norm_s[0]
+            )
+            if abs(rate) > 8.0:
+                self.rate_coast_seen = True
+                self.allow_credit = True
+            return await super()._send_flight_command(command, **kwargs)
+
+    class RefuseRateOutlierServo(_Servo):
+        def observe(self, snapshot, *args, **kwargs):
+            if abs(snapshot.current_track.center_velocity_norm_s[0]) > 8.0:
+                raise VisualApproachRefusal(
+                    "visual target adaptation refused: "
+                    "horizontal target rate is implausible"
+                )
+            return super().observe(snapshot, *args, **kwargs)
+
+    host = RateOutlierAfterLatchHost(initial_gate=6, finish_gate=6)
+    runtime, calls = _runtime(host)
+    runtime = replace(
+        runtime,
+        servo_factory=lambda *args, **kwargs: RefuseRateOutlierServo(
+            *args,
+            **kwargs,
+            calls=calls,
+        ),
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    assert host.rate_coast_seen
+    coast = result["segments"][0]["censored_passage_coast"]
+    assert coast["measurement_refusal"].endswith(
+        "horizontal target rate is implausible"
+    )
+
+
 @pytest.mark.parametrize("case", ("stale", "ambiguous", "off_center"))
 def test_latched_unsafe_target_is_refused_without_a_wire_send(case):
     class UnsafePostLatchHost(_Host):

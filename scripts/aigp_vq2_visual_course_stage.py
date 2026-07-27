@@ -132,6 +132,20 @@ GATE0_PROVED_NEXT_PREVIEW_BASIS = (
 CENSORED_PASSAGE_COAST_BASIS = (
     "latched-clean-attitude-close-censored-passage-v1"
 )
+# Once a clean, uncertainty-bounded near-plane state has been latched, a
+# tracker-rate outlier is a rejected measurement rather than evidence that the
+# separately bounded crossing commitment became unsafe.  All lineage,
+# identity, geometry, race, and command leases are still revalidated below.
+_LATCHED_RATE_MEASUREMENT_REFUSALS = frozenset(
+    {
+        "visual target adaptation refused: horizontal target rate is implausible",
+        (
+            "visual target adaptation refused: image-down vertical target "
+            "rate is implausible"
+        ),
+        "visual target adaptation refused: target scale rate is implausible",
+    }
+)
 APPROACH_TOP_RECOVERY_BASIS = (
     "clean-q-converging-top-censored-approach-v1"
 )
@@ -7749,9 +7763,16 @@ async def _run_visual_course_stage_impl(
                             "visual-course latched near-plane measurement "
                             "became unsafe"
                         ) from exc
+                rate_measurement_refused = bool(
+                    type(exc) is VisualApproachRefusal
+                    and str(exc) in _LATCHED_RATE_MEASUREMENT_REFUSALS
+                )
                 censored_coast_eligible = bool(
-                    type(exc)
-                    is VisualApproachCurrentGeometryUnavailable
+                    (
+                        type(exc)
+                        is VisualApproachCurrentGeometryUnavailable
+                        or rate_measurement_refused
+                    )
                     and crossing_anchor is not None
                     and crossing_coast_authority is not None
                     and previous_visible_token is not None
@@ -7821,6 +7842,11 @@ async def _run_visual_course_stage_impl(
                             ),
                             "commitment_deadline_monotonic_s": (
                                 crossing_commitment_deadline_s
+                            ),
+                            "measurement_refusal": (
+                                str(exc)
+                                if rate_measurement_refused
+                                else None
                             ),
                             "elapsed_s": 0.0,
                         }
