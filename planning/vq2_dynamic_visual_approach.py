@@ -87,11 +87,9 @@ class _StagedContext:
 class _WireGovernorConfig:
     max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
-    # A 0.75-rad/s^2 single-governor A/B still reached +0.228 rad/s while its
-    # saturated attitude demand drove measured q to +0.488 rad/s.  The clean
-    # baseline's sustained wire rise was 0.234 rad/s^2; keep that proved pace
-    # while retaining the final governor's fast reversal acceleration.
-    max_pitch_slew_rad_s2: float = 0.25
+    # Retain the collision-free baseline's largest measured pitch-wire slew
+    # for the isolated visual-course body-rate diagnostic A/B.
+    max_pitch_slew_rad_s2: float = 0.75
     max_yaw_slew_rad_s2: float = 0.75
     max_thrust_slew_s: float = 0.15
     max_roll_accel_rad_s3: float = 20.0

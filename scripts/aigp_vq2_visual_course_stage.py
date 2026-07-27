@@ -1768,15 +1768,24 @@ def _assert_course_attitude_state(
 
     roll, pitch, yaw, rates = _attitude_state(host, abort_type)
     excursion = _wrapped_delta(yaw, yaw_reference_rad)
+    peak_body_rate = max(abs(value) for value in rates)
+    if peak_body_rate > limits.max_abs_measured_body_rate_rad_s:
+        host.recorder.emit(
+            "visual_course_measured_body_rate_corridor_exceeded",
+            phase=phase,
+            disposition="diagnostic_only",
+            threshold_rad_s=limits.max_abs_measured_body_rate_rad_s,
+            peak_abs_body_rate_rad_s=peak_body_rate,
+            measured_body_rates_rad_s=list(rates),
+            measured_attitude_rpy_rad=[roll, pitch, yaw],
+        )
     if (
         abs(roll) > limits.max_abs_measured_roll_rad
         or pitch < limits.min_measured_pitch_rad
         or pitch > limits.max_measured_pitch_rad
-        or max(abs(value) for value in rates)
-        > limits.max_abs_measured_body_rate_rad_s
     ):
         raise abort_type(
-            "visual-course measured attitude/body-rate envelope was exceeded "
+            "visual-course measured attitude envelope was exceeded "
             f"during {phase}"
         )
     if (

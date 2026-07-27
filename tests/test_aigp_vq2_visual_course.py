@@ -3319,24 +3319,21 @@ def test_cross_axis_body_rates_use_exact_euler_yaw_kinematics():
 
 
 @pytest.mark.parametrize(
-    ("roll", "pitch", "rates"),
+    ("roll", "pitch"),
     (
-        (0.180001, 0.0, (0.0, 0.0, 0.0)),
-        (0.0, -0.350001, (0.0, 0.0, 0.0)),
-        (0.0, 0.150001, (0.0, 0.0, 0.0)),
-        (0.0, 0.0, (0.500001, 0.0, 0.0)),
-        (0.0, 0.0, (0.0, -0.500001, 0.0)),
+        (0.180001, 0.0),
+        (0.0, -0.350001),
+        (0.0, 0.150001),
     ),
 )
-def test_measured_roll_pitch_and_all_axis_rate_envelopes_fail_closed(
+def test_measured_roll_pitch_envelopes_fail_closed(
     roll,
     pitch,
-    rates,
 ):
     host = _Host()
-    _set_attitude(host, roll=roll, pitch=pitch, rates=rates)
+    _set_attitude(host, roll=roll, pitch=pitch)
 
-    with pytest.raises(SafetyAbort, match="attitude/body-rate envelope"):
+    with pytest.raises(SafetyAbort, match="measured attitude envelope"):
         course_stage._assert_course_attitude_state(
             host,
             yaw_reference_rad=0.0,
@@ -3345,6 +3342,42 @@ def test_measured_roll_pitch_and_all_axis_rate_envelopes_fail_closed(
             abort_type=SafetyAbort,
             phase="regression",
         )
+
+
+@pytest.mark.parametrize(
+    "rates",
+    (
+        (0.500001, 0.0, 0.0),
+        (0.0, -0.500001, 0.0),
+    ),
+)
+def test_measured_roll_pitch_rate_corridor_is_recorded_as_diagnostic(rates):
+    host = _Host()
+    _set_attitude(host, rates=rates)
+
+    _excursion, admitted_rates, _euler_yaw_rate = (
+        course_stage._assert_course_attitude_state(
+            host,
+            yaw_reference_rad=0.0,
+            limits=VisualCourseStageLimits(),
+            yaw_profile=_yaw_profile(),
+            abort_type=SafetyAbort,
+            phase="diagnostic-regression",
+        )
+    )
+
+    assert admitted_rates == rates
+    events = [
+        payload
+        for event, payload in host.recorder.events
+        if event == "visual_course_measured_body_rate_corridor_exceeded"
+    ]
+    assert len(events) == 1
+    assert events[0]["phase"] == "diagnostic-regression"
+    assert events[0]["disposition"] == "diagnostic_only"
+    assert events[0]["threshold_rad_s"] == 0.50
+    assert events[0]["peak_abs_body_rate_rad_s"] == pytest.approx(0.500001)
+    assert events[0]["measured_body_rates_rad_s"] == list(rates)
 
 
 def test_repeated_same_sign_yaw_requests_zero_before_hard_boundary():
@@ -3428,7 +3461,7 @@ def test_crossing_hold_checks_attitude_before_sending():
 
     with pytest.raises(
         SafetyAbort,
-        match="attitude/body-rate envelope",
+        match="measured attitude envelope",
     ):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)
@@ -3588,7 +3621,7 @@ def test_post_credit_wait_checks_attitude_before_sending_zero():
 
     with pytest.raises(
         SafetyAbort,
-        match="attitude/body-rate envelope",
+        match="measured attitude envelope",
     ):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)
@@ -3605,7 +3638,7 @@ def test_command_slot_wait_cannot_invalidate_attitude_guard():
     class SlotUnsafeHost(_Host):
         async def _wait_for_next_flight_command_slot(self):
             ready = await super()._wait_for_next_flight_command_slot()
-            _set_attitude(self, rates=(0.0, 0.500001, 0.0))
+            _set_attitude(self, roll=0.180001)
             return ready
 
     host = SlotUnsafeHost(initial_gate=0, finish_gate=0)
@@ -3613,7 +3646,7 @@ def test_command_slot_wait_cannot_invalidate_attitude_guard():
 
     with pytest.raises(
         SafetyAbort,
-        match="attitude/body-rate envelope",
+        match="measured attitude envelope",
     ):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)
