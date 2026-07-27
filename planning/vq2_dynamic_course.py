@@ -2782,6 +2782,186 @@ class DynamicCourseCore:
             0.0 <= age_s <= self.config.successor_lineage_hold_s
         )
 
+    def _reanchor_track_reference(self, track_id: str) -> None:
+        """Express one promoted track in its latest capture-camera basis.
+
+        Successors may first be observed well before they become current.
+        Retaining that old projective reference through a large inter-gate
+        yaw makes its forward component approach zero, coupling otherwise
+        ordinary vertical motion into an unbounded gnomonic coordinate.  An
+        authoritative promotion is the natural local-map ownership boundary:
+        change coordinates here without changing the represented ray, rate,
+        aperture lineage, or any race/passage authority.
+        """
+
+        estimate = self._tracks[track_id]
+        state = estimate.state
+        old_reference = estimate.reference_camera_to_world
+        new_reference = _quat_multiply(
+            state.body_to_reference_wxyz,
+            self.config.camera_to_body_wxyz,
+        )
+        old_to_new = _quat_multiply(
+            _quat_conjugate(new_reference),
+            old_reference,
+        )
+
+        def transform(
+            bearing: Vector2,
+        ) -> tuple[Vector3, Vector2, tuple[Vector2, Vector2]] | None:
+            horizontal, vertical = bearing
+            stable_ray = (
+                1.0,
+                math.tan(horizontal),
+                math.tan(vertical),
+            )
+            transformed_ray = _quat_rotate(old_to_new, stable_ray)
+            forward, right, down = transformed_ray
+            if forward <= 1e-6:
+                return None
+            transformed_bearing = _ray_bearing(transformed_ray)
+
+            horizontal_column = _quat_rotate(
+                old_to_new,
+                (
+                    0.0,
+                    1.0 / max(math.cos(horizontal) ** 2, _EPSILON),
+                    0.0,
+                ),
+            )
+            vertical_column = _quat_rotate(
+                old_to_new,
+                (
+                    0.0,
+                    0.0,
+                    1.0 / max(math.cos(vertical) ** 2, _EPSILON),
+                ),
+            )
+            horizontal_denominator = forward * forward + right * right
+            vertical_denominator = forward * forward + down * down
+
+            def derivative(column: Vector3) -> Vector2:
+                return (
+                    (
+                        forward * column[1]
+                        - right * column[0]
+                    )
+                    / max(horizontal_denominator, _EPSILON),
+                    (
+                        forward * column[2]
+                        - down * column[0]
+                    )
+                    / max(vertical_denominator, _EPSILON),
+                )
+
+            horizontal_derivative = derivative(horizontal_column)
+            vertical_derivative = derivative(vertical_column)
+            jacobian = (
+                (
+                    horizontal_derivative[0],
+                    vertical_derivative[0],
+                ),
+                (
+                    horizontal_derivative[1],
+                    vertical_derivative[1],
+                ),
+            )
+            values = (
+                *transformed_ray,
+                *transformed_bearing,
+                *jacobian[0],
+                *jacobian[1],
+            )
+            if not all(math.isfinite(value) for value in values):
+                raise DynamicCourseError(
+                    "track-reference reanchor produced non-finite geometry"
+                )
+            return transformed_ray, transformed_bearing, jacobian
+
+        transformed = transform(state.bearing_rad)
+        if transformed is None:
+            # Race credit remains authoritative even if a stale local
+            # prediction is no longer forward in its own capture camera.
+            # Leave that prediction untouched so this coordinate maintenance
+            # step can never veto the lifecycle transition.
+            return
+        _, bearing, jacobian = transformed
+        bearing_rate = tuple(
+            _clamp(
+                sum(
+                    jacobian[axis][source]
+                    * state.bearing_rate_rad_s[source]
+                    for source in range(2)
+                ),
+                -self.config.max_abs_bearing_rate_rad_s,
+                self.config.max_abs_bearing_rate_rad_s,
+            )
+            for axis in range(2)
+        )
+        bearing_rate_qualified = tuple(
+            all(
+                state.bearing_rate_qualified[source]
+                or abs(jacobian[axis][source]) <= 1e-9
+                for source in range(2)
+            )
+            for axis in range(2)
+        )
+
+        def transformed_uncertainty(
+            uncertainty: Vector2,
+            limit: float,
+        ) -> Vector2:
+            return tuple(
+                min(
+                    limit,
+                    max(
+                        1e-10,
+                        sum(
+                            abs(jacobian[axis][source])
+                            * uncertainty[source]
+                            for source in range(2)
+                        ),
+                    ),
+                )
+                for axis in range(2)
+            )  # type: ignore[return-value]
+
+        transformed_history: list[tuple[int, Vector2]] = []
+        for sample_ns, sample_bearing in estimate.measured_bearing_history:
+            transformed_sample = transform(sample_bearing)
+            if transformed_sample is None:
+                # A history straddling the new projective horizon cannot
+                # supply a meaningful successor-rate fit in this basis.
+                transformed_history.clear()
+                break
+            transformed_history.append(
+                (sample_ns, transformed_sample[1])
+            )
+
+        estimate.reference_camera_to_world = new_reference
+        estimate.last_measured_stable_ray = _normalise_vector(
+            _quat_rotate(
+                old_to_new,
+                estimate.last_measured_stable_ray,
+            )
+        )
+        estimate.measured_bearing_history[:] = transformed_history
+        estimate.state = replace(
+            state,
+            bearing_rad=bearing,
+            bearing_rate_rad_s=bearing_rate,  # type: ignore[arg-type]
+            bearing_rate_qualified=bearing_rate_qualified,  # type: ignore[arg-type]
+            reference_camera_to_world_wxyz=new_reference,
+            bearing_std_rad=transformed_uncertainty(
+                state.bearing_std_rad,
+                self.config.max_abs_bearing_rad,
+            ),
+            rate_std_rad_s=transformed_uncertainty(
+                state.rate_std_rad_s,
+                self.config.max_abs_bearing_rate_rad_s,
+            ),
+        )
+
     def promote_authoritative(
         self,
         *,
@@ -2812,6 +2992,7 @@ class DynamicCourseCore:
                 raise DynamicCourseError("promoted and next successor tracks must differ")
             if next_successor_track_id not in self._tracks:
                 raise DynamicCourseError("next successor track has no dynamic state")
+        self._reanchor_track_reference(promoted_track_id)
         self._current_gate_index = to_gate_index
         self._current_track_id = promoted_track_id
         self._successor_track_id = next_successor_track_id

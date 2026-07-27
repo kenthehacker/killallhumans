@@ -22,6 +22,8 @@ from planning.vq2_dynamic_course import (
     MIN_THRUST,
     SUPPORT_THRUST,
     TrackDynamicState,
+    _bearing_ray,
+    _quat_rotate,
     predict_aperture_relative_crossing,
 )
 
@@ -832,7 +834,23 @@ def test_successor_steering_and_state_are_continuous_through_promotion() -> None
         next_successor_track_id="gate-c",
         monotonic_ns=1_215_000_000,
     )
-    assert promoted.current == successor_before
+    assert promoted.current.track_id == successor_before.track_id
+    assert promoted.current.stream_generation == (
+        successor_before.stream_generation
+    )
+    assert promoted.current.frame_sequence == successor_before.frame_sequence
+    assert promoted.current.last_measurement_monotonic_ns == (
+        successor_before.last_measurement_monotonic_ns
+    )
+    assert promoted.current.aperture_half_size_norm == pytest.approx(
+        successor_before.aperture_half_size_norm
+    )
+    assert promoted.current.aperture_seed_monotonic_ns == (
+        successor_before.aperture_seed_monotonic_ns
+    )
+    assert promoted.current.aperture_prediction_deadline_monotonic_ns == (
+        successor_before.aperture_prediction_deadline_monotonic_ns
+    )
     assert promoted.last_applied_command == precredit.command
 
     _imu(core, 1.24)
@@ -2616,13 +2634,159 @@ def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:
         monotonic_ns=1_030_000_000,
     )
 
-    assert first.current == preserved["gate-b"]
-    assert second.current == preserved["gate-c"]
-    assert third.current == preserved["gate-d"]
+    assert first.current.track_id == preserved["gate-b"].track_id
+    assert second.current.track_id == preserved["gate-c"].track_id
+    assert third.current.track_id == preserved["gate-d"].track_id
+    assert first.current.frame_sequence == preserved["gate-b"].frame_sequence
+    assert second.current.frame_sequence == preserved["gate-c"].frame_sequence
+    assert third.current.frame_sequence == preserved["gate-d"].frame_sequence
+    assert first.current.aperture_seed_monotonic_ns == (
+        preserved["gate-b"].aperture_seed_monotonic_ns
+    )
+    assert second.current.aperture_seed_monotonic_ns == (
+        preserved["gate-c"].aperture_seed_monotonic_ns
+    )
+    assert third.current.aperture_seed_monotonic_ns == (
+        preserved["gate-d"].aperture_seed_monotonic_ns
+    )
     assert third.current_gate_index == 3
     assert third.current_track_id == "gate-d"
     assert third.successor_track_id is None
     assert third.promotion_count == 3
+
+
+def test_authoritative_promotion_reanchors_large_yaw_without_optical_jump() -> None:
+    config = DynamicCourseConfig(camera_delay_s=0.0)
+    core = DynamicCourseCore(config)
+    core.record_applied_command(_command(0.90))
+
+    def projected_center(
+        world_horizontal_rad: float,
+        yaw_rad: float,
+    ) -> tuple[float, float]:
+        world_ray = (
+            1.0,
+            math.tan(world_horizontal_rad),
+            math.tan(-0.18),
+        )
+        camera_forward = (
+            math.cos(yaw_rad) * world_ray[0]
+            + math.sin(yaw_rad) * world_ray[1]
+        )
+        camera_right = (
+            -math.sin(yaw_rad) * world_ray[0]
+            + math.cos(yaw_rad) * world_ray[1]
+        )
+        assert camera_forward > 0.0
+        return (
+            camera_right
+            / camera_forward
+            / config.horizontal_angle_scale_rad,
+            world_ray[2]
+            / camera_forward
+            / config.vertical_angle_scale_rad,
+        )
+
+    successor = None
+    last_center = None
+    for sequence in range(1, 7):
+        observation_time = 1.0 + (sequence - 1) * 0.04
+        yaw = (sequence - 1) * 0.20
+        world_horizontal = 1.20 + (sequence - 1) * 0.016
+        last_center = projected_center(world_horizontal, yaw)
+        _imu(core, observation_time, yaw_rad=yaw)
+        if sequence == 1:
+            core.observe_track(
+                _observation(
+                    "gate-a",
+                    sequence,
+                    observation_time,
+                    x=0.0,
+                    y=0.0,
+                )
+            )
+        successor = core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=last_center[0],
+                y=last_center[1],
+            )
+        )
+    assert successor is not None
+    assert last_center is not None
+    core.bind(
+        current_gate_index=0,
+        current_track_id="gate-a",
+        successor_track_id="gate-b",
+    )
+    before_world_ray = _quat_rotate(
+        successor.reference_camera_to_world_wxyz,
+        _bearing_ray(successor.bearing_rad),
+    )
+    before_prediction = core.predict_track_steering(
+        "gate-b",
+        successor.state_monotonic_ns,
+    )
+
+    promoted = core.promote_authoritative(
+        from_gate_index=0,
+        to_gate_index=1,
+        promoted_track_id="gate-b",
+        next_successor_track_id=None,
+        monotonic_ns=1_205_000_000,
+    )
+    after_world_ray = _quat_rotate(
+        promoted.current.reference_camera_to_world_wxyz,
+        _bearing_ray(promoted.current.bearing_rad),
+    )
+    after_prediction = core.predict_track_steering(
+        "gate-b",
+        successor.state_monotonic_ns,
+    )
+
+    assert after_world_ray == pytest.approx(before_world_ray, abs=1e-12)
+    assert after_prediction.camera_center_norm == pytest.approx(
+        before_prediction.camera_center_norm,
+        abs=1e-12,
+    )
+    assert after_prediction.camera_center_rate_norm_s == pytest.approx(
+        before_prediction.camera_center_rate_norm_s,
+        abs=1e-10,
+    )
+    assert abs(promoted.current.bearing_rad[0]) < 0.40
+    assert abs(promoted.current.bearing_rad[1]) < 0.20
+    assert promoted.current.raw_center_norm == pytest.approx(last_center)
+    assert promoted.current.aperture_half_size_norm == pytest.approx(
+        successor.aperture_half_size_norm
+    )
+
+    _imu(core, 1.24, yaw_rad=1.10)
+    decision = core.guide(1_240_000_000)
+    assert all(
+        math.isfinite(value)
+        for value in (
+            *decision.current_center_norm,
+            *decision.camera_current_center_norm,
+            *decision.current_aperture_half_size_norm,
+            decision.command.target_roll_rad,
+            decision.command.target_pitch_rad,
+            decision.command.yaw_rate_rad_s,
+            decision.command.thrust,
+        )
+    )
+    assert abs(decision.camera_current_center_norm[0]) < 0.50
+    assert abs(decision.camera_current_center_norm[1]) < 0.50
+    assert abs(decision.current_center_norm[1]) < 0.50
+    assert abs(decision.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= decision.command.target_pitch_rad
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert abs(decision.command.yaw_rate_rad_s) <= MAX_YAW_RATE_RAD_S
+    assert MIN_THRUST <= decision.command.thrust <= MAX_THRUST
 
 
 def test_current_and_successor_references_project_into_one_decision_frame() -> None:
