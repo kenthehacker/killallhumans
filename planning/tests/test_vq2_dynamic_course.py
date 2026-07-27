@@ -2326,6 +2326,42 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
         * stable.command.yaw_rate_rad_s
         >= 0.0
     )
+    committed = core.guide(
+        1_210_000_000,
+        passage_committed=True,
+    )
+    assert committed.passage_committed
+    assert committed.committed_successor_yaw_authority == 1.0
+    assert committed.committed_successor_yaw_rate_rad_s is not None
+    assert committed.command.yaw_rate_rad_s < 0.0
+    assert committed.command.yaw_rate_rad_s == pytest.approx(
+        committed.committed_successor_yaw_rate_rad_s
+    )
+    assert committed.command.target_roll_rad == pytest.approx(
+        dropped.command.target_roll_rad
+    )
+    assert committed.command.target_pitch_rad == pytest.approx(
+        dropped.command.target_pitch_rad
+    )
+    assert committed.command.thrust == pytest.approx(
+        dropped.command.thrust
+    )
+    assert committed.successor_passage_authority == 0.0
+    assert committed.successor_clearance_authority == 0.0
+    assert committed.passage_point_norm == (0.0, 0.0)
+    assert all(
+        math.isfinite(value)
+        for value in (
+            committed.command.target_roll_rad,
+            committed.command.target_pitch_rad,
+            committed.command.yaw_rate_rad_s,
+            committed.command.thrust,
+        )
+    )
+    assert (
+        abs(committed.command.yaw_rate_rad_s)
+        <= MAX_YAW_RATE_RAD_S
+    )
     _commit_decision(core, 1.21, dropped.command)
 
     _imu(core, 1.24)
@@ -2388,6 +2424,15 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     assert not expired.successor_transition_held
     assert expired.passage_point_norm == (0.0, 0.0)
     assert expired.current_yaw_release == 0.0
+    _imu(core, 1.60)
+    expired_committed = core.guide(
+        1_600_000_000,
+        passage_committed=True,
+    )
+    assert expired_committed.passage_committed
+    assert expired_committed.committed_successor_yaw_authority == 0.0
+    assert expired_committed.committed_successor_yaw_rate_rad_s is None
+    assert expired_committed.command == expired.command
 
 
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:

@@ -184,6 +184,7 @@ class _StagedContext:
     expected_gate_index: int
     expected_current_track_id: str
     adjacent_precredit: bool
+    passage_committed: bool
     camera_token: CameraFrameToken
     tracker_frame_sequence: int
 
@@ -559,7 +560,16 @@ class DynamicVisualCourseSession:
         expected_gate_index: int,
         expected_current_track_id: str,
         adjacent_precredit: bool,
+        passage_committed: bool = False,
     ) -> None:
+        if type(passage_committed) is not bool:
+            raise DynamicCourseError(
+                "dynamic staged passage commitment is invalid"
+            )
+        if adjacent_precredit and passage_committed:
+            raise DynamicCourseError(
+                "adjacent steering cannot own passage commitment"
+            )
         update = tracker.latest_update
         if update is None:
             raise VisualApproachRefusal(
@@ -620,6 +630,7 @@ class DynamicVisualCourseSession:
             expected_gate_index=expected_gate_index,
             expected_current_track_id=expected_current_track_id,
             adjacent_precredit=adjacent_precredit,
+            passage_committed=passage_committed,
             camera_token=token,
             tracker_frame_sequence=update.tracker_frame_sequence,
         )
@@ -1638,7 +1649,15 @@ class DynamicVisualCourseSession:
         if not self.has_applied_command:
             self._last_decision = None
             return None
-        decision = self.core.guide(monotonic_ns)
+        staged = self._staged
+        if staged is None:
+            raise DynamicCourseError(
+                "dynamic guidance lacks a staged graph publication"
+            )
+        decision = self.core.guide(
+            monotonic_ns,
+            passage_committed=staged.passage_committed,
+        )
         self._last_decision = decision
         return decision
 
@@ -2289,6 +2308,11 @@ class DynamicVisualCourseSession:
                         / self.core.config.vertical_angle_scale_rad,
                     ],
                     "successor_weight": decision.successor_weight,
+                    "successor_bearing_std_rad": (
+                        None
+                        if decision.successor_bearing_std_rad is None
+                        else list(decision.successor_bearing_std_rad)
+                    ),
                     "predicted_successor_bearing_rad": (
                         None
                         if decision.predicted_successor_bearing_rad is None
@@ -2322,6 +2346,13 @@ class DynamicVisualCourseSession:
                     ),
                     "successor_yaw_contribution_rad": (
                         decision.successor_yaw_contribution_rad
+                    ),
+                    "passage_committed": decision.passage_committed,
+                    "committed_successor_yaw_authority": (
+                        decision.committed_successor_yaw_authority
+                    ),
+                    "committed_successor_yaw_rate_rad_s": (
+                        decision.committed_successor_yaw_rate_rad_s
                     ),
                     "successor_transition_held": (
                         decision.successor_transition_held
@@ -3192,6 +3223,7 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             expected_gate_index=self.expected_gate_index,
             expected_current_track_id=self.expected_current_track_id,
             adjacent_precredit=False,
+            passage_committed=(mode is VisualApproachMode.PASSAGE),
         )
         return super().observe(
             snapshot,
@@ -3220,6 +3252,7 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
             expected_gate_index=self.expected_gate_index,
             expected_current_track_id=self.expected_current_track_id,
             adjacent_precredit=True,
+            passage_committed=False,
         )
         return super().observe_promotable_adjacent(
             snapshot,

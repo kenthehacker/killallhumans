@@ -1285,6 +1285,7 @@ def test_passage_retains_clean_seed_through_vertical_occlusion() -> None:
     top_state = session.core.course_state().current
     top_decision = session.last_decision
     assert top_decision is not None
+    assert top_decision.passage_committed
     assert top_passage.passage_admission is admission
     assert top_passage.servo_output.corridor_frames == (
         committed_corridor_frames
@@ -1329,6 +1330,7 @@ def test_passage_retains_clean_seed_through_vertical_occlusion() -> None:
     vertically_censored_state = session.core.course_state().current
     vertically_censored_decision = session.last_decision
     assert vertically_censored_decision is not None
+    assert vertically_censored_decision.passage_committed
     assert vertically_censored_passage.passage_admission is admission
     assert vertically_censored_passage.servo_output.corridor_frames == (
         committed_corridor_frames

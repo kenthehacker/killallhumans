@@ -771,6 +771,9 @@ class GuidanceDecision:
     current_yaw_release: float
     passage_yaw_authority: float
     successor_yaw_contribution_rad: float
+    passage_committed: bool
+    committed_successor_yaw_authority: float
+    committed_successor_yaw_rate_rad_s: float | None
     successor_transition_held: bool
     current_time_to_contact_s: float | None
     braking: bool
@@ -2767,8 +2770,15 @@ class DynamicCourseCore:
         self._last_promotion_ns = monotonic_ns
         return self.course_state()
 
-    def guide(self, monotonic_ns: int) -> GuidanceDecision:
+    def guide(
+        self,
+        monotonic_ns: int,
+        *,
+        passage_committed: bool = False,
+    ) -> GuidanceDecision:
         _exact_nonnegative_int(monotonic_ns, "monotonic_ns")
+        if type(passage_committed) is not bool:
+            raise TypeError("passage_committed must be an exact bool")
         if self._last_applied_command is None:
             raise DynamicCourseError(
                 "guidance requires a confirmed applied command"
@@ -3082,6 +3092,52 @@ class DynamicCourseCore:
             ),
             vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
+        committed_successor_yaw_authority = 0.0
+        committed_successor_yaw_rate: float | None = None
+        if (
+            passage_committed
+            and successor is not None
+            and successor_prediction is not None
+            and successor.sample_count >= 4
+            and not successor.ambiguous
+            and successor.stream_generation
+            == current.stream_generation
+        ):
+            successor_age_s = (
+                monotonic_ns
+                - successor.last_measurement_monotonic_ns
+            ) / _NS_PER_SECOND
+            if (
+                0.0
+                <= successor_age_s
+                <= min(
+                    self.config.successor_lineage_hold_s,
+                    self.config.successor_prediction_max_horizon_s,
+                )
+                and successor.bearing_std_rad[0]
+                <= (
+                    self.config
+                    .successor_prediction_max_extrapolation_rad
+                )
+                + _EPSILON
+            ):
+                # A race-stage passage commitment already owns the proved
+                # current-gate crossing.  It may therefore release only
+                # camera heading to the retained local successor state.
+                # Roll, pitch, thrust, passage geometry, and all promotion
+                # authority remain exactly current-gate owned.  The final
+                # wire governor is the sole temporal continuity limiter.
+                committed_successor_yaw_authority = 1.0
+                committed_successor_yaw_rate = _clamp(
+                    -self.config.yaw_gain
+                    * successor_prediction.bearing_rad[0],
+                    -MAX_YAW_RATE_RAD_S,
+                    MAX_YAW_RATE_RAD_S,
+                )
+                proposal = replace(
+                    proposal,
+                    yaw_rate_rad_s=committed_successor_yaw_rate,
+                )
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
             current_gate_index=state.current_gate_index,
@@ -3191,6 +3247,13 @@ class DynamicCourseCore:
             current_yaw_release=current_yaw_release,
             passage_yaw_authority=passage_yaw_authority,
             successor_yaw_contribution_rad=yaw_contribution,
+            passage_committed=passage_committed,
+            committed_successor_yaw_authority=(
+                committed_successor_yaw_authority
+            ),
+            committed_successor_yaw_rate_rad_s=(
+                committed_successor_yaw_rate
+            ),
             successor_transition_held=successor_transition_held,
             current_time_to_contact_s=current.time_to_contact_s,
             braking=braking,
