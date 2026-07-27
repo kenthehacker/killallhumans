@@ -1435,11 +1435,20 @@ def test_inner_aperture_not_outer_support_drives_controller_geometry() -> None:
     _observe(planner, snapshot, tracker)
 
     assert session.last_decision is not None
-    assert session.last_decision.current_aperture_half_size_norm == (
-        pytest.approx((0.21, 0.23))
+    passage_aperture = (
+        session.last_decision.current_aperture_half_size_norm
     )
+    assert passage_aperture is not None
+    # The paired angular chart may reproject an off-axis vertical extent by
+    # a small amount, but the inner aperture still owns the geometry and the
+    # much larger outer contour cannot leak into passage clearance.
+    assert passage_aperture[0] == pytest.approx(0.21, abs=0.003)
+    assert passage_aperture[1] == pytest.approx(0.23, abs=0.003)
     assert session.last_decision.aperture_margin_norm == pytest.approx(
-        (0.12, 0.14)
+        tuple(
+            value - session.core.config.passage_margin_norm
+            for value in passage_aperture
+        )
     )
     assert session.last_decision.camera_current_center_norm == pytest.approx(
         (0.08, -0.06)

@@ -237,7 +237,7 @@ def _camera_ray(center_norm: Vector2, horizontal_scale: float, vertical_scale: f
     )
 
 
-def _ray_bearing(ray: Vector3) -> Vector2:
+def _camera_bearing(ray: Vector3) -> Vector2:
     horizontal = math.atan2(ray[1], ray[0])
     # The calibrated camera model is gnomonic in each image axis.  Keeping the
     # inverse exactly paired with ``_camera_ray`` matters for coupled rotations.
@@ -245,9 +245,24 @@ def _ray_bearing(ray: Vector3) -> Vector2:
     return (horizontal, vertical)
 
 
+def _ray_bearing(ray: Vector3) -> Vector2:
+    """Return a paired azimuth/down-elevation chart for a stable 3-D ray."""
+
+    horizontal = math.atan2(ray[1], ray[0])
+    vertical = math.atan2(
+        ray[2],
+        math.hypot(ray[0], ray[1]),
+    )
+    return (horizontal, vertical)
+
+
 def _bearing_ray(bearing: Vector2) -> Vector3:
-    return _normalise_vector(
-        (1.0, math.tan(bearing[0]), math.tan(bearing[1]))
+    horizontal, vertical = bearing
+    cos_vertical = math.cos(vertical)
+    return (
+        cos_vertical * math.cos(horizontal),
+        cos_vertical * math.sin(horizontal),
+        math.sin(vertical),
     )
 
 
@@ -1243,7 +1258,7 @@ class DynamicCourseCore:
             _quat_rotate(_quat_conjugate(reference), ray_world)
         )
         measured_bearing = _ray_bearing(stable_ray)
-        raw_angle = _ray_bearing(ray_camera)
+        raw_angle = _camera_bearing(ray_camera)
         if existing is None:
             state = self._initial_state(
                 observation,
@@ -1339,6 +1354,7 @@ class DynamicCourseCore:
             existing,
             camera_to_world,
             raw_angle,
+            measured_bearing,
             capture_ns,
         )
         dt = (
@@ -1599,6 +1615,7 @@ class DynamicCourseCore:
         existing: _TrackEstimate,
         camera_to_world: Quaternion,
         raw_angle: Vector2,
+        measured_bearing: Vector2,
         capture_ns: int,
     ) -> tuple[Vector2, Vector2]:
         dt = (capture_ns - existing.last_raw_measurement_ns) / _NS_PER_SECOND
@@ -1611,18 +1628,21 @@ class DynamicCourseCore:
             _quat_conjugate(camera_to_world),
             previous_world_ray,
         )
-        predicted_raw_angle = _ray_bearing(predicted_camera_ray)
+        predicted_raw_angle = _camera_bearing(predicted_camera_ray)
         rotational = tuple(
             (predicted_raw_angle[axis] - existing.last_measured_raw_angle[axis]) / dt
             for axis in range(2)
         )
-        measured = tuple(
-            (raw_angle[axis] - existing.last_measured_raw_angle[axis]) / dt
-            for axis in range(2)
+        previous_bearing = _ray_bearing(
+            existing.last_measured_stable_ray
         )
         residual = tuple(
             _clamp(
-                measured[axis] - rotational[axis],
+                (
+                    measured_bearing[axis]
+                    - previous_bearing[axis]
+                )
+                / dt,
                 -self.config.max_abs_bearing_rate_rad_s,
                 self.config.max_abs_bearing_rate_rad_s,
             )
@@ -2617,15 +2637,26 @@ class DynamicCourseCore:
             aligned.body_to_reference_wxyz,
             self.config.camera_to_body_wxyz,
         )
-        stable_ray = (
-            1.0,
-            math.tan(bearing[0]),
-            math.tan(bearing[1]),
-        )
-        stable_ray_rate = (
+        horizontal, vertical = bearing
+        cos_horizontal = math.cos(horizontal)
+        sin_horizontal = math.sin(horizontal)
+        cos_vertical = math.cos(vertical)
+        sin_vertical = math.sin(vertical)
+        stable_ray = _bearing_ray(bearing)
+        horizontal_column = (
+            -cos_vertical * sin_horizontal,
+            cos_vertical * cos_horizontal,
             0.0,
-            rate[0] / max(math.cos(bearing[0]) ** 2, _EPSILON),
-            rate[1] / max(math.cos(bearing[1]) ** 2, _EPSILON),
+        )
+        vertical_column = (
+            -sin_vertical * cos_horizontal,
+            -sin_vertical * sin_horizontal,
+            cos_vertical,
+        )
+        stable_ray_rate = tuple(
+            horizontal_column[axis] * rate[0]
+            + vertical_column[axis] * rate[1]
+            for axis in range(3)
         )
         world_ray = _quat_rotate(
             estimate.reference_camera_to_world,
@@ -2810,10 +2841,26 @@ class DynamicCourseCore:
             bearing: Vector2,
         ) -> tuple[Vector3, Vector2, tuple[Vector2, Vector2]] | None:
             horizontal, vertical = bearing
-            stable_ray = (
-                1.0,
-                math.tan(horizontal),
-                math.tan(vertical),
+            cos_horizontal = math.cos(horizontal)
+            sin_horizontal = math.sin(horizontal)
+            cos_vertical = math.cos(vertical)
+            sin_vertical = math.sin(vertical)
+            stable_ray = _bearing_ray(bearing)
+            horizontal_column = _quat_rotate(
+                old_to_new,
+                (
+                    -cos_vertical * sin_horizontal,
+                    cos_vertical * cos_horizontal,
+                    0.0,
+                ),
+            )
+            vertical_column = _quat_rotate(
+                old_to_new,
+                (
+                    -sin_vertical * cos_horizontal,
+                    -sin_vertical * sin_horizontal,
+                    cos_vertical,
+                ),
             )
             transformed_ray = _quat_rotate(old_to_new, stable_ray)
             forward, right, down = transformed_ray
@@ -2821,26 +2868,16 @@ class DynamicCourseCore:
                 return None
             transformed_bearing = _ray_bearing(transformed_ray)
 
-            horizontal_column = _quat_rotate(
-                old_to_new,
-                (
-                    0.0,
-                    1.0 / max(math.cos(horizontal) ** 2, _EPSILON),
-                    0.0,
-                ),
-            )
-            vertical_column = _quat_rotate(
-                old_to_new,
-                (
-                    0.0,
-                    0.0,
-                    1.0 / max(math.cos(vertical) ** 2, _EPSILON),
-                ),
-            )
             horizontal_denominator = forward * forward + right * right
-            vertical_denominator = forward * forward + down * down
+            horizontal_norm = math.sqrt(horizontal_denominator)
+            vertical_denominator = (
+                horizontal_denominator + down * down
+            )
 
             def derivative(column: Vector3) -> Vector2:
+                horizontal_norm_rate = (
+                    forward * column[0] + right * column[1]
+                ) / max(horizontal_norm, _EPSILON)
                 return (
                     (
                         forward * column[1]
@@ -2848,8 +2885,8 @@ class DynamicCourseCore:
                     )
                     / max(horizontal_denominator, _EPSILON),
                     (
-                        forward * column[2]
-                        - down * column[0]
+                        horizontal_norm * column[2]
+                        - down * horizontal_norm_rate
                     )
                     / max(vertical_denominator, _EPSILON),
                 )
@@ -3589,6 +3626,8 @@ class DynamicCourseCore:
         self,
         track_id: str,
         target_camera_to_world: Quaternion,
+        *,
+        paired_stable_angles: bool = False,
     ) -> tuple[Vector2, Vector2 | None]:
         estimate = self._tracks[track_id]
 
@@ -3603,7 +3642,11 @@ class DynamicCourseCore:
             )
             if target_ray[0] <= 1e-6:
                 raise DynamicCourseError("gate ray is behind the target orientation")
-            bearing = _ray_bearing(target_ray)
+            bearing = (
+                _ray_bearing(target_ray)
+                if paired_stable_angles
+                else _camera_bearing(target_ray)
+            )
             return (
                 math.tan(bearing[0]) / self.config.horizontal_angle_scale_rad,
                 math.tan(bearing[1]) / self.config.vertical_angle_scale_rad,
@@ -3633,7 +3676,11 @@ class DynamicCourseCore:
                 raise DynamicCourseError(
                     "gate aperture is behind the target orientation"
                 )
-            bearing = _ray_bearing(target_ray)
+            bearing = (
+                _ray_bearing(target_ray)
+                if paired_stable_angles
+                else _camera_bearing(target_ray)
+            )
             return (
                 math.tan(bearing[0]) / self.config.horizontal_angle_scale_rad,
                 math.tan(bearing[1]) / self.config.vertical_angle_scale_rad,
@@ -3701,6 +3748,7 @@ class DynamicCourseCore:
         current_center, current_aperture = self._geometry_in_orientation(
             current_track_id,
             stable_orientation,
+            paired_stable_angles=True,
         )
         successor_center = (
             None
@@ -3708,6 +3756,7 @@ class DynamicCourseCore:
             else self._geometry_in_orientation(
                 successor_track_id,
                 stable_orientation,
+                paired_stable_angles=True,
             )[0]
         )
         return current_center, current_aperture, successor_center
@@ -4171,7 +4220,7 @@ class DynamicCourseCore:
             )
             if decision_ray[0] <= 1e-6:
                 return None
-            return _ray_bearing(decision_ray)
+            return _camera_bearing(decision_ray)
 
         measured = project(successor.bearing_rad)
         predicted = project(future_bearing)

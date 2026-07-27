@@ -510,6 +510,86 @@ def test_latest_gate0_pitch_and_image_motion_are_optically_invariant() -> None:
     assert abs(second.residual_translational_rate_rad_s[1]) < 0.003
 
 
+def test_stable_geometry_keeps_elevation_invariant_at_large_azimuth() -> None:
+    """A horizontal turn cannot magnify one unchanged physical elevation."""
+
+    config = DynamicCourseConfig(camera_delay_s=0.0)
+
+    def decision_at(
+        azimuth_rad: float,
+        elevation_rad: float,
+    ) -> tuple[DynamicCourseCore, GuidanceDecision]:
+        core = DynamicCourseCore(config)
+        core.record_applied_command(_command(0.90))
+        cos_elevation = math.cos(elevation_rad)
+        ray = (
+            cos_elevation * math.cos(azimuth_rad),
+            cos_elevation * math.sin(azimuth_rad),
+            math.sin(elevation_rad),
+        )
+        raw_center = (
+            ray[1]
+            / ray[0]
+            / config.horizontal_angle_scale_rad,
+            ray[2]
+            / ray[0]
+            / config.vertical_angle_scale_rad,
+        )
+        _imu(core, 1.0)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                1,
+                1.0,
+                x=raw_center[0],
+                y=raw_center[1],
+                aperture=(0.10, 0.10),
+            )
+        )
+        core.bind(
+            current_gate_index=0,
+            current_track_id="gate-a",
+            successor_track_id=None,
+        )
+        _imu(core, 1.01)
+        return core, core.guide(1_010_000_000)
+
+    _, centered = decision_at(0.20, -0.18)
+    _, turned = decision_at(1.30, -0.18)
+
+    assert turned.current_center_norm[0] > centered.current_center_norm[0]
+    assert turned.current_center_norm[1] == pytest.approx(
+        centered.current_center_norm[1],
+        abs=1e-12,
+    )
+    assert turned.current_center_norm[1] == pytest.approx(
+        math.tan(-0.18) / config.vertical_angle_scale_rad,
+        abs=1e-12,
+    )
+    assert abs(turned.camera_current_center_norm[1]) > (
+        3.0 * abs(centered.camera_current_center_norm[1])
+    )
+    assert all(
+        math.isfinite(value)
+        for value in (
+            *turned.current_center_norm,
+            *turned.current_aperture_half_size_norm,
+            turned.command.target_roll_rad,
+            turned.command.target_pitch_rad,
+            turned.command.yaw_rate_rad_s,
+            turned.command.thrust,
+        )
+    )
+    assert abs(turned.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= turned.command.target_pitch_rad
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert abs(turned.command.yaw_rate_rad_s) <= MAX_YAW_RATE_RAD_S
+    assert MIN_THRUST <= turned.command.thrust <= MAX_THRUST
+
+
 def test_4c42bb77_contour_completion_cannot_seed_collective_rate() -> None:
     """Reject the exact one-frame launch contour jump as translation."""
 
