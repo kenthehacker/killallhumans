@@ -2627,9 +2627,55 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                     and not self._has_exact_propagated_current_state(
                         current
                     )
+                    and not (
+                        mode is VisualApproachMode.APPROACH
+                        and self._has_exact_degraded_current_steering_state(
+                            current
+                        )
+                    )
                 )
             ):
                 raise
+
+    def _has_exact_degraded_current_steering_state(
+        self,
+        track: VisualTrack,
+    ) -> bool:
+        """Admit only the image axis left observable by clipped outer support."""
+
+        if not track.history:
+            return False
+        sample = track.history[-1]
+        try:
+            state = self._dynamic_session.core.course_state().current
+        except DynamicCourseError:
+            return False
+        censored_axes = (
+            bool(track.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)),
+            bool(track.clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)),
+        )
+        return bool(
+            _complete_current_inner_geometry(track) is None
+            and track.visible
+            and not track.ambiguous
+            and track.clipping != FrameEdge.NONE
+            and any(censored_axes)
+            and not all(censored_axes)
+            and sample.token == track.latest_token
+            and state.track_id == track.track_id
+            and state.stream_generation == track.latest_token.generation
+            and state.frame_sequence == sample.tracker_frame_sequence
+            and state.state_monotonic_ns
+            == state.last_measurement_monotonic_ns
+            and state.visible
+            and not state.ambiguous
+            and state.clipping == track.clipping
+            and state.clipping == sample.clipping
+            and state.censored_axes == censored_axes
+            and state.raw_center_norm == track.center_norm
+            and state.raw_log_scale is None
+            and state.aperture_half_size_norm is None
+        )
 
     def _has_exact_propagated_current_state(
         self,

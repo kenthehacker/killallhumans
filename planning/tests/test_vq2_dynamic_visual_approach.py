@@ -1699,7 +1699,7 @@ def test_propagated_current_fov_gap_refuses_clean_or_unseeded_aperture() -> None
             )
 
 
-def test_clipped_outer_support_without_clean_seed_still_refuses() -> None:
+def test_clipped_outer_support_without_seed_steers_only_observable_axis() -> None:
     rejected = _rejected_inner_aperture(
         clipping=FrameEdge.NONE,
         health_reason="no-clean-inner-aperture-seed",
@@ -1731,7 +1731,73 @@ def test_clipped_outer_support_without_clean_seed_still_refuses() -> None:
             current_width=0.36,
             current_height=0.38,
             include_successor=False,
+            current_center_x=0.12,
+            current_center_y=-0.10,
             current_clipping=FrameEdge.TOP,
+            current_center_censored=True,
+        )
+    )
+    snapshot = graph.observe(tracker)
+
+    proposal = _observe(planner, snapshot, tracker)
+    degraded = session.core.course_state().current
+    assert degraded.raw_center_norm == pytest.approx((0.12, -0.10))
+    assert degraded.raw_log_scale is None
+    assert degraded.censored_axes == (False, True)
+    assert degraded.aperture_half_size_norm is None
+    assert degraded.aperture_seed_monotonic_ns is None
+    assert degraded.aperture_prediction_deadline_monotonic_ns is None
+    assert not degraded.aperture_propagated
+    decision = session.last_decision
+    assert decision is not None
+    assert decision.current_aperture_half_size_norm is None
+    assert decision.crossing_allowance_norm == (0.0, 0.0)
+    assert not proposal.current_target.horizontal_geometry_censored
+    assert proposal.current_target.vertical_geometry_censored
+    assert proposal.current_target.normalized_x == pytest.approx(0.12)
+    assert abs(proposal.servo_output.yaw_rate_rad_s) > 0.0
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposal.servo_output.target_roll_rad,
+            proposal.servo_output.target_pitch_rad,
+            proposal.servo_output.yaw_rate_rad_s,
+            proposal.servo_output.thrust,
+        )
+    )
+
+
+def test_unseeded_clipping_that_censors_both_axes_still_refuses() -> None:
+    rejected = _rejected_inner_aperture(
+        clipping=FrameEdge.NONE,
+        health_reason="no-clean-inner-aperture-seed",
+    )
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+        inner_aperture=rejected,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.36,
+            current_height=0.38,
+            include_successor=False,
+            current_clipping=FrameEdge.TOP | FrameEdge.RIGHT,
             current_center_censored=True,
         )
     )
@@ -1740,10 +1806,8 @@ def test_clipped_outer_support_without_clean_seed_still_refuses() -> None:
     with pytest.raises(VisualApproachCurrentGeometryUnavailable):
         _observe(planner, snapshot, tracker)
     refused = session.core.course_state().current
+    assert refused.censored_axes == (True, True)
     assert refused.aperture_half_size_norm is None
-    assert refused.aperture_seed_monotonic_ns is None
-    assert refused.aperture_prediction_deadline_monotonic_ns is None
-    assert not refused.aperture_propagated
 
 
 def test_rejected_merged_inner_steers_without_adding_corridor() -> None:
