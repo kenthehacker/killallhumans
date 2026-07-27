@@ -1593,7 +1593,7 @@ def test_clipped_outer_support_without_clean_seed_still_refuses() -> None:
     assert not refused.aperture_propagated
 
 
-def test_rejected_merged_inner_uses_seed_without_adding_corridor() -> None:
+def test_rejected_merged_inner_steers_without_adding_corridor() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
         height=0.36,
@@ -1645,7 +1645,9 @@ def test_rejected_merged_inner_uses_seed_without_adding_corridor() -> None:
         clean_state.aperture_prediction_deadline_monotonic_ns
     )
     assert not state.ambiguous
-    assert all(state.censored_axes)
+    assert state.censored_axes == (False, False)
+    assert state.raw_log_scale is None
+    assert state.log_scale == pytest.approx(clean_state.log_scale)
     assert session.last_decision is not None
     assert session.last_decision.current_aperture_propagated
     assert (
@@ -1727,7 +1729,7 @@ def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> Non
     assert proposal.passage_admission is None
 
 
-def test_rejected_inner_geometry_predicts_instead_of_using_outer_support() -> None:
+def test_rejected_inner_outer_support_corrects_steering_only() -> None:
     tracker, graph, snapshot, current_id = _single_gate_graph(
         width=0.34,
         height=0.36,
@@ -1767,9 +1769,11 @@ def test_rejected_inner_geometry_predicts_instead_of_using_outer_support() -> No
     assert retained.visible
     assert retained.center_norm == pytest.approx((0.12, -0.10))
     state = session.core.course_state().current
-    assert state.bearing_rad == pytest.approx(prior.bearing_rad)
+    assert state.bearing_rad[0] > prior.bearing_rad[0]
+    assert state.bearing_rad[1] < prior.bearing_rad[1]
     assert state.log_scale == pytest.approx(prior.log_scale)
-    assert state.censored_axes == (True, True)
+    assert state.raw_log_scale is None
+    assert state.censored_axes == (False, False)
     assert not state.scale_rate_qualified
     assert state.aperture_propagated
     assert state.aperture_half_size_norm == pytest.approx(
@@ -1787,11 +1791,10 @@ def test_rejected_inner_geometry_predicts_instead_of_using_outer_support() -> No
         session.last_decision.current_aperture_half_size_norm
         == pytest.approx(prior.aperture_half_size_norm)
     )
-    assert proposal.current_target.normalized_x == pytest.approx(
-        prior.raw_center_norm[0]
-    )
-    assert proposal.current_target.normalized_y_down == pytest.approx(
-        prior.raw_center_norm[1]
+    assert proposal.current_target.normalized_x > prior.raw_center_norm[0]
+    assert (
+        proposal.current_target.normalized_y_down
+        < prior.raw_center_norm[1]
     )
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None

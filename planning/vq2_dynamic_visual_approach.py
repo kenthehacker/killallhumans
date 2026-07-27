@@ -481,21 +481,30 @@ class DynamicVisualCourseSession:
                 ambiguous = bool(track.ambiguous)
                 measurement_std = inner.measurement_std
             else:
-                # Outer support remains useful to initialise/retain identity,
-                # but it is censored control evidence and owns no aperture.
-                # This prevents a merged current+successor contour from
-                # manufacturing center, scale, q, or crossing clearance.
+                # Outer support may correct only the image axes that are not
+                # clipped.  It owns no aperture scale, q, TTC, clearance, or
+                # passage authority; those remain on the last clean inner
+                # seed.  This still lets a freshly reacquired current gate
+                # supply confidence-weighted steering before its inner
+                # opening becomes measurable.
                 center_norm = track.center_norm
                 log_scale = math.log(float(track.apparent_scale))
                 aperture = None
                 clipping = track.clipping
-                center_censored = True
+                center_censored = bool(
+                    track.center_censored
+                    and track.clipping == FrameEdge.NONE
+                )
                 # Missing inner geometry censors control measurements, but it
                 # is not itself evidence that the graph-retained track
                 # identity is ambiguous.  The bounded local state may bridge
                 # near-plane clipping without consuming this outer center or
                 # scale.
                 ambiguous = bool(track.ambiguous)
+                confidence = min(
+                    float(track.confidence),
+                    float(track.association_confidence),
+                )
                 measurement_std = (0.05, 0.06, 0.12)
             return GateObservation(
                 track_id=track.track_id,

@@ -3272,13 +3272,11 @@ def _dynamic_current_steering_correction_ready(
     *,
     track_id: str,
 ) -> bool:
-    """Require one exact complete inner fit before ending predicted steering.
+    """Require exact image geometry before ending predicted steering.
 
-    A promoted graph track can be visible from its outer support while its
-    aperture remains geometrically underconstrained.  That is sufficient for
-    identity continuity, but it is not a camera correction for the dynamic
-    gate-relative state.  Complete fitted inner geometry may restore steering
-    even when its uncertainty is still too large for passage authority.
+    Complete inner geometry can correct both steering and the local aperture
+    model.  Clean or one-edge outer support can correct only its observable
+    center axis; it cannot create aperture, passage, or race authority.
     """
 
     track = getattr(snapshot, "current_track", None)
@@ -3291,18 +3289,59 @@ def _dynamic_current_steering_correction_ready(
         or track is None
         or getattr(track, "track_id", None) != track_id
         or getattr(track, "latest_token", None) != token
+        or getattr(track, "visible", False) is not True
+        or getattr(track, "ambiguous", True) is not False
+        or getattr(track, "missed_frame_count", 1) != 0
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
         or type(history) is not tuple
         or not history
     ):
         return False
     sample = history[-1]
     inner = getattr(sample, "inner_aperture", None)
-    return bool(
-        getattr(sample, "token", None) == token
-        and type(inner) is VisualInnerApertureGeometry
+    complete_inner = bool(
+        type(inner) is VisualInnerApertureGeometry
         and inner.fitted
         and inner.complete_visibility
         and inner.clipping == FrameEdge.NONE
+    )
+    clipping = getattr(track, "clipping", None)
+    center = getattr(track, "center_norm", None)
+    velocity = getattr(track, "center_velocity_norm_s", None)
+    outer_axis_ready = bool(
+        type(center) is tuple
+        and len(center) == 2
+        and type(velocity) is tuple
+        and len(velocity) == 2
+        and (
+            (
+                clipping == FrameEdge.NONE
+                and getattr(track, "center_censored", True) is False
+                and all(
+                    type(value) in {int, float}
+                    and math.isfinite(float(value))
+                    for value in (*center, *velocity)
+                )
+            )
+            or (
+                clipping in {FrameEdge.TOP, FrameEdge.BOTTOM}
+                and type(center[0]) in {int, float}
+                and math.isfinite(float(center[0]))
+                and type(velocity[0]) in {int, float}
+                and math.isfinite(float(velocity[0]))
+            )
+            or (
+                clipping in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                and type(center[1]) in {int, float}
+                and math.isfinite(float(center[1]))
+                and type(velocity[1]) in {int, float}
+                and math.isfinite(float(velocity[1]))
+            )
+        )
+    )
+    return bool(
+        getattr(sample, "token", None) == token
+        and (complete_inner or outer_axis_ready)
     )
 
 
@@ -8427,8 +8466,8 @@ async def _run_visual_course_stage_impl(
                 latest_recovery_refusal = None
                 return True
             latest_recovery_refusal = (
-                "promoted dynamic current lacks a strictly newer complete "
-                "inner steering correction"
+                "promoted dynamic current lacks a strictly newer "
+                "image-axis steering correction"
                 if graph_current_ready and not dynamic_steering_ready
                 else (
                     "promoted current lacks a strictly newer observable, "

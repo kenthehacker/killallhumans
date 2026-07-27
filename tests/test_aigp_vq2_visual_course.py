@@ -746,10 +746,10 @@ def _snapshot(
     )
 
 
-def test_dynamic_recovery_requires_complete_inner_steering_correction():
+def test_dynamic_recovery_accepts_outer_steering_without_passage_geometry():
     snapshot = _snapshot(1, "track-1", 20)
 
-    assert not course_stage._dynamic_current_steering_correction_ready(
+    assert course_stage._dynamic_current_steering_correction_ready(
         snapshot,
         track_id="track-1",
     )
@@ -787,24 +787,29 @@ def test_dynamic_recovery_requires_complete_inner_steering_correction():
         track_id="track-1",
     )
 
+    rejected_inner = VisualInnerApertureGeometry(
+        center_norm=None,
+        half_size_norm=None,
+        log_scale=None,
+        measurement_std=None,
+        confidence=0.0,
+        clipping=FrameEdge.NONE,
+        visible_edges=FrameEdge.NONE,
+        geometry_model_id=None,
+        covariance_model_id=None,
+        health_reason="aperture_fit_rejected:degenerate",
+    )
     snapshot.current_track.history = (
         *snapshot.current_track.history[:-1],
         replace(
             snapshot.current_track.history[-1],
-            inner_aperture=VisualInnerApertureGeometry(
-                center_norm=None,
-                half_size_norm=None,
-                log_scale=None,
-                measurement_std=None,
-                confidence=0.0,
-                clipping=FrameEdge.NONE,
-                visible_edges=FrameEdge.NONE,
-                geometry_model_id=None,
-                covariance_model_id=None,
-                health_reason="aperture_fit_rejected:degenerate",
-            ),
+            clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+            center_censored=True,
+            inner_aperture=rejected_inner,
         ),
     )
+    snapshot.current_track.clipping = FrameEdge.TOP | FrameEdge.RIGHT
+    snapshot.current_track.center_censored = True
     assert not course_stage._dynamic_current_steering_correction_ready(
         snapshot,
         track_id="track-1",
