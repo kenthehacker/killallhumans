@@ -254,9 +254,11 @@ def _observation(
     x: float = 0.0,
     y: float = 0.0,
     log_scale: float = 0.0,
-    aperture: tuple[float, float] = (0.42, 0.34),
+    aperture: tuple[float, float] | None = (0.42, 0.34),
     clipping: FrameEdge = FrameEdge.NONE,
+    center_censored: bool = False,
     visible: bool = True,
+    ambiguous: bool = False,
     confidence: float = 0.95,
 ) -> GateObservation:
     timestamp = round(time_s * NS)
@@ -271,7 +273,9 @@ def _observation(
         log_scale=log_scale if visible else None,
         aperture_half_size_norm=aperture if visible else None,
         clipping=clipping,
+        center_censored=center_censored,
         visible=visible,
+        ambiguous=ambiguous,
         confidence=confidence,
         measurement_std=(0.005, 0.005, 0.01),
     )
@@ -1214,6 +1218,97 @@ def test_safe_near_plane_passage_releases_yaw_to_stable_successor() -> None:
         abs(decision.successor_yaw_contribution_rad)
         <= core.config.successor_max_yaw_contribution_rad
     )
+
+
+def test_missing_inner_aperture_clears_stale_crossing_geometry() -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            successor_clearance_dwell_s=0.04,
+            successor_clearance_ramp_s=0.04,
+        )
+    )
+    core.record_applied_command(_command(0.90))
+    prior = None
+    for sequence in range(1, 9):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=-0.05,
+                log_scale=-0.68 + sequence * 0.05,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.80,
+                log_scale=-1.0,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        prior = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, prior.command)
+
+    assert prior is not None
+    assert prior.current_aperture_half_size_norm == pytest.approx(
+        (0.42, 0.34)
+    )
+    assert prior.successor_clearance_authority > 0.0
+    assert prior.successor_passage_authority > 0.0
+
+    _imu(core, 1.32)
+    censored = core.observe_track(
+        _observation(
+            "gate-a",
+            9,
+            1.32,
+            x=-0.05,
+            log_scale=-0.23,
+            aperture=None,
+            center_censored=True,
+            ambiguous=True,
+        )
+    )
+    core.observe_track(
+        _observation(
+            "gate-b",
+            9,
+            1.32,
+            x=0.80,
+            log_scale=-1.0,
+        )
+    )
+    _imu(core, 1.325)
+    decision = core.guide(1_325_000_000)
+
+    assert censored.visible
+    assert censored.ambiguous
+    assert censored.aperture_half_size_norm is None
+    assert decision.current_aperture_half_size_norm is None
+    assert decision.crossing_allowance_norm == (0.0, 0.0)
+    assert decision.centered_crossing_clearance_norm == (0.0, 0.0)
+    assert decision.predicted_crossing_clearance_norm == (0.0, 0.0)
+    assert decision.terminal_crossing_clearance_norm == (0.0, 0.0)
+    assert decision.successor_clearance_authority == 0.0
+    assert decision.successor_passage_authority == 0.0
+    assert decision.passage_point_norm == (0.0, 0.0)
+    assert decision.current_yaw_release == 0.0
+    assert decision.passage_yaw_authority == 0.0
+    assert decision.successor_weight == 0.0
+    assert decision.successor_yaw_contribution_rad == 0.0
 
 
 def test_body_yaw_cannot_change_stable_passage_or_roll_authority() -> None:

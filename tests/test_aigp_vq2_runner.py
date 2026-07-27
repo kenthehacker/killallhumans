@@ -65,6 +65,10 @@ from estimation.imu_attitude import (
     ImuAttitudeEstimator,
 )
 from gate_detection.src.gate_detector import GateDetection
+from gate_detection.src.vq2_geometry import (
+    ApertureSide,
+    VQ2ApertureFit,
+)
 from planning.vq2_visual_servo import (
     MAX_NEXT_GATE_BLEND,
     ServoFrameToken,
@@ -126,6 +130,133 @@ def _detection(x, y, width, height, confidence=0.8):
         estimated_distance=999.0,
         confidence=confidence,
     )
+
+
+def _nominal_aperture_fit() -> VQ2ApertureFit:
+    corners = (
+        (69.5, 49.5),
+        (130.5, 49.5),
+        (130.5, 110.5),
+        (69.5, 110.5),
+    )
+    return VQ2ApertureFit(
+        image_size_px=(200, 160),
+        support_bbox_px=(59, 39, 83, 83),
+        clipping=ApertureSide.NONE,
+        fitted_corners_px=corners,
+        visible_edges=(
+            ApertureSide.LEFT
+            | ApertureSide.TOP
+            | ApertureSide.RIGHT
+            | ApertureSide.BOTTOM
+        ),
+        visible_corners=(True, True, True, True),
+        visible_segments_px=(
+            (corners[0], corners[1]),
+            (corners[1], corners[2]),
+            (corners[2], corners[3]),
+            (corners[3], corners[0]),
+        ),
+        geometry_model_id="vq2-visible-inner-quad-lines-v1",
+        covariance_model_id="vq2-visible-aperture-diagonal-v1",
+        covariance_diagonal=(0.0001, 0.0002, 0.0009, 0.001, 0.001),
+        residual_rms_px=0.0,
+        inlier_count=240,
+        support_count=240,
+        confidence=0.9,
+        rejection_reason=None,
+    )
+
+
+def _rejected_aperture_fit() -> VQ2ApertureFit:
+    return VQ2ApertureFit(
+        image_size_px=(200, 160),
+        support_bbox_px=(59, 39, 83, 83),
+        clipping=ApertureSide.NONE,
+        fitted_corners_px=None,
+        visible_edges=ApertureSide.NONE,
+        visible_corners=(False, False, False, False),
+        visible_segments_px=(None, None, None, None),
+        geometry_model_id=None,
+        covariance_model_id=None,
+        covariance_diagonal=None,
+        residual_rms_px=None,
+        inlier_count=0,
+        support_count=240,
+        confidence=0.0,
+        rejection_reason="ambiguous_multiple_aperture_gaps",
+    )
+
+
+def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
+    nominal = vq2_module._visual_inner_aperture_from_fit(
+        _nominal_aperture_fit()
+    )
+    clipped = vq2_module._visual_inner_aperture_from_fit(
+        replace(
+            _nominal_aperture_fit(),
+            clipping=ApertureSide.TOP,
+            visible_edges=(
+                ApertureSide.LEFT
+                | ApertureSide.RIGHT
+                | ApertureSide.BOTTOM
+            ),
+            visible_corners=(False, False, True, True),
+        )
+    )
+    rejected = vq2_module._visual_inner_aperture_from_fit(
+        _rejected_aperture_fit()
+    )
+
+    assert nominal.passage_usable
+    assert nominal.center_norm == pytest.approx((0.0, 0.0))
+    assert nominal.half_size_norm == pytest.approx((0.305, 0.38125))
+    assert nominal.measurement_std == pytest.approx((0.01, math.sqrt(0.0002), 0.03))
+    assert not clipped.passage_usable
+    assert clipped.center_norm is None
+    assert clipped.health_reason == "aperture_fit_censored:2"
+    assert not rejected.passage_usable
+    assert rejected.half_size_norm is None
+    assert rejected.health_reason == (
+        "aperture_fit_rejected:ambiguous_multiple_aperture_gaps"
+    )
+
+
+def test_runner_thresholds_once_for_all_detection_aperture_fits(
+    monkeypatch,
+) -> None:
+    image = np.zeros((160, 200, 3), dtype=np.uint8)
+    mask = np.zeros((160, 200), dtype=np.uint8)
+    calls = {"mask": 0, "fit": 0}
+
+    def build_mask(received_image, *, config):
+        assert received_image is image
+        assert config is vq2_module._VISUAL_INNER_APERTURE_CONFIG
+        calls["mask"] += 1
+        return mask
+
+    def fit_mask(received_mask, support_bbox, *, detection_confidence, config):
+        assert received_mask is mask
+        assert support_bbox in {(10, 20, 40, 50), (80, 30, 30, 45)}
+        assert detection_confidence == pytest.approx(0.8)
+        assert config is vq2_module._VISUAL_INNER_APERTURE_CONFIG
+        calls["fit"] += 1
+        return _rejected_aperture_fit()
+
+    monkeypatch.setattr(vq2_module, "vq2_gate_mask_from_bgr", build_mask)
+    monkeypatch.setattr(vq2_module, "fit_vq2_aperture_mask", fit_mask)
+
+    geometries = vq2_module._fit_visual_inner_apertures(
+        image,
+        (
+            _detection(10, 20, 40, 50),
+            _detection(80, 30, 30, 45),
+        ),
+    )
+
+    assert len(geometries) == 2
+    assert all(not geometry.passage_usable for geometry in geometries)
+    assert calls == {"mask": 1, "fit": 2}
 
 
 def _estimate(roll=0.0, pitch=-0.31, yaw=0.0):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,7 @@ from competition.vq2_visual_tracker import (
     StaleVisualFrameError,
     VisualDetection,
     VisualDetectionFrame,
+    VisualInnerApertureGeometry,
     VisualTrackRole,
     visual_track_history_sha256,
 )
@@ -28,6 +30,31 @@ from planning.vq2_gate_graph import (
 _FRAME_PERIOD_NS = 33_000_000
 
 
+def _inner_aperture(
+    center_x: float,
+    center_y: float,
+    *,
+    half_width: float = 0.12,
+    half_height: float = 0.14,
+) -> VisualInnerApertureGeometry:
+    return VisualInnerApertureGeometry(
+        center_norm=(center_x, center_y),
+        half_size_norm=(half_width, half_height),
+        log_scale=math.log(math.sqrt(4.0 * half_width * half_height)),
+        measurement_std=(0.01, 0.012, 0.03),
+        confidence=0.91,
+        clipping=FrameEdge.NONE,
+        visible_edges=(
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM
+        ),
+        geometry_model_id="test-inner-quad-v1",
+        covariance_model_id="test-inner-diagonal-v1",
+    )
+
+
 def _detection(
     source_index: int,
     center_x: float,
@@ -39,6 +66,7 @@ def _detection(
     clipping: FrameEdge = FrameEdge.NONE,
     center_censored: bool = False,
     appearance: tuple[float, ...] | None = None,
+    inner_aperture: VisualInnerApertureGeometry | None = None,
 ) -> VisualDetection:
     center_unit_x = 0.5 * (center_x + 1.0)
     center_unit_y = 0.5 * (center_y + 1.0)
@@ -54,6 +82,7 @@ def _detection(
         clipping=clipping,
         center_censored=center_censored,
         appearance=appearance,
+        inner_aperture=inner_aperture,
     )
 
 
@@ -111,6 +140,153 @@ def _race(
         received_monotonic_ns=received_ns,
         host_clock_id=host_clock_id,
         race_finished=finished,
+    )
+
+
+def test_inner_aperture_geometry_is_validated_and_passage_usable() -> None:
+    geometry = _inner_aperture(0.07, -0.11)
+
+    assert geometry.fitted
+    assert geometry.complete_visibility
+    assert geometry.passage_usable
+    with pytest.raises(ValueError, match="all present or all absent"):
+        VisualInnerApertureGeometry(
+            center_norm=(0.0, 0.0),
+            half_size_norm=None,
+            log_scale=-1.0,
+            measurement_std=(0.01, 0.01, 0.03),
+            confidence=0.9,
+            clipping=FrameEdge.NONE,
+            visible_edges=FrameEdge.NONE,
+            geometry_model_id="partial-v1",
+            covariance_model_id="partial-covariance-v1",
+        )
+
+
+def test_detector_frame_carries_parallel_aperture_geometry_into_history() -> None:
+    geometry = _inner_aperture(0.025, -0.08)
+    raw_detection = SimpleNamespace(
+        bbox=(250, 90, 140, 160),
+        center_x=320,
+        center_y=170,
+        confidence=0.94,
+        detection_method="vq2_red_gate",
+    )
+    frame = VisualDetectionFrame.from_detector_results(
+        (raw_detection,),
+        generation=7,
+        frame_id=29_001,
+        publication_sequence=1,
+        stream_id="vq2-camera",
+        final_unique_packet_monotonic_ns=1_033_000_000,
+        publish_monotonic_ns=1_034_000_000,
+        time_basis_id="vq2-host-monotonic",
+        aperture_geometries=(geometry,),
+    )
+
+    assert frame.detections[0].inner_aperture is geometry
+    tracker = MultiTargetVisualTracker()
+    update = tracker.update(frame)
+    track = update.visible_tracks[0]
+    assert track.history[-1].inner_aperture is geometry
+    with pytest.raises(ValueError, match="aperture_geometries"):
+        VisualDetectionFrame.from_detector_results(
+            (raw_detection,),
+            generation=7,
+            frame_id=29_002,
+            publication_sequence=2,
+            stream_id="vq2-camera",
+            final_unique_packet_monotonic_ns=1_066_000_000,
+            publish_monotonic_ns=1_067_000_000,
+            time_basis_id="vq2-host-monotonic",
+            aperture_geometries=(),
+        )
+
+
+def test_inner_aperture_geometry_does_not_change_outer_support_association() -> None:
+    baseline = MultiTargetVisualTracker()
+    fitted = MultiTargetVisualTracker()
+    outer_frames = (
+        (
+            _detection(0, -0.42, 0.02, 0.22, 0.26),
+            _detection(1, 0.43, -0.03, 0.16, 0.18),
+        ),
+        (
+            _detection(0, -0.36, 0.02, 0.23, 0.27),
+            _detection(1, 0.38, -0.03, 0.17, 0.19),
+        ),
+    )
+    fitted_frames = (
+        (
+            _detection(
+                0,
+                -0.42,
+                0.02,
+                0.22,
+                0.26,
+                inner_aperture=_inner_aperture(0.81, -0.70),
+            ),
+            _detection(
+                1,
+                0.43,
+                -0.03,
+                0.16,
+                0.18,
+                inner_aperture=_inner_aperture(-0.82, 0.69),
+            ),
+        ),
+        (
+            _detection(
+                0,
+                -0.36,
+                0.02,
+                0.23,
+                0.27,
+                inner_aperture=_inner_aperture(0.78, -0.66),
+            ),
+            _detection(
+                1,
+                0.38,
+                -0.03,
+                0.17,
+                0.19,
+                inner_aperture=_inner_aperture(-0.79, 0.65),
+            ),
+        ),
+    )
+
+    baseline_updates = tuple(
+        baseline.update(_frame(index, detections))
+        for index, detections in enumerate(outer_frames, start=1)
+    )
+    fitted_updates = tuple(
+        fitted.update(_frame(index, detections))
+        for index, detections in enumerate(fitted_frames, start=1)
+    )
+
+    for baseline_update, fitted_update in zip(
+        baseline_updates,
+        fitted_updates,
+        strict=True,
+    ):
+        assert fitted_update.created_track_ids == baseline_update.created_track_ids
+        assert (
+            fitted_update.associated_track_ids
+            == baseline_update.associated_track_ids
+        )
+        assert fitted_update.visible_track_ids == baseline_update.visible_track_ids
+        assert fitted_update.associations == baseline_update.associations
+    assert tuple(
+        tuple(sample.source_index for sample in track.history)
+        for track in fitted.tracks()
+    ) == tuple(
+        tuple(sample.source_index for sample in track.history)
+        for track in baseline.tracks()
+    )
+    assert all(
+        sample.inner_aperture is not None
+        for track in fitted.tracks()
+        for sample in track.history
     )
 
 

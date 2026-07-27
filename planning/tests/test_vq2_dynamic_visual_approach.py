@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from competition.adapter import AttitudeRateCommand
@@ -10,6 +12,7 @@ from competition.vq2_visual_tracker import (
     MultiTargetVisualTracker,
     VisualDetection,
     VisualDetectionFrame,
+    VisualInnerApertureGeometry,
 )
 from planning.vq2_dynamic_course import (
     DynamicCourseError,
@@ -32,6 +35,52 @@ from planning.vq2_visual_approach import (
 
 _BASE_NS = 10_000_000_000
 _PERIOD_NS = 33_000_000
+_ALL_FRAME_EDGES = (
+    FrameEdge.LEFT
+    | FrameEdge.TOP
+    | FrameEdge.RIGHT
+    | FrameEdge.BOTTOM
+)
+_AUTO_INNER_APERTURE = object()
+
+
+def _inner_aperture(
+    center_x: float,
+    center_y: float,
+    *,
+    half_width: float,
+    half_height: float,
+) -> VisualInnerApertureGeometry:
+    return VisualInnerApertureGeometry(
+        center_norm=(center_x, center_y),
+        half_size_norm=(half_width, half_height),
+        log_scale=math.log(math.sqrt(half_width * half_height)),
+        measurement_std=(0.012, 0.014, 0.040),
+        confidence=0.93,
+        clipping=FrameEdge.NONE,
+        visible_edges=_ALL_FRAME_EDGES,
+        geometry_model_id="test-inner-aperture-v1",
+        covariance_model_id="test-inner-aperture-covariance-v1",
+    )
+
+
+def _rejected_inner_aperture(
+    *,
+    clipping: FrameEdge,
+    health_reason: str,
+) -> VisualInnerApertureGeometry:
+    return VisualInnerApertureGeometry(
+        center_norm=None,
+        half_size_norm=None,
+        log_scale=None,
+        measurement_std=None,
+        confidence=0.0,
+        clipping=clipping,
+        visible_edges=FrameEdge.NONE,
+        geometry_model_id=None,
+        covariance_model_id=None,
+        health_reason=health_reason,
+    )
 
 
 def _detection(
@@ -43,9 +92,30 @@ def _detection(
     height: float,
     clipping: FrameEdge = FrameEdge.NONE,
     center_censored: bool = False,
+    inner_aperture: VisualInnerApertureGeometry | None | object = (
+        _AUTO_INNER_APERTURE
+    ),
 ) -> VisualDetection:
     unit_x = 0.5 * (center_x + 1.0)
     unit_y = 0.5 * (center_y + 1.0)
+    if inner_aperture is _AUTO_INNER_APERTURE:
+        inner_aperture = (
+            _rejected_inner_aperture(
+                clipping=clipping,
+                health_reason="test-clipped-or-censored-inner-aperture",
+            )
+            if clipping != FrameEdge.NONE or center_censored
+            else _inner_aperture(
+                center_x,
+                center_y,
+                half_width=width,
+                half_height=height,
+            )
+        )
+    assert (
+        inner_aperture is None
+        or isinstance(inner_aperture, VisualInnerApertureGeometry)
+    )
     return VisualDetection(
         source_index=source_index,
         center_norm=(center_x, center_y),
@@ -58,6 +128,7 @@ def _detection(
         confidence=0.95,
         clipping=clipping,
         center_censored=center_censored,
+        inner_aperture=inner_aperture,
     )
 
 
@@ -70,6 +141,9 @@ def _frame(
     current_center_y: float = 0.0,
     current_clipping: FrameEdge = FrameEdge.NONE,
     current_center_censored: bool = False,
+    current_inner_aperture: VisualInnerApertureGeometry | None | object = (
+        _AUTO_INNER_APERTURE
+    ),
 ) -> VisualDetectionFrame:
     observation_ns = _BASE_NS + sequence * _PERIOD_NS
     detections = [
@@ -81,6 +155,7 @@ def _frame(
             height=current_height,
             clipping=current_clipping,
             center_censored=current_center_censored,
+            inner_aperture=current_inner_aperture,
         )
     ]
     if include_successor:
@@ -150,6 +225,9 @@ def _single_gate_graph(
     *,
     width: float,
     height: float,
+    inner_aperture: VisualInnerApertureGeometry | None | object = (
+        _AUTO_INNER_APERTURE
+    ),
 ) -> tuple[
     MultiTargetVisualTracker,
     RollingVisualGateGraph,
@@ -167,6 +245,7 @@ def _single_gate_graph(
                 current_width=width,
                 current_height=height,
                 include_successor=False,
+                current_inner_aperture=inner_aperture,
             )
         )
         if sequence == 1:
@@ -657,10 +736,17 @@ def test_5dffc517_passage_seals_successor_through_expected_occlusion() -> None:
     assert passage.latched_next_track_id == retained_id
 
 
-def test_unit_bbox_full_size_maps_to_signed_center_half_aperture() -> None:
+def test_inner_aperture_not_outer_support_drives_controller_geometry() -> None:
+    inner = _inner_aperture(
+        0.08,
+        -0.06,
+        half_width=0.21,
+        half_height=0.23,
+    )
     tracker, graph, snapshot, current_id = _single_gate_graph(
-        width=0.34,
-        height=0.36,
+        width=0.50,
+        height=0.56,
+        inner_aperture=inner,
     )
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -678,15 +764,18 @@ def test_unit_bbox_full_size_maps_to_signed_center_half_aperture() -> None:
         for state in session.core.track_states
         if state.track_id == current_id
     )
-    assert state.aperture_half_size_norm == pytest.approx((0.34, 0.36))
+    assert state.raw_center_norm == pytest.approx((0.08, -0.06))
+    assert state.aperture_half_size_norm == pytest.approx((0.21, 0.23))
+    assert state.raw_log_scale == pytest.approx(inner.log_scale)
     _accept_proposal(session, tracker, seed)
 
     tracker.update(
         _frame(
             6,
-            current_width=0.34,
-            current_height=0.36,
+            current_width=0.70,
+            current_height=0.76,
             include_successor=False,
+            current_inner_aperture=inner,
         )
     )
     snapshot = graph.observe(tracker)
@@ -694,11 +783,64 @@ def test_unit_bbox_full_size_maps_to_signed_center_half_aperture() -> None:
 
     assert session.last_decision is not None
     assert session.last_decision.current_aperture_half_size_norm == (
-        pytest.approx((0.34, 0.36))
+        pytest.approx((0.21, 0.23))
     )
     assert session.last_decision.aperture_margin_norm == pytest.approx(
-        (0.25, 0.27)
+        (0.12, 0.14)
     )
+    assert session.last_decision.camera_current_center_norm == pytest.approx(
+        (0.08, -0.06)
+    )
+
+
+def test_rejected_merged_inner_geometry_cannot_manufacture_clearance() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+
+    rejected = _rejected_inner_aperture(
+        clipping=FrameEdge.NONE,
+        health_reason="merged-current-successor-contour",
+    )
+    update = tracker.update(
+        _frame(
+            6,
+            current_width=0.48,
+            current_height=0.52,
+            include_successor=False,
+            current_inner_aperture=rejected,
+        )
+    )
+    snapshot = graph.observe(tracker)
+
+    proposal = _observe(planner, snapshot, tracker)
+
+    retained = tracker.track(current_id)
+    assert retained.visible
+    assert retained.latest_token == update.token
+    assert retained.history[-1].inner_aperture == rejected
+    state = session.core.course_state().current
+    assert state.aperture_half_size_norm is None
+    assert state.ambiguous
+    assert all(state.censored_axes)
+    assert session.last_decision is not None
+    assert session.last_decision.current_aperture_half_size_norm is None
+    assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
+    assert session.last_decision.successor_passage_authority == 0.0
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
 
 
 def test_final_wire_governor_cannot_reverse_roll_in_one_frame():

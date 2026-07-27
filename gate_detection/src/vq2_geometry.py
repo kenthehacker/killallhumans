@@ -125,6 +125,16 @@ class VQ2ApertureFit:
 
 
 @dataclass(frozen=True, slots=True)
+class VQ2PassageGeometry:
+    """Conservative normalized inner geometry permitted to claim passage."""
+
+    center_norm: Point
+    aperture_half_size_norm: Point
+    log_scale: float
+    measurement_std: tuple[float, float, float]
+
+
+@dataclass(frozen=True, slots=True)
 class _LineFit:
     coefficients: tuple[float, float, float]
     inlier_points: tuple[Point, ...]
@@ -968,11 +978,177 @@ def fit_vq2_aperture_bgr(
     )
 
 
+def passage_geometry_from_vq2_aperture_fit(
+    fit: VQ2ApertureFit,
+    *,
+    minimum_confidence: float = 0.25,
+) -> Optional[VQ2PassageGeometry]:
+    """Return a conservative inscribed opening only from a nominal fit.
+
+    Detector support bounds are deliberately excluded.  A clipped,
+    under-supported, or low-confidence fit may remain useful diagnostic
+    evidence, but it cannot manufacture aperture-relative crossing clearance.
+    """
+
+    if type(fit) is not VQ2ApertureFit:
+        raise TypeError("fit must be an exact VQ2ApertureFit")
+    confidence_floor = _finite_confidence(minimum_confidence)
+    all_sides = (
+        ApertureSide.LEFT
+        | ApertureSide.TOP
+        | ApertureSide.RIGHT
+        | ApertureSide.BOTTOM
+    )
+    if (
+        not fit.succeeded
+        or fit.rejection_reason is not None
+        or fit.clipping != ApertureSide.NONE
+        or fit.visible_edges != all_sides
+        or fit.visible_corners != (True, True, True, True)
+        or fit.confidence < confidence_floor
+        or fit.fitted_corners_px is None
+        or fit.geometry_model_id
+        != "vq2-visible-inner-quad-lines-v1"
+        or fit.covariance_model_id
+        != "vq2-visible-aperture-diagonal-v1"
+        or fit.covariance_diagonal is None
+        or fit.residual_rms_px is None
+        or not math.isfinite(fit.residual_rms_px)
+        or fit.inlier_count <= 0
+        or fit.support_count < fit.inlier_count
+    ):
+        return None
+
+    width, height = fit.image_size_px
+    corners = tuple(
+        (
+            2.0 * point[0] / float(width) - 1.0,
+            2.0 * point[1] / float(height) - 1.0,
+        )
+        for point in fit.fitted_corners_px
+    )
+    first_diagonal = (
+        corners[2][0] - corners[0][0],
+        corners[2][1] - corners[0][1],
+    )
+    second_diagonal = (
+        corners[3][0] - corners[1][0],
+        corners[3][1] - corners[1][1],
+    )
+    offset = (
+        corners[1][0] - corners[0][0],
+        corners[1][1] - corners[0][1],
+    )
+    cross = (
+        first_diagonal[0] * second_diagonal[1]
+        - first_diagonal[1] * second_diagonal[0]
+    )
+    if abs(cross) <= 1e-12:
+        return None
+    fraction = (
+        offset[0] * second_diagonal[1]
+        - offset[1] * second_diagonal[0]
+    ) / cross
+    center = (
+        corners[0][0] + fraction * first_diagonal[0],
+        corners[0][1] + fraction * first_diagonal[1],
+    )
+
+    # Find the maximum-area axis-aligned rectangle centred at the diagonal
+    # intersection.  Each convex-quad edge contributes the half-plane
+    # constraint ``|dy| * half_x + |dx| * half_y <= center_slack``.
+    # Independent centerline spans are insufficient: their simultaneous
+    # corner can fall outside a projective/trapezoidal opening.
+    constraints: list[tuple[float, float, float]] = []
+    orientation: Optional[float] = None
+    for index, first in enumerate(corners):
+        second = corners[(index + 1) % 4]
+        dx = second[0] - first[0]
+        dy = second[1] - first[1]
+        signed_slack = (
+            dx * (center[1] - first[1])
+            - dy * (center[0] - first[0])
+        )
+        if abs(signed_slack) <= 1e-12:
+            return None
+        if orientation is None:
+            orientation = 1.0 if signed_slack > 0.0 else -1.0
+        slack = orientation * signed_slack
+        if slack <= 0.0:
+            return None
+        constraints.append((abs(dy), abs(dx), slack))
+
+    candidates: list[Point] = []
+    for coefficient_x, coefficient_y, slack in constraints:
+        if coefficient_x > 1e-12 and coefficient_y > 1e-12:
+            candidates.append(
+                (
+                    slack / (2.0 * coefficient_x),
+                    slack / (2.0 * coefficient_y),
+                )
+            )
+    for first_index, first in enumerate(constraints):
+        for second in constraints[first_index + 1 :]:
+            determinant = (
+                first[0] * second[1] - second[0] * first[1]
+            )
+            if abs(determinant) <= 1e-12:
+                continue
+            half_x = (
+                first[2] * second[1] - second[2] * first[1]
+            ) / determinant
+            half_y = (
+                first[0] * second[2] - second[0] * first[2]
+            ) / determinant
+            candidates.append((half_x, half_y))
+    feasible = tuple(
+        candidate
+        for candidate in candidates
+        if candidate[0] > 0.0
+        and candidate[1] > 0.0
+        and all(
+            coefficient_x * candidate[0]
+            + coefficient_y * candidate[1]
+            <= slack + 1e-10
+            for coefficient_x, coefficient_y, slack in constraints
+        )
+    )
+    if not feasible:
+        return None
+    half_size = max(
+        feasible,
+        key=lambda candidate: candidate[0] * candidate[1],
+    )
+    if (
+        not all(math.isfinite(value) and value > 0.0 for value in half_size)
+        or any(not math.isfinite(value) for value in center)
+    ):
+        return None
+    measurement_std = tuple(
+        math.sqrt(value) for value in fit.covariance_diagonal[:3]
+    )
+    if not all(
+        math.isfinite(value) and value > 0.0
+        for value in measurement_std
+    ):
+        return None
+    return VQ2PassageGeometry(
+        center_norm=center,
+        aperture_half_size_norm=half_size,
+        # Match the dynamic controller's historical half-extent scale
+        # convention.  An axis-aligned opening therefore changes no units.
+        log_scale=0.5 * math.log(half_size[0] * half_size[1]),
+        measurement_std=measurement_std,  # type: ignore[arg-type]
+    )
+
+
 __all__ = [
     "ApertureSide",
     "VQ2ApertureConfig",
     "VQ2ApertureFit",
+    "VQ2PassageGeometry",
     "fit_vq2_aperture_bgr",
     "fit_vq2_aperture_mask",
+    "passage_geometry_from_vq2_aperture_fit",
     "vq2_gate_mask_from_bgr",
 ]

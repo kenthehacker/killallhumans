@@ -313,34 +313,58 @@ class DynamicVisualCourseSession:
                 raise DynamicCourseError(
                     "graph track and tracker observation are not co-timed"
                 )
-            left, top, right, bottom = sample.bbox_norm
-            # bbox_norm is a full extent in unit [0, 1] coordinates, while
-            # center_norm spans signed [-1, 1].  Its unit-coordinate width is
-            # therefore exactly the half extent in signed center coordinates.
-            aperture = (right - left, bottom - top)
+            inner = sample.inner_aperture
+            inner_usable = bool(
+                inner is not None and inner.passage_usable
+            )
             confidence = min(
                 float(track.confidence),
                 float(track.association_confidence),
+                (
+                    float(inner.confidence)
+                    if inner_usable and inner is not None
+                    else 0.0
+                ),
             )
-            measurement_std = (
-                0.012 + 0.035 * (1.0 - confidence),
-                0.014 + 0.040 * (1.0 - confidence),
-                0.035 + 0.080 * (1.0 - confidence),
-            )
+            if inner_usable:
+                assert inner is not None
+                assert inner.center_norm is not None
+                assert inner.half_size_norm is not None
+                assert inner.log_scale is not None
+                assert inner.measurement_std is not None
+                center_norm = inner.center_norm
+                log_scale = inner.log_scale
+                aperture = inner.half_size_norm
+                clipping = inner.clipping
+                center_censored = False
+                ambiguous = bool(track.ambiguous)
+                measurement_std = inner.measurement_std
+            else:
+                # Outer support remains useful to initialise/retain identity,
+                # but it is censored control evidence and owns no aperture.
+                # This prevents a merged current+successor contour from
+                # manufacturing center, scale, q, or crossing clearance.
+                center_norm = track.center_norm
+                log_scale = math.log(float(track.apparent_scale))
+                aperture = None
+                clipping = track.clipping
+                center_censored = True
+                ambiguous = True
+                measurement_std = (0.05, 0.06, 0.12)
             return GateObservation(
                 track_id=track.track_id,
                 frame_sequence=tracker_frame_sequence,
                 observation_monotonic_ns=observation_monotonic_ns,
                 center_norm=(
-                    float(track.center_norm[0]),
-                    float(track.center_norm[1]),
+                    float(center_norm[0]),
+                    float(center_norm[1]),
                 ),
-                log_scale=math.log(float(track.apparent_scale)),
+                log_scale=float(log_scale),
                 aperture_half_size_norm=aperture,
-                clipping=track.clipping,
-                center_censored=bool(track.center_censored),
+                clipping=clipping,
+                center_censored=center_censored,
                 visible=True,
-                ambiguous=bool(track.ambiguous),
+                ambiguous=ambiguous,
                 confidence=confidence,
                 measurement_std=measurement_std,
                 timing_basis=DYNAMIC_TIMING_BASIS,

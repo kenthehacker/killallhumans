@@ -133,6 +133,132 @@ class CameraFrameToken:
 
 
 @dataclass(frozen=True, slots=True)
+class VisualInnerApertureGeometry:
+    """One detector-co-timed inner-aperture fit in image coordinates.
+
+    The tracker carries this value as observation evidence only.  Association
+    continues to use the detector's outer support center and bounding box.
+    A rejected fit may be represented with all four measurement fields set to
+    ``None`` and a non-empty ``health_reason``.
+    """
+
+    center_norm: Optional[tuple[float, float]]
+    half_size_norm: Optional[tuple[float, float]]
+    log_scale: Optional[float]
+    measurement_std: Optional[tuple[float, float, float]]
+    confidence: float
+    clipping: FrameEdge
+    visible_edges: FrameEdge
+    geometry_model_id: Optional[str]
+    covariance_model_id: Optional[str]
+    health_reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        confidence = _finite(
+            self.confidence,
+            "confidence",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        if type(self.clipping) is not FrameEdge:
+            raise TypeError("clipping must be an exact FrameEdge")
+        if type(self.visible_edges) is not FrameEdge:
+            raise TypeError("visible_edges must be an exact FrameEdge")
+        for name in ("geometry_model_id", "covariance_model_id", "health_reason"):
+            value = getattr(self, name)
+            if value is not None:
+                _nonempty_string(value, name)
+
+        measurement_fields = (
+            self.center_norm,
+            self.half_size_norm,
+            self.log_scale,
+            self.measurement_std,
+        )
+        fitted = all(value is not None for value in measurement_fields)
+        if fitted != any(value is not None for value in measurement_fields):
+            raise ValueError(
+                "inner-aperture measurement fields must be all present or all absent"
+            )
+        if fitted:
+            assert self.center_norm is not None
+            assert self.half_size_norm is not None
+            assert self.log_scale is not None
+            assert self.measurement_std is not None
+            center = _finite_pair(
+                self.center_norm,
+                "center_norm",
+                minimum=-2.5,
+                maximum=2.5,
+            )
+            half_size = _finite_pair(
+                self.half_size_norm,
+                "half_size_norm",
+                minimum=0.0,
+                maximum=2.0,
+            )
+            if any(value <= 0.0 for value in half_size):
+                raise ValueError("half_size_norm values must be positive")
+            log_scale = _finite(self.log_scale, "log_scale")
+            if abs(log_scale) > 12.0:
+                raise ValueError("log_scale must remain within +/-12")
+            if (
+                type(self.measurement_std) is not tuple
+                or len(self.measurement_std) != 3
+            ):
+                raise TypeError("measurement_std must be an exact 3-tuple")
+            measurement_std = tuple(
+                _finite(
+                    value,
+                    f"measurement_std[{index}]",
+                    strictly_positive=True,
+                )
+                for index, value in enumerate(self.measurement_std)
+            )
+            if self.geometry_model_id is None:
+                raise ValueError("fitted geometry requires geometry_model_id")
+            if self.covariance_model_id is None:
+                raise ValueError("fitted geometry requires covariance_model_id")
+            object.__setattr__(self, "center_norm", center)
+            object.__setattr__(self, "half_size_norm", half_size)
+            object.__setattr__(self, "log_scale", log_scale)
+            object.__setattr__(self, "measurement_std", measurement_std)
+        else:
+            if self.geometry_model_id is not None:
+                raise ValueError("rejected geometry cannot name geometry_model_id")
+            if self.covariance_model_id is not None:
+                raise ValueError("rejected geometry cannot name covariance_model_id")
+            if self.health_reason is None:
+                raise ValueError("rejected geometry requires health_reason")
+        object.__setattr__(self, "confidence", confidence)
+
+    @property
+    def fitted(self) -> bool:
+        return self.center_norm is not None
+
+    @property
+    def complete_visibility(self) -> bool:
+        return self.visible_edges == (
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM
+        )
+
+    @property
+    def passage_usable(self) -> bool:
+        """Whether the fit meets the existing conservative passage semantics."""
+
+        return bool(
+            self.fitted
+            and self.clipping == FrameEdge.NONE
+            and self.complete_visibility
+            and self.confidence >= 0.25
+            and self.health_reason is None
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class VisualDetection:
     """One eligible detector result represented only in image space.
 
@@ -150,6 +276,7 @@ class VisualDetection:
     center_censored: bool = False
     detection_method: str = "vq2_red_gate"
     appearance: Optional[tuple[float, ...]] = None
+    inner_aperture: Optional[VisualInnerApertureGeometry] = None
 
     def __post_init__(self) -> None:
         _nonnegative_int(self.source_index, "source_index")
@@ -176,6 +303,12 @@ class VisualDetection:
                 raise TypeError("appearance must be a non-empty exact tuple or None")
             for index, value in enumerate(self.appearance):
                 _finite(value, f"appearance[{index}]")
+        if self.inner_aperture is not None and (
+            type(self.inner_aperture) is not VisualInnerApertureGeometry
+        ):
+            raise TypeError(
+                "inner_aperture must be an exact VisualInnerApertureGeometry or None"
+            )
 
     @property
     def apparent_scale(self) -> float:
@@ -203,6 +336,7 @@ class VisualDetection:
         image_size_px: tuple[int, int],
         edge_margin_px: int = 2,
         appearance: Optional[tuple[float, ...]] = None,
+        inner_aperture: Optional[VisualInnerApertureGeometry] = None,
     ) -> "VisualDetection":
         """Adapt one legacy ``GateDetection`` without using metric placeholders."""
 
@@ -267,6 +401,7 @@ class VisualDetection:
             center_censored=clipping != FrameEdge.NONE,
             detection_method=method,
             appearance=appearance,
+            inner_aperture=inner_aperture,
         )
 
 
@@ -360,6 +495,9 @@ class VisualDetectionFrame:
         image_size_px: tuple[int, int] = (640, 360),
         edge_margin_px: int = 2,
         appearances: Optional[Sequence[Optional[tuple[float, ...]]]] = None,
+        aperture_geometries: Optional[
+            Sequence[Optional[VisualInnerApertureGeometry]]
+        ] = None,
         camera_source_time_ns: Optional[int] = None,
     ) -> "VisualDetectionFrame":
         """Adapt every supplied detector result, preserving its source index."""
@@ -367,6 +505,13 @@ class VisualDetectionFrame:
         raw = tuple(detections)
         if appearances is not None and len(appearances) != len(raw):
             raise ValueError("appearances must match the number of detections")
+        if (
+            aperture_geometries is not None
+            and len(aperture_geometries) != len(raw)
+        ):
+            raise ValueError(
+                "aperture_geometries must match the number of detections"
+            )
         adapted = tuple(
             VisualDetection.from_detector_result(
                 detection,
@@ -374,6 +519,11 @@ class VisualDetectionFrame:
                 image_size_px=image_size_px,
                 edge_margin_px=edge_margin_px,
                 appearance=(None if appearances is None else appearances[index]),
+                inner_aperture=(
+                    None
+                    if aperture_geometries is None
+                    else aperture_geometries[index]
+                ),
             )
             for index, detection in enumerate(raw)
         )
@@ -406,12 +556,22 @@ class VisualDetectionFrame:
         image_size_px: tuple[int, int] = (640, 360),
         edge_margin_px: int = 2,
         appearances: Optional[Sequence[Optional[tuple[float, ...]]]] = None,
+        aperture_geometries: Optional[
+            Sequence[Optional[VisualInnerApertureGeometry]]
+        ] = None,
     ) -> "VisualDetectionFrame":
         """Ingest historical capture fields without relabelling them as /1 timing."""
 
         raw = tuple(detections)
         if appearances is not None and len(appearances) != len(raw):
             raise ValueError("appearances must match the number of detections")
+        if (
+            aperture_geometries is not None
+            and len(aperture_geometries) != len(raw)
+        ):
+            raise ValueError(
+                "aperture_geometries must match the number of detections"
+            )
         adapted = tuple(
             VisualDetection.from_detector_result(
                 detection,
@@ -419,6 +579,11 @@ class VisualDetectionFrame:
                 image_size_px=image_size_px,
                 edge_margin_px=edge_margin_px,
                 appearance=(None if appearances is None else appearances[index]),
+                inner_aperture=(
+                    None
+                    if aperture_geometries is None
+                    else aperture_geometries[index]
+                ),
             )
             for index, detection in enumerate(raw)
         )
@@ -440,6 +605,9 @@ class VisualDetectionFrame:
         *,
         edge_margin_px: int = 2,
         appearances: Optional[Sequence[Optional[tuple[float, ...]]]] = None,
+        aperture_geometries: Optional[
+            Sequence[Optional[VisualInnerApertureGeometry]]
+        ] = None,
     ) -> "VisualDetectionFrame":
         """Build a batch from the receiver's exact timing ledger."""
 
@@ -476,6 +644,7 @@ class VisualDetectionFrame:
             ),
             edge_margin_px=edge_margin_px,
             appearances=appearances,
+            aperture_geometries=aperture_geometries,
             camera_source_time_ns=_nonnegative_int(
                 getattr(timing, "camera_source_time_ns", None),
                 "timing.camera_source_time_ns",
@@ -500,6 +669,7 @@ class VisualTrackSample:
     center_censored: bool
     association_confidence: float
     accepted_association: Optional["AssociationEvidence"] = None
+    inner_aperture: Optional[VisualInnerApertureGeometry] = None
 
     @property
     def bearing_norm(self) -> float:
@@ -594,7 +764,16 @@ def visual_track_history_sha256(
         )
     payload = {
         "schema": "aigp-vq2-visual-track-history/1",
-        "samples": [asdict(sample) for sample in history],
+        # Preserve historical /1 digests when the opt-in aperture fitter was
+        # not active.  New geometry is included when it was actually observed.
+        "samples": [
+            {
+                key: value
+                for key, value in asdict(sample).items()
+                if key != "inner_aperture" or value is not None
+            }
+            for sample in history
+        ],
     }
     try:
         encoded = json.dumps(
@@ -1564,6 +1743,7 @@ def _sample(
         center_censored=detection.center_censored,
         association_confidence=association_confidence,
         accepted_association=accepted_association,
+        inner_aperture=detection.inner_aperture,
     )
 
 

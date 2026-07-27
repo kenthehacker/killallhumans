@@ -1307,6 +1307,9 @@ class DynamicCourseCore:
             if existing is None:
                 raise DynamicCourseError("an invisible observation cannot initialise a track")
             existing.measured_bearing_history.clear()
+            for history in existing.measured_aperture_history:
+                history.clear()
+            existing.last_measured_aperture_half_size_norm = None
             for history in existing.measured_residual_rate_history:
                 history.clear()
             existing.residual_rate_reanchor_required[:] = [True, True]
@@ -1472,6 +1475,8 @@ class DynamicCourseCore:
                 )
         stabilized_aperture = (
             existing.last_measured_aperture_half_size_norm
+            if observation.aperture_half_size_norm is not None
+            else None
         )
         if rate_gap or observation.ambiguous:
             for history in existing.measured_aperture_history:
@@ -1521,10 +1526,9 @@ class DynamicCourseCore:
         existing.last_raw_measurement_ns = capture_ns
         existing.last_measurement_camera_to_world = camera_to_world
         existing.last_measured_center_norm = observation.center_norm
-        if stabilized_aperture is not None:
-            existing.last_measured_aperture_half_size_norm = (
-                stabilized_aperture
-            )
+        existing.last_measured_aperture_half_size_norm = (
+            stabilized_aperture
+        )
         if observation.ambiguous or observation.censored_axes[0]:
             existing.measured_bearing_history.clear()
         else:
@@ -1875,11 +1879,10 @@ class DynamicCourseCore:
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=observation.center_norm,
             raw_log_scale=observation.log_scale,
-            aperture_half_size_norm=(
-                stabilized_aperture
-                if stabilized_aperture is not None
-                else previous.aperture_half_size_norm
-            ),
+            # Passage geometry is measurement evidence, not a coasting state.
+            # Once this publication lacks a usable inner-aperture fit, keep
+            # identity/bearing prediction but withdraw all clearance authority.
+            aperture_half_size_norm=stabilized_aperture,
             bearing_rad=(bearing_values[0], bearing_values[1]),
             bearing_rate_rad_s=(bearing_rates[0], bearing_rates[1]),
             bearing_rate_qualified=(
@@ -1942,7 +1945,9 @@ class DynamicCourseCore:
             capture_timing_uncertainty_s=observation.timing_uncertainty_s,
             raw_center_norm=None,
             raw_log_scale=None,
-            aperture_half_size_norm=previous.aperture_half_size_norm,
+            # A coast may retain bearing lineage, but it cannot mint current
+            # passage clearance from stale aperture geometry.
+            aperture_half_size_norm=None,
             bearing_rad=bearing,
             bearing_rate_rad_s=rate,
             bearing_rate_qualified=(False, False),
@@ -2070,7 +2075,6 @@ class DynamicCourseCore:
             != state.current.stream_generation
             or successor.sample_count < 4
             or successor.ambiguous
-            or successor.aperture_half_size_norm is None
         ):
             return False
         age_s = (

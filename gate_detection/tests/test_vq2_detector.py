@@ -24,6 +24,7 @@ from gate_detection.src.vq2_geometry import (
     VQ2ApertureConfig,
     fit_vq2_aperture_bgr,
     fit_vq2_aperture_mask,
+    passage_geometry_from_vq2_aperture_fit,
     vq2_gate_mask_from_bgr,
 )
 from gate_detection.src.vq2_observation_adapter import (
@@ -231,6 +232,31 @@ def test_visible_inner_aperture_fit_is_deterministic_and_supported() -> None:
     assert all(value > 0.0 for value in _crosses(first.fitted_corners_px))
 
 
+def test_visible_inner_fit_yields_conservative_passage_geometry() -> None:
+    image = _aperture_scene((70, 50, 130, 110))
+    detection = _aperture_detection(image)
+    fit = fit_vq2_aperture_bgr(
+        image,
+        detection.bbox,
+        detection_confidence=detection.confidence,
+    )
+
+    geometry = passage_geometry_from_vq2_aperture_fit(fit)
+
+    assert geometry is not None
+    assert geometry.center_norm == pytest.approx((0.0, 0.0), abs=1e-12)
+    assert geometry.aperture_half_size_norm == pytest.approx(
+        (0.305, 0.38125),
+        abs=1e-12,
+    )
+    assert geometry.log_scale == pytest.approx(
+        0.5 * math.log(0.305 * 0.38125),
+    )
+    assert geometry.measurement_std == pytest.approx(
+        tuple(math.sqrt(value) for value in fit.covariance_diagonal[:3])
+    )
+
+
 @pytest.mark.parametrize(
     ("inner_bounds", "clipped", "expected_visible", "inferred_corner_indexes"),
     [
@@ -405,6 +431,28 @@ def test_complete_but_low_confidence_fit_is_degraded() -> None:
     assert observation.health_reason == "low_confidence_image_aperture"
 
 
+def test_low_confidence_or_clipped_fit_cannot_claim_passage_geometry() -> None:
+    visible_image = _aperture_scene((70, 50, 130, 110))
+    clipped_image = _aperture_scene((70, -12, 130, 48))
+    visible_detection = _aperture_detection(visible_image)
+    clipped_detection = _aperture_detection(clipped_image)
+    low_confidence = fit_vq2_aperture_bgr(
+        visible_image,
+        visible_detection.bbox,
+        detection_confidence=0.1,
+    )
+    clipped = fit_vq2_aperture_bgr(
+        clipped_image,
+        clipped_detection.bbox,
+        detection_confidence=clipped_detection.confidence,
+    )
+
+    assert low_confidence.succeeded
+    assert clipped.succeeded
+    assert passage_geometry_from_vq2_aperture_fit(low_confidence) is None
+    assert passage_geometry_from_vq2_aperture_fit(clipped) is None
+
+
 def test_perspective_inner_quad_remains_convex_and_corner_ordered() -> None:
     image = np.full((180, 240, 3), 18, dtype=np.uint8)
     color = _bgr_from_hsv(165, 100, 250)
@@ -449,6 +497,21 @@ def test_multiple_similar_aperture_gaps_are_rejected_as_ambiguous() -> None:
     assert fit.rejection_reason == "ambiguous_multiple_aperture_gaps"
     assert fit.fitted_corners_px is None
     assert fit.covariance_diagonal is None
+
+
+def test_connected_current_successor_union_never_claims_passage_geometry() -> None:
+    mask = np.zeros((160, 300), dtype=np.uint8)
+    cv2.rectangle(mask, (20, 20), (200, 140), 255, 10)
+    cv2.rectangle(mask, (198, 32), (282, 112), 255, 8)
+    cv2.rectangle(mask, (195, 30), (205, 48), 255, -1)
+
+    fit = fit_vq2_aperture_mask(
+        mask,
+        (15, 15, 272, 130),
+        detection_confidence=0.9,
+    )
+
+    assert passage_geometry_from_vq2_aperture_fit(fit) is None
 
 
 def test_degenerate_solid_support_falls_back_without_scale_or_skew() -> None:

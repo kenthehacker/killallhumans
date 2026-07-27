@@ -93,6 +93,7 @@ from competition.vq2_visual_tracker import (
     MultiTargetTrackerConfig,
     MultiTargetVisualTracker,
     VisualDetectionFrame,
+    VisualInnerApertureGeometry,
     VisualTrack,
     VisualTrackRole,
 )
@@ -103,6 +104,14 @@ from estimation.imu_attitude import (
 )
 from gate_detection.src.gate_detector import GateDetection
 from gate_detection.src.vq2_detector import VQ2GateDetector
+from gate_detection.src.vq2_geometry import (
+    ApertureSide,
+    VQ2ApertureConfig,
+    VQ2ApertureFit,
+    fit_vq2_aperture_mask,
+    passage_geometry_from_vq2_aperture_fit,
+    vq2_gate_mask_from_bgr,
+)
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateReacquisition,
@@ -267,6 +276,98 @@ def _load_live_transport_dependencies() -> Tuple[Any, Any, Any]:
 
 
 logger = logging.getLogger("aigp.vq2")
+
+_VISUAL_INNER_APERTURE_CONFIG = VQ2ApertureConfig(
+    # Match VQ2GateDetector's production support-mask morphology exactly.
+    morph_kernel_size=5,
+)
+
+
+def _visual_inner_aperture_from_fit(
+    fit: VQ2ApertureFit,
+) -> VisualInnerApertureGeometry:
+    """Project one deterministic fit into tracker-carried passage evidence."""
+
+    if type(fit) is not VQ2ApertureFit:
+        raise TypeError("visual inner aperture requires an exact fit")
+    geometry = passage_geometry_from_vq2_aperture_fit(fit)
+    clipping = FrameEdge(int(fit.clipping))
+    visible_edges = FrameEdge(int(fit.visible_edges))
+    if geometry is not None:
+        if (
+            fit.geometry_model_id is None
+            or fit.covariance_model_id is None
+        ):
+            raise ValueError(
+                "usable visual inner aperture lacks fit model identity"
+            )
+        return VisualInnerApertureGeometry(
+            center_norm=geometry.center_norm,
+            half_size_norm=geometry.aperture_half_size_norm,
+            log_scale=geometry.log_scale,
+            measurement_std=geometry.measurement_std,
+            confidence=fit.confidence,
+            clipping=clipping,
+            visible_edges=visible_edges,
+            geometry_model_id=fit.geometry_model_id,
+            covariance_model_id=fit.covariance_model_id,
+        )
+
+    all_sides = (
+        ApertureSide.LEFT
+        | ApertureSide.TOP
+        | ApertureSide.RIGHT
+        | ApertureSide.BOTTOM
+    )
+    if not fit.succeeded:
+        reason = (
+            "aperture_fit_rejected:"
+            + (fit.rejection_reason or "unknown")
+        )
+    elif fit.clipping != ApertureSide.NONE:
+        reason = f"aperture_fit_censored:{int(fit.clipping)}"
+    elif fit.visible_edges != all_sides:
+        reason = f"aperture_fit_incomplete:{int(fit.visible_edges)}"
+    elif fit.confidence < 0.25:
+        reason = "aperture_fit_low_confidence"
+    else:
+        reason = "aperture_fit_invalid_passage_geometry"
+    return VisualInnerApertureGeometry(
+        center_norm=None,
+        half_size_norm=None,
+        log_scale=None,
+        measurement_std=None,
+        confidence=fit.confidence,
+        clipping=clipping,
+        visible_edges=visible_edges,
+        geometry_model_id=None,
+        covariance_model_id=None,
+        health_reason=reason,
+    )
+
+
+def _fit_visual_inner_apertures(
+    image: Any,
+    detections: Sequence[GateDetection],
+) -> tuple[VisualInnerApertureGeometry, ...]:
+    """Threshold once, then fit every same-publication detector support."""
+
+    mask = vq2_gate_mask_from_bgr(
+        image,
+        config=_VISUAL_INNER_APERTURE_CONFIG,
+    )
+    return tuple(
+        _visual_inner_aperture_from_fit(
+            fit_vq2_aperture_mask(
+                mask,
+                detection.bbox,
+                detection_confidence=detection.confidence,
+                config=_VISUAL_INNER_APERTURE_CONFIG,
+            )
+        )
+        for detection in detections
+    )
+
 
 CONTROL_HZ = 50.0
 CONTROL_PERIOD_S = 1.0 / CONTROL_HZ
@@ -8739,6 +8840,11 @@ class VQ2Runner:
     def _visual_track_summary(track: VisualTrack) -> Dict[str, Any]:
         latest_token = track.latest_token
         first_token = track.first_token
+        inner = (
+            None
+            if not track.history
+            else track.history[-1].inner_aperture
+        )
         return {
             "track_id": track.track_id,
             "first_frame_token": (
@@ -8769,6 +8875,37 @@ class VQ2Runner:
             "authoritative_gate_index": track.authoritative_gate_index,
             "ambiguous": track.ambiguous,
             "visible": track.visible,
+            "inner_aperture": (
+                None
+                if inner is None
+                else {
+                    "passage_usable": inner.passage_usable,
+                    "center_norm_image_down": (
+                        None
+                        if inner.center_norm is None
+                        else list(inner.center_norm)
+                    ),
+                    "half_size_norm": (
+                        None
+                        if inner.half_size_norm is None
+                        else list(inner.half_size_norm)
+                    ),
+                    "log_scale": inner.log_scale,
+                    "measurement_std": (
+                        None
+                        if inner.measurement_std is None
+                        else list(inner.measurement_std)
+                    ),
+                    "confidence": inner.confidence,
+                    "clipping_edges": int(inner.clipping),
+                    "visible_edges": int(inner.visible_edges),
+                    "geometry_model_id": inner.geometry_model_id,
+                    "covariance_model_id": (
+                        inner.covariance_model_id
+                    ),
+                    "health_reason": inner.health_reason,
+                }
+            ),
         }
 
     @staticmethod
@@ -9205,9 +9342,16 @@ class VQ2Runner:
                     ) / 1_000_000.0
                 self._latest_raw_detections = detections
                 if self._visual_tracking_enabled:
+                    aperture_geometries = (
+                        _fit_visual_inner_apertures(
+                            image,
+                            detections,
+                        )
+                    )
                     visual_frame = VisualDetectionFrame.from_vision_snapshot(
                         snapshot,
                         detections,
+                        aperture_geometries=aperture_geometries,
                     )
                     visual_update = self.visual_tracker.update(visual_frame)
                     self._visual_latest_graph_snapshot = (
