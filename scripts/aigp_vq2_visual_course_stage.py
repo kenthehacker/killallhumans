@@ -110,6 +110,9 @@ GATE0_PROVED_COLLECTIVE_MAX_ABS_ERROR = 0.50
 GATE0_PROVED_COLLECTIVE_MAX_ABS_RATE = 5.0 / 3.0
 GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA = 0.35
 GATE0_PROVED_COLLECTIVE_BASIS = "proved-gate0-normalized-collective-v1"
+CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS = (
+    "proved-gate0-law-generic-current-aperture-v1"
+)
 GATE0_PROVED_NEXT_PREVIEW_ERROR_GAIN = 0.080
 GATE0_PROVED_NEXT_PREVIEW_MAX_THRUST_DELTA = 0.012
 GATE0_PROVED_NEXT_PREVIEW_BASIS = (
@@ -125,7 +128,7 @@ def _gate0_proved_vertical_collective(
     vertical: float,
     filtered_vertical_rate: float,
 ) -> float:
-    """Return the live-proved Gate-0 collective in normalized image space."""
+    """Return the Gate-0-proved law for any current course aperture."""
 
     vertical = float(vertical)
     filtered_vertical_rate = float(filtered_vertical_rate)
@@ -281,15 +284,60 @@ def _gate0_proved_collective_with_exact_next_preview(
 
 
 @dataclass(slots=True)
-class _Gate0ProvedCollectiveState:
+class _CurrentApertureProvedCollectiveState:
+    """Exact-frame collective state bound to one authoritative aperture.
+
+    The gains remain the flight-proved Gate-0 law.  The state itself is
+    gate-agnostic and is recreated at each authoritative gate transition.
+    A censored vertical axis cannot synthesize a new collective request, so
+    it retains the last request derived from an observable current aperture.
+    """
+
+    track_id: Optional[str] = None
     last_token_key: Optional[tuple[str, int, int, int]] = None
     last_received_monotonic_s: Optional[float] = None
     last_vertical: Optional[float] = None
+    last_observable_frame_id: Optional[int] = None
+    last_observable_thrust: Optional[float] = None
     filtered_vertical_rate: float = 0.0
+    last_observation_vertical_censored: bool = False
+    last_hold_reason: Optional[str] = None
+
+    def hold(self, *, reason: str) -> tuple[float, float]:
+        """Retain current-aperture collective without inventing geometry."""
+
+        if reason not in {
+            "vertical_censored",
+            "current_aperture_dropout",
+        }:
+            raise ValueError(
+                "current-aperture collective hold reason is invalid"
+            )
+        self.last_hold_reason = reason
+        self.last_observation_vertical_censored = (
+            reason == "vertical_censored"
+        )
+        thrust = (
+            GATE0_PROVED_COLLECTIVE_BASE
+            if self.last_observable_thrust is None
+            else self.last_observable_thrust
+        )
+        return thrust, self.filtered_vertical_rate
 
     def observe(self, target: Any) -> tuple[float, float]:
         """Apply the proved 0.35 filter on exact graph receiver timing."""
 
+        track_id = getattr(target, "track_id", None)
+        if type(track_id) is not str or not track_id:
+            raise ValueError(
+                "current-aperture collective target identity is invalid"
+            )
+        if self.track_id is None:
+            self.track_id = track_id
+        elif self.track_id != track_id:
+            raise ValueError(
+                "current-aperture collective target identity changed"
+            )
         token = target.frame_token
         token_key = (
             str(token.stream_id),
@@ -300,19 +348,50 @@ class _Gate0ProvedCollectiveState:
         received = float(target.received_monotonic_s)
         vertical = float(target.normalized_y_down)
         if not math.isfinite(received) or not math.isfinite(vertical):
-            raise ValueError("Gate-0 collective observation must be finite")
+            raise ValueError(
+                "current-aperture collective observation must be finite"
+            )
+        vertical_censored_value = getattr(
+            target,
+            "vertical_geometry_censored",
+            None,
+        )
+        if vertical_censored_value is None:
+            vertical_censored_value = bool(
+                getattr(target, "vertical_censored", False)
+                or (
+                    not getattr(target, "horizontal_censored", False)
+                    and (
+                        getattr(target, "clipped", False)
+                        or getattr(target, "center_censored", False)
+                    )
+                )
+            )
+        if type(vertical_censored_value) is not bool:
+            raise ValueError(
+                "current-aperture vertical censorship is invalid"
+            )
+        vertical_censored = vertical_censored_value
+        self.last_hold_reason = None
         if self.last_token_key is not None:
             if (
                 token_key[0] != self.last_token_key[0]
                 or token_key[1] != self.last_token_key[1]
                 or token_key[3] <= self.last_token_key[3]
-                or self.last_received_monotonic_s is None
-                or self.last_vertical is None
             ):
                 raise ValueError(
-                    "Gate-0 collective publication did not advance"
+                    "current-aperture collective publication did not advance"
                 )
-            if token_key[2] != self.last_token_key[2]:
+        if not vertical_censored:
+            if self.last_received_monotonic_s is None:
+                self.last_received_monotonic_s = received
+                self.last_vertical = vertical
+                self.last_observable_frame_id = token_key[2]
+            elif (
+                self.last_vertical is not None
+                and self.last_observable_frame_id is not None
+                and token_key[2] != self.last_observable_frame_id
+            ):
                 elapsed = received - self.last_received_monotonic_s
                 if elapsed > 1e-3:
                     raw_rate = (vertical - self.last_vertical) / elapsed
@@ -330,15 +409,70 @@ class _Gate0ProvedCollectiveState:
                     )
                 self.last_received_monotonic_s = received
                 self.last_vertical = vertical
-        else:
-            self.last_received_monotonic_s = received
-            self.last_vertical = vertical
+                self.last_observable_frame_id = token_key[2]
         self.last_token_key = token_key
+        self.last_observation_vertical_censored = vertical_censored
+        if vertical_censored:
+            return self.hold(
+                reason="vertical_censored",
+            )
         thrust = _gate0_proved_vertical_collective(
             vertical,
             self.filtered_vertical_rate,
         )
+        self.last_observable_thrust = thrust
         return thrust, self.filtered_vertical_rate
+
+
+@dataclass(frozen=True, slots=True)
+class _CurrentApertureCollectiveProposal:
+    requested_thrust: float
+    filtered_vertical_rate_down_s: float
+    vertical_censored: bool
+    current_aperture_dropout: bool
+    held_last_observable_collective: bool
+
+
+def _propose_current_aperture_collective(
+    state: _CurrentApertureProvedCollectiveState,
+    target: Any,
+    *,
+    authoritative_current_track_id: str,
+) -> _CurrentApertureCollectiveProposal:
+    """Allocate collective only from the authoritative current aperture."""
+
+    if (
+        type(authoritative_current_track_id) is not str
+        or not authoritative_current_track_id
+        or state.track_id != authoritative_current_track_id
+    ):
+        raise ValueError(
+            "current-aperture collective authority is invalid"
+        )
+    if target.track_id == authoritative_current_track_id:
+        thrust, filtered_rate = state.observe(target)
+    else:
+        # A clean adjacent target may own pre-credit heading during a bounded
+        # current-aperture dropout, but it cannot take collective authority
+        # before authoritative promotion.
+        thrust, filtered_rate = state.hold(
+            reason="current_aperture_dropout",
+        )
+    held = bool(
+        state.last_hold_reason is not None
+        and state.last_observable_thrust is not None
+    )
+    return _CurrentApertureCollectiveProposal(
+        requested_thrust=thrust,
+        filtered_vertical_rate_down_s=filtered_rate,
+        vertical_censored=(
+            state.last_hold_reason == "vertical_censored"
+        ),
+        current_aperture_dropout=(
+            state.last_hold_reason == "current_aperture_dropout"
+        ),
+        held_last_observable_collective=held,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1577,8 +1711,8 @@ async def _run_visual_course_stage_impl(
     total_zero_commands = 0
     max_gate_index = current_gate_index
     latest_authoritative_gate_index = current_gate_index
-    launch_collective_state: Optional[
-        _Gate0ProvedCollectiveState
+    current_aperture_collective_state: Optional[
+        _CurrentApertureProvedCollectiveState
     ] = None
     pending_post_credit_recovery: Optional[
         _PendingPostCreditRecovery
@@ -2019,6 +2153,80 @@ async def _run_visual_course_stage_impl(
             ),
         )
         launch = segment["launch_bootstrap"]
+        proved_collective: Optional[float] = None
+        proved_filtered_vertical_rate: Optional[float] = None
+        collective_evidence: Optional[Dict[str, Any]] = None
+        collective_proposal: Optional[
+            _CurrentApertureCollectiveProposal
+        ] = None
+        if runtime.dynamic_controller is not None:
+            assert current_aperture_collective_state is not None
+            collective_proposal = (
+                _propose_current_aperture_collective(
+                    current_aperture_collective_state,
+                    proposal.current_target,
+                    authoritative_current_track_id=current_track_id,
+                )
+            )
+            proved_collective = (
+                collective_proposal.requested_thrust
+            )
+            proved_filtered_vertical_rate = (
+                collective_proposal.filtered_vertical_rate_down_s
+            )
+        elif launch["enabled"] and apply_launch_bootstrap:
+            assert current_aperture_collective_state is not None
+            (
+                proved_collective,
+                proved_filtered_vertical_rate,
+            ) = current_aperture_collective_state.observe(
+                proposal.current_target
+            )
+        if runtime.dynamic_controller is not None:
+            assert proved_collective is not None
+            assert proved_filtered_vertical_rate is not None
+            assert collective_proposal is not None
+            # Dynamic pitch owns forward closure.  Current-aperture image-down
+            # error and its exact-frame filtered rate exclusively own
+            # collective after any launch-only boost.
+            command_thrust = proved_collective
+            collective_evidence = {
+                "basis": CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS,
+                "gate_index": current_gate_index,
+                "authority_track_id": current_track_id,
+                "observation_track_id": (
+                    proposal.current_target.track_id
+                ),
+                "current_vertical_error_image_down": (
+                    None
+                    if collective_proposal.current_aperture_dropout
+                    else float(
+                        proposal.current_target.normalized_y_down
+                    )
+                ),
+                "current_vertical_rate_down_s": (
+                    None
+                    if collective_proposal.current_aperture_dropout
+                    else float(
+                        proposal.current_target
+                        .normalized_y_rate_down_s
+                    )
+                ),
+                "proved_filtered_vertical_rate_down_s": (
+                    proved_filtered_vertical_rate
+                ),
+                "requested_thrust": proved_collective,
+                "vertical_censored": (
+                    collective_proposal.vertical_censored
+                ),
+                "current_aperture_dropout": (
+                    collective_proposal.current_aperture_dropout
+                ),
+                "held_last_observable_collective": (
+                    collective_proposal
+                    .held_last_observable_collective
+                ),
+            }
         launch_evidence: Optional[Dict[str, Any]] = None
         if launch["enabled"] and apply_launch_bootstrap:
             assert launch_spawn_pitch_rad is not None
@@ -2034,13 +2242,8 @@ async def _run_visual_course_stage_impl(
                 (1.0 - pitch_blend) * launch_spawn_pitch_rad
                 + pitch_blend * target_pitch_rad
             )
-            assert launch_collective_state is not None
-            (
-                _proved_collective,
-                proved_filtered_vertical_rate,
-            ) = launch_collective_state.observe(
-                proposal.current_target
-            )
+            assert proved_collective is not None
+            assert proved_filtered_vertical_rate is not None
             next_preview_collective_delta = 0.0
             next_preview_collective_track_id: Optional[str] = None
             if launch_elapsed_s < INITIAL_PAD_PRELOAD_DURATION_S:
@@ -2055,9 +2258,13 @@ async def _run_visual_course_stage_impl(
                 thrust_phase = "boost"
             else:
                 # Preload and boost are launch-only plant handling.  Once
-                # airborne, the same continuous generic servo owns collective
-                # for Gate 0 and every successor gate.
-                thrust_phase = "generic-visual-servo"
+                # airborne, the proved current-aperture loop owns collective
+                # for Gate 0 and every successor gate in the dynamic stack.
+                thrust_phase = (
+                    "proved-current-aperture"
+                    if runtime.dynamic_controller is not None
+                    else "generic-visual-servo"
+                )
             if (
                 target_pitch_rad < limits.min_measured_pitch_rad
                 or target_pitch_rad > limits.max_measured_pitch_rad
@@ -2091,6 +2298,10 @@ async def _run_visual_course_stage_impl(
                     next_preview_collective_track_id
                 ),
             }
+        if collective_evidence is not None:
+            collective_evidence[
+                "allocated_thrust_before_wire_governor"
+            ] = command_thrust
 
         await host._wait_for_next_flight_command_slot()
         if refresh_ingress_after_slot:
@@ -2392,6 +2603,56 @@ async def _run_visual_course_stage_impl(
             segment["dynamic_controller"] = dict(
                 dynamic_controller.evidence_summary()
             )
+        if collective_evidence is not None:
+            collective_evidence["wire_thrust"] = float(command.thrust)
+            host.recorder.emit(
+                "visual_course_current_aperture_collective",
+                **collective_evidence,
+            )
+            collective_summary = segment[
+                "current_aperture_collective"
+            ]
+            collective_summary["command_count"] = (
+                int(collective_summary["command_count"]) + 1
+            )
+            if collective_evidence[
+                "held_last_observable_collective"
+            ]:
+                collective_summary["held_command_count"] = (
+                    int(collective_summary["held_command_count"]) + 1
+                )
+            elif not collective_evidence["vertical_censored"]:
+                collective_summary["observable_command_count"] = (
+                    int(
+                        collective_summary[
+                            "observable_command_count"
+                        ]
+                    )
+                    + 1
+                )
+            for summary_name, evidence_name in (
+                (
+                    "last_current_vertical_error_image_down",
+                    "current_vertical_error_image_down",
+                ),
+                (
+                    "last_current_vertical_rate_down_s",
+                    "current_vertical_rate_down_s",
+                ),
+                (
+                    "last_filtered_vertical_rate_down_s",
+                    "proved_filtered_vertical_rate_down_s",
+                ),
+                ("last_requested_thrust", "requested_thrust"),
+                (
+                    "last_allocated_thrust_before_wire_governor",
+                    "allocated_thrust_before_wire_governor",
+                ),
+                ("last_wire_thrust", "wire_thrust"),
+            ):
+                collective_summary[summary_name] = (
+                    collective_evidence[evidence_name]
+                )
         host._record_tick(
             stage,
             float(runtime.monotonic()) - segment_started_s,
@@ -2848,9 +3109,11 @@ async def _run_visual_course_stage_impl(
             if carried_post_credit_yaw_reference_rad is None
             else carried_post_credit_yaw_reference_rad
         )
-        launch_collective_state = (
-            _Gate0ProvedCollectiveState()
-            if launch_enabled
+        current_aperture_collective_state = (
+            _CurrentApertureProvedCollectiveState(
+                track_id=current_track_id
+            )
+            if launch_enabled or runtime.dynamic_controller is not None
             else None
         )
 
@@ -2986,6 +3249,43 @@ async def _run_visual_course_stage_impl(
             "near_plane_measurement_mode": None,
             "crossing_anchor": None,
             "outcome": "running",
+            "current_aperture_collective": {
+                "enabled": runtime.dynamic_controller is not None,
+                "basis": (
+                    CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+                    if runtime.dynamic_controller is not None
+                    else None
+                ),
+                "base": (
+                    GATE0_PROVED_COLLECTIVE_BASE
+                    if runtime.dynamic_controller is not None
+                    else None
+                ),
+                "error_gain": (
+                    GATE0_PROVED_COLLECTIVE_ERROR_GAIN
+                    if runtime.dynamic_controller is not None
+                    else None
+                ),
+                "rate_gain": (
+                    GATE0_PROVED_COLLECTIVE_RATE_GAIN
+                    if runtime.dynamic_controller is not None
+                    else None
+                ),
+                "rate_filter_alpha": (
+                    GATE0_PROVED_COLLECTIVE_RATE_FILTER_ALPHA
+                    if runtime.dynamic_controller is not None
+                    else None
+                ),
+                "command_count": 0,
+                "observable_command_count": 0,
+                "held_command_count": 0,
+                "last_current_vertical_error_image_down": None,
+                "last_current_vertical_rate_down_s": None,
+                "last_filtered_vertical_rate_down_s": None,
+                "last_requested_thrust": None,
+                "last_allocated_thrust_before_wire_governor": None,
+                "last_wire_thrust": None,
+            },
             "launch_bootstrap": {
                 "enabled": launch_enabled,
                 "preload_duration_s": INITIAL_PAD_PRELOAD_DURATION_S,

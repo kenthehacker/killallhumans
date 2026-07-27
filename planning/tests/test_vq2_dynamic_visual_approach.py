@@ -441,6 +441,40 @@ def test_launch_thrust_override_does_not_seed_an_outward_slew():
     assert 0.275 <= resumed.thrust <= 0.32
 
 
+def test_proved_collective_descends_through_wire_governor_after_boost():
+    session = _session()
+    first_ns = _BASE_NS
+    session.record_wire_acceptance(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=0.0,
+        thrust=0.32,
+        wire_command=AttitudeRateCommand(0.0, 0.0, 0.0, 0.32),
+        wire_start_monotonic_ns=first_ns,
+        thrust_slew_override=True,
+    )
+
+    accepted = AttitudeRateCommand(0.0, 0.0, 0.0, 0.32)
+    for index in range(1, 21):
+        wire_ns = first_ns + index * 30_000_000
+        accepted = session.govern_wire_command(
+            AttitudeRateCommand(0.0, 0.0, 0.0, 0.21),
+            proposal_monotonic_ns=wire_ns,
+            launch_thrust_override=False,
+            yaw_safety_override=False,
+        )
+        session.record_wire_acceptance(
+            target_roll_rad=0.0,
+            target_pitch_rad=0.0,
+            yaw_rate_rad_s=0.0,
+            thrust=accepted.thrust,
+            wire_command=accepted,
+            wire_start_monotonic_ns=wire_ns,
+        )
+
+    assert 0.21 <= accepted.thrust < 0.275
+
+
 def test_final_wire_governor_projects_yaw_momentum_into_measured_envelope():
     session = _session()
     first_ns = _BASE_NS

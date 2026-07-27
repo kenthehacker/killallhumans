@@ -1666,8 +1666,8 @@ def test_gate0_proved_vertical_collective_rejects_nonfinite_input():
         )
 
 
-def test_gate0_proved_collective_recreates_new_frame_rate_filter():
-    state = course_stage._Gate0ProvedCollectiveState()
+def test_current_aperture_collective_recreates_new_frame_rate_filter():
+    state = course_stage._CurrentApertureProvedCollectiveState()
 
     def observed(sequence, received, vertical):
         target = _target(
@@ -1706,6 +1706,119 @@ def test_gate0_proved_collective_recreates_new_frame_rate_filter():
     assert duplicate_thrust == pytest.approx(0.28542)
     assert third_rate == pytest.approx(-0.0805)
     assert third_thrust == pytest.approx(0.287543)
+
+
+def test_105f607_terminal_vertical_replay_commands_below_support():
+    """Freeze the last clean current-aperture facts from live run 250407d7."""
+
+    state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-0",
+        # Exact value retained in the authoritative compact result.  Receiver
+        # timestamps are intentionally compacted, so seed the proved filter
+        # at its recorded terminal state instead of fabricating precision.
+        filtered_vertical_rate=0.6221695111650704,
+    )
+    target = replace(
+        _target(_snapshot(0, "track-0", 166), "track-0"),
+        received_monotonic_s=241806.953,
+        normalized_y_down=0.05555555555555558,
+        normalized_y_rate_down_s=0.6993507654430058,
+    )
+
+    proposal = course_stage._propose_current_aperture_collective(
+        state,
+        target,
+        authoritative_current_track_id="track-0",
+    )
+
+    assert proposal.filtered_vertical_rate_down_s == pytest.approx(
+        0.6221695111650704
+    )
+    assert proposal.requested_thrust == pytest.approx(0.21)
+    assert proposal.requested_thrust < 0.275
+    assert proposal.vertical_censored is False
+    assert proposal.held_last_observable_collective is False
+
+
+def test_current_aperture_collective_holds_through_censorship_and_dropout():
+    state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-3",
+        filtered_vertical_rate=0.6221695111650704,
+    )
+    clean = replace(
+        _target(_snapshot(3, "track-3", 20), "track-3"),
+        received_monotonic_s=12.0,
+        normalized_y_down=0.05555555555555558,
+    )
+    clean_proposal = course_stage._propose_current_aperture_collective(
+        state,
+        clean,
+        authoritative_current_track_id="track-3",
+    )
+    censored = replace(
+        clean,
+        frame_token=replace(
+            clean.frame_token,
+            frame_id=clean.frame_token.frame_id + 1,
+            publication_sequence=(
+                clean.frame_token.publication_sequence + 1
+            ),
+        ),
+        received_monotonic_s=12.03,
+        normalized_y_down=-1.0,
+        normalized_y_rate_down_s=-8.0,
+        clipped=True,
+        center_censored=True,
+        vertical_censored=True,
+    )
+    censored_proposal = (
+        course_stage._propose_current_aperture_collective(
+            state,
+            censored,
+            authoritative_current_track_id="track-3",
+        )
+    )
+    adjacent = _target(
+        _snapshot(4, "track-4", 22),
+        "track-4",
+    )
+    dropout_proposal = (
+        course_stage._propose_current_aperture_collective(
+            state,
+            adjacent,
+            authoritative_current_track_id="track-3",
+        )
+    )
+
+    assert clean_proposal.requested_thrust == pytest.approx(0.21)
+    assert censored_proposal.requested_thrust == pytest.approx(
+        clean_proposal.requested_thrust
+    )
+    assert censored_proposal.vertical_censored is True
+    assert censored_proposal.held_last_observable_collective is True
+    assert dropout_proposal.requested_thrust == pytest.approx(
+        clean_proposal.requested_thrust
+    )
+    assert dropout_proposal.current_aperture_dropout is True
+    assert dropout_proposal.held_last_observable_collective is True
+
+    promoted_state = (
+        course_stage._CurrentApertureProvedCollectiveState(
+            track_id="track-4"
+        )
+    )
+    promoted = replace(
+        adjacent,
+        normalized_y_down=-0.10,
+    )
+    promoted_proposal = (
+        course_stage._propose_current_aperture_collective(
+            promoted_state,
+            promoted,
+            authoritative_current_track_id="track-4",
+        )
+    )
+    assert promoted_proposal.requested_thrust > 0.275
 
 
 def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
