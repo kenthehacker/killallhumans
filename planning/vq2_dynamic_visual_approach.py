@@ -55,6 +55,7 @@ from planning.vq2_visual_servo import (
     VisualServoRefusal,
     VisualServoTuning,
     VisualTarget,
+    outward_bearing_bank_unload_authority,
 )
 
 
@@ -2434,6 +2435,7 @@ class _DynamicImageServo:
         self._latched_next_track_id: Optional[str] = None
         self._passage_preview_retired = False
         self._last_abs_error: Optional[tuple[float, float]] = None
+        self._retained_max_abs_target_roll_rad: Optional[float] = None
 
     @property
     def corridor_frames(self) -> int:
@@ -2449,6 +2451,82 @@ class _DynamicImageServo:
                 "dynamic passage preview lacks a latched successor"
             )
         self._passage_preview_retired = True
+
+    def _apply_outward_bank_unload(
+        self,
+        *,
+        target_roll_rad: float,
+        yaw_rate_rad_s: float,
+        horizontal_error_norm: float,
+        horizontal_rate_norm_s: float,
+        horizontal_censored: bool,
+    ) -> tuple[float, float, Optional[float]]:
+        """Retain an evidence-owned roll ceiling through side censorship."""
+
+        values = (
+            target_roll_rad,
+            yaw_rate_rad_s,
+            horizontal_error_norm,
+            horizontal_rate_norm_s,
+        )
+        if (
+            type(horizontal_censored) is not bool
+            or not all(math.isfinite(float(value)) for value in values)
+        ):
+            raise VisualServoRefusal(
+                "dynamic bank-unload state is invalid"
+            )
+        target_roll = float(target_roll_rad)
+        horizontal = float(horizontal_error_norm)
+        horizontal_rate = float(horizontal_rate_norm_s)
+        yaw_rate = float(yaw_rate_rad_s)
+        authority = 0.0
+        if not horizontal_censored:
+            outward_product = horizontal * horizontal_rate
+            if outward_product < 0.0:
+                # Only an exact observable inward trend releases the
+                # evidence-owned cap.  Final wire continuity remains owned by
+                # the one physical governor.
+                self._retained_max_abs_target_roll_rad = None
+            elif outward_product > 0.0 and horizontal * yaw_rate < 0.0:
+                authority = outward_bearing_bank_unload_authority(
+                    horizontal,
+                    horizontal_rate,
+                    yaw_rate,
+                    self.tuning,
+                )
+                candidate_ceiling = abs(target_roll) * (
+                    1.0 - authority
+                )
+                retained = self._retained_max_abs_target_roll_rad
+                self._retained_max_abs_target_roll_rad = (
+                    candidate_ceiling
+                    if retained is None
+                    else min(retained, candidate_ceiling)
+                )
+        retained = self._retained_max_abs_target_roll_rad
+        if retained is not None:
+            target_roll = math.copysign(
+                min(abs(target_roll), retained),
+                target_roll,
+            )
+        if (
+            not math.isfinite(target_roll)
+            or abs(target_roll) > MAX_TARGET_ROLL_RAD + 1e-12
+            or not 0.0 <= authority <= 1.0
+            or (
+                retained is not None
+                and (
+                    not math.isfinite(retained)
+                    or not 0.0 <= retained
+                    <= MAX_TARGET_ROLL_RAD + 1e-12
+                )
+            )
+        ):
+            raise VisualServoRefusal(
+                "dynamic bank unload escaped its retained envelope"
+            )
+        return target_roll, authority, retained
 
     def step(
         self,
@@ -2500,8 +2578,23 @@ class _DynamicImageServo:
             )
             self._last_abs_error = current_abs
             self._corridor_frames = 0
-            return VisualServoOutput(
+            (
+                target_roll,
+                _bank_unload_authority,
+                _retained_roll_ceiling,
+            ) = self._apply_outward_bank_unload(
                 target_roll_rad=float(authority["target_roll_rad"]),
+                yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
+                horizontal_error_norm=float(current.normalized_x),
+                horizontal_rate_norm_s=float(
+                    current.normalized_x_rate_s
+                ),
+                horizontal_censored=bool(
+                    current.horizontal_censored
+                ),
+            )
+            return VisualServoOutput(
+                target_roll_rad=target_roll,
                 target_pitch_rad=float(authority["target_pitch_rad"]),
                 yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
                 thrust=float(authority["thrust"]),
@@ -2594,6 +2687,22 @@ class _DynamicImageServo:
                 decision.terminal_crossing_clearance_norm
             )
             crossing_allowance = decision.crossing_allowance_norm
+
+        target_roll, _, _ = self._apply_outward_bank_unload(
+            target_roll_rad=target_roll,
+            yaw_rate_rad_s=yaw_rate,
+            horizontal_error_norm=float(
+                decision.camera_current_center_norm[0]
+                if decision is not None
+                else current.normalized_x
+            ),
+            horizontal_rate_norm_s=float(
+                effective_rate[0]
+                if decision is not None
+                else current.normalized_x_rate_s
+            ),
+            horizontal_censored=bool(current.horizontal_censored),
+        )
 
         terminal_history_qualified = bool(
             decision is not None

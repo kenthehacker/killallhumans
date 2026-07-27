@@ -686,9 +686,15 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
 
     # An abrupt, then stable, clean replacement models the successor's
     # graph-track reinitialization across current-gate plane clipping.
-    for sequence in range(6, 10):
+    for sequence, successor_center_x in zip(
+        range(6, 10),
+        (0.70, 0.73, 0.76, 0.79),
+    ):
         update = tracker.update(
-            _frame(sequence, successor_center_x=0.78)
+            _frame(
+                sequence,
+                successor_center_x=successor_center_x,
+            )
         )
         snapshot = graph.observe(tracker)
     assert snapshot.next_selection_ambiguous is False
@@ -727,8 +733,15 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert proposal.passage_admission is None
     assert proposal.servo_output.advance_enabled is False
     assert proposal.servo_output.next_gate_blend == 0.0
-    assert proposal.servo_output.target_roll_rad > 0.0
     assert proposal.servo_output.yaw_rate_rad_s < 0.0
+    prediction = session.core.predict_track_steering(
+        replacement.track_id,
+        update.observation_monotonic_ns + 5_000_000,
+    )
+    baseline = session._successor_steering_targets(prediction)
+    assert abs(proposal.servo_output.target_roll_rad) < abs(
+        baseline["target_roll_rad"]
+    )
     assert all(
         math.isfinite(value)
         for value in (
@@ -760,6 +773,59 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert promoted.current_gate_index == 1
     assert promoted.current_track_id == replacement.track_id
     assert promoted.promotion_count == 1
+
+
+def test_dynamic_bank_unload_holds_through_censorship_until_inward_motion():
+    tracker, _graph_state, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    servo = planner._servo
+
+    outward, outward_authority, outward_ceiling = (
+        servo._apply_outward_bank_unload(
+            target_roll_rad=MAX_TARGET_ROLL_RAD,
+            yaw_rate_rad_s=-MAX_YAW_RATE_RAD_S,
+            horizontal_error_norm=0.65,
+            horizontal_rate_norm_s=0.20,
+            horizontal_censored=False,
+        )
+    )
+    censored, censored_authority, censored_ceiling = (
+        servo._apply_outward_bank_unload(
+            target_roll_rad=MAX_TARGET_ROLL_RAD,
+            yaw_rate_rad_s=-MAX_YAW_RATE_RAD_S,
+            horizontal_error_norm=0.90,
+            horizontal_rate_norm_s=-0.20,
+            horizontal_censored=True,
+        )
+    )
+    recovered, recovered_authority, recovered_ceiling = (
+        servo._apply_outward_bank_unload(
+            target_roll_rad=MAX_TARGET_ROLL_RAD,
+            yaw_rate_rad_s=-MAX_YAW_RATE_RAD_S,
+            horizontal_error_norm=0.60,
+            horizontal_rate_norm_s=-0.20,
+            horizontal_censored=False,
+        )
+    )
+
+    assert outward_authority > 0.0
+    assert 0.0 <= outward <= MAX_TARGET_ROLL_RAD
+    assert outward_ceiling == pytest.approx(outward)
+    assert censored == pytest.approx(outward)
+    assert censored_authority == 0.0
+    assert censored_ceiling == pytest.approx(outward_ceiling)
+    assert recovered == pytest.approx(MAX_TARGET_ROLL_RAD)
+    assert recovered_authority == 0.0
+    assert recovered_ceiling is None
+    assert snapshot.current_track_id == current_id
 
 
 @pytest.mark.parametrize("gate_size", (0.36, 0.90))

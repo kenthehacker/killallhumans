@@ -38,6 +38,7 @@ from planning.vq2_visual_servo import (
     VisualServoRefusal,
     VisualServoTuning,
     VisualTarget,
+    outward_bearing_bank_unload_authority,
 )
 
 
@@ -2230,6 +2231,33 @@ def test_large_outward_bearing_uses_measured_yaw_and_unloads_bank():
     assert output.yaw_rate_rad_s == -MAX_VISUAL_YAW_RATE_RAD_S
     assert output.target_roll_rad == pytest.approx(0.0)
     assert output.target_pitch_rad == MAX_VISUAL_TARGET_PITCH_RAD
+
+
+def test_outward_bank_unload_authority_is_bounded_and_monotone():
+    tuning = VisualServoTuning()
+    authorities = tuple(
+        outward_bearing_bank_unload_authority(
+            0.60,
+            rate,
+            -MAX_VISUAL_YAW_RATE_RAD_S,
+            tuning,
+        )
+        for rate in (0.01, 0.03, 0.10)
+    )
+
+    assert 0.0 < authorities[0] <= authorities[1] <= authorities[2] <= 1.0
+    assert outward_bearing_bank_unload_authority(
+        0.60,
+        -0.10,
+        -MAX_VISUAL_YAW_RATE_RAD_S,
+        tuning,
+    ) == 0.0
+    assert outward_bearing_bank_unload_authority(
+        -0.60,
+        0.10,
+        MAX_VISUAL_YAW_RATE_RAD_S,
+        tuning,
+    ) == 0.0
 
 
 def test_left_clipping_suppresses_only_horizontal_correction_and_brakes():

@@ -670,6 +670,45 @@ def visual_bearing_yaw_rate(
     )
 
 
+def outward_bearing_bank_unload_authority(
+    horizontal: float,
+    horizontal_rate: float,
+    yaw_request_rad_s: float,
+    tuning: VisualServoTuning,
+) -> float:
+    """Return continuous bank-unload authority for outward image motion."""
+
+    if type(tuning) is not VisualServoTuning:
+        raise TypeError("bank unload requires exact visual tuning")
+    if not all(
+        type(value) in {int, float} and math.isfinite(float(value))
+        for value in (
+            horizontal,
+            horizontal_rate,
+            yaw_request_rad_s,
+        )
+    ):
+        raise VisualServoRefusal("bank-unload inputs must be finite")
+    steering_load = _clamp(
+        abs(float(yaw_request_rad_s))
+        / MAX_VISUAL_YAW_RATE_RAD_S,
+        0.0,
+        1.0,
+    )
+    return steering_load * _clamp(
+        (
+            float(horizontal)
+            * float(horizontal_rate)
+        )
+        / (
+            tuning.horizontal_corridor
+            * tuning.stable_rate_norm_s
+        ),
+        0.0,
+        1.0,
+    )
+
+
 def _passage_violation_detail(
     violation: PassageSafetyViolation,
     *,
@@ -1601,18 +1640,11 @@ class ImageVisualServo:
                     base_target_roll,
                 )
         outward_bearing_authority = (
-            steering_load
-            * _clamp(
-                (
-                    heading_horizontal
-                    * heading_horizontal_rate
-                )
-                / (
-                    self.tuning.horizontal_corridor
-                    * self.tuning.stable_rate_norm_s
-                ),
-                0.0,
-                1.0,
+            outward_bearing_bank_unload_authority(
+                heading_horizontal,
+                heading_horizontal_rate,
+                unconstrained_yaw_rate,
+                self.tuning,
             )
         )
         if outward_bearing_authority > 0.0:
@@ -1774,5 +1806,6 @@ __all__ = [
     "VisualServoRefusal",
     "VisualServoTuning",
     "VisualTarget",
+    "outward_bearing_bank_unload_authority",
     "visual_bearing_yaw_rate",
 ]
