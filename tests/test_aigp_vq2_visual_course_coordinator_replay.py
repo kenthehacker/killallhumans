@@ -23,6 +23,7 @@ from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
 )
+from scripts import aigp_vq2_visual_course_stage as course_stage
 from scripts.aigp_vq2_visual_course_stage import (
     VISUAL_RECEIVER_PROPOSAL_SUPERSEDED_REASON,
     VisualCourseStageLimits,
@@ -975,3 +976,331 @@ def test_recovery_one_edge_commands_before_a_clean_wire():
             recovery_wires[0]["token"].publication_sequence
         ),
     }
+
+
+class _C25DynamicCore:
+    def __init__(self, track_id):
+        self.config = SimpleNamespace(vertical_angle_scale_rad=1.0)
+        self._state = SimpleNamespace(
+            current_track_id=track_id,
+            current=SimpleNamespace(
+                residual_translational_rate_rad_s=(
+                    0.121279229347492,
+                    0.20443111726250962,
+                )
+            ),
+        )
+
+    def course_state(self):
+        return self._state
+
+
+class _C25DynamicController:
+    """Exact terminal c25 q/collective facts with a deterministic governor."""
+
+    def __init__(self, track_id, gate_index):
+        self.track_id = track_id
+        self.gate_index = gate_index
+        self.core = _C25DynamicCore(track_id)
+        self.last_decision = SimpleNamespace(
+            current_track_id=track_id,
+            current_center_norm=(
+                0.052115845809853005,
+                -1.0958578515774178,
+            ),
+        )
+        self.govern_count = 0
+        self.accepted_count = 0
+
+    def govern_wire_command(
+        self,
+        command,
+        *,
+        proposal_monotonic_ns,
+        launch_thrust_override,
+        yaw_safety_override,
+    ):
+        assert type(proposal_monotonic_ns) is int
+        assert launch_thrust_override is False
+        assert yaw_safety_override is False
+        governed_thrust = (
+            0.30799241399874683
+            if self.govern_count == 0
+            else 0.304
+        )
+        self.govern_count += 1
+        return replace(command, thrust=governed_thrust)
+
+    def record_wire_acceptance(
+        self,
+        *,
+        target_roll_rad,
+        target_pitch_rad,
+        yaw_rate_rad_s,
+        thrust,
+        wire_command,
+        wire_start_monotonic_ns,
+        thrust_slew_override=False,
+        yaw_slew_override=False,
+    ):
+        assert thrust_slew_override is False
+        assert yaw_slew_override is False
+        self.accepted_count += 1
+        return {
+            "schema": "aigp-vq2-dynamic-command/1",
+            "controller_family": "aigp-vq2-dynamic-image-course/1",
+            "applied_command_count": self.accepted_count,
+            "dynamic_command_count": self.accepted_count,
+            "roll_reversal_count": 0,
+            "wire_start_monotonic_ns": wire_start_monotonic_ns,
+            "target_attitude_yaw_thrust": [
+                target_roll_rad,
+                target_pitch_rad,
+                yaw_rate_rad_s,
+                thrust,
+            ],
+            "wire_command": {
+                "roll_rate": wire_command.roll_rate,
+                "pitch_rate": wire_command.pitch_rate,
+                "yaw_rate": wire_command.yaw_rate,
+                "thrust": wire_command.thrust,
+            },
+            "gate_index": self.gate_index,
+            "current_track_id": self.track_id,
+            "successor_track_id": "track-4",
+            "current_center_norm": [
+                0.052115845809853005,
+                -1.0958578515774178,
+            ],
+            "camera_current_center_norm": [
+                0.0599040959869629,
+                -0.3384720638086744,
+            ],
+            "passage_point_norm": [
+                0.2553373231601403,
+                -0.23547313447361046,
+            ],
+            "successor_passage_authority": 0.9171578072505727,
+            "passage_error_norm": [
+                0.3074531689699933,
+                -1.3313309860510283,
+            ],
+            "aperture_margin_norm": [
+                0.045211055792231,
+                0.4389479208946809,
+            ],
+            "crossing_prediction_horizon_s": 0.7509888689491439,
+            "crossing_coordinate_basis": (
+                course_stage.DYNAMIC_CROSSING_COORDINATE_BASIS
+            ),
+            "current_crossing_error_q": [
+                0.7872345285230035,
+                -1.7416199837792337,
+            ],
+            "crossing_rate_q_s": [
+                0.1328463672794427,
+                2.1763541677795883,
+            ],
+            "predicted_crossing_error_norm": [
+                0.8870006716301947,
+                -0.10720222888568531,
+            ],
+            "predicted_crossing_std_norm": [
+                0.09250658369983762,
+                0.16712723618103104,
+            ],
+            "crossing_allowance_norm": [0.50, 0.45],
+            "crossing_swept_occupancy_norm": [
+                1.7258056275019444,
+                2.2968614309187667,
+            ],
+            "predicted_crossing_clearance_norm": [
+                -1.2258056275019444,
+                -1.8468614309187668,
+            ],
+            "current_bearing_std_norm": [
+                0.018934613171084462,
+                0.024523885374696446,
+            ],
+            "residual_translation_rate_norm_s": [
+                0.121279229347492,
+                0.20443111726250962,
+            ],
+            "current_censored_axes": [False, False],
+            "current_bearing_rate_qualified": [True, True],
+            "current_scale_rate_qualified": True,
+            "current_log_scale": -0.7155249885531791,
+            "current_log_scale_std": 0.052547919807168456,
+            "expansion_rate_s": 1.3315776589329433,
+            "current_confidence": 0.749706062324875,
+            "current_ambiguous": False,
+            "current_visible": True,
+            "dropout_held": False,
+            "time_to_contact_s": 0.7509888689491439,
+            "braking": True,
+            "brake_reason": "vertical_alignment_unsettled",
+            "passage_scale_ready": False,
+            "successor_yaw_contribution_rad": 0.0,
+        }
+
+    def evidence_summary(self):
+        return {
+            "schema": "aigp-vq2-dynamic-controller-summary/1",
+            "controller_family": "aigp-vq2-dynamic-image-course/1",
+            "applied_command_count": self.accepted_count,
+            "dynamic_command_count": self.accepted_count,
+            "roll_reversal_count": 0,
+            "track_count": 2,
+            "promotion_count": 0,
+        }
+
+    def continuity_hold_authority(self, **_kwargs):
+        raise AssertionError("c25 replay must not enter a handoff hold")
+
+
+class _C25ApproachTopHost(_CoordinatorHost):
+    def __init__(self):
+        super().__init__(
+            initial_gate=3,
+            finish_gate=99,
+            disable_credit=True,
+        )
+
+    def _sample(self):
+        super()._sample()
+        snapshot = self.visual_gate_graph.latest_snapshot
+        track = snapshot.current_track
+        recovery_sent = any(
+            stage.endswith("approach-top-recovery")
+            for stage, _elapsed_s, _command in self.ticks
+        )
+        if not self.ticks:
+            track.center_norm = (
+                0.0599040959869629,
+                -0.3388888888888889,
+            )
+            track.center_velocity_norm_s = (
+                0.121279229347492,
+                0.6039185423722361,
+            )
+            track.apparent_scale = math.exp(-0.7155249885531791)
+            return
+        track.center_norm = (0.103125, -0.2944444444444444)
+        track.center_velocity_norm_s = (
+            0.6216978916774404,
+            0.6637248571542275,
+        )
+        track.apparent_scale = 0.590227
+        track.clipping = (
+            FrameEdge.TOP | FrameEdge.BOTTOM
+            if recovery_sent
+            else FrameEdge.TOP
+        )
+        track.center_censored = True
+
+
+class _C25ApproachTopServo(_CoordinatorServo):
+    def observe(self, snapshot, *args, **kwargs):
+        track = snapshot.current_track
+        if track.clipping != FrameEdge.NONE:
+            raise VisualApproachCurrentGeometryUnavailable(
+                "authoritative current aperture is clipped or censored"
+            )
+        proposal = super().observe(snapshot, *args, **kwargs)
+        latest = track.history[-1]
+        proposal.current_target = replace(
+            proposal.current_target,
+            received_monotonic_s=(
+                latest.observation_monotonic_ns / 1_000_000_000.0
+            ),
+            normalized_x=track.center_norm[0],
+            normalized_y_down=track.center_norm[1],
+            normalized_x_rate_s=track.center_velocity_norm_s[0],
+            normalized_y_rate_down_s=track.center_velocity_norm_s[1],
+            log_scale=math.log(track.apparent_scale),
+            log_scale_rate_s=1.3315776589329433,
+        )
+        proposal.servo_output = replace(
+            proposal.servo_output,
+            target_roll_rad=0.08288152550333001,
+            target_pitch_rad=0.12,
+            yaw_rate_rad_s=-0.010391620866495196,
+            thrust=0.275,
+            corridor_frames=0,
+            advance_enabled=False,
+            next_gate_blend=0.0,
+            brake_reason="vertical_alignment_unsettled",
+        )
+        proposal.passage_admission = None
+        return proposal
+
+
+def _c25_approach_top_runtime(host):
+    runtime, _calls = _runtime(host)
+    dynamic = _C25DynamicController(
+        host.current_track_id,
+        host.current_gate,
+    )
+    servo_calls = []
+
+    def servo_factory(*args, **kwargs):
+        return _C25ApproachTopServo(
+            *args,
+            **kwargs,
+            calls=servo_calls,
+        )
+
+    return replace(
+        runtime,
+        servo_factory=servo_factory,
+        dynamic_controller=dynamic,
+    )
+
+
+def test_c25_top_only_approach_recovery_is_bounded_and_never_latches():
+    host = _C25ApproachTopHost()
+
+    with pytest.raises(
+        SafetyAbort,
+        match="authoritative current aperture is clipped or censored",
+    ):
+        asyncio.run(
+            run_visual_course_stage(
+                host,
+                _context(),
+                runtime=_c25_approach_top_runtime(host),
+            )
+        )
+
+    recovery_wires = [
+        command
+        for (
+            (command, _kwargs, _gate_index),
+            (stage, _elapsed_s, _recorded_command),
+        ) in zip(host.commands, host.ticks)
+        if stage.endswith("approach-top-recovery")
+    ]
+    assert len(recovery_wires) == 1
+    assert recovery_wires[0].thrust == pytest.approx(0.304)
+    assert recovery_wires[0].thrust < host.commands[0][0].thrust
+    assert recovery_wires[0].thrust > 0.2892416792249238
+
+    segment = host._visual_course_summary["segments"][0]
+    assert segment["lifecycle"] == "approach"
+    assert segment["passage_authority_enabled"] is False
+    assert segment["near_plane_latch"] is None
+    assert segment["crossing_anchor"] is None
+    assert segment["approach_top_recovery_command_count"] == 1
+    assert segment["approach_top_recovery_fresh_frame_count"] == 1
+    recovery = segment["approach_top_recovery"]
+    assert recovery["basis"] == course_stage.APPROACH_TOP_RECOVERY_BASIS
+    assert recovery["vertical_endpoint_occupancy_q"] < (
+        recovery["vertical_allowance_q"]
+    )
+    assert recovery["requested_thrust"] == pytest.approx(
+        0.2892416792249238
+    )
+    assert not any(
+        event == "visual_course_near_plane_latched"
+        for event, _payload in host.recorder.events
+    )

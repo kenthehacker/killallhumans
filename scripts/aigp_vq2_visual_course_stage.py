@@ -128,6 +128,16 @@ GATE0_PROVED_NEXT_PREVIEW_BASIS = (
 CENSORED_PASSAGE_COAST_BASIS = (
     "latched-clean-attitude-close-censored-passage-v1"
 )
+APPROACH_TOP_RECOVERY_BASIS = (
+    "clean-q-converging-top-censored-approach-v1"
+)
+APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
+APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S = 0.25
+APPROACH_TOP_RECOVERY_MAX_VERTICAL_Q_STD = 0.18
+APPROACH_TOP_RECOVERY_MAX_ABS_CAMERA_CENTER_NORM = 0.50
+APPROACH_TOP_RECOVERY_THRUST_SLEW_PER_S = 0.15
+APPROACH_TOP_RECOVERY_MAX_THRUST_SETTLE_S = 0.20
+APPROACH_TOP_RECOVERY_ACTION_DELAY_S = 0.08
 _YAW_PROFILE_ISSUER = object()
 
 
@@ -878,6 +888,220 @@ class _CensoredPassageCoastAuthority:
 
 
 @dataclass(frozen=True, slots=True)
+class _ApproachTopRecoveryAuthority:
+    """Clean exact-wire authority for a bounded TOP-only approach hold.
+
+    This is deliberately not crossing authority.  It only preserves the last
+    clean current-gate command while a single censored vertical observation
+    arrives after both aperture-relative and raw image motion have turned
+    away from TOP.  Passage evidence cannot be advanced from this authority.
+    """
+
+    command: _CensoredPassageCoastAuthority
+    anchor_wire_start_monotonic_ns: int
+    current_vertical_q: float
+    vertical_q_rate_s: float
+    predicted_vertical_q: float
+    predicted_vertical_q_std: float
+    vertical_allowance_q: float
+    vertical_endpoint_occupancy_q: float
+    time_to_contact_s: float
+    raw_vertical_rate_down_s: float
+    thrust_settle_s: float
+    post_settle_contact_budget_s: float
+
+
+def _derive_approach_top_recovery_authority(
+    accepted: _AcceptedVisualCommand,
+    *,
+    gate_index: int,
+    track_id: str,
+    raw_vertical_rate_down_s: float,
+    requested_thrust: float,
+    minimum_brake_pitch_rad: float,
+    maximum_recovery_duration_s: float,
+) -> Optional[_ApproachTopRecoveryAuthority]:
+    """Admit only the clean c25-class state that is already moving inward."""
+
+    evidence = accepted.dynamic_evidence
+    if evidence is None:
+        return None
+    if not isinstance(evidence, Mapping):
+        raise ValueError("approach TOP recovery evidence is not a mapping")
+    if (
+        evidence.get("gate_index") is None
+        and evidence.get("current_track_id") is None
+        and evidence.get("dynamic_command_count") == 0
+    ):
+        return None
+    if evidence.get("time_to_contact_s") is None:
+        # A structurally valid warm-up decision cannot estimate closure until
+        # its scale-rate filter is qualified.  It is not recovery authority.
+        return None
+
+    def scalar(name: str) -> float:
+        value = evidence.get(name)
+        if (
+            type(value) not in {int, float}
+            or not math.isfinite(float(value))
+        ):
+            raise ValueError(
+                f"approach TOP recovery evidence {name} is invalid"
+            )
+        return float(value)
+
+    def pair(name: str) -> tuple[float, float]:
+        value = evidence.get(name)
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) != 2
+            or any(
+                type(item) not in {int, float}
+                or not math.isfinite(float(item))
+                for item in value
+            )
+        ):
+            raise ValueError(
+                f"approach TOP recovery evidence {name} is invalid"
+            )
+        return float(value[0]), float(value[1])
+
+    values = (
+        float(raw_vertical_rate_down_s),
+        float(requested_thrust),
+        float(minimum_brake_pitch_rad),
+        float(maximum_recovery_duration_s),
+    )
+    if (
+        not all(math.isfinite(value) for value in values)
+        or not MIN_VISUAL_THRUST <= values[1] <= MAX_VISUAL_THRUST
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= values[2]
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or values[3] <= 0.0
+    ):
+        raise ValueError("approach TOP recovery inputs are invalid")
+    if (
+        evidence.get("schema") != "aigp-vq2-dynamic-command/1"
+        or evidence.get("gate_index") != gate_index
+        or evidence.get("current_track_id") != track_id
+        or evidence.get("crossing_coordinate_basis")
+        != DYNAMIC_CROSSING_COORDINATE_BASIS
+    ):
+        raise ValueError("approach TOP recovery identity is invalid")
+
+    current_q = pair("current_crossing_error_q")
+    q_rate = pair("crossing_rate_q_s")
+    predicted_q = pair("predicted_crossing_error_norm")
+    predicted_std = pair("predicted_crossing_std_norm")
+    allowance = pair("crossing_allowance_norm")
+    camera_center = pair("camera_current_center_norm")
+    time_to_contact_s = scalar("time_to_contact_s")
+    successor_yaw = scalar("successor_yaw_contribution_rad")
+    expansion_rate_s = scalar("expansion_rate_s")
+    qualified = evidence.get("current_bearing_rate_qualified")
+    censored = evidence.get("current_censored_axes")
+    if (
+        not isinstance(qualified, (list, tuple))
+        or len(qualified) != 2
+        or any(type(value) is not bool for value in qualified)
+        or not isinstance(censored, (list, tuple))
+        or len(censored) != 2
+        or any(type(value) is not bool for value in censored)
+        or type(evidence.get("current_scale_rate_qualified")) is not bool
+        or type(evidence.get("current_visible")) is not bool
+        or type(evidence.get("current_ambiguous")) is not bool
+        or type(evidence.get("braking")) is not bool
+        or type(evidence.get("passage_scale_ready")) is not bool
+    ):
+        raise ValueError(
+            "approach TOP recovery qualification evidence is invalid"
+        )
+
+    vertical_endpoint_occupancy = (
+        abs(predicted_q[1])
+        + APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA * predicted_std[1]
+    )
+    thrust_settle_s = (
+        abs(float(accepted.command.thrust) - requested_thrust)
+        / APPROACH_TOP_RECOVERY_THRUST_SLEW_PER_S
+    )
+    post_settle_contact_budget_s = (
+        time_to_contact_s
+        - APPROACH_TOP_RECOVERY_ACTION_DELAY_S
+        - thrust_settle_s
+    )
+    eligible = bool(
+        evidence["current_visible"]
+        and not evidence["current_ambiguous"]
+        and not any(censored)
+        and all(qualified)
+        and evidence["current_scale_rate_qualified"]
+        and evidence["braking"]
+        and evidence.get("brake_reason")
+        == "vertical_alignment_unsettled"
+        and not evidence["passage_scale_ready"]
+        and current_q[1] < 0.0
+        and q_rate[1]
+        >= APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S
+        and current_q[1] * q_rate[1] < 0.0
+        and predicted_std[1]
+        <= APPROACH_TOP_RECOVERY_MAX_VERTICAL_Q_STD
+        and allowance[1] > 0.0
+        and vertical_endpoint_occupancy <= allowance[1]
+        and time_to_contact_s > maximum_recovery_duration_s
+        and thrust_settle_s
+        <= APPROACH_TOP_RECOVERY_MAX_THRUST_SETTLE_S
+        and post_settle_contact_budget_s
+        >= maximum_recovery_duration_s
+        and expansion_rate_s > 0.0
+        and raw_vertical_rate_down_s >= 0.0
+        and abs(camera_center[0])
+        <= APPROACH_TOP_RECOVERY_MAX_ABS_CAMERA_CENTER_NORM
+        and abs(camera_center[1])
+        <= APPROACH_TOP_RECOVERY_MAX_ABS_CAMERA_CENTER_NORM
+        and abs(successor_yaw) <= 1e-9
+        and accepted.target_pitch_rad
+        >= minimum_brake_pitch_rad - 1e-12
+    )
+    if not eligible:
+        return None
+    if (
+        any(value < 0.0 for value in predicted_std)
+        or any(value < 0.0 for value in allowance)
+        or type(accepted.wire_start_monotonic_ns) is not int
+        or accepted.wire_start_monotonic_ns < 0
+    ):
+        raise ValueError(
+            "approach TOP recovery uncertainty/timing is invalid"
+        )
+    return _ApproachTopRecoveryAuthority(
+        command=_CensoredPassageCoastAuthority(
+            gate_index=gate_index,
+            track_id=track_id,
+            anchor_camera_token=accepted.wire_camera_token,
+            target_roll_rad=accepted.target_roll_rad,
+            target_pitch_rad=accepted.target_pitch_rad,
+            yaw_rate_rad_s=float(accepted.command.yaw_rate),
+            requested_thrust=requested_thrust,
+        ),
+        anchor_wire_start_monotonic_ns=(
+            accepted.wire_start_monotonic_ns
+        ),
+        current_vertical_q=current_q[1],
+        vertical_q_rate_s=q_rate[1],
+        predicted_vertical_q=predicted_q[1],
+        predicted_vertical_q_std=predicted_std[1],
+        vertical_allowance_q=allowance[1],
+        vertical_endpoint_occupancy_q=vertical_endpoint_occupancy,
+        time_to_contact_s=time_to_contact_s,
+        raw_vertical_rate_down_s=raw_vertical_rate_down_s,
+        thrust_settle_s=thrust_settle_s,
+        post_settle_contact_budget_s=post_settle_contact_budget_s,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _ConfirmedCourseHandoff:
     """Common command boundary for retained promotion or fresh reacquisition."""
 
@@ -919,6 +1143,8 @@ class VisualCourseStageLimits:
     crossing_status_timeout_s: float = 0.75
     censored_passage_coast_max_duration_s: float = 0.30
     censored_passage_coast_max_fresh_frames: int = 8
+    approach_top_recovery_max_duration_s: float = 0.12
+    approach_top_recovery_max_fresh_frames: int = 3
     post_credit_fresh_frame_timeout_s: float = 0.20
     max_validation_to_wire_delay_s: float = 0.012
     max_command_rate_rad_s: float = 0.25
@@ -944,6 +1170,7 @@ class VisualCourseStageLimits:
             self.passage_hard_duration_s,
             self.crossing_status_timeout_s,
             self.censored_passage_coast_max_duration_s,
+            self.approach_top_recovery_max_duration_s,
             self.post_credit_fresh_frame_timeout_s,
             self.max_validation_to_wire_delay_s,
             self.max_command_rate_rad_s,
@@ -985,6 +1212,10 @@ class VisualCourseStageLimits:
         if not 0.20 <= self.censored_passage_coast_max_duration_s <= 0.30:
             raise ValueError(
                 "visual-course censored passage coast is outside bounds"
+            )
+        if not 0.08 <= self.approach_top_recovery_max_duration_s <= 0.12:
+            raise ValueError(
+                "visual-course approach TOP recovery is outside bounds"
             )
         if not 0.05 <= self.post_credit_fresh_frame_timeout_s <= 0.20:
             raise ValueError("visual-course fresh-frame wait is outside bounds")
@@ -1051,6 +1282,10 @@ class VisualCourseStageLimits:
             or not 4
             <= self.censored_passage_coast_max_fresh_frames
             <= 8
+            or type(self.approach_top_recovery_max_fresh_frames) is not int
+            or not 2
+            <= self.approach_top_recovery_max_fresh_frames
+            <= 3
             or type(self.max_gate_segments) is not int
             or not 1 <= self.max_gate_segments <= 128
         ):
@@ -3032,6 +3267,7 @@ async def _run_visual_course_stage_impl(
         stage: str,
         command_deadline_s: float,
         count_as_navigation: bool = True,
+        hold_basis: str = CENSORED_PASSAGE_COAST_BASIS,
     ) -> Optional[AttitudeRateCommand]:
         """Send a bounded attitude/thrust hold on one exact fresh frame."""
 
@@ -3088,7 +3324,12 @@ async def _run_visual_course_stage_impl(
             command_deadline_s,
         )
         if (
-            authority.gate_index != current_gate_index
+            hold_basis
+            not in {
+                CENSORED_PASSAGE_COAST_BASIS,
+                APPROACH_TOP_RECOVERY_BASIS,
+            }
+            or authority.gate_index != current_gate_index
             or authority.track_id != current_track_id
             or not all(math.isfinite(value) for value in values)
             or abs(authority.target_roll_rad)
@@ -3343,7 +3584,7 @@ async def _run_visual_course_stage_impl(
             )
             launch["last_target_pitch_rad"] = authority.target_pitch_rad
             launch["last_thrust"] = command.thrust
-            launch["last_thrust_phase"] = CENSORED_PASSAGE_COAST_BASIS
+            launch["last_thrust_phase"] = hold_basis
         if (
             count_as_navigation
             and
@@ -3357,10 +3598,16 @@ async def _run_visual_course_stage_impl(
                     "post_transition_navigation_command_count"
                 ]
             ) + 1
+        command_event = (
+            "visual_course_approach_top_recovery_command"
+            if hold_basis == APPROACH_TOP_RECOVERY_BASIS
+            else "visual_course_censored_passage_coast_command"
+        )
         host.recorder.emit(
-            "visual_course_censored_passage_coast_command",
+            command_event,
             gate_index=current_gate_index,
             stage=stage,
+            basis=hold_basis,
             camera_token=asdict(snapshot.latest_camera_token),
             anchor_camera_token=asdict(authority.anchor_camera_token),
             target_roll_rad=authority.target_roll_rad,
@@ -3558,6 +3805,15 @@ async def _run_visual_course_stage_impl(
         ] = None
         censored_passage_coast_fresh_frame_count = 0
         censored_passage_coast_command_count = 0
+        approach_top_recovery_authority: Optional[
+            _ApproachTopRecoveryAuthority
+        ] = None
+        approach_top_recovery_started_s: Optional[float] = None
+        approach_top_recovery_last_token: Optional[
+            CameraFrameToken
+        ] = None
+        approach_top_recovery_fresh_frame_count = 0
+        approach_top_recovery_command_count = 0
         crossing_wait_coast_command_count = 0
         crossing_wait_adjacent_command_count = 0
         credit_wait_adjacent_planner: Optional[Any] = None
@@ -3587,6 +3843,9 @@ async def _run_visual_course_stage_impl(
             "censored_passage_coast_fresh_frame_count": 0,
             "censored_passage_coast_command_count": 0,
             "censored_passage_coast": None,
+            "approach_top_recovery_fresh_frame_count": 0,
+            "approach_top_recovery_command_count": 0,
+            "approach_top_recovery": None,
             "post_credit_zero_command_count": 0,
             "post_credit_hold_command_count": 0,
             "recovery_navigation_command_count": 0,
@@ -4047,6 +4306,286 @@ async def _run_visual_course_stage_impl(
                 VisualApproachCurrentGeometryUnavailable,
                 VisualApproachRefusal,
             ) as exc:
+                recovery_authority = approach_top_recovery_authority
+                recovery_track = getattr(snapshot, "current_track", None)
+                recovery_velocity = getattr(
+                    recovery_track,
+                    "center_velocity_norm_s",
+                    None,
+                )
+                recovery_confidence = getattr(
+                    recovery_track,
+                    "confidence",
+                    None,
+                )
+                recovery_association = getattr(
+                    recovery_track,
+                    "association_confidence",
+                    None,
+                )
+                approach_top_recovery_eligible = bool(
+                    type(exc)
+                    is VisualApproachCurrentGeometryUnavailable
+                    and mode is VisualApproachMode.APPROACH
+                    and lifecycle is CourseLifecycle.APPROACH
+                    and runtime.dynamic_controller is not None
+                    and passage_admission is None
+                    and near_plane_latch is None
+                    and crossing_anchor is None
+                    and recovery_authority is not None
+                    and recovery_track is not None
+                    and getattr(recovery_track, "clipping", None)
+                    == FrameEdge.TOP
+                    and isinstance(recovery_velocity, tuple)
+                    and len(recovery_velocity) == 2
+                    and type(recovery_velocity[1]) in {int, float}
+                    and math.isfinite(float(recovery_velocity[1]))
+                    and float(recovery_velocity[1]) >= 0.0
+                    and type(recovery_confidence) in {int, float}
+                    and math.isfinite(float(recovery_confidence))
+                    and float(recovery_confidence)
+                    >= (
+                        DEFAULT_ROLLING_GATE_GRAPH_CONFIG
+                        .min_track_confidence
+                    )
+                    and type(recovery_association) in {int, float}
+                    and math.isfinite(float(recovery_association))
+                    and float(recovery_association)
+                    >= (
+                        DEFAULT_ROLLING_GATE_GRAPH_CONFIG
+                        .min_association_confidence
+                    )
+                    and _current_snapshot_ready(
+                        snapshot,
+                        gate_index=current_gate_index,
+                        track_id=current_track_id,
+                        newer_than=(
+                            recovery_authority
+                            .command.anchor_camera_token
+                        ),
+                        allow_one_edge_censored=True,
+                    )
+                    and (
+                        approach_top_recovery_last_token is None
+                        or _token_strictly_newer(
+                            token,
+                            approach_top_recovery_last_token,
+                        )
+                    )
+                )
+                if approach_top_recovery_eligible:
+                    assert recovery_authority is not None
+                    recovery_proposal_ns = runtime.perf_counter_ns()
+                    if (
+                        type(recovery_proposal_ns) is not int
+                        or recovery_proposal_ns
+                        < (
+                            recovery_authority
+                            .anchor_wire_start_monotonic_ns
+                        )
+                    ):
+                        raise abort_type(
+                            "visual-course approach TOP recovery QPC "
+                            "clock regressed"
+                        ) from exc
+                    anchor_age_s = (
+                        recovery_proposal_ns
+                        - (
+                            recovery_authority
+                            .anchor_wire_start_monotonic_ns
+                        )
+                    ) / 1_000_000_000.0
+                    remaining_contact_s = (
+                        recovery_authority.time_to_contact_s
+                        - anchor_age_s
+                    )
+                    contact_deadline_s = now + remaining_contact_s
+                    if (
+                        not math.isfinite(anchor_age_s)
+                        or (
+                            approach_top_recovery_started_s is None
+                            and anchor_age_s
+                            > (
+                                limits
+                                .approach_top_recovery_max_duration_s
+                            )
+                        )
+                        or not math.isfinite(remaining_contact_s)
+                        or remaining_contact_s <= limits.control_period_s
+                        or not math.isfinite(contact_deadline_s)
+                        or contact_deadline_s
+                        <= now + limits.control_period_s
+                    ):
+                        raise abort_type(
+                            "visual-course approach TOP recovery reached "
+                            "its clean-anchor contact horizon"
+                        ) from exc
+                    if approach_top_recovery_started_s is None:
+                        approach_top_recovery_started_s = now
+                        approach_top_recovery_fresh_frame_count = 0
+                        approach_top_recovery_last_token = None
+                        segment["approach_top_recovery"] = {
+                            "basis": APPROACH_TOP_RECOVERY_BASIS,
+                            "anchor_camera_token": asdict(
+                                recovery_authority
+                                .command.anchor_camera_token
+                            ),
+                            "first_censored_camera_token": asdict(token),
+                            "last_censored_camera_token": None,
+                            "clean_reacquired_camera_token": None,
+                            "outcome": "holding",
+                            "target_roll_rad": (
+                                recovery_authority
+                                .command.target_roll_rad
+                            ),
+                            "target_pitch_rad": (
+                                recovery_authority
+                                .command.target_pitch_rad
+                            ),
+                            "requested_thrust": (
+                                recovery_authority
+                                .command.requested_thrust
+                            ),
+                            "current_vertical_q": (
+                                recovery_authority.current_vertical_q
+                            ),
+                            "vertical_q_rate_s": (
+                                recovery_authority.vertical_q_rate_s
+                            ),
+                            "predicted_vertical_q": (
+                                recovery_authority.predicted_vertical_q
+                            ),
+                            "predicted_vertical_q_std": (
+                                recovery_authority
+                                .predicted_vertical_q_std
+                            ),
+                            "vertical_endpoint_occupancy_q": (
+                                recovery_authority
+                                .vertical_endpoint_occupancy_q
+                            ),
+                            "vertical_allowance_q": (
+                                recovery_authority
+                                .vertical_allowance_q
+                            ),
+                            "raw_vertical_rate_down_s": (
+                                recovery_authority
+                                .raw_vertical_rate_down_s
+                            ),
+                            "time_to_contact_s": (
+                                recovery_authority.time_to_contact_s
+                            ),
+                            "thrust_settle_s": (
+                                recovery_authority.thrust_settle_s
+                            ),
+                            "post_settle_contact_budget_s": (
+                                recovery_authority
+                                .post_settle_contact_budget_s
+                            ),
+                            "max_duration_s": (
+                                limits
+                                .approach_top_recovery_max_duration_s
+                            ),
+                            "max_fresh_frames": (
+                                limits
+                                .approach_top_recovery_max_fresh_frames
+                            ),
+                            "elapsed_s": 0.0,
+                        }
+                        near_plane_evidence = NearPlaneEvidence()
+                        segment["near_plane_evidence_frame_count"] = 0
+                        host.recorder.emit(
+                            "visual_course_approach_top_recovery_started",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "approach-top-recovery"
+                            ),
+                            **segment["approach_top_recovery"],
+                        )
+                    recovery_elapsed_s = (
+                        now - approach_top_recovery_started_s
+                    )
+                    if (
+                        recovery_elapsed_s
+                        >= (
+                            limits
+                            .approach_top_recovery_max_duration_s
+                        )
+                        or approach_top_recovery_fresh_frame_count
+                        >= (
+                            limits
+                            .approach_top_recovery_max_fresh_frames
+                        )
+                    ):
+                        assert segment["approach_top_recovery"] is not None
+                        segment["approach_top_recovery"]["outcome"] = (
+                            "bounded_hold_expired"
+                        )
+                        raise abort_type(
+                            "visual-course bounded approach TOP recovery "
+                            "expired"
+                        ) from exc
+                    approach_top_recovery_last_token = token
+                    approach_top_recovery_fresh_frame_count += 1
+                    segment[
+                        "approach_top_recovery_fresh_frame_count"
+                    ] = approach_top_recovery_fresh_frame_count
+                    assert segment["approach_top_recovery"] is not None
+                    segment["approach_top_recovery"].update(
+                        {
+                            "last_censored_camera_token": asdict(token),
+                            "elapsed_s": recovery_elapsed_s,
+                        }
+                    )
+                    last_planned_token = token
+                    command_deadline_s = min(
+                        approach_top_recovery_started_s
+                        + (
+                            limits
+                            .approach_top_recovery_max_duration_s
+                        ),
+                        contact_deadline_s,
+                    )
+                    try:
+                        recovery_command = (
+                            await send_censored_passage_coast(
+                                snapshot=snapshot,
+                                authority=(
+                                    recovery_authority.command
+                                ),
+                                yaw_reference_rad=yaw_reference_rad,
+                                segment_started_s=segment_started_s,
+                                stage=(
+                                    f"{VISUAL_COURSE_STAGE}/gate"
+                                    f"{current_gate_index}/"
+                                    "approach-top-recovery"
+                                ),
+                                command_deadline_s=(
+                                    command_deadline_s
+                                ),
+                                hold_basis=(
+                                    APPROACH_TOP_RECOVERY_BASIS
+                                ),
+                            )
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc
+                        )
+                        break
+                    if recovery_command is None:
+                        continue
+                    approach_top_recovery_command_count += 1
+                    approach_command_count += 1
+                    segment["approach_command_count"] = (
+                        approach_command_count
+                    )
+                    segment[
+                        "approach_top_recovery_command_count"
+                    ] = approach_top_recovery_command_count
+                    continue
+
                 previous_visible_token = (
                     censored_passage_coast_last_observed_token
                     or last_clean_passage_token
@@ -4541,6 +5080,76 @@ async def _run_visual_course_stage_impl(
                     )
                 approach_command_count += 1
                 segment["approach_command_count"] = approach_command_count
+                if approach_top_recovery_started_s is not None:
+                    current_track = getattr(
+                        snapshot,
+                        "current_track",
+                        None,
+                    )
+                    if (
+                        current_track is None
+                        or getattr(current_track, "clipping", None)
+                        != FrameEdge.NONE
+                        or getattr(
+                            current_track,
+                            "center_censored",
+                            True,
+                        )
+                        is not False
+                    ):
+                        raise abort_type(
+                            "visual-course approach TOP recovery did not "
+                            "return through clean geometry"
+                        )
+                    assert segment["approach_top_recovery"] is not None
+                    segment["approach_top_recovery"].update(
+                        {
+                            "clean_reacquired_camera_token": asdict(
+                                accepted.wire_camera_token
+                            ),
+                            "outcome": "clean_geometry_reacquired",
+                        }
+                    )
+                    host.recorder.emit(
+                        "visual_course_approach_top_recovery_completed",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/approach"
+                        ),
+                        **segment["approach_top_recovery"],
+                    )
+                    approach_top_recovery_started_s = None
+                try:
+                    approach_top_recovery_authority = (
+                        _derive_approach_top_recovery_authority(
+                            accepted,
+                            gate_index=current_gate_index,
+                            track_id=current_track_id,
+                            raw_vertical_rate_down_s=float(
+                                proposal.current_target
+                                .normalized_y_rate_down_s
+                            ),
+                            requested_thrust=(
+                                retained_current_aperture_collective(
+                                    accepted.command.thrust
+                                )
+                            ),
+                            minimum_brake_pitch_rad=float(
+                                host.visual_config.servo
+                                .brake_pitch_rad
+                            ),
+                            maximum_recovery_duration_s=(
+                                limits
+                                .approach_top_recovery_max_duration_s
+                            ),
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise abort_type(
+                        "visual-course approach TOP recovery evidence is "
+                        f"invalid: {exc}"
+                    ) from exc
                 if accepted.dynamic_evidence is not None:
                     current_track = getattr(
                         snapshot,

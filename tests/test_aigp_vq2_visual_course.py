@@ -121,6 +121,18 @@ def test_dynamic_continuity_seed_is_not_crossing_evidence():
         )
         is None
     )
+    assert (
+        course_stage._derive_approach_top_recovery_authority(
+            accepted,
+            gate_index=0,
+            track_id="vq2-track-000001",
+            raw_vertical_rate_down_s=0.0,
+            requested_thrust=0.275,
+            minimum_brake_pitch_rad=0.035,
+            maximum_recovery_duration_s=0.12,
+        )
+        is None
+    )
 
 
 def _accepted_dynamic_near_plane_command(
@@ -275,6 +287,152 @@ def test_dynamic_near_plane_wire_sample_accepts_zero_allowance() -> None:
 
     assert sample is not None
     assert sample.crossing_allowance_y_norm == 0.0
+
+
+def _c25_approach_top_recovery_command():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "current_crossing_error_q": [
+                0.7872345285230035,
+                -1.7416199837792337,
+            ],
+            "crossing_rate_q_s": [
+                0.1328463672794427,
+                2.1763541677795883,
+            ],
+            "predicted_crossing_error_norm": [
+                0.8870006716301947,
+                -0.10720222888568531,
+            ],
+            "predicted_crossing_std_norm": [
+                0.09250658369983762,
+                0.16712723618103104,
+            ],
+            "crossing_allowance_norm": [0.50, 0.45],
+            "crossing_swept_occupancy_norm": [
+                1.7258056275019444,
+                2.2968614309187667,
+            ],
+            "predicted_crossing_clearance_norm": [
+                -1.2258056275019444,
+                -1.8468614309187668,
+            ],
+            "camera_current_center_norm": [
+                0.0599040959869629,
+                -0.3384720638086744,
+            ],
+            "time_to_contact_s": 0.7509888689491439,
+            "successor_yaw_contribution_rad": 0.0,
+            "expansion_rate_s": 1.3315776589329433,
+            "braking": True,
+            "brake_reason": "vertical_alignment_unsettled",
+            "passage_scale_ready": False,
+        }
+    )
+    accepted = replace(
+        _accepted_dynamic_near_plane_command(evidence),
+        command=AttitudeRateCommand(
+            0.02879612662393212,
+            0.03948135293628269,
+            -0.010391620866495196,
+            0.30799241399874683,
+        ),
+        target_roll_rad=0.08288152550333001,
+        target_pitch_rad=0.12,
+    )
+    return accepted
+
+
+def test_c25_top_censor_replay_admits_only_bounded_approach_recovery():
+    accepted = _c25_approach_top_recovery_command()
+
+    authority = course_stage._derive_approach_top_recovery_authority(
+        accepted,
+        gate_index=0,
+        track_id="vq2-track-000001",
+        raw_vertical_rate_down_s=0.6039185423722361,
+        requested_thrust=0.2892416792249238,
+        minimum_brake_pitch_rad=0.035,
+        maximum_recovery_duration_s=0.12,
+    )
+
+    assert authority is not None
+    assert authority.command.anchor_camera_token == (
+        accepted.wire_camera_token
+    )
+    assert authority.command.requested_thrust == pytest.approx(
+        0.2892416792249238
+    )
+    assert authority.command.requested_thrust < accepted.command.thrust
+    assert authority.current_vertical_q == pytest.approx(
+        -1.7416199837792337
+    )
+    assert authority.vertical_q_rate_s == pytest.approx(
+        2.1763541677795883
+    )
+    assert authority.vertical_endpoint_occupancy_q == pytest.approx(
+        0.4414567012477474
+    )
+    assert authority.vertical_endpoint_occupancy_q < (
+        authority.vertical_allowance_q
+    )
+    assert authority.thrust_settle_s == pytest.approx(
+        0.1250048984921535
+    )
+    assert authority.post_settle_contact_budget_s > 0.54
+
+
+@pytest.mark.parametrize(
+    ("mutation", "raw_rate", "requested_thrust"),
+    [
+        (
+            {"successor_yaw_contribution_rad": 0.01},
+            0.6039185423722361,
+            0.2892416792249238,
+        ),
+        (
+            {
+                "predicted_crossing_error_norm": [
+                    0.8870006716301947,
+                    0.4842752,
+                ],
+                "predicted_crossing_std_norm": [
+                    0.09250658369983762,
+                    0.1035347,
+                ],
+            },
+            1.76237,
+            0.2892416792249238,
+        ),
+        (
+            {"time_to_contact_s": None},
+            0.6039185423722361,
+            0.2892416792249238,
+        ),
+        ({}, -0.01, 0.2892416792249238),
+        ({}, 0.6039185423722361, 0.21),
+    ],
+)
+def test_c25_top_recovery_rejects_yaw_endpoint_rate_or_collective_lag(
+    mutation,
+    raw_rate,
+    requested_thrust,
+):
+    accepted = _c25_approach_top_recovery_command()
+    accepted.dynamic_evidence.update(mutation)
+
+    authority = course_stage._derive_approach_top_recovery_authority(
+        accepted,
+        gate_index=0,
+        track_id="vq2-track-000001",
+        raw_vertical_rate_down_s=raw_rate,
+        requested_thrust=requested_thrust,
+        minimum_brake_pitch_rad=0.035,
+        maximum_recovery_duration_s=0.12,
+    )
+
+    assert authority is None
 
 
 def test_dynamic_near_plane_wire_sample_rejects_inconsistent_clearance() -> None:
