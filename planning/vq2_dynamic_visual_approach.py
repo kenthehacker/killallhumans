@@ -87,7 +87,10 @@ class _StagedContext:
 class _WireGovernorConfig:
     max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
-    max_pitch_slew_rad_s2: float = 2.0
+    # The first single-governor A/B reached +0.20 rad/s in 133 ms and tripped
+    # the measured-rate watchdog.  The largest collision-free baseline pitch
+    # slew was 0.754 rad/s^2, so retain that measured response envelope here.
+    max_pitch_slew_rad_s2: float = 0.75
     max_yaw_slew_rad_s2: float = 0.75
     max_thrust_slew_s: float = 0.15
     max_roll_accel_rad_s3: float = 20.0
