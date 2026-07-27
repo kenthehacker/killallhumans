@@ -202,6 +202,7 @@ class _PostCreditSuccessorSteering:
     last_correction_monotonic_ns: int
     activation_monotonic_ns: int
     expires_monotonic_ns: int
+    prediction_horizon_s: float
     steering_available: bool
     steering_unavailable_reason: str | None
     promotion_count: int
@@ -650,6 +651,7 @@ class DynamicVisualCourseSession:
             ),
             "activation_monotonic_ns": lease.activation_monotonic_ns,
             "expires_monotonic_ns": lease.expires_monotonic_ns,
+            "prediction_horizon_s": lease.prediction_horizon_s,
             "promotion_count": lease.promotion_count,
             "steering_available": lease.steering_available,
             "steering_unavailable_reason": (
@@ -819,6 +821,9 @@ class DynamicVisualCourseSession:
             last_correction_monotonic_ns=last_measurement_ns,
             activation_monotonic_ns=activation_monotonic_ns,
             expires_monotonic_ns=expires_ns,
+            prediction_horizon_s=(
+                self.core.config.successor_prediction_max_horizon_s
+            ),
             steering_available=steering_available,
             steering_unavailable_reason=steering_unavailable_reason,
             promotion_count=promoted.promotion_count,
@@ -887,10 +892,16 @@ class DynamicVisualCourseSession:
             and current.state_monotonic_ns <= expires_ns
         ):
             correction_ns = current.state_monotonic_ns
+            prediction_horizon_s = (
+                self.core.config
+                .post_credit_current_prediction_max_horizon_s
+            )
             expires_ns = correction_ns + round(
-                self.core.config.successor_prediction_max_horizon_s
+                prediction_horizon_s
                 * 1_000_000_000.0
             )
+        else:
+            prediction_horizon_s = lease.prediction_horizon_s
         refreshed = replace(
             lease,
             last_measurement_monotonic_ns=(
@@ -898,6 +909,7 @@ class DynamicVisualCourseSession:
             ),
             last_correction_monotonic_ns=correction_ns,
             expires_monotonic_ns=expires_ns,
+            prediction_horizon_s=prediction_horizon_s,
         )
         self._post_credit_successor_steering = refreshed
         return refreshed
@@ -961,7 +973,7 @@ class DynamicVisualCourseSession:
             )
         if (
             prediction.measurement_age_s
-            > self.core.config.successor_prediction_max_horizon_s + 1e-12
+            > lease.prediction_horizon_s + 1e-12
         ):
             self._post_credit_successor_steering = replace(
                 lease,
@@ -1286,7 +1298,7 @@ class DynamicVisualCourseSession:
             current.state_monotonic_ns
             + round(
                 self.core.config
-                .successor_prediction_max_horizon_s
+                .post_credit_current_prediction_max_horizon_s
                 * 1_000_000_000.0
             )
         )
@@ -1324,6 +1336,10 @@ class DynamicVisualCourseSession:
             last_correction_monotonic_ns=current.state_monotonic_ns,
             activation_monotonic_ns=activation_monotonic_ns,
             expires_monotonic_ns=expires_monotonic_ns,
+            prediction_horizon_s=(
+                self.core.config
+                .post_credit_current_prediction_max_horizon_s
+            ),
             steering_available=fresh_state_available,
             steering_unavailable_reason=(
                 None

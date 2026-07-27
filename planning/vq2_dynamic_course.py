@@ -464,6 +464,10 @@ class DynamicCourseConfig:
     successor_clearance_ramp_s: float = 0.20
     crossing_prediction_max_horizon_s: float = 1.20
     successor_prediction_max_horizon_s: float = 0.40
+    # Once race credit and a fresh current correction establish ownership,
+    # retain that local bearing through the measured exit/re-entry interval.
+    # The independent bearing-uncertainty envelope remains authoritative.
+    post_credit_current_prediction_max_horizon_s: float = 0.60
     successor_prediction_max_extrapolation_rad: float = 0.18
     successor_maximum_weight: float = 0.45
     successor_max_yaw_contribution_rad: float = 0.10
@@ -513,6 +517,7 @@ class DynamicCourseConfig:
             "successor_clearance_ramp_s",
             "crossing_prediction_max_horizon_s",
             "successor_prediction_max_horizon_s",
+            "post_credit_current_prediction_max_horizon_s",
             "successor_prediction_max_extrapolation_rad",
             "successor_max_yaw_contribution_rad",
             "successor_full_weight_ttc_s",

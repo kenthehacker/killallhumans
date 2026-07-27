@@ -2582,13 +2582,18 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     race_status = _credited_race(
         reviewed_state.state_monotonic_ns - 1_000_000
     )
-    horizon_ns = round(
+    successor_horizon_ns = round(
         session.core.config.successor_prediction_max_horizon_s
         * 1_000_000_000.0
     )
+    current_horizon_ns = round(
+        session.core.config.post_credit_current_prediction_max_horizon_s
+        * 1_000_000_000.0
+    )
     old_expiry_ns = min(
-        race_status.received_monotonic_ns + horizon_ns,
-        reviewed_state.last_measurement_monotonic_ns + horizon_ns,
+        race_status.received_monotonic_ns + successor_horizon_ns,
+        reviewed_state.last_measurement_monotonic_ns
+        + successor_horizon_ns,
     )
     wire_ns = reviewed_state.state_monotonic_ns + 2_000_000
     session.record_wire_acceptance(
@@ -2706,8 +2711,13 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     assert rebound_state.track_id == fresh_id
     assert rebound_state.visible
     assert not any(rebound_state.censored_axes)
+    assert (
+        rebound["recovery_steering"]["prediction_horizon_s"]
+        == session.core.config
+        .post_credit_current_prediction_max_horizon_s
+    )
     assert rebound["recovery_steering"]["expires_monotonic_ns"] == (
-        rebound_state.state_monotonic_ns + horizon_ns
+        rebound_state.state_monotonic_ns + current_horizon_ns
     )
     assert (
         rebound["recovery_steering"]["expires_monotonic_ns"]
