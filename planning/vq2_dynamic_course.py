@@ -3327,11 +3327,17 @@ class DynamicCourseCore:
             geometric_passage_yaw_authority,
             current_yaw_release,
         )
+        horizontal_crossing_unsafe = bool(
+            current.bearing_rate_qualified[0]
+            and current.scale_rate_qualified
+            and centered_crossing_prediction is not None
+            and centered_crossing_clearance[0] <= 0.0
+        )
         horizontal_alignment_unsettled = bool(
             not current.bearing_rate_qualified[0]
             or not current.scale_rate_qualified
             or centered_crossing_prediction is None
-            or centered_crossing_clearance[0] <= 0.0
+            or horizontal_crossing_unsafe
             or abs(aperture_relative_rate_norm[0])
             > self.config.vertical_settled_rate_norm_s
         )
@@ -3362,6 +3368,7 @@ class DynamicCourseCore:
             current_yaw_release,
             successor_weight,
             successor_prediction,
+            horizontal_crossing_unsafe=horizontal_crossing_unsafe,
             horizontal_alignment_unsettled=(
                 horizontal_alignment_unsettled
             ),
@@ -4269,6 +4276,7 @@ class DynamicCourseCore:
         successor_weight: float,
         successor_prediction: _SuccessorPrediction | None,
         *,
+        horizontal_crossing_unsafe: bool,
         horizontal_alignment_unsettled: bool,
         vertical_alignment_unsettled: bool,
     ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
@@ -4379,6 +4387,29 @@ class DynamicCourseCore:
             * stable_passage_rate_norm_s[0]
             * self.config.horizontal_angle_scale_rad
         )
+        outward_lateral_arrest = bool(
+            horizontal_crossing_unsafe
+            and current.visible
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and current.bearing_rate_qualified[0]
+            and current.scale_rate_qualified
+            and current.bearing_std_rad[0] <= 0.16
+            and lateral_error * stable_passage_rate_norm_s[0] > 0.0
+            and roll
+            * self.config.roll_guidance_sign
+            * lateral_error
+            > 0.0
+        )
+        if outward_lateral_arrest:
+            # Once qualified crossing geometry says the gate is laterally
+            # unsafe and residual translation is still carrying it outward,
+            # proportional gain must not delay use of already accepted bank
+            # authority.  This is a state-dependent attitude reference, not a
+            # temporal command governor; recovering motion releases it on the
+            # next guidance tick and the final wire governor remains the sole
+            # continuity limiter.
+            roll = math.copysign(MAX_TARGET_ROLL_RAD, roll)
         yaw = -self.config.yaw_gain * heading_error
         # Successor geometry may only slow the current-gate approach with the
         # same progressively admitted authority that governs successor yaw.

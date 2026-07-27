@@ -1239,7 +1239,7 @@ def test_successor_heading_cannot_reverse_roll_away_from_passage_intercept() -> 
     assert decision.proposed_command.target_roll_rad > 0.0
 
 
-def test_aperture_expansion_cannot_reverse_roll_away_from_lateral_intercept(
+def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1266,7 +1266,7 @@ def test_aperture_expansion_cannot_reverse_roll_away_from_lateral_intercept(
                 "gate-a",
                 sequence,
                 observation_time,
-                x=0.70 + (sequence - 1) * 0.004,
+                x=0.35 + (sequence - 1) * 0.004,
                 log_scale=log_scale,
                 aperture=(
                     0.14 * aperture_scale,
@@ -1295,11 +1295,61 @@ def test_aperture_expansion_cannot_reverse_roll_away_from_lateral_intercept(
     assert residual_lateral_rate_norm_s > 0.0
     assert current.expansion_rate_s > 0.0
     assert decision.crossing_rate_q_s[0] < 0.0
-    assert decision.proposed_command.target_roll_rad > 0.0
-    assert math.isfinite(decision.proposed_command.target_roll_rad)
+    assert decision.centered_crossing_clearance_norm[0] < 0.0
     assert (
-        abs(decision.proposed_command.target_roll_rad)
-        <= MAX_TARGET_ROLL_RAD
+        decision.proposed_command.target_roll_rad
+        == MAX_TARGET_ROLL_RAD
+    )
+    assert math.isfinite(decision.proposed_command.target_roll_rad)
+
+    recovered = None
+    recovered_decision = None
+    for sequence, x in ((8, 0.366), (9, 0.358)):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        log_scale = -1.40 + (sequence - 1) * 0.20
+        aperture_scale = math.exp(log_scale + 1.40)
+        _imu(core, observation_time)
+        recovered = core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=x,
+                log_scale=log_scale,
+                aperture=(
+                    0.14 * aperture_scale,
+                    0.11 * aperture_scale,
+                ),
+            )
+        )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        recovered_decision = core.guide(round(decision_time * NS))
+        _commit_decision(
+            core,
+            decision_time,
+            recovered_decision.command,
+        )
+
+    assert recovered is not None
+    assert recovered_decision is not None
+    recovered_lateral_rate_norm_s = (
+        recovered.residual_translational_rate_rad_s[0]
+        / core.config.horizontal_angle_scale_rad
+    )
+    assert recovered_lateral_rate_norm_s < 0.0
+    assert recovered_decision.passage_error_norm[0] > 0.0
+    assert (
+        recovered_decision.centered_crossing_clearance_norm[0]
+        < 0.0
+    )
+    assert (
+        0.0
+        < recovered_decision.proposed_command.target_roll_rad
+        < MAX_TARGET_ROLL_RAD
+    )
+    assert math.isfinite(
+        recovered_decision.proposed_command.target_roll_rad
     )
 
 
