@@ -134,6 +134,10 @@ CENSORED_PASSAGE_COAST_BASIS = (
 APPROACH_TOP_RECOVERY_BASIS = (
     "clean-q-converging-top-censored-approach-v1"
 )
+APPROACH_INNER_DROPOUT_HOLD_BASIS = (
+    "fresh-top-censored-prior-inner-fov-continuity-v1"
+)
+APPROACH_INNER_DROPOUT_MAX_DURATION_S = 0.120
 APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
 APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S = 0.25
 APPROACH_TOP_RECOVERY_MAX_VERTICAL_Q_STD = 0.18
@@ -453,6 +457,166 @@ class _TopFovObservation:
     previous_target_pitch_rad: Optional[float]
     raw_top_edge_basis: str
     raw_top_edge_confidence: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproachInnerDropoutAuthority:
+    track_id: str
+    anchor_camera_token: CameraFrameToken
+    anchor_observation_monotonic_ns: int
+    anchor_wire_start_monotonic_ns: int
+    last_camera_token: CameraFrameToken
+    age_s: float
+    maximum_age_s: float
+    maximum_target_pitch_rad: float
+
+
+def _derive_approach_inner_dropout_authority(
+    *,
+    snapshot: Any,
+    expected_gate_index: int,
+    expected_track_id: str,
+    maximum_age_s: float,
+    now_monotonic_ns: int,
+    fov_summary: Mapping[str, Any],
+    existing: Optional[_ApproachInnerDropoutAuthority] = None,
+) -> Optional[_ApproachInnerDropoutAuthority]:
+    """Bound a TOP-only fit dropout to the last exact inner/FOV authority."""
+
+    maximum_age = float(maximum_age_s)
+    track = getattr(snapshot, "current_track", None)
+    token = getattr(snapshot, "latest_camera_token", None)
+    history = getattr(track, "history", None)
+    if (
+        type(expected_gate_index) is not int
+        or expected_gate_index < 0
+        or type(expected_track_id) is not str
+        or not expected_track_id
+        or not math.isfinite(maximum_age)
+        or maximum_age <= 0.0
+        or maximum_age
+        > APPROACH_INNER_DROPOUT_MAX_DURATION_S + 1e-12
+        or type(now_monotonic_ns) is not int
+        or now_monotonic_ns < 0
+        or not isinstance(fov_summary, Mapping)
+        or getattr(snapshot, "current_gate_index", None)
+        != expected_gate_index
+        or getattr(snapshot, "current_track_id", None)
+        != expected_track_id
+        or getattr(snapshot, "authority_usable", False) is not True
+        or track is None
+        or getattr(track, "track_id", None) != expected_track_id
+        or getattr(track, "latest_token", None) != token
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "visible", False) is not True
+        or getattr(track, "ambiguous", True) is not False
+        or getattr(track, "missed_frame_count", None) != 0
+        or getattr(track, "clipping", None) != FrameEdge.TOP
+        or getattr(track, "center_censored", None) is not True
+        or type(token) is not CameraFrameToken
+        or type(history) is not tuple
+        or len(history) < 2
+    ):
+        return None
+    current_sample = history[-1]
+    if (
+        current_sample.token != token
+        or type(current_sample.observation_monotonic_ns) is not int
+        or current_sample.observation_monotonic_ns < 0
+    ):
+        return None
+    current_inner = current_sample.inner_aperture
+    if (
+        type(current_inner) is VisualInnerApertureGeometry
+        and current_inner.fitted
+        and current_inner.clipping == FrameEdge.NONE
+        and current_inner.complete_visibility
+    ):
+        return None
+
+    if existing is None:
+        anchor_sample = history[-2]
+        anchor_inner = anchor_sample.inner_aperture
+        if (
+            type(anchor_sample.token) is not CameraFrameToken
+            or anchor_sample.token.stream_id != token.stream_id
+            or anchor_sample.token.generation != token.generation
+            or not _token_strictly_newer(token, anchor_sample.token)
+            or type(anchor_sample.observation_monotonic_ns) is not int
+            or anchor_sample.observation_monotonic_ns < 0
+            or type(anchor_inner) is not VisualInnerApertureGeometry
+            or not anchor_inner.fitted
+            or anchor_inner.clipping != FrameEdge.NONE
+            or not anchor_inner.complete_visibility
+            or fov_summary.get("active") is not True
+            or fov_summary.get("last_track_id") != expected_track_id
+            or fov_summary.get("last_raw_top_edge_basis")
+            != TOP_FOV_INNER_EDGE_BASIS
+            or fov_summary.get("last_camera_token")
+            != asdict(anchor_sample.token)
+            or type(
+                fov_summary.get("last_wire_start_monotonic_ns")
+            )
+            is not int
+        ):
+            return None
+        maximum_target_pitch = float(
+            fov_summary.get("last_protected_target_pitch_rad", math.nan)
+        )
+        anchor_token = anchor_sample.token
+        anchor_observation_ns = anchor_sample.observation_monotonic_ns
+        anchor_wire_start_ns = int(
+            fov_summary["last_wire_start_monotonic_ns"]
+        )
+    else:
+        if (
+            type(existing) is not _ApproachInnerDropoutAuthority
+            or existing.track_id != expected_track_id
+            or existing.anchor_camera_token.stream_id != token.stream_id
+            or existing.anchor_camera_token.generation != token.generation
+            or not _token_strictly_newer(token, existing.last_camera_token)
+            or history[-2].token != existing.last_camera_token
+            or abs(existing.maximum_age_s - maximum_age) > 1e-12
+        ):
+            return None
+        maximum_target_pitch = existing.maximum_target_pitch_rad
+        anchor_token = existing.anchor_camera_token
+        anchor_observation_ns = (
+            existing.anchor_observation_monotonic_ns
+        )
+        anchor_wire_start_ns = (
+            existing.anchor_wire_start_monotonic_ns
+        )
+    observation_age_s = (
+        current_sample.observation_monotonic_ns - anchor_observation_ns
+    ) / 1_000_000_000.0
+    wall_age_s = (
+        now_monotonic_ns - anchor_wire_start_ns
+    ) / 1_000_000_000.0
+    age_s = max(observation_age_s, wall_age_s)
+    if (
+        not MIN_VISUAL_TARGET_PITCH_RAD
+        <= maximum_target_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not math.isfinite(observation_age_s)
+        or observation_age_s <= 0.0
+        or observation_age_s > maximum_age
+        or not math.isfinite(wall_age_s)
+        or wall_age_s < 0.0
+        or wall_age_s > maximum_age
+        or not math.isfinite(age_s)
+    ):
+        return None
+    return _ApproachInnerDropoutAuthority(
+        track_id=expected_track_id,
+        anchor_camera_token=anchor_token,
+        anchor_observation_monotonic_ns=anchor_observation_ns,
+        anchor_wire_start_monotonic_ns=anchor_wire_start_ns,
+        last_camera_token=token,
+        age_s=age_s,
+        maximum_age_s=maximum_age,
+        maximum_target_pitch_rad=maximum_target_pitch,
+    )
 
 
 def _propose_top_fov_pitch_reference(
@@ -3975,6 +4139,12 @@ async def _run_visual_course_stage_impl(
                     fov_summary.update(
                         {
                             "last_track_id": top_fov_track_id,
+                            "last_camera_token": asdict(
+                                snapshot.latest_camera_token
+                            ),
+                            "last_wire_start_monotonic_ns": (
+                                wire_start_monotonic_ns
+                            ),
                             "last_raw_top_edge_image_down": (
                                 top_fov_proposal.raw_top_edge_image_down
                             ),
@@ -4213,6 +4383,7 @@ async def _run_visual_course_stage_impl(
             not in {
                 CENSORED_PASSAGE_COAST_BASIS,
                 APPROACH_TOP_RECOVERY_BASIS,
+                APPROACH_INNER_DROPOUT_HOLD_BASIS,
             }
             or authority.gate_index != current_gate_index
             or authority.track_id != current_track_id
@@ -4486,7 +4657,12 @@ async def _run_visual_course_stage_impl(
         command_event = (
             "visual_course_approach_top_recovery_command"
             if hold_basis == APPROACH_TOP_RECOVERY_BASIS
-            else "visual_course_censored_passage_coast_command"
+            else (
+                "visual_course_approach_inner_dropout_hold_command"
+                if hold_basis
+                == APPROACH_INNER_DROPOUT_HOLD_BASIS
+                else "visual_course_censored_passage_coast_command"
+            )
         )
         host.recorder.emit(
             command_event,
@@ -4699,6 +4875,10 @@ async def _run_visual_course_stage_impl(
         ] = None
         approach_top_recovery_fresh_frame_count = 0
         approach_top_recovery_command_count = 0
+        approach_inner_dropout_authority: Optional[
+            _ApproachInnerDropoutAuthority
+        ] = None
+        approach_inner_dropout_hold_command_count = 0
         crossing_wait_coast_command_count = 0
         crossing_wait_adjacent_command_count = 0
         credit_wait_adjacent_planner: Optional[Any] = None
@@ -4731,6 +4911,8 @@ async def _run_visual_course_stage_impl(
             "approach_top_recovery_fresh_frame_count": 0,
             "approach_top_recovery_command_count": 0,
             "approach_top_recovery": None,
+            "approach_inner_dropout_hold_command_count": 0,
+            "approach_inner_dropout_hold": None,
             "post_credit_zero_command_count": 0,
             "post_credit_hold_command_count": 0,
             "recovery_navigation_command_count": 0,
@@ -4769,6 +4951,8 @@ async def _run_visual_course_stage_impl(
                 ),
                 "limited_command_count": 0,
                 "last_track_id": None,
+                "last_camera_token": None,
+                "last_wire_start_monotonic_ns": None,
                 "last_raw_top_edge_image_down": None,
                 "last_raw_top_edge_basis": None,
                 "last_raw_top_edge_confidence": None,
@@ -5233,6 +5417,167 @@ async def _run_visual_course_stage_impl(
                 VisualApproachCurrentGeometryUnavailable,
                 VisualApproachRefusal,
             ) as exc:
+                dropout_authority: Optional[
+                    _ApproachInnerDropoutAuthority
+                ] = None
+                if (
+                    type(exc)
+                    is VisualApproachCurrentGeometryUnavailable
+                    and mode is VisualApproachMode.APPROACH
+                    and lifecycle is CourseLifecycle.APPROACH
+                    and type(runtime.dynamic_controller)
+                    is DynamicVisualCourseSession
+                    and passage_admission is None
+                    and near_plane_latch is None
+                    and crossing_anchor is None
+                ):
+                    dropout_proposal_ns = runtime.perf_counter_ns()
+                    if (
+                        type(dropout_proposal_ns) is not int
+                        or dropout_proposal_ns < 0
+                    ):
+                        raise abort_type(
+                            "visual-course approach inner-dropout QPC "
+                            "clock is invalid"
+                        ) from exc
+                    dropout_authority = (
+                        _derive_approach_inner_dropout_authority(
+                            snapshot=snapshot,
+                            expected_gate_index=current_gate_index,
+                            expected_track_id=current_track_id,
+                            maximum_age_s=(
+                                runtime.dynamic_controller.core.config
+                                .dropout_hold_s
+                            ),
+                            now_monotonic_ns=dropout_proposal_ns,
+                            fov_summary=segment[
+                                "top_fov_pitch_protection"
+                            ],
+                            existing=approach_inner_dropout_authority,
+                        )
+                    )
+                if dropout_authority is not None:
+                    dynamic_controller = runtime.dynamic_controller
+                    assert type(dynamic_controller) is DynamicVisualCourseSession
+                    try:
+                        hold = dynamic_controller.continuity_hold_authority(
+                            now_monotonic_ns=dropout_proposal_ns,
+                            maximum_age_s=dropout_authority.maximum_age_s,
+                        )
+                    except (TypeError, ValueError) as hold_exc:
+                        raise abort_type(
+                            "visual-course approach inner-dropout hold "
+                            f"expired: {hold_exc}"
+                        ) from hold_exc
+                    if (
+                        not isinstance(hold, Mapping)
+                        or abs(
+                            float(hold["target_pitch_rad"])
+                            - (
+                                dropout_authority
+                                .maximum_target_pitch_rad
+                            )
+                        )
+                        > 1e-12
+                        or type(
+                            hold.get("source_wire_start_monotonic_ns")
+                        )
+                        is not int
+                        or int(
+                            hold["source_wire_start_monotonic_ns"]
+                        )
+                        < (
+                            dropout_authority
+                            .anchor_wire_start_monotonic_ns
+                        )
+                    ):
+                        raise abort_type(
+                            "visual-course approach inner-dropout hold "
+                            "escaped its last FOV-protected pitch"
+                        ) from exc
+                    near_plane_evidence = NearPlaneEvidence()
+                    approach_top_recovery_authority = None
+                    segment["near_plane_evidence_frame_count"] = 0
+                    last_planned_token = token
+                    approach_inner_dropout_authority = (
+                        dropout_authority
+                    )
+                    deadline_s = now + max(
+                        0.0,
+                        dropout_authority.maximum_age_s
+                        - dropout_authority.age_s,
+                    )
+                    hold_authority = _CensoredPassageCoastAuthority(
+                        gate_index=current_gate_index,
+                        track_id=current_track_id,
+                        anchor_camera_token=(
+                            dropout_authority.anchor_camera_token
+                        ),
+                        target_roll_rad=float(hold["target_roll_rad"]),
+                        target_pitch_rad=float(
+                            hold["target_pitch_rad"]
+                        ),
+                        yaw_rate_rad_s=float(hold["yaw_rate_rad_s"]),
+                        requested_thrust=float(hold["thrust"]),
+                    )
+                    hold_command = await send_censored_passage_coast(
+                        snapshot=snapshot,
+                        authority=hold_authority,
+                        yaw_reference_rad=yaw_reference_rad,
+                        segment_started_s=segment_started_s,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/"
+                            "approach-inner-dropout-hold"
+                        ),
+                        command_deadline_s=deadline_s,
+                        hold_basis=(
+                            APPROACH_INNER_DROPOUT_HOLD_BASIS
+                        ),
+                    )
+                    if hold_command is None:
+                        continue
+                    approach_inner_dropout_hold_command_count += 1
+                    approach_command_count += 1
+                    segment["approach_command_count"] = (
+                        approach_command_count
+                    )
+                    segment[
+                        "approach_inner_dropout_hold_command_count"
+                    ] = approach_inner_dropout_hold_command_count
+                    hold_summary = segment[
+                        "approach_inner_dropout_hold"
+                    ]
+                    if hold_summary is None:
+                        hold_summary = {
+                            "basis": (
+                                APPROACH_INNER_DROPOUT_HOLD_BASIS
+                            ),
+                            "anchor_camera_token": asdict(
+                                dropout_authority.anchor_camera_token
+                            ),
+                            "first_dropout_camera_token": asdict(token),
+                            "last_dropout_camera_token": None,
+                            "reacquired_camera_token": None,
+                            "maximum_age_s": (
+                                dropout_authority.maximum_age_s
+                            ),
+                            "maximum_target_pitch_rad": (
+                                dropout_authority
+                                .maximum_target_pitch_rad
+                            ),
+                            "outcome": "holding",
+                        }
+                        segment["approach_inner_dropout_hold"] = (
+                            hold_summary
+                        )
+                    hold_summary.update(
+                        {
+                            "last_dropout_camera_token": asdict(token),
+                            "age_s": dropout_authority.age_s,
+                        }
+                    )
+                    continue
                 recovery_authority = approach_top_recovery_authority
                 recovery_track = getattr(snapshot, "current_track", None)
                 recovery_velocity = getattr(
@@ -5749,6 +6094,18 @@ async def _run_visual_course_stage_impl(
                     ] = asdict(token)
                 break
 
+            if approach_inner_dropout_authority is not None:
+                hold_summary = segment[
+                    "approach_inner_dropout_hold"
+                ]
+                if isinstance(hold_summary, dict):
+                    hold_summary.update(
+                        {
+                            "reacquired_camera_token": asdict(token),
+                            "outcome": "reacquired",
+                        }
+                    )
+                approach_inner_dropout_authority = None
             if censored_passage_coast_started_s is not None:
                 raise abort_type(
                     "visual-course censored passage coast returned to "

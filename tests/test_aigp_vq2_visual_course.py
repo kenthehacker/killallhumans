@@ -2484,6 +2484,157 @@ def test_top_fov_outer_fallback_refuses_clipped_or_censored_support():
         course_stage._top_fov_raw_edge(sample)
 
 
+def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
+    anchor_token = _token(40)
+    dropout_token = _token(41)
+    anchor_inner = _inner_aperture(
+        center_y=-0.25,
+        half_y=0.30,
+    )
+    rejected_inner = VisualInnerApertureGeometry(
+        center_norm=None,
+        half_size_norm=None,
+        log_scale=None,
+        measurement_std=None,
+        confidence=0.0,
+        clipping=FrameEdge.TOP,
+        visible_edges=FrameEdge.NONE,
+        geometry_model_id=None,
+        covariance_model_id=None,
+        health_reason="aperture_fit_rejected:ambiguous_multiple_aperture_gaps",
+    )
+    anchor = SimpleNamespace(
+        token=anchor_token,
+        observation_monotonic_ns=1_000_000_000,
+        inner_aperture=anchor_inner,
+    )
+    dropout = SimpleNamespace(
+        token=dropout_token,
+        observation_monotonic_ns=1_032_000_000,
+        inner_aperture=rejected_inner,
+    )
+    track = SimpleNamespace(
+        track_id="track-0",
+        latest_token=dropout_token,
+        role=VisualTrackRole.CURRENT,
+        visible=True,
+        ambiguous=False,
+        missed_frame_count=0,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        history=(anchor, dropout),
+    )
+    snapshot = SimpleNamespace(
+        current_gate_index=0,
+        current_track_id="track-0",
+        current_track=track,
+        latest_camera_token=dropout_token,
+        authority_usable=True,
+    )
+    fov_summary = {
+        "active": True,
+        "last_track_id": "track-0",
+        "last_camera_token": asdict(anchor_token),
+        "last_wire_start_monotonic_ns": 1_010_000_000,
+        "last_raw_top_edge_basis": course_stage.TOP_FOV_INNER_EDGE_BASIS,
+        "last_protected_target_pitch_rad": -0.31,
+    }
+
+    authority = course_stage._derive_approach_inner_dropout_authority(
+        snapshot=snapshot,
+        expected_gate_index=0,
+        expected_track_id="track-0",
+        maximum_age_s=0.12,
+        now_monotonic_ns=1_042_000_000,
+        fov_summary=fov_summary,
+    )
+
+    assert authority is not None
+    assert authority.age_s == pytest.approx(0.032)
+    assert authority.maximum_target_pitch_rad == pytest.approx(-0.31)
+    assert math.isfinite(authority.maximum_target_pitch_rad)
+    assert (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+        <= authority.maximum_target_pitch_rad
+        <= course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+
+    mismatched_fov_summary = dict(fov_summary)
+    mismatched_fov_summary["last_camera_token"] = asdict(_token(39))
+    assert (
+        course_stage._derive_approach_inner_dropout_authority(
+            snapshot=snapshot,
+            expected_gate_index=0,
+            expected_track_id="track-0",
+            maximum_age_s=0.12,
+            now_monotonic_ns=1_042_000_000,
+            fov_summary=mismatched_fov_summary,
+        )
+        is None
+    )
+    assert (
+        course_stage._derive_approach_inner_dropout_authority(
+            snapshot=snapshot,
+            expected_gate_index=0,
+            expected_track_id="track-0",
+            maximum_age_s=0.120_001,
+            now_monotonic_ns=1_042_000_000,
+            fov_summary=fov_summary,
+        )
+        is None
+    )
+
+    skipped = SimpleNamespace(
+        token=_token(42),
+        observation_monotonic_ns=1_054_000_000,
+        inner_aperture=rejected_inner,
+    )
+    after_gap_token = _token(43)
+    after_gap = SimpleNamespace(
+        token=after_gap_token,
+        observation_monotonic_ns=1_076_000_000,
+        inner_aperture=rejected_inner,
+    )
+    track.latest_token = after_gap_token
+    track.history = (anchor, dropout, skipped, after_gap)
+    snapshot.latest_camera_token = after_gap_token
+    assert (
+        course_stage._derive_approach_inner_dropout_authority(
+            snapshot=snapshot,
+            expected_gate_index=0,
+            expected_track_id="track-0",
+            maximum_age_s=0.12,
+            now_monotonic_ns=1_086_000_000,
+            fov_summary=fov_summary,
+            existing=authority,
+        )
+        is None
+    )
+
+    expired_token = _token(42)
+    expired = SimpleNamespace(
+        token=expired_token,
+        observation_monotonic_ns=1_121_000_000,
+        inner_aperture=rejected_inner,
+    )
+    track.latest_token = expired_token
+    track.history = (anchor, dropout, expired)
+    snapshot.latest_camera_token = expired_token
+
+    assert (
+        course_stage._derive_approach_inner_dropout_authority(
+            snapshot=snapshot,
+            expected_gate_index=0,
+            expected_track_id="track-0",
+            maximum_age_s=0.12,
+            now_monotonic_ns=1_131_000_000,
+            fov_summary=fov_summary,
+            existing=authority,
+        )
+        is None
+    )
+
+
 def test_top_fov_uses_full_bounded_pitch_when_reserve_is_infeasible():
     proposal = course_stage._propose_top_fov_pitch_reference(
         capture_pitch_rad=-0.284,
