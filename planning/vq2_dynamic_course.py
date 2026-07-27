@@ -3083,7 +3083,13 @@ class DynamicCourseCore:
             successor,
             camera_current_center,
             passage_error,
-            aperture_relative_rate_norm,
+            # Aperture-relative q rate owns crossing clearance, but includes
+            # the apparent shrinkage of a fixed center error as the aperture
+            # expands.  Feeding that scale term back into roll can therefore
+            # reverse a same-side lateral intercept even while residual
+            # translation is still carrying the gate farther off axis.
+            # Roll damping must use only derotated center translation.
+            residual_rate_norm,
             current_yaw_release,
             successor_weight,
             successor_prediction,
