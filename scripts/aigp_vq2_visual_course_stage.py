@@ -527,7 +527,6 @@ def _top_fov_propagated_observation(
     )
     clipping = FrameEdge(clipping_value)
     vertical_edges = FrameEdge.TOP | FrameEdge.BOTTOM
-    horizontal_edges = FrameEdge.LEFT | FrameEdge.RIGHT
     if (
         not all(
             math.isfinite(value)
@@ -552,7 +551,6 @@ def _top_fov_propagated_observation(
         or vertical_scale <= 0.0
         or remaining_horizon_s <= 0.0
         or not bool(clipping & vertical_edges)
-        or bool(clipping & horizontal_edges)
     ):
         raise ValueError("propagated top-FOV geometry is invalid")
     nominal_top = center_y - aperture_y

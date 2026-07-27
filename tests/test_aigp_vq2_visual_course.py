@@ -2440,6 +2440,47 @@ def test_propagated_top_fov_gap_keeps_protected_pitch_from_reversing():
     assert proposal.limited is True
 
 
+def test_propagated_top_fov_gap_accepts_full_frame_near_plane_clipping():
+    authority = _propagated_top_fov_authority()
+    authority.update(
+        {
+            "camera_center_norm": [0.0, 0.05],
+            "camera_aperture_half_size_norm": [0.28, 0.49],
+            "camera_center_std_norm": [0.04, 0.07],
+            "aperture_log_scale_std": 0.08,
+            "clipping": int(
+                FrameEdge.LEFT
+                | FrameEdge.TOP
+                | FrameEdge.RIGHT
+                | FrameEdge.BOTTOM
+            ),
+        }
+    )
+
+    observation, proposal = (
+        course_stage._propose_propagated_top_fov_pitch_reference(
+            authority,
+            requested_target_pitch_rad=0.120,
+            prior_target_pitch_rad=-0.350,
+        )
+    )
+
+    assert math.isfinite(observation.projected_top_edge_image_down)
+    assert math.isfinite(proposal.protected_target_pitch_rad)
+    assert (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+        <= proposal.protected_target_pitch_rad
+        <= course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert proposal.protected_target_pitch_rad <= -0.350
+    assert proposal.predicted_protected_top_edge_image_down >= (
+        proposal.predicted_requested_top_edge_image_down
+    )
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     (
