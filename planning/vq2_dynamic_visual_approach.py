@@ -1911,10 +1911,10 @@ class DynamicVisualCourseSession:
         The rolling graph keeps authoritative identity while independently
         withholding visual-measurement authority.  This method admits only an
         exact clipped-edge loss and propagates the last measured bearing/rate
-        with IMU and accepted-command history for the existing bounded
-        dropout horizon.  Aperture/TTC qualification remains independent and
-        supplies no authority here.  Race status remains the sole advance
-        source.
+        with IMU and accepted-command history.  A still-live local aperture
+        lease may bound that propagation beyond the short bearing-only
+        fallback; it remains steering-only and cannot supply passage or race
+        authority.  Race status remains the sole advance source.
         """
 
         if type(track) is not VisualTrack:
@@ -1980,11 +1980,40 @@ class DynamicVisualCourseSession:
                 * 1_000_000_000.0
             )
         )
-        steering_deadline_ns = (
+        fallback_steering_deadline_ns = (
             sample.observation_monotonic_ns
             + round(
                 self.core.config.dropout_hold_s * 1_000_000_000.0
             )
+        )
+        aperture_steering_deadline_ns = (
+            current.aperture_prediction_deadline_monotonic_ns
+            if (
+                current.aperture_propagated
+                and current.aperture_half_size_norm is not None
+                and current.aperture_seed_monotonic_ns is not None
+                and current
+                .aperture_prediction_deadline_monotonic_ns
+                is not None
+            )
+            else None
+        )
+        steering_deadline_ns = max(
+            fallback_steering_deadline_ns,
+            (
+                fallback_steering_deadline_ns
+                if aperture_steering_deadline_ns is None
+                else aperture_steering_deadline_ns
+            ),
+        )
+        steering_deadline_basis = (
+            "propagated-local-aperture-state-v1"
+            if (
+                aperture_steering_deadline_ns is not None
+                and aperture_steering_deadline_ns
+                > fallback_steering_deadline_ns
+            )
+            else "clipped-bearing-fallback-v1"
         )
         if (
             state.current_gate_index != staged.expected_gate_index
@@ -2072,6 +2101,15 @@ class DynamicVisualCourseSession:
             ),
             "steering_prediction_deadline_monotonic_ns": (
                 steering_deadline_ns
+            ),
+            "steering_prediction_deadline_basis": (
+                steering_deadline_basis
+            ),
+            "fallback_steering_deadline_monotonic_ns": (
+                fallback_steering_deadline_ns
+            ),
+            "aperture_prediction_deadline_monotonic_ns": (
+                aperture_steering_deadline_ns
             ),
             "steering_prediction_horizon_remaining_s": (
                 remaining_horizon_s

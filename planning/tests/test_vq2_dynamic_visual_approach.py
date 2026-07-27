@@ -1734,6 +1734,126 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
         )
 
 
+def test_live_local_aperture_extends_clipped_steering_beyond_fallback() -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    tracker.update(
+        _frame(
+            6,
+            include_successor=False,
+            current_center_x=0.05,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    tracker.update(
+        _frame(
+            7,
+            include_successor=False,
+            current_center_x=0.10,
+            current_clipping=FrameEdge.RIGHT,
+            current_center_censored=True,
+            current_inner_aperture=None,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+
+    missing = replace(
+        _frame(8, include_successor=False),
+        detections=(),
+    )
+    update = tracker.update(missing)
+    snapshot = graph.observe(tracker)
+    with pytest.raises(
+        VisualApproachRefusal,
+        match="withheld authoritative current-gate identity",
+    ):
+        _observe(planner, snapshot, tracker)
+
+    track = tracker.track(current_id)
+    state = session.core.course_state().current
+    last_visible = track.history[-1]
+    fallback_deadline_ns = (
+        last_visible.observation_monotonic_ns
+        + round(session.core.config.dropout_hold_s * 1_000_000_000.0)
+    )
+    aperture_deadline_ns = (
+        state.aperture_prediction_deadline_monotonic_ns
+    )
+    assert state.aperture_propagated
+    assert state.aperture_half_size_norm is not None
+    assert aperture_deadline_ns is not None
+    assert aperture_deadline_ns > fallback_deadline_ns
+
+    authority = session.propagated_current_visibility_gap_authority(
+        track=track,
+        camera_token=update.token,
+        now_monotonic_ns=fallback_deadline_ns + 1_000_000,
+    )
+
+    assert authority["steering_prediction_deadline_basis"] == (
+        "propagated-local-aperture-state-v1"
+    )
+    assert authority["fallback_steering_deadline_monotonic_ns"] == (
+        fallback_deadline_ns
+    )
+    assert authority["aperture_prediction_deadline_monotonic_ns"] == (
+        aperture_deadline_ns
+    )
+    assert authority["steering_prediction_deadline_monotonic_ns"] == (
+        aperture_deadline_ns
+    )
+    assert authority["steering_prediction_horizon_remaining_s"] > 0.0
+    assert authority["current_aperture_propagated"] is True
+    assert authority["current_aperture_half_size_norm"] is not None
+    assert all(
+        math.isfinite(value)
+        for value in authority["command"].values()
+    )
+    assert abs(authority["command"]["target_roll_rad"]) <= (
+        MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= authority["command"]["target_pitch_rad"]
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert abs(authority["command"]["yaw_rate_rad_s"]) <= (
+        MAX_YAW_RATE_RAD_S
+    )
+    assert (
+        MIN_THRUST
+        <= authority["command"]["thrust"]
+        <= MAX_THRUST
+    )
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+    with pytest.raises(
+        DynamicCourseError,
+        match="fresh local steering",
+    ):
+        session.propagated_current_visibility_gap_authority(
+            track=track,
+            camera_token=update.token,
+            now_monotonic_ns=aperture_deadline_ns + 1,
+        )
+
+
 def test_propagated_current_fov_gap_refuses_identity_and_frame_mismatch() -> None:
     session, track, token, now_ns = _propagated_vertical_fov_gap()
     sample = track.history[-1]
