@@ -192,6 +192,9 @@ def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
     nominal = vq2_module._visual_inner_aperture_from_fit(
         _nominal_aperture_fit()
     )
+    low_confidence = vq2_module._visual_inner_aperture_from_fit(
+        replace(_nominal_aperture_fit(), confidence=0.10)
+    )
     clipped = vq2_module._visual_inner_aperture_from_fit(
         replace(
             _nominal_aperture_fit(),
@@ -212,6 +215,18 @@ def test_runner_projects_only_nominal_inner_fit_into_passage_geometry() -> None:
     assert nominal.center_norm == pytest.approx((0.0, 0.0))
     assert nominal.half_size_norm == pytest.approx((0.305, 0.38125))
     assert nominal.measurement_std == pytest.approx((0.01, math.sqrt(0.0002), 0.03))
+    assert low_confidence.fitted
+    assert not low_confidence.passage_usable
+    assert low_confidence.center_norm == nominal.center_norm
+    assert low_confidence.half_size_norm == nominal.half_size_norm
+    assert low_confidence.log_scale == nominal.log_scale
+    assert low_confidence.measurement_std == pytest.approx(
+        tuple(
+            value * math.sqrt(0.25 / 0.10)
+            for value in nominal.measurement_std
+        )
+    )
+    assert low_confidence.health_reason == "aperture_fit_low_confidence"
     assert not clipped.passage_usable
     assert clipped.center_norm is None
     assert clipped.health_reason == "aperture_fit_censored:2"

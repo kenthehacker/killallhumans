@@ -40,6 +40,8 @@ _SIDES = (
     ApertureSide.RIGHT,
     ApertureSide.BOTTOM,
 )
+_PASSAGE_MINIMUM_CONFIDENCE = 0.25
+_CONFIDENCE_UNCERTAINTY_EPSILON = 1e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +128,7 @@ class VQ2ApertureFit:
 
 @dataclass(frozen=True, slots=True)
 class VQ2PassageGeometry:
-    """Conservative normalized inner geometry permitted to claim passage."""
+    """Conservative normalized geometry from one complete visible inner fit."""
 
     center_norm: Point
     aperture_half_size_norm: Point
@@ -978,21 +980,19 @@ def fit_vq2_aperture_bgr(
     )
 
 
-def passage_geometry_from_vq2_aperture_fit(
+def _complete_geometry_from_vq2_aperture_fit(
     fit: VQ2ApertureFit,
-    *,
-    minimum_confidence: float = 0.25,
 ) -> Optional[VQ2PassageGeometry]:
-    """Return a conservative inscribed opening only from a nominal fit.
+    """Return an inscribed opening from an exact complete visible fit.
 
-    Detector support bounds are deliberately excluded.  A clipped,
-    under-supported, or low-confidence fit may remain useful diagnostic
-    evidence, but it cannot manufacture aperture-relative crossing clearance.
+    Confidence affects uncertainty here, not structural admission.  Public
+    passage admission applies its independent confidence floor before calling
+    this helper.
     """
 
     if type(fit) is not VQ2ApertureFit:
         raise TypeError("fit must be an exact VQ2ApertureFit")
-    confidence_floor = _finite_confidence(minimum_confidence)
+    fit_confidence = _finite_confidence(fit.confidence)
     all_sides = (
         ApertureSide.LEFT
         | ApertureSide.TOP
@@ -1005,7 +1005,6 @@ def passage_geometry_from_vq2_aperture_fit(
         or fit.clipping != ApertureSide.NONE
         or fit.visible_edges != all_sides
         or fit.visible_corners != (True, True, True, True)
-        or fit.confidence < confidence_floor
         or fit.fitted_corners_px is None
         or fit.geometry_model_id
         != "vq2-visible-inner-quad-lines-v1"
@@ -1127,6 +1126,22 @@ def passage_geometry_from_vq2_aperture_fit(
     measurement_std = tuple(
         math.sqrt(value) for value in fit.covariance_diagonal[:3]
     )
+    # The fit covariance reflects line residuals, but confidence also carries
+    # detector support and coverage quality.  Model variance as inversely
+    # proportional to confidence below the passage floor so degraded tracking
+    # cannot look as precise as a nominal passage measurement.
+    confidence_uncertainty_multiplier = math.sqrt(
+        _PASSAGE_MINIMUM_CONFIDENCE
+        / max(fit_confidence, _CONFIDENCE_UNCERTAINTY_EPSILON)
+    )
+    confidence_uncertainty_multiplier = max(
+        1.0,
+        confidence_uncertainty_multiplier,
+    )
+    measurement_std = tuple(
+        value * confidence_uncertainty_multiplier
+        for value in measurement_std
+    )
     if not all(
         math.isfinite(value) and value > 0.0
         for value in measurement_std
@@ -1142,6 +1157,41 @@ def passage_geometry_from_vq2_aperture_fit(
     )
 
 
+def tracking_geometry_from_vq2_aperture_fit(
+    fit: VQ2ApertureFit,
+) -> Optional[VQ2PassageGeometry]:
+    """Retain exact complete inner geometry, with confidence in uncertainty.
+
+    Clipped, incomplete, rejected, or non-production-model fits remain
+    unavailable rather than borrowing the detector's outer support geometry.
+    """
+
+    return _complete_geometry_from_vq2_aperture_fit(fit)
+
+
+def passage_geometry_from_vq2_aperture_fit(
+    fit: VQ2ApertureFit,
+    *,
+    minimum_confidence: float = _PASSAGE_MINIMUM_CONFIDENCE,
+) -> Optional[VQ2PassageGeometry]:
+    """Return a conservative inscribed opening only from a nominal fit.
+
+    Detector support bounds are deliberately excluded.  The configurable
+    floor may make admission stricter but can never weaken the retained 0.25
+    passage-confidence requirement.
+    """
+
+    if type(fit) is not VQ2ApertureFit:
+        raise TypeError("fit must be an exact VQ2ApertureFit")
+    confidence_floor = max(
+        _PASSAGE_MINIMUM_CONFIDENCE,
+        _finite_confidence(minimum_confidence),
+    )
+    if _finite_confidence(fit.confidence) < confidence_floor:
+        return None
+    return _complete_geometry_from_vq2_aperture_fit(fit)
+
+
 __all__ = [
     "ApertureSide",
     "VQ2ApertureConfig",
@@ -1150,5 +1200,6 @@ __all__ = [
     "fit_vq2_aperture_bgr",
     "fit_vq2_aperture_mask",
     "passage_geometry_from_vq2_aperture_fit",
+    "tracking_geometry_from_vq2_aperture_fit",
     "vq2_gate_mask_from_bgr",
 ]

@@ -50,17 +50,20 @@ def _inner_aperture(
     *,
     half_width: float,
     half_height: float,
+    confidence: float = 0.93,
+    health_reason: str | None = None,
 ) -> VisualInnerApertureGeometry:
     return VisualInnerApertureGeometry(
         center_norm=(center_x, center_y),
         half_size_norm=(half_width, half_height),
         log_scale=math.log(math.sqrt(half_width * half_height)),
         measurement_std=(0.012, 0.014, 0.040),
-        confidence=0.93,
+        confidence=confidence,
         clipping=FrameEdge.NONE,
         visible_edges=_ALL_FRAME_EDGES,
         geometry_model_id="test-inner-aperture-v1",
         covariance_model_id="test-inner-aperture-covariance-v1",
+        health_reason=health_reason,
     )
 
 
@@ -138,6 +141,7 @@ def _frame(
     current_width: float = 0.34,
     current_height: float = 0.36,
     include_successor: bool = True,
+    current_center_x: float = 0.0,
     current_center_y: float = 0.0,
     current_clipping: FrameEdge = FrameEdge.NONE,
     current_center_censored: bool = False,
@@ -149,7 +153,7 @@ def _frame(
     detections = [
         _detection(
             0,
-            0.0,
+            current_center_x,
             center_y=current_center_y,
             width=current_width,
             height=current_height,
@@ -839,6 +843,114 @@ def test_rejected_merged_inner_geometry_cannot_manufacture_clearance() -> None:
     assert session.last_decision.current_aperture_half_size_norm is None
     assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
     assert session.last_decision.successor_passage_authority == 0.0
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+
+
+def test_degraded_fitted_inner_updates_state_without_crossing_authority() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+    prior = session.core.course_state().current
+
+    degraded = _inner_aperture(
+        0.10,
+        -0.08,
+        half_width=0.26,
+        half_height=0.28,
+        confidence=0.20,
+        health_reason="low-confidence-inner-fit",
+    )
+    assert degraded.fitted
+    assert degraded.complete_visibility
+    assert not degraded.passage_usable
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.40,
+            current_height=0.42,
+            include_successor=False,
+            current_inner_aperture=degraded,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+
+    state = session.core.course_state().current
+    assert state.raw_center_norm == pytest.approx(degraded.center_norm)
+    assert state.raw_log_scale == pytest.approx(degraded.log_scale)
+    assert state.bearing_rad[0] > prior.bearing_rad[0]
+    assert state.bearing_rad[1] < prior.bearing_rad[1]
+    assert state.log_scale < prior.log_scale
+    assert state.censored_axes == (False, False)
+    assert state.aperture_half_size_norm is None
+    assert session.last_decision is not None
+    assert session.last_decision.current_aperture_half_size_norm is None
+    assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
+    assert session.last_decision.successor_passage_authority == 0.0
+    assert proposal.servo_output.corridor_frames == 0
+    assert proposal.passage_admission is None
+
+
+def test_rejected_inner_geometry_predicts_instead_of_using_outer_support() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    seed = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, seed)
+    prior = session.core.course_state().current
+
+    rejected = _rejected_inner_aperture(
+        clipping=FrameEdge.NONE,
+        health_reason="no-supported-inner-quadrilateral",
+    )
+    tracker.update(
+        _frame(
+            6,
+            current_width=0.48,
+            current_height=0.50,
+            include_successor=False,
+            current_center_x=0.12,
+            current_center_y=-0.10,
+            current_inner_aperture=rejected,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+
+    retained = tracker.track(current_id)
+    assert retained.visible
+    assert retained.center_norm == pytest.approx((0.12, -0.10))
+    state = session.core.course_state().current
+    assert state.bearing_rad == pytest.approx(prior.bearing_rad)
+    assert state.log_scale == pytest.approx(prior.log_scale)
+    assert state.censored_axes == (True, True)
+    assert not state.scale_rate_qualified
+    assert state.aperture_half_size_norm is None
+    assert session.last_decision is not None
+    assert session.last_decision.crossing_allowance_norm == (0.0, 0.0)
     assert proposal.servo_output.corridor_frames == 0
     assert proposal.passage_admission is None
 

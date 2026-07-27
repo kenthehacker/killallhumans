@@ -1757,6 +1757,116 @@ def test_clipped_axis_coasts_without_false_inward_update() -> None:
     assert clipped.time_to_contact_s is None
 
 
+def test_854d44b_repeated_censorship_has_bounded_additive_uncertainty() -> None:
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        successor_clearance_dwell_s=0.04,
+        successor_clearance_ramp_s=0.04,
+    )
+    core = DynamicCourseCore(config)
+    core.record_applied_command(_command(0.90))
+    clean = None
+    for sequence in range(1, 9):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=-0.05,
+                log_scale=-0.68 + sequence * 0.05,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.80,
+                log_scale=-1.0,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        clean = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, clean.command)
+
+    assert clean is not None
+    assert clean.successor_clearance_authority > 0.0
+    assert clean.successor_passage_authority > 0.0
+
+    censored_std: list[tuple[float, float]] = []
+    for offset in range(1, 38):
+        sequence = 8 + offset
+        observation_time = 1.28 + offset * 0.040
+        _imu(core, observation_time)
+        current = core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=-0.05,
+                log_scale=-0.23,
+                aperture=None,
+                clipping=FrameEdge.TOP,
+                center_censored=True,
+                ambiguous=True,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.80,
+                log_scale=-1.0,
+            )
+        )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, decision.command)
+        censored_std.append(current.bearing_std_rad)
+
+        assert decision.current_aperture_half_size_norm is None
+        assert decision.centered_crossing_clearance_norm == (0.0, 0.0)
+        assert decision.predicted_crossing_clearance_norm == (0.0, 0.0)
+        assert decision.terminal_crossing_clearance_norm == (0.0, 0.0)
+        assert decision.successor_clearance_authority == 0.0
+        assert decision.successor_passage_authority == 0.0
+        assert decision.passage_yaw_authority == 0.0
+
+    frame_dt_s = 0.040
+    additive_budget_rad = (
+        config.clipping_uncertainty_multiplier
+        * config.process_noise_bearing_rad_s
+        * frame_dt_s
+    )
+    for axis in range(2):
+        assert censored_std[0][axis] <= (
+            config.clipping_uncertainty_multiplier
+            * clean.current_bearing_std_rad[axis]
+            + additive_budget_rad
+        )
+        for previous, current in zip(censored_std, censored_std[1:]):
+            assert current[axis] <= (
+                previous[axis] + additive_budget_rad + 1e-12
+            )
+        assert censored_std[-1][axis] <= (
+            censored_std[0][axis]
+            + (len(censored_std) - 1) * additive_budget_rad
+            + 1e-12
+        )
+        assert censored_std[-1][axis] < config.max_abs_bearing_rad
+
+
 def test_measured_yaw_output_never_exceeds_capability_envelope() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     core.record_applied_command(_command(0.9))

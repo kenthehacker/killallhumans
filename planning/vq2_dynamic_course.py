@@ -1747,7 +1747,9 @@ class DynamicCourseCore:
                 value = predicted_bearing[axis]
                 rate = predicted_rate[axis]
                 residual = previous.residual_translational_rate_rad_s[axis]
-                multiplier = self.config.clipping_uncertainty_multiplier
+                uncertainty_growth = (
+                    self.config.clipping_uncertainty_multiplier
+                )
             else:
                 value, rate = self._robust_update(
                     predicted_bearing[axis],
@@ -1782,7 +1784,7 @@ class DynamicCourseCore:
                     -self.config.max_abs_bearing_rate_rad_s,
                     self.config.max_abs_bearing_rate_rad_s,
                 )
-                multiplier = 1.0
+                uncertainty_growth = 1.0
             bearing_values.append(value)
             bearing_rates.append(rate)
             residual_rates.append(residual)
@@ -1791,29 +1793,43 @@ class DynamicCourseCore:
                 self.config.process_noise_bearing_rad_s * dt
             )
             bearing_std.append(
-                multiplier
-                * math.sqrt(
-                    max(
-                        1e-10,
-                        (1.0 - alpha) * predicted_std * predicted_std
-                        + alpha * measurement_std_rad[axis] ** 2,
+                min(
+                    self.config.max_abs_bearing_rad,
+                    (
+                        # Censorship inflates process noise; it must not
+                        # multiply the entire posterior on every camera frame.
+                        previous.bearing_std_rad[axis]
+                        + uncertainty_growth
+                        * self.config.process_noise_bearing_rad_s
+                        * dt
+                    )
+                    if censored[axis]
+                    else math.sqrt(
+                        max(
+                            1e-10,
+                            (1.0 - alpha) * predicted_std * predicted_std
+                            + alpha * measurement_std_rad[axis] ** 2,
+                        )
                     )
                 )
             )
             rate_std.append(
-                multiplier
-                * min(
+                min(
                     self.config.max_abs_bearing_rate_rad_s,
                     previous.rate_std_rad_s[axis]
-                    + self.config.process_noise_bearing_rad_s,
+                    + uncertainty_growth
+                    * self.config.process_noise_bearing_rad_s,
                 )
             )
-        scale_rate_qualified = bool(
+        scale_measurement_usable = bool(
             observation.clipping == FrameEdge.NONE
             and not observation.ambiguous
+        )
+        scale_rate_qualified = bool(
+            scale_measurement_usable
             and measured_expansion_rate is not None
         )
-        if observation.clipping == FrameEdge.NONE:
+        if scale_measurement_usable:
             scale_innovation = _clamp(
                 observation.log_scale - predicted_scale,
                 -self.config.max_log_scale_innovation,
@@ -1847,23 +1863,30 @@ class DynamicCourseCore:
             log_scale = predicted_scale
             expansion = predicted_expansion
             scale_multiplier = self.config.clipping_uncertainty_multiplier
-        filtered_log_scale_std = math.sqrt(
-            max(
-                1e-10,
-                (1.0 - self.config.scale_alpha)
-                * (
-                    previous.log_scale_std
-                    + self.config.process_noise_scale_s * dt
+        filtered_log_scale_std = (
+            previous.log_scale_std
+            + scale_multiplier
+            * self.config.process_noise_scale_s
+            * dt
+            if not scale_measurement_usable
+            else math.sqrt(
+                max(
+                    1e-10,
+                    (1.0 - self.config.scale_alpha)
+                    * (
+                        previous.log_scale_std
+                        + self.config.process_noise_scale_s * dt
+                    )
+                    ** 2
+                    + self.config.scale_alpha
+                    * observation.measurement_std[2]
+                    ** 2,
                 )
-                ** 2
-                + self.config.scale_alpha
-                * observation.measurement_std[2]
-                ** 2,
             )
         )
-        if observation.clipping != FrameEdge.NONE:
-            filtered_log_scale_std *= scale_multiplier
-        elif not scale_rate_qualified:
+        if (
+            scale_measurement_usable and not scale_rate_qualified
+        ):
             filtered_log_scale_std = max(
                 previous.log_scale_std,
                 filtered_log_scale_std,
@@ -1905,11 +1928,11 @@ class DynamicCourseCore:
             bearing_std_rad=(bearing_std[0], bearing_std[1]),
             rate_std_rad_s=(rate_std[0], rate_std[1]),
             log_scale_std=filtered_log_scale_std,
-            expansion_rate_std_s=scale_multiplier
-            * min(
+            expansion_rate_std_s=min(
                 self.config.max_abs_expansion_rate_s,
                 previous.expansion_rate_std_s
-                + self.config.process_noise_scale_s,
+                + scale_multiplier
+                * self.config.process_noise_scale_s,
             ),
             clipping=observation.clipping,
             censored_axes=censored,

@@ -314,19 +314,22 @@ class DynamicVisualCourseSession:
                     "graph track and tracker observation are not co-timed"
                 )
             inner = sample.inner_aperture
-            inner_usable = bool(
-                inner is not None and inner.passage_usable
+            inner_tracking_usable = bool(
+                inner is not None
+                and inner.fitted
+                and inner.clipping == FrameEdge.NONE
+                and inner.complete_visibility
             )
             confidence = min(
                 float(track.confidence),
                 float(track.association_confidence),
                 (
                     float(inner.confidence)
-                    if inner_usable and inner is not None
+                    if inner_tracking_usable and inner is not None
                     else 0.0
                 ),
             )
-            if inner_usable:
+            if inner_tracking_usable:
                 assert inner is not None
                 assert inner.center_norm is not None
                 assert inner.half_size_norm is not None
@@ -334,7 +337,13 @@ class DynamicVisualCourseSession:
                 assert inner.measurement_std is not None
                 center_norm = inner.center_norm
                 log_scale = inner.log_scale
-                aperture = inner.half_size_norm
+                # Degraded complete fits may stabilize bearing/scale, but only
+                # nominal fits can create q or passage-clearance authority.
+                aperture = (
+                    inner.half_size_norm
+                    if inner.passage_usable
+                    else None
+                )
                 clipping = inner.clipping
                 center_censored = False
                 ambiguous = bool(track.ambiguous)

@@ -25,6 +25,7 @@ from gate_detection.src.vq2_geometry import (
     fit_vq2_aperture_bgr,
     fit_vq2_aperture_mask,
     passage_geometry_from_vq2_aperture_fit,
+    tracking_geometry_from_vq2_aperture_fit,
     vq2_gate_mask_from_bgr,
 )
 from gate_detection.src.vq2_observation_adapter import (
@@ -450,7 +451,57 @@ def test_low_confidence_or_clipped_fit_cannot_claim_passage_geometry() -> None:
     assert low_confidence.succeeded
     assert clipped.succeeded
     assert passage_geometry_from_vq2_aperture_fit(low_confidence) is None
+    assert (
+        passage_geometry_from_vq2_aperture_fit(
+            low_confidence,
+            minimum_confidence=0.0,
+        )
+        is None
+    )
     assert passage_geometry_from_vq2_aperture_fit(clipped) is None
+    degraded_tracking = tracking_geometry_from_vq2_aperture_fit(
+        low_confidence
+    )
+    assert degraded_tracking is not None
+    assert degraded_tracking.center_norm == pytest.approx((0.0, 0.0))
+    assert degraded_tracking.log_scale == pytest.approx(
+        0.5
+        * math.log(
+            degraded_tracking.aperture_half_size_norm[0]
+            * degraded_tracking.aperture_half_size_norm[1]
+        )
+    )
+    confidence_multiplier = math.sqrt(0.25 / low_confidence.confidence)
+    assert low_confidence.covariance_diagonal is not None
+    assert degraded_tracking.measurement_std == pytest.approx(
+        tuple(
+            math.sqrt(value) * confidence_multiplier
+            for value in low_confidence.covariance_diagonal[:3]
+        )
+    )
+    assert tracking_geometry_from_vq2_aperture_fit(clipped) is None
+    assert (
+        tracking_geometry_from_vq2_aperture_fit(
+            dataclasses.replace(
+                low_confidence,
+                visible_edges=(
+                    ApertureSide.LEFT
+                    | ApertureSide.TOP
+                    | ApertureSide.RIGHT
+                ),
+            )
+        )
+        is None
+    )
+    assert (
+        tracking_geometry_from_vq2_aperture_fit(
+            dataclasses.replace(
+                low_confidence,
+                geometry_model_id="unreviewed-inner-model",
+            )
+        )
+        is None
+    )
 
 
 def test_perspective_inner_quad_remains_convex_and_corner_ordered() -> None:

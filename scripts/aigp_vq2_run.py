@@ -110,6 +110,7 @@ from gate_detection.src.vq2_geometry import (
     VQ2ApertureFit,
     fit_vq2_aperture_mask,
     passage_geometry_from_vq2_aperture_fit,
+    tracking_geometry_from_vq2_aperture_fit,
     vq2_gate_mask_from_bgr,
 )
 from planning.vq2_gate_graph import (
@@ -290,7 +291,12 @@ def _visual_inner_aperture_from_fit(
 
     if type(fit) is not VQ2ApertureFit:
         raise TypeError("visual inner aperture requires an exact fit")
-    geometry = passage_geometry_from_vq2_aperture_fit(fit)
+    passage_geometry = passage_geometry_from_vq2_aperture_fit(fit)
+    geometry = (
+        passage_geometry
+        if passage_geometry is not None
+        else tracking_geometry_from_vq2_aperture_fit(fit)
+    )
     clipping = FrameEdge(int(fit.clipping))
     visible_edges = FrameEdge(int(fit.visible_edges))
     if geometry is not None:
@@ -311,6 +317,11 @@ def _visual_inner_aperture_from_fit(
             visible_edges=visible_edges,
             geometry_model_id=fit.geometry_model_id,
             covariance_model_id=fit.covariance_model_id,
+            health_reason=(
+                None
+                if passage_geometry is not None
+                else "aperture_fit_low_confidence"
+            ),
         )
 
     all_sides = (
