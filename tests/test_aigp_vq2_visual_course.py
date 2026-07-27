@@ -2116,28 +2116,39 @@ def test_ec7fc1b8_dynamic_brake_is_not_reblended_toward_spawn_pitch():
     assert legacy_target < governed
 
 
-def test_8319198e_dynamic_launch_does_not_discard_proved_collective():
-    thrust, phase = course_stage._allocate_launch_collective(
-        launch_elapsed_s=0.422,
-        post_preload_thrust=0.280,
-        configured_boost_duration_s=0.45,
-        configured_boost_thrust=0.32,
-        dynamic_collective_owns_post_preload=True,
-    )
-    legacy_thrust, legacy_phase = (
+def test_3935be9a_launch_support_precedes_dynamic_collective_handoff():
+    supported_thrust, supported_phase = (
         course_stage._allocate_launch_collective(
             launch_elapsed_s=0.422,
             post_preload_thrust=0.280,
             configured_boost_duration_s=0.45,
             configured_boost_thrust=0.32,
-            dynamic_collective_owns_post_preload=False,
+            dynamic_collective_owns_post_preload=True,
         )
     )
+    handed_off_thrust, handed_off_phase = (
+        course_stage._allocate_launch_collective(
+            launch_elapsed_s=0.451,
+            post_preload_thrust=0.280,
+            configured_boost_duration_s=0.45,
+            configured_boost_thrust=0.32,
+            dynamic_collective_owns_post_preload=True,
+        )
+    )
+    generic_thrust, generic_phase = course_stage._allocate_launch_collective(
+        launch_elapsed_s=0.422,
+        post_preload_thrust=0.280,
+        configured_boost_duration_s=0.45,
+        configured_boost_thrust=0.32,
+        dynamic_collective_owns_post_preload=False,
+    )
 
-    assert thrust == pytest.approx(0.280)
-    assert phase == "proved-current-aperture"
-    assert legacy_thrust == pytest.approx(0.32)
-    assert legacy_phase == "boost"
+    assert supported_thrust == pytest.approx(0.32)
+    assert supported_phase == "boost"
+    assert handed_off_thrust == pytest.approx(0.280)
+    assert handed_off_phase == "proved-current-aperture"
+    assert generic_thrust == pytest.approx(0.32)
+    assert generic_phase == "boost"
 
 
 def test_current_aperture_collective_recreates_new_frame_rate_filter():
