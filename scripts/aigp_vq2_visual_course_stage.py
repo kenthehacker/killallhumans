@@ -14,7 +14,7 @@ coordinate, or simulator gate-map input.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 from typing import Any, Awaitable, Callable, Dict, Mapping, Optional, Protocol
 
@@ -2104,6 +2104,90 @@ class _AcceptedVisualCommand:
     target_pitch_rad: float
     next_preview_collective_delta: float
     dynamic_evidence: Optional[Dict[str, Any]]
+
+
+def _refresh_committed_successor_yaw(
+    authority: _CensoredPassageCoastAuthority,
+    accepted: _AcceptedVisualCommand,
+    *,
+    gate_index: int,
+    current_track_id: str,
+    reviewed_successor_track_id: str,
+) -> _CensoredPassageCoastAuthority:
+    """Carry one clean committed successor correction into crossing coast.
+
+    The near-plane latch freezes current-gate roll, pitch, thrust, and
+    crossing geometry.  A later clean passage frame may still correct the
+    already-sealed successor bearing before the current aperture clips.  Only
+    that requested yaw is refreshed; the calibrated yaw soft stop and final
+    wire governor continue to own safety and continuity.
+    """
+
+    if (
+        type(authority) is not _CensoredPassageCoastAuthority
+        or type(accepted) is not _AcceptedVisualCommand
+        or type(gate_index) is not int
+        or gate_index < 0
+        or type(current_track_id) is not str
+        or not current_track_id
+        or type(reviewed_successor_track_id) is not str
+        or not reviewed_successor_track_id
+        or authority.gate_index != gate_index
+        or authority.track_id != current_track_id
+    ):
+        raise ValueError(
+            "committed successor yaw refresh identity is invalid"
+        )
+    evidence = accepted.dynamic_evidence
+    if (
+        evidence is None
+        or evidence.get("passage_committed") is not True
+        or accepted.yaw_soft_stop_zeroed
+    ):
+        return authority
+    censored_axes = evidence.get("current_censored_axes")
+    if (
+        evidence.get("current_visible") is not True
+        or evidence.get("current_ambiguous") is not False
+        or not isinstance(censored_axes, (list, tuple))
+        or len(censored_axes) != 2
+        or any(type(value) is not bool for value in censored_axes)
+        or censored_axes[0]
+    ):
+        return authority
+    if (
+        evidence.get("schema") != "aigp-vq2-dynamic-command/1"
+        or evidence.get("gate_index") != gate_index
+        or evidence.get("current_track_id") != current_track_id
+        or evidence.get("successor_track_id")
+        != reviewed_successor_track_id
+    ):
+        raise ValueError(
+            "committed successor yaw refresh lacks clean exact lineage"
+        )
+    committed_authority = evidence.get(
+        "committed_successor_yaw_authority"
+    )
+    committed_yaw = evidence.get(
+        "committed_successor_yaw_rate_rad_s"
+    )
+    if committed_authority == 0.0 and committed_yaw is None:
+        return authority
+    if (
+        type(committed_authority) not in {int, float}
+        or float(committed_authority) != 1.0
+        or type(committed_yaw) not in {int, float}
+        or not math.isfinite(float(committed_yaw))
+        or abs(float(committed_yaw))
+        > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+    ):
+        raise ValueError(
+            "committed successor yaw refresh escaped its authority"
+        )
+    return replace(
+        authority,
+        yaw_rate_rad_s=float(committed_yaw),
+    )
 
 
 def _dynamic_near_plane_wire_sample(
@@ -6314,6 +6398,8 @@ async def _run_visual_course_stage_impl(
             "next_preview_retired": False,
             "yaw_soft_stop_zero_command_count": 0,
             "passage_admission_yaw_soft_stop_withheld_count": 0,
+            "committed_successor_yaw_refresh_count": 0,
+            "last_committed_successor_yaw_refresh": None,
             "crossing_wait_zero_command_count": 0,
             "crossing_wait_coast_command_count": 0,
             "crossing_wait_adjacent_command_count": 0,
@@ -8852,6 +8938,82 @@ async def _run_visual_course_stage_impl(
             ):
                 advance_command_count += 1
                 segment["advance_command_count"] = advance_command_count
+            if (
+                near_plane_latch is not None
+                and near_plane_latch.basis
+                == DYNAMIC_NEAR_PLANE_LATCH_BASIS
+                and crossing_coast_authority is not None
+                and crossing_anchor is not None
+                and crossing_successor_identity_sealed
+                and crossing_reviewed_track_id is not None
+            ):
+                prior_crossing_yaw = (
+                    crossing_coast_authority.yaw_rate_rad_s
+                )
+                try:
+                    refreshed_crossing_authority = (
+                        _refresh_committed_successor_yaw(
+                            crossing_coast_authority,
+                            accepted,
+                            gate_index=current_gate_index,
+                            current_track_id=current_track_id,
+                            reviewed_successor_track_id=(
+                                crossing_reviewed_track_id
+                            ),
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise abort_type(
+                        "visual-course committed successor yaw refresh "
+                        f"refused: {exc}"
+                    ) from exc
+                if (
+                    refreshed_crossing_authority.yaw_rate_rad_s
+                    != prior_crossing_yaw
+                ):
+                    crossing_coast_authority = (
+                        refreshed_crossing_authority
+                    )
+                    refresh_evidence = {
+                        "basis": (
+                            "clean-committed-successor-crossing-yaw-v1"
+                        ),
+                        "camera_token": asdict(
+                            accepted.wire_camera_token
+                        ),
+                        "reviewed_successor_track_id": (
+                            crossing_reviewed_track_id
+                        ),
+                        "previous_yaw_rate_rad_s": prior_crossing_yaw,
+                        "requested_yaw_rate_rad_s": (
+                            crossing_coast_authority.yaw_rate_rad_s
+                        ),
+                        "accepted_wire_yaw_rate_rad_s": (
+                            accepted.command.yaw_rate
+                        ),
+                        "steering_only": True,
+                        "passage_authority": False,
+                        "advance_authority": False,
+                    }
+                    segment[
+                        "committed_successor_yaw_refresh_count"
+                    ] = int(
+                        segment[
+                            "committed_successor_yaw_refresh_count"
+                        ]
+                    ) + 1
+                    segment[
+                        "last_committed_successor_yaw_refresh"
+                    ] = refresh_evidence
+                    host.recorder.emit(
+                        "visual_course_committed_successor_yaw_refreshed",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/passage"
+                        ),
+                        **refresh_evidence,
+                    )
             if near_plane_latch is None:
                 track = getattr(snapshot, "current_track", None)
                 clipping = getattr(track, "clipping", None)

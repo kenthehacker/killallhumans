@@ -201,6 +201,94 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
     }
 
 
+def test_clean_committed_successor_yaw_replaces_only_crossing_yaw():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "successor_track_id": "vq2-track-000002",
+            "passage_committed": True,
+            "committed_successor_yaw_authority": 1.0,
+            "committed_successor_yaw_rate_rad_s": -0.15,
+        }
+    )
+    accepted = _accepted_dynamic_near_plane_command(evidence)
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=0,
+        track_id="vq2-track-000001",
+        anchor_camera_token=_token(1),
+        target_roll_rad=-0.04,
+        target_pitch_rad=0.035,
+        yaw_rate_rad_s=-0.042,
+        requested_thrust=0.29,
+    )
+
+    refreshed = course_stage._refresh_committed_successor_yaw(
+        authority,
+        accepted,
+        gate_index=0,
+        current_track_id="vq2-track-000001",
+        reviewed_successor_track_id="vq2-track-000002",
+    )
+
+    assert refreshed.yaw_rate_rad_s == pytest.approx(-0.15)
+    assert replace(refreshed, yaw_rate_rad_s=authority.yaw_rate_rad_s) == (
+        authority
+    )
+    assert math.isfinite(refreshed.yaw_rate_rad_s)
+    assert (
+        abs(refreshed.yaw_rate_rad_s)
+        <= course_stage.MAX_VISUAL_YAW_RATE_RAD_S
+    )
+
+
+def test_uncommitted_or_safety_zeroed_yaw_cannot_change_crossing_coast():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "successor_track_id": "vq2-track-000002",
+            "passage_committed": False,
+            "committed_successor_yaw_authority": 0.0,
+            "committed_successor_yaw_rate_rad_s": None,
+        }
+    )
+    accepted = _accepted_dynamic_near_plane_command(evidence)
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=0,
+        track_id="vq2-track-000001",
+        anchor_camera_token=_token(1),
+        target_roll_rad=-0.04,
+        target_pitch_rad=0.035,
+        yaw_rate_rad_s=-0.042,
+        requested_thrust=0.29,
+    )
+
+    assert course_stage._refresh_committed_successor_yaw(
+        authority,
+        accepted,
+        gate_index=0,
+        current_track_id="vq2-track-000001",
+        reviewed_successor_track_id="vq2-track-000002",
+    ) == authority
+
+    committed = replace(
+        accepted,
+        yaw_soft_stop_zeroed=True,
+        dynamic_evidence={
+            **evidence,
+            "passage_committed": True,
+            "committed_successor_yaw_authority": 1.0,
+            "committed_successor_yaw_rate_rad_s": -0.15,
+        },
+    )
+    assert course_stage._refresh_committed_successor_yaw(
+        authority,
+        committed,
+        gate_index=0,
+        current_track_id="vq2-track-000001",
+        reviewed_successor_track_id="vq2-track-000002",
+    ) == authority
+
+
 def _dynamic_near_plane_sample(
     evidence: dict[str, object],
     *,
