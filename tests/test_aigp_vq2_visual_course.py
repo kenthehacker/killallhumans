@@ -2019,6 +2019,60 @@ def test_current_aperture_collective_holds_through_censorship_and_dropout():
     assert promoted_proposal.requested_thrust > 0.275
 
 
+def test_faa7cee6_collective_uses_derotated_state_not_pitch_motion():
+    target = replace(
+        _target(_snapshot(0, "track-0", 10), "track-0"),
+        normalized_y_down=-0.3166666667,
+        normalized_y_rate_down_s=0.4157384466,
+    )
+    first_state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-0"
+    )
+    first = course_stage._propose_current_aperture_collective(
+        first_state,
+        target,
+        authoritative_current_track_id="track-0",
+        control_vertical_error_image_down=-1.0283863293,
+        control_vertical_rate_down_s=0.1110041644,
+        control_basis=(
+            course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+        ),
+    )
+    pitch_shifted = replace(
+        target,
+        normalized_y_down=0.20,
+        normalized_y_rate_down_s=-0.70,
+    )
+    second_state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-0"
+    )
+    second = course_stage._propose_current_aperture_collective(
+        second_state,
+        pitch_shifted,
+        authoritative_current_track_id="track-0",
+        control_vertical_error_image_down=-1.0283863293,
+        control_vertical_rate_down_s=0.1110041644,
+        control_basis=(
+            course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+        ),
+    )
+    falsified_raw_request = (
+        course_stage._gate0_proved_vertical_collective(
+            -0.3166666667,
+            0.4157384466,
+        )
+    )
+
+    assert falsified_raw_request == pytest.approx(0.2479502891)
+    assert first.requested_thrust == pytest.approx(0.3010134753)
+    assert second.requested_thrust == pytest.approx(
+        first.requested_thrust
+    )
+    assert first.control_basis == (
+        course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+    )
+
+
 def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     host = _Host(
         initial_gate=0,
