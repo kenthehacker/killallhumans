@@ -1611,9 +1611,14 @@ def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> No
     assert authority["advance_authority"] is False
 
 
-def test_qualified_local_state_guides_one_fresh_current_visibility_gap() -> None:
+def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
     tracker, graph, snapshot, current_id = _graph()
-    session = _session()
+    session = _session(
+        config=replace(
+            production_dynamic_course_config(),
+            crossing_prediction_max_horizon_s=0.10,
+        )
+    )
     planner = DynamicRollingVisualApproachServo(
         current_id,
         0,
@@ -1624,46 +1629,22 @@ def test_qualified_local_state_guides_one_fresh_current_visibility_gap() -> None
     )
     proposal = _observe(planner, snapshot, tracker)
     _accept_proposal(session, tracker, proposal)
-    for sequence in (6, 7, 8):
-        tracker.update(
-            _frame(
-                sequence,
-                current_width=0.34,
-                current_height=0.36,
-                include_successor=False,
-            )
-        )
-        snapshot = graph.observe(tracker)
-        proposal = _observe(planner, snapshot, tracker)
-        _accept_proposal(session, tracker, proposal)
-    for sequence, size in ((9, 0.38), (10, 0.43), (11, 0.49)):
-        tracker.update(
-            _frame(
-                sequence,
-                current_width=size,
-                current_height=size,
-                include_successor=False,
-                current_center_y=0.14,
-            )
-        )
-        snapshot = graph.observe(tracker)
-        proposal = _observe(planner, snapshot, tracker)
-        _accept_proposal(session, tracker, proposal)
-
-    all_edges = (
-        FrameEdge.LEFT
-        | FrameEdge.TOP
-        | FrameEdge.RIGHT
-        | FrameEdge.BOTTOM
-    )
     tracker.update(
         _frame(
-            12,
-            current_width=0.55,
-            current_height=0.55,
+            6,
             include_successor=False,
-            current_center_y=0.14,
-            current_clipping=all_edges,
+            current_center_x=0.05,
+        )
+    )
+    snapshot = graph.observe(tracker)
+    proposal = _observe(planner, snapshot, tracker)
+    _accept_proposal(session, tracker, proposal)
+    tracker.update(
+        _frame(
+            7,
+            include_successor=False,
+            current_center_x=0.10,
+            current_clipping=FrameEdge.RIGHT,
             current_center_censored=True,
             current_inner_aperture=None,
         )
@@ -1671,10 +1652,9 @@ def test_qualified_local_state_guides_one_fresh_current_visibility_gap() -> None
     snapshot = graph.observe(tracker)
     proposal = _observe(planner, snapshot, tracker)
     _accept_proposal(session, tracker, proposal)
-    assert session.core.course_state().current.aperture_dynamics_qualified
 
     missing = replace(
-        _frame(13, include_successor=False),
+        _frame(8, include_successor=False),
         detections=(),
     )
     update = tracker.update(missing)
@@ -1699,30 +1679,52 @@ def test_qualified_local_state_guides_one_fresh_current_visibility_gap() -> None
     assert state.frame_sequence == update.tracker_frame_sequence
     assert state.visible is False
     assert state.missed_count == 1
-    assert state.aperture_propagated
-    assert state.aperture_dynamics_qualified
+    assert state.aperture_prediction_deadline_monotonic_ns is not None
+    assert state.aperture_prediction_deadline_monotonic_ns < now_ns
+    assert authority["basis"] == (
+        "propagated-current-visibility-gap-guidance-v2"
+    )
     assert authority["camera_token"] == asdict(update.token)
     assert authority["last_visible_camera_token"] == asdict(
         tracker.track(current_id).latest_token
     )
+    assert authority["last_visible_clipping"] == int(FrameEdge.RIGHT)
     assert authority["missed_frame_count"] == 1
-    assert authority["aperture_prediction_horizon_remaining_s"] > 0.0
+    assert authority["steering_prediction_horizon_remaining_s"] > 0.0
+    assert authority["current_aperture_half_size_norm"] is None
     assert all(
         math.isfinite(value)
         for value in (
             *authority["current_center_norm"],
-            *authority["current_aperture_half_size_norm"],
             *authority["current_bearing_std_rad"],
             *authority["command"].values(),
         )
+    )
+    assert 0.0 < authority["command"]["target_roll_rad"] <= (
+        MAX_TARGET_ROLL_RAD
     )
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
 
-    deadline_ns = state.aperture_prediction_deadline_monotonic_ns
-    assert deadline_ns is not None
-    with pytest.raises(DynamicCourseError, match="qualified local state"):
+    last_visible = tracker.track(current_id).history[-1]
+    unclipped_track = replace(
+        tracker.track(current_id),
+        clipping=FrameEdge.NONE,
+        history=tracker.track(current_id).history[:-1]
+        + (replace(last_visible, clipping=FrameEdge.NONE),),
+    )
+    with pytest.raises(DynamicCourseError, match="exact clipped miss"):
+        session.propagated_current_visibility_gap_authority(
+            track=unclipped_track,
+            camera_token=update.token,
+            now_monotonic_ns=now_ns,
+        )
+
+    deadline_ns = authority[
+        "steering_prediction_deadline_monotonic_ns"
+    ]
+    with pytest.raises(DynamicCourseError, match="fresh local steering"):
         session.propagated_current_visibility_gap_authority(
             track=tracker.track(current_id),
             camera_token=update.token,

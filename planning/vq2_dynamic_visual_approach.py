@@ -1890,11 +1890,12 @@ class DynamicVisualCourseSession:
         """Guide one exact missed publication from the retained local state.
 
         The rolling graph keeps authoritative identity while independently
-        withholding visual-measurement authority.  This method admits only
-        that narrow near-plane case: the last visible sample was vertically
-        clipped, the staged current remains exact and unambiguous, and its
-        clean-seeded aperture model is still qualified and unexpired.  It
-        supplies steering only; race status remains the sole advance source.
+        withholding visual-measurement authority.  This method admits only an
+        exact clipped-edge loss and propagates the last measured bearing/rate
+        with IMU and accepted-command history for the existing bounded
+        dropout horizon.  Aperture/TTC qualification remains independent and
+        supplies no authority here.  Race status remains the sole advance
+        source.
         """
 
         if type(track) is not VisualTrack:
@@ -1928,9 +1929,10 @@ class DynamicVisualCourseSession:
             or type(missed_count) is not int
             or missed_count <= 0
             or sample.token != track.latest_token
-            or sample.clipping
-            & (FrameEdge.TOP | FrameEdge.BOTTOM)
-            == FrameEdge.NONE
+            or sample.clipping == FrameEdge.NONE
+            or track.clipping != sample.clipping
+            or type(sample.observation_monotonic_ns) is not int
+            or sample.observation_monotonic_ns < 0
             or camera_token.stream_id is None
             or camera_token.stream_id != sample.token.stream_id
             or camera_token.generation != sample.token.generation
@@ -1946,38 +1948,43 @@ class DynamicVisualCourseSession:
             < missed_count
         ):
             raise DynamicCourseError(
-                "propagated visibility gap is not an exact near-plane miss"
+                "propagated visibility gap is not an exact clipped miss"
             )
 
         state = self.core.course_state()
         current = state.current
         prior = self._last_decision
-        deadline_ns = current.aperture_prediction_deadline_monotonic_ns
+        expected_last_measurement_ns = (
+            sample.observation_monotonic_ns
+            - round(
+                self.core.config.camera_delay_s
+                * 1_000_000_000.0
+            )
+        )
+        steering_deadline_ns = (
+            sample.observation_monotonic_ns
+            + round(
+                self.core.config.dropout_hold_s * 1_000_000_000.0
+            )
+        )
         if (
             state.current_gate_index != staged.expected_gate_index
             or state.current_track_id != track.track_id
             or current.track_id != track.track_id
             or current.stream_generation != camera_token.generation
             or current.frame_sequence != staged.tracker_frame_sequence
+            or current.last_measurement_monotonic_ns
+            != expected_last_measurement_ns
             or current.visible
             or current.ambiguous
             or current.missed_count != missed_count
-            or current.aperture_half_size_norm is None
-            or not current.aperture_propagated
-            or not current.aperture_dynamics_qualified
-            or current.aperture_seed_monotonic_ns is None
-            or deadline_ns is None
-            or deadline_ns <= current.aperture_seed_monotonic_ns
-            or deadline_ns <= now_monotonic_ns
+            or steering_deadline_ns <= now_monotonic_ns
             or prior is None
             or prior.current_gate_index != state.current_gate_index
             or prior.current_track_id != state.current_track_id
-            or not prior.current_aperture_propagated
-            or not prior.current_aperture_dynamics_qualified
-            or prior.current_aperture_prediction_horizon_remaining_s <= 0.0
         ):
             raise DynamicCourseError(
-                "propagated visibility gap lacks qualified local state"
+                "propagated visibility gap lacks fresh local steering state"
             )
 
         decision = self.guide(
@@ -1991,25 +1998,25 @@ class DynamicVisualCourseSession:
             )
         command = decision.command
         remaining_horizon_s = (
-            deadline_ns - now_monotonic_ns
+            steering_deadline_ns - now_monotonic_ns
         ) / 1_000_000_000.0
+        decision_aperture = decision.current_aperture_half_size_norm
+        maximum_bearing_std_rad = (
+            self.core.config
+            .successor_prediction_max_extrapolation_rad
+        )
         if (
             decision.current_gate_index != state.current_gate_index
             or decision.current_track_id != state.current_track_id
-            or decision.current_aperture_half_size_norm is None
-            or not decision.current_aperture_propagated
-            or not decision.current_aperture_dynamics_qualified
-            or not math.isclose(
-                decision.current_aperture_prediction_horizon_remaining_s,
-                remaining_horizon_s,
-                rel_tol=0.0,
-                abs_tol=1e-9,
+            or remaining_horizon_s <= 0.0
+            or any(
+                value > maximum_bearing_std_rad + 1e-12
+                for value in decision.current_bearing_std_rad
             )
             or not all(
                 math.isfinite(float(value))
                 for value in (
                     *decision.current_center_norm,
-                    *decision.current_aperture_half_size_norm,
                     *decision.current_bearing_std_rad,
                     command.target_roll_rad,
                     command.target_pitch_rad,
@@ -2017,12 +2024,19 @@ class DynamicVisualCourseSession:
                     command.thrust,
                 )
             )
+            or (
+                decision_aperture is not None
+                and not all(
+                    math.isfinite(float(value)) and float(value) > 0.0
+                    for value in decision_aperture
+                )
+            )
         ):
             raise DynamicCourseError(
                 "propagated visibility gap guidance is invalid"
             )
         return {
-            "basis": "propagated-current-visibility-gap-guidance-v1",
+            "basis": "propagated-current-visibility-gap-guidance-v2",
             "gate_index": state.current_gate_index,
             "track_id": state.current_track_id,
             "camera_token": asdict(camera_token),
@@ -2032,17 +2046,28 @@ class DynamicVisualCourseSession:
                 sample.tracker_frame_sequence
             ),
             "missed_frame_count": missed_count,
+            "last_visible_clipping": int(sample.clipping),
             "guidance_monotonic_ns": decision.monotonic_ns,
-            "aperture_seed_monotonic_ns": (
-                current.aperture_seed_monotonic_ns
+            "last_measurement_monotonic_ns": (
+                current.last_measurement_monotonic_ns
             ),
-            "aperture_prediction_deadline_monotonic_ns": deadline_ns,
-            "aperture_prediction_horizon_remaining_s": (
+            "steering_prediction_deadline_monotonic_ns": (
+                steering_deadline_ns
+            ),
+            "steering_prediction_horizon_remaining_s": (
                 remaining_horizon_s
             ),
             "current_center_norm": list(decision.current_center_norm),
-            "current_aperture_half_size_norm": list(
-                decision.current_aperture_half_size_norm
+            "current_aperture_half_size_norm": (
+                None
+                if decision_aperture is None
+                else list(decision_aperture)
+            ),
+            "current_aperture_propagated": (
+                decision.current_aperture_propagated
+            ),
+            "current_aperture_dynamics_qualified": (
+                decision.current_aperture_dynamics_qualified
             ),
             "current_bearing_std_rad": list(
                 decision.current_bearing_std_rad

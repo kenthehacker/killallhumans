@@ -139,7 +139,7 @@ APPROACH_INNER_DROPOUT_HOLD_BASIS = (
     "fresh-top-censored-prior-inner-fov-continuity-v1"
 )
 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
-    "qualified-local-state-near-plane-visibility-gap-v1"
+    "qualified-local-state-clipped-visibility-gap-v2"
 )
 APPROACH_INNER_DROPOUT_MAX_DURATION_S = 0.120
 APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
@@ -2104,16 +2104,41 @@ def _approach_propagated_visibility_gap_authority(
     last_visible = evidence.get("last_visible_camera_token")
     last_handoff = fov_summary.get("last_propagated_state_handoff")
     missed_count = evidence.get("missed_frame_count")
+    last_visible_clipping = evidence.get("last_visible_clipping")
     remaining_horizon_s = evidence.get(
-        "aperture_prediction_horizon_remaining_s"
+        "steering_prediction_horizon_remaining_s"
     )
     protected_pitch = fov_summary.get(
         "last_protected_target_pitch_rad"
     )
+    known_clipping_edges = int(
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    )
+    vertical_clipping_edges = int(FrameEdge.TOP | FrameEdge.BOTTOM)
+    propagated_fov_lineage = bool(
+        isinstance(last_handoff, Mapping)
+        and last_handoff.get("basis")
+        == "propagated-current-fov-gap-steering-v1"
+        and isinstance(last_visible, Mapping)
+        and last_handoff.get("camera_token") == dict(last_visible)
+    )
+    direct_vertical_fov_lineage = bool(
+        type(last_visible_clipping) is int
+        and last_visible_clipping != 0
+        and last_visible_clipping & vertical_clipping_edges == 0
+        and fov_summary.get("last_raw_top_edge_basis")
+        in {
+            TOP_FOV_INNER_EDGE_BASIS,
+            TOP_FOV_OUTER_EDGE_FALLBACK_BASIS,
+        }
+    )
     if (
         not isinstance(evidence, Mapping)
         or evidence.get("basis")
-        != "propagated-current-visibility-gap-guidance-v1"
+        != "propagated-current-visibility-gap-guidance-v2"
         or evidence.get("steering_only") is not True
         or evidence.get("passage_authority") is not False
         or evidence.get("advance_authority") is not False
@@ -2132,13 +2157,18 @@ def _approach_propagated_visibility_gap_authority(
         or type(last_visible_token) is not CameraFrameToken
         or not isinstance(last_visible, Mapping)
         or dict(last_visible) != asdict(last_visible_token)
+        or type(last_visible_clipping) is not int
+        or last_visible_clipping == 0
+        or last_visible_clipping & ~known_clipping_edges
+        or int(getattr(track, "clipping", FrameEdge.NONE))
+        != last_visible_clipping
         or fov_summary.get("active") is not True
         or fov_summary.get("last_track_id") != track_id
         or fov_summary.get("last_camera_token") != dict(last_visible)
-        or not isinstance(last_handoff, Mapping)
-        or last_handoff.get("basis")
-        != "propagated-current-fov-gap-steering-v1"
-        or last_handoff.get("camera_token") != dict(last_visible)
+        or not (
+            propagated_fov_lineage
+            or direct_vertical_fov_lineage
+        )
         or not isinstance(command, Mapping)
         or type(remaining_horizon_s) not in {int, float}
         or not math.isfinite(float(remaining_horizon_s))
