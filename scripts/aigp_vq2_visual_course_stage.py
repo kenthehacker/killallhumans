@@ -3077,6 +3077,45 @@ def _current_snapshot_ready(
     )
 
 
+def _dynamic_current_steering_correction_ready(
+    snapshot: Any,
+    *,
+    track_id: str,
+) -> bool:
+    """Require one exact complete inner fit before ending predicted steering.
+
+    A promoted graph track can be visible from its outer support while its
+    aperture remains geometrically underconstrained.  That is sufficient for
+    identity continuity, but it is not a camera correction for the dynamic
+    gate-relative state.  Complete fitted inner geometry may restore steering
+    even when its uncertainty is still too large for passage authority.
+    """
+
+    track = getattr(snapshot, "current_track", None)
+    token = getattr(snapshot, "latest_camera_token", None)
+    history = getattr(track, "history", None)
+    if (
+        type(track_id) is not str
+        or not track_id
+        or type(token) is not CameraFrameToken
+        or track is None
+        or getattr(track, "track_id", None) != track_id
+        or getattr(track, "latest_token", None) != token
+        or type(history) is not tuple
+        or not history
+    ):
+        return False
+    sample = history[-1]
+    inner = getattr(sample, "inner_aperture", None)
+    return bool(
+        getattr(sample, "token", None) == token
+        and type(inner) is VisualInnerApertureGeometry
+        and inner.fitted
+        and inner.complete_visibility
+        and inner.clipping == FrameEdge.NONE
+    )
+
+
 def _servo_token_matches_camera(
     servo_token: Any,
     camera_token: CameraFrameToken,
@@ -8010,7 +8049,7 @@ async def _run_visual_course_stage_impl(
             nonlocal latest_recovery_refusal
 
             admitted_recovery_token = None
-            if _current_snapshot_ready(
+            graph_current_ready = _current_snapshot_ready(
                 snapshot,
                 gate_index=current_gate_index,
                 track_id=current_track_id,
@@ -8019,13 +8058,27 @@ async def _run_visual_course_stage_impl(
                     course_handoff.race_status.received_monotonic_ns
                 ),
                 allow_one_edge_censored=True,
-            ):
+            )
+            dynamic_steering_ready = bool(
+                type(runtime.dynamic_controller)
+                is not DynamicVisualCourseSession
+                or _dynamic_current_steering_correction_ready(
+                    snapshot,
+                    track_id=current_track_id,
+                )
+            )
+            if graph_current_ready and dynamic_steering_ready:
                 admitted_recovery_token = snapshot.latest_camera_token
                 latest_recovery_refusal = None
                 return True
             latest_recovery_refusal = (
-                "promoted current lacks a strictly newer observable, visible, "
-                "unambiguous frame"
+                "promoted dynamic current lacks a strictly newer complete "
+                "inner steering correction"
+                if graph_current_ready and not dynamic_steering_ready
+                else (
+                    "promoted current lacks a strictly newer observable, "
+                    "visible, unambiguous frame"
+                )
             )
             return False
 

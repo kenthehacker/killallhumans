@@ -696,6 +696,71 @@ def _snapshot(
     )
 
 
+def test_dynamic_recovery_requires_complete_inner_steering_correction():
+    snapshot = _snapshot(1, "track-1", 20)
+
+    assert not course_stage._dynamic_current_steering_correction_ready(
+        snapshot,
+        track_id="track-1",
+    )
+
+    inner = VisualInnerApertureGeometry(
+        center_norm=(0.04, 0.03),
+        half_size_norm=(0.08, 0.10),
+        log_scale=-2.40,
+        measurement_std=(0.02, 0.03, 0.20),
+        confidence=0.10,
+        clipping=FrameEdge.NONE,
+        visible_edges=(
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM
+        ),
+        geometry_model_id="test-complete-inner-v1",
+        covariance_model_id="test-complete-inner-covariance-v1",
+        health_reason="aperture_fit_low_confidence",
+    )
+    assert inner.fitted
+    assert inner.complete_visibility
+    assert not inner.passage_usable
+    snapshot.current_track.history = (
+        *snapshot.current_track.history[:-1],
+        replace(
+            snapshot.current_track.history[-1],
+            inner_aperture=inner,
+        ),
+    )
+
+    assert course_stage._dynamic_current_steering_correction_ready(
+        snapshot,
+        track_id="track-1",
+    )
+
+    snapshot.current_track.history = (
+        *snapshot.current_track.history[:-1],
+        replace(
+            snapshot.current_track.history[-1],
+            inner_aperture=VisualInnerApertureGeometry(
+                center_norm=None,
+                half_size_norm=None,
+                log_scale=None,
+                measurement_std=None,
+                confidence=0.0,
+                clipping=FrameEdge.NONE,
+                visible_edges=FrameEdge.NONE,
+                geometry_model_id=None,
+                covariance_model_id=None,
+                health_reason="aperture_fit_rejected:degenerate",
+            ),
+        ),
+    )
+    assert not course_stage._dynamic_current_steering_correction_ready(
+        snapshot,
+        track_id="track-1",
+    )
+
+
 class _Graph:
     def __init__(self, snapshot):
         self.latest_snapshot = snapshot
