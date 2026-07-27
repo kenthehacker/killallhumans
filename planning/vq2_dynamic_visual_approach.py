@@ -2032,8 +2032,7 @@ class DynamicVisualCourseSession:
         ) / 1_000_000_000.0
         decision_aperture = decision.current_aperture_half_size_norm
         maximum_bearing_std_rad = (
-            self.core.config
-            .successor_prediction_max_extrapolation_rad
+            self.core.config.max_abs_bearing_rad
         )
         if (
             decision.current_gate_index != state.current_gate_index

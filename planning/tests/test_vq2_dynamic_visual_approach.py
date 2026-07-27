@@ -1632,6 +1632,10 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
         config=replace(
             production_dynamic_course_config(),
             crossing_prediction_max_horizon_s=0.10,
+            # Exercise a clipped current-state uncertainty seed above the
+            # successor extrapolation cap without escaping the current
+            # estimator's own bounded bearing envelope.
+            process_noise_bearing_rad_s=2.10,
         )
     )
     planner = DynamicRollingVisualApproachServo(
@@ -1667,6 +1671,15 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
     snapshot = graph.observe(tracker)
     proposal = _observe(planner, snapshot, tracker)
     _accept_proposal(session, tracker, proposal)
+    clipped_seed_std = (
+        session.core.course_state().current.bearing_std_rad
+    )
+    assert max(clipped_seed_std) > (
+        session.core.config.successor_prediction_max_extrapolation_rad
+    )
+    assert max(clipped_seed_std) < (
+        session.core.config.max_abs_bearing_rad
+    )
 
     missing = replace(
         _frame(8, include_successor=False),
@@ -1728,6 +1741,13 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
                 *authority["current_bearing_std_rad"],
                 *authority["command"].values(),
             )
+        )
+        assert max(authority["current_bearing_std_rad"]) > (
+            session.core.config
+            .successor_prediction_max_extrapolation_rad
+        )
+        assert max(authority["current_bearing_std_rad"]) <= (
+            session.core.config.max_abs_bearing_rad
         )
         assert (
             0.0
