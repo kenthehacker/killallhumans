@@ -563,15 +563,37 @@ def _quad_coheres_with_tracking_prior(
     corners: Quad,
     prior: VQ2ApertureTrackingPrior,
 ) -> bool:
+    """Compare like-for-like aperture boundaries at the predicted centerlines."""
+
     tolerance = prior.maximum_boundary_residual_px
-    actual_boundaries = (
-        min(point[0] for point in corners),
-        min(point[1] for point in corners),
-        max(point[0] for point in corners),
-        max(point[1] for point in corners),
-    )
     center_x, center_y = prior.center_px
     half_x, half_y = prior.half_size_px
+    actual_boundaries = (
+        _segment_dependent_coordinate(
+            corners[0],
+            corners[3],
+            independent_coordinate=center_y,
+            independent_axis=1,
+        ),
+        _segment_dependent_coordinate(
+            corners[0],
+            corners[1],
+            independent_coordinate=center_x,
+            independent_axis=0,
+        ),
+        _segment_dependent_coordinate(
+            corners[1],
+            corners[2],
+            independent_coordinate=center_y,
+            independent_axis=1,
+        ),
+        _segment_dependent_coordinate(
+            corners[3],
+            corners[2],
+            independent_coordinate=center_x,
+            independent_axis=0,
+        ),
+    )
     predicted_boundaries = (
         center_x - half_x,
         center_y - half_y,
@@ -579,7 +601,8 @@ def _quad_coheres_with_tracking_prior(
         center_y + half_y,
     )
     return all(
-        abs(actual - predicted) <= tolerance
+        actual is not None
+        and abs(actual - predicted) <= tolerance
         for actual, predicted in zip(
             actual_boundaries,
             predicted_boundaries,

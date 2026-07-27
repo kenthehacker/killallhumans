@@ -18,6 +18,7 @@ from competition.vq2_contracts import (
     GateObservationV1,
     ObservationHealth,
 )
+from gate_detection.src import vq2_geometry as vq2_geometry_module
 from gate_detection.src.vq2_detector import VQ2GateDetector
 from gate_detection.src.vq2_geometry import (
     ApertureSide,
@@ -606,6 +607,25 @@ def test_unique_temporal_gap_association_is_tracking_only() -> None:
             minimum_confidence=0.0,
         )
         is None
+    )
+
+
+def test_temporal_prior_compares_perspective_edges_at_centerlines() -> None:
+    prior = VQ2ApertureTrackingPrior(
+        center_px=(90.0, 60.0),
+        half_size_px=(30.0, 40.0),
+        maximum_boundary_residual_px=1.0,
+    )
+    perspective_quad = (
+        (50.0, 20.0),
+        (130.0, 20.0),
+        (110.0, 100.0),
+        (70.0, 100.0),
+    )
+
+    assert vq2_geometry_module._quad_coheres_with_tracking_prior(
+        perspective_quad,
+        prior,
     )
 
 
