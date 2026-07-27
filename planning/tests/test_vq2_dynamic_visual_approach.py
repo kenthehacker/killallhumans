@@ -21,7 +21,11 @@ from planning.vq2_dynamic_course import (
     DynamicCourseError,
     ImuAttitudeSample,
     MAX_TARGET_PITCH_RAD,
+    MAX_TARGET_ROLL_RAD,
+    MAX_THRUST,
+    MAX_YAW_RATE_RAD_S,
     MIN_TARGET_PITCH_RAD,
+    MIN_THRUST,
 )
 from planning.vq2_dynamic_visual_approach import (
     BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ,
@@ -262,6 +266,12 @@ def _frame(
     current_inner_aperture: VisualInnerApertureGeometry | None | object = (
         _AUTO_INNER_APERTURE
     ),
+    successor_center_x: float = 0.32,
+    successor_center_y: float = 0.0,
+    successor_width: float = 0.15,
+    successor_height: float = 0.17,
+    successor_clipping: FrameEdge = FrameEdge.NONE,
+    successor_center_censored: bool = False,
 ) -> VisualDetectionFrame:
     observation_ns = _BASE_NS + sequence * _PERIOD_NS
     detections = [
@@ -278,7 +288,15 @@ def _frame(
     ]
     if include_successor:
         detections.append(
-            _detection(1, 0.32, width=0.15, height=0.17)
+            _detection(
+                1,
+                successor_center_x,
+                center_y=successor_center_y,
+                width=successor_width,
+                height=successor_height,
+                clipping=successor_clipping,
+                center_censored=successor_center_censored,
+            )
         )
     return VisualDetectionFrame(
         token=CameraFrameToken(
@@ -2259,6 +2277,216 @@ def test_post_credit_steering_uses_predicted_camera_elevation(
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
+
+
+def test_post_credit_local_state_steers_through_dual_edge_censorship(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tracker, graph, snapshot, current_id = _graph()
+    session = _session()
+    successor_id = snapshot.next_candidates[0].track_id
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+    for sequence in range(6, 10):
+        tracker.update(_frame(sequence))
+        snapshot = graph.observe(tracker)
+        session.stage_snapshot(
+            snapshot,
+            tracker,
+            expected_gate_index=0,
+            expected_current_track_id=current_id,
+            adjacent_precredit=False,
+        )
+    session.core.bind(
+        current_gate_index=0,
+        current_track_id=current_id,
+        successor_track_id=successor_id,
+    )
+    successor = session.core.course_state().successor
+    assert successor is not None
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    activation_ns = wire_ns + 2_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.05,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=-0.04,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(
+            0.03,
+            0.02,
+            -0.04,
+            0.275,
+        ),
+        wire_start_monotonic_ns=wire_ns,
+    )
+    activation = session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    predict = session.core.predict_track_steering
+
+    def top_of_camera_prediction(track_id: str, monotonic_ns: int):
+        base = predict(track_id, monotonic_ns)
+        return replace(
+            base,
+            camera_center_norm=(base.camera_center_norm[0], -0.605),
+            camera_center_rate_norm_s=(
+                base.camera_center_rate_norm_s[0],
+                -0.309,
+            ),
+        )
+
+    monkeypatch.setattr(
+        session.core,
+        "predict_track_steering",
+        top_of_camera_prediction,
+    )
+    seeded = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=activation_ns,
+    )
+    assert seeded["target_pitch_rad"] < 0.0
+
+    top_update = tracker.update(
+        _frame(
+            10,
+            successor_clipping=FrameEdge.TOP,
+            successor_center_censored=True,
+        )
+    )
+    top_snapshot = graph.observe(tracker)
+    assert tracker.track(successor_id).latest_token == top_update.token
+    session.stage_snapshot(
+        top_snapshot,
+        tracker,
+        expected_gate_index=1,
+        expected_current_track_id=successor_id,
+        adjacent_precredit=False,
+    )
+    top_state = session.core.course_state().current
+    top_authority = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=top_update.publish_monotonic_ns + 2_000_000,
+    )
+
+    dual_update = tracker.update(
+        _frame(
+            11,
+            successor_clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+            successor_center_censored=True,
+        )
+    )
+    dual_snapshot = graph.observe(tracker)
+    assert tracker.track(successor_id).latest_token == dual_update.token
+    session.stage_snapshot(
+        dual_snapshot,
+        tracker,
+        expected_gate_index=1,
+        expected_current_track_id=successor_id,
+        adjacent_precredit=False,
+    )
+    dual_state = session.core.course_state().current
+    dual_authority = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=dual_update.publish_monotonic_ns + 2_000_000,
+    )
+
+    assert top_state.censored_axes == (False, True)
+    assert dual_state.censored_axes == (True, True)
+    assert top_state.aperture_half_size_norm is not None
+    assert dual_state.aperture_half_size_norm is not None
+    assert top_state.aperture_propagated is True
+    assert dual_state.aperture_propagated is True
+    assert (
+        dual_state.aperture_seed_monotonic_ns
+        == top_state.aperture_seed_monotonic_ns
+    )
+    assert (
+        dual_state.aperture_prediction_deadline_monotonic_ns
+        == top_state.aperture_prediction_deadline_monotonic_ns
+    )
+    assert math.isfinite(dual_state.log_scale)
+    assert math.isfinite(dual_state.expansion_rate_s)
+    assert top_authority["last_correction_monotonic_ns"] > (
+        activation["last_correction_monotonic_ns"]
+    )
+    assert top_authority["expires_monotonic_ns"] > (
+        activation["expires_monotonic_ns"]
+    )
+    assert dual_authority["last_correction_monotonic_ns"] == (
+        top_authority["last_correction_monotonic_ns"]
+    )
+    assert dual_authority["expires_monotonic_ns"] == (
+        top_authority["expires_monotonic_ns"]
+    )
+    assert dual_authority["last_measurement_monotonic_ns"] > (
+        top_authority["last_measurement_monotonic_ns"]
+    )
+    assert dual_authority["target_pitch_rad"] <= (
+        top_authority["target_pitch_rad"] + 1e-12
+    )
+    assert dual_authority["vertical_axis_censored"] is True
+    assert dual_authority["steering_only"] is True
+    assert dual_authority["passage_authority"] is False
+    assert dual_authority["advance_authority"] is False
+    assert all(
+        math.isfinite(float(dual_authority[name]))
+        for name in (
+            "target_roll_rad",
+            "target_pitch_rad",
+            "yaw_rate_rad_s",
+            "thrust",
+        )
+    )
+    assert (
+        abs(float(dual_authority["target_roll_rad"]))
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= float(dual_authority["target_pitch_rad"])
+        <= MAX_TARGET_PITCH_RAD
+    )
+    assert (
+        abs(float(dual_authority["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
+    assert (
+        MIN_THRUST
+        <= float(dual_authority["thrust"])
+        <= MAX_THRUST
+    )
+    with pytest.raises(
+        DynamicCourseError,
+        match="lacks clean current state",
+    ):
+        session.complete_post_credit_recovery(
+            camera_token=dual_update.token,
+        )
+
+    clean_update = tracker.update(_frame(12))
+    clean_snapshot = graph.observe(tracker)
+    session.stage_snapshot(
+        clean_snapshot,
+        tracker,
+        expected_gate_index=1,
+        expected_current_track_id=successor_id,
+        adjacent_precredit=False,
+    )
+    release = session.complete_post_credit_recovery(
+        camera_token=clean_update.token,
+    )
+    assert release["basis"] == (
+        "clean-current-post-credit-recovery-release-v1"
+    )
+    assert release["passage_authority"] is False
+    assert release["advance_authority"] is False
+    assert session.post_credit_successor_steering_active is False
 
 
 def test_post_credit_activation_latency_never_extends_prediction_expiry():

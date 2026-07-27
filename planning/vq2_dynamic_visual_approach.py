@@ -198,11 +198,13 @@ class _PostCreditSuccessorSteering:
     reviewed_track_id: str
     stream_generation: int
     last_measurement_monotonic_ns: int
+    last_correction_monotonic_ns: int
     activation_monotonic_ns: int
     expires_monotonic_ns: int
     steering_available: bool
     steering_unavailable_reason: str | None
     promotion_count: int
+    vertical_target_pitch_ceiling_rad: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,6 +643,9 @@ class DynamicVisualCourseSession:
             "last_measurement_monotonic_ns": (
                 lease.last_measurement_monotonic_ns
             ),
+            "last_correction_monotonic_ns": (
+                lease.last_correction_monotonic_ns
+            ),
             "activation_monotonic_ns": lease.activation_monotonic_ns,
             "expires_monotonic_ns": lease.expires_monotonic_ns,
             "promotion_count": lease.promotion_count,
@@ -651,6 +656,9 @@ class DynamicVisualCourseSession:
             "steering_only": lease.steering_available,
             "passage_authority": False,
             "advance_authority": False,
+            "vertical_target_pitch_ceiling_rad": (
+                lease.vertical_target_pitch_ceiling_rad
+            ),
         }
 
     def activate_post_credit_successor_steering(
@@ -803,16 +811,91 @@ class DynamicVisualCourseSession:
             reviewed_track_id=reviewed_track_id,
             stream_generation=successor.stream_generation,
             last_measurement_monotonic_ns=last_measurement_ns,
+            last_correction_monotonic_ns=last_measurement_ns,
             activation_monotonic_ns=activation_monotonic_ns,
             expires_monotonic_ns=expires_ns,
             steering_available=steering_available,
             steering_unavailable_reason=steering_unavailable_reason,
             promotion_count=promoted.promotion_count,
+            vertical_target_pitch_ceiling_rad=None,
         )
         self._post_credit_successor_steering = lease
         self._staged = None
         self._last_decision = None
         return self._post_credit_lease_evidence(lease)
+
+    def _refresh_post_credit_successor_state(
+        self,
+        lease: _PostCreditSuccessorSteering,
+    ) -> _PostCreditSuccessorSteering:
+        """Correct observable axes without renewing fully censored geometry."""
+
+        state = self.core.course_state()
+        current = state.current
+        if (
+            state.current_gate_index != lease.to_gate_index
+            or state.current_track_id != lease.reviewed_track_id
+            or current.track_id != lease.reviewed_track_id
+            or current.stream_generation != lease.stream_generation
+            or state.promotion_count != lease.promotion_count
+        ):
+            raise DynamicCourseError(
+                "post-credit successor steering lost dynamic ownership"
+            )
+        if (
+            current.last_measurement_monotonic_ns
+            < lease.last_measurement_monotonic_ns
+        ):
+            raise DynamicCourseError(
+                "post-credit successor measurement clock regressed"
+            )
+        if (
+            current.last_measurement_monotonic_ns
+            == lease.last_measurement_monotonic_ns
+        ):
+            return lease
+
+        staged = self._staged
+        if (
+            staged is None
+            or staged.adjacent_precredit
+            or staged.expected_gate_index != lease.to_gate_index
+            or staged.expected_current_track_id
+            != lease.reviewed_track_id
+            or staged.camera_token.generation != lease.stream_generation
+            or current.frame_sequence != staged.tracker_frame_sequence
+            or current.state_monotonic_ns
+            != current.last_measurement_monotonic_ns
+            or not current.visible
+            or current.ambiguous
+            or current.missed_count != 0
+        ):
+            raise DynamicCourseError(
+                "post-credit successor correction lacks exact current state"
+            )
+
+        correction_available = not all(current.censored_axes)
+        correction_ns = lease.last_correction_monotonic_ns
+        expires_ns = lease.expires_monotonic_ns
+        if (
+            correction_available
+            and current.state_monotonic_ns <= expires_ns
+        ):
+            correction_ns = current.state_monotonic_ns
+            expires_ns = correction_ns + round(
+                self.core.config.successor_prediction_max_horizon_s
+                * 1_000_000_000.0
+            )
+        refreshed = replace(
+            lease,
+            last_measurement_monotonic_ns=(
+                current.last_measurement_monotonic_ns
+            ),
+            last_correction_monotonic_ns=correction_ns,
+            expires_monotonic_ns=expires_ns,
+        )
+        self._post_credit_successor_steering = refreshed
+        return refreshed
 
     def post_credit_successor_steering_authority(
         self,
@@ -838,6 +921,7 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "post-credit successor steering precedes activation"
             )
+        lease = self._refresh_post_credit_successor_state(lease)
         if now_monotonic_ns > lease.expires_monotonic_ns:
             self._post_credit_successor_steering = replace(
                 lease,
@@ -882,6 +966,22 @@ class DynamicVisualCourseSession:
             raise PostCreditSuccessorSteeringUnavailable(
                 "post-credit successor steering prediction expired"
             )
+        if any(
+            value
+            > self.core.config.successor_prediction_max_extrapolation_rad
+            + 1e-12
+            for value in prediction.bearing_std_rad
+        ):
+            self._post_credit_successor_steering = replace(
+                lease,
+                steering_available=False,
+                steering_unavailable_reason=(
+                    "excessive_prediction_uncertainty"
+                ),
+            )
+            raise PostCreditSuccessorSteeringUnavailable(
+                "post-credit successor steering uncertainty expired"
+            )
 
         target_roll = self.core.config.roll_guidance_sign * (
             self.core.config.roll_gain
@@ -912,6 +1012,34 @@ class DynamicVisualCourseSession:
             ),
             baseline_pitch_rad=self.core.config.brake_pitch_rad,
         )
+        vertical_axis_censored = bool(
+            not state.current.visible
+            or state.current.censored_axes[1]
+        )
+        retained_pitch_ceiling = (
+            lease.vertical_target_pitch_ceiling_rad
+        )
+        if vertical_axis_censored:
+            if retained_pitch_ceiling is None:
+                retained_pitch_ceiling = target_pitch
+            target_pitch = min(target_pitch, retained_pitch_ceiling)
+            retained_pitch_ceiling = min(
+                retained_pitch_ceiling,
+                target_pitch,
+            )
+        else:
+            retained_pitch_ceiling = target_pitch
+        if (
+            lease.vertical_target_pitch_ceiling_rad
+            != retained_pitch_ceiling
+        ):
+            lease = replace(
+                lease,
+                vertical_target_pitch_ceiling_rad=(
+                    retained_pitch_ceiling
+                ),
+            )
+            self._post_credit_successor_steering = lease
         camera_heading = math.atan(
             prediction.camera_center_norm[0]
             * self.core.config.horizontal_angle_scale_rad
@@ -979,6 +1107,8 @@ class DynamicVisualCourseSession:
                 "camera_elevation_error_rad": camera_elevation,
                 "camera_elevation_rate_rad_s": camera_elevation_rate,
                 "pitch_delay_lead_rad": pitch_delay_lead,
+                "vertical_axis_censored": vertical_axis_censored,
+                "retained_pitch_ceiling_rad": retained_pitch_ceiling,
                 "bearing_std_rad": list(
                     prediction.bearing_std_rad
                 ),
@@ -987,6 +1117,55 @@ class DynamicVisualCourseSession:
                 ),
             }
         )
+        return evidence
+
+    def complete_post_credit_recovery(
+        self,
+        *,
+        camera_token: CameraFrameToken,
+    ) -> Mapping[str, Any]:
+        """Release steering memory only after exact clean current geometry."""
+
+        if type(camera_token) is not CameraFrameToken:
+            raise DynamicCourseError(
+                "post-credit recovery completion requires an exact token"
+            )
+        lease = self._post_credit_successor_steering
+        staged = self._staged
+        state = self.core.course_state()
+        current = state.current
+        if (
+            lease is None
+            or staged is None
+            or staged.adjacent_precredit
+            or staged.camera_token != camera_token
+            or staged.expected_gate_index != lease.to_gate_index
+            or staged.expected_current_track_id
+            != lease.reviewed_track_id
+            or state.current_gate_index != lease.to_gate_index
+            or state.current_track_id != lease.reviewed_track_id
+            or current.track_id != lease.reviewed_track_id
+            or current.stream_generation != camera_token.generation
+            or current.frame_sequence != staged.tracker_frame_sequence
+            or not current.visible
+            or current.ambiguous
+            or current.missed_count != 0
+            or any(current.censored_axes)
+        ):
+            raise DynamicCourseError(
+                "post-credit recovery completion lacks clean current state"
+            )
+        evidence = dict(self._post_credit_lease_evidence(lease))
+        evidence.update(
+            {
+                "basis": "clean-current-post-credit-recovery-release-v1",
+                "camera_token": asdict(camera_token),
+                "steering_only": False,
+                "passage_authority": False,
+                "advance_authority": False,
+            }
+        )
+        self._post_credit_successor_steering = None
         return evidence
 
     def rebind_confirmed_reacquisition(
@@ -1146,7 +1325,6 @@ class DynamicVisualCourseSession:
                     raise DynamicCourseError(
                         "same-gate recovery differs from post-credit ownership"
                     )
-                self._post_credit_successor_steering = None
             retained_successor = (
                 successor_track_id
                 if successor_track_id is not None

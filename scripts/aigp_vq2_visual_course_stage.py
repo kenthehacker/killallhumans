@@ -3734,6 +3734,8 @@ async def _run_visual_course_stage_impl(
         *,
         yaw_reference_rad: float,
         successor_steering: bool = False,
+        require_successor_steering: bool = False,
+        command_deadline_s: Optional[float] = None,
     ) -> bool:
         """Bridge one bounded handoff gap with retained dynamic authority."""
 
@@ -3747,7 +3749,34 @@ async def _run_visual_course_stage_impl(
             raise abort_type(
                 "visual-course continuity hold lacks dynamic/yaw authority"
             )
+        if (
+            type(successor_steering) is not bool
+            or type(require_successor_steering) is not bool
+            or require_successor_steering
+            and not successor_steering
+        ):
+            raise abort_type(
+                "visual-course successor-steering selection is invalid"
+            )
+        if (
+            command_deadline_s is not None
+            and (
+                type(command_deadline_s) not in {int, float}
+                or not math.isfinite(float(command_deadline_s))
+            )
+        ):
+            raise abort_type(
+                "visual-course continuity-hold deadline is invalid"
+            )
         await host._wait_for_next_flight_command_slot()
+        if (
+            command_deadline_s is not None
+            and float(runtime.monotonic())
+            >= float(command_deadline_s)
+        ):
+            raise abort_type(
+                "visual-course continuity-hold authority expired before wire"
+            )
         pad_contact = initial_pad_contact_authority()
         host._watchdog(
             require_target=False,
@@ -3782,7 +3811,12 @@ async def _run_visual_course_stage_impl(
                     maximum_age_s=profile.control_hold_horizon_s,
                 )
             )
-        except PostCreditSuccessorSteeringUnavailable:
+        except PostCreditSuccessorSteeringUnavailable as exc:
+            if require_successor_steering:
+                raise abort_type(
+                    "visual-course required propagated successor state "
+                    f"expired: {exc}"
+                ) from exc
             actual_successor_steering = False
             try:
                 authority = dynamic_controller.continuity_hold_authority(
@@ -5678,6 +5712,7 @@ async def _run_visual_course_stage_impl(
             "recovery_navigation_command_count": 0,
             "recovery_clean_command_count": 0,
             "recovery_one_edge_command_count": 0,
+            "recovery_propagated_state_command_count": 0,
             "recovery_zero_command_count": 0,
             "recovery_support_command_count": 0,
             "passage_authority_enabled": False,
@@ -6107,6 +6142,89 @@ async def _run_visual_course_stage_impl(
                 recovery_last_track_token = (
                     snapshot.current_track.latest_token
                 )
+                if (
+                    type(runtime.dynamic_controller)
+                    is DynamicVisualCourseSession
+                    and recovery_measurement_mode
+                    in {
+                        PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+                        PostCreditMeasurementMode.REACQUIRE,
+                    }
+                ):
+                    dynamic_controller = runtime.dynamic_controller
+                    assert recovery_deadline_s is not None
+                    last_planned_token = token
+                    try:
+                        dynamic_controller.stage_snapshot(
+                            snapshot,
+                            host.visual_tracker,
+                            expected_gate_index=current_gate_index,
+                            expected_current_track_id=current_track_id,
+                            adjacent_precredit=False,
+                        )
+                        propagated_steering = await send_continuity_hold(
+                            (
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "recovery-propagated-state"
+                            ),
+                            float(runtime.monotonic()) - segment_started_s,
+                            yaw_reference_rad=yaw_reference_rad,
+                            successor_steering=True,
+                            require_successor_steering=True,
+                            command_deadline_s=recovery_deadline_s,
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as exc:
+                        raise abort_type(
+                            "visual-course race boundary changed during "
+                            "post-credit propagated recovery"
+                        ) from exc
+                    except (TypeError, ValueError) as exc:
+                        raise abort_type(
+                            "visual-course post-credit local-state "
+                            f"propagation refused: {exc}"
+                        ) from exc
+                    if not propagated_steering:
+                        raise abort_type(
+                            "visual-course post-credit local-state steering "
+                            "was not applied"
+                        )
+                    segment[
+                        "recovery_propagated_state_command_count"
+                    ] = int(
+                        segment[
+                            "recovery_propagated_state_command_count"
+                        ]
+                    ) + 1
+                    segment["recovery_navigation_command_count"] = int(
+                        segment["recovery_navigation_command_count"]
+                    ) + 1
+                    if (
+                        transitions
+                        and transitions[-1]["to_gate_index"]
+                        == current_gate_index
+                    ):
+                        transitions[-1][
+                            "post_transition_navigation_command_count"
+                        ] = int(
+                            transitions[-1][
+                                "post_transition_navigation_command_count"
+                            ]
+                        ) + 1
+                    if (
+                        recovery_measurement_mode
+                        is PostCreditMeasurementMode.ONE_EDGE_CENSORED
+                    ):
+                        segment["recovery_one_edge_command_count"] = int(
+                            segment["recovery_one_edge_command_count"]
+                        ) + 1
+                        recovery_deadline_s = min(
+                            course_deadline_s,
+                            segment_deadline_s,
+                            float(runtime.monotonic())
+                            + limits.post_credit_fresh_frame_timeout_s,
+                        )
+                    continue
                 if (
                     recovery_measurement_mode
                     is PostCreditMeasurementMode.REACQUIRE
@@ -7293,6 +7411,33 @@ async def _run_visual_course_stage_impl(
                     and not accepted.yaw_soft_stop_zeroed
                 )
                 if recovery_completed:
+                    dynamic_recovery_release = None
+                    if (
+                        type(runtime.dynamic_controller)
+                        is DynamicVisualCourseSession
+                    ):
+                        try:
+                            dynamic_recovery_release = (
+                                runtime.dynamic_controller
+                                .complete_post_credit_recovery(
+                                    camera_token=(
+                                        accepted.wire_camera_token
+                                    )
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise abort_type(
+                                "visual-course dynamic post-credit recovery "
+                                f"release refused: {exc}"
+                            ) from exc
+                        if not isinstance(
+                            dynamic_recovery_release,
+                            Mapping,
+                        ):
+                            raise abort_type(
+                                "visual-course dynamic post-credit recovery "
+                                "release evidence is invalid"
+                            )
                     lifecycle = CourseLifecycle.APPROACH
                     mode = VisualApproachMode.APPROACH
                     segment["lifecycle"] = lifecycle.value
@@ -7304,6 +7449,11 @@ async def _run_visual_course_stage_impl(
                         ),
                         clean_command_count=(
                             segment["recovery_clean_command_count"]
+                        ),
+                        dynamic_recovery_release=(
+                            None
+                            if dynamic_recovery_release is None
+                            else dict(dynamic_recovery_release)
                         ),
                     )
                 refresh_live_summary()
