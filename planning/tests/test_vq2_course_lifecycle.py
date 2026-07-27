@@ -757,6 +757,191 @@ def test_1cab9da6_terminal_window_latches_after_pre_scale_history() -> None:
     )
 
 
+def test_e38e73be_historical_thrust_settle_does_not_erase_corridor() -> None:
+    """Require contact budget on the live anchor, not its geometry history."""
+
+    base_samples = (
+        _sample(
+            frame_id=513779,
+            publication=161,
+            observation_ns=17_348_448_085_200,
+            publication_ns=17_348_448_990_200,
+            wire_start_ns=17_348_459_330_800,
+            wire_return_ns=17_348_459_366_400,
+            x=0.05053606646517718,
+            y=-0.6223224697616248,
+            x_rate=0.05025334644147395,
+            y_rate=-0.033858194627571905,
+            apparent_scale=math.exp(-0.7146496419146361),
+            log_scale_rate=1.260834536632019,
+            confidence=0.7123055934205911,
+            association_confidence=0.7123055934205911,
+            command=(
+                0.010134807198040273,
+                0.08262205795505823,
+                -0.006088170006393641,
+                0.3039436872898472,
+            ),
+        ),
+        _sample(
+            frame_id=513780,
+            publication=162,
+            observation_ns=17_348_483_033_900,
+            publication_ns=17_348_483_939_100,
+            wire_start_ns=17_348_506_283_200,
+            wire_return_ns=17_348_506_332_900,
+            x=0.08653616414151748,
+            y=-0.6273651659041501,
+            x_rate=0.04091165485339476,
+            y_rate=0.03821930443582828,
+            apparent_scale=math.exp(-0.6180676601303003),
+            log_scale_rate=1.3064908467203953,
+            confidence=0.806924018259926,
+            association_confidence=0.806924018259926,
+            command=(
+                0.011376099245041552,
+                0.07577596723099314,
+                -0.02245869711492665,
+                0.2969078922898472,
+            ),
+        ),
+        _sample(
+            frame_id=513781,
+            publication=163,
+            observation_ns=17_348_517_665_600,
+            publication_ns=17_348_518_525_600,
+            wire_start_ns=17_348_537_364_000,
+            wire_return_ns=17_348_537_409_200,
+            x=0.10140027539268794,
+            y=-0.617641999064406,
+            x_rate=-0.028659852912795117,
+            y_rate=0.20990216181945368,
+            apparent_scale=math.exp(-0.5380412056929045),
+            log_scale_rate=1.3315694955408057,
+            confidence=0.8718116627788197,
+            association_confidence=0.8718116627788197,
+            command=(
+                0.014274192011554394,
+                0.0725351021480228,
+                -0.03499463959022381,
+                0.2922525972898472,
+            ),
+        ),
+    )
+    model_facts = (
+        {
+            "log_scale_std": 0.05393956114685996,
+            "normalized_x_std": 0.019313857093835304,
+            "normalized_y_std": 0.024757701006388015,
+            "crossing_prediction_horizon_s": 0.7931254823263578,
+            "predicted_crossing_x_norm": 0.10799004469669124,
+            "predicted_crossing_y_down_norm": -0.0419069483569362,
+            "predicted_crossing_x_std_norm": 0.06044461697473255,
+            "predicted_crossing_y_std_norm": 0.11445338758528793,
+            "crossing_allowance_x_norm": 0.50,
+            "crossing_allowance_y_norm": 0.45,
+            "crossing_swept_x_occupancy_norm": 0.2563536037477585,
+            "crossing_swept_y_occupancy_norm": 1.153212086131139,
+            "current_crossing_x_q": 0.1369235861305697,
+            "current_crossing_y_q": -0.9711712520718878,
+            "crossing_x_q_rate_s": -0.03648040830690749,
+            "crossing_y_q_rate_s": 1.1716485277831168,
+            "post_governor_contact_budget_s": 0.15617276046455952,
+        },
+        {
+            "log_scale_std": 0.05404086897226105,
+            "normalized_x_std": 0.019777280285008324,
+            "normalized_y_std": 0.025594730559642065,
+            "crossing_prediction_horizon_s": 0.7654091128998257,
+            "predicted_crossing_x_norm": 0.06363920563947952,
+            "predicted_crossing_y_down_norm": 0.040047913656949485,
+            "predicted_crossing_x_std_norm": 0.05262943186855274,
+            "predicted_crossing_y_std_norm": 0.10494126918460928,
+            "crossing_allowance_x_norm": 0.50,
+            "crossing_allowance_y_norm": 0.45,
+            "crossing_swept_x_occupancy_norm": 0.2752598670183933,
+            "crossing_swept_y_occupancy_norm": 1.0217687753139812,
+            "current_crossing_x_q": 0.17586593085114566,
+            "current_crossing_y_q": -0.8588629917415753,
+            "crossing_x_q_rate_s": -0.14662318924644685,
+            "crossing_y_q_rate_s": 1.174418869920316,
+            "post_governor_contact_budget_s": 0.10602316430084424,
+        },
+        {
+            "log_scale_std": 0.051482961581514705,
+            "normalized_x_std": 0.018899687686455658,
+            "normalized_y_std": 0.024728570304547046,
+            "crossing_prediction_horizon_s": 0.7509934730022172,
+            "predicted_crossing_x_norm": -0.04245051623961754,
+            "predicted_crossing_y_down_norm": 0.20356659687707312,
+            "predicted_crossing_x_std_norm": 0.05402858274012277,
+            "predicted_crossing_y_std_norm": 0.0996599382573406,
+            "crossing_allowance_x_norm": 0.50,
+            "crossing_allowance_y_norm": 0.45,
+            "crossing_swept_x_occupancy_norm": 0.29513572728859017,
+            "crossing_swept_y_occupancy_norm": 0.9436038576650027,
+            "current_crossing_x_q": 0.19999170865222554,
+            "current_crossing_y_q": -0.7976093977128692,
+            "crossing_x_q_rate_s": -0.32282867109702207,
+            "crossing_y_q_rate_s": 1.333135414063694,
+            "post_governor_contact_budget_s": 0.12264282440323582,
+        },
+    )
+    samples = tuple(
+        replace(
+            sample,
+            geometry_basis=DYNAMIC_NEAR_PLANE_GEOMETRY_BASIS,
+            **facts,
+        )
+        for sample, facts in zip(base_samples, model_facts)
+    )
+
+    evidence = NearPlaneEvidence()
+    latch = None
+    retained_counts = []
+    for sample in samples:
+        evidence, latch = advance_dynamic_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            horizontal_corridor=0.16,
+            vertical_corridor=0.18,
+            minimum_post_governor_contact_budget_s=0.12,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+        retained_counts.append(len(evidence.samples))
+
+    assert retained_counts == [1, 2, 3]
+    assert samples[1].post_governor_contact_budget_s < 0.12
+    assert samples[2].post_governor_contact_budget_s >= 0.12
+    assert latch is not None
+    assert latch.anchor_camera_token == _token(513781, 163)
+
+    under_budget_anchor = replace(
+        samples[2],
+        post_governor_contact_budget_s=0.119,
+    )
+    evidence = NearPlaneEvidence()
+    latch = None
+    for sample in (*samples[:2], under_budget_anchor):
+        evidence, latch = advance_dynamic_near_plane_evidence(
+            evidence,
+            sample,
+            required_corridor_frames=_REQUIRED_FRAMES,
+            crossing_min_log_scale=_CROSSING_MIN_LOG_SCALE,
+            horizontal_corridor=0.16,
+            vertical_corridor=0.18,
+            minimum_post_governor_contact_budget_s=0.12,
+            min_track_confidence=_MIN_TRACK_CONFIDENCE,
+            min_association_confidence=_MIN_ASSOCIATION_CONFIDENCE,
+        )
+
+    assert len(evidence.samples) == 3
+    assert latch is None
+
+
 def test_zero_dynamic_crossing_allowance_is_valid_but_cannot_latch() -> None:
     sample = replace(
         _LATEST_NEAR_PLANE[0],

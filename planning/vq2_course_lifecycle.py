@@ -855,8 +855,6 @@ def advance_dynamic_near_plane_evidence(
             or current_q[axis] * q_rate[axis] < 0.0
             for axis in range(2)
         )
-        and float(sample.post_governor_contact_budget_s)
-        >= float(minimum_post_governor_contact_budget_s)
         and float(sample.log_scale_rate_s) > 0.0
     )
     if not qualified:
@@ -878,6 +876,11 @@ def advance_dynamic_near_plane_evidence(
     if (
         len(retained) < required_corridor_frames
         or scale_lower_bound < float(crossing_min_log_scale)
+        # Contact budget describes the command that can be acted on now.  A
+        # historical sample's older wire/request gap cannot invalidate an
+        # otherwise continuous terminal-geometry corridor.
+        or float(sample.post_governor_contact_budget_s)
+        < float(minimum_post_governor_contact_budget_s)
     ):
         return advanced, None
     return advanced, NearPlaneLatch(
