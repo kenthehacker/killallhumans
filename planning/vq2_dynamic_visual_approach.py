@@ -178,6 +178,19 @@ class _PostCreditSuccessorSteering:
 
 
 @dataclass(frozen=True, slots=True)
+class _PreCreditSuccessorRollReference:
+    """One exact graph-vetted successor target awaiting race promotion."""
+
+    from_gate_index: int
+    to_gate_index: int
+    track_id: str
+    stream_generation: int
+    target_roll_rad: float
+    authority_monotonic_ns: int
+    accepted_wire_start_monotonic_ns: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class _PostCreditRollReferenceHandoff:
     """One bounded successor reference retained across race-owned promotion."""
 
@@ -187,7 +200,7 @@ class _PostCreditRollReferenceHandoff:
     stream_generation: int
     promotion_count: int
     retained_target_roll_rad: float
-    source_decision_monotonic_ns: int
+    source_authority_monotonic_ns: int
     source_wire_start_monotonic_ns: int
 
 
@@ -393,6 +406,9 @@ class DynamicVisualCourseSession:
         ] = None
         self._post_credit_roll_reference_handoff: Optional[
             _PostCreditRollReferenceHandoff
+        ] = None
+        self._precredit_successor_roll_reference: Optional[
+            _PreCreditSuccessorRollReference
         ] = None
 
     @property
@@ -803,10 +819,37 @@ class DynamicVisualCourseSession:
                 "post-credit steering lacks causal accepted-command memory"
             )
         retained_roll: float | None = None
-        retained_source_decision_ns: int | None = None
+        retained_source_authority_ns: int | None = None
+        retained_source_wire_ns: int | None = None
+        precredit_reference = self._precredit_successor_roll_reference
+        if (
+            precredit_reference is not None
+            and precredit_reference.from_gate_index == from_gate_index
+            and precredit_reference.to_gate_index == to_gate_index
+            and precredit_reference.track_id == reviewed_track_id
+            and precredit_reference.stream_generation
+            == successor.stream_generation
+            and precredit_reference.accepted_wire_start_monotonic_ns
+            == applied.monotonic_ns
+            and precredit_reference.authority_monotonic_ns
+            <= applied.monotonic_ns
+            and applied.monotonic_ns <= activation_monotonic_ns
+            and math.isclose(
+                precredit_reference.target_roll_rad,
+                applied.target_roll_rad,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            retained_roll = precredit_reference.target_roll_rad
+            retained_source_authority_ns = (
+                precredit_reference.authority_monotonic_ns
+            )
+            retained_source_wire_ns = applied.monotonic_ns
         prior = self._last_decision
         if (
-            prior is not None
+            retained_roll is None
+            and prior is not None
             and prior.current_gate_index == from_gate_index
             and prior.current_track_id == state.current_track_id
             and prior.successor_track_id == reviewed_track_id
@@ -836,7 +879,8 @@ class DynamicVisualCourseSession:
                 )
             ):
                 retained_roll = candidate
-                retained_source_decision_ns = prior.monotonic_ns
+                retained_source_authority_ns = prior.monotonic_ns
+                retained_source_wire_ns = applied.monotonic_ns
         promoted = self.core.promote_authoritative(
             from_gate_index=from_gate_index,
             to_gate_index=to_gate_index,
@@ -866,11 +910,13 @@ class DynamicVisualCourseSession:
             vertical_target_pitch_ceiling_rad=None,
         )
         self._post_credit_successor_steering = lease
+        self._precredit_successor_roll_reference = None
         self._post_credit_roll_reference_handoff = (
             None
             if (
                 retained_roll is None
-                or retained_source_decision_ns is None
+                or retained_source_authority_ns is None
+                or retained_source_wire_ns is None
             )
             else _PostCreditRollReferenceHandoff(
                 authority_basis=(
@@ -881,10 +927,12 @@ class DynamicVisualCourseSession:
                 stream_generation=successor.stream_generation,
                 promotion_count=promoted.promotion_count,
                 retained_target_roll_rad=retained_roll,
-                source_decision_monotonic_ns=(
-                    retained_source_decision_ns
+                source_authority_monotonic_ns=(
+                    retained_source_authority_ns
                 ),
-                source_wire_start_monotonic_ns=applied.monotonic_ns,
+                source_wire_start_monotonic_ns=(
+                    retained_source_wire_ns
+                ),
             )
         )
         self._staged = None
@@ -1660,6 +1708,17 @@ class DynamicVisualCourseSession:
                 "precredit successor steering prediction is unavailable"
             )
         targets = dict(self._successor_steering_targets(prediction))
+        self._precredit_successor_roll_reference = (
+            _PreCreditSuccessorRollReference(
+                from_gate_index=state.current_gate_index,
+                to_gate_index=staged.expected_gate_index,
+                track_id=track_id,
+                stream_generation=successor.stream_generation,
+                target_roll_rad=float(targets["target_roll_rad"]),
+                authority_monotonic_ns=now_monotonic_ns,
+                accepted_wire_start_monotonic_ns=None,
+            )
+        )
         self._last_decision = None
         targets.update(
             {
@@ -2376,6 +2435,26 @@ class DynamicVisualCourseSession:
             discontinuity_axes=discontinuity_axes,
         )
         self._last_applied_sample = applied_sample
+        pending_roll = self._precredit_successor_roll_reference
+        if pending_roll is not None:
+            if (
+                pending_roll.authority_monotonic_ns
+                <= wire_start_monotonic_ns
+                and math.isclose(
+                    pending_roll.target_roll_rad,
+                    applied_sample.target_roll_rad,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                self._precredit_successor_roll_reference = replace(
+                    pending_roll,
+                    accepted_wire_start_monotonic_ns=(
+                        wire_start_monotonic_ns
+                    ),
+                )
+            else:
+                self._precredit_successor_roll_reference = None
         self._applied_command_count += 1
         decision = self._last_decision
         if decision is not None:
@@ -2453,9 +2532,9 @@ class DynamicVisualCourseSession:
                             "retained_target_roll_rad": (
                                 roll_handoff.retained_target_roll_rad
                             ),
-                            "source_decision_monotonic_ns": (
+                            "source_authority_monotonic_ns": (
                                 roll_handoff
-                                .source_decision_monotonic_ns
+                                .source_authority_monotonic_ns
                             ),
                             "source_wire_start_monotonic_ns": (
                                 roll_handoff

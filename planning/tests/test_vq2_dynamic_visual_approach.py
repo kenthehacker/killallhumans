@@ -592,9 +592,7 @@ def _bound_post_credit_successor() -> tuple[
 
 
 def _activated_committed_roll_handoff(
-    *,
-    retained_roll_rad: float = 0.13,
-) -> tuple[DynamicVisualCourseSession, object, str]:
+) -> tuple[DynamicVisualCourseSession, object, str, float]:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     successor_id = snapshot.next_candidates[0].track_id
@@ -634,58 +632,47 @@ def _activated_committed_roll_handoff(
     session.stage_snapshot(
         snapshot,
         tracker,
-        expected_gate_index=0,
-        expected_current_track_id=current_id,
-        adjacent_precredit=False,
-        passage_committed=True,
+        expected_gate_index=1,
+        expected_current_track_id=successor_id,
+        adjacent_precredit=True,
     )
-    decision_ns = seed_wire_ns + 1_000_000
-    decision = session.guide(
-        current_track_id=current_id,
-        successor_track_id=successor_id,
-        monotonic_ns=decision_ns,
+    authority_ns = seed_wire_ns + 1_000_000
+    authority = session.adjacent_precredit_successor_steering_authority(
+        track_id=successor_id,
+        now_monotonic_ns=authority_ns,
     )
-    assert decision is not None
-    retained_command = replace(
-        decision.command,
-        target_roll_rad=retained_roll_rad,
-    )
-    committed = replace(
-        decision,
-        passage_committed=True,
-        committed_successor_roll_authority=1.0,
-        committed_successor_target_roll_rad=retained_roll_rad,
-        proposed_command=retained_command,
-        command=retained_command,
-    )
-    session._last_decision = committed  # noqa: SLF001 - exact handoff seam
-    accepted_ns = decision_ns + 1_000_000
+    retained_roll_rad = float(authority["target_roll_rad"])
+    accepted_ns = authority_ns + 1_000_000
     session.record_wire_acceptance(
         target_roll_rad=retained_roll_rad,
-        target_pitch_rad=retained_command.target_pitch_rad,
-        yaw_rate_rad_s=retained_command.yaw_rate_rad_s,
-        thrust=retained_command.thrust,
+        target_pitch_rad=float(authority["target_pitch_rad"]),
+        yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
+        thrust=float(authority["thrust"]),
         wire_command=AttitudeRateCommand(
             0.02,
             0.01,
-            retained_command.yaw_rate_rad_s,
-            retained_command.thrust,
+            float(authority["yaw_rate_rad_s"]),
+            float(authority["thrust"]),
         ),
         wire_start_monotonic_ns=accepted_ns,
     )
     race_received_ns = accepted_ns + 1_000_000
+    activation_ns = race_received_ns + 1_000_000
     session.activate_post_credit_successor_steering(
         _credited_race(race_received_ns),
         from_gate_index=0,
         reviewed_track_id=successor_id,
-        activation_monotonic_ns=race_received_ns + 1_000_000,
+        activation_monotonic_ns=activation_ns,
     )
     assert session.post_credit_roll_reference_handoff_active
-    return session, committed, successor_id
+    source = session.core.guide(activation_ns + 1_000_000)
+    return session, source, successor_id, retained_roll_rad
 
 
 def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
-    session, source, successor_id = _activated_committed_roll_handoff()
+    session, source, successor_id, retained = (
+        _activated_committed_roll_handoff()
+    )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
         estimate.state,
@@ -696,7 +683,7 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     )
     normal_command = replace(
         source.command,
-        target_roll_rad=0.08,
+        target_roll_rad=0.60 * retained,
     )
     fresh = replace(
         source,
@@ -713,9 +700,9 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     )
 
     assert constrained.proposed_command.target_roll_rad == pytest.approx(
-        0.08
+        0.60 * retained
     )
-    assert constrained.command.target_roll_rad == pytest.approx(0.13)
+    assert constrained.command.target_roll_rad == pytest.approx(retained)
     assert math.isfinite(constrained.command.target_roll_rad)
     assert (
         abs(constrained.command.target_roll_rad)
@@ -732,7 +719,9 @@ def test_opposite_or_recovering_geometry_releases_roll_handoff_immediately(
     normal_roll_rad: float,
     residual_rate_rad_s: float,
 ):
-    session, source, successor_id = _activated_committed_roll_handoff()
+    session, source, successor_id, _retained = (
+        _activated_committed_roll_handoff()
+    )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
         estimate.state,
