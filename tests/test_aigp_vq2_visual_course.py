@@ -3090,6 +3090,118 @@ def _inner_aperture(
     )
 
 
+def test_top_fov_uncertainty_growth_is_not_physical_edge_velocity():
+    previous_token = _token(70)
+    current_token = _token(71)
+    previous_inner = _inner_aperture(
+        center_y=-0.05,
+        half_y=0.10,
+        std_y=0.005,
+        std_log_scale=0.02,
+        confidence=0.80,
+    )
+    uncertain_inner = _inner_aperture(
+        center_y=-0.05,
+        half_y=0.10,
+        std_y=0.080,
+        std_log_scale=0.20,
+        confidence=0.04,
+        health_reason="aperture_fit_low_confidence",
+    )
+    previous = SimpleNamespace(
+        tracker_frame_sequence=70,
+        token=previous_token,
+        observation_monotonic_ns=1_000_000_000,
+        bbox_norm=(0.40, 0.30, 0.60, 0.60),
+        confidence=0.80,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        inner_aperture=previous_inner,
+    )
+    current_sample = SimpleNamespace(
+        tracker_frame_sequence=71,
+        token=current_token,
+        observation_monotonic_ns=1_032_000_000,
+        bbox_norm=(0.40, 0.30, 0.60, 0.60),
+        confidence=0.80,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        inner_aperture=uncertain_inner,
+    )
+    track = SimpleNamespace(
+        track_id="track-0",
+        latest_token=current_token,
+        clipping=FrameEdge.NONE,
+        center_censored=False,
+        history=(previous, current_sample),
+    )
+    current_state = SimpleNamespace(
+        track_id="track-0",
+        frame_sequence=71,
+        body_to_reference_wxyz=(1.0, 0.0, 0.0, 0.0),
+        body_rates_rad_s=(0.0, 0.0, 0.0),
+    )
+    course = SimpleNamespace(
+        current_track_id="track-0",
+        current=current_state,
+        last_applied_command=None,
+    )
+    session = SimpleNamespace(
+        core=SimpleNamespace(
+            course_state=lambda: course,
+            config=SimpleNamespace(
+                camera_to_body_wxyz=(
+                    course_stage
+                    .BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
+                ),
+                vertical_angle_scale_rad=0.55,
+                pitch_command_delay_s=0.10,
+            ),
+        )
+    )
+
+    observation = course_stage._top_fov_observation(
+        session,
+        track,
+        current_token,
+    )
+    proposal = course_stage._propose_top_fov_pitch_reference(
+        capture_pitch_rad=observation.capture_pitch_rad,
+        raw_top_edge_image_down=observation.raw_top_edge_image_down,
+        raw_top_edge_rate_down_s=observation.raw_top_edge_rate_down_s,
+        requested_target_pitch_rad=-0.20,
+        prior_target_pitch_rad=-0.20,
+        vertical_angle_scale_rad=observation.vertical_angle_scale_rad,
+        active_before=False,
+        raw_top_edge_nonrotational_angle_rate_rad_s=(
+            observation.raw_top_edge_nonrotational_angle_rate_rad_s
+        ),
+        prediction_horizon_s=observation.pitch_response_delay_s,
+    )
+
+    assert observation.raw_nominal_top_edge_image_down == pytest.approx(
+        previous_inner.center_norm[1]
+        - previous_inner.half_size_norm[1]
+    )
+    assert observation.raw_top_edge_std_image_down > 0.08
+    assert observation.raw_top_edge_image_down < (
+        observation.raw_nominal_top_edge_image_down
+    )
+    assert observation.raw_top_edge_rate_down_s < 0.0
+    assert observation.raw_top_edge_motion_angle_rate_rad_s == pytest.approx(
+        0.0,
+        abs=1e-12,
+    )
+    assert (
+        observation.raw_top_edge_nonrotational_angle_rate_rad_s
+        == pytest.approx(0.0, abs=1e-12)
+    )
+    assert proposal.forecast_top_edge_image_down == pytest.approx(
+        observation.raw_top_edge_image_down
+    )
+    assert proposal.protected_target_pitch_rad == pytest.approx(-0.20)
+
+
 def test_top_fov_pitch_limit_uses_fitted_inner_extent_not_center_alone():
     short_top = course_stage._conservative_inner_aperture_top_image_down(
         _inner_aperture(center_y=-0.20, half_y=0.10)

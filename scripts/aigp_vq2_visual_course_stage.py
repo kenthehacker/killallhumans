@@ -1431,9 +1431,12 @@ def _top_fov_observation(
             )
             vertical_scale = float(config.vertical_angle_scale_rad)
             top_motion_angle_rate = (
-                math.atan(edge.top_edge_image_down * vertical_scale)
+                math.atan(
+                    edge.nominal_top_edge_image_down * vertical_scale
+                )
                 - math.atan(
-                    previous_edge.top_edge_image_down * vertical_scale
+                    previous_edge.nominal_top_edge_image_down
+                    * vertical_scale
                 )
             ) / elapsed_s
             body_rates = current.body_rates_rad_s
@@ -1442,9 +1445,11 @@ def _top_fov_observation(
             pitch_rate = float(body_rates[1])
             nonrotational_angle_rate = (
                 _top_fov_nonrotational_angle_rate_rad_s(
-                    current_top_edge_image_down=edge.top_edge_image_down,
+                    current_top_edge_image_down=(
+                        edge.nominal_top_edge_image_down
+                    ),
                     previous_top_edge_image_down=(
-                        previous_edge.top_edge_image_down
+                        previous_edge.nominal_top_edge_image_down
                     ),
                     vertical_angle_scale_rad=vertical_scale,
                     elapsed_s=elapsed_s,
