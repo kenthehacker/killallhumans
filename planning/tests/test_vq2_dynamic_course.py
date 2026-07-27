@@ -2489,14 +2489,57 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     assert expired.passage_point_norm == (0.0, 0.0)
     assert expired.current_yaw_release == 0.0
     _imu(core, 1.60)
+    assert not core.retains_successor_lineage(
+        "gate-b",
+        1_600_000_000,
+    )
     expired_committed = core.guide(
         1_600_000_000,
         passage_committed=True,
     )
     assert expired_committed.passage_committed
-    assert expired_committed.committed_successor_yaw_authority == 0.0
-    assert expired_committed.committed_successor_yaw_rate_rad_s is None
-    assert expired_committed.command == expired.command
+    assert expired_committed.committed_successor_yaw_authority == 1.0
+    assert expired_committed.committed_successor_yaw_rate_rad_s is not None
+    assert expired_committed.command.yaw_rate_rad_s == pytest.approx(
+        expired_committed.committed_successor_yaw_rate_rad_s
+    )
+    assert expired_committed.command.target_roll_rad == pytest.approx(
+        expired.command.target_roll_rad
+    )
+    assert expired_committed.command.target_pitch_rad == pytest.approx(
+        expired.command.target_pitch_rad
+    )
+    assert expired_committed.command.thrust == pytest.approx(
+        expired.command.thrust
+    )
+    assert all(
+        math.isfinite(value)
+        for value in (
+            expired_committed.command.target_roll_rad,
+            expired_committed.command.target_pitch_rad,
+            expired_committed.command.yaw_rate_rad_s,
+            expired_committed.command.thrust,
+        )
+    )
+    assert (
+        abs(expired_committed.command.yaw_rate_rad_s)
+        <= MAX_YAW_RATE_RAD_S
+    )
+
+    retained_successor = core.course_state().successor
+    assert retained_successor is not None
+    committed_deadline_ns = (
+        retained_successor.last_measurement_monotonic_ns
+        + round(core.config.crossing_prediction_max_horizon_s * NS)
+    )
+    _imu(core, (committed_deadline_ns + 1) / NS)
+    bounded_expiry = core.guide(
+        committed_deadline_ns + 1,
+        passage_committed=True,
+    )
+    assert bounded_expiry.passage_committed
+    assert bounded_expiry.committed_successor_yaw_authority == 0.0
+    assert bounded_expiry.committed_successor_yaw_rate_rad_s is None
 
 
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:

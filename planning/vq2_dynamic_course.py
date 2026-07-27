@@ -3116,10 +3116,7 @@ class DynamicCourseCore:
             if (
                 0.0
                 <= successor_age_s
-                <= min(
-                    self.config.successor_lineage_hold_s,
-                    self.config.successor_prediction_max_horizon_s,
-                )
+                <= self.config.crossing_prediction_max_horizon_s
                 and successor.bearing_std_rad[0]
                 <= (
                     self.config
@@ -3128,8 +3125,11 @@ class DynamicCourseCore:
                 + _EPSILON
             ):
                 # A race-stage passage commitment already owns the proved
-                # current-gate crossing.  It may therefore release only
-                # camera heading to the retained local successor state.
+                # current-gate crossing.  Its reviewed successor bearing may
+                # therefore outlive the ordinary visibility/lineage hold, but
+                # never the existing crossing-model horizon or uncertainty
+                # envelope.  The lease is anchored to the last successor
+                # measurement and cannot slide on coast frames or commands.
                 # Roll, pitch, thrust, passage geometry, and all promotion
                 # authority remain exactly current-gate owned.  The final
                 # wire governor is the sole temporal continuity limiter.
