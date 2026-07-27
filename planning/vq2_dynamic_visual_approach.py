@@ -36,6 +36,7 @@ from planning.vq2_dynamic_course import (
     MIN_TARGET_PITCH_RAD,
     MIN_THRUST,
     SUPPORT_THRUST,
+    successor_camera_pitch_reference,
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
@@ -84,51 +85,13 @@ def _predicted_successor_pitch_reference(
 ) -> tuple[float, float, float, float]:
     """Convert the predicted camera elevation into a bounded pitch reference."""
 
-    values = (
-        camera_center_y_norm,
-        camera_center_rate_y_norm_s,
-        vertical_angle_scale_rad,
-        pitch_command_delay_s,
-        maximum_lead_rad,
-        baseline_pitch_rad,
-    )
-    if (
-        not all(math.isfinite(value) for value in values)
-        or vertical_angle_scale_rad <= 0.0
-        or pitch_command_delay_s < 0.0
-        or maximum_lead_rad < 0.0
-    ):
-        raise DynamicCourseError(
-            "post-credit successor pitch geometry is invalid"
-        )
-    vertical_ratio = camera_center_y_norm * vertical_angle_scale_rad
-    camera_elevation_rad = math.atan(vertical_ratio)
-    camera_elevation_rate_rad_s = (
-        vertical_angle_scale_rad
-        * camera_center_rate_y_norm_s
-        / (1.0 + vertical_ratio * vertical_ratio)
-    )
-    pitch_delay_lead_rad = min(
-        maximum_lead_rad,
-        max(
-            -maximum_lead_rad,
-            pitch_command_delay_s * camera_elevation_rate_rad_s,
-        ),
-    )
-    target_pitch_rad = min(
-        MAX_TARGET_PITCH_RAD,
-        max(
-            MIN_TARGET_PITCH_RAD,
-            baseline_pitch_rad
-            + camera_elevation_rad
-            + pitch_delay_lead_rad,
-        ),
-    )
-    return (
-        target_pitch_rad,
-        camera_elevation_rad,
-        camera_elevation_rate_rad_s,
-        pitch_delay_lead_rad,
+    return successor_camera_pitch_reference(
+        camera_center_y_norm=camera_center_y_norm,
+        camera_center_rate_y_norm_s=camera_center_rate_y_norm_s,
+        vertical_angle_scale_rad=vertical_angle_scale_rad,
+        pitch_command_delay_s=pitch_command_delay_s,
+        maximum_lead_rad=maximum_lead_rad,
+        baseline_pitch_rad=baseline_pitch_rad,
     )
 
 
@@ -2410,11 +2373,47 @@ class DynamicVisualCourseSession:
                         decision.successor_yaw_contribution_rad
                     ),
                     "passage_committed": decision.passage_committed,
+                    "committed_successor_roll_authority": (
+                        decision.committed_successor_roll_authority
+                    ),
+                    "committed_successor_target_roll_rad": (
+                        decision.committed_successor_target_roll_rad
+                    ),
+                    "committed_successor_pitch_authority": (
+                        decision.committed_successor_pitch_authority
+                    ),
+                    "committed_successor_target_pitch_rad": (
+                        decision.committed_successor_target_pitch_rad
+                    ),
                     "committed_successor_yaw_authority": (
                         decision.committed_successor_yaw_authority
                     ),
                     "committed_successor_yaw_rate_rad_s": (
                         decision.committed_successor_yaw_rate_rad_s
+                    ),
+                    "committed_successor_camera_center_norm": (
+                        None
+                        if (
+                            decision
+                            .committed_successor_camera_center_norm
+                            is None
+                        )
+                        else list(
+                            decision
+                            .committed_successor_camera_center_norm
+                        )
+                    ),
+                    "committed_successor_camera_center_rate_norm_s": (
+                        None
+                        if (
+                            decision
+                            .committed_successor_camera_center_rate_norm_s
+                            is None
+                        )
+                        else list(
+                            decision
+                            .committed_successor_camera_center_rate_norm_s
+                        )
                     ),
                     "successor_transition_held": (
                         decision.successor_transition_held

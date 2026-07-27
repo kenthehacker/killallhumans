@@ -127,6 +127,51 @@ def _clamp(value: float, lower: float, upper: float) -> float:
     return min(upper, max(lower, value))
 
 
+def successor_camera_pitch_reference(
+    *,
+    camera_center_y_norm: float,
+    camera_center_rate_y_norm_s: float,
+    vertical_angle_scale_rad: float,
+    pitch_command_delay_s: float,
+    maximum_lead_rad: float,
+    baseline_pitch_rad: float,
+) -> tuple[float, float, float, float]:
+    """Map one local successor elevation/rate to a bounded pitch reference."""
+
+    values = (
+        _finite(camera_center_y_norm, "camera_center_y_norm"),
+        _finite(
+            camera_center_rate_y_norm_s,
+            "camera_center_rate_y_norm_s",
+        ),
+        _positive(vertical_angle_scale_rad, "vertical_angle_scale_rad"),
+        _nonnegative(pitch_command_delay_s, "pitch_command_delay_s"),
+        _nonnegative(maximum_lead_rad, "maximum_lead_rad"),
+        _finite(baseline_pitch_rad, "baseline_pitch_rad"),
+    )
+    vertical_ratio = values[0] * values[2]
+    camera_elevation_rad = math.atan(vertical_ratio)
+    camera_elevation_rate_rad_s = (
+        values[2] * values[1] / (1.0 + vertical_ratio * vertical_ratio)
+    )
+    pitch_delay_lead_rad = _clamp(
+        values[3] * camera_elevation_rate_rad_s,
+        -values[4],
+        values[4],
+    )
+    target_pitch_rad = _clamp(
+        values[5] + camera_elevation_rad + pitch_delay_lead_rad,
+        MIN_TARGET_PITCH_RAD,
+        MAX_TARGET_PITCH_RAD,
+    )
+    return (
+        target_pitch_rad,
+        camera_elevation_rad,
+        camera_elevation_rate_rad_s,
+        pitch_delay_lead_rad,
+    )
+
+
 def _quat_conjugate(value: Quaternion) -> Quaternion:
     return (value[0], -value[1], -value[2], -value[3])
 
@@ -772,8 +817,14 @@ class GuidanceDecision:
     passage_yaw_authority: float
     successor_yaw_contribution_rad: float
     passage_committed: bool
+    committed_successor_roll_authority: float
+    committed_successor_target_roll_rad: float | None
+    committed_successor_pitch_authority: float
+    committed_successor_target_pitch_rad: float | None
     committed_successor_yaw_authority: float
     committed_successor_yaw_rate_rad_s: float | None
+    committed_successor_camera_center_norm: Vector2 | None
+    committed_successor_camera_center_rate_norm_s: Vector2 | None
     successor_transition_held: bool
     current_time_to_contact_s: float | None
     braking: bool
@@ -3098,8 +3149,14 @@ class DynamicCourseCore:
             ),
             vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
-        committed_successor_yaw_authority = 0.0
+        committed_successor_roll_authority = 0.0
+        committed_successor_target_roll: float | None = None
+        committed_successor_pitch_authority = 0.0
+        committed_successor_target_pitch: float | None = None
+        committed_successor_camera_center: Vector2 | None = None
+        committed_successor_camera_center_rate: Vector2 | None = None
         committed_successor_yaw_rate: float | None = None
+        committed_successor_yaw_authority = 0.0
         if (
             passage_committed
             and successor is not None
@@ -3117,33 +3174,93 @@ class DynamicCourseCore:
                 0.0
                 <= successor_age_s
                 <= self.config.crossing_prediction_max_horizon_s
-                and successor.bearing_std_rad[0]
-                <= (
+            ):
+                # A race-stage passage commitment already owns the proved
+                # current-gate crossing.  The reviewed successor's bounded
+                # local bearing/elevation/rates may therefore steer the
+                # committed transition without owning passage or promotion.
+                # The lease remains anchored to the last visual measurement
+                # and the final wire governor alone owns command continuity.
+                successor_steering = self.predict_track_steering(
+                    successor.track_id,
+                    monotonic_ns,
+                )
+                maximum_std = (
                     self.config
                     .successor_prediction_max_extrapolation_rad
                 )
-                + _EPSILON
-            ):
-                # A race-stage passage commitment already owns the proved
-                # current-gate crossing.  Its reviewed successor bearing may
-                # therefore outlive the ordinary visibility/lineage hold, but
-                # never the existing crossing-model horizon or uncertainty
-                # envelope.  The lease is anchored to the last successor
-                # measurement and cannot slide on coast frames or commands.
-                # Roll, pitch, thrust, passage geometry, and all promotion
-                # authority remain exactly current-gate owned.  The final
-                # wire governor is the sole temporal continuity limiter.
-                committed_successor_yaw_authority = 1.0
-                committed_successor_yaw_rate = _clamp(
-                    -self.config.yaw_gain
-                    * successor_prediction.bearing_rad[0],
-                    -MAX_YAW_RATE_RAD_S,
-                    MAX_YAW_RATE_RAD_S,
+                committed_successor_camera_center = (
+                    successor_steering.camera_center_norm
                 )
-                proposal = replace(
-                    proposal,
-                    yaw_rate_rad_s=committed_successor_yaw_rate,
+                committed_successor_camera_center_rate = (
+                    successor_steering.camera_center_rate_norm_s
                 )
+                if (
+                    successor_steering.bearing_std_rad[0]
+                    <= maximum_std + _EPSILON
+                ):
+                    committed_successor_roll_authority = 1.0
+                    committed_successor_target_roll = _clamp(
+                        self.config.roll_guidance_sign
+                        * (
+                            self.config.roll_gain
+                            * successor_steering.stable_bearing_rad[0]
+                            + self.config.lateral_rate_gain
+                            * successor_steering
+                            .stable_bearing_rate_rad_s[0]
+                        ),
+                        -MAX_TARGET_ROLL_RAD,
+                        MAX_TARGET_ROLL_RAD,
+                    )
+                    committed_successor_yaw_authority = 1.0
+                    committed_successor_yaw_rate = _clamp(
+                        -self.config.yaw_gain
+                        * successor_prediction.bearing_rad[0],
+                        -MAX_YAW_RATE_RAD_S,
+                        MAX_YAW_RATE_RAD_S,
+                    )
+                    proposal = replace(
+                        proposal,
+                        target_roll_rad=(
+                            committed_successor_target_roll
+                        ),
+                        yaw_rate_rad_s=(
+                            committed_successor_yaw_rate
+                        ),
+                    )
+                if (
+                    successor_steering.bearing_std_rad[1]
+                    <= maximum_std + _EPSILON
+                ):
+                    committed_successor_pitch_authority = 1.0
+                    (
+                        committed_successor_target_pitch,
+                        _camera_elevation,
+                        _camera_elevation_rate,
+                        _pitch_delay_lead,
+                    ) = successor_camera_pitch_reference(
+                        camera_center_y_norm=(
+                            successor_steering.camera_center_norm[1]
+                        ),
+                        camera_center_rate_y_norm_s=(
+                            successor_steering
+                            .camera_center_rate_norm_s[1]
+                        ),
+                        vertical_angle_scale_rad=(
+                            self.config.vertical_angle_scale_rad
+                        ),
+                        pitch_command_delay_s=(
+                            self.config.pitch_command_delay_s
+                        ),
+                        maximum_lead_rad=maximum_std,
+                        baseline_pitch_rad=self.config.brake_pitch_rad,
+                    )
+                    proposal = replace(
+                        proposal,
+                        target_pitch_rad=(
+                            committed_successor_target_pitch
+                        ),
+                    )
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
             current_gate_index=state.current_gate_index,
@@ -3254,11 +3371,29 @@ class DynamicCourseCore:
             passage_yaw_authority=passage_yaw_authority,
             successor_yaw_contribution_rad=yaw_contribution,
             passage_committed=passage_committed,
+            committed_successor_roll_authority=(
+                committed_successor_roll_authority
+            ),
+            committed_successor_target_roll_rad=(
+                committed_successor_target_roll
+            ),
+            committed_successor_pitch_authority=(
+                committed_successor_pitch_authority
+            ),
+            committed_successor_target_pitch_rad=(
+                committed_successor_target_pitch
+            ),
             committed_successor_yaw_authority=(
                 committed_successor_yaw_authority
             ),
             committed_successor_yaw_rate_rad_s=(
                 committed_successor_yaw_rate
+            ),
+            committed_successor_camera_center_norm=(
+                committed_successor_camera_center
+            ),
+            committed_successor_camera_center_rate_norm_s=(
+                committed_successor_camera_center_rate
             ),
             successor_transition_held=successor_transition_held,
             current_time_to_contact_s=current.time_to_contact_s,
@@ -4128,4 +4263,5 @@ __all__ = [
     "TrackDynamicState",
     "TrackSteeringPrediction",
     "predict_aperture_relative_crossing",
+    "successor_camera_pitch_reference",
 ]

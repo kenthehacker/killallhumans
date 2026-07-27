@@ -2395,17 +2395,21 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
         passage_committed=True,
     )
     assert committed.passage_committed
+    assert committed.committed_successor_roll_authority == 1.0
+    assert committed.committed_successor_target_roll_rad is not None
+    assert committed.command.target_roll_rad == pytest.approx(
+        committed.committed_successor_target_roll_rad
+    )
+    assert committed.committed_successor_pitch_authority == 1.0
+    assert committed.committed_successor_target_pitch_rad is not None
+    assert committed.command.target_pitch_rad == pytest.approx(
+        committed.committed_successor_target_pitch_rad
+    )
     assert committed.committed_successor_yaw_authority == 1.0
     assert committed.committed_successor_yaw_rate_rad_s is not None
     assert committed.command.yaw_rate_rad_s < 0.0
     assert committed.command.yaw_rate_rad_s == pytest.approx(
         committed.committed_successor_yaw_rate_rad_s
-    )
-    assert committed.command.target_roll_rad == pytest.approx(
-        dropped.command.target_roll_rad
-    )
-    assert committed.command.target_pitch_rad == pytest.approx(
-        dropped.command.target_pitch_rad
     )
     assert committed.command.thrust == pytest.approx(
         dropped.command.thrust
@@ -2425,6 +2429,12 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     assert (
         abs(committed.command.yaw_rate_rad_s)
         <= MAX_YAW_RATE_RAD_S
+    )
+    assert abs(committed.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= committed.command.target_pitch_rad
+        <= MAX_TARGET_PITCH_RAD
     )
     _commit_decision(core, 1.21, dropped.command)
 
@@ -2498,16 +2508,20 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
         passage_committed=True,
     )
     assert expired_committed.passage_committed
+    assert expired_committed.committed_successor_roll_authority == 1.0
+    assert expired_committed.committed_successor_target_roll_rad is not None
+    assert expired_committed.command.target_roll_rad == pytest.approx(
+        expired_committed.committed_successor_target_roll_rad
+    )
+    assert expired_committed.committed_successor_pitch_authority == 1.0
+    assert expired_committed.committed_successor_target_pitch_rad is not None
+    assert expired_committed.command.target_pitch_rad == pytest.approx(
+        expired_committed.committed_successor_target_pitch_rad
+    )
     assert expired_committed.committed_successor_yaw_authority == 1.0
     assert expired_committed.committed_successor_yaw_rate_rad_s is not None
     assert expired_committed.command.yaw_rate_rad_s == pytest.approx(
         expired_committed.committed_successor_yaw_rate_rad_s
-    )
-    assert expired_committed.command.target_roll_rad == pytest.approx(
-        expired.command.target_roll_rad
-    )
-    assert expired_committed.command.target_pitch_rad == pytest.approx(
-        expired.command.target_pitch_rad
     )
     assert expired_committed.command.thrust == pytest.approx(
         expired.command.thrust
@@ -2525,6 +2539,15 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
         abs(expired_committed.command.yaw_rate_rad_s)
         <= MAX_YAW_RATE_RAD_S
     )
+    assert (
+        abs(expired_committed.command.target_roll_rad)
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert (
+        MIN_TARGET_PITCH_RAD
+        <= expired_committed.command.target_pitch_rad
+        <= MAX_TARGET_PITCH_RAD
+    )
 
     retained_successor = core.course_state().successor
     assert retained_successor is not None
@@ -2538,8 +2561,17 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
         passage_committed=True,
     )
     assert bounded_expiry.passage_committed
+    assert bounded_expiry.committed_successor_roll_authority == 0.0
+    assert bounded_expiry.committed_successor_target_roll_rad is None
+    assert bounded_expiry.committed_successor_pitch_authority == 0.0
+    assert bounded_expiry.committed_successor_target_pitch_rad is None
     assert bounded_expiry.committed_successor_yaw_authority == 0.0
     assert bounded_expiry.committed_successor_yaw_rate_rad_s is None
+    assert bounded_expiry.committed_successor_camera_center_norm is None
+    assert (
+        bounded_expiry.committed_successor_camera_center_rate_norm_s
+        is None
+    )
 
 
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:

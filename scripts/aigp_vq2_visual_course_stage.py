@@ -2106,7 +2106,7 @@ class _AcceptedVisualCommand:
     dynamic_evidence: Optional[Dict[str, Any]]
 
 
-def _refresh_committed_successor_yaw(
+def _refresh_committed_successor_steering(
     authority: _CensoredPassageCoastAuthority,
     accepted: _AcceptedVisualCommand,
     *,
@@ -2114,13 +2114,11 @@ def _refresh_committed_successor_yaw(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Carry one clean committed successor correction into crossing coast.
+    """Carry bounded committed successor steering into crossing coast.
 
-    The near-plane latch freezes current-gate roll, pitch, thrust, and
-    crossing geometry.  A later clean passage frame may still correct the
-    already-sealed successor bearing before the current aperture clips.  Only
-    that requested yaw is refreshed; the calibrated yaw soft stop and final
-    wire governor continue to own safety and continuity.
+    Current-gate clearance is already sealed before this is callable.
+    Successor roll/pitch/yaw remain steering-only; thrust, passage geometry,
+    promotion, safety limits, and the final wire governor are unchanged.
     """
 
     if (
@@ -2136,23 +2134,12 @@ def _refresh_committed_successor_yaw(
         or authority.track_id != current_track_id
     ):
         raise ValueError(
-            "committed successor yaw refresh identity is invalid"
+            "committed successor steering refresh identity is invalid"
         )
     evidence = accepted.dynamic_evidence
     if (
         evidence is None
         or evidence.get("passage_committed") is not True
-        or accepted.yaw_soft_stop_zeroed
-    ):
-        return authority
-    censored_axes = evidence.get("current_censored_axes")
-    if (
-        evidence.get("current_visible") is not True
-        or evidence.get("current_ambiguous") is not False
-        or not isinstance(censored_axes, (list, tuple))
-        or len(censored_axes) != 2
-        or any(type(value) is not bool for value in censored_axes)
-        or censored_axes[0]
     ):
         return authority
     if (
@@ -2163,30 +2150,71 @@ def _refresh_committed_successor_yaw(
         != reviewed_successor_track_id
     ):
         raise ValueError(
-            "committed successor yaw refresh lacks clean exact lineage"
+            "committed successor steering lacks exact lineage"
         )
-    committed_authority = evidence.get(
-        "committed_successor_yaw_authority"
+
+    def admitted_axis(
+        authority_name: str,
+        value_name: str,
+        *,
+        lower: float,
+        upper: float,
+    ) -> Optional[float]:
+        axis_authority = evidence.get(authority_name)
+        value = evidence.get(value_name)
+        if axis_authority == 0.0 and value is None:
+            return None
+        if (
+            type(axis_authority) not in {int, float}
+            or float(axis_authority) != 1.0
+            or type(value) not in {int, float}
+            or not math.isfinite(float(value))
+            or not lower - 1e-12 <= float(value) <= upper + 1e-12
+        ):
+            raise ValueError(
+                f"committed successor {value_name} escaped its authority"
+            )
+        return float(value)
+
+    committed_roll = admitted_axis(
+        "committed_successor_roll_authority",
+        "committed_successor_target_roll_rad",
+        lower=-MAX_VISUAL_TARGET_ROLL_RAD,
+        upper=MAX_VISUAL_TARGET_ROLL_RAD,
     )
-    committed_yaw = evidence.get(
-        "committed_successor_yaw_rate_rad_s"
+    committed_pitch = admitted_axis(
+        "committed_successor_pitch_authority",
+        "committed_successor_target_pitch_rad",
+        lower=MIN_VISUAL_TARGET_PITCH_RAD,
+        upper=MAX_VISUAL_TARGET_PITCH_RAD,
     )
-    if committed_authority == 0.0 and committed_yaw is None:
-        return authority
-    if (
-        type(committed_authority) not in {int, float}
-        or float(committed_authority) != 1.0
-        or type(committed_yaw) not in {int, float}
-        or not math.isfinite(float(committed_yaw))
-        or abs(float(committed_yaw))
-        > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
-    ):
-        raise ValueError(
-            "committed successor yaw refresh escaped its authority"
+    committed_yaw = (
+        None
+        if accepted.yaw_soft_stop_zeroed
+        else admitted_axis(
+            "committed_successor_yaw_authority",
+            "committed_successor_yaw_rate_rad_s",
+            lower=-MAX_VISUAL_YAW_RATE_RAD_S,
+            upper=MAX_VISUAL_YAW_RATE_RAD_S,
         )
+    )
     return replace(
         authority,
-        yaw_rate_rad_s=float(committed_yaw),
+        target_roll_rad=(
+            authority.target_roll_rad
+            if committed_roll is None
+            else committed_roll
+        ),
+        target_pitch_rad=(
+            authority.target_pitch_rad
+            if committed_pitch is None
+            else committed_pitch
+        ),
+        yaw_rate_rad_s=(
+            authority.yaw_rate_rad_s
+            if committed_yaw is None
+            else committed_yaw
+        ),
     )
 
 
@@ -6398,8 +6426,8 @@ async def _run_visual_course_stage_impl(
             "next_preview_retired": False,
             "yaw_soft_stop_zero_command_count": 0,
             "passage_admission_yaw_soft_stop_withheld_count": 0,
-            "committed_successor_yaw_refresh_count": 0,
-            "last_committed_successor_yaw_refresh": None,
+            "committed_successor_steering_refresh_count": 0,
+            "last_committed_successor_steering_refresh": None,
             "crossing_wait_zero_command_count": 0,
             "crossing_wait_coast_command_count": 0,
             "crossing_wait_adjacent_command_count": 0,
@@ -8947,12 +8975,14 @@ async def _run_visual_course_stage_impl(
                 and crossing_successor_identity_sealed
                 and crossing_reviewed_track_id is not None
             ):
-                prior_crossing_yaw = (
-                    crossing_coast_authority.yaw_rate_rad_s
+                prior_crossing_targets = (
+                    crossing_coast_authority.target_roll_rad,
+                    crossing_coast_authority.target_pitch_rad,
+                    crossing_coast_authority.yaw_rate_rad_s,
                 )
                 try:
                     refreshed_crossing_authority = (
-                        _refresh_committed_successor_yaw(
+                        _refresh_committed_successor_steering(
                             crossing_coast_authority,
                             accepted,
                             gate_index=current_gate_index,
@@ -8964,19 +8994,16 @@ async def _run_visual_course_stage_impl(
                     )
                 except (TypeError, ValueError) as exc:
                     raise abort_type(
-                        "visual-course committed successor yaw refresh "
+                        "visual-course committed successor steering refresh "
                         f"refused: {exc}"
                     ) from exc
-                if (
-                    refreshed_crossing_authority.yaw_rate_rad_s
-                    != prior_crossing_yaw
-                ):
+                if refreshed_crossing_authority != crossing_coast_authority:
                     crossing_coast_authority = (
                         refreshed_crossing_authority
                     )
                     refresh_evidence = {
                         "basis": (
-                            "clean-committed-successor-crossing-yaw-v1"
+                            "bounded-committed-successor-crossing-steering-v1"
                         ),
                         "camera_token": asdict(
                             accepted.wire_camera_token
@@ -8984,29 +9011,35 @@ async def _run_visual_course_stage_impl(
                         "reviewed_successor_track_id": (
                             crossing_reviewed_track_id
                         ),
-                        "previous_yaw_rate_rad_s": prior_crossing_yaw,
-                        "requested_yaw_rate_rad_s": (
-                            crossing_coast_authority.yaw_rate_rad_s
+                        "previous_target_attitude_yaw": list(
+                            prior_crossing_targets
                         ),
-                        "accepted_wire_yaw_rate_rad_s": (
-                            accepted.command.yaw_rate
-                        ),
+                        "requested_target_attitude_yaw": [
+                            crossing_coast_authority.target_roll_rad,
+                            crossing_coast_authority.target_pitch_rad,
+                            crossing_coast_authority.yaw_rate_rad_s,
+                        ],
+                        "accepted_wire_body_rates": [
+                            accepted.command.roll_rate,
+                            accepted.command.pitch_rate,
+                            accepted.command.yaw_rate,
+                        ],
                         "steering_only": True,
                         "passage_authority": False,
                         "advance_authority": False,
                     }
                     segment[
-                        "committed_successor_yaw_refresh_count"
+                        "committed_successor_steering_refresh_count"
                     ] = int(
                         segment[
-                            "committed_successor_yaw_refresh_count"
+                            "committed_successor_steering_refresh_count"
                         ]
                     ) + 1
                     segment[
-                        "last_committed_successor_yaw_refresh"
+                        "last_committed_successor_steering_refresh"
                     ] = refresh_evidence
                     host.recorder.emit(
-                        "visual_course_committed_successor_yaw_refreshed",
+                        "visual_course_committed_successor_steering_refreshed",
                         gate_index=current_gate_index,
                         stage=(
                             f"{VISUAL_COURSE_STAGE}/gate"
