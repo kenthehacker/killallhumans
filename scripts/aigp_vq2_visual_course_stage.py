@@ -786,7 +786,13 @@ def _allocate_fresh_top_censored_closure_recovery(
         and current_visible
         and not current_ambiguous
         and current_missed_count == 0
-        and current_censored_axes == (False, True)
+        and (
+            current_censored_axes == (False, True)
+            or (
+                boundary_authorized
+                and current_censored_axes == (False, False)
+            )
+        )
         and (
             boundary_authorized
             or (

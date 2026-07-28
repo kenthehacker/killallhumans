@@ -3286,6 +3286,39 @@ def test_fresh_post_credit_boundary_cannot_override_bad_current_lineage():
     )
 
 
+def test_fresh_raw_top_boundary_retains_tracking_only_inner_steering():
+    state, decision, source, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    boundary = course_stage._fresh_post_credit_top_boundary_authority(
+        state=state,
+        decision=decision,
+        authority=source,
+        recovery_snapshot=snapshot,
+        current_gate_index=1,
+    )
+    overrides = {
+        "current_censored_axes": (False, False),
+        "current_aperture_propagated": False,
+        "current_aperture_dynamics_qualified": False,
+        "stable_center_norm": (0.3905, -0.9399),
+        "expansion_rate_s": 0.0237,
+        "time_to_contact_s": None,
+    }
+
+    allocation = _dd89_top_censored_recovery(
+        **overrides,
+        fresh_boundary_current_authority=boundary,
+    )
+
+    assert allocation is not None
+    assert allocation.allocated_target_pitch_rad == 0.0
+    assert allocation.forward_closure_authorized is False
+    assert allocation.passage_authority is False
+    assert allocation.advance_authority is False
+    assert _dd89_top_censored_recovery(**overrides) is None
+
+
 def test_fresh_top_boundary_command_still_uses_final_wire_governor():
     session = DynamicVisualCourseSession()
     seed_ns = 1_000_000_000
