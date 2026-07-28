@@ -39,7 +39,10 @@ MAX_VISUAL_YAW_RATE_RAD_S = 0.15
 MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = 0.65
 VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = 0.60
 MAX_VISUAL_SEGMENT_DURATION_S = 8.0
-MAX_VISUAL_TARGET_ROLL_RAD = 0.17
+# Keep the stage-side target-attitude validation envelope coherent with the
+# dynamic controller's isolated 0.20-rad Gate-1 authority A/B.  The final
+# physical wire-rate envelope remains independently fixed at 0.25 rad/s.
+MAX_VISUAL_TARGET_ROLL_RAD = 0.20
 MIN_VISUAL_TARGET_PITCH_RAD = -0.35
 MAX_VISUAL_TARGET_PITCH_RAD = 0.15
 MIN_VISUAL_THRUST = 0.21
