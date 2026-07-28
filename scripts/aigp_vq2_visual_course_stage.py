@@ -7189,7 +7189,6 @@ def _unlatched_atomic_credit_successor_evidence(
         or getattr(snapshot, "withholding_reason", None)
         != "current_track_not_visible"
         or getattr(snapshot, "next_selection_ambiguous", True) is not False
-        or getattr(snapshot, "provisional_track_ids", ()) != ()
         or current is None
         or getattr(current, "track_id", None) != current_track_id
         or getattr(current, "role", None) is not VisualTrackRole.CURRENT

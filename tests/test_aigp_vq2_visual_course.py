@@ -3005,7 +3005,7 @@ def test_atomic_credit_during_clipped_gap_uses_sole_graph_successor_only():
     )
     snapshot.withholding_reason = "current_track_not_visible"
     snapshot.next_selection_ambiguous = False
-    snapshot.provisional_track_ids = ()
+    snapshot.provisional_track_ids = ("unrelated-one-frame-fragment",)
     successor = SimpleNamespace(
         track_id="track-9",
         latest_token=token,
@@ -8686,7 +8686,9 @@ def test_delayed_atomic_credit_uses_sole_clipped_gap_successor():
             snapshot.authority_usable = False
             snapshot.withholding_reason = "current_track_not_visible"
             snapshot.next_selection_ambiguous = False
-            snapshot.provisional_track_ids = ()
+            snapshot.provisional_track_ids = (
+                "unrelated-one-frame-fragment",
+            )
             snapshot.current_track.ambiguous = False
             snapshot.current_track.missed_frame_count = 5
             snapshot.current_track.clipping = FrameEdge.TOP
