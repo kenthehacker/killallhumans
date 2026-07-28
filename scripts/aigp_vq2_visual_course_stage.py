@@ -6931,11 +6931,6 @@ async def _run_visual_course_stage_impl(
                 and getattr(target_track, "missed_frame_count", None) == 0
             ):
                 try:
-                    horizontal_course = (
-                        dynamic_controller.core.course_state()
-                    )
-                    horizontal_current = horizontal_course.current
-                    horizontal_decision = dynamic_controller.last_decision
                     horizontal_history = getattr(
                         target_track,
                         "history",
@@ -6950,51 +6945,16 @@ async def _run_visual_course_stage_impl(
                     if (
                         top_fov_observation is None
                         or top_fov_proposal is None
-                        or horizontal_decision is None
                         or horizontal_sample is None
-                        or getattr(snapshot, "current_gate_index", None)
-                        != current_gate_index
-                        or getattr(snapshot, "current_track_id", None)
-                        != current_track_id
-                        or getattr(snapshot, "authority_usable", None)
-                        is not True
-                        or getattr(snapshot, "withholding_reason", None)
-                        is not None
-                        or getattr(snapshot, "race_finished", None)
-                        is not False
-                        or horizontal_course.current_gate_index
-                        != current_gate_index
-                        or horizontal_course.current_track_id
-                        != current_track_id
-                        or horizontal_current.track_id
-                        != current_track_id
-                        or horizontal_decision.current_gate_index
-                        != current_gate_index
-                        or horizontal_decision.current_track_id
-                        != current_track_id
-                        or getattr(target_track, "track_id", None)
-                        != current_track_id
-                        or getattr(target_track, "role", None)
-                        is not VisualTrackRole.CURRENT
-                        or getattr(
-                            target_track,
-                            "authoritative_gate_index",
-                            None,
-                        )
-                        != current_gate_index
-                        or getattr(target_track, "latest_token", None)
-                        != snapshot.latest_camera_token
-                        or horizontal_sample.token
-                        != snapshot.latest_camera_token
-                        or horizontal_current.frame_sequence
-                        != horizontal_sample.tracker_frame_sequence
-                        or horizontal_current.stream_generation
-                        != snapshot.latest_camera_token.generation
                     ):
                         raise ValueError(
-                            "fresh horizontal-FOV brake differs from "
-                            "authoritative current lineage"
+                            "fresh horizontal-FOV brake lacks the admitted "
+                            "raw current"
                         )
+                    # _top_fov_observation has already proved this exact
+                    # sample/token against the dynamic authoritative CURRENT.
+                    # Reuse that admission instead of maintaining a second,
+                    # subtly different lineage contract here.
                     horizontal_fov_closure_brake = (
                         _allocate_fresh_horizontal_fov_closure_brake(
                             bbox_norm_ltrb=horizontal_sample.bbox_norm,
@@ -7008,15 +6968,22 @@ async def _run_visual_course_stage_impl(
                             center_censored=(
                                 target_track.center_censored
                             ),
-                            current_visible=horizontal_current.visible,
+                            current_visible=target_track.visible,
                             current_ambiguous=(
-                                horizontal_current.ambiguous
+                                target_track.ambiguous
                             ),
                             current_missed_count=(
-                                horizontal_current.missed_count
+                                target_track.missed_frame_count
                             ),
                             current_censored_axes=(
-                                horizontal_current.censored_axes
+                                bool(
+                                    proposal.current_target
+                                    .horizontal_geometry_censored
+                                ),
+                                bool(
+                                    proposal.current_target
+                                    .vertical_geometry_censored
+                                ),
                             ),
                             passage_committed=bool(
                                 proposal.mode
