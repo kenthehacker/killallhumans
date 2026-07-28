@@ -38,6 +38,7 @@ from planning.vq2_visual_approach import (
 from planning.vq2_visual_servo import (
     MAX_VISUAL_TARGET_PITCH_RAD,
     MAX_VISUAL_THRUST,
+    VisualServoRefusal,
 )
 
 
@@ -1686,6 +1687,35 @@ def test_nonpromotable_adjacent_with_relationship_is_unavailable() -> None:
     with pytest.raises(
         VisualApproachAdjacentUnavailable,
         match="adjacent authority is unavailable",
+    ):
+        adjacent.observe_promotable_adjacent(
+            snapshot,
+            tracker,
+            now_monotonic_s=_now_s(tracker),
+            segment_elapsed_s=0.5,
+            segment_yaw_excursion_rad=0.0,
+        )
+
+
+def test_adjacent_servo_refusal_is_optional_authority_unavailable() -> None:
+    tracker, _, snapshot, _, next_id, _ = _build_bound_graph()
+    assert next_id is not None
+    adjacent = RollingVisualApproachServo(
+        next_id,
+        1,
+        next_gate_blend=_CONFIGURED_NEXT_BLEND,
+    )
+
+    def refuse(*_args, **_kwargs):
+        raise VisualServoRefusal(
+            "precredit successor steering prediction is unavailable"
+        )
+
+    adjacent._servo.step = refuse
+
+    with pytest.raises(
+        VisualApproachAdjacentUnavailable,
+        match="precredit successor steering prediction is unavailable",
     ):
         adjacent.observe_promotable_adjacent(
             snapshot,

@@ -721,7 +721,7 @@ class RollingVisualApproachServo:
                 allow_passage_safe_next_blend=False,
             )
         except VisualServoRefusal as exc:
-            raise VisualApproachRefusal(
+            raise VisualApproachAdjacentUnavailable(
                 "credit-wait adjacent servo refused authority: "
                 f"{exc}"
             ) from exc
