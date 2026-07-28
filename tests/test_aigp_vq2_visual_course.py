@@ -6711,27 +6711,23 @@ def _fresh_search_track(
 @pytest.mark.parametrize(
     (
         "clipping",
-        "last_protected_pitch",
         "expected_pitch",
         "expected_thrust",
     ),
     (
-        (FrameEdge.TOP, -0.186, -0.186, 0.32),
-        (FrameEdge.TOP | FrameEdge.RIGHT, -0.135, -0.135, 0.32),
-        (FrameEdge.TOP, None, 0.12, 0.32),
-        (FrameEdge.RIGHT, -0.186, 0.12, 0.275),
+        (FrameEdge.TOP, 0.12, 0.32),
+        (FrameEdge.TOP | FrameEdge.RIGHT, 0.12, 0.32),
+        (FrameEdge.RIGHT, 0.12, 0.275),
     ),
 )
-def test_expired_geometry_search_retains_only_valid_top_vertical_recovery(
+def test_expired_geometry_search_brakes_with_top_collective_support(
     clipping,
-    last_protected_pitch,
     expected_pitch,
     expected_thrust,
 ):
     pitch, thrust = (
         course_stage._approach_expired_geometry_search_vertical_reference(
             current_clipping=clipping,
-            last_protected_target_pitch_rad=last_protected_pitch,
             brake_pitch_rad=0.12,
             brake_thrust=0.275,
             support_thrust=0.32,
@@ -6751,17 +6747,18 @@ def test_expired_geometry_search_uses_sole_fresh_horizontal_detection():
         tracks=(track,),
         gate_index=1,
         track_id="track-1",
+        excluded_track_ids_at_start=("track-1",),
         retained_horizontal_edge=FrameEdge.NONE,
         brake_pitch_rad=0.12,
         requested_thrust=0.275,
         tuning=default_visual_config().servo,
     )
 
-    assert authority.source == "sole-fresh-visible-track"
+    assert authority.source == "sole-fresh-post-search-track"
     assert authority.observed_track_id == "fresh-1"
     assert authority.observed_source_index == 3
     assert authority.horizontal_norm == pytest.approx(0.60)
-    assert authority.command.target_roll_rad == 0.0
+    assert authority.command.target_roll_rad < 0.0
     assert authority.command.target_pitch_rad == pytest.approx(0.12)
     assert authority.command.yaw_rate_rad_s < 0.0
     assert authority.command.requested_thrust == pytest.approx(0.275)
@@ -6780,6 +6777,7 @@ def test_expired_geometry_search_uses_only_side_bit_when_fresh_view_is_not_uniqu
         tracks=tracks,
         gate_index=1,
         track_id="track-1",
+        excluded_track_ids_at_start=("track-1",),
         retained_horizontal_edge=FrameEdge.RIGHT,
         brake_pitch_rad=0.12,
         requested_thrust=0.275,
@@ -6791,7 +6789,9 @@ def test_expired_geometry_search_uses_only_side_bit_when_fresh_view_is_not_uniqu
     assert authority.observed_source_index is None
     assert authority.horizontal_norm == 1.0
     assert authority.command.yaw_rate_rad_s < 0.0
-    assert authority.command.target_roll_rad == 0.0
+    assert authority.command.target_roll_rad == pytest.approx(
+        -course_stage.MAX_VISUAL_TARGET_ROLL_RAD
+    )
 
 
 def test_expired_geometry_search_does_not_consume_stale_detection():
@@ -6803,6 +6803,7 @@ def test_expired_geometry_search_does_not_consume_stale_detection():
         tracks=(stale,),
         gate_index=1,
         track_id="track-1",
+        excluded_track_ids_at_start=("track-1",),
         retained_horizontal_edge=FrameEdge.NONE,
         brake_pitch_rad=0.12,
         requested_thrust=0.275,
@@ -6812,6 +6813,35 @@ def test_expired_geometry_search_does_not_consume_stale_detection():
     assert authority.source == "neutral-no-unique-horizontal-evidence"
     assert authority.horizontal_norm == 0.0
     assert authority.command.yaw_rate_rad_s == 0.0
+
+
+def test_expired_geometry_search_ignores_tracks_present_at_search_start():
+    snapshot = _expired_geometry_search_snapshot()
+    known_next = _fresh_search_track(
+        snapshot.latest_camera_token,
+        track_id="known-next",
+        horizontal=-0.62,
+    )
+
+    authority = course_stage._approach_expired_geometry_search_authority(
+        snapshot=snapshot,
+        tracks=(known_next,),
+        gate_index=1,
+        track_id="track-1",
+        excluded_track_ids_at_start=("known-next", "track-1"),
+        retained_horizontal_edge=FrameEdge.RIGHT,
+        brake_pitch_rad=0.12,
+        requested_thrust=0.32,
+        tuning=default_visual_config().servo,
+    )
+
+    assert authority.source == "retained-right-edge-bit"
+    assert authority.observed_track_id is None
+    assert authority.horizontal_norm == 1.0
+    assert authority.command.target_roll_rad == pytest.approx(
+        -course_stage.MAX_VISUAL_TARGET_ROLL_RAD
+    )
+    assert authority.command.yaw_rate_rad_s < 0.0
 
 
 def test_missing_local_state_transitions_directly_to_fresh_search():

@@ -4542,12 +4542,11 @@ class _ApproachExpiredGeometrySearchAuthority:
 def _approach_expired_geometry_search_vertical_reference(
     *,
     current_clipping: FrameEdge,
-    last_protected_target_pitch_rad: Optional[float],
     brake_pitch_rad: float,
     brake_thrust: float,
     support_thrust: float,
 ) -> tuple[float, float]:
-    """Carry a bounded TOP recovery reference into fresh-frame search."""
+    """Brake forward motion while retaining bounded TOP collective support."""
 
     brake_pitch, brake_collective, support_collective = map(
         float,
@@ -4567,15 +4566,7 @@ def _approach_expired_geometry_search_vertical_reference(
     ):
         raise ValueError("expired-geometry search vertical input is invalid")
     if current_clipping & FrameEdge.TOP:
-        protected = (
-            float("nan")
-            if last_protected_target_pitch_rad is None
-            else float(last_protected_target_pitch_rad)
-        )
-        return (
-            protected if math.isfinite(protected) else brake_pitch,
-            support_collective,
-        )
+        return brake_pitch, support_collective
     return brake_pitch, brake_collective
 
 
@@ -4615,6 +4606,7 @@ def _approach_expired_geometry_search_authority(
     tracks: tuple[Any, ...],
     gate_index: int,
     track_id: str,
+    excluded_track_ids_at_start: tuple[str, ...],
     retained_horizontal_edge: FrameEdge,
     brake_pitch_rad: float,
     requested_thrust: float,
@@ -4629,6 +4621,17 @@ def _approach_expired_geometry_search_authority(
     if (
         type(token) is not CameraFrameToken
         or type(tracks) is not tuple
+        or type(excluded_track_ids_at_start) is not tuple
+        or not excluded_track_ids_at_start
+        or any(
+            type(excluded_id) is not str or not excluded_id
+            for excluded_id in excluded_track_ids_at_start
+        )
+        or tuple(sorted(excluded_track_ids_at_start))
+        != excluded_track_ids_at_start
+        or len(set(excluded_track_ids_at_start))
+        != len(excluded_track_ids_at_start)
+        or track_id not in excluded_track_ids_at_start
         or type(gate_index) is not int
         or type(track_id) is not str
         or not track_id
@@ -4653,11 +4656,12 @@ def _approach_expired_geometry_search_authority(
     ):
         raise ValueError("expired-geometry search structure is invalid")
 
-    fresh_tracks = []
+    fresh_post_search_tracks = []
     for track in tracks:
         history = getattr(track, "history", None)
         center = getattr(track, "center_norm", None)
         role = getattr(track, "role", None)
+        candidate_track_id = getattr(track, "track_id", None)
         if (
             getattr(track, "visible", False) is not True
             or getattr(track, "ambiguous", True) is not False
@@ -4665,6 +4669,7 @@ def _approach_expired_geometry_search_authority(
             or getattr(track, "latest_token", None) != token
             or role
             in {VisualTrackRole.RETIRED, VisualTrackRole.AMBIGUOUS}
+            or candidate_track_id in excluded_track_ids_at_start
             or type(history) is not tuple
             or not history
             or getattr(history[-1], "token", None) != token
@@ -4680,19 +4685,19 @@ def _approach_expired_geometry_search_authority(
             or abs(float(center[0])) > 1.0
         ):
             continue
-        fresh_tracks.append(track)
+        fresh_post_search_tracks.append(track)
 
     observed_track_id: Optional[str] = None
     observed_source_index: Optional[int] = None
-    if len(fresh_tracks) == 1:
-        observed = fresh_tracks[0]
+    if len(fresh_post_search_tracks) == 1:
+        observed = fresh_post_search_tracks[0]
         observed_id = getattr(observed, "track_id", None)
         if type(observed_id) is not str or not observed_id:
             raise ValueError("fresh search track identity is invalid")
         observed_track_id = observed_id
         observed_source_index = int(observed.history[-1].source_index)
         horizontal = float(observed.center_norm[0])
-        source = "sole-fresh-visible-track"
+        source = "sole-fresh-post-search-track"
     elif retained_horizontal_edge is FrameEdge.LEFT:
         horizontal = -1.0
         source = "retained-left-edge-bit"
@@ -4704,12 +4709,24 @@ def _approach_expired_geometry_search_authority(
         source = "neutral-no-unique-horizontal-evidence"
 
     yaw_rate = visual_bearing_yaw_rate(horizontal, 0.0, tuning)
+    horizontal_corridor = float(tuning.horizontal_corridor)
+    if not math.isfinite(horizontal_corridor) or horizontal_corridor <= 0.0:
+        raise ValueError("fresh search horizontal corridor is invalid")
+    bank_load = min(1.0, abs(horizontal) / horizontal_corridor)
+    target_roll = (
+        0.0
+        if bank_load == 0.0
+        else math.copysign(
+            bank_load * MAX_VISUAL_TARGET_ROLL_RAD,
+            -horizontal,
+        )
+    )
     return _ApproachExpiredGeometrySearchAuthority(
         command=_CensoredPassageCoastAuthority(
             gate_index=gate_index,
             track_id=track_id,
             anchor_camera_token=token,
-            target_roll_rad=0.0,
+            target_roll_rad=target_roll,
             target_pitch_rad=brake_pitch,
             yaw_rate_rad_s=yaw_rate,
             requested_thrust=thrust,
@@ -12741,9 +12758,6 @@ async def _run_visual_course_stage_impl(
                                             else FrameEdge.NONE
                                         )
                                     ),
-                                    last_protected_target_pitch_rad=segment[
-                                        "top_fov_pitch_protection"
-                                    ].get("last_protected_target_pitch_rad"),
                                     brake_pitch_rad=float(
                                         dynamic_controller.core.config
                                         .brake_pitch_rad
@@ -12766,6 +12780,10 @@ async def _run_visual_course_stage_impl(
                                     tracks=host.visual_tracker.tracks(),
                                     gate_index=current_gate_index,
                                     track_id=current_track_id,
+                                    excluded_track_ids_at_start=(
+                                        approach_same_gate_rebind_search
+                                        .excluded_track_ids_at_start
+                                    ),
                                     retained_horizontal_edge=(
                                         approach_expired_geometry_search_horizontal_edge
                                     ),
