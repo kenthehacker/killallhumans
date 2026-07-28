@@ -135,11 +135,12 @@ def production_dynamic_course_config() -> DynamicCourseConfig:
         camera_to_body_wxyz=(
             BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
         ),
-        # The camera derotation map and translational bank response are separate
-        # conventions.  Fixed-variable Gate-1 flights showed that negative bank
-        # drives a positive stable/image error farther right; positive bank is
-        # the empirically convergent lateral demand.
-        roll_guidance_sign=1.0,
+        # Rx(pi) maps camera/image right to body-FRD left.  Positive body roll
+        # accelerates toward body right, so a positive stable gate bearing
+        # requires negative bank.  With the heading preview and crossing
+        # command held fixed, positive bank left the Gate-1 residual moving
+        # outward after the measured attitude had settled.
+        roll_guidance_sign=-1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
         roll_to_lateral_bearing_accel=0.0,
