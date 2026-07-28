@@ -645,6 +645,9 @@ class DynamicVisualCourseSession:
             track_ids.add(course_state.current_track_id)
             if course_state.successor_track_id is not None:
                 track_ids.add(course_state.successor_track_id)
+        known_dynamic_track_ids = {
+            state.track_id for state in self.core.track_states
+        }
         current_raw_clipping = FrameEdge.NONE
         for track_id in sorted(track_ids):
             try:
@@ -653,6 +656,20 @@ class DynamicVisualCourseSession:
                 continue
             if track_id == expected_current_track_id:
                 current_raw_clipping = track.clipping
+            if (
+                not track.visible
+                and track_id not in known_dynamic_track_ids
+            ):
+                if track_id == expected_current_track_id:
+                    raise VisualApproachRefusal(
+                        "dynamic current cannot initialize from an "
+                        "invisible track"
+                    )
+                # A candidate that appeared only in receiver publications
+                # skipped by this controller has no dynamic state and no
+                # steering authority. Ignore it until a visible publication
+                # can initialize it; this is normal tracker churn.
+                continue
             if self._last_frame_by_track.get(track_id) == (
                 update.tracker_frame_sequence
             ):

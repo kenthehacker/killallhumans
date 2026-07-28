@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 import math
+from types import SimpleNamespace
 
 import pytest
 
@@ -5037,6 +5038,72 @@ def test_same_gate_rebind_replaces_dynamic_current_on_binding_frame() -> None:
             proposal.servo_output.thrust,
         )
     )
+
+
+def test_stage_snapshot_ignores_uninitialized_invisible_candidate() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+
+    churn_id = ""
+    for sequence in range(6, 9):
+        base = _frame(sequence, include_successor=False)
+        update = tracker.update(
+            replace(
+                base,
+                detections=(
+                    *base.detections,
+                    _detection(
+                        2,
+                        -0.78,
+                        center_y=0.62,
+                        width=0.08,
+                        height=0.10,
+                    ),
+                ),
+            )
+        )
+        created = tuple(
+            track_id
+            for track_id in update.created_track_ids
+            if track_id != current_id
+        )
+        if created:
+            assert not churn_id
+            assert len(created) == 1
+            churn_id = created[0]
+        snapshot = graph.observe(tracker)
+    assert churn_id
+
+    update = tracker.update(_frame(9, include_successor=False))
+    snapshot = graph.observe(tracker)
+    assert not tracker.track(churn_id).visible
+    snapshot = replace(
+        snapshot,
+        next_candidates=(SimpleNamespace(track_id=churn_id),),
+    )
+
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+
+    assert churn_id not in {
+        state.track_id for state in session.core.track_states
+    }
+    assert session._last_frame_by_track.get(churn_id) is None  # noqa: SLF001
 
 
 def test_post_credit_activation_latency_never_extends_prediction_expiry():
