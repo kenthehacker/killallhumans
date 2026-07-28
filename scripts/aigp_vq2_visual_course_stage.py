@@ -870,6 +870,91 @@ def _approach_top_recovery_reacquisition_outcome(
     return None
 
 
+def _retire_promote_reacquire_top_recovery_on_clean_wire(
+    *,
+    recovery_started_s: Any,
+    recovery_summary: Any,
+    wire_camera_token: Any,
+    current_gate_index: Any,
+    current_track_id: Any,
+    current_track: Any,
+) -> bool:
+    """Retire a TOP steering bridge on an exact accepted clean recovery wire."""
+
+    if recovery_started_s is None:
+        return False
+    if (
+        type(recovery_started_s) not in {int, float}
+        or not math.isfinite(float(recovery_started_s))
+        or float(recovery_started_s) < 0.0
+        or not isinstance(recovery_summary, dict)
+        or type(wire_camera_token) is not CameraFrameToken
+        or type(current_gate_index) is not int
+        or type(current_track_id) is not str
+        or not current_track_id
+        or current_track is None
+        or recovery_summary.get("source_decision_gate_index")
+        != current_gate_index
+        or recovery_summary.get("source_decision_track_id")
+        != current_track_id
+        or recovery_summary.get("steering_only") is not True
+        or recovery_summary.get("passage_authority") is not False
+        or recovery_summary.get("advance_authority") is not False
+        or getattr(current_track, "track_id", None) != current_track_id
+        or getattr(current_track, "latest_token", None)
+        != wire_camera_token
+        or getattr(current_track, "role", None)
+        is not VisualTrackRole.CURRENT
+        or getattr(
+            current_track,
+            "authoritative_gate_index",
+            None,
+        )
+        != current_gate_index
+        or getattr(current_track, "visible", None) is not True
+        or getattr(current_track, "ambiguous", None) is not False
+        or getattr(current_track, "missed_frame_count", None) != 0
+    ):
+        raise ValueError(
+            "PROMOTE_REACQUIRE TOP recovery clean wire lacks exact lineage"
+        )
+    try:
+        recovery_horizontal_edge = FrameEdge(
+            int(
+                recovery_summary.get(
+                    "horizontal_edge",
+                    int(FrameEdge.NONE),
+                )
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "PROMOTE_REACQUIRE TOP recovery edge is invalid"
+        ) from exc
+    outcome = _approach_top_recovery_reacquisition_outcome(
+        recovery_horizontal_edge=recovery_horizontal_edge,
+        clipping=getattr(current_track, "clipping", None),
+        center_censored=getattr(
+            current_track,
+            "center_censored",
+            None,
+        ),
+    )
+    if outcome != "clean_geometry_reacquired":
+        raise ValueError(
+            "PROMOTE_REACQUIRE TOP recovery wire is not clean"
+        )
+    recovery_summary.update(
+        {
+            "clean_reacquired_camera_token": asdict(
+                wire_camera_token
+            ),
+            "outcome": outcome,
+        }
+    )
+    return True
+
+
 def _fresh_exact_top_boundary_preempts_propagated_fov(
     clipping: Any,
 ) -> bool:
@@ -12557,6 +12642,45 @@ async def _run_visual_course_stage_impl(
                     segment["recovery_clean_command_count"] = int(
                         segment["recovery_clean_command_count"]
                     ) + 1
+                    recovery_summary = segment[
+                        "approach_top_recovery"
+                    ]
+                    try:
+                        top_recovery_retired = (
+                            _retire_promote_reacquire_top_recovery_on_clean_wire(
+                                recovery_started_s=(
+                                    approach_top_recovery_started_s
+                                ),
+                                recovery_summary=recovery_summary,
+                                wire_camera_token=(
+                                    accepted.wire_camera_token
+                                ),
+                                current_gate_index=current_gate_index,
+                                current_track_id=current_track_id,
+                                current_track=getattr(
+                                    snapshot,
+                                    "current_track",
+                                    None,
+                                ),
+                            )
+                        )
+                    except ValueError as exc:
+                        raise abort_type(
+                            "visual-course PROMOTE_REACQUIRE TOP recovery "
+                            f"clean retirement refused: {exc}"
+                        ) from exc
+                    if top_recovery_retired:
+                        assert isinstance(recovery_summary, dict)
+                        host.recorder.emit(
+                            "visual_course_approach_top_recovery_completed",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/recovery-clean"
+                            ),
+                            **recovery_summary,
+                        )
+                        approach_top_recovery_started_s = None
                     if recovery_first_clean_wire_token is None:
                         recovery_first_clean_wire_token = (
                             accepted.wire_camera_token

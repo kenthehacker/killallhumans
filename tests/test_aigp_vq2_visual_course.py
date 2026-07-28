@@ -3753,6 +3753,115 @@ def test_top_corner_continuity_classifies_only_reduced_censorship(
     )
 
 
+def _promote_reacquire_top_recovery_clean_wire_case():
+    _state, _decision, _authority, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    snapshot.current_track.clipping = FrameEdge.NONE
+    snapshot.current_track.center_censored = False
+    summary = {
+        "horizontal_edge": int(FrameEdge.NONE),
+        "source_decision_gate_index": 1,
+        "source_decision_track_id": "track-1",
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+        "clean_reacquired_camera_token": None,
+        "outcome": "braking",
+    }
+    return summary, snapshot
+
+
+def test_promote_reacquire_clean_wire_retires_active_top_recovery():
+    summary, snapshot = (
+        _promote_reacquire_top_recovery_clean_wire_case()
+    )
+
+    assert (
+        course_stage
+        ._retire_promote_reacquire_top_recovery_on_clean_wire(
+            recovery_started_s=1.0,
+            recovery_summary=summary,
+            wire_camera_token=snapshot.latest_camera_token,
+            current_gate_index=1,
+            current_track_id="track-1",
+            current_track=snapshot.current_track,
+        )
+        is True
+    )
+    assert summary["clean_reacquired_camera_token"] == asdict(
+        snapshot.latest_camera_token
+    )
+    assert summary["outcome"] == "clean_geometry_reacquired"
+    assert (
+        course_stage
+        ._retire_promote_reacquire_top_recovery_on_clean_wire(
+            recovery_started_s=None,
+            recovery_summary=None,
+            wire_camera_token=None,
+            current_gate_index=None,
+            current_track_id=None,
+            current_track=None,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong_source_gate",
+        "wrong_source_track",
+        "stale_wire",
+        "wrong_role",
+        "still_top",
+        "still_censored",
+    ),
+)
+def test_promote_reacquire_top_recovery_refuses_inexact_clean_wire(
+    mutation,
+):
+    summary, snapshot = (
+        _promote_reacquire_top_recovery_clean_wire_case()
+    )
+    if mutation == "wrong_source_gate":
+        summary["source_decision_gate_index"] = 0
+    elif mutation == "wrong_source_track":
+        summary["source_decision_track_id"] = "other-track"
+    elif mutation == "stale_wire":
+        snapshot.current_track.latest_token = _token(49)
+    elif mutation == "wrong_role":
+        snapshot.current_track.role = VisualTrackRole.NEXT
+    elif mutation == "still_top":
+        snapshot.current_track.clipping = FrameEdge.TOP
+        snapshot.current_track.center_censored = True
+    else:
+        snapshot.current_track.center_censored = True
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "lacks exact lineage"
+            if mutation
+            in {
+                "wrong_source_gate",
+                "wrong_source_track",
+                "stale_wire",
+                "wrong_role",
+            }
+            else "wire is not clean"
+        ),
+    ):
+        course_stage._retire_promote_reacquire_top_recovery_on_clean_wire(
+            recovery_started_s=1.0,
+            recovery_summary=summary,
+            wire_camera_token=snapshot.latest_camera_token,
+            current_gate_index=1,
+            current_track_id="track-1",
+            current_track=snapshot.current_track,
+        )
+
+
 def test_fresh_raw_top_boundary_accepts_same_frame_unclipped_inner_state(
     monkeypatch,
 ):
