@@ -537,6 +537,46 @@ def test_committed_successor_refresh_applies_fresh_roll_and_yaw():
     )
 
 
+def test_committed_successor_refresh_releases_revoked_roll_to_fresh_proposal():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "successor_track_id": "vq2-track-000002",
+            "passage_committed": True,
+            "committed_successor_roll_authority": 0.0,
+            "committed_successor_target_roll_rad": None,
+            "committed_successor_pitch_authority": 0.0,
+            "committed_successor_target_pitch_rad": None,
+            "committed_successor_yaw_authority": 0.0,
+            "committed_successor_yaw_rate_rad_s": None,
+            "unconstrained_target_roll_rad": 0.055,
+        }
+    )
+    accepted = _accepted_dynamic_near_plane_command(evidence)
+    authority = course_stage._CensoredPassageCoastAuthority(
+        gate_index=0,
+        track_id="vq2-track-000001",
+        anchor_camera_token=_token(1),
+        target_roll_rad=-0.35,
+        target_pitch_rad=0.035,
+        yaw_rate_rad_s=-0.08,
+        requested_thrust=0.299,
+    )
+
+    refreshed = course_stage._refresh_committed_successor_steering(
+        authority,
+        accepted,
+        gate_index=0,
+        current_track_id="vq2-track-000001",
+        reviewed_successor_track_id="vq2-track-000002",
+    )
+
+    assert refreshed.target_roll_rad == pytest.approx(0.055)
+    assert refreshed.target_pitch_rad == authority.target_pitch_rad
+    assert refreshed.yaw_rate_rad_s == authority.yaw_rate_rad_s
+    assert refreshed.requested_thrust == authority.requested_thrust
+
+
 def test_passage_admission_never_imports_successor_roll():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
@@ -607,6 +647,7 @@ def test_passage_admission_never_imports_successor_roll():
             "committed_successor_target_pitch_rad": 0.12,
             "committed_successor_yaw_authority": 1.0,
             "committed_successor_yaw_rate_rad_s": 0.15,
+            "unconstrained_target_roll_rad": -0.02,
         }
     )
     later = replace(accepted, dynamic_evidence=later_evidence)
@@ -617,12 +658,13 @@ def test_passage_admission_never_imports_successor_roll():
         current_track_id="vq2-track-000001",
         reviewed_successor_track_id="vq2-track-000002",
     )
-    assert refreshed.target_roll_rad == sealed.target_roll_rad
+    assert refreshed.target_roll_rad == pytest.approx(-0.02)
     assert refreshed.target_pitch_rad == sealed.target_pitch_rad
     assert refreshed.yaw_rate_rad_s == pytest.approx(0.15)
     assert refreshed.requested_thrust == sealed.requested_thrust
     assert replace(
         refreshed,
+        target_roll_rad=sealed.target_roll_rad,
         yaw_rate_rad_s=sealed.yaw_rate_rad_s,
     ) == sealed
 

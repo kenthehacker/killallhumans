@@ -4003,8 +4003,9 @@ def _refresh_committed_successor_steering(
     """Carry fresh bounded successor roll/yaw into the crossing command.
 
     Current-gate pitch, thrust, passage proof, and race ownership remain
-    sealed. Roll/yaw are refreshed only from the exact graph-vetted successor
-    state carried by this accepted publication.
+    sealed. Roll/yaw use the exact graph-vetted successor state carried by this
+    accepted publication while that authority exists. A fresh revocation
+    releases roll to the same publication's ordinary current-gate proposal.
     """
 
     if (
@@ -4068,6 +4069,25 @@ def _refresh_committed_successor_steering(
         lower=-MAX_VISUAL_TARGET_ROLL_RAD,
         upper=MAX_VISUAL_TARGET_ROLL_RAD,
     )
+    refreshed_roll = committed_roll
+    if committed_roll is None:
+        # Exact fresh passage evidence has revoked the successor's roll
+        # authority.  Release the previously latched bank to the same
+        # publication's ordinary current-gate proposal instead of replaying
+        # stale full-bank steering until successor authority happens to
+        # return.
+        unconstrained_roll = evidence.get("unconstrained_target_roll_rad")
+        if (
+            type(unconstrained_roll) not in {int, float}
+            or not math.isfinite(float(unconstrained_roll))
+            or abs(float(unconstrained_roll))
+            > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        ):
+            raise ValueError(
+                "committed successor roll release lacks a fresh bounded "
+                "current-gate proposal"
+            )
+        refreshed_roll = float(unconstrained_roll)
     admitted_axis(
         "committed_successor_pitch_authority",
         "committed_successor_target_pitch_rad",
@@ -4080,15 +4100,14 @@ def _refresh_committed_successor_steering(
         lower=-MAX_VISUAL_YAW_RATE_RAD_S,
         upper=MAX_VISUAL_YAW_RATE_RAD_S,
     )
-    if committed_roll is None and committed_yaw is None:
+    if (
+        refreshed_roll == authority.target_roll_rad
+        and committed_yaw is None
+    ):
         return authority
     return replace(
         authority,
-        target_roll_rad=(
-            authority.target_roll_rad
-            if committed_roll is None
-            else committed_roll
-        ),
+        target_roll_rad=refreshed_roll,
         yaw_rate_rad_s=(
             authority.yaw_rate_rad_s
             if accepted.yaw_soft_stop_zeroed or committed_yaw is None
@@ -11898,10 +11917,105 @@ async def _run_visual_course_stage_impl(
                         )
                     )
                 except (TypeError, ValueError) as ambiguity_exc:
-                    raise abort_type(
-                        "visual-course current-ambiguity quarantine refused: "
-                        f"{ambiguity_exc}"
-                    ) from ambiguity_exc
+                    ambiguity_unavailable_reason = str(ambiguity_exc)
+                    if ambiguity_unavailable_reason not in {
+                        (
+                            "approach ambiguity wire hold lacks exact "
+                            "current identity"
+                        ),
+                        (
+                            "approach ambiguity wire hold continuity is "
+                            "invalid or expired"
+                        ),
+                        (
+                            "approach ambiguity wire hold lacks an accepted "
+                            "current command"
+                        ),
+                        (
+                            "approach ambiguity wire hold lacks fresh "
+                            "bounded authority"
+                        ),
+                    }:
+                        raise abort_type(
+                            "visual-course current-ambiguity quarantine "
+                            f"refused: {ambiguity_exc}"
+                        ) from ambiguity_exc
+
+                    # Ambiguity is an expected visual lifecycle state, not a
+                    # stage failure.  When no fixed last-wire lease remains,
+                    # consume no ambiguous geometry and send a fresh-token,
+                    # IMU-leveling support command while the next camera
+                    # publication resolves or replaces the identity.
+                    approach_current_ambiguity_quarantine = None
+                    fallback_wire_thrust = (
+                        float(host.visual_config.servo.brake_thrust)
+                        if latest_accepted_current_wire is None
+                        else latest_accepted_current_wire.thrust
+                    )
+                    try:
+                        support_thrust = (
+                            current_aperture_collective_state.retained_or_wire(
+                                fallback_wire_thrust
+                            )
+                        )
+                    except ValueError as support_exc:
+                        raise abort_type(
+                            "visual-course current-ambiguity support "
+                            f"collective refused: {support_exc}"
+                        ) from support_exc
+                    last_planned_token = token
+                    try:
+                        support_command = await send_censored_passage_coast(
+                            snapshot=snapshot,
+                            authority=_CensoredPassageCoastAuthority(
+                                gate_index=current_gate_index,
+                                track_id=current_track_id,
+                                anchor_camera_token=token,
+                                target_roll_rad=0.0,
+                                target_pitch_rad=float(
+                                    host.visual_config.servo.brake_pitch_rad
+                                ),
+                                yaw_rate_rad_s=0.0,
+                                requested_thrust=support_thrust,
+                            ),
+                            yaw_reference_rad=yaw_reference_rad,
+                            segment_started_s=segment_started_s,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "approach-current-ambiguity-support"
+                            ),
+                            command_deadline_s=segment_deadline_s,
+                            count_as_navigation=False,
+                            hold_basis=(
+                                APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
+                            ),
+                            same_gate_steering_anchor_authorized=False,
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc,
+                        )
+                        break
+                    if support_command is not None:
+                        segment["recovery_support_command_count"] = int(
+                            segment["recovery_support_command_count"]
+                        ) + 1
+                        host.recorder.emit(
+                            "visual_course_approach_current_ambiguity_"
+                            "support",
+                            gate_index=current_gate_index,
+                            track_id=current_track_id,
+                            camera_token=asdict(token),
+                            unavailable_reason=(
+                                ambiguity_unavailable_reason
+                            ),
+                            ambiguous_geometry_consumed=False,
+                            steering_only=True,
+                            passage_authority=False,
+                            advance_authority=False,
+                        )
+                    continue
                 ambiguity_authority = (
                     approach_current_ambiguity_quarantine
                 )
