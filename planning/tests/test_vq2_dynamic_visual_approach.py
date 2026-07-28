@@ -3058,6 +3058,42 @@ def test_opposite_valid_demand_reduces_applied_roll_on_next_wire_tick():
     assert authority["wire_command"] == proposed
 
 
+def test_top_fov_protected_pitch_reduces_wire_pitch_on_next_tick():
+    session = _session()
+    first_ns = _BASE_NS
+    accepted = AttitudeRateCommand(-0.20, 0.066, -0.03, 0.275)
+    session.record_wire_acceptance(
+        target_roll_rad=-0.25,
+        target_pitch_rad=0.120,
+        yaw_rate_rad_s=-0.03,
+        thrust=0.275,
+        wire_command=accepted,
+        wire_start_monotonic_ns=first_ns,
+    )
+
+    proposed = session.govern_wire_command(
+        AttitudeRateCommand(-0.25, -0.25, -0.15, 0.275),
+        proposal_monotonic_ns=first_ns + 20_000_000,
+        launch_thrust_override=False,
+        yaw_safety_override=False,
+    )
+
+    assert proposed.pitch_rate < accepted.pitch_rate
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposed.roll_rate,
+            proposed.pitch_rate,
+            proposed.yaw_rate,
+            proposed.thrust,
+        )
+    )
+    assert abs(proposed.roll_rate) <= 0.25
+    assert abs(proposed.pitch_rate) <= 0.25
+    assert abs(proposed.yaw_rate) <= 0.15
+    assert 0.21 <= proposed.thrust <= 0.32
+
+
 def test_launch_thrust_override_does_not_seed_an_outward_slew():
     session = _session()
     first_ns = _BASE_NS
@@ -3657,6 +3693,22 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     top_authority = session.post_credit_successor_steering_authority(
         now_monotonic_ns=top_update.publish_monotonic_ns + 2_000_000,
     )
+    top_decision = session.guide(
+        current_track_id=successor_id,
+        successor_track_id=None,
+        monotonic_ns=top_update.publish_monotonic_ns + 2_000_000,
+    )
+    assert top_decision is not None
+    top_fov_authority = session.propagated_current_fov_gap_authority(
+        track=tracker.track(successor_id),
+        camera_token=top_update.token,
+        now_monotonic_ns=top_update.publish_monotonic_ns + 2_000_000,
+    )
+    assert top_fov_authority["clipping"] == int(FrameEdge.TOP)
+    assert top_fov_authority["camera_aperture_half_size_norm"][1] > 0.0
+    assert top_fov_authority["steering_only"] is True
+    assert top_fov_authority["passage_authority"] is False
+    assert top_fov_authority["advance_authority"] is False
 
     dual_update = tracker.update(
         _frame(

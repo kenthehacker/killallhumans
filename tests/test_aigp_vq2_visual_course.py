@@ -2923,6 +2923,144 @@ def test_propagated_top_fov_gap_keeps_protected_pitch_from_reversing():
     assert proposal.limited is True
 
 
+def test_post_credit_top_clip_protects_only_pitch_and_survives_blind_gap():
+    authority = _propagated_top_fov_authority()
+    pitch = -0.049
+    authority.update(
+        {
+            "camera_center_norm": [0.25, -0.75],
+            "camera_aperture_half_size_norm": [0.18, 0.25],
+            "camera_center_std_norm": [0.03, 0.04],
+            "aperture_log_scale_std": 0.10,
+            "body_to_reference_wxyz": [
+                math.cos(pitch / 2.0),
+                0.0,
+                math.sin(pitch / 2.0),
+                0.0,
+            ],
+            "clipping": int(FrameEdge.TOP),
+        }
+    )
+    successor_command = {
+        "reviewed_track_id": "vq2-track-000005",
+        "target_roll_rad": -0.25,
+        "target_pitch_rad": 0.120,
+        "yaw_rate_rad_s": -0.15,
+        "thrust": 0.275,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+
+    observation, proposal = (
+        course_stage._propose_propagated_top_fov_pitch_reference(
+            authority,
+            requested_target_pitch_rad=successor_command[
+                "target_pitch_rad"
+            ],
+            prior_target_pitch_rad=None,
+        )
+    )
+    applied = dict(successor_command)
+    applied["target_pitch_rad"] = proposal.protected_target_pitch_rad
+
+    assert observation.projected_top_edge_image_down == pytest.approx(
+        -1.0
+    )
+    assert proposal.protected_target_pitch_rad == pytest.approx(
+        -0.18433436874696507
+    )
+    assert proposal.predicted_requested_top_edge_image_down == pytest.approx(
+        -1.4459249065787538
+    )
+    assert proposal.predicted_protected_top_edge_image_down == pytest.approx(
+        course_stage.TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+    )
+    assert {
+        key: applied[key]
+        for key in (
+            "target_roll_rad",
+            "yaw_rate_rad_s",
+            "thrust",
+        )
+    } == {
+        key: successor_command[key]
+        for key in (
+            "target_roll_rad",
+            "yaw_rate_rad_s",
+            "thrust",
+        )
+    }
+    assert applied["steering_only"] is True
+    assert applied["passage_authority"] is False
+    assert applied["advance_authority"] is False
+    assert all(
+        math.isfinite(float(applied[key]))
+        for key in (
+            "target_roll_rad",
+            "target_pitch_rad",
+            "yaw_rate_rad_s",
+            "thrust",
+        )
+    )
+    assert abs(float(applied["target_roll_rad"])) <= 0.25
+    assert (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+        <= float(applied["target_pitch_rad"])
+        <= course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert abs(float(applied["yaw_rate_rad_s"])) <= 0.15
+
+    retained = course_stage._retain_post_credit_top_fov_pitch_reference(
+        successor_command,
+        {
+            "active": True,
+            "last_track_id": successor_command["reviewed_track_id"],
+            "last_protected_target_pitch_rad": (
+                proposal.protected_target_pitch_rad
+            ),
+        },
+    )
+    assert retained is not None
+    retained_pitch, retained_evidence = retained
+    assert retained_pitch == pytest.approx(
+        proposal.protected_target_pitch_rad
+    )
+    assert retained_evidence["retained_through_missing_frame"] is True
+    assert retained_evidence["steering_only"] is True
+    assert retained_evidence["passage_authority"] is False
+    assert retained_evidence["advance_authority"] is False
+
+
+@pytest.mark.parametrize(
+    "summary",
+    (
+        {
+            "active": True,
+            "last_track_id": "wrong-track",
+            "last_protected_target_pitch_rad": -0.18,
+        },
+        {
+            "active": True,
+            "last_track_id": "vq2-track-000005",
+            "last_protected_target_pitch_rad": math.nan,
+        },
+    ),
+)
+def test_post_credit_top_fov_blind_retention_refuses_bad_state(summary):
+    with pytest.raises(
+        ValueError,
+        match="retained post-credit TOP-FOV authority is invalid",
+    ):
+        course_stage._retain_post_credit_top_fov_pitch_reference(
+            {
+                "reviewed_track_id": "vq2-track-000005",
+                "target_pitch_rad": 0.120,
+            },
+            summary,
+        )
+
+
 def test_propagated_top_fov_gap_accepts_full_frame_near_plane_clipping():
     authority = _propagated_top_fov_authority()
     authority.update(

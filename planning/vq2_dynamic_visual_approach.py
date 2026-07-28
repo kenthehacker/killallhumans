@@ -2270,10 +2270,11 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "propagated FOV gap current track is not unambiguous"
             )
+        raw_clipping = staged.current_raw_clipping
         if (
-            current.clipping != track.clipping
-            or current.clipping != sample.clipping
-            or current.clipping == FrameEdge.NONE
+            raw_clipping != track.clipping
+            or raw_clipping != sample.clipping
+            or raw_clipping == FrameEdge.NONE
         ):
             raise DynamicCourseError(
                 "propagated FOV gap publication is not clipped"
@@ -2312,7 +2313,7 @@ class DynamicVisualCourseSession:
             "body_to_reference_wxyz": list(quaternion),
             "horizontal_angle_scale_rad": horizontal_scale,
             "vertical_angle_scale_rad": vertical_scale,
-            "clipping": int(current.clipping),
+            "clipping": int(raw_clipping),
             "terminal_crossing_clearance_norm": list(
                 decision.terminal_crossing_clearance_norm
             ),

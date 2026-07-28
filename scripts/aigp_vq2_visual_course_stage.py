@@ -1041,6 +1041,56 @@ def _propose_propagated_top_fov_pitch_reference(
     return observation, proposal
 
 
+def _retain_post_credit_top_fov_pitch_reference(
+    authority: Mapping[str, Any],
+    fov_summary: Mapping[str, Any],
+) -> Optional[tuple[float, Mapping[str, Any]]]:
+    """Retain an accepted raw-FOV ceiling through a blind successor gap."""
+
+    if not isinstance(authority, Mapping) or not isinstance(
+        fov_summary,
+        Mapping,
+    ):
+        raise ValueError("retained post-credit TOP-FOV inputs are invalid")
+    if fov_summary.get("active") is not True:
+        return None
+    retained_track_id = fov_summary.get("last_track_id")
+    retained_pitch = fov_summary.get(
+        "last_protected_target_pitch_rad"
+    )
+    requested_pitch = float(authority["target_pitch_rad"])
+    if (
+        retained_track_id != authority.get("reviewed_track_id")
+        or type(retained_pitch) not in {int, float}
+        or not math.isfinite(float(retained_pitch))
+        or not math.isfinite(requested_pitch)
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= float(retained_pitch)
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= requested_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+    ):
+        raise ValueError(
+            "retained post-credit TOP-FOV authority is invalid"
+        )
+    protected_pitch = min(requested_pitch, float(retained_pitch))
+    return protected_pitch, {
+        "basis": TOP_FOV_PITCH_PROTECTION_BASIS,
+        "track_id": retained_track_id,
+        "safe_top_edge_image_down": TOP_FOV_SAFE_EDGE_IMAGE_DOWN,
+        "requested_target_pitch_rad": requested_pitch,
+        "protected_target_pitch_rad": protected_pitch,
+        "retained_through_missing_frame": True,
+        "active_before": True,
+        "active_after": True,
+        "limited": protected_pitch < requested_pitch - 1e-12,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+
+
 def _propose_retained_raw_top_fov_pitch_reference(
     session: DynamicVisualCourseSession,
     target_track: Any,
@@ -4499,6 +4549,10 @@ async def _run_visual_course_stage_impl(
         successor_steering: bool = False,
         require_successor_steering: bool = False,
         command_deadline_s: Optional[float] = None,
+        recovery_measurement_mode: Optional[
+            PostCreditMeasurementMode
+        ] = None,
+        recovery_snapshot: Any = None,
     ) -> bool:
         """Bridge one bounded handoff gap with retained dynamic authority."""
 
@@ -4520,6 +4574,25 @@ async def _run_visual_course_stage_impl(
         ):
             raise abort_type(
                 "visual-course successor-steering selection is invalid"
+            )
+        if (
+            recovery_measurement_mode is None
+            and recovery_snapshot is not None
+            or recovery_measurement_mode is not None
+            and (
+                type(recovery_measurement_mode)
+                is not PostCreditMeasurementMode
+                or recovery_measurement_mode
+                not in {
+                    PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+                    PostCreditMeasurementMode.REACQUIRE,
+                }
+                or recovery_snapshot is None
+                or not require_successor_steering
+            )
+        ):
+            raise abort_type(
+                "visual-course successor recovery selection is invalid"
             )
         if (
             command_deadline_s is not None
@@ -4609,6 +4682,137 @@ async def _run_visual_course_stage_impl(
         target_pitch_rad = float(authority["target_pitch_rad"])
         requested_yaw = float(authority["yaw_rate_rad_s"])
         thrust = float(authority["thrust"])
+        top_fov_handoff: Optional[Mapping[str, Any]] = None
+        top_fov_observation: Optional[
+            _TopFovPropagatedObservation
+        ] = None
+        top_fov_proposal: Optional[_TopFovPitchProposal] = None
+        top_fov_guidance: Optional[Mapping[str, Any]] = None
+        if (
+            recovery_measurement_mode
+            is PostCreditMeasurementMode.ONE_EDGE_CENSORED
+        ):
+            if (
+                type(dynamic_controller)
+                is not DynamicVisualCourseSession
+                or not actual_successor_steering
+            ):
+                raise abort_type(
+                    "visual-course one-edge recovery lacks dynamic "
+                    "successor authority"
+                )
+            try:
+                state = dynamic_controller.core.course_state()
+                decision = dynamic_controller.guide(
+                    current_track_id=state.current_track_id,
+                    successor_track_id=state.successor_track_id,
+                    monotonic_ns=proposal_ns,
+                )
+                if (
+                    decision is None
+                    or decision.current_gate_index
+                    != current_gate_index
+                    or decision.current_track_id
+                    != authority.get("reviewed_track_id")
+                ):
+                    raise ValueError(
+                        "one-edge FOV decision lost credited current ownership"
+                    )
+                top_fov_handoff = (
+                    dynamic_controller.propagated_current_fov_gap_authority(
+                        track=recovery_snapshot.current_track,
+                        camera_token=(
+                            recovery_snapshot.latest_camera_token
+                        ),
+                        now_monotonic_ns=proposal_ns,
+                    )
+                )
+                if not isinstance(top_fov_handoff, Mapping):
+                    raise ValueError(
+                        "one-edge recovery lacks local FOV state"
+                    )
+                fov_summary = segment["top_fov_pitch_protection"]
+                if bool(
+                    FrameEdge(int(top_fov_handoff["clipping"]))
+                    & FrameEdge.TOP
+                ):
+                    (
+                        top_fov_observation,
+                        top_fov_proposal,
+                    ) = _propose_propagated_top_fov_pitch_reference(
+                        top_fov_handoff,
+                        requested_target_pitch_rad=target_pitch_rad,
+                        prior_target_pitch_rad=(
+                            fov_summary[
+                                "last_protected_target_pitch_rad"
+                            ]
+                        ),
+                    )
+                    target_pitch_rad = (
+                        top_fov_proposal.protected_target_pitch_rad
+                    )
+                    top_fov_guidance = {
+                        "basis": TOP_FOV_PITCH_PROTECTION_BASIS,
+                        "track_id": authority["reviewed_track_id"],
+                        "safe_top_edge_image_down": (
+                            TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+                        ),
+                        "geometry_basis": (
+                            top_fov_observation.geometry_basis
+                        ),
+                        "projected_nominal_top_edge_image_down": (
+                            top_fov_observation
+                            .projected_nominal_top_edge_image_down
+                        ),
+                        "projected_top_edge_std_image_down": (
+                            top_fov_observation
+                            .projected_top_edge_std_image_down
+                        ),
+                        "prediction_horizon_remaining_s": (
+                            top_fov_observation
+                            .prediction_horizon_remaining_s
+                        ),
+                        **asdict(top_fov_proposal),
+                        "steering_only": True,
+                        "passage_authority": False,
+                        "advance_authority": False,
+                    }
+                else:
+                    retained = (
+                        _retain_post_credit_top_fov_pitch_reference(
+                            authority,
+                            fov_summary,
+                        )
+                    )
+                    if retained is not None:
+                        target_pitch_rad, top_fov_guidance = retained
+            except (
+                AttributeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise abort_type(
+                    "visual-course post-credit TOP-FOV pitch guidance "
+                    f"refused: {exc}"
+                ) from exc
+        elif (
+            recovery_measurement_mode
+            is PostCreditMeasurementMode.REACQUIRE
+        ):
+            fov_summary = segment["top_fov_pitch_protection"]
+            try:
+                retained = _retain_post_credit_top_fov_pitch_reference(
+                    authority,
+                    fov_summary,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise abort_type(
+                    "visual-course retained post-credit TOP-FOV "
+                    f"authority refused: {exc}"
+                ) from exc
+            if retained is not None:
+                target_pitch_rad, top_fov_guidance = retained
         bounded_yaw = requested_yaw
         if requested_yaw != 0.0:
             bounded_yaw = _limit_calibrated_yaw_request(
@@ -4704,9 +4908,14 @@ async def _run_visual_course_stage_impl(
             raise abort_type(
                 "visual-course continuity hold evidence is invalid"
             )
+        accepted_dynamic_evidence = dict(dynamic_evidence)
+        if top_fov_guidance is not None:
+            accepted_dynamic_evidence["top_fov_pitch_guidance"] = dict(
+                top_fov_guidance
+            )
         host.recorder.emit(
             "visual_course_dynamic_command",
-            **dict(dynamic_evidence),
+            **accepted_dynamic_evidence,
         )
         if actual_successor_steering:
             steering_evidence = {
@@ -4717,6 +4926,70 @@ async def _run_visual_course_stage_impl(
                 )
                 for key, value in authority.items()
             }
+            if top_fov_guidance is not None:
+                steering_evidence[
+                    "target_pitch_rad_before_top_fov"
+                ] = float(authority["target_pitch_rad"])
+                steering_evidence["target_pitch_rad"] = target_pitch_rad
+                steering_evidence["top_fov_pitch_guidance"] = dict(
+                    top_fov_guidance
+                )
+                fov_summary = segment["top_fov_pitch_protection"]
+                if top_fov_proposal is not None:
+                    assert top_fov_handoff is not None
+                    assert top_fov_observation is not None
+                    if top_fov_proposal.limited:
+                        fov_summary["limited_command_count"] += 1
+                    fov_summary[
+                        "propagated_state_handoff_command_count"
+                    ] = int(
+                        fov_summary[
+                            "propagated_state_handoff_command_count"
+                        ]
+                    ) + 1
+                    fov_summary["last_propagated_state_handoff"] = dict(
+                        top_fov_handoff
+                    )
+                    fov_summary.update(
+                        {
+                            "last_track_id": authority[
+                                "reviewed_track_id"
+                            ],
+                            "last_camera_token": dict(
+                                top_fov_handoff["camera_token"]
+                            ),
+                            "last_wire_start_monotonic_ns": call_start,
+                            "last_forecast_top_edge_image_down": (
+                                top_fov_proposal
+                                .forecast_top_edge_image_down
+                            ),
+                            "last_protected_target_pitch_rad": (
+                                top_fov_proposal
+                                .protected_target_pitch_rad
+                            ),
+                            "active": top_fov_proposal.active_after,
+                        }
+                    )
+                    host.recorder.emit(
+                        "visual_course_dynamic_fov_gap_handoff",
+                        gate_index=current_gate_index,
+                        stage=stage,
+                        camera_token=dict(
+                            top_fov_handoff["camera_token"]
+                        ),
+                        authority=dict(top_fov_handoff),
+                        pitch_guidance=dict(top_fov_guidance),
+                        command=asdict(command),
+                    )
+                else:
+                    fov_summary.update(
+                        {
+                            "last_wire_start_monotonic_ns": call_start,
+                            "last_protected_target_pitch_rad": (
+                                target_pitch_rad
+                            ),
+                        }
+                    )
             host.recorder.emit(
                 "visual_course_dynamic_post_credit_successor_steering",
                 gate_index=current_gate_index,
@@ -7189,6 +7462,10 @@ async def _run_visual_course_stage_impl(
                                 course_deadline_s,
                                 segment_deadline_s,
                             ),
+                            recovery_measurement_mode=(
+                                recovery_measurement_mode
+                            ),
+                            recovery_snapshot=snapshot,
                         )
                     except RaceActiveBoundaryChangedBeforeWire as exc:
                         raise abort_type(
