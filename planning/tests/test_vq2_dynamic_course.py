@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 
 import pytest
@@ -3107,7 +3108,7 @@ def test_precommit_successor_heading_yields_to_current_fov_clearance() -> None:
     assert opposing_current.command.yaw_rate_rad_s > 0.0
 
 
-def test_precommit_successor_roll_releases_or_yields_to_current() -> None:
+def test_precommit_successor_roll_releases_or_uses_crossing_reserve() -> None:
     _, recovered = _precommit_successor_case(
         successor_x_step=-0.004,
     )
@@ -3122,9 +3123,13 @@ def test_precommit_successor_roll_releases_or_yields_to_current() -> None:
     assert recovered.precommit_successor_target_roll_rad is None
 
     assert opposing_current.current_center_norm[0] < 0.0
-    assert opposing_current.command.target_roll_rad < 0.0
-    assert opposing_current.precommit_successor_roll_authority == 0.0
-    assert opposing_current.precommit_successor_target_roll_rad is None
+    assert opposing_current.centered_crossing_clearance_norm[0] > 0.0
+    assert opposing_current.precommit_successor_roll_authority > 0.0
+    assert opposing_current.precommit_successor_target_roll_rad is not None
+    assert opposing_current.command.target_roll_rad == pytest.approx(
+        opposing_current.precommit_successor_target_roll_rad
+    )
+    assert opposing_current.command.target_roll_rad > 0.0
 
 
 def test_precommit_successor_roll_requires_current_crossing_reserve() -> None:
@@ -3159,18 +3164,45 @@ def test_precommit_roll_retains_closure_seed_but_expires_stale_vision() -> None:
     assert retained.precommit_successor_roll_authority > 0.0
     assert retained.precommit_successor_target_roll_rad is not None
 
-    _imu(core, 1.41)
-    core.observe_track(
-        _observation(
-            "gate-a",
-            9,
-            1.41,
-            y=-0.30,
-            log_scale=-1.11,
-        )
+    successor_estimate = core._tracks["gate-b"]  # noqa: SLF001
+    successor_source = successor_estimate.state
+    successor_estimate.state = replace(
+        successor_source,
+        visible=False,
+        censored_axes=(True, True),
+        confidence=0.0,
+        missed_count=successor_source.missed_count + 1,
     )
-    _imu(core, 1.415)
-    expired = core.guide(1_415_000_000)
+    propagated_time_ns = successor_source.last_measurement_monotonic_ns + (
+        2 * round(core.config.dropout_hold_s * NS)
+    )
+    _imu(core, propagated_time_ns / NS)
+    propagated = core.guide(propagated_time_ns)
+
+    assert not core.course_state().successor.visible
+    assert (
+        propagated_time_ns
+        - successor_source.last_measurement_monotonic_ns
+        > round(core.config.dropout_hold_s * NS)
+    )
+    assert propagated.precommit_successor_roll_authority > 0.0
+    assert propagated.precommit_successor_target_roll_rad is not None
+    assert propagated.command.target_roll_rad == pytest.approx(
+        propagated.precommit_successor_target_roll_rad
+    )
+    assert math.isfinite(propagated.command.target_roll_rad)
+    assert (
+        abs(propagated.command.target_roll_rad)
+        <= MAX_TARGET_ROLL_RAD
+    )
+
+    expired_time_ns = (
+        successor_source.last_measurement_monotonic_ns
+        + round(core.config.crossing_prediction_max_horizon_s * NS)
+        + 1
+    )
+    _imu(core, expired_time_ns / NS)
+    expired = core.guide(expired_time_ns)
 
     assert expired.precommit_successor_roll_authority == 0.0
     assert expired.precommit_successor_target_roll_rad is None

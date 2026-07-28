@@ -3580,7 +3580,6 @@ class DynamicCourseCore:
         precommit_geometry_eligible = bool(
             not passage_committed
             and successor is not None
-            and successor_prediction is not None
             and current.visible
             and not current.ambiguous
             and not current.censored_axes[0]
@@ -3590,14 +3589,17 @@ class DynamicCourseCore:
             <= self.config.passage_margin_norm
             and abs(residual_rate_norm[0])
             <= self.config.vertical_settled_rate_norm_s
-            and successor.visible
             and not successor.ambiguous
-            and not successor.censored_axes[0]
             and successor.sample_count >= 4
             and successor.stream_generation == current.stream_generation
         )
         closure_seed_eligible = bool(
             precommit_geometry_eligible
+            and successor is not None
+            and successor_prediction is not None
+            and successor.visible
+            and not successor.censored_axes[0]
+            and successor_prediction.confidence > 0.0
             and current.scale_rate_qualified
             and current.time_to_contact_s is not None
             and self.config.minimum_ttc_s
@@ -3619,7 +3621,6 @@ class DynamicCourseCore:
             and self._precommit_successor_roll_key == precommit_key
         ):
             assert successor is not None
-            assert successor_prediction is not None
             successor_age_s = (
                 monotonic_ns
                 - successor.last_measurement_monotonic_ns
@@ -3627,8 +3628,7 @@ class DynamicCourseCore:
             if (
                 0.0
                 <= successor_age_s
-                <= self.config.dropout_hold_s
-                and successor_prediction.confidence > 0.0
+                <= self.config.crossing_prediction_max_horizon_s
             ):
                 successor_steering = self.predict_track_steering(
                     successor.track_id,
@@ -3650,21 +3650,6 @@ class DynamicCourseCore:
                     -MAX_TARGET_ROLL_RAD,
                     MAX_TARGET_ROLL_RAD,
                 )
-                current_only_roll = _clamp(
-                    self.config.roll_guidance_sign
-                    * (
-                        self.config.roll_gain
-                        * math.atan(
-                            current_center[0]
-                            * self.config.horizontal_angle_scale_rad
-                        )
-                        + self.config.lateral_rate_gain
-                        * residual_rate_norm[0]
-                        * self.config.horizontal_angle_scale_rad
-                    ),
-                    -MAX_TARGET_ROLL_RAD,
-                    MAX_TARGET_ROLL_RAD,
-                )
                 outward_successor = bool(
                     abs(self.config.roll_guidance_sign) > _EPSILON
                     and successor_steering.bearing_std_rad[0]
@@ -3679,11 +3664,7 @@ class DynamicCourseCore:
                     * successor_steering.stable_bearing_rad[0]
                     > 0.0
                 )
-                current_roll_opposes_successor = bool(
-                    current_only_roll * normal_successor_roll
-                    < -_EPSILON
-                )
-                if outward_successor and not current_roll_opposes_successor:
+                if outward_successor:
                     ttc = current.time_to_contact_s
                     ttc_progress = _clamp(
                         (
@@ -3709,14 +3690,17 @@ class DynamicCourseCore:
                         )
                         * ttc_progress
                     )
-                    confidence_authority = _clamp(
-                        successor_prediction.confidence
-                        / self.config.successor_passage_full_confidence,
+                    uncertainty_authority = _clamp(
+                        1.0
+                        - (
+                            successor_steering.bearing_std_rad[0]
+                            / maximum_std
+                        ),
                         0.0,
                         1.0,
                     )
                     precommit_successor_roll_authority = _clamp(
-                        closure_authority * confidence_authority,
+                        closure_authority * uncertainty_authority,
                         0.0,
                         1.0,
                     )
@@ -3736,11 +3720,13 @@ class DynamicCourseCore:
                             lookahead_roll = proposal.target_roll_rad
                         precommit_successor_target_roll = lookahead_roll
                         # This is a gate-relative steering reference, not a
-                        # command smoother.  The current gate must remain
-                        # horizontally settled, an opposite current-gate
-                        # correction wins on the next guidance tick, and the
-                        # final wire governor remains the sole continuity
-                        # authority.
+                        # command smoother.  A fresh successor seeds the
+                        # reference; bounded uncertainty propagation may keep
+                        # it through expected near-plane clipping without
+                        # another clean successor frame.  Any loss of current
+                        # horizontal crossing reserve releases it on the next
+                        # tick, and the final wire governor remains the sole
+                        # continuity authority.
                         proposal = replace(
                             proposal,
                             target_roll_rad=lookahead_roll,
