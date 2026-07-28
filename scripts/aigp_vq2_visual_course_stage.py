@@ -161,6 +161,9 @@ APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS = (
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
+EXACT_NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS = (
+    "exact-current-top-nonrapid-off-axis-fov-priority-v1"
+)
 RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "retained-fresh-top-boundary-closure-recovery-v1"
 )
@@ -1375,6 +1378,75 @@ def _allocate_fresh_top_censored_closure_recovery(
         steering_only=True,
         passage_authority=False,
         advance_authority=False,
+    )
+
+
+def _exact_nonrapid_off_axis_top_fov_owns_pitch(
+    *,
+    mode: VisualApproachMode,
+    exact_fov_proposal: _TopFovPitchProposal,
+    fresh_top_boundary: _FreshCurrentTopBoundaryAuthority,
+    closure_recovery: _FreshTopCensoredClosureRecovery,
+    rapid_expansion_rate_s: float,
+    rapid_closure_ttc_s: float,
+) -> bool:
+    """Arbitrate one exact TOP frame without reviving urgent closure.
+
+    The full positive-pitch brake remains authoritative for aligned, rapid,
+    or contact-time-unknown closure.  During a same-publication, nonrapid,
+    off-axis approach, however, replacing the exact FOV-safe pitch reverses
+    camera observability before the horizontal intercept can take effect.
+    This policy is deliberately available only to the normal exact proposal
+    path; propagated, retained, post-credit, and geometry-refusal paths keep
+    their existing brake ownership.
+    """
+
+    rapid_expansion, rapid_ttc = map(
+        float,
+        (rapid_expansion_rate_s, rapid_closure_ttc_s),
+    )
+    if (
+        type(mode) is not VisualApproachMode
+        or type(exact_fov_proposal) is not _TopFovPitchProposal
+        or type(fresh_top_boundary) is not _FreshCurrentTopBoundaryAuthority
+        or type(closure_recovery) is not _FreshTopCensoredClosureRecovery
+        or not all(
+            math.isfinite(value)
+            for value in (rapid_expansion, rapid_ttc)
+        )
+        or rapid_expansion <= 0.0
+        or rapid_ttc <= 0.0
+    ):
+        raise ValueError("exact TOP pitch arbitration inputs are invalid")
+
+    ttc = closure_recovery.time_to_contact_s
+    return bool(
+        mode is VisualApproachMode.APPROACH
+        and closure_recovery.fresh_boundary_current_authority
+        and not closure_recovery.horizontal_aligned
+        and closure_recovery.steering_only
+        and not closure_recovery.forward_closure_authorized
+        and not closure_recovery.passage_authority
+        and not closure_recovery.advance_authority
+        and exact_fov_proposal.active_after
+        and exact_fov_proposal.limited
+        and math.isclose(
+            exact_fov_proposal.requested_target_pitch_rad,
+            closure_recovery.requested_target_pitch_rad,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            exact_fov_proposal.protected_target_pitch_rad,
+            closure_recovery.fov_protected_target_pitch_rad,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and exact_fov_proposal.protected_target_pitch_rad
+        < closure_recovery.allocated_target_pitch_rad - 1e-12
+        and closure_recovery.expansion_rate_s < rapid_expansion
+        and ttc is not None
+        and ttc > rapid_ttc
     )
 
 
@@ -7156,6 +7228,7 @@ async def _run_visual_course_stage_impl(
         top_censored_closure_recovery: Optional[
             _FreshTopCensoredClosureRecovery
         ] = None
+        top_censored_pitch_arbitration: Optional[Dict[str, Any]] = None
         horizontal_fov_closure_brake: Optional[
             _FreshHorizontalFovClosureBrake
         ] = None
@@ -7494,18 +7567,59 @@ async def _run_visual_course_stage_impl(
                         f"refused: {exc}"
                     ) from exc
                 if top_censored_closure_recovery is not None:
-                    target_pitch_rad = (
-                        top_censored_closure_recovery
-                        .allocated_target_pitch_rad
-                    )
-                    command_thrust = (
-                        top_censored_closure_recovery.allocated_thrust
-                    )
-                    if launch_evidence is not None:
-                        launch_evidence["target_pitch_rad"] = (
-                            target_pitch_rad
+                    exact_fov_owns_pitch = (
+                        top_fov_proposal is not None
+                        and _exact_nonrapid_off_axis_top_fov_owns_pitch(
+                            mode=proposal.mode,
+                            exact_fov_proposal=top_fov_proposal,
+                            fresh_top_boundary=fresh_top_boundary,
+                            closure_recovery=(
+                                top_censored_closure_recovery
+                            ),
+                            rapid_expansion_rate_s=float(
+                                recovery_config.rapid_expansion_rate_s
+                            ),
+                            rapid_closure_ttc_s=float(
+                                recovery_config.successor_lookahead_ttc_s
+                            ),
                         )
-                        launch_evidence["thrust"] = command_thrust
+                    )
+                    if exact_fov_owns_pitch:
+                        top_censored_pitch_arbitration = {
+                            "basis": (
+                                EXACT_NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS
+                            ),
+                            "closure_recovery": asdict(
+                                top_censored_closure_recovery
+                            ),
+                            "rapid_expansion_rate_s": float(
+                                recovery_config.rapid_expansion_rate_s
+                            ),
+                            "rapid_closure_ttc_s": float(
+                                recovery_config.successor_lookahead_ttc_s
+                            ),
+                            "selected_target_pitch_rad": (
+                                top_fov_proposal
+                                .protected_target_pitch_rad
+                            ),
+                            "steering_only": True,
+                            "passage_authority": False,
+                            "advance_authority": False,
+                        }
+                        top_censored_closure_recovery = None
+                    else:
+                        target_pitch_rad = (
+                            top_censored_closure_recovery
+                            .allocated_target_pitch_rad
+                        )
+                        command_thrust = (
+                            top_censored_closure_recovery.allocated_thrust
+                        )
+                        if launch_evidence is not None:
+                            launch_evidence["target_pitch_rad"] = (
+                                target_pitch_rad
+                            )
+                            launch_evidence["thrust"] = command_thrust
             if (
                 horizontal_fov_closure_brake_enabled
                 and committed_crossing_authority is None
@@ -8259,6 +8373,22 @@ async def _run_visual_course_stage_impl(
                         pitch_guidance=accepted_dynamic_evidence[
                             "top_fov_pitch_guidance"
                         ],
+                        command=asdict(command),
+                    )
+                if top_censored_pitch_arbitration is not None:
+                    accepted_dynamic_evidence[
+                        "top_censored_pitch_arbitration"
+                    ] = dict(top_censored_pitch_arbitration)
+                    host.recorder.emit(
+                        "visual_course_top_censored_pitch_arbitration",
+                        gate_index=current_gate_index,
+                        stage=stage,
+                        camera_token=asdict(
+                            snapshot.latest_camera_token
+                        ),
+                        arbitration=dict(
+                            top_censored_pitch_arbitration
+                        ),
                         command=asdict(command),
                     )
                 if top_censored_closure_recovery is not None:

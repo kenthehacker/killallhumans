@@ -3899,6 +3899,122 @@ def test_fresh_raw_top_boundary_retains_tracking_only_inner_steering():
     assert _dd89_top_censored_recovery(**overrides) is None
 
 
+def _latest_gate_one_top_pitch_arbitration_case():
+    state, decision, source, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    boundary = course_stage._fresh_post_credit_top_boundary_authority(
+        state=state,
+        decision=decision,
+        authority=source,
+        recovery_snapshot=snapshot,
+        current_gate_index=1,
+    )
+    fov_proposal = course_stage._TopFovPitchProposal(
+        raw_top_edge_image_down=-1.0,
+        raw_top_edge_rate_down_s=0.0,
+        raw_top_edge_nonrotational_angle_rate_rad_s=-0.45817977264976284,
+        prediction_horizon_s=0.1,
+        forecast_top_edge_image_down=-1.0,
+        capture_pitch_rad=-0.22379758754703757,
+        requested_target_pitch_rad=0.12,
+        maximum_observable_target_pitch_rad=-0.35913195629400263,
+        protected_target_pitch_rad=-0.35,
+        predicted_requested_top_edge_image_down=-2.0557272776594364,
+        predicted_protected_top_edge_image_down=-0.7191324167681183,
+        clearance_recovering=False,
+        envelope_saturated=True,
+        active_before=True,
+        active_after=True,
+        limited=True,
+    )
+    recovery = _dd89_top_censored_recovery(
+        current_censored_axes=(False, False),
+        current_aperture_propagated=False,
+        current_aperture_dynamics_qualified=False,
+        capture_pitch_rad=-0.22379758754703757,
+        body_pitch_rate_rad_s=-0.11513304288709995,
+        stable_center_norm=(
+            0.35998653124754565,
+            -0.7721254168759125,
+        ),
+        residual_rate_rad_s=(
+            0.1529029176055957,
+            -0.35184627838666793,
+        ),
+        expansion_rate_s=0.4310497643720502,
+        time_to_contact_s=2.319917751159873,
+        fov_protected_target_pitch_rad=-0.35,
+        requested_thrust=0.319418770004778,
+        fresh_boundary_current_authority=boundary,
+    )
+    assert recovery is not None
+    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
+    assert recovery.horizontal_aligned is False
+    return boundary, fov_proposal, recovery
+
+
+def test_latest_nonrapid_off_axis_exact_top_keeps_fov_pitch_ownership():
+    boundary, fov_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+
+    owns_pitch = (
+        course_stage._exact_nonrapid_off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.APPROACH,
+            exact_fov_proposal=fov_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+        )
+    )
+
+    assert owns_pitch is True
+    assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
+    assert recovery.forward_closure_authorized is False
+    assert recovery.passage_authority is False
+    assert recovery.advance_authority is False
+
+
+@pytest.mark.parametrize(
+    "recovery_change",
+    (
+        {"stable_center_norm": (0.0, -0.7721254168759125)},
+        {"expansion_rate_s": 0.45},
+        {"time_to_contact_s": 2.2},
+        {"time_to_contact_s": None},
+    ),
+)
+def test_exact_top_fov_does_not_preempt_aligned_or_rapid_closure(
+    recovery_change,
+):
+    boundary, fov_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+    if "stable_center_norm" in recovery_change:
+        recovery = replace(
+            recovery,
+            stable_center_norm=recovery_change["stable_center_norm"],
+            horizontal_aligned=True,
+        )
+    else:
+        recovery = replace(recovery, **recovery_change)
+
+    assert (
+        course_stage._exact_nonrapid_off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.APPROACH,
+            exact_fov_proposal=fov_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+        )
+        is False
+    )
+    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
+
+
 def test_fresh_top_boundary_command_still_uses_final_wire_governor():
     session = DynamicVisualCourseSession()
     seed_ns = 1_000_000_000
