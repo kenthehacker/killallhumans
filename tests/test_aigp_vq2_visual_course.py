@@ -4684,7 +4684,7 @@ def _latest_gate_one_top_pitch_arbitration_case():
     return boundary, fov_proposal, recovery
 
 
-def test_latest_off_axis_exact_top_keeps_fov_pitch_ownership():
+def test_latest_off_axis_exact_top_yields_to_forward_brake():
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
@@ -4698,7 +4698,7 @@ def test_latest_off_axis_exact_top_keeps_fov_pitch_ownership():
         )
     )
 
-    assert owns_pitch is True
+    assert owns_pitch is False
     assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
     assert recovery.forward_closure_authorized is False
     assert recovery.passage_authority is False
@@ -4803,7 +4803,7 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
             closure_recovery=ordinary_off_axis,
             propagated_state_handoff=authority,
         )
-        is True
+        is False
     )
 
 
@@ -4879,7 +4879,7 @@ def test_exact_top_fov_yields_when_horizontally_aligned():
         },
     ),
 )
-def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
+def test_off_axis_top_fov_yields_during_rapid_closure(
     recovery_change,
 ):
     boundary, fov_proposal, recovery = (
@@ -4894,11 +4894,71 @@ def test_off_axis_top_fov_keeps_pitch_during_rapid_closure(
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
-        is True
+        is False
     )
     assert recovery.horizontal_aligned is False
     assert fov_proposal.protected_target_pitch_rad < (
         recovery.allocated_target_pitch_rad
+    )
+
+
+def test_nonimproving_later_gate_brake_preempts_top_fov():
+    assert (
+        course_stage._current_gate_brake_preempts_top_fov(
+            current_gate_index=1,
+            initial_gate_index=0,
+            mode=VisualApproachMode.APPROACH,
+            requested_target_pitch_rad=0.12,
+            braking=True,
+            current_visible=True,
+            current_ambiguous=False,
+            horizontal_rate_qualified=True,
+            stable_center_x_norm=0.50,
+            residual_horizontal_rate_rad_s=0.10,
+            horizontal_angle_scale_rad=0.80,
+            off_axis_brake_rad=0.10,
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"current_gate_index": 0},
+        {"requested_target_pitch_rad": -0.10},
+        {"braking": False},
+        {"current_visible": False},
+        {"current_ambiguous": True},
+        {"horizontal_rate_qualified": False},
+        {"residual_horizontal_rate_rad_s": -0.10},
+        {"stable_center_x_norm": 0.02},
+    ),
+)
+def test_current_gate_brake_preemption_requires_exact_outward_recovery(
+    change,
+):
+    arguments = {
+        "current_gate_index": 1,
+        "initial_gate_index": 0,
+        "mode": VisualApproachMode.APPROACH,
+        "requested_target_pitch_rad": 0.12,
+        "braking": True,
+        "current_visible": True,
+        "current_ambiguous": False,
+        "horizontal_rate_qualified": True,
+        "stable_center_x_norm": 0.50,
+        "residual_horizontal_rate_rad_s": 0.10,
+        "horizontal_angle_scale_rad": 0.80,
+        "off_axis_brake_rad": 0.10,
+    }
+    arguments.update(change)
+
+    assert (
+        course_stage._current_gate_brake_preempts_top_fov(
+            **arguments,
+        )
+        is False
     )
 
 
@@ -5842,6 +5902,57 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     )
     assert vertical.command.target_pitch_rad == pytest.approx(-0.35)
     assert vertical.evidence["passage_authority"] is False
+
+
+def test_same_gate_wire_anchor_needs_no_independent_fov_lease():
+    snapshot = _snapshot(1, "track-1", 40, visible=False)
+    snapshot.current_track.clipping = FrameEdge.TOP | FrameEdge.RIGHT
+    snapshot.current_track.missed_frame_count = 15
+    last_visible_token = snapshot.current_track.latest_token
+    evidence = {
+        "basis": "propagated-current-visibility-gap-guidance-v2",
+        "gate_index": 1,
+        "track_id": "track-1",
+        "camera_token": asdict(snapshot.latest_camera_token),
+        "last_visible_camera_token": asdict(last_visible_token),
+        "steering_anchor_camera_token": asdict(last_visible_token),
+        "steering_anchor_wire_start_monotonic_ns": 1_500_000_000,
+        "last_visible_clipping": int(FrameEdge.TOP | FrameEdge.RIGHT),
+        "missed_frame_count": 15,
+        "steering_prediction_deadline_basis": (
+            "fresh-publication-same-gate-steering-anchor-v1"
+        ),
+        "steering_prediction_horizon_remaining_s": 0.60,
+        "command": {
+            "target_roll_rad": -0.35,
+            "target_pitch_rad": 0.12,
+            "yaw_rate_rad_s": -0.15,
+            "thrust": 0.275,
+        },
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+
+    authority = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=1,
+            track_id="track-1",
+            fov_summary={},
+        )
+    )
+
+    assert authority.command.anchor_camera_token == last_visible_token
+    assert authority.command.target_roll_rad == pytest.approx(-0.35)
+    assert authority.command.target_pitch_rad == pytest.approx(0.12)
+    assert authority.command.yaw_rate_rad_s == pytest.approx(-0.15)
+    assert authority.command.requested_thrust == pytest.approx(0.275)
+    assert authority.remaining_horizon_s == pytest.approx(0.60)
+    assert authority.evidence["steering_only"] is True
+    assert authority.evidence["passage_authority"] is False
+    assert authority.evidence["advance_authority"] is False
 
 
 def test_full_frame_gap_retains_two_superseded_propagated_fov_frames():

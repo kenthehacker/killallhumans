@@ -222,6 +222,18 @@ class _PendingPostCreditRollReference:
 
 
 @dataclass(frozen=True, slots=True)
+class _SameGateSteeringAnchor:
+    """Last exact visible same-gate reference accepted by the wire."""
+
+    gate_index: int
+    track_id: str
+    stream_generation: int
+    camera_token: CameraFrameToken
+    wire_start_monotonic_ns: int
+    decision: GuidanceDecision
+
+
+@dataclass(frozen=True, slots=True)
 class _WireGovernorConfig:
     max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
@@ -432,6 +444,9 @@ class DynamicVisualCourseSession:
         ] = None
         self._pending_precredit_successor_roll_reference: Optional[
             _PreCreditSuccessorRollReference
+        ] = None
+        self._same_gate_steering_anchor: Optional[
+            _SameGateSteeringAnchor
         ] = None
 
     @property
@@ -1340,7 +1355,6 @@ class DynamicVisualCourseSession:
             )
             + 1e-12
             and abs(guidance_sign) > 1e-12
-            and now_monotonic_ns <= handoff.expires_monotonic_ns
         )
         direction = 1.0 if retained_roll > 0.0 else -1.0
         same_corrective_demand = direction * target_roll_rad > 1e-12
@@ -2258,7 +2272,6 @@ class DynamicVisualCourseSession:
             )
             + 1e-12
             and abs(guidance_sign) > 1e-12
-            and decision.monotonic_ns <= handoff.expires_monotonic_ns
         )
         direction = 1.0 if retained_roll > 0.0 else -1.0
         same_corrective_demand = bool(
@@ -2555,16 +2568,14 @@ class DynamicVisualCourseSession:
         camera_token: CameraFrameToken,
         now_monotonic_ns: int,
     ) -> Mapping[str, Any]:
-        """Guide exact successive misses from the retained local state.
+        """Continue accepted same-gate steering across exact fresh misses.
 
         The rolling graph keeps authoritative identity while independently
-        withholding visual-measurement authority.  This method admits only an
-        exact clipped-edge loss and propagates the last measured bearing/rate
-        with IMU and accepted-command history.  A still-live local aperture
-        lease may extend the same absolute local-state horizon.  Missing
-        publications never renew either seed.  Bearing uncertainty remains an
-        independent hard bound, and this authority is steering-only: it
-        cannot supply passage, race, or advance authority.
+        withholding visual-measurement authority.  Each exact newer camera
+        publication proves the stream is live, so a clipped-edge miss may
+        continue the last bounded same-gate command that actually reached the
+        wire.  No bearing, aperture, scale, TTC, passage, race, or advance
+        geometry is renewed through blindness.
         """
 
         if type(track) is not VisualTrack:
@@ -2622,7 +2633,6 @@ class DynamicVisualCourseSession:
 
         state = self.core.course_state()
         current = state.current
-        prior = self._last_decision
         expected_last_measurement_ns = (
             sample.observation_monotonic_ns
             - round(
@@ -2630,25 +2640,14 @@ class DynamicVisualCourseSession:
                 * 1_000_000_000.0
             )
         )
-        fallback_steering_deadline_ns = (
-            sample.observation_monotonic_ns
-            + round(
-                self.core.config.dropout_hold_s * 1_000_000_000.0
-            )
-        )
+        anchor = self._same_gate_steering_anchor
         bearing_prediction_seed_ns = current.last_measurement_monotonic_ns
-        # Reuse the calibrated post-credit current-state horizon that owns the
-        # same rolling bearing/IMU/accepted-wire estimate during reacquisition.
-        # Anchoring it to the last measurement, rather than the latest coast
-        # frame or wire command, prevents a sliding lease through blindness.
-        bearing_prediction_deadline_ns = (
-            bearing_prediction_seed_ns
-            + round(
-                self.core.config
-                .post_credit_current_prediction_max_horizon_s
-                * 1_000_000_000.0
-            )
-        )
+        # Aperture/scale authority still expires from its measured seed.  It
+        # must never own passage or clearance after that deadline.  Steering
+        # continuity is different: every exact next camera publication proves
+        # the receiver is live, so retain the last same-gate reference that
+        # actually reached the wire instead of aborting on an inherited
+        # predecessor timestamp.
         aperture_steering_deadline_ns = (
             current.aperture_prediction_deadline_monotonic_ns
             if (
@@ -2661,23 +2660,14 @@ class DynamicVisualCourseSession:
             )
             else None
         )
-        steering_deadline_ns = max(
-            fallback_steering_deadline_ns,
-            bearing_prediction_deadline_ns,
-            (
-                fallback_steering_deadline_ns
-                if aperture_steering_deadline_ns is None
-                else aperture_steering_deadline_ns
-            ),
+        fresh_publication_horizon_s = (
+            self.core.config.post_credit_current_prediction_max_horizon_s
+        )
+        steering_deadline_ns = now_monotonic_ns + round(
+            fresh_publication_horizon_s * 1_000_000_000.0
         )
         steering_deadline_basis = (
-            "propagated-local-aperture-state-v1"
-            if (
-                aperture_steering_deadline_ns is not None
-                and aperture_steering_deadline_ns
-                > bearing_prediction_deadline_ns
-            )
-            else "propagated-local-bearing-state-v1"
+            "fresh-publication-same-gate-steering-anchor-v1"
         )
         if (
             state.current_gate_index != staged.expected_gate_index
@@ -2690,29 +2680,27 @@ class DynamicVisualCourseSession:
             or current.visible
             or current.ambiguous
             or current.missed_count != missed_count
-            or steering_deadline_ns <= now_monotonic_ns
-            or prior is None
-            or prior.current_gate_index != state.current_gate_index
-            or prior.current_track_id != state.current_track_id
+            or anchor is None
+            or anchor.gate_index != state.current_gate_index
+            or anchor.track_id != state.current_track_id
+            or anchor.stream_generation != current.stream_generation
+            or anchor.camera_token != sample.token
+            or anchor.camera_token.stream_id != camera_token.stream_id
+            or anchor.wire_start_monotonic_ns
+            < current.last_measurement_monotonic_ns
+            or anchor.wire_start_monotonic_ns > now_monotonic_ns
         ):
             raise DynamicCourseError(
                 "propagated visibility gap lacks fresh local steering state"
             )
 
-        decision = self.guide(
-            current_track_id=state.current_track_id,
-            successor_track_id=state.successor_track_id,
-            monotonic_ns=now_monotonic_ns,
-        )
-        if decision is None:
-            raise DynamicCourseError(
-                "propagated visibility gap lacks applied-command guidance"
-            )
+        decision = anchor.decision
         command = decision.command
-        remaining_horizon_s = (
-            steering_deadline_ns - now_monotonic_ns
-        ) / 1_000_000_000.0
-        decision_aperture = decision.current_aperture_half_size_norm
+        remaining_horizon_s = fresh_publication_horizon_s
+        # The anchor owns only bounded attitude/yaw/thrust steering.  Never
+        # carry aperture, scale, TTC, passage, or advance geometry through
+        # blindness.
+        decision_aperture = None
         maximum_bearing_std_rad = (
             self.core.config.max_abs_bearing_rad
         )
@@ -2752,6 +2740,12 @@ class DynamicVisualCourseSession:
             "track_id": state.current_track_id,
             "camera_token": asdict(camera_token),
             "last_visible_camera_token": asdict(sample.token),
+            "steering_anchor_camera_token": asdict(
+                anchor.camera_token
+            ),
+            "steering_anchor_wire_start_monotonic_ns": (
+                anchor.wire_start_monotonic_ns
+            ),
             "tracker_frame_sequence": staged.tracker_frame_sequence,
             "last_visible_tracker_frame_sequence": (
                 sample.tracker_frame_sequence
@@ -2769,13 +2763,13 @@ class DynamicVisualCourseSession:
                 steering_deadline_basis
             ),
             "fallback_steering_deadline_monotonic_ns": (
-                fallback_steering_deadline_ns
+                steering_deadline_ns
             ),
             "bearing_prediction_seed_monotonic_ns": (
                 bearing_prediction_seed_ns
             ),
             "bearing_prediction_deadline_monotonic_ns": (
-                bearing_prediction_deadline_ns
+                steering_deadline_ns
             ),
             "aperture_prediction_deadline_monotonic_ns": (
                 aperture_steering_deadline_ns
@@ -2790,10 +2784,10 @@ class DynamicVisualCourseSession:
                 else list(decision_aperture)
             ),
             "current_aperture_propagated": (
-                decision.current_aperture_propagated
+                False
             ),
             "current_aperture_dynamics_qualified": (
-                decision.current_aperture_dynamics_qualified
+                False
             ),
             "current_bearing_std_rad": list(
                 decision.current_bearing_std_rad
@@ -2866,6 +2860,50 @@ class DynamicVisualCourseSession:
             discontinuity_axes=discontinuity_axes,
         )
         self._last_applied_sample = applied_sample
+        staged = self._staged
+        decision = self._last_decision
+        if staged is not None and decision is not None:
+            state = self.core.course_state()
+            current = state.current
+            exact_visible_same_gate = bool(
+                not staged.adjacent_precredit
+                and decision.current_gate_index == state.current_gate_index
+                and decision.current_track_id == state.current_track_id
+                and staged.expected_gate_index == state.current_gate_index
+                and staged.expected_current_track_id == state.current_track_id
+                and staged.camera_token.generation
+                == current.stream_generation
+                and staged.tracker_frame_sequence == current.frame_sequence
+                and current.state_monotonic_ns
+                == current.last_measurement_monotonic_ns
+                and current.visible
+                and not current.ambiguous
+                and current.missed_count == 0
+                and not all(current.censored_axes)
+                and not decision.passage_committed
+                and decision.monotonic_ns <= wire_start_monotonic_ns
+            )
+            if exact_visible_same_gate:
+                accepted_anchor_decision = replace(
+                    decision,
+                    command=replace(
+                        decision.command,
+                        target_roll_rad=float(target_roll_rad),
+                        target_pitch_rad=float(target_pitch_rad),
+                        yaw_rate_rad_s=float(yaw_rate_rad_s),
+                        thrust=float(thrust),
+                    ),
+                )
+                self._same_gate_steering_anchor = (
+                    _SameGateSteeringAnchor(
+                        gate_index=state.current_gate_index,
+                        track_id=state.current_track_id,
+                        stream_generation=current.stream_generation,
+                        camera_token=staged.camera_token,
+                        wire_start_monotonic_ns=wire_start_monotonic_ns,
+                        decision=accepted_anchor_decision,
+                    )
+                )
         pending_roll = self._pending_precredit_successor_roll_reference
         if pending_roll is not None:
             self._pending_precredit_successor_roll_reference = None

@@ -769,7 +769,7 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     assert session.post_credit_roll_reference_handoff_active
 
 
-def test_unqualified_post_credit_rate_retains_bank_only_until_expiry():
+def test_unqualified_post_credit_rate_retains_bank_across_old_deadline():
     session, source, successor_id, retained = (
         _activated_committed_roll_handoff()
     )
@@ -810,12 +810,17 @@ def test_unqualified_post_credit_rate_retains_bank_only_until_expiry():
         unqualified,
         monotonic_ns=handoff.expires_monotonic_ns + 1,
     )
-    released = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+    retained_after_deadline = (  # noqa: SLF001
+        session._apply_post_credit_roll_reference_handoff(
         expired
+        )
     )
 
-    assert released.command == normal_command
-    assert not session.post_credit_roll_reference_handoff_active
+    assert (
+        retained_after_deadline.command.target_roll_rad
+        == pytest.approx(retained)
+    )
+    assert session.post_credit_roll_reference_handoff_active
 
 
 @pytest.mark.parametrize(
@@ -2056,7 +2061,7 @@ def test_propagated_current_fov_gap_authority_is_exact_and_steering_only() -> No
     assert authority["advance_authority"] is False
 
 
-def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
+def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
     tracker, graph, snapshot, current_id = _graph()
     session = _session(
         config=replace(
@@ -2128,9 +2133,8 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
 
     authorities = []
     bearing_seed_ns = None
-    bearing_deadline_ns = None
     last_measurement_ns = None
-    previous_remaining_horizon_s = None
+    accepted_anchor_command = None
     for sequence in range(8, 21):
         if sequence != 8:
             update = tracker.update(
@@ -2163,16 +2167,17 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
         )
         assert authority["camera_token"] == asdict(update.token)
         assert authority["missed_frame_count"] == sequence - 7
-        assert authority["steering_prediction_horizon_remaining_s"] > 0.0
-        if previous_remaining_horizon_s is not None:
-            assert (
-                authority["steering_prediction_horizon_remaining_s"]
-                < previous_remaining_horizon_s
-            )
-        previous_remaining_horizon_s = authority[
+        assert authority[
             "steering_prediction_horizon_remaining_s"
-        ]
+        ] == pytest.approx(
+            session.core.config
+            .post_credit_current_prediction_max_horizon_s
+        )
         assert authority["current_aperture_half_size_norm"] is None
+        assert authority["current_aperture_propagated"] is False
+        assert authority[
+            "current_aperture_dynamics_qualified"
+        ] is False
         assert all(
             math.isfinite(value)
             for value in (
@@ -2196,12 +2201,13 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
         assert authority["steering_only"] is True
         assert authority["passage_authority"] is False
         assert authority["advance_authority"] is False
+        if accepted_anchor_command is None:
+            accepted_anchor_command = authority["command"]
+        else:
+            assert authority["command"] == accepted_anchor_command
         if bearing_seed_ns is None:
             bearing_seed_ns = authority[
                 "bearing_prediction_seed_monotonic_ns"
-            ]
-            bearing_deadline_ns = authority[
-                "bearing_prediction_deadline_monotonic_ns"
             ]
             last_measurement_ns = authority[
                 "last_measurement_monotonic_ns"
@@ -2211,11 +2217,25 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
                 "bearing_prediction_seed_monotonic_ns"
             ] == bearing_seed_ns
             assert authority[
-                "bearing_prediction_deadline_monotonic_ns"
-            ] == bearing_deadline_ns
-            assert authority[
                 "last_measurement_monotonic_ns"
             ] == last_measurement_ns
+        expected_deadline_ns = (
+            now_ns
+            + round(
+                session.core.config
+                .post_credit_current_prediction_max_horizon_s
+                * 1_000_000_000.0
+            )
+        )
+        assert authority[
+            "steering_prediction_deadline_monotonic_ns"
+        ] == expected_deadline_ns
+        assert authority[
+            "bearing_prediction_deadline_monotonic_ns"
+        ] == expected_deadline_ns
+        assert authority[
+            "fallback_steering_deadline_monotonic_ns"
+        ] == expected_deadline_ns
 
     authority = authorities[-1]
     now_ns = update.observation_monotonic_ns + 5_000_000
@@ -2232,11 +2252,10 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
     )
     assert authority["last_visible_clipping"] == int(FrameEdge.RIGHT)
     assert authority["steering_prediction_deadline_basis"] == (
-        "propagated-local-bearing-state-v1"
+        "fresh-publication-same-gate-steering-anchor-v1"
     )
-    assert now_ns > authority["fallback_steering_deadline_monotonic_ns"]
     assert authority["bearing_prediction_deadline_monotonic_ns"] == (
-        authority["bearing_prediction_seed_monotonic_ns"]
+        now_ns
         + round(
             session.core.config
             .post_credit_current_prediction_max_horizon_s
@@ -2258,16 +2277,8 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
             now_monotonic_ns=now_ns,
         )
 
-    deadline_ns = authority["steering_prediction_deadline_monotonic_ns"]
-    with pytest.raises(DynamicCourseError, match="fresh local steering"):
-        session.propagated_current_visibility_gap_authority(
-            track=tracker.track(current_id),
-            camera_token=update.token,
-            now_monotonic_ns=deadline_ns + 1,
-        )
 
-
-def test_live_local_aperture_extends_clipped_steering_beyond_fallback() -> None:
+def test_fresh_missing_publication_uses_wire_anchor_not_aperture_lease() -> None:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -2331,27 +2342,38 @@ def test_live_local_aperture_extends_clipped_steering_beyond_fallback() -> None:
     assert aperture_deadline_ns is not None
     assert aperture_deadline_ns > fallback_deadline_ns
 
+    authority_now_ns = fallback_deadline_ns + 1_000_000
     authority = session.propagated_current_visibility_gap_authority(
         track=track,
         camera_token=update.token,
-        now_monotonic_ns=fallback_deadline_ns + 1_000_000,
+        now_monotonic_ns=authority_now_ns,
     )
 
     assert authority["steering_prediction_deadline_basis"] == (
-        "propagated-local-aperture-state-v1"
+        "fresh-publication-same-gate-steering-anchor-v1"
     )
     assert authority["fallback_steering_deadline_monotonic_ns"] == (
-        fallback_deadline_ns
+        authority["steering_prediction_deadline_monotonic_ns"]
     )
     assert authority["aperture_prediction_deadline_monotonic_ns"] == (
         aperture_deadline_ns
     )
     assert authority["steering_prediction_deadline_monotonic_ns"] == (
-        aperture_deadline_ns
+        authority_now_ns
+        + round(
+            session.core.config
+            .post_credit_current_prediction_max_horizon_s
+            * 1_000_000_000.0
+        )
     )
-    assert authority["steering_prediction_horizon_remaining_s"] > 0.0
-    assert authority["current_aperture_propagated"] is True
-    assert authority["current_aperture_half_size_norm"] is not None
+    assert authority[
+        "steering_prediction_horizon_remaining_s"
+    ] == pytest.approx(
+        session.core.config
+        .post_credit_current_prediction_max_horizon_s
+    )
+    assert authority["current_aperture_propagated"] is False
+    assert authority["current_aperture_half_size_norm"] is None
     assert all(
         math.isfinite(value)
         for value in authority["command"].values()
@@ -2375,17 +2397,6 @@ def test_live_local_aperture_extends_clipped_steering_beyond_fallback() -> None:
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
-
-    with pytest.raises(
-        DynamicCourseError,
-        match="fresh local steering",
-    ):
-        session.propagated_current_visibility_gap_authority(
-            track=track,
-            camera_token=update.token,
-            now_monotonic_ns=aperture_deadline_ns + 1,
-        )
-
 
 def test_propagated_current_fov_gap_refuses_identity_and_frame_mismatch() -> None:
     session, track, token, now_ns = _propagated_vertical_fov_gap()

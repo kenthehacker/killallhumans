@@ -1915,15 +1915,11 @@ def _off_axis_top_fov_owns_pitch(
     ):
         raise ValueError("TOP pitch arbitration inputs are invalid")
 
-    ordinary_off_axis_approach = bool(
-        mode is VisualApproachMode.APPROACH
-        and not closure_recovery.horizontal_aligned
-    )
     bounded_post_credit_recovery = bool(
         mode is VisualApproachMode.PROMOTE_REACQUIRE
     )
     return bool(
-        (ordinary_off_axis_approach or bounded_post_credit_recovery)
+        bounded_post_credit_recovery
         and closure_recovery.fresh_boundary_current_authority
         and closure_recovery.steering_only
         and not closure_recovery.forward_closure_authorized
@@ -1945,6 +1941,77 @@ def _off_axis_top_fov_owns_pitch(
         )
         and fov_proposal.protected_target_pitch_rad
         < closure_recovery.allocated_target_pitch_rad - 1e-12
+    )
+
+
+def _current_gate_brake_preempts_top_fov(
+    *,
+    current_gate_index: int,
+    initial_gate_index: int,
+    mode: VisualApproachMode,
+    requested_target_pitch_rad: float,
+    braking: bool,
+    current_visible: bool,
+    current_ambiguous: bool,
+    horizontal_rate_qualified: bool,
+    stable_center_x_norm: float,
+    residual_horizontal_rate_rad_s: float,
+    horizontal_angle_scale_rad: float,
+    off_axis_brake_rad: float,
+) -> bool:
+    """Let fresh current-gate recovery stop closure before preserving FOV.
+
+    Gate 0 keeps its proved launch/crossing pitch schedule.  On later gates,
+    once fixed-reference lateral recovery stalls or turns outward, the core's
+    nonforward brake owns pitch.  Roll and yaw continue steering; temporary
+    visual loss is handled by the same-gate accepted-wire anchor.
+    """
+
+    if (
+        type(current_gate_index) is not int
+        or type(initial_gate_index) is not int
+        or type(mode) is not VisualApproachMode
+        or type(braking) is not bool
+        or type(current_visible) is not bool
+        or type(current_ambiguous) is not bool
+        or type(horizontal_rate_qualified) is not bool
+    ):
+        raise ValueError("current-gate brake priority structure is invalid")
+    requested, stable_x, residual_x, angle_scale, off_axis = map(
+        float,
+        (
+            requested_target_pitch_rad,
+            stable_center_x_norm,
+            residual_horizontal_rate_rad_s,
+            horizontal_angle_scale_rad,
+            off_axis_brake_rad,
+        ),
+    )
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                requested,
+                stable_x,
+                residual_x,
+                angle_scale,
+                off_axis,
+            )
+        )
+        or angle_scale <= 0.0
+        or off_axis <= 0.0
+    ):
+        raise ValueError("current-gate brake priority input is invalid")
+    return bool(
+        current_gate_index > initial_gate_index
+        and mode is VisualApproachMode.APPROACH
+        and requested >= 0.0
+        and braking
+        and current_visible
+        and not current_ambiguous
+        and horizontal_rate_qualified
+        and abs(math.atan(stable_x * angle_scale)) >= off_axis
+        and stable_x * residual_x >= 0.0
     )
 
 
@@ -4438,7 +4505,7 @@ def _approach_propagated_visibility_gap_authority(
     track_id: str,
     fov_summary: Mapping[str, Any],
 ) -> _ApproachPropagatedVisibilityGapAuthority:
-    """Bind state guidance to the last FOV-protected visible publication."""
+    """Bind a fresh miss to accepted same-gate steering or legacy FOV state."""
 
     token = getattr(snapshot, "latest_camera_token", None)
     track = getattr(snapshot, "current_track", None)
@@ -4457,6 +4524,21 @@ def _approach_propagated_visibility_gap_authority(
     )
     protected_pitch = fov_summary.get(
         "last_protected_target_pitch_rad"
+    )
+    same_gate_wire_anchor_requested = (
+        evidence.get("steering_prediction_deadline_basis")
+        == "fresh-publication-same-gate-steering-anchor-v1"
+    )
+    same_gate_wire_anchor = bool(
+        same_gate_wire_anchor_requested
+        and isinstance(last_visible, Mapping)
+        and evidence.get("steering_anchor_camera_token")
+        == dict(last_visible)
+        and type(
+            evidence.get("steering_anchor_wire_start_monotonic_ns")
+        )
+        is int
+        and evidence["steering_anchor_wire_start_monotonic_ns"] >= 0
     )
     known_clipping_edges = int(
         FrameEdge.LEFT
@@ -4693,6 +4775,34 @@ def _approach_propagated_visibility_gap_authority(
         # authority across exactly that one-publication race.
         and direct_outer_token_lineage
     )
+    legacy_fov_authority_usable = bool(
+        isinstance(last_visible, Mapping)
+        and (
+            fov_summary.get("active") is True
+            or direct_outer_fov_lineage
+            or inactive_safe_inner_fov_lineage
+        )
+        and fov_summary.get("last_track_id") == track_id
+        and (
+            fov_summary.get("last_camera_token") == dict(last_visible)
+            or direct_outer_fov_lineage
+            or propagated_superseded_fov_lineage
+            or retained_raw_superseded_fov_lineage
+        )
+        and (
+            propagated_fov_lineage
+            or propagated_superseded_fov_lineage
+            or retained_raw_fov_lineage
+            or retained_raw_superseded_fov_lineage
+            or direct_inner_fov_lineage
+            or direct_outer_fov_lineage
+        )
+        and type(protected_pitch) in {int, float}
+        and math.isfinite(float(protected_pitch))
+        and MIN_VISUAL_TARGET_PITCH_RAD
+        <= float(protected_pitch)
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+    )
     if (
         not isinstance(evidence, Mapping)
         or evidence.get("basis")
@@ -4720,39 +4830,24 @@ def _approach_propagated_visibility_gap_authority(
         or last_visible_clipping & ~known_clipping_edges
         or int(getattr(track, "clipping", FrameEdge.NONE))
         != last_visible_clipping
-        # A horizontal-only clipped loss does not need an actively limiting
-        # top-FOV envelope.  Neither does an exact same-publication inner
-        # observation that proved the top edge safe and accepted an already
-        # nonforward pitch.  Both remain steering-only and horizon bounded.
+        # The accepted-wire anchor already includes any stage-level FOV
+        # arbitration that reached the vehicle.  It needs no second,
+        # independently expiring FOV lineage.  Older evidence still follows
+        # the legacy FOV contract.
         or (
-            fov_summary.get("active") is not True
-            and not direct_outer_fov_lineage
-            and not inactive_safe_inner_fov_lineage
-        )
-        or fov_summary.get("last_track_id") != track_id
-        or (
-            fov_summary.get("last_camera_token") != dict(last_visible)
-            and not direct_outer_fov_lineage
-            and not propagated_superseded_fov_lineage
-            and not retained_raw_superseded_fov_lineage
-        )
-        or not (
-            propagated_fov_lineage
-            or propagated_superseded_fov_lineage
-            or retained_raw_fov_lineage
-            or retained_raw_superseded_fov_lineage
-            or direct_inner_fov_lineage
-            or direct_outer_fov_lineage
+            (
+                same_gate_wire_anchor_requested
+                and not same_gate_wire_anchor
+            )
+            or (
+                not same_gate_wire_anchor_requested
+                and not legacy_fov_authority_usable
+            )
         )
         or not isinstance(command, Mapping)
         or type(remaining_horizon_s) not in {int, float}
         or not math.isfinite(float(remaining_horizon_s))
         or float(remaining_horizon_s) <= 0.0
-        or type(protected_pitch) not in {int, float}
-        or not math.isfinite(float(protected_pitch))
-        or not MIN_VISUAL_TARGET_PITCH_RAD
-        <= float(protected_pitch)
-        <= MAX_VISUAL_TARGET_PITCH_RAD
     ):
         raise ValueError(
             "approach visibility gap lacks exact propagated/FOV authority"
@@ -4766,7 +4861,11 @@ def _approach_propagated_visibility_gap_authority(
         raise ValueError(
             "approach visibility gap command is malformed"
         ) from exc
-    target_pitch = min(requested_pitch, float(protected_pitch))
+    target_pitch = (
+        requested_pitch
+        if same_gate_wire_anchor
+        else min(requested_pitch, float(protected_pitch))
+    )
     if (
         not all(
             math.isfinite(value)
@@ -8035,6 +8134,7 @@ async def _run_visual_course_stage_impl(
         requested_pitch_before_top_fov = target_pitch_rad
         top_fov_track_id: Optional[str] = None
         dynamic_controller = runtime.dynamic_controller
+        current_gate_brake_preempted_top_fov = False
         if type(dynamic_controller) is DynamicVisualCourseSession:
             top_fov_track_id = getattr(target_track, "track_id", None)
             if (
@@ -8044,6 +8144,47 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course top-FOV target identity is invalid"
                 )
+            brake_decision = dynamic_controller.last_decision
+            if brake_decision is not None:
+                brake_course = dynamic_controller.core.course_state()
+                brake_current = brake_course.current
+                try:
+                    current_gate_brake_preempted_top_fov = (
+                        _current_gate_brake_preempts_top_fov(
+                            current_gate_index=current_gate_index,
+                            initial_gate_index=initial_gate_index,
+                            mode=proposal.mode,
+                            requested_target_pitch_rad=(
+                                requested_pitch_before_top_fov
+                            ),
+                            braking=bool(brake_decision.braking),
+                            current_visible=bool(brake_current.visible),
+                            current_ambiguous=bool(brake_current.ambiguous),
+                            horizontal_rate_qualified=bool(
+                                brake_current.bearing_rate_qualified[0]
+                            ),
+                            stable_center_x_norm=float(
+                                brake_decision.current_center_norm[0]
+                            ),
+                            residual_horizontal_rate_rad_s=float(
+                                brake_current
+                                .residual_translational_rate_rad_s[0]
+                            ),
+                            horizontal_angle_scale_rad=float(
+                                dynamic_controller.core.config
+                                .horizontal_angle_scale_rad
+                            ),
+                            off_axis_brake_rad=float(
+                                dynamic_controller.core.config
+                                .off_axis_brake_rad
+                            ),
+                        )
+                    )
+                except (IndexError, TypeError, ValueError) as exc:
+                    raise abort_type(
+                        "visual-course current-gate brake priority refused: "
+                        f"{exc}"
+                    ) from exc
             fov_summary = segment["top_fov_pitch_protection"]
             if not top_fov_transition_owned:
                 try:
@@ -8242,6 +8383,12 @@ async def _run_visual_course_stage_impl(
                 or top_fov_propagated_proposal
                 or top_fov_retained_raw_proposal
             )
+            if (
+                current_gate_brake_preempted_top_fov
+                and fov_reference is not None
+                and committed_crossing_authority is None
+            ):
+                target_pitch_rad = requested_pitch_before_top_fov
             if (
                 (
                     fov_reference is not None
@@ -8982,6 +9129,21 @@ async def _run_visual_course_stage_impl(
             accepted_dynamic_evidence["roll_yaw_transport_rate_rad_s"] = (
                 roll_yaw_transport_rate
             )
+            if current_gate_brake_preempted_top_fov:
+                accepted_dynamic_evidence[
+                    "current_gate_forward_brake_preemption"
+                ] = {
+                    "basis": (
+                        "fresh-current-nonimproving-closure-brake-v1"
+                    ),
+                    "requested_target_pitch_rad": (
+                        requested_pitch_before_top_fov
+                    ),
+                    "applied_target_pitch_rad": target_pitch_rad,
+                    "steering_only": True,
+                    "passage_authority": False,
+                    "advance_authority": False,
+                }
             if (
                 type(dynamic_controller)
                 is DynamicVisualCourseSession
