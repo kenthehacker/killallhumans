@@ -7461,6 +7461,91 @@ def test_approach_inner_dropout_hold_is_bounded_to_prior_fov_authority():
     )
 
 
+def test_approach_inner_dropout_hold_bridges_fresh_corner_after_wired_fit():
+    anchor_token = _token(80)
+    superseded_token = _token(81)
+    dropout_token = _token(82)
+    anchor_inner = _inner_aperture(center_y=0.58, half_y=0.20)
+    rejected_inner = VisualInnerApertureGeometry(
+        center_norm=None,
+        half_size_norm=None,
+        log_scale=None,
+        measurement_std=None,
+        confidence=0.0,
+        clipping=FrameEdge.RIGHT | FrameEdge.BOTTOM,
+        visible_edges=FrameEdge.NONE,
+        geometry_model_id=None,
+        covariance_model_id=None,
+        health_reason="aperture_fit_rejected:insufficient_visible_edges",
+    )
+    anchor = SimpleNamespace(
+        token=anchor_token,
+        observation_monotonic_ns=2_000_000_000,
+        inner_aperture=anchor_inner,
+        clipping=FrameEdge.RIGHT | FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    # This publication had a complete fit but was superseded before a command
+    # was wired. Continuity remains anchored to the prior actually wired fit.
+    superseded = SimpleNamespace(
+        token=superseded_token,
+        observation_monotonic_ns=2_032_000_000,
+        inner_aperture=_inner_aperture(center_y=0.62, half_y=0.20),
+        clipping=FrameEdge.RIGHT | FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    dropout = SimpleNamespace(
+        token=dropout_token,
+        observation_monotonic_ns=2_064_000_000,
+        inner_aperture=rejected_inner,
+        clipping=FrameEdge.RIGHT | FrameEdge.BOTTOM,
+        center_censored=True,
+    )
+    track = SimpleNamespace(
+        track_id="track-1",
+        latest_token=dropout_token,
+        role=VisualTrackRole.CURRENT,
+        visible=True,
+        ambiguous=False,
+        missed_frame_count=0,
+        clipping=FrameEdge.RIGHT | FrameEdge.BOTTOM,
+        center_censored=True,
+        history=(anchor, superseded, dropout),
+    )
+    snapshot = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        current_track=track,
+        latest_camera_token=dropout_token,
+        authority_usable=True,
+    )
+    fov_summary = {
+        "last_inner_active": False,
+        "last_inner_track_id": "track-1",
+        "last_inner_camera_token": asdict(anchor_token),
+        "last_inner_wire_start_monotonic_ns": 2_010_000_000,
+        "last_inner_raw_top_edge_basis": (
+            course_stage.TOP_FOV_INNER_EDGE_BASIS
+        ),
+        "last_inner_protected_target_pitch_rad": 0.12,
+    }
+
+    authority = course_stage._derive_approach_inner_dropout_authority(
+        snapshot=snapshot,
+        expected_gate_index=1,
+        expected_track_id="track-1",
+        maximum_age_s=0.12,
+        now_monotonic_ns=2_074_000_000,
+        fov_summary=fov_summary,
+    )
+
+    assert authority is not None
+    assert authority.anchor_camera_token == anchor_token
+    assert authority.last_camera_token == dropout_token
+    assert authority.age_s == pytest.approx(0.064)
+    assert authority.maximum_target_pitch_rad == pytest.approx(0.12)
+
+
 def test_top_fov_uses_full_bounded_pitch_when_reserve_is_infeasible():
     proposal = course_stage._propose_top_fov_pitch_reference(
         capture_pitch_rad=-0.284,

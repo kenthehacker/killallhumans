@@ -2202,7 +2202,7 @@ def _derive_approach_inner_dropout_authority(
     fov_summary: Mapping[str, Any],
     existing: Optional[_ApproachInnerDropoutAuthority] = None,
 ) -> Optional[_ApproachInnerDropoutAuthority]:
-    """Bound a vertical-support refusal to the last exact inner authority."""
+    """Bridge a fresh clipped-current fit failure from the last wired fit."""
 
     maximum_age = float(maximum_age_s)
     track = getattr(snapshot, "current_track", None)
@@ -2232,8 +2232,8 @@ def _derive_approach_inner_dropout_authority(
         or getattr(track, "visible", False) is not True
         or getattr(track, "ambiguous", True) is not False
         or getattr(track, "missed_frame_count", None) != 0
-        or getattr(track, "clipping", None)
-        not in {FrameEdge.TOP, FrameEdge.BOTTOM}
+        or not isinstance(getattr(track, "clipping", None), FrameEdge)
+        or getattr(track, "clipping", None) == FrameEdge.NONE
         or getattr(track, "center_censored", None) is not True
         or type(token) is not CameraFrameToken
         or type(history) is not tuple
@@ -2286,9 +2286,7 @@ def _derive_approach_inner_dropout_authority(
             or not anchor_inner.fitted
             or anchor_inner.clipping != FrameEdge.NONE
             or not anchor_inner.complete_visibility
-            or fov_summary.get("last_inner_active") is not True
-            or fov_summary.get("last_inner_track_id")
-            != expected_track_id
+            or fov_summary.get("last_inner_track_id") != expected_track_id
             or fov_summary.get("last_inner_raw_top_edge_basis")
             != TOP_FOV_INNER_EDGE_BASIS
             or type(
@@ -2301,7 +2299,6 @@ def _derive_approach_inner_dropout_authority(
             return None
         previous_sample = anchor_sample
         for dropout_sample in history[anchor_index + 1 :]:
-            dropout_inner = dropout_sample.inner_aperture
             if (
                 type(dropout_sample.token) is not CameraFrameToken
                 or dropout_sample.token.stream_id != token.stream_id
@@ -2316,12 +2313,7 @@ def _derive_approach_inner_dropout_authority(
                 is not int
                 or dropout_sample.observation_monotonic_ns
                 <= previous_sample.observation_monotonic_ns
-                or dropout_sample.clipping
-                not in {
-                    FrameEdge.NONE,
-                    FrameEdge.TOP,
-                    FrameEdge.BOTTOM,
-                }
+                or not isinstance(dropout_sample.clipping, FrameEdge)
                 or (
                     dropout_sample.clipping == FrameEdge.NONE
                     and dropout_sample.center_censored
@@ -2329,13 +2321,6 @@ def _derive_approach_inner_dropout_authority(
                 or (
                     dropout_sample.clipping != FrameEdge.NONE
                     and not dropout_sample.center_censored
-                )
-                or (
-                    type(dropout_inner)
-                    is VisualInnerApertureGeometry
-                    and dropout_inner.fitted
-                    and dropout_inner.clipping == FrameEdge.NONE
-                    and dropout_inner.complete_visibility
                 )
             ):
                 return None
@@ -8551,7 +8536,11 @@ async def _run_visual_course_stage_impl(
                         current_aperture_observable
                     ),
                     subsupport_collective_authorized=(
+                        # The proved support floor launches Gate 0. Once
+                        # credited, fresh visual vertical control must retain
+                        # the configured bounded authority to descend.
                         top_fov_transition_owned
+                        or current_gate_index > initial_gate_index
                     ),
                 )
             )
