@@ -825,6 +825,49 @@ def test_unqualified_post_credit_rate_releases_bank_at_handoff_deadline():
     assert session.post_credit_roll_reference_handoff_active is False
 
 
+def test_qualified_inward_rate_releases_bank_while_still_off_axis():
+    session, source, successor_id, retained = (
+        _activated_committed_roll_handoff()
+    )
+    estimate = session.core._tracks[successor_id]  # noqa: SLF001
+    estimate.state = replace(
+        estimate.state,
+        residual_translational_rate_rad_s=(-0.05, 0.0),
+        bearing_rate_qualified=(True, True),
+        bearing_std_rad=(0.02, 0.02),
+        ambiguous=False,
+    )
+    normal_command = replace(
+        source.command,
+        target_roll_rad=0.60 * retained,
+    )
+    fresh_recovering = replace(
+        source,
+        current_gate_index=1,
+        current_track_id=successor_id,
+        successor_track_id=None,
+        current_center_norm=(0.30, 0.0),
+        proposed_command=normal_command,
+        command=normal_command,
+    )
+    assert (
+        abs(
+            math.atan(
+                fresh_recovering.current_center_norm[0]
+                * session.core.config.horizontal_angle_scale_rad
+            )
+        )
+        > session.core.config.off_axis_brake_rad
+    )
+
+    released = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        fresh_recovering
+    )
+
+    assert released.command == normal_command
+    assert session.post_credit_roll_reference_handoff_active is False
+
+
 @pytest.mark.parametrize(
     (
         "normal_roll_rad",
@@ -3920,10 +3963,8 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
             )
         )
     )
-    assert recovering_off_axis.command.target_roll_rad == pytest.approx(
-        expected_roll
-    )
-    assert session.post_credit_roll_reference_handoff_active
+    assert recovering_off_axis.command == normal_command
+    assert session.post_credit_roll_reference_handoff_active is False
 
     recovered = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
         replace(

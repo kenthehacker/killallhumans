@@ -2233,10 +2233,11 @@ class DynamicVisualCourseSession:
         retains one already accepted, bounded successor attitude target while
         the promoted current error still requires the same correction.  A
         short unqualified-rate gap retains that reference only through the
-        reviewed successor horizon.  A qualified recovering-rate sample may
-        release it only after the promoted gate reaches the existing off-axis
-        envelope; farther out, fresh guidance must catch up or opposite
-        geometry must own the release.
+        reviewed successor horizon.  A qualified recovering-rate sample
+        releases it immediately.  Once fresh promoted-current geometry proves
+        that the lateral error is already closing, retaining a larger
+        pre-credit bank would fight the current controller and create an
+        avoidable overshoot.
         """
 
         handoff = self._post_credit_roll_reference_handoff
@@ -2298,8 +2299,6 @@ class DynamicVisualCourseSession:
         qualified_recovery = bool(
             current.bearing_rate_qualified[0]
             and direction * guidance_sign * residual_rate <= 1e-12
-            and abs(stable_bearing_rad)
-            <= self.core.config.off_axis_brake_rad + 1e-12
         )
         if (
             not bounded_state

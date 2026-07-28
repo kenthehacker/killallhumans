@@ -4928,7 +4928,9 @@ def test_nonimproving_later_gate_brake_preempts_top_fov():
             braking=True,
             current_visible=True,
             current_ambiguous=False,
+            horizontal_rate_qualified=True,
             stable_center_x_norm=0.50,
+            residual_horizontal_rate_rad_s=0.10,
             horizontal_angle_scale_rad=0.80,
             off_axis_brake_rad=0.10,
         )
@@ -4944,6 +4946,8 @@ def test_nonimproving_later_gate_brake_preempts_top_fov():
         {"braking": False},
         {"current_visible": False},
         {"current_ambiguous": True},
+        {"horizontal_rate_qualified": False},
+        {"residual_horizontal_rate_rad_s": -0.10},
         {"stable_center_x_norm": 0.02},
     ),
 )
@@ -4958,7 +4962,9 @@ def test_current_gate_brake_preemption_requires_exact_outward_recovery(
         "braking": True,
         "current_visible": True,
         "current_ambiguous": False,
+        "horizontal_rate_qualified": True,
         "stable_center_x_norm": 0.50,
+        "residual_horizontal_rate_rad_s": 0.10,
         "horizontal_angle_scale_rad": 0.80,
         "off_axis_brake_rad": 0.10,
     }

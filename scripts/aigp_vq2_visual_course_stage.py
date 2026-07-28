@@ -1966,16 +1966,19 @@ def _current_gate_brake_preempts_top_fov(
     braking: bool,
     current_visible: bool,
     current_ambiguous: bool,
+    horizontal_rate_qualified: bool,
     stable_center_x_norm: float,
+    residual_horizontal_rate_rad_s: float,
     horizontal_angle_scale_rad: float,
     off_axis_brake_rad: float,
 ) -> bool:
     """Let fresh current-gate recovery stop closure before preserving FOV.
 
     Gate 0 keeps its proved launch/crossing pitch schedule.  On later gates,
-    once the fresh current target is materially off axis and the core has
-    requested a nonforward brake, that brake owns pitch.  A short-lived
-    inward image rate must not turn braking back into forward acceleration.
+    once the fresh current target is materially off axis and its qualified
+    residual motion is stalled or outward, the core's nonforward brake owns
+    pitch.  While the error is measurably closing, exact TOP-boundary guidance
+    keeps the camera pointed at the target.
     """
 
     if (
@@ -1985,13 +1988,15 @@ def _current_gate_brake_preempts_top_fov(
         or type(braking) is not bool
         or type(current_visible) is not bool
         or type(current_ambiguous) is not bool
+        or type(horizontal_rate_qualified) is not bool
     ):
         raise ValueError("current-gate brake priority structure is invalid")
-    requested, stable_x, angle_scale, off_axis = map(
+    requested, stable_x, residual_x, angle_scale, off_axis = map(
         float,
         (
             requested_target_pitch_rad,
             stable_center_x_norm,
+            residual_horizontal_rate_rad_s,
             horizontal_angle_scale_rad,
             off_axis_brake_rad,
         ),
@@ -2002,6 +2007,7 @@ def _current_gate_brake_preempts_top_fov(
             for value in (
                 requested,
                 stable_x,
+                residual_x,
                 angle_scale,
                 off_axis,
             )
@@ -2017,7 +2023,9 @@ def _current_gate_brake_preempts_top_fov(
         and braking
         and current_visible
         and not current_ambiguous
+        and horizontal_rate_qualified
         and abs(math.atan(stable_x * angle_scale)) >= off_axis
+        and stable_x * residual_x >= 0.0
     )
 
 
@@ -8611,8 +8619,15 @@ async def _run_visual_course_stage_impl(
                             braking=bool(brake_decision.braking),
                             current_visible=bool(brake_current.visible),
                             current_ambiguous=bool(brake_current.ambiguous),
+                            horizontal_rate_qualified=bool(
+                                brake_current.bearing_rate_qualified[0]
+                            ),
                             stable_center_x_norm=float(
                                 brake_decision.current_center_norm[0]
+                            ),
+                            residual_horizontal_rate_rad_s=float(
+                                brake_current
+                                .residual_translational_rate_rad_s[0]
                             ),
                             horizontal_angle_scale_rad=float(
                                 dynamic_controller.core.config
