@@ -567,8 +567,8 @@ class _FreshTopCensoredClosureRecovery:
 
 
 @dataclass(frozen=True, slots=True)
-class _FreshPostCreditTopBoundaryAuthority:
-    """Exact credited-current publication allowed to withhold closure."""
+class _FreshCurrentTopBoundaryAuthority:
+    """Exact authoritative-current publication allowed to withhold closure."""
 
     gate_index: int
     track_id: str
@@ -579,6 +579,93 @@ class _FreshPostCreditTopBoundaryAuthority:
     sample: Any
 
 
+def _fresh_current_top_boundary_authority(
+    session: DynamicVisualCourseSession,
+    *,
+    snapshot: Any,
+    current_gate_index: int,
+    current_track_id: str,
+) -> _FreshCurrentTopBoundaryAuthority:
+    """Bind one fresh TOP boundary without consuming stale aperture state."""
+
+    if type(session) is not DynamicVisualCourseSession:
+        raise ValueError("fresh current TOP boundary lacks dynamic authority")
+    state = session.core.course_state()
+    current = getattr(state, "current", None)
+    track = getattr(snapshot, "current_track", None)
+    token = getattr(snapshot, "latest_camera_token", None)
+    history = getattr(track, "history", None)
+    sample = (
+        None
+        if type(history) is not tuple or not history
+        else history[-1]
+    )
+    raw_top: Optional[float] = None
+    if sample is not None:
+        try:
+            raw_top = _raw_bbox_top_image_down(sample.bbox_norm)
+        except (AttributeError, TypeError, ValueError):
+            raw_top = None
+    if (
+        type(current_gate_index) is not int
+        or current_gate_index < 0
+        or type(current_track_id) is not str
+        or not current_track_id
+        or type(token) is not CameraFrameToken
+        or sample is None
+        or current is None
+        or getattr(snapshot, "current_gate_index", None)
+        != current_gate_index
+        or getattr(snapshot, "current_track_id", None)
+        != current_track_id
+        or getattr(snapshot, "authority_usable", None) is not True
+        or getattr(snapshot, "withholding_reason", None) is not None
+        or getattr(snapshot, "race_finished", None) is not False
+        or getattr(state, "current_gate_index", None)
+        != current_gate_index
+        or getattr(state, "current_track_id", None)
+        != current_track_id
+        or getattr(current, "track_id", None) != current_track_id
+        or getattr(track, "track_id", None) != current_track_id
+        or getattr(track, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(track, "authoritative_gate_index", None)
+        != current_gate_index
+        or getattr(track, "latest_token", None) != token
+        or getattr(sample, "token", None) != token
+        or getattr(current, "frame_sequence", None)
+        != getattr(sample, "tracker_frame_sequence", None)
+        or getattr(current, "stream_generation", None)
+        != token.generation
+        or getattr(current, "clipping", None) is not FrameEdge.TOP
+        or getattr(current, "censored_axes", None)
+        not in {(False, True), (False, False)}
+        or not bool(getattr(current, "visible", False))
+        or bool(getattr(current, "ambiguous", True))
+        or getattr(current, "missed_count", None) != 0
+        or not bool(getattr(track, "visible", False))
+        or bool(getattr(track, "ambiguous", True))
+        or getattr(track, "missed_frame_count", None) != 0
+        or getattr(track, "clipping", None) is not FrameEdge.TOP
+        or getattr(sample, "clipping", None) is not FrameEdge.TOP
+        or getattr(track, "center_censored", None) is not True
+        or getattr(sample, "center_censored", None) is not True
+        or raw_top is None
+        or raw_top > -1.0 + 1e-12
+    ):
+        raise ValueError(
+            "fresh current TOP boundary differs from authoritative lineage"
+        )
+    return _FreshCurrentTopBoundaryAuthority(
+        gate_index=current_gate_index,
+        track_id=current_track_id,
+        camera_token=token,
+        tracker_frame_sequence=sample.tracker_frame_sequence,
+        current=current,
+        track=track,
+        sample=sample,
+    )
+
+
 def _fresh_post_credit_top_boundary_authority(
     *,
     state: Any,
@@ -586,7 +673,7 @@ def _fresh_post_credit_top_boundary_authority(
     authority: Mapping[str, Any],
     recovery_snapshot: Any,
     current_gate_index: int,
-) -> _FreshPostCreditTopBoundaryAuthority:
+) -> _FreshCurrentTopBoundaryAuthority:
     """Bind aperture-free recovery to one exact fresh credited boundary."""
 
     track = getattr(recovery_snapshot, "current_track", None)
@@ -643,7 +730,7 @@ def _fresh_post_credit_top_boundary_authority(
             "fresh post-credit TOP boundary differs from credited current "
             "lineage"
         )
-    return _FreshPostCreditTopBoundaryAuthority(
+    return _FreshCurrentTopBoundaryAuthority(
         gate_index=current_gate_index,
         track_id=track_id,
         camera_token=token,
@@ -853,7 +940,7 @@ def _allocate_fresh_top_censored_closure_recovery(
     fov_protected_target_pitch_rad: float,
     requested_thrust: float,
     fresh_boundary_current_authority: Optional[
-        _FreshPostCreditTopBoundaryAuthority
+        _FreshCurrentTopBoundaryAuthority
     ] = None,
 ) -> Optional[_FreshTopCensoredClosureRecovery]:
     """Remove forward authority while a fresh current gate is TOP-censored.
@@ -876,7 +963,7 @@ def _allocate_fresh_top_censored_closure_recovery(
         or (
             fresh_boundary_current_authority is not None
             and type(fresh_boundary_current_authority)
-            is not _FreshPostCreditTopBoundaryAuthority
+            is not _FreshCurrentTopBoundaryAuthority
         )
         or type(current_censored_axes) is not tuple
         or len(current_censored_axes) != 2
@@ -991,7 +1078,16 @@ def _allocate_fresh_top_censored_closure_recovery(
         return None
 
     predicted_pitch = capture_pitch + pitch_rate * response_delay
-    allocated_pitch = min(requested_pitch, max(0.0, predicted_pitch))
+    # The exact fresh boundary removes forward-closure authority and calls
+    # for the already-bounded dynamic brake reference.  The final wire
+    # governor remains the sole temporal slew authority; projecting this
+    # target back to zero previously left only ~0.024 rad/s of pitch response
+    # in live TOP saturation and failed to arrest closure.
+    allocated_pitch = (
+        requested_pitch
+        if boundary_authorized
+        else min(requested_pitch, max(0.0, predicted_pitch))
+    )
     allocated_thrust = max(GATE0_PROVED_COLLECTIVE_BASE, thrust)
     residual_rate_norm = (
         residual_x / horizontal_scale,
@@ -8858,6 +8954,327 @@ async def _run_visual_course_stage_impl(
                         "approach_propagated_visibility_gap_command_count"
                     ] = (
                         approach_propagated_visibility_gap_command_count
+                    )
+                    continue
+                fresh_top_track = getattr(
+                    snapshot,
+                    "current_track",
+                    None,
+                )
+                fresh_top_boundary_eligible = bool(
+                    type(exc)
+                    is VisualApproachCurrentGeometryUnavailable
+                    and mode is VisualApproachMode.APPROACH
+                    and lifecycle is CourseLifecycle.APPROACH
+                    and type(runtime.dynamic_controller)
+                    is DynamicVisualCourseSession
+                    and passage_admission is None
+                    and near_plane_latch is None
+                    and crossing_anchor is None
+                    and getattr(snapshot, "current_gate_index", None)
+                    == current_gate_index
+                    and getattr(snapshot, "current_track_id", None)
+                    == current_track_id
+                    and getattr(snapshot, "authority_usable", None)
+                    is True
+                    and getattr(snapshot, "withholding_reason", None)
+                    is None
+                    and getattr(snapshot, "race_finished", None) is False
+                    and getattr(fresh_top_track, "clipping", None)
+                    is FrameEdge.TOP
+                )
+                if fresh_top_boundary_eligible:
+                    dynamic_controller = runtime.dynamic_controller
+                    assert type(dynamic_controller) is DynamicVisualCourseSession
+                    recovery_proposal_ns = runtime.perf_counter_ns()
+                    if (
+                        type(recovery_proposal_ns) is not int
+                        or recovery_proposal_ns < 0
+                    ):
+                        raise abort_type(
+                            "visual-course fresh TOP-boundary brake QPC "
+                            "clock is invalid"
+                        ) from exc
+                    try:
+                        boundary = _fresh_current_top_boundary_authority(
+                            dynamic_controller,
+                            snapshot=snapshot,
+                            current_gate_index=current_gate_index,
+                            current_track_id=current_track_id,
+                        )
+                        hold = (
+                            dynamic_controller.continuity_hold_authority(
+                                now_monotonic_ns=recovery_proposal_ns,
+                                maximum_age_s=(
+                                    runtime.yaw_profile
+                                    .control_hold_horizon_s
+                                ),
+                            )
+                        )
+                        if not isinstance(hold, Mapping):
+                            raise ValueError(
+                                "fresh TOP-boundary brake lacks an accepted "
+                                "command"
+                            )
+                        recovery_config = dynamic_controller.core.config
+                        recovery_current = boundary.current
+                        recovery_center = tuple(
+                            map(float, boundary.track.center_norm)
+                        )
+                        recovery = (
+                            _allocate_fresh_top_censored_closure_recovery(
+                                raw_top_edge_image_down=(
+                                    _raw_bbox_top_image_down(
+                                        boundary.sample.bbox_norm
+                                    )
+                                ),
+                                clipping=boundary.track.clipping,
+                                center_censored=True,
+                                current_visible=True,
+                                current_ambiguous=False,
+                                current_missed_count=0,
+                                current_censored_axes=(
+                                    recovery_current.censored_axes
+                                ),
+                                # The expired aperture is deliberately not
+                                # consumed by this exact fresh-boundary path.
+                                current_aperture_propagated=False,
+                                current_aperture_dynamics_qualified=False,
+                                passage_committed=False,
+                                capture_pitch_rad=(
+                                    _body_to_reference_pitch_rad(
+                                        recovery_current
+                                        .body_to_reference_wxyz
+                                    )
+                                ),
+                                body_pitch_rate_rad_s=float(
+                                    recovery_current.body_rates_rad_s[1]
+                                ),
+                                pitch_response_delay_s=float(
+                                    recovery_config.pitch_command_delay_s
+                                ),
+                                stable_center_norm=recovery_center,
+                                residual_rate_rad_s=(0.0, 0.0),
+                                horizontal_angle_scale_rad=float(
+                                    recovery_config
+                                    .horizontal_angle_scale_rad
+                                ),
+                                vertical_angle_scale_rad=float(
+                                    recovery_config
+                                    .vertical_angle_scale_rad
+                                ),
+                                off_axis_brake_rad=float(
+                                    recovery_config.off_axis_brake_rad
+                                ),
+                                expansion_rate_s=0.0,
+                                time_to_contact_s=None,
+                                requested_target_pitch_rad=float(
+                                    recovery_config.brake_pitch_rad
+                                ),
+                                fov_protected_target_pitch_rad=float(
+                                    hold["target_pitch_rad"]
+                                ),
+                                requested_thrust=float(
+                                    limits.max_thrust
+                                ),
+                                fresh_boundary_current_authority=boundary,
+                            )
+                        )
+                        if (
+                            recovery is None
+                            or recovery.allocated_target_pitch_rad
+                            != recovery.requested_target_pitch_rad
+                            or recovery.forward_closure_authorized
+                            or not recovery.steering_only
+                            or recovery.passage_authority
+                            or recovery.advance_authority
+                        ):
+                            raise ValueError(
+                                "fresh TOP-boundary brake lacks bounded "
+                                "steering-only authority"
+                            )
+                    except (
+                        AttributeError,
+                        KeyError,
+                        TypeError,
+                        ValueError,
+                    ) as recovery_exc:
+                        raise abort_type(
+                            "visual-course fresh TOP-boundary brake "
+                            f"refused: {recovery_exc}"
+                        ) from recovery_exc
+                    if approach_top_recovery_started_s is None:
+                        approach_top_recovery_started_s = now
+                        approach_top_recovery_fresh_frame_count = 0
+                        approach_top_recovery_last_token = None
+                        segment["approach_top_recovery"] = {
+                            "basis": recovery.basis,
+                            "authority_basis": (
+                                "fresh-authoritative-current-top-boundary-v1"
+                            ),
+                            "anchor_camera_token": asdict(token),
+                            "first_censored_camera_token": asdict(token),
+                            "last_censored_camera_token": None,
+                            "clean_reacquired_camera_token": None,
+                            "outcome": "braking",
+                            "target_roll_rad": float(
+                                hold["target_roll_rad"]
+                            ),
+                            "requested_brake_target_pitch_rad": (
+                                recovery.requested_target_pitch_rad
+                            ),
+                            "applied_brake_target_pitch_rad": (
+                                recovery.allocated_target_pitch_rad
+                            ),
+                            "source_fov_target_pitch_rad": (
+                                recovery.fov_protected_target_pitch_rad
+                            ),
+                            "requested_thrust": (
+                                recovery.allocated_thrust
+                            ),
+                            "steering_only": True,
+                            "passage_authority": False,
+                            "advance_authority": False,
+                            "cross_gap_identity_claimed": False,
+                            "max_duration_s": (
+                                limits
+                                .approach_top_recovery_max_duration_s
+                            ),
+                            "max_fresh_frames": (
+                                limits
+                                .approach_top_recovery_max_fresh_frames
+                            ),
+                            "elapsed_s": 0.0,
+                        }
+                        near_plane_evidence = NearPlaneEvidence()
+                        approach_top_recovery_authority = None
+                        segment["near_plane_evidence_frame_count"] = 0
+                        host.recorder.emit(
+                            "visual_course_approach_top_recovery_started",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "approach-top-boundary-brake"
+                            ),
+                            **segment["approach_top_recovery"],
+                        )
+                    recovery_elapsed_s = (
+                        now - approach_top_recovery_started_s
+                    )
+                    if (
+                        recovery_elapsed_s
+                        >= limits.approach_top_recovery_max_duration_s
+                        or approach_top_recovery_fresh_frame_count
+                        >= limits.approach_top_recovery_max_fresh_frames
+                    ):
+                        assert segment["approach_top_recovery"] is not None
+                        segment["approach_top_recovery"]["outcome"] = (
+                            "bounded_brake_expired"
+                        )
+                        raise abort_type(
+                            "visual-course bounded fresh TOP-boundary "
+                            "brake expired"
+                        ) from exc
+                    if (
+                        approach_top_recovery_last_token is not None
+                        and not _token_strictly_newer(
+                            token,
+                            approach_top_recovery_last_token,
+                        )
+                    ):
+                        raise abort_type(
+                            "visual-course fresh TOP-boundary brake did "
+                            "not advance"
+                        ) from exc
+                    approach_top_recovery_last_token = token
+                    approach_top_recovery_fresh_frame_count += 1
+                    segment[
+                        "approach_top_recovery_fresh_frame_count"
+                    ] = approach_top_recovery_fresh_frame_count
+                    assert segment["approach_top_recovery"] is not None
+                    segment["approach_top_recovery"].update(
+                        {
+                            "last_censored_camera_token": asdict(token),
+                            "elapsed_s": recovery_elapsed_s,
+                            "requested_brake_target_pitch_rad": (
+                                recovery.requested_target_pitch_rad
+                            ),
+                            "applied_brake_target_pitch_rad": (
+                                recovery.allocated_target_pitch_rad
+                            ),
+                        }
+                    )
+                    last_planned_token = token
+                    brake_authority = _CensoredPassageCoastAuthority(
+                        gate_index=current_gate_index,
+                        track_id=current_track_id,
+                        anchor_camera_token=token,
+                        target_roll_rad=float(hold["target_roll_rad"]),
+                        target_pitch_rad=(
+                            recovery.allocated_target_pitch_rad
+                        ),
+                        yaw_rate_rad_s=float(hold["yaw_rate_rad_s"]),
+                        requested_thrust=recovery.allocated_thrust,
+                    )
+                    try:
+                        brake_command = await send_censored_passage_coast(
+                            snapshot=snapshot,
+                            authority=brake_authority,
+                            yaw_reference_rad=yaw_reference_rad,
+                            segment_started_s=segment_started_s,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "approach-top-boundary-brake"
+                            ),
+                            command_deadline_s=min(
+                                course_deadline_s,
+                                segment_deadline_s,
+                                approach_top_recovery_started_s
+                                + (
+                                    limits
+                                    .approach_top_recovery_max_duration_s
+                                ),
+                            ),
+                            hold_basis=APPROACH_TOP_RECOVERY_BASIS,
+                        )
+                    except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                        credited_race = accept_no_wire_race_boundary(
+                            race_exc
+                        )
+                        break
+                    if brake_command is None:
+                        continue
+                    approach_top_recovery_command_count += 1
+                    approach_command_count += 1
+                    segment["approach_command_count"] = (
+                        approach_command_count
+                    )
+                    segment[
+                        "approach_top_recovery_command_count"
+                    ] = approach_top_recovery_command_count
+                    host.recorder.emit(
+                        "visual_course_fresh_top_boundary_brake_applied",
+                        gate_index=current_gate_index,
+                        stage=(
+                            f"{VISUAL_COURSE_STAGE}/gate"
+                            f"{current_gate_index}/"
+                            "approach-top-boundary-brake"
+                        ),
+                        camera_token=asdict(token),
+                        requested_brake_target_pitch_rad=(
+                            recovery.requested_target_pitch_rad
+                        ),
+                        applied_brake_target_pitch_rad=(
+                            recovery.allocated_target_pitch_rad
+                        ),
+                        requested_thrust=recovery.allocated_thrust,
+                        steering_only=True,
+                        passage_authority=False,
+                        advance_authority=False,
+                        cross_gap_identity_claimed=False,
+                        command=asdict(brake_command),
                     )
                     continue
                 dropout_authority: Optional[
