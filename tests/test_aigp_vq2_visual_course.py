@@ -3204,6 +3204,29 @@ def test_fresh_current_top_boundary_admits_exact_authoritative_publication(
     assert boundary.sample is snapshot.current_track.history[-1]
 
 
+def test_fresh_raw_top_boundary_accepts_same_frame_unclipped_inner_state(
+    monkeypatch,
+):
+    state, _decision, _authority, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    state.current.clipping = FrameEdge.NONE
+    state.current.censored_axes = (False, False)
+    session = DynamicVisualCourseSession()
+    monkeypatch.setattr(session.core, "course_state", lambda: state)
+
+    boundary = course_stage._fresh_current_top_boundary_authority(
+        session,
+        snapshot=snapshot,
+        current_gate_index=1,
+        current_track_id="track-1",
+    )
+
+    assert boundary.camera_token == snapshot.latest_camera_token
+    assert boundary.current.clipping is FrameEdge.NONE
+    assert boundary.track.clipping is FrameEdge.TOP
+
+
 @pytest.mark.parametrize(
     "mutation",
     ("unusable", "stale_token", "ambiguous", "not_top"),

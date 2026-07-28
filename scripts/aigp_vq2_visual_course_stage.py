@@ -860,7 +860,11 @@ def _fresh_current_top_boundary_authority(
         != getattr(sample, "tracker_frame_sequence", None)
         or getattr(current, "stream_generation", None)
         != token.generation
-        or getattr(current, "clipping", None) is not FrameEdge.TOP
+        # The dynamic state may carry a complete tracking-only inner fit from
+        # this same publication, so its control geometry remains unclipped
+        # while the exact raw outer support below owns the TOP boundary.
+        or getattr(current, "clipping", None)
+        not in {FrameEdge.NONE, FrameEdge.TOP}
         or getattr(current, "censored_axes", None)
         not in {(False, True), (False, False)}
         or not bool(getattr(current, "visible", False))
