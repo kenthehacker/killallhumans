@@ -5965,6 +5965,10 @@ async def _run_visual_course_stage_impl(
             if (
                 fov_reference is not None
                 and committed_crossing_authority is None
+                and getattr(target_track, "clipping", None)
+                is FrameEdge.TOP
+                and getattr(target_track, "center_censored", None)
+                is True
             ):
                 try:
                     recovery_course = (
