@@ -1135,6 +1135,7 @@ def _fresh_current_top_boundary_authority(
     snapshot: Any,
     current_gate_index: int,
     current_track_id: str,
+    now_monotonic_ns: int,
 ) -> _FreshCurrentTopBoundaryAuthority:
     """Bind one fresh TOP boundary without consuming stale aperture state.
 
@@ -1170,6 +1171,24 @@ def _fresh_current_top_boundary_authority(
     )
     current_clipping = getattr(current, "clipping", None)
     current_censored_axes = getattr(current, "censored_axes", None)
+    retained_aperture = getattr(
+        current,
+        "aperture_half_size_norm",
+        None,
+    )
+    retained_aperture_deadline_ns = getattr(
+        current,
+        "aperture_prediction_deadline_monotonic_ns",
+        None,
+    )
+    expired_propagated_aperture = bool(
+        retained_aperture is not None
+        and getattr(current, "aperture_propagated", False) is True
+        and type(retained_aperture_deadline_ns) is int
+        and retained_aperture_deadline_ns >= 0
+        and type(now_monotonic_ns) is int
+        and now_monotonic_ns > retained_aperture_deadline_ns
+    )
     corner_geometry_matches = bool(
         horizontal_edge in {FrameEdge.LEFT, FrameEdge.RIGHT}
         and current_clipping == track_clipping
@@ -1179,7 +1198,15 @@ def _fresh_current_top_boundary_authority(
         and getattr(current, "raw_center_norm", None)
         == getattr(track, "center_norm", None)
         and getattr(current, "raw_log_scale", None) is None
-        and getattr(current, "aperture_half_size_norm", None) is None
+        # The state is stamped at camera-capture time.  A propagated
+        # aperture may therefore still be structurally present even though
+        # its fixed deadline has expired by this exact proposal QPC.  The
+        # corner path consumes only the fresh raw boundary and never that
+        # expired aperture.
+        and (
+            retained_aperture is None
+            or expired_propagated_aperture
+        )
     )
     top_geometry_matches = bool(
         horizontal_edge == FrameEdge.NONE
@@ -1227,6 +1254,8 @@ def _fresh_current_top_boundary_authority(
         or current_gate_index < 0
         or type(current_track_id) is not str
         or not current_track_id
+        or type(now_monotonic_ns) is not int
+        or now_monotonic_ns < 0
         or type(token) is not CameraFrameToken
         or sample is None
         or current is None
@@ -8264,12 +8293,21 @@ async def _run_visual_course_stage_impl(
                         )
                     recovery_config = dynamic_controller.core.config
                     if fresh_top_boundary is None:
+                        fresh_boundary_ns = runtime.perf_counter_ns()
+                        if (
+                            type(fresh_boundary_ns) is not int
+                            or fresh_boundary_ns < 0
+                        ):
+                            raise ValueError(
+                                "fresh TOP boundary QPC is invalid"
+                            )
                         fresh_top_boundary = (
                             _fresh_current_top_boundary_authority(
                                 dynamic_controller,
                                 snapshot=snapshot,
                                 current_gate_index=current_gate_index,
                                 current_track_id=current_track_id,
+                                now_monotonic_ns=fresh_boundary_ns,
                             )
                         )
                     top_censored_closure_recovery = (
@@ -11497,6 +11535,7 @@ async def _run_visual_course_stage_impl(
                             snapshot=snapshot,
                             current_gate_index=current_gate_index,
                             current_track_id=current_track_id,
+                            now_monotonic_ns=recovery_proposal_ns,
                         )
                         hold = (
                             dynamic_controller.continuity_hold_authority(

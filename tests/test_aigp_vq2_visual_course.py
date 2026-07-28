@@ -3501,6 +3501,7 @@ def test_fresh_current_top_boundary_admits_exact_authoritative_publication(
         snapshot=snapshot,
         current_gate_index=1,
         current_track_id="track-1",
+        now_monotonic_ns=1_000_000_001,
     )
 
     assert boundary.gate_index == 1
@@ -3553,12 +3554,66 @@ def test_fresh_current_top_corner_admits_exact_authoritative_publication(
         snapshot=snapshot,
         current_gate_index=1,
         current_track_id="track-1",
+        now_monotonic_ns=1_000_000_001,
     )
 
     assert boundary.horizontal_edge is horizontal_edge
     assert boundary.current.censored_axes == (True, True)
     assert boundary.track.clipping == FrameEdge.TOP | horizontal_edge
     assert boundary.sample.clipping == boundary.track.clipping
+
+
+@pytest.mark.parametrize(
+    ("aperture_propagated", "proposal_offset_ns", "accepted"),
+    (
+        (True, 1, True),
+        (True, 0, False),
+        (False, 1, False),
+    ),
+)
+def test_fresh_current_top_corner_ignores_only_expired_propagated_aperture(
+    monkeypatch,
+    aperture_propagated,
+    proposal_offset_ns,
+    accepted,
+):
+    state, snapshot = _fresh_top_corner_boundary_case(FrameEdge.RIGHT)
+    aperture_deadline_ns = 1_100_000_000
+    state.current.aperture_half_size_norm = (0.08, 0.11)
+    state.current.aperture_propagated = aperture_propagated
+    state.current.aperture_prediction_deadline_monotonic_ns = (
+        aperture_deadline_ns
+    )
+    session = DynamicVisualCourseSession()
+    monkeypatch.setattr(session.core, "course_state", lambda: state)
+
+    if accepted:
+        boundary = course_stage._fresh_current_top_boundary_authority(
+            session,
+            snapshot=snapshot,
+            current_gate_index=1,
+            current_track_id="track-1",
+            now_monotonic_ns=(
+                aperture_deadline_ns + proposal_offset_ns
+            ),
+        )
+        assert boundary.horizontal_edge is FrameEdge.RIGHT
+        assert boundary.current.aperture_propagated is True
+        return
+
+    with pytest.raises(
+        ValueError,
+        match="differs from authoritative lineage",
+    ):
+        course_stage._fresh_current_top_boundary_authority(
+            session,
+            snapshot=snapshot,
+            current_gate_index=1,
+            current_track_id="track-1",
+            now_monotonic_ns=(
+                aperture_deadline_ns + proposal_offset_ns
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -3613,6 +3668,7 @@ def test_fresh_current_top_corner_refuses_inexact_publication(
             snapshot=snapshot,
             current_gate_index=1,
             current_track_id="track-1",
+            now_monotonic_ns=1_000_000_001,
         )
 
 
@@ -3637,6 +3693,7 @@ def test_fresh_top_corner_continuity_requires_inward_roll_and_yaw(
         snapshot=snapshot,
         current_gate_index=1,
         current_track_id="track-1",
+        now_monotonic_ns=1_000_000_001,
     )
     prior_decision = SimpleNamespace(
         current_gate_index=1,
@@ -3884,6 +3941,7 @@ def test_fresh_raw_top_boundary_accepts_same_frame_unclipped_inner_state(
         snapshot=snapshot,
         current_gate_index=1,
         current_track_id="track-1",
+        now_monotonic_ns=1_000_000_001,
     )
 
     assert boundary.camera_token == snapshot.latest_camera_token
@@ -3922,6 +3980,7 @@ def test_fresh_current_top_boundary_refuses_inexact_publication(
             snapshot=snapshot,
             current_gate_index=1,
             current_track_id="track-1",
+            now_monotonic_ns=1_000_000_001,
         )
 
 
@@ -4345,6 +4404,7 @@ def test_fresh_top_corner_allocates_only_bounded_continuity(
         snapshot=snapshot,
         current_gate_index=1,
         current_track_id="track-1",
+        now_monotonic_ns=1_000_000_001,
     )
 
     allocation = _dd89_top_censored_recovery(
