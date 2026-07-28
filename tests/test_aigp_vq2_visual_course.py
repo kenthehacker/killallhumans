@@ -26,6 +26,7 @@ from planning.vq2_gate_graph import (
     ConfirmedGateTransition,
 )
 from planning.vq2_course_lifecycle import (
+    CourseLifecycle,
     LatchedMeasurementMode,
     NearPlaneEvidence,
     NearPlaneLatch,
@@ -146,6 +147,62 @@ def test_post_credit_successor_handoff_retires_only_after_one_edge_wire(
             propagated_steering_applied=propagated_steering_applied,
         )
         is expected_required_after
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "mode",
+        "lifecycle",
+        "recovery_measurement_mode",
+        "expected",
+    ),
+    (
+        (
+            VisualApproachMode.APPROACH,
+            CourseLifecycle.APPROACH,
+            None,
+            True,
+        ),
+        (
+            VisualApproachMode.PROMOTE_REACQUIRE,
+            CourseLifecycle.PROMOTE_REACQUIRE,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            True,
+        ),
+        (
+            VisualApproachMode.PROMOTE_REACQUIRE,
+            CourseLifecycle.PROMOTE_REACQUIRE,
+            PostCreditMeasurementMode.CLEAN,
+            False,
+        ),
+        (
+            VisualApproachMode.PASSAGE,
+            CourseLifecycle.PASSAGE_ARMED,
+            None,
+            False,
+        ),
+        (
+            VisualApproachMode.APPROACH,
+            CourseLifecycle.PROMOTE_REACQUIRE,
+            None,
+            False,
+        ),
+    ),
+)
+def test_fresh_top_boundary_recovery_is_lifecycle_scoped(
+    mode,
+    lifecycle,
+    recovery_measurement_mode,
+    expected,
+):
+    assert (
+        course_stage._fresh_top_boundary_recovery_lifecycle_eligible(
+            mode=mode,
+            lifecycle=lifecycle,
+            recovery_measurement_mode=recovery_measurement_mode,
+        )
+        is expected
     )
 
 

@@ -260,6 +260,29 @@ def _post_credit_successor_handoff_required_after_command(
     )
 
 
+def _fresh_top_boundary_recovery_lifecycle_eligible(
+    *,
+    mode: VisualApproachMode,
+    lifecycle: CourseLifecycle,
+    recovery_measurement_mode: Optional[PostCreditMeasurementMode],
+) -> bool:
+    """Admit the bounded TOP brake before and during clean reacquisition."""
+
+    return bool(
+        (
+            mode is VisualApproachMode.APPROACH
+            and lifecycle is CourseLifecycle.APPROACH
+            and recovery_measurement_mode is None
+        )
+        or (
+            mode is VisualApproachMode.PROMOTE_REACQUIRE
+            and lifecycle is CourseLifecycle.PROMOTE_REACQUIRE
+            and recovery_measurement_mode
+            is PostCreditMeasurementMode.ONE_EDGE_CENSORED
+        )
+    )
+
+
 def _body_to_reference_pitch_rad(
     body_to_reference_wxyz: tuple[float, float, float, float],
 ) -> float:
@@ -10590,8 +10613,13 @@ async def _run_visual_course_stage_impl(
                 fresh_top_boundary_eligible = bool(
                     type(exc)
                     is VisualApproachCurrentGeometryUnavailable
-                    and mode is VisualApproachMode.APPROACH
-                    and lifecycle is CourseLifecycle.APPROACH
+                    and _fresh_top_boundary_recovery_lifecycle_eligible(
+                        mode=mode,
+                        lifecycle=lifecycle,
+                        recovery_measurement_mode=(
+                            recovery_measurement_mode
+                        ),
+                    )
                     and type(runtime.dynamic_controller)
                     is DynamicVisualCourseSession
                     and passage_admission is None
@@ -10873,13 +10901,50 @@ async def _run_visual_course_stage_impl(
                     if brake_command is None:
                         continue
                     approach_top_recovery_command_count += 1
-                    approach_command_count += 1
-                    segment["approach_command_count"] = (
-                        approach_command_count
-                    )
                     segment[
                         "approach_top_recovery_command_count"
                     ] = approach_top_recovery_command_count
+                    if (
+                        lifecycle
+                        is CourseLifecycle.PROMOTE_REACQUIRE
+                    ):
+                        segment[
+                            "recovery_navigation_command_count"
+                        ] = int(
+                            segment[
+                                "recovery_navigation_command_count"
+                            ]
+                        ) + 1
+                        segment[
+                            "recovery_one_edge_command_count"
+                        ] = int(
+                            segment[
+                                "recovery_one_edge_command_count"
+                            ]
+                        ) + 1
+                        recovery_deadline_s = min(
+                            course_deadline_s,
+                            segment_deadline_s,
+                            float(runtime.monotonic())
+                            + limits.post_credit_fresh_frame_timeout_s,
+                        )
+                        if (
+                            transitions
+                            and transitions[-1]["to_gate_index"]
+                            == current_gate_index
+                        ):
+                            transitions[-1][
+                                "post_transition_navigation_command_count"
+                            ] = int(
+                                transitions[-1][
+                                    "post_transition_navigation_command_count"
+                                ]
+                            ) + 1
+                    else:
+                        approach_command_count += 1
+                        segment["approach_command_count"] = (
+                            approach_command_count
+                        )
                     host.recorder.emit(
                         "visual_course_fresh_top_boundary_brake_applied",
                         gate_index=current_gate_index,
