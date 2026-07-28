@@ -287,7 +287,7 @@ def test_fresh_top_corner_continuity_has_only_exact_lifecycle_seams(
             False,
             FrameEdge.TOP,
             True,
-            False,
+            True,
         ),
         (
             VisualApproachMode.PROMOTE_REACQUIRE,
@@ -341,7 +341,7 @@ def test_fresh_top_corner_continuity_has_only_exact_lifecycle_seams(
         ),
     ),
 )
-def test_missing_fov_deferral_is_scoped_to_promoted_top_boundary(
+def test_missing_fov_deferral_is_scoped_to_current_owned_top_boundary(
     mode,
     lifecycle,
     measurement,

@@ -322,14 +322,23 @@ def _promoted_top_boundary_may_defer_missing_fov(
     current_clipping: Any,
     current_center_censored: Any,
 ) -> bool:
-    """Admit no-FOV recovery only for an exact post-handoff TOP frame."""
+    """Admit current-owned TOP braking without an optional aperture fit."""
 
     return bool(
-        mode is VisualApproachMode.PROMOTE_REACQUIRE
-        and _fresh_top_boundary_recovery_lifecycle_eligible(
-            mode=mode,
-            lifecycle=lifecycle,
-            recovery_measurement_mode=recovery_measurement_mode,
+        (
+            (
+                mode is VisualApproachMode.APPROACH
+                and lifecycle is CourseLifecycle.APPROACH
+                and recovery_measurement_mode is None
+            )
+            or (
+                mode is VisualApproachMode.PROMOTE_REACQUIRE
+                and _fresh_top_boundary_recovery_lifecycle_eligible(
+                    mode=mode,
+                    lifecycle=lifecycle,
+                    recovery_measurement_mode=recovery_measurement_mode,
+                )
+            )
         )
         and not successor_handoff_required
         and not committed_crossing
@@ -8560,7 +8569,7 @@ async def _run_visual_course_stage_impl(
                         and top_censored_closure_recovery is None
                     ):
                         raise ValueError(
-                            "promoted fresh TOP boundary lacks bounded "
+                            "fresh TOP boundary lacks bounded "
                             "no-FOV recovery"
                         )
                 except (
