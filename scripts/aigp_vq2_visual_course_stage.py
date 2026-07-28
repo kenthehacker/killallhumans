@@ -1805,16 +1805,17 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
     """Arbitrate one fresh TOP frame without reviving urgent closure.
 
     The full positive-pitch brake remains authoritative for aligned, rapid,
-    or ordinary contact-time-unknown approach closure.  During an off-axis,
+    or ordinary contact-time-unknown APPROACH closure.  During an off-axis,
     nonrapid approach, replacing the exact FOV-safe pitch reverses camera
     observability before the horizontal intercept can take effect.
 
     Post-credit recovery may also consume the already-existing fixed,
     nonrenewing retained-raw FOV lease.  That mode is itself bounded and
-    needs a second clean accepted wire before release, so unknown TTC does
-    not imply rapid closure when expansion remains below the planner's
-    existing rapid threshold.  Successor-propagated and geometry-refusal
-    paths never call this policy.
+    needs a second clean accepted wire before release.  It has no passage or
+    advance authority, so its exact FOV-safe pitch remains authoritative even
+    when the censored closure classifier reports aligned or rapid closure;
+    collective retains the positive closure brake.  Successor-propagated and
+    geometry-refusal paths never call this policy.
     """
 
     rapid_expansion, rapid_ttc = map(
@@ -1876,7 +1877,6 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
     return bool(
         (normal_exact_approach or bounded_post_credit_recovery)
         and closure_recovery.fresh_boundary_current_authority
-        and not closure_recovery.horizontal_aligned
         and closure_recovery.steering_only
         and not closure_recovery.forward_closure_authorized
         and not closure_recovery.passage_authority
@@ -1897,8 +1897,14 @@ def _nonrapid_off_axis_top_fov_owns_pitch(
         )
         and fov_proposal.protected_target_pitch_rad
         < closure_recovery.allocated_target_pitch_rad - 1e-12
-        and closure_recovery.expansion_rate_s < rapid_expansion
-        and (ttc is None or ttc > rapid_ttc)
+        and (
+            bounded_post_credit_recovery
+            or (
+                not closure_recovery.horizontal_aligned
+                and closure_recovery.expansion_rate_s < rapid_expansion
+                and (ttc is None or ttc > rapid_ttc)
+            )
+        )
     )
 
 

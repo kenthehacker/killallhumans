@@ -4693,24 +4693,27 @@ def test_nonrapid_post_credit_top_recovery_keeps_fov_pitch_ownership(
 
 
 @pytest.mark.parametrize(
-    ("expansion_rate_s", "time_to_contact_s"),
+    ("recovery_change",),
     (
-        (0.45, None),
-        (0.44, 2.2),
+        ({"stable_center_norm": (0.0, -0.7721254168759125)},),
+        ({"expansion_rate_s": 0.45, "time_to_contact_s": None},),
+        ({"expansion_rate_s": 0.44, "time_to_contact_s": 2.2},),
     ),
 )
-def test_post_credit_top_fov_cannot_preempt_rapid_closure(
-    expansion_rate_s,
-    time_to_contact_s,
+def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
+    recovery_change,
 ):
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
-    recovery = replace(
-        recovery,
-        expansion_rate_s=expansion_rate_s,
-        time_to_contact_s=time_to_contact_s,
-    )
+    if "stable_center_norm" in recovery_change:
+        recovery = replace(
+            recovery,
+            stable_center_norm=recovery_change["stable_center_norm"],
+            horizontal_aligned=True,
+        )
+    else:
+        recovery = replace(recovery, **recovery_change)
 
     assert (
         course_stage._nonrapid_off_axis_top_fov_owns_pitch(
@@ -4721,8 +4724,12 @@ def test_post_credit_top_fov_cannot_preempt_rapid_closure(
             rapid_expansion_rate_s=0.45,
             rapid_closure_ttc_s=2.2,
         )
-        is False
+        is True
     )
+    assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
+    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
+    assert recovery.passage_authority is False
+    assert recovery.advance_authority is False
 
 
 @pytest.mark.parametrize(
