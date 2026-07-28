@@ -4821,12 +4821,10 @@ class DynamicCourseCore:
             * self.config.horizontal_angle_scale_rad
         )
         outward_lateral_arrest = bool(
-            horizontal_crossing_unsafe
-            and current.visible
+            current.visible
             and not current.ambiguous
             and not current.censored_axes[0]
             and current.bearing_rate_qualified[0]
-            and current.scale_rate_qualified
             and current.bearing_std_rad[0] <= 0.16
             and abs(stable_passage_bearing[0])
             >= self.config.off_axis_brake_rad
@@ -4837,13 +4835,14 @@ class DynamicCourseCore:
             > 0.0
         )
         if outward_lateral_arrest:
-            # Once qualified crossing geometry says the gate is laterally
-            # unsafe, meaningfully off axis, and residual translation is still
-            # carrying it outward, proportional gain must not delay use of
-            # already accepted bank authority.  This is a state-dependent
-            # attitude reference, not a temporal command governor; recovering
-            # motion releases it on the next guidance tick and the final wire
-            # governor remains the sole continuity limiter.
+            # Steering authority is independent of passage authority.  A
+            # horizontally valid gate that is meaningfully off axis and still
+            # moving outward may use the accepted bank envelope without
+            # waiting for scale/TTC or crossing-clearance qualification.
+            # This state-dependent attitude reference grants no passage or
+            # promotion authority; recovering motion releases it on the next
+            # guidance tick and the final wire governor remains the sole
+            # continuity limiter.
             roll = math.copysign(MAX_TARGET_ROLL_RAD, roll)
         yaw = -self.config.yaw_gain * heading_error
         # Successor geometry may only slow the current-gate approach with the

@@ -1325,7 +1325,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
+def test_off_axis_outward_steering_does_not_wait_for_crossing_authority(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1344,8 +1344,7 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
     current = None
     for sequence in range(1, 8):
         observation_time = 1.0 + (sequence - 1) * 0.040
-        log_scale = -1.40 + (sequence - 1) * 0.20
-        aperture_scale = math.exp(log_scale + 1.40)
+        log_scale = -1.40
         _imu(core, observation_time)
         current = core.observe_track(
             _observation(
@@ -1354,10 +1353,7 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
                 observation_time,
                 x=0.35 + (sequence - 1) * 0.004,
                 log_scale=log_scale,
-                aperture=(
-                    0.14 * aperture_scale,
-                    0.11 * aperture_scale,
-                ),
+                aperture=(0.14, 0.11),
             )
         )
         if sequence == 1:
@@ -1379,9 +1375,11 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
     )
     assert decision.passage_error_norm[0] > 0.0
     assert residual_lateral_rate_norm_s > 0.0
-    assert current.expansion_rate_s > 0.0
-    assert decision.crossing_rate_q_s[0] < 0.0
-    assert decision.centered_crossing_clearance_norm[0] < 0.0
+    assert current.time_to_contact_s is None
+    assert decision.current_time_to_contact_s is None
+    assert not decision.passage_committed
+    assert decision.successor_passage_authority == 0.0
+    assert decision.passage_yaw_authority == 0.0
     assert (
         decision.proposed_command.target_roll_rad
         == MAX_TARGET_ROLL_RAD
@@ -1397,8 +1395,7 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
     recovered_decision = None
     for sequence, x in ((8, 0.366), (9, 0.358)):
         observation_time = 1.0 + (sequence - 1) * 0.040
-        log_scale = -1.40 + (sequence - 1) * 0.20
-        aperture_scale = math.exp(log_scale + 1.40)
+        log_scale = -1.40
         _imu(core, observation_time)
         recovered = core.observe_track(
             _observation(
@@ -1407,10 +1404,7 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
                 observation_time,
                 x=x,
                 log_scale=log_scale,
-                aperture=(
-                    0.14 * aperture_scale,
-                    0.11 * aperture_scale,
-                ),
+                aperture=(0.14, 0.11),
             )
         )
         decision_time = observation_time + 0.005
@@ -1430,10 +1424,9 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
     )
     assert recovered_lateral_rate_norm_s < 0.0
     assert recovered_decision.passage_error_norm[0] > 0.0
-    assert (
-        recovered_decision.centered_crossing_clearance_norm[0]
-        < 0.0
-    )
+    assert recovered.time_to_contact_s is None
+    assert recovered_decision.current_time_to_contact_s is None
+    assert not recovered_decision.passage_committed
     assert (
         0.0
         < recovered_decision.proposed_command.target_roll_rad
