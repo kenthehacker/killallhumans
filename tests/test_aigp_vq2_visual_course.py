@@ -6556,6 +6556,72 @@ def test_authoritative_transition_without_passage_evidence_fails_closed():
         )
 
 
+def test_delayed_atomic_credit_uses_sole_clipped_gap_successor():
+    class DelayedAtomicCreditHost(_Host):
+        def _sample(self):
+            super()._sample()
+            if (
+                self.after_promotion_samples is not None
+                or self.race.race_finished
+                or self.race.active_gate_index
+                != self.current_gate + 1
+            ):
+                return
+            snapshot = _snapshot(
+                self.current_gate,
+                self.current_track_id,
+                self.sequence,
+                visible=False,
+            )
+            self.visual_gate_graph.latest_snapshot = snapshot
+            snapshot.authority_usable = False
+            snapshot.withholding_reason = "current_track_not_visible"
+            snapshot.next_selection_ambiguous = False
+            snapshot.provisional_track_ids = ()
+            snapshot.current_track.ambiguous = False
+            snapshot.current_track.missed_frame_count = 5
+            snapshot.current_track.clipping = FrameEdge.TOP
+            snapshot.next_candidates = (
+                SimpleNamespace(
+                    track_id=f"track-{self.current_gate + 1}",
+                    latest_token=snapshot.latest_camera_token,
+                    promotable=True,
+                    center_censored=False,
+                    stable_frame_count=6,
+                    confidence=0.84,
+                    association_confidence=0.91,
+                ),
+            )
+
+    host = DelayedAtomicCreditHost(
+        initial_gate=8,
+        finish_gate=9,
+        credit_on_approach=True,
+        fresh_after_samples=1,
+    )
+    runtime, _calls = _runtime(host)
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    assert result["race_finished"] is True
+    segment = result["segments"][0]
+    reconciliation = segment["authoritative_credit_reconciliation"]
+    assert reconciliation["basis"] == (
+        "authoritative-credit-clipped-current-successor-identity-v1"
+    )
+    assert reconciliation["retired_track_id"] == "track-8"
+    assert reconciliation["reviewed_track_id"] == "track-9"
+    assert reconciliation["current_missed_frame_count"] == 5
+    assert reconciliation["candidate_stable_frame_count"] == 6
+    assert reconciliation["passage_authority"] is False
+    assert reconciliation["advance_authority"] is False
+    assert segment["crossing_anchor"] is None
+    assert host.requested_promotion_track_ids[0] == "track-9"
+
+
 def test_passage_timer_is_tight_and_cannot_run_without_advance():
     host = _Host(initial_gate=2, finish_gate=2, disable_credit=True)
     limits = replace(

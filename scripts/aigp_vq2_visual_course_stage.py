@@ -9428,10 +9428,33 @@ async def _run_visual_course_stage_impl(
                         "visual-course transition lacks newer race ingress"
                     )
                 if crossing_anchor is None:
-                    raise abort_type(
-                        "visual-course race credit arrived without credible "
-                        "passage evidence"
+                    credit_snapshot = (
+                        host.visual_gate_graph.latest_snapshot
                     )
+                    reconciliation = (
+                        _unlatched_atomic_credit_successor_evidence(
+                            credit_snapshot,
+                            current_gate_index=current_gate_index,
+                            current_track_id=current_track_id,
+                        )
+                    )
+                    if reconciliation is None:
+                        raise abort_type(
+                            "visual-course race credit arrived without "
+                            "credible passage evidence"
+                        )
+                    credit_wait_reviewed_track_id = str(
+                        reconciliation["reviewed_track_id"]
+                    )
+                    segment["authoritative_credit_reconciliation"] = {
+                        **dict(reconciliation),
+                        "race_status_sequence": (
+                            race.race_status_sequence
+                        ),
+                        "race_received_monotonic_ns": (
+                            race.received_monotonic_ns
+                        ),
+                    }
                 credited_race = race
                 last_race = race
                 crossing_started_s = crossing_started_s or now
