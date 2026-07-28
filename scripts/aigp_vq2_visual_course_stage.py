@@ -4435,6 +4435,11 @@ def _approach_propagated_visibility_gap_authority(
         | FrameEdge.RIGHT
         | FrameEdge.BOTTOM
     )
+    maximum_superseded_fov_publications = (
+        2
+        if last_visible_clipping == known_clipping_edges
+        else 1
+    )
     vertical_clipping_edges = int(FrameEdge.TOP | FrameEdge.BOTTOM)
     last_fov_token = fov_summary.get("last_camera_token")
     direct_outer_token_lineage = bool(
@@ -4480,13 +4485,14 @@ def _approach_propagated_visibility_gap_authority(
         )
         is int
         and type(last_visible.get("publication_sequence")) is int
-        and (
+        and 1
+        <= (
             int(last_visible["publication_sequence"])
             - int(
                 last_handoff["camera_token"]["publication_sequence"]
             )
         )
-        == 1
+        <= maximum_superseded_fov_publications
         and last_fov_token == dict(last_handoff["camera_token"])
         and type(last_visible_clipping) is int
         and last_visible_clipping != 0
@@ -4527,7 +4533,8 @@ def _approach_propagated_visibility_gap_authority(
         )
         is int
         and type(last_visible.get("publication_sequence")) is int
-        and (
+        and 1
+        <= (
             int(last_visible["publication_sequence"])
             - int(
                 last_retained_raw_handoff[
@@ -4535,7 +4542,7 @@ def _approach_propagated_visibility_gap_authority(
                 ]["publication_sequence"]
             )
         )
-        == 1
+        <= maximum_superseded_fov_publications
         and last_fov_token
         == dict(last_retained_raw_handoff["camera_token"])
         and type(last_visible_clipping) is int

@@ -5784,7 +5784,7 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert vertical.evidence["passage_authority"] is False
 
 
-def test_clipped_visibility_gap_retains_one_superseded_propagated_fov_frame():
+def test_full_frame_gap_retains_two_superseded_propagated_fov_frames():
     snapshot = _snapshot(0, "track-0", 20, visible=False)
     snapshot.current_track.clipping = (
         FrameEdge.LEFT
@@ -5883,13 +5883,45 @@ def test_clipped_visibility_gap_retains_one_superseded_propagated_fov_frame():
     assert retained.evidence["passage_authority"] is False
     assert retained.evidence["advance_authority"] is False
 
+    two_publications_prior = replace(
+        accepted_token,
+        publication_sequence=(
+            accepted_token.publication_sequence - 1
+        ),
+    )
+    two_publication_handoff = {
+        **handoff,
+        "camera_token": asdict(two_publications_prior),
+    }
+    two_publication_summary = {
+        **fov_summary,
+        "last_camera_token": asdict(two_publications_prior),
+        "last_propagated_state_handoff": two_publication_handoff,
+    }
+    two_publication_authority = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=two_publication_summary,
+        )
+    )
+    assert (
+        two_publication_authority.command.anchor_camera_token
+        == last_visible_token
+    )
+    assert two_publication_authority.evidence["steering_only"] is True
+    assert two_publication_authority.evidence["passage_authority"] is False
+    assert two_publication_authority.evidence["advance_authority"] is False
+
     stale_retained = {
         **retained_handoff,
         "camera_token": asdict(
             replace(
-                accepted_token,
+                two_publications_prior,
                 publication_sequence=(
-                    accepted_token.publication_sequence - 1
+                    two_publications_prior.publication_sequence - 1
                 ),
             )
         ),
@@ -5920,9 +5952,9 @@ def test_clipped_visibility_gap_retains_one_superseded_propagated_fov_frame():
         {
             "camera_token": asdict(
                 replace(
-                    accepted_token,
+                    two_publications_prior,
                     publication_sequence=(
-                        accepted_token.publication_sequence - 1
+                        two_publications_prior.publication_sequence - 1
                     ),
                 )
             )
