@@ -2146,12 +2146,14 @@ def _refresh_committed_successor_steering(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Admit successor yaw without replacing the sealed crossing command.
+    """Validate successor steering without replacing the sealed command.
 
-    The current-gate clearance proof retains roll, pitch, thrust, identity,
-    and all passage authority.  A lineage-bound successor heading may update
-    only calibrated yaw, which rotates the camera/course tangent without
-    claiming passage or promotion.
+    The precommit heading preview now establishes bounded successor steering
+    while complete current-gate geometry remains available.  Once the
+    current-gate clearance proof seals a crossing command, roll, pitch, yaw,
+    thrust, identity, and passage authority all remain unchanged until race
+    credit or abort.  The dynamic successor fields are still validated here so
+    malformed steering evidence cannot hide behind the sealed command.
     """
 
     if (
@@ -2221,22 +2223,13 @@ def _refresh_committed_successor_steering(
         lower=MIN_VISUAL_TARGET_PITCH_RAD,
         upper=MAX_VISUAL_TARGET_PITCH_RAD,
     )
-    committed_yaw = (
-        None
-        if accepted.yaw_soft_stop_zeroed
-        else admitted_axis(
-            "committed_successor_yaw_authority",
-            "committed_successor_yaw_rate_rad_s",
-            lower=-MAX_VISUAL_YAW_RATE_RAD_S,
-            upper=MAX_VISUAL_YAW_RATE_RAD_S,
-        )
+    admitted_axis(
+        "committed_successor_yaw_authority",
+        "committed_successor_yaw_rate_rad_s",
+        lower=-MAX_VISUAL_YAW_RATE_RAD_S,
+        upper=MAX_VISUAL_YAW_RATE_RAD_S,
     )
-    if committed_yaw is None:
-        return authority
-    return replace(
-        authority,
-        yaw_rate_rad_s=committed_yaw,
-    )
+    return authority
 
 
 def _dynamic_near_plane_wire_sample(
