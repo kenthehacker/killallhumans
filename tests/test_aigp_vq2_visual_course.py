@@ -4501,6 +4501,25 @@ def test_adverse_nonrotational_edge_motion_tightens_pitch_before_clipping():
     )
 
 
+def test_raw_top_motion_cannot_claim_recovery_against_derotated_closure():
+    proposal = course_stage._propose_top_fov_pitch_reference(
+        capture_pitch_rad=-0.277,
+        raw_top_edge_image_down=-0.219,
+        raw_top_edge_rate_down_s=0.285,
+        requested_target_pitch_rad=-0.035,
+        prior_target_pitch_rad=-0.277,
+        vertical_angle_scale_rad=0.55,
+        active_before=False,
+        raw_top_edge_nonrotational_angle_rate_rad_s=-0.118,
+        prediction_horizon_s=0.10,
+    )
+
+    assert proposal.clearance_recovering is False
+    assert proposal.active_after is True
+    assert proposal.protected_target_pitch_rad == pytest.approx(-0.277)
+    assert proposal.limited is True
+
+
 def test_top_fov_nonrotational_rate_is_invariant_under_pure_pitch():
     previous_top = -0.42
     scale = 0.55

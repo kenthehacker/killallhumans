@@ -1544,7 +1544,14 @@ def _propose_top_fov_pitch_reference(
         MIN_VISUAL_TARGET_PITCH_RAD,
         maximum_observable,
     )
-    recovering = bool(rate is not None and rate > 0.0)
+    recovery_rate = (
+        nonrotational_rate
+        if nonrotational_rate is not None
+        else rate
+    )
+    recovering = bool(
+        recovery_rate is not None and recovery_rate > 0.0
+    )
     exceeds = requested > maximum_observable + 1e-12
     active_after = active_before
     protected = requested
