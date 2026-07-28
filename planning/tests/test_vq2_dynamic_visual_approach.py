@@ -1977,7 +1977,8 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
     bearing_seed_ns = None
     bearing_deadline_ns = None
     last_measurement_ns = None
-    for sequence in range(8, 12):
+    previous_remaining_horizon_s = None
+    for sequence in range(8, 18):
         if sequence != 8:
             update = tracker.update(
                 replace(
@@ -2010,6 +2011,14 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
         assert authority["camera_token"] == asdict(update.token)
         assert authority["missed_frame_count"] == sequence - 7
         assert authority["steering_prediction_horizon_remaining_s"] > 0.0
+        if previous_remaining_horizon_s is not None:
+            assert (
+                authority["steering_prediction_horizon_remaining_s"]
+                < previous_remaining_horizon_s
+            )
+        previous_remaining_horizon_s = authority[
+            "steering_prediction_horizon_remaining_s"
+        ]
         assert authority["current_aperture_half_size_norm"] is None
         assert all(
             math.isfinite(value)
@@ -2057,6 +2066,7 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
 
     authority = authorities[-1]
     now_ns = update.observation_monotonic_ns + 5_000_000
+    assert authority["missed_frame_count"] == 10
     assert authority["basis"] == (
         "propagated-current-visibility-gap-guidance-v2"
     )

@@ -2689,6 +2689,33 @@ class _ApproachPropagatedVisibilityGapAuthority:
     evidence: Mapping[str, Any]
 
 
+def _approach_propagated_visibility_gap_command_deadline_s(
+    authority: _ApproachPropagatedVisibilityGapAuthority,
+    *,
+    now_s: float,
+    control_period_s: float,
+) -> float:
+    """Use the core's fixed local-state lease as the sole gap deadline."""
+
+    remaining_horizon_s = authority.remaining_horizon_s
+    if (
+        not math.isfinite(now_s)
+        or not math.isfinite(control_period_s)
+        or control_period_s <= 0.0
+        or not math.isfinite(remaining_horizon_s)
+        or remaining_horizon_s <= control_period_s
+    ):
+        raise ValueError(
+            "approach visibility gap exhausted its local-state horizon"
+        )
+    deadline_s = now_s + remaining_horizon_s
+    if not math.isfinite(deadline_s) or deadline_s <= now_s:
+        raise ValueError(
+            "approach visibility gap deadline is invalid"
+        )
+    return deadline_s
+
+
 def _approach_propagated_visibility_gap_authority(
     evidence: Mapping[str, Any],
     *,
@@ -7376,13 +7403,13 @@ async def _run_visual_course_stage_impl(
                             "first_missing_camera_token": asdict(token),
                             "last_missing_camera_token": None,
                             "reacquired_camera_token": None,
-                            "maximum_duration_s": (
-                                limits
-                                .censored_passage_coast_max_duration_s
+                            "initial_state_horizon_s": (
+                                gap_authority.remaining_horizon_s
                             ),
-                            "maximum_fresh_frames": (
-                                limits
-                                .censored_passage_coast_max_fresh_frames
+                            "state_deadline_basis": (
+                                gap_authority.evidence.get(
+                                    "steering_prediction_deadline_basis"
+                                )
                             ),
                             "outcome": "propagating",
                         }
@@ -7390,14 +7417,15 @@ async def _run_visual_course_stage_impl(
                         now
                         - approach_propagated_visibility_gap_started_s
                     )
-                    if (
-                        gap_elapsed_s
-                        >= limits.censored_passage_coast_max_duration_s
-                        or approach_propagated_visibility_gap_fresh_frame_count
-                        >= limits.censored_passage_coast_max_fresh_frames
-                        or gap_authority.remaining_horizon_s
-                        <= limits.control_period_s
-                    ):
+                    try:
+                        command_deadline_s = (
+                            _approach_propagated_visibility_gap_command_deadline_s(
+                                gap_authority,
+                                now_s=now,
+                                control_period_s=limits.control_period_s,
+                            )
+                        )
+                    except ValueError:
                         assert (
                             segment[
                                 "approach_propagated_visibility_gap"
@@ -7406,7 +7434,7 @@ async def _run_visual_course_stage_impl(
                         )
                         segment[
                             "approach_propagated_visibility_gap"
-                        ]["outcome"] = "bounded_horizon_expired"
+                        ]["outcome"] = "state_horizon_expired"
                         raise abort_type(
                             "visual-course propagated visibility-gap "
                             "horizon expired"
@@ -7434,14 +7462,6 @@ async def _run_visual_course_stage_impl(
                         }
                     )
                     last_planned_token = token
-                    command_deadline_s = min(
-                        (
-                            approach_propagated_visibility_gap_started_s
-                            + limits
-                            .censored_passage_coast_max_duration_s
-                        ),
-                        now + gap_authority.remaining_horizon_s,
-                    )
                     try:
                         gap_command = await send_censored_passage_coast(
                             snapshot=snapshot,

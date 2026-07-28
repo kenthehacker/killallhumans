@@ -3487,6 +3487,48 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert vertical.evidence["passage_authority"] is False
 
 
+def test_ninth_visibility_gap_command_uses_live_state_horizon():
+    authority = course_stage._ApproachPropagatedVisibilityGapAuthority(
+        command=course_stage._CensoredPassageCoastAuthority(
+            gate_index=1,
+            track_id="track-1",
+            anchor_camera_token=_token(220),
+            target_roll_rad=-0.25,
+            target_pitch_rad=-0.35,
+            yaw_rate_rad_s=-0.15,
+            requested_thrust=0.275,
+        ),
+        missed_frame_count=9,
+        remaining_horizon_s=0.2499415,
+        evidence={
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        },
+    )
+
+    deadline_s = (
+        course_stage
+        ._approach_propagated_visibility_gap_command_deadline_s(
+            authority,
+            now_s=10.25,
+            control_period_s=0.02,
+        )
+    )
+
+    assert deadline_s == pytest.approx(10.4999415)
+    assert authority.missed_frame_count == 9
+    assert authority.evidence["steering_only"] is True
+    assert authority.evidence["passage_authority"] is False
+    assert authority.evidence["advance_authority"] is False
+    with pytest.raises(ValueError, match="local-state horizon"):
+        course_stage._approach_propagated_visibility_gap_command_deadline_s(
+            replace(authority, remaining_horizon_s=0.02),
+            now_s=10.25,
+            control_period_s=0.02,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     (
