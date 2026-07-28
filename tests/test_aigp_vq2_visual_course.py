@@ -5008,6 +5008,59 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert direct_vertical.command.target_pitch_rad == pytest.approx(-0.35)
 
     fov_summary["active"] = False
+    fov_summary["last_inner_active"] = False
+    fov_summary["last_protected_target_pitch_rad"] = 0.12
+    fov_summary["last_raw_top_edge_image_down"] = 0.241
+    fov_summary["last_forecast_top_edge_image_down"] = 0.241
+    fov_summary["last_wire_start_monotonic_ns"] = 1_100_000_000
+    fov_summary["last_inner_wire_start_monotonic_ns"] = 1_100_000_000
+    fov_summary["exact_raw_anchor"] = {
+        "basis": course_stage.TOP_FOV_EXACT_RAW_ANCHOR_BASIS,
+        "track_id": "track-0",
+        "camera_token": asdict(last_visible_token),
+        "wire_start_monotonic_ns": 1_100_000_000,
+        "raw_top_edge_basis": course_stage.TOP_FOV_INNER_EDGE_BASIS,
+        "raw_top_edge_image_down": 0.241,
+        "raw_top_edge_nonrotational_angle_rate_rad_s": 1.0,
+        "protected_target_pitch_rad": 0.12,
+        "active": False,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+    inactive_safe_vertical = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            vertical_evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    )
+    assert inactive_safe_vertical.command.target_pitch_rad == pytest.approx(
+        0.12
+    )
+    assert inactive_safe_vertical.evidence["steering_only"] is True
+    assert inactive_safe_vertical.evidence["passage_authority"] is False
+    assert inactive_safe_vertical.evidence["advance_authority"] is False
+
+    vertical_evidence["missed_frame_count"] = 2
+    snapshot.current_track.missed_frame_count = 2
+    with pytest.raises(
+        ValueError,
+        match="exact propagated/FOV authority",
+    ):
+        course_stage._approach_propagated_visibility_gap_authority(
+            vertical_evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    vertical_evidence["missed_frame_count"] = 1
+    snapshot.current_track.missed_frame_count = 1
+
+    fov_summary["last_protected_target_pitch_rad"] = -0.35
     with pytest.raises(
         ValueError,
         match="exact propagated/FOV authority",
@@ -5020,6 +5073,7 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
             fov_summary=fov_summary,
         )
     fov_summary["active"] = True
+    fov_summary["last_inner_active"] = True
 
     fov_summary["last_inner_camera_token"] = asdict(
         replace(

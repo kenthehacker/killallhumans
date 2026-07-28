@@ -4025,6 +4025,7 @@ def _approach_propagated_visibility_gap_authority(
     last_retained_raw_handoff = fov_summary.get(
         "last_retained_raw_state_handoff"
     )
+    exact_raw_anchor = fov_summary.get("exact_raw_anchor")
     missed_count = evidence.get("missed_frame_count")
     last_visible_clipping = evidence.get("last_visible_clipping")
     remaining_horizon_s = evidence.get(
@@ -4106,7 +4107,7 @@ def _approach_propagated_visibility_gap_authority(
         and last_retained_raw_handoff.get("camera_token")
         == dict(last_visible)
     )
-    direct_inner_fov_lineage = bool(
+    direct_inner_token_lineage = bool(
         fov_summary.get("last_raw_top_edge_basis")
         == TOP_FOV_INNER_EDGE_BASIS
         and fov_summary.get("last_inner_raw_top_edge_basis")
@@ -4118,7 +4119,97 @@ def _approach_propagated_visibility_gap_authority(
             if not isinstance(last_visible, Mapping)
             else dict(last_visible)
         )
-        and fov_summary.get("last_inner_active") is True
+    )
+    inactive_safe_inner_fov_lineage = bool(
+        direct_inner_token_lineage
+        and missed_count == 1
+        and fov_summary.get("active") is False
+        and fov_summary.get("last_inner_active") is False
+        and isinstance(exact_raw_anchor, Mapping)
+        and exact_raw_anchor.get("basis")
+        == TOP_FOV_EXACT_RAW_ANCHOR_BASIS
+        and exact_raw_anchor.get("track_id") == track_id
+        and exact_raw_anchor.get("camera_token") == dict(last_visible)
+        and exact_raw_anchor.get("raw_top_edge_basis")
+        == TOP_FOV_INNER_EDGE_BASIS
+        and exact_raw_anchor.get("active") is False
+        and exact_raw_anchor.get("steering_only") is True
+        and exact_raw_anchor.get("passage_authority") is False
+        and exact_raw_anchor.get("advance_authority") is False
+        and type(exact_raw_anchor.get("wire_start_monotonic_ns")) is int
+        and exact_raw_anchor.get("wire_start_monotonic_ns")
+        == fov_summary.get("last_wire_start_monotonic_ns")
+        == fov_summary.get("last_inner_wire_start_monotonic_ns")
+        and type(fov_summary.get("last_raw_top_edge_image_down"))
+        in {int, float}
+        and math.isfinite(
+            float(fov_summary["last_raw_top_edge_image_down"])
+        )
+        and type(exact_raw_anchor.get("raw_top_edge_image_down"))
+        in {int, float}
+        and math.isfinite(
+            float(exact_raw_anchor["raw_top_edge_image_down"])
+        )
+        and math.isclose(
+            float(exact_raw_anchor["raw_top_edge_image_down"]),
+            float(fov_summary["last_raw_top_edge_image_down"]),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and float(fov_summary["last_raw_top_edge_image_down"])
+        >= TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+        and type(fov_summary.get("last_forecast_top_edge_image_down"))
+        in {int, float}
+        and math.isfinite(
+            float(fov_summary["last_forecast_top_edge_image_down"])
+        )
+        and float(fov_summary["last_forecast_top_edge_image_down"])
+        >= TOP_FOV_SAFE_EDGE_IMAGE_DOWN
+        and type(
+            exact_raw_anchor.get(
+                "raw_top_edge_nonrotational_angle_rate_rad_s"
+            )
+        )
+        in {int, float}
+        and math.isfinite(
+            float(
+                exact_raw_anchor[
+                    "raw_top_edge_nonrotational_angle_rate_rad_s"
+                ]
+            )
+        )
+        and float(
+            exact_raw_anchor[
+                "raw_top_edge_nonrotational_angle_rate_rad_s"
+            ]
+        )
+        >= 0.0
+        and type(protected_pitch) in {int, float}
+        and math.isfinite(float(protected_pitch))
+        and type(exact_raw_anchor.get("protected_target_pitch_rad"))
+        in {int, float}
+        and math.isfinite(
+            float(exact_raw_anchor["protected_target_pitch_rad"])
+        )
+        and math.isclose(
+            float(exact_raw_anchor["protected_target_pitch_rad"]),
+            float(protected_pitch),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and 0.0
+        <= float(protected_pitch)
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    direct_inner_fov_lineage = bool(
+        direct_inner_token_lineage
+        and (
+            (
+                fov_summary.get("active") is True
+                and fov_summary.get("last_inner_active") is True
+            )
+            or inactive_safe_inner_fov_lineage
+        )
     )
     direct_outer_fov_lineage = bool(
         type(last_visible_clipping) is int
@@ -4160,12 +4251,13 @@ def _approach_propagated_visibility_gap_authority(
         or int(getattr(track, "clipping", FrameEdge.NONE))
         != last_visible_clipping
         # A horizontal-only clipped loss does not need an actively limiting
-        # top-FOV envelope.  Its exact outer-edge lineage and the already
-        # finite protected pitch are sufficient; vertical clipping still
-        # requires active inner/propagated FOV ownership.
+        # top-FOV envelope.  Neither does an exact same-publication inner
+        # observation that proved the top edge safe and accepted an already
+        # nonforward pitch.  Both remain steering-only and horizon bounded.
         or (
             fov_summary.get("active") is not True
             and not direct_outer_fov_lineage
+            and not inactive_safe_inner_fov_lineage
         )
         or fov_summary.get("last_track_id") != track_id
         or (
