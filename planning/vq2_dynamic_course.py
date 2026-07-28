@@ -27,7 +27,11 @@ Quaternion = tuple[float, float, float, float]
 Vector2 = tuple[float, float]
 Vector3 = tuple[float, float, float]
 
-MAX_TARGET_ROLL_RAD = 0.16
+# Run 97e98fce held the prior 0.16-rad target from the first Gate-1
+# correction, measured at most 0.1614 rad, and still diverged RIGHT.  The
+# isolated 0.17-rad tier remains below the independent 0.18-rad measured
+# course abort while leaving every wire-rate bound unchanged.
+MAX_TARGET_ROLL_RAD = 0.17
 MIN_TARGET_PITCH_RAD = -0.35
 MAX_TARGET_PITCH_RAD = 0.15
 MAX_YAW_RATE_RAD_S = 0.15
