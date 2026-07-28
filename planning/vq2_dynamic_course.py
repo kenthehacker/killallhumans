@@ -4698,25 +4698,15 @@ class DynamicCourseCore:
             * stable_passage_rate_norm_s[0]
             * self.config.horizontal_angle_scale_rad
         )
-        # The roll-to-image acceleration magnitude remains uncharacterized.
-        # Keep this channel bounded and proportional.  Live Gate-1 evidence
-        # showed that escalating and latching a full bank after the rate
-        # turned outward drove fixed-reference gate error from +0.25 to +1.92.
+        # Keep the empirically identified roll direction available whenever
+        # fresh fixed-frame gate error asks for lateral interception.  An
+        # earlier heuristic forced roll to zero while an off-axis gate was
+        # moving outward under saturated yaw.  Build-3385 run 4bc1b9d1 then
+        # held zero bank for 27 fresh Gate-1 publications while error grew
+        # from +0.27 to +1.63, guaranteeing a right-edge loss.  Outward
+        # motion is evidence that more correction is needed, not authority to
+        # discard the only bounded lateral-translation channel.
         yaw = -self.config.yaw_gain * heading_error
-        if (
-            current.bearing_rate_qualified[0]
-            and abs(stable_passage_bearing[0])
-            >= self.config.off_axis_brake_rad
-            and stable_passage_bearing[0]
-            * stable_passage_rate_norm_s[0]
-            > 0.0
-            and abs(yaw) >= 0.90 * MAX_YAW_RATE_RAD_S
-        ):
-            # Both tested bank polarities worsened a fresh, outward Gate-1
-            # residual while calibrated yaw was already saturated.  Do not
-            # keep accelerating laterally from an unidentified roll sign;
-            # level bank until fresh image motion starts recovering.
-            roll = 0.0
         # Successor geometry may only slow the current-gate approach with the
         # same progressively admitted authority that governs successor yaw.
         # In particular, a visible but temporally unproved successor must not

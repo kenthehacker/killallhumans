@@ -1369,7 +1369,7 @@ def test_graph_vetted_adjacent_rebind_uses_fresh_full_bank_then_tapers():
     )
 
 
-def test_dynamic_adapter_unloads_bank_for_fresh_outward_motion():
+def test_dynamic_adapter_retains_bank_for_fresh_outward_motion():
     tracker, _graph_state, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -1408,11 +1408,7 @@ def test_dynamic_adapter_unloads_bank_for_fresh_outward_motion():
     assert corrective
     assert all(
         math.isfinite(target_roll)
-        and -MAX_TARGET_ROLL_RAD <= target_roll <= 0.0
-        for target_roll in corrective
-    )
-    assert any(
-        math.isclose(target_roll, 0.0, abs_tol=1e-12)
+        and -MAX_TARGET_ROLL_RAD <= target_roll < 0.0
         for target_roll in corrective
     )
 

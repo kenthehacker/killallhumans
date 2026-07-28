@@ -1318,7 +1318,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_off_axis_outward_steering_unloads_bank_until_rate_recovers(
+def test_off_axis_outward_steering_retains_bounded_intercept_bank(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1383,7 +1383,9 @@ def test_off_axis_outward_steering_unloads_bank_until_rate_recovers(
         * current.residual_translational_rate_rad_s[0]
     )
     assert 0.0 < expected_outward_roll < MAX_TARGET_ROLL_RAD
-    assert decision.proposed_command.target_roll_rad == 0.0
+    assert decision.proposed_command.target_roll_rad == pytest.approx(
+        expected_outward_roll
+    )
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
     recovered = None
