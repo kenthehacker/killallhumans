@@ -2999,6 +2999,7 @@ def _retained_raw_top_fov_case(
         ),
         vertical_angle_scale_rad=0.55,
         dropout_hold_s=0.120,
+        post_credit_current_prediction_max_horizon_s=0.600,
         pitch_command_delay_s=0.100,
         process_noise_bearing_rad_s=process_noise_rate,
     )
@@ -3171,7 +3172,42 @@ def test_retained_raw_top_fov_state_keeps_fixed_anchor_across_clipped_frames():
         case.anchor_wire_ns
     )
     assert observation.observation_age_s == pytest.approx(0.063)
-    assert observation.prediction_horizon_remaining_s < 0.06
+    assert observation.prediction_horizon_remaining_s == pytest.approx(
+        0.536
+    )
+
+
+def test_retained_raw_top_fov_uses_state_horizon_not_command_hold():
+    case = _retained_raw_top_fov_case()
+    case.now_monotonic_ns = case.anchor_wire_ns + 241_000_000
+
+    observation, proposal, authority = (
+        course_stage._propose_retained_raw_top_fov_pitch_reference(
+            case.session,
+            case.track,
+            case.current_token,
+            fov_summary=case.fov_summary,
+            now_monotonic_ns=case.now_monotonic_ns,
+            requested_target_pitch_rad=0.120,
+        )
+    )
+
+    assert (
+        authority["maximum_age_s"]
+        == case.session.core.config
+        .post_credit_current_prediction_max_horizon_s
+    )
+    assert authority["maximum_age_s"] > (
+        case.session.core.config.dropout_hold_s
+    )
+    assert observation.prediction_horizon_remaining_s == pytest.approx(
+        0.359
+    )
+    assert math.isfinite(proposal.protected_target_pitch_rad)
+    assert proposal.protected_target_pitch_rad <= case.protected_pitch
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
 
 
 @pytest.mark.parametrize("failure", ("anchor-token", "ambiguous", "expired"))
@@ -3184,7 +3220,7 @@ def test_retained_raw_top_fov_state_refuses_bad_lineage_or_expiry(failure):
     elif failure == "ambiguous":
         case.track.ambiguous = True
     else:
-        case.now_monotonic_ns = case.anchor_wire_ns + 121_000_000
+        case.now_monotonic_ns = case.anchor_wire_ns + 601_000_000
 
     with pytest.raises(ValueError, match="retained top-FOV"):
         course_stage._propose_retained_raw_top_fov_pitch_reference(

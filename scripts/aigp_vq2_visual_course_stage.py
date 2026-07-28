@@ -1161,7 +1161,12 @@ def _propose_retained_raw_top_fov_pitch_reference(
         if nonrotational_rate_value is None
         else float(nonrotational_rate_value)
     )
-    maximum_age_s = float(config.dropout_hold_s)
+    # This is uncertainty-growing local gate state, not a retained command.
+    # Keep it on the existing bounded current-state prediction horizon rather
+    # than expiring it with the much shorter one-frame command-dropout hold.
+    maximum_age_s = float(
+        config.post_credit_current_prediction_max_horizon_s
+    )
     if (
         type(anchor_observation_ns) is not int
         or anchor_observation_ns < 0
