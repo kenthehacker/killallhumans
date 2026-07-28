@@ -2173,14 +2173,26 @@ class DynamicVisualCourseSession:
         )
         compatible = normal_roll * rebound_roll >= -1e-12
         stronger = abs(rebound_roll) > abs(normal_roll) + 1e-12
+        equal_reference = math.isclose(
+            rebound_roll,
+            normal_roll,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
         if not (
             bounded
             and outward
             and corrective
             and compatible
-            and stronger
+            and (stronger or equal_reference)
         ):
             self._pending_post_credit_roll_reference = None
+            return decision
+        if equal_reference:
+            # The ordinary law already requests the exact bounded rebound,
+            # so leave this proposal unchanged while preserving the pending
+            # reference for accepted-wire admission.  A later transient rate
+            # reversal must not erase the useful saturated attitude target.
             return decision
         return replace(
             decision,
@@ -2266,16 +2278,11 @@ class DynamicVisualCourseSession:
             and abs(stable_bearing_rad)
             <= self.core.config.off_axis_brake_rad + 1e-12
         )
-        demand_caught_up = bool(
-            same_corrective_demand
-            and abs(normal_roll) + 1e-12 >= abs(retained_roll)
-        )
         if (
             not bounded_state
             or not same_corrective_demand
             or not error_still_requires_correction
             or qualified_recovery
-            or demand_caught_up
         ):
             self._post_credit_roll_reference_handoff = None
             return decision

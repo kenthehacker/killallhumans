@@ -3470,7 +3470,13 @@ def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
     assert session.post_credit_roll_reference_handoff_active is False
 
 
-def test_fresh_rebound_outward_roll_arms_geometry_released_handoff():
+@pytest.mark.parametrize(
+    "normal_roll_rad",
+    (-0.04, -MAX_TARGET_ROLL_RAD),
+)
+def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
+    normal_roll_rad: float,
+):
     session, successor_id = _bound_post_credit_successor()
     successor = session.core.course_state().successor
     assert successor is not None
@@ -3506,7 +3512,7 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff():
     source = session.core.guide(activation_ns + 1_000_000)
     normal_command = replace(
         source.command,
-        target_roll_rad=-0.04,
+        target_roll_rad=normal_roll_rad,
     )
     normal = replace(
         source,
