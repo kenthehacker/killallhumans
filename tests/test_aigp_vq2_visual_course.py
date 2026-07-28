@@ -201,14 +201,14 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
     }
 
 
-def test_committed_successor_memory_cannot_change_sealed_crossing():
+def test_latest_trace_successor_memory_reaches_crossing_roll_and_yaw():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
             "successor_track_id": "vq2-track-000002",
             "passage_committed": True,
             "committed_successor_roll_authority": 1.0,
-            "committed_successor_target_roll_rad": -0.10,
+            "committed_successor_target_roll_rad": -0.17,
             "committed_successor_pitch_authority": 1.0,
             "committed_successor_target_pitch_rad": -0.12,
             "committed_successor_yaw_authority": 1.0,
@@ -220,10 +220,10 @@ def test_committed_successor_memory_cannot_change_sealed_crossing():
         gate_index=0,
         track_id="vq2-track-000001",
         anchor_camera_token=_token(1),
-        target_roll_rad=-0.04,
+        target_roll_rad=0.0063695565046909,
         target_pitch_rad=0.035,
-        yaw_rate_rad_s=-0.042,
-        requested_thrust=0.29,
+        yaw_rate_rad_s=0.08142202986017193,
+        requested_thrust=0.2905324317940466,
     )
 
     refreshed = course_stage._refresh_committed_successor_steering(
@@ -234,7 +234,13 @@ def test_committed_successor_memory_cannot_change_sealed_crossing():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed == authority
+    assert refreshed.target_roll_rad == pytest.approx(-0.17)
+    assert refreshed.yaw_rate_rad_s == pytest.approx(-0.15)
+    assert replace(
+        refreshed,
+        target_roll_rad=authority.target_roll_rad,
+        yaw_rate_rad_s=authority.yaw_rate_rad_s,
+    ) == authority
     assert all(
         math.isfinite(value)
         for value in (
@@ -331,12 +337,19 @@ def test_passage_admission_seals_latest_safe_reference_before_crossing():
         }
     )
     later = replace(accepted, dynamic_evidence=later_evidence)
-    assert course_stage._refresh_committed_successor_steering(
+    refreshed = course_stage._refresh_committed_successor_steering(
         sealed,
         later,
         gate_index=0,
         current_track_id="vq2-track-000001",
         reviewed_successor_track_id="vq2-track-000002",
+    )
+    assert refreshed.target_roll_rad == pytest.approx(0.17)
+    assert refreshed.yaw_rate_rad_s == pytest.approx(0.15)
+    assert replace(
+        refreshed,
+        target_roll_rad=sealed.target_roll_rad,
+        yaw_rate_rad_s=sealed.yaw_rate_rad_s,
     ) == sealed
 
 
@@ -407,7 +420,7 @@ def test_uncommitted_successor_cannot_change_crossing_coast():
     ) == authority
 
 
-def test_yaw_soft_stop_does_not_change_sealed_crossing_reference():
+def test_yaw_soft_stop_retains_sealed_yaw_while_roll_refreshes():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
@@ -442,7 +455,12 @@ def test_yaw_soft_stop_does_not_change_sealed_crossing_reference():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed == authority
+    assert refreshed.target_roll_rad == pytest.approx(-0.10)
+    assert refreshed.yaw_rate_rad_s == authority.yaw_rate_rad_s
+    assert replace(
+        refreshed,
+        target_roll_rad=authority.target_roll_rad,
+    ) == authority
 
 
 def _dynamic_near_plane_sample(
@@ -1212,6 +1230,8 @@ class _Servo:
         next_gate_blend_start_log_scale=None,
         next_gate_blend_full_log_scale=None,
         yaw_rate=0.02,
+        adjacent_target_roll_rad=0.0,
+        adjacent_yaw_rate_rad_s=None,
         passage_advances=True,
         preview_track_id=None,
         passage_preview_blend=0.0,
@@ -1231,6 +1251,12 @@ class _Servo:
             next_gate_blend_full_log_scale
         )
         self.yaw_rate = yaw_rate
+        self.adjacent_target_roll_rad = adjacent_target_roll_rad
+        self.adjacent_yaw_rate_rad_s = (
+            yaw_rate
+            if adjacent_yaw_rate_rad_s is None
+            else adjacent_yaw_rate_rad_s
+        )
         self.passage_advances = passage_advances
         self.preview_track_id = (
             preview_track_id
@@ -1279,9 +1305,9 @@ class _Servo:
             log_scale=-1.70,
         )
         output = VisualServoOutput(
-            target_roll_rad=0.0,
+            target_roll_rad=self.adjacent_target_roll_rad,
             target_pitch_rad=0.08,
-            yaw_rate_rad_s=self.yaw_rate,
+            yaw_rate_rad_s=self.adjacent_yaw_rate_rad_s,
             thrust=0.27,
             corridor_frames=0,
             advance_enabled=False,
@@ -5661,7 +5687,12 @@ def test_credit_wait_uses_one_stable_adjacent_without_advance():
                 command,
                 **kwargs,
             )
-            if self.current_gate == 6 and command.thrust == 0.27:
+            if (
+                self.current_gate == 6
+                and self.visual_planner_calls
+                and self.visual_planner_calls[-1][1]
+                is VisualApproachMode.ADJACENT_RECENTER
+            ):
                 self.adjacent_command_count += 1
                 if self.adjacent_command_count >= 2:
                     self._advance_race()
@@ -5688,14 +5719,18 @@ def test_credit_wait_uses_one_stable_adjacent_without_advance():
         if stage == "visual-course/gate6/credit-wait-adjacent"
     ]
     assert len(adjacent_tick_indexes) == 2
+    coast_command = next(
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage == "visual-course/gate6/credit-wait"
+    )
     assert all(
         host.commands[index][2] == 6
-        and host.commands[index][0].thrust == 0.27
+        and host.commands[index][0].pitch_rate
+        == coast_command.pitch_rate
+        and host.commands[index][0].thrust == coast_command.thrust
         for index in adjacent_tick_indexes
     )
-    assert host.intercept_response_authorities.count(1.0) >= transition[
-        "crossing_wait_adjacent_command_count"
-    ]
     assert any(
         gate_index == 7
         and mode is VisualApproachMode.ADJACENT_RECENTER
@@ -5755,14 +5790,26 @@ def test_credit_wait_uses_unique_graph_vetted_replacement_without_advance():
                 command,
                 **kwargs,
             )
-            if self.current_gate == 6 and command.thrust == 0.27:
+            if (
+                self.current_gate == 6
+                and self.visual_planner_calls
+                and self.visual_planner_calls[-1][1]
+                is VisualApproachMode.ADJACENT_RECENTER
+            ):
                 self.adjacent_command_count += 1
                 if self.adjacent_command_count >= 2:
                     self._advance_race()
             return receipt
 
     host = ReplacementAdjacentHost()
-    runtime, calls = _runtime(host)
+    runtime, calls = _runtime(
+        host,
+        servo_options={
+            "yaw_rate": 0.08142,
+            "adjacent_target_roll_rad": -0.17,
+            "adjacent_yaw_rate_rad_s": -0.15,
+        },
+    )
 
     result = asyncio.run(
         run_visual_course_stage(host, _context(), runtime=runtime)
@@ -5776,15 +5823,132 @@ def test_credit_wait_uses_unique_graph_vetted_replacement_without_advance():
     )
     assert transition["crossing_wait_adjacent_command_count"] == 2
     assert host.requested_promotion_track_ids == ["replacement-track-8"]
+    adjacent_commands = [
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage == "visual-course/gate6/credit-wait-adjacent"
+    ]
+    assert len(adjacent_commands) == 2
     assert all(
-        gate_index == 6
-        for command, _kwargs, gate_index in host.commands
-        if command.thrust == 0.27
+        command.roll_rate < 0.0
+        and command.yaw_rate < 0.0
+        and math.isfinite(command.roll_rate)
+        and math.isfinite(command.yaw_rate)
+        and abs(command.roll_rate) <= 0.25
+        and abs(command.yaw_rate) <= 0.15
+        for command in adjacent_commands
+    )
+    applied_events = [
+        payload
+        for event, payload in host.recorder.events
+        if event
+        == "visual_course_committed_successor_steering_applied"
+    ]
+    assert len(applied_events) == 2
+    assert all(
+        event["steering_only"] is True
+        and event["passage_authority"] is False
+        and event["promotion_authority"] is False
+        and event["advance_authority"] is False
+        and event["steering_crossing_authority"][
+            "target_pitch_rad"
+        ]
+        == event["sealed_crossing_authority"]["target_pitch_rad"]
+        and event["steering_crossing_authority"][
+            "requested_thrust"
+        ]
+        == event["sealed_crossing_authority"]["requested_thrust"]
+        for event in applied_events
+    )
+    assert all(
+        command.pitch_rate
+        == event["sealed_crossing_authority"]["target_pitch_rad"]
+        and command.thrust
+        == event["sealed_crossing_authority"]["requested_thrust"]
+        for command, event in zip(adjacent_commands, applied_events)
     )
     assert any(
         gate_index == 7
         and mode is VisualApproachMode.ADJACENT_RECENTER
         for gate_index, mode, *_rest in calls
+    )
+
+
+@pytest.mark.parametrize("contention", ("ambiguous", "multiple"))
+def test_credit_wait_contention_applies_exact_sealed_fallback(contention):
+    class ContendedAdjacentHost(_Host):
+        def __init__(self):
+            super().__init__(
+                initial_gate=6,
+                finish_gate=7,
+                lose_before_credit=True,
+            )
+
+        def _sample(self):
+            super()._sample()
+            snapshot = self.visual_gate_graph.latest_snapshot
+            snapshot.next_candidates = ()
+            snapshot.next_selection_ambiguous = False
+            snapshot.provisional_track_ids = ()
+            if (
+                self.current_gate == 6
+                and not snapshot.current_track.visible
+            ):
+                token = snapshot.latest_camera_token
+
+                def candidate(track_id):
+                    return SimpleNamespace(
+                        track_id=track_id,
+                        latest_token=token,
+                        promotable=True,
+                        stable_frame_count=4,
+                        confidence=0.90,
+                        association_confidence=0.90,
+                        relationship=None,
+                    )
+
+                if contention == "ambiguous":
+                    snapshot.next_selection_ambiguous = True
+                    snapshot.next_candidates = (
+                        candidate("ambiguous-track-7"),
+                    )
+                else:
+                    snapshot.next_candidates = (
+                        candidate("candidate-track-7a"),
+                        candidate("candidate-track-7b"),
+                    )
+
+    host = ContendedAdjacentHost()
+    runtime, _calls = _runtime(
+        host,
+        servo_options={
+            "yaw_rate": 0.08142,
+            "adjacent_target_roll_rad": -0.17,
+            "adjacent_yaw_rate_rad_s": -0.15,
+        },
+    )
+
+    result = asyncio.run(
+        run_visual_course_stage(host, _context(), runtime=runtime)
+    )
+
+    assert result["success"] is True
+    transition = result["authoritative_transitions"][0]
+    assert transition["crossing_wait_adjacent_command_count"] == 0
+    assert not any(
+        stage == "visual-course/gate6/credit-wait-adjacent"
+        for stage, _elapsed, _command in host.ticks
+    )
+    coast_commands = [
+        command
+        for stage, _elapsed, command in host.ticks
+        if stage == "visual-course/gate6/credit-wait"
+    ]
+    assert coast_commands
+    assert all(command == coast_commands[0] for command in coast_commands)
+    assert not any(
+        event == "visual_course_committed_successor_steering_applied"
+        for event, _payload in host.recorder.events
     )
 
 

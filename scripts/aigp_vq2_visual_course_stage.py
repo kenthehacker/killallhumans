@@ -2151,14 +2151,12 @@ def _refresh_committed_successor_steering(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Validate successor steering without replacing the sealed command.
+    """Carry bounded successor roll/yaw into the next crossing command.
 
-    The precommit heading preview now establishes bounded successor steering
-    while complete current-gate geometry remains available.  Once the
-    current-gate clearance proof seals a crossing command, roll, pitch, yaw,
-    thrust, identity, and passage authority all remain unchanged until race
-    credit or abort.  The dynamic successor fields are still validated here so
-    malformed steering evidence cannot hide behind the sealed command.
+    The current-gate clearance proof, pitch, thrust, identity, and passage
+    authority remain sealed.  Exact-lineage dynamic evidence may update only
+    roll and yaw steering, which still passes through the final wire governor
+    on the next control tick.
     """
 
     if (
@@ -2216,7 +2214,7 @@ def _refresh_committed_successor_steering(
             )
         return float(value)
 
-    admitted_axis(
+    committed_roll = admitted_axis(
         "committed_successor_roll_authority",
         "committed_successor_target_roll_rad",
         lower=-MAX_VISUAL_TARGET_ROLL_RAD,
@@ -2228,13 +2226,23 @@ def _refresh_committed_successor_steering(
         lower=MIN_VISUAL_TARGET_PITCH_RAD,
         upper=MAX_VISUAL_TARGET_PITCH_RAD,
     )
-    admitted_axis(
+    committed_yaw = admitted_axis(
         "committed_successor_yaw_authority",
         "committed_successor_yaw_rate_rad_s",
         lower=-MAX_VISUAL_YAW_RATE_RAD_S,
         upper=MAX_VISUAL_YAW_RATE_RAD_S,
     )
-    return authority
+    if committed_roll is None or committed_yaw is None:
+        return authority
+    return replace(
+        authority,
+        target_roll_rad=committed_roll,
+        yaw_rate_rad_s=(
+            authority.yaw_rate_rad_s
+            if accepted.yaw_soft_stop_zeroed
+            else committed_yaw
+        ),
+    )
 
 
 def _finalize_crossing_command_at_passage_admission(
@@ -9707,9 +9715,9 @@ async def _run_visual_course_stage_impl(
             # and no provisional contender own this steering-only rebind.
             # Low-confidence or contended relationship failures do not gain
             # command authority.
+            admitted_adjacent_candidate: Optional[Any] = None
             if (
-                credit_wait_adjacent_planner is None
-                and getattr(
+                getattr(
                     snapshot,
                     "next_selection_ambiguous",
                     True,
@@ -9720,23 +9728,21 @@ async def _run_visual_course_stage_impl(
                 and adjacent_candidates[0].latest_token == token
                 and type(adjacent_candidates[0].track_id) is str
                 and adjacent_candidates[0].track_id
+                and crossing_coast_authority is not None
+                and type(passage_admission)
+                is VisualApproachPassageAdmission
+            ):
+                admitted_adjacent_candidate = adjacent_candidates[0]
+            if (
+                admitted_adjacent_candidate is not None
                 and (
-                    (
-                        crossing_successor_identity_sealed
-                        and
-                        type(crossing_reviewed_track_id) is str
-                        and adjacent_candidates[0].track_id
-                        == crossing_reviewed_track_id
-                    )
-                    or (
-                        not crossing_successor_identity_sealed
-                        and type(passage_admission)
-                        is VisualApproachPassageAdmission
-                    )
+                    credit_wait_adjacent_planner is None
+                    or credit_wait_adjacent_track_id
+                    != admitted_adjacent_candidate.track_id
                 )
             ):
                 credit_wait_adjacent_track_id = (
-                    adjacent_candidates[0].track_id
+                    admitted_adjacent_candidate.track_id
                 )
                 credit_wait_adjacent_planner = make_planner(
                     track_id=credit_wait_adjacent_track_id,
@@ -9761,7 +9767,12 @@ async def _run_visual_course_stage_impl(
             adjacent_proposal: Optional[Any] = None
             adjacent_track: Optional[Any] = None
             adjacent_yaw_reference_rad = yaw_reference_rad
-            if credit_wait_adjacent_planner is not None:
+            if (
+                admitted_adjacent_candidate is not None
+                and credit_wait_adjacent_planner is not None
+                and credit_wait_adjacent_track_id
+                == admitted_adjacent_candidate.track_id
+            ):
                 if crossing_wait_adjacent_command_count == 0:
                     (
                         _roll,
@@ -9804,11 +9815,36 @@ async def _run_visual_course_stage_impl(
             if adjacent_proposal is not None:
                 assert credit_wait_adjacent_track_id is not None
                 assert adjacent_track is not None
+                assert crossing_coast_authority is not None
                 credit_wait_reviewed_track_id = (
                     credit_wait_adjacent_track_id
                 )
                 segment["crossing_wait_adjacent_track_id"] = (
                     credit_wait_reviewed_track_id
+                )
+                adjacent_output = adjacent_proposal.servo_output
+                adjacent_roll = float(
+                    adjacent_output.target_roll_rad
+                )
+                adjacent_yaw = float(
+                    adjacent_output.yaw_rate_rad_s
+                )
+                if (
+                    not math.isfinite(adjacent_roll)
+                    or abs(adjacent_roll)
+                    > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+                    or not math.isfinite(adjacent_yaw)
+                    or abs(adjacent_yaw)
+                    > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+                ):
+                    raise abort_type(
+                        "visual-course adjacent successor steering escaped "
+                        "its fixed envelope"
+                    )
+                adjacent_crossing_authority = replace(
+                    crossing_coast_authority,
+                    target_roll_rad=adjacent_roll,
+                    yaw_rate_rad_s=adjacent_yaw,
                 )
                 try:
                     accepted_adjacent = await send_visual(
@@ -9816,13 +9852,13 @@ async def _run_visual_course_stage_impl(
                         snapshot=snapshot,
                         target_track=adjacent_track,
                         apply_launch_bootstrap=False,
-                        # Once the near plane is latched and the old aperture
-                        # has disappeared, apply the already flight-proved
-                        # pitch response to fresh successor braking.  This
-                        # moves closure control before race-packet latency
-                        # without changing roll, yaw, thrust, or any bound.
-                        intercept_response_authority=1.0,
+                        # The exact graph-vetted successor owns roll/yaw
+                        # steering only.  The current gate retains its sealed
+                        # pitch, thrust, passage proof, and race ownership.
                         top_fov_transition_owned=True,
+                        committed_crossing_authority=(
+                            adjacent_crossing_authority
+                        ),
                         command_deadline_s=min(
                             course_deadline_s,
                             crossing_deadline_s,
@@ -9850,6 +9886,27 @@ async def _run_visual_course_stage_impl(
                 crossing_wait_adjacent_command_count += 1
                 segment["crossing_wait_adjacent_command_count"] = (
                     crossing_wait_adjacent_command_count
+                )
+                host.recorder.emit(
+                    "visual_course_committed_successor_steering_applied",
+                    gate_index=current_gate_index,
+                    stage=(
+                        f"{VISUAL_COURSE_STAGE}/gate"
+                        f"{current_gate_index}/credit-wait-adjacent"
+                    ),
+                    camera_token=asdict(token),
+                    successor_track_id=credit_wait_reviewed_track_id,
+                    sealed_crossing_authority=asdict(
+                        crossing_coast_authority
+                    ),
+                    steering_crossing_authority=asdict(
+                        adjacent_crossing_authority
+                    ),
+                    wire_command=asdict(accepted_adjacent.command),
+                    steering_only=True,
+                    passage_authority=False,
+                    promotion_authority=False,
+                    advance_authority=False,
                 )
                 continue
 
