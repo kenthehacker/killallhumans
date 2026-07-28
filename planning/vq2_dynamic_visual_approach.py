@@ -2089,6 +2089,7 @@ class DynamicVisualCourseSession:
         track: VisualTrack,
         camera_token: CameraFrameToken,
         now_monotonic_ns: int,
+        allow_tracking_only_inner_raw_clipping: bool = False,
     ) -> Mapping[str, Any]:
         """Prove exact, bounded steering ownership of a clipped FOV gap.
 
@@ -2108,6 +2109,10 @@ class DynamicVisualCourseSession:
         if type(now_monotonic_ns) is not int or now_monotonic_ns < 0:
             raise DynamicCourseError(
                 "propagated FOV gap clock is invalid"
+            )
+        if type(allow_tracking_only_inner_raw_clipping) is not bool:
+            raise DynamicCourseError(
+                "propagated FOV gap clipping selection is invalid"
             )
         if (
             tuple(self.core.config.camera_to_body_wxyz)
@@ -2270,7 +2275,11 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "propagated FOV gap current track is not unambiguous"
             )
-        raw_clipping = staged.current_raw_clipping
+        raw_clipping = (
+            staged.current_raw_clipping
+            if allow_tracking_only_inner_raw_clipping
+            else current.clipping
+        )
         if (
             raw_clipping != track.clipping
             or raw_clipping != sample.clipping

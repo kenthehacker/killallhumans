@@ -3699,10 +3699,22 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
         monotonic_ns=top_update.publish_monotonic_ns + 2_000_000,
     )
     assert top_decision is not None
+    with pytest.raises(
+        DynamicCourseError,
+        match="publication is not clipped",
+    ):
+        session.propagated_current_fov_gap_authority(
+            track=tracker.track(successor_id),
+            camera_token=top_update.token,
+            now_monotonic_ns=(
+                top_update.publish_monotonic_ns + 2_000_000
+            ),
+        )
     top_fov_authority = session.propagated_current_fov_gap_authority(
         track=tracker.track(successor_id),
         camera_token=top_update.token,
         now_monotonic_ns=top_update.publish_monotonic_ns + 2_000_000,
+        allow_tracking_only_inner_raw_clipping=True,
     )
     assert top_fov_authority["clipping"] == int(FrameEdge.TOP)
     assert top_fov_authority["camera_aperture_half_size_norm"][1] > 0.0

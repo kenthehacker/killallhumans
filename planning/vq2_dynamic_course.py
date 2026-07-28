@@ -1078,9 +1078,6 @@ class DynamicCourseCore:
             tuple[int, str, str | None] | None
         ) = None
         self._successor_clearance_positive_since_ns: int | None = None
-        self._precommit_successor_roll_key: (
-            tuple[int, str, str] | None
-        ) = None
         self._last_applied_command: DynamicCourseCommand | None = None
 
     @property
@@ -2548,16 +2545,6 @@ class DynamicCourseCore:
         if ownership_key != self._successor_clearance_key:
             self._successor_clearance_key = None
             self._successor_clearance_positive_since_ns = None
-        if (
-            self._precommit_successor_roll_key is not None
-            and self._precommit_successor_roll_key
-            != (
-                current_gate_index,
-                current_track_id,
-                successor_track_id,
-            )
-        ):
-            self._precommit_successor_roll_key = None
         self._current_track_id = current_track_id
         self._current_gate_index = current_gate_index
         self._successor_track_id = successor_track_id
@@ -3059,7 +3046,6 @@ class DynamicCourseCore:
         self._successor_track_id = next_successor_track_id
         self._successor_clearance_key = None
         self._successor_clearance_positive_since_ns = None
-        self._precommit_successor_roll_key = None
         self._promotion_count += 1
         self._last_promotion_ns = monotonic_ns
         return self.course_state()
@@ -3082,7 +3068,7 @@ class DynamicCourseCore:
         successor = state.successor
         if monotonic_ns < current.state_monotonic_ns:
             raise DynamicCourseError("guidance time cannot precede the current state")
-        camera_current_center, camera_current_aperture = self._decision_geometry(
+        camera_current_center, _ = self._decision_geometry(
             current.track_id,
             monotonic_ns,
         )
@@ -3404,339 +3390,12 @@ class DynamicCourseCore:
         precommit_successor_yaw_heading_delta: float | None = None
         precommit_successor_yaw_contribution: float | None = None
         precommit_current_horizontal_fov_clearance: float | None = None
-        if (
-            not passage_committed
-            and successor_clearance_authority <= _EPSILON
-            and successor is not None
-            and successor_prediction is not None
-            and successor_prediction.confidence > 0.0
-            and current.visible
-            and not current.ambiguous
-            and not current.censored_axes[0]
-            and camera_current_aperture is not None
-            and not successor.ambiguous
-            and not successor.censored_axes[0]
-            and successor.sample_count >= 4
-            and successor.stream_generation == current.stream_generation
-            and successor.bearing_std_rad[0]
-            <= (
-                self.config
-                .successor_prediction_max_extrapolation_rad
-            )
-            and current.aperture_dynamics_qualified
-            and current.time_to_contact_s is not None
-            and self.config.minimum_ttc_s
-            <= current.time_to_contact_s
-            <= self.config.successor_lookahead_ttc_s
-        ):
-            # Heading lookahead is steering-only.  It may use a credible
-            # successor while the current crossing envelope still withholds
-            # passage bias, but it may not consume the complete current
-            # aperture's horizontal FOV reserve.  Forecast both uncertainty-
-            # expanded aperture edges through calibrated angle space, then
-            # allocate a bounded heading contribution under the existing
-            # successor lookahead cap.  The full current-gate heading remains
-            # present, and an unsettled opposing current correction wins.
-            full_successor_yaw = _clamp(
-                -self.config.yaw_gain
-                * successor_prediction.bearing_rad[0],
-                -MAX_YAW_RATE_RAD_S,
-                MAX_YAW_RATE_RAD_S,
-            )
-            current_camera_angle = math.atan(
-                camera_current_center[0]
-                * self.config.horizontal_angle_scale_rad
-            )
-            preview_horizon_s = (
-                self.config.yaw_command_delay_s
-                + self.config.dropout_hold_s
-            )
-            expanded_aperture = (
-                camera_current_aperture[0]
-                + 2.0 * current_std_norm[0]
-            )
-            current_edges = (
-                camera_current_center[0] - expanded_aperture,
-                camera_current_center[0] + expanded_aperture,
-            )
-            predicted_edges = tuple(
-                math.tan(
-                    math.atan(
-                        edge
-                        * self.config.horizontal_angle_scale_rad
-                    )
-                    + full_successor_yaw * preview_horizon_s
-                )
-                / self.config.horizontal_angle_scale_rad
-                for edge in current_edges
-            )
-            horizontal_fov_occupancy = max(
-                abs(edge)
-                for edge in (*current_edges, *predicted_edges)
-            )
-            precommit_current_horizontal_fov_clearance = (
-                1.0 - horizontal_fov_occupancy
-            )
-            fov_authority = _clamp(
-                (
-                    precommit_current_horizontal_fov_clearance
-                    - self.config.passage_margin_norm
-                )
-                / (1.0 - self.config.passage_margin_norm),
-                0.0,
-                1.0,
-            )
-            confidence_authority = _clamp(
-                successor_prediction.confidence
-                / self.config.successor_passage_full_confidence,
-                0.0,
-                1.0,
-            )
-            ttc_progress = _clamp(
-                (
-                    self.config.successor_lookahead_ttc_s
-                    - current.time_to_contact_s
-                )
-                / (
-                    self.config.successor_lookahead_ttc_s
-                    - self.config.successor_full_weight_ttc_s
-                ),
-                0.0,
-                1.0,
-            )
-            closure_authority = (
-                self.config.successor_passage_far_authority
-                + (
-                    1.0
-                    - self.config.successor_passage_far_authority
-                )
-                * ttc_progress
-            )
-            precommit_successor_yaw_authority = (
-                self.config.successor_maximum_weight
-                * closure_authority
-                * fov_authority
-                * confidence_authority
-            )
-            precommit_successor_yaw_heading_delta = (
-                successor_prediction.bearing_rad[0]
-                - current_camera_angle
-            )
-            current_horizontal_settled = bool(
-                current.bearing_rate_qualified[0]
-                and abs(current_center[0])
-                + 2.0 * current_std_norm[0]
-                <= self.config.passage_margin_norm
-                and abs(residual_rate_norm[0])
-                <= self.config.vertical_settled_rate_norm_s
-            )
-            same_yaw_direction = bool(
-                abs(proposal.yaw_rate_rad_s) <= _EPSILON
-                or proposal.yaw_rate_rad_s * full_successor_yaw
-                >= 0.0
-            )
-            if (
-                precommit_successor_yaw_authority > _EPSILON
-                and abs(precommit_successor_yaw_heading_delta) > _EPSILON
-                and (
-                    current_horizontal_settled
-                    or same_yaw_direction
-                )
-            ):
-                precommit_successor_yaw_contribution = _clamp(
-                    precommit_successor_yaw_authority
-                    * precommit_successor_yaw_heading_delta,
-                    -self.config.successor_max_yaw_contribution_rad,
-                    self.config.successor_max_yaw_contribution_rad,
-                )
-                precommit_successor_yaw_rate = _clamp(
-                    -self.config.yaw_gain
-                    * (
-                        current_camera_angle
-                        + precommit_successor_yaw_contribution
-                    ),
-                    -MAX_YAW_RATE_RAD_S,
-                    MAX_YAW_RATE_RAD_S,
-                )
-                proposal = replace(
-                    proposal,
-                    yaw_rate_rad_s=precommit_successor_yaw_rate,
-                )
-            else:
-                precommit_successor_yaw_authority = 0.0
-                precommit_successor_yaw_heading_delta = None
-                precommit_successor_yaw_contribution = None
         precommit_successor_roll_authority = 0.0
         precommit_successor_target_roll: float | None = None
-        precommit_key = (
-            None
-            if successor is None
-            else (
-                state.current_gate_index,
-                current.track_id,
-                successor.track_id,
-            )
-        )
-        precommit_geometry_eligible = bool(
-            not passage_committed
-            and successor is not None
-            and current.visible
-            and not current.ambiguous
-            and not current.censored_axes[0]
-            and current.bearing_rate_qualified[0]
-            and not horizontal_alignment_unsettled
-            and abs(current_center[0])
-            <= self.config.passage_margin_norm
-            and abs(residual_rate_norm[0])
-            <= self.config.vertical_settled_rate_norm_s
-            and not successor.ambiguous
-            and successor.sample_count >= 4
-            and successor.stream_generation == current.stream_generation
-        )
-        closure_seed_eligible = bool(
-            precommit_geometry_eligible
-            and successor is not None
-            and successor_prediction is not None
-            and successor.visible
-            and not successor.censored_axes[0]
-            and successor_prediction.confidence > 0.0
-            and current.scale_rate_qualified
-            and current.time_to_contact_s is not None
-            and self.config.minimum_ttc_s
-            <= current.time_to_contact_s
-            <= self.config.successor_lookahead_ttc_s
-        )
-        if (
-            closure_seed_eligible
-            and precommit_key is not None
-            and self._precommit_successor_roll_key is None
-        ):
-            # Closure qualifies admission once; horizontal image geometry,
-            # successor freshness, and correction direction own release.
-            # This is rolling gate-relative state, not command continuity.
-            self._precommit_successor_roll_key = precommit_key
-        if (
-            precommit_geometry_eligible
-            and precommit_key is not None
-            and self._precommit_successor_roll_key == precommit_key
-        ):
-            assert successor is not None
-            successor_age_s = (
-                monotonic_ns
-                - successor.last_measurement_monotonic_ns
-            ) / _NS_PER_SECOND
-            if (
-                0.0
-                <= successor_age_s
-                <= self.config.crossing_prediction_max_horizon_s
-            ):
-                successor_steering = self.predict_track_steering(
-                    successor.track_id,
-                    monotonic_ns,
-                )
-                maximum_std = (
-                    self.config
-                    .successor_prediction_max_extrapolation_rad
-                )
-                normal_successor_roll = _clamp(
-                    self.config.roll_guidance_sign
-                    * (
-                        self.config.roll_gain
-                        * successor_steering.stable_bearing_rad[0]
-                        + self.config.lateral_rate_gain
-                        * successor_steering
-                        .stable_bearing_rate_rad_s[0]
-                    ),
-                    -MAX_TARGET_ROLL_RAD,
-                    MAX_TARGET_ROLL_RAD,
-                )
-                outward_successor = bool(
-                    abs(self.config.roll_guidance_sign) > _EPSILON
-                    and successor_steering.bearing_std_rad[0]
-                    <= maximum_std + _EPSILON
-                    and abs(successor_steering.stable_bearing_rad[0])
-                    >= self.config.off_axis_brake_rad
-                    and successor_steering.stable_bearing_rad[0]
-                    * successor_steering.stable_bearing_rate_rad_s[0]
-                    > 0.0
-                    and normal_successor_roll
-                    * self.config.roll_guidance_sign
-                    * successor_steering.stable_bearing_rad[0]
-                    > 0.0
-                )
-                if outward_successor:
-                    ttc = current.time_to_contact_s
-                    ttc_progress = _clamp(
-                        (
-                            self.config.successor_lookahead_ttc_s
-                            - (
-                                self.config.successor_lookahead_ttc_s
-                                if ttc is None
-                                else ttc
-                            )
-                        )
-                        / (
-                            self.config.successor_lookahead_ttc_s
-                            - self.config.successor_full_weight_ttc_s
-                        ),
-                        0.0,
-                        1.0,
-                    )
-                    closure_authority = (
-                        self.config.successor_passage_far_authority
-                        + (
-                            1.0
-                            - self.config.successor_passage_far_authority
-                        )
-                        * ttc_progress
-                    )
-                    uncertainty_authority = _clamp(
-                        1.0
-                        - (
-                            successor_steering.bearing_std_rad[0]
-                            / maximum_std
-                        ),
-                        0.0,
-                        1.0,
-                    )
-                    precommit_successor_roll_authority = _clamp(
-                        closure_authority * uncertainty_authority,
-                        0.0,
-                        1.0,
-                    )
-                    if precommit_successor_roll_authority > _EPSILON:
-                        lookahead_roll = math.copysign(
-                            MAX_TARGET_ROLL_RAD
-                            * precommit_successor_roll_authority,
-                            normal_successor_roll,
-                        )
-                        if (
-                            proposal.target_roll_rad
-                            * lookahead_roll
-                            >= 0.0
-                            and abs(proposal.target_roll_rad)
-                            > abs(lookahead_roll)
-                        ):
-                            lookahead_roll = proposal.target_roll_rad
-                        precommit_successor_target_roll = lookahead_roll
-                        # This is a gate-relative steering reference, not a
-                        # command smoother.  A fresh successor seeds the
-                        # reference; bounded uncertainty propagation may keep
-                        # it through expected near-plane clipping without
-                        # another clean successor frame.  Any loss of current
-                        # horizontal crossing reserve releases it on the next
-                        # tick, and the final wire governor remains the sole
-                        # continuity authority.
-                        proposal = replace(
-                            proposal,
-                            target_roll_rad=lookahead_roll,
-                        )
-                else:
-                    self._precommit_successor_roll_key = None
-            else:
-                self._precommit_successor_roll_key = None
-        elif self._precommit_successor_roll_key is not None:
-            self._precommit_successor_roll_key = None
+        # Successor steering does not own the wire before the current gate is
+        # passage-committed.  Retain the fields as explicit zero-authority
+        # trace evidence; the committed branch below owns the graph-vetted
+        # successor handoff without granting passage or promotion authority.
         committed_successor_roll_authority = 0.0
         committed_successor_target_roll: float | None = None
         committed_successor_pitch_authority = 0.0

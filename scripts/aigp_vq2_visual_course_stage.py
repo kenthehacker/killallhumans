@@ -4725,6 +4725,7 @@ async def _run_visual_course_stage_impl(
                             recovery_snapshot.latest_camera_token
                         ),
                         now_monotonic_ns=proposal_ns,
+                        allow_tracking_only_inner_raw_clipping=True,
                     )
                 )
                 if not isinstance(top_fov_handoff, Mapping):
