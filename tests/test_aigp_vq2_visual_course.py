@@ -259,6 +259,120 @@ def test_committed_successor_memory_cannot_change_sealed_crossing():
     )
 
 
+def test_passage_admission_seals_latest_safe_reference_before_crossing():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "successor_track_id": "vq2-track-000002",
+            "passage_committed": False,
+            "precommit_successor_roll_authority": 0.70,
+            "precommit_successor_target_roll_rad": -0.12,
+        }
+    )
+    accepted = replace(
+        _accepted_dynamic_near_plane_command(evidence),
+        command=AttitudeRateCommand(-0.08, 0.04, -0.03, 0.288),
+        target_roll_rad=-0.12,
+        target_pitch_rad=-0.18,
+    )
+    early_latch = course_stage._CensoredPassageCoastAuthority(
+        gate_index=0,
+        track_id="vq2-track-000001",
+        anchor_camera_token=_token(1),
+        target_roll_rad=0.005,
+        target_pitch_rad=0.035,
+        yaw_rate_rad_s=-0.004,
+        requested_thrust=0.274,
+    )
+
+    sealed = (
+        course_stage._finalize_crossing_command_at_passage_admission(
+            early_latch,
+            accepted,
+            gate_index=0,
+            current_track_id="vq2-track-000001",
+            reviewed_successor_track_id="vq2-track-000002",
+        )
+    )
+
+    assert sealed.anchor_camera_token == early_latch.anchor_camera_token
+    assert sealed.target_roll_rad == pytest.approx(-0.12)
+    assert sealed.target_pitch_rad == early_latch.target_pitch_rad
+    assert sealed.yaw_rate_rad_s == early_latch.yaw_rate_rad_s
+    assert sealed.requested_thrust == early_latch.requested_thrust
+    assert all(
+        math.isfinite(value)
+        for value in (
+            sealed.target_roll_rad,
+            sealed.target_pitch_rad,
+            sealed.yaw_rate_rad_s,
+            sealed.requested_thrust,
+        )
+    )
+    assert (
+        abs(sealed.target_roll_rad)
+        <= course_stage.MAX_VISUAL_TARGET_ROLL_RAD
+    )
+    assert (
+        abs(sealed.yaw_rate_rad_s)
+        <= course_stage.MAX_VISUAL_YAW_RATE_RAD_S
+    )
+
+    later_evidence = dict(evidence)
+    later_evidence.update(
+        {
+            "passage_committed": True,
+            "committed_successor_roll_authority": 1.0,
+            "committed_successor_target_roll_rad": 0.17,
+            "committed_successor_pitch_authority": 1.0,
+            "committed_successor_target_pitch_rad": 0.12,
+            "committed_successor_yaw_authority": 1.0,
+            "committed_successor_yaw_rate_rad_s": 0.15,
+        }
+    )
+    later = replace(accepted, dynamic_evidence=later_evidence)
+    assert course_stage._refresh_committed_successor_steering(
+        sealed,
+        later,
+        gate_index=0,
+        current_track_id="vq2-track-000001",
+        reviewed_successor_track_id="vq2-track-000002",
+    ) == sealed
+
+
+def test_passage_admission_without_successor_roll_keeps_latch_command():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "successor_track_id": "vq2-track-000002",
+            "passage_committed": False,
+            "precommit_successor_roll_authority": 0.0,
+            "precommit_successor_target_roll_rad": None,
+        }
+    )
+    accepted = _accepted_dynamic_near_plane_command(evidence)
+    early_latch = course_stage._CensoredPassageCoastAuthority(
+        gate_index=0,
+        track_id="vq2-track-000001",
+        anchor_camera_token=_token(1),
+        target_roll_rad=0.005,
+        target_pitch_rad=0.035,
+        yaw_rate_rad_s=-0.004,
+        requested_thrust=0.274,
+    )
+
+    assert (
+        course_stage._finalize_crossing_command_at_passage_admission(
+            early_latch,
+            accepted,
+            gate_index=0,
+            current_track_id="vq2-track-000001",
+            reviewed_successor_track_id="vq2-track-000002",
+        )
+        == early_latch
+    )
+
+
 def test_uncommitted_successor_cannot_change_crossing_coast():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(

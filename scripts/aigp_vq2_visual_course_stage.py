@@ -2232,6 +2232,91 @@ def _refresh_committed_successor_steering(
     return authority
 
 
+def _finalize_crossing_command_at_passage_admission(
+    authority: _CensoredPassageCoastAuthority,
+    accepted: _AcceptedVisualCommand,
+    *,
+    gate_index: int,
+    current_track_id: str,
+    reviewed_successor_track_id: str,
+) -> _CensoredPassageCoastAuthority:
+    """Seal an accepted successor-roll reference exactly once.
+
+    A near-plane latch may precede the clean passage-admission frame that
+    finishes the current-gate geometry proof.  Its command is therefore only
+    the bounded fallback if clipping begins immediately.  Once admission
+    accepts an exact bounded successor-roll reference under current-gate
+    crossing reserve, that roll becomes part of the immutable crossing
+    command.  Pitch, yaw, thrust, anchor, and all later propagated successor
+    updates remain unchanged.
+    """
+
+    evidence = accepted.dynamic_evidence
+    if (
+        type(authority) is not _CensoredPassageCoastAuthority
+        or type(accepted) is not _AcceptedVisualCommand
+        or type(gate_index) is not int
+        or gate_index < 0
+        or type(current_track_id) is not str
+        or not current_track_id
+        or type(reviewed_successor_track_id) is not str
+        or not reviewed_successor_track_id
+        or authority.gate_index != gate_index
+        or authority.track_id != current_track_id
+        or accepted.wire_race_gate_index != gate_index
+        or accepted.publication_pinned_through_transport_return is not True
+        or accepted.yaw_soft_stop_zeroed
+        or accepted.observation_monotonic_ns
+        > accepted.publication_monotonic_ns
+        or accepted.publication_monotonic_ns
+        > accepted.wire_start_monotonic_ns
+        or accepted.wire_start_monotonic_ns
+        > accepted.wire_return_monotonic_ns
+        or not isinstance(evidence, Mapping)
+        or evidence.get("schema") != "aigp-vq2-dynamic-command/1"
+        or evidence.get("gate_index") != gate_index
+        or evidence.get("current_track_id") != current_track_id
+    ):
+        raise ValueError(
+            "passage-admission crossing command evidence is invalid"
+        )
+
+    roll_authority = evidence.get(
+        "precommit_successor_roll_authority"
+    )
+    roll_reference = evidence.get(
+        "precommit_successor_target_roll_rad"
+    )
+    if roll_authority in {None, 0.0} and roll_reference is None:
+        return authority
+    if (
+        evidence.get("passage_committed") is not False
+        or evidence.get("successor_track_id")
+        != reviewed_successor_track_id
+        or type(roll_authority) not in {int, float}
+        or not math.isfinite(float(roll_authority))
+        or not 0.0 < float(roll_authority) <= 1.0
+        or type(roll_reference) not in {int, float}
+        or not math.isfinite(float(roll_reference))
+        or abs(float(roll_reference))
+        > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        or not math.isclose(
+            float(roll_reference),
+            float(accepted.target_roll_rad),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError(
+            "passage-admission successor roll evidence is invalid"
+        )
+
+    return replace(
+        authority,
+        target_roll_rad=float(roll_reference),
+    )
+
+
 def _dynamic_near_plane_wire_sample(
     accepted: _AcceptedVisualCommand,
     *,
@@ -6591,6 +6676,7 @@ async def _run_visual_course_stage_impl(
             "recovery_support_command_count": 0,
             "passage_authority_enabled": False,
             "passage_admission": None,
+            "passage_command_seal": None,
             "lifecycle": lifecycle.value,
             "near_plane_evidence_frame_count": 0,
             "near_plane_latch": None,
@@ -9053,6 +9139,64 @@ async def _run_visual_course_stage_impl(
                         segment[
                             "near_plane_successor_identity_sealed"
                         ] = crossing_successor_identity_sealed
+                    if (
+                        accepted.dynamic_evidence is not None
+                        and crossing_reviewed_track_id is not None
+                    ):
+                        if (
+                            crossing_coast_authority is None
+                            or not crossing_successor_identity_sealed
+                        ):
+                            raise abort_type(
+                                "visual-course passage admission lacks its "
+                                "sealed successor crossing command"
+                            )
+                        prior_crossing_command = (
+                            crossing_coast_authority
+                        )
+                        try:
+                            crossing_coast_authority = (
+                                _finalize_crossing_command_at_passage_admission(
+                                    prior_crossing_command,
+                                    accepted,
+                                    gate_index=current_gate_index,
+                                    current_track_id=current_track_id,
+                                    reviewed_successor_track_id=(
+                                        crossing_reviewed_track_id
+                                    ),
+                                )
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise abort_type(
+                                "visual-course passage-admission command "
+                                f"seal is invalid: {exc}"
+                            ) from exc
+                        segment["passage_command_seal"] = {
+                            "basis": (
+                                "accepted-passage-admission-successor-roll-v1"
+                            ),
+                            "camera_token": asdict(
+                                accepted.wire_camera_token
+                            ),
+                            "source_wire_start_monotonic_ns": (
+                                accepted.wire_start_monotonic_ns
+                            ),
+                            "previous_command": asdict(
+                                prior_crossing_command
+                            ),
+                            "command": asdict(
+                                crossing_coast_authority
+                            ),
+                        }
+                        host.recorder.emit(
+                            "visual_course_passage_command_sealed",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/approach"
+                            ),
+                            **segment["passage_command_seal"],
+                        )
                 continue
 
             if proposal.mode is not VisualApproachMode.PASSAGE:
