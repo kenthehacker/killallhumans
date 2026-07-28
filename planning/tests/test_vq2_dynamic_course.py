@@ -1066,7 +1066,7 @@ def test_successor_bias_waits_for_fresh_safe_dwell_then_ramps() -> None:
     )
 
 
-def test_096f78c4_unsafe_current_gate_owns_passage_and_yaw() -> None:
+def test_unsafe_current_gate_keeps_passage_while_successor_can_steer() -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
             camera_delay_s=0.0,
@@ -1126,6 +1126,25 @@ def test_096f78c4_unsafe_current_gate_owns_passage_and_yaw() -> None:
     assert qualified.passage_yaw_authority == 0.0
     assert qualified.successor_weight == 0.0
     assert qualified.successor_yaw_contribution_rad == 0.0
+    assert 0.0 < qualified.precommit_successor_yaw_authority <= 1.0
+    assert qualified.precommit_successor_yaw_rate_rad_s is not None
+    assert qualified.precommit_successor_yaw_rate_rad_s < 0.0
+    assert qualified.precommit_successor_yaw_heading_delta_rad is not None
+    assert qualified.precommit_successor_yaw_heading_delta_rad > 0.0
+    assert qualified.precommit_successor_yaw_contribution_rad is not None
+    assert (
+        0.0
+        < qualified.precommit_successor_yaw_contribution_rad
+        <= core.config.successor_max_yaw_contribution_rad
+    )
+    assert qualified.command.yaw_rate_rad_s == pytest.approx(
+        qualified.precommit_successor_yaw_rate_rad_s
+    )
+    assert qualified.precommit_current_horizontal_fov_clearance_norm is not None
+    assert (
+        qualified.precommit_current_horizontal_fov_clearance_norm
+        > core.config.passage_margin_norm
+    )
     assert qualified.braking
 
 
@@ -1524,8 +1543,9 @@ def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
         )
     ) == 3
     # This replay never establishes a horizontally safe current-aperture
-    # passage.  Successor prediction therefore remains lookahead evidence,
-    # but it gets no yaw leverage with which to recreate the observed hunt.
+    # passage.  Passage and promotion authority therefore remain withheld,
+    # while the consistently right-hand successor may contribute only bounded
+    # steering inside the current gate's raw horizontal FOV reserve.
     assert all(
         decision.successor_clearance_authority == 0.0
         and decision.successor_passage_authority == 0.0
@@ -1539,6 +1559,10 @@ def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
         decision.successor_yaw_contribution_rad == 0.0
         for decision in decisions
     )
+    assert any(
+        decision.precommit_successor_yaw_authority > 0.0
+        for decision in decisions
+    )
     for decision in decisions:
         assert (
             abs(decision.proposed_command.yaw_rate_rad_s)
@@ -1549,9 +1573,20 @@ def test_trace_3ff977f_successor_flips_cannot_hunt_current_gate_yaw() -> None:
             decision.camera_current_center_norm[0]
             * core.config.horizontal_angle_scale_rad
         )
-        assert decision.proposed_command.yaw_rate_rad_s == pytest.approx(
-            max(-MAX_YAW_RATE_RAD_S, min(MAX_YAW_RATE_RAD_S, current_only))
+        bounded_current_only = max(
+            -MAX_YAW_RATE_RAD_S,
+            min(MAX_YAW_RATE_RAD_S, current_only),
         )
+        assert decision.proposed_command.yaw_rate_rad_s <= (
+            bounded_current_only + 1e-12
+        )
+        assert decision.proposed_command.yaw_rate_rad_s >= (
+            -MAX_YAW_RATE_RAD_S - 1e-12
+        )
+        if decision.precommit_successor_yaw_rate_rad_s is not None:
+            assert decision.proposed_command.yaw_rate_rad_s == pytest.approx(
+                decision.precommit_successor_yaw_rate_rad_s
+            )
     assert all(decision.braking for decision in decisions[-3:])
 
 
@@ -2971,7 +3006,7 @@ def _precommit_successor_case(
     return core, decision
 
 
-def test_settled_current_allows_only_bounded_precommit_successor_roll() -> None:
+def test_settled_current_allows_bounded_precommit_successor_steering() -> None:
     _, decision = _precommit_successor_case(successor_x_step=0.004)
 
     assert not decision.passage_committed
@@ -2993,7 +3028,27 @@ def test_settled_current_allows_only_bounded_precommit_successor_roll() -> None:
     assert decision.command.target_pitch_rad == pytest.approx(
         DynamicCourseConfig().brake_pitch_rad
     )
-    assert decision.command.yaw_rate_rad_s == 0.0
+    assert 0.0 < decision.precommit_successor_yaw_authority <= 1.0
+    assert decision.precommit_successor_yaw_rate_rad_s is not None
+    assert (
+        -MAX_YAW_RATE_RAD_S
+        <= decision.precommit_successor_yaw_rate_rad_s
+        < 0.0
+    )
+    assert decision.command.yaw_rate_rad_s == pytest.approx(
+        decision.precommit_successor_yaw_rate_rad_s
+    )
+    assert decision.precommit_successor_yaw_contribution_rad is not None
+    assert (
+        0.0
+        < decision.precommit_successor_yaw_contribution_rad
+        <= DynamicCourseConfig().successor_max_yaw_contribution_rad
+    )
+    assert decision.precommit_current_horizontal_fov_clearance_norm is not None
+    assert (
+        decision.precommit_current_horizontal_fov_clearance_norm
+        > DynamicCourseConfig().passage_margin_norm
+    )
     assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
     assert all(
         math.isfinite(value)
@@ -3004,6 +3059,59 @@ def test_settled_current_allows_only_bounded_precommit_successor_roll() -> None:
             decision.command.thrust,
         )
     )
+
+
+def test_precommit_successor_heading_yields_to_current_fov_clearance() -> None:
+    core, recovered = _precommit_successor_case(
+        successor_x_step=0.004,
+        current_x=0.0,
+    )
+    _, fov_limited = _precommit_successor_case(
+        successor_x_step=0.004,
+        current_x=-0.55,
+    )
+    _, opposing_current = _precommit_successor_case(
+        successor_x_step=0.004,
+        current_x=-0.15,
+    )
+
+    assert recovered.precommit_successor_yaw_authority > 0.0
+    assert recovered.precommit_successor_yaw_rate_rad_s is not None
+    assert recovered.precommit_successor_yaw_rate_rad_s < 0.0
+    assert (
+        recovered.precommit_current_horizontal_fov_clearance_norm
+        is not None
+    )
+    assert (
+        recovered.precommit_current_horizontal_fov_clearance_norm
+        > core.config.passage_margin_norm
+    )
+
+    assert fov_limited.precommit_successor_yaw_authority == 0.0
+    assert fov_limited.precommit_successor_yaw_rate_rad_s is None
+    assert (
+        fov_limited.precommit_current_horizontal_fov_clearance_norm
+        is not None
+    )
+    assert (
+        fov_limited.precommit_current_horizontal_fov_clearance_norm
+        <= core.config.passage_margin_norm
+    )
+    assert fov_limited.command.yaw_rate_rad_s > 0.0
+    assert fov_limited.successor_passage_authority == 0.0
+    assert fov_limited.passage_point_norm == (0.0, 0.0)
+
+    assert (
+        opposing_current.precommit_current_horizontal_fov_clearance_norm
+        is not None
+    )
+    assert (
+        opposing_current.precommit_current_horizontal_fov_clearance_norm
+        > core.config.passage_margin_norm
+    )
+    assert opposing_current.precommit_successor_yaw_authority == 0.0
+    assert opposing_current.precommit_successor_yaw_rate_rad_s is None
+    assert opposing_current.command.yaw_rate_rad_s > 0.0
 
 
 def test_precommit_successor_roll_releases_or_yields_to_current() -> None:

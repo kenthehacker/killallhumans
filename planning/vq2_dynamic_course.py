@@ -838,6 +838,11 @@ class GuidanceDecision:
     passage_committed: bool
     precommit_successor_roll_authority: float
     precommit_successor_target_roll_rad: float | None
+    precommit_successor_yaw_authority: float
+    precommit_successor_yaw_rate_rad_s: float | None
+    precommit_successor_yaw_heading_delta_rad: float | None
+    precommit_successor_yaw_contribution_rad: float | None
+    precommit_current_horizontal_fov_clearance_norm: float | None
     committed_successor_roll_authority: float
     committed_successor_target_roll_rad: float | None
     committed_successor_pitch_authority: float
@@ -3077,7 +3082,7 @@ class DynamicCourseCore:
         successor = state.successor
         if monotonic_ns < current.state_monotonic_ns:
             raise DynamicCourseError("guidance time cannot precede the current state")
-        camera_current_center, _ = self._decision_geometry(
+        camera_current_center, camera_current_aperture = self._decision_geometry(
             current.track_id,
             monotonic_ns,
         )
@@ -3394,6 +3399,173 @@ class DynamicCourseCore:
             ),
             vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
+        precommit_successor_yaw_authority = 0.0
+        precommit_successor_yaw_rate: float | None = None
+        precommit_successor_yaw_heading_delta: float | None = None
+        precommit_successor_yaw_contribution: float | None = None
+        precommit_current_horizontal_fov_clearance: float | None = None
+        if (
+            not passage_committed
+            and successor_clearance_authority <= _EPSILON
+            and successor is not None
+            and successor_prediction is not None
+            and successor_prediction.confidence > 0.0
+            and current.visible
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and camera_current_aperture is not None
+            and not successor.ambiguous
+            and not successor.censored_axes[0]
+            and successor.sample_count >= 4
+            and successor.stream_generation == current.stream_generation
+            and successor.bearing_std_rad[0]
+            <= (
+                self.config
+                .successor_prediction_max_extrapolation_rad
+            )
+            and current.aperture_dynamics_qualified
+            and current.time_to_contact_s is not None
+            and self.config.minimum_ttc_s
+            <= current.time_to_contact_s
+            <= self.config.successor_lookahead_ttc_s
+        ):
+            # Heading lookahead is steering-only.  It may use a credible
+            # successor while the current crossing envelope still withholds
+            # passage bias, but it may not consume the complete current
+            # aperture's horizontal FOV reserve.  Forecast both uncertainty-
+            # expanded aperture edges through calibrated angle space, then
+            # allocate a bounded heading contribution under the existing
+            # successor lookahead cap.  The full current-gate heading remains
+            # present, and an unsettled opposing current correction wins.
+            full_successor_yaw = _clamp(
+                -self.config.yaw_gain
+                * successor_prediction.bearing_rad[0],
+                -MAX_YAW_RATE_RAD_S,
+                MAX_YAW_RATE_RAD_S,
+            )
+            current_camera_angle = math.atan(
+                camera_current_center[0]
+                * self.config.horizontal_angle_scale_rad
+            )
+            preview_horizon_s = (
+                self.config.yaw_command_delay_s
+                + self.config.dropout_hold_s
+            )
+            expanded_aperture = (
+                camera_current_aperture[0]
+                + 2.0 * current_std_norm[0]
+            )
+            current_edges = (
+                camera_current_center[0] - expanded_aperture,
+                camera_current_center[0] + expanded_aperture,
+            )
+            predicted_edges = tuple(
+                math.tan(
+                    math.atan(
+                        edge
+                        * self.config.horizontal_angle_scale_rad
+                    )
+                    + full_successor_yaw * preview_horizon_s
+                )
+                / self.config.horizontal_angle_scale_rad
+                for edge in current_edges
+            )
+            horizontal_fov_occupancy = max(
+                abs(edge)
+                for edge in (*current_edges, *predicted_edges)
+            )
+            precommit_current_horizontal_fov_clearance = (
+                1.0 - horizontal_fov_occupancy
+            )
+            fov_authority = _clamp(
+                (
+                    precommit_current_horizontal_fov_clearance
+                    - self.config.passage_margin_norm
+                )
+                / (1.0 - self.config.passage_margin_norm),
+                0.0,
+                1.0,
+            )
+            confidence_authority = _clamp(
+                successor_prediction.confidence
+                / self.config.successor_passage_full_confidence,
+                0.0,
+                1.0,
+            )
+            ttc_progress = _clamp(
+                (
+                    self.config.successor_lookahead_ttc_s
+                    - current.time_to_contact_s
+                )
+                / (
+                    self.config.successor_lookahead_ttc_s
+                    - self.config.successor_full_weight_ttc_s
+                ),
+                0.0,
+                1.0,
+            )
+            closure_authority = (
+                self.config.successor_passage_far_authority
+                + (
+                    1.0
+                    - self.config.successor_passage_far_authority
+                )
+                * ttc_progress
+            )
+            precommit_successor_yaw_authority = (
+                self.config.successor_maximum_weight
+                * closure_authority
+                * fov_authority
+                * confidence_authority
+            )
+            precommit_successor_yaw_heading_delta = (
+                successor_prediction.bearing_rad[0]
+                - current_camera_angle
+            )
+            current_horizontal_settled = bool(
+                current.bearing_rate_qualified[0]
+                and abs(current_center[0])
+                + 2.0 * current_std_norm[0]
+                <= self.config.passage_margin_norm
+                and abs(residual_rate_norm[0])
+                <= self.config.vertical_settled_rate_norm_s
+            )
+            same_yaw_direction = bool(
+                abs(proposal.yaw_rate_rad_s) <= _EPSILON
+                or proposal.yaw_rate_rad_s * full_successor_yaw
+                >= 0.0
+            )
+            if (
+                precommit_successor_yaw_authority > _EPSILON
+                and abs(precommit_successor_yaw_heading_delta) > _EPSILON
+                and (
+                    current_horizontal_settled
+                    or same_yaw_direction
+                )
+            ):
+                precommit_successor_yaw_contribution = _clamp(
+                    precommit_successor_yaw_authority
+                    * precommit_successor_yaw_heading_delta,
+                    -self.config.successor_max_yaw_contribution_rad,
+                    self.config.successor_max_yaw_contribution_rad,
+                )
+                precommit_successor_yaw_rate = _clamp(
+                    -self.config.yaw_gain
+                    * (
+                        current_camera_angle
+                        + precommit_successor_yaw_contribution
+                    ),
+                    -MAX_YAW_RATE_RAD_S,
+                    MAX_YAW_RATE_RAD_S,
+                )
+                proposal = replace(
+                    proposal,
+                    yaw_rate_rad_s=precommit_successor_yaw_rate,
+                )
+            else:
+                precommit_successor_yaw_authority = 0.0
+                precommit_successor_yaw_heading_delta = None
+                precommit_successor_yaw_contribution = None
         precommit_successor_roll_authority = 0.0
         precommit_successor_target_roll: float | None = None
         precommit_key = (
@@ -3841,6 +4013,21 @@ class DynamicCourseCore:
             ),
             precommit_successor_target_roll_rad=(
                 precommit_successor_target_roll
+            ),
+            precommit_successor_yaw_authority=(
+                precommit_successor_yaw_authority
+            ),
+            precommit_successor_yaw_rate_rad_s=(
+                precommit_successor_yaw_rate
+            ),
+            precommit_successor_yaw_heading_delta_rad=(
+                precommit_successor_yaw_heading_delta
+            ),
+            precommit_successor_yaw_contribution_rad=(
+                precommit_successor_yaw_contribution
+            ),
+            precommit_current_horizontal_fov_clearance_norm=(
+                precommit_current_horizontal_fov_clearance
             ),
             committed_successor_roll_authority=(
                 committed_successor_roll_authority

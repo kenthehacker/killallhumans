@@ -70,11 +70,10 @@ def test_production_camera_boundary_uses_live_axis_calibration() -> None:
         BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
     )
     assert config.camera_to_body_wxyz == (0.0, 1.0, 0.0, 0.0)
-    # Rx(pi) maps image-right to body-left, while positive FRD roll accelerates
-    # body-right.  The bounded demand must therefore oppose positive image
-    # bearing; matched live Gate-1 runs also retained visibility longer with
-    # this sign.
-    assert config.roll_guidance_sign == -1.0
+    # Optical derotation does not determine translational bank sign.  Live
+    # fixed-variable Gate-1 response identifies positive bank as convergent for
+    # a positive stable/image lateral error.
+    assert config.roll_guidance_sign == 1.0
 
 
 def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
@@ -204,15 +203,15 @@ def test_successor_steering_uses_full_bank_only_while_off_axis_and_outward():
     )._successor_steering_targets(prediction)
 
     assert outward["target_roll_rad"] == pytest.approx(
-        -MAX_TARGET_ROLL_RAD
+        MAX_TARGET_ROLL_RAD
     )
     assert outward["target_pitch_rad"] == pytest.approx(
         session.core.config.brake_pitch_rad
     )
     assert (
-        -MAX_TARGET_ROLL_RAD
+        0.0
         < recovered["target_roll_rad"]
-        < 0.0
+        < MAX_TARGET_ROLL_RAD
     )
     assert (
         recovered["target_pitch_rad"]
@@ -817,7 +816,7 @@ def test_unqualified_post_credit_rate_retains_bank_only_until_expiry():
 
 @pytest.mark.parametrize(
     ("normal_roll_rad", "residual_rate_rad_s"),
-    ((0.04, 0.25), (-0.04, -0.05)),
+    ((-0.04, 0.25), (0.04, -0.05)),
 )
 def test_opposite_or_recovering_geometry_releases_roll_handoff_immediately(
     normal_roll_rad: float,
@@ -914,7 +913,7 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
         proposal = _observe(planner, snapshot, tracker)
         _accept_proposal(session, tracker, proposal)
 
-    assert proposal.servo_output.target_roll_rad < 0.0
+    assert proposal.servo_output.target_roll_rad > 0.0
     assert proposal.servo_output.target_pitch_rad <= 0.12
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
@@ -1046,7 +1045,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert proposal.servo_output.target_roll_rad == pytest.approx(
         baseline["target_roll_rad"]
     )
-    assert proposal.servo_output.target_roll_rad < 0.0
+    assert proposal.servo_output.target_roll_rad > 0.0
     assert all(
         math.isfinite(value)
         for value in (
@@ -1119,7 +1118,7 @@ def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
     assert corrective
     assert all(
         math.isfinite(target_roll)
-        and -MAX_TARGET_ROLL_RAD <= target_roll < 0.0
+        and 0.0 < target_roll <= MAX_TARGET_ROLL_RAD
         for target_roll in corrective
     )
 
@@ -2020,9 +2019,9 @@ def test_clipped_local_state_guides_after_aperture_authority_expires() -> None:
             session.core.config.max_abs_bearing_rad
         )
         assert (
-            -MAX_TARGET_ROLL_RAD
-            <= authority["command"]["target_roll_rad"]
-            < 0.0
+            0.0
+            < authority["command"]["target_roll_rad"]
+            <= MAX_TARGET_ROLL_RAD
         )
         assert authority["steering_only"] is True
         assert authority["passage_authority"] is False

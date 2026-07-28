@@ -135,12 +135,11 @@ def production_dynamic_course_config() -> DynamicCourseConfig:
         camera_to_body_wxyz=(
             BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
         ),
-        # Rx(pi) maps camera/image right to body-FRD left.  Positive body roll
-        # accelerates toward body right, so a positive stable gate bearing
-        # requires negative bank.  The matched Gate-1 flights confirm this
-        # geometry: increasing positive bank advanced RIGHT clipping, while
-        # negative bank retained the gate longer.
-        roll_guidance_sign=-1.0,
+        # The camera derotation map and translational bank response are separate
+        # conventions.  Fixed-variable Gate-1 flights showed that negative bank
+        # drives a positive stable/image error farther right; positive bank is
+        # the empirically convergent lateral demand.
+        roll_guidance_sign=1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
         roll_to_lateral_bearing_accel=0.0,
@@ -2821,6 +2820,24 @@ class DynamicVisualCourseSession:
                     ),
                     "precommit_successor_target_roll_rad": (
                         decision.precommit_successor_target_roll_rad
+                    ),
+                    "precommit_successor_yaw_authority": (
+                        decision.precommit_successor_yaw_authority
+                    ),
+                    "precommit_successor_yaw_rate_rad_s": (
+                        decision.precommit_successor_yaw_rate_rad_s
+                    ),
+                    "precommit_successor_yaw_heading_delta_rad": (
+                        decision
+                        .precommit_successor_yaw_heading_delta_rad
+                    ),
+                    "precommit_successor_yaw_contribution_rad": (
+                        decision
+                        .precommit_successor_yaw_contribution_rad
+                    ),
+                    "precommit_current_horizontal_fov_clearance_norm": (
+                        decision
+                        .precommit_current_horizontal_fov_clearance_norm
                     ),
                     "committed_successor_roll_authority": (
                         decision.committed_successor_roll_authority
