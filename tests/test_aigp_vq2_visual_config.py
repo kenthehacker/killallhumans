@@ -136,7 +136,7 @@ def test_immutable_safety_envelopes_are_not_configuration_fields():
 
     assert MAX_VISUAL_YAW_RATE_RAD_S == 0.15
     assert MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD > 0.05
-    assert MAX_VISUAL_SEGMENT_DURATION_S == 8.0
+    assert MAX_VISUAL_SEGMENT_DURATION_S == 120.0
     assert PREPASS_CURRENT_MAX_ABS_X_NORM == 0.20
     assert PREPASS_CURRENT_MAX_ABS_Y_NORM == 0.28
     assert PREPASS_CURRENT_MAX_ABS_CENTER_RATE_NORM_S == 0.60

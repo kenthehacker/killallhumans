@@ -3447,43 +3447,10 @@ class DynamicCourseCore:
                     successor_steering.bearing_std_rad[0]
                     <= maximum_std + _EPSILON
                 ):
-                    committed_successor_roll_authority = 1.0
-                    normal_successor_roll = _clamp(
-                        self.config.roll_guidance_sign
-                        * (
-                            self.config.roll_gain
-                            * successor_steering.stable_bearing_rad[0]
-                            + self.config.lateral_rate_gain
-                            * successor_steering
-                            .stable_bearing_rate_rad_s[0]
-                        ),
-                        -MAX_TARGET_ROLL_RAD,
-                        MAX_TARGET_ROLL_RAD,
-                    )
-                    committed_successor_target_roll = normal_successor_roll
-                    successor_outward = bool(
-                        abs(self.config.roll_guidance_sign) > _EPSILON
-                        and abs(normal_successor_roll) > _EPSILON
-                        and abs(successor_steering.stable_bearing_rad[0])
-                        >= self.config.off_axis_brake_rad
-                        and successor_steering.stable_bearing_rad[0]
-                        * successor_steering.stable_bearing_rate_rad_s[0]
-                        > 0.0
-                        and normal_successor_roll
-                        * self.config.roll_guidance_sign
-                        * successor_steering.stable_bearing_rad[0]
-                        > 0.0
-                    )
-                    if successor_outward:
-                        # The graph-vetted successor may use the full bounded
-                        # bank only while the current gate's proved crossing
-                        # still owns the lifecycle.  After promotion, ordinary
-                        # current-gate guidance remains proportional and has no
-                        # full-bank latch.
-                        committed_successor_target_roll = math.copysign(
-                            MAX_TARGET_ROLL_RAD,
-                            normal_successor_roll,
-                        )
+                    # A successor visible during the current-gate crossing may
+                    # pre-turn heading, but it must not translate the vehicle
+                    # sideways before authoritative credit.  Yaw points at the
+                    # next gate; current-gate roll remains in force.
                     committed_successor_yaw_authority = 1.0
                     committed_successor_yaw_rate = _clamp(
                         -self.config.yaw_gain
@@ -3493,9 +3460,6 @@ class DynamicCourseCore:
                     )
                     proposal = replace(
                         proposal,
-                        target_roll_rad=(
-                            committed_successor_target_roll
-                        ),
                         yaw_rate_rad_s=(
                             committed_successor_yaw_rate
                         ),
@@ -3533,6 +3497,11 @@ class DynamicCourseCore:
                             committed_successor_target_pitch
                         ),
                     )
+        if state.current_gate_index > 0:
+            # Later gates use a point-then-advance strategy.  Yaw owns
+            # horizontal pointing; level roll prevents lateral translation
+            # from fighting that heading turn.
+            proposal = replace(proposal, target_roll_rad=0.0)
         return GuidanceDecision(
             monotonic_ns=monotonic_ns,
             current_gate_index=state.current_gate_index,

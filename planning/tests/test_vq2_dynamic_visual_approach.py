@@ -651,7 +651,7 @@ def _bound_post_credit_successor() -> tuple[
     return session, successor_id
 
 
-def _activated_committed_roll_handoff(
+def _activated_yaw_only_transition(
 ) -> tuple[DynamicVisualCourseSession, object, str, float]:
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
@@ -701,15 +701,22 @@ def _activated_committed_roll_handoff(
         track_id=successor_id,
         now_monotonic_ns=authority_ns,
     )
-    retained_roll_rad = float(authority["target_roll_rad"])
+    level_roll_rad = float(authority["target_roll_rad"])
+    assert level_roll_rad == pytest.approx(0.0)
+    assert authority["retained_roll_reference_applied"] is False
+    assert math.isfinite(float(authority["yaw_rate_rad_s"]))
+    assert (
+        abs(float(authority["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
     accepted_ns = authority_ns + 1_000_000
     session.record_wire_acceptance(
-        target_roll_rad=retained_roll_rad,
+        target_roll_rad=level_roll_rad,
         target_pitch_rad=float(authority["target_pitch_rad"]),
         yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
         thrust=float(authority["thrust"]),
         wire_command=AttitudeRateCommand(
-            0.02,
+            0.0,
             0.01,
             float(authority["yaw_rate_rad_s"]),
             float(authority["thrust"]),
@@ -724,14 +731,25 @@ def _activated_committed_roll_handoff(
         reviewed_track_id=successor_id,
         activation_monotonic_ns=activation_ns,
     )
-    assert session.post_credit_roll_reference_handoff_active
+    post_credit = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=activation_ns,
+    )
+    assert post_credit["target_roll_rad"] == pytest.approx(0.0)
+    assert post_credit["retained_roll_reference_applied"] is False
+    assert math.isfinite(float(post_credit["yaw_rate_rad_s"]))
+    assert (
+        abs(float(post_credit["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
+    assert session.post_credit_roll_reference_handoff_active is False
     source = session.core.guide(activation_ns + 1_000_000)
-    return session, source, successor_id, retained_roll_rad
+    assert source.command.target_roll_rad == pytest.approx(0.0)
+    return session, source, successor_id, level_roll_rad
 
 
-def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
-    session, source, successor_id, retained = (
-        _activated_committed_roll_handoff()
+def test_outward_post_credit_demand_stays_level_with_yaw_only_steering():
+    session, source, successor_id, level_roll = (
+        _activated_yaw_only_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -743,7 +761,7 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     )
     normal_command = replace(
         source.command,
-        target_roll_rad=0.60 * retained,
+        target_roll_rad=level_roll,
     )
     fresh = replace(
         source,
@@ -760,20 +778,20 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     )
 
     assert constrained.proposed_command.target_roll_rad == pytest.approx(
-        0.60 * retained
+        0.0
     )
-    assert constrained.command.target_roll_rad == pytest.approx(retained)
+    assert constrained.command.target_roll_rad == pytest.approx(0.0)
     assert math.isfinite(constrained.command.target_roll_rad)
     assert (
         abs(constrained.command.target_roll_rad)
         <= MAX_TARGET_ROLL_RAD
     )
-    assert session.post_credit_roll_reference_handoff_active
+    assert session.post_credit_roll_reference_handoff_active is False
 
 
-def test_unqualified_post_credit_rate_releases_bank_at_handoff_deadline():
-    session, source, successor_id, retained = (
-        _activated_committed_roll_handoff()
+def test_unqualified_post_credit_rate_cannot_arm_roll_handoff():
+    session, source, successor_id, level_roll = (
+        _activated_yaw_only_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -785,7 +803,7 @@ def test_unqualified_post_credit_rate_releases_bank_at_handoff_deadline():
     )
     normal_command = replace(
         source.command,
-        target_roll_rad=0.60 * retained,
+        target_roll_rad=level_roll,
     )
     unqualified = replace(
         source,
@@ -801,33 +819,15 @@ def test_unqualified_post_credit_rate_releases_bank_at_handoff_deadline():
         unqualified
     )
 
-    assert constrained.command.target_roll_rad == pytest.approx(retained)
+    assert constrained.command.target_roll_rad == pytest.approx(0.0)
     assert math.isfinite(constrained.command.target_roll_rad)
     assert abs(constrained.command.target_roll_rad) <= MAX_TARGET_ROLL_RAD
-    assert session.post_credit_roll_reference_handoff_active
-
-    handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
-    assert handoff is not None
-    expired = replace(
-        unqualified,
-        monotonic_ns=handoff.expires_monotonic_ns + 1,
-    )
-    released_after_deadline = (  # noqa: SLF001
-        session._apply_post_credit_roll_reference_handoff(
-        expired
-        )
-    )
-
-    assert (
-        released_after_deadline.command.target_roll_rad
-        == pytest.approx(normal_command.target_roll_rad)
-    )
     assert session.post_credit_roll_reference_handoff_active is False
 
 
-def test_qualified_inward_rate_releases_bank_while_still_off_axis():
-    session, source, successor_id, retained = (
-        _activated_committed_roll_handoff()
+def test_qualified_inward_rate_preserves_level_yaw_only_steering():
+    session, source, successor_id, level_roll = (
+        _activated_yaw_only_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -839,7 +839,7 @@ def test_qualified_inward_rate_releases_bank_while_still_off_axis():
     )
     normal_command = replace(
         source.command,
-        target_roll_rad=0.60 * retained,
+        target_roll_rad=level_roll,
     )
     fresh_recovering = replace(
         source,
@@ -870,22 +870,20 @@ def test_qualified_inward_rate_releases_bank_while_still_off_axis():
 
 @pytest.mark.parametrize(
     (
-        "normal_roll_rad",
         "residual_rate_rad_s",
         "current_center_x",
     ),
     (
-        (0.04, 0.25, 0.30),
-        (-0.04, -0.05, 0.05),
+        (0.25, 0.30),
+        (-0.05, 0.05),
     ),
 )
-def test_opposite_or_near_center_recovery_releases_roll_handoff_immediately(
-    normal_roll_rad: float,
+def test_opposite_or_near_center_recovery_never_arms_roll_handoff(
     residual_rate_rad_s: float,
     current_center_x: float,
 ):
-    session, source, successor_id, _retained = (
-        _activated_committed_roll_handoff()
+    session, source, successor_id, level_roll = (
+        _activated_yaw_only_transition()
     )
     estimate = session.core._tracks[successor_id]  # noqa: SLF001
     estimate.state = replace(
@@ -900,7 +898,7 @@ def test_opposite_or_near_center_recovery_releases_roll_handoff_immediately(
     )
     normal_command = replace(
         source.command,
-        target_roll_rad=normal_roll_rad,
+        target_roll_rad=level_roll,
     )
     fresh = replace(
         source,
@@ -916,9 +914,7 @@ def test_opposite_or_near_center_recovery_releases_roll_handoff_immediately(
         fresh
     )
 
-    assert released.command.target_roll_rad == pytest.approx(
-        normal_roll_rad
-    )
+    assert released.command.target_roll_rad == pytest.approx(0.0)
     assert session.post_credit_roll_reference_handoff_active is False
 
 
@@ -1010,7 +1006,7 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     )
 
 
-def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
+def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
     planner = DynamicRollingVisualApproachServo(
@@ -1142,9 +1138,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert abs(float(baseline["target_roll_rad"])) < abs(
         committed_roll
     )
-    assert proposal.servo_output.target_roll_rad == pytest.approx(
-        committed_roll
-    )
+    assert proposal.servo_output.target_roll_rad == pytest.approx(0.0)
     assert proposal.servo_output.target_pitch_rad == pytest.approx(
         baseline["target_pitch_rad"]
     )
@@ -1173,28 +1167,27 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     )
 
     _accept_proposal(session, tracker, proposal)
-    accepted_reference = (
+    assert (
         session._precredit_successor_roll_reference  # noqa: SLF001
+        is None
     )
-    assert accepted_reference is not None
-    assert accepted_reference.target_roll_rad == pytest.approx(
-        committed_roll
-    )
-    assert accepted_reference.accepted_wire_start_monotonic_ns == (
-        update.observation_monotonic_ns + 8_000_000
-    )
-    # A newer proposal can be refused atomically by race credit.  It must not
-    # overwrite the last reference that actually reached the wire.
+    # Re-evaluating the exact adjacent authority may update yaw and pitch, but
+    # it cannot create a pre-credit roll reference.
     no_wire = session.adjacent_precredit_successor_steering_authority(
         track_id=replacement.track_id,
         now_monotonic_ns=(
             update.observation_monotonic_ns + 9_000_000
         ),
     )
-    assert no_wire["target_roll_rad"] == pytest.approx(committed_roll)
+    assert no_wire["target_roll_rad"] == pytest.approx(0.0)
+    assert no_wire["retained_roll_reference_applied"] is False
+    assert (
+        abs(float(no_wire["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
     assert (
         session._precredit_successor_roll_reference  # noqa: SLF001
-        == accepted_reference
+        is None
     )
     race_received_ns = update.observation_monotonic_ns + 10_000_000
     activation_ns = race_received_ns + 1_000_000
@@ -1209,10 +1202,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert promoted.current_track_id == replacement.track_id
     assert promoted.promotion_count == 1
     handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
-    assert handoff is not None
-    assert handoff.retained_target_roll_rad == pytest.approx(
-        committed_roll
-    )
+    assert handoff is None
 
 
 def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
@@ -3767,6 +3757,12 @@ def test_post_credit_activation_accepts_causal_wire_after_race_ingress():
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
+    assert authority["target_roll_rad"] == pytest.approx(0.0)
+    assert authority["retained_roll_reference_applied"] is False
+    assert (
+        abs(float(authority["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
     assert authority["target_pitch_rad"] == pytest.approx(
         session.core.config.brake_pitch_rad
     )
@@ -3790,13 +3786,9 @@ def test_post_credit_activation_accepts_causal_wire_after_race_ingress():
         wire_start_monotonic_ns=accepted_ns,
     )
 
-    assert session.post_credit_roll_reference_handoff_active is True
+    assert session.post_credit_roll_reference_handoff_active is False
     handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
-    assert handoff is not None
-    assert handoff.retained_target_roll_rad == pytest.approx(
-        authority["target_roll_rad"]
-    )
-    assert handoff.source_wire_start_monotonic_ns == accepted_ns
+    assert handoff is None
 
 
 def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
@@ -3845,7 +3837,7 @@ def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
     "normal_roll_rad",
     (-0.04, -MAX_TARGET_ROLL_RAD),
 )
-def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
+def test_fresh_rebound_authority_never_arms_roll_handoff(
     normal_roll_rad: float,
 ):
     session, successor_id = _bound_post_credit_successor()
@@ -3908,8 +3900,8 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
             now_monotonic_ns=normal.monotonic_ns,
         )["target_roll_rad"]
     )
-    expected_roll = rebound_roll
-    assert constrained.command.target_roll_rad == pytest.approx(expected_roll)
+    assert rebound_roll == pytest.approx(0.0)
+    assert constrained.command == normal_command
     assert constrained.passage_committed is False
     assert constrained.current_gate_index == 1
     assert session.post_credit_roll_reference_handoff_active is False
@@ -3925,19 +3917,19 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
 
     accepted_ns = constrained.monotonic_ns + 1_000_000
     session.record_wire_acceptance(
-        target_roll_rad=constrained.command.target_roll_rad,
+        target_roll_rad=0.0,
         target_pitch_rad=constrained.command.target_pitch_rad,
         yaw_rate_rad_s=constrained.command.yaw_rate_rad_s,
         thrust=constrained.command.thrust,
         wire_command=AttitudeRateCommand(
-            -0.05,
+            0.0,
             0.02,
             constrained.command.yaw_rate_rad_s,
             constrained.command.thrust,
         ),
         wire_start_monotonic_ns=accepted_ns,
     )
-    assert session.post_credit_roll_reference_handoff_active
+    assert session.post_credit_roll_reference_handoff_active is False
 
     # Recovery completion retires the rebound lease, while the accepted
     # reference remains state-owned until the qualified residual recovers.
@@ -3949,7 +3941,7 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
     retained = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
         outward
     )
-    assert retained.command.target_roll_rad == pytest.approx(expected_roll)
+    assert retained.command == normal_command
 
     estimate.state = replace(
         estimate.state,
@@ -4347,7 +4339,7 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     assert session.post_credit_successor_steering_active is False
 
 
-def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
+def test_fresh_cross_id_rebind_renews_bounded_clipped_yaw_recovery() -> None:
     tracker, _graph_state, snapshot, current_id = _graph()
     session = _session()
     for monotonic_ns in range(
@@ -4438,16 +4430,21 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         track_id=reviewed_id,
         now_monotonic_ns=authority_ns,
     )
-    retained_roll = float(precredit["target_roll_rad"])
-    assert retained_roll == pytest.approx(-MAX_TARGET_ROLL_RAD)
+    level_roll = float(precredit["target_roll_rad"])
+    assert level_roll == pytest.approx(0.0)
+    assert precredit["retained_roll_reference_applied"] is False
+    assert (
+        abs(float(precredit["yaw_rate_rad_s"]))
+        <= MAX_YAW_RATE_RAD_S
+    )
     wire_ns = authority_ns + 500_000
     session.record_wire_acceptance(
-        target_roll_rad=retained_roll,
+        target_roll_rad=level_roll,
         target_pitch_rad=float(precredit["target_pitch_rad"]),
         yaw_rate_rad_s=float(precredit["yaw_rate_rad_s"]),
         thrust=float(precredit["thrust"]),
         wire_command=AttitudeRateCommand(
-            -0.07553,
+            0.0,
             0.02,
             float(precredit["yaw_rate_rad_s"]),
             float(precredit["thrust"]),
@@ -4463,9 +4460,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     assert expired["steering_available"] is False
     assert expired["steering_unavailable_reason"] == "expired_prediction"
     dormant = session._post_credit_roll_reference_handoff  # noqa: SLF001
-    assert dormant is not None
-    assert dormant.retained_target_roll_rad == pytest.approx(retained_roll)
-    assert dormant.expires_monotonic_ns == old_expiry_ns
+    assert dormant is None
     with pytest.raises(
         PostCreditSuccessorSteeringUnavailable,
         match="handoff has no steering authority",
@@ -4596,18 +4591,10 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     rebound_handoff = (
         session._post_credit_roll_reference_handoff  # noqa: SLF001
     )
-    assert rebound_handoff is not None
-    assert rebound_handoff.track_id == fresh_id
-    assert rebound_handoff.retained_target_roll_rad == pytest.approx(
-        retained_roll
-    )
-    assert rebound_handoff.expires_monotonic_ns == (
-        rebound["recovery_steering"]["expires_monotonic_ns"]
-    )
+    assert rebound_handoff is None
     # The exact fresh cross-ID reanchor starts with an unqualified horizontal
-    # rate and a +0.190625 normalized center.  Its ordinary proportional
-    # reference is weaker, but it must not unwind the already accepted,
-    # bounded successor pre-turn.
+    # rate and a +0.190625 normalized center. It may update yaw and pitch, but
+    # cannot inherit or manufacture a roll reference.
     fresh_center_x = 0.190625
     fresh_bearing_rad = math.atan(
         fresh_center_x * session.core.config.horizontal_angle_scale_rad
@@ -4636,18 +4623,13 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
             now_monotonic_ns=binding_ns,
         )
     )
-    assert abs(
-        float(binding_authority["unconstrained_target_roll_rad"])
-    ) < abs(retained_roll)
     assert binding_authority["unconstrained_target_roll_rad"] == pytest.approx(
         session.core.config.roll_guidance_sign
         * session.core.config.roll_gain
         * fresh_bearing_rad
     )
-    assert binding_authority["target_roll_rad"] == pytest.approx(
-        retained_roll
-    )
-    assert binding_authority["retained_roll_reference_applied"] is True
+    assert binding_authority["target_roll_rad"] == pytest.approx(0.0)
+    assert binding_authority["retained_roll_reference_applied"] is False
     assert binding_authority["target_pitch_rad"] == pytest.approx(
         unconstrained_targets["target_pitch_rad"]
     )
@@ -4672,7 +4654,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     )
     governed = session.govern_wire_command(
         AttitudeRateCommand(
-            -MAX_TARGET_ROLL_RAD,
+            0.0,
             0.02,
             float(binding_authority["yaw_rate_rad_s"]),
             float(binding_authority["thrust"]),
@@ -4681,7 +4663,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         launch_thrust_override=False,
         yaw_safety_override=False,
     )
-    assert -MAX_TARGET_ROLL_RAD <= governed.roll_rate <= 0.0
+    assert governed.roll_rate == pytest.approx(0.0)
     assert abs(governed.pitch_rate) <= MAX_TARGET_PITCH_RAD
     assert abs(governed.yaw_rate) <= MAX_YAW_RATE_RAD_S
     assert MIN_THRUST <= governed.thrust <= MAX_THRUST
@@ -4738,6 +4720,9 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
+    assert authority["target_roll_rad"] == pytest.approx(0.0)
+    assert authority["retained_roll_reference_applied"] is False
+    assert session.post_credit_roll_reference_handoff_active is False
     assert all(
         math.isfinite(float(authority[name]))
         for name in (

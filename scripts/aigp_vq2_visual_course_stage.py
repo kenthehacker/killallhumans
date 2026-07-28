@@ -3976,12 +3976,10 @@ def _refresh_committed_successor_steering(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Carry bounded successor roll/yaw into the next crossing command.
+    """Carry bounded successor yaw into the next crossing command.
 
-    The current-gate clearance proof, pitch, thrust, identity, and passage
-    authority remain sealed.  Exact-lineage dynamic evidence may update only
-    roll and yaw steering, which still passes through the final wire governor
-    on the next control tick.
+    The current-gate command remains sealed except for heading.  Successor
+    geometry must never introduce or refresh bank before race credit.
     """
 
     if (
@@ -4057,11 +4055,14 @@ def _refresh_committed_successor_steering(
         lower=-MAX_VISUAL_YAW_RATE_RAD_S,
         upper=MAX_VISUAL_YAW_RATE_RAD_S,
     )
-    if committed_roll is None or committed_yaw is None:
+    if committed_roll is not None:
+        raise ValueError(
+            "committed successor roll is forbidden in yaw-only mode"
+        )
+    if committed_yaw is None:
         return authority
     return replace(
         authority,
-        target_roll_rad=committed_roll,
         yaw_rate_rad_s=(
             authority.yaw_rate_rad_s
             if accepted.yaw_soft_stop_zeroed
@@ -4078,15 +4079,10 @@ def _finalize_crossing_command_at_passage_admission(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Seal an accepted successor-roll reference exactly once.
+    """Keep the current-gate crossing command sealed at passage admission.
 
-    A near-plane latch may precede the clean passage-admission frame that
-    finishes the current-gate geometry proof.  Its command is therefore only
-    the bounded fallback if clipping begins immediately.  Once admission
-    accepts an exact bounded successor-roll reference under current-gate
-    crossing reserve, that roll becomes part of the immutable crossing
-    command.  Pitch, yaw, thrust, anchor, and all later propagated successor
-    updates remain unchanged.
+    Successor heading is refreshed separately.  Successor-derived bank is not
+    admitted before race credit.
     """
 
     evidence = accepted.dynamic_evidence
@@ -4119,40 +4115,7 @@ def _finalize_crossing_command_at_passage_admission(
             "passage-admission crossing command evidence is invalid"
         )
 
-    roll_authority = evidence.get(
-        "precommit_successor_roll_authority"
-    )
-    roll_reference = evidence.get(
-        "precommit_successor_target_roll_rad"
-    )
-    if roll_authority in {None, 0.0} and roll_reference is None:
-        return authority
-    if (
-        evidence.get("passage_committed") is not False
-        or evidence.get("successor_track_id")
-        != reviewed_successor_track_id
-        or type(roll_authority) not in {int, float}
-        or not math.isfinite(float(roll_authority))
-        or not 0.0 < float(roll_authority) <= 1.0
-        or type(roll_reference) not in {int, float}
-        or not math.isfinite(float(roll_reference))
-        or abs(float(roll_reference))
-        > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
-        or not math.isclose(
-            float(roll_reference),
-            float(accepted.target_roll_rad),
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-    ):
-        raise ValueError(
-            "passage-admission successor roll evidence is invalid"
-        )
-
-    return replace(
-        authority,
-        target_roll_rad=float(roll_reference),
-    )
+    return authority
 
 
 def _dynamic_near_plane_wire_sample(

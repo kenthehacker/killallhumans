@@ -1156,12 +1156,13 @@ class DynamicVisualCourseSession:
 
         targets = self._successor_steering_targets(prediction)
         unconstrained_target_roll = float(targets["target_roll_rad"])
-        target_roll = self._retain_fresh_reacquisition_roll_reference(
-            lease=lease,
-            target_roll_rad=unconstrained_target_roll,
-            stable_bearing_rad=float(prediction.stable_bearing_rad[0]),
-            now_monotonic_ns=now_monotonic_ns,
-        )
+        # Authoritative post-credit navigation is point-then-advance: yaw owns
+        # horizontal pointing and roll remains level.  Retaining a pre-credit
+        # bank translates the vehicle sideways while yaw is already turning
+        # toward the gate.
+        self._pending_post_credit_roll_reference = None
+        self._post_credit_roll_reference_handoff = None
+        target_roll = 0.0
         target_pitch = float(targets["target_pitch_rad"])
         yaw_rate = float(targets["yaw_rate_rad_s"])
         camera_elevation = float(
@@ -1246,12 +1247,7 @@ class DynamicVisualCourseSession:
             {
                 "target_roll_rad": target_roll,
                 "unconstrained_target_roll_rad": unconstrained_target_roll,
-                "retained_roll_reference_applied": not math.isclose(
-                    target_roll,
-                    unconstrained_target_roll,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                ),
+                "retained_roll_reference_applied": False,
                 "target_pitch_rad": target_pitch,
                 "yaw_rate_rad_s": yaw_rate,
                 "thrust": SUPPORT_THRUST,
@@ -1888,69 +1884,6 @@ class DynamicVisualCourseSession:
                 "precredit successor steering lacks staged graph authority"
             )
 
-        applied = self._last_applied_sample
-        retained_roll: float | None = None
-        accepted_reference = self._precredit_successor_roll_reference
-        if (
-            accepted_reference is not None
-            and applied is not None
-            and accepted_reference.from_gate_index
-            == state.current_gate_index
-            and accepted_reference.to_gate_index
-            == staged.expected_gate_index
-            and accepted_reference.track_id == track_id
-            and accepted_reference.stream_generation
-            == staged.camera_token.generation
-            and accepted_reference.accepted_wire_start_monotonic_ns
-            == applied.monotonic_ns
-            and accepted_reference.authority_monotonic_ns
-            <= applied.monotonic_ns
-            <= now_monotonic_ns
-            and math.isclose(
-                accepted_reference.target_roll_rad,
-                applied.target_roll_rad,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-        ):
-            retained_roll = accepted_reference.target_roll_rad
-        prior = self._last_decision
-        if (
-            retained_roll is None
-            and applied is not None
-            and prior is not None
-            and state.successor_track_id is not None
-            and state.successor_track_id != track_id
-            and prior.current_gate_index == state.current_gate_index
-            and prior.current_track_id == state.current_track_id
-            and prior.successor_track_id == state.successor_track_id
-            and prior.passage_committed
-            and prior.committed_successor_roll_authority == 1.0
-            and prior.committed_successor_target_roll_rad is not None
-            and prior.monotonic_ns <= applied.monotonic_ns
-            <= now_monotonic_ns
-        ):
-            committed_roll = float(
-                prior.committed_successor_target_roll_rad
-            )
-            if (
-                math.isfinite(committed_roll)
-                and 0.0 < abs(committed_roll) <= MAX_TARGET_ROLL_RAD
-                and math.isclose(
-                    prior.command.target_roll_rad,
-                    committed_roll,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-                and math.isclose(
-                    applied.target_roll_rad,
-                    committed_roll,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-            ):
-                retained_roll = committed_roll
-
         # RollingVisualApproachServo invokes this only after validating the
         # exact latest graph publication as one clean, stable, unambiguous
         # NEXT candidate.  Replace the stale pre-clipping image identity in
@@ -2010,38 +1943,11 @@ class DynamicVisualCourseSession:
             )
         targets = dict(self._successor_steering_targets(prediction))
         unconstrained_roll = float(targets["target_roll_rad"])
-        retained_roll_applied = False
-        if retained_roll is not None:
-            stable_bearing = float(prediction.stable_bearing_rad[0])
-            guidance_sign = float(self.core.config.roll_guidance_sign)
-            values = (
-                retained_roll,
-                unconstrained_roll,
-                stable_bearing,
-                guidance_sign,
-            )
-            retained_roll_applied = bool(
-                all(math.isfinite(value) for value in values)
-                and 0.0 < abs(retained_roll) <= MAX_TARGET_ROLL_RAD
-                and abs(guidance_sign) > 1e-12
-                and retained_roll * guidance_sign * stable_bearing > 1e-12
-                and retained_roll * unconstrained_roll >= -1e-12
-                and abs(retained_roll)
-                > abs(unconstrained_roll) + 1e-12
-            )
-            if retained_roll_applied:
-                targets["target_roll_rad"] = retained_roll
-        self._pending_precredit_successor_roll_reference = (
-            _PreCreditSuccessorRollReference(
-                from_gate_index=state.current_gate_index,
-                to_gate_index=staged.expected_gate_index,
-                track_id=track_id,
-                stream_generation=successor.stream_generation,
-                target_roll_rad=float(targets["target_roll_rad"]),
-                authority_monotonic_ns=now_monotonic_ns,
-                accepted_wire_start_monotonic_ns=None,
-            )
-        )
+        # The adjacent successor may pre-turn heading before credit, but it
+        # must not start a lateral translation that survives promotion.
+        targets["target_roll_rad"] = 0.0
+        self._pending_precredit_successor_roll_reference = None
+        self._precredit_successor_roll_reference = None
         self._last_decision = None
         targets.update(
             {
@@ -2059,9 +1965,7 @@ class DynamicVisualCourseSession:
                 "authority_monotonic_ns": now_monotonic_ns,
                 "measurement_age_s": prediction.measurement_age_s,
                 "unconstrained_target_roll_rad": unconstrained_roll,
-                "retained_roll_reference_applied": (
-                    retained_roll_applied
-                ),
+                "retained_roll_reference_applied": False,
                 "stable_bearing_rad": list(
                     prediction.stable_bearing_rad
                 ),
@@ -2112,6 +2016,20 @@ class DynamicVisualCourseSession:
         decision = self._apply_post_credit_roll_reference_handoff(
             decision
         )
+        if decision.current_gate_index > 0:
+            self._pending_post_credit_roll_reference = None
+            self._post_credit_roll_reference_handoff = None
+            decision = replace(
+                decision,
+                proposed_command=replace(
+                    decision.proposed_command,
+                    target_roll_rad=0.0,
+                ),
+                command=replace(
+                    decision.command,
+                    target_roll_rad=0.0,
+                ),
+            )
         self._last_decision = decision
         return decision
 

@@ -469,14 +469,14 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
     }
 
 
-def test_latest_trace_successor_memory_reaches_crossing_roll_and_yaw():
+def test_committed_successor_refresh_preserves_sealed_roll_and_updates_only_yaw():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
             "successor_track_id": "vq2-track-000002",
             "passage_committed": True,
-            "committed_successor_roll_authority": 1.0,
-            "committed_successor_target_roll_rad": -0.17,
+            "committed_successor_roll_authority": 0.0,
+            "committed_successor_target_roll_rad": None,
             "committed_successor_pitch_authority": 1.0,
             "committed_successor_target_pitch_rad": -0.12,
             "committed_successor_yaw_authority": 1.0,
@@ -502,11 +502,12 @@ def test_latest_trace_successor_memory_reaches_crossing_roll_and_yaw():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed.target_roll_rad == pytest.approx(-0.17)
+    assert refreshed.target_roll_rad == authority.target_roll_rad
+    assert refreshed.target_pitch_rad == authority.target_pitch_rad
     assert refreshed.yaw_rate_rad_s == pytest.approx(-0.15)
+    assert refreshed.requested_thrust == authority.requested_thrust
     assert replace(
         refreshed,
-        target_roll_rad=authority.target_roll_rad,
         yaw_rate_rad_s=authority.yaw_rate_rad_s,
     ) == authority
     assert all(
@@ -533,7 +534,7 @@ def test_latest_trace_successor_memory_reaches_crossing_roll_and_yaw():
     )
 
 
-def test_passage_admission_seals_latest_safe_reference_before_crossing():
+def test_passage_admission_never_imports_successor_roll():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
@@ -570,10 +571,11 @@ def test_passage_admission_seals_latest_safe_reference_before_crossing():
     )
 
     assert sealed.anchor_camera_token == early_latch.anchor_camera_token
-    assert sealed.target_roll_rad == pytest.approx(-0.12)
+    assert sealed.target_roll_rad == early_latch.target_roll_rad
     assert sealed.target_pitch_rad == early_latch.target_pitch_rad
     assert sealed.yaw_rate_rad_s == early_latch.yaw_rate_rad_s
     assert sealed.requested_thrust == early_latch.requested_thrust
+    assert sealed == early_latch
     assert all(
         math.isfinite(value)
         for value in (
@@ -596,8 +598,8 @@ def test_passage_admission_seals_latest_safe_reference_before_crossing():
     later_evidence.update(
         {
             "passage_committed": True,
-            "committed_successor_roll_authority": 1.0,
-            "committed_successor_target_roll_rad": 0.17,
+            "committed_successor_roll_authority": 0.0,
+            "committed_successor_target_roll_rad": None,
             "committed_successor_pitch_authority": 1.0,
             "committed_successor_target_pitch_rad": 0.12,
             "committed_successor_yaw_authority": 1.0,
@@ -612,11 +614,12 @@ def test_passage_admission_seals_latest_safe_reference_before_crossing():
         current_track_id="vq2-track-000001",
         reviewed_successor_track_id="vq2-track-000002",
     )
-    assert refreshed.target_roll_rad == pytest.approx(0.17)
+    assert refreshed.target_roll_rad == sealed.target_roll_rad
+    assert refreshed.target_pitch_rad == sealed.target_pitch_rad
     assert refreshed.yaw_rate_rad_s == pytest.approx(0.15)
+    assert refreshed.requested_thrust == sealed.requested_thrust
     assert replace(
         refreshed,
-        target_roll_rad=sealed.target_roll_rad,
         yaw_rate_rad_s=sealed.yaw_rate_rad_s,
     ) == sealed
 
@@ -688,14 +691,14 @@ def test_uncommitted_successor_cannot_change_crossing_coast():
     ) == authority
 
 
-def test_yaw_soft_stop_retains_sealed_yaw_while_roll_refreshes():
+def test_yaw_soft_stop_preserves_sealed_yaw_and_roll():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
             "successor_track_id": "vq2-track-000002",
             "passage_committed": True,
-            "committed_successor_roll_authority": 1.0,
-            "committed_successor_target_roll_rad": -0.10,
+            "committed_successor_roll_authority": 0.0,
+            "committed_successor_target_roll_rad": None,
             "committed_successor_pitch_authority": 1.0,
             "committed_successor_target_pitch_rad": -0.12,
             "committed_successor_yaw_authority": 1.0,
@@ -723,12 +726,9 @@ def test_yaw_soft_stop_retains_sealed_yaw_while_roll_refreshes():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed.target_roll_rad == pytest.approx(-0.10)
+    assert refreshed.target_roll_rad == authority.target_roll_rad
     assert refreshed.yaw_rate_rad_s == authority.yaw_rate_rad_s
-    assert replace(
-        refreshed,
-        target_roll_rad=authority.target_roll_rad,
-    ) == authority
+    assert refreshed == authority
 
 
 def _dynamic_near_plane_sample(
@@ -8600,7 +8600,7 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
     ("field", "value", "message"),
     (
         ("control_period_s", 0.019, "exactly 50 Hz"),
-        ("passage_hard_duration_s", 8.01, "passage duration"),
+        ("passage_hard_duration_s", 120.01, "passage duration"),
         ("crossing_status_timeout_s", 0.76, "crossing wait"),
         (
             "censored_passage_coast_max_duration_s",

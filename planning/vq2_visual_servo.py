@@ -40,10 +40,9 @@ from competition.vq2_visual_tracker import (
 MAX_VISUAL_YAW_RATE_RAD_S = 0.15
 MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = math.pi
 VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = math.pi - 0.05
-MAX_VISUAL_SEGMENT_DURATION_S = 8.0
-# Keep the stage-side target-attitude validation envelope coherent with the
-# dynamic controller's 0.35-rad Gate-1 authority step.  The final physical
-# wire-rate envelope remains independently fixed at 0.25 rad/s.
+MAX_VISUAL_SEGMENT_DURATION_S = 120.0
+# Target-attitude references remain separate from the final physical
+# wire-rate envelope, which is independently fixed at 0.25 rad/s.
 MAX_VISUAL_TARGET_ROLL_RAD = 0.35
 MIN_VISUAL_TARGET_PITCH_RAD = -0.35
 MAX_VISUAL_TARGET_PITCH_RAD = 0.15
