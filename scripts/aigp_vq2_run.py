@@ -875,11 +875,11 @@ MAX_COMMAND_RATE_RAD_S = 0.25
 # the final wire governor authoritative and increase only the roll error
 # response; the retained derivative term still damps measured body roll.
 VISUAL_ROLL_ATTITUDE_KP = 2.0
-# A prior collision-free Gate-0 course run proved this pitch response while
-# reaching the requested braking attitude sooner.  Generic post-credit
-# intercepts allocate it when saturated steering calls for reduced closure;
-# approach/passage retain the baseline response.
-VISUAL_INTERCEPT_PITCH_KP = 1.0
+# The final 0.25-rad/s wire-rate bound already limits the physical response.
+# Use the same direct attitude response on pitch as roll so an off-axis gate
+# can arrest inherited forward momentum instead of spending most of its
+# visible turn slowly approaching a bounded brake target.
+VISUAL_INTERCEPT_PITCH_KP = 2.0
 CALIBRATION_MAX_ATTITUDE_EXCURSION_RAD = 0.025
 
 RESET_RACE_DROP_MS = 500

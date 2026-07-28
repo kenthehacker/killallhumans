@@ -2261,7 +2261,9 @@ def test_attitude_loop_reaches_intercept_braking_pitch_sooner():
     )
 
     assert command.roll_rate == pytest.approx(0.0, abs=1e-12)
-    assert 0.14 < command.pitch_rate <= vq2_module.MAX_COMMAND_RATE_RAD_S
+    assert command.pitch_rate == pytest.approx(
+        vq2_module.MAX_COMMAND_RATE_RAD_S
+    )
     assert command.yaw_rate == 0.0
 
 

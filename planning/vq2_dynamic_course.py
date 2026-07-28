@@ -553,7 +553,10 @@ class DynamicCourseConfig:
     roll_gain: float = 0.22
     lateral_rate_gain: float = 0.06
     advance_pitch_rad: float = -0.12
-    brake_pitch_rad: float = 0.12
+    # Use the full target-attitude tier that remains inside the proved
+    # +10-degree measured-pitch envelope.  Off-axis turns need to arrest
+    # inherited forward momentum before asking vision to reacquire.
+    brake_pitch_rad: float = 0.15
     off_axis_brake_rad: float = 0.18
     rapid_expansion_rate_s: float = 0.45
     dropout_hold_s: float = 0.120
@@ -4488,10 +4491,11 @@ class DynamicCourseCore:
             or current.ambiguous
             or current.bearing_std_rad[0] > 0.16
         )
-        off_axis_braking = (
-            successor is not None
-            and (current_off_axis or successor_off_axis)
-        )
+        # A current gate that is already off axis must own braking even when
+        # no successor is visible.  Requiring a successor here made the
+        # vehicle continue its old line precisely when it needed time to turn
+        # toward the authoritative current gate.
+        off_axis_braking = current_off_axis or successor_off_axis
         uncertain_braking = uncertain and rapid_closure
         # Unsafe current-aperture geometry owns closure immediately in either
         # axis.  Waiting for a second expansion/TTC trigger allowed launch

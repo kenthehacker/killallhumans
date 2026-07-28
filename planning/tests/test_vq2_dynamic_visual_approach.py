@@ -168,7 +168,7 @@ def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
     assert top_rate < 0.0
     assert top_lead < 0.0
     assert recovered_target == pytest.approx(config.brake_pitch_rad)
-    assert bottom_target > recovered_target
+    assert bottom_target == pytest.approx(MAX_TARGET_PITCH_RAD)
     assert recovered_error == 0.0
     assert recovered_rate == 0.0
     assert recovered_lead == 0.0
@@ -931,7 +931,10 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
         _accept_proposal(session, tracker, proposal)
 
     assert proposal.servo_output.target_roll_rad < 0.0
-    assert proposal.servo_output.target_pitch_rad <= 0.12
+    assert (
+        proposal.servo_output.target_pitch_rad
+        <= session.core.config.brake_pitch_rad
+    )
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
     assert session.last_decision.current_gate_index == 0
