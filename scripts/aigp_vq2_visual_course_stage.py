@@ -155,6 +155,9 @@ APPROACH_INNER_DROPOUT_HOLD_BASIS = (
 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
     "qualified-local-state-clipped-visibility-gap-v2"
 )
+POST_CREDIT_PROPAGATED_VISIBILITY_GAP_BASIS = (
+    "post-credit-propagated-current-visibility-gap-v1"
+)
 APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS = (
     "same-current-identity-ambiguity-quarantine-v1"
 )
@@ -4528,6 +4531,45 @@ def _approach_propagated_visibility_gap_authority(
         and last_retained_raw_handoff.get("camera_token")
         == dict(last_visible)
     )
+    retained_raw_superseded_fov_lineage = bool(
+        isinstance(last_retained_raw_handoff, Mapping)
+        and last_retained_raw_handoff.get("basis")
+        == TOP_FOV_RETAINED_RAW_STATE_BASIS
+        and last_retained_raw_handoff.get("gate_index") == gate_index
+        and last_retained_raw_handoff.get("track_id") == track_id
+        and last_retained_raw_handoff.get("steering_only") is True
+        and last_retained_raw_handoff.get("passage_authority") is False
+        and last_retained_raw_handoff.get("advance_authority") is False
+        and isinstance(last_visible, Mapping)
+        and isinstance(
+            last_retained_raw_handoff.get("camera_token"),
+            Mapping,
+        )
+        and last_retained_raw_handoff["camera_token"].get("stream_id")
+        == last_visible.get("stream_id")
+        and last_retained_raw_handoff["camera_token"].get("generation")
+        == last_visible.get("generation")
+        and type(
+            last_retained_raw_handoff["camera_token"].get(
+                "publication_sequence"
+            )
+        )
+        is int
+        and type(last_visible.get("publication_sequence")) is int
+        and (
+            int(last_visible["publication_sequence"])
+            - int(
+                last_retained_raw_handoff[
+                    "camera_token"
+                ]["publication_sequence"]
+            )
+        )
+        == 1
+        and last_fov_token
+        == dict(last_retained_raw_handoff["camera_token"])
+        and type(last_visible_clipping) is int
+        and last_visible_clipping != 0
+    )
     direct_inner_token_lineage = bool(
         fov_summary.get("last_raw_top_edge_basis")
         == TOP_FOV_INNER_EDGE_BASIS
@@ -4685,11 +4727,13 @@ def _approach_propagated_visibility_gap_authority(
             fov_summary.get("last_camera_token") != dict(last_visible)
             and not direct_outer_fov_lineage
             and not propagated_superseded_fov_lineage
+            and not retained_raw_superseded_fov_lineage
         )
         or not (
             propagated_fov_lineage
             or propagated_superseded_fov_lineage
             or retained_raw_fov_lineage
+            or retained_raw_superseded_fov_lineage
             or direct_inner_fov_lineage
             or direct_outer_fov_lineage
         )
@@ -9496,6 +9540,7 @@ async def _run_visual_course_stage_impl(
                 APPROACH_TOP_RECOVERY_BASIS,
                 APPROACH_INNER_DROPOUT_HOLD_BASIS,
                 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS,
+                POST_CREDIT_PROPAGATED_VISIBILITY_GAP_BASIS,
                 APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS,
             }
             or authority.gate_index != current_gate_index
@@ -9789,11 +9834,19 @@ async def _run_visual_course_stage_impl(
                     if hold_basis
                     == APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
                     else (
-                        "visual_course_approach_current_ambiguity_"
-                        "quarantine_command"
+                        "visual_course_post_credit_propagated_"
+                        "visibility_gap_command"
                         if hold_basis
-                        == APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
-                        else "visual_course_censored_passage_coast_command"
+                        == POST_CREDIT_PROPAGATED_VISIBILITY_GAP_BASIS
+                        else (
+                            "visual_course_approach_current_ambiguity_"
+                            "quarantine_command"
+                            if hold_basis
+                            == APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
+                            else (
+                                "visual_course_censored_passage_coast_command"
+                            )
+                        )
                     )
                 )
             )
@@ -10764,6 +10817,125 @@ async def _run_visual_course_stage_impl(
                     and not recovery_top_corner_continuity
                 ):
                     assert recovery_deadline_s is not None
+                    recovery_gap_command = None
+                    if (
+                        type(runtime.dynamic_controller)
+                        is DynamicVisualCourseSession
+                        and int(
+                            segment["recovery_one_edge_command_count"]
+                        )
+                        > 0
+                    ):
+                        dynamic_controller = runtime.dynamic_controller
+                        gap_proposal_ns = runtime.perf_counter_ns()
+                        if (
+                            type(gap_proposal_ns) is not int
+                            or gap_proposal_ns < 0
+                        ):
+                            raise abort_type(
+                                "visual-course post-credit visibility-gap "
+                                "clock is invalid"
+                            )
+                        try:
+                            dynamic_controller.stage_snapshot(
+                                snapshot,
+                                host.visual_tracker,
+                                expected_gate_index=current_gate_index,
+                                expected_current_track_id=current_track_id,
+                                adjacent_precredit=False,
+                            )
+                            gap_evidence = (
+                                dynamic_controller
+                                .propagated_current_visibility_gap_authority(
+                                    track=snapshot.current_track,
+                                    camera_token=token,
+                                    now_monotonic_ns=gap_proposal_ns,
+                                )
+                            )
+                            gap_authority = (
+                                _approach_propagated_visibility_gap_authority(
+                                    gap_evidence,
+                                    snapshot=snapshot,
+                                    gate_index=current_gate_index,
+                                    track_id=current_track_id,
+                                    fov_summary=segment[
+                                        "top_fov_pitch_protection"
+                                    ],
+                                )
+                            )
+                            gap_deadline_s = min(
+                                recovery_deadline_s,
+                                (
+                                    _approach_propagated_visibility_gap_command_deadline_s(
+                                        gap_authority,
+                                        now_s=now,
+                                        control_period_s=(
+                                            limits.control_period_s
+                                        ),
+                                    )
+                                ),
+                            )
+                            last_planned_token = token
+                            recovery_gap_command = (
+                                await send_censored_passage_coast(
+                                    snapshot=snapshot,
+                                    authority=gap_authority.command,
+                                    yaw_reference_rad=yaw_reference_rad,
+                                    segment_started_s=segment_started_s,
+                                    stage=(
+                                        f"{VISUAL_COURSE_STAGE}/gate"
+                                        f"{current_gate_index}/"
+                                        "recovery-propagated-visibility-gap"
+                                    ),
+                                    command_deadline_s=gap_deadline_s,
+                                    count_as_navigation=True,
+                                    hold_basis=(
+                                        POST_CREDIT_PROPAGATED_VISIBILITY_GAP_BASIS
+                                    ),
+                                )
+                            )
+                        except RaceActiveBoundaryChangedBeforeWire as exc:
+                            raise abort_type(
+                                "visual-course race boundary changed during "
+                                "post-credit visibility-gap recovery"
+                            ) from exc
+                        except (
+                            AttributeError,
+                            KeyError,
+                            TypeError,
+                            ValueError,
+                        ) as gap_exc:
+                            host.recorder.emit(
+                                "visual_course_post_credit_propagated_"
+                                "visibility_gap_unavailable",
+                                gate_index=current_gate_index,
+                                stage=(
+                                    f"{VISUAL_COURSE_STAGE}/gate"
+                                    f"{current_gate_index}/"
+                                    "recovery-propagated-visibility-gap"
+                                ),
+                                camera_token=asdict(token),
+                                reason=str(gap_exc),
+                            )
+                        if recovery_gap_command is not None:
+                            segment[
+                                "recovery_propagated_state_command_count"
+                            ] = int(
+                                segment[
+                                    "recovery_propagated_state_command_count"
+                                ]
+                            ) + 1
+                            segment[
+                                "recovery_navigation_command_count"
+                            ] = int(
+                                segment[
+                                    "recovery_navigation_command_count"
+                                ]
+                            ) + 1
+                            continue
+                        if last_planned_token == token:
+                            recovery_refresh_receiver_snapshot = True
+                            continue
                     servo_tuning = host.visual_config.servo
                     last_planned_token = token
                     try:

@@ -631,6 +631,52 @@ def test_edge_transition_quarantines_only_censored_box_derivatives() -> None:
     assert horizontal_uncensor.log_scale_rate_s == 0.0
 
 
+def test_same_edge_impossible_contraction_becomes_a_visibility_gap() -> None:
+    tracker = MultiTargetVisualTracker()
+    first = tracker.update(
+        _frame(
+            1,
+            (
+                _detection(
+                    0,
+                    0.20,
+                    -0.76,
+                    0.24,
+                    0.24,
+                    clipping=FrameEdge.TOP,
+                    center_censored=True,
+                ),
+            ),
+        )
+    )
+    track_id = first.visible_track_ids[0]
+    tracker.assign_role(track_id, VisualTrackRole.CURRENT)
+
+    collapsed = tracker.update(
+        _frame(
+            2,
+            (
+                _detection(
+                    0,
+                    0.30,
+                    -0.91,
+                    0.18,
+                    0.09,
+                    clipping=FrameEdge.TOP,
+                    center_censored=True,
+                ),
+            ),
+        )
+    )
+
+    retained = collapsed.track(track_id)
+    assert retained.visible is False
+    assert retained.missed_frame_count == 1
+    assert retained.latest_token == first.track(track_id).latest_token
+    assert track_id not in collapsed.associated_track_ids
+    assert len(collapsed.created_track_ids) == 1
+
+
 def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> None:
     config = MultiTargetTrackerConfig(ambiguity_margin=0.20)
     tracker = MultiTargetVisualTracker(config)

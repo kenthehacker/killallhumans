@@ -5790,6 +5790,65 @@ def test_clipped_visibility_gap_retains_one_superseded_propagated_fov_frame():
     assert authority.evidence["passage_authority"] is False
     assert authority.evidence["advance_authority"] is False
 
+    retained_handoff = {
+        "basis": course_stage.TOP_FOV_RETAINED_RAW_STATE_BASIS,
+        "gate_index": 0,
+        "track_id": "track-0",
+        "camera_token": asdict(accepted_token),
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+    retained_summary = {
+        **fov_summary,
+        "last_propagated_state_handoff": None,
+        "last_retained_raw_state_handoff": retained_handoff,
+    }
+    retained = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=retained_summary,
+        )
+    )
+    assert retained.command.anchor_camera_token == last_visible_token
+    assert retained.command.target_roll_rad == pytest.approx(0.14)
+    assert retained.command.target_pitch_rad == pytest.approx(-0.35)
+    assert retained.evidence["steering_only"] is True
+    assert retained.evidence["passage_authority"] is False
+    assert retained.evidence["advance_authority"] is False
+
+    stale_retained = {
+        **retained_handoff,
+        "camera_token": asdict(
+            replace(
+                accepted_token,
+                publication_sequence=(
+                    accepted_token.publication_sequence - 1
+                ),
+            )
+        ),
+    }
+    with pytest.raises(
+        ValueError,
+        match="exact propagated/FOV authority",
+    ):
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary={
+                **retained_summary,
+                "last_camera_token": dict(
+                    stale_retained["camera_token"]
+                ),
+                "last_retained_raw_state_handoff": stale_retained,
+            },
+        )
+
     for mutation in (
         {"steering_only": False},
         {"passage_authority": True},

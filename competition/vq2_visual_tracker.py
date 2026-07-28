@@ -1441,6 +1441,35 @@ class MultiTargetVisualTracker:
         new_width, new_height = _bbox_size(detection.bbox_norm)
         log_width_change = math.log(new_width / old_width)
         log_height_change = math.log(new_height / old_height)
+        current_inner = detection.inner_aperture
+        current_complete_inner = bool(
+            type(current_inner) is VisualInnerApertureGeometry
+            and current_inner.fitted
+            and current_inner.complete_visibility
+        )
+        same_vertical_edge = bool(
+            latest.clipping == detection.clipping
+            and detection.clipping in {FrameEdge.TOP, FrameEdge.BOTTOM}
+        )
+        same_horizontal_edge = bool(
+            latest.clipping == detection.clipping
+            and detection.clipping in {FrameEdge.LEFT, FrameEdge.RIGHT}
+        )
+        if (
+            (
+                same_vertical_edge
+                and log_height_change < -self.config.max_log_height_change
+            )
+            or (
+                same_horizontal_edge
+                and log_width_change < -self.config.max_log_width_change
+            )
+        ) and not current_complete_inner:
+            # A censored support box can collapse when the detector switches
+            # to a smaller fragment on the same edge.  Preserve the ordinary
+            # unrelaxed bound along that edge's normal: the relaxation is for
+            # clip transitions, not an impossible identity/scale update.
+            return None
         predicted_log_scale = (
             math.log(latest.apparent_scale) + state.log_scale_rate_s * dt_s
         )
