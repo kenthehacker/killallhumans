@@ -5308,12 +5308,12 @@ def _approach_current_ambiguity_quarantine_authority(
 
 @dataclass(frozen=True, slots=True)
 class _ApproachTopRecoveryAuthority:
-    """Clean exact-wire authority for a bounded TOP-only approach hold.
+    """Clean exact-wire authority for a fresh TOP-only approach hold.
 
     This is deliberately not crossing authority.  It only preserves the last
-    clean current-gate command while a single censored vertical observation
-    arrives after both aperture-relative and raw image motion have turned
-    away from TOP.  Passage evidence cannot be advanced from this authority.
+    clean current-gate command while fresh censored vertical observations
+    arrive after both aperture-relative and raw image motion have turned away
+    from TOP.  Passage evidence cannot be advanced from this authority.
     """
 
     command: _CensoredPassageCoastAuthority
@@ -5338,7 +5338,6 @@ def _derive_approach_top_recovery_authority(
     raw_vertical_rate_down_s: float,
     requested_thrust: float,
     minimum_brake_pitch_rad: float,
-    maximum_recovery_duration_s: float,
 ) -> Optional[_ApproachTopRecoveryAuthority]:
     """Admit only the clean c25-class state that is already moving inward."""
 
@@ -5389,7 +5388,6 @@ def _derive_approach_top_recovery_authority(
         float(raw_vertical_rate_down_s),
         float(requested_thrust),
         float(minimum_brake_pitch_rad),
-        float(maximum_recovery_duration_s),
     )
     if (
         not all(math.isfinite(value) for value in values)
@@ -5397,7 +5395,6 @@ def _derive_approach_top_recovery_authority(
         or not MIN_VISUAL_TARGET_PITCH_RAD
         <= values[2]
         <= MAX_VISUAL_TARGET_PITCH_RAD
-        or values[3] <= 0.0
     ):
         raise ValueError("approach TOP recovery inputs are invalid")
     if (
@@ -5468,11 +5465,9 @@ def _derive_approach_top_recovery_authority(
         <= APPROACH_TOP_RECOVERY_MAX_VERTICAL_Q_STD
         and allowance[1] > 0.0
         and vertical_endpoint_occupancy <= allowance[1]
-        and time_to_contact_s > maximum_recovery_duration_s
         and thrust_settle_s
         <= APPROACH_TOP_RECOVERY_MAX_THRUST_SETTLE_S
-        and post_settle_contact_budget_s
-        >= maximum_recovery_duration_s
+        and post_settle_contact_budget_s > 0.0
         and expansion_rate_s > 0.0
         and raw_vertical_rate_down_s >= 0.0
         and abs(camera_center[0])
@@ -5563,8 +5558,6 @@ class VisualCourseStageLimits:
     crossing_status_timeout_s: float = 0.75
     censored_passage_coast_max_duration_s: float = 0.30
     censored_passage_coast_max_fresh_frames: int = 8
-    approach_top_recovery_max_duration_s: float = 0.12
-    approach_top_recovery_max_fresh_frames: int = 3
     post_credit_fresh_frame_timeout_s: float = 0.20
     max_validation_to_wire_delay_s: float = 0.012
     max_command_rate_rad_s: float = 0.25
@@ -5593,7 +5586,6 @@ class VisualCourseStageLimits:
             self.passage_hard_duration_s,
             self.crossing_status_timeout_s,
             self.censored_passage_coast_max_duration_s,
-            self.approach_top_recovery_max_duration_s,
             self.post_credit_fresh_frame_timeout_s,
             self.max_validation_to_wire_delay_s,
             self.max_command_rate_rad_s,
@@ -5635,10 +5627,6 @@ class VisualCourseStageLimits:
         if not 0.20 <= self.censored_passage_coast_max_duration_s <= 0.30:
             raise ValueError(
                 "visual-course censored passage coast is outside bounds"
-            )
-        if not 0.08 <= self.approach_top_recovery_max_duration_s <= 0.12:
-            raise ValueError(
-                "visual-course approach TOP recovery is outside bounds"
             )
         if not 0.05 <= self.post_credit_fresh_frame_timeout_s <= 0.20:
             raise ValueError("visual-course fresh-frame wait is outside bounds")
@@ -5703,10 +5691,6 @@ class VisualCourseStageLimits:
             or not 4
             <= self.censored_passage_coast_max_fresh_frames
             <= 8
-            or type(self.approach_top_recovery_max_fresh_frames) is not int
-            or not 2
-            <= self.approach_top_recovery_max_fresh_frames
-            <= 3
             or type(self.max_gate_segments) is not int
             or not 1 <= self.max_gate_segments <= 128
         ):
@@ -11920,13 +11904,8 @@ async def _run_visual_course_stage_impl(
                             "passage_authority": False,
                             "advance_authority": False,
                             "cross_gap_identity_claimed": False,
-                            "max_duration_s": (
-                                limits
-                                .approach_top_recovery_max_duration_s
-                            ),
-                            "max_fresh_frames": (
-                                limits
-                                .approach_top_recovery_max_fresh_frames
+                            "continuation_basis": (
+                                "fresh-authoritative-current-publication-v1"
                             ),
                             "elapsed_s": 0.0,
                         }
@@ -11987,20 +11966,6 @@ async def _run_visual_course_stage_impl(
                         now - approach_top_recovery_started_s
                     )
                     if (
-                        recovery_elapsed_s
-                        >= limits.approach_top_recovery_max_duration_s
-                        or approach_top_recovery_fresh_frame_count
-                        >= limits.approach_top_recovery_max_fresh_frames
-                    ):
-                        assert segment["approach_top_recovery"] is not None
-                        segment["approach_top_recovery"]["outcome"] = (
-                            "bounded_brake_expired"
-                        )
-                        raise abort_type(
-                            "visual-course bounded fresh TOP-boundary "
-                            "brake expired"
-                        ) from exc
-                    if (
                         approach_top_recovery_last_token is not None
                         and not _token_strictly_newer(
                             token,
@@ -12055,11 +12020,6 @@ async def _run_visual_course_stage_impl(
                             command_deadline_s=min(
                                 course_deadline_s,
                                 segment_deadline_s,
-                                approach_top_recovery_started_s
-                                + (
-                                    limits
-                                    .approach_top_recovery_max_duration_s
-                                ),
                             ),
                             hold_basis=APPROACH_TOP_RECOVERY_BASIS,
                         )
@@ -12400,9 +12360,9 @@ async def _run_visual_course_stage_impl(
                         or (
                             approach_top_recovery_started_s is None
                             and anchor_age_s
-                            > (
-                                limits
-                                .approach_top_recovery_max_duration_s
+                            >= (
+                                recovery_authority
+                                .post_settle_contact_budget_s
                             )
                         )
                         or not math.isfinite(remaining_contact_s)
@@ -12476,13 +12436,9 @@ async def _run_visual_course_stage_impl(
                                 recovery_authority
                                 .post_settle_contact_budget_s
                             ),
-                            "max_duration_s": (
-                                limits
-                                .approach_top_recovery_max_duration_s
-                            ),
-                            "max_fresh_frames": (
-                                limits
-                                .approach_top_recovery_max_fresh_frames
+                            "continuation_basis": (
+                                "fresh-authoritative-current-publication-"
+                                "and-contact-horizon-v1"
                             ),
                             "elapsed_s": 0.0,
                         }
@@ -12501,26 +12457,6 @@ async def _run_visual_course_stage_impl(
                     recovery_elapsed_s = (
                         now - approach_top_recovery_started_s
                     )
-                    if (
-                        recovery_elapsed_s
-                        >= (
-                            limits
-                            .approach_top_recovery_max_duration_s
-                        )
-                        or approach_top_recovery_fresh_frame_count
-                        >= (
-                            limits
-                            .approach_top_recovery_max_fresh_frames
-                        )
-                    ):
-                        assert segment["approach_top_recovery"] is not None
-                        segment["approach_top_recovery"]["outcome"] = (
-                            "bounded_hold_expired"
-                        )
-                        raise abort_type(
-                            "visual-course bounded approach TOP recovery "
-                            "expired"
-                        ) from exc
                     approach_top_recovery_last_token = token
                     approach_top_recovery_fresh_frame_count += 1
                     segment[
@@ -12535,11 +12471,8 @@ async def _run_visual_course_stage_impl(
                     )
                     last_planned_token = token
                     command_deadline_s = min(
-                        approach_top_recovery_started_s
-                        + (
-                            limits
-                            .approach_top_recovery_max_duration_s
-                        ),
+                        course_deadline_s,
+                        segment_deadline_s,
                         contact_deadline_s,
                     )
                     try:
@@ -13388,7 +13321,7 @@ async def _run_visual_course_stage_impl(
                     ) is None:
                         # Reduced censorship returns ordinary fresh steering
                         # to the planner, but it does not renew the corner
-                        # bridge's original absolute time/frame budget.
+                        # bridge's exact identity and steering authority.
                         recovery_summary.update(
                             {
                                 "single_axis_reacquired_camera_token": (
@@ -13425,10 +13358,6 @@ async def _run_visual_course_stage_impl(
                             minimum_brake_pitch_rad=float(
                                 host.visual_config.servo
                                 .brake_pitch_rad
-                            ),
-                            maximum_recovery_duration_s=(
-                                limits
-                                .approach_top_recovery_max_duration_s
                             ),
                         )
                     )

@@ -1186,7 +1186,7 @@ class _C25ApproachTopHost(_CoordinatorHost):
         super()._sample()
         snapshot = self.visual_gate_graph.latest_snapshot
         track = snapshot.current_track
-        recovery_sent = any(
+        recovery_count = sum(
             stage.endswith("approach-top-recovery")
             for stage, _elapsed_s, _command in self.ticks
         )
@@ -1209,7 +1209,7 @@ class _C25ApproachTopHost(_CoordinatorHost):
         track.apparent_scale = 0.590227
         track.clipping = (
             FrameEdge.TOP | FrameEdge.BOTTOM
-            if recovery_sent
+            if recovery_count >= 8
             else FrameEdge.TOP
         )
         track.center_censored = True
@@ -1273,7 +1273,7 @@ def _c25_approach_top_runtime(host):
     )
 
 
-def test_c25_top_only_approach_recovery_is_bounded_and_never_latches():
+def test_c25_top_only_recovery_follows_fresh_frames_and_never_latches():
     host = _C25ApproachTopHost()
 
     with pytest.raises(
@@ -1296,20 +1296,34 @@ def test_c25_top_only_approach_recovery_is_bounded_and_never_latches():
         ) in zip(host.commands, host.ticks)
         if stage.endswith("approach-top-recovery")
     ]
-    assert len(recovery_wires) == 1
-    assert recovery_wires[0].thrust == pytest.approx(0.304)
-    assert recovery_wires[0].thrust < host.commands[0][0].thrust
-    assert recovery_wires[0].thrust > 0.2892416792249238
+    assert len(recovery_wires) == 8
+    assert all(
+        command.thrust == pytest.approx(0.304)
+        for command in recovery_wires
+    )
+    assert all(
+        command.thrust < host.commands[0][0].thrust
+        for command in recovery_wires
+    )
+    assert all(
+        command.thrust > 0.2892416792249238
+        for command in recovery_wires
+    )
 
     segment = host._visual_course_summary["segments"][0]
     assert segment["lifecycle"] == "approach"
     assert segment["passage_authority_enabled"] is False
     assert segment["near_plane_latch"] is None
     assert segment["crossing_anchor"] is None
-    assert segment["approach_top_recovery_command_count"] == 1
-    assert segment["approach_top_recovery_fresh_frame_count"] == 1
+    assert segment["approach_top_recovery_command_count"] == 8
+    assert segment["approach_top_recovery_fresh_frame_count"] == 8
     recovery = segment["approach_top_recovery"]
     assert recovery["basis"] == course_stage.APPROACH_TOP_RECOVERY_BASIS
+    assert recovery["continuation_basis"] == (
+        "fresh-authoritative-current-publication-and-contact-horizon-v1"
+    )
+    assert "max_duration_s" not in recovery
+    assert "max_fresh_frames" not in recovery
     assert recovery["vertical_endpoint_occupancy_q"] < (
         recovery["vertical_allowance_q"]
     )

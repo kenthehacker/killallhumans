@@ -404,7 +404,6 @@ def test_dynamic_continuity_seed_is_not_crossing_evidence():
             raw_vertical_rate_down_s=0.0,
             requested_thrust=0.275,
             minimum_brake_pitch_rad=0.035,
-            maximum_recovery_duration_s=0.12,
         )
         is None
     )
@@ -1103,7 +1102,7 @@ def _c25_approach_top_recovery_command():
     return accepted
 
 
-def test_c25_top_censor_replay_admits_only_bounded_approach_recovery():
+def test_c25_top_censor_replay_admits_fresh_approach_recovery():
     accepted = _c25_approach_top_recovery_command()
 
     authority = course_stage._derive_approach_top_recovery_authority(
@@ -1113,7 +1112,6 @@ def test_c25_top_censor_replay_admits_only_bounded_approach_recovery():
         raw_vertical_rate_down_s=0.6039185423722361,
         requested_thrust=0.2892416792249238,
         minimum_brake_pitch_rad=0.035,
-        maximum_recovery_duration_s=0.12,
     )
 
     assert authority is not None
@@ -1188,7 +1186,6 @@ def test_c25_top_recovery_rejects_yaw_endpoint_rate_or_collective_lag(
         raw_vertical_rate_down_s=raw_rate,
         requested_thrust=requested_thrust,
         minimum_brake_pitch_rad=0.035,
-        maximum_recovery_duration_s=0.12,
     )
 
     assert authority is None
