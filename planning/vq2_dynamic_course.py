@@ -176,6 +176,83 @@ def successor_camera_pitch_reference(
     )
 
 
+def successor_roll_reference(
+    *,
+    stable_bearing_rad: float,
+    stable_bearing_rate_rad_s: float,
+    bearing_std_rad: float,
+    roll_guidance_sign: float,
+    roll_gain: float,
+    lateral_rate_gain: float,
+    off_axis_brake_rad: float,
+    maximum_bearing_std_rad: float,
+    full_bank_when_outward: bool,
+) -> tuple[float, bool]:
+    """Map one fresh fixed-frame successor state to a bounded roll target.
+
+    The proportional law remains the ordinary promoted-gate controller.
+    During a graph-vetted committed transition only, a qualified successor
+    that is both off axis and still moving outward may request the full
+    bounded attitude target.  The caller must establish freshness and rate
+    qualification; this pure mapper retains no predecessor target.
+    """
+
+    values = (
+        _finite(stable_bearing_rad, "stable_bearing_rad"),
+        _finite(
+            stable_bearing_rate_rad_s,
+            "stable_bearing_rate_rad_s",
+        ),
+        _nonnegative(bearing_std_rad, "bearing_std_rad"),
+        _finite(roll_guidance_sign, "roll_guidance_sign"),
+        _positive(roll_gain, "roll_gain"),
+        _positive(lateral_rate_gain, "lateral_rate_gain"),
+        _positive(off_axis_brake_rad, "off_axis_brake_rad"),
+        _positive(
+            maximum_bearing_std_rad,
+            "maximum_bearing_std_rad",
+        ),
+    )
+    if type(full_bank_when_outward) is not bool:
+        raise TypeError("full_bank_when_outward must be an exact bool")
+    (
+        bearing,
+        bearing_rate,
+        bearing_std,
+        guidance_sign,
+        proportional_gain,
+        rate_gain,
+        off_axis_threshold,
+        maximum_std,
+    ) = values
+    proportional = _clamp(
+        guidance_sign
+        * (
+            proportional_gain * bearing
+            + rate_gain * bearing_rate
+        ),
+        -MAX_TARGET_ROLL_RAD,
+        MAX_TARGET_ROLL_RAD,
+    )
+    outward_full_bank = bool(
+        full_bank_when_outward
+        and abs(guidance_sign) > _EPSILON
+        and abs(proportional) > _EPSILON
+        and bearing_std <= maximum_std + _EPSILON
+        and abs(bearing) >= off_axis_threshold
+        and bearing * bearing_rate > _EPSILON
+        and proportional * guidance_sign * bearing > _EPSILON
+    )
+    return (
+        (
+            math.copysign(MAX_TARGET_ROLL_RAD, proportional)
+            if outward_full_bank
+            else proportional
+        ),
+        outward_full_bank,
+    )
+
+
 def _quat_conjugate(value: Quaternion) -> Quaternion:
     return (value[0], -value[1], -value[2], -value[3])
 
@@ -3447,10 +3524,73 @@ class DynamicCourseCore:
                     successor_steering.bearing_std_rad[0]
                     <= maximum_std + _EPSILON
                 ):
-                    # A successor visible during the current-gate crossing may
-                    # pre-turn heading, but it must not translate the vehicle
-                    # sideways before authoritative credit.  Yaw points at the
-                    # next gate; current-gate roll remains in force.
+                    fresh_horizontal_successor = bool(
+                        successor.visible
+                        and successor.missed_count == 0
+                        and not any(successor.censored_axes)
+                        and successor.state_monotonic_ns
+                        == successor.last_measurement_monotonic_ns
+                        and successor.state_monotonic_ns
+                        == current.state_monotonic_ns
+                        and successor.frame_sequence
+                        == current.frame_sequence
+                        and successor_steering.last_measurement_monotonic_ns
+                        == successor.last_measurement_monotonic_ns
+                        and successor_steering.measurement_age_s
+                        <= (
+                            self.config
+                            .successor_prediction_max_horizon_s
+                        )
+                        + _EPSILON
+                    )
+                    if (
+                        fresh_horizontal_successor
+                        and abs(self.config.roll_guidance_sign)
+                        > _EPSILON
+                    ):
+                        fresh_successor_rate = (
+                            successor_steering
+                            .stable_bearing_rate_rad_s[0]
+                            if successor.bearing_rate_qualified[0]
+                            else 0.0
+                        )
+                        (
+                            committed_successor_target_roll,
+                            _outward_full_bank,
+                        ) = successor_roll_reference(
+                            stable_bearing_rad=(
+                                successor_steering
+                                .stable_bearing_rad[0]
+                            ),
+                            stable_bearing_rate_rad_s=(
+                                fresh_successor_rate
+                            ),
+                            bearing_std_rad=(
+                                successor_steering
+                                .bearing_std_rad[0]
+                            ),
+                            roll_guidance_sign=(
+                                self.config.roll_guidance_sign
+                            ),
+                            roll_gain=self.config.roll_gain,
+                            lateral_rate_gain=(
+                                self.config.lateral_rate_gain
+                            ),
+                            off_axis_brake_rad=(
+                                self.config.off_axis_brake_rad
+                            ),
+                            maximum_bearing_std_rad=maximum_std,
+                            full_bank_when_outward=(
+                                successor.bearing_rate_qualified[0]
+                            ),
+                        )
+                        committed_successor_roll_authority = 1.0
+                        proposal = replace(
+                            proposal,
+                            target_roll_rad=(
+                                committed_successor_target_roll
+                            ),
+                        )
                     committed_successor_yaw_authority = 1.0
                     committed_successor_yaw_rate = _clamp(
                         -self.config.yaw_gain
@@ -4538,4 +4678,5 @@ __all__ = [
     "TrackSteeringPrediction",
     "predict_aperture_relative_crossing",
     "successor_camera_pitch_reference",
+    "successor_roll_reference",
 ]

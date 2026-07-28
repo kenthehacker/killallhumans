@@ -37,10 +37,12 @@ from planning.vq2_dynamic_course import (
     MIN_THRUST,
     SUPPORT_THRUST,
     successor_camera_pitch_reference,
+    successor_roll_reference,
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateReacquisition,
+    ConfirmedSameGateRebind,
     RaceStatusProvenanceBasis,
 )
 from planning.vq2_visual_approach import (
@@ -864,69 +866,6 @@ class DynamicVisualCourseSession:
             raise DynamicCourseError(
                 "post-credit steering lacks causal accepted-command memory"
             )
-        retained_roll: float | None = None
-        retained_source_authority_ns: int | None = None
-        retained_source_wire_ns: int | None = None
-        precredit_reference = self._precredit_successor_roll_reference
-        if (
-            precredit_reference is not None
-            and precredit_reference.from_gate_index == from_gate_index
-            and precredit_reference.to_gate_index == to_gate_index
-            and precredit_reference.track_id == reviewed_track_id
-            and precredit_reference.stream_generation
-            == successor.stream_generation
-            and precredit_reference.accepted_wire_start_monotonic_ns
-            == applied.monotonic_ns
-            and precredit_reference.authority_monotonic_ns
-            <= applied.monotonic_ns
-            and applied.monotonic_ns <= activation_monotonic_ns
-            and math.isclose(
-                precredit_reference.target_roll_rad,
-                applied.target_roll_rad,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            )
-        ):
-            retained_roll = precredit_reference.target_roll_rad
-            retained_source_authority_ns = (
-                precredit_reference.authority_monotonic_ns
-            )
-            retained_source_wire_ns = applied.monotonic_ns
-        prior = self._last_decision
-        if (
-            retained_roll is None
-            and prior is not None
-            and prior.current_gate_index == from_gate_index
-            and prior.current_track_id == state.current_track_id
-            and prior.successor_track_id == reviewed_track_id
-            and prior.passage_committed
-            and prior.committed_successor_roll_authority == 1.0
-            and prior.committed_successor_target_roll_rad is not None
-            and prior.monotonic_ns <= applied.monotonic_ns
-            and applied.monotonic_ns <= activation_monotonic_ns
-        ):
-            candidate = float(
-                prior.committed_successor_target_roll_rad
-            )
-            if (
-                math.isfinite(candidate)
-                and 0.0 < abs(candidate) <= MAX_TARGET_ROLL_RAD
-                and math.isclose(
-                    prior.command.target_roll_rad,
-                    candidate,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-                and math.isclose(
-                    applied.target_roll_rad,
-                    candidate,
-                    rel_tol=0.0,
-                    abs_tol=1e-12,
-                )
-            ):
-                retained_roll = candidate
-                retained_source_authority_ns = prior.monotonic_ns
-                retained_source_wire_ns = applied.monotonic_ns
         promoted = self.core.promote_authoritative(
             from_gate_index=from_gate_index,
             to_gate_index=to_gate_index,
@@ -959,31 +898,10 @@ class DynamicVisualCourseSession:
         self._pending_post_credit_roll_reference = None
         self._pending_precredit_successor_roll_reference = None
         self._precredit_successor_roll_reference = None
-        self._post_credit_roll_reference_handoff = (
-            None
-            if (
-                retained_roll is None
-                or retained_source_authority_ns is None
-                or retained_source_wire_ns is None
-            )
-            else _PostCreditRollReferenceHandoff(
-                authority_basis=(
-                    "race-promoted-committed-successor-roll-reference-v1"
-                ),
-                to_gate_index=to_gate_index,
-                track_id=reviewed_track_id,
-                stream_generation=successor.stream_generation,
-                promotion_count=promoted.promotion_count,
-                retained_target_roll_rad=retained_roll,
-                source_authority_monotonic_ns=(
-                    retained_source_authority_ns
-                ),
-                source_wire_start_monotonic_ns=(
-                    retained_source_wire_ns
-                ),
-                expires_monotonic_ns=expires_ns,
-            )
-        )
+        # The committed pre-credit target ends at authoritative promotion.
+        # Promoted-gate roll is recomputed proportionally from its own fresh
+        # geometry; no accepted predecessor bank may become a temporal latch.
+        self._post_credit_roll_reference_handoff = None
         self._staged = None
         self._last_decision = None
         return self._post_credit_lease_evidence(lease)
@@ -1669,6 +1587,142 @@ class DynamicVisualCourseSession:
         }
         return evidence
 
+    def rebind_confirmed_same_gate(
+        self,
+        rebind: ConfirmedSameGateRebind,
+        tracker: MultiTargetVisualTracker,
+    ) -> Mapping[str, Any]:
+        """Replace a lost dynamic CURRENT without advancing the race gate."""
+
+        if type(rebind) is not ConfirmedSameGateRebind:
+            raise DynamicCourseError(
+                "dynamic same-gate rebind requires exact graph proof"
+            )
+        if type(tracker) is not MultiTargetVisualTracker:
+            raise DynamicCourseError(
+                "dynamic same-gate rebind requires the exact tracker"
+            )
+        update = tracker.latest_update
+        if (
+            update is None
+            or update.token != rebind.camera_token_at_binding
+        ):
+            raise DynamicCourseError(
+                "dynamic same-gate rebind lacks the exact binding publication"
+            )
+        try:
+            track = tracker.track(rebind.rebound_track_id)
+        except KeyError as exc:
+            raise DynamicCourseError(
+                "dynamic same-gate rebound track is absent"
+            ) from exc
+        if (
+            rebind.cross_gap_identity_claimed
+            or rebind.gate_index != rebind.search.gate_index
+            or rebind.retired_track_id != rebind.search.lost_track_id
+            or rebind.rebound_track_id == rebind.retired_track_id
+            or not track.history
+            or track.latest_token != rebind.camera_token_at_binding
+            or track.first_token != rebind.rebound_first_token
+            or len(track.history) != rebind.history_length_at_binding
+            or not track.visible
+            or track.ambiguous
+            or track.role is not VisualTrackRole.CURRENT
+            or track.authoritative_gate_index != rebind.gate_index
+            or track.authority_race_status_sequence
+            != rebind.race_status_at_binding.race_status_sequence
+        ):
+            raise DynamicCourseError(
+                "dynamic same-gate rebound lacks graph current authority"
+            )
+        state_before = self.core.course_state()
+        if (
+            state_before.current_gate_index != rebind.gate_index
+            or state_before.current_track_id != rebind.retired_track_id
+        ):
+            raise DynamicCourseError(
+                "dynamic same-gate rebind differs from current ownership"
+            )
+        known_track_ids = {
+            state.track_id for state in self.core.track_states
+        }
+        if (
+            self._last_frame_by_track.get(track.track_id)
+            != update.tracker_frame_sequence
+        ):
+            self.core.observe_track(
+                self._track_observation(
+                    track,
+                    tracker_frame_sequence=update.tracker_frame_sequence,
+                    observation_monotonic_ns=(
+                        update.observation_monotonic_ns
+                    ),
+                    stream_generation=update.token.generation,
+                )
+            )
+            self._last_frame_by_track[track.track_id] = (
+                update.tracker_frame_sequence
+            )
+        elif track.track_id not in known_track_ids:
+            raise DynamicCourseError(
+                "dynamic same-gate binding publication was consumed "
+                "without state"
+            )
+        rebound_state = self.core.bind(
+            current_gate_index=rebind.gate_index,
+            current_track_id=track.track_id,
+            successor_track_id=None,
+        )
+        current = rebound_state.current
+        fresh_state_available = bool(
+            current.track_id == track.track_id
+            and current.stream_generation == update.token.generation
+            and current.frame_sequence == update.tracker_frame_sequence
+            and current.last_measurement_monotonic_ns
+            == current.state_monotonic_ns
+            and current.visible
+            and not current.ambiguous
+            and current.missed_count == 0
+            and not all(current.censored_axes)
+        )
+        if (
+            not fresh_state_available
+            or rebound_state.promotion_count
+            != state_before.promotion_count
+        ):
+            raise DynamicCourseError(
+                "dynamic same-gate rebound lacks fresh steering state"
+            )
+
+        # No predecessor command, prediction lease, passage state, or
+        # successor slot survives an identity replacement. The wire governor
+        # remains continuous; the exact binding frame is planned normally.
+        self._staged = None
+        self._last_decision = None
+        self._post_credit_successor_steering = None
+        self._post_credit_roll_reference_handoff = None
+        self._pending_post_credit_roll_reference = None
+        self._precredit_successor_roll_reference = None
+        self._pending_precredit_successor_roll_reference = None
+        self._same_gate_steering_anchor = None
+        return {
+            "basis": "graph-proven-fresh-same-gate-dynamic-rebind-v1",
+            "gate_index": rebind.gate_index,
+            "retired_track_id": rebind.retired_track_id,
+            "rebound_track_id": rebind.rebound_track_id,
+            "current_track_id": rebind.rebound_track_id,
+            "binding_camera_token": asdict(
+                rebind.camera_token_at_binding
+            ),
+            "stream_generation": update.token.generation,
+            "promotion_count": rebound_state.promotion_count,
+            "cross_gap_identity_claimed": False,
+            "fresh_state_available": True,
+            "same_gate_current_authority": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        }
+
     def _prepare_roles(
         self,
         *,
@@ -1904,10 +1958,51 @@ class DynamicVisualCourseSession:
                 "precredit successor steering prediction is unavailable"
             )
         targets = dict(self._successor_steering_targets(prediction))
-        unconstrained_roll = float(targets["target_roll_rad"])
-        # The adjacent successor may pre-turn heading before credit, but it
-        # must not start a lateral translation that survives promotion.
-        targets["target_roll_rad"] = 0.0
+        fresh_horizontal_rate = (
+            prediction.stable_bearing_rate_rad_s[0]
+            if successor.bearing_rate_qualified[0]
+            else 0.0
+        )
+        (
+            proportional_roll,
+            _unused_full_bank,
+        ) = successor_roll_reference(
+            stable_bearing_rad=prediction.stable_bearing_rad[0],
+            stable_bearing_rate_rad_s=fresh_horizontal_rate,
+            bearing_std_rad=prediction.bearing_std_rad[0],
+            roll_guidance_sign=self.core.config.roll_guidance_sign,
+            roll_gain=self.core.config.roll_gain,
+            lateral_rate_gain=self.core.config.lateral_rate_gain,
+            off_axis_brake_rad=self.core.config.off_axis_brake_rad,
+            maximum_bearing_std_rad=(
+                self.core.config
+                .successor_prediction_max_extrapolation_rad
+            ),
+            full_bank_when_outward=False,
+        )
+        (
+            target_roll,
+            outward_full_bank,
+        ) = successor_roll_reference(
+            stable_bearing_rad=prediction.stable_bearing_rad[0],
+            stable_bearing_rate_rad_s=fresh_horizontal_rate,
+            bearing_std_rad=prediction.bearing_std_rad[0],
+            roll_guidance_sign=self.core.config.roll_guidance_sign,
+            roll_gain=self.core.config.roll_gain,
+            lateral_rate_gain=self.core.config.lateral_rate_gain,
+            off_axis_brake_rad=self.core.config.off_axis_brake_rad,
+            maximum_bearing_std_rad=(
+                self.core.config
+                .successor_prediction_max_extrapolation_rad
+            ),
+            full_bank_when_outward=(
+                successor.bearing_rate_qualified[0]
+            ),
+        )
+        targets["target_roll_rad"] = target_roll
+        # Every adjacent proposal is derived from this exact staged graph
+        # publication. Accepted predecessor targets are deliberately ignored,
+        # and promotion cannot retain this pre-credit bank.
         self._pending_precredit_successor_roll_reference = None
         self._precredit_successor_roll_reference = None
         self._last_decision = None
@@ -1926,8 +2021,9 @@ class DynamicVisualCourseSession:
                 ),
                 "authority_monotonic_ns": now_monotonic_ns,
                 "measurement_age_s": prediction.measurement_age_s,
-                "unconstrained_target_roll_rad": unconstrained_roll,
+                "unconstrained_target_roll_rad": proportional_roll,
                 "retained_roll_reference_applied": False,
+                "outward_full_bank_applied": outward_full_bank,
                 "stable_bearing_rad": list(
                     prediction.stable_bearing_rad
                 ),

@@ -630,6 +630,172 @@ class ConfirmedGateReacquisition:
 
 
 @dataclass(frozen=True, slots=True)
+class SameGateRebindSearch:
+    """Exact start boundary for replacing one lost current visual identity.
+
+    This is not a gate transition and does not claim that a later local track
+    is the same physical contour as the lost tracker identity.  It only freezes
+    the point after which a wholly new identity may become eligible to carry
+    the unchanged authoritative race-gate index.
+    """
+
+    gate_index: int
+    lost_track_id: str
+    race_status_at_start: AuthoritativeRaceStatusRef
+    camera_token_at_start: CameraFrameToken
+    tracker_frame_sequence_at_start: int
+    lost_track_latest_token: CameraFrameToken
+    lost_history_length_at_start: int
+    lost_history_sha256_at_start: str
+    excluded_track_ids_at_start: tuple[str, ...]
+    required_stable_frames: int
+
+    def __post_init__(self) -> None:
+        _nonnegative_int(self.gate_index, "gate_index")
+        if type(self.lost_track_id) is not str or not self.lost_track_id:
+            raise TypeError("lost_track_id must be a non-empty exact string")
+        if type(self.race_status_at_start) is not AuthoritativeRaceStatusRef:
+            raise TypeError(
+                "race_status_at_start must be an exact AuthoritativeRaceStatusRef"
+            )
+        if (
+            self.race_status_at_start.race_finished
+            or self.race_status_at_start.active_gate_index != self.gate_index
+        ):
+            raise ValueError("search race status does not prove the unchanged gate")
+        for name in ("camera_token_at_start", "lost_track_latest_token"):
+            if type(getattr(self, name)) is not CameraFrameToken:
+                raise TypeError(f"{name} must be an exact CameraFrameToken")
+        _nonnegative_int(
+            self.tracker_frame_sequence_at_start,
+            "tracker_frame_sequence_at_start",
+        )
+        _positive_int(
+            self.lost_history_length_at_start,
+            "lost_history_length_at_start",
+        )
+        _history_digest(
+            self.lost_history_sha256_at_start,
+            "lost_history_sha256_at_start",
+        )
+        if not _token_strictly_precedes(
+            self.lost_track_latest_token,
+            self.camera_token_at_start,
+        ):
+            raise ValueError(
+                "lost current must be invisible before the rebind search starts"
+            )
+        excluded = self.excluded_track_ids_at_start
+        if (
+            type(excluded) is not tuple
+            or not excluded
+            or any(type(track_id) is not str or not track_id for track_id in excluded)
+            or tuple(sorted(excluded)) != excluded
+            or len(set(excluded)) != len(excluded)
+            or self.lost_track_id not in excluded
+        ):
+            raise TypeError(
+                "excluded_track_ids_at_start must be a sorted unique exact "
+                "track-id tuple containing the lost current"
+            )
+        _positive_int(self.required_stable_frames, "required_stable_frames")
+        if self.required_stable_frames < 3:
+            raise ValueError("same-gate rebind requires at least three stable frames")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedSameGateRebind:
+    """One new local identity bound to an unchanged authoritative race gate."""
+
+    search: SameGateRebindSearch
+    race_status_at_binding: AuthoritativeRaceStatusRef
+    gate_index: int
+    retired_track_id: str
+    rebound_track_id: str
+    camera_token_at_binding: CameraFrameToken
+    rebound_first_token: CameraFrameToken
+    stable_frame_tokens: tuple[CameraFrameToken, ...]
+    history_length_at_binding: int
+    history_sha256: str
+    cross_gap_identity_claimed: bool = False
+
+    @property
+    def current_track_id(self) -> str:
+        return self.rebound_track_id
+
+    @property
+    def identity_basis(self) -> str:
+        return "fresh-unique-same-gate-local-track"
+
+    def __post_init__(self) -> None:
+        if type(self.search) is not SameGateRebindSearch:
+            raise TypeError("search must be an exact SameGateRebindSearch")
+        if type(self.race_status_at_binding) is not AuthoritativeRaceStatusRef:
+            raise TypeError(
+                "race_status_at_binding must be an exact AuthoritativeRaceStatusRef"
+            )
+        _nonnegative_int(self.gate_index, "gate_index")
+        if (
+            self.gate_index != self.search.gate_index
+            or self.race_status_at_binding.race_finished
+            or self.race_status_at_binding.active_gate_index != self.gate_index
+        ):
+            raise ValueError("same-gate rebind changed the authoritative race gate")
+        for name in ("retired_track_id", "rebound_track_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value:
+                raise TypeError(f"{name} must be a non-empty exact string")
+        if (
+            self.retired_track_id != self.search.lost_track_id
+            or self.rebound_track_id == self.retired_track_id
+            or self.rebound_track_id in self.search.excluded_track_ids_at_start
+        ):
+            raise ValueError(
+                "same-gate rebind must replace the lost current with a new identity"
+            )
+        for name in ("camera_token_at_binding", "rebound_first_token"):
+            if type(getattr(self, name)) is not CameraFrameToken:
+                raise TypeError(f"{name} must be an exact CameraFrameToken")
+        if not _token_strictly_precedes(
+            self.search.camera_token_at_start,
+            self.rebound_first_token,
+        ):
+            raise ValueError("rebound identity was not first observed after search start")
+        if (
+            type(self.stable_frame_tokens) is not tuple
+            or len(self.stable_frame_tokens) < self.search.required_stable_frames
+            or any(
+                type(token) is not CameraFrameToken
+                for token in self.stable_frame_tokens
+            )
+        ):
+            raise TypeError(
+                "stable_frame_tokens must carry the required exact token tail"
+            )
+        if self.stable_frame_tokens[-1] != self.camera_token_at_binding:
+            raise ValueError("stable same-gate tail must end at the binding token")
+        if not _token_precedes_or_equals(
+            self.rebound_first_token,
+            self.stable_frame_tokens[0],
+        ):
+            raise ValueError("stable same-gate tail predates the rebound identity")
+        for predecessor, successor in zip(
+            self.stable_frame_tokens,
+            self.stable_frame_tokens[1:],
+        ):
+            if not _token_strictly_precedes(predecessor, successor):
+                raise ValueError("stable same-gate tokens must strictly advance")
+        _positive_int(self.history_length_at_binding, "history_length_at_binding")
+        if len(self.stable_frame_tokens) > self.history_length_at_binding:
+            raise ValueError("stable tail exceeds rebound local history")
+        _history_digest(self.history_sha256, "history_sha256")
+        if type(self.cross_gap_identity_claimed) is not bool:
+            raise TypeError("cross_gap_identity_claimed must be an exact bool")
+        if self.cross_gap_identity_claimed:
+            raise ValueError("same-gate rebind cannot claim cross-gap identity")
+
+
+@dataclass(frozen=True, slots=True)
 class GateGraphSnapshot:
     tracker_frame_sequence: int
     latest_camera_token: CameraFrameToken
@@ -1366,6 +1532,257 @@ class RollingVisualGateGraph:
         self.observe(tracker)
         return reacquisition
 
+    def begin_same_gate_rebind_search(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        race_status: AuthoritativeRaceStatusRef,
+        camera_token_at_start: CameraFrameToken,
+    ) -> SameGateRebindSearch:
+        """Freeze a lost-current boundary without changing visual authority."""
+
+        self._tracker(tracker)
+        self._race_ref(race_status)
+        if type(camera_token_at_start) is not CameraFrameToken:
+            raise TypeError(
+                "camera_token_at_start must be an exact CameraFrameToken"
+            )
+        if (
+            self._phase is not GateGraphPhase.CURRENT_BOUND
+            or self._pending_unbound_advance is not None
+            or self._current_track_id is None
+            or self._current_gate_index is None
+            or self._race_finished
+        ):
+            raise GateGraphError(
+                "same-gate rebind search requires one bound current gate"
+            )
+        update = tracker.latest_update
+        if (
+            update is None
+            or update.token != camera_token_at_start
+            or not tracker.has_processed_token(camera_token_at_start)
+        ):
+            raise GateGraphError(
+                "same-gate search token is not the latest processed frame"
+            )
+        snapshot = self.observe(tracker)
+        current = snapshot.current_track
+        if (
+            snapshot.current_track_id != self._current_track_id
+            or snapshot.current_gate_index != self._current_gate_index
+            or current is None
+            or current.role is not VisualTrackRole.CURRENT
+            or current.authoritative_gate_index != self._current_gate_index
+        ):
+            raise GateGraphError(
+                "same-gate rebind search lacks the bound current identity"
+            )
+        if current.visible:
+            raise GateGraphError(
+                "same-gate rebind search requires an invisible current track"
+            )
+        if current.ambiguous:
+            raise GateGraphError(
+                "same-gate rebind search cannot start from ambiguous current state"
+            )
+        self._validate_unchanged_race_status(
+            race_status,
+            expected_gate_index=self._current_gate_index,
+        )
+        self._last_race_status = race_status
+        self.observe(tracker)
+        return SameGateRebindSearch(
+            gate_index=self._current_gate_index,
+            lost_track_id=self._current_track_id,
+            race_status_at_start=race_status,
+            camera_token_at_start=camera_token_at_start,
+            tracker_frame_sequence_at_start=update.tracker_frame_sequence,
+            lost_track_latest_token=current.latest_token,
+            lost_history_length_at_start=len(current.history),
+            lost_history_sha256_at_start=visual_track_history_sha256(
+                current.history
+            ),
+            excluded_track_ids_at_start=tuple(
+                sorted(track.track_id for track in update.tracks)
+            ),
+            required_stable_frames=max(
+                3,
+                self.config.min_current_binding_frames,
+            ),
+        )
+
+    def try_confirm_same_gate_rebind(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        search: SameGateRebindSearch,
+        race_status: AuthoritativeRaceStatusRef,
+        camera_token_at_binding: CameraFrameToken,
+    ) -> ConfirmedSameGateRebind | GateReacquisitionPending:
+        """Return soft uniqueness/readiness outcomes for active search."""
+
+        try:
+            return self.confirm_same_gate_rebind(
+                tracker,
+                search=search,
+                race_status=race_status,
+                camera_token_at_binding=camera_token_at_binding,
+            )
+        except AmbiguousGateReacquisitionError as exc:
+            return GateReacquisitionPending(
+                reason=str(exc),
+                ambiguous=True,
+            )
+        except GateReacquisitionNotReadyError as exc:
+            return GateReacquisitionPending(
+                reason=str(exc),
+                ambiguous=False,
+            )
+
+    def confirm_same_gate_rebind(
+        self,
+        tracker: MultiTargetVisualTracker,
+        *,
+        search: SameGateRebindSearch,
+        race_status: AuthoritativeRaceStatusRef,
+        camera_token_at_binding: CameraFrameToken,
+    ) -> ConfirmedSameGateRebind:
+        """Replace one lost CURRENT with one unique post-search local track."""
+
+        self._tracker(tracker)
+        if type(search) is not SameGateRebindSearch:
+            raise TypeError("search must be an exact SameGateRebindSearch")
+        self._race_ref(race_status)
+        if type(camera_token_at_binding) is not CameraFrameToken:
+            raise TypeError(
+                "camera_token_at_binding must be an exact CameraFrameToken"
+            )
+        if (
+            self._phase is not GateGraphPhase.CURRENT_BOUND
+            or self._pending_unbound_advance is not None
+            or self._current_track_id != search.lost_track_id
+            or self._current_gate_index != search.gate_index
+            or self._last_race_status != search.race_status_at_start
+            or self._race_finished
+        ):
+            raise GateGraphError(
+                "same-gate rebind search no longer matches graph authority"
+            )
+        update = tracker.latest_update
+        if (
+            update is None
+            or update.token != camera_token_at_binding
+            or not tracker.has_processed_token(camera_token_at_binding)
+        ):
+            raise GateGraphError(
+                "same-gate binding token is not the latest processed frame"
+            )
+        if not _token_strictly_precedes(
+            search.camera_token_at_start,
+            camera_token_at_binding,
+        ):
+            raise GateReacquisitionNotReadyError(
+                "same-gate binding frame does not follow search start"
+            )
+        self._validate_unchanged_race_status(
+            race_status,
+            expected_gate_index=search.gate_index,
+        )
+
+        snapshot = self.observe(tracker)
+        lost = snapshot.current_track
+        if (
+            snapshot.latest_camera_token != camera_token_at_binding
+            or snapshot.tracker_frame_sequence != update.tracker_frame_sequence
+        ):
+            raise GateGraphError(
+                "same-gate graph does not match the binding frame"
+            )
+        if (
+            lost is None
+            or lost.track_id != search.lost_track_id
+            or lost.role is not VisualTrackRole.CURRENT
+            or lost.authoritative_gate_index != search.gate_index
+        ):
+            raise GateGraphError(
+                "same-gate rebind lost its original current authority"
+            )
+        if lost.visible:
+            raise GateReacquisitionNotReadyError(
+                "original current became visible; same-gate rebind is unnecessary"
+            )
+        if (
+            lost.latest_token != search.lost_track_latest_token
+            or len(lost.history) != search.lost_history_length_at_start
+            or visual_track_history_sha256(lost.history)
+            != search.lost_history_sha256_at_start
+        ):
+            raise GateReacquisitionNotReadyError(
+                "original current changed after same-gate search start"
+            )
+
+        local_candidates: list[
+            tuple[VisualTrack, tuple[VisualTrackSample, ...]]
+        ] = []
+        for track in update.tracks:
+            stable_tail = _same_gate_rebind_observable_tail(
+                track,
+                search=search,
+                camera_token_at_binding=camera_token_at_binding,
+                min_track_confidence=self.config.min_track_confidence,
+                min_association_confidence=(
+                    self.config.min_association_confidence
+                ),
+            )
+            if stable_tail is not None:
+                local_candidates.append((track, stable_tail))
+        if not local_candidates:
+            raise GateReacquisitionNotReadyError(
+                "no unique fresh post-search same-gate candidate is ready"
+            )
+        if len(local_candidates) > 1:
+            raise AmbiguousGateReacquisitionError(
+                "post-search same-gate candidate selection is ambiguous"
+            )
+        selected, stable_tail = local_candidates[0]
+        history_before = selected.history
+        rebind = ConfirmedSameGateRebind(
+            search=search,
+            race_status_at_binding=race_status,
+            gate_index=search.gate_index,
+            retired_track_id=search.lost_track_id,
+            rebound_track_id=selected.track_id,
+            camera_token_at_binding=camera_token_at_binding,
+            rebound_first_token=selected.first_token,
+            stable_frame_tokens=tuple(
+                sample.token for sample in stable_tail
+            ),
+            history_length_at_binding=len(history_before),
+            history_sha256=visual_track_history_sha256(history_before),
+            cross_gap_identity_claimed=False,
+        )
+
+        # All readiness, uniqueness, race-gate, and immutable-history checks
+        # complete before this bounded role/authority replacement.
+        tracker.retire_track(search.lost_track_id)
+        tracker.assign_role(selected.track_id, VisualTrackRole.CURRENT)
+        tracker.confirm_authoritative_gate(
+            selected.track_id,
+            gate_index=search.gate_index,
+            race_status_sequence=race_status.race_status_sequence,
+            race_status_boot_ms=race_status.race_status_boot_ms,
+        )
+        bound = tracker.track(selected.track_id)
+        if bound.history != history_before:
+            raise RuntimeError("same-gate rebind reset or rewrote local history")
+        self._current_track_id = selected.track_id
+        self._current_gate_index = search.gate_index
+        self._last_race_status = race_status
+        self._phase = GateGraphPhase.CURRENT_BOUND
+        self.observe(tracker)
+        return rebind
+
     def confirm_race_finished(
         self,
         tracker: MultiTargetVisualTracker,
@@ -1807,6 +2224,33 @@ class RollingVisualGateGraph:
             fresh=state.fresh,
             contended=state.contended,
         )
+
+    def _validate_unchanged_race_status(
+        self,
+        current: AuthoritativeRaceStatusRef,
+        *,
+        expected_gate_index: int,
+    ) -> None:
+        """Accept the graph baseline or one newer heartbeat at the same gate."""
+
+        previous = self._last_race_status
+        if previous is None:
+            raise GateGraphError(
+                "same-gate rebind lacks an authoritative race baseline"
+            )
+        if current.race_finished:
+            raise GateGraphError("race finished during same-gate rebind")
+        if current.active_gate_index != expected_gate_index:
+            raise GateGraphError(
+                "authoritative race gate changed during same-gate rebind"
+            )
+        if current == previous:
+            return
+        self._validate_race_advance(current, allow_same_gate=True)
+        if current.active_gate_index != previous.active_gate_index:
+            raise GateGraphError(
+                "authoritative race gate changed during same-gate rebind"
+            )
 
     def _validate_race_advance(
         self,
@@ -2332,7 +2776,6 @@ def _reacquisition_observable_tail(
         or not track.visible
         or track.ambiguous
         or track.missed_frame_count != 0
-        or track.latest_token != camera_token_at_binding
         or track.clipping
         not in {
             FrameEdge.NONE,
@@ -2345,6 +2788,7 @@ def _reacquisition_observable_tail(
             track.clipping == FrameEdge.NONE
             and track.center_censored
         )
+        or track.latest_token != camera_token_at_binding
         or track.consecutive_frame_count < required_frames
         or track.confidence < min_track_confidence
         or track.association_confidence < min_association_confidence
@@ -2373,6 +2817,87 @@ def _reacquisition_observable_tail(
         or (
             sample.clipping == FrameEdge.NONE
             and sample.center_censored
+        )
+        or sample.confidence < min_track_confidence
+        or sample.association_confidence < min_association_confidence
+        or (
+            sample.accepted_association is not None
+            and sample.accepted_association.ambiguous
+        )
+        for sample in tail
+    ):
+        return None
+    for predecessor, successor in zip(tail, tail[1:]):
+        if (
+            successor.tracker_frame_sequence
+            != predecessor.tracker_frame_sequence + 1
+            or not _token_strictly_precedes(
+                predecessor.token,
+                successor.token,
+            )
+        ):
+            return None
+    return tail
+
+
+def _same_gate_rebind_observable_tail(
+    track: VisualTrack,
+    *,
+    search: SameGateRebindSearch,
+    camera_token_at_binding: CameraFrameToken,
+    min_track_confidence: float,
+    min_association_confidence: float,
+) -> Optional[tuple[VisualTrackSample, ...]]:
+    """Return one wholly post-search, contiguous local identity tail."""
+
+    required_frames = search.required_stable_frames
+    if (
+        track.track_id in search.excluded_track_ids_at_start
+        or track.role is VisualTrackRole.RETIRED
+        or track.authoritative_gate_index is not None
+        or not track.visible
+        or track.ambiguous
+        or track.missed_frame_count != 0
+        or track.clipping
+        not in {
+            FrameEdge.NONE,
+            FrameEdge.LEFT,
+            FrameEdge.TOP,
+            FrameEdge.RIGHT,
+            FrameEdge.BOTTOM,
+        }
+        or (
+            track.clipping == FrameEdge.NONE
+            and track.center_censored
+        )
+        or track.latest_token != camera_token_at_binding
+        or not _token_strictly_precedes(
+            search.camera_token_at_start,
+            track.first_token,
+        )
+        or track.consecutive_frame_count < required_frames
+        or track.confidence < min_track_confidence
+        or track.association_confidence < min_association_confidence
+        or len(track.history) < required_frames
+        or track.history[0].token != track.first_token
+    ):
+        return None
+    tail = track.history[-required_frames:]
+    if tail[-1].token != camera_token_at_binding:
+        return None
+    expected_provenance = (
+        FrameProvenanceBasis.RECEIVER_TIMING_V1
+        if (
+            search.race_status_at_start.provenance_basis
+            is RaceStatusProvenanceBasis.LIVE_INGRESS
+        )
+        else FrameProvenanceBasis.LEGACY_CAPTURE
+    )
+    if any(
+        sample.provenance_basis is not expected_provenance
+        or not _token_strictly_precedes(
+            search.camera_token_at_start,
+            sample.token,
         )
         or sample.confidence < min_track_confidence
         or sample.association_confidence < min_association_confidence

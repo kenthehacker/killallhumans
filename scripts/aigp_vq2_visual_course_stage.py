@@ -31,12 +31,14 @@ from competition.vq2_visual_tracker import (
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateReacquisition,
+    ConfirmedSameGateRebind,
     ConfirmedGateTransition,
     CreditedUnboundGateAdvance,
     DEFAULT_ROLLING_GATE_GRAPH_CONFIG,
     GateGraphError,
     GateReacquisitionPending,
     RaceStatusProvenanceBasis,
+    SameGateRebindSearch,
 )
 from planning.vq2_course_lifecycle import (
     CourseLifecycle,
@@ -3976,10 +3978,11 @@ def _refresh_committed_successor_steering(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Carry bounded successor yaw into the next crossing command.
+    """Carry fresh bounded successor roll/yaw into the crossing command.
 
-    The current-gate command remains sealed except for heading.  Successor
-    geometry must never introduce or refresh bank before race credit.
+    Current-gate pitch, thrust, passage proof, and race ownership remain
+    sealed. Roll/yaw are refreshed only from the exact graph-vetted successor
+    state carried by this accepted publication.
     """
 
     if (
@@ -4055,17 +4058,18 @@ def _refresh_committed_successor_steering(
         lower=-MAX_VISUAL_YAW_RATE_RAD_S,
         upper=MAX_VISUAL_YAW_RATE_RAD_S,
     )
-    if committed_roll is not None:
-        raise ValueError(
-            "committed successor roll is forbidden in yaw-only mode"
-        )
-    if committed_yaw is None:
+    if committed_roll is None and committed_yaw is None:
         return authority
     return replace(
         authority,
+        target_roll_rad=(
+            authority.target_roll_rad
+            if committed_roll is None
+            else committed_roll
+        ),
         yaw_rate_rad_s=(
             authority.yaw_rate_rad_s
-            if accepted.yaw_soft_stop_zeroed
+            if accepted.yaw_soft_stop_zeroed or committed_yaw is None
             else committed_yaw
         ),
     )
@@ -4081,8 +4085,8 @@ def _finalize_crossing_command_at_passage_admission(
 ) -> _CensoredPassageCoastAuthority:
     """Keep the current-gate crossing command sealed at passage admission.
 
-    Successor heading is refreshed separately.  Successor-derived bank is not
-    admitted before race credit.
+    Fresh successor roll/heading may be refreshed separately only after this
+    current-gate passage commitment exists.
     """
 
     evidence = accepted.dynamic_evidence
@@ -4809,6 +4813,87 @@ def _begin_approach_expired_geometry_search(
         "outcome": "searching",
     }
     return horizontal_edge
+
+
+def _validated_same_gate_rebind_evidence(
+    rebind: ConfirmedSameGateRebind,
+    dynamic_evidence: Mapping[str, Any],
+    *,
+    snapshot: Any,
+    expected_gate_index: int,
+    expected_retired_track_id: str,
+) -> Dict[str, Any]:
+    """Validate one unchanged-gate CURRENT replacement for stage adoption."""
+
+    if type(rebind) is not ConfirmedSameGateRebind:
+        raise TypeError("same-gate rebind must be exact")
+    if (
+        type(expected_gate_index) is not int
+        or expected_gate_index < 0
+        or type(expected_retired_track_id) is not str
+        or not expected_retired_track_id
+        or rebind.gate_index != expected_gate_index
+        or rebind.retired_track_id != expected_retired_track_id
+        or rebind.rebound_track_id == expected_retired_track_id
+        or rebind.cross_gap_identity_claimed
+    ):
+        raise ValueError("same-gate rebind changed stage authority")
+    if not isinstance(dynamic_evidence, Mapping):
+        raise TypeError("dynamic same-gate rebind evidence must be a mapping")
+
+    rebound_track_id = dynamic_evidence.get(
+        "rebound_track_id",
+        dynamic_evidence.get("current_track_id"),
+    )
+    dynamic_current_track_id = dynamic_evidence.get("current_track_id")
+    if (
+        type(dynamic_evidence.get("basis")) is not str
+        or not dynamic_evidence["basis"]
+        or dynamic_evidence.get("gate_index") != expected_gate_index
+        or dynamic_evidence.get("retired_track_id")
+        != expected_retired_track_id
+        or rebound_track_id != rebind.rebound_track_id
+        or (
+            dynamic_current_track_id is not None
+            and dynamic_current_track_id != rebind.rebound_track_id
+        )
+        or dynamic_evidence.get("cross_gap_identity_claimed") is not False
+        or dynamic_evidence.get("passage_authority") is not False
+        or dynamic_evidence.get("advance_authority") is not False
+        or dynamic_evidence.get("same_gate_current_authority") is not True
+        or dynamic_evidence.get("fresh_state_available") is not True
+    ):
+        raise ValueError("dynamic same-gate rebind evidence is incomplete")
+    if (
+        getattr(snapshot, "latest_camera_token", None)
+        != rebind.camera_token_at_binding
+        or not _current_snapshot_ready(
+            snapshot,
+            gate_index=expected_gate_index,
+            track_id=rebind.rebound_track_id,
+            allow_one_edge_censored=True,
+        )
+    ):
+        raise ValueError("same-gate rebound graph snapshot is unusable")
+
+    return {
+        "basis": dynamic_evidence["basis"],
+        "gate_index": expected_gate_index,
+        "retired_track_id": expected_retired_track_id,
+        "rebound_track_id": rebind.rebound_track_id,
+        "camera_token_at_binding": asdict(
+            rebind.camera_token_at_binding
+        ),
+        "identity_basis": rebind.identity_basis,
+        "stable_frame_count": len(rebind.stable_frame_tokens),
+        "history_length_at_binding": rebind.history_length_at_binding,
+        "history_sha256": rebind.history_sha256,
+        "same_gate_current_authority": True,
+        "fresh_state_available": True,
+        "cross_gap_identity_claimed": False,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
 
 
 def _approach_propagated_visibility_gap_authority(
@@ -10767,6 +10852,9 @@ async def _run_visual_course_stage_impl(
         approach_propagated_visibility_gap_fresh_frame_count = 0
         approach_propagated_visibility_gap_command_count = 0
         approach_expired_geometry_search_started_s: Optional[float] = None
+        approach_same_gate_rebind_search: Optional[
+            SameGateRebindSearch
+        ] = None
         approach_expired_geometry_search_horizontal_edge = FrameEdge.NONE
         approach_expired_geometry_search_command_count = 0
         approach_current_ambiguity_quarantine: Optional[
@@ -12044,7 +12132,19 @@ async def _run_visual_course_stage_impl(
                                     unavailable_reason=gap_unavailable_reason,
                                     segment=segment,
                                 )
-                            except (TypeError, ValueError) as search_exc:
+                                approach_same_gate_rebind_search = (
+                                    host.visual_gate_graph
+                                    .begin_same_gate_rebind_search(
+                                        host.visual_tracker,
+                                        race_status=race,
+                                        camera_token_at_start=token,
+                                    )
+                                )
+                            except (
+                                GateGraphError,
+                                TypeError,
+                                ValueError,
+                            ) as search_exc:
                                 raise abort_type(
                                     "visual-course expired-geometry active "
                                     f"search transition refused: {search_exc}"
@@ -12109,7 +12209,16 @@ async def _run_visual_course_stage_impl(
                                         unavailable_reason=None,
                                         segment=segment,
                                     )
+                                    approach_same_gate_rebind_search = (
+                                        host.visual_gate_graph
+                                        .begin_same_gate_rebind_search(
+                                            host.visual_tracker,
+                                            race_status=race,
+                                            camera_token_at_start=token,
+                                        )
+                                    )
                                 except (
+                                    GateGraphError,
                                     TypeError,
                                     ValueError,
                                 ) as search_exc:
@@ -12128,6 +12237,271 @@ async def _run_visual_course_stage_impl(
                                 ) from deadline_exc
 
                     if approach_expired_geometry_search_started_s is not None:
+                        if approach_same_gate_rebind_search is None:
+                            raise abort_type(
+                                "visual-course expired-geometry search lacks "
+                                "its exact same-gate rebind boundary"
+                            )
+                        try:
+                            same_gate_rebind = (
+                                host.visual_gate_graph
+                                .try_confirm_same_gate_rebind(
+                                    host.visual_tracker,
+                                    search=approach_same_gate_rebind_search,
+                                    race_status=race,
+                                    camera_token_at_binding=token,
+                                )
+                            )
+                        except (
+                            GateGraphError,
+                            TypeError,
+                            ValueError,
+                        ) as rebind_exc:
+                            raise abort_type(
+                                "visual-course same-gate CURRENT rebind "
+                                f"refused: {rebind_exc}"
+                            ) from rebind_exc
+                        if type(same_gate_rebind) is ConfirmedSameGateRebind:
+                            retired_track_id = current_track_id
+                            try:
+                                dynamic_rebind = (
+                                    dynamic_controller
+                                    .rebind_confirmed_same_gate(
+                                        same_gate_rebind,
+                                        host.visual_tracker,
+                                    )
+                                )
+                                rebound_snapshot = (
+                                    host.visual_gate_graph.latest_snapshot
+                                )
+                                rebind_evidence = (
+                                    _validated_same_gate_rebind_evidence(
+                                        same_gate_rebind,
+                                        dynamic_rebind,
+                                        snapshot=rebound_snapshot,
+                                        expected_gate_index=(
+                                            current_gate_index
+                                        ),
+                                        expected_retired_track_id=(
+                                            retired_track_id
+                                        ),
+                                    )
+                                )
+                            except (
+                                AttributeError,
+                                TypeError,
+                                ValueError,
+                            ) as rebind_exc:
+                                raise abort_type(
+                                    "visual-course could not adopt same-gate "
+                                    f"CURRENT rebind: {rebind_exc}"
+                                ) from rebind_exc
+
+                            current_track_id = (
+                                same_gate_rebind.rebound_track_id
+                            )
+                            segment["current_track_id"] = current_track_id
+                            planner = make_planner(
+                                track_id=current_track_id,
+                                gate_index=current_gate_index,
+                                next_gate_blend=(
+                                    host.visual_config.lifecycle
+                                    .next_gate_blend_max
+                                ),
+                            )
+                            current_aperture_collective_state = (
+                                _CurrentApertureProvedCollectiveState(
+                                    track_id=current_track_id
+                                )
+                            )
+                            latest_accepted_current_wire = None
+                            last_clean_passage_token = None
+                            snapshot = rebound_snapshot
+
+                            try:
+                                binding_proposal = planner.observe(
+                                    snapshot,
+                                    host.visual_tracker,
+                                    (
+                                        runtime.perf_counter_ns()
+                                        / 1_000_000_000.0
+                                    ),
+                                    now - segment_started_s,
+                                    excursion,
+                                    mode=VisualApproachMode.APPROACH,
+                                    passage_admission=None,
+                                    passage_forward_closure_authorized=(
+                                        passage_forward_closure_authorized
+                                    ),
+                                )
+                            except (
+                                VisualApproachCurrentGeometryUnavailable,
+                                VisualApproachRefusal,
+                            ) as proposal_exc:
+                                raise abort_type(
+                                    "visual-course rebound binding frame "
+                                    f"could not plan: {proposal_exc}"
+                                ) from proposal_exc
+                            if binding_proposal.servo_output.advance_enabled:
+                                raise abort_type(
+                                    "visual-course rebound binding frame "
+                                    "acquired advance authority"
+                                )
+                            last_planned_token = token
+                            try:
+                                binding_command = await send_visual(
+                                    proposal=binding_proposal,
+                                    snapshot=snapshot,
+                                    yaw_reference_rad=yaw_reference_rad,
+                                    segment_started_s=segment_started_s,
+                                    horizontal_fov_closure_brake_enabled=True,
+                                    stage=(
+                                        f"{VISUAL_COURSE_STAGE}/gate"
+                                        f"{current_gate_index}/approach"
+                                    ),
+                                )
+                            except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                                credited_race = accept_no_wire_race_boundary(
+                                    race_exc,
+                                    allow_unlatched_graph_reconciliation=True,
+                                )
+                                break
+                            if type(binding_command) is _SupersededVisualProposal:
+                                search_summary = segment[
+                                    "approach_expired_geometry_search"
+                                ]
+                                if not isinstance(search_summary, dict):
+                                    raise abort_type(
+                                        "visual-course same-gate rebind lacks "
+                                        "its active-search summary"
+                                    )
+                                search_summary.update(
+                                    {
+                                        "reacquired_camera_token": asdict(
+                                            token
+                                        ),
+                                        "retired_track_id": (
+                                            retired_track_id
+                                        ),
+                                        "rebound_track_id": current_track_id,
+                                        "rebind_identity_basis": (
+                                            same_gate_rebind.identity_basis
+                                        ),
+                                        "cross_gap_identity_claimed": False,
+                                        "binding_frame_command_applied": False,
+                                        "outcome": (
+                                            "authoritative_same_gate_current_"
+                                            "rebound_binding_superseded"
+                                        ),
+                                    }
+                                )
+                                approach_expired_geometry_search_started_s = (
+                                    None
+                                )
+                                approach_same_gate_rebind_search = None
+                                approach_expired_geometry_search_horizontal_edge = (
+                                    FrameEdge.NONE
+                                )
+                                approach_propagated_visibility_gap_started_s = (
+                                    None
+                                )
+                                approach_propagated_visibility_gap_fresh_frame_count = (
+                                    0
+                                )
+                                continue
+                            if type(binding_command) is not _AcceptedVisualCommand:
+                                raise abort_type(
+                                    "visual-course rebound binding-frame "
+                                    "command outcome is invalid"
+                                )
+                            approach_command_count += 1
+                            segment["approach_command_count"] = (
+                                approach_command_count
+                            )
+
+                            search_summary = segment[
+                                "approach_expired_geometry_search"
+                            ]
+                            if not isinstance(search_summary, dict):
+                                raise abort_type(
+                                    "visual-course same-gate rebind lacks "
+                                    "its active-search summary"
+                                )
+                            search_summary.update(
+                                {
+                                    "reacquired_camera_token": asdict(token),
+                                    "retired_track_id": retired_track_id,
+                                    "rebound_track_id": current_track_id,
+                                    "rebind_identity_basis": (
+                                        same_gate_rebind.identity_basis
+                                    ),
+                                    "cross_gap_identity_claimed": False,
+                                    "binding_frame_command_applied": True,
+                                    "binding_frame_wire_camera_token": asdict(
+                                        binding_command.wire_camera_token
+                                    ),
+                                    "binding_frame_passage_admission_deferred": (
+                                        binding_proposal.passage_admission
+                                        is not None
+                                    ),
+                                    "outcome": (
+                                        "authoritative_same_gate_current_rebound"
+                                    ),
+                                }
+                            )
+                            gap_summary = segment[
+                                "approach_propagated_visibility_gap"
+                            ]
+                            if isinstance(gap_summary, dict):
+                                gap_summary.update(
+                                    {
+                                        "reacquired_camera_token": asdict(
+                                            token
+                                        ),
+                                        "rebound_track_id": current_track_id,
+                                    }
+                                )
+                            host.recorder.emit(
+                                "visual_course_approach_same_gate_current_"
+                                "rebound",
+                                binding_frame_command_applied=True,
+                                binding_frame_wire_camera_token=asdict(
+                                    binding_command.wire_camera_token
+                                ),
+                                **rebind_evidence,
+                            )
+                            approach_expired_geometry_search_started_s = None
+                            approach_same_gate_rebind_search = None
+                            approach_expired_geometry_search_horizontal_edge = (
+                                FrameEdge.NONE
+                            )
+                            approach_propagated_visibility_gap_started_s = None
+                            approach_propagated_visibility_gap_fresh_frame_count = (
+                                0
+                            )
+                            continue
+                        if type(same_gate_rebind) is not GateReacquisitionPending:
+                            raise abort_type(
+                                "visual-course same-gate rebind returned an "
+                                "invalid lifecycle outcome"
+                            )
+                        search_summary = segment[
+                            "approach_expired_geometry_search"
+                        ]
+                        if not isinstance(search_summary, dict):
+                            raise abort_type(
+                                "visual-course active-search summary is invalid"
+                            )
+                        search_summary.update(
+                            {
+                                "last_rebind_pending_reason": (
+                                    same_gate_rebind.reason
+                                ),
+                                "last_rebind_pending_ambiguous": (
+                                    same_gate_rebind.ambiguous
+                                ),
+                            }
+                        )
                         try:
                             (
                                 search_pitch_rad,
@@ -13968,6 +14342,10 @@ async def _run_visual_course_stage_impl(
                         **search_summary,
                     )
                     approach_expired_geometry_search_started_s = None
+                    approach_same_gate_rebind_search = None
+                    approach_expired_geometry_search_horizontal_edge = (
+                        FrameEdge.NONE
+                    )
                     approach_propagated_visibility_gap_started_s = None
                     approach_propagated_visibility_gap_fresh_frame_count = 0
                 if approach_top_recovery_started_s is not None:

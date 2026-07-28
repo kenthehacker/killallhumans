@@ -24,6 +24,8 @@ from competition.vq2_visual_tracker import (
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateTransition,
+    ConfirmedSameGateRebind,
+    SameGateRebindSearch,
 )
 from planning.vq2_course_lifecycle import (
     CourseLifecycle,
@@ -469,14 +471,14 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
     }
 
 
-def test_committed_successor_refresh_preserves_sealed_roll_and_updates_only_yaw():
+def test_committed_successor_refresh_applies_fresh_roll_and_yaw():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
             "successor_track_id": "vq2-track-000002",
             "passage_committed": True,
-            "committed_successor_roll_authority": 0.0,
-            "committed_successor_target_roll_rad": None,
+            "committed_successor_roll_authority": 1.0,
+            "committed_successor_target_roll_rad": -0.35,
             "committed_successor_pitch_authority": 1.0,
             "committed_successor_target_pitch_rad": -0.12,
             "committed_successor_yaw_authority": 1.0,
@@ -502,12 +504,13 @@ def test_committed_successor_refresh_preserves_sealed_roll_and_updates_only_yaw(
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed.target_roll_rad == authority.target_roll_rad
+    assert refreshed.target_roll_rad == pytest.approx(-0.35)
     assert refreshed.target_pitch_rad == authority.target_pitch_rad
     assert refreshed.yaw_rate_rad_s == pytest.approx(-0.15)
     assert refreshed.requested_thrust == authority.requested_thrust
     assert replace(
         refreshed,
+        target_roll_rad=authority.target_roll_rad,
         yaw_rate_rad_s=authority.yaw_rate_rad_s,
     ) == authority
     assert all(
@@ -691,14 +694,14 @@ def test_uncommitted_successor_cannot_change_crossing_coast():
     ) == authority
 
 
-def test_yaw_soft_stop_preserves_sealed_yaw_and_roll():
+def test_yaw_soft_stop_preserves_sealed_yaw_but_applies_fresh_roll():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
             "successor_track_id": "vq2-track-000002",
             "passage_committed": True,
-            "committed_successor_roll_authority": 0.0,
-            "committed_successor_target_roll_rad": None,
+            "committed_successor_roll_authority": 1.0,
+            "committed_successor_target_roll_rad": -0.35,
             "committed_successor_pitch_authority": 1.0,
             "committed_successor_target_pitch_rad": -0.12,
             "committed_successor_yaw_authority": 1.0,
@@ -726,9 +729,12 @@ def test_yaw_soft_stop_preserves_sealed_yaw_and_roll():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed.target_roll_rad == authority.target_roll_rad
+    assert refreshed.target_roll_rad == pytest.approx(-0.35)
     assert refreshed.yaw_rate_rad_s == authority.yaw_rate_rad_s
-    assert refreshed == authority
+    assert replace(
+        refreshed,
+        target_roll_rad=authority.target_roll_rad,
+    ) == authority
 
 
 def _dynamic_near_plane_sample(

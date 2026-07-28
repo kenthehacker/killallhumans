@@ -25,6 +25,7 @@ from competition.vq2_contracts import FrameEdge
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateReacquisition,
+    ConfirmedSameGateRebind,
     ConfirmedGateTransition,
     CreditedUnboundGateAdvance,
     GateGraphError,
@@ -32,6 +33,7 @@ from planning.vq2_gate_graph import (
     GateReacquisitionPending,
     RaceStatusProvenanceBasis,
     RollingVisualGateGraph,
+    SameGateRebindSearch,
 )
 
 
@@ -681,3 +683,221 @@ def test_try_reacquisition_preserves_hard_binding_token_errors() -> None:
             credited_advance=state.advance,
             camera_token_at_binding=state.credit_frame.token,
         )
+
+
+def _same_gate_candidate_detection(
+    sequence: int,
+    *,
+    source_index: int = 2,
+) -> VisualDetection:
+    return _detection(
+        source_index,
+        -0.72 + 0.004 * (sequence - 7),
+        -0.60 + 0.003 * (sequence - 7),
+        0.12,
+        0.15,
+        confidence=0.91,
+    )
+
+
+def _second_same_gate_candidate_detection(sequence: int) -> VisualDetection:
+    return _detection(
+        3,
+        0.72 - 0.004 * (sequence - 7),
+        0.60 - 0.003 * (sequence - 7),
+        0.12,
+        0.15,
+        confidence=0.89,
+    )
+
+
+def _begin_same_gate_search(
+    *,
+    gate_index: int = 2,
+    detections_at_start: tuple[VisualDetection, ...] = (),
+) -> tuple[
+    MultiTargetVisualTracker,
+    RollingVisualGateGraph,
+    str,
+    str,
+    SameGateRebindSearch,
+]:
+    tracker, graph, current_track_id, preexisting_track_id = (
+        _bind_initial_tracks(from_gate_index=gate_index)
+    )
+    search_frame = _frame(6, detections_at_start)
+    tracker.update(search_frame)
+    snapshot = graph.observe(tracker)
+    assert snapshot.current_track is not None
+    assert not snapshot.current_track.visible
+    assert snapshot.latest_race_status is not None
+    search = graph.begin_same_gate_rebind_search(
+        tracker,
+        race_status=snapshot.latest_race_status,
+        camera_token_at_start=search_frame.token,
+    )
+    return (
+        tracker,
+        graph,
+        current_track_id,
+        preexisting_track_id,
+        search,
+    )
+
+
+def test_same_gate_rebind_requires_three_new_contiguous_frames_and_preserves_gate() -> None:
+    tracker, graph, lost_id, preexisting_id, search = (
+        _begin_same_gate_search()
+    )
+    candidate_id: str | None = None
+    pending: ConfirmedSameGateRebind | GateReacquisitionPending | None = None
+    for sequence in range(7, 10):
+        frame = _frame(
+            sequence,
+            (_same_gate_candidate_detection(sequence),),
+        )
+        update = tracker.update(frame)
+        graph.observe(tracker)
+        if sequence == 7:
+            assert len(update.created_track_ids) == 1
+            candidate_id = update.created_track_ids[0]
+        if sequence < 9:
+            pending = graph.try_confirm_same_gate_rebind(
+                tracker,
+                search=search,
+                race_status=search.race_status_at_start,
+                camera_token_at_binding=frame.token,
+            )
+            assert type(pending) is GateReacquisitionPending
+            assert not pending.ambiguous
+    assert candidate_id is not None
+    history_before = tracker.track(candidate_id).history
+    binding_race = _race(
+        gate_index=search.gate_index,
+        sequence=101,
+        boot_ms=1_250,
+        received_ns=frame.publish_monotonic_ns + 1,
+    )
+
+    rebound = graph.try_confirm_same_gate_rebind(
+        tracker,
+        search=search,
+        race_status=binding_race,
+        camera_token_at_binding=frame.token,
+    )
+
+    assert type(rebound) is ConfirmedSameGateRebind
+    assert rebound.gate_index == 2
+    assert rebound.retired_track_id == lost_id
+    assert rebound.rebound_track_id == candidate_id
+    assert rebound.current_track_id == candidate_id
+    assert rebound.identity_basis == "fresh-unique-same-gate-local-track"
+    assert not rebound.cross_gap_identity_claimed
+    assert rebound.race_status_at_binding == binding_race
+    assert rebound.rebound_first_token == history_before[0].token
+    assert rebound.rebound_first_token != search.camera_token_at_start
+    assert len(rebound.stable_frame_tokens) == 3
+    assert rebound.history_sha256 == visual_track_history_sha256(
+        history_before
+    )
+    assert preexisting_id in search.excluded_track_ids_at_start
+    assert candidate_id not in search.excluded_track_ids_at_start
+    assert tracker.track(lost_id).role is VisualTrackRole.RETIRED
+    assert tracker.track(candidate_id).role is VisualTrackRole.CURRENT
+    assert tracker.track(candidate_id).authoritative_gate_index == 2
+    snapshot = graph.latest_snapshot
+    assert snapshot is not None
+    assert snapshot.current_gate_index == 2
+    assert snapshot.current_track_id == candidate_id
+    assert snapshot.authority_usable
+
+
+def test_same_gate_rebind_excludes_every_track_present_at_search_start() -> None:
+    tracker, graph, lost_id, preexisting_id, search = (
+        _begin_same_gate_search(
+            detections_at_start=(_reviewed_detection(6),),
+        )
+    )
+    for sequence in range(7, 10):
+        frame = _frame(
+            sequence,
+            (_reviewed_detection(sequence),),
+        )
+        update = tracker.update(frame)
+        graph.observe(tracker)
+        assert preexisting_id in update.associated_track_ids
+    tracks_before = tracker.tracks()
+
+    outcome = graph.try_confirm_same_gate_rebind(
+        tracker,
+        search=search,
+        race_status=search.race_status_at_start,
+        camera_token_at_binding=frame.token,
+    )
+
+    assert type(outcome) is GateReacquisitionPending
+    assert not outcome.ambiguous
+    assert "no unique fresh post-search" in outcome.reason
+    assert tracker.tracks() == tracks_before
+    assert tracker.track(lost_id).role is VisualTrackRole.CURRENT
+    assert tracker.track(preexisting_id).authoritative_gate_index is None
+
+
+def test_same_gate_rebind_refuses_two_equally_fresh_local_candidates() -> None:
+    tracker, graph, lost_id, _, search = _begin_same_gate_search()
+    for sequence in range(7, 10):
+        frame = _frame(
+            sequence,
+            (
+                _same_gate_candidate_detection(sequence),
+                _second_same_gate_candidate_detection(sequence),
+            ),
+        )
+        tracker.update(frame)
+        graph.observe(tracker)
+    tracks_before = tracker.tracks()
+
+    outcome = graph.try_confirm_same_gate_rebind(
+        tracker,
+        search=search,
+        race_status=search.race_status_at_start,
+        camera_token_at_binding=frame.token,
+    )
+
+    assert type(outcome) is GateReacquisitionPending
+    assert outcome.ambiguous
+    assert "selection is ambiguous" in outcome.reason
+    assert tracker.tracks() == tracks_before
+    assert tracker.track(lost_id).role is VisualTrackRole.CURRENT
+
+
+def test_same_gate_rebind_rejects_authoritative_gate_change_without_mutation() -> None:
+    tracker, graph, lost_id, _, search = _begin_same_gate_search()
+    for sequence in range(7, 10):
+        frame = _frame(
+            sequence,
+            (_same_gate_candidate_detection(sequence),),
+        )
+        tracker.update(frame)
+        graph.observe(tracker)
+    tracks_before = tracker.tracks()
+    advanced_race = _race(
+        gate_index=search.gate_index + 1,
+        sequence=101,
+        boot_ms=1_250,
+        received_ns=frame.publish_monotonic_ns + 1,
+    )
+
+    with pytest.raises(
+        GateGraphError,
+        match="authoritative race gate changed",
+    ):
+        graph.confirm_same_gate_rebind(
+            tracker,
+            search=search,
+            race_status=advanced_race,
+            camera_token_at_binding=frame.token,
+        )
+
+    assert tracker.tracks() == tracks_before
+    assert tracker.track(lost_id).role is VisualTrackRole.CURRENT

@@ -2852,7 +2852,7 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     )
 
 
-def test_committed_off_axis_successor_preturns_with_yaw_not_bank(
+def test_committed_fresh_off_axis_successor_turns_with_full_negative_bank(
 ) -> None:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,
@@ -2860,7 +2860,7 @@ def test_committed_off_axis_successor_preturns_with_yaw_not_bank(
         bearing_beta=1.0,
         scale_alpha=1.0,
         scale_beta=1.0,
-        roll_guidance_sign=1.0,
+        roll_guidance_sign=-1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
     )
@@ -2907,9 +2907,13 @@ def test_committed_off_axis_successor_preturns_with_yaw_not_bank(
         * successor.bearing_rate_rad_s[0]
         > 0.0
     )
-    assert outward.committed_successor_roll_authority == 0.0
-    assert outward.committed_successor_target_roll_rad is None
-    assert outward.command.target_roll_rad == pytest.approx(0.0)
+    assert outward.committed_successor_roll_authority == 1.0
+    assert outward.committed_successor_target_roll_rad == pytest.approx(
+        -MAX_TARGET_ROLL_RAD
+    )
+    assert outward.command.target_roll_rad == pytest.approx(
+        outward.committed_successor_target_roll_rad
+    )
     assert outward.committed_successor_yaw_authority == 1.0
     assert outward.command.yaw_rate_rad_s < 0.0
     assert outward.committed_successor_target_pitch_rad is not None
@@ -2946,9 +2950,19 @@ def test_committed_off_axis_successor_preturns_with_yaw_not_bank(
     assert recovered is not None
     assert abs(successor.bearing_rad[0]) >= config.off_axis_brake_rad
     assert successor.bearing_rate_rad_s[0] < 0.0
-    assert recovered.committed_successor_roll_authority == 0.0
-    assert recovered.committed_successor_target_roll_rad is None
-    assert recovered.command.target_roll_rad == pytest.approx(0.0)
+    assert recovered.committed_successor_roll_authority == 1.0
+    assert recovered.committed_successor_target_roll_rad is not None
+    assert (
+        -MAX_TARGET_ROLL_RAD
+        < recovered.committed_successor_target_roll_rad
+        < 0.0
+    )
+    assert abs(
+        recovered.committed_successor_target_roll_rad
+    ) < abs(outward.committed_successor_target_roll_rad)
+    assert recovered.command.target_roll_rad == pytest.approx(
+        recovered.committed_successor_target_roll_rad
+    )
     assert recovered.committed_successor_yaw_authority == 1.0
     assert recovered.committed_successor_target_pitch_rad is not None
     assert (
@@ -3097,9 +3111,13 @@ def test_latest_trace_unsafe_current_gate_waits_for_passage_commitment() -> None
         passage_committed=True,
     )
     assert committed.passage_committed
-    assert committed.committed_successor_roll_authority == 0.0
-    assert committed.committed_successor_target_roll_rad is None
-    assert committed.command.target_roll_rad == pytest.approx(0.0)
+    assert committed.committed_successor_roll_authority == 1.0
+    assert committed.committed_successor_target_roll_rad == pytest.approx(
+        MAX_TARGET_ROLL_RAD
+    )
+    assert committed.command.target_roll_rad == pytest.approx(
+        committed.committed_successor_target_roll_rad
+    )
     assert committed.committed_successor_yaw_authority == 1.0
     assert committed.committed_successor_yaw_rate_rad_s is not None
     assert committed.command.yaw_rate_rad_s < 0.0

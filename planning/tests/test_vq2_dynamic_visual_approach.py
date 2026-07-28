@@ -43,6 +43,7 @@ from planning.vq2_dynamic_visual_approach import (
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateReacquisition,
+    ConfirmedSameGateRebind,
     CreditedUnboundGateAdvance,
     RollingVisualGateGraph,
 )
@@ -708,8 +709,13 @@ def _activated_zero_precredit_proportional_postcredit_transition(
         track_id=successor_id,
         now_monotonic_ns=authority_ns,
     )
-    level_roll_rad = float(authority["target_roll_rad"])
-    assert level_roll_rad == pytest.approx(0.0)
+    precredit_roll_rad = float(authority["target_roll_rad"])
+    assert (
+        -MAX_TARGET_ROLL_RAD
+        < precredit_roll_rad
+        < 0.0
+    )
+    assert authority["outward_full_bank_applied"] is False
     assert authority["retained_roll_reference_applied"] is False
     assert math.isfinite(float(authority["yaw_rate_rad_s"]))
     assert (
@@ -718,7 +724,7 @@ def _activated_zero_precredit_proportional_postcredit_transition(
     )
     accepted_ns = authority_ns + 1_000_000
     session.record_wire_acceptance(
-        target_roll_rad=level_roll_rad,
+        target_roll_rad=precredit_roll_rad,
         target_pitch_rad=float(authority["target_pitch_rad"]),
         yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
         thrust=float(authority["thrust"]),
@@ -1021,9 +1027,23 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
     )
 
 
-def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
+def test_graph_vetted_adjacent_rebind_uses_fresh_full_bank_then_tapers():
     tracker, graph, snapshot, current_id = _graph()
     session = _session()
+    for monotonic_ns in range(
+        _BASE_NS + 700_000_000,
+        _BASE_NS + 1_000_000_000,
+        10_000_000,
+    ):
+        session.record_imu(
+            ImuAttitudeSample(
+                monotonic_ns=monotonic_ns,
+                body_to_reference_wxyz=(1.0, 0.0, 0.0, 0.0),
+                body_rates_rad_s=(0.0, 0.0, 0.0),
+                source_timestamp_us=monotonic_ns // 1_000,
+                host_clock_id="host-perf-counter",
+            )
+        )
     planner = DynamicRollingVisualApproachServo(
         current_id,
         0,
@@ -1050,7 +1070,8 @@ def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
     committed = session.last_decision
     assert committed is not None
     assert committed.successor_track_id == original_successor_id
-    committed_roll = -MAX_TARGET_ROLL_RAD
+    # An opposite predecessor bank must not survive the graph-vetted rebind.
+    committed_roll = MAX_TARGET_ROLL_RAD
     session._last_decision = replace(  # noqa: SLF001
         committed,
         passage_committed=True,
@@ -1072,7 +1093,7 @@ def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
         yaw_rate_rad_s=committed.command.yaw_rate_rad_s,
         thrust=committed.command.thrust,
         wire_command=AttitudeRateCommand(
-            -0.10,
+            0.10,
             0.0,
             committed.command.yaw_rate_rad_s,
             committed.command.thrust,
@@ -1150,10 +1171,15 @@ def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
         update.observation_monotonic_ns + 5_000_000,
     )
     baseline = session._successor_steering_targets(prediction)
-    assert abs(float(baseline["target_roll_rad"])) < abs(
+    assert abs(float(baseline["target_roll_rad"])) < abs(committed_roll)
+    assert (
+        -MAX_TARGET_ROLL_RAD
+        < proposal.servo_output.target_roll_rad
+        < 0.0
+    )
+    assert proposal.servo_output.target_roll_rad != pytest.approx(
         committed_roll
     )
-    assert proposal.servo_output.target_roll_rad == pytest.approx(0.0)
     assert proposal.servo_output.target_pitch_rad == pytest.approx(
         baseline["target_pitch_rad"]
     )
@@ -1186,15 +1212,127 @@ def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
         session._precredit_successor_roll_reference  # noqa: SLF001
         is None
     )
-    # Re-evaluating the exact adjacent authority may update yaw and pitch, but
-    # it cannot create a pre-credit roll reference.
+    # Once fresh same-ID publications qualify the outward fixed-frame rate,
+    # the committed transition uses the full bounded negative bank.
+    outward_authority = None
+    for sequence, successor_center_x in zip(
+        range(19, 23),
+        (0.46, 0.48, 0.50, 0.52),
+    ):
+        update = tracker.update(
+            _frame(
+                sequence,
+                successor_center_x=successor_center_x,
+                successor_inner_aperture=_inner_aperture(
+                    successor_center_x,
+                    0.0,
+                    half_width=0.15,
+                    half_height=0.17,
+                    confidence=0.18,
+                    health_reason="aperture_fit_low_confidence",
+                ),
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = adjacent.observe_promotable_adjacent(
+            snapshot,
+            tracker,
+            now_monotonic_s=(
+                update.observation_monotonic_ns + 5_000_000
+            )
+            / 1_000_000_000.0,
+            segment_elapsed_s=1.0,
+            segment_yaw_excursion_rad=0.0,
+        )
+        _accept_proposal(session, tracker, proposal)
+        outward_authority = (
+            session.adjacent_precredit_successor_steering_authority(
+                track_id=replacement.track_id,
+                now_monotonic_ns=(
+                    update.observation_monotonic_ns + 9_000_000
+                ),
+            )
+        )
+    assert outward_authority is not None
+    rebound_successor = session.core.course_state().successor
+    assert rebound_successor is not None
+    assert rebound_successor.bearing_rate_qualified[0]
+    assert (
+        rebound_successor.bearing_rad[0]
+        * rebound_successor.bearing_rate_rad_s[0]
+        > 0.0
+    )
+    assert outward_authority["target_roll_rad"] == pytest.approx(
+        -MAX_TARGET_ROLL_RAD
+    )
+    assert outward_authority["outward_full_bank_applied"] is True
+    assert outward_authority["retained_roll_reference_applied"] is False
+
+    # A newly measured inward rate immediately releases the escalation and
+    # recomputes the ordinary proportional target from that exact frame.
+    inward_authority = None
+    for sequence, successor_center_x in zip(
+        range(23, 28),
+        (0.48, 0.40, 0.32, 0.24, 0.16),
+    ):
+        update = tracker.update(
+            _frame(
+                sequence,
+                successor_center_x=successor_center_x,
+                successor_inner_aperture=_inner_aperture(
+                    successor_center_x,
+                    0.0,
+                    half_width=0.15,
+                    half_height=0.17,
+                    confidence=0.18,
+                    health_reason="aperture_fit_low_confidence",
+                ),
+            )
+        )
+        snapshot = graph.observe(tracker)
+        proposal = adjacent.observe_promotable_adjacent(
+            snapshot,
+            tracker,
+            now_monotonic_s=(
+                update.observation_monotonic_ns + 5_000_000
+            )
+            / 1_000_000_000.0,
+            segment_elapsed_s=1.0,
+            segment_yaw_excursion_rad=0.0,
+        )
+        _accept_proposal(session, tracker, proposal)
+        inward_authority = (
+            session.adjacent_precredit_successor_steering_authority(
+                track_id=replacement.track_id,
+                now_monotonic_ns=(
+                    update.observation_monotonic_ns + 9_000_000
+                ),
+            )
+        )
+    assert inward_authority is not None
+    rebound_successor = session.core.course_state().successor
+    assert rebound_successor is not None
+    assert rebound_successor.bearing_rate_qualified[0]
+    assert rebound_successor.bearing_rate_rad_s[0] < 0.0
+    assert inward_authority["outward_full_bank_applied"] is False
+    assert inward_authority["target_roll_rad"] == pytest.approx(
+        inward_authority["unconstrained_target_roll_rad"]
+    )
+    assert abs(float(inward_authority["target_roll_rad"])) < (
+        MAX_TARGET_ROLL_RAD
+    )
+    assert inward_authority["retained_roll_reference_applied"] is False
+
+    # Re-evaluating without a newer frame cannot create a stored roll target.
     no_wire = session.adjacent_precredit_successor_steering_authority(
         track_id=replacement.track_id,
         now_monotonic_ns=(
             update.observation_monotonic_ns + 9_000_000
         ),
     )
-    assert no_wire["target_roll_rad"] == pytest.approx(0.0)
+    assert no_wire["target_roll_rad"] == pytest.approx(
+        inward_authority["target_roll_rad"]
+    )
     assert no_wire["retained_roll_reference_applied"] is False
     assert (
         abs(float(no_wire["yaw_rate_rad_s"]))
@@ -1218,6 +1356,15 @@ def test_graph_vetted_adjacent_rebind_uses_yaw_without_inheriting_bank():
     assert promoted.promotion_count == 1
     handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
     assert handoff is None
+    post_credit = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=activation_ns,
+    )
+    assert post_credit["target_roll_rad"] == pytest.approx(
+        post_credit["unconstrained_target_roll_rad"]
+    )
+    assert abs(float(post_credit["target_roll_rad"])) < (
+        MAX_TARGET_ROLL_RAD
+    )
 
 
 def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
@@ -4452,8 +4599,9 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_yaw_recovery() -> None:
         track_id=reviewed_id,
         now_monotonic_ns=authority_ns,
     )
-    level_roll = float(precredit["target_roll_rad"])
-    assert level_roll == pytest.approx(0.0)
+    precredit_roll = float(precredit["target_roll_rad"])
+    assert precredit_roll == pytest.approx(-MAX_TARGET_ROLL_RAD)
+    assert precredit["outward_full_bank_applied"] is True
     assert precredit["retained_roll_reference_applied"] is False
     assert (
         abs(float(precredit["yaw_rate_rad_s"]))
@@ -4461,7 +4609,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_yaw_recovery() -> None:
     )
     wire_ns = authority_ns + 500_000
     session.record_wire_acceptance(
-        target_roll_rad=level_roll,
+        target_roll_rad=precredit_roll,
         target_pitch_rad=float(precredit["target_pitch_rad"]),
         yaw_rate_rad_s=float(precredit["yaw_rate_rad_s"]),
         thrust=float(precredit["thrust"]),
@@ -4749,6 +4897,8 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_yaw_recovery() -> None:
     assert authority["steering_only"] is True
     assert authority["passage_authority"] is False
     assert authority["advance_authority"] is False
+
+
     assert authority["target_roll_rad"] == pytest.approx(
         authority["unconstrained_target_roll_rad"]
     )
@@ -4794,6 +4944,99 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_yaw_recovery() -> None:
     assert release["passage_authority"] is False
     assert release["advance_authority"] is False
     assert session.post_credit_successor_steering_active is False
+
+
+def test_same_gate_rebind_replaces_dynamic_current_on_binding_frame() -> None:
+    tracker, graph, snapshot, current_id = _single_gate_graph(
+        width=0.34,
+        height=0.36,
+    )
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    _accept_proposal(session, tracker, _observe(planner, snapshot, tracker))
+
+    blank = replace(_frame(6), detections=())
+    tracker.update(blank)
+    snapshot = graph.observe(tracker)
+    assert snapshot.latest_race_status is not None
+    search = graph.begin_same_gate_rebind_search(
+        tracker,
+        race_status=snapshot.latest_race_status,
+        camera_token_at_start=blank.token,
+    )
+
+    rebound: ConfirmedSameGateRebind | None = None
+    for sequence in range(7, 10):
+        fresh = replace(
+            _frame(sequence),
+            detections=(
+                _detection(
+                    2,
+                    0.84 + 0.03 * (sequence - 7),
+                    center_y=-0.62,
+                    width=0.06,
+                    height=0.16,
+                    clipping=FrameEdge.RIGHT,
+                    center_censored=True,
+                ),
+            ),
+        )
+        tracker.update(fresh)
+        graph.observe(tracker)
+        outcome = graph.try_confirm_same_gate_rebind(
+            tracker,
+            search=search,
+            race_status=search.race_status_at_start,
+            camera_token_at_binding=fresh.token,
+        )
+        if type(outcome) is ConfirmedSameGateRebind:
+            rebound = outcome
+    assert rebound is not None
+    assert rebound.retired_track_id == current_id
+
+    evidence = session.rebind_confirmed_same_gate(rebound, tracker)
+    rebound_snapshot = graph.latest_snapshot
+    assert rebound_snapshot is not None
+    resumed = DynamicRollingVisualApproachServo(
+        rebound.rebound_track_id,
+        rebound.gate_index,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    proposal = _observe(resumed, rebound_snapshot, tracker)
+
+    assert evidence["gate_index"] == 0
+    assert evidence["retired_track_id"] == current_id
+    assert evidence["rebound_track_id"] == rebound.rebound_track_id
+    assert evidence["current_track_id"] == rebound.rebound_track_id
+    assert evidence["fresh_state_available"] is True
+    assert evidence["same_gate_current_authority"] is True
+    assert evidence["cross_gap_identity_claimed"] is False
+    assert evidence["passage_authority"] is False
+    assert evidence["advance_authority"] is False
+    state = session.core.course_state()
+    assert state.current_gate_index == 0
+    assert state.current_track_id == rebound.rebound_track_id
+    assert state.promotion_count == 0
+    assert session._same_gate_steering_anchor is None  # noqa: SLF001
+    assert all(
+        math.isfinite(value)
+        for value in (
+            proposal.servo_output.target_roll_rad,
+            proposal.servo_output.target_pitch_rad,
+            proposal.servo_output.yaw_rate_rad_s,
+            proposal.servo_output.thrust,
+        )
+    )
 
 
 def test_post_credit_activation_latency_never_extends_prediction_expiry():
