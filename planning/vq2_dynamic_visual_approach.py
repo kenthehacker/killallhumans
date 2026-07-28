@@ -2646,13 +2646,21 @@ class DynamicVisualCourseSession:
             self.core.config.max_abs_bearing_rad
         )
         if (
-            decision.current_gate_index != state.current_gate_index
-            or decision.current_track_id != state.current_track_id
-            or remaining_horizon_s <= 0.0
+            remaining_horizon_s <= 0.0
             or any(
                 value > maximum_bearing_std_rad + 1e-12
                 for value in decision.current_bearing_std_rad
             )
+        ):
+            # Expired local geometry is a normal navigation state.  The stage
+            # will retire propagation and continue with fresh-publication
+            # yaw-only search; it must not abort the course.
+            raise PropagatedCurrentVisibilityGapUnavailable(
+                "propagated visibility gap exhausted local steering state"
+            )
+        if (
+            decision.current_gate_index != state.current_gate_index
+            or decision.current_track_id != state.current_track_id
             or not all(
                 math.isfinite(float(value))
                 for value in (

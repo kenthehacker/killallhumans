@@ -2307,8 +2307,8 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
     )
 
     with pytest.raises(
-        DynamicCourseError,
-        match="guidance is invalid",
+        PropagatedCurrentVisibilityGapUnavailable,
+        match="exhausted local steering state",
     ):
         session.propagated_current_visibility_gap_authority(
             track=tracker.track(current_id),
