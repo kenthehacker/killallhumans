@@ -207,6 +207,51 @@ def test_fresh_top_boundary_recovery_is_lifecycle_scoped(
 
 
 @pytest.mark.parametrize(
+    ("mode", "lifecycle", "measurement", "expected"),
+    (
+        (
+            VisualApproachMode.APPROACH,
+            CourseLifecycle.APPROACH,
+            None,
+            True,
+        ),
+        (
+            VisualApproachMode.PROMOTE_REACQUIRE,
+            CourseLifecycle.PROMOTE_REACQUIRE,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            False,
+        ),
+        (
+            VisualApproachMode.APPROACH,
+            CourseLifecycle.PROMOTE_REACQUIRE,
+            None,
+            False,
+        ),
+        (
+            VisualApproachMode.PASSAGE,
+            CourseLifecycle.PASSAGE_ARMED,
+            None,
+            False,
+        ),
+    ),
+)
+def test_fresh_top_corner_continuity_is_approach_only(
+    mode,
+    lifecycle,
+    measurement,
+    expected,
+):
+    assert (
+        course_stage._fresh_top_corner_continuity_lifecycle_eligible(
+            mode=mode,
+            lifecycle=lifecycle,
+            recovery_measurement_mode=measurement,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
     (
         "mode",
         "lifecycle",
@@ -3325,7 +3370,10 @@ def _fresh_post_credit_top_boundary_case():
         tracker_frame_sequence=50,
         clipping=FrameEdge.TOP,
         bbox_norm=(0.72, 0.0, 0.88, 0.24),
+        center_norm=(0.80, -0.76),
         center_censored=True,
+        confidence=0.90,
+        association_confidence=0.88,
     )
     track = SimpleNamespace(
         track_id="track-1",
@@ -3337,7 +3385,11 @@ def _fresh_post_credit_top_boundary_case():
         ambiguous=False,
         missed_frame_count=0,
         clipping=FrameEdge.TOP,
+        bbox_norm=(0.72, 0.0, 0.88, 0.24),
         center_censored=True,
+        center_norm=(0.80, -0.76),
+        confidence=0.90,
+        association_confidence=0.88,
     )
     current = SimpleNamespace(
         track_id="track-1",
@@ -3348,6 +3400,11 @@ def _fresh_post_credit_top_boundary_case():
         missed_count=0,
         clipping=FrameEdge.TOP,
         censored_axes=(False, False),
+        state_monotonic_ns=1_000_000_000,
+        last_measurement_monotonic_ns=1_000_000_000,
+        raw_center_norm=(0.80, -0.76),
+        raw_log_scale=None,
+        aperture_half_size_norm=None,
         body_to_reference_wxyz=(1.0, 0.0, 0.0, 0.0),
         body_rates_rad_s=(0.0, -0.095, 0.0),
     )
@@ -3397,6 +3454,33 @@ def test_fresh_exact_top_boundary_alone_preempts_propagated_fov(
     )
 
 
+@pytest.mark.parametrize(
+    ("clipping", "expected"),
+    (
+        (FrameEdge.TOP, FrameEdge.NONE),
+        (FrameEdge.TOP | FrameEdge.LEFT, FrameEdge.LEFT),
+        (FrameEdge.TOP | FrameEdge.RIGHT, FrameEdge.RIGHT),
+        (FrameEdge.LEFT, None),
+        (FrameEdge.RIGHT, None),
+        (FrameEdge.TOP | FrameEdge.BOTTOM, None),
+        (
+            FrameEdge.TOP | FrameEdge.LEFT | FrameEdge.RIGHT,
+            None,
+        ),
+    ),
+)
+def test_fresh_top_boundary_recovery_classifies_only_one_horizontal_corner(
+    clipping,
+    expected,
+):
+    assert (
+        course_stage._fresh_top_boundary_recovery_horizontal_edge(
+            clipping
+        )
+        == expected
+    )
+
+
 def test_fresh_current_top_boundary_admits_exact_authoritative_publication(
     monkeypatch,
 ):
@@ -3419,6 +3503,254 @@ def test_fresh_current_top_boundary_admits_exact_authoritative_publication(
     assert boundary.current is state.current
     assert boundary.track is snapshot.current_track
     assert boundary.sample is snapshot.current_track.history[-1]
+    assert boundary.horizontal_edge is FrameEdge.NONE
+
+
+def _fresh_top_corner_boundary_case(horizontal_edge):
+    state, _decision, _authority, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    clipping = FrameEdge.TOP | horizontal_edge
+    if horizontal_edge is FrameEdge.LEFT:
+        bbox = (0.0, 0.0, 0.31, 0.40)
+        center = (-0.69, -0.60)
+    else:
+        bbox = (0.69, 0.0, 1.0, 0.40)
+        center = (0.69, -0.60)
+    sample = snapshot.current_track.history[-1]
+    sample.clipping = clipping
+    sample.bbox_norm = bbox
+    sample.center_norm = center
+    snapshot.current_track.clipping = clipping
+    snapshot.current_track.bbox_norm = bbox
+    snapshot.current_track.center_norm = center
+    state.current.clipping = clipping
+    state.current.censored_axes = (True, True)
+    state.current.raw_center_norm = center
+    return state, snapshot
+
+
+@pytest.mark.parametrize(
+    "horizontal_edge",
+    (FrameEdge.LEFT, FrameEdge.RIGHT),
+)
+def test_fresh_current_top_corner_admits_exact_authoritative_publication(
+    monkeypatch,
+    horizontal_edge,
+):
+    state, snapshot = _fresh_top_corner_boundary_case(horizontal_edge)
+    session = DynamicVisualCourseSession()
+    monkeypatch.setattr(session.core, "course_state", lambda: state)
+
+    boundary = course_stage._fresh_current_top_boundary_authority(
+        session,
+        snapshot=snapshot,
+        current_gate_index=1,
+        current_track_id="track-1",
+    )
+
+    assert boundary.horizontal_edge is horizontal_edge
+    assert boundary.current.censored_axes == (True, True)
+    assert boundary.track.clipping == FrameEdge.TOP | horizontal_edge
+    assert boundary.sample.clipping == boundary.track.clipping
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "unsaturated_horizontal_edge",
+        "dynamic_clipping_mismatch",
+        "opposite_center",
+        "track_sample_center_mismatch",
+        "track_sample_bbox_mismatch",
+        "three_edges",
+    ),
+)
+def test_fresh_current_top_corner_refuses_inexact_publication(
+    monkeypatch,
+    mutation,
+):
+    state, snapshot = _fresh_top_corner_boundary_case(FrameEdge.RIGHT)
+    sample = snapshot.current_track.history[-1]
+    if mutation == "unsaturated_horizontal_edge":
+        sample.bbox_norm = (0.69, 0.0, 0.99, 0.40)
+    elif mutation == "dynamic_clipping_mismatch":
+        state.current.clipping = FrameEdge.TOP
+    elif mutation == "opposite_center":
+        sample.center_norm = (-0.69, -0.60)
+        snapshot.current_track.center_norm = (-0.69, -0.60)
+    elif mutation == "track_sample_center_mismatch":
+        snapshot.current_track.center_norm = (0.68, -0.60)
+    elif mutation == "track_sample_bbox_mismatch":
+        snapshot.current_track.bbox_norm = (
+            0.68,
+            0.0,
+            1.0,
+            0.40,
+        )
+    else:
+        clipping = (
+            FrameEdge.TOP | FrameEdge.RIGHT | FrameEdge.BOTTOM
+        )
+        sample.clipping = clipping
+        snapshot.current_track.clipping = clipping
+        state.current.clipping = clipping
+    session = DynamicVisualCourseSession()
+    monkeypatch.setattr(session.core, "course_state", lambda: state)
+
+    with pytest.raises(
+        ValueError,
+        match="differs from authoritative lineage",
+    ):
+        course_stage._fresh_current_top_boundary_authority(
+            session,
+            snapshot=snapshot,
+            current_gate_index=1,
+            current_track_id="track-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("horizontal_edge", "target_roll", "yaw_rate"),
+    (
+        (FrameEdge.LEFT, 0.35, 0.15),
+        (FrameEdge.RIGHT, -0.35, -0.15),
+    ),
+)
+def test_fresh_top_corner_continuity_requires_inward_roll_and_yaw(
+    monkeypatch,
+    horizontal_edge,
+    target_roll,
+    yaw_rate,
+):
+    state, snapshot = _fresh_top_corner_boundary_case(horizontal_edge)
+    session = DynamicVisualCourseSession()
+    monkeypatch.setattr(session.core, "course_state", lambda: state)
+    boundary = course_stage._fresh_current_top_boundary_authority(
+        session,
+        snapshot=snapshot,
+        current_gate_index=1,
+        current_track_id="track-1",
+    )
+    prior_decision = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        command=SimpleNamespace(
+            target_roll_rad=target_roll,
+            yaw_rate_rad_s=yaw_rate,
+        ),
+    )
+
+    course_stage._validate_fresh_top_corner_continuity_hold(
+        boundary,
+        {
+            "target_roll_rad": target_roll,
+            "yaw_rate_rad_s": yaw_rate,
+            "source_wire_start_monotonic_ns": 1_000_000_000,
+        },
+        roll_guidance_sign=-1.0,
+        right_image_error_to_controller_yaw_sign=-1,
+        prior_decision=prior_decision,
+    )
+    for outward in (
+        {
+            "target_roll_rad": -target_roll,
+            "yaw_rate_rad_s": yaw_rate,
+        },
+        {
+            "target_roll_rad": target_roll,
+            "yaw_rate_rad_s": -yaw_rate,
+        },
+        {
+            "target_roll_rad": 0.0,
+            "yaw_rate_rad_s": yaw_rate,
+        },
+        {
+            "target_roll_rad": target_roll,
+            "yaw_rate_rad_s": 0.0,
+        },
+    ):
+        outward["source_wire_start_monotonic_ns"] = 1_000_000_000
+        outward_prior_decision = SimpleNamespace(
+            current_gate_index=1,
+            current_track_id="track-1",
+            command=SimpleNamespace(
+                target_roll_rad=outward["target_roll_rad"],
+                yaw_rate_rad_s=outward["yaw_rate_rad_s"],
+            ),
+        )
+        with pytest.raises(ValueError, match="does not point inward"):
+            course_stage._validate_fresh_top_corner_continuity_hold(
+                boundary,
+                outward,
+                roll_guidance_sign=-1.0,
+                right_image_error_to_controller_yaw_sign=-1,
+                prior_decision=outward_prior_decision,
+            )
+    wrong_lineage = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="other-track",
+        command=prior_decision.command,
+    )
+    with pytest.raises(ValueError, match="structure is invalid"):
+        course_stage._validate_fresh_top_corner_continuity_hold(
+            boundary,
+            {
+                "target_roll_rad": target_roll,
+                "yaw_rate_rad_s": yaw_rate,
+                "source_wire_start_monotonic_ns": 1_000_000_000,
+            },
+            roll_guidance_sign=-1.0,
+            right_image_error_to_controller_yaw_sign=-1,
+            prior_decision=wrong_lineage,
+        )
+
+
+@pytest.mark.parametrize(
+    ("horizontal_edge", "clipping", "center_censored", "expected"),
+    (
+        (
+            FrameEdge.RIGHT,
+            FrameEdge.TOP,
+            True,
+            "single_axis_geometry_reacquired",
+        ),
+        (
+            FrameEdge.RIGHT,
+            FrameEdge.RIGHT,
+            True,
+            "single_axis_geometry_reacquired",
+        ),
+        (
+            FrameEdge.LEFT,
+            FrameEdge.NONE,
+            False,
+            "clean_geometry_reacquired",
+        ),
+        (FrameEdge.NONE, FrameEdge.TOP, True, None),
+        (
+            FrameEdge.RIGHT,
+            FrameEdge.TOP | FrameEdge.RIGHT,
+            True,
+            None,
+        ),
+        (FrameEdge.RIGHT, FrameEdge.LEFT, True, None),
+    ),
+)
+def test_top_corner_continuity_classifies_only_reduced_censorship(
+    horizontal_edge,
+    clipping,
+    center_censored,
+    expected,
+):
+    assert (
+        course_stage._approach_top_recovery_reacquisition_outcome(
+            recovery_horizontal_edge=horizontal_edge,
+            clipping=clipping,
+            center_censored=center_censored,
+        )
+        == expected
+    )
 
 
 def test_fresh_raw_top_boundary_accepts_same_frame_unclipped_inner_state(
@@ -3849,6 +4181,7 @@ def test_fresh_post_credit_top_boundary_gates_closure_without_aperture():
     allocation = _dd89_top_censored_recovery(
         current_aperture_propagated=False,
         current_aperture_dynamics_qualified=False,
+        current_censored_axes=state.current.censored_axes,
         stable_center_norm=(0.30619, 0.0),
         expansion_rate_s=-0.0099,
         time_to_contact_s=None,
@@ -3879,6 +4212,63 @@ def test_fresh_post_credit_top_boundary_gates_closure_without_aperture():
     assert allocation.advance_authority is False
     assert successor_authority["target_pitch_rad"] == pytest.approx(0.12)
     assert successor_authority["thrust"] == pytest.approx(0.275)
+
+
+@pytest.mark.parametrize(
+    "horizontal_edge",
+    (FrameEdge.LEFT, FrameEdge.RIGHT),
+)
+def test_fresh_top_corner_allocates_only_bounded_continuity(
+    monkeypatch,
+    horizontal_edge,
+):
+    state, snapshot = _fresh_top_corner_boundary_case(horizontal_edge)
+    session = DynamicVisualCourseSession()
+    monkeypatch.setattr(session.core, "course_state", lambda: state)
+    boundary = course_stage._fresh_current_top_boundary_authority(
+        session,
+        snapshot=snapshot,
+        current_gate_index=1,
+        current_track_id="track-1",
+    )
+
+    allocation = _dd89_top_censored_recovery(
+        clipping=FrameEdge.TOP | horizontal_edge,
+        current_censored_axes=(True, True),
+        current_aperture_propagated=False,
+        current_aperture_dynamics_qualified=False,
+        stable_center_norm=snapshot.current_track.center_norm,
+        expansion_rate_s=0.0,
+        time_to_contact_s=None,
+        fresh_boundary_current_authority=boundary,
+    )
+
+    assert allocation is not None
+    assert allocation.allocated_target_pitch_rad == pytest.approx(0.12)
+    assert allocation.allocated_thrust == pytest.approx(0.32)
+    assert allocation.fresh_boundary_current_authority is True
+    assert allocation.forward_closure_authorized is False
+    assert allocation.steering_only is True
+    assert allocation.passage_authority is False
+    assert allocation.advance_authority is False
+    opposite_edge = (
+        FrameEdge.RIGHT
+        if horizontal_edge is FrameEdge.LEFT
+        else FrameEdge.LEFT
+    )
+    assert (
+        _dd89_top_censored_recovery(
+            clipping=FrameEdge.TOP | opposite_edge,
+            current_censored_axes=(True, True),
+            current_aperture_propagated=False,
+            current_aperture_dynamics_qualified=False,
+            stable_center_norm=snapshot.current_track.center_norm,
+            expansion_rate_s=0.0,
+            time_to_contact_s=None,
+            fresh_boundary_current_authority=boundary,
+        )
+        is None
+    )
 
 
 def _retained_post_credit_top_recovery_case():

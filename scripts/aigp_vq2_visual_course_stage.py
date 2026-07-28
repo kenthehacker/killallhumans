@@ -164,6 +164,9 @@ APPROACH_CURRENT_AMBIGUITY_EXACT_RAW_LEASE_BASIS = (
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
+FRESH_TOP_CORNER_CONTINUITY_BASIS = (
+    "fresh-top-corner-inward-command-continuity-v1"
+)
 NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS = (
     "current-top-nonrapid-off-axis-fov-priority-v2"
 )
@@ -280,6 +283,21 @@ def _fresh_top_boundary_recovery_lifecycle_eligible(
             and recovery_measurement_mode
             is PostCreditMeasurementMode.ONE_EDGE_CENSORED
         )
+    )
+
+
+def _fresh_top_corner_continuity_lifecycle_eligible(
+    *,
+    mode: VisualApproachMode,
+    lifecycle: CourseLifecycle,
+    recovery_measurement_mode: Optional[PostCreditMeasurementMode],
+) -> bool:
+    """Keep two-axis corner continuity inside ordinary current-gate approach."""
+
+    return bool(
+        mode is VisualApproachMode.APPROACH
+        and lifecycle is CourseLifecycle.APPROACH
+        and recovery_measurement_mode is None
     )
 
 
@@ -720,9 +738,136 @@ class _FreshCurrentTopBoundaryAuthority:
     track_id: str
     camera_token: CameraFrameToken
     tracker_frame_sequence: int
+    horizontal_edge: FrameEdge
     current: Any
     track: Any
     sample: Any
+
+
+def _fresh_top_boundary_recovery_horizontal_edge(
+    clipping: Any,
+) -> Optional[FrameEdge]:
+    """Classify exact TOP or TOP-plus-one-horizontal recovery geometry."""
+
+    if type(clipping) is not FrameEdge:
+        return None
+    if clipping == FrameEdge.TOP:
+        return FrameEdge.NONE
+    if clipping == (FrameEdge.TOP | FrameEdge.LEFT):
+        return FrameEdge.LEFT
+    if clipping == (FrameEdge.TOP | FrameEdge.RIGHT):
+        return FrameEdge.RIGHT
+    return None
+
+
+def _validate_fresh_top_corner_continuity_hold(
+    boundary: _FreshCurrentTopBoundaryAuthority,
+    hold: Mapping[str, Any],
+    *,
+    roll_guidance_sign: float,
+    right_image_error_to_controller_yaw_sign: int,
+    prior_decision: Any,
+) -> None:
+    """Require the last accepted lateral command to point into the image."""
+
+    if (
+        type(boundary) is not _FreshCurrentTopBoundaryAuthority
+        or boundary.horizontal_edge
+        not in {FrameEdge.LEFT, FrameEdge.RIGHT}
+        or not isinstance(hold, Mapping)
+        or right_image_error_to_controller_yaw_sign not in {-1, 1}
+        or getattr(prior_decision, "current_gate_index", None)
+        != boundary.gate_index
+        or getattr(prior_decision, "current_track_id", None)
+        != boundary.track_id
+    ):
+        raise ValueError("fresh TOP-corner continuity structure is invalid")
+    try:
+        target_roll = float(hold["target_roll_rad"])
+        yaw_rate = float(hold["yaw_rate_rad_s"])
+        source_wire_start_monotonic_ns = hold[
+            "source_wire_start_monotonic_ns"
+        ]
+        guidance_sign = float(roll_guidance_sign)
+        prior_command = prior_decision.command
+        prior_target_roll = float(prior_command.target_roll_rad)
+        prior_yaw_rate = float(prior_command.yaw_rate_rad_s)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "fresh TOP-corner continuity command is invalid"
+        ) from exc
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                target_roll,
+                yaw_rate,
+                guidance_sign,
+                prior_target_roll,
+                prior_yaw_rate,
+            )
+        )
+        or abs(guidance_sign) <= 1e-12
+        or type(source_wire_start_monotonic_ns) is not int
+        or source_wire_start_monotonic_ns < 0
+        or abs(target_roll) > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        or abs(yaw_rate) > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+        or not math.isclose(
+            target_roll,
+            prior_target_roll,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        or not math.isclose(
+            yaw_rate,
+            prior_yaw_rate,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("fresh TOP-corner continuity command is invalid")
+    image_side = (
+        -1.0
+        if boundary.horizontal_edge == FrameEdge.LEFT
+        else 1.0
+    )
+    if (
+        target_roll * guidance_sign * image_side <= 1e-12
+        or (
+            yaw_rate
+            * right_image_error_to_controller_yaw_sign
+            * image_side
+            <= 1e-12
+        )
+    ):
+        raise ValueError(
+            "fresh TOP-corner continuity command does not point inward"
+        )
+
+
+def _approach_top_recovery_reacquisition_outcome(
+    *,
+    recovery_horizontal_edge: Any,
+    clipping: Any,
+    center_censored: Any,
+) -> Optional[str]:
+    """Classify geometry that safely ends the bounded TOP recovery bridge."""
+
+    if (
+        type(recovery_horizontal_edge) is not FrameEdge
+        or type(clipping) is not FrameEdge
+        or type(center_censored) is not bool
+    ):
+        return None
+    if clipping == FrameEdge.NONE and not center_censored:
+        return "clean_geometry_reacquired"
+    if (
+        recovery_horizontal_edge in {FrameEdge.LEFT, FrameEdge.RIGHT}
+        and clipping in {FrameEdge.TOP, recovery_horizontal_edge}
+        and center_censored
+    ):
+        return "single_axis_geometry_reacquired"
+    return None
 
 
 def _fresh_exact_top_boundary_preempts_propagated_fov(
@@ -895,7 +1040,12 @@ def _fresh_current_top_boundary_authority(
     current_gate_index: int,
     current_track_id: str,
 ) -> _FreshCurrentTopBoundaryAuthority:
-    """Bind one fresh TOP boundary without consuming stale aperture state."""
+    """Bind one fresh TOP boundary without consuming stale aperture state.
+
+    A TOP-plus-one-horizontal corner remains admissible only as exact,
+    same-publication lineage for the separately bounded inward-command bridge.
+    It does not create a two-axis aperture measurement.
+    """
 
     if type(session) is not DynamicVisualCourseSession:
         raise ValueError("fresh current TOP boundary lacks dynamic authority")
@@ -910,11 +1060,72 @@ def _fresh_current_top_boundary_authority(
         else history[-1]
     )
     raw_top: Optional[float] = None
+    raw_bbox: Optional[tuple[float, float, float, float]] = None
     if sample is not None:
         try:
             raw_top = _raw_bbox_top_image_down(sample.bbox_norm)
+            raw_bbox = tuple(map(float, sample.bbox_norm))
         except (AttributeError, TypeError, ValueError):
             raw_top = None
+            raw_bbox = None
+    track_clipping = getattr(track, "clipping", None)
+    horizontal_edge = _fresh_top_boundary_recovery_horizontal_edge(
+        track_clipping
+    )
+    current_clipping = getattr(current, "clipping", None)
+    current_censored_axes = getattr(current, "censored_axes", None)
+    corner_geometry_matches = bool(
+        horizontal_edge in {FrameEdge.LEFT, FrameEdge.RIGHT}
+        and current_clipping == track_clipping
+        and current_censored_axes == (True, True)
+        and getattr(current, "state_monotonic_ns", None)
+        == getattr(current, "last_measurement_monotonic_ns", None)
+        and getattr(current, "raw_center_norm", None)
+        == getattr(track, "center_norm", None)
+        and getattr(current, "raw_log_scale", None) is None
+        and getattr(current, "aperture_half_size_norm", None) is None
+    )
+    top_geometry_matches = bool(
+        horizontal_edge == FrameEdge.NONE
+        and current_clipping in {FrameEdge.NONE, FrameEdge.TOP}
+        and current_censored_axes in {(False, True), (False, False)}
+    )
+    corner_raw_boundary_matches = True
+    if horizontal_edge in {FrameEdge.LEFT, FrameEdge.RIGHT}:
+        sample_center_norm = getattr(sample, "center_norm", None)
+        track_center_norm = getattr(track, "center_norm", None)
+        track_bbox_norm = getattr(track, "bbox_norm", None)
+        try:
+            sample_center = tuple(map(float, sample_center_norm))
+            track_center = tuple(map(float, track_center_norm))
+            track_bbox = tuple(map(float, track_bbox_norm))
+        except (IndexError, TypeError, ValueError):
+            sample_center = ()
+            track_center = ()
+            track_bbox = ()
+        center_x = (
+            math.nan
+            if len(sample_center) != 2
+            else sample_center[0]
+        )
+        left = math.nan if raw_bbox is None else raw_bbox[0]
+        right = math.nan if raw_bbox is None else raw_bbox[2]
+        image_side = (
+            -1.0
+            if horizontal_edge == FrameEdge.LEFT
+            else 1.0
+        )
+        corner_raw_boundary_matches = bool(
+            math.isfinite(center_x)
+            and center_x * image_side > 0.0
+            and sample_center == track_center
+            and raw_bbox == track_bbox
+            and (
+                left <= 1e-12
+                if horizontal_edge == FrameEdge.LEFT
+                else right >= 1.0 - 1e-12
+            )
+        )
     if (
         type(current_gate_index) is not int
         or current_gate_index < 0
@@ -945,25 +1156,23 @@ def _fresh_current_top_boundary_authority(
         != getattr(sample, "tracker_frame_sequence", None)
         or getattr(current, "stream_generation", None)
         != token.generation
-        # The dynamic state may carry a complete tracking-only inner fit from
-        # this same publication, so its control geometry remains unclipped
-        # while the exact raw outer support below owns the TOP boundary.
-        or getattr(current, "clipping", None)
-        not in {FrameEdge.NONE, FrameEdge.TOP}
-        or getattr(current, "censored_axes", None)
-        not in {(False, True), (False, False)}
+        or horizontal_edge is None
+        # TOP-only may retain a complete same-frame tracking inner fit.
+        # A corner has no observable image axis, so it requires exact matching
+        # dynamic censorship and can only reach the bounded continuity bridge.
+        or not (top_geometry_matches or corner_geometry_matches)
         or not bool(getattr(current, "visible", False))
         or bool(getattr(current, "ambiguous", True))
         or getattr(current, "missed_count", None) != 0
         or not bool(getattr(track, "visible", False))
         or bool(getattr(track, "ambiguous", True))
         or getattr(track, "missed_frame_count", None) != 0
-        or getattr(track, "clipping", None) is not FrameEdge.TOP
-        or getattr(sample, "clipping", None) is not FrameEdge.TOP
+        or getattr(sample, "clipping", None) != track_clipping
         or getattr(track, "center_censored", None) is not True
         or getattr(sample, "center_censored", None) is not True
         or raw_top is None
         or raw_top > -1.0 + 1e-12
+        or not corner_raw_boundary_matches
     ):
         raise ValueError(
             "fresh current TOP boundary differs from authoritative lineage"
@@ -973,6 +1182,7 @@ def _fresh_current_top_boundary_authority(
         track_id=current_track_id,
         camera_token=token,
         tracker_frame_sequence=sample.tracker_frame_sequence,
+        horizontal_edge=horizontal_edge,
         current=current,
         track=track,
         sample=sample,
@@ -1048,6 +1258,7 @@ def _fresh_post_credit_top_boundary_authority(
         track_id=track_id,
         camera_token=token,
         tracker_frame_sequence=sample.tracker_frame_sequence,
+        horizontal_edge=FrameEdge.NONE,
         current=current,
         track=track,
         sample=sample,
@@ -1271,6 +1482,43 @@ def _allocate_fresh_top_censored_closure_recovery(
     boundary_authorized = (
         fresh_boundary_current_authority is not None
     )
+    boundary_horizontal_edge = (
+        None
+        if fresh_boundary_current_authority is None
+        else getattr(
+            fresh_boundary_current_authority,
+            "horizontal_edge",
+            None,
+        )
+    )
+    clipping_horizontal_edge = (
+        _fresh_top_boundary_recovery_horizontal_edge(clipping)
+    )
+    boundary_lineage_matches = not boundary_authorized
+    if (
+        type(fresh_boundary_current_authority)
+        is _FreshCurrentTopBoundaryAuthority
+    ):
+        boundary_lineage_matches = bool(
+            getattr(
+                fresh_boundary_current_authority.track,
+                "clipping",
+                None,
+            )
+            == clipping
+            and getattr(
+                fresh_boundary_current_authority.sample,
+                "clipping",
+                None,
+            )
+            == clipping
+            and getattr(
+                fresh_boundary_current_authority.current,
+                "censored_axes",
+                None,
+            )
+            == current_censored_axes
+        )
     if (
         type(clipping) is not FrameEdge
         or (
@@ -1357,16 +1605,34 @@ def _allocate_fresh_top_censored_closure_recovery(
     ):
         raise ValueError("fresh TOP recovery input is invalid")
     if not (
-        clipping is FrameEdge.TOP
+        (
+            clipping_horizontal_edge is not None
+            and boundary_lineage_matches
+            and (
+                not boundary_authorized
+                or boundary_horizontal_edge == clipping_horizontal_edge
+            )
+        )
         and center_censored
         and current_visible
         and not current_ambiguous
         and current_missed_count == 0
         and (
-            current_censored_axes == (False, True)
+            (
+                clipping_horizontal_edge == FrameEdge.NONE
+                and (
+                    current_censored_axes == (False, True)
+                    or (
+                        boundary_authorized
+                        and current_censored_axes == (False, False)
+                    )
+                )
+            )
             or (
                 boundary_authorized
-                and current_censored_axes == (False, False)
+                and clipping_horizontal_edge
+                in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                and current_censored_axes == (True, True)
             )
         )
         and (
@@ -10782,6 +11048,15 @@ async def _run_visual_course_stage_impl(
                     "current_track",
                     None,
                 )
+                fresh_top_horizontal_edge = (
+                    _fresh_top_boundary_recovery_horizontal_edge(
+                        getattr(
+                            fresh_top_track,
+                            "clipping",
+                            None,
+                        )
+                    )
+                )
                 fresh_top_boundary_eligible = bool(
                     type(exc)
                     is VisualApproachCurrentGeometryUnavailable
@@ -10791,6 +11066,22 @@ async def _run_visual_course_stage_impl(
                         recovery_measurement_mode=(
                             recovery_measurement_mode
                         ),
+                    )
+                    and (
+                        fresh_top_horizontal_edge == FrameEdge.NONE
+                        or (
+                            fresh_top_horizontal_edge
+                            in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                            and (
+                                _fresh_top_corner_continuity_lifecycle_eligible(
+                                    mode=mode,
+                                    lifecycle=lifecycle,
+                                    recovery_measurement_mode=(
+                                        recovery_measurement_mode
+                                    ),
+                                )
+                            )
+                        )
                     )
                     and type(runtime.dynamic_controller)
                     is DynamicVisualCourseSession
@@ -10806,8 +11097,7 @@ async def _run_visual_course_stage_impl(
                     and getattr(snapshot, "withholding_reason", None)
                     is None
                     and getattr(snapshot, "race_finished", None) is False
-                    and getattr(fresh_top_track, "clipping", None)
-                    is FrameEdge.TOP
+                    and fresh_top_horizontal_edge is not None
                 )
                 if fresh_top_boundary_eligible:
                     dynamic_controller = runtime.dynamic_controller
@@ -10843,9 +11133,35 @@ async def _run_visual_course_stage_impl(
                                 "command"
                             )
                         recovery_config = dynamic_controller.core.config
+                        if boundary.horizontal_edge in {
+                            FrameEdge.LEFT,
+                            FrameEdge.RIGHT,
+                        }:
+                            yaw_profile = runtime.yaw_profile
+                            if yaw_profile is None:
+                                raise ValueError(
+                                    "fresh TOP-corner continuity lacks "
+                                    "calibrated yaw authority"
+                                )
+                            _validate_fresh_top_corner_continuity_hold(
+                                boundary,
+                                hold,
+                                roll_guidance_sign=(
+                                    recovery_config.roll_guidance_sign
+                                ),
+                                right_image_error_to_controller_yaw_sign=(
+                                    -int(
+                                        yaw_profile
+                                        .controller_to_image_sign
+                                    )
+                                ),
+                                prior_decision=(
+                                    dynamic_controller.last_decision
+                                ),
+                            )
                         recovery_current = boundary.current
                         recovery_center = tuple(
-                            map(float, boundary.track.center_norm)
+                            map(float, boundary.sample.center_norm)
                         )
                         recovery = (
                             _allocate_fresh_top_censored_closure_recovery(
@@ -10936,15 +11252,44 @@ async def _run_visual_course_stage_impl(
                         segment["approach_top_recovery"] = {
                             "basis": recovery.basis,
                             "authority_basis": (
-                                "fresh-authoritative-current-top-boundary-v1"
+                                FRESH_TOP_CORNER_CONTINUITY_BASIS
+                                if boundary.horizontal_edge
+                                in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                                else (
+                                    "fresh-authoritative-current-"
+                                    "top-boundary-v1"
+                                )
+                            ),
+                            "horizontal_edge": int(
+                                boundary.horizontal_edge
                             ),
                             "anchor_camera_token": asdict(token),
                             "first_censored_camera_token": asdict(token),
                             "last_censored_camera_token": None,
+                            "single_axis_reacquired_camera_token": None,
                             "clean_reacquired_camera_token": None,
                             "outcome": "braking",
                             "target_roll_rad": float(
                                 hold["target_roll_rad"]
+                            ),
+                            "source_target_roll_rad": float(
+                                hold["target_roll_rad"]
+                            ),
+                            "source_yaw_rate_rad_s": float(
+                                hold["yaw_rate_rad_s"]
+                            ),
+                            "source_wire_start_monotonic_ns": int(
+                                hold["source_wire_start_monotonic_ns"]
+                            ),
+                            "source_decision_gate_index": int(
+                                dynamic_controller
+                                .last_decision
+                                .current_gate_index
+                            ),
+                            "source_decision_track_id": (
+                                dynamic_controller
+                                .last_decision
+                                .current_track_id
                             ),
                             "requested_brake_target_pitch_rad": (
                                 recovery.requested_target_pitch_rad
@@ -10985,6 +11330,46 @@ async def _run_visual_course_stage_impl(
                             ),
                             **segment["approach_top_recovery"],
                         )
+                    else:
+                        recovery_summary = segment[
+                            "approach_top_recovery"
+                        ]
+                        if not isinstance(recovery_summary, dict):
+                            raise abort_type(
+                                "visual-course fresh TOP-boundary brake "
+                                "summary is invalid"
+                            ) from exc
+                        recorded_horizontal_edge = FrameEdge(
+                            int(
+                                recovery_summary.get(
+                                    "horizontal_edge",
+                                    int(FrameEdge.NONE),
+                                )
+                            )
+                        )
+                        if boundary.horizontal_edge in {
+                            FrameEdge.LEFT,
+                            FrameEdge.RIGHT,
+                        }:
+                            if recorded_horizontal_edge not in {
+                                FrameEdge.NONE,
+                                boundary.horizontal_edge,
+                            }:
+                                raise abort_type(
+                                    "visual-course fresh TOP-corner "
+                                    "continuity changed horizontal edge"
+                                ) from exc
+                            recovery_summary.update(
+                                {
+                                    "authority_basis": (
+                                        FRESH_TOP_CORNER_CONTINUITY_BASIS
+                                    ),
+                                    "horizontal_edge": int(
+                                        boundary.horizontal_edge
+                                    ),
+                                    "outcome": "braking",
+                                }
+                            )
                     recovery_elapsed_s = (
                         now - approach_top_recovery_started_s
                     )
@@ -11133,6 +11518,8 @@ async def _run_visual_course_stage_impl(
                             recovery.allocated_target_pitch_rad
                         ),
                         requested_thrust=recovery.allocated_thrust,
+                        boundary_clipping=int(boundary.track.clipping),
+                        horizontal_edge=int(boundary.horizontal_edge),
                         steering_only=True,
                         passage_authority=False,
                         advance_authority=False,
@@ -12270,40 +12657,101 @@ async def _run_visual_course_stage_impl(
                         "current_track",
                         None,
                     )
-                    if (
-                        current_track is None
-                        or getattr(current_track, "clipping", None)
-                        != FrameEdge.NONE
-                        or getattr(
-                            current_track,
-                            "center_censored",
-                            True,
+                    recovery_summary = segment[
+                        "approach_top_recovery"
+                    ]
+                    if not isinstance(recovery_summary, dict):
+                        raise abort_type(
+                            "visual-course approach TOP recovery summary "
+                            "is invalid"
                         )
-                        is not False
-                    ):
+                    try:
+                        recovery_horizontal_edge = FrameEdge(
+                            int(
+                                recovery_summary.get(
+                                    "horizontal_edge",
+                                    int(FrameEdge.NONE),
+                                )
+                            )
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise abort_type(
+                            "visual-course approach TOP recovery edge is "
+                            "invalid"
+                        ) from exc
+                    reacquired_clipping = getattr(
+                        current_track,
+                        "clipping",
+                        None,
+                    )
+                    reacquired_center_censored = getattr(
+                        current_track,
+                        "center_censored",
+                        True,
+                    )
+                    reacquisition_outcome = (
+                        None
+                        if current_track is None
+                        else _approach_top_recovery_reacquisition_outcome(
+                            recovery_horizontal_edge=(
+                                recovery_horizontal_edge
+                            ),
+                            clipping=reacquired_clipping,
+                            center_censored=(
+                                reacquired_center_censored
+                            ),
+                        )
+                    )
+                    if reacquisition_outcome is None:
                         raise abort_type(
                             "visual-course approach TOP recovery did not "
-                            "return through clean geometry"
+                            "return through reduced-censorship geometry"
                         )
-                    assert segment["approach_top_recovery"] is not None
-                    segment["approach_top_recovery"].update(
-                        {
-                            "clean_reacquired_camera_token": asdict(
-                                accepted.wire_camera_token
+                    if (
+                        reacquisition_outcome
+                        == "clean_geometry_reacquired"
+                    ):
+                        recovery_summary.update(
+                            {
+                                "clean_reacquired_camera_token": asdict(
+                                    accepted.wire_camera_token
+                                ),
+                                "outcome": reacquisition_outcome,
+                            }
+                        )
+                        host.recorder.emit(
+                            "visual_course_approach_top_recovery_completed",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/approach"
                             ),
-                            "outcome": "clean_geometry_reacquired",
-                        }
-                    )
-                    host.recorder.emit(
-                        "visual_course_approach_top_recovery_completed",
-                        gate_index=current_gate_index,
-                        stage=(
-                            f"{VISUAL_COURSE_STAGE}/gate"
-                            f"{current_gate_index}/approach"
-                        ),
-                        **segment["approach_top_recovery"],
-                    )
-                    approach_top_recovery_started_s = None
+                            **recovery_summary,
+                        )
+                        approach_top_recovery_started_s = None
+                    elif recovery_summary.get(
+                        "single_axis_reacquired_camera_token"
+                    ) is None:
+                        # Reduced censorship returns ordinary fresh steering
+                        # to the planner, but it does not renew the corner
+                        # bridge's original absolute time/frame budget.
+                        recovery_summary.update(
+                            {
+                                "single_axis_reacquired_camera_token": (
+                                    asdict(accepted.wire_camera_token)
+                                ),
+                                "outcome": reacquisition_outcome,
+                            }
+                        )
+                        host.recorder.emit(
+                            "visual_course_approach_top_corner_reduced",
+                            gate_index=current_gate_index,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/approach"
+                            ),
+                            **recovery_summary,
+                        )
                 try:
                     approach_top_recovery_authority = (
                         _derive_approach_top_recovery_authority(
