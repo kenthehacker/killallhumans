@@ -680,8 +680,7 @@ def _attempt5_runtime(host):
         VisualCourseStageLimits(),
         post_credit_fresh_frame_timeout_s=0.05,
     )
-    runtime, _calls = _runtime(host, limits=limits)
-    servo_calls = []
+    runtime, servo_calls = _runtime(host, limits=limits)
 
     def servo_factory(*args, **kwargs):
         return _Attempt5RecoveryServo(

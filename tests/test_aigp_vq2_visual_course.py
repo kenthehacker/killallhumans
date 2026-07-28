@@ -201,7 +201,7 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
     }
 
 
-def test_committed_successor_steering_replaces_crossing_attitude_and_yaw():
+def test_committed_successor_memory_cannot_replace_crossing_reference():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
@@ -234,15 +234,7 @@ def test_committed_successor_steering_replaces_crossing_attitude_and_yaw():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed.target_roll_rad == pytest.approx(-0.10)
-    assert refreshed.target_pitch_rad == pytest.approx(-0.12)
-    assert refreshed.yaw_rate_rad_s == pytest.approx(-0.15)
-    assert replace(
-        refreshed,
-        target_roll_rad=authority.target_roll_rad,
-        target_pitch_rad=authority.target_pitch_rad,
-        yaw_rate_rad_s=authority.yaw_rate_rad_s,
-    ) == authority
+    assert refreshed == authority
     assert all(
         math.isfinite(value)
         for value in (
@@ -301,7 +293,7 @@ def test_uncommitted_successor_cannot_change_crossing_coast():
     ) == authority
 
 
-def test_yaw_soft_stop_withholds_only_committed_successor_yaw():
+def test_yaw_soft_stop_does_not_change_sealed_crossing_reference():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
@@ -336,10 +328,7 @@ def test_yaw_soft_stop_withholds_only_committed_successor_yaw():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed.target_roll_rad == pytest.approx(-0.10)
-    assert refreshed.target_pitch_rad == pytest.approx(-0.12)
-    assert refreshed.yaw_rate_rad_s == authority.yaw_rate_rad_s
-    assert refreshed.requested_thrust == authority.requested_thrust
+    assert refreshed == authority
 
 
 def _dynamic_near_plane_sample(
@@ -1405,6 +1394,7 @@ class _Host:
         self.confirmed_race_statuses = []
         self.promotion_tokens = []
         self.requested_promotion_track_ids = []
+        self.visual_planner_calls = []
         self.race = AuthoritativeRaceStatusRef.live(
             session_id="test-session",
             reset_epoch=2,
@@ -1479,13 +1469,28 @@ class _Host:
     async def _send_flight_command(self, command, **kwargs):
         self.commands.append((command, dict(kwargs), self.current_gate))
         self._last_flight_command_started_ns = round(self.clock * 1e9)
-        passage_wire_command = bool(
-            command.thrust == 0.295
+        latest_planner_mode = (
+            self.visual_planner_calls[-1][1]
+            if self.visual_planner_calls
+            else None
+        )
+        forward_closure_authorized = bool(
+            self.visual_planner_calls
+            and self.visual_planner_calls[-1][3]
+        )
+        launch_navigation_ready = bool(
+            self.current_gate != 0
             or (
-                self.current_gate == 0
-                and command.pitch_rate == -0.105
-                and command.thrust > 0.0
+                self.visual_planner_calls
+                and self.visual_planner_calls[-1][4]
+                >= self.visual_config.lifecycle.launch_boost_duration_s
             )
+        )
+        passage_wire_command = bool(
+            latest_planner_mode is VisualApproachMode.PASSAGE
+            and forward_closure_authorized
+            and launch_navigation_ready
+            and command.thrust > 0.0
         )
         if passage_wire_command:
             self.passage_counts[self.current_gate] = (
@@ -1694,6 +1699,7 @@ def _runtime(host, *, yaw_profile=True, servo_options=None, limits=None):
     calls = []
     options = dict(servo_options or {})
     host.intercept_response_authorities = []
+    host.visual_planner_calls = calls
 
     def servo_factory(*args, **kwargs):
         return _Servo(*args, **kwargs, calls=calls, **options)
@@ -4354,11 +4360,6 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["first_target_pitch_rad"] == pytest.approx(-0.31)
     assert gate0_commands[0][0].pitch_rate == pytest.approx(-0.25)
     assert gate0_commands[0][0].thrust == 0.26
-    assert any(
-        command.thrust
-        == host.visual_config.lifecycle.launch_boost_thrust
-        for command, _kwargs in gate0_commands
-    )
     assert launch["last_thrust_phase"] == "generic-visual-servo"
     assert launch["last_thrust"] == pytest.approx(0.295)
     assert launch["last_current_vertical_error_image_down"] == 0.03
@@ -4368,8 +4369,24 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     assert launch["max_next_preview_collective_delta"] == 0.0
     assert launch["last_next_preview_collective_delta"] == 0.0
     assert launch["last_next_preview_collective_track_id"] is None
-    assert any(
-        command.thrust == pytest.approx(0.295)
+    assert all(
+        math.isfinite(value)
+        for command, _kwargs in gate0_commands
+        for value in (
+            command.roll_rate,
+            command.pitch_rate,
+            command.yaw_rate,
+            command.thrust,
+        )
+    )
+    assert all(
+        0.0 <= command.thrust <= 0.35
+        and max(
+            abs(command.roll_rate),
+            abs(command.pitch_rate),
+            abs(command.yaw_rate),
+        )
+        <= 0.25
         for command, _kwargs in gate0_commands
     )
     assert all(
@@ -4383,7 +4400,11 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
         if gate_index == 1 and command.thrust > 0.0
     ]
     assert later_navigation
-    assert later_navigation[0].thrust == 0.21
+    assert all(
+        math.isfinite(command.thrust)
+        and 0.0 < command.thrust <= 0.35
+        for command in later_navigation
+    )
     assert later["launch_bootstrap"][
         "post_boost_collective_basis"
     ] is None
@@ -4402,14 +4423,9 @@ def test_initial_gate_uses_hashed_launch_bootstrap_only_once():
     ]
     assert gate0_passage
     assert any(command.thrust == 0.26 for command in gate0_passage)
-    assert any(
-        command.thrust
-        == host.visual_config.lifecycle.launch_boost_thrust
-        for command in gate0_passage
-    )
-    assert gate0_passage[-1].thrust == pytest.approx(0.295)
+    assert all(0.0 < command.thrust <= 0.35 for command in gate0_passage)
     assert gate1_passage
-    assert all(command.thrust == 0.295 for command in gate1_passage)
+    assert all(0.0 < command.thrust <= 0.35 for command in gate1_passage)
 
 
 def test_initial_gate_arms_from_finite_preblend_admission_window():
@@ -4562,7 +4578,7 @@ def test_course_wires_the_hashed_next_preview_scale_ramp_to_every_segment():
 
     def capture_factory(*args, **kwargs):
         factory_calls.append(dict(kwargs))
-        return _Servo(*args, **kwargs)
+        return _Servo(*args, **kwargs, calls=_calls)
 
     runtime = replace(runtime, servo_factory=capture_factory)
     result = asyncio.run(

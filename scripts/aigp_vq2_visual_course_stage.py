@@ -2123,11 +2123,12 @@ def _refresh_committed_successor_steering(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Carry bounded committed successor steering into crossing coast.
+    """Validate successor memory without replacing the sealed crossing command.
 
-    Current-gate clearance is already sealed before this is callable.
-    Successor roll/pitch/yaw remain steering-only; thrust, passage geometry,
-    promotion, safety limits, and the final wire governor are unchanged.
+    The current-gate clearance proof is causal only for the attitude/yaw/thrust
+    reference accepted when the near-plane latch formed.  Successor geometry
+    remains available for the authoritative post-credit handoff, but changing
+    the command before credit would invalidate that crossing proof.
     """
 
     if (
@@ -2185,46 +2186,26 @@ def _refresh_committed_successor_steering(
             )
         return float(value)
 
-    committed_roll = admitted_axis(
+    admitted_axis(
         "committed_successor_roll_authority",
         "committed_successor_target_roll_rad",
         lower=-MAX_VISUAL_TARGET_ROLL_RAD,
         upper=MAX_VISUAL_TARGET_ROLL_RAD,
     )
-    committed_pitch = admitted_axis(
+    admitted_axis(
         "committed_successor_pitch_authority",
         "committed_successor_target_pitch_rad",
         lower=MIN_VISUAL_TARGET_PITCH_RAD,
         upper=MAX_VISUAL_TARGET_PITCH_RAD,
     )
-    committed_yaw = (
-        None
-        if accepted.yaw_soft_stop_zeroed
-        else admitted_axis(
+    if not accepted.yaw_soft_stop_zeroed:
+        admitted_axis(
             "committed_successor_yaw_authority",
             "committed_successor_yaw_rate_rad_s",
             lower=-MAX_VISUAL_YAW_RATE_RAD_S,
             upper=MAX_VISUAL_YAW_RATE_RAD_S,
         )
-    )
-    return replace(
-        authority,
-        target_roll_rad=(
-            authority.target_roll_rad
-            if committed_roll is None
-            else committed_roll
-        ),
-        target_pitch_rad=(
-            authority.target_pitch_rad
-            if committed_pitch is None
-            else committed_pitch
-        ),
-        yaw_rate_rad_s=(
-            authority.yaw_rate_rad_s
-            if committed_yaw is None
-            else committed_yaw
-        ),
-    )
+    return authority
 
 
 def _dynamic_near_plane_wire_sample(
@@ -4618,6 +4599,9 @@ async def _run_visual_course_stage_impl(
         refresh_ingress_after_slot: bool = False,
         intercept_response_authority: float = 0.0,
         top_fov_transition_owned: bool = False,
+        committed_crossing_authority: Optional[
+            _CensoredPassageCoastAuthority
+        ] = None,
     ) -> _AcceptedVisualCommand | _SupersededVisualProposal:
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
@@ -4680,6 +4664,21 @@ async def _run_visual_course_stage_impl(
         if type(top_fov_transition_owned) is not bool:
             raise abort_type(
                 "visual-course top-FOV transition ownership is invalid"
+            )
+        if (
+            committed_crossing_authority is not None
+            and (
+                type(committed_crossing_authority)
+                is not _CensoredPassageCoastAuthority
+                or committed_crossing_authority.gate_index
+                != current_gate_index
+                or committed_crossing_authority.track_id
+                != current_track_id
+                or not top_fov_transition_owned
+            )
+        ):
+            raise abort_type(
+                "visual-course committed crossing reference is invalid"
             )
         if (
             command_deadline_s is not None
@@ -5142,6 +5141,53 @@ async def _run_visual_course_stage_impl(
                         launch_evidence["target_pitch_rad"] = (
                             target_pitch_rad
                         )
+        if committed_crossing_authority is not None:
+            # Observations, local-state propagation, and diagnostics continue
+            # updating above, but the latch-sealed current-gate coast owns the
+            # applied reference until authoritative race credit.  The hard
+            # yaw soft-stop and final wire governor remain downstream.
+            target_roll_rad = float(
+                committed_crossing_authority.target_roll_rad
+            )
+            target_pitch_rad = float(
+                committed_crossing_authority.target_pitch_rad
+            )
+            requested_yaw = float(
+                committed_crossing_authority.yaw_rate_rad_s
+            )
+            command_thrust = float(
+                committed_crossing_authority.requested_thrust
+            )
+            if (
+                not all(
+                    math.isfinite(value)
+                    for value in (
+                        target_roll_rad,
+                        target_pitch_rad,
+                        requested_yaw,
+                        command_thrust,
+                    )
+                )
+                or abs(target_roll_rad)
+                > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+                or not MIN_VISUAL_TARGET_PITCH_RAD - 1e-12
+                <= target_pitch_rad
+                <= MAX_VISUAL_TARGET_PITCH_RAD + 1e-12
+                or abs(requested_yaw)
+                > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+                or not limits.min_thrust
+                <= command_thrust
+                <= limits.max_thrust
+            ):
+                raise abort_type(
+                    "visual-course committed crossing reference escaped "
+                    "its fixed envelope"
+                )
+            if requested_yaw != 0.0 and runtime.yaw_profile is None:
+                raise abort_type(
+                    "visual-course committed crossing yaw lacks calibrated "
+                    "authority"
+                )
         # Allocate the static attitude-loop response from the reference that
         # will actually be applied this tick.  Before the old inner governor
         # was removed, its governed output implicitly provided this behavior;
@@ -8961,6 +9007,9 @@ async def _run_visual_course_stage_impl(
                     top_fov_transition_owned=bool(
                         near_plane_latch is not None
                         or crossing_anchor is not None
+                    ),
+                    committed_crossing_authority=(
+                        crossing_coast_authority
                     ),
                     stage=(
                         f"{VISUAL_COURSE_STAGE}/gate"
