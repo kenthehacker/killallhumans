@@ -3156,6 +3156,30 @@ def _fresh_post_credit_top_boundary_case():
     return state, decision, authority, snapshot
 
 
+@pytest.mark.parametrize(
+    ("clipping", "expected"),
+    (
+        (FrameEdge.TOP, True),
+        (FrameEdge.TOP | FrameEdge.RIGHT, False),
+        (FrameEdge.TOP | FrameEdge.LEFT, False),
+        (FrameEdge.LEFT, False),
+        (FrameEdge.RIGHT, False),
+        (FrameEdge.BOTTOM, False),
+        (FrameEdge.NONE, False),
+    ),
+)
+def test_fresh_exact_top_boundary_alone_preempts_propagated_fov(
+    clipping,
+    expected,
+):
+    assert (
+        course_stage._fresh_exact_top_boundary_preempts_propagated_fov(
+            clipping
+        )
+        is expected
+    )
+
+
 def test_fresh_current_top_boundary_admits_exact_authoritative_publication(
     monkeypatch,
 ):

@@ -579,6 +579,14 @@ class _FreshCurrentTopBoundaryAuthority:
     sample: Any
 
 
+def _fresh_exact_top_boundary_preempts_propagated_fov(
+    clipping: Any,
+) -> bool:
+    """Select physical TOP closure before still-live propagated aperture."""
+
+    return clipping is FrameEdge.TOP
+
+
 def _fresh_current_top_boundary_authority(
     session: DynamicVisualCourseSession,
     *,
@@ -5465,7 +5473,24 @@ async def _run_visual_course_stage_impl(
                         "one-edge FOV decision lost credited current ownership"
                     )
                 fov_summary = segment["top_fov_pitch_protection"]
+                recovery_clipping = getattr(
+                    recovery_snapshot.current_track,
+                    "clipping",
+                    None,
+                )
                 try:
+                    if _fresh_exact_top_boundary_preempts_propagated_fov(
+                        recovery_clipping
+                    ):
+                        # A fresh exact TOP boundary is physical closure
+                        # evidence.  Brake on that publication before a
+                        # still-live propagated aperture can keep selecting
+                        # increasingly forward pitch.  The exact boundary
+                        # guard below remains the fail-closed admission.
+                        raise ValueError(
+                            "propagated FOV gap lacks a clean propagated "
+                            "aperture"
+                        )
                     top_fov_handoff = (
                         dynamic_controller
                         .propagated_current_fov_gap_authority(
@@ -5482,11 +5507,6 @@ async def _run_visual_course_stage_impl(
                         "propagated FOV gap lacks a clean propagated aperture"
                     ):
                         raise
-                    recovery_clipping = getattr(
-                        recovery_snapshot.current_track,
-                        "clipping",
-                        None,
-                    )
                     if recovery_clipping in {
                         FrameEdge.LEFT,
                         FrameEdge.RIGHT,
