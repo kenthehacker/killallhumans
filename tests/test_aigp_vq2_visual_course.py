@@ -6675,7 +6675,7 @@ def test_expired_geometry_search_uses_sole_fresh_horizontal_detection():
     assert authority.observed_track_id == "fresh-1"
     assert authority.observed_source_index == 3
     assert authority.horizontal_norm == pytest.approx(0.60)
-    assert authority.command.target_roll_rad < 0.0
+    assert authority.command.target_roll_rad == 0.0
     assert authority.command.target_pitch_rad == pytest.approx(0.12)
     assert authority.command.yaw_rate_rad_s < 0.0
     assert authority.command.requested_thrust == pytest.approx(0.275)
@@ -6706,9 +6706,7 @@ def test_expired_geometry_search_uses_only_side_bit_when_fresh_view_is_not_uniqu
     assert authority.observed_source_index is None
     assert authority.horizontal_norm == 1.0
     assert authority.command.yaw_rate_rad_s < 0.0
-    assert authority.command.target_roll_rad == pytest.approx(
-        -course_stage.MAX_VISUAL_TARGET_ROLL_RAD
-    )
+    assert authority.command.target_roll_rad == 0.0
 
 
 def test_expired_geometry_search_does_not_consume_stale_detection():
@@ -6755,9 +6753,7 @@ def test_expired_geometry_search_ignores_tracks_present_at_search_start():
     assert authority.source == "retained-right-edge-bit"
     assert authority.observed_track_id is None
     assert authority.horizontal_norm == 1.0
-    assert authority.command.target_roll_rad == pytest.approx(
-        -course_stage.MAX_VISUAL_TARGET_ROLL_RAD
-    )
+    assert authority.command.target_roll_rad == 0.0
     assert authority.command.yaw_rate_rad_s < 0.0
 
 

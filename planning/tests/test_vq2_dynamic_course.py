@@ -1067,7 +1067,7 @@ def test_successor_bias_waits_for_fresh_safe_dwell_then_ramps() -> None:
     )
 
 
-def test_unsafe_current_gate_withholds_uncommitted_successor_steering() -> None:
+def test_unsafe_vertical_passage_still_allows_successor_heading() -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
             camera_delay_s=0.0,
@@ -1129,17 +1129,14 @@ def test_unsafe_current_gate_withholds_uncommitted_successor_steering() -> None:
     assert qualified.successor_yaw_contribution_rad == 0.0
     assert qualified.precommit_successor_roll_authority == 0.0
     assert qualified.precommit_successor_target_roll_rad is None
-    assert qualified.precommit_successor_yaw_authority == 0.0
-    assert qualified.precommit_successor_yaw_rate_rad_s is None
-    assert qualified.precommit_successor_yaw_heading_delta_rad is None
-    assert qualified.precommit_successor_yaw_contribution_rad is None
-    assert qualified.precommit_current_horizontal_fov_clearance_norm is None
-    current_only_yaw = -core.config.yaw_gain * math.atan(
-        qualified.camera_current_center_norm[0]
-        * core.config.horizontal_angle_scale_rad
-    )
+    assert qualified.precommit_successor_yaw_authority == 1.0
+    assert qualified.precommit_successor_yaw_rate_rad_s is not None
+    assert qualified.precommit_successor_yaw_rate_rad_s < 0.0
+    assert qualified.precommit_successor_yaw_heading_delta_rad is not None
+    assert qualified.precommit_successor_yaw_contribution_rad is not None
+    assert qualified.precommit_current_horizontal_fov_clearance_norm is not None
     assert qualified.command.yaw_rate_rad_s == pytest.approx(
-        max(-MAX_YAW_RATE_RAD_S, min(MAX_YAW_RATE_RAD_S, current_only_yaw))
+        qualified.precommit_successor_yaw_rate_rad_s
     )
     assert qualified.braking
 
@@ -1321,7 +1318,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_off_axis_outward_steering_remains_bounded_and_proportional(
+def test_off_axis_outward_steering_unloads_bank_until_rate_recovers(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1385,14 +1382,8 @@ def test_off_axis_outward_steering_remains_bounded_and_proportional(
         + core.config.lateral_rate_gain
         * current.residual_translational_rate_rad_s[0]
     )
-    assert decision.proposed_command.target_roll_rad == pytest.approx(
-        expected_outward_roll
-    )
-    assert (
-        0.0
-        < decision.proposed_command.target_roll_rad
-        < MAX_TARGET_ROLL_RAD
-    )
+    assert 0.0 < expected_outward_roll < MAX_TARGET_ROLL_RAD
+    assert decision.proposed_command.target_roll_rad == 0.0
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
     recovered = None
@@ -1431,10 +1422,10 @@ def test_off_axis_outward_steering_remains_bounded_and_proportional(
     assert recovered.time_to_contact_s is None
     assert recovered_decision.current_time_to_contact_s is None
     assert not recovered_decision.passage_committed
+    assert 0.0 < recovered_decision.proposed_command.target_roll_rad
     assert (
-        0.0
-        < recovered_decision.proposed_command.target_roll_rad
-        < decision.proposed_command.target_roll_rad
+        recovered_decision.proposed_command.target_roll_rad
+        < expected_outward_roll
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad
@@ -3017,6 +3008,7 @@ def _uncommitted_successor_case(
     *,
     successor_x_step: float,
     current_x: float = 0.0,
+    current_y: float = -0.30,
     current_log_scales: tuple[float, ...] | None = None,
     crossing_max_occupancy_q: tuple[float, float] = (0.50, 0.45),
     bind_successor: bool = True,
@@ -3049,7 +3041,7 @@ def _uncommitted_successor_case(
                 sequence,
                 observation_time,
                 x=current_x,
-                y=-0.30,
+                y=current_y,
                 log_scale=log_scale,
             )
         )
@@ -3079,7 +3071,27 @@ def _uncommitted_successor_case(
     return core, decision
 
 
-def test_latest_trace_unsafe_current_gate_waits_for_passage_commitment() -> None:
+def test_centered_close_gate_turns_toward_visible_successor_before_commit(
+) -> None:
+    _, decision = _uncommitted_successor_case(
+        successor_x_step=0.004,
+        current_y=-0.05,
+    )
+
+    assert not decision.passage_committed
+    assert decision.successor_prediction_confidence > 0.0
+    assert decision.precommit_successor_yaw_authority == 1.0
+    assert decision.precommit_successor_yaw_rate_rad_s is not None
+    assert decision.precommit_successor_yaw_rate_rad_s < 0.0
+    assert decision.command.yaw_rate_rad_s == pytest.approx(
+        decision.precommit_successor_yaw_rate_rad_s
+    )
+    assert decision.precommit_successor_roll_authority == 0.0
+    assert decision.precommit_successor_target_roll_rad is None
+    assert decision.passage_committed is False
+
+
+def test_centered_current_gate_can_preturn_before_passage_commitment() -> None:
     core, decision = _uncommitted_successor_case(
         successor_x_step=0.004
     )
@@ -3092,13 +3104,16 @@ def test_latest_trace_unsafe_current_gate_waits_for_passage_commitment() -> None
     assert decision.successor_yaw_contribution_rad == 0.0
     assert decision.precommit_successor_roll_authority == 0.0
     assert decision.precommit_successor_target_roll_rad is None
-    assert decision.precommit_successor_yaw_authority == 0.0
-    assert decision.precommit_successor_yaw_rate_rad_s is None
-    assert decision.precommit_successor_yaw_heading_delta_rad is None
-    assert decision.precommit_successor_yaw_contribution_rad is None
-    assert decision.precommit_current_horizontal_fov_clearance_norm is None
+    assert decision.precommit_successor_yaw_authority == 1.0
+    assert decision.precommit_successor_yaw_rate_rad_s is not None
+    assert decision.precommit_successor_yaw_rate_rad_s < 0.0
+    assert decision.precommit_successor_yaw_heading_delta_rad is not None
+    assert decision.precommit_successor_yaw_contribution_rad is not None
+    assert decision.precommit_current_horizontal_fov_clearance_norm is not None
     assert decision.command.target_roll_rad == pytest.approx(0.0)
-    assert decision.command.yaw_rate_rad_s == pytest.approx(0.0)
+    assert decision.command.yaw_rate_rad_s == pytest.approx(
+        decision.precommit_successor_yaw_rate_rad_s
+    )
     assert decision.command.target_pitch_rad == pytest.approx(
         DynamicCourseConfig().brake_pitch_rad
     )
@@ -3135,17 +3150,18 @@ def test_latest_trace_unsafe_current_gate_waits_for_passage_commitment() -> None
 
 
 @pytest.mark.parametrize(
-    ("successor_x_step", "current_x"),
+    ("successor_x_step", "current_x", "expect_preturn"),
     (
-        (0.004, 0.0),
-        (0.004, -0.15),
-        (0.004, -0.55),
-        (-0.004, 0.0),
+        (0.004, 0.0, True),
+        (0.004, -0.15, False),
+        (0.004, -0.55, False),
+        (-0.004, 0.0, True),
     ),
 )
-def test_uncommitted_successor_never_overwrites_current_gate_command(
+def test_uncommitted_successor_yaw_requires_centered_current_gate(
     successor_x_step: float,
     current_x: float,
+    expect_preturn: bool,
 ) -> None:
     _, with_successor = _uncommitted_successor_case(
         successor_x_step=successor_x_step,
@@ -3160,10 +3176,31 @@ def test_uncommitted_successor_never_overwrites_current_gate_command(
     assert not with_successor.passage_committed
     assert with_successor.precommit_successor_roll_authority == 0.0
     assert with_successor.precommit_successor_target_roll_rad is None
-    assert with_successor.precommit_successor_yaw_authority == 0.0
-    assert with_successor.precommit_successor_yaw_rate_rad_s is None
-    assert with_successor.command == current_only.command
-    assert with_successor.proposed_command == current_only.proposed_command
+    if expect_preturn:
+        assert with_successor.precommit_successor_yaw_authority == 1.0
+        assert with_successor.precommit_successor_yaw_rate_rad_s is not None
+        assert with_successor.precommit_successor_yaw_rate_rad_s < 0.0
+        assert (
+            with_successor.command.yaw_rate_rad_s
+            != current_only.command.yaw_rate_rad_s
+        )
+        assert (
+            with_successor.command.target_roll_rad
+            == current_only.command.target_roll_rad
+        )
+        assert (
+            with_successor.command.target_pitch_rad
+            == current_only.command.target_pitch_rad
+        )
+        assert (
+            with_successor.command.thrust
+            == current_only.command.thrust
+        )
+    else:
+        assert with_successor.precommit_successor_yaw_authority == 0.0
+        assert with_successor.precommit_successor_yaw_rate_rad_s is None
+        assert with_successor.command == current_only.command
+        assert with_successor.proposed_command == current_only.proposed_command
     assert all(
         math.isfinite(value)
         for value in (

@@ -4636,24 +4636,16 @@ def _approach_expired_geometry_search_authority(
         source = "neutral-no-unique-horizontal-evidence"
 
     yaw_rate = visual_bearing_yaw_rate(horizontal, 0.0, tuning)
-    horizontal_corridor = float(tuning.horizontal_corridor)
-    if not math.isfinite(horizontal_corridor) or horizontal_corridor <= 0.0:
-        raise ValueError("fresh search horizontal corridor is invalid")
-    bank_load = min(1.0, abs(horizontal) / horizontal_corridor)
-    target_roll = (
-        0.0
-        if bank_load == 0.0
-        else math.copysign(
-            bank_load * MAX_VISUAL_TARGET_ROLL_RAD,
-            -horizontal,
-        )
-    )
     return _ApproachExpiredGeometrySearchAuthority(
         command=_CensoredPassageCoastAuthority(
             gate_index=gate_index,
             track_id=track_id,
             anchor_camera_token=token,
-            target_roll_rad=target_roll,
+            # Once exact gate geometry has expired, sustained bank turns a
+            # heading search into unobserved lateral acceleration.  Level the
+            # vehicle and search only with the calibrated yaw channel; a fresh
+            # current observation immediately restores normal bank control.
+            target_roll_rad=0.0,
             target_pitch_rad=brake_pitch,
             yaw_rate_rad_s=yaw_rate,
             requested_thrust=thrust,

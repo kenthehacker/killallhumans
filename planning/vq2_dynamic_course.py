@@ -3147,7 +3147,7 @@ class DynamicCourseCore:
         successor = state.successor
         if monotonic_ns < current.state_monotonic_ns:
             raise DynamicCourseError("guidance time cannot precede the current state")
-        camera_current_center, _ = self._decision_geometry(
+        camera_current_center, camera_current_aperture = self._decision_geometry(
             current.track_id,
             monotonic_ns,
         )
@@ -3470,10 +3470,80 @@ class DynamicCourseCore:
         precommit_current_horizontal_fov_clearance: float | None = None
         precommit_successor_roll_authority = 0.0
         precommit_successor_target_roll: float | None = None
-        # Successor steering does not own the wire before the current gate is
-        # passage-committed.  Retain the fields as explicit zero-authority
-        # trace evidence; the committed branch below owns the graph-vetted
-        # successor handoff without granting passage or promotion authority.
+        if (
+            not passage_committed
+            and successor is not None
+            and successor_prediction is not None
+            and successor_prediction.confidence > 0.0
+            and current.visible
+            and not current.ambiguous
+            and not any(current.censored_axes)
+            and current.bearing_rate_qualified[0]
+            and current.time_to_contact_s is not None
+            and self.config.minimum_ttc_s
+            <= current.time_to_contact_s
+            <= self.config.successor_lookahead_ttc_s
+            and abs(current_center[0]) + 2.0 * current_std_norm[0]
+            <= self.config.passage_margin_norm
+            and abs(residual_rate_norm[0])
+            <= self.config.vertical_settled_rate_norm_s
+            and camera_current_aperture is not None
+            and successor.visible
+            and not successor.ambiguous
+            and not successor.censored_axes[0]
+            and successor.sample_count >= 4
+            and successor.stream_generation == current.stream_generation
+            and successor.bearing_std_rad[0]
+            <= (
+                self.config
+                .successor_prediction_max_extrapolation_rad
+            )
+            + _EPSILON
+        ):
+            successor_age_s = (
+                monotonic_ns
+                - successor.last_measurement_monotonic_ns
+            ) / _NS_PER_SECOND
+            precommit_current_horizontal_fov_clearance = (
+                1.0
+                - abs(camera_current_center[0])
+                - camera_current_aperture[0]
+                - 2.0 * current_std_norm[0]
+            )
+            if (
+                0.0
+                <= successor_age_s
+                <= self.config.crossing_prediction_max_horizon_s
+                and precommit_current_horizontal_fov_clearance
+                > self.config.passage_margin_norm
+            ):
+                camera_current_heading = math.atan(
+                    camera_current_center[0]
+                    * self.config.horizontal_angle_scale_rad
+                )
+                precommit_successor_yaw_heading_delta = (
+                    successor_prediction.bearing_rad[0]
+                    - camera_current_heading
+                )
+                precommit_successor_yaw_contribution = (
+                    successor_prediction.bearing_rad[0]
+                )
+                precommit_successor_yaw_rate = _clamp(
+                    -self.config.yaw_gain
+                    * successor_prediction.bearing_rad[0],
+                    -MAX_YAW_RATE_RAD_S,
+                    MAX_YAW_RATE_RAD_S,
+                )
+                if abs(precommit_successor_yaw_rate) > _EPSILON:
+                    # A reviewed next gate may own heading before passage
+                    # commitment while the current gate remains centered and
+                    # inside the camera.  Roll, pitch, thrust, passage, and
+                    # promotion remain owned by the current gate.
+                    precommit_successor_yaw_authority = 1.0
+                    proposal = replace(
+                        proposal,
+                        yaw_rate_rad_s=precommit_successor_yaw_rate,
+                    )
         committed_successor_roll_authority = 0.0
         committed_successor_target_roll: float | None = None
         committed_successor_pitch_authority = 0.0
@@ -4563,6 +4633,20 @@ class DynamicCourseCore:
         # showed that escalating and latching a full bank after the rate
         # turned outward drove fixed-reference gate error from +0.25 to +1.92.
         yaw = -self.config.yaw_gain * heading_error
+        if (
+            current.bearing_rate_qualified[0]
+            and abs(stable_passage_bearing[0])
+            >= self.config.off_axis_brake_rad
+            and stable_passage_bearing[0]
+            * stable_passage_rate_norm_s[0]
+            > 0.0
+            and abs(yaw) >= 0.90 * MAX_YAW_RATE_RAD_S
+        ):
+            # Both tested bank polarities worsened a fresh, outward Gate-1
+            # residual while calibrated yaw was already saturated.  Do not
+            # keep accelerating laterally from an unidentified roll sign;
+            # level bank until fresh image motion starts recovering.
+            roll = 0.0
         # Successor geometry may only slow the current-gate approach with the
         # same progressively admitted authority that governs successor yaw.
         # In particular, a visible but temporally unproved successor must not
