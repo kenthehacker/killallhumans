@@ -6220,6 +6220,62 @@ def _current_top_ambiguity_fov_summary() -> dict:
     }
 
 
+def test_current_ambiguity_holds_last_accepted_wire_without_fov_lineage():
+    accepted = course_stage._AcceptedCurrentWireAnchor(
+        gate_index=1,
+        track_id="track-1",
+        camera_token=_token(51),
+        wire_start_monotonic_ns=1_060_000_000,
+        target_roll_rad=-0.35,
+        target_pitch_rad=0.12,
+        yaw_rate_rad_s=-0.15,
+        thrust=0.32,
+    )
+
+    authority = course_stage._approach_current_ambiguity_wire_authority(
+        snapshot=_current_top_ambiguity_snapshot(52),
+        gate_index=1,
+        track_id="track-1",
+        now_monotonic_ns=1_100_000_000,
+        maximum_hold_age_s=0.12,
+        accepted=accepted,
+        existing=None,
+    )
+
+    assert authority.accepted_camera_token == _token(51)
+    assert authority.first_ambiguous_camera_token == _token(52)
+    assert authority.latest_ambiguous_camera_token == _token(52)
+    assert authority.command.anchor_camera_token == _token(51)
+    assert authority.command.target_roll_rad == pytest.approx(-0.35)
+    assert authority.command.target_pitch_rad == pytest.approx(0.12)
+    assert authority.command.yaw_rate_rad_s == pytest.approx(-0.15)
+    assert authority.command.requested_thrust == pytest.approx(0.32)
+    assert authority.expires_monotonic_ns == 1_180_000_000
+
+    continued = course_stage._approach_current_ambiguity_wire_authority(
+        snapshot=_current_top_ambiguity_snapshot(53),
+        gate_index=1,
+        track_id="track-1",
+        now_monotonic_ns=1_140_000_000,
+        maximum_hold_age_s=0.12,
+        accepted=None,
+        existing=authority,
+    )
+    assert continued.latest_ambiguous_camera_token == _token(53)
+    assert continued.expires_monotonic_ns == authority.expires_monotonic_ns
+
+    with pytest.raises(ValueError, match="continuity is invalid or expired"):
+        course_stage._approach_current_ambiguity_wire_authority(
+            snapshot=_current_top_ambiguity_snapshot(54),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=authority.expires_monotonic_ns,
+            maximum_hold_age_s=0.12,
+            accepted=None,
+            existing=continued,
+        )
+
+
 def test_current_ambiguity_quarantine_retains_one_fixed_raw_top_lease():
     snapshot = _current_top_ambiguity_snapshot(52)
     fov_summary = _current_top_ambiguity_fov_summary()

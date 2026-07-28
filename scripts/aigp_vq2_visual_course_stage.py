@@ -5324,6 +5324,177 @@ def _approach_current_ambiguity_quarantine_authority(
 
 
 @dataclass(frozen=True, slots=True)
+class _AcceptedCurrentWireAnchor:
+    """Exact accepted current-gate command retained across unusable vision."""
+
+    gate_index: int
+    track_id: str
+    camera_token: CameraFrameToken
+    wire_start_monotonic_ns: int
+    target_roll_rad: float
+    target_pitch_rad: float
+    yaw_rate_rad_s: float
+    thrust: float
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproachCurrentAmbiguityWireAuthority:
+    """Fresh ambiguity watermark with no authority from ambiguous geometry."""
+
+    command: _CensoredPassageCoastAuthority
+    accepted_camera_token: CameraFrameToken
+    first_ambiguous_camera_token: CameraFrameToken
+    latest_ambiguous_camera_token: CameraFrameToken
+    source_wire_start_monotonic_ns: int
+    expires_monotonic_ns: int
+
+
+def _approach_current_ambiguity_wire_authority(
+    *,
+    snapshot: Any,
+    gate_index: int,
+    track_id: str,
+    now_monotonic_ns: int,
+    maximum_hold_age_s: float,
+    accepted: Optional[_AcceptedCurrentWireAnchor],
+    existing: Optional[_ApproachCurrentAmbiguityWireAuthority],
+) -> _ApproachCurrentAmbiguityWireAuthority:
+    """Hold one accepted current-gate wire without consuming ambiguity."""
+
+    maximum_age_s = float(maximum_hold_age_s)
+    if (
+        type(gate_index) is not int
+        or gate_index < 0
+        or type(track_id) is not str
+        or not track_id
+        or type(now_monotonic_ns) is not int
+        or now_monotonic_ns < 0
+        or not math.isfinite(maximum_age_s)
+        or not 0.0 < maximum_age_s <= 0.12 + 1e-12
+        or (
+            accepted is not None
+            and type(accepted) is not _AcceptedCurrentWireAnchor
+        )
+        or (
+            existing is not None
+            and type(existing)
+            is not _ApproachCurrentAmbiguityWireAuthority
+        )
+    ):
+        raise ValueError("approach ambiguity wire hold inputs are invalid")
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    history = getattr(track, "history", None)
+    sample = history[-1] if type(history) is tuple and history else None
+    missed_count = getattr(track, "missed_frame_count", None)
+    provisional_ids = getattr(snapshot, "provisional_track_ids", None)
+    if (
+        type(token) is not CameraFrameToken
+        or getattr(snapshot, "current_gate_index", None) != gate_index
+        or getattr(snapshot, "current_track_id", None) != track_id
+        or getattr(snapshot, "authority_usable", True) is not False
+        or getattr(snapshot, "withholding_reason", None)
+        != "current_track_ambiguous"
+        or getattr(snapshot, "race_finished", True) is not False
+        or getattr(snapshot, "next_selection_ambiguous", True) is not False
+        or type(provisional_ids) is not tuple
+        or track is None
+        or getattr(track, "track_id", None) != track_id
+        or getattr(track, "role", None) is not VisualTrackRole.AMBIGUOUS
+        or getattr(track, "authoritative_gate_index", None) != gate_index
+        or getattr(track, "visible", False) is not True
+        or getattr(track, "ambiguous", False) is not True
+        or type(missed_count) is not int
+        or missed_count != 0
+        or getattr(track, "latest_token", None) != token
+        or sample is None
+        or getattr(sample, "token", None) != token
+    ):
+        raise ValueError(
+            "approach ambiguity wire hold lacks exact current identity"
+        )
+
+    if existing is not None:
+        if (
+            accepted is not None
+            or existing.command.gate_index != gate_index
+            or existing.command.track_id != track_id
+            or not _token_strictly_newer(
+                token,
+                existing.latest_ambiguous_camera_token,
+            )
+            or token.stream_id
+            != existing.accepted_camera_token.stream_id
+            or token.generation
+            != existing.accepted_camera_token.generation
+            or now_monotonic_ns >= existing.expires_monotonic_ns
+        ):
+            raise ValueError(
+                "approach ambiguity wire hold continuity is invalid or "
+                "expired"
+            )
+        return replace(
+            existing,
+            latest_ambiguous_camera_token=token,
+        )
+
+    if accepted is None:
+        raise ValueError(
+            "approach ambiguity wire hold lacks an accepted current command"
+        )
+    expires_ns = accepted.wire_start_monotonic_ns + round(
+        maximum_age_s * 1_000_000_000.0
+    )
+    values = (
+        accepted.target_roll_rad,
+        accepted.target_pitch_rad,
+        accepted.yaw_rate_rad_s,
+        accepted.thrust,
+    )
+    if (
+        accepted.gate_index != gate_index
+        or accepted.track_id != track_id
+        or accepted.camera_token.stream_id != token.stream_id
+        or accepted.camera_token.generation != token.generation
+        or not _token_strictly_newer(token, accepted.camera_token)
+        or accepted.wire_start_monotonic_ns < 0
+        or accepted.wire_start_monotonic_ns > now_monotonic_ns
+        or now_monotonic_ns >= expires_ns
+        or not all(math.isfinite(value) for value in values)
+        or abs(accepted.target_roll_rad)
+        > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= accepted.target_pitch_rad
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or abs(accepted.yaw_rate_rad_s)
+        > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+        or not MIN_VISUAL_THRUST <= accepted.thrust <= MAX_VISUAL_THRUST
+    ):
+        raise ValueError(
+            "approach ambiguity wire hold lacks fresh bounded authority"
+        )
+    return _ApproachCurrentAmbiguityWireAuthority(
+        command=_CensoredPassageCoastAuthority(
+            gate_index=gate_index,
+            track_id=track_id,
+            anchor_camera_token=accepted.camera_token,
+            target_roll_rad=accepted.target_roll_rad,
+            target_pitch_rad=accepted.target_pitch_rad,
+            yaw_rate_rad_s=accepted.yaw_rate_rad_s,
+            requested_thrust=accepted.thrust,
+        ),
+        accepted_camera_token=accepted.camera_token,
+        first_ambiguous_camera_token=token,
+        latest_ambiguous_camera_token=token,
+        source_wire_start_monotonic_ns=(
+            accepted.wire_start_monotonic_ns
+        ),
+        expires_monotonic_ns=expires_ns,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _ApproachTopRecoveryAuthority:
     """Clean exact-wire authority for a fresh TOP-only approach hold.
 
@@ -6847,6 +7018,7 @@ async def _run_visual_course_stage_impl(
     current_aperture_collective_state: Optional[
         _CurrentApertureProvedCollectiveState
     ] = None
+    latest_accepted_current_wire: Optional[_AcceptedCurrentWireAnchor] = None
     pending_post_credit_recovery: Optional[
         _PendingPostCreditRecovery
     ] = None
@@ -7750,6 +7922,7 @@ async def _run_visual_course_stage_impl(
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
         nonlocal consecutive_superseded_proposals
+        nonlocal latest_accepted_current_wire
 
         def drop_superseded_proposal(
             exc: BaseException,
@@ -9623,7 +9796,7 @@ async def _run_visual_course_stage_impl(
                 ]
             ) + 1
         refresh_live_summary()
-        return _AcceptedVisualCommand(
+        accepted = _AcceptedVisualCommand(
             command=command,
             yaw_soft_stop_zeroed=yaw_soft_stop_zeroed,
             observation_monotonic_ns=observation_monotonic_ns,
@@ -9646,6 +9819,17 @@ async def _run_visual_course_stage_impl(
             ),
             dynamic_evidence=accepted_dynamic_evidence,
         )
+        latest_accepted_current_wire = _AcceptedCurrentWireAnchor(
+            gate_index=current_gate_index,
+            track_id=current_track_id,
+            camera_token=accepted.wire_camera_token,
+            wire_start_monotonic_ns=accepted.wire_start_monotonic_ns,
+            target_roll_rad=accepted.target_roll_rad,
+            target_pitch_rad=accepted.target_pitch_rad,
+            yaw_rate_rad_s=float(accepted.command.yaw_rate),
+            thrust=float(accepted.command.thrust),
+        )
+        return accepted
 
     async def send_censored_passage_coast(
         *,
@@ -9663,6 +9847,7 @@ async def _run_visual_course_stage_impl(
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
         nonlocal consecutive_superseded_proposals
+        nonlocal latest_accepted_current_wire
 
         def drop_superseded_coast(
             exc: BaseException,
@@ -10045,6 +10230,16 @@ async def _run_visual_course_stage_impl(
             counted_as_navigation=count_as_navigation,
             command=asdict(command),
         )
+        latest_accepted_current_wire = _AcceptedCurrentWireAnchor(
+            gate_index=current_gate_index,
+            track_id=current_track_id,
+            camera_token=snapshot.latest_camera_token,
+            wire_start_monotonic_ns=wire_start_monotonic_ns,
+            target_roll_rad=authority.target_roll_rad,
+            target_pitch_rad=authority.target_pitch_rad,
+            yaw_rate_rad_s=float(command.yaw_rate),
+            thrust=float(command.thrust),
+        )
         refresh_live_summary()
         return command
 
@@ -10275,7 +10470,7 @@ async def _run_visual_course_stage_impl(
         approach_propagated_visibility_gap_fresh_frame_count = 0
         approach_propagated_visibility_gap_command_count = 0
         approach_current_ambiguity_quarantine: Optional[
-            _ApproachCurrentAmbiguityQuarantineAuthority
+            _ApproachCurrentAmbiguityWireAuthority
         ] = None
         approach_current_ambiguity_quarantine_command_count = 0
         crossing_wait_coast_command_count = 0
@@ -11220,8 +11415,6 @@ async def _run_visual_course_stage_impl(
                 and getattr(snapshot, "race_finished", True) is False
             )
             if current_ambiguity_eligible:
-                dynamic_controller = runtime.dynamic_controller
-                assert type(dynamic_controller) is DynamicVisualCourseSession
                 ambiguity_proposal_ns = runtime.perf_counter_ns()
                 if (
                     type(ambiguity_proposal_ns) is not int
@@ -11232,20 +11425,8 @@ async def _run_visual_course_stage_impl(
                         "clock is invalid"
                     )
                 try:
-                    ambiguity_hold = (
-                        dynamic_controller.continuity_hold_authority(
-                            now_monotonic_ns=ambiguity_proposal_ns,
-                            maximum_age_s=(
-                                runtime.yaw_profile.control_hold_horizon_s
-                            ),
-                        )
-                        if (
-                            approach_current_ambiguity_quarantine is None
-                        )
-                        else None
-                    )
                     approach_current_ambiguity_quarantine = (
-                        _approach_current_ambiguity_quarantine_authority(
+                        _approach_current_ambiguity_wire_authority(
                             snapshot=snapshot,
                             gate_index=current_gate_index,
                             track_id=current_track_id,
@@ -11254,10 +11435,14 @@ async def _run_visual_course_stage_impl(
                                 runtime.yaw_profile
                                 .control_hold_horizon_s
                             ),
-                            fov_summary=segment[
-                                "top_fov_pitch_protection"
-                            ],
-                            hold=ambiguity_hold,
+                            accepted=(
+                                latest_accepted_current_wire
+                                if (
+                                    approach_current_ambiguity_quarantine
+                                    is None
+                                )
+                                else None
+                            ),
                             existing=(
                                 approach_current_ambiguity_quarantine
                             ),
@@ -11292,7 +11477,7 @@ async def _run_visual_course_stage_impl(
                             APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
                         ),
                         "anchor_camera_token": asdict(
-                            ambiguity_authority.clean_camera_token
+                            ambiguity_authority.accepted_camera_token
                         ),
                         "first_ambiguous_camera_token": asdict(
                             ambiguity_authority
@@ -11302,7 +11487,7 @@ async def _run_visual_course_stage_impl(
                         "reacquired_camera_token": None,
                         "anchor_wire_start_monotonic_ns": (
                             ambiguity_authority
-                            .anchor_wire_start_monotonic_ns
+                            .source_wire_start_monotonic_ns
                         ),
                         "source_wire_start_monotonic_ns": (
                             ambiguity_authority
