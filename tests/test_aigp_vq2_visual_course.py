@@ -4036,14 +4036,23 @@ def test_current_aperture_collective_recreates_new_frame_rate_filter():
     assert third_thrust == pytest.approx(0.287543)
 
 
-def test_105f607_terminal_vertical_replay_commands_below_support():
-    """Freeze the last clean current-aperture facts from live run 250407d7."""
+@pytest.mark.parametrize(
+    ("subsupport_authorized", "floor_applied"),
+    (
+        (False, True),
+        (True, False),
+    ),
+)
+def test_current_aperture_collective_reserves_support_until_crossing(
+    subsupport_authorized,
+    floor_applied,
+):
+    """Ordinary flight retains support; committed crossing restores range."""
 
     state = course_stage._CurrentApertureProvedCollectiveState(
         track_id="track-0",
-        # Exact value retained in the authoritative compact result.  Receiver
-        # timestamps are intentionally compacted, so seed the proved filter
-        # at its recorded terminal state instead of fabricating precision.
+        # Live terminal state that drives the unconstrained law to its lower
+        # envelope.  Receiver timestamps are intentionally compacted.
         filtered_vertical_rate=0.6221695111650704,
     )
     target = replace(
@@ -4057,13 +4066,34 @@ def test_105f607_terminal_vertical_replay_commands_below_support():
         state,
         target,
         authoritative_current_track_id="track-0",
+        subsupport_collective_authorized=subsupport_authorized,
     )
 
-    assert proposal.filtered_vertical_rate_down_s == pytest.approx(
-        0.6221695111650704
+    assert math.isfinite(proposal.requested_thrust)
+    assert (
+        course_stage.MIN_VISUAL_THRUST
+        <= proposal.requested_thrust
+        <= course_stage.MAX_VISUAL_THRUST
     )
-    assert proposal.requested_thrust == pytest.approx(0.21)
-    assert proposal.requested_thrust < 0.275
+    assert proposal.unconstrained_requested_thrust < (
+        course_stage.GATE0_PROVED_COLLECTIVE_BASE
+    )
+    if subsupport_authorized:
+        assert proposal.requested_thrust == pytest.approx(
+            proposal.unconstrained_requested_thrust
+        )
+    else:
+        assert proposal.requested_thrust == pytest.approx(
+            course_stage.GATE0_PROVED_COLLECTIVE_BASE
+        )
+    assert (
+        proposal.noncommitted_support_floor_applied
+        is floor_applied
+    )
+    assert (
+        proposal.subsupport_collective_authorized
+        is subsupport_authorized
+    )
     assert proposal.vertical_censored is False
     assert proposal.held_last_observable_collective is False
 
@@ -4199,7 +4229,15 @@ def test_current_aperture_collective_holds_through_censorship_and_dropout():
         )
     )
 
-    assert clean_proposal.requested_thrust == pytest.approx(0.21)
+    assert state.last_observable_thrust == pytest.approx(0.21)
+    assert clean_proposal.requested_thrust == pytest.approx(
+        course_stage.GATE0_PROVED_COLLECTIVE_BASE
+    )
+    assert (
+        clean_proposal.unconstrained_requested_thrust
+        == pytest.approx(state.last_observable_thrust)
+    )
+    assert clean_proposal.noncommitted_support_floor_applied is True
     assert censored_proposal.requested_thrust == pytest.approx(
         clean_proposal.requested_thrust
     )

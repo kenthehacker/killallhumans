@@ -1980,12 +1980,15 @@ class _CurrentApertureProvedCollectiveState:
 @dataclass(frozen=True, slots=True)
 class _CurrentApertureCollectiveProposal:
     requested_thrust: float
+    unconstrained_requested_thrust: float
     filtered_vertical_rate_down_s: float
     control_vertical_error_image_down: Optional[float]
     control_basis: str
     vertical_censored: bool
     current_aperture_dropout: bool
     held_last_observable_collective: bool
+    noncommitted_support_floor_applied: bool
+    subsupport_collective_authorized: bool
 
 
 def _dynamic_current_aperture_collective_inputs(
@@ -2046,14 +2049,22 @@ def _propose_current_aperture_collective(
     control_vertical_rate_down_s: Optional[float] = None,
     control_basis: str = RAW_CURRENT_APERTURE_COLLECTIVE_BASIS,
     current_aperture_observable: bool = True,
+    subsupport_collective_authorized: bool = False,
 ) -> _CurrentApertureCollectiveProposal:
-    """Allocate collective only from the authoritative current aperture."""
+    """Allocate collective only from the authoritative current aperture.
+
+    Residual image-rate damping may request less than the proved support
+    collective only after exact near-plane evidence has committed the
+    crossing.  This is a state-dependent authority boundary, not a temporal
+    command governor.
+    """
 
     if (
         type(authoritative_current_track_id) is not str
         or not authoritative_current_track_id
         or state.track_id != authoritative_current_track_id
         or type(current_aperture_observable) is not bool
+        or type(subsupport_collective_authorized) is not bool
     ):
         raise ValueError(
             "current-aperture collective authority is invalid"
@@ -2079,12 +2090,20 @@ def _propose_current_aperture_collective(
         thrust, filtered_rate = state.hold(
             reason="current_aperture_dropout",
         )
+    unconstrained_thrust = float(thrust)
+    support_floor_applied = bool(
+        not subsupport_collective_authorized
+        and unconstrained_thrust < GATE0_PROVED_COLLECTIVE_BASE
+    )
+    if support_floor_applied:
+        thrust = GATE0_PROVED_COLLECTIVE_BASE
     held = bool(
         state.last_hold_reason is not None
         and state.last_observable_thrust is not None
     )
     return _CurrentApertureCollectiveProposal(
         requested_thrust=thrust,
+        unconstrained_requested_thrust=unconstrained_thrust,
         filtered_vertical_rate_down_s=filtered_rate,
         control_vertical_error_image_down=state.last_vertical,
         control_basis=state.last_control_basis,
@@ -2095,6 +2114,10 @@ def _propose_current_aperture_collective(
             state.last_hold_reason == "current_aperture_dropout"
         ),
         held_last_observable_collective=held,
+        noncommitted_support_floor_applied=support_floor_applied,
+        subsupport_collective_authorized=(
+            subsupport_collective_authorized
+        ),
     )
 
 
@@ -4834,6 +4857,9 @@ async def _run_visual_course_stage_impl(
                     current_aperture_observable=(
                         current_aperture_observable
                     ),
+                    subsupport_collective_authorized=(
+                        top_fov_transition_owned
+                    ),
                 )
             )
             proved_collective = (
@@ -4891,6 +4917,18 @@ async def _run_visual_course_stage_impl(
                     proved_filtered_vertical_rate
                 ),
                 "requested_thrust": proved_collective,
+                "unconstrained_requested_thrust": (
+                    collective_proposal
+                    .unconstrained_requested_thrust
+                ),
+                "noncommitted_support_floor_applied": (
+                    collective_proposal
+                    .noncommitted_support_floor_applied
+                ),
+                "subsupport_collective_authorized": (
+                    collective_proposal
+                    .subsupport_collective_authorized
+                ),
                 "vertical_censored": (
                     collective_proposal.vertical_censored
                 ),
@@ -6365,10 +6403,16 @@ async def _run_visual_course_stage_impl(
 
         def retained_current_aperture_collective(
             fallback_wire_thrust: float,
+            *,
+            subsupport_collective_authorized: bool,
         ) -> float:
             """Return the last clean aperture request for bounded coast."""
 
             fallback = float(fallback_wire_thrust)
+            if type(subsupport_collective_authorized) is not bool:
+                raise abort_type(
+                    "visual-course retained collective authority is invalid"
+                )
             if runtime.dynamic_controller is None:
                 return fallback
             state = current_aperture_collective_state
@@ -6386,6 +6430,11 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course retained current-aperture collective "
                     "escaped its fixed envelope"
+                )
+            if not subsupport_collective_authorized:
+                requested = max(
+                    GATE0_PROVED_COLLECTIVE_BASE,
+                    requested,
                 )
             return requested
 
@@ -8506,7 +8555,8 @@ async def _run_visual_course_stage_impl(
                             ),
                             requested_thrust=(
                                 retained_current_aperture_collective(
-                                    accepted.command.thrust
+                                    accepted.command.thrust,
+                                    subsupport_collective_authorized=False,
                                 )
                             ),
                             minimum_brake_pitch_rad=float(
@@ -8644,7 +8694,8 @@ async def _run_visual_course_stage_impl(
                                 yaw_rate_rad_s=command.yaw_rate,
                                 requested_thrust=(
                                     retained_current_aperture_collective(
-                                        coast_thrust
+                                        coast_thrust,
+                                        subsupport_collective_authorized=True,
                                     )
                                 ),
                             )
@@ -9309,7 +9360,8 @@ async def _run_visual_course_stage_impl(
                             yaw_rate_rad_s=crossing_successor_yaw_rate,
                             requested_thrust=(
                                 retained_current_aperture_collective(
-                                    crossing_coast_thrust
+                                    crossing_coast_thrust,
+                                    subsupport_collective_authorized=True,
                                 )
                             ),
                         )
