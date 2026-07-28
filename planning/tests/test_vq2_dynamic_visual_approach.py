@@ -3069,6 +3069,10 @@ def test_one_axis_clip_keeps_fresh_observable_and_bounds_projection(
 
     state = session.core.course_state().current
     raw_center = tracker.track(current_id).center_norm
+    aperture_deadline_ns = (
+        state.aperture_prediction_deadline_monotonic_ns
+    )
+    assert aperture_deadline_ns is not None
     target_center = (
         proposal.current_target.normalized_x,
         proposal.current_target.normalized_y_down,
@@ -3124,6 +3128,30 @@ def test_one_axis_clip_keeps_fresh_observable_and_bounds_projection(
         <= MAX_YAW_RATE_RAD_S
     )
     assert MIN_THRUST <= proposal.servo_output.thrust <= MAX_THRUST
+    latest_update = tracker.latest_update
+    assert latest_update is not None
+    near_decision_deadline_ns = (
+        latest_update.observation_monotonic_ns + 6_000_000
+    )
+    estimate = session.core._tracks[current_id]  # noqa: SLF001
+    estimate.state = replace(
+        estimate.state,
+        aperture_prediction_deadline_monotonic_ns=(
+            near_decision_deadline_ns
+        ),
+    )
+    expired_aperture_steering = planner._target(
+        tracker.track(current_id),
+        now_monotonic_s=(
+            near_decision_deadline_ns + 1
+        )
+        / 1_000_000_000.0,
+        require_current_authority=True,
+    )
+    assert (
+        expired_aperture_steering.normalized_x,
+        expired_aperture_steering.normalized_y_down,
+    ) == pytest.approx(raw_center)
 
 
 def test_clipped_outer_degraded_inner_steers_without_scale_authority() -> None:

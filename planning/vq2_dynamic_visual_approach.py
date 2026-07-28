@@ -3991,13 +3991,25 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 > state.aperture_prediction_deadline_monotonic_ns
             ):
                 # A state may be valid at camera capture and expire before the
-                # later control decision.  If the exact current outer center
-                # is still fully observable, fall back to that fresh steering
-                # measurement so post-credit recovery can use its independent
-                # bounded lease.  Clipped/censored geometry remains refused.
+                # later control decision.  The expired aperture loses all
+                # scale, passage, and clearance authority, but it must not
+                # erase a fresh outer-support steering measurement.  A clean
+                # center can steer directly; a one-axis clip can steer from
+                # its measured axis plus the bounded edge direction.  The
+                # dynamic core independently withholds the expired aperture
+                # from passage/advance decisions.
+                horizontal_censored = bool(
+                    track.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+                )
+                vertical_censored = bool(
+                    track.clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+                )
                 if (
-                    track.clipping == FrameEdge.NONE
-                    and not track.center_censored
+                    (
+                        track.clipping == FrameEdge.NONE
+                        and not track.center_censored
+                    )
+                    or horizontal_censored != vertical_censored
                 ):
                     return target
                 raise VisualApproachCurrentGeometryUnavailable(
