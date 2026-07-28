@@ -3273,6 +3273,72 @@ def test_post_credit_activation_accepts_causal_wire_after_race_ingress():
     assert authority["camera_elevation_error_rad"] == pytest.approx(0.0)
     assert authority["camera_elevation_rate_rad_s"] == pytest.approx(0.0)
     assert authority["pitch_delay_lead_rad"] == pytest.approx(0.0)
+    assert session.post_credit_roll_reference_handoff_active is False
+
+    accepted_ns = activation_ns + 1_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=float(authority["target_roll_rad"]),
+        target_pitch_rad=float(authority["target_pitch_rad"]),
+        yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
+        thrust=float(authority["thrust"]),
+        wire_command=AttitudeRateCommand(
+            0.04,
+            0.02,
+            float(authority["yaw_rate_rad_s"]),
+            float(authority["thrust"]),
+        ),
+        wire_start_monotonic_ns=accepted_ns,
+    )
+
+    assert session.post_credit_roll_reference_handoff_active is True
+    handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
+    assert handoff is not None
+    assert handoff.retained_target_roll_rad == pytest.approx(
+        authority["target_roll_rad"]
+    )
+    assert handoff.source_wire_start_monotonic_ns == accepted_ns
+
+
+def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
+    session, successor_id = _bound_post_credit_successor()
+    successor = session.core.course_state().successor
+    assert successor is not None
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    activation_ns = wire_ns + 2_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.05,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=-0.04,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(0.03, 0.02, -0.04, 0.275),
+        wire_start_monotonic_ns=wire_ns,
+    )
+    session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    authority = session.post_credit_successor_steering_authority(
+        now_monotonic_ns=activation_ns,
+    )
+    opposite_roll = -float(authority["target_roll_rad"])
+    session.record_wire_acceptance(
+        target_roll_rad=opposite_roll,
+        target_pitch_rad=float(authority["target_pitch_rad"]),
+        yaw_rate_rad_s=float(authority["yaw_rate_rad_s"]),
+        thrust=float(authority["thrust"]),
+        wire_command=AttitudeRateCommand(
+            -0.04,
+            0.02,
+            float(authority["yaw_rate_rad_s"]),
+            float(authority["thrust"]),
+        ),
+        wire_start_monotonic_ns=activation_ns + 1_000_000,
+    )
+
+    assert session.post_credit_roll_reference_handoff_active is False
 
 
 def test_post_credit_steering_uses_predicted_camera_elevation(

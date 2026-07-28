@@ -206,6 +206,19 @@ class _PostCreditRollReferenceHandoff:
 
 
 @dataclass(frozen=True, slots=True)
+class _PendingPostCreditRollReference:
+    """One steering-only target awaiting exact accepted-wire binding."""
+
+    to_gate_index: int
+    track_id: str
+    stream_generation: int
+    promotion_count: int
+    target_roll_rad: float
+    authority_monotonic_ns: int
+    expires_monotonic_ns: int
+
+
+@dataclass(frozen=True, slots=True)
 class _WireGovernorConfig:
     max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
@@ -407,6 +420,9 @@ class DynamicVisualCourseSession:
         ] = None
         self._post_credit_roll_reference_handoff: Optional[
             _PostCreditRollReferenceHandoff
+        ] = None
+        self._pending_post_credit_roll_reference: Optional[
+            _PendingPostCreditRollReference
         ] = None
         self._precredit_successor_roll_reference: Optional[
             _PreCreditSuccessorRollReference
@@ -911,6 +927,7 @@ class DynamicVisualCourseSession:
             vertical_target_pitch_ceiling_rad=None,
         )
         self._post_credit_successor_steering = lease
+        self._pending_post_credit_roll_reference = None
         self._precredit_successor_roll_reference = None
         self._post_credit_roll_reference_handoff = (
             None
@@ -1212,6 +1229,19 @@ class DynamicVisualCourseSession:
                     prediction.body_rates_rad_s
                 ),
             }
+        )
+        self._pending_post_credit_roll_reference = (
+            None
+            if abs(target_roll) <= 1e-12
+            else _PendingPostCreditRollReference(
+                to_gate_index=lease.to_gate_index,
+                track_id=lease.reviewed_track_id,
+                stream_generation=lease.stream_generation,
+                promotion_count=lease.promotion_count,
+                target_roll_rad=target_roll,
+                authority_monotonic_ns=now_monotonic_ns,
+                expires_monotonic_ns=lease.expires_monotonic_ns,
+            )
         )
         return evidence
 
@@ -2497,6 +2527,67 @@ class DynamicVisualCourseSession:
                 )
             else:
                 self._precredit_successor_roll_reference = None
+        pending_post_credit = self._pending_post_credit_roll_reference
+        if pending_post_credit is not None:
+            lease = self._post_credit_successor_steering
+            state = self.core.course_state()
+            accepted_post_credit_reference = bool(
+                lease is not None
+                and lease.steering_available
+                and lease.to_gate_index
+                == pending_post_credit.to_gate_index
+                and lease.reviewed_track_id
+                == pending_post_credit.track_id
+                and lease.stream_generation
+                == pending_post_credit.stream_generation
+                and lease.promotion_count
+                == pending_post_credit.promotion_count
+                and state.current_gate_index
+                == pending_post_credit.to_gate_index
+                and state.current_track_id
+                == pending_post_credit.track_id
+                and state.current.stream_generation
+                == pending_post_credit.stream_generation
+                and pending_post_credit.authority_monotonic_ns
+                <= wire_start_monotonic_ns
+                <= pending_post_credit.expires_monotonic_ns
+                and math.isclose(
+                    pending_post_credit.target_roll_rad,
+                    applied_sample.target_roll_rad,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            )
+            self._pending_post_credit_roll_reference = None
+            if (
+                accepted_post_credit_reference
+                and self._post_credit_roll_reference_handoff is None
+            ):
+                self._post_credit_roll_reference_handoff = (
+                    _PostCreditRollReferenceHandoff(
+                        authority_basis=(
+                            "accepted-post-credit-successor-roll-reference-v1"
+                        ),
+                        to_gate_index=pending_post_credit.to_gate_index,
+                        track_id=pending_post_credit.track_id,
+                        stream_generation=(
+                            pending_post_credit.stream_generation
+                        ),
+                        promotion_count=pending_post_credit.promotion_count,
+                        retained_target_roll_rad=(
+                            pending_post_credit.target_roll_rad
+                        ),
+                        source_authority_monotonic_ns=(
+                            pending_post_credit.authority_monotonic_ns
+                        ),
+                        source_wire_start_monotonic_ns=(
+                            wire_start_monotonic_ns
+                        ),
+                        expires_monotonic_ns=(
+                            pending_post_credit.expires_monotonic_ns
+                        ),
+                    )
+                )
         self._applied_command_count += 1
         decision = self._last_decision
         if decision is not None:
