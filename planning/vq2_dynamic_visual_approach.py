@@ -20,6 +20,7 @@ from competition.vq2_visual_tracker import (
     VisualInnerApertureGeometry,
     VisualTrack,
     VisualTrackRole,
+    visual_track_history_sha256,
 )
 from planning.vq2_dynamic_course import (
     AppliedCommandSample,
@@ -42,6 +43,7 @@ from planning.vq2_dynamic_course import (
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
     ConfirmedGateReacquisition,
+    ConfirmedGateTransition,
     ConfirmedSameGateRebind,
     RaceStatusProvenanceBasis,
 )
@@ -746,6 +748,147 @@ class DynamicVisualCourseSession:
                 lease.vertical_target_pitch_ceiling_rad
             ),
         }
+
+    def activate_confirmed_transition_steering(
+        self,
+        transition: ConfirmedGateTransition,
+        tracker: MultiTargetVisualTracker,
+        *,
+        activation_monotonic_ns: int,
+    ) -> Mapping[str, Any]:
+        """Synchronize dynamic roles from one exact graph-owned transition.
+
+        Race status and the rolling graph own gate identity.  The dynamic
+        successor slot is only local steering state, so a stale slot must not
+        veto a graph-confirmed transition.  This method verifies the exact
+        promoted tracker publication, adopts that track as the local
+        successor when necessary, and then uses the normal authoritative
+        promotion path.
+        """
+
+        if type(transition) is not ConfirmedGateTransition:
+            raise DynamicCourseError(
+                "dynamic transition activation requires exact graph proof"
+            )
+        if type(tracker) is not MultiTargetVisualTracker:
+            raise DynamicCourseError(
+                "dynamic transition activation requires the exact tracker"
+            )
+        update = tracker.latest_update
+        if (
+            update is None
+            or update.token
+            != transition.promoted_latest_token_at_promotion
+        ):
+            raise DynamicCourseError(
+                "dynamic transition activation lacks its exact publication"
+            )
+        try:
+            track = tracker.track(transition.promoted_track_id)
+        except KeyError as exc:
+            raise DynamicCourseError(
+                "dynamic transition promoted track is absent"
+            ) from exc
+        if (
+            track.latest_token
+            != transition.promoted_latest_token_at_promotion
+            or track.first_token != transition.promoted_first_token
+            or len(track.history)
+            != transition.history_length_after_promotion
+            or visual_track_history_sha256(track.history)
+            != transition.promoted_history_sha256
+            or not track.visible
+            or track.ambiguous
+            or track.role is not VisualTrackRole.CURRENT
+            or track.authoritative_gate_index
+            != transition.to_gate_index
+            or track.authority_race_status_sequence
+            != transition.race_status.race_status_sequence
+        ):
+            raise DynamicCourseError(
+                "dynamic transition differs from graph-owned promoted state"
+            )
+
+        state = self.core.course_state()
+        if (
+            state.current_gate_index != transition.from_gate_index
+            or state.current_track_id != transition.retired_track_id
+            or state.current_track_id == transition.promoted_track_id
+        ):
+            raise DynamicCourseError(
+                "dynamic transition predecessor ownership differs"
+            )
+        known_track_ids = {
+            dynamic.track_id for dynamic in self.core.track_states
+        }
+        if (
+            self._last_frame_by_track.get(track.track_id)
+            != update.tracker_frame_sequence
+        ):
+            self.core.observe_track(
+                self._track_observation(
+                    track,
+                    tracker_frame_sequence=update.tracker_frame_sequence,
+                    observation_monotonic_ns=(
+                        update.observation_monotonic_ns
+                    ),
+                    stream_generation=update.token.generation,
+                )
+            )
+            self._last_frame_by_track[track.track_id] = (
+                update.tracker_frame_sequence
+            )
+        elif track.track_id not in known_track_ids:
+            raise DynamicCourseError(
+                "dynamic transition publication was consumed without state"
+            )
+
+        previous_successor_track_id = state.successor_track_id
+        successor_reconciled = bool(
+            previous_successor_track_id
+            != transition.promoted_track_id
+        )
+        if successor_reconciled:
+            if previous_successor_track_id is not None:
+                self.core.handoff_graph_vetted_successor_state(
+                    predecessor_track_id=previous_successor_track_id,
+                    replacement_track_id=transition.promoted_track_id,
+                )
+            state = self.core.bind(
+                current_gate_index=state.current_gate_index,
+                current_track_id=state.current_track_id,
+                successor_track_id=transition.promoted_track_id,
+            )
+        successor = state.successor
+        if (
+            successor is None
+            or successor.track_id != transition.promoted_track_id
+            or successor.stream_generation != update.token.generation
+        ):
+            raise DynamicCourseError(
+                "dynamic transition could not adopt graph successor"
+            )
+
+        evidence = dict(
+            self.activate_post_credit_successor_steering(
+                transition.race_status,
+                from_gate_index=transition.from_gate_index,
+                reviewed_track_id=transition.promoted_track_id,
+                activation_monotonic_ns=activation_monotonic_ns,
+            )
+        )
+        evidence.update(
+            {
+                "graph_transition_reconciled": successor_reconciled,
+                "previous_successor_track_id": (
+                    previous_successor_track_id
+                ),
+                "graph_transition_history_sha256": (
+                    transition.promoted_history_sha256
+                ),
+            }
+        )
+        return evidence
 
     def activate_post_credit_successor_steering(
         self,

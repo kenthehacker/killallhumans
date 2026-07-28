@@ -43,6 +43,7 @@ from planning.vq2_dynamic_visual_approach import (
 )
 from planning.vq2_gate_graph import (
     AuthoritativeRaceStatusRef,
+    ConfirmedGateTransition,
     ConfirmedGateReacquisition,
     ConfirmedSameGateRebind,
     CreditedUnboundGateAdvance,
@@ -3957,6 +3958,125 @@ def test_post_credit_activation_accepts_causal_wire_after_race_ingress():
     assert session.post_credit_roll_reference_handoff_active is False
     handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
     assert handoff is None
+
+
+def test_graph_confirmed_transition_reconciles_stale_dynamic_successor():
+    tracker, graph, snapshot, current_id = _graph()
+    promoted_id = snapshot.next_candidates[0].track_id
+    session = _session()
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=0,
+        expected_current_track_id=current_id,
+        adjacent_precredit=False,
+    )
+    session.core.bind(
+        current_gate_index=0,
+        current_track_id=current_id,
+        successor_track_id=promoted_id,
+    )
+
+    known_ids = {
+        track.track_id for track in tracker.latest_update.tracks
+    }
+    stale_successor_id = ""
+    for sequence in (6, 7, 8):
+        frame = _frame(sequence)
+        frame = replace(
+            frame,
+            detections=(
+                *frame.detections,
+                _detection(
+                    2,
+                    -0.72,
+                    width=0.08,
+                    height=0.09,
+                ),
+            ),
+        )
+        update = tracker.update(frame)
+        if not stale_successor_id:
+            created_ids = {
+                track.track_id for track in update.tracks
+            } - known_ids
+            assert len(created_ids) == 1
+            stale_successor_id = created_ids.pop()
+        snapshot = graph.observe(tracker)
+        session.stage_snapshot(
+            snapshot,
+            tracker,
+            expected_gate_index=0,
+            expected_current_track_id=current_id,
+            adjacent_precredit=False,
+        )
+    assert stale_successor_id in {
+        state.track_id for state in session.core.track_states
+    }
+    session.core.bind(
+        current_gate_index=0,
+        current_track_id=current_id,
+        successor_track_id=stale_successor_id,
+    )
+
+    for sequence in (9, 10, 11):
+        update = tracker.update(_frame(sequence))
+        snapshot = graph.observe(tracker)
+        session.stage_snapshot(
+            snapshot,
+            tracker,
+            expected_gate_index=0,
+            expected_current_track_id=current_id,
+            adjacent_precredit=False,
+        )
+    assert (
+        session.core.course_state().successor_track_id
+        == stale_successor_id
+    )
+    assert update.publish_monotonic_ns is not None
+    race = _credited_race(update.publish_monotonic_ns + 1_000_000)
+    transition = graph.confirm_transition(
+        tracker,
+        race_status=race,
+        camera_token_at_credit=update.token,
+        promoted_track_id=promoted_id,
+    )
+    assert type(transition) is ConfirmedGateTransition
+    assert transition.promoted_track_id != stale_successor_id
+
+    wire_ns = race.received_monotonic_ns + 1_000_000
+    activation_ns = wire_ns + 1_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.02,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=-0.03,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(
+            0.01,
+            0.02,
+            -0.03,
+            0.275,
+        ),
+        wire_start_monotonic_ns=wire_ns,
+    )
+
+    evidence = session.activate_confirmed_transition_steering(
+        transition,
+        tracker,
+        activation_monotonic_ns=activation_ns,
+    )
+
+    state = session.core.course_state()
+    assert state.current_gate_index == 1
+    assert state.current_track_id == promoted_id
+    assert state.successor_track_id is None
+    assert state.promotion_count == 1
+    assert evidence["graph_transition_reconciled"] is True
+    assert evidence["previous_successor_track_id"] == stale_successor_id
+    assert evidence["reviewed_track_id"] == promoted_id
+    assert evidence["steering_only"] is True
+    assert evidence["passage_authority"] is False
+    assert evidence["advance_authority"] is False
 
 
 def test_unaccepted_post_credit_roll_target_cannot_create_handoff():

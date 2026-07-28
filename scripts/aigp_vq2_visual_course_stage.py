@@ -16465,6 +16465,34 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course retained transition promotion is incomplete"
                 )
+            # The graph mutation above is the completed navigation milestone.
+            # Optional dynamic steering synchronization happens afterward and
+            # must not make failure evidence claim that promotion never
+            # occurred.
+            transition_summary.update(
+                {
+                    "promotion_confirmed": True,
+                    "retired_track_id": (
+                        retained_transition.retired_track_id
+                    ),
+                    "promoted_track_id": (
+                        retained_transition.promoted_track_id
+                    ),
+                    "history_length_before_promotion": (
+                        retained_transition
+                        .history_length_before_promotion
+                    ),
+                    "history_length_after_promotion": (
+                        retained_transition
+                        .history_length_after_promotion
+                    ),
+                    "promotion_mode": "retained_reviewed_identity",
+                    "reviewed_track_id": requested_promoted_track_id,
+                    "credit_consumed_without_visual_current": False,
+                }
+            )
+            segment["outcome"] = "transition_confirmed"
+            refresh_live_summary()
             dynamic_controller = runtime.dynamic_controller
             if type(dynamic_controller) is DynamicVisualCourseSession:
                 activation_ns = runtime.perf_counter_ns()
@@ -16476,12 +16504,9 @@ async def _run_visual_course_stage_impl(
                 try:
                     steering_activation = (
                         dynamic_controller
-                        .activate_post_credit_successor_steering(
-                            credited_race,
-                            from_gate_index=current_gate_index,
-                            reviewed_track_id=(
-                                requested_promoted_track_id
-                            ),
+                        .activate_confirmed_transition_steering(
+                            retained_transition,
+                            host.visual_tracker,
                             activation_monotonic_ns=activation_ns,
                         )
                     )
@@ -16551,13 +16576,6 @@ async def _run_visual_course_stage_impl(
                     "rolling-graph-retained-reviewed-identity-v1"
                 ),
                 cross_gap_identity_claimed=False,
-            )
-            transition_summary.update(
-                {
-                    "promotion_mode": "retained_reviewed_identity",
-                    "reviewed_track_id": requested_promoted_track_id,
-                    "credit_consumed_without_visual_current": False,
-                }
             )
         else:
             raise abort_type(
