@@ -30,6 +30,7 @@ from planning.vq2_course_lifecycle import (
     NearPlaneEvidence,
     NearPlaneLatch,
 )
+from planning.vq2_dynamic_visual_approach import DynamicVisualCourseSession
 from planning.vq2_visual_approach import (
     VisualApproachCurrentGeometryUnavailable,
     VisualApproachMode,
@@ -3100,6 +3101,53 @@ def _dd89_top_censored_recovery(**overrides):
     )
 
 
+def _fresh_post_credit_top_boundary_case():
+    token = _token(50)
+    sample = SimpleNamespace(
+        token=token,
+        tracker_frame_sequence=50,
+        clipping=FrameEdge.TOP,
+        bbox_norm=(0.72, 0.0, 0.88, 0.24),
+    )
+    track = SimpleNamespace(
+        track_id="track-1",
+        role=VisualTrackRole.CURRENT,
+        authoritative_gate_index=1,
+        latest_token=token,
+        history=(sample,),
+        visible=True,
+        ambiguous=False,
+        missed_frame_count=0,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+    )
+    current = SimpleNamespace(
+        track_id="track-1",
+        frame_sequence=50,
+        stream_generation=token.generation,
+        visible=True,
+        ambiguous=False,
+        missed_count=0,
+    )
+    state = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        current=current,
+    )
+    decision = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+    )
+    snapshot = SimpleNamespace(
+        current_gate_index=1,
+        current_track_id="track-1",
+        latest_camera_token=token,
+        current_track=track,
+    )
+    authority = {"reviewed_track_id": "track-1"}
+    return state, decision, authority, snapshot
+
+
 def test_dd89_fresh_top_boundary_allocates_vertical_without_forward_closure():
     allocation = _dd89_top_censored_recovery()
 
@@ -3158,6 +3206,167 @@ def test_top_censored_vertical_collective_cannot_restore_forward_pitch():
         for allocation in allocations
         if allocation is not None
     ] == pytest.approx([0.275, 0.300, 0.320])
+
+
+def test_fresh_post_credit_top_boundary_gates_closure_without_aperture():
+    state, decision, source, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    boundary = course_stage._fresh_post_credit_top_boundary_authority(
+        state=state,
+        decision=decision,
+        authority=source,
+        recovery_snapshot=snapshot,
+        current_gate_index=1,
+    )
+    successor_authority = {
+        "target_roll_rad": -0.25,
+        "target_pitch_rad": 0.12,
+        "yaw_rate_rad_s": -0.15,
+        "thrust": 0.275,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+
+    allocation = _dd89_top_censored_recovery(
+        current_aperture_propagated=False,
+        current_aperture_dynamics_qualified=False,
+        stable_center_norm=(0.30619, 0.0),
+        expansion_rate_s=-0.0099,
+        time_to_contact_s=None,
+        fov_protected_target_pitch_rad=successor_authority[
+            "target_pitch_rad"
+        ],
+        requested_thrust=0.320,
+        fresh_boundary_current_authority=boundary,
+    )
+
+    assert allocation is not None
+    applied = dict(successor_authority)
+    applied.update(
+        {
+            "target_pitch_rad": allocation.allocated_target_pitch_rad,
+            "thrust": allocation.allocated_thrust,
+        }
+    )
+    assert applied["target_roll_rad"] == -0.25
+    assert applied["yaw_rate_rad_s"] == -0.15
+    assert applied["target_pitch_rad"] == 0.0
+    assert applied["thrust"] == pytest.approx(0.320)
+    assert allocation.fresh_boundary_current_authority is True
+    assert allocation.time_to_contact_s is None
+    assert allocation.forward_closure_authorized is False
+    assert allocation.steering_only is True
+    assert allocation.passage_authority is False
+    assert allocation.advance_authority is False
+    assert successor_authority["target_pitch_rad"] == pytest.approx(0.12)
+    assert successor_authority["thrust"] == pytest.approx(0.275)
+
+
+def test_fresh_post_credit_boundary_cannot_override_bad_current_lineage():
+    state, decision, source, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    boundary = course_stage._fresh_post_credit_top_boundary_authority(
+        state=state,
+        decision=decision,
+        authority=source,
+        recovery_snapshot=snapshot,
+        current_gate_index=1,
+    )
+    assert (
+        _dd89_top_censored_recovery(
+            current_aperture_propagated=False,
+            current_aperture_dynamics_qualified=False,
+            current_ambiguous=True,
+            fresh_boundary_current_authority=boundary,
+        )
+        is None
+    )
+
+
+def test_fresh_top_boundary_command_still_uses_final_wire_governor():
+    session = DynamicVisualCourseSession()
+    seed_ns = 1_000_000_000
+    seed = AttitudeRateCommand(-0.08, 0.06, -0.05, 0.275)
+    session.record_wire_acceptance(
+        target_roll_rad=-0.25,
+        target_pitch_rad=0.12,
+        yaw_rate_rad_s=-0.15,
+        thrust=0.275,
+        wire_command=seed,
+        wire_start_monotonic_ns=seed_ns,
+    )
+
+    proposal_ns = seed_ns + 20_000_000
+    governed = session.govern_wire_command(
+        AttitudeRateCommand(-0.25, 0.0, -0.15, 0.320),
+        proposal_monotonic_ns=proposal_ns,
+        launch_thrust_override=False,
+        yaw_safety_override=False,
+    )
+
+    assert governed.roll_rate < 0.0
+    assert governed.yaw_rate < 0.0
+    assert 0.0 <= governed.pitch_rate < seed.pitch_rate
+    assert seed.thrust < governed.thrust < 0.320
+    assert all(
+        math.isfinite(value)
+        for value in (
+            governed.roll_rate,
+            governed.pitch_rate,
+            governed.yaw_rate,
+            governed.thrust,
+        )
+    )
+    assert abs(governed.roll_rate) <= 0.25
+    assert abs(governed.pitch_rate) <= 0.25
+    assert abs(governed.yaw_rate) <= 0.15
+    session.record_wire_acceptance(
+        target_roll_rad=-0.25,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=-0.15,
+        thrust=0.320,
+        wire_command=governed,
+        wire_start_monotonic_ns=proposal_ns,
+        requested_thrust=0.320,
+    )
+    hold = session.continuity_hold_authority(
+        now_monotonic_ns=proposal_ns,
+        maximum_age_s=0.12,
+    )
+    assert hold["wire_command"] == governed
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("stale_token", "ambiguous", "wrong_track", "wrong_gate"),
+)
+def test_fresh_post_credit_top_boundary_requires_exact_lineage(mutation):
+    state, decision, authority, snapshot = (
+        _fresh_post_credit_top_boundary_case()
+    )
+    if mutation == "stale_token":
+        snapshot.latest_camera_token = _token(51)
+    elif mutation == "ambiguous":
+        snapshot.current_track.ambiguous = True
+    elif mutation == "wrong_track":
+        state.current_track_id = "wrong-track"
+    else:
+        snapshot.current_track.authoritative_gate_index = 2
+
+    with pytest.raises(
+        ValueError,
+        match="differs from credited current lineage",
+    ):
+        course_stage._fresh_post_credit_top_boundary_authority(
+            state=state,
+            decision=decision,
+            authority=authority,
+            recovery_snapshot=snapshot,
+            current_gate_index=1,
+        )
 
 
 @pytest.mark.parametrize(
