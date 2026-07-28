@@ -161,6 +161,11 @@ FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
 FRESH_HORIZONTAL_DIRECT_TOP_FOV_BASIS = (
     "fresh-horizontal-edge-direct-top-fov-steering-v1"
 )
+FRESH_HORIZONTAL_FOV_CLOSURE_BRAKE_BASIS = (
+    "fresh-horizontal-edge-predicted-contact-brake-v1"
+)
+FRESH_HORIZONTAL_FOV_EDGE_THRESHOLD = 0.90
+FRESH_HORIZONTAL_FOV_MAX_EDGE_CONTACT_S = 0.25
 APPROACH_INNER_DROPOUT_MAX_DURATION_S = 0.120
 APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
 APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S = 0.25
@@ -567,6 +572,33 @@ class _FreshTopCensoredClosureRecovery:
 
 
 @dataclass(frozen=True, slots=True)
+class _FreshHorizontalFovClosureBrake:
+    """Non-forward allocation for one predicted horizontal FOV escape."""
+
+    basis: str
+    horizontal_edge: int
+    raw_bbox_norm_ltrb: tuple[float, float, float, float]
+    raw_outward_edge_image_fraction: float
+    raw_half_width_image_fraction: float
+    raw_center_velocity_norm_s: float
+    log_scale_rate_s: float
+    outward_edge_rate_image_fraction_s: float
+    predicted_edge_contact_s: float
+    edge_threshold_image_fraction: float
+    maximum_edge_contact_s: float
+    requested_target_pitch_rad: float
+    fov_protected_target_pitch_rad: float
+    allocated_target_pitch_rad: float
+    requested_thrust: float
+    allocated_thrust: float
+    fresh_current_authority: bool
+    forward_closure_authorized: bool
+    steering_only: bool
+    passage_authority: bool
+    advance_authority: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _FreshCurrentTopBoundaryAuthority:
     """Exact authoritative-current publication allowed to withhold closure."""
 
@@ -585,6 +617,161 @@ def _fresh_exact_top_boundary_preempts_propagated_fov(
     """Select physical TOP closure before still-live propagated aperture."""
 
     return clipping is FrameEdge.TOP
+
+
+def _allocate_fresh_horizontal_fov_closure_brake(
+    *,
+    bbox_norm_ltrb: tuple[float, float, float, float],
+    center_velocity_norm_s: tuple[float, float],
+    log_scale_rate_s: float,
+    clipping: FrameEdge,
+    center_censored: bool,
+    current_visible: bool,
+    current_ambiguous: bool,
+    current_missed_count: int,
+    current_censored_axes: tuple[bool, bool],
+    passage_committed: bool,
+    requested_target_pitch_rad: float,
+    fov_protected_target_pitch_rad: float,
+    requested_thrust: float,
+) -> Optional[_FreshHorizontalFovClosureBrake]:
+    """Stop closure before a fresh current gate leaves a horizontal edge.
+
+    Tracker center velocity is expressed in normalized ``[-1, 1]`` image
+    coordinates, while the raw bbox uses image fractions.  Half the center
+    rate plus scale-driven half-width growth therefore predicts each raw
+    side's contact with the viewport.  This allocation changes pitch only;
+    fresh visual guidance retains roll/yaw steering and no passage authority
+    is created.
+    """
+
+    if (
+        type(bbox_norm_ltrb) is not tuple
+        or len(bbox_norm_ltrb) != 4
+        or type(center_velocity_norm_s) is not tuple
+        or len(center_velocity_norm_s) != 2
+        or type(clipping) is not FrameEdge
+        or type(center_censored) is not bool
+        or type(current_visible) is not bool
+        or type(current_ambiguous) is not bool
+        or type(current_missed_count) is not int
+        or type(current_censored_axes) is not tuple
+        or len(current_censored_axes) != 2
+        or type(passage_committed) is not bool
+    ):
+        raise ValueError("fresh horizontal FOV brake structure is invalid")
+    left, top, right, bottom = map(float, bbox_norm_ltrb)
+    velocity_x, velocity_y = map(float, center_velocity_norm_s)
+    expansion = float(log_scale_rate_s)
+    requested_pitch = float(requested_target_pitch_rad)
+    protected_pitch = float(fov_protected_target_pitch_rad)
+    thrust = float(requested_thrust)
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                left,
+                top,
+                right,
+                bottom,
+                velocity_x,
+                velocity_y,
+                expansion,
+                requested_pitch,
+                protected_pitch,
+                thrust,
+            )
+        )
+        or not 0.0 <= left < right <= 1.0
+        or not 0.0 <= top < bottom <= 1.0
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= requested_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= protected_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_THRUST <= thrust <= MAX_VISUAL_THRUST
+    ):
+        raise ValueError("fresh horizontal FOV brake input is invalid")
+    if not (
+        clipping is FrameEdge.NONE
+        and not center_censored
+        and current_visible
+        and not current_ambiguous
+        and current_missed_count == 0
+        and current_censored_axes == (False, False)
+        and not passage_committed
+    ):
+        return None
+
+    half_width = 0.5 * (right - left)
+    candidates: list[tuple[float, FrameEdge, float, float]] = []
+    side_inputs = (
+        (
+            FrameEdge.LEFT,
+            1.0 - left,
+            -0.5 * velocity_x + half_width * expansion,
+        ),
+        (
+            FrameEdge.RIGHT,
+            right,
+            0.5 * velocity_x + half_width * expansion,
+        ),
+    )
+    for side, outward_edge, outward_rate in side_inputs:
+        if (
+            outward_edge
+            < FRESH_HORIZONTAL_FOV_EDGE_THRESHOLD - 1e-12
+            or outward_rate <= 0.0
+        ):
+            continue
+        edge_contact_s = (1.0 - outward_edge) / outward_rate
+        if (
+            edge_contact_s < -1e-12
+            or edge_contact_s
+            > FRESH_HORIZONTAL_FOV_MAX_EDGE_CONTACT_S + 1e-12
+        ):
+            continue
+        candidates.append(
+            (
+                max(0.0, edge_contact_s),
+                side,
+                outward_edge,
+                outward_rate,
+            )
+        )
+    if not candidates:
+        return None
+    (
+        edge_contact_s,
+        side,
+        outward_edge,
+        outward_rate,
+    ) = min(candidates, key=lambda candidate: candidate[0])
+    allocated_pitch = max(0.0, protected_pitch)
+    return _FreshHorizontalFovClosureBrake(
+        basis=FRESH_HORIZONTAL_FOV_CLOSURE_BRAKE_BASIS,
+        horizontal_edge=int(side),
+        raw_bbox_norm_ltrb=(left, top, right, bottom),
+        raw_outward_edge_image_fraction=outward_edge,
+        raw_half_width_image_fraction=half_width,
+        raw_center_velocity_norm_s=velocity_x,
+        log_scale_rate_s=expansion,
+        outward_edge_rate_image_fraction_s=outward_rate,
+        predicted_edge_contact_s=edge_contact_s,
+        edge_threshold_image_fraction=FRESH_HORIZONTAL_FOV_EDGE_THRESHOLD,
+        maximum_edge_contact_s=FRESH_HORIZONTAL_FOV_MAX_EDGE_CONTACT_S,
+        requested_target_pitch_rad=requested_pitch,
+        fov_protected_target_pitch_rad=protected_pitch,
+        allocated_target_pitch_rad=allocated_pitch,
+        requested_thrust=thrust,
+        allocated_thrust=thrust,
+        fresh_current_authority=True,
+        forward_closure_authorized=False,
+        steering_only=True,
+        passage_authority=False,
+        advance_authority=False,
+    )
 
 
 def _fresh_current_top_boundary_authority(
@@ -6001,6 +6188,7 @@ async def _run_visual_course_stage_impl(
         refresh_ingress_after_slot: bool = False,
         intercept_response_authority: float = 0.0,
         top_fov_transition_owned: bool = False,
+        horizontal_fov_closure_brake_enabled: bool = False,
         committed_crossing_authority: Optional[
             _CensoredPassageCoastAuthority
         ] = None,
@@ -6066,6 +6254,10 @@ async def _run_visual_course_stage_impl(
         if type(top_fov_transition_owned) is not bool:
             raise abort_type(
                 "visual-course top-FOV transition ownership is invalid"
+            )
+        if type(horizontal_fov_closure_brake_enabled) is not bool:
+            raise abort_type(
+                "visual-course horizontal-FOV brake selection is invalid"
             )
         if (
             committed_crossing_authority is not None
@@ -6386,6 +6578,9 @@ async def _run_visual_course_stage_impl(
         ] = None
         top_censored_closure_recovery: Optional[
             _FreshTopCensoredClosureRecovery
+        ] = None
+        horizontal_fov_closure_brake: Optional[
+            _FreshHorizontalFovClosureBrake
         ] = None
         requested_pitch_before_top_fov = target_pitch_rad
         top_fov_track_id: Optional[str] = None
@@ -6723,6 +6918,133 @@ async def _run_visual_course_stage_impl(
                             target_pitch_rad
                         )
                         launch_evidence["thrust"] = command_thrust
+            if (
+                horizontal_fov_closure_brake_enabled
+                and committed_crossing_authority is None
+                and not top_fov_transition_owned
+                and getattr(target_track, "clipping", None)
+                is FrameEdge.NONE
+                and getattr(target_track, "center_censored", None)
+                is False
+                and bool(getattr(target_track, "visible", False))
+                and not bool(getattr(target_track, "ambiguous", True))
+                and getattr(target_track, "missed_frame_count", None) == 0
+            ):
+                try:
+                    horizontal_course = (
+                        dynamic_controller.core.course_state()
+                    )
+                    horizontal_current = horizontal_course.current
+                    horizontal_decision = dynamic_controller.last_decision
+                    horizontal_history = getattr(
+                        target_track,
+                        "history",
+                        None,
+                    )
+                    horizontal_sample = (
+                        None
+                        if type(horizontal_history) is not tuple
+                        or not horizontal_history
+                        else horizontal_history[-1]
+                    )
+                    if (
+                        top_fov_observation is None
+                        or top_fov_proposal is None
+                        or horizontal_decision is None
+                        or horizontal_sample is None
+                        or getattr(snapshot, "current_gate_index", None)
+                        != current_gate_index
+                        or getattr(snapshot, "current_track_id", None)
+                        != current_track_id
+                        or getattr(snapshot, "authority_usable", None)
+                        is not True
+                        or getattr(snapshot, "withholding_reason", None)
+                        is not None
+                        or getattr(snapshot, "race_finished", None)
+                        is not False
+                        or horizontal_course.current_gate_index
+                        != current_gate_index
+                        or horizontal_course.current_track_id
+                        != current_track_id
+                        or horizontal_current.track_id
+                        != current_track_id
+                        or horizontal_decision.current_gate_index
+                        != current_gate_index
+                        or horizontal_decision.current_track_id
+                        != current_track_id
+                        or getattr(target_track, "track_id", None)
+                        != current_track_id
+                        or getattr(target_track, "role", None)
+                        is not VisualTrackRole.CURRENT
+                        or getattr(
+                            target_track,
+                            "authoritative_gate_index",
+                            None,
+                        )
+                        != current_gate_index
+                        or getattr(target_track, "latest_token", None)
+                        != snapshot.latest_camera_token
+                        or horizontal_sample.token
+                        != snapshot.latest_camera_token
+                        or horizontal_current.frame_sequence
+                        != horizontal_sample.tracker_frame_sequence
+                        or horizontal_current.stream_generation
+                        != snapshot.latest_camera_token.generation
+                    ):
+                        raise ValueError(
+                            "fresh horizontal-FOV brake differs from "
+                            "authoritative current lineage"
+                        )
+                    horizontal_fov_closure_brake = (
+                        _allocate_fresh_horizontal_fov_closure_brake(
+                            bbox_norm_ltrb=horizontal_sample.bbox_norm,
+                            center_velocity_norm_s=(
+                                target_track.center_velocity_norm_s
+                            ),
+                            log_scale_rate_s=(
+                                target_track.log_scale_rate_s
+                            ),
+                            clipping=target_track.clipping,
+                            center_censored=(
+                                target_track.center_censored
+                            ),
+                            current_visible=horizontal_current.visible,
+                            current_ambiguous=(
+                                horizontal_current.ambiguous
+                            ),
+                            current_missed_count=(
+                                horizontal_current.missed_count
+                            ),
+                            current_censored_axes=(
+                                horizontal_current.censored_axes
+                            ),
+                            passage_committed=bool(
+                                proposal.mode
+                                is VisualApproachMode.PASSAGE
+                            ),
+                            requested_target_pitch_rad=(
+                                requested_pitch_before_top_fov
+                            ),
+                            fov_protected_target_pitch_rad=(
+                                target_pitch_rad
+                            ),
+                            requested_thrust=command_thrust,
+                        )
+                    )
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise abort_type(
+                        "visual-course fresh horizontal-FOV closure brake "
+                        f"refused: {exc}"
+                    ) from exc
+                if horizontal_fov_closure_brake is not None:
+                    target_pitch_rad = (
+                        horizontal_fov_closure_brake
+                        .allocated_target_pitch_rad
+                    )
+                    if launch_evidence is not None:
+                        launch_evidence["target_pitch_rad"] = (
+                            target_pitch_rad
+                        )
         if committed_crossing_authority is not None:
             # Observations, local-state propagation, and diagnostics continue
             # updating above, but the latch-sealed current-gate coast owns the
@@ -7412,6 +7734,49 @@ async def _run_visual_course_stage_impl(
                             snapshot.latest_camera_token
                         ),
                         allocation=recovery_evidence,
+                        command=asdict(command),
+                    )
+                if horizontal_fov_closure_brake is not None:
+                    brake_evidence = asdict(
+                        horizontal_fov_closure_brake
+                    )
+                    accepted_dynamic_evidence[
+                        "fresh_horizontal_fov_closure_brake"
+                    ] = brake_evidence
+                    pitch_guidance = accepted_dynamic_evidence.get(
+                        "top_fov_pitch_guidance"
+                    )
+                    if isinstance(pitch_guidance, dict):
+                        pitch_guidance[
+                            "superseded_by_horizontal_fov_closure_brake"
+                        ] = True
+                        pitch_guidance[
+                            "applied_target_pitch_rad"
+                        ] = target_pitch_rad
+                    fov_summary[
+                        "last_protected_target_pitch_rad"
+                    ] = target_pitch_rad
+                    segment[
+                        "horizontal_fov_closure_brake_command_count"
+                    ] = (
+                        int(
+                            segment[
+                                "horizontal_fov_closure_brake_command_count"
+                            ]
+                        )
+                        + 1
+                    )
+                    segment[
+                        "last_horizontal_fov_closure_brake"
+                    ] = brake_evidence
+                    host.recorder.emit(
+                        "visual_course_fresh_horizontal_fov_closure_brake",
+                        gate_index=current_gate_index,
+                        stage=stage,
+                        camera_token=asdict(
+                            snapshot.latest_camera_token
+                        ),
+                        allocation=brake_evidence,
                         command=asdict(command),
                     )
             host.recorder.emit(
@@ -8165,6 +8530,8 @@ async def _run_visual_course_stage_impl(
             "approach_propagated_visibility_gap_fresh_frame_count": 0,
             "approach_propagated_visibility_gap_command_count": 0,
             "approach_propagated_visibility_gap": None,
+            "horizontal_fov_closure_brake_command_count": 0,
+            "last_horizontal_fov_closure_brake": None,
             "authoritative_credit_reconciliation": None,
             "post_credit_zero_command_count": 0,
             "post_credit_hold_command_count": 0,
@@ -10411,6 +10778,7 @@ async def _run_visual_course_stage_impl(
                         snapshot=snapshot,
                         yaw_reference_rad=yaw_reference_rad,
                         segment_started_s=segment_started_s,
+                        horizontal_fov_closure_brake_enabled=True,
                         stage=(
                             f"{VISUAL_COURSE_STAGE}/gate"
                             f"{current_gate_index}/approach"

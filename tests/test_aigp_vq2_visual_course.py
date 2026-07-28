@@ -3419,6 +3419,112 @@ def test_fresh_horizontal_top_reference_requires_exact_current_lineage(
         )
 
 
+@pytest.mark.parametrize(
+    ("bbox_norm_ltrb", "center_velocity_x", "expected_edge"),
+    (
+        (
+            (0.7546875, 0.20, 0.9046875, 0.60),
+            0.71718,
+            FrameEdge.RIGHT,
+        ),
+        (
+            (0.0953125, 0.20, 0.2453125, 0.60),
+            -0.71718,
+            FrameEdge.LEFT,
+        ),
+    ),
+)
+def test_fresh_horizontal_edge_contact_preempts_forward_pitch(
+    bbox_norm_ltrb,
+    center_velocity_x,
+    expected_edge,
+):
+    allocation = (
+        course_stage._allocate_fresh_horizontal_fov_closure_brake(
+            bbox_norm_ltrb=bbox_norm_ltrb,
+            center_velocity_norm_s=(center_velocity_x, -0.10),
+            log_scale_rate_s=1.15895,
+            clipping=FrameEdge.NONE,
+            center_censored=False,
+            current_visible=True,
+            current_ambiguous=False,
+            current_missed_count=0,
+            current_censored_axes=(False, False),
+            passage_committed=False,
+            requested_target_pitch_rad=0.120,
+            fov_protected_target_pitch_rad=-0.21458,
+            requested_thrust=0.275,
+        )
+    )
+
+    assert allocation is not None
+    assert allocation.basis == (
+        course_stage.FRESH_HORIZONTAL_FOV_CLOSURE_BRAKE_BASIS
+    )
+    assert allocation.horizontal_edge == int(expected_edge)
+    assert allocation.raw_half_width_image_fraction == pytest.approx(
+        0.075
+    )
+    assert (
+        allocation.outward_edge_rate_image_fraction_s
+        == pytest.approx(0.44551125)
+    )
+    assert allocation.predicted_edge_contact_s == pytest.approx(
+        0.21393960
+    )
+    assert allocation.fov_protected_target_pitch_rad == pytest.approx(
+        -0.21458
+    )
+    assert allocation.allocated_target_pitch_rad == 0.0
+    assert allocation.allocated_thrust == pytest.approx(0.275)
+    assert allocation.forward_closure_authorized is False
+    assert allocation.steering_only is True
+    assert allocation.passage_authority is False
+    assert allocation.advance_authority is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("inside", "receding", "clipped", "passage"),
+)
+def test_horizontal_fov_brake_requires_fresh_outward_precontact_threat(
+    mutation,
+):
+    arguments = {
+        "bbox_norm_ltrb": (0.7546875, 0.20, 0.9046875, 0.60),
+        "center_velocity_norm_s": (0.71718, -0.10),
+        "log_scale_rate_s": 1.15895,
+        "clipping": FrameEdge.NONE,
+        "center_censored": False,
+        "current_visible": True,
+        "current_ambiguous": False,
+        "current_missed_count": 0,
+        "current_censored_axes": (False, False),
+        "passage_committed": False,
+        "requested_target_pitch_rad": 0.120,
+        "fov_protected_target_pitch_rad": -0.21458,
+        "requested_thrust": 0.275,
+    }
+    if mutation == "inside":
+        arguments["bbox_norm_ltrb"] = (0.70, 0.20, 0.89, 0.60)
+    elif mutation == "receding":
+        arguments["center_velocity_norm_s"] = (-1.0, -0.10)
+        arguments["log_scale_rate_s"] = 0.0
+    elif mutation == "clipped":
+        arguments["clipping"] = FrameEdge.RIGHT
+        arguments["center_censored"] = True
+        arguments["current_censored_axes"] = (True, False)
+    else:
+        arguments["passage_committed"] = True
+
+    assert (
+        course_stage._allocate_fresh_horizontal_fov_closure_brake(
+            **arguments
+        )
+        is None
+    )
+
+
 def test_dd89_fresh_top_boundary_allocates_vertical_without_forward_closure():
     allocation = _dd89_top_censored_recovery()
 
