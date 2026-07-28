@@ -1368,7 +1368,7 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
         == MAX_TARGET_ROLL_RAD
     )
     assert (
-        0.18
+        0.0
         < decision.proposed_command.target_roll_rad
         < math.radians(25.0)
     )

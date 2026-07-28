@@ -201,7 +201,7 @@ def _valid_dynamic_near_plane_evidence() -> dict[str, object]:
     }
 
 
-def test_committed_successor_memory_cannot_replace_crossing_reference():
+def test_committed_successor_memory_updates_only_crossing_yaw():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
         {
@@ -234,7 +234,11 @@ def test_committed_successor_memory_cannot_replace_crossing_reference():
         reviewed_successor_track_id="vq2-track-000002",
     )
 
-    assert refreshed == authority
+    assert refreshed.yaw_rate_rad_s == -0.15
+    assert replace(
+        refreshed,
+        yaw_rate_rad_s=authority.yaw_rate_rad_s,
+    ) == authority
     assert all(
         math.isfinite(value)
         for value in (

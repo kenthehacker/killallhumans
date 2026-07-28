@@ -2123,12 +2123,12 @@ def _refresh_committed_successor_steering(
     current_track_id: str,
     reviewed_successor_track_id: str,
 ) -> _CensoredPassageCoastAuthority:
-    """Validate successor memory without replacing the sealed crossing command.
+    """Admit successor yaw without replacing the sealed crossing command.
 
-    The current-gate clearance proof is causal only for the attitude/yaw/thrust
-    reference accepted when the near-plane latch formed.  Successor geometry
-    remains available for the authoritative post-credit handoff, but changing
-    the command before credit would invalidate that crossing proof.
+    The current-gate clearance proof retains roll, pitch, thrust, identity,
+    and all passage authority.  A lineage-bound successor heading may update
+    only calibrated yaw, which rotates the camera/course tangent without
+    claiming passage or promotion.
     """
 
     if (
@@ -2198,14 +2198,22 @@ def _refresh_committed_successor_steering(
         lower=MIN_VISUAL_TARGET_PITCH_RAD,
         upper=MAX_VISUAL_TARGET_PITCH_RAD,
     )
-    if not accepted.yaw_soft_stop_zeroed:
-        admitted_axis(
+    committed_yaw = (
+        None
+        if accepted.yaw_soft_stop_zeroed
+        else admitted_axis(
             "committed_successor_yaw_authority",
             "committed_successor_yaw_rate_rad_s",
             lower=-MAX_VISUAL_YAW_RATE_RAD_S,
             upper=MAX_VISUAL_YAW_RATE_RAD_S,
         )
-    return authority
+    )
+    if committed_yaw is None:
+        return authority
+    return replace(
+        authority,
+        yaw_rate_rad_s=committed_yaw,
+    )
 
 
 def _dynamic_near_plane_wire_sample(

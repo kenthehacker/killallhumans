@@ -27,12 +27,11 @@ Quaternion = tuple[float, float, float, float]
 Vector2 = tuple[float, float]
 Vector3 = tuple[float, float, float]
 
-# Gate-1 runs 019d69d6 and 227125fd held the former 0.17-rad target while
-# the authoritative current gate continued diverging RIGHT into clipping.
-# Allocate the full bounded intercept reference here; the independent host
-# watchdog still owns the broader 25-degree attitude envelope and the final
-# wire governor remains bounded at 0.25 rad/s.
-MAX_TARGET_ROLL_RAD = 0.25
+# Run ae52c448 applied the isolated 0.25-rad target and measured 0.242 rad,
+# but Gate 1 clipped RIGHT earlier than the otherwise equivalent 0.17-rad
+# run.  Retain the smaller bank reference while transition heading is fixed;
+# the independent host watchdog and final wire governor remain unchanged.
+MAX_TARGET_ROLL_RAD = 0.17
 MIN_TARGET_PITCH_RAD = -0.35
 MAX_TARGET_PITCH_RAD = 0.15
 MAX_YAW_RATE_RAD_S = 0.15
