@@ -2460,12 +2460,16 @@ def _dynamic_near_plane_wire_sample(
         scalar(
             "current_aperture_prediction_horizon_remaining_s",
             minimum=0.0,
-            minimum_inclusive=False,
             maximum=DYNAMIC_CROSSING_PREDICTION_MAX_HORIZON_S,
         )
         if propagated_aperture
         else None
     )
+    if propagated_horizon_remaining_s == 0.0:
+        # The core reports a clamped zero when a previously qualified local
+        # aperture reaches its fixed, non-sliding prediction deadline.  That
+        # is valid expired state, but it owns no new passage evidence.
+        return None
     if (
         propagated_horizon_remaining_s is not None
         and crossing_prediction_horizon_s

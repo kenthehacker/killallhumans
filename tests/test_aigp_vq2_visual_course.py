@@ -623,6 +623,19 @@ def test_expiring_propagated_aperture_declines_passage_evidence():
     assert _dynamic_near_plane_sample(evidence) is None
 
 
+def test_expired_propagated_aperture_declines_passage_evidence():
+    evidence = _valid_dynamic_near_plane_evidence()
+    evidence.update(
+        {
+            "current_aperture_propagated": True,
+            "current_aperture_dynamics_qualified": True,
+            "current_aperture_prediction_horizon_remaining_s": 0.0,
+        }
+    )
+
+    assert _dynamic_near_plane_sample(evidence) is None
+
+
 def test_dynamic_near_plane_wire_sample_maps_1cab_terminal_window():
     evidence = _valid_dynamic_near_plane_evidence()
     evidence.update(
