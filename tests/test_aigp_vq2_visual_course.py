@@ -2985,6 +2985,25 @@ def test_atomic_credit_during_clipped_gap_uses_sole_graph_successor_only():
     assert reconciliation["passage_authority"] is False
     assert reconciliation["advance_authority"] is False
     assert reconciliation["cross_gap_identity_claimed"] is False
+    assert reconciliation["candidate_center_censored"] is False
+
+    clipped_successor = SimpleNamespace(
+        **{
+            **vars(successor),
+            "center_censored": True,
+        }
+    )
+    snapshot.next_candidates = (clipped_successor,)
+    clipped_reconciliation = (
+        course_stage._unlatched_atomic_credit_successor_evidence(
+            snapshot,
+            current_gate_index=8,
+            current_track_id="track-8",
+        )
+    )
+    assert clipped_reconciliation is not None
+    assert clipped_reconciliation["reviewed_track_id"] == "track-9"
+    assert clipped_reconciliation["candidate_center_censored"] is True
 
     snapshot.next_selection_ambiguous = True
     assert (

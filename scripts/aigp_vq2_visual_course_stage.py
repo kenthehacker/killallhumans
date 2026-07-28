@@ -7112,7 +7112,6 @@ def _unlatched_atomic_credit_successor_evidence(
         or type(candidate_id) is not str
         or not candidate_id
         or candidate_id == current_track_id
-        or getattr(candidate, "center_censored", True) is not False
     ):
         return None
     return {
@@ -7131,6 +7130,11 @@ def _unlatched_atomic_credit_successor_evidence(
         "candidate_association_confidence": getattr(
             candidate,
             "association_confidence",
+            None,
+        ),
+        "candidate_center_censored": getattr(
+            candidate,
+            "center_censored",
             None,
         ),
         "passage_authority": False,
