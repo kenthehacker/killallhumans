@@ -3413,6 +3413,7 @@ class DynamicCourseCore:
             and not current.ambiguous
             and not current.censored_axes[0]
             and current.bearing_rate_qualified[0]
+            and not horizontal_alignment_unsettled
             and abs(current_center[0])
             <= self.config.passage_margin_norm
             and abs(residual_rate_norm[0])

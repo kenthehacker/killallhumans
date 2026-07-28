@@ -2908,6 +2908,7 @@ def _precommit_successor_case(
     successor_x_step: float,
     current_x: float = 0.0,
     current_log_scales: tuple[float, ...] | None = None,
+    crossing_max_occupancy_q: tuple[float, float] = (0.50, 0.45),
 ) -> tuple[DynamicCourseCore, GuidanceDecision]:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,
@@ -2918,6 +2919,7 @@ def _precommit_successor_case(
         roll_guidance_sign=1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
+        crossing_max_occupancy_q=crossing_max_occupancy_q,
     )
     core = DynamicCourseCore(config)
     core.record_applied_command(_command(0.90))
@@ -3017,6 +3019,19 @@ def test_precommit_successor_roll_releases_or_yields_to_current() -> None:
     assert opposing_current.command.target_roll_rad < 0.0
     assert opposing_current.precommit_successor_roll_authority == 0.0
     assert opposing_current.precommit_successor_target_roll_rad is None
+
+
+def test_precommit_successor_roll_requires_current_crossing_reserve() -> None:
+    _, unsafe = _precommit_successor_case(
+        successor_x_step=0.004,
+        crossing_max_occupancy_q=(0.02, 0.45),
+    )
+
+    assert unsafe.centered_crossing_clearance_norm[0] < 0.0
+    assert unsafe.crossing_rate_q_s[0] == pytest.approx(0.0)
+    assert unsafe.precommit_successor_roll_authority == 0.0
+    assert unsafe.precommit_successor_target_roll_rad is None
+    assert unsafe.command.target_roll_rad == pytest.approx(0.0)
 
 
 def test_precommit_roll_retains_closure_seed_but_expires_stale_vision() -> None:
