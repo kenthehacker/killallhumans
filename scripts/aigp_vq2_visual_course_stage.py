@@ -1840,6 +1840,9 @@ def _allocate_fresh_top_censored_closure_recovery(
 def _off_axis_top_fov_owns_pitch(
     *,
     mode: VisualApproachMode,
+    current_gate_index: int,
+    initial_gate_index: int,
+    current_gate_brake_preempted: bool,
     fov_proposal: _TopFovPitchProposal,
     fresh_top_boundary: _FreshCurrentTopBoundaryAuthority,
     closure_recovery: _FreshTopCensoredClosureRecovery,
@@ -1854,16 +1857,21 @@ def _off_axis_top_fov_owns_pitch(
     collective retains the closure brake while pitch keeps the gate in view.
 
     Exact, bounded propagated-state, and fixed nonrenewing retained-raw FOV
-    authority are admitted.  Post-credit recovery needs a second clean
-    accepted wire before release and therefore retains FOV pitch even when
-    horizontally aligned.  None of these paths has passage or advance
-    authority.  Geometry-refusal paths never call this policy.
+    authority are admitted.  Post-credit recovery retains FOV pitch directly.
+    During ordinary later-gate approach it does the same unless qualified
+    current motion proves that the nonforward brake must preempt it.  None of
+    these paths has passage or advance authority.  Geometry-refusal paths
+    never call this policy.
     """
 
     retained = retained_raw_handoff is not None
     propagated = propagated_state_handoff is not None
     if (
         type(mode) is not VisualApproachMode
+        or type(current_gate_index) is not int
+        or type(initial_gate_index) is not int
+        or current_gate_index < initial_gate_index
+        or type(current_gate_brake_preempted) is not bool
         or type(fov_proposal) is not _TopFovPitchProposal
         or type(fresh_top_boundary) is not _FreshCurrentTopBoundaryAuthority
         or type(closure_recovery) is not _FreshTopCensoredClosureRecovery
@@ -1928,11 +1936,16 @@ def _off_axis_top_fov_owns_pitch(
     ):
         raise ValueError("TOP pitch arbitration inputs are invalid")
 
-    bounded_post_credit_recovery = bool(
+    pitch_ownership_mode = bool(
         mode is VisualApproachMode.PROMOTE_REACQUIRE
+        or (
+            mode is VisualApproachMode.APPROACH
+            and current_gate_index > initial_gate_index
+            and not current_gate_brake_preempted
+        )
     )
     return bool(
-        bounded_post_credit_recovery
+        pitch_ownership_mode
         and closure_recovery.fresh_boundary_current_authority
         and closure_recovery.steering_only
         and not closure_recovery.forward_closure_authorized
@@ -4516,6 +4529,44 @@ class _ApproachExpiredGeometrySearchAuthority:
     observed_source_index: Optional[int]
     horizontal_norm: float
     retained_horizontal_edge: FrameEdge
+
+
+def _approach_expired_geometry_search_vertical_reference(
+    *,
+    current_clipping: FrameEdge,
+    last_protected_target_pitch_rad: Optional[float],
+    brake_pitch_rad: float,
+    brake_thrust: float,
+    support_thrust: float,
+) -> tuple[float, float]:
+    """Carry a bounded TOP recovery reference into fresh-frame search."""
+
+    brake_pitch, brake_collective, support_collective = map(
+        float,
+        (brake_pitch_rad, brake_thrust, support_thrust),
+    )
+    if (
+        type(current_clipping) is not FrameEdge
+        or not all(
+            math.isfinite(value)
+            for value in (
+                brake_pitch,
+                brake_collective,
+                support_collective,
+            )
+        )
+        or not 0.0 <= brake_collective <= support_collective <= 1.0
+    ):
+        raise ValueError("expired-geometry search vertical input is invalid")
+    if current_clipping & FrameEdge.TOP:
+        protected = (
+            float("nan")
+            if last_protected_target_pitch_rad is None
+            else float(last_protected_target_pitch_rad)
+        )
+        if math.isfinite(protected) and protected < brake_pitch:
+            return protected, support_collective
+    return brake_pitch, brake_collective
 
 
 def _approach_propagated_visibility_gap_command_deadline_s(
@@ -9053,6 +9104,11 @@ async def _run_visual_course_stage_impl(
                         pitch_priority_proposal is not None
                         and _off_axis_top_fov_owns_pitch(
                             mode=proposal.mode,
+                            current_gate_index=current_gate_index,
+                            initial_gate_index=initial_gate_index,
+                            current_gate_brake_preempted=(
+                                current_gate_brake_preempted_top_fov
+                            ),
                             fov_proposal=pitch_priority_proposal,
                             fresh_top_boundary=fresh_top_boundary,
                             closure_recovery=(
@@ -12108,6 +12164,35 @@ async def _run_visual_course_stage_impl(
 
                     if approach_expired_geometry_search_started_s is not None:
                         try:
+                            (
+                                search_pitch_rad,
+                                search_thrust,
+                            ) = (
+                                _approach_expired_geometry_search_vertical_reference(
+                                    current_clipping=getattr(
+                                        snapshot.current_track,
+                                        "clipping",
+                                        FrameEdge.NONE,
+                                    ),
+                                    last_protected_target_pitch_rad=segment[
+                                        "top_fov_pitch_protection"
+                                    ].get("last_protected_target_pitch_rad"),
+                                    brake_pitch_rad=float(
+                                        dynamic_controller.core.config
+                                        .brake_pitch_rad
+                                    ),
+                                    brake_thrust=float(
+                                        host.visual_config.servo.brake_thrust
+                                    ),
+                                    support_thrust=float(limits.max_thrust),
+                                )
+                            )
+                        except (AttributeError, TypeError, ValueError) as exc:
+                            raise abort_type(
+                                "visual-course expired-geometry search "
+                                f"vertical reference refused: {exc}"
+                            ) from exc
+                        try:
                             search_authority = (
                                 _approach_expired_geometry_search_authority(
                                     snapshot=snapshot,
@@ -12117,13 +12202,8 @@ async def _run_visual_course_stage_impl(
                                     retained_horizontal_edge=(
                                         approach_expired_geometry_search_horizontal_edge
                                     ),
-                                    brake_pitch_rad=float(
-                                        dynamic_controller.core.config
-                                        .brake_pitch_rad
-                                    ),
-                                    requested_thrust=float(
-                                        host.visual_config.servo.brake_thrust
-                                    ),
+                                    brake_pitch_rad=search_pitch_rad,
+                                    requested_thrust=search_thrust,
                                     tuning=host.visual_config.servo,
                                 )
                             )

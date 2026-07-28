@@ -4708,6 +4708,9 @@ def test_latest_off_axis_exact_top_yields_to_forward_brake():
     owns_pitch = (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=True,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4751,6 +4754,9 @@ def test_post_credit_top_recovery_keeps_fov_pitch_ownership(
     assert (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=False,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4792,6 +4798,9 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
     assert (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=False,
             fov_proposal=propagated_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4814,12 +4823,15 @@ def test_post_credit_propagated_top_fov_keeps_pitch_ownership():
     assert (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=False,
             fov_proposal=propagated_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=ordinary_off_axis,
             propagated_state_handoff=authority,
         )
-        is False
+        is True
     )
 
 
@@ -4849,6 +4861,9 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
     assert (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=False,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -4861,7 +4876,7 @@ def test_post_credit_top_fov_owns_pitch_during_aligned_or_rapid_closure(
     assert recovery.advance_authority is False
 
 
-def test_exact_top_fov_yields_when_horizontally_aligned():
+def test_exact_top_fov_owns_pitch_when_horizontally_aligned():
     boundary, fov_proposal, recovery = (
         _latest_gate_one_top_pitch_arbitration_case()
     )
@@ -4874,11 +4889,14 @@ def test_exact_top_fov_yields_when_horizontally_aligned():
     assert (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=False,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
         )
-        is False
+        is True
     )
     assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
 
@@ -4906,6 +4924,9 @@ def test_off_axis_top_fov_yields_during_rapid_closure(
     assert (
         course_stage._off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
+            current_gate_index=1,
+            initial_gate_index=0,
+            current_gate_brake_preempted=True,
             fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
@@ -6609,6 +6630,40 @@ def _fresh_search_track(
         center_norm=(horizontal, -0.70),
         history=(sample,),
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "clipping",
+        "last_protected_pitch",
+        "expected_pitch",
+        "expected_thrust",
+    ),
+    (
+        (FrameEdge.TOP, -0.186, -0.186, 0.32),
+        (FrameEdge.TOP | FrameEdge.RIGHT, -0.135, -0.135, 0.32),
+        (FrameEdge.TOP, None, 0.12, 0.275),
+        (FrameEdge.RIGHT, -0.186, 0.12, 0.275),
+    ),
+)
+def test_expired_geometry_search_retains_only_valid_top_vertical_recovery(
+    clipping,
+    last_protected_pitch,
+    expected_pitch,
+    expected_thrust,
+):
+    pitch, thrust = (
+        course_stage._approach_expired_geometry_search_vertical_reference(
+            current_clipping=clipping,
+            last_protected_target_pitch_rad=last_protected_pitch,
+            brake_pitch_rad=0.12,
+            brake_thrust=0.275,
+            support_thrust=0.32,
+        )
+    )
+
+    assert pitch == pytest.approx(expected_pitch)
+    assert thrust == pytest.approx(expected_thrust)
 
 
 def test_expired_geometry_search_uses_sole_fresh_horizontal_detection():
