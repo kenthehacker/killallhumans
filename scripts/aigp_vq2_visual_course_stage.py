@@ -4253,6 +4253,7 @@ class _PendingPostCreditRecovery:
     camera_token_at_credit: CameraFrameToken
     admitted_camera_token: CameraFrameToken
     deadline_s: float
+    successor_steering_available: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -8543,6 +8544,8 @@ async def _run_visual_course_stage_impl(
             )
             or not math.isfinite(post_credit_recovery.deadline_s)
             or post_credit_recovery.deadline_s <= segment_started_s
+            or type(post_credit_recovery.successor_steering_available)
+            is not bool
         ):
             raise abort_type(
                 "visual-course pending post-credit recovery is invalid "
@@ -9243,6 +9246,7 @@ async def _run_visual_course_stage_impl(
                 if (
                     type(runtime.dynamic_controller)
                     is DynamicVisualCourseSession
+                    and post_credit_recovery.successor_steering_available
                     and recovery_measurement_mode
                     in {
                         PostCreditMeasurementMode.ONE_EDGE_CENSORED,
@@ -13159,6 +13163,9 @@ async def _run_visual_course_stage_impl(
             ),
             admitted_camera_token=admitted_recovery_token,
             deadline_s=fresh_deadline_s,
+            successor_steering_available=(
+                post_credit_successor_steering_active
+            ),
         )
         carry_adjacent_planner = bool(
             crossing_wait_adjacent_command_count > 0
