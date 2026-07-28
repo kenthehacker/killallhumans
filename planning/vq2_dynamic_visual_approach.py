@@ -1961,9 +1961,10 @@ class DynamicVisualCourseSession:
         retains one already accepted, bounded successor attitude target while
         the promoted current error still requires the same correction.  A
         short unqualified-rate gap retains that reference only through the
-        reviewed successor horizon; once the rate is qualified, fresh
-        guidance catches up or recovering/opposite geometry releases it
-        immediately.
+        reviewed successor horizon.  A qualified recovering-rate sample may
+        release it only after the promoted gate reaches the existing off-axis
+        envelope; farther out, fresh guidance must catch up or opposite
+        geometry must own the release.
         """
 
         handoff = self._post_credit_roll_reference_handoff
@@ -1977,6 +1978,10 @@ class DynamicVisualCourseSession:
             current.residual_translational_rate_rad_s[0]
         )
         stable_error = float(decision.current_center_norm[0])
+        stable_bearing_rad = math.atan(
+            stable_error
+            * self.core.config.horizontal_angle_scale_rad
+        )
         guidance_sign = float(self.core.config.roll_guidance_sign)
         lineage_matches = bool(
             decision.current_gate_index == handoff.to_gate_index
@@ -1992,6 +1997,7 @@ class DynamicVisualCourseSession:
             retained_roll,
             residual_rate,
             stable_error,
+            stable_bearing_rad,
             guidance_sign,
         )
         bounded_state = bool(
@@ -2018,6 +2024,8 @@ class DynamicVisualCourseSession:
         qualified_recovery = bool(
             current.bearing_rate_qualified[0]
             and direction * guidance_sign * residual_rate <= 1e-12
+            and abs(stable_bearing_rad)
+            <= self.core.config.off_axis_brake_rad + 1e-12
         )
         demand_caught_up = bool(
             same_corrective_demand

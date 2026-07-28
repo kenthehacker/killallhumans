@@ -815,12 +815,20 @@ def test_unqualified_post_credit_rate_retains_bank_only_until_expiry():
 
 
 @pytest.mark.parametrize(
-    ("normal_roll_rad", "residual_rate_rad_s"),
-    ((0.04, 0.25), (-0.04, -0.05)),
+    (
+        "normal_roll_rad",
+        "residual_rate_rad_s",
+        "current_center_x",
+    ),
+    (
+        (0.04, 0.25, 0.30),
+        (-0.04, -0.05, 0.05),
+    ),
 )
-def test_opposite_or_recovering_geometry_releases_roll_handoff_immediately(
+def test_opposite_or_near_center_recovery_releases_roll_handoff_immediately(
     normal_roll_rad: float,
     residual_rate_rad_s: float,
+    current_center_x: float,
 ):
     session, source, successor_id, _retained = (
         _activated_committed_roll_handoff()
@@ -845,7 +853,7 @@ def test_opposite_or_recovering_geometry_releases_roll_handoff_immediately(
         current_gate_index=1,
         current_track_id=successor_id,
         successor_track_id=None,
-        current_center_norm=(0.30, 0.0),
+        current_center_norm=(current_center_x, 0.0),
         proposed_command=normal_command,
         command=normal_command,
     )
@@ -3447,10 +3455,24 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff():
         estimate.state,
         residual_translational_rate_rad_s=(-0.10, 0.0),
     )
+    recovering_off_axis = (
+        session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+            replace(
+                outward,
+                monotonic_ns=accepted_ns + 2_000_000,
+            )
+        )
+    )
+    assert recovering_off_axis.command.target_roll_rad == pytest.approx(
+        -MAX_TARGET_ROLL_RAD
+    )
+    assert session.post_credit_roll_reference_handoff_active
+
     recovered = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
         replace(
             outward,
-            monotonic_ns=accepted_ns + 2_000_000,
+            monotonic_ns=accepted_ns + 3_000_000,
+            current_center_norm=(0.05, 0.0),
         )
     )
     assert recovered.command == normal_command
