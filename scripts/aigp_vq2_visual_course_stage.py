@@ -3622,8 +3622,9 @@ class _CurrentApertureProvedCollectiveState:
 
     The gains remain the flight-proved Gate-0 law.  The state itself is
     gate-agnostic and is recreated at each authoritative gate transition.
-    A censored vertical axis cannot synthesize a new collective request, so
-    it retains the last request derived from an observable current aperture.
+    Raw censorship cannot synthesize a new collective request.  An already
+    admitted IMU-derotated dynamic state remains usable because its caller has
+    separately proved current identity, visibility, and uncensored axes.
     """
 
     track_id: Optional[str] = None
@@ -3760,7 +3761,12 @@ class _CurrentApertureProvedCollectiveState:
             raise ValueError(
                 "current-aperture vertical censorship is invalid"
             )
-        vertical_censored = vertical_censored_value
+        # The raw inner-aperture fit and the dynamic estimator have separate
+        # observability tests.  Do not throw away a qualified, IMU-derotated
+        # current state merely because the raw inner fit is TOP-censored.
+        vertical_censored = bool(
+            vertical_censored_value and not supplied_dynamic_state
+        )
         self.last_hold_reason = None
         if self.last_token_key is not None:
             if (
@@ -3903,10 +3909,8 @@ def _propose_current_aperture_collective(
 ) -> _CurrentApertureCollectiveProposal:
     """Allocate collective only from the authoritative current aperture.
 
-    Residual image-rate damping may request less than the proved support
-    collective only after exact near-plane evidence has committed the
-    crossing.  This is a state-dependent authority boundary, not a temporal
-    command governor.
+    Residual image-rate damping may request less than the proved support only
+    with explicit state-dependent authority from the caller.
     """
 
     if (
@@ -8536,11 +8540,16 @@ async def _run_visual_course_stage_impl(
                         current_aperture_observable
                     ),
                     subsupport_collective_authorized=(
-                        # The proved support floor launches Gate 0. Once
-                        # credited, fresh visual vertical control must retain
-                        # the configured bounded authority to descend.
                         top_fov_transition_owned
-                        or current_gate_index > initial_gate_index
+                        or (
+                            # Later gates may descend only from the qualified
+                            # dynamic state saying the gate is below.  A new
+                            # censored gate with no such evidence keeps lift.
+                            current_gate_index > initial_gate_index
+                            and current_aperture_observable
+                            and control_vertical_error_image_down is not None
+                            and control_vertical_error_image_down > 0.0
+                        )
                     ),
                 )
             )

@@ -7903,6 +7903,62 @@ def test_current_aperture_collective_holds_through_censorship_and_dropout():
     assert promoted_proposal.requested_thrust > 0.275
 
 
+def test_current_aperture_collective_uses_admitted_dynamic_top_state():
+    state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-1"
+    )
+    target = replace(
+        _target(_snapshot(1, "track-1", 181), "track-1"),
+        received_monotonic_s=14.0,
+        normalized_y_down=-0.50,
+        normalized_y_rate_down_s=-2.0,
+        clipped=True,
+        center_censored=True,
+        vertical_censored=True,
+    )
+
+    proposal = course_stage._propose_current_aperture_collective(
+        state,
+        target,
+        authoritative_current_track_id="track-1",
+        control_vertical_error_image_down=-0.4544247317938894,
+        control_vertical_rate_down_s=-0.3508247067106462,
+        control_basis=(
+            course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+        ),
+    )
+
+    assert proposal.requested_thrust == pytest.approx(
+        course_stage.MAX_VISUAL_THRUST
+    )
+    assert proposal.vertical_censored is False
+    assert proposal.current_aperture_dropout is False
+    assert proposal.control_vertical_error_image_down == pytest.approx(
+        -0.4544247317938894
+    )
+    assert proposal.control_basis == (
+        course_stage.CURRENT_APERTURE_PROVED_COLLECTIVE_BASIS
+    )
+    assert state.last_observable_thrust == pytest.approx(
+        course_stage.MAX_VISUAL_THRUST
+    )
+
+    dropout = _target(
+        _snapshot(1, "other-track", 182),
+        "other-track",
+    )
+    retained = course_stage._propose_current_aperture_collective(
+        state,
+        dropout,
+        authoritative_current_track_id="track-1",
+    )
+    assert retained.requested_thrust == pytest.approx(
+        course_stage.MAX_VISUAL_THRUST
+    )
+    assert retained.current_aperture_dropout is True
+    assert retained.held_last_observable_collective is True
+
+
 def test_faa7cee6_collective_uses_derotated_state_not_pitch_motion():
     target = replace(
         _target(_snapshot(0, "track-0", 10), "track-0"),
