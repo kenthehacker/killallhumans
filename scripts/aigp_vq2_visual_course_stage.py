@@ -1641,6 +1641,79 @@ def _pitch_response_authority(
     )
 
 
+def _roll_yaw_transport_rate_rad_s(
+    *,
+    target_roll_rad: float,
+    target_pitch_rad: float,
+    bounded_yaw_rate_rad_s: float,
+) -> float:
+    """Keep a bank reference fixed while its yaw chart rotates.
+
+    For fixed roll/pitch Euler references, a desired body-yaw rate requires
+    ``p = -r*tan(pitch)/cos(roll)``.  The visual attitude loop previously
+    treated the corresponding body-roll transport as roll motion to damp,
+    leaving a persistent bank error during the simultaneous Gate-1 turn.
+    Allocate the instantaneous desired-reference term here; the existing
+    static command clamp and final wire governor remain the only
+    envelope/continuity authorities.
+    """
+
+    roll = float(target_roll_rad)
+    pitch = float(target_pitch_rad)
+    yaw_rate = float(bounded_yaw_rate_rad_s)
+    if (
+        not all(math.isfinite(value) for value in (roll, pitch, yaw_rate))
+        or abs(roll) > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or abs(yaw_rate) > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+    ):
+        raise ValueError("roll/yaw transport inputs are invalid")
+    roll_cosine = math.cos(roll)
+    if not math.isfinite(roll_cosine) or roll_cosine <= 0.0:
+        raise ValueError("roll/yaw transport chart is singular")
+    transport = -yaw_rate * math.tan(pitch) / roll_cosine
+    if not math.isfinite(transport):
+        raise ValueError("roll/yaw transport is non-finite")
+    return transport
+
+
+def _allocate_roll_yaw_transport(
+    command: AttitudeRateCommand,
+    *,
+    target_roll_rad: float,
+    target_pitch_rad: float,
+    bounded_yaw_rate_rad_s: float,
+) -> tuple[AttitudeRateCommand, float]:
+    """Add desired-reference roll transport without changing other axes."""
+
+    if type(command) is not AttitudeRateCommand:
+        raise TypeError("roll/yaw transport requires an exact command")
+    transport = _roll_yaw_transport_rate_rad_s(
+        target_roll_rad=target_roll_rad,
+        target_pitch_rad=target_pitch_rad,
+        bounded_yaw_rate_rad_s=bounded_yaw_rate_rad_s,
+    )
+    allocated = AttitudeRateCommand(
+        roll_rate=float(command.roll_rate) + transport,
+        pitch_rate=float(command.pitch_rate),
+        yaw_rate=float(command.yaw_rate),
+        thrust=float(command.thrust),
+    )
+    if not all(
+        math.isfinite(float(value))
+        for value in (
+            allocated.roll_rate,
+            allocated.pitch_rate,
+            allocated.yaw_rate,
+            allocated.thrust,
+        )
+    ):
+        raise ValueError("roll/yaw transport command is non-finite")
+    return allocated, transport
+
+
 def _allocate_launch_collective(
     *,
     launch_elapsed_s: float,
@@ -4909,6 +4982,12 @@ async def _run_visual_course_stage_impl(
             target_pitch_rad=target_pitch_rad,
             thrust=thrust,
         )
+        base, roll_yaw_transport_rate = _allocate_roll_yaw_transport(
+            base,
+            target_roll_rad=target_roll_rad,
+            target_pitch_rad=target_pitch_rad,
+            bounded_yaw_rate_rad_s=bounded_yaw,
+        )
         limited = runtime.limit_command_rates(
             base,
             limits.max_command_rate_rad_s,
@@ -4989,6 +5068,9 @@ async def _run_visual_course_stage_impl(
                 "visual-course continuity hold evidence is invalid"
             )
         accepted_dynamic_evidence = dict(dynamic_evidence)
+        accepted_dynamic_evidence["roll_yaw_transport_rate_rad_s"] = (
+            roll_yaw_transport_rate
+        )
         if top_fov_guidance is not None:
             accepted_dynamic_evidence["top_fov_pitch_guidance"] = dict(
                 top_fov_guidance
@@ -5802,6 +5884,12 @@ async def _run_visual_course_stage_impl(
                 continuous_pitch_response_authority
             ),
         )
+        base, roll_yaw_transport_rate = _allocate_roll_yaw_transport(
+            base,
+            target_roll_rad=target_roll_rad,
+            target_pitch_rad=target_pitch_rad,
+            bounded_yaw_rate_rad_s=bounded_yaw,
+        )
         limited = runtime.limit_command_rates(
             base,
             limits.max_command_rate_rad_s,
@@ -6027,6 +6115,9 @@ async def _run_visual_course_stage_impl(
                     "visual-course dynamic command evidence is invalid"
                 )
             accepted_dynamic_evidence = dict(dynamic_evidence)
+            accepted_dynamic_evidence["roll_yaw_transport_rate_rad_s"] = (
+                roll_yaw_transport_rate
+            )
             if (
                 type(dynamic_controller)
                 is DynamicVisualCourseSession
@@ -6581,6 +6672,12 @@ async def _run_visual_course_stage_impl(
             target_pitch_rad=authority.target_pitch_rad,
             thrust=authority.requested_thrust,
         )
+        base, roll_yaw_transport_rate = _allocate_roll_yaw_transport(
+            base,
+            target_roll_rad=authority.target_roll_rad,
+            target_pitch_rad=authority.target_pitch_rad,
+            bounded_yaw_rate_rad_s=bounded_yaw,
+        )
         limited = runtime.limit_command_rates(
             base,
             limits.max_command_rate_rad_s,
@@ -6734,9 +6831,13 @@ async def _run_visual_course_stage_impl(
                 raise abort_type(
                     "visual-course dynamic coast evidence is invalid"
                 )
+            accepted_dynamic_evidence = dict(dynamic_evidence)
+            accepted_dynamic_evidence["roll_yaw_transport_rate_rad_s"] = (
+                roll_yaw_transport_rate
+            )
             host.recorder.emit(
                 "visual_course_dynamic_command",
-                **dict(dynamic_evidence),
+                **accepted_dynamic_evidence,
             )
             segment["dynamic_controller"] = dict(
                 dynamic_controller.evidence_summary()

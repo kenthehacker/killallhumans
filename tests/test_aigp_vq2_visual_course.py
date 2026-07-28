@@ -2865,6 +2865,68 @@ def test_launch_destination_cannot_raise_gain_before_reference_allocates_it():
     ) == 1.0
 
 
+def test_latest_gate_one_turn_allocates_roll_yaw_transport_toward_bank():
+    base = AttitudeRateCommand(-0.026, -0.041, 0.0, 0.32)
+    allocated, transport = course_stage._allocate_roll_yaw_transport(
+        base,
+        target_roll_rad=-0.25,
+        target_pitch_rad=-0.35,
+        bounded_yaw_rate_rad_s=-0.15,
+    )
+
+    assert math.isfinite(transport)
+    assert transport < 0.0
+    assert -0.25 <= allocated.roll_rate < base.roll_rate < 0.0
+    assert allocated.pitch_rate == base.pitch_rate
+    assert allocated.yaw_rate == base.yaw_rate
+    assert allocated.thrust == base.thrust
+
+
+@pytest.mark.parametrize(
+    ("pitch", "yaw_rate"),
+    (
+        (0.0, -0.15),
+        (-0.21830105259879207, 0.0),
+    ),
+)
+def test_roll_yaw_transport_releases_without_coupled_turn(pitch, yaw_rate):
+    assert course_stage._roll_yaw_transport_rate_rad_s(
+        target_roll_rad=-0.25,
+        target_pitch_rad=pitch,
+        bounded_yaw_rate_rad_s=yaw_rate,
+    ) == pytest.approx(0.0)
+
+
+def test_roll_yaw_transport_reverses_with_valid_opposite_yaw():
+    negative = course_stage._roll_yaw_transport_rate_rad_s(
+        target_roll_rad=-0.25,
+        target_pitch_rad=-0.35,
+        bounded_yaw_rate_rad_s=-0.15,
+    )
+    positive = course_stage._roll_yaw_transport_rate_rad_s(
+        target_roll_rad=-0.25,
+        target_pitch_rad=-0.35,
+        bounded_yaw_rate_rad_s=0.15,
+    )
+
+    assert negative == pytest.approx(-positive)
+    assert negative < 0.0 < positive
+
+
+def test_roll_yaw_transport_prevents_raw_body_rate_damping_from_unwinding():
+    transport = course_stage._roll_yaw_transport_rate_rad_s(
+        target_roll_rad=-0.25,
+        target_pitch_rad=-0.35,
+        bounded_yaw_rate_rad_s=-0.15,
+    )
+    raw_body_rate_damping = -0.4 * transport
+    corrected_hold_roll_rate = raw_body_rate_damping + transport
+
+    assert raw_body_rate_damping > 0.0
+    assert -0.25 <= corrected_hold_roll_rate < 0.0
+    assert math.isfinite(corrected_hold_roll_rate)
+
+
 def test_live_top_fov_outer_fallback_holds_nose_up_before_support_clips():
     raw_top = course_stage._raw_bbox_top_image_down(
         (
