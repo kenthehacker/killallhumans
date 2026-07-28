@@ -2413,6 +2413,29 @@ def _propose_propagated_top_fov_pitch_reference(
     return observation, proposal
 
 
+def _record_superseded_top_fov_pitch_reference(
+    fov_summary: Dict[str, Any],
+    pitch_guidance: Dict[str, Any],
+    *,
+    applied_target_pitch_rad: float,
+) -> None:
+    """Keep the exact FOV pitch available after a visible TOP brake.
+
+    Fresh-boundary closure recovery may deliberately apply its brake while
+    the gate remains visible.  The simultaneously computed FOV pitch is the
+    bounded reacquisition reference if the next publication loses that same
+    TOP-clipped track, so recording the applied brake must not overwrite it.
+    """
+
+    pitch_guidance["superseded_by_fresh_boundary_recovery"] = True
+    pitch_guidance["applied_target_pitch_rad"] = (
+        applied_target_pitch_rad
+    )
+    fov_summary["last_protected_target_pitch_rad"] = pitch_guidance[
+        "protected_target_pitch_rad"
+    ]
+
+
 def _retain_post_credit_top_fov_pitch_reference(
     authority: Mapping[str, Any],
     fov_summary: Mapping[str, Any],
@@ -9155,15 +9178,15 @@ async def _run_visual_course_stage_impl(
                         "top_fov_pitch_guidance"
                     )
                     if isinstance(pitch_guidance, dict):
-                        pitch_guidance[
-                            "superseded_by_fresh_boundary_recovery"
-                        ] = True
-                        pitch_guidance[
-                            "applied_target_pitch_rad"
+                        _record_superseded_top_fov_pitch_reference(
+                            fov_summary,
+                            pitch_guidance,
+                            applied_target_pitch_rad=target_pitch_rad,
+                        )
+                    else:
+                        fov_summary[
+                            "last_protected_target_pitch_rad"
                         ] = target_pitch_rad
-                    fov_summary[
-                        "last_protected_target_pitch_rad"
-                    ] = target_pitch_rad
                     host.recorder.emit(
                         "visual_course_fresh_top_censored_recovery",
                         gate_index=current_gate_index,

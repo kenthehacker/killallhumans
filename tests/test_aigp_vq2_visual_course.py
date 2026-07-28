@@ -5330,6 +5330,29 @@ def test_retained_raw_top_fov_uses_state_horizon_not_command_hold():
     assert authority["advance_authority"] is False
 
 
+def test_visible_top_brake_preserves_fov_pitch_for_next_missing_frame():
+    fov_summary = {
+        "last_protected_target_pitch_rad": -0.259,
+    }
+    pitch_guidance = {
+        "protected_target_pitch_rad": -0.259,
+    }
+
+    course_stage._record_superseded_top_fov_pitch_reference(
+        fov_summary,
+        pitch_guidance,
+        applied_target_pitch_rad=0.12,
+    )
+
+    assert fov_summary["last_protected_target_pitch_rad"] == pytest.approx(
+        -0.259
+    )
+    assert (
+        pitch_guidance["superseded_by_fresh_boundary_recovery"] is True
+    )
+    assert pitch_guidance["applied_target_pitch_rad"] == pytest.approx(0.12)
+
+
 @pytest.mark.parametrize("failure", ("anchor-token", "ambiguous", "expired"))
 def test_retained_raw_top_fov_state_refuses_bad_lineage_or_expiry(failure):
     case = _retained_raw_top_fov_case()
