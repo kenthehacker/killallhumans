@@ -73,9 +73,10 @@ def test_production_camera_boundary_uses_live_axis_calibration() -> None:
         BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
     )
     assert config.camera_to_body_wxyz == (0.0, 1.0, 0.0, 0.0)
-    # Build-3385 closed-loop flight identifies the translational sign:
-    # positive image-right error requires positive roll.
-    assert config.roll_guidance_sign == 1.0
+    # Rx(pi) maps image-right to body-left, while positive FRD roll accelerates
+    # body-right.  The bounded translational demand therefore opposes positive
+    # stable/image bearing.
+    assert config.roll_guidance_sign == -1.0
 
 
 def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
@@ -205,16 +206,18 @@ def test_successor_steering_preturns_then_releases_proportionally():
     )._successor_steering_targets(prediction)
 
     assert outward["target_roll_rad"] == pytest.approx(
-        MAX_TARGET_ROLL_RAD
+        -MAX_TARGET_ROLL_RAD
     )
     assert recovered["target_roll_rad"] == pytest.approx(
-        session.core.config.roll_gain * 0.40
-        - session.core.config.lateral_rate_gain * 0.10
+        -(
+            session.core.config.roll_gain * 0.40
+            - session.core.config.lateral_rate_gain * 0.10
+        )
     )
     assert (
-        0.0
+        -MAX_TARGET_ROLL_RAD
         < recovered["target_roll_rad"]
-        < MAX_TARGET_ROLL_RAD
+        < 0.0
     )
     assert outward["target_pitch_rad"] == pytest.approx(
         recovered["target_pitch_rad"]
@@ -827,8 +830,8 @@ def test_unqualified_post_credit_rate_releases_bank_at_handoff_deadline():
         "current_center_x",
     ),
     (
-        (-0.04, 0.25, 0.30),
-        (0.04, -0.05, 0.05),
+        (0.04, 0.25, 0.30),
+        (-0.04, -0.05, 0.05),
     ),
 )
 def test_opposite_or_near_center_recovery_releases_roll_handoff_immediately(
@@ -927,7 +930,7 @@ def test_dynamic_graph_adapter_releases_bias_after_safe_current_dwell():
         proposal = _observe(planner, snapshot, tracker)
         _accept_proposal(session, tracker, proposal)
 
-    assert proposal.servo_output.target_roll_rad > 0.0
+    assert proposal.servo_output.target_roll_rad < 0.0
     assert proposal.servo_output.target_pitch_rad <= 0.12
     assert proposal.servo_output.reviewed_next_track_id is not None
     assert session.last_decision is not None
@@ -988,7 +991,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     committed = session.last_decision
     assert committed is not None
     assert committed.successor_track_id == original_successor_id
-    committed_roll = MAX_TARGET_ROLL_RAD
+    committed_roll = -MAX_TARGET_ROLL_RAD
     session._last_decision = replace(  # noqa: SLF001
         committed,
         passage_committed=True,
@@ -1010,7 +1013,7 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
         yaw_rate_rad_s=committed.command.yaw_rate_rad_s,
         thrust=committed.command.thrust,
         wire_command=AttitudeRateCommand(
-            0.10,
+            -0.10,
             0.0,
             committed.command.yaw_rate_rad_s,
             committed.command.thrust,
@@ -1203,7 +1206,7 @@ def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
     assert corrective
     assert all(
         math.isfinite(target_roll)
-        and 0.0 < target_roll <= MAX_TARGET_ROLL_RAD
+        and -MAX_TARGET_ROLL_RAD <= target_roll < 0.0
         for target_roll in corrective
     )
 
@@ -2208,9 +2211,9 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
             session.core.config.max_abs_bearing_rad
         )
         assert (
-            0.0
-            < authority["command"]["target_roll_rad"]
-            <= MAX_TARGET_ROLL_RAD
+            -MAX_TARGET_ROLL_RAD
+            <= authority["command"]["target_roll_rad"]
+            < 0.0
         )
         assert authority["command"]["target_pitch_rad"] >= 0.0
         assert authority["steering_only"] is True
@@ -3687,7 +3690,7 @@ def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
 
 @pytest.mark.parametrize(
     "normal_roll_rad",
-    (0.04, MAX_TARGET_ROLL_RAD),
+    (-0.04, -MAX_TARGET_ROLL_RAD),
 )
 def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
     normal_roll_rad: float,
@@ -3774,7 +3777,7 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
         yaw_rate_rad_s=constrained.command.yaw_rate_rad_s,
         thrust=constrained.command.thrust,
         wire_command=AttitudeRateCommand(
-            0.05,
+            -0.05,
             0.02,
             constrained.command.yaw_rate_rad_s,
             constrained.command.thrust,
@@ -4285,7 +4288,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         now_monotonic_ns=authority_ns,
     )
     retained_roll = float(precredit["target_roll_rad"])
-    assert retained_roll == pytest.approx(MAX_TARGET_ROLL_RAD)
+    assert retained_roll == pytest.approx(-MAX_TARGET_ROLL_RAD)
     wire_ns = authority_ns + 500_000
     session.record_wire_acceptance(
         target_roll_rad=retained_roll,
@@ -4293,7 +4296,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         yaw_rate_rad_s=float(precredit["yaw_rate_rad_s"]),
         thrust=float(precredit["thrust"]),
         wire_command=AttitudeRateCommand(
-            0.07553,
+            -0.07553,
             0.02,
             float(precredit["yaw_rate_rad_s"]),
             float(precredit["thrust"]),
@@ -4518,7 +4521,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     )
     governed = session.govern_wire_command(
         AttitudeRateCommand(
-            MAX_TARGET_ROLL_RAD,
+            -MAX_TARGET_ROLL_RAD,
             0.02,
             float(binding_authority["yaw_rate_rad_s"]),
             float(binding_authority["thrust"]),
@@ -4527,7 +4530,7 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         launch_thrust_override=False,
         yaw_safety_override=False,
     )
-    assert 0.0 <= governed.roll_rate <= MAX_TARGET_ROLL_RAD
+    assert -MAX_TARGET_ROLL_RAD <= governed.roll_rate <= 0.0
     assert abs(governed.pitch_rate) <= MAX_TARGET_PITCH_RAD
     assert abs(governed.yaw_rate) <= MAX_YAW_RATE_RAD_S
     assert MIN_THRUST <= governed.thrust <= MAX_THRUST
