@@ -182,7 +182,7 @@ def test_successor_steering_uses_full_bank_only_while_off_axis_and_outward():
         measurement_age_s=0.0,
         stable_bearing_rad=(0.40, 0.0),
         stable_bearing_rate_rad_s=(0.10, 0.0),
-        camera_center_norm=(0.30, 0.0),
+        camera_center_norm=(0.30, -0.40),
         camera_center_rate_norm_s=(0.05, 0.0),
         bearing_std_rad=(0.02, 0.02),
         body_rates_rad_s=(0.0, 0.0, 0.0),
@@ -205,12 +205,23 @@ def test_successor_steering_uses_full_bank_only_while_off_axis_and_outward():
     assert outward["target_roll_rad"] == pytest.approx(
         MAX_TARGET_ROLL_RAD
     )
+    assert outward["target_pitch_rad"] == pytest.approx(
+        session.core.config.brake_pitch_rad
+    )
     assert (
         0.0
         < recovered["target_roll_rad"]
         < MAX_TARGET_ROLL_RAD
     )
+    assert (
+        recovered["target_pitch_rad"]
+        < session.core.config.brake_pitch_rad
+    )
     assert unidentified["target_roll_rad"] == 0.0
+    assert (
+        unidentified["target_pitch_rad"]
+        < session.core.config.brake_pitch_rad
+    )
 
 
 def _inner_aperture(

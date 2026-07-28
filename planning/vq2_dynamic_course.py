@@ -3386,6 +3386,7 @@ class DynamicCourseCore:
         committed_successor_camera_center_rate: Vector2 | None = None
         committed_successor_yaw_rate: float | None = None
         committed_successor_yaw_authority = 0.0
+        committed_successor_outward_arrest = False
         if (
             passage_committed
             and successor is not None
@@ -3509,6 +3510,15 @@ class DynamicCourseCore:
                         maximum_lead_rad=maximum_std,
                         baseline_pitch_rad=self.config.brake_pitch_rad,
                     )
+                    if committed_successor_outward_arrest:
+                        # Do not accelerate into an off-axis successor while
+                        # full lateral arrest is still required.  Existing raw
+                        # FOV guidance may constrain this reference downstream;
+                        # recovering lateral motion releases it immediately.
+                        committed_successor_target_pitch = max(
+                            committed_successor_target_pitch,
+                            self.config.brake_pitch_rad,
+                        )
                     proposal = replace(
                         proposal,
                         target_pitch_rad=(

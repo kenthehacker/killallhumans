@@ -1617,6 +1617,11 @@ class DynamicVisualCourseSession:
             ),
             baseline_pitch_rad=self.core.config.brake_pitch_rad,
         )
+        if successor_outward_arrest:
+            target_pitch = max(
+                target_pitch,
+                self.core.config.brake_pitch_rad,
+            )
         camera_heading = math.atan(
             prediction.camera_center_norm[0]
             * self.core.config.horizontal_angle_scale_rad

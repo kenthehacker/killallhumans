@@ -2816,6 +2816,7 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
                 sequence,
                 observation_time,
                 x=0.35 + (sequence - 1) * 0.004,
+                y=-0.40,
                 log_scale=-0.80,
             )
         )
@@ -2850,6 +2851,12 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
     assert outward.command.target_roll_rad == pytest.approx(
         MAX_TARGET_ROLL_RAD
     )
+    assert outward.committed_successor_target_pitch_rad == pytest.approx(
+        config.brake_pitch_rad
+    )
+    assert outward.command.target_pitch_rad == pytest.approx(
+        config.brake_pitch_rad
+    )
 
     recovered = None
     for sequence, x in ((8, 0.370), (9, 0.366)):
@@ -2864,6 +2871,7 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
                 sequence,
                 observation_time,
                 x=x,
+                y=-0.40,
                 log_scale=-0.80,
             )
         )
@@ -2887,6 +2895,11 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
     )
     assert recovered.command.target_roll_rad == pytest.approx(
         recovered.committed_successor_target_roll_rad
+    )
+    assert recovered.committed_successor_target_pitch_rad is not None
+    assert (
+        recovered.committed_successor_target_pitch_rad
+        < config.brake_pitch_rad
     )
 
 
