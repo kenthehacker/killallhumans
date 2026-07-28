@@ -292,12 +292,20 @@ def _fresh_top_corner_continuity_lifecycle_eligible(
     lifecycle: CourseLifecycle,
     recovery_measurement_mode: Optional[PostCreditMeasurementMode],
 ) -> bool:
-    """Keep two-axis corner continuity inside ordinary current-gate approach."""
+    """Keep exact inward steering through one bounded TOP-corner seam."""
 
     return bool(
-        mode is VisualApproachMode.APPROACH
-        and lifecycle is CourseLifecycle.APPROACH
-        and recovery_measurement_mode is None
+        (
+            mode is VisualApproachMode.APPROACH
+            and lifecycle is CourseLifecycle.APPROACH
+            and recovery_measurement_mode is None
+        )
+        or (
+            mode is VisualApproachMode.PROMOTE_REACQUIRE
+            and lifecycle is CourseLifecycle.PROMOTE_REACQUIRE
+            and recovery_measurement_mode
+            is PostCreditMeasurementMode.REACQUIRE
+        )
     )
 
 
@@ -10019,6 +10027,7 @@ async def _run_visual_course_stage_impl(
             "recovery_navigation_command_count": 0,
             "recovery_clean_command_count": 0,
             "recovery_one_edge_command_count": 0,
+            "recovery_corner_command_count": 0,
             "recovery_propagated_state_command_count": 0,
             "recovery_zero_command_count": 0,
             "recovery_support_command_count": 0,
@@ -10659,9 +10668,34 @@ async def _run_visual_course_stage_impl(
                         )
                         refresh_live_summary()
                     continue
+                recovery_top_corner_continuity = bool(
+                    recovery_measurement_mode
+                    is PostCreditMeasurementMode.REACQUIRE
+                    and not post_credit_successor_handoff_required
+                    and int(
+                        segment["recovery_one_edge_command_count"]
+                    )
+                    > 0
+                    and _fresh_top_boundary_recovery_horizontal_edge(
+                        getattr(
+                            snapshot.current_track,
+                            "clipping",
+                            None,
+                        )
+                    )
+                    in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                    and _fresh_top_corner_continuity_lifecycle_eligible(
+                        mode=mode,
+                        lifecycle=lifecycle,
+                        recovery_measurement_mode=(
+                            recovery_measurement_mode
+                        ),
+                    )
+                )
                 if (
                     recovery_measurement_mode
                     is PostCreditMeasurementMode.REACQUIRE
+                    and not recovery_top_corner_continuity
                 ):
                     assert recovery_deadline_s is not None
                     servo_tuning = host.visual_config.servo
@@ -11168,15 +11202,19 @@ async def _run_visual_course_stage_impl(
                 fresh_top_boundary_eligible = bool(
                     type(exc)
                     is VisualApproachCurrentGeometryUnavailable
-                    and _fresh_top_boundary_recovery_lifecycle_eligible(
-                        mode=mode,
-                        lifecycle=lifecycle,
-                        recovery_measurement_mode=(
-                            recovery_measurement_mode
-                        ),
-                    )
                     and (
-                        fresh_top_horizontal_edge == FrameEdge.NONE
+                        (
+                            fresh_top_horizontal_edge == FrameEdge.NONE
+                            and (
+                                _fresh_top_boundary_recovery_lifecycle_eligible(
+                                    mode=mode,
+                                    lifecycle=lifecycle,
+                                    recovery_measurement_mode=(
+                                        recovery_measurement_mode
+                                    ),
+                                )
+                            )
+                        )
                         or (
                             fresh_top_horizontal_edge
                             in {FrameEdge.LEFT, FrameEdge.RIGHT}
@@ -11189,6 +11227,19 @@ async def _run_visual_course_stage_impl(
                                     ),
                                 )
                             )
+                        )
+                    )
+                    and (
+                        lifecycle is not CourseLifecycle.PROMOTE_REACQUIRE
+                        or fresh_top_horizontal_edge == FrameEdge.NONE
+                        or (
+                            not post_credit_successor_handoff_required
+                            and int(
+                                segment[
+                                    "recovery_one_edge_command_count"
+                                ]
+                            )
+                            > 0
                         )
                     )
                     and type(runtime.dynamic_controller)
@@ -11580,12 +11631,14 @@ async def _run_visual_course_stage_impl(
                                 "recovery_navigation_command_count"
                             ]
                         ) + 1
-                        segment[
-                            "recovery_one_edge_command_count"
-                        ] = int(
-                            segment[
-                                "recovery_one_edge_command_count"
-                            ]
+                        recovery_count_key = (
+                            "recovery_corner_command_count"
+                            if boundary.horizontal_edge
+                            in {FrameEdge.LEFT, FrameEdge.RIGHT}
+                            else "recovery_one_edge_command_count"
+                        )
+                        segment[recovery_count_key] = int(
+                            segment[recovery_count_key]
                         ) + 1
                         recovery_deadline_s = min(
                             course_deadline_s,

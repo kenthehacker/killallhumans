@@ -222,6 +222,12 @@ def test_fresh_top_boundary_recovery_is_lifecycle_scoped(
             False,
         ),
         (
+            VisualApproachMode.PROMOTE_REACQUIRE,
+            CourseLifecycle.PROMOTE_REACQUIRE,
+            PostCreditMeasurementMode.REACQUIRE,
+            True,
+        ),
+        (
             VisualApproachMode.APPROACH,
             CourseLifecycle.PROMOTE_REACQUIRE,
             None,
@@ -235,7 +241,7 @@ def test_fresh_top_boundary_recovery_is_lifecycle_scoped(
         ),
     ),
 )
-def test_fresh_top_corner_continuity_is_approach_only(
+def test_fresh_top_corner_continuity_has_only_exact_lifecycle_seams(
     mode,
     lifecycle,
     measurement,
