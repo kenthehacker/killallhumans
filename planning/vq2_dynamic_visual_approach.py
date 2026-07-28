@@ -155,6 +155,7 @@ class _StagedContext:
     passage_committed: bool
     camera_token: CameraFrameToken
     tracker_frame_sequence: int
+    current_raw_clipping: FrameEdge
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,11 +620,14 @@ class DynamicVisualCourseSession:
             track_ids.add(course_state.current_track_id)
             if course_state.successor_track_id is not None:
                 track_ids.add(course_state.successor_track_id)
+        current_raw_clipping = FrameEdge.NONE
         for track_id in sorted(track_ids):
             try:
                 track = tracker.track(track_id)
             except KeyError:
                 continue
+            if track_id == expected_current_track_id:
+                current_raw_clipping = track.clipping
             if self._last_frame_by_track.get(track_id) == (
                 update.tracker_frame_sequence
             ):
@@ -655,6 +659,7 @@ class DynamicVisualCourseSession:
             passage_committed=passage_committed,
             camera_token=token,
             tracker_frame_sequence=update.tracker_frame_sequence,
+            current_raw_clipping=current_raw_clipping,
         )
 
     @staticmethod
@@ -1137,9 +1142,27 @@ class DynamicVisualCourseSession:
             targets["camera_elevation_rate_rad_s"]
         )
         pitch_delay_lead = float(targets["pitch_delay_lead_rad"])
+        staged = self._staged
+        staged_raw_clipping = FrameEdge.NONE
+        if (
+            staged is not None
+            and staged.expected_gate_index == state.current_gate_index
+            and staged.expected_current_track_id == state.current_track_id
+            and staged.camera_token.generation
+            == state.current.stream_generation
+            and staged.tracker_frame_sequence
+            == state.current.frame_sequence
+        ):
+            staged_raw_clipping = staged.current_raw_clipping
         vertical_axis_censored = bool(
             not state.current.visible
             or state.current.censored_axes[1]
+            # A complete tracking-only inner fit may correctly preserve
+            # steering while the outer gate support remains at a frame edge.
+            # Raw camera geometry still owns FOV protection, so that degraded
+            # fit cannot release the retained pitch ceiling.
+            or staged_raw_clipping
+            & (FrameEdge.TOP | FrameEdge.BOTTOM)
         )
         retained_pitch_ceiling = (
             lease.vertical_target_pitch_ceiling_rad
@@ -1222,6 +1245,7 @@ class DynamicVisualCourseSession:
                 "camera_elevation_rate_rad_s": camera_elevation_rate,
                 "pitch_delay_lead_rad": pitch_delay_lead,
                 "vertical_axis_censored": vertical_axis_censored,
+                "current_raw_clipping": int(staged_raw_clipping),
                 "retained_pitch_ceiling_rad": retained_pitch_ceiling,
                 "bearing_std_rad": list(
                     prediction.bearing_std_rad

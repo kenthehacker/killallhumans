@@ -3589,14 +3589,22 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     )
     predict = session.core.predict_track_steering
 
+    predicted_vertical = {
+        "center_y": -0.605,
+        "rate_y": -0.309,
+    }
+
     def top_of_camera_prediction(track_id: str, monotonic_ns: int):
         base = predict(track_id, monotonic_ns)
         return replace(
             base,
-            camera_center_norm=(base.camera_center_norm[0], -0.605),
+            camera_center_norm=(
+                base.camera_center_norm[0],
+                predicted_vertical["center_y"],
+            ),
             camera_center_rate_norm_s=(
                 base.camera_center_rate_norm_s[0],
-                -0.309,
+                predicted_vertical["rate_y"],
             ),
         )
 
@@ -3610,15 +3618,24 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     )
     assert seeded["target_pitch_rad"] < 0.0
 
+    predicted_vertical.update(center_y=0.0, rate_y=0.0)
     top_update = tracker.update(
         _frame(
             10,
             successor_clipping=FrameEdge.TOP,
             successor_center_censored=True,
+            successor_inner_aperture=_inner_aperture(
+                0.32,
+                0.0,
+                half_width=0.15,
+                half_height=0.17,
+                health_reason="outer_support_clipped_tracking_only",
+            ),
         )
     )
     top_snapshot = graph.observe(tracker)
     assert tracker.track(successor_id).latest_token == top_update.token
+    assert tracker.track(successor_id).clipping == FrameEdge.TOP
     session.stage_snapshot(
         top_snapshot,
         tracker,
@@ -3676,7 +3693,10 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
             )
         )
 
-    assert top_state.censored_axes == (False, True)
+    # A complete tracking-only inner fit may steer both axes, while the raw
+    # outer TOP clip independently retains FOV protection.
+    assert top_state.clipping == FrameEdge.NONE
+    assert top_state.censored_axes == (False, False)
     assert dual_state.censored_axes == (True, True)
     assert top_state.aperture_half_size_norm is not None
     assert dual_state.aperture_half_size_norm is not None
@@ -3718,6 +3738,11 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
     )
     assert dual_authority["target_pitch_rad"] <= (
         top_authority["target_pitch_rad"] + 1e-12
+    )
+    assert top_authority["current_raw_clipping"] == int(FrameEdge.TOP)
+    assert top_authority["vertical_axis_censored"] is True
+    assert top_authority["target_pitch_rad"] <= (
+        seeded["target_pitch_rad"] + 1e-12
     )
     assert dual_authority["vertical_axis_censored"] is True
     assert dual_authority["steering_only"] is True
@@ -3766,6 +3791,23 @@ def test_post_credit_local_state_steers_through_dual_edge_censorship(
         expected_gate_index=1,
         expected_current_track_id=successor_id,
         adjacent_precredit=False,
+    )
+    recovered_authority = (
+        session.post_credit_successor_steering_authority(
+            now_monotonic_ns=(
+                clean_update.publish_monotonic_ns + 2_000_000
+            ),
+        )
+    )
+    assert recovered_authority["current_raw_clipping"] == int(
+        FrameEdge.NONE
+    )
+    assert recovered_authority["vertical_axis_censored"] is False
+    assert recovered_authority["target_pitch_rad"] == pytest.approx(
+        session.core.config.brake_pitch_rad
+    )
+    assert recovered_authority["target_pitch_rad"] > (
+        top_authority["target_pitch_rad"]
     )
     release = session.complete_post_credit_recovery(
         camera_token=clean_update.token,
