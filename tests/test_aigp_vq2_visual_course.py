@@ -3672,8 +3672,8 @@ def test_fresh_current_top_corner_refuses_inexact_publication(
 @pytest.mark.parametrize(
     ("horizontal_edge", "target_roll", "yaw_rate"),
     (
-        (FrameEdge.LEFT, 0.35, 0.15),
-        (FrameEdge.RIGHT, -0.35, -0.15),
+        (FrameEdge.LEFT, -0.35, 0.15),
+        (FrameEdge.RIGHT, 0.35, -0.15),
     ),
 )
 def test_fresh_top_corner_continuity_requires_inward_roll_and_yaw(
@@ -3708,7 +3708,7 @@ def test_fresh_top_corner_continuity_requires_inward_roll_and_yaw(
             "yaw_rate_rad_s": yaw_rate,
             "source_wire_start_monotonic_ns": 1_000_000_000,
         },
-        roll_guidance_sign=-1.0,
+        roll_guidance_sign=1.0,
         right_image_error_to_controller_yaw_sign=-1,
         prior_decision=prior_decision,
     )
@@ -3743,7 +3743,7 @@ def test_fresh_top_corner_continuity_requires_inward_roll_and_yaw(
             course_stage._validate_fresh_top_corner_continuity_hold(
                 boundary,
                 outward,
-                roll_guidance_sign=-1.0,
+                roll_guidance_sign=1.0,
                 right_image_error_to_controller_yaw_sign=-1,
                 prior_decision=outward_prior_decision,
             )
@@ -3760,7 +3760,7 @@ def test_fresh_top_corner_continuity_requires_inward_roll_and_yaw(
                 "yaw_rate_rad_s": yaw_rate,
                 "source_wire_start_monotonic_ns": 1_000_000_000,
             },
-            roll_guidance_sign=-1.0,
+            roll_guidance_sign=1.0,
             right_image_error_to_controller_yaw_sign=-1,
             prior_decision=wrong_lineage,
         )

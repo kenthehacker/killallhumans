@@ -136,12 +136,12 @@ def production_dynamic_course_config() -> DynamicCourseConfig:
         camera_to_body_wxyz=(
             BUILD_3385_EFFECTIVE_CAMERA_TO_BODY_WXYZ
         ),
-        # Rx(pi) maps camera/image right to body-FRD left.  Positive body roll
-        # accelerates toward body right, so a positive stable gate bearing
-        # requires negative bank.  With the heading preview and crossing
-        # command held fixed, positive bank left the Gate-1 residual moving
-        # outward after the measured attitude had settled.
-        roll_guidance_sign=-1.0,
+        # Build-3385 closed-loop flight evidence identifies the translational
+        # sign directly: after attitude settles, negative bank drives a
+        # positive (image-right) gate residual farther right.  Therefore a
+        # positive stable image error requires positive roll.  Keep the
+        # independently calibrated yaw sign unchanged.
+        roll_guidance_sign=1.0,
         roll_gain=0.18,
         lateral_rate_gain=0.045,
         roll_to_lateral_bearing_accel=0.0,
