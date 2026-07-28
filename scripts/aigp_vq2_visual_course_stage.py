@@ -6809,6 +6809,14 @@ async def _run_visual_course_stage_impl(
                             "fresh TOP recovery differs from current lineage"
                         )
                     recovery_config = dynamic_controller.core.config
+                    fresh_top_boundary = (
+                        _fresh_current_top_boundary_authority(
+                            dynamic_controller,
+                            snapshot=snapshot,
+                            current_gate_index=current_gate_index,
+                            current_track_id=current_track_id,
+                        )
+                    )
                     top_censored_closure_recovery = (
                         _allocate_fresh_top_censored_closure_recovery(
                             raw_top_edge_image_down=(
@@ -6894,6 +6902,9 @@ async def _run_visual_course_stage_impl(
                                 .protected_target_pitch_rad
                             ),
                             requested_thrust=command_thrust,
+                            fresh_boundary_current_authority=(
+                                fresh_top_boundary
+                            ),
                         )
                     )
                 except (
