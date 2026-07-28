@@ -6881,6 +6881,63 @@ def test_missing_local_state_transitions_directly_to_fresh_search():
     ] is False
 
 
+def test_completed_expired_geometry_search_can_restart_after_later_loss():
+    snapshot = _expired_geometry_search_snapshot(sequence=251)
+    completed = {
+        "basis": course_stage.APPROACH_EXPIRED_GEOMETRY_SEARCH_BASIS,
+        "started_camera_token": asdict(_token(215)),
+        "reacquired_camera_token": asdict(_token(250)),
+        "outcome": "authoritative_same_gate_current_rebound",
+    }
+    segment = {
+        "approach_propagated_visibility_gap": None,
+        "approach_expired_geometry_search": completed,
+        "approach_expired_geometry_search_history": [],
+    }
+
+    course_stage._begin_approach_expired_geometry_search(
+        snapshot=snapshot,
+        camera_token=snapshot.latest_camera_token,
+        now_s=10.5,
+        propagated_started_s=None,
+        propagated_authority=None,
+        unavailable_reason="rebound current was lost on a later frame",
+        segment=segment,
+    )
+
+    assert segment["approach_expired_geometry_search_history"] == [
+        completed
+    ]
+    restarted = segment["approach_expired_geometry_search"]
+    assert restarted["outcome"] == "searching"
+    assert restarted["started_camera_token"] == asdict(
+        snapshot.latest_camera_token
+    )
+
+
+def test_active_expired_geometry_search_still_rejects_duplicate_start():
+    snapshot = _expired_geometry_search_snapshot(sequence=252)
+    segment = {
+        "approach_propagated_visibility_gap": None,
+        "approach_expired_geometry_search": {"outcome": "searching"},
+        "approach_expired_geometry_search_history": [],
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="search was already started",
+    ):
+        course_stage._begin_approach_expired_geometry_search(
+            snapshot=snapshot,
+            camera_token=snapshot.latest_camera_token,
+            now_s=10.6,
+            propagated_started_s=None,
+            propagated_authority=None,
+            unavailable_reason="duplicate active-search transition",
+            segment=segment,
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     (

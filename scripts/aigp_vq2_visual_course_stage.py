@@ -4855,8 +4855,25 @@ def _begin_approach_expired_geometry_search(
             else FrameEdge.NONE
         )
     )
-    if segment.get("approach_expired_geometry_search") is not None:
-        raise ValueError("expired-geometry search was already started")
+    previous_search = segment.get("approach_expired_geometry_search")
+    if previous_search is not None:
+        if (
+            not isinstance(previous_search, dict)
+            or previous_search.get("outcome") == "searching"
+        ):
+            raise ValueError("expired-geometry search was already started")
+        search_history = segment.setdefault(
+            "approach_expired_geometry_search_history",
+            [],
+        )
+        if not isinstance(search_history, list):
+            raise ValueError(
+                "expired-geometry search history is invalid"
+            )
+        # A same-gate rebound completes one search episode.  Losing that
+        # rebound on a later frame starts a new episode; the historical
+        # summary is evidence, not a one-shot navigation latch.
+        search_history.append(dict(previous_search))
     segment["approach_expired_geometry_search"] = {
         "basis": APPROACH_EXPIRED_GEOMETRY_SEARCH_BASIS,
         "started_camera_token": asdict(camera_token),
@@ -10999,6 +11016,7 @@ async def _run_visual_course_stage_impl(
             "approach_propagated_visibility_gap": None,
             "approach_expired_geometry_search_command_count": 0,
             "approach_expired_geometry_search": None,
+            "approach_expired_geometry_search_history": [],
             "approach_current_ambiguity_quarantine_command_count": 0,
             "approach_current_ambiguity_quarantine": None,
             "horizontal_fov_closure_brake_command_count": 0,
