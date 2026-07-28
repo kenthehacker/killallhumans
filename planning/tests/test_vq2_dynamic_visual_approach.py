@@ -979,6 +979,38 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
         snapshot = graph.observe(tracker)
         hold = _observe(planner, snapshot, tracker)
         _accept_proposal(session, tracker, hold)
+    committed = session.last_decision
+    assert committed is not None
+    assert committed.successor_track_id == original_successor_id
+    committed_roll = -MAX_TARGET_ROLL_RAD
+    session._last_decision = replace(  # noqa: SLF001
+        committed,
+        passage_committed=True,
+        committed_successor_roll_authority=1.0,
+        committed_successor_target_roll_rad=committed_roll,
+        command=replace(
+            committed.command,
+            target_roll_rad=committed_roll,
+        ),
+    )
+    latest_update = tracker.latest_update
+    assert latest_update is not None
+    committed_wire_ns = (
+        latest_update.observation_monotonic_ns + 9_000_000
+    )
+    session.record_wire_acceptance(
+        target_roll_rad=committed_roll,
+        target_pitch_rad=committed.command.target_pitch_rad,
+        yaw_rate_rad_s=committed.command.yaw_rate_rad_s,
+        thrust=committed.command.thrust,
+        wire_command=AttitudeRateCommand(
+            -0.10,
+            0.0,
+            committed.command.yaw_rate_rad_s,
+            committed.command.thrust,
+        ),
+        wire_start_monotonic_ns=committed_wire_ns,
+    )
 
     # A nearby stable degraded-inner replacement supplies graph-vetted
     # center/scale correction, but no new aperture or passage authority.
@@ -1050,10 +1082,21 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
         update.observation_monotonic_ns + 5_000_000,
     )
     baseline = session._successor_steering_targets(prediction)
-    assert proposal.servo_output.target_roll_rad == pytest.approx(
-        baseline["target_roll_rad"]
+    assert abs(float(baseline["target_roll_rad"])) < abs(
+        committed_roll
     )
-    assert proposal.servo_output.target_roll_rad < 0.0
+    assert proposal.servo_output.target_roll_rad == pytest.approx(
+        committed_roll
+    )
+    assert proposal.servo_output.target_pitch_rad == pytest.approx(
+        baseline["target_pitch_rad"]
+    )
+    assert proposal.servo_output.yaw_rate_rad_s == pytest.approx(
+        baseline["yaw_rate_rad_s"]
+    )
+    assert proposal.servo_output.thrust == pytest.approx(
+        baseline["thrust"]
+    )
     assert all(
         math.isfinite(value)
         for value in (
@@ -1073,7 +1116,30 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     )
 
     _accept_proposal(session, tracker, proposal)
-    race_received_ns = update.observation_monotonic_ns + 9_000_000
+    accepted_reference = (
+        session._precredit_successor_roll_reference  # noqa: SLF001
+    )
+    assert accepted_reference is not None
+    assert accepted_reference.target_roll_rad == pytest.approx(
+        committed_roll
+    )
+    assert accepted_reference.accepted_wire_start_monotonic_ns == (
+        update.observation_monotonic_ns + 8_000_000
+    )
+    # A newer proposal can be refused atomically by race credit.  It must not
+    # overwrite the last reference that actually reached the wire.
+    no_wire = session.adjacent_precredit_successor_steering_authority(
+        track_id=replacement.track_id,
+        now_monotonic_ns=(
+            update.observation_monotonic_ns + 9_000_000
+        ),
+    )
+    assert no_wire["target_roll_rad"] == pytest.approx(committed_roll)
+    assert (
+        session._precredit_successor_roll_reference  # noqa: SLF001
+        == accepted_reference
+    )
+    race_received_ns = update.observation_monotonic_ns + 10_000_000
     activation_ns = race_received_ns + 1_000_000
     session.activate_post_credit_successor_steering(
         _credited_race(race_received_ns),
@@ -1085,6 +1151,11 @@ def test_graph_vetted_adjacent_rebinds_local_successor_before_race_promotion():
     assert promoted.current_gate_index == 1
     assert promoted.current_track_id == replacement.track_id
     assert promoted.promotion_count == 1
+    handoff = session._post_credit_roll_reference_handoff  # noqa: SLF001
+    assert handoff is not None
+    assert handoff.retained_target_roll_rad == pytest.approx(
+        committed_roll
+    )
 
 
 def test_dynamic_adapter_preserves_bounded_outward_correction_demand():
