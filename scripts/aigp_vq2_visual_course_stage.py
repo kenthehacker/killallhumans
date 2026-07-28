@@ -5426,8 +5426,11 @@ class VisualCourseStageLimits:
     max_command_rate_rad_s: float = 0.25
     max_yaw_rate_rad_s: float = MAX_VISUAL_YAW_RATE_RAD_S
     max_abs_measured_roll_rad: float = 0.18
-    min_measured_pitch_rad: float = -0.35
-    max_measured_pitch_rad: float = 0.15
+    # Match the user-designated outer FlightSim watchdog.  The former
+    # [-0.35, +0.15] stage corridor duplicated a bounded experiment and put
+    # the measured lower abort exactly on the legal -0.35 target.
+    min_measured_pitch_rad: float = math.radians(-35.0)
+    max_measured_pitch_rad: float = math.radians(10.0)
     max_abs_measured_body_rate_rad_s: float = 0.50
     max_segment_yaw_excursion_rad: float = (
         MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD
@@ -5508,7 +5511,7 @@ class VisualCourseStageLimits:
                 "visual-course measured roll diagnostic threshold is invalid"
             )
         if not (
-            -0.35
+            math.radians(-35.0)
             <= self.min_measured_pitch_rad
             <= MIN_VISUAL_TARGET_PITCH_RAD
         ):
@@ -5518,7 +5521,7 @@ class VisualCourseStageLimits:
         if not (
             MAX_VISUAL_TARGET_PITCH_RAD
             <= self.max_measured_pitch_rad
-            <= 0.15
+            <= math.radians(10.0)
         ):
             raise ValueError(
                 "visual-course measured maximum pitch bound is invalid"

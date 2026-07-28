@@ -33,11 +33,13 @@ from competition.vq2_visual_tracker import (
 # These are code-owned controller authority ceilings.  Repeated saturated
 # 0.12-rad/s successor corrections continued outward, so production consumes
 # the collision-free paired-polarity 0.15-rad/s build-3385 capability tier.
-# The excursion is a separate per-segment course-turn envelope, not a
-# calibration limit.
+# Heading excursion is represented as a wrapped delta, so +/-pi is the full
+# meaningful per-segment domain rather than a development turn cap.  Reserve
+# only the final 0.05 rad at the wrap ambiguity; calibrated command authority
+# remains independently bounded below.
 MAX_VISUAL_YAW_RATE_RAD_S = 0.15
-MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = 0.65
-VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = 0.60
+MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD = math.pi
+VISUAL_SEGMENT_YAW_SOFT_STOP_RAD = math.pi - 0.05
 MAX_VISUAL_SEGMENT_DURATION_S = 8.0
 # Keep the stage-side target-attitude validation envelope coherent with the
 # dynamic controller's 0.35-rad Gate-1 authority step.  The final physical

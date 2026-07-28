@@ -8120,6 +8120,16 @@ def test_yaw_profile_loads_only_the_exact_tracked_multi_run_authority():
             MAX_VISUAL_SEGMENT_YAW_EXCURSION_RAD + 0.001,
             "yaw excursion",
         ),
+        (
+            "min_measured_pitch_rad",
+            math.radians(-35.0) - 0.001,
+            "minimum pitch",
+        ),
+        (
+            "max_measured_pitch_rad",
+            math.radians(10.0) + 0.001,
+            "maximum pitch",
+        ),
     ),
 )
 def test_course_limits_refuse_widened_safety_envelopes(
@@ -8336,8 +8346,8 @@ def test_cross_axis_body_rates_use_exact_euler_yaw_kinematics():
 @pytest.mark.parametrize(
     "pitch",
     (
-        -0.350001,
-        0.150001,
+        math.radians(-35.0) - 0.000001,
+        math.radians(10.0) + 0.000001,
     ),
 )
 def test_measured_pitch_envelope_fails_closed(pitch):
@@ -8438,7 +8448,7 @@ def test_repeated_same_sign_yaw_requests_zero_before_hard_boundary():
             profile.observed_max_abs_measured_yaw_rate_rad_s
             * limits.control_period_s
         )
-        assert admitted < 200
+        assert admitted < 500
 
     assert admitted > 0
     assert excursion < limits.max_segment_yaw_excursion_rad
@@ -8455,7 +8465,7 @@ def test_duplicate_camera_frame_cannot_hide_new_unsafe_attitude():
             if self.sample_count == 2:
                 _set_attitude(
                     self,
-                    yaw=limits.max_segment_yaw_excursion_rad + 0.000001,
+                    pitch=limits.max_measured_pitch_rad + 0.000001,
                 )
                 return
             super()._sample()
@@ -8463,7 +8473,7 @@ def test_duplicate_camera_frame_cannot_hide_new_unsafe_attitude():
     host = DuplicateUnsafeHost(initial_gate=0, finish_gate=0)
     runtime, _calls = _runtime(host)
 
-    with pytest.raises(SafetyAbort, match="yaw envelope"):
+    with pytest.raises(SafetyAbort, match="measured attitude envelope"):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)
         )
@@ -8479,7 +8489,11 @@ def test_crossing_hold_checks_attitude_before_sending():
         def _sample(self):
             if self.crossing_loss_observed:
                 super()._sample()
-                _set_attitude(self, pitch=0.150001)
+                _set_attitude(
+                    self,
+                    pitch=VisualCourseStageLimits().max_measured_pitch_rad
+                    + 0.000001,
+                )
                 return
             super()._sample()
             if (
@@ -8864,7 +8878,11 @@ def test_post_credit_wait_checks_attitude_before_sending_zero():
                 self.after_promotion_samples is not None
                 and self.after_promotion_samples > 0
             ):
-                _set_attitude(self, pitch=0.150001)
+                _set_attitude(
+                    self,
+                    pitch=VisualCourseStageLimits().max_measured_pitch_rad
+                    + 0.000001,
+                )
 
     host = RecoveryUnsafeHost(
         initial_gate=1,
@@ -8892,7 +8910,11 @@ def test_command_slot_wait_cannot_invalidate_attitude_guard():
     class SlotUnsafeHost(_Host):
         async def _wait_for_next_flight_command_slot(self):
             ready = await super()._wait_for_next_flight_command_slot()
-            _set_attitude(self, pitch=0.150001)
+            _set_attitude(
+                self,
+                pitch=VisualCourseStageLimits().max_measured_pitch_rad
+                + 0.000001,
+            )
             return ready
 
     host = SlotUnsafeHost(initial_gate=0, finish_gate=0)
@@ -8917,14 +8939,14 @@ def test_terminal_race_finish_checks_attitude_before_success_return():
             if self.race.race_finished:
                 _set_attitude(
                     self,
-                    yaw=-(limits.max_segment_yaw_excursion_rad + 0.000001),
+                    pitch=limits.min_measured_pitch_rad - 0.000001,
                 )
             return self.race
 
     host = TerminalUnsafeHost(initial_gate=4, finish_gate=4)
     runtime, _calls = _runtime(host)
 
-    with pytest.raises(SafetyAbort, match="yaw envelope"):
+    with pytest.raises(SafetyAbort, match="measured attitude envelope"):
         asyncio.run(
             run_visual_course_stage(host, _context(), runtime=runtime)
         )

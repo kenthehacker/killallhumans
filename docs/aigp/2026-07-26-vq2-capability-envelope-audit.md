@@ -45,8 +45,8 @@ recovery while error worsened, so production consumes the measured
 | Visual target roll | `+/-0.16 rad` | Material coordinated-bank authority inside the separately enforced `+/-0.18 rad` measured stage corridor; not a plant maximum |
 | Visual target pitch | `[-0.30, +0.15] rad` | Controller trajectory/braking range inside the broad outer watchdog; not a plant maximum |
 | Visual thrust | `[0.21, 0.32]` | Stage tuning range; not the plant thrust envelope |
-| Visual measured roll/pitch/rate | roll `+/-0.18`, pitch `[-0.35,+0.15]`, rate `0.50` | Narrow stage corridor duplicated inside the broad watchdog |
-| Visual segment yaw excursion/soft stop | `0.65/0.60 rad` | Course-turn policy without direct calibration support; it must not be confused with a plant limit |
+| Visual measured roll/pitch/rate | roll `+/-0.18` diagnostic, pitch `[-35,+10] deg`, rate `0.50` diagnostic | Roll/rate retain diagnostics; pitch now matches the broad outer watchdog instead of duplicating a narrow stage abort |
+| Visual segment yaw excursion/soft stop | wrapped `pi/(pi-0.05) rad` | Full meaningful wrapped heading domain with only a wrap-ambiguity response reserve; no bounded-experiment course-turn cap |
 | Legacy alignment/recovery caps | rate `0.12`, yaw `0.12`, thrust `0.285-0.30`, several `0.05-0.18 rad` attitude deltas | Historical stage experiment limits except for the accepted production yaw cap; they are not generic plant maxima |
 | Corridor dwell, bbox/rate/scale/censor bounds, exact transition timers | Trace-derived navigation confidence | Keep only where causally needed for observation validity or crossing safety; never use them as actuator capability |
 
