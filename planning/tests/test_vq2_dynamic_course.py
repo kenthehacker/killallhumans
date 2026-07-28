@@ -3091,6 +3091,120 @@ def test_centered_close_gate_turns_toward_visible_successor_before_commit(
     assert decision.passage_committed is False
 
 
+def test_precommit_successor_yaw_stays_owned_after_center_band_jitter(
+) -> None:
+    core, admitted = _uncommitted_successor_case(
+        successor_x_step=0.004,
+        current_y=-0.05,
+    )
+    assert admitted.precommit_successor_yaw_authority == 1.0
+
+    observation_time = 1.32
+    _imu(core, observation_time)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            9,
+            observation_time,
+            x=0.10,
+            y=-0.05,
+            log_scale=-0.96,
+        )
+    )
+    core.observe_track(
+        _observation(
+            "gate-b",
+            9,
+            observation_time,
+            x=0.432,
+            y=-0.40,
+            log_scale=-1.60,
+        )
+    )
+    decision_time = observation_time + 0.005
+    _imu(core, decision_time)
+    retained = core.guide(round(decision_time * NS))
+
+    assert (
+        abs(retained.current_center_norm[0])
+        + 2.0
+        * retained.current_bearing_std_rad[0]
+        / core.config.horizontal_angle_scale_rad
+        > core.config.passage_margin_norm
+    )
+    assert retained.precommit_current_horizontal_fov_clearance_norm is not None
+    assert retained.precommit_current_horizontal_fov_clearance_norm > 0.0
+    assert retained.precommit_successor_yaw_authority == 1.0
+    assert retained.precommit_successor_yaw_rate_rad_s is not None
+    assert retained.command.yaw_rate_rad_s == pytest.approx(
+        retained.precommit_successor_yaw_rate_rad_s
+    )
+
+
+def test_precommit_yaw_uses_fresh_successor_side_not_rate_extrapolation(
+) -> None:
+    core = DynamicCourseCore(
+        DynamicCourseConfig(
+            camera_delay_s=0.0,
+            bearing_alpha=1.0,
+            bearing_beta=1.0,
+            scale_alpha=1.0,
+            scale_beta=1.0,
+        )
+    )
+    core.record_applied_command(_command(0.90))
+    decision = None
+    successor_bearing = (0.60, 0.52, 0.44, 0.36, 0.28, 0.20, 0.12, 0.04)
+    for sequence, next_bearing in enumerate(successor_bearing, 1):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=0.0,
+                y=-0.05,
+                log_scale=-1.20 + (sequence - 1) * 0.03,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=(
+                    math.tan(next_bearing)
+                    / core.config.horizontal_angle_scale_rad
+                ),
+                y=-0.20,
+                log_scale=-1.60,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, decision.command)
+
+    assert decision is not None
+    assert decision.measured_successor_bearing_rad is not None
+    assert decision.predicted_successor_bearing_rad is not None
+    assert decision.measured_successor_bearing_rad[0] > 0.0
+    assert decision.predicted_successor_bearing_rad[0] < 0.0
+    assert decision.precommit_successor_yaw_authority == 1.0
+    assert decision.precommit_successor_yaw_rate_rad_s is not None
+    assert decision.precommit_successor_yaw_rate_rad_s < 0.0
+    assert decision.command.yaw_rate_rad_s == pytest.approx(
+        decision.precommit_successor_yaw_rate_rad_s
+    )
+
+
 def test_centered_current_gate_can_preturn_before_passage_commitment() -> None:
     core, decision = _uncommitted_successor_case(
         successor_x_step=0.004
@@ -3225,7 +3339,8 @@ def test_uncommitted_successor_is_withheld_without_crossing_reserve() -> None:
     assert unsafe.command.target_roll_rad == pytest.approx(0.0)
 
 
-def test_uncommitted_successor_does_not_create_a_command_lease() -> None:
+def test_precommit_yaw_latch_ignores_dropout_but_releases_at_horizontal_edge(
+) -> None:
     core, retained = _uncommitted_successor_case(
         successor_x_step=0.004,
         current_log_scales=(
@@ -3243,8 +3358,8 @@ def test_uncommitted_successor_does_not_create_a_command_lease() -> None:
     assert retained.current_time_to_contact_s is None
     assert retained.precommit_successor_roll_authority == 0.0
     assert retained.precommit_successor_target_roll_rad is None
-    assert retained.precommit_successor_yaw_authority == 0.0
-    assert retained.precommit_successor_yaw_rate_rad_s is None
+    assert retained.precommit_successor_yaw_authority == 1.0
+    assert retained.precommit_successor_yaw_rate_rad_s is not None
 
     successor_estimate = core._tracks["gate-b"]  # noqa: SLF001
     successor_source = successor_estimate.state
@@ -3269,26 +3384,37 @@ def test_uncommitted_successor_does_not_create_a_command_lease() -> None:
     )
     assert propagated.precommit_successor_roll_authority == 0.0
     assert propagated.precommit_successor_target_roll_rad is None
-    assert propagated.precommit_successor_yaw_authority == 0.0
-    assert propagated.precommit_successor_yaw_rate_rad_s is None
+    assert propagated.precommit_successor_yaw_authority == 1.0
+    assert propagated.precommit_successor_yaw_rate_rad_s == pytest.approx(
+        retained.precommit_successor_yaw_rate_rad_s
+    )
     assert math.isfinite(propagated.command.target_roll_rad)
     assert (
         abs(propagated.command.target_roll_rad)
         <= MAX_TARGET_ROLL_RAD
     )
 
-    expired_time_ns = (
-        successor_source.last_measurement_monotonic_ns
-        + round(core.config.crossing_prediction_max_horizon_s * NS)
-        + 1
+    edge_observation_ns = propagated_time_ns + 40_000_000
+    _imu(core, edge_observation_ns / NS)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            9,
+            edge_observation_ns / NS,
+            x=0.95,
+            y=-0.30,
+            log_scale=-1.08,
+            clipping=FrameEdge.RIGHT,
+        )
     )
-    _imu(core, expired_time_ns / NS)
-    expired = core.guide(expired_time_ns)
+    edge_decision_ns = edge_observation_ns + 5_000_000
+    _imu(core, edge_decision_ns / NS)
+    released = core.guide(edge_decision_ns)
 
-    assert expired.precommit_successor_roll_authority == 0.0
-    assert expired.precommit_successor_target_roll_rad is None
-    assert expired.precommit_successor_yaw_authority == 0.0
-    assert expired.precommit_successor_yaw_rate_rad_s is None
+    assert released.precommit_successor_roll_authority == 0.0
+    assert released.precommit_successor_target_roll_rad is None
+    assert released.precommit_successor_yaw_authority == 0.0
+    assert released.precommit_successor_yaw_rate_rad_s is None
 
 
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:
