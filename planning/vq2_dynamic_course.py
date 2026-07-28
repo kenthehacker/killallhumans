@@ -42,7 +42,6 @@ SUPPORT_THRUST = 0.275
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 _NS_PER_SECOND = 1_000_000_000
 _EPSILON = 1e-12
-_LATERAL_ARREST_RELEASE_FRESH_FRAMES = 3
 
 
 class DynamicCourseError(ValueError):
@@ -1059,18 +1058,6 @@ class _SuccessorPrediction:
     confidence: float
 
 
-@dataclass(slots=True)
-class _LateralArrestHysteresis:
-    current_gate_index: int
-    track_id: str
-    stream_generation: int
-    error_direction: int
-    roll_direction: int
-    last_frame_sequence: int
-    last_abs_error_rad: float
-    improving_frame_count: int
-
-
 class DynamicCourseCore:
     """Per-track estimator plus an authority-neutral rolling course lifecycle."""
 
@@ -1092,10 +1079,6 @@ class DynamicCourseCore:
         ) = None
         self._successor_clearance_positive_since_ns: int | None = None
         self._last_applied_command: DynamicCourseCommand | None = None
-        self._current_role_command_floor = 0
-        self._lateral_arrest_hysteresis: (
-            _LateralArrestHysteresis | None
-        ) = None
 
     @property
     def track_states(self) -> tuple[TrackDynamicState, ...]:
@@ -2562,13 +2545,6 @@ class DynamicCourseCore:
         if ownership_key != self._successor_clearance_key:
             self._successor_clearance_key = None
             self._successor_clearance_positive_since_ns = None
-        current_role_changed = bool(
-            self._current_gate_index != current_gate_index
-            or self._current_track_id != current_track_id
-        )
-        if current_role_changed:
-            self._current_role_command_floor = len(self._commands)
-            self._lateral_arrest_hysteresis = None
         self._current_track_id = current_track_id
         self._current_gate_index = current_gate_index
         self._successor_track_id = successor_track_id
@@ -3070,8 +3046,6 @@ class DynamicCourseCore:
         self._successor_track_id = next_successor_track_id
         self._successor_clearance_key = None
         self._successor_clearance_positive_since_ns = None
-        self._current_role_command_floor = len(self._commands)
-        self._lateral_arrest_hysteresis = None
         self._promotion_count += 1
         self._last_promotion_ns = monotonic_ns
         return self.course_state()
@@ -3405,8 +3379,6 @@ class DynamicCourseCore:
             current_yaw_release,
             successor_weight,
             successor_prediction,
-            guidance_monotonic_ns=monotonic_ns,
-            horizontal_crossing_unsafe=horizontal_crossing_unsafe,
             horizontal_alignment_unsettled=(
                 horizontal_alignment_unsettled
             ),
@@ -3431,7 +3403,6 @@ class DynamicCourseCore:
         committed_successor_camera_center_rate: Vector2 | None = None
         committed_successor_yaw_rate: float | None = None
         committed_successor_yaw_authority = 0.0
-        committed_successor_outward_arrest = False
         if (
             passage_committed
             and successor is not None
@@ -3488,30 +3459,6 @@ class DynamicCourseCore:
                         MAX_TARGET_ROLL_RAD,
                     )
                     committed_successor_target_roll = normal_successor_roll
-                    committed_successor_outward_arrest = bool(
-                        abs(self.config.roll_guidance_sign) > _EPSILON
-                        and abs(normal_successor_roll) > _EPSILON
-                        and abs(successor_steering.stable_bearing_rad[0])
-                        >= self.config.off_axis_brake_rad
-                        and successor_steering.stable_bearing_rad[0]
-                        * successor_steering.stable_bearing_rate_rad_s[0]
-                        > 0.0
-                        and normal_successor_roll
-                        * self.config.roll_guidance_sign
-                        * successor_steering.stable_bearing_rad[0]
-                        > 0.0
-                    )
-                    if committed_successor_outward_arrest:
-                        # Passage commitment already owns the current-gate
-                        # crossing.  A reviewed successor that is meaningfully
-                        # off axis and still moving outward needs the full
-                        # accepted bank reference before promotion; recovering
-                        # rate releases immediately to the proportional law.
-                        committed_successor_target_roll = math.copysign(
-                            MAX_TARGET_ROLL_RAD,
-                            self.config.roll_guidance_sign
-                            * successor_steering.stable_bearing_rad[0],
-                        )
                     committed_successor_yaw_authority = 1.0
                     committed_successor_yaw_rate = _clamp(
                         -self.config.yaw_gain
@@ -3555,15 +3502,6 @@ class DynamicCourseCore:
                         maximum_lead_rad=maximum_std,
                         baseline_pitch_rad=self.config.brake_pitch_rad,
                     )
-                    if committed_successor_outward_arrest:
-                        # Do not accelerate into an off-axis successor while
-                        # full lateral arrest is still required.  Existing raw
-                        # FOV guidance may constrain this reference downstream;
-                        # recovering lateral motion releases it immediately.
-                        committed_successor_target_pitch = max(
-                            committed_successor_target_pitch,
-                            self.config.brake_pitch_rad,
-                        )
                     proposal = replace(
                         proposal,
                         target_pitch_rad=(
@@ -4370,170 +4308,6 @@ class DynamicCourseCore:
             confidence=confidence,
         )
 
-    def _apply_lateral_arrest_hysteresis(
-        self,
-        current: TrackDynamicState,
-        *,
-        guidance_monotonic_ns: int,
-        lateral_error_rad: float,
-        lateral_rate_rad_s: float,
-        proposed_roll_rad: float,
-        outward_lateral_arrest: bool,
-    ) -> float:
-        """Keep accepted corrective bank through transient rate reversals.
-
-        A derotated rate estimate can briefly report inward motion while the
-        fixed-reference gate error is still growing.  Immediately releasing a
-        saturated attitude target in that state asks the downstream slew
-        governor to reverse, costing several fresh frames if the rate estimate
-        flips back.  Retain only an already accepted same-current saturated
-        reference, and release it after three fresh improving observations or
-        immediate corridor entry.  This changes neither passage authority nor
-        the final command envelope.
-        """
-
-        _exact_nonnegative_int(
-            guidance_monotonic_ns,
-            "guidance_monotonic_ns",
-        )
-        error = _finite(lateral_error_rad, "lateral_error_rad")
-        rate = _finite(lateral_rate_rad_s, "lateral_rate_rad_s")
-        proposed_roll = _finite(
-            proposed_roll_rad,
-            "proposed_roll_rad",
-        )
-        if type(outward_lateral_arrest) is not bool:
-            raise TypeError(
-                "outward_lateral_arrest must be an exact bool"
-            )
-        current_gate_index = self._current_gate_index
-        current_track_id = self._current_track_id
-        guidance_sign = float(self.config.roll_guidance_sign)
-        age_s = (
-            guidance_monotonic_ns - current.last_measurement_monotonic_ns
-        ) / _NS_PER_SECOND
-        error_direction = 1 if error > 0.0 else (-1 if error < 0.0 else 0)
-        abs_error = abs(error)
-        raw_error = (
-            None
-            if current.raw_center_norm is None
-            else float(current.raw_center_norm[0])
-        )
-        raw_error_direction = (
-            0
-            if raw_error is None or abs(raw_error) <= _EPSILON
-            else (1 if raw_error > 0.0 else -1)
-        )
-        geometry_valid = bool(
-            current_gate_index is not None
-            and current_track_id == current.track_id
-            and 0.0 <= age_s <= self.config.dropout_hold_s
-            and current.visible
-            and not current.ambiguous
-            and current.missed_count == 0
-            and not current.censored_axes[0]
-            and current.bearing_std_rad[0] <= 0.16
-            and abs(guidance_sign) > _EPSILON
-            and error_direction != 0
-            and raw_error_direction == error_direction
-        )
-        outside_corridor = bool(
-            abs_error >= self.config.off_axis_brake_rad
-        )
-
-        latch = self._lateral_arrest_hysteresis
-        latch_matches = bool(
-            latch is not None
-            and current_gate_index == latch.current_gate_index
-            and current.track_id == latch.track_id
-            and current.stream_generation == latch.stream_generation
-            and error_direction == latch.error_direction
-            and (
-                latch.roll_direction
-                * guidance_sign
-                * error
-                > _EPSILON
-            )
-        )
-        if latch is not None and not latch_matches:
-            self._lateral_arrest_hysteresis = None
-            latch = None
-
-        if not geometry_valid or not outside_corridor:
-            self._lateral_arrest_hysteresis = None
-            return proposed_roll
-
-        if latch is not None:
-            if current.frame_sequence != latch.last_frame_sequence:
-                improving = bool(
-                    error * rate < -_EPSILON
-                    and abs_error
-                    < latch.last_abs_error_rad - _EPSILON
-                )
-                latch.improving_frame_count = (
-                    latch.improving_frame_count + 1
-                    if improving
-                    else 0
-                )
-                latch.last_frame_sequence = current.frame_sequence
-                latch.last_abs_error_rad = abs_error
-            if (
-                latch.improving_frame_count
-                >= _LATERAL_ARREST_RELEASE_FRESH_FRAMES
-            ):
-                self._lateral_arrest_hysteresis = None
-                return proposed_roll
-            return math.copysign(
-                MAX_TARGET_ROLL_RAD,
-                float(latch.roll_direction),
-            )
-
-        last_applied = self._last_applied_command
-        accepted_current_role_saturated = bool(
-            len(self._commands) > self._current_role_command_floor
-            and last_applied is not None
-            and math.isclose(
-                abs(last_applied.target_roll_rad),
-                MAX_TARGET_ROLL_RAD,
-                rel_tol=0.0,
-                abs_tol=_EPSILON,
-            )
-            and (
-                last_applied.target_roll_rad
-                * guidance_sign
-                * error
-                > _EPSILON
-            )
-        )
-        if accepted_current_role_saturated:
-            assert last_applied is not None
-            roll_direction = (
-                1 if last_applied.target_roll_rad > 0.0 else -1
-            )
-            self._lateral_arrest_hysteresis = (
-                _LateralArrestHysteresis(
-                    current_gate_index=current_gate_index,
-                    track_id=current.track_id,
-                    stream_generation=current.stream_generation,
-                    error_direction=error_direction,
-                    roll_direction=roll_direction,
-                    last_frame_sequence=current.frame_sequence,
-                    last_abs_error_rad=abs_error,
-                    improving_frame_count=0,
-                )
-            )
-            return math.copysign(
-                MAX_TARGET_ROLL_RAD,
-                float(roll_direction),
-            )
-
-        # The ordinary outward-arrest law may issue the first saturated
-        # proposal.  Hysteresis arms only after that exact reference is
-        # accepted and recorded on a later fresh current publication.
-        if outward_lateral_arrest:
-            return proposed_roll
-        return proposed_roll
-
     def _propose_command(
         self,
         current: TrackDynamicState,
@@ -4545,8 +4319,6 @@ class DynamicCourseCore:
         successor_weight: float,
         successor_prediction: _SuccessorPrediction | None,
         *,
-        guidance_monotonic_ns: int,
-        horizontal_crossing_unsafe: bool,
         horizontal_alignment_unsettled: bool,
         vertical_alignment_unsettled: bool,
     ) -> tuple[DynamicCourseCommand, bool, str | None, float]:
@@ -4657,37 +4429,10 @@ class DynamicCourseCore:
             * stable_passage_rate_norm_s[0]
             * self.config.horizontal_angle_scale_rad
         )
-        outward_lateral_arrest = bool(
-            current.visible
-            and not current.ambiguous
-            and not current.censored_axes[0]
-            and current.bearing_rate_qualified[0]
-            and current.bearing_std_rad[0] <= 0.16
-            and abs(stable_passage_bearing[0])
-            >= self.config.off_axis_brake_rad
-            and lateral_error * stable_passage_rate_norm_s[0] > 0.0
-            and roll
-            * self.config.roll_guidance_sign
-            * lateral_error
-            > 0.0
-        )
-        if outward_lateral_arrest:
-            # Steering authority is independent of passage authority.  A
-            # horizontally valid gate that is meaningfully off axis and still
-            # moving outward may use the accepted bank envelope without
-            # waiting for scale/TTC or crossing-clearance qualification.
-            roll = math.copysign(MAX_TARGET_ROLL_RAD, roll)
-        roll = self._apply_lateral_arrest_hysteresis(
-            current,
-            guidance_monotonic_ns=guidance_monotonic_ns,
-            lateral_error_rad=lateral_error,
-            lateral_rate_rad_s=(
-                stable_passage_rate_norm_s[0]
-                * self.config.horizontal_angle_scale_rad
-            ),
-            proposed_roll_rad=roll,
-            outward_lateral_arrest=outward_lateral_arrest,
-        )
+        # The roll-to-image acceleration magnitude remains uncharacterized.
+        # Keep this channel bounded and proportional.  Live Gate-1 evidence
+        # showed that escalating and latching a full bank after the rate
+        # turned outward drove fixed-reference gate error from +0.25 to +1.92.
         yaw = -self.config.yaw_gain * heading_error
         # Successor geometry may only slow the current-gate approach with the
         # same progressively admitted authority that governs successor yaw.

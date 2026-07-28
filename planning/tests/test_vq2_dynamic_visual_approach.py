@@ -174,7 +174,7 @@ def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
     assert recovered_lead == 0.0
 
 
-def test_successor_steering_uses_full_bank_only_while_off_axis_and_outward():
+def test_successor_steering_roll_remains_bounded_and_proportional():
     session = _session(config=production_dynamic_course_config())
     prediction = TrackSteeringPrediction(
         track_id="gate-b",
@@ -206,24 +206,29 @@ def test_successor_steering_uses_full_bank_only_while_off_axis_and_outward():
     )._successor_steering_targets(prediction)
 
     assert outward["target_roll_rad"] == pytest.approx(
-        -MAX_TARGET_ROLL_RAD
+        -(
+            session.core.config.roll_gain * 0.40
+            + session.core.config.lateral_rate_gain * 0.10
+        )
     )
-    assert outward["target_pitch_rad"] == pytest.approx(
-        session.core.config.brake_pitch_rad
+    assert recovered["target_roll_rad"] == pytest.approx(
+        -(
+            session.core.config.roll_gain * 0.40
+            - session.core.config.lateral_rate_gain * 0.10
+        )
     )
     assert (
         -MAX_TARGET_ROLL_RAD
+        < outward["target_roll_rad"]
         < recovered["target_roll_rad"]
         < 0.0
     )
-    assert (
+    assert outward["target_pitch_rad"] == pytest.approx(
         recovered["target_pitch_rad"]
-        < session.core.config.brake_pitch_rad
     )
     assert unidentified["target_roll_rad"] == 0.0
-    assert (
-        unidentified["target_pitch_rad"]
-        < session.core.config.brake_pitch_rad
+    assert unidentified["target_pitch_rad"] == pytest.approx(
+        recovered["target_pitch_rad"]
     )
 
 
@@ -3565,11 +3570,12 @@ def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
 
 
 @pytest.mark.parametrize(
-    "normal_roll_rad",
-    (-0.04, -MAX_TARGET_ROLL_RAD),
+    ("normal_roll_rad", "rebound_admitted"),
+    ((-0.04, True), (-MAX_TARGET_ROLL_RAD, False)),
 )
 def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
     normal_roll_rad: float,
+    rebound_admitted: bool,
 ):
     session, successor_id = _bound_post_credit_successor()
     successor = session.core.course_state().successor
@@ -3626,9 +3632,17 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
     )
 
     assert constrained.proposed_command == normal_command
-    assert constrained.command.target_roll_rad == pytest.approx(
-        -MAX_TARGET_ROLL_RAD
+    rebound_roll = float(
+        session.post_credit_successor_steering_authority(
+            now_monotonic_ns=normal.monotonic_ns,
+        )["target_roll_rad"]
     )
+    expected_roll = (
+        rebound_roll
+        if rebound_admitted
+        else normal_roll_rad
+    )
+    assert constrained.command.target_roll_rad == pytest.approx(expected_roll)
     assert constrained.passage_committed is False
     assert constrained.current_gate_index == 1
     assert session.post_credit_roll_reference_handoff_active is False
@@ -3656,7 +3670,10 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
         ),
         wire_start_monotonic_ns=accepted_ns,
     )
-    assert session.post_credit_roll_reference_handoff_active
+    assert (
+        session.post_credit_roll_reference_handoff_active
+        is rebound_admitted
+    )
 
     # Recovery completion retires the rebound lease, while the accepted
     # reference remains state-owned until the qualified residual recovers.
@@ -3668,9 +3685,7 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
     retained = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
         outward
     )
-    assert retained.command.target_roll_rad == pytest.approx(
-        -MAX_TARGET_ROLL_RAD
-    )
+    assert retained.command.target_roll_rad == pytest.approx(expected_roll)
 
     estimate.state = replace(
         estimate.state,
@@ -3685,9 +3700,12 @@ def test_fresh_rebound_outward_roll_arms_geometry_released_handoff(
         )
     )
     assert recovering_off_axis.command.target_roll_rad == pytest.approx(
-        -MAX_TARGET_ROLL_RAD
+        expected_roll
     )
-    assert session.post_credit_roll_reference_handoff_active
+    assert (
+        session.post_credit_roll_reference_handoff_active
+        is rebound_admitted
+    )
 
     recovered = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
         replace(
@@ -4161,7 +4179,20 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         now_monotonic_ns=authority_ns,
     )
     retained_roll = float(precredit["target_roll_rad"])
-    assert retained_roll == pytest.approx(-MAX_TARGET_ROLL_RAD)
+    precredit_prediction = session.core.predict_track_steering(
+        reviewed_id,
+        authority_ns,
+    )
+    assert retained_roll == pytest.approx(
+        session.core.config.roll_guidance_sign
+        * (
+            session.core.config.roll_gain
+            * precredit_prediction.stable_bearing_rad[0]
+            + session.core.config.lateral_rate_gain
+            * precredit_prediction.stable_bearing_rate_rad_s[0]
+        )
+    )
+    assert -MAX_TARGET_ROLL_RAD < retained_roll < 0.0
     wire_ns = authority_ns + 500_000
     session.record_wire_acceptance(
         target_roll_rad=retained_roll,
@@ -4326,10 +4357,10 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     assert rebound_handoff.expires_monotonic_ns == (
         rebound["recovery_steering"]["expires_monotonic_ns"]
     )
-    # Latest-flight facts: the exact fresh cross-ID reanchor starts with an
-    # unqualified horizontal rate and a +0.190625 normalized center.  Its
-    # ordinary proportional reference is about -0.053 rad, but it must not
-    # unwind the already accepted -0.25-rad successor bank.
+    # The exact fresh cross-ID reanchor starts with an unqualified horizontal
+    # rate and a +0.190625 normalized center.  Its ordinary proportional
+    # reference is weaker, but it must not unwind the already accepted,
+    # bounded successor reference.
     fresh_center_x = 0.190625
     fresh_bearing_rad = math.atan(
         fresh_center_x * session.core.config.horizontal_angle_scale_rad

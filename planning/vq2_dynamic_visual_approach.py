@@ -1752,34 +1752,10 @@ class DynamicVisualCourseSession:
             MAX_TARGET_ROLL_RAD,
             max(-MAX_TARGET_ROLL_RAD, target_roll),
         )
-        successor_outward_arrest = bool(
-            abs(self.core.config.roll_guidance_sign) > 1e-12
-            and abs(target_roll) > 1e-12
-            and prediction.bearing_std_rad[0]
-            <= (
-                self.core.config
-                .successor_prediction_max_extrapolation_rad
-            )
-            + 1e-12
-            and abs(prediction.stable_bearing_rad[0])
-            >= self.core.config.off_axis_brake_rad
-            and prediction.stable_bearing_rad[0]
-            * prediction.stable_bearing_rate_rad_s[0]
-            > 0.0
-            and target_roll
-            * self.core.config.roll_guidance_sign
-            * prediction.stable_bearing_rad[0]
-            > 0.0
-        )
-        if successor_outward_arrest:
-            # Keep the reviewed successor inside the lateral approach
-            # envelope before and through race-owned promotion.  This is a
-            # geometry-selected attitude reference, not command continuity;
-            # recovering motion releases to the proportional law immediately.
-            target_roll = math.copysign(
-                MAX_TARGET_ROLL_RAD,
-                target_roll,
-            )
+        # Roll sign is identified, but its image-acceleration magnitude is
+        # not.  Preserve the bounded proportional prediction across credit;
+        # escalating an outward successor directly to full bank made that
+        # uncharacterized channel dominate the calibrated yaw correction.
         (
             target_pitch,
             camera_elevation,
@@ -1799,11 +1775,6 @@ class DynamicVisualCourseSession:
             ),
             baseline_pitch_rad=self.core.config.brake_pitch_rad,
         )
-        if successor_outward_arrest:
-            target_pitch = max(
-                target_pitch,
-                self.core.config.brake_pitch_rad,
-            )
         camera_heading = math.atan(
             prediction.camera_center_norm[0]
             * self.core.config.horizontal_angle_scale_rad

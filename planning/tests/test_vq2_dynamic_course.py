@@ -1321,7 +1321,7 @@ def test_negative_clearance_near_center_cannot_invent_full_bank() -> None:
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
 
-def test_off_axis_outward_steering_does_not_wait_for_crossing_authority(
+def test_off_axis_outward_steering_remains_bounded_and_proportional(
 ) -> None:
     core = DynamicCourseCore(
         DynamicCourseConfig(
@@ -1376,14 +1376,22 @@ def test_off_axis_outward_steering_does_not_wait_for_crossing_authority(
     assert not decision.passage_committed
     assert decision.successor_passage_authority == 0.0
     assert decision.passage_yaw_authority == 0.0
-    assert (
-        decision.proposed_command.target_roll_rad
-        == MAX_TARGET_ROLL_RAD
+    expected_outward_roll = core.config.roll_guidance_sign * (
+        core.config.roll_gain
+        * math.atan(
+            decision.passage_error_norm[0]
+            * core.config.horizontal_angle_scale_rad
+        )
+        + core.config.lateral_rate_gain
+        * current.residual_translational_rate_rad_s[0]
+    )
+    assert decision.proposed_command.target_roll_rad == pytest.approx(
+        expected_outward_roll
     )
     assert (
         0.0
         < decision.proposed_command.target_roll_rad
-        < math.radians(25.0)
+        < MAX_TARGET_ROLL_RAD
     )
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
@@ -1424,18 +1432,17 @@ def test_off_axis_outward_steering_does_not_wait_for_crossing_authority(
     assert recovered_decision.current_time_to_contact_s is None
     assert not recovered_decision.passage_committed
     assert (
-        recovered_decision.proposed_command.target_roll_rad
-        == MAX_TARGET_ROLL_RAD
+        0.0
+        < recovered_decision.proposed_command.target_roll_rad
+        < decision.proposed_command.target_roll_rad
     )
     assert math.isfinite(
         recovered_decision.proposed_command.target_roll_rad
     )
 
-    # One transient inward estimate must not unwind an accepted saturated
-    # bank while the fixed-reference error remains materially off axis.  Two
-    # additional fresh, actually improving observations complete the
-    # three-frame release dwell.
-    release_decisions = []
+    # Further fresh inward motion continuously reduces the proportional
+    # reference; there is no hidden full-bank dwell.
+    improving_decisions = []
     for sequence, x in ((10, 0.340), (11, 0.320)):
         observation_time = 1.0 + (sequence - 1) * 0.040
         _imu(core, observation_time)
@@ -1451,22 +1458,18 @@ def test_off_axis_outward_steering_does_not_wait_for_crossing_authority(
         )
         decision_time = observation_time + 0.005
         _imu(core, decision_time)
-        release_decision = core.guide(round(decision_time * NS))
-        release_decisions.append(release_decision)
+        improving_decision = core.guide(round(decision_time * NS))
+        improving_decisions.append(improving_decision)
         _commit_decision(
             core,
             decision_time,
-            release_decision.command,
+            improving_decision.command,
         )
 
     assert (
-        release_decisions[0].proposed_command.target_roll_rad
-        == MAX_TARGET_ROLL_RAD
-    )
-    assert (
         0.0
-        < release_decisions[1].proposed_command.target_roll_rad
-        < MAX_TARGET_ROLL_RAD
+        < improving_decisions[-1].proposed_command.target_roll_rad
+        < recovered_decision.proposed_command.target_roll_rad
     )
 
 
@@ -2849,7 +2852,7 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     )
 
 
-def test_committed_off_axis_successor_uses_full_bank_then_releases(
+def test_committed_off_axis_successor_roll_remains_proportional(
 ) -> None:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,
@@ -2905,17 +2908,30 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
         > 0.0
     )
     assert outward.committed_successor_roll_authority == 1.0
+    successor_prediction = core.predict_track_steering(
+        "gate-b",
+        outward.monotonic_ns,
+    )
+    expected_outward_roll = config.roll_guidance_sign * (
+        config.roll_gain * successor_prediction.stable_bearing_rad[0]
+        + config.lateral_rate_gain
+        * successor_prediction.stable_bearing_rate_rad_s[0]
+    )
     assert outward.committed_successor_target_roll_rad == pytest.approx(
-        MAX_TARGET_ROLL_RAD
+        expected_outward_roll
     )
     assert outward.command.target_roll_rad == pytest.approx(
-        MAX_TARGET_ROLL_RAD
+        expected_outward_roll
     )
-    assert outward.committed_successor_target_pitch_rad == pytest.approx(
-        config.brake_pitch_rad
+    assert (
+        0.0
+        < outward.committed_successor_target_roll_rad
+        < MAX_TARGET_ROLL_RAD
     )
-    assert outward.command.target_pitch_rad == pytest.approx(
-        config.brake_pitch_rad
+    assert outward.committed_successor_target_pitch_rad is not None
+    assert (
+        outward.committed_successor_target_pitch_rad
+        < config.brake_pitch_rad
     )
 
     recovered = None
@@ -2951,7 +2967,7 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
     assert (
         0.0
         < recovered.committed_successor_target_roll_rad
-        < MAX_TARGET_ROLL_RAD
+        < outward.committed_successor_target_roll_rad
     )
     assert recovered.command.target_roll_rad == pytest.approx(
         recovered.committed_successor_target_roll_rad
