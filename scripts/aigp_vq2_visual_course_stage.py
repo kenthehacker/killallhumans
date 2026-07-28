@@ -3104,12 +3104,10 @@ class VisualCourseStageLimits:
             raise ValueError("visual-course command-rate bound is invalid")
         if not 0.0 < self.max_yaw_rate_rad_s <= MAX_VISUAL_YAW_RATE_RAD_S:
             raise ValueError("visual-course yaw-rate bound is invalid")
-        if not (
-            MAX_VISUAL_TARGET_ROLL_RAD
-            <= self.max_abs_measured_roll_rad
-            <= 0.18
-        ):
-            raise ValueError("visual-course measured roll bound is invalid")
+        if not 0.0 < self.max_abs_measured_roll_rad <= 0.18:
+            raise ValueError(
+                "visual-course measured roll diagnostic threshold is invalid"
+            )
         if not (
             -0.35
             <= self.min_measured_pitch_rad
@@ -3555,9 +3553,18 @@ def _assert_course_attitude_state(
             measured_body_rates_rad_s=list(rates),
             measured_attitude_rpy_rad=[roll, pitch, yaw],
         )
+    if abs(roll) > limits.max_abs_measured_roll_rad:
+        host.recorder.emit(
+            "visual_course_measured_roll_corridor_exceeded",
+            phase=phase,
+            disposition="diagnostic_only",
+            threshold_rad=limits.max_abs_measured_roll_rad,
+            measured_roll_rad=roll,
+            measured_pitch_rad=pitch,
+            measured_body_rates_rad_s=list(rates),
+        )
     if (
-        abs(roll) > limits.max_abs_measured_roll_rad
-        or pitch < limits.min_measured_pitch_rad
+        pitch < limits.min_measured_pitch_rad
         or pitch > limits.max_measured_pitch_rad
     ):
         raise abort_type(

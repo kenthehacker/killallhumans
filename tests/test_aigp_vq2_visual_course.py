@@ -5216,19 +5216,15 @@ def test_cross_axis_body_rates_use_exact_euler_yaw_kinematics():
 
 
 @pytest.mark.parametrize(
-    ("roll", "pitch"),
+    "pitch",
     (
-        (0.180001, 0.0),
-        (0.0, -0.350001),
-        (0.0, 0.150001),
+        -0.350001,
+        0.150001,
     ),
 )
-def test_measured_roll_pitch_envelopes_fail_closed(
-    roll,
-    pitch,
-):
+def test_measured_pitch_envelope_fails_closed(pitch):
     host = _Host()
-    _set_attitude(host, roll=roll, pitch=pitch)
+    _set_attitude(host, pitch=pitch)
 
     with pytest.raises(SafetyAbort, match="measured attitude envelope"):
         course_stage._assert_course_attitude_state(
@@ -5239,6 +5235,31 @@ def test_measured_roll_pitch_envelopes_fail_closed(
             abort_type=SafetyAbort,
             phase="regression",
         )
+
+
+def test_measured_roll_corridor_is_recorded_as_diagnostic():
+    host = _Host()
+    _set_attitude(host, roll=0.250001)
+
+    course_stage._assert_course_attitude_state(
+        host,
+        yaw_reference_rad=0.0,
+        limits=VisualCourseStageLimits(),
+        yaw_profile=_yaw_profile(),
+        abort_type=SafetyAbort,
+        phase="roll-authority-regression",
+    )
+
+    events = [
+        payload
+        for event, payload in host.recorder.events
+        if event == "visual_course_measured_roll_corridor_exceeded"
+    ]
+    assert len(events) == 1
+    assert events[0]["phase"] == "roll-authority-regression"
+    assert events[0]["disposition"] == "diagnostic_only"
+    assert events[0]["threshold_rad"] == 0.18
+    assert events[0]["measured_roll_rad"] == pytest.approx(0.250001)
 
 
 @pytest.mark.parametrize(
@@ -5340,7 +5361,7 @@ def test_crossing_hold_checks_attitude_before_sending():
         def _sample(self):
             if self.crossing_loss_observed:
                 super()._sample()
-                _set_attitude(self, roll=0.180001)
+                _set_attitude(self, pitch=0.150001)
                 return
             super()._sample()
             if (
@@ -5615,7 +5636,7 @@ def test_command_slot_wait_cannot_invalidate_attitude_guard():
     class SlotUnsafeHost(_Host):
         async def _wait_for_next_flight_command_slot(self):
             ready = await super()._wait_for_next_flight_command_slot()
-            _set_attitude(self, roll=0.180001)
+            _set_attitude(self, pitch=0.150001)
             return ready
 
     host = SlotUnsafeHost(initial_gate=0, finish_gate=0)

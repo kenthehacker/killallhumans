@@ -1367,6 +1367,11 @@ def test_unsafe_outward_lateral_motion_uses_full_attitude_then_releases(
         decision.proposed_command.target_roll_rad
         == MAX_TARGET_ROLL_RAD
     )
+    assert (
+        0.18
+        < decision.proposed_command.target_roll_rad
+        < math.radians(25.0)
+    )
     assert math.isfinite(decision.proposed_command.target_roll_rad)
 
     recovered = None
