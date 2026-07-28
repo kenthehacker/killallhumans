@@ -2724,6 +2724,12 @@ class DynamicVisualCourseSession:
                         decision.successor_yaw_contribution_rad
                     ),
                     "passage_committed": decision.passage_committed,
+                    "precommit_successor_roll_authority": (
+                        decision.precommit_successor_roll_authority
+                    ),
+                    "precommit_successor_target_roll_rad": (
+                        decision.precommit_successor_target_roll_rad
+                    ),
                     "committed_successor_roll_authority": (
                         decision.committed_successor_roll_authority
                     ),

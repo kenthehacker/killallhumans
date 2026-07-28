@@ -836,6 +836,8 @@ class GuidanceDecision:
     passage_yaw_authority: float
     successor_yaw_contribution_rad: float
     passage_committed: bool
+    precommit_successor_roll_authority: float
+    precommit_successor_target_roll_rad: float | None
     committed_successor_roll_authority: float
     committed_successor_target_roll_rad: float | None
     committed_successor_pitch_authority: float
@@ -1071,6 +1073,9 @@ class DynamicCourseCore:
             tuple[int, str, str | None] | None
         ) = None
         self._successor_clearance_positive_since_ns: int | None = None
+        self._precommit_successor_roll_key: (
+            tuple[int, str, str] | None
+        ) = None
         self._last_applied_command: DynamicCourseCommand | None = None
 
     @property
@@ -2538,6 +2543,16 @@ class DynamicCourseCore:
         if ownership_key != self._successor_clearance_key:
             self._successor_clearance_key = None
             self._successor_clearance_positive_since_ns = None
+        if (
+            self._precommit_successor_roll_key is not None
+            and self._precommit_successor_roll_key
+            != (
+                current_gate_index,
+                current_track_id,
+                successor_track_id,
+            )
+        ):
+            self._precommit_successor_roll_key = None
         self._current_track_id = current_track_id
         self._current_gate_index = current_gate_index
         self._successor_track_id = successor_track_id
@@ -3039,6 +3054,7 @@ class DynamicCourseCore:
         self._successor_track_id = next_successor_track_id
         self._successor_clearance_key = None
         self._successor_clearance_positive_since_ns = None
+        self._precommit_successor_roll_key = None
         self._promotion_count += 1
         self._last_promotion_ns = monotonic_ns
         return self.course_state()
@@ -3378,6 +3394,190 @@ class DynamicCourseCore:
             ),
             vertical_alignment_unsettled=vertical_alignment_unsettled,
         )
+        precommit_successor_roll_authority = 0.0
+        precommit_successor_target_roll: float | None = None
+        precommit_key = (
+            None
+            if successor is None
+            else (
+                state.current_gate_index,
+                current.track_id,
+                successor.track_id,
+            )
+        )
+        precommit_geometry_eligible = bool(
+            not passage_committed
+            and successor is not None
+            and successor_prediction is not None
+            and current.visible
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and current.bearing_rate_qualified[0]
+            and abs(current_center[0])
+            <= self.config.passage_margin_norm
+            and abs(residual_rate_norm[0])
+            <= self.config.vertical_settled_rate_norm_s
+            and successor.visible
+            and not successor.ambiguous
+            and not successor.censored_axes[0]
+            and successor.sample_count >= 4
+            and successor.stream_generation == current.stream_generation
+        )
+        closure_seed_eligible = bool(
+            precommit_geometry_eligible
+            and current.scale_rate_qualified
+            and current.time_to_contact_s is not None
+            and self.config.minimum_ttc_s
+            <= current.time_to_contact_s
+            <= self.config.successor_lookahead_ttc_s
+        )
+        if (
+            closure_seed_eligible
+            and precommit_key is not None
+            and self._precommit_successor_roll_key is None
+        ):
+            # Closure qualifies admission once; horizontal image geometry,
+            # successor freshness, and correction direction own release.
+            # This is rolling gate-relative state, not command continuity.
+            self._precommit_successor_roll_key = precommit_key
+        if (
+            precommit_geometry_eligible
+            and precommit_key is not None
+            and self._precommit_successor_roll_key == precommit_key
+        ):
+            assert successor is not None
+            assert successor_prediction is not None
+            successor_age_s = (
+                monotonic_ns
+                - successor.last_measurement_monotonic_ns
+            ) / _NS_PER_SECOND
+            if (
+                0.0
+                <= successor_age_s
+                <= self.config.dropout_hold_s
+                and successor_prediction.confidence > 0.0
+            ):
+                successor_steering = self.predict_track_steering(
+                    successor.track_id,
+                    monotonic_ns,
+                )
+                maximum_std = (
+                    self.config
+                    .successor_prediction_max_extrapolation_rad
+                )
+                normal_successor_roll = _clamp(
+                    self.config.roll_guidance_sign
+                    * (
+                        self.config.roll_gain
+                        * successor_steering.stable_bearing_rad[0]
+                        + self.config.lateral_rate_gain
+                        * successor_steering
+                        .stable_bearing_rate_rad_s[0]
+                    ),
+                    -MAX_TARGET_ROLL_RAD,
+                    MAX_TARGET_ROLL_RAD,
+                )
+                current_only_roll = _clamp(
+                    self.config.roll_guidance_sign
+                    * (
+                        self.config.roll_gain
+                        * math.atan(
+                            current_center[0]
+                            * self.config.horizontal_angle_scale_rad
+                        )
+                        + self.config.lateral_rate_gain
+                        * residual_rate_norm[0]
+                        * self.config.horizontal_angle_scale_rad
+                    ),
+                    -MAX_TARGET_ROLL_RAD,
+                    MAX_TARGET_ROLL_RAD,
+                )
+                outward_successor = bool(
+                    abs(self.config.roll_guidance_sign) > _EPSILON
+                    and successor_steering.bearing_std_rad[0]
+                    <= maximum_std + _EPSILON
+                    and abs(successor_steering.stable_bearing_rad[0])
+                    >= self.config.off_axis_brake_rad
+                    and successor_steering.stable_bearing_rad[0]
+                    * successor_steering.stable_bearing_rate_rad_s[0]
+                    > 0.0
+                    and normal_successor_roll
+                    * self.config.roll_guidance_sign
+                    * successor_steering.stable_bearing_rad[0]
+                    > 0.0
+                )
+                current_roll_opposes_successor = bool(
+                    current_only_roll * normal_successor_roll
+                    < -_EPSILON
+                )
+                if outward_successor and not current_roll_opposes_successor:
+                    ttc = current.time_to_contact_s
+                    ttc_progress = _clamp(
+                        (
+                            self.config.successor_lookahead_ttc_s
+                            - (
+                                self.config.successor_lookahead_ttc_s
+                                if ttc is None
+                                else ttc
+                            )
+                        )
+                        / (
+                            self.config.successor_lookahead_ttc_s
+                            - self.config.successor_full_weight_ttc_s
+                        ),
+                        0.0,
+                        1.0,
+                    )
+                    closure_authority = (
+                        self.config.successor_passage_far_authority
+                        + (
+                            1.0
+                            - self.config.successor_passage_far_authority
+                        )
+                        * ttc_progress
+                    )
+                    confidence_authority = _clamp(
+                        successor_prediction.confidence
+                        / self.config.successor_passage_full_confidence,
+                        0.0,
+                        1.0,
+                    )
+                    precommit_successor_roll_authority = _clamp(
+                        closure_authority * confidence_authority,
+                        0.0,
+                        1.0,
+                    )
+                    if precommit_successor_roll_authority > _EPSILON:
+                        lookahead_roll = math.copysign(
+                            MAX_TARGET_ROLL_RAD
+                            * precommit_successor_roll_authority,
+                            normal_successor_roll,
+                        )
+                        if (
+                            proposal.target_roll_rad
+                            * lookahead_roll
+                            >= 0.0
+                            and abs(proposal.target_roll_rad)
+                            > abs(lookahead_roll)
+                        ):
+                            lookahead_roll = proposal.target_roll_rad
+                        precommit_successor_target_roll = lookahead_roll
+                        # This is a gate-relative steering reference, not a
+                        # command smoother.  The current gate must remain
+                        # horizontally settled, an opposite current-gate
+                        # correction wins on the next guidance tick, and the
+                        # final wire governor remains the sole continuity
+                        # authority.
+                        proposal = replace(
+                            proposal,
+                            target_roll_rad=lookahead_roll,
+                        )
+                else:
+                    self._precommit_successor_roll_key = None
+            else:
+                self._precommit_successor_roll_key = None
+        elif self._precommit_successor_roll_key is not None:
+            self._precommit_successor_roll_key = None
         committed_successor_roll_authority = 0.0
         committed_successor_target_roll: float | None = None
         committed_successor_pitch_authority = 0.0
@@ -3635,6 +3835,12 @@ class DynamicCourseCore:
             passage_yaw_authority=passage_yaw_authority,
             successor_yaw_contribution_rad=yaw_contribution,
             passage_committed=passage_committed,
+            precommit_successor_roll_authority=(
+                precommit_successor_roll_authority
+            ),
+            precommit_successor_target_roll_rad=(
+                precommit_successor_target_roll
+            ),
             committed_successor_roll_authority=(
                 committed_successor_roll_authority
             ),

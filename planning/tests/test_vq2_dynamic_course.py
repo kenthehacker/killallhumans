@@ -2903,6 +2903,158 @@ def test_committed_off_axis_successor_uses_full_bank_then_releases(
     )
 
 
+def _precommit_successor_case(
+    *,
+    successor_x_step: float,
+    current_x: float = 0.0,
+    current_log_scales: tuple[float, ...] | None = None,
+) -> tuple[DynamicCourseCore, GuidanceDecision]:
+    config = DynamicCourseConfig(
+        camera_delay_s=0.0,
+        bearing_alpha=1.0,
+        bearing_beta=1.0,
+        scale_alpha=1.0,
+        scale_beta=1.0,
+        roll_guidance_sign=1.0,
+        roll_gain=0.18,
+        lateral_rate_gain=0.045,
+    )
+    core = DynamicCourseCore(config)
+    core.record_applied_command(_command(0.90))
+    decision = None
+    for sequence in range(1, 9):
+        observation_time = 1.0 + (sequence - 1) * 0.040
+        log_scale = (
+            -1.20 + (sequence - 1) * 0.03
+            if current_log_scales is None
+            else current_log_scales[sequence - 1]
+        )
+        _imu(core, observation_time)
+        core.observe_track(
+            _observation(
+                "gate-a",
+                sequence,
+                observation_time,
+                x=current_x,
+                y=-0.30,
+                log_scale=log_scale,
+            )
+        )
+        core.observe_track(
+            _observation(
+                "gate-b",
+                sequence,
+                observation_time,
+                x=0.40 + (sequence - 1) * successor_x_step,
+                y=-0.40,
+                log_scale=-1.60,
+            )
+        )
+        if sequence == 1:
+            core.bind(
+                current_gate_index=0,
+                current_track_id="gate-a",
+                successor_track_id="gate-b",
+            )
+        decision_time = observation_time + 0.005
+        _imu(core, decision_time)
+        decision = core.guide(round(decision_time * NS))
+        _commit_decision(core, decision_time, decision.command)
+    assert decision is not None
+    return core, decision
+
+
+def test_settled_current_allows_only_bounded_precommit_successor_roll() -> None:
+    _, decision = _precommit_successor_case(successor_x_step=0.004)
+
+    assert not decision.passage_committed
+    assert decision.centered_crossing_clearance_norm[1] < 0.0
+    assert decision.successor_clearance_authority == 0.0
+    assert decision.successor_passage_authority == 0.0
+    assert decision.passage_yaw_authority == 0.0
+    assert decision.successor_yaw_contribution_rad == 0.0
+    assert 0.0 < decision.precommit_successor_roll_authority <= 1.0
+    assert decision.precommit_successor_target_roll_rad is not None
+    assert (
+        0.0
+        < decision.precommit_successor_target_roll_rad
+        <= MAX_TARGET_ROLL_RAD
+    )
+    assert decision.command.target_roll_rad == pytest.approx(
+        decision.precommit_successor_target_roll_rad
+    )
+    assert decision.command.target_pitch_rad == pytest.approx(
+        DynamicCourseConfig().brake_pitch_rad
+    )
+    assert decision.command.yaw_rate_rad_s == 0.0
+    assert decision.command.thrust == pytest.approx(SUPPORT_THRUST)
+    assert all(
+        math.isfinite(value)
+        for value in (
+            decision.command.target_roll_rad,
+            decision.command.target_pitch_rad,
+            decision.command.yaw_rate_rad_s,
+            decision.command.thrust,
+        )
+    )
+
+
+def test_precommit_successor_roll_releases_or_yields_to_current() -> None:
+    _, recovered = _precommit_successor_case(
+        successor_x_step=-0.004,
+    )
+    _, opposing_current = _precommit_successor_case(
+        successor_x_step=0.004,
+        current_x=-0.06,
+    )
+
+    assert recovered.successor_rate_rad_s is not None
+    assert recovered.successor_rate_rad_s[0] < 0.0
+    assert recovered.precommit_successor_roll_authority == 0.0
+    assert recovered.precommit_successor_target_roll_rad is None
+
+    assert opposing_current.current_center_norm[0] < 0.0
+    assert opposing_current.command.target_roll_rad < 0.0
+    assert opposing_current.precommit_successor_roll_authority == 0.0
+    assert opposing_current.precommit_successor_target_roll_rad is None
+
+
+def test_precommit_roll_retains_closure_seed_but_expires_stale_vision() -> None:
+    core, retained = _precommit_successor_case(
+        successor_x_step=0.004,
+        current_log_scales=(
+            -1.20,
+            -1.17,
+            -1.14,
+            -1.11,
+            -1.11,
+            -1.11,
+            -1.11,
+            -1.11,
+        ),
+    )
+
+    assert retained.current_time_to_contact_s is None
+    assert retained.precommit_successor_roll_authority > 0.0
+    assert retained.precommit_successor_target_roll_rad is not None
+
+    _imu(core, 1.41)
+    core.observe_track(
+        _observation(
+            "gate-a",
+            9,
+            1.41,
+            y=-0.30,
+            log_scale=-1.11,
+        )
+    )
+    _imu(core, 1.415)
+    expired = core.guide(1_415_000_000)
+
+    assert expired.precommit_successor_roll_authority == 0.0
+    assert expired.precommit_successor_target_roll_rad is None
+
+
 def test_generic_authoritative_lifecycle_continues_past_gate_one() -> None:
     core = DynamicCourseCore(DynamicCourseConfig(camera_delay_s=0.0))
     _imu(core, 1.0)
