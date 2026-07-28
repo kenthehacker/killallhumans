@@ -553,10 +553,9 @@ class DynamicCourseConfig:
     roll_gain: float = 0.22
     lateral_rate_gain: float = 0.06
     advance_pitch_rad: float = -0.12
-    # Use the full target-attitude tier that remains inside the proved
-    # +10-degree measured-pitch envelope.  Off-axis turns need to arrest
-    # inherited forward momentum before asking vision to reacquire.
-    brake_pitch_rad: float = 0.15
+    # This bounded nonforward reference was already exercised without
+    # consuming most of the proved +10-degree measured-pitch margin.
+    brake_pitch_rad: float = 0.12
     off_axis_brake_rad: float = 0.18
     rapid_expansion_rate_s: float = 0.45
     dropout_hold_s: float = 0.120

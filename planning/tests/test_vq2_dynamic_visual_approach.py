@@ -77,6 +77,7 @@ def test_production_camera_boundary_uses_live_axis_calibration() -> None:
     # body-right.  The bounded translational demand therefore opposes positive
     # stable/image bearing.
     assert config.roll_guidance_sign == -1.0
+    assert config.brake_pitch_rad == pytest.approx(0.12)
 
 
 def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
@@ -168,7 +169,7 @@ def test_successor_pitch_reference_steers_from_predicted_vertical_geometry():
     assert top_rate < 0.0
     assert top_lead < 0.0
     assert recovered_target == pytest.approx(config.brake_pitch_rad)
-    assert bottom_target == pytest.approx(MAX_TARGET_PITCH_RAD)
+    assert bottom_target > recovered_target
     assert recovered_error == 0.0
     assert recovered_rate == 0.0
     assert recovered_lead == 0.0
@@ -3352,6 +3353,67 @@ def test_opposite_valid_demand_reduces_applied_roll_on_next_wire_tick():
         maximum_age_s=0.12,
     )
     assert authority["wire_command"] == proposed
+
+
+def test_off_axis_brake_pitch_can_reverse_wire_rate_without_artificial_delay():
+    session = _session()
+    first_ns = _BASE_NS
+    accepted = AttitudeRateCommand(0.0, -0.10, 0.0, 0.275)
+    session.record_wire_acceptance(
+        target_roll_rad=0.0,
+        target_pitch_rad=-0.12,
+        yaw_rate_rad_s=0.0,
+        thrust=0.275,
+        wire_command=accepted,
+        wire_start_monotonic_ns=first_ns,
+    )
+
+    proposed = session.govern_wire_command(
+        AttitudeRateCommand(0.0, 0.25, 0.0, 0.275),
+        proposal_monotonic_ns=first_ns + 100_000_000,
+        launch_thrust_override=False,
+        yaw_safety_override=False,
+    )
+
+    assert proposed.pitch_rate > 0.05
+    assert abs(proposed.pitch_rate) <= 0.25
+    assert session._wire_governor.config.max_pitch_slew_rad_s2 == 2.0  # noqa: SLF001
+
+
+def test_search_wire_cannot_create_a_same_gate_steering_anchor():
+    tracker, _graph_instance, snapshot, current_id = _graph()
+    session = _session()
+    planner = DynamicRollingVisualApproachServo(
+        current_id,
+        0,
+        next_gate_blend=0.35,
+        next_gate_blend_start_log_scale=-1.80,
+        next_gate_blend_full_log_scale=-0.50,
+        session=session,
+    )
+    proposal = _observe(planner, snapshot, tracker)
+    output = proposal.servo_output
+    update = tracker.latest_update
+    assert update is not None
+
+    session.record_wire_acceptance(
+        target_roll_rad=output.target_roll_rad,
+        target_pitch_rad=output.target_pitch_rad,
+        yaw_rate_rad_s=output.yaw_rate_rad_s,
+        thrust=output.thrust,
+        wire_command=AttitudeRateCommand(
+            0.0,
+            0.0,
+            output.yaw_rate_rad_s,
+            output.thrust,
+        ),
+        wire_start_monotonic_ns=(
+            update.observation_monotonic_ns + 8_000_000
+        ),
+        same_gate_steering_anchor_authorized=False,
+    )
+
+    assert session._same_gate_steering_anchor is None  # noqa: SLF001
 
 
 def test_top_fov_protected_pitch_reduces_wire_pitch_on_next_tick():

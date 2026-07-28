@@ -237,9 +237,9 @@ class _SameGateSteeringAnchor:
 class _WireGovernorConfig:
     max_roll_pitch_rate_rad_s: float = 0.25
     max_roll_slew_rad_s2: float = 2.0
-    # Retain the collision-free baseline's largest measured pitch-wire slew
-    # for the isolated visual-course body-rate diagnostic A/B.
-    max_pitch_slew_rad_s2: float = 0.75
+    # Pitch needs the same bounded response authority as roll during an
+    # off-axis brake.  The final body-rate clamp remains +/-0.25 rad/s.
+    max_pitch_slew_rad_s2: float = 2.0
     max_yaw_slew_rad_s2: float = 0.75
     max_thrust_slew_s: float = 0.15
     max_roll_accel_rad_s3: float = 20.0
@@ -2845,12 +2845,17 @@ class DynamicVisualCourseSession:
         requested_thrust: Optional[float] = None,
         thrust_slew_override: bool = False,
         yaw_slew_override: bool = False,
+        same_gate_steering_anchor_authorized: bool = True,
     ) -> Mapping[str, Any]:
         requested_wire_thrust = (
             float(thrust)
             if requested_thrust is None
             else float(requested_thrust)
         )
+        if type(same_gate_steering_anchor_authorized) is not bool:
+            raise TypeError(
+                "same-gate steering-anchor authority must be an exact bool"
+            )
         if (
             not math.isfinite(requested_wire_thrust)
             or requested_wire_thrust < MIN_THRUST
@@ -2902,7 +2907,7 @@ class DynamicVisualCourseSession:
                 and not decision.passage_committed
                 and decision.monotonic_ns <= wire_start_monotonic_ns
             )
-            if exact_visible_same_gate:
+            if exact_visible_same_gate and same_gate_steering_anchor_authorized:
                 accepted_anchor_decision = replace(
                     decision,
                     command=replace(

@@ -1037,6 +1037,7 @@ class _C25DynamicController:
         requested_thrust=None,
         thrust_slew_override=False,
         yaw_slew_override=False,
+        same_gate_steering_anchor_authorized=True,
     ):
         effective_requested_thrust = (
             thrust if requested_thrust is None else requested_thrust
@@ -1044,6 +1045,7 @@ class _C25DynamicController:
         assert 0.21 <= effective_requested_thrust <= 0.32
         assert thrust_slew_override is False
         assert yaw_slew_override is False
+        assert type(same_gate_steering_anchor_authorized) is bool
         self.accepted_count += 1
         return {
             "schema": "aigp-vq2-dynamic-command/1",

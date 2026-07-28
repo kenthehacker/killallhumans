@@ -4909,9 +4909,7 @@ def test_nonimproving_later_gate_brake_preempts_top_fov():
             braking=True,
             current_visible=True,
             current_ambiguous=False,
-            horizontal_rate_qualified=True,
             stable_center_x_norm=0.50,
-            residual_horizontal_rate_rad_s=0.10,
             horizontal_angle_scale_rad=0.80,
             off_axis_brake_rad=0.10,
         )
@@ -4927,8 +4925,6 @@ def test_nonimproving_later_gate_brake_preempts_top_fov():
         {"braking": False},
         {"current_visible": False},
         {"current_ambiguous": True},
-        {"horizontal_rate_qualified": False},
-        {"residual_horizontal_rate_rad_s": -0.10},
         {"stable_center_x_norm": 0.02},
     ),
 )
@@ -4943,9 +4939,7 @@ def test_current_gate_brake_preemption_requires_exact_outward_recovery(
         "braking": True,
         "current_visible": True,
         "current_ambiguous": False,
-        "horizontal_rate_qualified": True,
         "stable_center_x_norm": 0.50,
-        "residual_horizontal_rate_rad_s": 0.10,
         "horizontal_angle_scale_rad": 0.80,
         "off_axis_brake_rad": 0.10,
     }
@@ -6541,12 +6535,127 @@ def test_ninth_visibility_gap_command_uses_live_state_horizon():
     assert authority.evidence["steering_only"] is True
     assert authority.evidence["passage_authority"] is False
     assert authority.evidence["advance_authority"] is False
-    with pytest.raises(ValueError, match="local-state horizon"):
+    with pytest.raises(
+        course_stage._ApproachPropagatedVisibilityGapExpired,
+        match="local-state horizon",
+    ):
         course_stage._approach_propagated_visibility_gap_command_deadline_s(
             replace(authority, remaining_horizon_s=0.02),
             now_s=10.25,
             control_period_s=0.02,
         )
+
+
+def _expired_geometry_search_snapshot(sequence: int = 241):
+    token = _token(sequence)
+    current = SimpleNamespace(
+        track_id="track-1",
+        role=VisualTrackRole.CURRENT,
+        visible=False,
+        ambiguous=False,
+        missed_frame_count=9,
+    )
+    return SimpleNamespace(
+        latest_camera_token=token,
+        current_gate_index=1,
+        current_track_id="track-1",
+        current_track=current,
+        authority_usable=False,
+        withholding_reason="current_track_not_visible",
+        race_finished=False,
+    )
+
+
+def _fresh_search_track(
+    token,
+    *,
+    track_id="fresh-1",
+    horizontal=0.60,
+    source_index=3,
+):
+    sample = SimpleNamespace(token=token, source_index=source_index)
+    return SimpleNamespace(
+        track_id=track_id,
+        role=VisualTrackRole.UNKNOWN,
+        visible=True,
+        ambiguous=False,
+        missed_frame_count=0,
+        latest_token=token,
+        center_norm=(horizontal, -0.70),
+        history=(sample,),
+    )
+
+
+def test_expired_geometry_search_uses_sole_fresh_horizontal_detection():
+    snapshot = _expired_geometry_search_snapshot()
+    track = _fresh_search_track(snapshot.latest_camera_token)
+
+    authority = course_stage._approach_expired_geometry_search_authority(
+        snapshot=snapshot,
+        tracks=(track,),
+        gate_index=1,
+        track_id="track-1",
+        retained_horizontal_edge=FrameEdge.NONE,
+        brake_pitch_rad=0.12,
+        requested_thrust=0.275,
+        tuning=default_visual_config().servo,
+    )
+
+    assert authority.source == "sole-fresh-visible-track"
+    assert authority.observed_track_id == "fresh-1"
+    assert authority.observed_source_index == 3
+    assert authority.horizontal_norm == pytest.approx(0.60)
+    assert authority.command.target_roll_rad == 0.0
+    assert authority.command.target_pitch_rad == pytest.approx(0.12)
+    assert authority.command.yaw_rate_rad_s < 0.0
+    assert authority.command.requested_thrust == pytest.approx(0.275)
+
+
+def test_expired_geometry_search_uses_only_side_bit_when_fresh_view_is_not_unique():
+    snapshot = _expired_geometry_search_snapshot()
+    token = snapshot.latest_camera_token
+    tracks = (
+        _fresh_search_track(token, track_id="fresh-1", horizontal=-0.40),
+        _fresh_search_track(token, track_id="fresh-2", horizontal=0.70),
+    )
+
+    authority = course_stage._approach_expired_geometry_search_authority(
+        snapshot=snapshot,
+        tracks=tracks,
+        gate_index=1,
+        track_id="track-1",
+        retained_horizontal_edge=FrameEdge.RIGHT,
+        brake_pitch_rad=0.12,
+        requested_thrust=0.275,
+        tuning=default_visual_config().servo,
+    )
+
+    assert authority.source == "retained-right-edge-bit"
+    assert authority.observed_track_id is None
+    assert authority.observed_source_index is None
+    assert authority.horizontal_norm == 1.0
+    assert authority.command.yaw_rate_rad_s < 0.0
+    assert authority.command.target_roll_rad == 0.0
+
+
+def test_expired_geometry_search_does_not_consume_stale_detection():
+    snapshot = _expired_geometry_search_snapshot()
+    stale = _fresh_search_track(_token(240), horizontal=-0.80)
+
+    authority = course_stage._approach_expired_geometry_search_authority(
+        snapshot=snapshot,
+        tracks=(stale,),
+        gate_index=1,
+        track_id="track-1",
+        retained_horizontal_edge=FrameEdge.NONE,
+        brake_pitch_rad=0.12,
+        requested_thrust=0.275,
+        tuning=default_visual_config().servo,
+    )
+
+    assert authority.source == "neutral-no-unique-horizontal-evidence"
+    assert authority.horizontal_norm == 0.0
+    assert authority.command.yaw_rate_rad_s == 0.0
 
 
 @pytest.mark.parametrize(
