@@ -3952,17 +3952,52 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         reviewed_state.last_measurement_monotonic_ns
         + successor_horizon_ns,
     )
-    wire_ns = reviewed_state.state_monotonic_ns + 2_000_000
+    seed_wire_ns = reviewed_state.state_monotonic_ns + 500_000
     session.record_wire_acceptance(
-        target_roll_rad=0.05,
-        target_pitch_rad=0.04,
-        yaw_rate_rad_s=-0.04,
+        target_roll_rad=0.0,
+        target_pitch_rad=0.0,
+        yaw_rate_rad_s=0.0,
         thrust=0.275,
+        wire_command=AttitudeRateCommand(0.0, 0.0, 0.0, 0.275),
+        wire_start_monotonic_ns=seed_wire_ns,
+    )
+    reviewed_estimate = session.core._tracks[reviewed_id]  # noqa: SLF001
+    reviewed_estimate.state = replace(
+        reviewed_estimate.state,
+        bearing_rad=(0.40, 0.0),
+        bearing_rate_rad_s=(0.10, 0.0),
+        residual_translational_rate_rad_s=(0.10, 0.0),
+        bearing_rate_qualified=(True, True),
+        bearing_std_rad=(0.02, 0.02),
+        censored_axes=(False, False),
+        visible=True,
+        ambiguous=False,
+    )
+    session.stage_snapshot(
+        snapshot,
+        tracker,
+        expected_gate_index=1,
+        expected_current_track_id=reviewed_id,
+        adjacent_precredit=True,
+    )
+    authority_ns = seed_wire_ns + 500_000
+    precredit = session.adjacent_precredit_successor_steering_authority(
+        track_id=reviewed_id,
+        now_monotonic_ns=authority_ns,
+    )
+    retained_roll = float(precredit["target_roll_rad"])
+    assert retained_roll == pytest.approx(-MAX_TARGET_ROLL_RAD)
+    wire_ns = authority_ns + 500_000
+    session.record_wire_acceptance(
+        target_roll_rad=retained_roll,
+        target_pitch_rad=float(precredit["target_pitch_rad"]),
+        yaw_rate_rad_s=float(precredit["yaw_rate_rad_s"]),
+        thrust=float(precredit["thrust"]),
         wire_command=AttitudeRateCommand(
-            0.03,
+            -0.07553,
             0.02,
-            -0.04,
-            0.275,
+            float(precredit["yaw_rate_rad_s"]),
+            float(precredit["thrust"]),
         ),
         wire_start_monotonic_ns=wire_ns,
     )
@@ -3974,6 +4009,17 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
     )
     assert expired["steering_available"] is False
     assert expired["steering_unavailable_reason"] == "expired_prediction"
+    dormant = session._post_credit_roll_reference_handoff  # noqa: SLF001
+    assert dormant is not None
+    assert dormant.retained_target_roll_rad == pytest.approx(retained_roll)
+    assert dormant.expires_monotonic_ns == old_expiry_ns
+    with pytest.raises(
+        PostCreditSuccessorSteeringUnavailable,
+        match="handoff has no steering authority",
+    ):
+        session.post_credit_successor_steering_authority(
+            now_monotonic_ns=old_expiry_ns + 1,
+        )
 
     reviewed_track = tracker.track(reviewed_id)
     credited_advance = CreditedUnboundGateAdvance(
@@ -4094,13 +4140,69 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
         rebound["recovery_steering"]["expires_monotonic_ns"]
         > old_expiry_ns
     )
+    rebound_handoff = (
+        session._post_credit_roll_reference_handoff  # noqa: SLF001
+    )
+    assert rebound_handoff is not None
+    assert rebound_handoff.track_id == fresh_id
+    assert rebound_handoff.retained_target_roll_rad == pytest.approx(
+        retained_roll
+    )
+    assert rebound_handoff.expires_monotonic_ns == (
+        rebound["recovery_steering"]["expires_monotonic_ns"]
+    )
+    # Latest-flight facts: the exact fresh cross-ID reanchor starts with an
+    # unqualified horizontal rate and a +0.190625 normalized center.  Its
+    # ordinary proportional reference is about -0.053 rad, but it must not
+    # unwind the already accepted -0.25-rad successor bank.
+    fresh_center_x = 0.190625
+    fresh_bearing_rad = math.atan(
+        fresh_center_x * session.core.config.horizontal_angle_scale_rad
+    )
+    fresh_estimate = session.core._tracks[fresh_id]  # noqa: SLF001
+    fresh_estimate.state = replace(
+        fresh_estimate.state,
+        bearing_rad=(fresh_bearing_rad, 0.0),
+        bearing_rate_rad_s=(0.0, 0.0),
+        residual_translational_rate_rad_s=(0.0, 0.0),
+        bearing_rate_qualified=(False, True),
+        bearing_std_rad=(0.02, 0.02),
+    )
+    binding_ns = (
+        fresh_track.history[-1].publication_monotonic_ns + 2_000_000
+    )
+    unconstrained_prediction = session.core.predict_track_steering(
+        fresh_id,
+        binding_ns,
+    )
+    unconstrained_targets = session._successor_steering_targets(  # noqa: SLF001
+        unconstrained_prediction
+    )
     binding_authority = (
         session.post_credit_successor_steering_authority(
-            now_monotonic_ns=(
-                fresh_track.history[-1].publication_monotonic_ns
-                + 2_000_000
-            ),
+            now_monotonic_ns=binding_ns,
         )
+    )
+    assert abs(
+        float(binding_authority["unconstrained_target_roll_rad"])
+    ) < abs(retained_roll)
+    assert binding_authority["unconstrained_target_roll_rad"] == pytest.approx(
+        session.core.config.roll_guidance_sign
+        * session.core.config.roll_gain
+        * fresh_bearing_rad
+    )
+    assert binding_authority["target_roll_rad"] == pytest.approx(
+        retained_roll
+    )
+    assert binding_authority["retained_roll_reference_applied"] is True
+    assert binding_authority["target_pitch_rad"] == pytest.approx(
+        unconstrained_targets["target_pitch_rad"]
+    )
+    assert binding_authority["yaw_rate_rad_s"] == pytest.approx(
+        unconstrained_targets["yaw_rate_rad_s"]
+    )
+    assert binding_authority["thrust"] == pytest.approx(
+        unconstrained_targets["thrust"]
     )
     assert binding_authority["vertical_axis_censored"] is True
     assert binding_authority["steering_only"] is True
@@ -4113,6 +4215,30 @@ def test_fresh_cross_id_rebind_renews_bounded_clipped_recovery() -> None:
             "target_pitch_rad",
             "yaw_rate_rad_s",
             "thrust",
+        )
+    )
+    governed = session.govern_wire_command(
+        AttitudeRateCommand(
+            -MAX_TARGET_ROLL_RAD,
+            0.02,
+            float(binding_authority["yaw_rate_rad_s"]),
+            float(binding_authority["thrust"]),
+        ),
+        proposal_monotonic_ns=binding_ns + 1_000_000,
+        launch_thrust_override=False,
+        yaw_safety_override=False,
+    )
+    assert -MAX_TARGET_ROLL_RAD <= governed.roll_rate <= 0.0
+    assert abs(governed.pitch_rate) <= MAX_TARGET_PITCH_RAD
+    assert abs(governed.yaw_rate) <= MAX_YAW_RATE_RAD_S
+    assert MIN_THRUST <= governed.thrust <= MAX_THRUST
+    assert all(
+        math.isfinite(value)
+        for value in (
+            governed.roll_rate,
+            governed.pitch_rate,
+            governed.yaw_rate,
+            governed.thrust,
         )
     )
 

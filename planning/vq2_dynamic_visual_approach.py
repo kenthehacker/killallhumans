@@ -941,7 +941,6 @@ class DynamicVisualCourseSession:
                 retained_roll is None
                 or retained_source_authority_ns is None
                 or retained_source_wire_ns is None
-                or activation_monotonic_ns > expires_ns
             )
             else _PostCreditRollReferenceHandoff(
                 authority_basis=(
@@ -1132,7 +1131,13 @@ class DynamicVisualCourseSession:
             )
 
         targets = self._successor_steering_targets(prediction)
-        target_roll = float(targets["target_roll_rad"])
+        unconstrained_target_roll = float(targets["target_roll_rad"])
+        target_roll = self._retain_fresh_reacquisition_roll_reference(
+            lease=lease,
+            target_roll_rad=unconstrained_target_roll,
+            stable_bearing_rad=float(prediction.stable_bearing_rad[0]),
+            now_monotonic_ns=now_monotonic_ns,
+        )
         target_pitch = float(targets["target_pitch_rad"])
         yaw_rate = float(targets["yaw_rate_rad_s"])
         camera_elevation = float(
@@ -1216,6 +1221,13 @@ class DynamicVisualCourseSession:
         evidence.update(
             {
                 "target_roll_rad": target_roll,
+                "unconstrained_target_roll_rad": unconstrained_target_roll,
+                "retained_roll_reference_applied": not math.isclose(
+                    target_roll,
+                    unconstrained_target_roll,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                ),
                 "target_pitch_rad": target_pitch,
                 "yaw_rate_rad_s": yaw_rate,
                 "thrust": SUPPORT_THRUST,
@@ -1269,6 +1281,91 @@ class DynamicVisualCourseSession:
             )
         )
         return evidence
+
+    def _retain_fresh_reacquisition_roll_reference(
+        self,
+        *,
+        lease: _PostCreditSuccessorSteering,
+        target_roll_rad: float,
+        stable_bearing_rad: float,
+        now_monotonic_ns: int,
+    ) -> float:
+        """Keep accepted bank while exact fresh geometry needs that correction.
+
+        The reference is an already accepted gate-relative attitude target,
+        not propagated predecessor geometry and not a temporal command
+        governor.  Only an exact fresh post-credit lease may consume it; the
+        final wire governor remains the sole command-continuity authority.
+        """
+
+        handoff = self._post_credit_roll_reference_handoff
+        if handoff is None:
+            return target_roll_rad
+        state = self.core.course_state()
+        current = state.current
+        retained_roll = float(handoff.retained_target_roll_rad)
+        guidance_sign = float(self.core.config.roll_guidance_sign)
+        lineage_matches = bool(
+            handoff.to_gate_index == lease.to_gate_index
+            and handoff.track_id == lease.reviewed_track_id
+            and handoff.stream_generation == lease.stream_generation
+            and handoff.promotion_count == lease.promotion_count
+            and state.current_gate_index == handoff.to_gate_index
+            and state.current_track_id == handoff.track_id
+            and current.track_id == handoff.track_id
+            and current.stream_generation == handoff.stream_generation
+            and state.promotion_count == handoff.promotion_count
+        )
+        values = (
+            target_roll_rad,
+            retained_roll,
+            stable_bearing_rad,
+            guidance_sign,
+        )
+        bounded_state = bool(
+            lineage_matches
+            and all(math.isfinite(value) for value in values)
+            and 0.0 < abs(retained_roll) <= MAX_TARGET_ROLL_RAD
+            and current.visible
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and current.bearing_std_rad[0]
+            <= (
+                self.core.config.successor_prediction_max_extrapolation_rad
+            )
+            + 1e-12
+            and abs(guidance_sign) > 1e-12
+            and now_monotonic_ns <= handoff.expires_monotonic_ns
+        )
+        direction = 1.0 if retained_roll > 0.0 else -1.0
+        same_corrective_demand = direction * target_roll_rad > 1e-12
+        error_still_requires_correction = bool(
+            direction * guidance_sign * stable_bearing_rad > 1e-12
+        )
+        demand_caught_up = bool(
+            same_corrective_demand
+            and abs(target_roll_rad) + 1e-12 >= abs(retained_roll)
+        )
+        if (
+            not bounded_state
+            or not same_corrective_demand
+            or not error_still_requires_correction
+            or demand_caught_up
+        ):
+            self._post_credit_roll_reference_handoff = None
+            return target_roll_rad
+        constrained = math.copysign(
+            max(abs(target_roll_rad), abs(retained_roll)),
+            retained_roll,
+        )
+        if (
+            not math.isfinite(constrained)
+            or abs(constrained) > MAX_TARGET_ROLL_RAD + 1e-12
+        ):
+            raise DynamicCourseError(
+                "fresh reacquisition roll reference left the bounded envelope"
+            )
+        return constrained
 
     def complete_post_credit_recovery(
         self,
@@ -1491,6 +1588,26 @@ class DynamicVisualCourseSession:
         self._post_credit_successor_steering = rebound_lease
         roll_handoff = self._post_credit_roll_reference_handoff
         if roll_handoff is not None:
+            retained_roll = float(roll_handoff.retained_target_roll_rad)
+            fresh_bearing = float(current.bearing_rad[0])
+            guidance_sign = float(self.core.config.roll_guidance_sign)
+            fresh_horizontal_reference = bool(
+                fresh_state_available
+                and not current.censored_axes[0]
+                and all(
+                    math.isfinite(value)
+                    for value in (
+                        retained_roll,
+                        fresh_bearing,
+                        guidance_sign,
+                    )
+                )
+                and 0.0 < abs(retained_roll) <= MAX_TARGET_ROLL_RAD
+                and abs(guidance_sign) > 1e-12
+                and abs(fresh_bearing)
+                >= self.core.config.off_axis_brake_rad - 1e-12
+                and retained_roll * guidance_sign * fresh_bearing > 1e-12
+            )
             if (
                 roll_handoff.to_gate_index == lease.to_gate_index
                 and roll_handoff.track_id == lease.reviewed_track_id
@@ -1498,12 +1615,17 @@ class DynamicVisualCourseSession:
                 == lease.stream_generation
                 and roll_handoff.promotion_count
                 == lease.promotion_count
+                and fresh_horizontal_reference
             ):
                 self._post_credit_roll_reference_handoff = replace(
                     roll_handoff,
+                    authority_basis=(
+                        "graph-proven-fresh-reacquisition-roll-reference-v1"
+                    ),
                     track_id=track.track_id,
                     stream_generation=update.token.generation,
                     promotion_count=rebound.promotion_count,
+                    expires_monotonic_ns=expires_monotonic_ns,
                 )
             else:
                 self._post_credit_roll_reference_handoff = None
