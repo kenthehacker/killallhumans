@@ -155,6 +155,9 @@ APPROACH_INNER_DROPOUT_HOLD_BASIS = (
 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
     "qualified-local-state-clipped-visibility-gap-v2"
 )
+APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS = (
+    "same-current-identity-ambiguity-quarantine-v1"
+)
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
@@ -4009,6 +4012,264 @@ def _approach_propagated_visibility_gap_authority(
         missed_frame_count=missed_count,
         remaining_horizon_s=float(remaining_horizon_s),
         evidence=dict(evidence),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproachCurrentAmbiguityQuarantineAuthority:
+    """Prior accepted command retained without consuming ambiguous geometry."""
+
+    command: _CensoredPassageCoastAuthority
+    clean_camera_token: CameraFrameToken
+    first_ambiguous_camera_token: CameraFrameToken
+    latest_ambiguous_camera_token: CameraFrameToken
+    anchor_wire_start_monotonic_ns: int
+    source_wire_start_monotonic_ns: int
+    expires_monotonic_ns: int
+    raw_top_handoff: Mapping[str, Any]
+
+
+def _approach_current_ambiguity_quarantine_authority(
+    *,
+    snapshot: Any,
+    gate_index: int,
+    track_id: str,
+    now_monotonic_ns: int,
+    fov_summary: Mapping[str, Any],
+    hold: Optional[Mapping[str, Any]],
+    existing: Optional[_ApproachCurrentAmbiguityQuarantineAuthority],
+) -> _ApproachCurrentAmbiguityQuarantineAuthority:
+    """Quarantine one same-identity ambiguous TOP publication.
+
+    The ambiguous publication is admitted only as a fresh wire watermark.  Its
+    center, scale, rates, and aperture never enter the dynamic estimator.  The
+    command and absolute deadline come from the immediately preceding accepted
+    unambiguous raw-TOP handoff, and subsequent ambiguous publications cannot
+    renew either.
+    """
+
+    if (
+        type(gate_index) is not int
+        or gate_index < 0
+        or type(track_id) is not str
+        or not track_id
+        or type(now_monotonic_ns) is not int
+        or now_monotonic_ns < 0
+        or not isinstance(fov_summary, Mapping)
+        or (
+            existing is not None
+            and type(existing)
+            is not _ApproachCurrentAmbiguityQuarantineAuthority
+        )
+    ):
+        raise ValueError("approach ambiguity quarantine inputs are invalid")
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    track = getattr(snapshot, "current_track", None)
+    history = getattr(track, "history", None)
+    sample = history[-1] if type(history) is tuple and history else None
+    missed_count = getattr(track, "missed_frame_count", None)
+    provisional_ids = getattr(snapshot, "provisional_track_ids", None)
+    if (
+        type(token) is not CameraFrameToken
+        or getattr(snapshot, "current_gate_index", None) != gate_index
+        or getattr(snapshot, "current_track_id", None) != track_id
+        or getattr(snapshot, "authority_usable", True) is not False
+        or getattr(snapshot, "withholding_reason", None)
+        != "current_track_ambiguous"
+        or getattr(snapshot, "race_finished", True) is not False
+        or getattr(snapshot, "next_selection_ambiguous", True) is not False
+        or type(provisional_ids) is not tuple
+        or track is None
+        or getattr(track, "track_id", None) != track_id
+        or getattr(track, "role", None) is not VisualTrackRole.AMBIGUOUS
+        or getattr(track, "authoritative_gate_index", None) != gate_index
+        or getattr(track, "visible", False) is not True
+        or getattr(track, "ambiguous", False) is not True
+        or type(missed_count) is not int
+        or missed_count != 0
+        or getattr(track, "latest_token", None) != token
+        or getattr(track, "clipping", None) is not FrameEdge.TOP
+        or getattr(track, "center_censored", False) is not True
+        or sample is None
+        or getattr(sample, "token", None) != token
+        or getattr(sample, "clipping", None) is not FrameEdge.TOP
+        or getattr(sample, "center_censored", False) is not True
+    ):
+        raise ValueError(
+            "approach ambiguity quarantine lacks exact current TOP identity"
+        )
+
+    raw_handoff = fov_summary.get("last_retained_raw_state_handoff")
+    if not isinstance(raw_handoff, Mapping):
+        raise ValueError(
+            "approach ambiguity quarantine lacks retained raw TOP authority"
+        )
+
+    if existing is not None:
+        if (
+            hold is not None
+            or dict(raw_handoff) != dict(existing.raw_top_handoff)
+            or existing.command.gate_index != gate_index
+            or existing.command.track_id != track_id
+            or existing.clean_camera_token
+            != existing.command.anchor_camera_token
+            or not _token_strictly_newer(
+                token,
+                existing.latest_ambiguous_camera_token,
+            )
+            or token.stream_id != existing.clean_camera_token.stream_id
+            or token.generation != existing.clean_camera_token.generation
+            or now_monotonic_ns >= existing.expires_monotonic_ns
+        ):
+            raise ValueError(
+                "approach ambiguity quarantine continuity is invalid or "
+                "expired"
+            )
+        return replace(
+            existing,
+            latest_ambiguous_camera_token=token,
+        )
+
+    if not isinstance(hold, Mapping):
+        raise ValueError(
+            "approach ambiguity quarantine lacks an accepted command"
+        )
+    raw_token_fields = raw_handoff.get("camera_token")
+    raw_anchor_token_fields = raw_handoff.get("anchor_camera_token")
+    exact_raw_anchor = fov_summary.get("exact_raw_anchor")
+    if (
+        not isinstance(raw_token_fields, Mapping)
+        or not isinstance(raw_anchor_token_fields, Mapping)
+        or not isinstance(exact_raw_anchor, Mapping)
+    ):
+        raise ValueError(
+            "approach ambiguity quarantine raw TOP lineage is malformed"
+        )
+    try:
+        clean_token = CameraFrameToken(**dict(raw_token_fields))
+        raw_anchor_token = CameraFrameToken(
+            **dict(raw_anchor_token_fields)
+        )
+        anchor_wire_ns = int(
+            raw_handoff["anchor_wire_start_monotonic_ns"]
+        )
+        authority_ns = int(raw_handoff["authority_monotonic_ns"])
+        maximum_age_s = float(raw_handoff["maximum_age_s"])
+        stated_remaining_s = float(
+            raw_handoff["prediction_horizon_remaining_s"]
+        )
+        source_wire_ns = int(hold["source_wire_start_monotonic_ns"])
+        target_roll = float(hold["target_roll_rad"])
+        target_pitch = float(hold["target_pitch_rad"])
+        yaw_rate = float(hold["yaw_rate_rad_s"])
+        thrust = float(hold["thrust"])
+        protected_pitch = float(
+            fov_summary["last_protected_target_pitch_rad"]
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "approach ambiguity quarantine authority is malformed"
+        ) from exc
+
+    expires_ns = anchor_wire_ns + round(
+        maximum_age_s * 1_000_000_000.0
+    )
+    expected_remaining_s = (
+        expires_ns - authority_ns
+    ) / 1_000_000_000.0
+    clean_publication = clean_token.publication_sequence
+    ambiguous_publication = token.publication_sequence
+    if (
+        raw_handoff.get("basis") != TOP_FOV_RETAINED_RAW_STATE_BASIS
+        or raw_handoff.get("gate_index") != gate_index
+        or raw_handoff.get("track_id") != track_id
+        or raw_handoff.get("steering_only") is not True
+        or raw_handoff.get("passage_authority") is not False
+        or raw_handoff.get("advance_authority") is not False
+        or fov_summary.get("active") is not True
+        or fov_summary.get("last_track_id") != track_id
+        or fov_summary.get("last_camera_token") != dict(raw_token_fields)
+        or fov_summary.get("last_wire_start_monotonic_ns")
+        != source_wire_ns
+        or exact_raw_anchor.get("basis")
+        != TOP_FOV_EXACT_RAW_ANCHOR_BASIS
+        or exact_raw_anchor.get("gate_index") != gate_index
+        or exact_raw_anchor.get("track_id") != track_id
+        or exact_raw_anchor.get("camera_token")
+        != dict(raw_anchor_token_fields)
+        or exact_raw_anchor.get("wire_start_monotonic_ns")
+        != anchor_wire_ns
+        or exact_raw_anchor.get("steering_only") is not True
+        or exact_raw_anchor.get("passage_authority") is not False
+        or exact_raw_anchor.get("advance_authority") is not False
+        or not _token_strictly_newer(clean_token, raw_anchor_token)
+        or not _token_strictly_newer(token, clean_token)
+        or clean_token.stream_id != token.stream_id
+        or clean_token.generation != token.generation
+        or type(clean_publication) is not int
+        or type(ambiguous_publication) is not int
+        or ambiguous_publication - clean_publication != 1
+        or anchor_wire_ns < 0
+        or authority_ns < anchor_wire_ns
+        or source_wire_ns < authority_ns
+        or source_wire_ns >= expires_ns
+        or not math.isfinite(maximum_age_s)
+        or maximum_age_s <= 0.0
+        or maximum_age_s > 0.60 + 1e-12
+        or not math.isfinite(stated_remaining_s)
+        or not math.isclose(
+            stated_remaining_s,
+            expected_remaining_s,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        )
+        or authority_ns > now_monotonic_ns
+        or now_monotonic_ns >= expires_ns
+        or not all(
+            math.isfinite(value)
+            for value in (
+                target_roll,
+                target_pitch,
+                yaw_rate,
+                thrust,
+                protected_pitch,
+            )
+        )
+        or abs(target_roll) > MAX_VISUAL_TARGET_ROLL_RAD + 1e-12
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= target_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or abs(yaw_rate) > MAX_VISUAL_YAW_RATE_RAD_S + 1e-12
+        or not MIN_VISUAL_THRUST <= thrust <= MAX_VISUAL_THRUST
+        or not math.isclose(
+            target_pitch,
+            protected_pitch,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError(
+            "approach ambiguity quarantine lacks exact fixed raw TOP lease"
+        )
+
+    return _ApproachCurrentAmbiguityQuarantineAuthority(
+        command=_CensoredPassageCoastAuthority(
+            gate_index=gate_index,
+            track_id=track_id,
+            anchor_camera_token=clean_token,
+            target_roll_rad=target_roll,
+            target_pitch_rad=target_pitch,
+            yaw_rate_rad_s=yaw_rate,
+            requested_thrust=thrust,
+        ),
+        clean_camera_token=clean_token,
+        first_ambiguous_camera_token=token,
+        latest_ambiguous_camera_token=token,
+        anchor_wire_start_monotonic_ns=anchor_wire_ns,
+        source_wire_start_monotonic_ns=source_wire_ns,
+        expires_monotonic_ns=expires_ns,
+        raw_top_handoff=dict(raw_handoff),
     )
 
 
@@ -8195,6 +8456,7 @@ async def _run_visual_course_stage_impl(
                 APPROACH_TOP_RECOVERY_BASIS,
                 APPROACH_INNER_DROPOUT_HOLD_BASIS,
                 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS,
+                APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS,
             }
             or authority.gate_index != current_gate_index
             or authority.track_id != current_track_id
@@ -8486,7 +8748,13 @@ async def _run_visual_course_stage_impl(
                     "visual_course_approach_propagated_visibility_gap_command"
                     if hold_basis
                     == APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
-                    else "visual_course_censored_passage_coast_command"
+                    else (
+                        "visual_course_approach_current_ambiguity_"
+                        "quarantine_command"
+                        if hold_basis
+                        == APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
+                        else "visual_course_censored_passage_coast_command"
+                    )
                 )
             )
         )
@@ -8725,6 +8993,10 @@ async def _run_visual_course_stage_impl(
         approach_propagated_visibility_gap_started_s: Optional[float] = None
         approach_propagated_visibility_gap_fresh_frame_count = 0
         approach_propagated_visibility_gap_command_count = 0
+        approach_current_ambiguity_quarantine: Optional[
+            _ApproachCurrentAmbiguityQuarantineAuthority
+        ] = None
+        approach_current_ambiguity_quarantine_command_count = 0
         crossing_wait_coast_command_count = 0
         crossing_wait_adjacent_command_count = 0
         credit_wait_adjacent_planner: Optional[Any] = None
@@ -8766,6 +9038,8 @@ async def _run_visual_course_stage_impl(
             "approach_propagated_visibility_gap_fresh_frame_count": 0,
             "approach_propagated_visibility_gap_command_count": 0,
             "approach_propagated_visibility_gap": None,
+            "approach_current_ambiguity_quarantine_command_count": 0,
+            "approach_current_ambiguity_quarantine": None,
             "horizontal_fov_closure_brake_command_count": 0,
             "last_horizontal_fov_closure_brake": None,
             "authoritative_credit_reconciliation": None,
@@ -9384,6 +9658,238 @@ async def _run_visual_course_stage_impl(
                         segment["recovery_support_command_count"]
                     ) + 1
                     continue
+            current_ambiguity_eligible = bool(
+                mode is VisualApproachMode.APPROACH
+                and lifecycle is CourseLifecycle.APPROACH
+                and type(runtime.dynamic_controller)
+                is DynamicVisualCourseSession
+                and passage_admission is None
+                and near_plane_latch is None
+                and crossing_anchor is None
+                and getattr(snapshot, "current_gate_index", None)
+                == current_gate_index
+                and getattr(snapshot, "current_track_id", None)
+                == current_track_id
+                and getattr(snapshot, "authority_usable", True) is False
+                and getattr(snapshot, "withholding_reason", None)
+                == "current_track_ambiguous"
+                and getattr(snapshot, "race_finished", True) is False
+            )
+            if current_ambiguity_eligible:
+                dynamic_controller = runtime.dynamic_controller
+                assert type(dynamic_controller) is DynamicVisualCourseSession
+                ambiguity_proposal_ns = runtime.perf_counter_ns()
+                if (
+                    type(ambiguity_proposal_ns) is not int
+                    or ambiguity_proposal_ns < 0
+                ):
+                    raise abort_type(
+                        "visual-course current-ambiguity quarantine QPC "
+                        "clock is invalid"
+                    )
+                try:
+                    ambiguity_hold = (
+                        dynamic_controller.continuity_hold_authority(
+                            now_monotonic_ns=ambiguity_proposal_ns,
+                            maximum_age_s=(
+                                runtime.yaw_profile.control_hold_horizon_s
+                            ),
+                        )
+                        if (
+                            approach_current_ambiguity_quarantine is None
+                        )
+                        else None
+                    )
+                    approach_current_ambiguity_quarantine = (
+                        _approach_current_ambiguity_quarantine_authority(
+                            snapshot=snapshot,
+                            gate_index=current_gate_index,
+                            track_id=current_track_id,
+                            now_monotonic_ns=ambiguity_proposal_ns,
+                            fov_summary=segment[
+                                "top_fov_pitch_protection"
+                            ],
+                            hold=ambiguity_hold,
+                            existing=(
+                                approach_current_ambiguity_quarantine
+                            ),
+                        )
+                    )
+                except (TypeError, ValueError) as ambiguity_exc:
+                    raise abort_type(
+                        "visual-course current-ambiguity quarantine refused: "
+                        f"{ambiguity_exc}"
+                    ) from ambiguity_exc
+                ambiguity_authority = (
+                    approach_current_ambiguity_quarantine
+                )
+                remaining_ambiguity_horizon_s = (
+                    ambiguity_authority.expires_monotonic_ns
+                    - ambiguity_proposal_ns
+                ) / 1_000_000_000.0
+                if (
+                    not math.isfinite(remaining_ambiguity_horizon_s)
+                    or remaining_ambiguity_horizon_s <= 0.0
+                ):
+                    raise abort_type(
+                        "visual-course current-ambiguity quarantine "
+                        "expired"
+                    )
+                quarantine_summary = segment[
+                    "approach_current_ambiguity_quarantine"
+                ]
+                if quarantine_summary is None:
+                    quarantine_summary = {
+                        "basis": (
+                            APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
+                        ),
+                        "anchor_camera_token": asdict(
+                            ambiguity_authority.clean_camera_token
+                        ),
+                        "first_ambiguous_camera_token": asdict(
+                            ambiguity_authority
+                            .first_ambiguous_camera_token
+                        ),
+                        "latest_ambiguous_camera_token": None,
+                        "reacquired_camera_token": None,
+                        "anchor_wire_start_monotonic_ns": (
+                            ambiguity_authority
+                            .anchor_wire_start_monotonic_ns
+                        ),
+                        "source_wire_start_monotonic_ns": (
+                            ambiguity_authority
+                            .source_wire_start_monotonic_ns
+                        ),
+                        "expires_monotonic_ns": (
+                            ambiguity_authority.expires_monotonic_ns
+                        ),
+                        "initial_remaining_horizon_s": (
+                            remaining_ambiguity_horizon_s
+                        ),
+                        "ambiguous_geometry_consumed": False,
+                        "lease_renewable": False,
+                        "steering_only": True,
+                        "passage_authority": False,
+                        "advance_authority": False,
+                        "outcome": "quarantining",
+                    }
+                    segment[
+                        "approach_current_ambiguity_quarantine"
+                    ] = quarantine_summary
+                assert isinstance(quarantine_summary, dict)
+                quarantine_summary.update(
+                    {
+                        "latest_ambiguous_camera_token": asdict(token),
+                        "remaining_horizon_s": (
+                            remaining_ambiguity_horizon_s
+                        ),
+                    }
+                )
+                last_planned_token = token
+                try:
+                    ambiguity_command = (
+                        await send_censored_passage_coast(
+                            snapshot=snapshot,
+                            authority=ambiguity_authority.command,
+                            yaw_reference_rad=yaw_reference_rad,
+                            segment_started_s=segment_started_s,
+                            stage=(
+                                f"{VISUAL_COURSE_STAGE}/gate"
+                                f"{current_gate_index}/"
+                                "approach-current-ambiguity-quarantine"
+                            ),
+                            command_deadline_s=(
+                                now + remaining_ambiguity_horizon_s
+                            ),
+                            hold_basis=(
+                                APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS
+                            ),
+                        )
+                    )
+                except RaceActiveBoundaryChangedBeforeWire as race_exc:
+                    credited_race = accept_no_wire_race_boundary(
+                        race_exc,
+                    )
+                    break
+                if ambiguity_command is None:
+                    continue
+                approach_current_ambiguity_quarantine_command_count += 1
+                approach_command_count += 1
+                segment[
+                    "approach_current_ambiguity_quarantine_command_count"
+                ] = (
+                    approach_current_ambiguity_quarantine_command_count
+                )
+                segment["approach_command_count"] = approach_command_count
+                continue
+            if approach_current_ambiguity_quarantine is not None:
+                reacquired_track = getattr(
+                    snapshot,
+                    "current_track",
+                    None,
+                )
+                clean_same_current_reacquisition = bool(
+                    mode is VisualApproachMode.APPROACH
+                    and lifecycle is CourseLifecycle.APPROACH
+                    and getattr(snapshot, "current_gate_index", None)
+                    == current_gate_index
+                    and getattr(snapshot, "current_track_id", None)
+                    == current_track_id
+                    and getattr(snapshot, "authority_usable", False)
+                    is True
+                    and getattr(snapshot, "withholding_reason", None)
+                    is None
+                    and getattr(snapshot, "race_finished", True) is False
+                    and reacquired_track is not None
+                    and getattr(reacquired_track, "track_id", None)
+                    == current_track_id
+                    and getattr(reacquired_track, "role", None)
+                    is VisualTrackRole.CURRENT
+                    and getattr(reacquired_track, "visible", False)
+                    is True
+                    and getattr(reacquired_track, "ambiguous", True)
+                    is False
+                    and getattr(reacquired_track, "missed_frame_count", -1)
+                    == 0
+                    and getattr(reacquired_track, "latest_token", None)
+                    == token
+                    and _token_strictly_newer(
+                        token,
+                        approach_current_ambiguity_quarantine
+                        .latest_ambiguous_camera_token,
+                    )
+                )
+                if not clean_same_current_reacquisition:
+                    raise abort_type(
+                        "visual-course current-ambiguity quarantine ended "
+                        "without clean same-current reacquisition"
+                    )
+                quarantine_summary = segment[
+                    "approach_current_ambiguity_quarantine"
+                ]
+                if not isinstance(quarantine_summary, dict):
+                    raise abort_type(
+                        "visual-course current-ambiguity quarantine summary "
+                        "is invalid"
+                    )
+                quarantine_summary.update(
+                    {
+                        "reacquired_camera_token": asdict(token),
+                        "outcome": "reacquired",
+                    }
+                )
+                host.recorder.emit(
+                    "visual_course_approach_current_ambiguity_reacquired",
+                    gate_index=current_gate_index,
+                    track_id=current_track_id,
+                    camera_token=asdict(token),
+                    quarantined_command_count=(
+                        approach_current_ambiguity_quarantine_command_count
+                    ),
+                    ambiguous_geometry_consumed=False,
+                    lease_renewed=False,
+                )
+                approach_current_ambiguity_quarantine = None
             passage_forward_closure_authorized = bool(
                 not segment["launch_bootstrap"]["enabled"]
                 or now - course_started_s

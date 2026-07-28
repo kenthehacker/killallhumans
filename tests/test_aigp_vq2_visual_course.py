@@ -4658,6 +4658,205 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert vertical.evidence["passage_authority"] is False
 
 
+def _current_top_ambiguity_snapshot(sequence: int) -> SimpleNamespace:
+    token = _token(sequence)
+    sample = SimpleNamespace(
+        token=token,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+    )
+    track = SimpleNamespace(
+        track_id="track-1",
+        role=VisualTrackRole.AMBIGUOUS,
+        authoritative_gate_index=1,
+        visible=True,
+        ambiguous=True,
+        missed_frame_count=0,
+        latest_token=token,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        history=(sample,),
+    )
+    return SimpleNamespace(
+        latest_camera_token=token,
+        current_gate_index=1,
+        current_track_id="track-1",
+        current_track=track,
+        authority_usable=False,
+        withholding_reason="current_track_ambiguous",
+        race_finished=False,
+        next_selection_ambiguous=False,
+        provisional_track_ids=("stale-fragment",),
+    )
+
+
+def _current_top_ambiguity_fov_summary() -> dict:
+    raw_anchor_token = _token(50)
+    clean_token = _token(51)
+    anchor_wire_ns = 1_000_000_000
+    authority_ns = 1_050_000_000
+    maximum_age_s = 0.60
+    return {
+        "active": True,
+        "last_track_id": "track-1",
+        "last_camera_token": asdict(clean_token),
+        "last_wire_start_monotonic_ns": 1_060_000_000,
+        "last_protected_target_pitch_rad": 0.12,
+        "exact_raw_anchor": {
+            "basis": course_stage.TOP_FOV_EXACT_RAW_ANCHOR_BASIS,
+            "gate_index": 1,
+            "track_id": "track-1",
+            "camera_token": asdict(raw_anchor_token),
+            "wire_start_monotonic_ns": anchor_wire_ns,
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        },
+        "last_retained_raw_state_handoff": {
+            "basis": course_stage.TOP_FOV_RETAINED_RAW_STATE_BASIS,
+            "gate_index": 1,
+            "track_id": "track-1",
+            "anchor_camera_token": asdict(raw_anchor_token),
+            "camera_token": asdict(clean_token),
+            "anchor_wire_start_monotonic_ns": anchor_wire_ns,
+            "authority_monotonic_ns": authority_ns,
+            "maximum_age_s": maximum_age_s,
+            "prediction_horizon_remaining_s": 0.55,
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        },
+    }
+
+
+def test_current_ambiguity_quarantine_retains_one_fixed_raw_top_lease():
+    snapshot = _current_top_ambiguity_snapshot(52)
+    fov_summary = _current_top_ambiguity_fov_summary()
+    hold = {
+        "target_roll_rad": -0.25,
+        "target_pitch_rad": 0.12,
+        "yaw_rate_rad_s": -0.12,
+        "thrust": 0.301,
+        "source_wire_start_monotonic_ns": 1_060_000_000,
+    }
+
+    authority = (
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=snapshot,
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_100_000_000,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=None,
+        )
+    )
+
+    assert authority.clean_camera_token == _token(51)
+    assert authority.first_ambiguous_camera_token == _token(52)
+    assert authority.latest_ambiguous_camera_token == _token(52)
+    assert authority.command.anchor_camera_token == _token(51)
+    assert authority.command.target_roll_rad == pytest.approx(-0.25)
+    assert authority.command.target_pitch_rad == pytest.approx(0.12)
+    assert authority.command.yaw_rate_rad_s == pytest.approx(-0.12)
+    assert authority.command.requested_thrust == pytest.approx(0.301)
+    assert authority.expires_monotonic_ns == 1_600_000_000
+
+    continued = (
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=_current_top_ambiguity_snapshot(53),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_140_000_000,
+            fov_summary=fov_summary,
+            hold=None,
+            existing=authority,
+        )
+    )
+    assert continued.latest_ambiguous_camera_token == _token(53)
+    assert continued.first_ambiguous_camera_token == _token(52)
+    assert continued.command == authority.command
+    assert (
+        continued.anchor_wire_start_monotonic_ns
+        == authority.anchor_wire_start_monotonic_ns
+    )
+    assert continued.expires_monotonic_ns == authority.expires_monotonic_ns
+
+
+def test_current_ambiguity_quarantine_refuses_renewal_and_bad_lineage():
+    snapshot = _current_top_ambiguity_snapshot(52)
+    fov_summary = _current_top_ambiguity_fov_summary()
+    hold = {
+        "target_roll_rad": -0.25,
+        "target_pitch_rad": 0.12,
+        "yaw_rate_rad_s": -0.12,
+        "thrust": 0.301,
+        "source_wire_start_monotonic_ns": 1_060_000_000,
+    }
+    authority = (
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=snapshot,
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_100_000_000,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=None,
+        )
+    )
+
+    with pytest.raises(ValueError, match="continuity is invalid"):
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=_current_top_ambiguity_snapshot(53),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_140_000_000,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=authority,
+        )
+    with pytest.raises(ValueError, match="continuity is invalid"):
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=_current_top_ambiguity_snapshot(53),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=authority.expires_monotonic_ns,
+            fov_summary=fov_summary,
+            hold=None,
+            existing=authority,
+        )
+
+    changed_fov = {
+        **fov_summary,
+        "last_retained_raw_state_handoff": {
+            **fov_summary["last_retained_raw_state_handoff"],
+            "authority_monotonic_ns": 1_060_000_000,
+        },
+    }
+    with pytest.raises(ValueError, match="continuity is invalid"):
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=_current_top_ambiguity_snapshot(53),
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_140_000_000,
+            fov_summary=changed_fov,
+            hold=None,
+            existing=authority,
+        )
+
+    nonadjacent = _current_top_ambiguity_snapshot(54)
+    with pytest.raises(ValueError, match="fixed raw TOP lease"):
+        course_stage._approach_current_ambiguity_quarantine_authority(
+            snapshot=nonadjacent,
+            gate_index=1,
+            track_id="track-1",
+            now_monotonic_ns=1_100_000_000,
+            fov_summary=fov_summary,
+            hold=hold,
+            existing=None,
+        )
+
+
 def test_ninth_visibility_gap_command_uses_live_state_horizon():
     authority = course_stage._ApproachPropagatedVisibilityGapAuthority(
         command=course_stage._CensoredPassageCoastAuthority(
