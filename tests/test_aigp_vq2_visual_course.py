@@ -2674,6 +2674,89 @@ def test_atomic_no_wire_credit_uses_latched_passage_and_finishes():
     assert host.post_credit_navigation_attempts == 0
 
 
+def test_atomic_credit_during_clipped_gap_uses_sole_graph_successor_only():
+    snapshot = _snapshot(
+        8,
+        "track-8",
+        179,
+        visible=False,
+    )
+    token = snapshot.latest_camera_token
+    snapshot.current_track.missed_frame_count = 6
+    snapshot.current_track.clipping = (
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    )
+    snapshot.withholding_reason = "current_track_not_visible"
+    snapshot.next_selection_ambiguous = False
+    snapshot.provisional_track_ids = ()
+    successor = SimpleNamespace(
+        track_id="track-9",
+        latest_token=token,
+        promotable=True,
+        center_censored=False,
+        stable_frame_count=7,
+        confidence=0.73,
+        association_confidence=0.94,
+    )
+    snapshot.next_candidates = (successor,)
+
+    reconciliation = (
+        course_stage._unlatched_atomic_credit_successor_evidence(
+            snapshot,
+            current_gate_index=8,
+            current_track_id="track-8",
+        )
+    )
+
+    assert reconciliation is not None
+    assert reconciliation["basis"] == (
+        "authoritative-credit-clipped-current-successor-identity-v1"
+    )
+    assert reconciliation["reviewed_track_id"] == "track-9"
+    assert reconciliation["passage_authority"] is False
+    assert reconciliation["advance_authority"] is False
+    assert reconciliation["cross_gap_identity_claimed"] is False
+
+    snapshot.next_selection_ambiguous = True
+    assert (
+        course_stage._unlatched_atomic_credit_successor_evidence(
+            snapshot,
+            current_gate_index=8,
+            current_track_id="track-8",
+        )
+        is None
+    )
+    snapshot.next_selection_ambiguous = False
+    snapshot.next_candidates = (successor, successor)
+    assert (
+        course_stage._unlatched_atomic_credit_successor_evidence(
+            snapshot,
+            current_gate_index=8,
+            current_track_id="track-8",
+        )
+        is None
+    )
+    snapshot.next_candidates = (
+        SimpleNamespace(
+            **{
+                **vars(successor),
+                "latest_token": _token(178),
+            }
+        ),
+    )
+    assert (
+        course_stage._unlatched_atomic_credit_successor_evidence(
+            snapshot,
+            current_gate_index=8,
+            current_track_id="track-8",
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("vertical", "vertical_rate", "expected"),
     [

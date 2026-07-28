@@ -4281,6 +4281,85 @@ def _dynamic_current_steering_correction_ready(
     )
 
 
+def _unlatched_atomic_credit_successor_evidence(
+    snapshot: Any,
+    *,
+    current_gate_index: int,
+    current_track_id: str,
+) -> Optional[Mapping[str, Any]]:
+    """Select only one exact graph-vetted identity after atomic race credit.
+
+    This does not create passage or advance authority.  The newer live race
+    status owns credit; vision supplies only the adjacent identity needed to
+    continue the already-authoritative course lifecycle.
+    """
+
+    token = getattr(snapshot, "latest_camera_token", None)
+    current = getattr(snapshot, "current_track", None)
+    candidates = getattr(snapshot, "next_candidates", ())
+    if (
+        type(token) is not CameraFrameToken
+        or getattr(snapshot, "current_gate_index", None)
+        != current_gate_index
+        or getattr(snapshot, "current_track_id", None) != current_track_id
+        or getattr(snapshot, "race_finished", False) is not False
+        or getattr(snapshot, "authority_usable", True) is not False
+        or getattr(snapshot, "withholding_reason", None)
+        != "current_track_not_visible"
+        or getattr(snapshot, "next_selection_ambiguous", True) is not False
+        or getattr(snapshot, "provisional_track_ids", ()) != ()
+        or current is None
+        or getattr(current, "track_id", None) != current_track_id
+        or getattr(current, "role", None) is not VisualTrackRole.CURRENT
+        or getattr(current, "authoritative_gate_index", None)
+        != current_gate_index
+        or getattr(current, "visible", True) is not False
+        or getattr(current, "ambiguous", True) is not False
+        or type(getattr(current, "missed_frame_count", None)) is not int
+        or getattr(current, "missed_frame_count", 0) <= 0
+        or getattr(current, "clipping", FrameEdge.NONE) == FrameEdge.NONE
+        or type(candidates) is not tuple
+        or len(candidates) != 1
+    ):
+        return None
+    current_token = getattr(current, "latest_token", None)
+    candidate = candidates[0]
+    candidate_id = getattr(candidate, "track_id", None)
+    if (
+        type(current_token) is not CameraFrameToken
+        or not _token_strictly_newer(token, current_token)
+        or getattr(candidate, "promotable", False) is not True
+        or getattr(candidate, "latest_token", None) != token
+        or type(candidate_id) is not str
+        or not candidate_id
+        or candidate_id == current_track_id
+        or getattr(candidate, "center_censored", True) is not False
+    ):
+        return None
+    return {
+        "basis": "authoritative-credit-clipped-current-successor-identity-v1",
+        "camera_token": asdict(token),
+        "retired_track_id": current_track_id,
+        "reviewed_track_id": candidate_id,
+        "current_missed_frame_count": current.missed_frame_count,
+        "current_clipping": int(current.clipping),
+        "candidate_stable_frame_count": getattr(
+            candidate,
+            "stable_frame_count",
+            None,
+        ),
+        "candidate_confidence": getattr(candidate, "confidence", None),
+        "candidate_association_confidence": getattr(
+            candidate,
+            "association_confidence",
+            None,
+        ),
+        "passage_authority": False,
+        "advance_authority": False,
+        "cross_gap_identity_claimed": False,
+    }
+
+
 def _servo_token_matches_camera(
     servo_token: Any,
     camera_token: CameraFrameToken,
@@ -6983,6 +7062,7 @@ async def _run_visual_course_stage_impl(
             "approach_propagated_visibility_gap_fresh_frame_count": 0,
             "approach_propagated_visibility_gap_command_count": 0,
             "approach_propagated_visibility_gap": None,
+            "authoritative_credit_reconciliation": None,
             "post_credit_zero_command_count": 0,
             "post_credit_hold_command_count": 0,
             "post_credit_successor_steering_command_count": 0,
@@ -7211,10 +7291,13 @@ async def _run_visual_course_stage_impl(
 
         def accept_no_wire_race_boundary(
             exc: RaceActiveBoundaryChangedBeforeWire,
+            *,
+            allow_unlatched_graph_reconciliation: bool = False,
         ) -> AuthoritativeRaceStatusRef:
             """Consume only proved credit after a navigation send was refused."""
 
             nonlocal crossing_started_s
+            nonlocal credit_wait_reviewed_track_id
             nonlocal last_race
 
             refused_race = host._visual_race_status_ref()
@@ -7223,11 +7306,6 @@ async def _run_visual_course_stage_impl(
                 last_race,
                 abort_type,
             )
-            if crossing_anchor is None:
-                raise abort_type(
-                    "visual-course race boundary changed before wire "
-                    "without previously latched passage evidence"
-                ) from exc
             if relation <= 0:
                 raise abort_type(
                     "visual-course no-wire race boundary lacks newer "
@@ -7242,6 +7320,33 @@ async def _run_visual_course_stage_impl(
                     "visual-course no-wire race boundary is not a "
                     "sequential credit or race finish"
                 ) from exc
+            if crossing_anchor is None and not refused_race.race_finished:
+                reconciliation = (
+                    _unlatched_atomic_credit_successor_evidence(
+                        snapshot,
+                        current_gate_index=current_gate_index,
+                        current_track_id=current_track_id,
+                    )
+                    if allow_unlatched_graph_reconciliation
+                    else None
+                )
+                if reconciliation is None:
+                    raise abort_type(
+                        "visual-course race boundary changed before wire "
+                        "without previously latched passage evidence"
+                    ) from exc
+                credit_wait_reviewed_track_id = str(
+                    reconciliation["reviewed_track_id"]
+                )
+                segment["authoritative_credit_reconciliation"] = {
+                    **dict(reconciliation),
+                    "race_status_sequence": (
+                        refused_race.race_status_sequence
+                    ),
+                    "race_received_monotonic_ns": (
+                        refused_race.received_monotonic_ns
+                    ),
+                }
             last_race = refused_race
             crossing_started_s = (
                 crossing_started_s or float(runtime.monotonic())
@@ -7758,7 +7863,8 @@ async def _run_visual_course_stage_impl(
                         )
                     except RaceActiveBoundaryChangedBeforeWire as race_exc:
                         credited_race = accept_no_wire_race_boundary(
-                            race_exc
+                            race_exc,
+                            allow_unlatched_graph_reconciliation=True,
                         )
                         break
                     if gap_command is None:
