@@ -12362,6 +12362,46 @@ async def _run_visual_course_stage_impl(
                                     f"CURRENT rebind: {rebind_exc}"
                                 ) from rebind_exc
 
+                            if approach_top_recovery_started_s is not None:
+                                recovery_summary = segment[
+                                    "approach_top_recovery"
+                                ]
+                                if not isinstance(recovery_summary, dict):
+                                    raise abort_type(
+                                        "visual-course same-gate CURRENT "
+                                        "rebind lacks its TOP-recovery summary"
+                                    )
+                                recovery_summary.update(
+                                    {
+                                        "retired_track_id": retired_track_id,
+                                        "rebound_track_id": (
+                                            same_gate_rebind.rebound_track_id
+                                        ),
+                                        "retired_camera_token": asdict(token),
+                                        "outcome": (
+                                            "retired_on_authoritative_same_gate_"
+                                            "current_rebound"
+                                        ),
+                                    }
+                                )
+                                host.recorder.emit(
+                                    "visual_course_approach_top_recovery_"
+                                    "retired_on_current_rebound",
+                                    gate_index=current_gate_index,
+                                    stage=(
+                                        f"{VISUAL_COURSE_STAGE}/gate"
+                                        f"{current_gate_index}/approach"
+                                    ),
+                                    **recovery_summary,
+                                )
+                            approach_top_recovery_started_s = None
+                            approach_top_recovery_last_token = None
+                            approach_top_recovery_authority = None
+                            approach_top_recovery_fresh_frame_count = 0
+                            segment[
+                                "approach_top_recovery_fresh_frame_count"
+                            ] = 0
+
                             current_track_id = (
                                 same_gate_rebind.rebound_track_id
                             )
