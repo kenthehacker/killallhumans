@@ -4945,7 +4945,16 @@ def test_off_axis_top_fov_yields_during_rapid_closure(
     )
 
 
-def test_nonimproving_later_gate_brake_preempts_top_fov():
+@pytest.mark.parametrize(
+    "urgent_closure",
+    (
+        {"expansion_rate_s": 0.45, "time_to_contact_s": None},
+        {"expansion_rate_s": 0.223, "time_to_contact_s": 2.2},
+    ),
+)
+def test_nonimproving_later_gate_brake_preempts_top_fov_for_urgent_closure(
+    urgent_closure,
+):
     assert (
         course_stage._current_gate_brake_preempts_top_fov(
             current_gate_index=1,
@@ -4960,6 +4969,9 @@ def test_nonimproving_later_gate_brake_preempts_top_fov():
             residual_horizontal_rate_rad_s=0.10,
             horizontal_angle_scale_rad=0.80,
             off_axis_brake_rad=0.10,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+            **urgent_closure,
         )
         is True
     )
@@ -4976,9 +4988,21 @@ def test_nonimproving_later_gate_brake_preempts_top_fov():
         {"horizontal_rate_qualified": False},
         {"residual_horizontal_rate_rad_s": -0.10},
         {"stable_center_x_norm": 0.02},
+        {
+            "expansion_rate_s": 0.223,
+            "time_to_contact_s": 4.479,
+        },
+        {
+            "expansion_rate_s": -0.212,
+            "time_to_contact_s": None,
+        },
+        {
+            "expansion_rate_s": 0.44,
+            "time_to_contact_s": 2.2001,
+        },
     ),
 )
-def test_current_gate_brake_preemption_requires_exact_outward_recovery(
+def test_current_gate_brake_preemption_requires_outward_urgent_closure(
     change,
 ):
     arguments = {
@@ -4994,6 +5018,10 @@ def test_current_gate_brake_preemption_requires_exact_outward_recovery(
         "residual_horizontal_rate_rad_s": 0.10,
         "horizontal_angle_scale_rad": 0.80,
         "off_axis_brake_rad": 0.10,
+        "expansion_rate_s": 0.45,
+        "time_to_contact_s": None,
+        "rapid_expansion_rate_s": 0.45,
+        "rapid_closure_ttc_s": 2.2,
     }
     arguments.update(change)
 

@@ -1986,14 +1986,19 @@ def _current_gate_brake_preempts_top_fov(
     residual_horizontal_rate_rad_s: float,
     horizontal_angle_scale_rad: float,
     off_axis_brake_rad: float,
+    expansion_rate_s: float,
+    time_to_contact_s: Optional[float],
+    rapid_expansion_rate_s: float,
+    rapid_closure_ttc_s: float,
 ) -> bool:
-    """Let fresh current-gate recovery stop closure before preserving FOV.
+    """Let urgent current-gate closure stop before preserving TOP FOV.
 
     Gate 0 keeps its proved launch/crossing pitch schedule.  On later gates,
-    once the fresh current target is materially off axis and its qualified
-    residual motion is stalled or outward, the core's nonforward brake owns
-    pitch.  While the error is measurably closing, exact TOP-boundary guidance
-    keeps the camera pointed at the target.
+    an off-axis outward intercept is not by itself a reason to point the
+    camera away from a fresh TOP-clipped target.  The nonforward brake owns
+    pitch only when scale expansion or time-to-contact also proves that
+    closure is urgent.  Otherwise TOP observability keeps the gate in view
+    while roll and yaw correct the intercept.
     """
 
     if (
@@ -2006,7 +2011,16 @@ def _current_gate_brake_preempts_top_fov(
         or type(horizontal_rate_qualified) is not bool
     ):
         raise ValueError("current-gate brake priority structure is invalid")
-    requested, stable_x, residual_x, angle_scale, off_axis = map(
+    (
+        requested,
+        stable_x,
+        residual_x,
+        angle_scale,
+        off_axis,
+        expansion,
+        rapid_expansion,
+        rapid_ttc,
+    ) = map(
         float,
         (
             requested_target_pitch_rad,
@@ -2014,7 +2028,15 @@ def _current_gate_brake_preempts_top_fov(
             residual_horizontal_rate_rad_s,
             horizontal_angle_scale_rad,
             off_axis_brake_rad,
+            expansion_rate_s,
+            rapid_expansion_rate_s,
+            rapid_closure_ttc_s,
         ),
+    )
+    ttc = (
+        None
+        if time_to_contact_s is None
+        else float(time_to_contact_s)
     )
     if (
         not all(
@@ -2025,12 +2047,22 @@ def _current_gate_brake_preempts_top_fov(
                 residual_x,
                 angle_scale,
                 off_axis,
+                expansion,
+                rapid_expansion,
+                rapid_ttc,
             )
         )
+        or ttc is not None and not math.isfinite(ttc)
         or angle_scale <= 0.0
         or off_axis <= 0.0
+        or rapid_expansion <= 0.0
+        or rapid_ttc <= 0.0
     ):
         raise ValueError("current-gate brake priority input is invalid")
+    urgent_closure = bool(
+        expansion >= rapid_expansion
+        or ttc is not None and ttc <= rapid_ttc
+    )
     return bool(
         current_gate_index > initial_gate_index
         and mode is VisualApproachMode.APPROACH
@@ -2041,6 +2073,7 @@ def _current_gate_brake_preempts_top_fov(
         and horizontal_rate_qualified
         and abs(math.atan(stable_x * angle_scale)) >= off_axis
         and stable_x * residual_x >= 0.0
+        and urgent_closure
     )
 
 
@@ -8738,6 +8771,20 @@ async def _run_visual_course_stage_impl(
                                 dynamic_controller.core.config
                                 .off_axis_brake_rad
                             ),
+                            expansion_rate_s=float(
+                                brake_current.expansion_rate_s
+                            ),
+                            time_to_contact_s=(
+                                brake_current.time_to_contact_s
+                            ),
+                            rapid_expansion_rate_s=float(
+                                dynamic_controller.core.config
+                                .rapid_expansion_rate_s
+                            ),
+                            rapid_closure_ttc_s=float(
+                                dynamic_controller.core.config
+                                .successor_lookahead_ttc_s
+                            ),
                         )
                     )
                 except (IndexError, TypeError, ValueError) as exc:
@@ -9699,12 +9746,26 @@ async def _run_visual_course_stage_impl(
                     "current_gate_forward_brake_preemption"
                 ] = {
                     "basis": (
-                        "fresh-current-nonimproving-closure-brake-v1"
+                        "fresh-current-nonimproving-urgent-closure-brake-v2"
                     ),
                     "requested_target_pitch_rad": (
                         requested_pitch_before_top_fov
                     ),
                     "applied_target_pitch_rad": target_pitch_rad,
+                    "expansion_rate_s": (
+                        brake_current.expansion_rate_s
+                    ),
+                    "time_to_contact_s": (
+                        brake_current.time_to_contact_s
+                    ),
+                    "rapid_expansion_rate_s": (
+                        dynamic_controller.core.config
+                        .rapid_expansion_rate_s
+                    ),
+                    "rapid_closure_ttc_s": (
+                        dynamic_controller.core.config
+                        .successor_lookahead_ttc_s
+                    ),
                     "steering_only": True,
                     "passage_authority": False,
                     "advance_authority": False,
@@ -12082,41 +12143,47 @@ async def _run_visual_course_stage_impl(
                                 "visual-course propagated visibility-gap QPC "
                                 "clock is invalid"
                             ) from exc
-                        gap_unavailable_reason: Optional[str] = None
-                        try:
-                            gap_evidence = (
-                                dynamic_controller
-                                .propagated_current_visibility_gap_authority(
-                                    track=snapshot.current_track,
-                                    camera_token=token,
-                                    now_monotonic_ns=gap_proposal_ns,
+                        gap_unavailable_reason: Optional[str] = (
+                            "later-gate visual loss enters fresh search "
+                            "without blind command retention"
+                            if current_gate_index > initial_gate_index
+                            else None
+                        )
+                        if gap_unavailable_reason is None:
+                            try:
+                                gap_evidence = (
+                                    dynamic_controller
+                                    .propagated_current_visibility_gap_authority(
+                                        track=snapshot.current_track,
+                                        camera_token=token,
+                                        now_monotonic_ns=gap_proposal_ns,
+                                    )
                                 )
-                            )
-                            gap_authority = (
-                                _approach_propagated_visibility_gap_authority(
-                                    gap_evidence,
-                                    snapshot=snapshot,
-                                    gate_index=current_gate_index,
-                                    track_id=current_track_id,
-                                    fov_summary=segment[
-                                        "top_fov_pitch_protection"
-                                    ],
+                                gap_authority = (
+                                    _approach_propagated_visibility_gap_authority(
+                                        gap_evidence,
+                                        snapshot=snapshot,
+                                        gate_index=current_gate_index,
+                                        track_id=current_track_id,
+                                        fov_summary=segment[
+                                            "top_fov_pitch_protection"
+                                        ],
+                                    )
                                 )
-                            )
-                        except (
-                            PropagatedCurrentVisibilityGapUnavailable
-                        ) as gap_exc:
-                            gap_unavailable_reason = str(gap_exc)
-                        except (
-                            AttributeError,
-                            KeyError,
-                            TypeError,
-                            ValueError,
-                        ) as gap_exc:
-                            raise abort_type(
-                                "visual-course propagated visibility-gap "
-                                f"guidance refused: {gap_exc}"
-                            ) from gap_exc
+                            except (
+                                PropagatedCurrentVisibilityGapUnavailable
+                            ) as gap_exc:
+                                gap_unavailable_reason = str(gap_exc)
+                            except (
+                                AttributeError,
+                                KeyError,
+                                TypeError,
+                                ValueError,
+                            ) as gap_exc:
+                                raise abort_type(
+                                    "visual-course propagated visibility-gap "
+                                    f"guidance refused: {gap_exc}"
+                                ) from gap_exc
                         if gap_unavailable_reason is not None:
                             try:
                                 (
