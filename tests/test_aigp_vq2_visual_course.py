@@ -4658,6 +4658,112 @@ def test_clipped_visibility_gap_uses_direct_or_propagated_fov_lineage():
     assert vertical.evidence["passage_authority"] is False
 
 
+def test_clipped_visibility_gap_retains_one_superseded_propagated_fov_frame():
+    snapshot = _snapshot(0, "track-0", 20, visible=False)
+    snapshot.current_track.clipping = (
+        FrameEdge.LEFT
+        | FrameEdge.TOP
+        | FrameEdge.RIGHT
+        | FrameEdge.BOTTOM
+    )
+    last_visible_token = snapshot.current_track.latest_token
+    assert last_visible_token.publication_sequence is not None
+    accepted_token = replace(
+        last_visible_token,
+        publication_sequence=(
+            last_visible_token.publication_sequence - 1
+        ),
+    )
+    evidence = {
+        "basis": "propagated-current-visibility-gap-guidance-v2",
+        "gate_index": 0,
+        "track_id": "track-0",
+        "camera_token": asdict(snapshot.latest_camera_token),
+        "last_visible_camera_token": asdict(last_visible_token),
+        "last_visible_clipping": int(snapshot.current_track.clipping),
+        "missed_frame_count": 1,
+        "steering_prediction_horizon_remaining_s": 0.09,
+        "command": {
+            "target_roll_rad": 0.14,
+            "target_pitch_rad": 0.12,
+            "yaw_rate_rad_s": -0.10,
+            "thrust": 0.275,
+        },
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+    handoff = {
+        "basis": "propagated-current-fov-gap-steering-v1",
+        "gate_index": 0,
+        "track_id": "track-0",
+        "camera_token": asdict(accepted_token),
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+    }
+    fov_summary = {
+        "active": True,
+        "last_track_id": "track-0",
+        "last_camera_token": asdict(accepted_token),
+        "last_protected_target_pitch_rad": -0.35,
+        "last_raw_top_edge_basis": None,
+        "last_propagated_state_handoff": handoff,
+    }
+
+    authority = (
+        course_stage._approach_propagated_visibility_gap_authority(
+            evidence,
+            snapshot=snapshot,
+            gate_index=0,
+            track_id="track-0",
+            fov_summary=fov_summary,
+        )
+    )
+
+    assert authority.command.anchor_camera_token == last_visible_token
+    assert authority.command.target_pitch_rad == pytest.approx(-0.35)
+    assert authority.evidence["steering_only"] is True
+    assert authority.evidence["passage_authority"] is False
+    assert authority.evidence["advance_authority"] is False
+
+    for mutation in (
+        {"steering_only": False},
+        {"passage_authority": True},
+        {"advance_authority": True},
+        {"track_id": "other-track"},
+        {
+            "camera_token": asdict(
+                replace(
+                    accepted_token,
+                    publication_sequence=(
+                        accepted_token.publication_sequence - 1
+                    ),
+                )
+            )
+        },
+    ):
+        rejected_handoff = {**handoff, **mutation}
+        rejected_summary = {
+            **fov_summary,
+            "last_camera_token": dict(
+                rejected_handoff["camera_token"]
+            ),
+            "last_propagated_state_handoff": rejected_handoff,
+        }
+        with pytest.raises(
+            ValueError,
+            match="exact propagated/FOV authority",
+        ):
+            course_stage._approach_propagated_visibility_gap_authority(
+                evidence,
+                snapshot=snapshot,
+                gate_index=0,
+                track_id="track-0",
+                fov_summary=rejected_summary,
+            )
+
+
 def _current_top_ambiguity_snapshot(sequence: int) -> SimpleNamespace:
     token = _token(sequence)
     sample = SimpleNamespace(

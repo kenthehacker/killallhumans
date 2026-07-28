@@ -3872,6 +3872,37 @@ def _approach_propagated_visibility_gap_authority(
         and isinstance(last_visible, Mapping)
         and last_handoff.get("camera_token") == dict(last_visible)
     )
+    propagated_superseded_fov_lineage = bool(
+        isinstance(last_handoff, Mapping)
+        and last_handoff.get("basis")
+        == "propagated-current-fov-gap-steering-v1"
+        and last_handoff.get("gate_index") == gate_index
+        and last_handoff.get("track_id") == track_id
+        and last_handoff.get("steering_only") is True
+        and last_handoff.get("passage_authority") is False
+        and last_handoff.get("advance_authority") is False
+        and isinstance(last_visible, Mapping)
+        and isinstance(last_handoff.get("camera_token"), Mapping)
+        and last_handoff["camera_token"].get("stream_id")
+        == last_visible.get("stream_id")
+        and last_handoff["camera_token"].get("generation")
+        == last_visible.get("generation")
+        and type(
+            last_handoff["camera_token"].get("publication_sequence")
+        )
+        is int
+        and type(last_visible.get("publication_sequence")) is int
+        and (
+            int(last_visible["publication_sequence"])
+            - int(
+                last_handoff["camera_token"]["publication_sequence"]
+            )
+        )
+        == 1
+        and last_fov_token == dict(last_handoff["camera_token"])
+        and type(last_visible_clipping) is int
+        and last_visible_clipping != 0
+    )
     retained_raw_fov_lineage = bool(
         isinstance(last_retained_raw_handoff, Mapping)
         and last_retained_raw_handoff.get("basis")
@@ -3948,9 +3979,11 @@ def _approach_propagated_visibility_gap_authority(
         or (
             fov_summary.get("last_camera_token") != dict(last_visible)
             and not direct_outer_fov_lineage
+            and not propagated_superseded_fov_lineage
         )
         or not (
             propagated_fov_lineage
+            or propagated_superseded_fov_lineage
             or retained_raw_fov_lineage
             or direct_inner_fov_lineage
             or direct_outer_fov_lineage
