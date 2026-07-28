@@ -4553,7 +4553,7 @@ def _approach_propagated_visibility_gap_authority(
     )
     same_gate_wire_anchor_requested = (
         evidence.get("steering_prediction_deadline_basis")
-        == "fresh-publication-same-gate-steering-anchor-v1"
+        == "accepted-wire-same-gate-steering-anchor-v2"
     )
     same_gate_wire_anchor = bool(
         same_gate_wire_anchor_requested
@@ -9847,7 +9847,6 @@ async def _run_visual_course_stage_impl(
         nonlocal total_navigation_commands
         nonlocal last_command_send_s
         nonlocal consecutive_superseded_proposals
-        nonlocal latest_accepted_current_wire
 
         def drop_superseded_coast(
             exc: BaseException,
@@ -10229,16 +10228,6 @@ async def _run_visual_course_stage_impl(
             wire_thrust=command.thrust,
             counted_as_navigation=count_as_navigation,
             command=asdict(command),
-        )
-        latest_accepted_current_wire = _AcceptedCurrentWireAnchor(
-            gate_index=current_gate_index,
-            track_id=current_track_id,
-            camera_token=snapshot.latest_camera_token,
-            wire_start_monotonic_ns=wire_start_monotonic_ns,
-            target_roll_rad=authority.target_roll_rad,
-            target_pitch_rad=authority.target_pitch_rad,
-            yaw_rate_rad_s=float(command.yaw_rate),
-            thrust=float(command.thrust),
         )
         refresh_live_summary()
         return command

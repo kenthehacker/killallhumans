@@ -5917,7 +5917,7 @@ def test_same_gate_wire_anchor_needs_no_independent_fov_lease():
         "last_visible_clipping": int(FrameEdge.TOP | FrameEdge.RIGHT),
         "missed_frame_count": 15,
         "steering_prediction_deadline_basis": (
-            "fresh-publication-same-gate-steering-anchor-v1"
+            "accepted-wire-same-gate-steering-anchor-v2"
         ),
         "steering_prediction_horizon_remaining_s": 0.60,
         "command": {

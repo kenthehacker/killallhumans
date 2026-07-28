@@ -1460,6 +1460,26 @@ class MultiTargetVisualTracker:
             latest.clipping == detection.clipping
             and detection.clipping in {FrameEdge.LEFT, FrameEdge.RIGHT}
         )
+        # A clipped detector can change which tangential gate fragment it
+        # reports without the gate moving or changing range.  Preserve that
+        # identity when the dimension normal to the shared image edge is the
+        # more stable dimension.  The ordinary center/overlap assignment
+        # bounds still apply, and contraction of the normal dimension remains
+        # a genuine visibility gap.
+        vertical_tangent_fragment_contraction = bool(
+            same_vertical_edge
+            and log_width_change < 0.0
+            and abs(log_width_change) > abs(log_height_change)
+        )
+        horizontal_tangent_fragment_contraction = bool(
+            same_horizontal_edge
+            and log_height_change < 0.0
+            and abs(log_height_change) > abs(log_width_change)
+        )
+        tangent_fragment_contraction = bool(
+            vertical_tangent_fragment_contraction
+            or horizontal_tangent_fragment_contraction
+        )
         if (
             (
                 same_vertical_edge
@@ -1473,6 +1493,7 @@ class MultiTargetVisualTracker:
                 (same_vertical_edge or same_horizontal_edge)
                 and observed_log_scale_rate
                 < -self.config.max_clipped_contraction_log_scale_rate_s
+                and not tangent_fragment_contraction
             )
         ) and not current_complete_inner:
             # A censored support box can collapse when the detector switches
@@ -1486,12 +1507,27 @@ class MultiTargetVisualTracker:
         log_area_residual = 2.0 * (
             detection.log_scale - predicted_log_scale
         )
+        bounded_log_width_change = (
+            0.0
+            if vertical_tangent_fragment_contraction
+            else log_width_change
+        )
+        bounded_log_height_change = (
+            0.0
+            if horizontal_tangent_fragment_contraction
+            else log_height_change
+        )
+        bounded_log_area_residual = (
+            0.0
+            if tangent_fragment_contraction and log_area_residual < 0.0
+            else log_area_residual
+        )
         if (
-            abs(log_width_change)
+            abs(bounded_log_width_change)
             > self.config.max_log_width_change * relaxation
-            or abs(log_height_change)
+            or abs(bounded_log_height_change)
             > self.config.max_log_height_change * relaxation
-            or abs(log_area_residual)
+            or abs(bounded_log_area_residual)
             > self.config.max_log_area_residual * relaxation
         ):
             return None
@@ -1517,11 +1553,11 @@ class MultiTargetVisualTracker:
             0.5 if appearance_distance is None else min(1.0, appearance_distance)
         )
         size_cost = (
-            abs(log_width_change)
+            abs(bounded_log_width_change)
             / (self.config.max_log_width_change * relaxation)
-            + abs(log_height_change)
+            + abs(bounded_log_height_change)
             / (self.config.max_log_height_change * relaxation)
-            + abs(log_area_residual)
+            + abs(bounded_log_area_residual)
             / (self.config.max_log_area_residual * relaxation)
         ) / 3.0
         cost = (

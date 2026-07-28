@@ -553,6 +553,50 @@ def test_top_clipped_fragment_continuity_is_degraded_but_keeps_identity() -> Non
     assert second.associations[0].clipping_continuity == 1.0
 
 
+def test_top_clipped_tangential_fragment_switch_keeps_current_identity() -> None:
+    tracker = MultiTargetVisualTracker()
+    first = tracker.update(
+        _frame(
+            1,
+            (
+                VisualDetection(
+                    source_index=0,
+                    center_norm=(0.578125, -0.8388888888888889),
+                    bbox_norm=(0.6828125, 0.0, 0.896875, 0.1638888888888889),
+                    confidence=0.30839832048081417,
+                    clipping=FrameEdge.TOP,
+                    center_censored=True,
+                ),
+            ),
+        )
+    )
+    current_id = first.visible_track_ids[0]
+    tracker.assign_role(current_id, VisualTrackRole.CURRENT)
+
+    fragmented = tracker.update(
+        _frame(
+            2,
+            (
+                VisualDetection(
+                    source_index=0,
+                    center_norm=(0.421875, -0.8444444444444444),
+                    bbox_norm=(0.678125, 0.0, 0.74375, 0.15555555555555556),
+                    confidence=0.547340975609756,
+                    clipping=FrameEdge.TOP,
+                    center_censored=True,
+                ),
+            ),
+        )
+    )
+
+    retained = fragmented.track(current_id)
+    assert fragmented.created_track_ids == ()
+    assert fragmented.associated_track_ids == (current_id,)
+    assert retained.visible is True
+    assert retained.missed_frame_count == 0
+    assert retained.center_norm == pytest.approx((0.421875, -0.8444444444444444))
+
+
 def test_edge_transition_quarantines_only_censored_box_derivatives() -> None:
     tracker = MultiTargetVisualTracker()
     first = tracker.update(

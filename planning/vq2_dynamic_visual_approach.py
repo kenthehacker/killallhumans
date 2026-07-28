@@ -2238,6 +2238,9 @@ class DynamicVisualCourseSession:
         handoff = self._post_credit_roll_reference_handoff
         if handoff is None:
             return decision
+        if decision.monotonic_ns > handoff.expires_monotonic_ns:
+            self._post_credit_roll_reference_handoff = None
+            return decision
         state = self.core.course_state()
         current = state.current
         normal_roll = float(decision.command.target_roll_rad)
@@ -2651,11 +2654,10 @@ class DynamicVisualCourseSession:
         anchor = self._same_gate_steering_anchor
         bearing_prediction_seed_ns = current.last_measurement_monotonic_ns
         # Aperture/scale authority still expires from its measured seed.  It
-        # must never own passage or clearance after that deadline.  Steering
-        # continuity is different: every exact next camera publication proves
-        # the receiver is live, so retain the last same-gate reference that
-        # actually reached the wire instead of aborting on an inherited
-        # predecessor timestamp.
+        # must never own passage or clearance after that deadline.  A fresh
+        # blank publication proves only that the receiver is live; it cannot
+        # renew geometry or the accepted command.  Pin steering expiry to the
+        # last visible command that actually reached the wire.
         aperture_steering_deadline_ns = (
             current.aperture_prediction_deadline_monotonic_ns
             if (
@@ -2668,14 +2670,11 @@ class DynamicVisualCourseSession:
             )
             else None
         )
-        fresh_publication_horizon_s = (
+        fixed_visibility_gap_horizon_s = (
             self.core.config.post_credit_current_prediction_max_horizon_s
         )
-        steering_deadline_ns = now_monotonic_ns + round(
-            fresh_publication_horizon_s * 1_000_000_000.0
-        )
         steering_deadline_basis = (
-            "fresh-publication-same-gate-steering-anchor-v1"
+            "accepted-wire-same-gate-steering-anchor-v2"
         )
         if (
             state.current_gate_index != staged.expected_gate_index
@@ -2702,9 +2701,22 @@ class DynamicVisualCourseSession:
                 "propagated visibility gap lacks fresh local steering state"
             )
 
+        steering_deadline_ns = anchor.wire_start_monotonic_ns + round(
+            fixed_visibility_gap_horizon_s * 1_000_000_000.0
+        )
         decision = anchor.decision
-        command = decision.command
-        remaining_horizon_s = fresh_publication_horizon_s
+        command = replace(
+            decision.command,
+            # Never carry forward/negative pitch through blindness.  This
+            # branch is reacquisition steering, not approach closure.
+            target_pitch_rad=max(
+                0.0,
+                float(decision.command.target_pitch_rad),
+            ),
+        )
+        remaining_horizon_s = (
+            steering_deadline_ns - now_monotonic_ns
+        ) / 1_000_000_000.0
         # The anchor owns only bounded attitude/yaw/thrust steering.  Never
         # carry aperture, scale, TTC, passage, or advance geometry through
         # blindness.

@@ -769,7 +769,7 @@ def test_outward_post_credit_demand_cannot_unwind_retained_successor_bank():
     assert session.post_credit_roll_reference_handoff_active
 
 
-def test_unqualified_post_credit_rate_retains_bank_across_old_deadline():
+def test_unqualified_post_credit_rate_releases_bank_at_handoff_deadline():
     session, source, successor_id, retained = (
         _activated_committed_roll_handoff()
     )
@@ -810,17 +810,17 @@ def test_unqualified_post_credit_rate_retains_bank_across_old_deadline():
         unqualified,
         monotonic_ns=handoff.expires_monotonic_ns + 1,
     )
-    retained_after_deadline = (  # noqa: SLF001
+    released_after_deadline = (  # noqa: SLF001
         session._apply_post_credit_roll_reference_handoff(
         expired
         )
     )
 
     assert (
-        retained_after_deadline.command.target_roll_rad
-        == pytest.approx(retained)
+        released_after_deadline.command.target_roll_rad
+        == pytest.approx(normal_command.target_roll_rad)
     )
-    assert session.post_credit_roll_reference_handoff_active
+    assert session.post_credit_roll_reference_handoff_active is False
 
 
 @pytest.mark.parametrize(
@@ -2135,6 +2135,17 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
     bearing_seed_ns = None
     last_measurement_ns = None
     accepted_anchor_command = None
+    accepted_anchor = session._same_gate_steering_anchor  # noqa: SLF001
+    assert accepted_anchor is not None
+    expected_deadline_ns = (
+        accepted_anchor.wire_start_monotonic_ns
+        + round(
+            session.core.config
+            .post_credit_current_prediction_max_horizon_s
+            * 1_000_000_000.0
+        )
+    )
+    previous_remaining_s = math.inf
     for sequence in range(8, 21):
         if sequence != 8:
             update = tracker.update(
@@ -2170,9 +2181,15 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
         assert authority[
             "steering_prediction_horizon_remaining_s"
         ] == pytest.approx(
-            session.core.config
-            .post_credit_current_prediction_max_horizon_s
+            (expected_deadline_ns - now_ns) / 1_000_000_000.0
         )
+        assert (
+            authority["steering_prediction_horizon_remaining_s"]
+            < previous_remaining_s
+        )
+        previous_remaining_s = authority[
+            "steering_prediction_horizon_remaining_s"
+        ]
         assert authority["current_aperture_half_size_norm"] is None
         assert authority["current_aperture_propagated"] is False
         assert authority[
@@ -2198,6 +2215,7 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
             <= authority["command"]["target_roll_rad"]
             < 0.0
         )
+        assert authority["command"]["target_pitch_rad"] >= 0.0
         assert authority["steering_only"] is True
         assert authority["passage_authority"] is False
         assert authority["advance_authority"] is False
@@ -2219,14 +2237,6 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
             assert authority[
                 "last_measurement_monotonic_ns"
             ] == last_measurement_ns
-        expected_deadline_ns = (
-            now_ns
-            + round(
-                session.core.config
-                .post_credit_current_prediction_max_horizon_s
-                * 1_000_000_000.0
-            )
-        )
         assert authority[
             "steering_prediction_deadline_monotonic_ns"
         ] == expected_deadline_ns
@@ -2252,16 +2262,21 @@ def test_fresh_clipped_misses_keep_accepted_same_gate_steering() -> None:
     )
     assert authority["last_visible_clipping"] == int(FrameEdge.RIGHT)
     assert authority["steering_prediction_deadline_basis"] == (
-        "fresh-publication-same-gate-steering-anchor-v1"
+        "accepted-wire-same-gate-steering-anchor-v2"
     )
     assert authority["bearing_prediction_deadline_monotonic_ns"] == (
-        now_ns
-        + round(
-            session.core.config
-            .post_credit_current_prediction_max_horizon_s
-            * 1_000_000_000.0
-        )
+        expected_deadline_ns
     )
+
+    with pytest.raises(
+        DynamicCourseError,
+        match="guidance is invalid",
+    ):
+        session.propagated_current_visibility_gap_authority(
+            track=tracker.track(current_id),
+            camera_token=update.token,
+            now_monotonic_ns=expected_deadline_ns + 1,
+        )
 
     last_visible = tracker.track(current_id).history[-1]
     unclipped_track = replace(
@@ -2348,9 +2363,19 @@ def test_fresh_missing_publication_uses_wire_anchor_not_aperture_lease() -> None
         camera_token=update.token,
         now_monotonic_ns=authority_now_ns,
     )
+    accepted_anchor = session._same_gate_steering_anchor  # noqa: SLF001
+    assert accepted_anchor is not None
+    fixed_deadline_ns = (
+        accepted_anchor.wire_start_monotonic_ns
+        + round(
+            session.core.config
+            .post_credit_current_prediction_max_horizon_s
+            * 1_000_000_000.0
+        )
+    )
 
     assert authority["steering_prediction_deadline_basis"] == (
-        "fresh-publication-same-gate-steering-anchor-v1"
+        "accepted-wire-same-gate-steering-anchor-v2"
     )
     assert authority["fallback_steering_deadline_monotonic_ns"] == (
         authority["steering_prediction_deadline_monotonic_ns"]
@@ -2359,19 +2384,14 @@ def test_fresh_missing_publication_uses_wire_anchor_not_aperture_lease() -> None
         aperture_deadline_ns
     )
     assert authority["steering_prediction_deadline_monotonic_ns"] == (
-        authority_now_ns
-        + round(
-            session.core.config
-            .post_credit_current_prediction_max_horizon_s
-            * 1_000_000_000.0
-        )
+        fixed_deadline_ns
     )
     assert authority[
         "steering_prediction_horizon_remaining_s"
     ] == pytest.approx(
-        session.core.config
-        .post_credit_current_prediction_max_horizon_s
+        (fixed_deadline_ns - authority_now_ns) / 1_000_000_000.0
     )
+    assert authority["command"]["target_pitch_rad"] >= 0.0
     assert authority["current_aperture_propagated"] is False
     assert authority["current_aperture_half_size_norm"] is None
     assert all(
