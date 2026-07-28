@@ -3960,9 +3960,9 @@ def test_latest_nonrapid_off_axis_exact_top_keeps_fov_pitch_ownership():
     )
 
     owns_pitch = (
-        course_stage._exact_nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
-            exact_fov_proposal=fov_proposal,
+            fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
             rapid_expansion_rate_s=0.45,
@@ -3975,6 +3975,84 @@ def test_latest_nonrapid_off_axis_exact_top_keeps_fov_pitch_ownership():
     assert recovery.forward_closure_authorized is False
     assert recovery.passage_authority is False
     assert recovery.advance_authority is False
+
+
+@pytest.mark.parametrize(
+    "retained",
+    (False, True),
+)
+def test_nonrapid_post_credit_top_recovery_keeps_fov_pitch_ownership(
+    retained,
+):
+    boundary, fov_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+    recovery = replace(
+        recovery,
+        expansion_rate_s=-0.0121339925,
+        time_to_contact_s=None,
+    )
+    retained_handoff = (
+        {
+            "basis": course_stage.TOP_FOV_RETAINED_RAW_STATE_BASIS,
+            "prediction_horizon_remaining_s": 0.5334766,
+            "steering_only": True,
+            "passage_authority": False,
+            "advance_authority": False,
+        }
+        if retained
+        else None
+    )
+
+    assert (
+        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            fov_proposal=fov_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+            retained_raw_handoff=retained_handoff,
+        )
+        is True
+    )
+    assert fov_proposal.protected_target_pitch_rad == pytest.approx(-0.35)
+    assert recovery.allocated_target_pitch_rad == pytest.approx(0.12)
+    assert recovery.passage_authority is False
+    assert recovery.advance_authority is False
+
+
+@pytest.mark.parametrize(
+    ("expansion_rate_s", "time_to_contact_s"),
+    (
+        (0.45, None),
+        (0.44, 2.2),
+    ),
+)
+def test_post_credit_top_fov_cannot_preempt_rapid_closure(
+    expansion_rate_s,
+    time_to_contact_s,
+):
+    boundary, fov_proposal, recovery = (
+        _latest_gate_one_top_pitch_arbitration_case()
+    )
+    recovery = replace(
+        recovery,
+        expansion_rate_s=expansion_rate_s,
+        time_to_contact_s=time_to_contact_s,
+    )
+
+    assert (
+        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
+            mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            fov_proposal=fov_proposal,
+            fresh_top_boundary=boundary,
+            closure_recovery=recovery,
+            rapid_expansion_rate_s=0.45,
+            rapid_closure_ttc_s=2.2,
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -4002,9 +4080,9 @@ def test_exact_top_fov_does_not_preempt_aligned_or_rapid_closure(
         recovery = replace(recovery, **recovery_change)
 
     assert (
-        course_stage._exact_nonrapid_off_axis_top_fov_owns_pitch(
+        course_stage._nonrapid_off_axis_top_fov_owns_pitch(
             mode=VisualApproachMode.APPROACH,
-            exact_fov_proposal=fov_proposal,
+            fov_proposal=fov_proposal,
             fresh_top_boundary=boundary,
             closure_recovery=recovery,
             rapid_expansion_rate_s=0.45,

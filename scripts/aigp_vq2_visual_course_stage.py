@@ -161,8 +161,8 @@ APPROACH_CURRENT_AMBIGUITY_QUARANTINE_BASIS = (
 FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "fresh-top-boundary-imu-closure-recovery-v1"
 )
-EXACT_NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS = (
-    "exact-current-top-nonrapid-off-axis-fov-priority-v1"
+NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS = (
+    "current-top-nonrapid-off-axis-fov-priority-v2"
 )
 RETAINED_FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
     "retained-fresh-top-boundary-closure-recovery-v1"
@@ -1381,35 +1381,69 @@ def _allocate_fresh_top_censored_closure_recovery(
     )
 
 
-def _exact_nonrapid_off_axis_top_fov_owns_pitch(
+def _nonrapid_off_axis_top_fov_owns_pitch(
     *,
     mode: VisualApproachMode,
-    exact_fov_proposal: _TopFovPitchProposal,
+    fov_proposal: _TopFovPitchProposal,
     fresh_top_boundary: _FreshCurrentTopBoundaryAuthority,
     closure_recovery: _FreshTopCensoredClosureRecovery,
     rapid_expansion_rate_s: float,
     rapid_closure_ttc_s: float,
+    retained_raw_handoff: Optional[Mapping[str, Any]] = None,
 ) -> bool:
-    """Arbitrate one exact TOP frame without reviving urgent closure.
+    """Arbitrate one fresh TOP frame without reviving urgent closure.
 
     The full positive-pitch brake remains authoritative for aligned, rapid,
-    or contact-time-unknown closure.  During a same-publication, nonrapid,
-    off-axis approach, however, replacing the exact FOV-safe pitch reverses
-    camera observability before the horizontal intercept can take effect.
-    This policy is deliberately available only to the normal exact proposal
-    path; propagated, retained, post-credit, and geometry-refusal paths keep
-    their existing brake ownership.
+    or ordinary contact-time-unknown approach closure.  During an off-axis,
+    nonrapid approach, replacing the exact FOV-safe pitch reverses camera
+    observability before the horizontal intercept can take effect.
+
+    Post-credit recovery may also consume the already-existing fixed,
+    nonrenewing retained-raw FOV lease.  That mode is itself bounded and
+    needs a second clean accepted wire before release, so unknown TTC does
+    not imply rapid closure when expansion remains below the planner's
+    existing rapid threshold.  Successor-propagated and geometry-refusal
+    paths never call this policy.
     """
 
     rapid_expansion, rapid_ttc = map(
         float,
         (rapid_expansion_rate_s, rapid_closure_ttc_s),
     )
+    retained = retained_raw_handoff is not None
     if (
         type(mode) is not VisualApproachMode
-        or type(exact_fov_proposal) is not _TopFovPitchProposal
+        or type(fov_proposal) is not _TopFovPitchProposal
         or type(fresh_top_boundary) is not _FreshCurrentTopBoundaryAuthority
         or type(closure_recovery) is not _FreshTopCensoredClosureRecovery
+        or retained
+        and (
+            not isinstance(retained_raw_handoff, Mapping)
+            or retained_raw_handoff.get("basis")
+            != TOP_FOV_RETAINED_RAW_STATE_BASIS
+            or retained_raw_handoff.get("steering_only") is not True
+            or retained_raw_handoff.get("passage_authority") is not False
+            or retained_raw_handoff.get("advance_authority") is not False
+            or type(
+                retained_raw_handoff.get(
+                    "prediction_horizon_remaining_s"
+                )
+            )
+            not in {int, float}
+            or not math.isfinite(
+                float(
+                    retained_raw_handoff[
+                        "prediction_horizon_remaining_s"
+                    ]
+                )
+            )
+            or float(
+                retained_raw_handoff[
+                    "prediction_horizon_remaining_s"
+                ]
+            )
+            <= 0.0
+        )
         or not all(
             math.isfinite(value)
             for value in (rapid_expansion, rapid_ttc)
@@ -1417,36 +1451,43 @@ def _exact_nonrapid_off_axis_top_fov_owns_pitch(
         or rapid_expansion <= 0.0
         or rapid_ttc <= 0.0
     ):
-        raise ValueError("exact TOP pitch arbitration inputs are invalid")
+        raise ValueError("TOP pitch arbitration inputs are invalid")
 
     ttc = closure_recovery.time_to_contact_s
-    return bool(
+    normal_exact_approach = bool(
         mode is VisualApproachMode.APPROACH
+        and not retained
+        and ttc is not None
+    )
+    bounded_post_credit_recovery = bool(
+        mode is VisualApproachMode.PROMOTE_REACQUIRE
+    )
+    return bool(
+        (normal_exact_approach or bounded_post_credit_recovery)
         and closure_recovery.fresh_boundary_current_authority
         and not closure_recovery.horizontal_aligned
         and closure_recovery.steering_only
         and not closure_recovery.forward_closure_authorized
         and not closure_recovery.passage_authority
         and not closure_recovery.advance_authority
-        and exact_fov_proposal.active_after
-        and exact_fov_proposal.limited
+        and fov_proposal.active_after
+        and fov_proposal.limited
         and math.isclose(
-            exact_fov_proposal.requested_target_pitch_rad,
+            fov_proposal.requested_target_pitch_rad,
             closure_recovery.requested_target_pitch_rad,
             rel_tol=0.0,
             abs_tol=1e-12,
         )
         and math.isclose(
-            exact_fov_proposal.protected_target_pitch_rad,
+            fov_proposal.protected_target_pitch_rad,
             closure_recovery.fov_protected_target_pitch_rad,
             rel_tol=0.0,
             abs_tol=1e-12,
         )
-        and exact_fov_proposal.protected_target_pitch_rad
+        and fov_proposal.protected_target_pitch_rad
         < closure_recovery.allocated_target_pitch_rad - 1e-12
         and closure_recovery.expansion_rate_s < rapid_expansion
-        and ttc is not None
-        and ttc > rapid_ttc
+        and (ttc is None or ttc > rapid_ttc)
     )
 
 
@@ -7567,11 +7608,21 @@ async def _run_visual_course_stage_impl(
                         f"refused: {exc}"
                     ) from exc
                 if top_censored_closure_recovery is not None:
-                    exact_fov_owns_pitch = (
-                        top_fov_proposal is not None
-                        and _exact_nonrapid_off_axis_top_fov_owns_pitch(
+                    pitch_priority_proposal = (
+                        top_fov_proposal
+                        if top_fov_proposal is not None
+                        else top_fov_retained_raw_proposal
+                    )
+                    pitch_priority_retained_handoff = (
+                        None
+                        if top_fov_proposal is not None
+                        else top_fov_retained_raw_handoff
+                    )
+                    fov_owns_pitch = (
+                        pitch_priority_proposal is not None
+                        and _nonrapid_off_axis_top_fov_owns_pitch(
                             mode=proposal.mode,
-                            exact_fov_proposal=top_fov_proposal,
+                            fov_proposal=pitch_priority_proposal,
                             fresh_top_boundary=fresh_top_boundary,
                             closure_recovery=(
                                 top_censored_closure_recovery
@@ -7582,12 +7633,22 @@ async def _run_visual_course_stage_impl(
                             rapid_closure_ttc_s=float(
                                 recovery_config.successor_lookahead_ttc_s
                             ),
+                            retained_raw_handoff=(
+                                pitch_priority_retained_handoff
+                            ),
                         )
                     )
-                    if exact_fov_owns_pitch:
+                    if fov_owns_pitch:
+                        assert pitch_priority_proposal is not None
                         top_censored_pitch_arbitration = {
                             "basis": (
-                                EXACT_NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS
+                                NONRAPID_OFF_AXIS_TOP_FOV_PRIORITY_BASIS
+                            ),
+                            "lifecycle_mode": proposal.mode.value,
+                            "fov_authority_kind": (
+                                "exact_same_publication"
+                                if pitch_priority_retained_handoff is None
+                                else "fixed_retained_raw_lease"
                             ),
                             "closure_recovery": asdict(
                                 top_censored_closure_recovery
@@ -7599,8 +7660,15 @@ async def _run_visual_course_stage_impl(
                                 recovery_config.successor_lookahead_ttc_s
                             ),
                             "selected_target_pitch_rad": (
-                                top_fov_proposal
+                                pitch_priority_proposal
                                 .protected_target_pitch_rad
+                            ),
+                            "retained_raw_handoff": (
+                                None
+                                if pitch_priority_retained_handoff is None
+                                else dict(
+                                    pitch_priority_retained_handoff
+                                )
                             ),
                             "steering_only": True,
                             "passage_authority": False,
