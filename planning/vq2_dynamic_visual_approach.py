@@ -1846,11 +1846,110 @@ class DynamicVisualCourseSession:
             monotonic_ns,
             passage_committed=staged.passage_committed,
         )
+        decision = self._apply_post_credit_rebound_roll_reference(
+            decision
+        )
         decision = self._apply_post_credit_roll_reference_handoff(
             decision
         )
         self._last_decision = decision
         return decision
+
+    def _apply_post_credit_rebound_roll_reference(
+        self,
+        decision: GuidanceDecision,
+    ) -> GuidanceDecision:
+        """Consume fresh rebound steering until an accepted reference exists.
+
+        A graph-proven cross-ID reacquisition creates a bounded steering-only
+        lease, but normal guidance previously ignored it and the lifecycle
+        discarded it after two clean frames.  Admit only its horizontal
+        attitude reference while the qualified promoted-gate residual is
+        moving outward.  Exact wire acceptance then arms the existing
+        geometry-released handoff; no temporal command continuity is added.
+        """
+
+        lease = self._post_credit_successor_steering
+        if (
+            lease is None
+            or not lease.steering_available
+            or self._post_credit_roll_reference_handoff is not None
+        ):
+            return decision
+        state = self.core.course_state()
+        current = state.current
+        lineage_matches = bool(
+            decision.current_gate_index == lease.to_gate_index
+            and decision.current_track_id == lease.reviewed_track_id
+            and not decision.passage_committed
+            and state.current_gate_index == lease.to_gate_index
+            and state.current_track_id == lease.reviewed_track_id
+            and current.track_id == lease.reviewed_track_id
+            and current.stream_generation == lease.stream_generation
+            and state.promotion_count == lease.promotion_count
+        )
+        if not lineage_matches:
+            self._pending_post_credit_roll_reference = None
+            return decision
+        try:
+            authority = self.post_credit_successor_steering_authority(
+                now_monotonic_ns=decision.monotonic_ns,
+            )
+        except PostCreditSuccessorSteeringUnavailable:
+            self._pending_post_credit_roll_reference = None
+            return decision
+
+        normal_roll = float(decision.command.target_roll_rad)
+        rebound_roll = float(authority["target_roll_rad"])
+        stable_error = float(decision.current_center_norm[0])
+        residual_rate = float(
+            current.residual_translational_rate_rad_s[0]
+        )
+        guidance_sign = float(self.core.config.roll_guidance_sign)
+        values = (
+            normal_roll,
+            rebound_roll,
+            stable_error,
+            residual_rate,
+            guidance_sign,
+        )
+        bounded = bool(
+            all(math.isfinite(value) for value in values)
+            and abs(rebound_roll) <= MAX_TARGET_ROLL_RAD + 1e-12
+            and current.visible
+            and not current.ambiguous
+            and not current.censored_axes[0]
+            and current.bearing_rate_qualified[0]
+            and current.bearing_std_rad[0]
+            <= (
+                self.core.config
+                .successor_prediction_max_extrapolation_rad
+            )
+            + 1e-12
+            and abs(guidance_sign) > 1e-12
+        )
+        outward = stable_error * residual_rate > 1e-12
+        corrective = (
+            rebound_roll * guidance_sign * stable_error > 1e-12
+        )
+        compatible = normal_roll * rebound_roll >= -1e-12
+        stronger = abs(rebound_roll) > abs(normal_roll) + 1e-12
+        if not (
+            bounded
+            and outward
+            and corrective
+            and compatible
+            and stronger
+        ):
+            self._pending_post_credit_roll_reference = None
+            return decision
+        return replace(
+            decision,
+            command=replace(
+                decision.command,
+                target_roll_rad=rebound_roll,
+            ),
+        )
 
     def _apply_post_credit_roll_reference_handoff(
         self,

@@ -3341,6 +3341,122 @@ def test_unaccepted_post_credit_roll_target_cannot_create_handoff():
     assert session.post_credit_roll_reference_handoff_active is False
 
 
+def test_fresh_rebound_outward_roll_arms_geometry_released_handoff():
+    session, successor_id = _bound_post_credit_successor()
+    successor = session.core.course_state().successor
+    assert successor is not None
+    race_received_ns = successor.state_monotonic_ns - 1_000_000
+    wire_ns = successor.state_monotonic_ns + 2_000_000
+    activation_ns = wire_ns + 2_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=0.0,
+        target_pitch_rad=0.04,
+        yaw_rate_rad_s=0.0,
+        thrust=0.275,
+        wire_command=AttitudeRateCommand(0.0, 0.02, 0.0, 0.275),
+        wire_start_monotonic_ns=wire_ns,
+    )
+    session.activate_post_credit_successor_steering(
+        _credited_race(race_received_ns),
+        from_gate_index=0,
+        reviewed_track_id=successor_id,
+        activation_monotonic_ns=activation_ns,
+    )
+    estimate = session.core._tracks[successor_id]  # noqa: SLF001
+    estimate.state = replace(
+        estimate.state,
+        bearing_rad=(0.40, 0.0),
+        bearing_rate_rad_s=(0.10, 0.0),
+        residual_translational_rate_rad_s=(0.10, 0.0),
+        bearing_rate_qualified=(True, True),
+        bearing_std_rad=(0.02, 0.02),
+        censored_axes=(False, False),
+        visible=True,
+        ambiguous=False,
+    )
+    source = session.core.guide(activation_ns + 1_000_000)
+    normal_command = replace(
+        source.command,
+        target_roll_rad=-0.04,
+    )
+    normal = replace(
+        source,
+        current_gate_index=1,
+        current_track_id=successor_id,
+        successor_track_id=None,
+        current_center_norm=(0.30, 0.0),
+        passage_committed=False,
+        proposed_command=normal_command,
+        command=normal_command,
+    )
+
+    constrained = (
+        session._apply_post_credit_rebound_roll_reference(  # noqa: SLF001
+            normal
+        )
+    )
+
+    assert constrained.proposed_command == normal_command
+    assert constrained.command.target_roll_rad == pytest.approx(
+        -MAX_TARGET_ROLL_RAD
+    )
+    assert constrained.passage_committed is False
+    assert constrained.current_gate_index == 1
+    assert session.post_credit_roll_reference_handoff_active is False
+    assert all(
+        math.isfinite(value)
+        for value in (
+            constrained.command.target_roll_rad,
+            constrained.command.target_pitch_rad,
+            constrained.command.yaw_rate_rad_s,
+            constrained.command.thrust,
+        )
+    )
+
+    accepted_ns = constrained.monotonic_ns + 1_000_000
+    session.record_wire_acceptance(
+        target_roll_rad=constrained.command.target_roll_rad,
+        target_pitch_rad=constrained.command.target_pitch_rad,
+        yaw_rate_rad_s=constrained.command.yaw_rate_rad_s,
+        thrust=constrained.command.thrust,
+        wire_command=AttitudeRateCommand(
+            -0.05,
+            0.02,
+            constrained.command.yaw_rate_rad_s,
+            constrained.command.thrust,
+        ),
+        wire_start_monotonic_ns=accepted_ns,
+    )
+    assert session.post_credit_roll_reference_handoff_active
+
+    # Recovery completion retires the rebound lease, while the accepted
+    # reference remains state-owned until the qualified residual recovers.
+    session._post_credit_successor_steering = None  # noqa: SLF001
+    outward = replace(
+        normal,
+        monotonic_ns=accepted_ns + 1_000_000,
+    )
+    retained = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        outward
+    )
+    assert retained.command.target_roll_rad == pytest.approx(
+        -MAX_TARGET_ROLL_RAD
+    )
+
+    estimate.state = replace(
+        estimate.state,
+        residual_translational_rate_rad_s=(-0.10, 0.0),
+    )
+    recovered = session._apply_post_credit_roll_reference_handoff(  # noqa: SLF001
+        replace(
+            outward,
+            monotonic_ns=accepted_ns + 2_000_000,
+        )
+    )
+    assert recovered.command == normal_command
+    assert session.post_credit_roll_reference_handoff_active is False
+
+
 def test_post_credit_steering_uses_predicted_camera_elevation(
     monkeypatch: pytest.MonkeyPatch,
 ):
