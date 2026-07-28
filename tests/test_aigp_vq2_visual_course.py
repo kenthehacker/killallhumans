@@ -6658,6 +6658,43 @@ def test_expired_geometry_search_does_not_consume_stale_detection():
     assert authority.command.yaw_rate_rad_s == 0.0
 
 
+def test_missing_local_state_transitions_directly_to_fresh_search():
+    snapshot = _expired_geometry_search_snapshot()
+    snapshot.current_track.clipping = FrameEdge.TOP | FrameEdge.RIGHT
+    segment = {
+        "approach_propagated_visibility_gap": None,
+        "approach_expired_geometry_search": None,
+    }
+
+    horizontal_edge = (
+        course_stage._begin_approach_expired_geometry_search(
+            snapshot=snapshot,
+            camera_token=snapshot.latest_camera_token,
+            now_s=10.0,
+            propagated_started_s=None,
+            propagated_authority=None,
+            unavailable_reason=(
+                "propagated visibility gap lacks fresh local steering state"
+            ),
+            segment=segment,
+        )
+    )
+
+    assert horizontal_edge is FrameEdge.RIGHT
+    assert segment["approach_propagated_visibility_gap"]["outcome"] == (
+        "state_horizon_expired_to_active_search"
+    )
+    assert segment["approach_propagated_visibility_gap"][
+        "remaining_state_horizon_s"
+    ] == 0.0
+    assert segment["approach_expired_geometry_search"]["outcome"] == (
+        "searching"
+    )
+    assert segment["approach_expired_geometry_search"][
+        "passage_authority"
+    ] is False
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     (

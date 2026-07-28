@@ -75,6 +75,10 @@ class PostCreditSuccessorSteeringUnavailable(DynamicCourseError):
     """Optional predicted steering ended while race-owned handoff remains."""
 
 
+class PropagatedCurrentVisibilityGapUnavailable(DynamicCourseError):
+    """No stale local steering state remains; fresh search must take over."""
+
+
 def _predicted_successor_pitch_reference(
     *,
     camera_center_y_norm: float,
@@ -2697,7 +2701,7 @@ class DynamicVisualCourseSession:
             < current.last_measurement_monotonic_ns
             or anchor.wire_start_monotonic_ns > now_monotonic_ns
         ):
-            raise DynamicCourseError(
+            raise PropagatedCurrentVisibilityGapUnavailable(
                 "propagated visibility gap lacks fresh local steering state"
             )
 
@@ -4278,5 +4282,6 @@ __all__ = [
     "DynamicRollingVisualApproachServo",
     "DynamicVisualCourseSession",
     "PostCreditSuccessorSteeringUnavailable",
+    "PropagatedCurrentVisibilityGapUnavailable",
     "production_dynamic_course_config",
 ]

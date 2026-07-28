@@ -58,6 +58,7 @@ from planning.vq2_dynamic_visual_approach import (
     DYNAMIC_CROSSING_COORDINATE_BASIS,
     DynamicVisualCourseSession,
     PostCreditSuccessorSteeringUnavailable,
+    PropagatedCurrentVisibilityGapUnavailable,
 )
 from planning.vq2_visual_approach import (
     RollingVisualApproachServo,
@@ -4651,6 +4652,139 @@ def _approach_expired_geometry_search_authority(
         horizontal_norm=horizontal,
         retained_horizontal_edge=retained_horizontal_edge,
     )
+
+
+def _begin_approach_expired_geometry_search(
+    *,
+    snapshot: Any,
+    camera_token: CameraFrameToken,
+    now_s: float,
+    propagated_started_s: Optional[float],
+    propagated_authority: Optional[
+        _ApproachPropagatedVisibilityGapAuthority
+    ],
+    unavailable_reason: Optional[str],
+    segment: Dict[str, Any],
+) -> FrameEdge:
+    """Record the one-way transition from stale propagation to fresh search."""
+
+    current = getattr(snapshot, "current_track", None)
+    clipping = getattr(current, "clipping", FrameEdge.NONE)
+    if (
+        type(camera_token) is not CameraFrameToken
+        or not math.isfinite(float(now_s))
+        or (
+            propagated_started_s is not None
+            and not math.isfinite(float(propagated_started_s))
+        )
+        or (
+            propagated_authority is None
+            and (
+                type(unavailable_reason) is not str
+                or not unavailable_reason
+            )
+        )
+        or (
+            propagated_authority is not None
+            and unavailable_reason is not None
+        )
+        or not isinstance(segment, dict)
+        or current is None
+        or type(clipping) is not FrameEdge
+    ):
+        raise ValueError("expired-geometry search transition is invalid")
+
+    gap_summary = segment.get("approach_propagated_visibility_gap")
+    if gap_summary is None:
+        gap_summary = {
+            "basis": APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS,
+            "anchor_camera_token": (
+                None
+                if propagated_authority is None
+                else asdict(
+                    propagated_authority.command.anchor_camera_token
+                )
+            ),
+            "first_missing_camera_token": asdict(camera_token),
+            "last_missing_camera_token": None,
+            "reacquired_camera_token": None,
+            "initial_state_horizon_s": (
+                0.0
+                if propagated_authority is None
+                else propagated_authority.remaining_horizon_s
+            ),
+            "state_deadline_basis": (
+                "no-fresh-local-steering-state"
+                if propagated_authority is None
+                else propagated_authority.evidence.get(
+                    "steering_prediction_deadline_basis"
+                )
+            ),
+            "outcome": "propagating",
+        }
+        segment["approach_propagated_visibility_gap"] = gap_summary
+    if not isinstance(gap_summary, dict):
+        raise ValueError("propagated visibility-gap summary is invalid")
+
+    elapsed_s = (
+        0.0
+        if propagated_started_s is None
+        else float(now_s) - float(propagated_started_s)
+    )
+    missed_count = getattr(current, "missed_frame_count", None)
+    if (
+        not math.isfinite(elapsed_s)
+        or elapsed_s < 0.0
+        or type(missed_count) is not int
+        or missed_count <= 0
+    ):
+        raise ValueError("expired-geometry search evidence is invalid")
+    gap_summary.update(
+        {
+            "last_missing_camera_token": asdict(camera_token),
+            "missed_frame_count": (
+                missed_count
+                if propagated_authority is None
+                else propagated_authority.missed_frame_count
+            ),
+            "elapsed_s": elapsed_s,
+            "remaining_state_horizon_s": (
+                0.0
+                if propagated_authority is None
+                else propagated_authority.remaining_horizon_s
+            ),
+            "unavailable_reason": unavailable_reason,
+            "outcome": "state_horizon_expired_to_active_search",
+        }
+    )
+
+    has_left = bool(clipping & FrameEdge.LEFT)
+    has_right = bool(clipping & FrameEdge.RIGHT)
+    horizontal_edge = (
+        FrameEdge.LEFT
+        if has_left and not has_right
+        else (
+            FrameEdge.RIGHT
+            if has_right and not has_left
+            else FrameEdge.NONE
+        )
+    )
+    if segment.get("approach_expired_geometry_search") is not None:
+        raise ValueError("expired-geometry search was already started")
+    segment["approach_expired_geometry_search"] = {
+        "basis": APPROACH_EXPIRED_GEOMETRY_SEARCH_BASIS,
+        "started_camera_token": asdict(camera_token),
+        "last_camera_token": None,
+        "reacquired_camera_token": None,
+        "retained_horizontal_edge": int(horizontal_edge),
+        "last_source": None,
+        "last_observed_track_id": None,
+        "steering_only": True,
+        "passage_authority": False,
+        "advance_authority": False,
+        "outcome": "searching",
+    }
+    return horizontal_edge
 
 
 def _approach_propagated_visibility_gap_authority(
@@ -11820,6 +11954,7 @@ async def _run_visual_course_stage_impl(
                                 "visual-course propagated visibility-gap QPC "
                                 "clock is invalid"
                             ) from exc
+                        gap_unavailable_reason: Optional[str] = None
                         try:
                             gap_evidence = (
                                 dynamic_controller
@@ -11841,6 +11976,10 @@ async def _run_visual_course_stage_impl(
                                 )
                             )
                         except (
+                            PropagatedCurrentVisibilityGapUnavailable
+                        ) as gap_exc:
+                            gap_unavailable_reason = str(gap_exc)
+                        except (
                             AttributeError,
                             KeyError,
                             TypeError,
@@ -11850,120 +11989,103 @@ async def _run_visual_course_stage_impl(
                                 "visual-course propagated visibility-gap "
                                 f"guidance refused: {gap_exc}"
                             ) from gap_exc
-                        if (
-                            approach_propagated_visibility_gap_started_s
-                            is None
-                        ):
-                            approach_propagated_visibility_gap_started_s = now
-                            (
-                                approach_propagated_visibility_gap_fresh_frame_count
-                            ) = 0
-                            segment[
-                                "approach_propagated_visibility_gap"
-                            ] = {
-                                "basis": (
-                                    APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
-                                ),
-                                "anchor_camera_token": asdict(
-                                    gap_authority.command.anchor_camera_token
-                                ),
-                                "first_missing_camera_token": asdict(token),
-                                "last_missing_camera_token": None,
-                                "reacquired_camera_token": None,
-                                "initial_state_horizon_s": (
-                                    gap_authority.remaining_horizon_s
-                                ),
-                                "state_deadline_basis": (
-                                    gap_authority.evidence.get(
-                                        "steering_prediction_deadline_basis"
-                                    )
-                                ),
-                                "outcome": "propagating",
-                            }
-                        gap_elapsed_s = (
-                            now
-                            - approach_propagated_visibility_gap_started_s
-                        )
-                        try:
-                            command_deadline_s = (
-                                _approach_propagated_visibility_gap_command_deadline_s(
-                                    gap_authority,
+                        if gap_unavailable_reason is not None:
+                            try:
+                                (
+                                    approach_expired_geometry_search_horizontal_edge
+                                ) = _begin_approach_expired_geometry_search(
+                                    snapshot=snapshot,
+                                    camera_token=token,
                                     now_s=now,
-                                    control_period_s=(
-                                        limits.control_period_s
+                                    propagated_started_s=(
+                                        approach_propagated_visibility_gap_started_s
                                     ),
+                                    propagated_authority=None,
+                                    unavailable_reason=gap_unavailable_reason,
+                                    segment=segment,
                                 )
-                            )
-                        except _ApproachPropagatedVisibilityGapExpired:
-                            gap_summary = segment[
-                                "approach_propagated_visibility_gap"
-                            ]
-                            if not isinstance(gap_summary, dict):
+                            except (TypeError, ValueError) as search_exc:
                                 raise abort_type(
-                                    "visual-course propagated visibility-gap "
-                                    "summary is invalid"
-                                ) from exc
-                            gap_summary.update(
-                                {
-                                    "last_missing_camera_token": asdict(token),
-                                    "missed_frame_count": (
-                                        gap_authority.missed_frame_count
+                                    "visual-course expired-geometry active "
+                                    f"search transition refused: {search_exc}"
+                                ) from search_exc
+                            approach_expired_geometry_search_started_s = now
+                        else:
+                            assert gap_authority is not None
+                            if (
+                                approach_propagated_visibility_gap_started_s
+                                is None
+                            ):
+                                (
+                                    approach_propagated_visibility_gap_started_s
+                                ) = now
+                                (
+                                    approach_propagated_visibility_gap_fresh_frame_count
+                                ) = 0
+                                segment[
+                                    "approach_propagated_visibility_gap"
+                                ] = {
+                                    "basis": (
+                                        APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS
                                     ),
-                                    "elapsed_s": gap_elapsed_s,
-                                    "remaining_state_horizon_s": (
+                                    "anchor_camera_token": asdict(
+                                        gap_authority.command.anchor_camera_token
+                                    ),
+                                    "first_missing_camera_token": asdict(token),
+                                    "last_missing_camera_token": None,
+                                    "reacquired_camera_token": None,
+                                    "initial_state_horizon_s": (
                                         gap_authority.remaining_horizon_s
                                     ),
-                                    "outcome": (
-                                        "state_horizon_expired_to_active_search"
+                                    "state_deadline_basis": (
+                                        gap_authority.evidence.get(
+                                            "steering_prediction_deadline_basis"
+                                        )
                                     ),
+                                    "outcome": "propagating",
                                 }
-                            )
-                            clipping = getattr(
-                                snapshot.current_track,
-                                "clipping",
-                                FrameEdge.NONE,
-                            )
-                            if type(clipping) is not FrameEdge:
-                                raise abort_type(
-                                    "visual-course active-search retained edge "
-                                    "is invalid"
-                                ) from exc
-                            has_left = bool(clipping & FrameEdge.LEFT)
-                            has_right = bool(clipping & FrameEdge.RIGHT)
-                            approach_expired_geometry_search_horizontal_edge = (
-                                FrameEdge.LEFT
-                                if has_left and not has_right
-                                else (
-                                    FrameEdge.RIGHT
-                                    if has_right and not has_left
-                                    else FrameEdge.NONE
+                            try:
+                                command_deadline_s = (
+                                    _approach_propagated_visibility_gap_command_deadline_s(
+                                        gap_authority,
+                                        now_s=now,
+                                        control_period_s=(
+                                            limits.control_period_s
+                                        ),
+                                    )
                                 )
-                            )
-                            approach_expired_geometry_search_started_s = now
-                            segment[
-                                "approach_expired_geometry_search"
-                            ] = {
-                                "basis": (
-                                    APPROACH_EXPIRED_GEOMETRY_SEARCH_BASIS
-                                ),
-                                "started_camera_token": asdict(token),
-                                "last_camera_token": None,
-                                "reacquired_camera_token": None,
-                                "retained_horizontal_edge": int(
-                                    approach_expired_geometry_search_horizontal_edge
-                                ),
-                                "last_source": None,
-                                "last_observed_track_id": None,
-                                "steering_only": True,
-                                "passage_authority": False,
-                                "advance_authority": False,
-                                "outcome": "searching",
-                            }
-                        except ValueError as deadline_exc:
-                            raise abort_type(
-                                "visual-course propagated visibility-gap "
-                                f"deadline refused: {deadline_exc}"
-                            ) from deadline_exc
+                            except _ApproachPropagatedVisibilityGapExpired:
+                                try:
+                                    (
+                                        approach_expired_geometry_search_horizontal_edge
+                                    ) = _begin_approach_expired_geometry_search(
+                                        snapshot=snapshot,
+                                        camera_token=token,
+                                        now_s=now,
+                                        propagated_started_s=(
+                                            approach_propagated_visibility_gap_started_s
+                                        ),
+                                        propagated_authority=gap_authority,
+                                        unavailable_reason=None,
+                                        segment=segment,
+                                    )
+                                except (
+                                    TypeError,
+                                    ValueError,
+                                ) as search_exc:
+                                    raise abort_type(
+                                        "visual-course expired-geometry "
+                                        "active search transition refused: "
+                                        f"{search_exc}"
+                                    ) from search_exc
+                                approach_expired_geometry_search_started_s = (
+                                    now
+                                )
+                            except ValueError as deadline_exc:
+                                raise abort_type(
+                                    "visual-course propagated visibility-gap "
+                                    f"deadline refused: {deadline_exc}"
+                                ) from deadline_exc
 
                     if approach_expired_geometry_search_started_s is not None:
                         try:
