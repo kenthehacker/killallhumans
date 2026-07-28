@@ -3459,6 +3459,29 @@ class DynamicCourseCore:
                         MAX_TARGET_ROLL_RAD,
                     )
                     committed_successor_target_roll = normal_successor_roll
+                    successor_outward = bool(
+                        abs(self.config.roll_guidance_sign) > _EPSILON
+                        and abs(normal_successor_roll) > _EPSILON
+                        and abs(successor_steering.stable_bearing_rad[0])
+                        >= self.config.off_axis_brake_rad
+                        and successor_steering.stable_bearing_rad[0]
+                        * successor_steering.stable_bearing_rate_rad_s[0]
+                        > 0.0
+                        and normal_successor_roll
+                        * self.config.roll_guidance_sign
+                        * successor_steering.stable_bearing_rad[0]
+                        > 0.0
+                    )
+                    if successor_outward:
+                        # The graph-vetted successor may use the full bounded
+                        # bank only while the current gate's proved crossing
+                        # still owns the lifecycle.  After promotion, ordinary
+                        # current-gate guidance remains proportional and has no
+                        # full-bank latch.
+                        committed_successor_target_roll = math.copysign(
+                            MAX_TARGET_ROLL_RAD,
+                            normal_successor_roll,
+                        )
                     committed_successor_yaw_authority = 1.0
                     committed_successor_yaw_rate = _clamp(
                         -self.config.yaw_gain

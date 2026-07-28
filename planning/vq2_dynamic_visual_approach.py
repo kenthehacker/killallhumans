@@ -1752,10 +1752,33 @@ class DynamicVisualCourseSession:
             MAX_TARGET_ROLL_RAD,
             max(-MAX_TARGET_ROLL_RAD, target_roll),
         )
-        # Roll sign is identified, but its image-acceleration magnitude is
-        # not.  Preserve the bounded proportional prediction across credit;
-        # escalating an outward successor directly to full bank made that
-        # uncharacterized channel dominate the calibrated yaw correction.
+        successor_outward = bool(
+            abs(self.core.config.roll_guidance_sign) > 1e-12
+            and abs(target_roll) > 1e-12
+            and prediction.bearing_std_rad[0]
+            <= (
+                self.core.config
+                .successor_prediction_max_extrapolation_rad
+            )
+            + 1e-12
+            and abs(prediction.stable_bearing_rad[0])
+            >= self.core.config.off_axis_brake_rad
+            and prediction.stable_bearing_rad[0]
+            * prediction.stable_bearing_rate_rad_s[0]
+            > 0.0
+            and target_roll
+            * self.core.config.roll_guidance_sign
+            * prediction.stable_bearing_rad[0]
+            > 0.0
+        )
+        if successor_outward:
+            # Preserve the useful graph-vetted pre-turn through authoritative
+            # promotion.  This bounded steering lease expires independently;
+            # the promoted current-gate law has no full-bank escalation.
+            target_roll = math.copysign(
+                MAX_TARGET_ROLL_RAD,
+                target_roll,
+            )
         (
             target_pitch,
             camera_elevation,

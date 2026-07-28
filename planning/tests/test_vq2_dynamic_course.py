@@ -2852,7 +2852,7 @@ def test_successor_dropout_retains_local_rate_for_reacquisition_continuity(
     )
 
 
-def test_committed_off_axis_successor_roll_remains_proportional(
+def test_committed_off_axis_successor_preturns_then_releases_proportionally(
 ) -> None:
     config = DynamicCourseConfig(
         camera_delay_s=0.0,
@@ -2908,25 +2908,11 @@ def test_committed_off_axis_successor_roll_remains_proportional(
         > 0.0
     )
     assert outward.committed_successor_roll_authority == 1.0
-    successor_prediction = core.predict_track_steering(
-        "gate-b",
-        outward.monotonic_ns,
-    )
-    expected_outward_roll = config.roll_guidance_sign * (
-        config.roll_gain * successor_prediction.stable_bearing_rad[0]
-        + config.lateral_rate_gain
-        * successor_prediction.stable_bearing_rate_rad_s[0]
-    )
     assert outward.committed_successor_target_roll_rad == pytest.approx(
-        expected_outward_roll
+        MAX_TARGET_ROLL_RAD
     )
     assert outward.command.target_roll_rad == pytest.approx(
-        expected_outward_roll
-    )
-    assert (
-        0.0
-        < outward.committed_successor_target_roll_rad
-        < MAX_TARGET_ROLL_RAD
+        MAX_TARGET_ROLL_RAD
     )
     assert outward.committed_successor_target_pitch_rad is not None
     assert (
