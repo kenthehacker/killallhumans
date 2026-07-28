@@ -3599,6 +3599,23 @@ class _CurrentApertureProvedCollectiveState:
     last_observation_vertical_censored: bool = False
     last_hold_reason: Optional[str] = None
 
+    def retained_or_wire(self, fallback_wire_thrust: float) -> float:
+        """Use the latest observable request, or the accepted current wire."""
+
+        fallback = float(fallback_wire_thrust)
+        if not math.isfinite(fallback):
+            raise ValueError(
+                "current-aperture collective wire fallback must be finite"
+            )
+        if self.last_observable_thrust is None:
+            return fallback
+        retained = float(self.last_observable_thrust)
+        if not math.isfinite(retained):
+            raise ValueError(
+                "retained current-aperture collective must be finite"
+            )
+        return retained
+
     def hold(self, *, reason: str) -> tuple[float, float]:
         """Retain current-aperture collective without inventing geometry."""
 
@@ -10108,7 +10125,7 @@ async def _run_visual_course_stage_impl(
             *,
             subsupport_collective_authorized: bool,
         ) -> float:
-            """Return the last clean aperture request for bounded coast."""
+            """Return current wire authority or a newer clean-aperture request."""
 
             fallback = float(fallback_wire_thrust)
             if type(subsupport_collective_authorized) is not bool:
@@ -10118,12 +10135,17 @@ async def _run_visual_course_stage_impl(
             if runtime.dynamic_controller is None:
                 return fallback
             state = current_aperture_collective_state
-            if state is None or state.last_observable_thrust is None:
+            if state is None:
                 raise abort_type(
-                    "visual-course dynamic crossing lacks a retained "
-                    "current-aperture collective"
+                    "visual-course current-aperture collective state is absent"
                 )
-            requested = float(state.last_observable_thrust)
+            try:
+                requested = state.retained_or_wire(fallback)
+            except (TypeError, ValueError) as exc:
+                raise abort_type(
+                    "visual-course retained current-aperture collective "
+                    f"is invalid: {exc}"
+                ) from exc
             if (
                 not math.isfinite(requested)
                 or requested < limits.min_thrust - 1e-12

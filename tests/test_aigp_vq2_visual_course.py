@@ -7246,6 +7246,22 @@ def test_current_aperture_collective_recreates_new_frame_rate_filter():
     assert third_thrust == pytest.approx(0.287543)
 
 
+def test_current_aperture_collective_uses_accepted_wire_before_clean_seed():
+    state = course_stage._CurrentApertureProvedCollectiveState(
+        track_id="track-1"
+    )
+
+    assert state.retained_or_wire(0.29273983694703976) == pytest.approx(
+        0.29273983694703976
+    )
+    assert state.last_observable_thrust is None
+
+    state.last_observable_thrust = 0.286
+    assert state.retained_or_wire(0.29273983694703976) == pytest.approx(
+        0.286
+    )
+
+
 @pytest.mark.parametrize(
     ("subsupport_authorized", "floor_applied"),
     (
