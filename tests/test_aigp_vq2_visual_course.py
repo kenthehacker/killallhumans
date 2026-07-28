@@ -3068,6 +3068,123 @@ def test_propagated_top_fov_gap_keeps_protected_pitch_from_reversing():
     assert proposal.limited is True
 
 
+def _dd89_top_censored_recovery(**overrides):
+    inputs = {
+        "raw_top_edge_image_down": -1.0,
+        "clipping": FrameEdge.TOP,
+        "center_censored": True,
+        "current_visible": True,
+        "current_ambiguous": False,
+        "current_missed_count": 0,
+        "current_censored_axes": (False, True),
+        "current_aperture_propagated": True,
+        "current_aperture_dynamics_qualified": True,
+        "passage_committed": False,
+        "capture_pitch_rad": -0.092,
+        "body_pitch_rate_rad_s": -0.095,
+        "pitch_response_delay_s": 0.100,
+        "stable_center_norm": (0.256, -0.650),
+        "residual_rate_rad_s": (0.030, -0.104),
+        "horizontal_angle_scale_rad": 0.80,
+        "vertical_angle_scale_rad": 0.55,
+        "off_axis_brake_rad": 0.18,
+        "expansion_rate_s": 0.463,
+        "time_to_contact_s": 1.0 / 0.463,
+        "requested_target_pitch_rad": 0.120,
+        "fov_protected_target_pitch_rad": -0.225,
+        "requested_thrust": 0.320,
+    }
+    inputs.update(overrides)
+    return course_stage._allocate_fresh_top_censored_closure_recovery(
+        **inputs
+    )
+
+
+def test_dd89_fresh_top_boundary_allocates_vertical_without_forward_closure():
+    allocation = _dd89_top_censored_recovery()
+
+    assert allocation is not None
+    assert allocation.basis == (
+        course_stage.FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS
+    )
+    assert allocation.raw_top_edge_image_down == -1.0
+    assert allocation.predicted_pitch_at_response_rad < 0.0
+    assert allocation.requested_target_pitch_rad == pytest.approx(0.120)
+    assert allocation.fov_protected_target_pitch_rad == pytest.approx(
+        -0.225
+    )
+    assert allocation.allocated_target_pitch_rad == 0.0
+    assert allocation.allocated_thrust == pytest.approx(0.320)
+    assert allocation.forward_closure_authorized is False
+    assert allocation.steering_only is True
+    assert allocation.passage_authority is False
+    assert allocation.advance_authority is False
+    assert allocation.horizontal_aligned is False
+    assert all(
+        math.isfinite(value)
+        for value in (
+            allocation.allocated_target_pitch_rad,
+            allocation.allocated_thrust,
+            *allocation.stable_center_norm,
+            *allocation.residual_rate_norm_s,
+        )
+    )
+    assert (
+        course_stage.MIN_VISUAL_TARGET_PITCH_RAD
+        <= allocation.allocated_target_pitch_rad
+        <= course_stage.MAX_VISUAL_TARGET_PITCH_RAD
+    )
+    assert (
+        course_stage.MIN_VISUAL_THRUST
+        <= allocation.allocated_thrust
+        <= course_stage.MAX_VISUAL_THRUST
+    )
+
+
+def test_top_censored_vertical_collective_cannot_restore_forward_pitch():
+    allocations = tuple(
+        _dd89_top_censored_recovery(requested_thrust=thrust)
+        for thrust in (0.275, 0.300, 0.320)
+    )
+
+    assert all(allocation is not None for allocation in allocations)
+    assert [
+        allocation.allocated_target_pitch_rad
+        for allocation in allocations
+        if allocation is not None
+    ] == [0.0, 0.0, 0.0]
+    assert [
+        allocation.allocated_thrust
+        for allocation in allocations
+        if allocation is not None
+    ] == pytest.approx([0.275, 0.300, 0.320])
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"raw_top_edge_image_down": -0.99},
+        {"clipping": FrameEdge.NONE},
+        {"center_censored": False},
+        {"current_visible": False},
+        {"current_ambiguous": True},
+        {"current_missed_count": 1},
+        {"current_censored_axes": (True, True)},
+        {"current_aperture_propagated": False},
+        {"current_aperture_dynamics_qualified": False},
+        {"passage_committed": True},
+        {"expansion_rate_s": 0.0},
+        {"time_to_contact_s": None},
+        {"requested_target_pitch_rad": -0.120},
+        {"fov_protected_target_pitch_rad": 0.120},
+    ),
+)
+def test_top_censored_closure_recovery_releases_without_exact_authority(
+    changes,
+):
+    assert _dd89_top_censored_recovery(**changes) is None
+
+
 def test_post_credit_top_clip_protects_only_pitch_and_survives_blind_gap():
     authority = _propagated_top_fov_authority()
     pitch = -0.049

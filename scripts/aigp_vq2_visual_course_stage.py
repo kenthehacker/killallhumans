@@ -155,6 +155,9 @@ APPROACH_INNER_DROPOUT_HOLD_BASIS = (
 APPROACH_PROPAGATED_VISIBILITY_GAP_BASIS = (
     "qualified-local-state-clipped-visibility-gap-v2"
 )
+FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS = (
+    "fresh-top-boundary-imu-closure-recovery-v1"
+)
 APPROACH_INNER_DROPOUT_MAX_DURATION_S = 0.120
 APPROACH_TOP_RECOVERY_ENDPOINT_SIGMA = 2.0
 APPROACH_TOP_RECOVERY_MIN_INWARD_Q_RATE_S = 0.25
@@ -527,6 +530,205 @@ class _TopFovRetainedRawStateObservation:
     wall_age_s: float
     prediction_horizon_remaining_s: float
     geometry_basis: str
+
+
+@dataclass(frozen=True, slots=True)
+class _FreshTopCensoredClosureRecovery:
+    """Joint pitch/collective allocation for one fresh TOP boundary.
+
+    The raw boundary and IMU state recover only steering/control allocation.
+    They do not recreate an aperture, crossing clearance, passage, or race
+    authority.
+    """
+
+    basis: str
+    raw_top_edge_image_down: float
+    capture_pitch_rad: float
+    body_pitch_rate_rad_s: float
+    predicted_pitch_at_response_rad: float
+    stable_center_norm: tuple[float, float]
+    residual_rate_norm_s: tuple[float, float]
+    expansion_rate_s: float
+    time_to_contact_s: float
+    horizontal_aligned: bool
+    requested_target_pitch_rad: float
+    fov_protected_target_pitch_rad: float
+    allocated_target_pitch_rad: float
+    requested_thrust: float
+    allocated_thrust: float
+    forward_closure_authorized: bool
+    steering_only: bool
+    passage_authority: bool
+    advance_authority: bool
+
+
+def _allocate_fresh_top_censored_closure_recovery(
+    *,
+    raw_top_edge_image_down: float,
+    clipping: FrameEdge,
+    center_censored: bool,
+    current_visible: bool,
+    current_ambiguous: bool,
+    current_missed_count: int,
+    current_censored_axes: tuple[bool, bool],
+    current_aperture_propagated: bool,
+    current_aperture_dynamics_qualified: bool,
+    passage_committed: bool,
+    capture_pitch_rad: float,
+    body_pitch_rate_rad_s: float,
+    pitch_response_delay_s: float,
+    stable_center_norm: tuple[float, float],
+    residual_rate_rad_s: tuple[float, float],
+    horizontal_angle_scale_rad: float,
+    vertical_angle_scale_rad: float,
+    off_axis_brake_rad: float,
+    expansion_rate_s: float,
+    time_to_contact_s: Optional[float],
+    requested_target_pitch_rad: float,
+    fov_protected_target_pitch_rad: float,
+    requested_thrust: float,
+) -> Optional[_FreshTopCensoredClosureRecovery]:
+    """Remove forward authority while a fresh current gate is TOP-censored.
+
+    A saturated raw top edge is a fresh one-sided observation, not a measured
+    aperture edge.  The local state and IMU therefore retain vertical/lateral
+    steering, while the requested attitude is projected to the non-forward
+    half-space and the existing collective remains dedicated to vertical
+    recovery.  This is a state-dependent reference allocation; the final wire
+    governor remains the sole temporal continuity authority.
+    """
+
+    if (
+        type(clipping) is not FrameEdge
+        or type(current_censored_axes) is not tuple
+        or len(current_censored_axes) != 2
+        or type(stable_center_norm) is not tuple
+        or len(stable_center_norm) != 2
+        or type(residual_rate_rad_s) is not tuple
+        or len(residual_rate_rad_s) != 2
+    ):
+        raise ValueError("fresh TOP recovery structure is invalid")
+    (
+        raw_top,
+        capture_pitch,
+        pitch_rate,
+        response_delay,
+        stable_x,
+        stable_y,
+        residual_x,
+        residual_y,
+        horizontal_scale,
+        vertical_scale,
+        off_axis,
+        expansion,
+        requested_pitch,
+        fov_pitch,
+        thrust,
+    ) = map(
+        float,
+        (
+            raw_top_edge_image_down,
+            capture_pitch_rad,
+            body_pitch_rate_rad_s,
+            pitch_response_delay_s,
+            *stable_center_norm,
+            *residual_rate_rad_s,
+            horizontal_angle_scale_rad,
+            vertical_angle_scale_rad,
+            off_axis_brake_rad,
+            expansion_rate_s,
+            requested_target_pitch_rad,
+            fov_protected_target_pitch_rad,
+            requested_thrust,
+        ),
+    )
+    ttc = None if time_to_contact_s is None else float(time_to_contact_s)
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                raw_top,
+                capture_pitch,
+                pitch_rate,
+                response_delay,
+                stable_x,
+                stable_y,
+                residual_x,
+                residual_y,
+                horizontal_scale,
+                vertical_scale,
+                off_axis,
+                expansion,
+                requested_pitch,
+                fov_pitch,
+                thrust,
+            )
+        )
+        or ttc is not None and not math.isfinite(ttc)
+        or response_delay < 0.0
+        or horizontal_scale <= 0.0
+        or vertical_scale <= 0.0
+        or off_axis <= 0.0
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= requested_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_TARGET_PITCH_RAD
+        <= fov_pitch
+        <= MAX_VISUAL_TARGET_PITCH_RAD
+        or not MIN_VISUAL_THRUST <= thrust <= MAX_VISUAL_THRUST
+    ):
+        raise ValueError("fresh TOP recovery input is invalid")
+    if not (
+        clipping is FrameEdge.TOP
+        and center_censored
+        and current_visible
+        and not current_ambiguous
+        and current_missed_count == 0
+        and current_censored_axes == (False, True)
+        and current_aperture_propagated
+        and current_aperture_dynamics_qualified
+        and not passage_committed
+        and raw_top <= -1.0 + 1e-12
+        and stable_y < 0.0
+        and expansion > 0.0
+        and ttc is not None
+        and ttc > response_delay
+        and requested_pitch >= 0.0
+        and fov_pitch < requested_pitch - 1e-12
+    ):
+        return None
+
+    predicted_pitch = capture_pitch + pitch_rate * response_delay
+    allocated_pitch = min(requested_pitch, max(0.0, predicted_pitch))
+    allocated_thrust = max(GATE0_PROVED_COLLECTIVE_BASE, thrust)
+    residual_rate_norm = (
+        residual_x / horizontal_scale,
+        residual_y / vertical_scale,
+    )
+    horizontal_aligned = bool(
+        abs(math.atan(stable_x * horizontal_scale)) < off_axis
+    )
+    return _FreshTopCensoredClosureRecovery(
+        basis=FRESH_TOP_CENSORED_CLOSURE_RECOVERY_BASIS,
+        raw_top_edge_image_down=raw_top,
+        capture_pitch_rad=capture_pitch,
+        body_pitch_rate_rad_s=pitch_rate,
+        predicted_pitch_at_response_rad=predicted_pitch,
+        stable_center_norm=(stable_x, stable_y),
+        residual_rate_norm_s=residual_rate_norm,
+        expansion_rate_s=expansion,
+        time_to_contact_s=ttc,
+        horizontal_aligned=horizontal_aligned,
+        requested_target_pitch_rad=requested_pitch,
+        fov_protected_target_pitch_rad=fov_pitch,
+        allocated_target_pitch_rad=allocated_pitch,
+        requested_thrust=thrust,
+        allocated_thrust=allocated_thrust,
+        forward_closure_authorized=False,
+        steering_only=True,
+        passage_authority=False,
+        advance_authority=False,
+    )
 
 
 def _top_fov_propagated_observation(
@@ -5577,6 +5779,10 @@ async def _run_visual_course_stage_impl(
         top_fov_retained_raw_proposal: Optional[
             _TopFovPitchProposal
         ] = None
+        top_censored_closure_recovery: Optional[
+            _FreshTopCensoredClosureRecovery
+        ] = None
+        requested_pitch_before_top_fov = target_pitch_rad
         top_fov_track_id: Optional[str] = None
         dynamic_controller = runtime.dynamic_controller
         if type(dynamic_controller) is DynamicVisualCourseSession:
@@ -5751,6 +5957,163 @@ async def _run_visual_course_stage_impl(
                         launch_evidence["target_pitch_rad"] = (
                             target_pitch_rad
                         )
+            fov_reference = (
+                top_fov_proposal
+                or top_fov_propagated_proposal
+                or top_fov_retained_raw_proposal
+            )
+            if (
+                fov_reference is not None
+                and committed_crossing_authority is None
+            ):
+                try:
+                    recovery_course = (
+                        dynamic_controller.core.course_state()
+                    )
+                    recovery_current = recovery_course.current
+                    recovery_decision = dynamic_controller.last_decision
+                    recovery_history = getattr(
+                        target_track,
+                        "history",
+                        None,
+                    )
+                    recovery_sample = (
+                        None
+                        if type(recovery_history) is not tuple
+                        or not recovery_history
+                        else recovery_history[-1]
+                    )
+                    if (
+                        recovery_decision is None
+                        or recovery_sample is None
+                        or recovery_course.current_gate_index
+                        != current_gate_index
+                        or recovery_course.current_track_id
+                        != current_track_id
+                        or recovery_current.track_id
+                        != current_track_id
+                        or getattr(target_track, "track_id", None)
+                        != current_track_id
+                        or recovery_sample.token
+                        != snapshot.latest_camera_token
+                        or recovery_current.frame_sequence
+                        != recovery_sample.tracker_frame_sequence
+                        or recovery_current.stream_generation
+                        != snapshot.latest_camera_token.generation
+                    ):
+                        raise ValueError(
+                            "fresh TOP recovery differs from current lineage"
+                        )
+                    recovery_config = dynamic_controller.core.config
+                    top_censored_closure_recovery = (
+                        _allocate_fresh_top_censored_closure_recovery(
+                            raw_top_edge_image_down=(
+                                _raw_bbox_top_image_down(
+                                    recovery_sample.bbox_norm
+                                )
+                            ),
+                            clipping=getattr(
+                                target_track,
+                                "clipping",
+                                FrameEdge.NONE,
+                            ),
+                            center_censored=bool(
+                                getattr(
+                                    target_track,
+                                    "center_censored",
+                                    False,
+                                )
+                            ),
+                            current_visible=bool(
+                                recovery_current.visible
+                            ),
+                            current_ambiguous=bool(
+                                recovery_current.ambiguous
+                            ),
+                            current_missed_count=int(
+                                recovery_current.missed_count
+                            ),
+                            current_censored_axes=(
+                                recovery_current.censored_axes
+                            ),
+                            current_aperture_propagated=bool(
+                                recovery_current.aperture_propagated
+                            ),
+                            current_aperture_dynamics_qualified=bool(
+                                recovery_current
+                                .aperture_dynamics_qualified
+                            ),
+                            passage_committed=bool(
+                                proposal.mode
+                                is VisualApproachMode.PASSAGE
+                            ),
+                            capture_pitch_rad=(
+                                _body_to_reference_pitch_rad(
+                                    recovery_current
+                                    .body_to_reference_wxyz
+                                )
+                            ),
+                            body_pitch_rate_rad_s=float(
+                                recovery_current.body_rates_rad_s[1]
+                            ),
+                            pitch_response_delay_s=float(
+                                recovery_config.pitch_command_delay_s
+                            ),
+                            stable_center_norm=(
+                                recovery_decision.current_center_norm
+                            ),
+                            residual_rate_rad_s=(
+                                recovery_current
+                                .residual_translational_rate_rad_s
+                            ),
+                            horizontal_angle_scale_rad=float(
+                                recovery_config
+                                .horizontal_angle_scale_rad
+                            ),
+                            vertical_angle_scale_rad=float(
+                                recovery_config.vertical_angle_scale_rad
+                            ),
+                            off_axis_brake_rad=float(
+                                recovery_config.off_axis_brake_rad
+                            ),
+                            expansion_rate_s=float(
+                                recovery_current.expansion_rate_s
+                            ),
+                            time_to_contact_s=(
+                                recovery_current.time_to_contact_s
+                            ),
+                            requested_target_pitch_rad=(
+                                requested_pitch_before_top_fov
+                            ),
+                            fov_protected_target_pitch_rad=(
+                                fov_reference
+                                .protected_target_pitch_rad
+                            ),
+                            requested_thrust=command_thrust,
+                        )
+                    )
+                except (
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    raise abort_type(
+                        "visual-course fresh TOP-censored recovery "
+                        f"refused: {exc}"
+                    ) from exc
+                if top_censored_closure_recovery is not None:
+                    target_pitch_rad = (
+                        top_censored_closure_recovery
+                        .allocated_target_pitch_rad
+                    )
+                    command_thrust = (
+                        top_censored_closure_recovery.allocated_thrust
+                    )
+                    if launch_evidence is not None:
+                        launch_evidence["target_pitch_rad"] = (
+                            target_pitch_rad
+                        )
+                        launch_evidence["thrust"] = command_thrust
         if committed_crossing_authority is not None:
             # Observations, local-state propagation, and diagnostics continue
             # updating above, but the latch-sealed current-gate coast owns the
@@ -6410,6 +6773,36 @@ async def _run_visual_course_stage_impl(
                         pitch_guidance=accepted_dynamic_evidence[
                             "top_fov_pitch_guidance"
                         ],
+                        command=asdict(command),
+                    )
+                if top_censored_closure_recovery is not None:
+                    recovery_evidence = asdict(
+                        top_censored_closure_recovery
+                    )
+                    accepted_dynamic_evidence[
+                        "fresh_top_censored_closure_recovery"
+                    ] = recovery_evidence
+                    pitch_guidance = accepted_dynamic_evidence.get(
+                        "top_fov_pitch_guidance"
+                    )
+                    if isinstance(pitch_guidance, dict):
+                        pitch_guidance[
+                            "superseded_by_fresh_boundary_recovery"
+                        ] = True
+                        pitch_guidance[
+                            "applied_target_pitch_rad"
+                        ] = target_pitch_rad
+                    fov_summary[
+                        "last_protected_target_pitch_rad"
+                    ] = target_pitch_rad
+                    host.recorder.emit(
+                        "visual_course_fresh_top_censored_recovery",
+                        gate_index=current_gate_index,
+                        stage=stage,
+                        camera_token=asdict(
+                            snapshot.latest_camera_token
+                        ),
+                        allocation=recovery_evidence,
                         command=asdict(command),
                     )
             host.recorder.emit(
