@@ -50,6 +50,9 @@ from planning.vq2_visual_approach import (
     VisualApproachMode,
     VisualApproachRefusal,
 )
+from planning.vq2_visual_servo import (
+    MAX_VISUAL_TARGET_COORDINATE_NORM,
+)
 
 
 _BASE_NS = 10_000_000_000
@@ -2824,20 +2827,20 @@ def test_rehydrated_inner_lineage_guides_multiedge_clip_without_passage() -> Non
         (
             FrameEdge.RIGHT,
             (True, False),
-            (0.80, -1.40),
+            (1.40, -1.40),
             1,
             0,
         ),
         (
             FrameEdge.TOP,
             (False, True),
-            (1.40, -0.80),
+            (1.40, -1.40),
             0,
             1,
         ),
     ),
 )
-def test_one_axis_clip_keeps_fresh_observable_coordinate(
+def test_one_axis_clip_keeps_fresh_observable_and_bounds_projection(
     monkeypatch: pytest.MonkeyPatch,
     clipping: FrameEdge,
     expected_censored_axes: tuple[bool, bool],
@@ -2897,14 +2900,27 @@ def test_one_axis_clip_keeps_fresh_observable_coordinate(
         proposal.current_target.normalized_y_down,
     )
     assert state.censored_axes == expected_censored_axes
-    assert abs(projected_center[observable_axis]) > 1.25
+    assert (
+        abs(projected_center[observable_axis])
+        > MAX_VISUAL_TARGET_COORDINATE_NORM
+    )
     assert target_center[observable_axis] == pytest.approx(
         raw_center[observable_axis]
     )
-    assert target_center[propagated_axis] == pytest.approx(
-        projected_center[propagated_axis]
+    assert (
+        abs(projected_center[propagated_axis])
+        > MAX_VISUAL_TARGET_COORDINATE_NORM
     )
-    assert all(abs(value) <= 1.25 for value in target_center)
+    assert target_center[propagated_axis] == pytest.approx(
+        math.copysign(
+            MAX_VISUAL_TARGET_COORDINATE_NORM,
+            projected_center[propagated_axis],
+        )
+    )
+    assert all(
+        abs(value) <= MAX_VISUAL_TARGET_COORDINATE_NORM
+        for value in target_center
+    )
     assert session.last_decision is not None
     assert session.last_decision.camera_current_center_norm == pytest.approx(
         projected_center

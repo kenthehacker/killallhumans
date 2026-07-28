@@ -52,6 +52,7 @@ from planning.vq2_visual_approach import (
     VisualApproachRefusal,
 )
 from planning.vq2_visual_servo import (
+    MAX_VISUAL_TARGET_COORDINATE_NORM,
     VisualServoOutput,
     VisualServoRefusal,
     VisualServoTuning,
@@ -3997,10 +3998,34 @@ class DynamicRollingVisualApproachServo(RollingVisualApproachServo):
                 )
                 for axis in range(2)
             )
+            if not all(
+                math.isfinite(float(value))
+                for value in shell_center
+            ):
+                raise VisualApproachRefusal(
+                    "dynamic current target projection is nonfinite"
+                )
+            # The dynamic core retains the unsaturated off-frame projection.
+            # The legacy VisualTarget is only a bounded servo-shaped shell:
+            # clamp a censored axis at its representable boundary while
+            # preserving direction.  This does not create fresh geometry or
+            # change passage/advance authority.
+            bounded_shell_center = tuple(
+                max(
+                    -MAX_VISUAL_TARGET_COORDINATE_NORM,
+                    min(
+                        MAX_VISUAL_TARGET_COORDINATE_NORM,
+                        float(shell_center[axis]),
+                    ),
+                )
+                if state.censored_axes[axis]
+                else float(shell_center[axis])
+                for axis in range(2)
+            )
             return replace(
                 target,
-                normalized_x=float(shell_center[0]),
-                normalized_y_down=float(shell_center[1]),
+                normalized_x=bounded_shell_center[0],
+                normalized_y_down=bounded_shell_center[1],
                 normalized_x_rate_s=(
                     state.residual_translational_rate_rad_s[0]
                     / scale.horizontal_angle_scale_rad

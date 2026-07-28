@@ -45,6 +45,7 @@ MAX_VISUAL_SEGMENT_DURATION_S = 8.0
 MAX_VISUAL_TARGET_ROLL_RAD = 0.35
 MIN_VISUAL_TARGET_PITCH_RAD = -0.35
 MAX_VISUAL_TARGET_PITCH_RAD = 0.15
+MAX_VISUAL_TARGET_COORDINATE_NORM = 1.25
 MIN_VISUAL_THRUST = 0.21
 MAX_VISUAL_THRUST = 0.32
 MAX_VISUAL_OBSERVATION_AGE_S = 0.10
@@ -339,9 +340,15 @@ class VisualTarget:
             for value in values
         ):
             raise VisualServoRefusal("visual target fields must be finite")
-        if abs(float(self.normalized_x)) > 1.25:
+        if (
+            abs(float(self.normalized_x))
+            > MAX_VISUAL_TARGET_COORDINATE_NORM
+        ):
             raise VisualServoRefusal("horizontal target coordinate is implausible")
-        if abs(float(self.normalized_y_down)) > 1.25:
+        if (
+            abs(float(self.normalized_y_down))
+            > MAX_VISUAL_TARGET_COORDINATE_NORM
+        ):
             raise VisualServoRefusal(
                 "image-down vertical target coordinate is implausible"
             )
