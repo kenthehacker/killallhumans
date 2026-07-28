@@ -5373,6 +5373,60 @@ def test_retained_raw_top_fov_state_keeps_fixed_anchor_across_clipped_frames():
     )
 
 
+def test_retained_raw_top_fov_keeps_anchor_after_superseded_raw_frame():
+    case = _retained_raw_top_fov_case()
+    superseded_raw = case.track.history[-1]
+    superseded_raw.inner_aperture = VisualInnerApertureGeometry(
+        center_norm=(0.0, -0.72),
+        half_size_norm=(0.08, 0.03),
+        log_scale=-2.9,
+        measurement_std=(0.01, 0.02, 0.12),
+        confidence=0.08,
+        clipping=FrameEdge.NONE,
+        visible_edges=(
+            FrameEdge.LEFT
+            | FrameEdge.TOP
+            | FrameEdge.RIGHT
+            | FrameEdge.BOTTOM
+        ),
+        geometry_model_id="vq2-visible-inner-quad-lines-v1",
+        covariance_model_id="vq2-visible-aperture-diagonal-v1",
+        health_reason="outer_support_clipped_tracking_only",
+    )
+    current_token = _token(185)
+    current = SimpleNamespace(
+        tracker_frame_sequence=185,
+        token=current_token,
+        observation_monotonic_ns=1_063_000_000,
+        bbox_norm=(0.40, 0.0, 0.80, 0.34),
+        confidence=0.79,
+        clipping=FrameEdge.TOP,
+        center_censored=True,
+        inner_aperture=None,
+    )
+    case.track.history = (*case.track.history, current)
+    case.track.latest_token = current_token
+    case.session.core.course_state().current.frame_sequence = 185
+
+    observation, proposal, authority = (
+        course_stage._propose_retained_raw_top_fov_pitch_reference(
+            case.session,
+            case.track,
+            current_token,
+            fov_summary=case.fov_summary,
+            now_monotonic_ns=1_074_000_000,
+            requested_target_pitch_rad=0.120,
+        )
+    )
+
+    assert observation.anchor_camera_token == _token(183)
+    assert authority["camera_token"] == asdict(current_token)
+    assert proposal.protected_target_pitch_rad <= case.protected_pitch
+    assert authority["steering_only"] is True
+    assert authority["passage_authority"] is False
+    assert authority["advance_authority"] is False
+
+
 def test_retained_raw_top_fov_uses_state_horizon_not_command_hold():
     case = _retained_raw_top_fov_case()
     case.now_monotonic_ns = case.anchor_wire_ns + 241_000_000

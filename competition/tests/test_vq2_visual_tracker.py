@@ -631,7 +631,7 @@ def test_edge_transition_quarantines_only_censored_box_derivatives() -> None:
     assert horizontal_uncensor.log_scale_rate_s == 0.0
 
 
-def test_same_edge_impossible_contraction_becomes_a_visibility_gap() -> None:
+def test_same_edge_implausible_contraction_becomes_a_visibility_gap() -> None:
     tracker = MultiTargetVisualTracker()
     first = tracker.update(
         _frame(
@@ -639,10 +639,10 @@ def test_same_edge_impossible_contraction_becomes_a_visibility_gap() -> None:
             (
                 _detection(
                     0,
-                    0.20,
-                    -0.76,
-                    0.24,
-                    0.24,
+                    0.178,
+                    -0.811,
+                    0.236,
+                    0.192,
                     clipping=FrameEdge.TOP,
                     center_censored=True,
                 ),
@@ -658,10 +658,10 @@ def test_same_edge_impossible_contraction_becomes_a_visibility_gap() -> None:
             (
                 _detection(
                     0,
-                    0.30,
-                    -0.91,
-                    0.18,
-                    0.09,
+                    0.281,
+                    -0.90,
+                    0.172,
+                    0.10,
                     clipping=FrameEdge.TOP,
                     center_censored=True,
                 ),

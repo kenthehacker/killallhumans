@@ -2870,14 +2870,10 @@ def _propose_retained_raw_top_fov_pitch_reference(
             raise ValueError(
                 "retained top-FOV clipped history is discontinuous"
             )
-        try:
-            _top_fov_raw_edge(clipped_sample)
-        except (AttributeError, TypeError, ValueError):
-            pass
-        else:
-            raise ValueError(
-                "retained top-FOV state bypasses recoverable raw geometry"
-            )
+        # A raw-edge proposal can be superseded before it reaches the wire.
+        # Its measurement remains useful history, but it cannot replace the
+        # last accepted immutable anchor.  Continue projecting that accepted
+        # anchor until a newer raw proposal is itself accepted.
         previous_sample = clipped_sample
 
     current_observation_ns = current_sample.observation_monotonic_ns
@@ -10795,6 +10791,20 @@ async def _run_visual_course_stage_impl(
                         segment["recovery_one_edge_command_count"]
                     )
                     > 0
+                    and getattr(
+                        snapshot.current_track,
+                        "visible",
+                        False,
+                    )
+                    is True
+                    and getattr(snapshot, "authority_usable", False)
+                    is True
+                    and getattr(
+                        snapshot.current_track,
+                        "latest_token",
+                        None,
+                    )
+                    == token
                     and _fresh_top_boundary_recovery_horizontal_edge(
                         getattr(
                             snapshot.current_track,

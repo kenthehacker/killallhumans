@@ -834,6 +834,7 @@ class MultiTargetTrackerConfig:
     min_bbox_iou: float = 0.01
     fallback_center_residual_norm: float = 0.18
     clipped_fragment_relaxation: float = 1.45
+    max_clipped_contraction_log_scale_rate_s: float = 12.0
     max_assignment_cost: float = 0.82
     unmatched_cost: float = 0.86
     ambiguity_margin: float = 0.08
@@ -867,6 +868,7 @@ class MultiTargetTrackerConfig:
             "max_log_area_residual",
             "fallback_center_residual_norm",
             "clipped_fragment_relaxation",
+            "max_clipped_contraction_log_scale_rate_s",
         ):
             _finite(getattr(self, name), name, minimum=0.0, strictly_positive=True)
         if self.clipped_fragment_relaxation < 1.0:
@@ -1441,6 +1443,9 @@ class MultiTargetVisualTracker:
         new_width, new_height = _bbox_size(detection.bbox_norm)
         log_width_change = math.log(new_width / old_width)
         log_height_change = math.log(new_height / old_height)
+        observed_log_scale_rate = (
+            detection.log_scale - math.log(latest.apparent_scale)
+        ) / dt_s
         current_inner = detection.inner_aperture
         current_complete_inner = bool(
             type(current_inner) is VisualInnerApertureGeometry
@@ -1463,6 +1468,11 @@ class MultiTargetVisualTracker:
             or (
                 same_horizontal_edge
                 and log_width_change < -self.config.max_log_width_change
+            )
+            or (
+                (same_vertical_edge or same_horizontal_edge)
+                and observed_log_scale_rate
+                < -self.config.max_clipped_contraction_log_scale_rate_s
             )
         ) and not current_complete_inner:
             # A censored support box can collapse when the detector switches
