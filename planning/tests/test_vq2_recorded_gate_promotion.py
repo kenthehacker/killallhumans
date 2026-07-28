@@ -418,11 +418,14 @@ def test_recorded_next_gate_is_pretracked_and_promoted_without_reset() -> None:
         round(row["received_monotonic_s"] * 1_000_000_000)
         for row in recorded_next
     ]
+    # The final two recorded boxes touch the image top.  Horizontal motion
+    # remains observable, but their truncated vertical centers and box scale
+    # cannot supply physical derivatives.
     assert promoted.bearing_rate_norm_s > 0.0
-    assert promoted.elevation_rate_norm_s > 0.0
-    assert promoted.log_scale_rate_s > 0.0
-    assert promoted.association_confidence > 0.90
     assert promoted.center_censored
+    assert promoted.elevation_rate_norm_s == 0.0
+    assert promoted.log_scale_rate_s == 0.0
+    assert promoted.association_confidence > 0.90
 
     final_snapshot = graph.latest_snapshot
     assert final_snapshot is not None

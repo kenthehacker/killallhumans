@@ -553,6 +553,84 @@ def test_top_clipped_fragment_continuity_is_degraded_but_keeps_identity() -> Non
     assert second.associations[0].clipping_continuity == 1.0
 
 
+def test_edge_transition_quarantines_only_censored_box_derivatives() -> None:
+    tracker = MultiTargetVisualTracker()
+    first = tracker.update(
+        _frame(
+            1,
+            (
+                _detection(
+                    0,
+                    0.60,
+                    -0.50,
+                    0.28,
+                    0.30,
+                    clipping=FrameEdge.TOP | FrameEdge.RIGHT,
+                    center_censored=True,
+                ),
+            ),
+        )
+    )
+    track_id = first.visible_track_ids[0]
+
+    vertical_uncensor = tracker.update(
+        _frame(
+            2,
+            (
+                _detection(
+                    0,
+                    0.62,
+                    -0.20,
+                    0.30,
+                    0.32,
+                    clipping=FrameEdge.RIGHT,
+                    center_censored=True,
+                ),
+            ),
+        )
+    ).track(track_id)
+    assert vertical_uncensor.center_velocity_norm_s == (0.0, 0.0)
+    assert vertical_uncensor.log_scale_rate_s == 0.0
+
+    vertically_observable = tracker.update(
+        _frame(
+            3,
+            (
+                _detection(
+                    0,
+                    0.64,
+                    -0.18,
+                    0.31,
+                    0.33,
+                    clipping=FrameEdge.RIGHT,
+                    center_censored=True,
+                ),
+            ),
+        )
+    ).track(track_id)
+    assert vertically_observable.center_velocity_norm_s[0] == 0.0
+    assert vertically_observable.center_velocity_norm_s[1] > 0.0
+    assert vertically_observable.log_scale_rate_s == 0.0
+
+    horizontal_uncensor = tracker.update(
+        _frame(
+            4,
+            (
+                _detection(
+                    0,
+                    0.34,
+                    -0.16,
+                    0.32,
+                    0.34,
+                ),
+            ),
+        )
+    ).track(track_id)
+    assert horizontal_uncensor.center_velocity_norm_s[0] == 0.0
+    assert horizontal_uncensor.center_velocity_norm_s[1] > 0.0
+    assert horizontal_uncensor.log_scale_rate_s == 0.0
+
+
 def test_ambiguous_near_tie_is_explicit_and_cannot_receive_gate_authority() -> None:
     config = MultiTargetTrackerConfig(ambiguity_margin=0.20)
     tracker = MultiTargetVisualTracker(config)

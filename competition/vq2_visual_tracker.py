@@ -1569,16 +1569,60 @@ class MultiTargetVisualTracker:
         measured_log_scale_rate = (
             detection.log_scale - math.log(latest.apparent_scale)
         ) / dt_s
+        # A clipped outer-box center is censored only on the corresponding
+        # image axis.  Its apparent jump when an edge enters or leaves the
+        # frame is not target motion.  Quarantine that derivative for the
+        # transition frame, while retaining motion on the orthogonal
+        # observable axis.  An undifferentiated censored center suppresses
+        # both axes.  Scale is derived from both box axes, so either endpoint
+        # being clipped makes its transition derivative unavailable.
+        previous_unknown_center_censorship = bool(
+            latest.center_censored and latest.clipping == FrameEdge.NONE
+        )
+        current_unknown_center_censorship = bool(
+            detection.center_censored
+            and detection.clipping == FrameEdge.NONE
+        )
+        horizontal_rate_censored = bool(
+            previous_unknown_center_censorship
+            or current_unknown_center_censorship
+            or latest.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+            or detection.clipping & (FrameEdge.LEFT | FrameEdge.RIGHT)
+        )
+        vertical_rate_censored = bool(
+            previous_unknown_center_censorship
+            or current_unknown_center_censorship
+            or latest.clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+            or detection.clipping & (FrameEdge.TOP | FrameEdge.BOTTOM)
+        )
+        scale_rate_censored = bool(
+            latest.center_censored
+            or detection.center_censored
+            or latest.clipping != FrameEdge.NONE
+            or detection.clipping != FrameEdge.NONE
+        )
         alpha = self.config.velocity_smoothing
         state.center_velocity_norm_s = (
-            alpha * measured_velocity[0]
-            + (1.0 - alpha) * state.center_velocity_norm_s[0],
-            alpha * measured_velocity[1]
-            + (1.0 - alpha) * state.center_velocity_norm_s[1],
+            0.0
+            if horizontal_rate_censored
+            else (
+                alpha * measured_velocity[0]
+                + (1.0 - alpha) * state.center_velocity_norm_s[0]
+            ),
+            0.0
+            if vertical_rate_censored
+            else (
+                alpha * measured_velocity[1]
+                + (1.0 - alpha) * state.center_velocity_norm_s[1]
+            ),
         )
         state.log_scale_rate_s = (
-            alpha * measured_log_scale_rate
-            + (1.0 - alpha) * state.log_scale_rate_s
+            0.0
+            if scale_rate_censored
+            else (
+                alpha * measured_log_scale_rate
+                + (1.0 - alpha) * state.log_scale_rate_s
+            )
         )
         confidence_alpha = self.config.confidence_smoothing
         state.confidence = (
