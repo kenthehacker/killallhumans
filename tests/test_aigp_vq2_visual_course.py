@@ -206,6 +206,72 @@ def test_fresh_top_boundary_recovery_is_lifecycle_scoped(
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "dynamic_controller_exact",
+        "recovery_measurement_mode",
+        "successor_handoff_required",
+        "current_clipping",
+        "expected",
+    ),
+    (
+        (
+            True,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            False,
+            FrameEdge.TOP,
+            True,
+        ),
+        (
+            False,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            False,
+            FrameEdge.TOP,
+            False,
+        ),
+        (
+            True,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            True,
+            FrameEdge.TOP,
+            False,
+        ),
+        (
+            True,
+            PostCreditMeasurementMode.CLEAN,
+            False,
+            FrameEdge.TOP,
+            False,
+        ),
+        (
+            True,
+            PostCreditMeasurementMode.ONE_EDGE_CENSORED,
+            False,
+            FrameEdge.RIGHT,
+            False,
+        ),
+    ),
+)
+def test_promoted_top_boundary_routes_after_handoff_retirement(
+    dynamic_controller_exact,
+    recovery_measurement_mode,
+    successor_handoff_required,
+    current_clipping,
+    expected,
+):
+    assert (
+        course_stage._promoted_fresh_top_boundary_brake_required(
+            dynamic_controller_exact=dynamic_controller_exact,
+            mode=VisualApproachMode.PROMOTE_REACQUIRE,
+            lifecycle=CourseLifecycle.PROMOTE_REACQUIRE,
+            recovery_measurement_mode=recovery_measurement_mode,
+            successor_handoff_required=successor_handoff_required,
+            current_clipping=current_clipping,
+        )
+        is expected
+    )
+
+
 def test_dynamic_continuity_seed_is_not_crossing_evidence():
     token = _token(1)
     accepted = course_stage._AcceptedVisualCommand(

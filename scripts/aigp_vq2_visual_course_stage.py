@@ -283,6 +283,30 @@ def _fresh_top_boundary_recovery_lifecycle_eligible(
     )
 
 
+def _promoted_fresh_top_boundary_brake_required(
+    *,
+    dynamic_controller_exact: bool,
+    mode: VisualApproachMode,
+    lifecycle: CourseLifecycle,
+    recovery_measurement_mode: Optional[PostCreditMeasurementMode],
+    successor_handoff_required: bool,
+    current_clipping: Any,
+) -> bool:
+    """Route post-handoff TOP frames through the bounded boundary brake."""
+
+    return bool(
+        dynamic_controller_exact
+        and not successor_handoff_required
+        and current_clipping is FrameEdge.TOP
+        and _fresh_top_boundary_recovery_lifecycle_eligible(
+            mode=mode,
+            lifecycle=lifecycle,
+            recovery_measurement_mode=recovery_measurement_mode,
+        )
+        and mode is VisualApproachMode.PROMOTE_REACQUIRE
+    )
+
+
 def _body_to_reference_pitch_rad(
     body_to_reference_wxyz: tuple[float, float, float, float],
 ) -> float:
@@ -10407,6 +10431,33 @@ async def _run_visual_course_stage_impl(
                 )
             )
             try:
+                if _promoted_fresh_top_boundary_brake_required(
+                    dynamic_controller_exact=(
+                        type(runtime.dynamic_controller)
+                        is DynamicVisualCourseSession
+                    ),
+                    mode=mode,
+                    lifecycle=lifecycle,
+                    recovery_measurement_mode=(
+                        recovery_measurement_mode
+                    ),
+                    successor_handoff_required=(
+                        post_credit_successor_handoff_required
+                    ),
+                    current_clipping=getattr(
+                        getattr(snapshot, "current_track", None),
+                        "clipping",
+                        None,
+                    ),
+                ):
+                    # The ordinary planner can steer from a fresh one-axis
+                    # outer shell even when a newly rebound current has never
+                    # seeded an aperture.  Its downstream raw-edge FOV path
+                    # cannot consume TOP censorship, so route the exact
+                    # boundary into the already-bounded steering-only brake.
+                    raise VisualApproachCurrentGeometryUnavailable(
+                        "promoted current TOP boundary requires bounded brake"
+                    )
                 proposal = planner.observe(
                     snapshot,
                     host.visual_tracker,
